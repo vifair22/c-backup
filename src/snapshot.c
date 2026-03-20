@@ -18,6 +18,7 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
     uint32_t snap_id;
+    uint64_t created_sec;
     uint32_t node_count;
     uint32_t dirent_count;
     uint64_t dirent_data_len;
@@ -47,6 +48,7 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     snapshot_t *snap = calloc(1, sizeof(*snap));
     if (!snap) { close(fd); return ERR_NOMEM; }
     snap->snap_id         = fhdr.snap_id;
+    snap->created_sec     = fhdr.created_sec;
     snap->node_count      = fhdr.node_count;
     snap->dirent_count    = fhdr.dirent_count;
     snap->dirent_data_len = (size_t)fhdr.dirent_data_len;
@@ -84,6 +86,7 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         .magic           = SNAP_MAGIC,
         .version         = SNAP_VERSION,
         .snap_id         = snap->snap_id,
+        .created_sec     = snap->created_sec,
         .node_count      = snap->node_count,
         .dirent_count    = snap->dirent_count,
         .dirent_data_len = snap->dirent_data_len,

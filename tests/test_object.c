@@ -37,7 +37,7 @@ static void test_store_and_load(void **state) {
                                   data, len, hash), OK);
 
     void *out = NULL; size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len), OK);
+    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, len);
     assert_memory_equal(out, data, len);
     free(out);

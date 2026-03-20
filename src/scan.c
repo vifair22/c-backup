@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -17,6 +18,58 @@
 #include <acl/libacl.h>
 
 static uint64_t next_node_id = 1;
+
+/* ------------------------------------------------------------------ */
+/* Inode map: inode_identity (uint64) → first node_id (uint64)        */
+/* Exposed as scan_imap_t so callers can share it across scan_tree()  */
+/* calls to deduplicate hard links spanning multiple source roots.     */
+/* ------------------------------------------------------------------ */
+
+typedef struct { uint64_t key; uint64_t val; } imap_slot_t;
+struct scan_imap { imap_slot_t *s; size_t cap; size_t cnt; };
+typedef struct scan_imap imap_t;  /* local alias */
+
+scan_imap_t *scan_imap_new(void) {
+    imap_t *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+    m->s = calloc(256, sizeof(imap_slot_t));
+    if (!m->s) { free(m); return NULL; }
+    m->cap = 256;
+    return m;
+}
+void scan_imap_free(scan_imap_t *m) { if (m) { free(m->s); free(m); } }
+
+static uint64_t imap_get(const imap_t *m, uint64_t key) {
+    if (!key) return 0;
+    size_t h = (size_t)((key * 11400714819323198485ULL) >> 32) & (m->cap - 1);
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t idx = (h + i) & (m->cap - 1);
+        if (!m->s[idx].key) return 0;
+        if (m->s[idx].key == key) return m->s[idx].val;
+    }
+    return 0;
+}
+
+static int imap_set(imap_t *m, uint64_t key, uint64_t val) {
+    if (!key) return 0;
+    if (m->cnt * 10 >= m->cap * 7) {
+        size_t nc = m->cap * 2;
+        imap_slot_t *ns = calloc(nc, sizeof(imap_slot_t));
+        if (!ns) return -1;
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!m->s[i].key) continue;
+            size_t h = (size_t)((m->s[i].key * 11400714819323198485ULL) >> 32) & (nc - 1);
+            while (ns[h].key) h = (h + 1) & (nc - 1);
+            ns[h] = m->s[i];
+        }
+        free(m->s); m->s = ns; m->cap = nc;
+    }
+    size_t h = (size_t)((key * 11400714819323198485ULL) >> 32) & (m->cap - 1);
+    while (m->s[h].key && m->s[h].key != key) h = (h + 1) & (m->cap - 1);
+    if (!m->s[h].key) m->cnt++;
+    m->s[h].key = key; m->s[h].val = val;
+    return 0;
+}
 
 static status_t result_append(scan_result_t *res, const scan_entry_t *e) {
     if (res->count == res->capacity) {
@@ -97,10 +150,12 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
 
 /* Forward declaration */
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
-                         size_t strip_prefix_len, scan_result_t *res);
+                         size_t strip_prefix_len, imap_t *imap,
+                         const scan_opts_t *opts, scan_result_t *res);
 
 static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
-                               size_t strip_prefix_len, scan_result_t *res) {
+                               size_t strip_prefix_len, imap_t *imap,
+                               const scan_opts_t *opts, scan_result_t *res) {
     struct stat st;
     if (lstat(path, &st) == -1) {
         log_msg("WARN", "lstat failed, skipping entry");
@@ -116,6 +171,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
 
     node_t *nd = &e.node;
     nd->node_id        = next_node_id++;
+    nd->inode_identity = (uint64_t)st.st_dev ^ ((uint64_t)st.st_ino << 32);
     nd->type           = stat_to_node_type(&st);
     nd->mode           = (uint32_t)st.st_mode;
     nd->uid            = (uint32_t)st.st_uid;
@@ -124,7 +180,16 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     nd->mtime_sec      = (uint64_t)st.st_mtim.tv_sec;
     nd->mtime_nsec     = (uint64_t)st.st_mtim.tv_nsec;
     nd->link_count     = (uint32_t)st.st_nlink;
-    nd->inode_identity = (uint64_t)st.st_dev ^ ((uint64_t)st.st_ino << 32);
+
+    /* Hard link detection: if we've seen this inode before, record the primary */
+    if (nd->link_count > 1 && nd->type == NODE_TYPE_REG) {
+        uint64_t primary = imap_get(imap, nd->inode_identity);
+        if (primary) {
+            e.hardlink_to_node_id = primary;
+        } else {
+            imap_set(imap, nd->inode_identity, nd->node_id);
+        }
+    }
 
     if (nd->type == NODE_TYPE_CHR || nd->type == NODE_TYPE_BLK) {
         nd->device.major = (uint32_t)major(st.st_rdev);
@@ -154,27 +219,40 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     }
 
     if (S_ISDIR(st.st_mode))
-        return scan_dir(path, this_node_id, strip_prefix_len, res);
+        return scan_dir(path, this_node_id, strip_prefix_len, imap, opts, res);
     return OK;
 }
 
+static int is_excluded(const char *name, const scan_opts_t *opts) {
+    if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
+    for (int i = 0; i < opts->n_exclude; i++) {
+        if (fnmatch(opts->exclude[i], name, FNM_PATHNAME) == 0 ||
+            fnmatch(opts->exclude[i], name, 0) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
-                         size_t strip_prefix_len, scan_result_t *res) {
+                         size_t strip_prefix_len, imap_t *imap,
+                         const scan_opts_t *opts, scan_result_t *res) {
     DIR *d = opendir(path);
     if (!d) { log_msg("WARN", "cannot open directory"); return OK; }
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (is_excluded(de->d_name, opts)) continue;
         char child[PATH_MAX];
         snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
-        status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, res);
+        status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
         if (st != OK) { closedir(d); return st; }
     }
     closedir(d);
     return OK;
 }
 
-status_t scan_tree(const char *root, scan_result_t **out) {
+status_t scan_tree(const char *root, scan_imap_t *imap,
+                   const scan_opts_t *opts, scan_result_t **out) {
     scan_result_t *res = calloc(1, sizeof(*res));
     if (!res) return ERR_NOMEM;
 
@@ -191,7 +269,7 @@ status_t scan_tree(const char *root, scan_result_t **out) {
     const char *last_slash = strrchr(root, '/');
     size_t strip_prefix_len = last_slash ? (size_t)(last_slash - root + 1) : 0;
 
-    status_t st = scan_entry_at(root, 0, strip_prefix_len, res);
+    status_t st = scan_entry_at(root, 0, strip_prefix_len, imap, opts, res);
     if (st != OK) { scan_result_free(res); return st; }
     *out = res;
     return OK;

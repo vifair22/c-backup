@@ -14,6 +14,7 @@ typedef struct {
     char    *path;              /* full absolute path */
     uint64_t parent_node_id;   /* node_id of parent dir; 0 for source root */
     size_t   strip_prefix_len; /* bytes to strip from path to get repo-relative path */
+    uint64_t hardlink_to_node_id; /* non-zero: this is a hard link to that primary node_id */
     node_t   node;
     char    *symlink_target;   /* readlink() result for symlinks; NULL otherwise */
     /* raw xattr blob (serialised name+value pairs) */
@@ -31,5 +32,29 @@ typedef struct {
     uint32_t      capacity;
 } scan_result_t;
 
-status_t scan_tree(const char *root, scan_result_t **out);
+/*
+ * Opaque inode map used for hard-link deduplication across scan_tree() calls.
+ * Create one with scan_imap_new(), pass it to every scan_tree() call in a
+ * backup run so hard links spanning multiple source roots are detected.
+ * Free with scan_imap_free() when done with all scans.
+ */
+typedef struct scan_imap scan_imap_t;
+scan_imap_t *scan_imap_new(void);
+void         scan_imap_free(scan_imap_t *m);
+
+/*
+ * Options for scan_tree.  Pass NULL for defaults (no exclusions).
+ */
+typedef struct {
+    const char **exclude;   /* fnmatch(3) patterns matched against basename */
+    int          n_exclude;
+} scan_opts_t;
+
+/*
+ * Scan a directory tree rooted at 'root'.
+ * imap: shared inode map (from scan_imap_new).  Must not be NULL.
+ * opts: may be NULL for no exclusions.
+ */
+status_t scan_tree(const char *root, scan_imap_t *imap,
+                   const scan_opts_t *opts, scan_result_t **out);
 void     scan_result_free(scan_result_t *res);

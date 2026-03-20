@@ -1,0 +1,45 @@
+#pragma once
+
+#include "error.h"
+#include "repo.h"
+#include "object.h"
+#include <stdint.h>
+
+#define PACK_DAT_MAGIC  0x42504b44u   /* "BPKD" */
+#define PACK_IDX_MAGIC  0x42504b49u   /* "BPKI" */
+#define PACK_VERSION    1u
+
+/*
+ * Pack all loose objects into a new pack file.
+ * Runs GC first so only referenced blobs are packed.
+ * *out_packed (may be NULL) receives the number of objects packed.
+ */
+status_t repo_pack(repo_t *repo, uint32_t *out_packed);
+
+/* --- used by object.c -------------------------------------------- */
+
+/*
+ * Search all pack index files for hash.  If found, decompress and
+ * return the payload in *out_data / *out_size.  Returns OK,
+ * ERR_NOT_FOUND (not in any pack), or ERR_IO / ERR_CORRUPT.
+ */
+status_t pack_object_load(repo_t *repo,
+                          const uint8_t hash[OBJECT_HASH_SIZE],
+                          void **out_data, size_t *out_size,
+                          uint8_t *out_type);
+
+/* Returns 1 if hash lives in any pack file, 0 otherwise. */
+int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+/* Drop the cached pack index so it is reloaded on next access. */
+void pack_cache_invalidate(repo_t *repo);
+
+/*
+ * Rewrite any pack files that contain unreferenced objects, keeping only
+ * entries whose hash appears in the sorted refs array (refs_cnt entries of
+ * OBJECT_HASH_SIZE bytes each).  Called by repo_gc after collecting refs.
+ * *out_kept / *out_deleted (may be NULL) receive aggregate counts.
+ */
+status_t pack_gc(repo_t *repo,
+                 const uint8_t *refs, size_t refs_cnt,
+                 uint32_t *out_kept, uint32_t *out_deleted);

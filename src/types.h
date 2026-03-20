@@ -6,6 +6,7 @@
 #define OBJECT_TYPE_FILE    1
 #define OBJECT_TYPE_XATTR   2
 #define OBJECT_TYPE_ACL     3
+#define OBJECT_TYPE_SPARSE  4   /* sparse file: region table prepended to data */
 
 #define COMPRESS_NONE 0
 #define COMPRESS_LZ4  1
@@ -67,6 +68,20 @@ typedef struct {
     uint16_t name_len;
     /* followed by name_len bytes of name */
 } __attribute__((packed)) dirent_rec_t;
+
+/* ---------- sparse file payload ---------- */
+
+#define SPARSE_MAGIC 0x53505253u  /* "SPRS" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t region_count;
+} __attribute__((packed)) sparse_hdr_t;
+
+typedef struct {
+    uint64_t offset;
+    uint64_t length;
+} __attribute__((packed)) sparse_region_t;
 
 /* ---------- reverse record ---------- */
 

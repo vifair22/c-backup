@@ -12,6 +12,7 @@
  */
 typedef struct {
     uint32_t    snap_id;
+    uint64_t    created_sec;   /* wall-clock time when snapshot was written */
     uint32_t    node_count;
     uint32_t    dirent_count;
     node_t     *nodes;

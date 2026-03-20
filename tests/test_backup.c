@@ -112,17 +112,17 @@ static void test_unchanged_backup(void **state) {
 
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
-    /* Sync mtimes — nothing should change */
+    /* Second run with nothing changed — snapshot should be skipped */
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
+    /* HEAD must still point to snapshot 1; no snapshot 2 was created */
     uint32_t head = 0;
     assert_int_equal(snapshot_read_head(repo, &head), OK);
-    assert_int_equal(head, 2u);
+    assert_int_equal(head, 1u);
 
-    /* Snapshot 2 reverse file should not exist (no changes) */
-    char rev_path[256];
-    snprintf(rev_path, sizeof(rev_path), "%s/reverse/%08u.rev", TEST_REPO, 2u);
-    assert_int_not_equal(access(rev_path, F_OK), 0);
+    char snap2[256];
+    snprintf(snap2, sizeof(snap2), "%s/snapshots/%08u.snap", TEST_REPO, 2u);
+    assert_int_not_equal(access(snap2, F_OK), 0);
 }
 
 /* Deleted file: reverse record should contain REV_OP_RESTORE for that path */

@@ -4,17 +4,23 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #define FORMAT_VERSION "c-backup-1\n"
 
 struct repo {
-    char *path;
-    int   dirfd;
+    char   *path;
+    int     dirfd;
+    int     lock_fd;          /* -1 when unlocked */
+    /* pack index cache, owned by pack.c, freed on close */
+    void   *pack_cache;
+    size_t  pack_cache_cnt;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -74,14 +80,14 @@ status_t repo_init(const char *path) {
     if (repofd == -1) { log_msg("ERROR", "cannot open repo dir"); return ERR_IO; }
 
     status_t st = OK;
-    if ((st = write_format(repofd))       != OK) goto done;
-    if ((st = mkdir_at(repofd, "objects")) != OK) goto done;
-    if ((st = mkdir_at(repofd, "packs"))   != OK) goto done;
+    if ((st = write_format(repofd))         != OK) goto done;
+    if ((st = mkdir_at(repofd, "objects"))   != OK) goto done;
+    if ((st = mkdir_at(repofd, "packs"))     != OK) goto done;
     if ((st = mkdir_at(repofd, "snapshots")) != OK) goto done;
-    if ((st = mkdir_at(repofd, "reverse")) != OK) goto done;
-    if ((st = mkdir_at(repofd, "logs"))    != OK) goto done;
-    if ((st = mkdir_at(repofd, "tmp"))     != OK) goto done;
-    if ((st = write_head(repofd))          != OK) goto done;
+    if ((st = mkdir_at(repofd, "reverse"))   != OK) goto done;
+    if ((st = mkdir_at(repofd, "logs"))      != OK) goto done;
+    if ((st = mkdir_at(repofd, "tmp"))       != OK) goto done;
+    if ((st = write_head(repofd))            != OK) goto done;
 
     log_msg("INFO", "repository initialised");
 
@@ -115,16 +121,21 @@ status_t repo_open(const char *path, repo_t **out) {
 
     repo_t *r = malloc(sizeof(*r));
     if (!r) { close(fd); return ERR_NOMEM; }
-    r->path   = strdup(path);
-    r->dirfd  = fd;
+    r->path           = strdup(path);
+    r->dirfd          = fd;
+    r->lock_fd        = -1;
+    r->pack_cache     = NULL;
+    r->pack_cache_cnt = 0;
     *out = r;
     return OK;
 }
 
 void repo_close(repo_t *repo) {
     if (!repo) return;
+    repo_unlock(repo);
     close(repo->dirfd);
     free(repo->path);
+    free(repo->pack_cache);
     free(repo);
 }
 
@@ -134,4 +145,54 @@ int repo_fd(const repo_t *repo) {
 
 const char *repo_path(const repo_t *repo) {
     return repo->path;
+}
+
+void repo_set_pack_cache(repo_t *repo, void *data, size_t cnt) {
+    free(repo->pack_cache);
+    repo->pack_cache     = data;
+    repo->pack_cache_cnt = cnt;
+}
+
+void *repo_pack_cache_data(const repo_t *repo) {
+    return repo->pack_cache;
+}
+
+size_t repo_pack_cache_count(const repo_t *repo) {
+    return repo->pack_cache_cnt;
+}
+
+/* ------------------------------------------------------------------ */
+/* Advisory lock                                                       */
+/* ------------------------------------------------------------------ */
+
+status_t repo_lock(repo_t *repo) {
+    if (repo->lock_fd != -1) return OK;   /* already locked by us */
+
+    char lock_path[PATH_MAX];
+    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
+
+    int fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
+    if (fd == -1) {
+        log_msg("ERROR", "cannot open lock file");
+        return ERR_IO;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        close(fd);
+        if (errno == EWOULDBLOCK)
+            log_msg("ERROR", "repository is locked by another process");
+        else
+            log_msg("ERROR", "flock failed");
+        return ERR_IO;
+    }
+
+    repo->lock_fd = fd;
+    return OK;
+}
+
+void repo_unlock(repo_t *repo) {
+    if (!repo || repo->lock_fd == -1) return;
+    flock(repo->lock_fd, LOCK_UN);
+    close(repo->lock_fd);
+    repo->lock_fd = -1;
 }

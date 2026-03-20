@@ -5,5 +5,6 @@ typedef enum {
     ERR_IO,
     ERR_CORRUPT,
     ERR_NOMEM,
-    ERR_INVALID
+    ERR_INVALID,
+    ERR_NOT_FOUND
 } status_t;

@@ -1,0 +1,284 @@
+#define _POSIX_C_SOURCE 200809L
+#include "ls.h"
+#include "object.h"
+#include "snapshot.h"
+#include "../vendor/log.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/* Internal path table — mirrors snap_paths_build in restore.c        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t parent_id;
+    uint64_t node_id;
+    char    *name;
+    char    *full_path;   /* lazily built */
+} ls_dirent_t;
+
+static ls_dirent_t *find_dr(ls_dirent_t *arr, uint32_t n, uint64_t id) {
+    for (uint32_t i = 0; i < n; i++)
+        if (arr[i].node_id == id) return &arr[i];
+    return NULL;
+}
+
+static char *build_path(ls_dirent_t *arr, uint32_t n, ls_dirent_t *e) {
+    if (e->full_path) return e->full_path;
+    if (e->parent_id == 0) {
+        e->full_path = strdup(e->name);
+        return e->full_path;
+    }
+    ls_dirent_t *parent = find_dr(arr, n, e->parent_id);
+    if (!parent) { e->full_path = strdup(e->name); return e->full_path; }
+    char *pp = build_path(arr, n, parent);
+    if (!pp) return NULL;
+    size_t plen = strlen(pp), nlen = strlen(e->name);
+    char *fp = malloc(plen + 1 + nlen + 1);
+    if (!fp) return NULL;
+    memcpy(fp, pp, plen);
+    fp[plen] = '/';
+    memcpy(fp + plen + 1, e->name, nlen + 1);
+    e->full_path = fp;
+    return fp;
+}
+
+/* ------------------------------------------------------------------ */
+/* Formatting helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+static char type_char(uint8_t node_type) {
+    switch (node_type) {
+        case NODE_TYPE_DIR:      return 'd';
+        case NODE_TYPE_SYMLINK:  return 'l';
+        case NODE_TYPE_FIFO:     return 'p';
+        case NODE_TYPE_CHR:      return 'c';
+        case NODE_TYPE_BLK:      return 'b';
+        default:                 return '-';
+    }
+}
+
+static void mode_str(uint8_t node_type, uint32_t mode, char out[11]) {
+    out[0] = type_char(node_type);
+    out[1] = (mode & 0400) ? 'r' : '-';
+    out[2] = (mode & 0200) ? 'w' : '-';
+    out[3] = (mode & 04000) ? 's' : (mode & 0100) ? 'x' : '-';
+    out[4] = (mode & 0040) ? 'r' : '-';
+    out[5] = (mode & 0020) ? 'w' : '-';
+    out[6] = (mode & 02000) ? 's' : (mode & 0010) ? 'x' : '-';
+    out[7] = (mode & 0004) ? 'r' : '-';
+    out[8] = (mode & 0002) ? 'w' : '-';
+    out[9] = (mode & 01000) ? 't' : (mode & 0001) ? 'x' : '-';
+    out[10] = '\0';
+}
+
+static void fmt_time(uint64_t sec, char out[20]) {
+    time_t t = (time_t)sec;
+    struct tm *tm = localtime(&t);
+    if (tm) strftime(out, 20, "%Y-%m-%d %H:%M", tm);
+    else    snprintf(out, 20, "?");
+}
+
+/* ------------------------------------------------------------------ */
+/* Comparison for sorting child entries by name                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char    *name;
+    const node_t  *node;
+    char           symlink_target[256];   /* empty if not a symlink */
+} ls_entry_t;
+
+static int ls_entry_cmp(const void *a, const void *b) {
+    return strcmp(((const ls_entry_t *)a)->name,
+                  ((const ls_entry_t *)b)->name);
+}
+
+/* ------------------------------------------------------------------ */
+/* snapshot_ls                                                         */
+/* ------------------------------------------------------------------ */
+
+status_t snapshot_ls(repo_t *repo, uint32_t snap_id, const char *dir_path) {
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    /* Normalise dir_path: strip leading/trailing slashes, treat "." as "" */
+    char norm[4096] = "";
+    if (dir_path && strcmp(dir_path, ".") != 0 && strcmp(dir_path, "/") != 0) {
+        const char *s = dir_path;
+        while (*s == '/') s++;
+        size_t len = strlen(s);
+        while (len > 0 && s[len - 1] == '/') len--;
+        if (len >= sizeof(norm)) { snapshot_free(snap); return ERR_INVALID; }
+        memcpy(norm, s, len);
+        norm[len] = '\0';
+    }
+
+    /* Build flat dirent list from the snapshot's binary dirent_data */
+    ls_dirent_t *flat = calloc(snap->dirent_count + 1, sizeof(ls_dirent_t));
+    if (!flat) { snapshot_free(snap); return ERR_NOMEM; }
+    uint32_t n_flat = 0;
+
+    const uint8_t *p   = snap->dirent_data;
+    const uint8_t *end = p + snap->dirent_data_len;
+    while (p < end && n_flat < snap->dirent_count) {
+        if (p + sizeof(dirent_rec_t) > end) break;
+        dirent_rec_t dr;
+        memcpy(&dr, p, sizeof(dr));
+        p += sizeof(dr);
+        if (p + dr.name_len > end) break;
+        char *name = malloc(dr.name_len + 1);
+        if (!name) { st = ERR_NOMEM; goto done; }
+        memcpy(name, p, dr.name_len);
+        name[dr.name_len] = '\0';
+        p += dr.name_len;
+        flat[n_flat].parent_id  = dr.parent_node;
+        flat[n_flat].node_id    = dr.node_id;
+        flat[n_flat].name       = name;
+        flat[n_flat].full_path  = NULL;
+        n_flat++;
+    }
+
+    /* Force full path computation for all entries */
+    for (uint32_t i = 0; i < n_flat; i++)
+        build_path(flat, n_flat, &flat[i]);
+
+    /* If dir_path is non-empty, confirm it exists as a directory in the snapshot */
+    if (norm[0] != '\0') {
+        int found_dir = 0;
+        for (uint32_t i = 0; i < n_flat; i++) {
+            if (!flat[i].full_path || strcmp(flat[i].full_path, norm) != 0) continue;
+            /* Look up node type */
+            for (uint32_t j = 0; j < snap->node_count; j++) {
+                if (snap->nodes[j].node_id == flat[i].node_id &&
+                    snap->nodes[j].type == NODE_TYPE_DIR) {
+                    found_dir = 1; break;
+                }
+            }
+            break;
+        }
+        if (!found_dir) {
+            fprintf(stderr, "ls: '%s' is not a directory in snapshot %u\n",
+                    norm, snap_id);
+            st = ERR_INVALID;
+            goto done;
+        }
+    }
+
+    /* Collect direct children of norm */
+    ls_entry_t *children = malloc(n_flat * sizeof(ls_entry_t));
+    if (!children) { st = ERR_NOMEM; goto done; }
+    uint32_t n_children = 0;
+
+    for (uint32_t i = 0; i < n_flat; i++) {
+        if (!flat[i].full_path) continue;
+
+        /* Compute parent path of this entry */
+        const char *fp   = flat[i].full_path;
+        const char *slash = strrchr(fp, '/');
+        const char *basename;
+        char        parent[4096] = "";
+
+        if (!slash) {
+            /* top-level entry */
+            basename = fp;
+            /* parent = "" */
+        } else {
+            basename = slash + 1;
+            size_t plen = (size_t)(slash - fp);
+            if (plen >= sizeof(parent)) continue;
+            memcpy(parent, fp, plen);
+            parent[plen] = '\0';
+        }
+
+        if (strcmp(parent, norm) != 0) continue;
+
+        /* Find node */
+        const node_t *nd = NULL;
+        for (uint32_t j = 0; j < snap->node_count; j++) {
+            if (snap->nodes[j].node_id == flat[i].node_id) {
+                nd = &snap->nodes[j]; break;
+            }
+        }
+
+        ls_entry_t *ce = &children[n_children++];
+        ce->name = basename;   /* points into flat[i].full_path */
+        ce->node = nd;
+        ce->symlink_target[0] = '\0';
+
+        /* Load symlink target for display */
+        if (nd && nd->type == NODE_TYPE_SYMLINK) {
+            uint8_t zero[OBJECT_HASH_SIZE] = {0};
+            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                void  *tdata = NULL;
+                size_t tlen  = 0;
+                if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) == OK) {
+                    size_t copy = tlen < sizeof(ce->symlink_target) - 1
+                                  ? tlen : sizeof(ce->symlink_target) - 1;
+                    memcpy(ce->symlink_target, tdata, copy);
+                    ce->symlink_target[copy] = '\0';
+                    free(tdata);
+                }
+            }
+        }
+    }
+
+    qsort(children, n_children, sizeof(*children), ls_entry_cmp);
+
+    /* Print header */
+    if (norm[0] == '\0')
+        printf("snapshot %u  /\n", snap_id);
+    else
+        printf("snapshot %u  /%s\n", snap_id, norm);
+
+    if (n_children == 0) {
+        printf("(empty)\n");
+        free(children);
+        goto done;
+    }
+
+    /* Print entries */
+    for (uint32_t i = 0; i < n_children; i++) {
+        const ls_entry_t *ce = &children[i];
+        if (!ce->node) {
+            printf("??????????  ???  ???  %12s  %s\n", "?", ce->name);
+            continue;
+        }
+        char mstr[11];
+        mode_str(ce->node->type, ce->node->mode, mstr);
+
+        char tstr[20];
+        fmt_time(ce->node->mtime_sec, tstr);
+
+        if (ce->node->type == NODE_TYPE_SYMLINK) {
+            printf("%s  %4u  %4u  %12" PRIu64 "  %s  %s -> %s\n",
+                   mstr, ce->node->uid, ce->node->gid,
+                   ce->node->size, tstr, ce->name, ce->symlink_target);
+        } else if (ce->node->type == NODE_TYPE_CHR ||
+                   ce->node->type == NODE_TYPE_BLK) {
+            printf("%s  %4u  %4u  %5u,%5u  %s  %s\n",
+                   mstr, ce->node->uid, ce->node->gid,
+                   ce->node->device.major, ce->node->device.minor,
+                   tstr, ce->name);
+        } else {
+            printf("%s  %4u  %4u  %12" PRIu64 "  %s  %s\n",
+                   mstr, ce->node->uid, ce->node->gid,
+                   ce->node->size, tstr, ce->name);
+        }
+    }
+    free(children);
+
+done:
+    for (uint32_t i = 0; i < n_flat; i++) {
+        free(flat[i].name);
+        free(flat[i].full_path);
+    }
+    free(flat);
+    snapshot_free(snap);
+    return st;
+}

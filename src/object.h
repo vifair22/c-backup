@@ -16,12 +16,22 @@ status_t object_store(repo_t *repo, uint8_t type,
                       uint8_t out_hash[OBJECT_HASH_SIZE]);
 
 /*
+ * Store a regular file, automatically detecting sparse regions.
+ * Stores as OBJECT_TYPE_SPARSE if the file has holes, OBJECT_TYPE_FILE
+ * otherwise.  Caller passes the fd (already open O_RDONLY) and file size.
+ */
+status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
+                           uint8_t out_hash[OBJECT_HASH_SIZE]);
+
+/*
  * Load object data by hash.  Caller must free(*out_data).
- * out_size is the uncompressed size.
+ * out_size is the uncompressed payload size.
+ * out_type (may be NULL) receives the object type byte.
  */
 status_t object_load(repo_t *repo,
                      const uint8_t hash[OBJECT_HASH_SIZE],
-                     void **out_data, size_t *out_size);
+                     void **out_data, size_t *out_size,
+                     uint8_t *out_type);
 
 /* Check whether an object already exists (avoids re-hashing). */
 int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
