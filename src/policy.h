@@ -31,6 +31,7 @@ typedef struct {
     int  auto_gc;
     int  auto_prune;
     int  auto_checkpoint;
+    int  verify_after;      /* verify all objects exist after each backup */
 } policy_t;
 
 /* Load from repo/policy.conf.  Returns ERR_NOT_FOUND if file is absent. */

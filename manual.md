@@ -130,6 +130,8 @@ backup run --repo /mnt/backup/myrepo --no-prune --no-gc --quiet
 | `--no-checkpoint` | Skip post-backup checkpoint even if policy has `auto_checkpoint = true`. |
 | `--no-policy` | Ignore `policy.conf` entirely; all options must be supplied on the command line. |
 | `--quiet` | Suppress progress output. |
+| `--verify-after` | After committing the snapshot, verify every referenced object exists in the store. Overrides policy if policy has `verify_after = false`. |
+| `--no-verify-after` | Suppress verification even if policy has `verify_after = true`. |
 
 Source paths are stored under their **basename** in the snapshot. For example, backing up `/home/alice` stores it as `alice/` in the snapshot tree. Multiple paths are stored as siblings.
 
@@ -402,6 +404,7 @@ backup policy --repo <path> edit
 | `--auto-gc` / `--no-auto-gc` | false | Run GC after each `run`. |
 | `--auto-prune` / `--no-auto-prune` | false | Run prune after each `run`. |
 | `--auto-checkpoint` / `--no-auto-checkpoint` | false | Run checkpoint after each `run`. |
+| `--verify-after` / `--no-verify-after` | false | After committing each snapshot, confirm every object it references is present in the store. Recommended for mission-critical backups. |
 
 ### GFS-style retention example
 

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -187,6 +188,22 @@ status_t repo_lock(repo_t *repo) {
     }
 
     repo->lock_fd = fd;
+
+    /* Clean up any temp files left by a previous crashed run. */
+    char tmp_dir[PATH_MAX];
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", repo->path);
+    DIR *td = opendir(tmp_dir);
+    if (td) {
+        struct dirent *de;
+        while ((de = readdir(td)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char entry[PATH_MAX];
+            snprintf(entry, sizeof(entry), "%s/tmp/%s", repo->path, de->d_name);
+            unlink(entry);
+        }
+        closedir(td);
+    }
+
     return OK;
 }
 
@@ -195,4 +212,30 @@ void repo_unlock(repo_t *repo) {
     flock(repo->lock_fd, LOCK_UN);
     close(repo->lock_fd);
     repo->lock_fd = -1;
+}
+
+/*
+ * Acquire a shared (read) lock.  Blocks until any exclusive writer finishes.
+ * Non-fatal: if the lock file does not exist yet (no writer has ever run)
+ * or if flock fails for any reason, we proceed without the lock — reads are
+ * safe as long as no writer is active, and the warning makes the situation
+ * visible.
+ */
+status_t repo_lock_shared(repo_t *repo) {
+    if (repo->lock_fd != -1) return OK;   /* already holds a lock */
+
+    char lock_path[PATH_MAX];
+    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
+
+    int fd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    if (fd == -1) return OK;   /* no lock file — no writer has run, safe to proceed */
+
+    if (flock(fd, LOCK_SH) == -1) {
+        close(fd);
+        log_msg("WARN", "could not acquire shared lock; proceeding without lock");
+        return OK;
+    }
+
+    repo->lock_fd = fd;
+    return OK;
 }

@@ -78,6 +78,10 @@ static int lock_or_die(repo_t *repo) {
     return 0;
 }
 
+static void lock_shared(repo_t *repo) {
+    repo_lock_shared(repo);   /* non-fatal — warning already logged on failure */
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage:\n"
@@ -88,6 +92,7 @@ static void usage(void) {
         "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
         "                               [--no-pack] [--no-prune] [--no-gc]\n"
         "                               [--no-checkpoint] [--no-policy] [--quiet]\n"
+        "                               [--verify-after]\n"
         "  backup list     --repo <path>\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
         "  backup restore  --repo <path> --dest <path>\n"
@@ -114,6 +119,7 @@ static void usage(void) {
         "                --auto-gc --no-auto-gc\n"
         "                --auto-prune --no-auto-prune\n"
         "                --auto-checkpoint --no-auto-checkpoint\n"
+        "                --verify-after --no-verify-after\n"
     );
 }
 
@@ -174,6 +180,8 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
     if (opt_has(argc, argv, start, "--no-auto-prune"))   p->auto_prune      = 0;
     if (opt_has(argc, argv, start, "--auto-checkpoint")) p->auto_checkpoint = 1;
     if (opt_has(argc, argv, start, "--no-auto-checkpoint")) p->auto_checkpoint = 0;
+    if (opt_has(argc, argv, start, "--verify-after"))    p->verify_after    = 1;
+    if (opt_has(argc, argv, start, "--no-verify-after")) p->verify_after    = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -257,6 +265,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("auto_gc          = %s\n", p->auto_gc          ? "true" : "false");
         printf("auto_prune       = %s\n", p->auto_prune       ? "true" : "false");
         printf("auto_checkpoint  = %s\n", p->auto_checkpoint  ? "true" : "false");
+        printf("verify_after     = %s\n", p->verify_after     ? "true" : "false");
         policy_free(p);
         return 0;
 
@@ -300,6 +309,8 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     int no_gc         = opt_has(argc, argv, 2, "--no-gc");
     int no_checkpoint = opt_has(argc, argv, 2, "--no-checkpoint");
     int quiet         = opt_has(argc, argv, 2, "--quiet");
+    int verify_after  = opt_has(argc, argv, 2, "--verify-after");
+    int no_verify_after = opt_has(argc, argv, 2, "--no-verify-after");
 
     /* Load policy (unless suppressed) */
     policy_t *pol = NULL;
@@ -345,11 +356,15 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     /* Determine effective auto-pack: policy controls unless --no-pack */
     int effective_no_pack = no_pack || (pol && !pol->auto_pack);
 
+    int effective_verify = verify_after ||
+                          (!no_verify_after && pol && pol->verify_after);
+
     backup_opts_t bopts = {
-        .exclude   = excludes,
-        .n_exclude = n_excl,
-        .no_pack   = effective_no_pack,
-        .quiet     = quiet,
+        .exclude      = excludes,
+        .n_exclude    = n_excl,
+        .no_pack      = effective_no_pack,
+        .quiet        = quiet,
+        .verify_after = effective_verify,
     };
 
     if (lock_or_die(repo)) { policy_free(pol); return 1; }
@@ -390,6 +405,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
 
 static int cmd_list(repo_t *repo, int argc, char **argv) {
     (void)argc; (void)argv;
+    lock_shared(repo);
     uint32_t head = 0;
     snapshot_read_head(repo, &head);
     for (uint32_t id = 1; id <= head; id++) {
@@ -411,6 +427,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_ls(repo_t *repo, int argc, char **argv) {
+    lock_shared(repo);
     const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
     if (!snap_arg) {
         fprintf(stderr, "error: --snapshot required\n");
@@ -426,6 +443,7 @@ static int cmd_ls(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_restore(repo_t *repo, int argc, char **argv) {
+    lock_shared(repo);
     const char *dest = opt_get(argc, argv, 2, "--dest");
     if (!dest) { fprintf(stderr, "error: --dest required\n"); return 1; }
 
@@ -499,6 +517,7 @@ static int cmd_restore(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_diff(repo_t *repo, int argc, char **argv) {
+    lock_shared(repo);
     const char *from_arg = opt_get(argc, argv, 2, "--from");
     const char *to_arg   = opt_get(argc, argv, 2, "--to");
     if (!from_arg || !to_arg) {
@@ -600,11 +619,13 @@ static int cmd_checkpoint(repo_t *repo, int argc, char **argv) {
 
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
     (void)argc; (void)argv;
+    lock_shared(repo);
     return repo_verify(repo) == OK ? 0 : 1;
 }
 
 static int cmd_stats(repo_t *repo, int argc, char **argv) {
     (void)argc; (void)argv;
+    lock_shared(repo);
     repo_stat_t s = {0};
     if (repo_stats(repo, &s) != OK) return 1;
     repo_stats_print(&s);

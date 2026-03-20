@@ -23,9 +23,16 @@ void  *repo_pack_cache_data(const repo_t *repo);
 size_t repo_pack_cache_count(const repo_t *repo);
 
 /*
- * Acquire / release an exclusive advisory lock on the repository.
- * repo_lock() fails immediately (ERR_IO) if another process holds the lock.
+ * Exclusive lock — held during all write operations (run, prune, gc, pack,
+ * checkpoint).  Fails immediately (ERR_IO) if another writer holds the lock.
  * The lock is released automatically by repo_close().
  */
 status_t repo_lock(repo_t *repo);
 void     repo_unlock(repo_t *repo);
+
+/*
+ * Shared lock — held during read-only operations (restore, list, diff, verify,
+ * stats, ls).  Blocks until any exclusive writer finishes.  Non-fatal: if the
+ * lock cannot be acquired the operation proceeds with a warning.
+ */
+status_t repo_lock_shared(repo_t *repo);

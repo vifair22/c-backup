@@ -431,9 +431,48 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     if (st != OK) { snapshot_free(new_snap); goto done; }
 
     st = snapshot_write_head(repo, new_snap->snap_id);
-    if (st == OK && (!opts || !opts->quiet)) {
-        fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
-                new_snap->snap_id, scan->count, rev.entry_count);
+    if (st == OK) {
+        if (!opts || !opts->quiet)
+            fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
+                    new_snap->snap_id, scan->count, rev.entry_count);
+
+        /* ----------------------------------------------------------------
+         * Phase 7 (optional): verify every object referenced by the new
+         * snapshot actually landed in the object store.
+         * ---------------------------------------------------------------- */
+        if (opts && opts->verify_after) {
+            log_msg("INFO", "Phase 7: verifying stored objects");
+            uint32_t missing = 0;
+            for (uint32_t i = 0; i < new_snap->node_count; i++) {
+                const node_t *nd = &new_snap->nodes[i];
+                int j;
+                int c_zero = 1, x_zero = 1, a_zero = 1;
+                for (j = 0; j < OBJECT_HASH_SIZE; j++) {
+                    if (nd->content_hash[j]) c_zero = 0;
+                    if (nd->xattr_hash[j])   x_zero = 0;
+                    if (nd->acl_hash[j])     a_zero = 0;
+                }
+                if (!c_zero && !object_exists(repo, nd->content_hash)) {
+                    missing++;
+                    fprintf(stderr, "error: missing content object for node %u\n", i);
+                }
+                if (!x_zero && !object_exists(repo, nd->xattr_hash)) {
+                    missing++;
+                    fprintf(stderr, "error: missing xattr object for node %u\n", i);
+                }
+                if (!a_zero && !object_exists(repo, nd->acl_hash)) {
+                    missing++;
+                    fprintf(stderr, "error: missing acl object for node %u\n", i);
+                }
+            }
+            if (missing > 0) {
+                fprintf(stderr, "error: %u object(s) missing — "
+                        "repository may be corrupt\n", missing);
+                st = ERR_CORRUPT;
+            } else if (!opts->quiet) {
+                fprintf(stderr, "verify: all objects present\n");
+            }
+        }
     }
 
     snapshot_free(new_snap);

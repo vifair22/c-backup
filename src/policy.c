@@ -114,6 +114,8 @@ status_t policy_load(repo_t *repo, policy_t **out) {
             p->auto_prune = parse_bool(val);
         } else if (strcmp(key, "auto_checkpoint") == 0) {
             p->auto_checkpoint = parse_bool(val);
+        } else if (strcmp(key, "verify_after") == 0) {
+            p->verify_after = parse_bool(val);
         }
     }
     fclose(f);
@@ -154,6 +156,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     fprintf(f, "auto_gc = %s\n",          p->auto_gc          ? "true" : "false");
     fprintf(f, "auto_prune = %s\n",       p->auto_prune       ? "true" : "false");
     fprintf(f, "auto_checkpoint = %s\n",  p->auto_checkpoint  ? "true" : "false");
+    fprintf(f, "verify_after = %s\n",     p->verify_after     ? "true" : "false");
 
     if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
     if (rename(tmp, path) != 0) { unlink(tmp); return ERR_IO; }

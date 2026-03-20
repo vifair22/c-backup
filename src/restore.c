@@ -172,10 +172,15 @@ static int path_is_safe(const char *rel) {
     return 1;
 }
 
-static void apply_metadata(const char *full, const node_t *nd,
-                           repo_t *repo, int is_symlink) {
-    (void)lchown(full, (uid_t)nd->uid, (gid_t)nd->gid);
-    if (!is_symlink) (void)chmod(full, (mode_t)nd->mode);
+/* Returns count of non-fatal metadata failures (permissions, ACL, xattr).
+ * These are expected when not running as root and do not abort the restore. */
+static int apply_metadata(const char *full, const node_t *nd,
+                          repo_t *repo, int is_symlink) {
+    int warn = 0;
+    if (lchown(full, (uid_t)nd->uid, (gid_t)nd->gid) == -1)
+        warn++;
+    if (!is_symlink && chmod(full, (mode_t)nd->mode) == -1)
+        warn++;
 
     /* xattrs */
     if (!hash_is_zero(nd->xattr_hash)) {
@@ -189,7 +194,7 @@ static void apply_metadata(const char *full, const node_t *nd,
                 if (pp + 4 > ep) break;
                 uint32_t vlen; memcpy(&vlen, pp, 4); pp += 4;
                 if (pp + vlen > ep) break;
-                lsetxattr(full, xname, pp, vlen, 0);
+                if (lsetxattr(full, xname, pp, vlen, 0) == -1) warn++;
                 pp += vlen;
             }
             free(xd);
@@ -201,7 +206,10 @@ static void apply_metadata(const char *full, const node_t *nd,
         void *ad = NULL; size_t al = 0;
         if (object_load(repo, nd->acl_hash, &ad, &al, NULL) == OK) {
             acl_t acl = acl_from_text((char *)ad);
-            if (acl) { acl_set_file(full, ACL_TYPE_ACCESS, acl); acl_free(acl); }
+            if (acl) {
+                if (acl_set_file(full, ACL_TYPE_ACCESS, acl) == -1) warn++;
+                acl_free(acl);
+            }
             free(ad);
         }
     }
@@ -213,6 +221,7 @@ static void apply_metadata(const char *full, const node_t *nd,
     };
     utimensat(AT_FDCWD, full,
               times, is_symlink ? AT_SYMLINK_NOFOLLOW : 0);
+    return warn;
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,6 +268,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
     if (!nl_map) { st = ERR_NOMEM; goto done; }
     uint32_t restore_files = 0;
     uint64_t restore_bytes = 0;
+    uint32_t warn_count    = 0;
 
     for (uint32_t i = 0; i < sp.count; i++) {
         const snap_pe_t *pe = &sp.entries[i];
@@ -349,26 +359,32 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
             if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
             unlink(full);
             if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
-                free(tdata); free(nl_map); st = ERR_IO; goto done;
+                fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                restore_files++;
             }
             free(tdata);
-            restore_files++;
             break;
         }
         case NODE_TYPE_FIFO:
             if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
-                free(nl_map); st = ERR_IO; goto done;
+                fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                restore_files++;
             }
-            restore_files++;
             break;
         case NODE_TYPE_CHR:
         case NODE_TYPE_BLK: {
             dev_t dev = makedev(nd->device.major, nd->device.minor);
             mode_t m  = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
             if (mknod(full, m, dev) == -1 && errno != EEXIST) {
-                free(nl_map); st = ERR_IO; goto done;
+                fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                restore_files++;
             }
-            restore_files++;
             break;
         }
         default: break;
@@ -390,7 +406,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         if (!path_is_safe(pe->path)) continue;
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-        apply_metadata(full, pe->node, repo, pe->node->type == NODE_TYPE_SYMLINK);
+        warn_count += (uint32_t)apply_metadata(full, pe->node, repo, pe->node->type == NODE_TYPE_SYMLINK);
     }
     /* dirs in reverse DFS order (leaves before roots) */
     for (uint32_t i = sp.count; i-- > 0;) {
@@ -399,7 +415,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         if (!path_is_safe(pe->path)) continue;
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-        apply_metadata(full, pe->node, repo, 0);
+        warn_count += (uint32_t)apply_metadata(full, pe->node, repo, 0);
     }
     /* set metadata on dest_path root if the snapshot has a root-level dir node */
     for (uint32_t i = 0; i < sp.count; i++) {
@@ -407,10 +423,14 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         if (pe->node && pe->node->type == NODE_TYPE_DIR &&
             strchr(pe->path, '/') == NULL) {
             /* top-level entry — apply metadata to dest_path */
-            apply_metadata(dest_path, pe->node, repo, 0);
+            warn_count += (uint32_t)apply_metadata(dest_path, pe->node, repo, 0);
             break;
         }
     }
+    if (warn_count > 0)
+        fprintf(stderr, "warn: %u metadata/special-file error(s) — "
+                "ownership, permissions, xattrs, and/or special files may be incomplete "
+                "(try running as root)\n", warn_count);
 
 done:
     snap_paths_free(&sp);
@@ -492,6 +512,7 @@ static status_t do_restore_ws(repo_t *repo,
     if (!nl_map) return ERR_NOMEM;
     uint32_t ws_restore_files = 0;
     uint64_t ws_restore_bytes = 0;
+    uint32_t warn_count       = 0;
 
     for (uint32_t i = 0; i < ws_cnt; i++) {
         if (!ws[i].path || ws[i].node.type == NODE_TYPE_DIR) continue;
@@ -545,11 +566,15 @@ static status_t do_restore_ws(repo_t *repo,
                         }
                     }
                 } else {
-                    if (len > 0) (void)write(fd, data, len);
+                    if (len > 0 && (size_t)write(fd, data, len) != len) {
+                        free(data); close(fd); free(nl_map); return ERR_IO;
+                    }
                 }
                 free(data);
             }
-            if (nd->size > 0) (void)ftruncate(fd, (off_t)nd->size);
+            if (nd->size > 0 && ftruncate(fd, (off_t)nd->size) == -1) {
+                close(fd); free(nl_map); return ERR_IO;
+            }
             fsync(fd); close(fd);
             ws_restore_files++;
             ws_restore_bytes += nd->size;
@@ -562,16 +587,33 @@ static status_t do_restore_ws(repo_t *repo,
             void *tdata = NULL; size_t tlen = 0;
             if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
             unlink(full);
-            (void)symlink((char *)tdata, full);
+            if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
+                fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                ws_restore_files++;
+            }
             free(tdata); break;
         }
         case NODE_TYPE_FIFO:
-            (void)mkfifo(full, (mode_t)nd->mode); break;
+            if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
+                fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                ws_restore_files++;
+            }
+            break;
         case NODE_TYPE_CHR:
         case NODE_TYPE_BLK: {
             dev_t dev = makedev(nd->device.major, nd->device.minor);
             mode_t m = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
-            (void)mknod(full, m, dev); break;
+            if (mknod(full, m, dev) == -1 && errno != EEXIST) {
+                fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
+                warn_count++;
+            } else {
+                ws_restore_files++;
+            }
+            break;
         }
         default: break;
         }
@@ -589,7 +631,7 @@ static status_t do_restore_ws(repo_t *repo,
         if (!path_is_safe(ws[i].path)) continue;
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-        apply_metadata(full, &ws[i].node, repo, ws[i].node.type == NODE_TYPE_SYMLINK);
+        warn_count += (uint32_t)apply_metadata(full, &ws[i].node, repo, ws[i].node.type == NODE_TYPE_SYMLINK);
     }
     /* dirs in reverse order */
     for (uint32_t i = ws_cnt; i-- > 0;) {
@@ -597,8 +639,12 @@ static status_t do_restore_ws(repo_t *repo,
         if (!path_is_safe(ws[i].path)) continue;
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-        apply_metadata(full, &ws[i].node, repo, 0);
+        warn_count += (uint32_t)apply_metadata(full, &ws[i].node, repo, 0);
     }
+    if (warn_count > 0)
+        fprintf(stderr, "warn: %u metadata/special-file error(s) — "
+                "ownership, permissions, xattrs, and/or special files may be incomplete "
+                "(try running as root)\n", warn_count);
 
     return st;
 }
