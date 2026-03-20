@@ -767,6 +767,8 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
 
     int errors = 0;
     uint8_t read_hash[OBJECT_HASH_SIZE];
+    uint8_t expected_hash[OBJECT_HASH_SIZE];
+    static const uint8_t zero_buf[65536];   /* BSS zeroes, no stack cost */
 
     for (uint32_t i = 0; i < cnt; i++) {
         if (!ws[i].path) continue;
@@ -776,12 +778,12 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
 
+        /* Hash the restored file on disk */
         int fd = open(full, O_RDONLY);
         if (fd == -1) {
             fprintf(stderr, "verify: cannot open %s\n", full);
             errors++; continue;
         }
-
         SHA256_CTX ctx;
         SHA256_Init(&ctx);
         uint8_t buf[65536];
@@ -791,7 +793,69 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
         close(fd);
         SHA256_Final(read_hash, &ctx);
 
-        if (memcmp(read_hash, ws[i].node.content_hash, OBJECT_HASH_SIZE) != 0) {
+        /* Compute the expected hash from the stored object.
+         * For OBJECT_TYPE_FILE the object payload IS the raw bytes, so
+         * SHA256(object_data) == content_hash and we can shortcut.
+         * For OBJECT_TYPE_SPARSE the content_hash covers the sparse
+         * payload (header+regions+data), not the expanded file bytes,
+         * so we reconstruct the expected hash by streaming through
+         * the regions and filling gaps with zeros. */
+        void *obj_data = NULL; size_t obj_len = 0; uint8_t obj_type = 0;
+        if (object_load(repo, ws[i].node.content_hash,
+                        &obj_data, &obj_len, &obj_type) != OK) {
+            fprintf(stderr, "verify: cannot load object for %s\n", ws[i].path);
+            errors++; continue;
+        }
+
+        if (obj_type != OBJECT_TYPE_SPARSE ||
+            obj_len < sizeof(sparse_hdr_t)) {
+            /* Non-sparse: expected hash == content_hash */
+            memcpy(expected_hash, ws[i].node.content_hash, OBJECT_HASH_SIZE);
+        } else {
+            /* Sparse: stream expected bytes = zeros + region data */
+            sparse_hdr_t shdr;
+            memcpy(&shdr, obj_data, sizeof(shdr));
+            if (shdr.magic != SPARSE_MAGIC ||
+                obj_len < sizeof(sparse_hdr_t) +
+                          shdr.region_count * sizeof(sparse_region_t)) {
+                memcpy(expected_hash, ws[i].node.content_hash, OBJECT_HASH_SIZE);
+            } else {
+                const sparse_region_t *rgns =
+                    (const sparse_region_t *)((uint8_t *)obj_data + sizeof(shdr));
+                const uint8_t *rdata =
+                    (const uint8_t *)obj_data + sizeof(shdr)
+                    + shdr.region_count * sizeof(sparse_region_t);
+
+                SHA256_CTX ectx;
+                SHA256_Init(&ectx);
+                uint64_t pos = 0;
+                for (uint32_t r = 0; r < shdr.region_count; r++) {
+                    /* zeros covering the hole before this region */
+                    uint64_t gap = rgns[r].offset - pos;
+                    while (gap > 0) {
+                        uint64_t chunk = gap < sizeof(zero_buf)
+                                         ? gap : sizeof(zero_buf);
+                        SHA256_Update(&ectx, zero_buf, (size_t)chunk);
+                        gap -= chunk; pos += chunk;
+                    }
+                    SHA256_Update(&ectx, rdata, (size_t)rgns[r].length);
+                    rdata += rgns[r].length;
+                    pos   += rgns[r].length;
+                }
+                /* trailing zeros to reach file size */
+                uint64_t tail = ws[i].node.size - pos;
+                while (tail > 0) {
+                    uint64_t chunk = tail < sizeof(zero_buf)
+                                     ? tail : sizeof(zero_buf);
+                    SHA256_Update(&ectx, zero_buf, (size_t)chunk);
+                    tail -= chunk;
+                }
+                SHA256_Final(expected_hash, &ectx);
+            }
+        }
+        free(obj_data);
+
+        if (memcmp(read_hash, expected_hash, OBJECT_HASH_SIZE) != 0) {
             fprintf(stderr, "verify: hash mismatch: %s\n", ws[i].path);
             errors++;
         }
@@ -808,6 +872,23 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
     return ERR_CORRUPT;
 }
 
+/* Recursively create parent directories for dest_path/rel_path. */
+static void makedirs_for(const char *dest_path, const char *rel_path) {
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s/%s", dest_path, rel_path);
+    char *last = strrchr(buf, '/');
+    if (!last) return;
+    *last = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(buf, 0755);
+}
+
 status_t restore_file(repo_t *repo, uint32_t snap_id,
                       const char *file_path, const char *dest_path) {
     snapshot_t *snap = NULL;
@@ -822,6 +903,8 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
     for (uint32_t i = 0; i < sp.count; i++) {
         if (strcmp(sp.entries[i].path, file_path) != 0) continue;
         if (!sp.entries[i].node) break;
+        /* Directories are not "files" — signal caller to try restore_subtree */
+        if (sp.entries[i].node->type == NODE_TYPE_DIR) { st = ERR_NOT_FOUND; break; }
         if (!path_is_safe(file_path)) { st = ERR_INVALID; break; }
 
         /* Create a temporary snapshot containing just this one node + dirent */
@@ -844,6 +927,8 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
             memcpy(dp, &dr, sizeof(dr)); dp += sizeof(dr);
             memcpy(dp, file_path, strlen(file_path));
             single.dirent_count = 1;
+            /* Pre-create intermediate parent directories */
+            makedirs_for(dest_path, file_path);
             st = do_restore(repo, &single, dest_path);
             free(single.dirent_data);
         } else {
@@ -852,6 +937,99 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
         break;
     }
 
+    snap_paths_free(&sp);
+    snapshot_free(snap);
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+
+status_t restore_subtree(repo_t *repo, uint32_t snap_id,
+                         const char *subtree_path, const char *dest_path) {
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    snap_paths_t sp = {0};
+    st = snap_paths_build(snap, &sp);
+    if (st != OK) { snapshot_free(snap); return st; }
+
+    size_t pfx_len = strlen(subtree_path);
+
+#define MATCHES(path) \
+    (strcmp((path), subtree_path) == 0 || \
+     (strncmp((path), subtree_path, pfx_len) == 0 && (path)[pfx_len] == '/'))
+
+    /* Count matching entries and total dirent blob size */
+    uint32_t nmatch = 0;
+    size_t   dirent_sz = 0;
+    for (uint32_t i = 0; i < sp.count; i++) {
+        if (!MATCHES(sp.entries[i].path)) continue;
+        nmatch++;
+        dirent_sz += sizeof(dirent_rec_t) + strlen(sp.entries[i].path);
+    }
+
+    if (nmatch == 0) {
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return ERR_NOT_FOUND;
+    }
+
+    /* Collect unique nodes for matching entries */
+    uint64_t *node_ids = malloc(nmatch * sizeof(uint64_t));
+    node_t   *nodes    = malloc(nmatch * sizeof(node_t));
+    uint8_t  *dirent_data = malloc(dirent_sz ? dirent_sz : 1);
+    if (!node_ids || !nodes || !dirent_data) {
+        free(node_ids); free(nodes); free(dirent_data);
+        snap_paths_free(&sp); snapshot_free(snap);
+        return ERR_NOMEM;
+    }
+
+    uint32_t n_nodes = 0;
+    uint8_t *dp = dirent_data;
+    uint32_t dcount = 0;
+
+    for (uint32_t i = 0; i < sp.count; i++) {
+        const char *p = sp.entries[i].path;
+        if (!MATCHES(p)) continue;
+
+        /* Collect unique node */
+        uint64_t nid = sp.entries[i].node_id;
+        int found = 0;
+        for (uint32_t j = 0; j < n_nodes; j++)
+            if (node_ids[j] == nid) { found = 1; break; }
+        if (!found && sp.entries[i].node) {
+            node_ids[n_nodes] = nid;
+            nodes[n_nodes]    = *sp.entries[i].node;
+            n_nodes++;
+        }
+
+        /* Write dirent: parent_node=0, name=full_path */
+        uint16_t nlen = (uint16_t)strlen(p);
+        dirent_rec_t dr = { .parent_node = 0, .node_id = nid, .name_len = nlen };
+        memcpy(dp, &dr, sizeof(dr)); dp += sizeof(dr);
+        memcpy(dp, p, nlen);         dp += nlen;
+        dcount++;
+
+        /* Pre-create intermediate parent directories */
+        makedirs_for(dest_path, p);
+    }
+#undef MATCHES
+
+    snapshot_t synth = {
+        .snap_id         = snap_id,
+        .node_count      = n_nodes,
+        .nodes           = nodes,
+        .dirent_count    = dcount,
+        .dirent_data     = dirent_data,
+        .dirent_data_len = dirent_sz,
+    };
+
+    st = do_restore(repo, &synth, dest_path);
+
+    free(dirent_data);
+    free(node_ids);
+    free(nodes);
     snap_paths_free(&sp);
     snapshot_free(snap);
     return st;

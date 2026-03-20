@@ -201,8 +201,18 @@ status_t snapshot_synthesize_every(repo_t *repo, uint32_t interval,
         log_msg("ERROR", "cannot read HEAD"); return ERR_IO;
     }
 
+    /*
+     * Iterate high → low so each synthesis can anchor on the checkpoint
+     * just written above it, keeping each reverse-chain walk to at most
+     * `interval` steps.  Low → high would anchor every synthesis on the
+     * nearest surviving full snapshot above (potentially far away).
+     */
     uint32_t count = 0;
-    for (uint32_t id = interval; id <= head_id; id += interval) {
+    uint32_t start = (head_id / interval) * interval;
+    /* HEAD itself always has a .snap file; snapshot_synthesize is a no-op for
+     * it, but skipping it avoids a pointless probe. */
+    if (start >= head_id && start >= interval) start -= interval;
+    for (uint32_t id = start; id >= interval; id -= interval) {
         status_t st = snapshot_synthesize(repo, id);
         if (st != OK) return st;
         count++;

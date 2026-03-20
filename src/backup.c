@@ -2,6 +2,7 @@
 #include "backup.h"
 #include "scan.h"
 #include "object.h"
+#include "pack.h"
 #include "snapshot.h"
 #include "reverse.h"
 #include "../vendor/log.h"
@@ -205,7 +206,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                 total_bytes += scan->entries[i].node.size;
         char sz[32];
         fmt_bytes(total_bytes, sz, sizeof(sz));
-        fprintf(stderr, "scan:    %u file(s)  %s\n", scan->count, sz);
+        if (!opts || !opts->quiet)
+            fprintf(stderr, "scan:    %u file(s)  %s\n", scan->count, sz);
     }
 
     /* ----------------------------------------------------------------
@@ -340,19 +342,21 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                     ? dctx.rev->entry_count - (n_new + n_modified + n_meta) : 0;
     }
 
-    fprintf(stderr, "changes: %u new  %u modified  %u unchanged  %u meta-only  %u deleted\n",
-            n_new, n_modified, n_unchanged, n_meta, n_deleted);
+    if (!opts || !opts->quiet)
+        fprintf(stderr, "changes: %u new  %u modified  %u unchanged  %u meta-only  %u deleted\n",
+                n_new, n_modified, n_unchanged, n_meta, n_deleted);
 
     /* No changes since last backup — skip snapshot creation entirely. */
     if (prev_id > 0 && rev.entry_count == 0) {
-        fprintf(stderr, "no changes since snapshot %u, skipping\n", prev_id);
+        if (!opts || !opts->quiet)
+            fprintf(stderr, "no changes since snapshot %u, skipping\n", prev_id);
         goto done;
     }
 
     /* ----------------------------------------------------------------
      * Phase 3b: Parallel file content storage
      * ---------------------------------------------------------------- */
-    if (store_qlen > 0)
+    if (store_qlen > 0 && (!opts || !opts->quiet))
         fprintf(stderr, "storing: %u new object(s)...\n", store_qlen);
     st = store_parallel(repo, scan->entries, store_queue, store_qlen);
     if (st != OK) goto done;
@@ -427,7 +431,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     if (st != OK) { snapshot_free(new_snap); goto done; }
 
     st = snapshot_write_head(repo, new_snap->snap_id);
-    if (st == OK) {
+    if (st == OK && (!opts || !opts->quiet)) {
         fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
                 new_snap->snap_id, scan->count, rev.entry_count);
     }
@@ -441,5 +445,12 @@ done:
     scan_result_free(scan);
     for (uint32_t i = 0; i < rev.entry_count; i++) free(rev.entries[i].path);
     free(rev.entries);
+
+    /* Auto-pack loose objects after a successful backup, unless suppressed. */
+    if (st == OK && !(opts && opts->no_pack)) {
+        log_msg("INFO", "packing objects");
+        repo_pack(repo, NULL);   /* best-effort: ignore pack errors */
+    }
+
     return st;
 }

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "gc.h"
+#include "tag.h"
 #include "pack.h"
 #include "snapshot.h"
 #include "reverse.h"
@@ -240,6 +241,12 @@ status_t repo_prune(repo_t *repo, uint32_t keep_count, uint32_t *out_pruned,
                     id, timebuf, entries);
             pruned++;
         } else {
+            char tname[256] = {0};
+            if (tag_snap_is_preserved(repo, id, tname, sizeof(tname))) {
+                fprintf(stderr, "warn: skipping snapshot %08u — protected by"
+                        " preserved tag '%s'\n", id, tname);
+                continue;
+            }
             if (unlink(path) == 0) pruned++;
             /* Reverse records are kept — they are needed for reverse-chain
              * historical restore and are scanned by GC to retain objects. */
@@ -330,13 +337,18 @@ static int snap_info_cmp_id(const void *a, const void *b) {
     return (int)((const snap_info_t *)a)->id - (int)((const snap_info_t *)b)->id;
 }
 
-/* Day/week/month bucket helpers (seconds since epoch) */
-static int64_t day_bucket(uint64_t ts) { return (int64_t)(ts / 86400); }
-static int64_t week_bucket(uint64_t ts) { return (int64_t)(ts / (86400 * 7)); }
+/* Day/week/month/year bucket helpers (seconds since epoch) */
+static int64_t day_bucket(uint64_t ts)   { return (int64_t)(ts / 86400); }
+static int64_t week_bucket(uint64_t ts)  { return (int64_t)(ts / (86400 * 7)); }
 static int64_t month_bucket(uint64_t ts) {
     time_t t = (time_t)ts;
     struct tm *tm = localtime(&t);
     return tm ? (int64_t)tm->tm_year * 12 + tm->tm_mon : 0;
+}
+static int64_t year_bucket(uint64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm *tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_year : 0;
 }
 
 status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
@@ -411,9 +423,32 @@ status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
         }
     }
 
+    /* keep_yearly */
+    if (policy->keep_yearly > 0) {
+        int64_t this_year = year_bucket(now_ts);
+        for (int y = 0; y < policy->keep_yearly; y++) {
+            int64_t bucket = this_year - y;
+            for (int32_t i = (int32_t)n - 1; i >= 0; i--) {
+                if (year_bucket(snaps[i].ts) == bucket) { keep[i] = 1; break; }
+            }
+        }
+    }
+
+    /* Preserved tags: always keep, warn if policy would have pruned them */
+    for (uint32_t i = 0; i < n; i++) {
+        if (keep[i]) continue;
+        char tname[256] = {0};
+        if (tag_snap_is_preserved(repo, snaps[i].id, tname, sizeof(tname))) {
+            fprintf(stderr, "warn: skipping snapshot %08u — protected by"
+                    " preserved tag '%s'\n", snaps[i].id, tname);
+            keep[i] = 1;
+        }
+    }
+
     /* If no rule is active at all, keep everything */
     int any_rule = (policy->keep_last > 0 || policy->keep_daily > 0 ||
-                    policy->keep_weekly > 0 || policy->keep_monthly > 0);
+                    policy->keep_weekly > 0 || policy->keep_monthly > 0 ||
+                    policy->keep_yearly > 0);
     if (!any_rule) {
         free(keep); free(snaps);
         if (out_pruned) *out_pruned = 0;

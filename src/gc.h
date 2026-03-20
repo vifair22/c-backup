@@ -42,6 +42,7 @@ typedef struct {
     int keep_daily;
     int keep_weekly;
     int keep_monthly;
+    int keep_yearly;
 } prune_policy_t;
 
 status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,

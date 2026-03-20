@@ -91,9 +91,12 @@ static void test_gc_removes_orphans(void **state) {
                                   orphan_hash), OK);
     assert_true(object_exists(repo, orphan_hash));
 
-    /* Run a backup — snapshot does not reference the orphan */
+    /* Run a backup — snapshot does not reference the orphan.
+     * no_pack=1: skip auto-pack so the orphan is still a loose object
+     * when we call repo_gc explicitly below. */
     const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
+    backup_opts_t nopack = { .no_pack = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &nopack), OK);
 
     uint32_t kept = 0, deleted = 0;
     assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
@@ -110,7 +113,9 @@ static void test_gc_removes_orphans(void **state) {
 static void test_verify_detects_corruption(void **state) {
     (void)state;
     const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
+    /* no_pack=1: keep objects loose so we can delete one by path below */
+    backup_opts_t nopack = { .no_pack = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &nopack), OK);
 
     /* Find a content hash from the snapshot */
     snapshot_t *snap = NULL;

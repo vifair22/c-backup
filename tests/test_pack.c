@@ -52,7 +52,9 @@ static int teardown(void **state) {
 static void test_pack_removes_loose(void **state) {
     (void)state;
     const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
+    /* no_pack=1: leave loose objects so we can test repo_pack explicitly */
+    backup_opts_t nopack = { .no_pack = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &nopack), OK);
 
     /* Collect content hashes before packing */
     snapshot_t *snap = NULL;
@@ -136,7 +138,8 @@ static void test_backup_after_pack(void **state) {
 static void test_double_pack(void **state) {
     (void)state;
     const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
+    backup_opts_t nopack = { .no_pack = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &nopack), OK);
 
     uint32_t p1 = 0;
     assert_int_equal(repo_pack(repo, &p1), OK);
@@ -144,7 +147,7 @@ static void test_double_pack(void **state) {
 
     /* Second backup adds new loose objects */
     write_file(TEST_SRC "/c.txt", "third file");
-    assert_int_equal(backup_run(repo, paths, 1), OK);
+    assert_int_equal(backup_run_opts(repo, paths, 1, &nopack), OK);
 
     uint32_t p2 = 0;
     assert_int_equal(repo_pack(repo, &p2), OK);
