@@ -135,6 +135,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         if (tlen > 0) {
             target[tlen] = '\0';
             nd->symlink.target_len = (uint32_t)tlen + 1;
+            e.symlink_target = strdup(target);
         }
     }
 
@@ -200,6 +201,7 @@ void scan_result_free(scan_result_t *res) {
     if (!res) return;
     for (uint32_t i = 0; i < res->count; i++) {
         free(res->entries[i].path);
+        free(res->entries[i].symlink_target);
         free(res->entries[i].xattr_data);
         free(res->entries[i].acl_data);
     }

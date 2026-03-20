@@ -199,6 +199,16 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count) {
                     if (st != OK) goto done;
                 }
             }
+        } else if (e->node.type == NODE_TYPE_SYMLINK && e->symlink_target) {
+            /* Store symlink target as a content object so restore can recreate it */
+            if (change == CHANGE_UNCHANGED || change == CHANGE_METADATA_ONLY) {
+                memcpy(e->node.content_hash, prev->content_hash, OBJECT_HASH_SIZE);
+            } else {
+                size_t tlen = strlen(e->symlink_target) + 1;
+                st = object_store(repo, OBJECT_TYPE_FILE,
+                                  e->symlink_target, tlen, e->node.content_hash);
+                if (st != OK) goto done;
+            }
         }
 
         /* --- Step E: emit reverse entry --- */

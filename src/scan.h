@@ -15,6 +15,7 @@ typedef struct {
     uint64_t parent_node_id;   /* node_id of parent dir; 0 for source root */
     size_t   strip_prefix_len; /* bytes to strip from path to get repo-relative path */
     node_t   node;
+    char    *symlink_target;   /* readlink() result for symlinks; NULL otherwise */
     /* raw xattr blob (serialised name+value pairs) */
     uint8_t *xattr_data;
     size_t   xattr_len;
