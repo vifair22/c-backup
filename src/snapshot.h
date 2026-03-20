@@ -30,3 +30,42 @@ status_t snapshot_write_head(repo_t *repo, uint32_t snap_id);
 
 /* Lookup helpers */
 const node_t *snapshot_find_node(const snapshot_t *snap, uint64_t node_id);
+
+/* ---------- path map ----------
+ *
+ * Maps repo-relative path strings to node_t values from a snapshot.
+ * Used by the compare phase to check what existed in the previous snapshot.
+ */
+typedef struct pm_slot {
+    char   *key;       /* heap-allocated path string (NULL = empty slot) */
+    node_t  value;     /* copy of node_t */
+    int     seen;      /* marked true during compare; unseen = deleted */
+} pm_slot_t;
+
+typedef struct {
+    pm_slot_t *slots;
+    size_t     capacity;   /* always a power of 2 */
+    size_t     count;
+} pathmap_t;
+
+/*
+ * Build a pathmap from a snapshot's dirent tree.
+ * Caller must call pathmap_free() when done.
+ */
+status_t pathmap_build(const snapshot_t *snap, pathmap_t **out);
+
+/* Look up a path. Returns NULL if not found. */
+const node_t *pathmap_lookup(const pathmap_t *map, const char *path);
+
+/* Mark an entry as seen (used during compare to find deleted entries). */
+void pathmap_mark_seen(pathmap_t *map, const char *path);
+
+/*
+ * Iterate over all unseen entries (i.e. entries deleted since prev snapshot).
+ * The callback receives the path, node, and user-provided ctx.
+ */
+void pathmap_foreach_unseen(const pathmap_t *map,
+                            void (*cb)(const char *path, const node_t *node, void *ctx),
+                            void *ctx);
+
+void pathmap_free(pathmap_t *map);

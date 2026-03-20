@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +48,6 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     if (!names) return ERR_NOMEM;
     if (llistxattr(path, names, list_sz) < 0) { free(names); return ERR_IO; }
 
-    /* Two-pass: first measure, then fill */
     size_t total = 0;
     for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
         ssize_t vsz = lgetxattr(path, n, NULL, 0);
@@ -95,9 +95,12 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
     return OK;
 }
 
-static status_t scan_dir(const char *path, scan_result_t *res);
+/* Forward declaration */
+static status_t scan_dir(const char *path, uint64_t dir_node_id,
+                         size_t strip_prefix_len, scan_result_t *res);
 
-static status_t scan_entry_at(const char *path, scan_result_t *res) {
+static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
+                               size_t strip_prefix_len, scan_result_t *res) {
     struct stat st;
     if (lstat(path, &st) == -1) {
         log_msg("WARN", "lstat failed, skipping entry");
@@ -105,20 +108,22 @@ static status_t scan_entry_at(const char *path, scan_result_t *res) {
     }
 
     scan_entry_t e = {0};
-    e.path = strdup(path);
+    e.path             = strdup(path);
     if (!e.path) return ERR_NOMEM;
-    e.st = st;
+    e.parent_node_id   = parent_node_id;
+    e.strip_prefix_len = strip_prefix_len;
+    e.st               = st;
 
     node_t *nd = &e.node;
-    nd->node_id       = next_node_id++;
-    nd->type          = stat_to_node_type(&st);
-    nd->mode          = (uint32_t)st.st_mode;
-    nd->uid           = (uint32_t)st.st_uid;
-    nd->gid           = (uint32_t)st.st_gid;
-    nd->size          = (uint64_t)st.st_size;
-    nd->mtime_sec     = (uint64_t)st.st_mtim.tv_sec;
-    nd->mtime_nsec    = (uint64_t)st.st_mtim.tv_nsec;
-    nd->link_count    = (uint32_t)st.st_nlink;
+    nd->node_id        = next_node_id++;
+    nd->type           = stat_to_node_type(&st);
+    nd->mode           = (uint32_t)st.st_mode;
+    nd->uid            = (uint32_t)st.st_uid;
+    nd->gid            = (uint32_t)st.st_gid;
+    nd->size           = (uint64_t)st.st_size;
+    nd->mtime_sec      = (uint64_t)st.st_mtim.tv_sec;
+    nd->mtime_nsec     = (uint64_t)st.st_mtim.tv_nsec;
+    nd->link_count     = (uint32_t)st.st_nlink;
     nd->inode_identity = (uint64_t)st.st_dev ^ ((uint64_t)st.st_ino << 32);
 
     if (nd->type == NODE_TYPE_CHR || nd->type == NODE_TYPE_BLK) {
@@ -141,15 +146,19 @@ static status_t scan_entry_at(const char *path, scan_result_t *res) {
         free(e.path); free(e.xattr_data); return st2;
     }
 
+    uint64_t this_node_id = nd->node_id;
+
     if ((st2 = result_append(res, &e)) != OK) {
         free(e.path); free(e.xattr_data); free(e.acl_data); return st2;
     }
 
-    if (S_ISDIR(st.st_mode)) return scan_dir(path, res);
+    if (S_ISDIR(st.st_mode))
+        return scan_dir(path, this_node_id, strip_prefix_len, res);
     return OK;
 }
 
-static status_t scan_dir(const char *path, scan_result_t *res) {
+static status_t scan_dir(const char *path, uint64_t dir_node_id,
+                         size_t strip_prefix_len, scan_result_t *res) {
     DIR *d = opendir(path);
     if (!d) { log_msg("WARN", "cannot open directory"); return OK; }
     struct dirent *de;
@@ -157,7 +166,7 @@ static status_t scan_dir(const char *path, scan_result_t *res) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         char child[PATH_MAX];
         snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
-        status_t st = scan_entry_at(child, res);
+        status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, res);
         if (st != OK) { closedir(d); return st; }
     }
     closedir(d);
@@ -167,7 +176,21 @@ static status_t scan_dir(const char *path, scan_result_t *res) {
 status_t scan_tree(const char *root, scan_result_t **out) {
     scan_result_t *res = calloc(1, sizeof(*res));
     if (!res) return ERR_NOMEM;
-    status_t st = scan_entry_at(root, res);
+
+    /*
+     * strip_prefix_len: strip everything up to and including the last '/'
+     * before the source root basename, so the stored relative path starts
+     * with basename(root).
+     *
+     * e.g. root="/home/alice" → strip_prefix_len = strlen("/home/") = 6
+     *      "/home/alice/file.txt" → rel = "alice/file.txt"
+     * e.g. root="/etc" → strip_prefix_len = 1 (just the leading '/')
+     *      "/etc/hosts" → rel = "etc/hosts"
+     */
+    const char *last_slash = strrchr(root, '/');
+    size_t strip_prefix_len = last_slash ? (size_t)(last_slash - root + 1) : 0;
+
+    status_t st = scan_entry_at(root, 0, strip_prefix_len, res);
     if (st != OK) { scan_result_free(res); return st; }
     *out = res;
     return OK;

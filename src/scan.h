@@ -11,7 +11,9 @@
  * collected during the scan phase.
  */
 typedef struct {
-    char    *path;          /* full path relative to source root */
+    char    *path;              /* full absolute path */
+    uint64_t parent_node_id;   /* node_id of parent dir; 0 for source root */
+    size_t   strip_prefix_len; /* bytes to strip from path to get repo-relative path */
     node_t   node;
     /* raw xattr blob (serialised name+value pairs) */
     uint8_t *xattr_data;
@@ -19,7 +21,7 @@ typedef struct {
     /* raw ACL blob */
     uint8_t *acl_data;
     size_t   acl_len;
-    struct stat st;         /* original stat result */
+    struct stat st;             /* original stat result */
 } scan_entry_t;
 
 typedef struct {
