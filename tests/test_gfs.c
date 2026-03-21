@@ -382,6 +382,107 @@ static void test_gfs_run_dry_run_no_changes(void **state) {
 }
 
 /* ================================================================== */
+/* 8. Tier-expiry: keep_daily caps daily-tier anchors                 */
+/* ================================================================== */
+
+/* Helper: set GFS_DAILY flag on snap_id */
+static void set_daily(uint32_t snap_id) {
+    assert_int_equal(snapshot_set_gfs_flags(repo, snap_id, GFS_DAILY), OK);
+}
+
+static void test_tier_expiry_daily_cap(void **state) {
+    (void)state;
+    make_backups(5);
+
+    /* Flag snaps 1, 2, 3 as daily-tier anchors */
+    set_daily(1); set_daily(2); set_daily(3);
+
+    /* keep_daily=2: snap 3 and 2 are the 2 newest daily anchors → snap 1 is expired.
+     * keep_revs=0 (→ base=1), so rev_window_start = 5-1 = 4.
+     * Snap 1: expired daily, id < 4 → pruned.
+     * Snap 2: expired daily, id < 4 → pruned (2 newer dailies: 2 and 3 → count=2 >= keep=2).
+     * Wait — snap 3 is newest daily (0 newer), snap 2 has 1 newer (snap3), snap 1 has 2 newer.
+     * keep_daily=2 → expired when tier_newer_count >= 2 → only snap 1 is expired.
+     * Snap 2: tier_newer_count=1 < 2 → NOT expired → kept as GFS anchor.
+     * Snap 3: tier_newer_count=0 < 2 → NOT expired → kept as GFS anchor.
+     * Snap 1: tier_newer_count=2 >= 2 → expired → pruned (id=1 < rev_window_start=4). */
+    policy_t pol = {0};
+    pol.keep_daily = 2;
+    pol.keep_revs  = 1;  /* rev_window_start = 5 - 1 = 4 */
+
+    assert_int_equal(gfs_run(repo, &pol, 5, 0, 1), OK);
+
+    assert_false(snap_exists(1));  /* expired daily, outside rev window */
+    assert_true(snap_exists(2));   /* live daily anchor (1 newer daily) */
+    assert_true(snap_exists(3));   /* live daily anchor (0 newer dailies) */
+    assert_true(snap_exists(4));   /* within rev window */
+    assert_true(snap_exists(5));   /* HEAD */
+}
+
+static void test_tier_expiry_within_rev_window_kept(void **state) {
+    (void)state;
+    /* Expired daily anchors that fall inside the rev window must NOT be pruned. */
+    make_backups(5);
+
+    set_daily(1); set_daily(2); set_daily(3);
+
+    /* keep_daily=1, keep_revs=5 → rev_window_start = max(1, 5-5=0) = 1.
+     * All snaps are within the window → none pruned even though snaps 1 and 2 are expired. */
+    policy_t pol = {0};
+    pol.keep_daily = 1;
+    pol.keep_revs  = 5;
+
+    assert_int_equal(gfs_run(repo, &pol, 5, 0, 1), OK);
+
+    for (uint32_t id = 1; id <= 5; id++)
+        assert_true(snap_exists(id));
+}
+
+static void test_tier_expiry_zero_means_unlimited(void **state) {
+    (void)state;
+    /* keep_daily=0 → no cap; all daily anchors are kept regardless of count. */
+    make_backups(5);
+
+    for (uint32_t id = 1; id <= 4; id++) set_daily(id);
+
+    policy_t pol = {0};
+    pol.keep_daily = 0;   /* unlimited */
+    pol.keep_revs  = 1;   /* rev_window_start = 4 */
+
+    assert_int_equal(gfs_run(repo, &pol, 5, 0, 1), OK);
+
+    /* Snaps 1-4 all have daily flag and keep_daily=0 → none expired → all kept */
+    for (uint32_t id = 1; id <= 5; id++)
+        assert_true(snap_exists(id));
+}
+
+static void test_tier_expiry_weekly_cap(void **state) {
+    (void)state;
+    /* keep_weekly=1: only the newest weekly anchor is retained. */
+    make_backups(5);
+
+    /* Flag snaps 1 and 3 as weekly-tier (daily+weekly) */
+    assert_int_equal(snapshot_set_gfs_flags(repo, 1, GFS_DAILY | GFS_WEEKLY), OK);
+    assert_int_equal(snapshot_set_gfs_flags(repo, 3, GFS_DAILY | GFS_WEEKLY), OK);
+
+    /* keep_weekly=1: snap 3 is newest weekly (0 newer) → live.
+     * Snap 1: 1 newer weekly (snap 3) >= keep_weekly=1 → expired.
+     * keep_revs=1 → rev_window_start = 4.
+     * Snap 1: expired weekly, id=1 < 4 → pruned. */
+    policy_t pol = {0};
+    pol.keep_weekly = 1;
+    pol.keep_revs   = 1;
+
+    assert_int_equal(gfs_run(repo, &pol, 5, 0, 1), OK);
+
+    assert_false(snap_exists(1));  /* expired weekly, outside rev window */
+    assert_false(snap_exists(2));  /* non-GFS, outside rev window (id=2 < 4) → pruned */
+    assert_true(snap_exists(3));   /* live weekly anchor */
+    assert_true(snap_exists(4));   /* within rev window */
+    assert_true(snap_exists(5));   /* HEAD */
+}
+
+/* ================================================================== */
 /* main                                                                */
 /* ================================================================== */
 
@@ -412,6 +513,12 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_gfs_run_keeps_preserved_snap,   setup, teardown),
         cmocka_unit_test_setup_teardown(test_gfs_run_flags_daily_anchor,     setup, teardown),
         cmocka_unit_test_setup_teardown(test_gfs_run_dry_run_no_changes,     setup, teardown),
+
+        /* Integration: tier expiry */
+        cmocka_unit_test_setup_teardown(test_tier_expiry_daily_cap,           setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tier_expiry_within_rev_window_kept, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tier_expiry_zero_means_unlimited, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tier_expiry_weekly_cap,          setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

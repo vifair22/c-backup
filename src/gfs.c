@@ -134,11 +134,23 @@ uint32_t gfs_effective_keep_revs(const policy_t *policy,
                                  const gfs_snap_info_t *snaps, uint32_t n) {
     uint32_t base = (policy->keep_revs > 0) ? (uint32_t)policy->keep_revs : 1;
 
-    /* Find the oldest GFS-anchored snap */
+    /* Find the oldest non-expired GFS-anchored snap.
+     * Expired anchors (whose tier keep_N has been exceeded) no longer
+     * need to stretch the rev window — they will be pruned themselves. */
     uint32_t oldest_gfs = head_id;
     for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].gfs_flags != 0 && snaps[i].id < oldest_gfs)
-            oldest_gfs = snaps[i].id;
+        if (snaps[i].gfs_flags == 0) continue;
+        uint32_t tier  = highest_tier(snaps[i].gfs_flags);
+        int keep_n = 0;
+        switch (tier) {
+            case GFS_DAILY:   keep_n = policy->keep_daily;   break;
+            case GFS_WEEKLY:  keep_n = policy->keep_weekly;  break;
+            case GFS_MONTHLY: keep_n = policy->keep_monthly; break;
+            case GFS_YEARLY:  keep_n = policy->keep_yearly;  break;
+        }
+        /* Skip if tier limit exceeded (same logic as tier_expired in gfs_run) */
+        if (keep_n > 0 && tier_newer_count(snaps, n, i) >= keep_n) continue;
+        if (snaps[i].id < oldest_gfs) oldest_gfs = snaps[i].id;
     }
 
     uint32_t distance = (head_id >= oldest_gfs) ? (head_id - oldest_gfs) : 0;

@@ -593,11 +593,12 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     /* GFS mode: delegate entirely to gfs_run */
     if (use_gfs) {
-        int has_gfs_policy = pol && (pol->keep_revs > 0 || pol->keep_weekly > 0 ||
-                                     pol->keep_monthly > 0 || pol->keep_yearly > 0);
+        int has_gfs_policy = pol && (pol->keep_revs > 0 || pol->keep_daily > 0 ||
+                                     pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
+                                     pol->keep_yearly > 0);
         if (!has_gfs_policy) {
-            fprintf(stderr, "error: --gfs requires keep_revs / keep_weekly / "
-                            "keep_monthly / keep_yearly in policy\n");
+            fprintf(stderr, "error: --gfs requires keep_revs / keep_daily / "
+                            "keep_weekly / keep_monthly / keep_yearly in policy\n");
             policy_free(pol);
             return 1;
         }

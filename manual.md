@@ -54,7 +54,7 @@ Reverse records are **never deleted by prune** — they are required to reconstr
 
 ### GFS retention
 
-GFS (Grandfather-Father-Son) retention automatically selects one snapshot per calendar period to serve as a permanent anchor point. After each `backup run` the engine detects which tier boundaries were crossed and marks the appropriate snapshot with a GFS flag stored in its `.snap` file. GFS-flagged snapshots are never deleted.
+GFS (Grandfather-Father-Son) retention automatically selects one snapshot per calendar period to serve as an anchor point. After each `backup run` the engine detects which tier boundaries were crossed and marks the appropriate snapshot with a GFS flag stored in its `.snap` file. By default GFS-anchored snapshots are kept indefinitely; setting `keep_daily`, `keep_weekly`, `keep_monthly`, or `keep_yearly` caps the number of anchors retained per tier.
 
 **Calendar boundaries (all UTC)**
 
@@ -91,7 +91,7 @@ snapshot 00000007  2024-03-24 00:00:18  [daily+weekly]  318 entries
 
 **Activation**
 
-The GFS engine runs automatically after `backup run` when `policy.auto_prune = true` and `keep_revs` or a GFS-related retention field (`keep_weekly`, `keep_monthly`, `keep_yearly`) is set. Pass `--no-gfs` to skip the GFS engine for a single run. Run the GFS engine manually with `backup prune --gfs`.
+The GFS engine runs automatically after `backup run` when `policy.auto_prune = true` and `keep_revs` or any GFS tier retention field (`keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`) is set. Pass `--no-gfs` to skip the GFS engine for a single run. Run the GFS engine manually with `backup prune --gfs`.
 
 ### Checkpoints
 
@@ -213,7 +213,7 @@ After a successful backup, `run` automatically:
 1. Packs loose objects (unless `--no-pack` or `policy.auto_pack = false`)
 2. Synthesises checkpoints at the configured interval (if `policy.auto_checkpoint = true`)
 3. Runs the GFS engine — detects calendar boundaries, flags GFS anchors, prunes non-anchor snapshots outside the `keep_revs` window, and runs GC (if `policy.auto_prune = true` and `keep_revs` or a GFS tier is set; skip with `--no-gfs`)
-4. Legacy prune (if `policy.auto_prune = true` and `keep_last` is set but no GFS fields are active)
+4. Legacy prune (if `policy.auto_prune = true` and `keep_daily/weekly/monthly/yearly` are set but no GFS fields activate the engine)
 5. Runs GC (if `policy.auto_gc = true` and neither prune path ran it)
 
 **Exclusion patterns** match against the **basename** of each filesystem entry using `fnmatch(3)` shell-glob syntax. When a directory matches, its entire subtree is skipped.
@@ -335,22 +335,22 @@ Delete old snapshot files according to a retention policy, then run GC.
 backup prune --repo /mnt/backup/myrepo --gfs
 
 # Legacy sliding-window prune
-backup prune --repo /mnt/backup/myrepo --keep-last 7 --keep-weekly 8 --keep-monthly 12 --keep-yearly 5
-backup prune --repo /mnt/backup/myrepo --keep-last 5 --dry-run
+backup prune --repo /mnt/backup/myrepo --keep-daily 7 --keep-weekly 8 --keep-monthly 12 --keep-yearly 5
+backup prune --repo /mnt/backup/myrepo --keep-daily 7 --dry-run
 backup prune --repo /mnt/backup/myrepo   # uses policy.conf
 ```
 
 | Flag | Meaning |
 |------|---------|
 | `--gfs` | Run the GFS engine: detect calendar anchors, flag them, prune non-anchor snapshots outside `keep_revs`, delete eligible rev records, run GC. Requires `keep_revs` or a GFS tier to be set in policy. |
-| `--keep-last N` | Legacy: always keep the N most recent snapshots by ID |
+| `--keep-daily N` | Legacy: keep one snapshot per calendar day for the last N days |
 | `--keep-weekly N` | Legacy: keep one snapshot per week (Mon–Sun) for the last N weeks |
 | `--keep-monthly N` | Legacy: keep one snapshot per calendar month for the last N months |
 | `--keep-yearly N` | Legacy: keep one snapshot per calendar year for the last N years |
 | `--no-policy` | Ignore `policy.conf`; all retention rules must be on the command line |
 | `--dry-run` | Show which snapshots and reverse records would be removed without deleting anything |
 
-**GFS mode (`--gfs`):** Uses the GFS engine (see [GFS retention](#gfs-retention)). Calendar anchor snapshots are never deleted. Non-anchor snapshots outside the `keep_revs` window are deleted. Reverse records are deleted only when outside the `keep_revs` window AND older than the oldest GFS anchor. GC runs automatically at the end.
+**GFS mode (`--gfs`):** Uses the GFS engine (see [GFS retention](#gfs-retention)). Calendar anchor snapshots are kept indefinitely unless a per-tier limit (`keep_daily`, `keep_weekly`, etc.) is set in policy, in which case only the N most recent anchors at that tier are retained. Non-anchor (or tier-expired) snapshots outside the `keep_revs` window are deleted. Reverse records are deleted only when outside the `keep_revs` window AND older than the oldest live GFS anchor. GC runs automatically at the end.
 
 **Legacy mode:** Any combination of `--keep-*` flags may be used; a snapshot is kept if it satisfies any rule. Snapshots not selected by any rule are deleted. If no rules are provided on the command line and no policy is loaded, the command exits with an error rather than deleting everything.
 
@@ -474,12 +474,12 @@ backup policy --repo <path> edit
 |--------|---------|---------|
 | `--path <p>` | (none) | Source path. Repeatable. |
 | `--exclude <pat>` | (none) | Exclusion glob. Repeatable. |
-| `--keep-revs N` | 0 (off) | GFS: minimum rolling window of snapshots to keep. Silently extended to always reach the oldest GFS anchor. |
+| `--keep-revs N` | 0 (off) | GFS: minimum rolling window of snapshots to keep. Silently extended to reach the oldest live GFS anchor. |
 | `--checkpoint-every N` | 0 (off) | Auto-synthesise checkpoints every N snapshots after `run`. |
-| `--keep-last N` | 0 (off) | Legacy retention: keep N most recent snapshots. |
-| `--keep-weekly N` | 0 (off) | GFS activation: also used as a signal to activate the GFS engine when combined with `keep_revs`. |
-| `--keep-monthly N` | 0 (off) | GFS activation signal (see above). |
-| `--keep-yearly N` | 0 (off) | GFS activation signal (see above). |
+| `--keep-daily N` | 0 (off) | GFS: cap daily-tier anchors at N. Also activates the GFS engine. |
+| `--keep-weekly N` | 0 (off) | GFS: cap weekly-tier anchors at N. Also activates the GFS engine. |
+| `--keep-monthly N` | 0 (off) | GFS: cap monthly-tier anchors at N. Also activates the GFS engine. |
+| `--keep-yearly N` | 0 (off) | GFS: cap yearly-tier anchors at N. Also activates the GFS engine. |
 | `--auto-pack` / `--no-auto-pack` | true | Pack objects after each `run`. |
 | `--auto-gc` / `--no-auto-gc` | false | Run GC after each `run`. |
 | `--auto-prune` / `--no-auto-prune` | false | Run prune/GFS after each `run`. |
@@ -488,40 +488,45 @@ backup policy --repo <path> edit
 
 ### GFS retention example (recommended)
 
-Keep a rolling window of 20 recent snapshots, plus permanent GFS anchors (daily/weekly/monthly/yearly):
+Keep a rolling 20-snapshot window plus bounded GFS anchors — 7 daily, 8 weekly, 12 monthly, indefinite yearly:
 
 ```
 backup policy --repo /mnt/backup/myrepo set \
     --keep-revs 20 \
+    --keep-daily 7 \
+    --keep-weekly 8 \
+    --keep-monthly 12 \
     --auto-prune
 ```
 
 With this policy and daily backups, after each `backup run`:
 
 - The 20 most recent snapshots are always kept.
-- Each calendar day's last snapshot is permanently anchored as a **daily** GFS snapshot.
-- Each Sunday's daily snapshot is promoted to a **weekly** anchor.
-- The last Sunday of each month is promoted to a **monthly** anchor.
-- The last Sunday of December is promoted to a **yearly** anchor.
-- Snapshots outside the 20-snapshot window that carry no GFS flag are deleted.
-- Reverse records are deleted only when outside the 20-snapshot window *and* older than the oldest GFS anchor.
+- Each calendar day's last snapshot is anchored as a **daily** GFS snapshot; only the 7 most recent daily anchors are retained.
+- Each Sunday's daily snapshot is promoted to a **weekly** anchor; only the 8 most recent weekly anchors are retained.
+- The last Sunday of each month is promoted to a **monthly** anchor; only the 12 most recent monthly anchors are retained.
+- The last Sunday of December is promoted to a **yearly** anchor (no cap — kept indefinitely).
+- Snapshots outside the 20-snapshot window that carry no live GFS flag are deleted.
+- Reverse records are deleted only when outside the 20-snapshot window *and* older than the oldest live GFS anchor.
 
 **What this looks like over time** (running daily):
 
 | Age | What survives |
 |-----|--------------|
 | Last 20 days | All snapshots (rolling window) |
-| 21+ days | Only GFS-anchored snaps (daily/weekly/monthly/yearly) |
-| After a Sunday | That Sunday's snap is a weekly anchor — kept indefinitely |
-| After December | That December's last-Sunday snap is a yearly anchor — kept indefinitely |
+| 21+ days | Live GFS-anchored snaps only |
+| 8–20 days | 7 daily anchors (one per day) |
+| 2–8 weeks | 8 weekly anchors (one per Sunday) |
+| 3–12 months | 12 monthly anchors (last Sunday of each month) |
+| 1+ years | All yearly anchors (last Sunday of each December) |
 
-**Restoring any GFS-anchored snapshot is always direct** — its `.snap` file is preserved permanently. No reverse-chain walking is needed.
+**Restoring any live GFS-anchored snapshot is always direct** — its `.snap` file is present. No reverse-chain walking is needed.
 
-**Restoring a non-anchored day** (e.g. a Wednesday from 3 months ago) requires `restore --at`. The tool walks the reverse chain back from the nearest surviving GFS anchor. Since weekly anchors exist for every Sunday, the worst-case walk from a monthly anchor is ~4 steps (Sunday gaps). Between yearly anchors in years with no monthly anchors, the walk can be longer; adding `--checkpoint-every 30` caps it at 29 steps regardless of age.
+**Restoring a non-anchored day** (e.g. a Wednesday from 3 months ago) requires `restore --at`. The tool walks the reverse chain back from the nearest surviving GFS anchor. Since weekly anchors exist for every Sunday in the retention window, the worst-case walk from a monthly anchor is ~4 steps (Sunday gaps). Adding `--checkpoint-every 30` caps the walk at 29 steps regardless of age.
 
 ### Legacy sliding-window retention
 
-The older `keep_last / keep_weekly / keep_monthly / keep_yearly` flags still work for configurations that do not use `keep_revs`. They select survivors purely by recency within a window and do not write GFS flags into snapshot files.
+The `keep_daily / keep_weekly / keep_monthly / keep_yearly` flags can also be used without `keep_revs` as a pure sliding-window retention policy. In this mode they select survivors by recency within a calendar window and do not write GFS flags into snapshot files.
 
 ---
 
