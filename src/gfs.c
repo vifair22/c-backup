@@ -50,6 +50,27 @@ static int is_december(uint64_t ts) {
     return tm.tm_mon == 11;
 }
 
+/* Highest GFS tier flag set in a snapshot */
+static uint32_t highest_tier(uint32_t flags) {
+    if (flags & GFS_YEARLY)  return GFS_YEARLY;
+    if (flags & GFS_MONTHLY) return GFS_MONTHLY;
+    if (flags & GFS_WEEKLY)  return GFS_WEEKLY;
+    if (flags & GFS_DAILY)   return GFS_DAILY;
+    return 0;
+}
+
+/* Count snaps with the same highest_tier as snaps[idx] that have a higher ID */
+static int tier_newer_count(const gfs_snap_info_t *snaps, uint32_t n, uint32_t idx) {
+    uint32_t tier = highest_tier(snaps[idx].gfs_flags);
+    int count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i == idx) continue;
+        if (snaps[i].id > snaps[idx].id && highest_tier(snaps[i].gfs_flags) == tier)
+            count++;
+    }
+    return count;
+}
+
 /* ------------------------------------------------------------------ */
 /* gfs_detect_boundaries                                               */
 /* ------------------------------------------------------------------ */
@@ -239,29 +260,48 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
         }
     }
 
+    /* Step 2b: mark tier-expired GFS snaps.
+     * A GFS snap is expired when keep_N > 0 for its tier and there are
+     * already >= keep_N newer snaps at the same (highest) tier. */
+    int *tier_expired = calloc(n, sizeof(int));
+    if (!tier_expired) { free(snaps); return ERR_NOMEM; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (snaps[i].gfs_flags == 0) continue;
+        uint32_t tier = highest_tier(snaps[i].gfs_flags);
+        int keep_n = 0;
+        switch (tier) {
+            case GFS_DAILY:   keep_n = policy->keep_daily;   break;
+            case GFS_WEEKLY:  keep_n = policy->keep_weekly;  break;
+            case GFS_MONTHLY: keep_n = policy->keep_monthly; break;
+            case GFS_YEARLY:  keep_n = policy->keep_yearly;  break;
+        }
+        if (keep_n > 0 && tier_newer_count(snaps, n, i) >= keep_n)
+            tier_expired[i] = 1;
+    }
+
     /* Step 3: compute effective rev retention window */
     uint32_t eff_revs = gfs_effective_keep_revs(policy, new_snap_id, snaps, n);
 
-    /* Step 4: determine oldest GFS anchor */
+    /* Step 4: determine oldest non-expired GFS anchor */
     uint32_t oldest_gfs = new_snap_id;
     for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].gfs_flags != 0 && snaps[i].id < oldest_gfs)
+        if (snaps[i].gfs_flags != 0 && !tier_expired[i] && snaps[i].id < oldest_gfs)
             oldest_gfs = snaps[i].id;
     }
 
-    /* Step 5: prune non-GFS snaps outside the rev window.
-     * Keep snap if: it is the new HEAD, it has GFS flags, it is within
-     * the rev window (id >= new_snap_id - eff_revs), or it is preserved. */
+    /* Step 5: prune snaps outside the rev window.
+     * Keep snap if: HEAD, non-expired GFS anchor, within rev window, or preserved.
+     * Tier-expired GFS snaps are treated like non-GFS and pruned outside the window. */
     uint32_t rev_window_start = (new_snap_id > eff_revs)
                                 ? (new_snap_id - eff_revs) : 1;
     uint32_t pruned_snaps = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t id = snaps[i].id;
-        if (id == new_snap_id)          continue;   /* HEAD always kept */
-        if (snaps[i].gfs_flags != 0)    continue;   /* GFS anchor */
-        if (id >= rev_window_start)     continue;   /* within rev window */
-        if (snaps[i].preserved)         continue;   /* preserved tag */
+        if (id == new_snap_id)                          continue;   /* HEAD always kept */
+        if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;  /* live GFS anchor */
+        if (id >= rev_window_start)                     continue;   /* within rev window */
+        if (snaps[i].preserved)                         continue;   /* preserved tag */
 
         if (dry_run) {
             fprintf(stderr, "  would remove snap %08u\n", id);
@@ -305,6 +345,7 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
                     pruned_snaps, pruned_revs);
     }
 
+    free(tier_expired);
     free(snaps);
 
     /* Step 7: GC */
