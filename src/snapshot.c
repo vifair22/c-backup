@@ -40,7 +40,11 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     snap_path(repo, snap_id, path, sizeof(path));
 
     int fd = open(path, O_RDONLY);
-    if (fd == -1) { log_msg("ERROR", "cannot open snapshot file"); return ERR_IO; }
+    if (fd == -1) {
+        if (errno == ENOENT) return ERR_NOT_FOUND;
+        log_msg("ERROR", "cannot open snapshot file");
+        return ERR_IO;
+    }
 
     /* Read the magic + version first to decide which header size to read */
     uint32_t magic = 0, version = 0;
