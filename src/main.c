@@ -14,11 +14,28 @@
 #include "gfs.h"
 #include "../vendor/log.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* Signal handling                                                     */
+/* ------------------------------------------------------------------ */
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    /* Only async-signal-safe functions allowed here.
+     * write() is safe; _exit() skips atexit but releases fds (and the
+     * flock) via the OS.  The repo is always consistent because every
+     * write uses the mkstemp → fsync → rename pattern. */
+    static const char msg[] =
+        "\ninterrupted — repository is consistent\n";
+    if (write(STDERR_FILENO, msg, sizeof(msg) - 1)) { /* best-effort */ }
+    _exit(130);
+}
 
 /* ------------------------------------------------------------------ */
 /* Lightweight option parser                                           */
@@ -76,6 +93,7 @@ static int lock_or_die(repo_t *repo) {
         fprintf(stderr, "error: cannot acquire repository lock\n");
         return 1;
     }
+    repo_prune_resume_pending(repo);  /* complete any prune interrupted by crash */
     return 0;
 }
 
@@ -718,6 +736,16 @@ static int cmd_tag(repo_t *repo, int argc, char **argv) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
+    /* Install SIGINT/SIGTERM handlers early so any long-running operation
+     * exits cleanly with a user-visible message.  The repo is always
+     * consistent because writes use atomic rename. */
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags   = 0;
+    sa.sa_handler = sigint_handler;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     if (argc < 2) { usage(); return 1; }
 
     const char *cmd = argv[1];

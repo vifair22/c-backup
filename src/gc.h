@@ -22,11 +22,20 @@ status_t repo_prune(repo_t *repo, uint32_t keep_count, uint32_t *out_pruned,
                     int dry_run);
 
 /*
- * Verify that every object hash referenced by every snapshot exists in
- * the object store.  Returns OK if all objects are present, ERR_CORRUPT
- * if any are missing.
+ * Verify every object referenced by every surviving snapshot: loads and
+ * decompresses each object, re-hashing its content to confirm integrity.
+ * Returns OK if all objects are present and uncorrupted, ERR_CORRUPT
+ * if any are missing or have hash mismatches.
  */
 status_t repo_verify(repo_t *repo);
+
+/*
+ * Complete any prune that was interrupted before GC could run.
+ * Reads repo/prune-pending (if it exists), deletes any listed snap files
+ * that have not already been removed, runs GC, then removes the file.
+ * Called automatically on every exclusive lock acquisition.
+ */
+status_t repo_prune_resume_pending(repo_t *repo);
 
 /*
  * Fine-grained retention policy prune.

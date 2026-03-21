@@ -217,6 +217,28 @@ status_t repo_prune(repo_t *repo, uint32_t keep_count, uint32_t *out_pruned,
     uint32_t prune_up_to = head - keep_count;
     uint32_t pruned = 0;
 
+    /* Phase 1 (non-dry-run): write pending-prune file so a crash during
+     * deletion can be resumed on next repo_lock.  The file lists the IDs
+     * we intend to delete; preserved snaps are excluded. */
+    char pending_path[PATH_MAX];
+    snprintf(pending_path, sizeof(pending_path),
+             "%s/prune-pending", repo_path(repo));
+
+    if (!dry_run) {
+        FILE *pf = fopen(pending_path, "w");
+        if (pf) {
+            for (uint32_t id = 1; id <= prune_up_to; id++) {
+                char tname[256] = {0};
+                if (!tag_snap_is_preserved(repo, id, tname, sizeof(tname)))
+                    fprintf(pf, "%u\n", id);
+            }
+            fflush(pf);
+            fsync(fileno(pf));
+            fclose(pf);
+        }
+    }
+
+    /* Phase 2: execute deletions */
     for (uint32_t id = 1; id <= prune_up_to; id++) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/snapshots/%08u.snap",
@@ -264,9 +286,50 @@ status_t repo_prune(repo_t *repo, uint32_t keep_count, uint32_t *out_pruned,
             pruned, keep_count);
     if (out_pruned) *out_pruned = pruned;
 
-    /* Clean up objects that are no longer referenced by any surviving
-     * snapshot or reverse record.                                     */
-    return repo_gc(repo, NULL, NULL);
+    /* Phase 3: GC, then remove the pending file */
+    status_t st = repo_gc(repo, NULL, NULL);
+    unlink(pending_path);
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* repo_prune_resume_pending                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * If a previous prune was interrupted before GC ran, a prune-pending file
+ * lists the snap IDs scheduled for deletion.  Complete the work and run GC
+ * so storage is reclaimed.  Called on every exclusive lock acquisition.
+ */
+status_t repo_prune_resume_pending(repo_t *repo) {
+    char pending_path[PATH_MAX];
+    snprintf(pending_path, sizeof(pending_path),
+             "%s/prune-pending", repo_path(repo));
+
+    FILE *pf = fopen(pending_path, "r");
+    if (!pf) return OK;   /* no pending prune */
+
+    uint32_t id;
+    uint32_t deleted = 0;
+    while (fscanf(pf, "%u", &id) == 1) {
+        char tname[256] = {0};
+        if (tag_snap_is_preserved(repo, id, tname, sizeof(tname))) {
+            fprintf(stderr, "prune-resume: snap %08u is preserved — skipping\n", id);
+            continue;
+        }
+        char snap_path[PATH_MAX];
+        snprintf(snap_path, sizeof(snap_path), "%s/snapshots/%08u.snap",
+                 repo_path(repo), id);
+        if (unlink(snap_path) == 0) deleted++;
+    }
+    fclose(pf);
+
+    if (deleted > 0)
+        fprintf(stderr, "prune-resume: completed %u pending deletion(s)\n", deleted);
+
+    repo_gc(repo, NULL, NULL);
+    unlink(pending_path);
+    return OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -289,26 +352,42 @@ status_t repo_verify(repo_t *repo) {
         }
         for (uint32_t j = 0; j < snap->node_count; j++) {
             const node_t *nd = &snap->nodes[j];
-            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0 &&
-                !object_exists(repo, nd->content_hash)) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1];
-                char emsg[120];
-                object_hash_to_hex(nd->content_hash, hex);
-                snprintf(emsg, sizeof(emsg),
-                         "verify: snap %u node %llu missing content %s",
-                         id, (unsigned long long)nd->node_id, hex);
-                log_msg("ERROR", emsg);
-                errors++;
+
+            /* Verify content object: load and decompress, which re-hashes */
+            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                void *data = NULL; size_t sz = 0;
+                status_t obj_st = object_load(repo, nd->content_hash,
+                                              &data, &sz, NULL);
+                free(data);
+                if (obj_st != OK) {
+                    char hex[OBJECT_HASH_SIZE * 2 + 1];
+                    char emsg[128];
+                    object_hash_to_hex(nd->content_hash, hex);
+                    snprintf(emsg, sizeof(emsg),
+                             "verify: snap %u node %llu %s: %s",
+                             id, (unsigned long long)nd->node_id, hex,
+                             obj_st == ERR_CORRUPT ? "corrupt" : "missing");
+                    log_msg("ERROR", emsg);
+                    errors++;
+                }
             }
-            if (memcmp(nd->xattr_hash, zero, OBJECT_HASH_SIZE) != 0 &&
-                !object_exists(repo, nd->xattr_hash)) {
-                log_msg("ERROR", "verify: missing xattr object");
-                errors++;
+
+            if (memcmp(nd->xattr_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                void *data = NULL; size_t sz = 0;
+                if (object_load(repo, nd->xattr_hash, &data, &sz, NULL) != OK) {
+                    log_msg("ERROR", "verify: missing or corrupt xattr object");
+                    errors++;
+                }
+                free(data);
             }
-            if (memcmp(nd->acl_hash, zero, OBJECT_HASH_SIZE) != 0 &&
-                !object_exists(repo, nd->acl_hash)) {
-                log_msg("ERROR", "verify: missing acl object");
-                errors++;
+
+            if (memcmp(nd->acl_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                void *data = NULL; size_t sz = 0;
+                if (object_load(repo, nd->acl_hash, &data, &sz, NULL) != OK) {
+                    log_msg("ERROR", "verify: missing or corrupt acl object");
+                    errors++;
+                }
+                free(data);
             }
         }
         snapshot_free(snap);
@@ -455,7 +534,23 @@ status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
         return OK;
     }
 
-    /* Prune snaps not in keep set */
+    /* Phase 1 (non-dry-run): write pending-prune file before any deletions */
+    char pending_path[PATH_MAX];
+    snprintf(pending_path, sizeof(pending_path),
+             "%s/prune-pending", repo_path(repo));
+
+    if (!dry_run) {
+        FILE *pf = fopen(pending_path, "w");
+        if (pf) {
+            for (uint32_t i = 0; i < n; i++)
+                if (!keep[i]) fprintf(pf, "%u\n", snaps[i].id);
+            fflush(pf);
+            fsync(fileno(pf));
+            fclose(pf);
+        }
+    }
+
+    /* Phase 2: execute deletions */
     uint32_t pruned = 0;
     for (uint32_t i = 0; i < n; i++) {
         if (keep[i]) continue;
@@ -487,5 +582,9 @@ status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
 
     fprintf(stderr, "prune-policy: removed %u snapshot(s)\n", pruned);
     if (out_pruned) *out_pruned = pruned;
-    return repo_gc(repo, NULL, NULL);
+
+    /* Phase 3: GC, then remove the pending file */
+    status_t st = repo_gc(repo, NULL, NULL);
+    unlink(pending_path);
+    return st;
 }
