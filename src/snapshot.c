@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define SNAP_MAGIC    0x43424B50u  /* "CBKP" */
@@ -23,11 +24,13 @@ typedef struct __attribute__((packed)) {
     uint32_t dirent_count;
     uint64_t dirent_data_len;
     uint32_t gfs_flags;
+    uint32_t snap_flags;
 } snap_file_header_t;
 
 
 static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
-    return snprintf(buf, bufsz, "%s/snapshots/%08u.snap", repo_path(repo), id) >= 0 ? 0 : -1;
+    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.snap", repo_path(repo), id);
+    return (n >= 0 && (size_t)n < bufsz) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -36,7 +39,7 @@ static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
 
 status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     char path[PATH_MAX];
-    snap_path(repo, snap_id, path, sizeof(path));
+    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return ERR_IO;
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
@@ -55,8 +58,12 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
         close(fd); log_msg("ERROR", "invalid snapshot magic/version"); return ERR_CORRUPT;
     }
 
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) { close(fd); return ERR_IO; }
+
     /* Read the remaining header fields */
     uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
+    uint32_t snap_flags = 0;
     uint64_t created_sec = 0, dirent_data_len = 0;
 
 #define RD32(v) (read(fd, &(v), 4) != 4)
@@ -69,6 +76,20 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
 #undef RD32
 #undef RD64
 
+    uint64_t payload_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
+    uint64_t expect_old = 40u + payload_sz;
+    uint64_t expect_new = 44u + payload_sz;
+    uint64_t fsz = (uint64_t)sb.st_size;
+    if (fsz == expect_new) {
+        if (read(fd, &snap_flags, sizeof(snap_flags)) != (ssize_t)sizeof(snap_flags)) {
+            close(fd);
+            return ERR_CORRUPT;
+        }
+    } else if (fsz != expect_old) {
+        close(fd);
+        return ERR_CORRUPT;
+    }
+
     snapshot_t *snap = calloc(1, sizeof(*snap));
     if (!snap) { close(fd); return ERR_NOMEM; }
     snap->snap_id         = snap_id_f;
@@ -77,6 +98,7 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     snap->dirent_count    = dirent_count;
     snap->dirent_data_len = (size_t)dirent_data_len;
     snap->gfs_flags       = gfs_flags;
+    snap->snap_flags      = snap_flags;
 
     snap->nodes = malloc(node_count * sizeof(node_t));
     if (!snap->nodes && node_count > 0) { free(snap); close(fd); return ERR_NOMEM; }
@@ -103,7 +125,8 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
 
 status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     char tmppath[PATH_MAX];
-    snprintf(tmppath, sizeof(tmppath), "%s/tmp/snap.XXXXXX", repo_path(repo));
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/snap.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) return ERR_IO;
     int fd = mkstemp(tmppath);
     if (fd == -1) return ERR_IO;
 
@@ -130,11 +153,14 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     close(fd); fd = -1;
 
     char dstpath[PATH_MAX];
-    snap_path(repo, snap->snap_id, dstpath, sizeof(dstpath));
+    if (snap_path(repo, snap->snap_id, dstpath, sizeof(dstpath)) != 0) {
+        st = ERR_IO; goto fail;
+    }
     if (rename(tmppath, dstpath) == -1) { st = ERR_IO; goto fail; }
     {
         char dirpath[PATH_MAX];
-        snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo));
+        if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo))
+            >= (int)sizeof(dirpath)) { st = ERR_IO; goto fail; }
         int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
@@ -146,7 +172,7 @@ fail:
 
 status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags) {
     char path[PATH_MAX];
-    snap_path(repo, snap_id, path, sizeof(path));
+    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return ERR_IO;
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) return ERR_IO;
@@ -190,7 +216,8 @@ void snapshot_free(snapshot_t *snap) {
 
 status_t snapshot_read_head(repo_t *repo, uint32_t *out_id) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/refs/HEAD", repo_path(repo));
+    if (snprintf(path, sizeof(path), "%s/refs/HEAD", repo_path(repo)) >= (int)sizeof(path))
+        return ERR_IO;
     FILE *f = fopen(path, "r");
     if (!f) return ERR_IO;
     unsigned long id = 0;
@@ -202,7 +229,8 @@ status_t snapshot_read_head(repo_t *repo, uint32_t *out_id) {
 
 status_t snapshot_write_head(repo_t *repo, uint32_t snap_id) {
     char tmppath[PATH_MAX];
-    snprintf(tmppath, sizeof(tmppath), "%s/tmp/HEAD.XXXXXX", repo_path(repo));
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/HEAD.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) return ERR_IO;
     int fd = mkstemp(tmppath);
     if (fd == -1) return ERR_IO;
     char buf[32];
@@ -211,10 +239,12 @@ status_t snapshot_write_head(repo_t *repo, uint32_t snap_id) {
     if (fsync(fd) == -1) { close(fd); unlink(tmppath); return ERR_IO; }
     close(fd);
     char dstpath[PATH_MAX];
-    snprintf(dstpath, sizeof(dstpath), "%s/refs/HEAD", repo_path(repo));
+    if (snprintf(dstpath, sizeof(dstpath), "%s/refs/HEAD", repo_path(repo))
+        >= (int)sizeof(dstpath)) { unlink(tmppath); return ERR_IO; }
     if (rename(tmppath, dstpath) == -1) { unlink(tmppath); return ERR_IO; }
     char dirpath[PATH_MAX];
-    snprintf(dirpath, sizeof(dirpath), "%s/refs", repo_path(repo));
+    if (snprintf(dirpath, sizeof(dirpath), "%s/refs", repo_path(repo))
+        >= (int)sizeof(dirpath)) return ERR_IO;
     int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
     if (dfd >= 0) { fsync(dfd); close(dfd); }
     return OK;
@@ -327,14 +357,65 @@ typedef struct {
     char    *full_path;   /* built incrementally */
 } dr_flat_t;
 
-static dr_flat_t *find_flat_by_id(dr_flat_t *arr, size_t n, uint64_t id) {
-    for (size_t i = 0; i < n; i++)
-        if (arr[i].node_id == id) return &arr[i];
-    return NULL;
+typedef struct {
+    uint64_t  key;
+    uintptr_t val;
+} id_slot_t;
+
+typedef struct {
+    id_slot_t *slots;
+    size_t     capacity;
+} id_map_t;
+
+static uint64_t id_hash_u64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static int id_map_init(id_map_t *m, size_t want) {
+    size_t cap = pm_next_pow2(want < 16 ? 16 : want);
+    m->slots = calloc(cap, sizeof(*m->slots));
+    if (!m->slots) return -1;
+    m->capacity = cap;
+    return 0;
+}
+
+static void id_map_free(id_map_t *m) {
+    free(m->slots);
+    m->slots = NULL;
+    m->capacity = 0;
+}
+
+static int id_map_put_if_absent(id_map_t *m, uint64_t key, uintptr_t val) {
+    if (key == 0) return 0;
+    size_t mask = m->capacity - 1;
+    size_t h = (size_t)(id_hash_u64(key) & (uint64_t)mask);
+    while (m->slots[h].key != 0) {
+        if (m->slots[h].key == key) return 0;
+        h = (h + 1) & mask;
+    }
+    m->slots[h].key = key;
+    m->slots[h].val = val;
+    return 0;
+}
+
+static uintptr_t id_map_get(const id_map_t *m, uint64_t key) {
+    if (key == 0 || !m->slots) return 0;
+    size_t mask = m->capacity - 1;
+    size_t h = (size_t)(id_hash_u64(key) & (uint64_t)mask);
+    while (m->slots[h].key != 0) {
+        if (m->slots[h].key == key) return m->slots[h].val;
+        h = (h + 1) & mask;
+    }
+    return 0;
 }
 
 /* Recursively build the full path for a dirent entry. */
-static char *build_full_path(dr_flat_t *arr, size_t n, dr_flat_t *e) {
+static char *build_full_path(const id_map_t *idx, dr_flat_t *e) {
     if (e->full_path) return e->full_path;   /* already built */
 
     if (e->parent_node_id == 0) {
@@ -342,13 +423,13 @@ static char *build_full_path(dr_flat_t *arr, size_t n, dr_flat_t *e) {
         return e->full_path;
     }
 
-    dr_flat_t *parent = find_flat_by_id(arr, n, e->parent_node_id);
+    dr_flat_t *parent = (dr_flat_t *)id_map_get(idx, e->parent_node_id);
     if (!parent) {
         e->full_path = strdup(e->name);
         return e->full_path;
     }
 
-    char *parent_path = build_full_path(arr, n, parent);
+    char *parent_path = build_full_path(idx, parent);
     if (!parent_path) return NULL;
 
     size_t plen = strlen(parent_path);
@@ -362,7 +443,9 @@ static char *build_full_path(dr_flat_t *arr, size_t n, dr_flat_t *e) {
     return fp;
 }
 
-status_t pathmap_build(const snapshot_t *snap, pathmap_t **out) {
+status_t pathmap_build_progress(const snapshot_t *snap, pathmap_t **out,
+                                void (*progress_cb)(uint32_t done, uint32_t total, void *ctx),
+                                void *ctx) {
     size_t cap = pm_next_pow2(snap->node_count < 8 ? 16 : snap->node_count * 2);
     pathmap_t *m = calloc(1, sizeof(*m));
     if (!m) return ERR_NOMEM;
@@ -374,9 +457,30 @@ status_t pathmap_build(const snapshot_t *snap, pathmap_t **out) {
     dr_flat_t *flat = calloc(snap->dirent_count, sizeof(dr_flat_t));
     if (!flat && snap->dirent_count > 0) { pathmap_free(m); return ERR_NOMEM; }
     size_t n_flat = 0;
+    id_map_t flat_idx = {0};
+    id_map_t node_idx = {0};
+    if (id_map_init(&flat_idx, snap->dirent_count * 2u + 16u) != 0) {
+        free(flat);
+        pathmap_free(m);
+        return ERR_NOMEM;
+    }
+    if (id_map_init(&node_idx, snap->node_count * 2u + 16u) != 0) {
+        id_map_free(&flat_idx);
+        free(flat);
+        pathmap_free(m);
+        return ERR_NOMEM;
+    }
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        if (id_map_put_if_absent(&node_idx, snap->nodes[i].node_id,
+                                 (uintptr_t)&snap->nodes[i]) != 0)
+            goto oom;
+    }
 
     const uint8_t *p   = snap->dirent_data;
     const uint8_t *end = p + snap->dirent_data_len;
+    uint32_t total = snap->dirent_count ? snap->dirent_count * 2u : 1u;
+    uint32_t done = 0;
+    if (progress_cb) progress_cb(done, total, ctx);
 
     while (p < end && n_flat < snap->dirent_count) {
         if (p + sizeof(dirent_rec_t) > end) break;
@@ -395,29 +499,43 @@ status_t pathmap_build(const snapshot_t *snap, pathmap_t **out) {
         flat[n_flat].node_id        = dr.node_id;
         flat[n_flat].name           = name;
         flat[n_flat].full_path      = NULL;
+        if (id_map_put_if_absent(&flat_idx, dr.node_id, (uintptr_t)&flat[n_flat]) != 0)
+            goto oom;
         n_flat++;
+        done++;
+        if (progress_cb) progress_cb(done, total, ctx);
     }
 
     /* Reconstruct full paths and insert into map */
     for (size_t i = 0; i < n_flat; i++) {
-        char *fp = build_full_path(flat, n_flat, &flat[i]);
+        char *fp = build_full_path(&flat_idx, &flat[i]);
         if (!fp) goto oom;
 
-        const node_t *nd = snapshot_find_node(snap, flat[i].node_id);
+        const node_t *nd = (const node_t *)id_map_get(&node_idx, flat[i].node_id);
         if (nd && pm_insert_node(m, fp, nd) != 0) goto oom;
+        done++;
+        if (progress_cb) progress_cb(done, total, ctx);
     }
 
     for (size_t i = 0; i < n_flat; i++) {
         free(flat[i].name);
         free(flat[i].full_path);
     }
+    id_map_free(&flat_idx);
+    id_map_free(&node_idx);
     free(flat);
     *out = m;
     return OK;
 
 oom:
     for (size_t i = 0; i < n_flat; i++) { free(flat[i].name); free(flat[i].full_path); }
+    id_map_free(&flat_idx);
+    id_map_free(&node_idx);
     free(flat);
     pathmap_free(m);
     return ERR_NOMEM;
+}
+
+status_t pathmap_build(const snapshot_t *snap, pathmap_t **out) {
+    return pathmap_build_progress(snap, out, NULL, NULL);
 }

@@ -12,6 +12,9 @@
 #define GFS_MONTHLY  (1u << 2)
 #define GFS_YEARLY   (1u << 3)
 
+/* Snapshot flags stored in the snap file header. */
+#define SNAP_FLAG_SYNTHETIC (1u << 0)
+
 /*
  * In-memory snapshot representation.
  * node_table and dirent_table are flat arrays loaded from the .snap file.
@@ -22,6 +25,7 @@ typedef struct {
     uint32_t    node_count;
     uint32_t    dirent_count;
     uint32_t    gfs_flags;     /* bitmask of GFS_* tier membership */
+    uint32_t    snap_flags;    /* bitmask of SNAP_FLAG_* */
     node_t     *nodes;
     /* dirents are variable-size; stored as raw bytes */
     uint8_t    *dirent_data;
@@ -70,6 +74,9 @@ typedef struct {
  * Caller must call pathmap_free() when done.
  */
 status_t pathmap_build(const snapshot_t *snap, pathmap_t **out);
+status_t pathmap_build_progress(const snapshot_t *snap, pathmap_t **out,
+                                void (*progress_cb)(uint32_t done, uint32_t total, void *ctx),
+                                void *ctx);
 
 /* Look up a path. Returns NULL if not found. */
 const node_t *pathmap_lookup(const pathmap_t *map, const char *path);

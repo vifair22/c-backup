@@ -46,8 +46,13 @@ void         scan_imap_free(scan_imap_t *m);
  * Options for scan_tree.  Pass NULL for defaults (no exclusions).
  */
 typedef struct {
-    const char **exclude;   /* fnmatch(3) patterns matched against basename */
+    const char **exclude;   /* basename patterns; patterns containing '/' match full path */
     int          n_exclude;
+    int          verbose;
+    void       (*progress_cb)(uint32_t scanned_entries, void *ctx);
+    void       (*progress_clear_cb)(void *ctx);
+    void        *progress_ctx;
+    uint32_t     progress_every;
 } scan_opts_t;
 
 /*

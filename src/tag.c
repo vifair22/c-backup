@@ -11,12 +11,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static void tag_dir(repo_t *repo, char *buf, size_t sz) {
-    snprintf(buf, sz, "%s/tags", repo_path(repo));
+static int parse_u32_str(const char *s, uint32_t *out) {
+    char *end = NULL;
+    unsigned long v;
+    if (!s || !*s || !out) return 0;
+    errno = 0;
+    v = strtoul(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v == 0 || v > UINT32_MAX) return 0;
+    *out = (uint32_t)v;
+    return 1;
 }
 
-static void tag_path(repo_t *repo, const char *name, char *buf, size_t sz) {
-    snprintf(buf, sz, "%s/tags/%s", repo_path(repo), name);
+static int tag_dir(repo_t *repo, char *buf, size_t sz) {
+    int n = snprintf(buf, sz, "%s/tags", repo_path(repo));
+    return (n >= 0 && (size_t)n < sz) ? 0 : -1;
+}
+
+static int tag_path(repo_t *repo, const char *name, char *buf, size_t sz) {
+    int n = snprintf(buf, sz, "%s/tags/%s", repo_path(repo), name);
+    return (n >= 0 && (size_t)n < sz) ? 0 : -1;
 }
 
 static int tag_name_valid(const char *name) {
@@ -31,11 +44,11 @@ status_t tag_set(repo_t *repo, const char *name, uint32_t snap_id, int preserve)
     if (!tag_name_valid(name)) return ERR_INVALID;
 
     char dir[PATH_MAX];
-    tag_dir(repo, dir, sizeof(dir));
+    if (tag_dir(repo, dir, sizeof(dir)) != 0) return ERR_IO;
     if (mkdir(dir, 0755) == -1 && errno != EEXIST) return ERR_IO;
 
     char path[PATH_MAX];
-    tag_path(repo, name, path, sizeof(path));
+    if (tag_path(repo, name, path, sizeof(path)) != 0) return ERR_IO;
     FILE *f = fopen(path, "w");
     if (!f) return ERR_IO;
     fprintf(f, "id = %u\n", snap_id);
@@ -44,7 +57,7 @@ status_t tag_set(repo_t *repo, const char *name, uint32_t snap_id, int preserve)
     return OK;
 }
 
-/* Parse a tag file; both old format (plain number) and new key=value format. */
+/* Parse a tag file in key=value format. */
 static status_t tag_parse(const char *path, uint32_t *out_id, int *out_preserve) {
     FILE *f = fopen(path, "r");
     if (!f) return ERR_NOT_FOUND;
@@ -54,22 +67,6 @@ static status_t tag_parse(const char *path, uint32_t *out_id, int *out_preserve)
     *out_id = 0;
     if (out_preserve) *out_preserve = 0;
 
-    /* Peek first char to detect old format (starts with a digit) */
-    int ch = fgetc(f);
-    if (ch == EOF) { fclose(f); return ERR_CORRUPT; }
-    ungetc(ch, f);
-
-    if (isdigit(ch)) {
-        /* Old plain-number format */
-        unsigned id = 0;
-        int ok = (fscanf(f, "%u", &id) == 1);
-        fclose(f);
-        if (!ok || id == 0) return ERR_CORRUPT;
-        *out_id = (uint32_t)id;
-        return OK;
-    }
-
-    /* New key = value format */
     while (fgets(line, sizeof(line), f)) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
@@ -79,8 +76,7 @@ static status_t tag_parse(const char *path, uint32_t *out_id, int *out_preserve)
         char *key = line;
         char *val = eq + 3;
         if (strcmp(key, "id") == 0) {
-            *out_id = (uint32_t)atoi(val);
-            got_id = 1;
+            if (parse_u32_str(val, out_id)) got_id = 1;
         } else if (strcmp(key, "preserve") == 0 && out_preserve) {
             *out_preserve = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
         }
@@ -92,21 +88,21 @@ static status_t tag_parse(const char *path, uint32_t *out_id, int *out_preserve)
 status_t tag_get(repo_t *repo, const char *name, uint32_t *out_id) {
     if (!tag_name_valid(name)) return ERR_INVALID;
     char path[PATH_MAX];
-    tag_path(repo, name, path, sizeof(path));
+    if (tag_path(repo, name, path, sizeof(path)) != 0) return ERR_IO;
     return tag_parse(path, out_id, NULL);
 }
 
 status_t tag_delete(repo_t *repo, const char *name) {
     if (!tag_name_valid(name)) return ERR_INVALID;
     char path[PATH_MAX];
-    tag_path(repo, name, path, sizeof(path));
+    if (tag_path(repo, name, path, sizeof(path)) != 0) return ERR_IO;
     if (unlink(path) == -1) return ERR_IO;
     return OK;
 }
 
 status_t tag_list(repo_t *repo) {
     char dir[PATH_MAX];
-    tag_dir(repo, dir, sizeof(dir));
+    if (tag_dir(repo, dir, sizeof(dir)) != 0) return ERR_IO;
     DIR *d = opendir(dir);
     if (!d) {
         printf("(no tags)\n");
@@ -118,7 +114,7 @@ status_t tag_list(repo_t *repo) {
         if (de->d_name[0] == '.') continue;
         if (!tag_name_valid(de->d_name)) continue;
         char path[PATH_MAX];
-        tag_path(repo, de->d_name, path, sizeof(path));
+        if (tag_path(repo, de->d_name, path, sizeof(path)) != 0) continue;
         uint32_t id = 0;
         int preserve = 0;
         if (tag_parse(path, &id, &preserve) == OK) {
@@ -135,7 +131,7 @@ status_t tag_list(repo_t *repo) {
 int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
                           char *name_out, size_t name_sz) {
     char dir[PATH_MAX];
-    tag_dir(repo, dir, sizeof(dir));
+    if (tag_dir(repo, dir, sizeof(dir)) != 0) return 0;
     DIR *d = opendir(dir);
     if (!d) return 0;
 
@@ -145,7 +141,7 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
         if (de->d_name[0] == '.') continue;
         if (!tag_name_valid(de->d_name)) continue;
         char path[PATH_MAX];
-        tag_path(repo, de->d_name, path, sizeof(path));
+        if (tag_path(repo, de->d_name, path, sizeof(path)) != 0) continue;
         uint32_t id = 0;
         int preserve = 0;
         if (tag_parse(path, &id, &preserve) == OK && id == snap_id && preserve) {
@@ -158,11 +154,6 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
 }
 
 status_t tag_resolve(repo_t *repo, const char *arg, uint32_t *out_id) {
-    char *end;
-    unsigned long v = strtoul(arg, &end, 10);
-    if (*end == '\0' && v > 0) {
-        *out_id = (uint32_t)v;
-        return OK;
-    }
+    if (parse_u32_str(arg, out_id)) return OK;
     return tag_get(repo, arg, out_id);
 }

@@ -4,7 +4,6 @@
 #include "tag.h"
 #include "pack.h"
 #include "snapshot.h"
-#include "reverse.h"
 #include "object.h"
 #include "../vendor/log.h"
 
@@ -16,6 +15,45 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static size_t g_gc_line_len = 0;
+
+static int gc_progress_enabled(void) {
+    return isatty(STDERR_FILENO);
+}
+
+static void gc_line_set(const char *msg) {
+    size_t len = strlen(msg);
+    fprintf(stderr, "\r%s", msg);
+    if (g_gc_line_len > len) {
+        size_t pad = g_gc_line_len - len;
+        while (pad--) fputc(' ', stderr);
+        fputc('\r', stderr);
+        fputs(msg, stderr);
+    }
+    fflush(stderr);
+    g_gc_line_len = len;
+}
+
+static void gc_line_clear(void) {
+    if (g_gc_line_len == 0) return;
+    fputc('\r', stderr);
+    for (size_t i = 0; i < g_gc_line_len; i++) fputc(' ', stderr);
+    fputc('\r', stderr);
+    fflush(stderr);
+    g_gc_line_len = 0;
+}
+
+static int gc_tick_due(struct timespec *next_tick) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec < next_tick->tv_sec ||
+        (now.tv_sec == next_tick->tv_sec && now.tv_nsec < next_tick->tv_nsec))
+        return 0;
+    next_tick->tv_sec = now.tv_sec + 1;
+    next_tick->tv_nsec = now.tv_nsec;
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /* Shared helpers                                                      */
@@ -56,11 +94,7 @@ static status_t ref_push(uint8_t **refs, size_t *cap, size_t *cnt,
     return OK;
 }
 
-/*
- * Collect all object hashes referenced by any snapshot or reverse record.
- * Reverse records are included so that historical restore via the reverse
- * chain continues to work after old snapshot files are pruned.
- */
+/* Collect all object hashes referenced by surviving snapshots. */
 static status_t collect_refs(repo_t *repo,
                               uint8_t **out_refs, size_t *out_cnt) {
     uint32_t head = 0;
@@ -86,22 +120,6 @@ static status_t collect_refs(repo_t *repo,
             }
         }
         snapshot_free(snap);
-    }
-
-    /* Reverse records — contain prev_node hashes needed for reverse-chain
-     * historical restore even after old snapshot files have been pruned. */
-    for (uint32_t id = 1; id <= head; id++) {
-        rev_record_t *rev = NULL;
-        if (reverse_load(repo, id, &rev) != OK) continue;
-        for (uint32_t j = 0; j < rev->entry_count; j++) {
-            const node_t *nd = &rev->entries[j].prev_node;
-            if ((st = ref_push(&refs, &cap, &cnt, nd->content_hash, zero)) != OK ||
-                (st = ref_push(&refs, &cap, &cnt, nd->xattr_hash,   zero)) != OK ||
-                (st = ref_push(&refs, &cap, &cnt, nd->acl_hash,     zero)) != OK) {
-                reverse_free(rev); goto done;
-            }
-        }
-        reverse_free(rev);
     }
 
     /* Sort and deduplicate */
@@ -134,7 +152,11 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
     status_t st = collect_refs(repo, &refs, &ref_cnt);
     if (st != OK) return st;
 
-    uint32_t kept = 0, deleted = 0;
+    uint32_t loose_kept = 0, loose_deleted = 0;
+    uint32_t scanned = 0;
+    int show_progress = gc_progress_enabled();
+    struct timespec next_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
     int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
     if (obj_fd == -1) { free(refs); return OK; }
@@ -161,15 +183,25 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
             if (hex_decode(hexhash, (size_t)hlen, hash) != 0) continue;
 
             if (bsearch(hash, refs, ref_cnt, OBJECT_HASH_SIZE, hash_cmp)) {
-                kept++;
+                loose_kept++;
             } else {
                 unlinkat(sub_fd, sde->d_name, 0);
-                deleted++;
+                loose_deleted++;
+            }
+            scanned++;
+            if (show_progress && gc_tick_due(&next_tick)) {
+                char line[128];
+                snprintf(line, sizeof(line),
+                         "gc: scanning loose objects (%u scanned, %u deleted)",
+                         scanned, loose_deleted);
+                gc_line_set(line);
             }
         }
         closedir(sub);
     }
     closedir(top);
+
+    if (show_progress) gc_line_clear();
 
     /* Also compact pack files, removing unreferenced entries */
     uint32_t pack_kept = 0, pack_deleted = 0;
@@ -177,15 +209,19 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
     free(refs);
     if (st != OK) return st;
 
-    kept    += pack_kept;
-    deleted += pack_deleted;
+    uint32_t kept    = loose_kept + pack_kept;
+    uint32_t deleted = loose_deleted + pack_deleted;
 
     if (out_kept)    *out_kept    = kept;
     if (out_deleted) *out_deleted = deleted;
 
-    char msg[80];
+    char msg[192];
     snprintf(msg, sizeof(msg),
-             "gc: kept %u, deleted %u unreferenced object(s)", kept, deleted);
+             "gc: refs=%zu, loose kept/deleted=%u/%u, pack kept/deleted=%u/%u, total kept/deleted=%u/%u",
+             ref_cnt,
+             loose_kept, loose_deleted,
+             pack_kept, pack_deleted,
+             kept, deleted);
     log_msg("INFO", msg);
     return OK;
 }
@@ -304,5 +340,3 @@ status_t repo_verify(repo_t *repo) {
     log_msg("ERROR", emsg);
     return ERR_CORRUPT;
 }
-
-

@@ -46,8 +46,10 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
                 if (de->d_name[0] == '.') continue;
                 uint32_t id; char dummy;
                 if (sscanf(de->d_name, "%u.snap%c", &id, &dummy) == 1) {
+                    uint64_t sz = file_size_at(dir, de->d_name);
                     out->snap_count++;
-                    out->total_bytes += file_size_at(dir, de->d_name);
+                    out->snap_bytes += sz;
+                    out->total_bytes += sz;
                 }
             }
             closedir(d);
@@ -102,27 +104,6 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
         }
     }
 
-    /* Reverse records */
-    {
-        char rdir[PATH_MAX];
-        snprintf(rdir, sizeof(rdir), "%s/reverse", root);
-        DIR *d = opendir(rdir);
-        if (d) {
-            struct dirent *de;
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                uint32_t id; char dummy;
-                if (sscanf(de->d_name, "%u.rev%c", &id, &dummy) == 1) {
-                    uint64_t sz = file_size_at(rdir, de->d_name);
-                    out->reverse_records++;
-                    out->reverse_bytes += sz;
-                    out->total_bytes   += sz;
-                }
-            }
-            closedir(d);
-        }
-    }
-
     return OK;
 }
 
@@ -132,14 +113,14 @@ void repo_stats_print(const repo_stat_t *s) {
     if (s->snap_total > 0) printf(" / %u total (HEAD)", s->snap_total);
     printf("\n");
 
+    fmt_bytes(s->snap_bytes, buf, sizeof(buf));
+    printf("manifests:       %u  (%s)\n", s->snap_count, buf);
+
     fmt_bytes(s->loose_bytes, buf, sizeof(buf));
     printf("loose objects:   %u  (%s)\n", s->loose_objects, buf);
 
     fmt_bytes(s->pack_bytes, buf, sizeof(buf));
     printf("pack files:      %u  (%s)\n", s->pack_files, buf);
-
-    fmt_bytes(s->reverse_bytes, buf, sizeof(buf));
-    printf("reverse records: %u  (%s)\n", s->reverse_records, buf);
 
     fmt_bytes(s->total_bytes, buf, sizeof(buf));
     printf("total repo size: %s\n", buf);

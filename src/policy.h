@@ -17,9 +17,8 @@ typedef struct {
     char  **exclude;
     int     n_exclude;
 
-    /* Rev retention window: keep at least this many reverse records.
-     * Silently extended to cover the oldest GFS anchor when GFS is active. */
-    int  keep_revs;
+    /* Full snapshot retention window: keep at least this many .snap files. */
+    int  keep_snaps;
 
     /* GFS retention (0 = disabled) */
     int  keep_daily;
@@ -27,14 +26,10 @@ typedef struct {
     int  keep_monthly;
     int  keep_yearly;
 
-    /* Checkpoint synthesis interval (0 = disabled) */
-    int  checkpoint_every;
-
     /* Auto-run flags (0 = false, 1 = true) */
     int  auto_pack;
     int  auto_gc;
     int  auto_prune;
-    int  auto_checkpoint;
     int  verify_after;      /* verify all objects exist after each backup */
 } policy_t;
 
@@ -53,3 +48,6 @@ void policy_path(repo_t *repo, char *buf, size_t sz);
 /* Create policy.conf with all options commented out (template).
  * No-op if the file already exists. */
 status_t policy_write_template(repo_t *repo);
+
+/* Initialize a policy struct to runtime defaults. */
+void policy_init_defaults(policy_t *policy);

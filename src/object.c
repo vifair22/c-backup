@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <lz4.h>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 
 /* ------------------------------------------------------------------ */
@@ -38,6 +39,10 @@ void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf) {
 
 static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) {
     SHA256((const unsigned char *)data, len, out);
+}
+
+static int obj_name_exists_at(int subfd, const char *fname) {
+    return faccessat(subfd, fname, F_OK, 0) == 0;
 }
 
 int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
@@ -88,28 +93,54 @@ static status_t write_object(repo_t *repo, uint8_t type,
 
     int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
     if (objfd == -1) { free(compressed); return ERR_IO; }
-    mkdirat(objfd, subdir, 0755);
+    if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
+        close(objfd);
+        free(compressed);
+        return ERR_IO;
+    }
+    if (errno == EEXIST) errno = 0;
     int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
     close(objfd);
     if (subfd == -1) { free(compressed); return ERR_IO; }
 
     char tmppath[PATH_MAX];
-    snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo));
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) {
+        close(subfd); free(compressed); return ERR_IO;
+    }
     int fd = mkstemp(tmppath);
     if (fd == -1) { close(subfd); free(compressed); return ERR_IO; }
 
     status_t st = OK;
-    if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) { st = ERR_IO; goto fail; }
-    if (write(fd, payload, payload_size) != (ssize_t)payload_size) { st = ERR_IO; goto fail; }
+    if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        if (errno == 0) errno = EIO;
+        st = ERR_IO;
+        goto fail;
+    }
+    if (write(fd, payload, payload_size) != (ssize_t)payload_size) {
+        if (errno == 0) errno = EIO;
+        st = ERR_IO;
+        goto fail;
+    }
     if (fsync(fd) == -1) { st = ERR_IO; goto fail; }
     close(fd); fd = -1;
 
     char dstpath[PATH_MAX];
-    snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
-    if (rename(tmppath, dstpath) == -1) { st = ERR_IO; goto fail; }
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)
+        >= (int)sizeof(dstpath)) { st = ERR_IO; goto fail; }
+    if (rename(tmppath, dstpath) == -1) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
+            unlink(tmppath);
+            close(subfd); free(compressed);
+            return OK;
+        }
+        st = ERR_IO;
+        goto fail;
+    }
     {
         char dirpath[PATH_MAX];
-        snprintf(dirpath, sizeof(dirpath), "%s/objects/%s", repo_path(repo), subdir);
+        if (snprintf(dirpath, sizeof(dirpath), "%s/objects/%s", repo_path(repo), subdir)
+            >= (int)sizeof(dirpath)) { st = ERR_IO; goto fail; }
         int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
@@ -120,6 +151,178 @@ fail:
     unlink(tmppath);
     close(subfd); free(compressed);
     return st;
+}
+
+static status_t write_object_file_stream(repo_t *repo, int src_fd,
+                                         uint64_t file_size,
+                                         uint8_t out_hash[OBJECT_HASH_SIZE]) {
+    enum { FILE_CHUNK = 1024 * 1024 };
+    uint8_t *buf = malloc(FILE_CHUNK);
+    if (!buf) return ERR_NOMEM;
+
+    char tmppath[PATH_MAX];
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) {
+        free(buf);
+        return ERR_IO;
+    }
+
+    int tfd = mkstemp(tmppath);
+    if (tfd == -1) { free(buf); return ERR_IO; }
+
+    object_header_t hdr = {
+        .type              = OBJECT_TYPE_FILE,
+        .compression       = COMPRESS_NONE,
+        .uncompressed_size = file_size,
+        .compressed_size   = file_size,
+    };
+    if (write(tfd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        if (errno == 0) errno = EIO;
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_NOMEM;
+    }
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    uint64_t got = 0;
+    status_t st = OK;
+    while (got < file_size) {
+        size_t want = (size_t)(file_size - got);
+        if (want > FILE_CHUNK) want = FILE_CHUNK;
+        ssize_t r = read(src_fd, buf, want);
+        if (r == 0) {
+            errno = ESTALE;
+            st = ERR_IO;
+            break;
+        }
+        if (r < 0) { st = ERR_IO; break; }
+
+        if (EVP_DigestUpdate(mdctx, buf, (size_t)r) != 1) {
+            st = ERR_IO;
+            break;
+        }
+        if (write(tfd, buf, (size_t)r) != r) {
+            if (errno == 0) errno = EIO;
+            st = ERR_IO;
+            break;
+        }
+        got += (uint64_t)r;
+    }
+
+    if (st != OK) {
+        EVP_MD_CTX_free(mdctx);
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return st;
+    }
+
+    unsigned int dlen = 0;
+    if (EVP_DigestFinal_ex(mdctx, out_hash, &dlen) != 1 || dlen != OBJECT_HASH_SIZE) {
+        EVP_MD_CTX_free(mdctx);
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+    EVP_MD_CTX_free(mdctx);
+    if (object_exists(repo, out_hash)) {
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return OK;
+    }
+
+    hdr.uncompressed_size = got;
+    hdr.compressed_size   = got;
+    memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
+    if (pwrite(tfd, &hdr, sizeof(hdr), 0) != sizeof(hdr)) {
+        if (errno == 0) errno = EIO;
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    if (fsync(tfd) == -1) {
+        close(tfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+    close(tfd);
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(out_hash, subdir, fname);
+
+    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    if (objfd == -1) {
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+    if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
+        close(objfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+    if (errno == EEXIST) errno = 0;
+    int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
+    close(objfd);
+    if (subfd == -1) {
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    char dstpath[PATH_MAX];
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)
+        >= (int)sizeof(dstpath)) {
+        close(subfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+    if (rename(tmppath, dstpath) == -1) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
+            close(subfd);
+            unlink(tmppath);
+            free(buf);
+            return OK;
+        }
+        close(subfd);
+        unlink(tmppath);
+        free(buf);
+        return ERR_IO;
+    }
+
+    fsync(subfd);
+    close(subfd);
+    free(buf);
+    return OK;
 }
 
 status_t object_store(repo_t *repo, uint8_t type,
@@ -171,7 +374,7 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
                 regions[n_regions].length = (uint64_t)(hole_start - data_start);
                 n_regions++;
                 if (hole_start < data_start) break;  /* shouldn't happen */
-                if (hole_start != data_start) is_sparse = 1;
+                if ((uint64_t)hole_start < file_size) is_sparse = 1;
             }
 
             /* advance past the hole */
@@ -183,18 +386,7 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
     /* If the file isn't sparse (or the FS doesn't report holes), read it whole */
     if (!is_sparse || n_regions == 0) {
         free(regions);
-        lseek(fd, 0, SEEK_SET);
-        uint8_t *buf = malloc(file_size);
-        if (!buf) return ERR_NOMEM;
-        size_t got = 0;
-        while (got < file_size) {
-            ssize_t r = read(fd, buf + got, file_size - got);
-            if (r <= 0) break;
-            got += (size_t)r;
-        }
-        status_t st = write_object(repo, OBJECT_TYPE_FILE, buf, got, out_hash);
-        free(buf);
-        return st;
+        return write_object_file_stream(repo, fd, file_size, out_hash);
     }
 
     /* Build sparse payload: [sparse_hdr][regions][data bytes] */
@@ -219,7 +411,12 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
         size_t remaining = (size_t)regions[i].length;
         while (remaining > 0) {
             ssize_t r = read(fd, p, remaining);
-            if (r <= 0) break;
+            if (r <= 0) {
+                free(regions);
+                free(payload);
+                errno = (r == 0) ? ESTALE : errno;
+                return ERR_IO;
+            }
             p += r; remaining -= (size_t)r;
         }
     }

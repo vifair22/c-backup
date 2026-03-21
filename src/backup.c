@@ -4,15 +4,16 @@
 #include "object.h"
 #include "pack.h"
 #include "snapshot.h"
-#include "reverse.h"
 #include "../vendor/log.h"
 
 #include <fcntl.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,6 +28,134 @@ static void fmt_bytes(uint64_t n, char *buf, size_t sz) {
         snprintf(buf, sz, "%.1f KB", (double)n / 1024.0);
     else
         snprintf(buf, sz, "%" PRIu64 " B", n);
+}
+
+static const char *status_name(status_t st) {
+    switch (st) {
+    case OK: return "OK";
+    case ERR_IO: return "ERR_IO";
+    case ERR_CORRUPT: return "ERR_CORRUPT";
+    case ERR_NOMEM: return "ERR_NOMEM";
+    case ERR_INVALID: return "ERR_INVALID";
+    case ERR_NOT_FOUND: return "ERR_NOT_FOUND";
+    default: return "ERR_UNKNOWN";
+    }
+}
+
+static size_t g_phase_line_len = 0;
+static int ts_ge(const struct timespec *a, const struct timespec *b);
+static struct timespec ts_add_ms(struct timespec t, long ms);
+
+static int phase_ui_enabled(const backup_opts_t *opts) {
+    return (!opts || !opts->quiet) && isatty(STDERR_FILENO);
+}
+
+static void phase_line_setf(const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    size_t len = (size_t)n;
+    if (len >= sizeof(msg)) len = sizeof(msg) - 1;
+
+    fprintf(stderr, "\r%s", msg);
+    if (g_phase_line_len > len) {
+        size_t pad = g_phase_line_len - len;
+        while (pad--) fputc(' ', stderr);
+        fputc('\r', stderr);
+        fputs(msg, stderr);
+    }
+    fflush(stderr);
+    g_phase_line_len = len;
+}
+
+static void phase_line_clear(void) {
+    if (g_phase_line_len == 0) return;
+    fputc('\r', stderr);
+    for (size_t i = 0; i < g_phase_line_len; i++) fputc(' ', stderr);
+    fputc('\r', stderr);
+    fflush(stderr);
+    g_phase_line_len = 0;
+}
+
+typedef struct {
+    struct timespec next_update;
+} scan_progress_state_t;
+
+typedef struct {
+    struct timespec next_update;
+} phase2_progress_state_t;
+
+static void scan_progress_clear_cb(void *ctx) {
+    (void)ctx;
+    phase_line_clear();
+}
+
+static void scan_progress_cb(uint32_t scanned_entries, void *ctx) {
+    scan_progress_state_t *st = ctx;
+    if (st) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (scanned_entries != 1 && !ts_ge(&now, &st->next_update)) return;
+        st->next_update = ts_add_ms(now, 1000);
+    }
+    phase_line_setf("Phase 1: scanning (%u entries)", scanned_entries);
+}
+
+static void phase2_progress_cb(uint32_t done, uint32_t total, void *ctx) {
+    phase2_progress_state_t *st = ctx;
+    if (st) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (done != 0 && done != total && !ts_ge(&now, &st->next_update)) return;
+        st->next_update = ts_add_ms(now, 1000);
+    }
+    phase_line_setf("Phase 2: loading previous snapshot (%u/%u)", done, total);
+}
+
+static double elapsed_sec(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    time_t ds = now.tv_sec - start->tv_sec;
+    long dn = now.tv_nsec - start->tv_nsec;
+    return (double)ds + (double)dn / 1000000000.0;
+}
+
+static double elapsed_between(const struct timespec *a, const struct timespec *b) {
+    time_t ds = b->tv_sec - a->tv_sec;
+    long dn = b->tv_nsec - a->tv_nsec;
+    return (double)ds + (double)dn / 1000000000.0;
+}
+
+static int ts_ge(const struct timespec *a, const struct timespec *b) {
+    if (a->tv_sec != b->tv_sec) return a->tv_sec > b->tv_sec;
+    return a->tv_nsec >= b->tv_nsec;
+}
+
+static struct timespec ts_add_ms(struct timespec t, long ms) {
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (ms % 1000) * 1000000L;
+    if (t.tv_nsec >= 1000000000L) {
+        t.tv_sec += 1;
+        t.tv_nsec -= 1000000000L;
+    }
+    return t;
+}
+
+static void fmt_eta(double sec, char *buf, size_t sz) {
+    if (sec < 1.0) {
+        snprintf(buf, sz, "<1s");
+        return;
+    }
+    unsigned long s = (unsigned long)sec;
+    unsigned long h = s / 3600;
+    unsigned long m = (s % 3600) / 60;
+    unsigned long r = s % 60;
+    if (h > 0) snprintf(buf, sz, "%luh%lum", h, m);
+    else if (m > 0) snprintf(buf, sz, "%lum%lus", m, r);
+    else snprintf(buf, sz, "%lus", r);
 }
 
 /* Change classification */
@@ -46,38 +175,40 @@ static status_t store_file_content(repo_t *repo, const char *path,
     return st;
 }
 
-/* Append a reverse entry; grows the array as needed. */
-static status_t rev_append(rev_record_t *rev, uint32_t *cap,
-                            uint8_t op, const char *path, const node_t *prev) {
-    if (rev->entry_count == *cap) {
-        uint32_t nc = *cap ? *cap * 2 : 16;
-        rev_entry_t *tmp = realloc(rev->entries, nc * sizeof(*tmp));
-        if (!tmp) return ERR_NOMEM;
-        rev->entries = tmp;
-        *cap = nc;
-    }
-    rev_entry_t *e = &rev->entries[rev->entry_count++];
-    e->op_type = op;
-    e->path    = strdup(path);
-    if (!e->path) { rev->entry_count--; return ERR_NOMEM; }
-    if (prev)
-        e->prev_node = *prev;
-    else
-        memset(&e->prev_node, 0, sizeof(e->prev_node));
-    return OK;
-}
-
-/* Context passed to pathmap_foreach_unseen callback */
 typedef struct {
-    rev_record_t *rev;
-    uint32_t     *cap;
-    status_t      st;
+    uint32_t count;
 } deleted_ctx_t;
 
+typedef struct {
+    uint64_t *ids;
+    uint32_t  count;
+    uint32_t  cap;
+} skipped_ids_t;
+
+static int skipped_add(skipped_ids_t *s, uint64_t id) {
+    if (id == 0) return 0;
+    if (s->count == s->cap) {
+        uint32_t nc = s->cap ? s->cap * 2 : 32;
+        uint64_t *tmp = realloc(s->ids, nc * sizeof(*tmp));
+        if (!tmp) return -1;
+        s->ids = tmp;
+        s->cap = nc;
+    }
+    s->ids[s->count++] = id;
+    return 0;
+}
+
+static int skipped_has(const skipped_ids_t *s, uint64_t id) {
+    for (uint32_t i = 0; i < s->count; i++)
+        if (s->ids[i] == id) return 1;
+    return 0;
+}
+
 static void deleted_cb(const char *path, const node_t *node, void *ctx_) {
+    (void)path;
+    (void)node;
     deleted_ctx_t *ctx = ctx_;
-    if (ctx->st != OK) return;
-    ctx->st = rev_append(ctx->rev, ctx->cap, REV_OP_RESTORE, path, node);
+    ctx->count++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -85,11 +216,33 @@ static void deleted_cb(const char *path, const node_t *node, void *ctx_) {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
+    uint32_t idx;
+    int      has_prev;
+    node_t   prev;
+} store_task_t;
+
+typedef struct {
     repo_t        *repo;
     scan_entry_t  *entries;    /* full scan array */
-    uint32_t      *queue;      /* indices of entries needing content store */
+    store_task_t  *tasks;      /* entries needing content store */
     uint32_t       queue_len;
     uint32_t       next;       /* next queue slot to claim */
+    uint32_t       done;       /* number of queue items fully processed */
+    uint64_t       total_bytes;
+    uint64_t       bytes_done;
+    int            show_progress;
+    struct timespec started_at;
+    struct timespec last_log_at;
+    struct timespec next_log_at;
+    uint32_t       last_log_done;
+    uint64_t       last_log_bytes;
+    double         ema_speed;
+    double         ema_bps;
+    uint32_t       skipped_transient;
+    char           first_skipped_path[PATH_MAX];
+    int            first_skipped_errno;
+    char           first_error_path[PATH_MAX];
+    int            first_error_errno;
     pthread_mutex_t mu;
     status_t        first_error;
 } store_pool_t;
@@ -97,40 +250,151 @@ typedef struct {
 static void *store_worker_fn(void *arg) {
     store_pool_t *pool = arg;
     for (;;) {
+        int do_log = 0;
+        uint32_t done_now = 0;
+        uint32_t total_now = 0;
+        uint64_t bytes_done_now = 0;
+        uint64_t bytes_total_now = 0;
+        double speed_now = 0.0;
+        double bps_now = 0.0;
+
         pthread_mutex_lock(&pool->mu);
         uint32_t qi = pool->next++;
         pthread_mutex_unlock(&pool->mu);
         if (qi >= pool->queue_len) break;
 
-        scan_entry_t *e = &pool->entries[pool->queue[qi]];
+        store_task_t *t = &pool->tasks[qi];
+        scan_entry_t *e = &pool->entries[t->idx];
+        uint64_t bytes_for_task = e->node.size;
         status_t st = store_file_content(pool->repo, e->path,
                                          e->node.size, e->node.content_hash);
         if (st != OK) {
-            pthread_mutex_lock(&pool->mu);
-            if (pool->first_error == OK) pool->first_error = st;
-            pthread_mutex_unlock(&pool->mu);
+            int err = errno;
+            if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE) {
+                pthread_mutex_lock(&pool->mu);
+                pool->skipped_transient++;
+                if (pool->first_skipped_path[0] == '\0') {
+                    if (snprintf(pool->first_skipped_path, sizeof(pool->first_skipped_path),
+                                 "%s", e->path) >= (int)sizeof(pool->first_skipped_path)) {
+                        pool->first_skipped_path[0] = '\0';
+                    }
+                    pool->first_skipped_errno = err;
+                }
+                pthread_mutex_unlock(&pool->mu);
+
+                if (t->has_prev) {
+                    e->node = t->prev;
+                } else {
+                    e->node.type = 0;
+                }
+                st = OK;
+            }
+
+            if (st != OK) {
+                pthread_mutex_lock(&pool->mu);
+                if (pool->first_error == OK) {
+                    pool->first_error = st;
+                    pool->first_error_errno = err;
+                    if (snprintf(pool->first_error_path, sizeof(pool->first_error_path),
+                                 "%s", e->path) >= (int)sizeof(pool->first_error_path)) {
+                        pool->first_error_path[0] = '\0';
+                    }
+                }
+                pthread_mutex_unlock(&pool->mu);
+                return (void *)1;
+            }
+        }
+
+        pthread_mutex_lock(&pool->mu);
+        pool->done++;
+        pool->bytes_done += bytes_for_task;
+        if (pool->show_progress) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (ts_ge(&now, &pool->next_log_at)) {
+                double dt = elapsed_between(&pool->last_log_at, &now);
+                uint32_t delta = pool->done - pool->last_log_done;
+                uint64_t delta_bytes = pool->bytes_done - pool->last_log_bytes;
+                if (dt > 0.0) {
+                    double inst = (double)delta / dt;
+                    if (pool->ema_speed <= 0.0) pool->ema_speed = inst;
+                    else pool->ema_speed = (0.12 * inst) + (0.88 * pool->ema_speed);
+
+                    double inst_bps = (double)delta_bytes / dt;
+                    if (pool->ema_bps <= 0.0) pool->ema_bps = inst_bps;
+                    else pool->ema_bps = (0.12 * inst_bps) + (0.88 * pool->ema_bps);
+                }
+
+                do_log = 1;
+                done_now = pool->done;
+                total_now = pool->queue_len;
+                speed_now = pool->ema_speed;
+                bps_now = pool->ema_bps;
+                bytes_done_now = pool->bytes_done;
+                bytes_total_now = pool->total_bytes;
+
+                pool->last_log_done = pool->done;
+                pool->last_log_bytes = pool->bytes_done;
+                pool->last_log_at = now;
+                pool->next_log_at = ts_add_ms(now, 1000);
+            }
+        }
+        pthread_mutex_unlock(&pool->mu);
+
+        if (do_log) {
+            double rem = (bps_now > 0.0 && bytes_total_now > bytes_done_now)
+                       ? ((double)(bytes_total_now - bytes_done_now) / bps_now)
+                       : 0.0;
+            char eta[32];
+            fmt_eta(rem, eta, sizeof(eta));
+            phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
+                            done_now, total_now,
+                            bps_now / (1024.0 * 1024.0),
+                            speed_now, eta);
         }
     }
-    return NULL;
+    return (void *)0;
 }
 
 static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
-                                uint32_t *queue, uint32_t queue_len) {
+                                store_task_t *tasks, uint32_t queue_len,
+                                int show_progress, uint32_t *out_skipped) {
     if (queue_len == 0) return OK;
 
     int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 1;
-    if (nthreads > 16) nthreads = 16;
+    {
+        const char *env = getenv("CBACKUP_STORE_THREADS");
+        if (env && *env) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0) nthreads = (int)v;
+        }
+    }
+    if (nthreads > 256) nthreads = 256;
     if ((uint32_t)nthreads > queue_len) nthreads = (int)queue_len;
 
     store_pool_t pool = {
         .repo        = repo,
         .entries     = entries,
-        .queue       = queue,
+        .tasks       = tasks,
         .queue_len   = queue_len,
         .next        = 0,
+        .done        = 0,
+        .total_bytes = 0,
+        .bytes_done  = 0,
+        .show_progress = show_progress,
         .first_error = OK,
     };
+    for (uint32_t i = 0; i < queue_len; i++)
+        pool.total_bytes += entries[tasks[i].idx].node.size;
+    clock_gettime(CLOCK_MONOTONIC, &pool.started_at);
+    pool.last_log_at = pool.started_at;
+    pool.next_log_at = ts_add_ms(pool.started_at, 1000);
+    pool.last_log_done = 0;
+    pool.last_log_bytes = 0;
+    pool.ema_speed = 0.0;
+    pool.ema_bps = 0.0;
     pthread_mutex_init(&pool.mu, NULL);
 
     pthread_t *threads = malloc((size_t)nthreads * sizeof(pthread_t));
@@ -141,7 +405,91 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         if (pthread_create(&threads[i], NULL, store_worker_fn, &pool) != 0) break;
         n_started++;
     }
-    for (int i = 0; i < n_started; i++) pthread_join(threads[i], NULL);
+
+    if (n_started == 0) {
+        if (pool.show_progress) phase_line_clear();
+        log_msg("ERROR", "failed to start store worker thread");
+        free(threads);
+        pthread_mutex_destroy(&pool.mu);
+        return ERR_IO;
+    }
+    if (n_started < nthreads) {
+        if (pool.show_progress) phase_line_clear();
+        log_msg("ERROR", "failed to start all requested store workers");
+        for (int i = 0; i < n_started; i++) {
+            (void)pthread_join(threads[i], NULL);
+        }
+        free(threads);
+        pthread_mutex_destroy(&pool.mu);
+        return ERR_IO;
+    }
+
+    for (int i = 0; i < n_started; i++) {
+        void *ret = NULL;
+        if (pthread_join(threads[i], &ret) != 0) {
+            if (pool.first_error == OK) pool.first_error = ERR_IO;
+            if (pool.show_progress) phase_line_clear();
+            log_msg("ERROR", "store worker thread join failed");
+            continue;
+        }
+        if (ret != 0 && pool.first_error == OK) {
+            pool.first_error = ERR_IO;
+        }
+    }
+
+    if (pool.done < queue_len && pool.first_error == OK) {
+        pool.first_error = ERR_IO;
+        if (pool.show_progress) phase_line_clear();
+        log_msg("ERROR", "store worker exited early before queue completion");
+    }
+
+    if (pool.first_error != OK) {
+        if (pool.show_progress) phase_line_clear();
+        if (pool.first_error_path[0]) {
+            char msg[PATH_MAX + 160];
+            if (pool.first_error_errno != 0) {
+                snprintf(msg, sizeof(msg),
+                         "store failed at path '%s': %s (%s)",
+                         pool.first_error_path, status_name(pool.first_error),
+                         strerror(pool.first_error_errno));
+            } else {
+                snprintf(msg, sizeof(msg),
+                         "store failed at path '%s': %s",
+                         pool.first_error_path, status_name(pool.first_error));
+            }
+            log_msg("ERROR", msg);
+        } else {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "store failed: %s", status_name(pool.first_error));
+            log_msg("ERROR", msg);
+        }
+    }
+
+    if (out_skipped) *out_skipped = pool.skipped_transient;
+
+    if (pool.skipped_transient > 0 && pool.first_skipped_path[0]) {
+        char msg[PATH_MAX + 192];
+        snprintf(msg, sizeof(msg),
+                 "skipped %u transiently unavailable file(s), first: '%s' (%s)",
+                 pool.skipped_transient,
+                 pool.first_skipped_path,
+                 strerror(pool.first_skipped_errno));
+        log_msg("WARN", msg);
+    }
+
+    if (pool.show_progress) {
+        double sec = elapsed_sec(&pool.started_at);
+        double speed = pool.ema_speed > 0.0 ? pool.ema_speed
+                     : ((sec > 0.0) ? ((double)pool.done / sec) : 0.0);
+        double bps = pool.ema_bps > 0.0 ? pool.ema_bps
+                   : ((sec > 0.0) ? ((double)pool.bytes_done / sec) : 0.0);
+        char eta[32];
+        fmt_eta(0.0, eta, sizeof(eta));
+        phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
+                        pool.done, pool.queue_len,
+                        bps / (1024.0 * 1024.0), speed, eta);
+    }
+
     free(threads);
     pthread_mutex_destroy(&pool.mu);
     return pool.first_error;
@@ -155,6 +503,9 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count) {
 
 status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count,
                          const backup_opts_t *opts) {
+    int tui = phase_ui_enabled(opts);
+    const char *fail_ctx = "startup";
+
     /* ----------------------------------------------------------------
      * Phase 1: Scan source trees (shared imap across all roots)
      * ---------------------------------------------------------------- */
@@ -165,12 +516,26 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
     /* Build scan_opts_t from backup_opts_t */
     scan_opts_t sopts = {0};
-    if (opts) { sopts.exclude = opts->exclude; sopts.n_exclude = opts->n_exclude; }
+    scan_progress_state_t scan_prog = {0};
+    if (opts) {
+        sopts.exclude = opts->exclude;
+        sopts.n_exclude = opts->n_exclude;
+        sopts.verbose = opts->verbose;
+    }
+    if (tui) {
+        clock_gettime(CLOCK_MONOTONIC, &scan_prog.next_update);
+        sopts.progress_cb = scan_progress_cb;
+        sopts.progress_clear_cb = scan_progress_clear_cb;
+        sopts.progress_ctx = &scan_prog;
+        sopts.progress_every = 1;
+        phase_line_setf("Phase 1: scanning");
+    }
     const scan_opts_t *sp = (opts && opts->n_exclude > 0) ? &sopts : NULL;
 
     scan_result_t *scan = NULL;
     for (int i = 0; i < path_count; i++) {
         scan_result_t *partial = NULL;
+        fail_ctx = "scan";
         status_t st = scan_tree(source_paths[i], imap, sp, &partial);
         if (st != OK) { scan_imap_free(imap); scan_result_free(scan); return st; }
         if (!scan) {
@@ -200,6 +565,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
     /* Print scan summary */
     {
+        if (tui) phase_line_clear();
         uint64_t total_bytes = 0;
         for (uint32_t i = 0; i < scan->count; i++)
             if (scan->entries[i].node.type == NODE_TYPE_REG)
@@ -218,35 +584,46 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     uint32_t   prev_id   = 0;
     snapshot_t *prev_snap = NULL;
     pathmap_t  *prev_map  = NULL;
+    phase2_progress_state_t phase2_prog = {0};
+    if (tui) {
+        clock_gettime(CLOCK_MONOTONIC, &phase2_prog.next_update);
+        phase_line_setf("Phase 2: loading previous snapshot");
+    }
 
     if (snapshot_read_head(repo, &prev_id) == OK && prev_id > 0) {
+        fail_ctx = "load previous snapshot";
         if (snapshot_load(repo, prev_id, &prev_snap) == OK) {
-            if (pathmap_build(prev_snap, &prev_map) != OK) {
+            if (pathmap_build_progress(prev_snap, &prev_map,
+                                       tui ? phase2_progress_cb : NULL,
+                                       tui ? &phase2_prog : NULL) != OK) {
+                if (tui) phase_line_clear();
                 log_msg("WARN", "could not build previous path map; treating all as new");
                 prev_map = NULL;
             }
         }
     }
+    if (tui) phase_line_clear();
 
     /* ----------------------------------------------------------------
      * Phase 3a: Classify entries; store xattr/acl/symlink objects;
-     *           queue regular files for parallel content storage;
-     *           emit reverse records.
+     *           queue regular files for parallel content storage.
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 3: compare and store");
 
-    rev_record_t rev    = { .snap_id = prev_id + 1 };
-    uint32_t     rev_cap = 0;
-    status_t     st      = OK;
+    status_t st = OK;
 
-    uint32_t *store_queue = malloc(scan->count * sizeof(uint32_t));
+    skipped_ids_t skipped = {0};
+    store_task_t *store_queue = malloc(scan->count * sizeof(*store_queue));
     if (!store_queue) { st = ERR_NOMEM; goto done; }
     uint32_t store_qlen = 0;
+    uint32_t n_transient_skipped_store = 0;
 
     uint32_t n_new = 0, n_modified = 0, n_unchanged = 0, n_meta = 0, n_deleted = 0;
+    uint32_t n_unreadable = 0;
 
     for (uint32_t i = 0; i < scan->count; i++) {
         scan_entry_t *e = &scan->entries[i];
+        int skip_entry = 0;
 
         /* Repo-relative path */
         const char *rel = e->path + e->strip_prefix_len;
@@ -256,14 +633,22 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
         /* --- Step A: store xattr/acl --- */
         if (e->xattr_len > 0) {
+            fail_ctx = "store xattrs";
             st = object_store(repo, OBJECT_TYPE_XATTR,
                               e->xattr_data, e->xattr_len, e->node.xattr_hash);
             if (st != OK) goto done;
+            free(e->xattr_data);
+            e->xattr_data = NULL;
+            e->xattr_len = 0;
         }
         if (e->acl_len > 0) {
+            fail_ctx = "store ACLs";
             st = object_store(repo, OBJECT_TYPE_ACL,
                               e->acl_data, e->acl_len, e->node.acl_hash);
             if (st != OK) goto done;
+            free(e->acl_data);
+            e->acl_data = NULL;
+            e->acl_len = 0;
         }
 
         /* --- Step B: look up in previous snapshot --- */
@@ -279,7 +664,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
             if (e->node.type == NODE_TYPE_REG) {
                 content_same = (e->node.size       == prev->size       &&
                                 e->node.mtime_sec  == prev->mtime_sec  &&
-                                e->node.mtime_nsec == prev->mtime_nsec);
+                                e->node.mtime_nsec == prev->mtime_nsec &&
+                                e->node.inode_identity == prev->inode_identity);
             } else {
                 content_same = 1;
             }
@@ -302,7 +688,46 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
             if (change == CHANGE_UNCHANGED || change == CHANGE_METADATA_ONLY) {
                 memcpy(e->node.content_hash, prev->content_hash, OBJECT_HASH_SIZE);
             } else if (e->node.size > 0) {
-                store_queue[store_qlen++] = i;   /* deferred to Phase 3b */
+                int fd = open(e->path, O_RDONLY);
+                if (fd == -1 &&
+                    (errno == EACCES || errno == EPERM || errno == ENOENT)) {
+                    n_unreadable++;
+                    if (opts && opts->verbose) {
+                        char msg[PATH_MAX + 128];
+                        if (snprintf(msg, sizeof(msg),
+                                     "cannot read file, skipping: %s (%s)",
+                                     e->path, strerror(errno)) >= (int)sizeof(msg)) {
+                            log_msg("WARN", "cannot read file, skipping: <path-too-long>");
+                        } else {
+                            log_msg("WARN", msg);
+                        }
+                    }
+                    if (prev) {
+                        e->node = *prev;
+                        change = CHANGE_UNCHANGED;
+                    } else {
+                        if (skipped_add(&skipped, e->node.node_id) != 0) {
+                            st = ERR_NOMEM;
+                            goto done;
+                        }
+                        e->node.type = 0;
+                        skip_entry = 1;
+                    }
+                } else if (fd == -1) {
+                    st = ERR_IO;
+                    goto done;
+                } else {
+                    close(fd);
+                    store_queue[store_qlen].idx = i;
+                    if (prev) {
+                        store_queue[store_qlen].has_prev = 1;
+                        store_queue[store_qlen].prev = *prev;
+                    } else {
+                        store_queue[store_qlen].has_prev = 0;
+                        memset(&store_queue[store_qlen].prev, 0, sizeof(node_t));
+                    }
+                    store_qlen++;
+                }
             }
         } else if (e->node.type == NODE_TYPE_SYMLINK && e->symlink_target) {
             if (change == CHANGE_UNCHANGED || change == CHANGE_METADATA_ONLY) {
@@ -313,41 +738,52 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                                   e->symlink_target, tlen, e->node.content_hash);
                 if (st != OK) goto done;
             }
+            free(e->symlink_target);
+            e->symlink_target = NULL;
         }
 
-        /* --- Step E: emit reverse entry --- */
+        /* --- Step E: classify counters --- */
+        if (skip_entry) continue;
         switch (change) {
         case CHANGE_CREATED:
             n_new++;
-            st = rev_append(&rev, &rev_cap, REV_OP_REMOVE, rel, NULL);    break;
+            break;
         case CHANGE_MODIFIED:
             n_modified++;
-            st = rev_append(&rev, &rev_cap, REV_OP_RESTORE, rel, prev);   break;
+            break;
         case CHANGE_METADATA_ONLY:
             n_meta++;
-            st = rev_append(&rev, &rev_cap, REV_OP_META, rel, prev);      break;
+            break;
         default:
             n_unchanged++;
             break;
         }
-        if (st != OK) goto done;
     }
 
     /* Find deleted entries (in prev but unseen during this scan) */
     if (prev_map) {
-        deleted_ctx_t dctx = { .rev = &rev, .cap = &rev_cap, .st = OK };
+        deleted_ctx_t dctx = {0};
         pathmap_foreach_unseen(prev_map, deleted_cb, &dctx);
-        if (dctx.st != OK) { st = dctx.st; goto done; }
-        n_deleted = dctx.rev->entry_count > (n_new + n_modified + n_meta)
-                    ? dctx.rev->entry_count - (n_new + n_modified + n_meta) : 0;
+        n_deleted = dctx.count;
     }
 
-    if (!opts || !opts->quiet)
+    if (!opts || !opts->quiet) {
         fprintf(stderr, "changes: %u new  %u modified  %u unchanged  %u meta-only  %u deleted\n",
                 n_new, n_modified, n_unchanged, n_meta, n_deleted);
+    }
+
+    if (n_unreadable > 0) {
+        if (opts && opts->verbose) {
+            fprintf(stderr, "warning: skipped %u unreadable file(s)\n", n_unreadable);
+        } else {
+            fprintf(stderr,
+                    "warning: skipped %u unreadable file(s) (use --verbose to list paths)\n",
+                    n_unreadable);
+        }
+    }
 
     /* No changes since last backup — skip snapshot creation entirely. */
-    if (prev_id > 0 && rev.entry_count == 0) {
+    if (prev_id > 0 && n_new == 0 && n_modified == 0 && n_meta == 0 && n_deleted == 0) {
         if (!opts || !opts->quiet)
             fprintf(stderr, "no changes since snapshot %u, skipping\n", prev_id);
         goto done;
@@ -356,10 +792,21 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     /* ----------------------------------------------------------------
      * Phase 3b: Parallel file content storage
      * ---------------------------------------------------------------- */
-    if (store_qlen > 0 && (!opts || !opts->quiet))
-        fprintf(stderr, "storing: %u new object(s)...\n", store_qlen);
-    st = store_parallel(repo, scan->entries, store_queue, store_qlen);
+    if (store_qlen > 0 && (!opts || !opts->quiet)) {
+        if (tui) phase_line_setf("Phase 3: storing 0/%u", store_qlen);
+        else fprintf(stderr, "storing: %u new object(s)...\n", store_qlen);
+    }
+    fail_ctx = "store file contents";
+    st = store_parallel(repo, scan->entries, store_queue, store_qlen,
+                        tui, &n_transient_skipped_store);
     if (st != OK) goto done;
+    if (tui) phase_line_clear();
+
+    if (n_transient_skipped_store > 0) {
+        fprintf(stderr,
+                "warning: skipped %u file(s) that changed/disappeared during store\n",
+                n_transient_skipped_store);
+    }
 
     /* ----------------------------------------------------------------
      * Phase 4 & 5: Build new snapshot
@@ -374,27 +821,34 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     /* Node table: primary nodes only (skip hard link secondaries) */
     uint32_t primary_count = 0;
     for (uint32_t i = 0; i < scan->count; i++)
-        if (scan->entries[i].hardlink_to_node_id == 0) primary_count++;
+        if (scan->entries[i].node.type != 0 &&
+            scan->entries[i].hardlink_to_node_id == 0) primary_count++;
     new_snap->node_count = primary_count;
     new_snap->nodes      = malloc(primary_count * sizeof(node_t));
     if (!new_snap->nodes) { free(new_snap); st = ERR_NOMEM; goto done; }
     {
         uint32_t ni = 0;
         for (uint32_t i = 0; i < scan->count; i++)
-            if (scan->entries[i].hardlink_to_node_id == 0)
+            if (scan->entries[i].node.type != 0 &&
+                scan->entries[i].hardlink_to_node_id == 0)
                 new_snap->nodes[ni++] = scan->entries[i].node;
     }
 
     /* Build dirent table: all entries; secondaries reference the primary node_id */
     size_t dirent_buf_sz = 0;
+    uint32_t dirent_count = 0;
     for (uint32_t i = 0; i < scan->count; i++) {
+        if (scan->entries[i].node.type == 0) continue;
+        if (scan->entries[i].hardlink_to_node_id != 0 &&
+            skipped_has(&skipped, scan->entries[i].hardlink_to_node_id)) continue;
         const char *name = strrchr(scan->entries[i].path, '/');
         name = name ? name + 1 : scan->entries[i].path;
         dirent_buf_sz += sizeof(dirent_rec_t) + strlen(name);
+        dirent_count++;
     }
     new_snap->dirent_data     = malloc(dirent_buf_sz ? dirent_buf_sz : 1);
     new_snap->dirent_data_len = dirent_buf_sz;
-    new_snap->dirent_count    = scan->count;
+    new_snap->dirent_count    = dirent_count;
 
     if (!new_snap->dirent_data) {
         snapshot_free(new_snap); st = ERR_NOMEM; goto done;
@@ -403,6 +857,9 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     uint8_t *dp = new_snap->dirent_data;
     for (uint32_t i = 0; i < scan->count; i++) {
         const scan_entry_t *e = &scan->entries[i];
+        if (e->node.type == 0) continue;
+        if (e->hardlink_to_node_id != 0 && skipped_has(&skipped, e->hardlink_to_node_id))
+            continue;
         const char *name = strrchr(e->path, '/');
         name = name ? name + 1 : e->path;
         uint16_t nlen = (uint16_t)strlen(name);
@@ -418,23 +875,21 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     }
 
     /* ----------------------------------------------------------------
-     * Phase 6: Commit (objects → reverse → snapshot → HEAD)
+     * Phase 6: Commit (objects → snapshot → HEAD)
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 6: committing");
 
-    if (rev.entry_count > 0) {
-        st = reverse_write(repo, &rev);
-        if (st != OK) { snapshot_free(new_snap); goto done; }
-    }
-
+    fail_ctx = "write snapshot";
     st = snapshot_write(repo, new_snap);
     if (st != OK) { snapshot_free(new_snap); goto done; }
 
+    fail_ctx = "update HEAD";
     st = snapshot_write_head(repo, new_snap->snap_id);
     if (st == OK) {
         if (!opts || !opts->quiet)
             fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
-                    new_snap->snap_id, scan->count, rev.entry_count);
+                    new_snap->snap_id, scan->count,
+                    n_new + n_modified + n_meta + n_deleted);
 
         /* ----------------------------------------------------------------
          * Phase 7 (optional): verify every object referenced by the new
@@ -478,16 +933,21 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     snapshot_free(new_snap);
 
 done:
+    if (tui) phase_line_clear();
+    if (st != OK) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "backup failed in %s: %s", fail_ctx, status_name(st));
+        log_msg("ERROR", msg);
+    }
+    free(skipped.ids);
     free(store_queue);
     pathmap_free(prev_map);
     snapshot_free(prev_snap);
     scan_result_free(scan);
-    for (uint32_t i = 0; i < rev.entry_count; i++) free(rev.entries[i].path);
-    free(rev.entries);
 
-    /* Auto-pack loose objects after a successful backup, unless suppressed. */
-    if (st == OK && !(opts && opts->no_pack)) {
-        log_msg("INFO", "packing objects");
+    /* Always pack after a successful backup so loose objects are transient. */
+    if (st == OK) {
+        log_msg("INFO", "Phase 8: packing objects");
         repo_pack(repo, NULL);   /* best-effort: ignore pack errors */
     }
 

@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gfs.h"
 #include "gc.h"
-#include "synth.h"
 #include "tag.h"
 #include "../vendor/log.h"
 
@@ -126,38 +125,6 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 }
 
 /* ------------------------------------------------------------------ */
-/* gfs_effective_keep_revs                                             */
-/* ------------------------------------------------------------------ */
-
-static uint32_t gfs_effective_keep_revs(const policy_t *policy,
-                                 uint32_t head_id,
-                                 const gfs_snap_info_t *snaps, uint32_t n) {
-    uint32_t base = (policy->keep_revs > 0) ? (uint32_t)policy->keep_revs : 0;
-
-    /* Find the oldest non-expired GFS-anchored snap.
-     * Expired anchors (whose tier keep_N has been exceeded) no longer
-     * need to stretch the rev window — they will be pruned themselves. */
-    uint32_t oldest_gfs = head_id;
-    for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].gfs_flags == 0) continue;
-        uint32_t tier  = highest_tier(snaps[i].gfs_flags);
-        int keep_n = 0;
-        switch (tier) {
-            case GFS_DAILY:   keep_n = policy->keep_daily;   break;
-            case GFS_WEEKLY:  keep_n = policy->keep_weekly;  break;
-            case GFS_MONTHLY: keep_n = policy->keep_monthly; break;
-            case GFS_YEARLY:  keep_n = policy->keep_yearly;  break;
-        }
-        /* Skip if tier limit exceeded (same logic as tier_expired in gfs_run) */
-        if (keep_n > 0 && tier_newer_count(snaps, n, i) >= keep_n) continue;
-        if (snaps[i].id < oldest_gfs) oldest_gfs = snaps[i].id;
-    }
-
-    uint32_t distance = (head_id >= oldest_gfs) ? (head_id - oldest_gfs) : 0;
-    return (base > distance) ? base : distance;
-}
-
-/* ------------------------------------------------------------------ */
 /* Internal: load all snap metadata into a gfs_snap_info_t array      */
 /* ------------------------------------------------------------------ */
 
@@ -253,12 +220,11 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
             if (boundary & GFS_YEARLY)  tier |= GFS_YEARLY;
 
             if (!dry_run) {
-                st = snapshot_synthesize_gfs(repo, cand, tier);
+                st = snapshot_set_gfs_flags(repo, cand, tier);
                 if (st != OK) {
-                    log_msg("WARN", "gfs: could not synthesise GFS anchor snap");
-                    st = OK;   /* non-fatal: skip flagging, keep revs intact */
+                    log_msg("WARN", "gfs: could not set GFS flags on anchor snap");
+                    st = OK;
                 } else {
-                    /* Update our in-memory copy */
                     for (uint32_t i = 0; i < n; i++) {
                         if (snaps[i].id == cand) { snaps[i].gfs_flags |= tier; break; }
                     }
@@ -291,28 +257,22 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
             tier_expired[i] = 1;
     }
 
-    /* Step 3: compute effective rev retention window */
-    uint32_t eff_revs = gfs_effective_keep_revs(policy, new_snap_id, snaps, n);
-
-    /* Step 4: determine oldest non-expired GFS anchor */
-    uint32_t oldest_gfs = new_snap_id;
-    for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].gfs_flags != 0 && !tier_expired[i] && snaps[i].id < oldest_gfs)
-            oldest_gfs = snaps[i].id;
-    }
-
-    /* Step 5: prune snaps outside the rev window.
-     * Keep snap if: HEAD, non-expired GFS anchor, within rev window, or preserved.
+    /* Step 3: prune snaps outside the snapshot window.
+     * Keep snap if: HEAD, non-expired GFS anchor, within snapshot window, or preserved.
      * Tier-expired GFS snaps are treated like non-GFS and pruned outside the window. */
-    uint32_t rev_window_start = (new_snap_id > eff_revs)
-                                ? (new_snap_id - eff_revs) : 1;
+    uint32_t snap_window = (policy->keep_snaps > 0) ? (uint32_t)policy->keep_snaps : 0;
+    uint32_t snap_window_start = 1;
+    if (snap_window > 0) {
+        uint32_t span = snap_window - 1;
+        snap_window_start = (new_snap_id > span) ? (new_snap_id - span) : 1;
+    }
     uint32_t pruned_snaps = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t id = snaps[i].id;
         if (id == new_snap_id)                          continue;   /* HEAD always kept */
         if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;  /* live GFS anchor */
-        if (id >= rev_window_start)                     continue;   /* within rev window */
+        if (id >= snap_window_start)                    continue;   /* within snapshot window */
         if (snaps[i].preserved)                         continue;   /* preserved tag */
 
         if (dry_run) {
@@ -326,41 +286,21 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
         if (dry_run) pruned_snaps++;
     }
 
-    /* Step 6: delete revs satisfying BOTH conditions:
-     *   (a) id < oldest_gfs anchor  AND  (b) id < rev_window_start
-     * i.e. delete when id < min(oldest_gfs, rev_window_start) */
-    uint32_t rev_delete_below = (oldest_gfs < rev_window_start)
-                                ? oldest_gfs : rev_window_start;
-    uint32_t pruned_revs = 0;
-
-    for (uint32_t id = 1; id < rev_delete_below; id++) {
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/reverse/%08u.rev",
-                 repo_path(repo), id);
-        if (dry_run) {
-            /* Only count if the rev file actually exists */
-            if (access(path, F_OK) == 0) pruned_revs++;
-        } else {
-            if (unlink(path) == 0) pruned_revs++;
-        }
-    }
-
     if (!quiet || dry_run) {
         if (dry_run)
             fprintf(stderr,
-                    "gfs (dry-run): would remove %u snap(s), %u rev(s); "
-                    "effective rev window=%u, oldest GFS anchor=%08u\n",
-                    pruned_snaps, pruned_revs, eff_revs, oldest_gfs);
+                    "gfs (dry-run): would remove %u snap(s); snap window=%u\n",
+                    pruned_snaps, snap_window);
         else
             fprintf(stderr,
-                    "gfs: removed %u snap(s), %u rev(s)\n",
-                    pruned_snaps, pruned_revs);
+                    "gfs: removed %u snap(s)\n",
+                    pruned_snaps);
     }
 
     free(tier_expired);
     free(snaps);
 
-    /* Step 7: GC */
+    /* Step 4: GC */
     if (!dry_run)
         st = repo_gc(repo, NULL, NULL);
 

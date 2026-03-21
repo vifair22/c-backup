@@ -6,7 +6,6 @@
 #include "gc.h"
 #include "ls.h"
 #include "pack.h"
-#include "synth.h"
 #include "diff.h"
 #include "stats.h"
 #include "tag.h"
@@ -14,12 +13,17 @@
 #include "gfs.h"
 #include "../vendor/log.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <wordexp.h>
 
 /* ------------------------------------------------------------------ */
 /* Signal handling                                                     */
@@ -55,23 +59,90 @@ static int opt_has(int argc, char **argv, int start, const char *flag) {
     return 0;
 }
 
-/*
- * Find the first positional argument (not starting with '--' and not a value
- * immediately following a '--key' flag) in argv[start..argc-1].
- * Returns NULL if none found.
- */
-static const char *opt_subcmd(int argc, char **argv, int start) {
+static int parse_nonneg_int(const char *s, int *out) {
+    char *end = NULL;
+    long v;
+    if (!s || !*s || !out) return 0;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v < 0 || v > INT_MAX) return 0;
+    *out = (int)v;
+    return 1;
+}
+
+typedef struct {
+    const char *name;
+    int takes_value;
+} flag_spec_t;
+
+static int is_flag_token(const char *s) {
+    return s && s[0] == '-' && s[1] == '-';
+}
+
+static int flag_takes_value(const char *flag,
+                            const flag_spec_t *specs, size_t n_specs) {
+    for (size_t i = 0; i < n_specs; i++) {
+        if (strcmp(flag, specs[i].name) == 0)
+            return specs[i].takes_value;
+    }
+    return 0;
+}
+
+/* Find first positional token after skipping known global flags. */
+static const char *find_subcmd(int argc, char **argv, int start,
+                               const flag_spec_t *specs, size_t n_specs) {
     for (int i = start; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
-            /* This is a flag; skip its value too if it's a --key value pair */
-            /* We skip value only if next arg doesn't look like a flag itself */
-            if (i + 1 < argc && (argv[i+1][0] != '-' || argv[i+1][1] != '-'))
-                i++;  /* skip value */
+            if (flag_takes_value(argv[i], specs, n_specs) && i + 1 < argc)
+                i++;
             continue;
         }
         return argv[i];
     }
     return NULL;
+}
+
+static int is_known_positional(const char *tok,
+                               const char *const *positionals,
+                               size_t n_positional) {
+    for (size_t i = 0; i < n_positional; i++)
+        if (strcmp(tok, positionals[i]) == 0) return 1;
+    return 0;
+}
+
+static int validate_options(int argc, char **argv, int start,
+                            const flag_spec_t *specs, size_t n_specs,
+                            const char *const *positionals, size_t n_positional) {
+    for (int i = start; i < argc; i++) {
+        const char *tok = argv[i];
+        if (is_flag_token(tok)) {
+            int takes_value = -1;
+            for (size_t k = 0; k < n_specs; k++) {
+                if (strcmp(tok, specs[k].name) == 0) {
+                    takes_value = specs[k].takes_value;
+                    break;
+                }
+            }
+            if (takes_value < 0) {
+                fprintf(stderr, "error: unknown option '%s'\n", tok);
+                return 1;
+            }
+            if (takes_value) {
+                if (i + 1 >= argc || is_flag_token(argv[i + 1])) {
+                    fprintf(stderr, "error: option '%s' requires a value\n", tok);
+                    return 1;
+                }
+                i++;
+            }
+            continue;
+        }
+
+        if (!is_known_positional(tok, positionals, n_positional)) {
+            fprintf(stderr, "error: unexpected argument '%s'\n", tok);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Collect all values for a repeatable flag (e.g. --path /a --path /b).
@@ -82,6 +153,17 @@ static int opt_multi(int argc, char **argv, int start, const char *flag,
     for (int i = start; i < argc - 1 && n < max; i++)
         if (strcmp(argv[i], flag) == 0) out[n++] = argv[i + 1];
     return n;
+}
+
+static void fmt_bytes_short(uint64_t n, char *buf, size_t sz) {
+    if (n >= (uint64_t)1024 * 1024 * 1024)
+        snprintf(buf, sz, "%.1fG", (double)n / (1024.0 * 1024 * 1024));
+    else if (n >= (uint64_t)1024 * 1024)
+        snprintf(buf, sz, "%.1fM", (double)n / (1024.0 * 1024));
+    else if (n >= 1024)
+        snprintf(buf, sz, "%.1fK", (double)n / 1024.0);
+    else
+        snprintf(buf, sz, "%lluB", (unsigned long long)n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,6 +183,45 @@ static void lock_shared(repo_t *repo) {
     repo_lock_shared(repo);   /* non-fatal — warning already logged on failure */
 }
 
+static int launch_editor(const char *editor, const char *path) {
+    if (!editor || !*editor || !path) return -1;
+
+    wordexp_t we;
+    memset(&we, 0, sizeof(we));
+    if (wordexp(editor, &we, WRDE_NOCMD) != 0 || we.we_wordc == 0) {
+        wordfree(&we);
+        return -1;
+    }
+
+    size_t argc_exec = we.we_wordc + 1;
+    char **argv_exec = calloc(argc_exec + 1, sizeof(char *));
+    if (!argv_exec) {
+        wordfree(&we);
+        return -1;
+    }
+    for (size_t i = 0; i < we.we_wordc; i++)
+        argv_exec[i] = we.we_wordv[i];
+    argv_exec[we.we_wordc] = (char *)path;
+    argv_exec[argc_exec] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(argv_exec);
+        wordfree(&we);
+        return -1;
+    }
+    if (pid == 0) {
+        execvp(argv_exec[0], argv_exec);
+        _exit(127);
+    }
+
+    int status = 0;
+    int ok = (waitpid(pid, &status, 0) >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    free(argv_exec);
+    wordfree(&we);
+    return ok ? 0 : -1;
+}
+
 static void usage(void) {
     fprintf(stderr,
         "usage:\n"
@@ -109,20 +230,19 @@ static void usage(void) {
         "  backup policy   --repo <path> set [policy options]\n"
         "  backup policy   --repo <path> edit\n"
         "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
-        "                               [--no-pack] [--no-gc] [--no-checkpoint]\n"
-        "                               [--no-policy] [--quiet] [--verify-after]\n"
-        "  backup list     --repo <path>\n"
+        "                               [--no-gc]\n"
+        "                               [--no-policy] [--quiet] [--verbose] [--verify-after]\n"
+        "  backup list     --repo <path> [--simple]\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
         "  backup restore  --repo <path> --dest <path>\n"
-        "                               [--snapshot <id|tag>] [--at] [--file <path>]\n"
+        "                               [--snapshot <id|tag>] [--file <path>]\n"
         "                               [--verify] [--quiet]\n"
         "  backup diff     --repo <path> --from <id|tag> --to <id|tag>\n"
-        "  backup prune    --repo <path> [--keep-revs N] [--keep-daily N]\n"
+        "  backup prune    --repo <path> [--keep-snaps N] [--keep-daily N]\n"
         "                               [--keep-weekly N] [--keep-monthly N]\n"
         "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
-        "  backup checkpoint --repo <path> [--snapshot <id|tag>] [--every N]\n"
         "  backup verify   --repo <path>\n"
         "  backup stats    --repo <path>\n"
         "  backup tag      --repo <path> set --snapshot <id|tag> --name <name>"
@@ -130,14 +250,12 @@ static void usage(void) {
         "  backup tag      --repo <path> list\n"
         "  backup tag      --repo <path> delete --name <name>\n"
         "\n"
-        "policy options: --path <p> --exclude <pat> --keep-revs N\n"
-        "                --checkpoint-every N\n"
+        "policy options: --path <p> --exclude <pat> --keep-snaps N\n"
         "                --keep-daily N --keep-weekly N --keep-monthly N\n"
         "                --keep-yearly N\n"
         "                --auto-pack --no-auto-pack\n"
         "                --auto-gc --no-auto-gc\n"
         "                --auto-prune --no-auto-prune\n"
-        "                --auto-checkpoint --no-auto-checkpoint\n"
         "                --verify-after --no-verify-after\n"
     );
 }
@@ -180,18 +298,21 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
         }
     }
 
-    if ((val = opt_get(argc, argv, start, "--keep-revs")) != NULL)
-        p->keep_revs = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--checkpoint-every")) != NULL)
-        p->checkpoint_every = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--keep-daily")) != NULL)
-        p->keep_daily = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--keep-weekly")) != NULL)
-        p->keep_weekly = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--keep-monthly")) != NULL)
-        p->keep_monthly = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--keep-yearly")) != NULL)
-        p->keep_yearly = atoi(val);
+    if ((val = opt_get(argc, argv, start, "--keep-snaps")) != NULL &&
+        !parse_nonneg_int(val, &p->keep_snaps))
+        fprintf(stderr, "warning: ignoring invalid --keep-snaps value '%s'\n", val);
+    if ((val = opt_get(argc, argv, start, "--keep-daily")) != NULL &&
+        !parse_nonneg_int(val, &p->keep_daily))
+        fprintf(stderr, "warning: ignoring invalid --keep-daily value '%s'\n", val);
+    if ((val = opt_get(argc, argv, start, "--keep-weekly")) != NULL &&
+        !parse_nonneg_int(val, &p->keep_weekly))
+        fprintf(stderr, "warning: ignoring invalid --keep-weekly value '%s'\n", val);
+    if ((val = opt_get(argc, argv, start, "--keep-monthly")) != NULL &&
+        !parse_nonneg_int(val, &p->keep_monthly))
+        fprintf(stderr, "warning: ignoring invalid --keep-monthly value '%s'\n", val);
+    if ((val = opt_get(argc, argv, start, "--keep-yearly")) != NULL &&
+        !parse_nonneg_int(val, &p->keep_yearly))
+        fprintf(stderr, "warning: ignoring invalid --keep-yearly value '%s'\n", val);
 
     if (opt_has(argc, argv, start, "--auto-pack"))       p->auto_pack       = 1;
     if (opt_has(argc, argv, start, "--no-auto-pack"))    p->auto_pack       = 0;
@@ -199,8 +320,6 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
     if (opt_has(argc, argv, start, "--no-auto-gc"))      p->auto_gc         = 0;
     if (opt_has(argc, argv, start, "--auto-prune"))      p->auto_prune      = 1;
     if (opt_has(argc, argv, start, "--no-auto-prune"))   p->auto_prune      = 0;
-    if (opt_has(argc, argv, start, "--auto-checkpoint")) p->auto_checkpoint = 1;
-    if (opt_has(argc, argv, start, "--no-auto-checkpoint")) p->auto_checkpoint = 0;
     if (opt_has(argc, argv, start, "--verify-after"))    p->verify_after    = 1;
     if (opt_has(argc, argv, start, "--no-verify-after")) p->verify_after    = 0;
 }
@@ -210,6 +329,28 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
 /* ------------------------------------------------------------------ */
 
 static int cmd_init(int argc, char **argv) {
+    static const flag_spec_t init_specs[] = {
+        { "--repo", 1 },
+        { "--path", 1 },
+        { "--exclude", 1 },
+        { "--keep-snaps", 1 },
+        { "--keep-daily", 1 },
+        { "--keep-weekly", 1 },
+        { "--keep-monthly", 1 },
+        { "--keep-yearly", 1 },
+        { "--auto-pack", 0 },
+        { "--no-auto-pack", 0 },
+        { "--auto-gc", 0 },
+        { "--no-auto-gc", 0 },
+        { "--auto-prune", 0 },
+        { "--no-auto-prune", 0 },
+        { "--verify-after", 0 },
+        { "--no-verify-after", 0 },
+    };
+    if (validate_options(argc, argv, 2,
+                         init_specs, sizeof(init_specs) / sizeof(init_specs[0]),
+                         NULL, 0)) return 1;
+
     const char *repo_arg = opt_get(argc, argv, 2, "--repo");
     if (!repo_arg) {
         fprintf(stderr, "error: --repo required\n");
@@ -224,8 +365,7 @@ static int cmd_init(int argc, char **argv) {
     int has_policy_opt =
         opt_has(argc, argv, 2, "--path") ||
         opt_has(argc, argv, 2, "--exclude") ||
-        opt_has(argc, argv, 2, "--keep-revs") ||
-        opt_has(argc, argv, 2, "--checkpoint-every") ||
+        opt_has(argc, argv, 2, "--keep-snaps") ||
         opt_has(argc, argv, 2, "--keep-daily") ||
         opt_has(argc, argv, 2, "--keep-weekly") ||
         opt_has(argc, argv, 2, "--keep-monthly") ||
@@ -235,9 +375,7 @@ static int cmd_init(int argc, char **argv) {
         opt_has(argc, argv, 2, "--auto-gc") ||
         opt_has(argc, argv, 2, "--no-auto-gc") ||
         opt_has(argc, argv, 2, "--auto-prune") ||
-        opt_has(argc, argv, 2, "--no-auto-prune") ||
-        opt_has(argc, argv, 2, "--auto-checkpoint") ||
-        opt_has(argc, argv, 2, "--no-auto-checkpoint");
+        opt_has(argc, argv, 2, "--no-auto-prune");
 
     repo_t *repo = NULL;
     if (repo_open(repo_arg, &repo) != OK) {
@@ -250,7 +388,8 @@ static int cmd_init(int argc, char **argv) {
 
     int ret = 0;
     if (has_policy_opt) {
-        policy_t p = {0};
+        policy_t p;
+        policy_init_defaults(&p);
         apply_policy_opts(argc, argv, 2, &p);
         ret = (policy_save(repo, &p) == OK) ? 0 : 1;
         /* Free any allocated strings in p */
@@ -264,8 +403,39 @@ static int cmd_init(int argc, char **argv) {
 }
 
 static int cmd_policy(repo_t *repo, int argc, char **argv) {
-    const char *sub = opt_subcmd(argc, argv, 2);
+    static const flag_spec_t global_flags[] = {
+        { "--repo", 1 },
+    };
+    const char *sub = find_subcmd(argc, argv, 2,
+                                  global_flags,
+                                  sizeof(global_flags) / sizeof(global_flags[0]));
     if (!sub) { usage(); return 1; }
+
+    if (strcmp(sub, "get") == 0) {
+        static const flag_spec_t specs[] = { { "--repo", 1 } };
+        static const char *const pos[] = { "get" };
+        if (validate_options(argc, argv, 2, specs, 1, pos, 1)) return 1;
+    } else if (strcmp(sub, "set") == 0) {
+        static const flag_spec_t specs[] = {
+            { "--repo", 1 },
+            { "--path", 1 }, { "--exclude", 1 },
+            { "--keep-snaps", 1 },
+            { "--keep-daily", 1 }, { "--keep-weekly", 1 },
+            { "--keep-monthly", 1 }, { "--keep-yearly", 1 },
+            { "--auto-pack", 0 }, { "--no-auto-pack", 0 },
+            { "--auto-gc", 0 }, { "--no-auto-gc", 0 },
+            { "--auto-prune", 0 }, { "--no-auto-prune", 0 },
+            { "--verify-after", 0 }, { "--no-verify-after", 0 },
+        };
+        static const char *const pos[] = { "set" };
+        if (validate_options(argc, argv, 2,
+                             specs, sizeof(specs) / sizeof(specs[0]),
+                             pos, 1)) return 1;
+    } else if (strcmp(sub, "edit") == 0) {
+        static const flag_spec_t specs[] = { { "--repo", 1 } };
+        static const char *const pos[] = { "edit" };
+        if (validate_options(argc, argv, 2, specs, 1, pos, 1)) return 1;
+    }
 
     if (strcmp(sub, "get") == 0) {
         policy_t *p = NULL;
@@ -282,8 +452,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("exclude         = ");
         for (int i = 0; i < p->n_exclude; i++) printf("%s%s", i? " " : "", p->exclude[i]);
         printf("\n");
-        printf("keep_revs        = %d\n", p->keep_revs);
-        printf("checkpoint_every = %d\n", p->checkpoint_every);
+        printf("keep_snaps       = %d\n", p->keep_snaps);
         printf("keep_daily       = %d\n", p->keep_daily);
         printf("keep_weekly      = %d\n", p->keep_weekly);
         printf("keep_monthly     = %d\n", p->keep_monthly);
@@ -291,7 +460,6 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("auto_pack        = %s\n", p->auto_pack        ? "true" : "false");
         printf("auto_gc          = %s\n", p->auto_gc          ? "true" : "false");
         printf("auto_prune       = %s\n", p->auto_prune       ? "true" : "false");
-        printf("auto_checkpoint  = %s\n", p->auto_checkpoint  ? "true" : "false");
         printf("verify_after     = %s\n", p->verify_after     ? "true" : "false");
         policy_free(p);
         return 0;
@@ -302,6 +470,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         if (policy_load(repo, &p) != OK) {
             p = calloc(1, sizeof(*p));
             if (!p) { fprintf(stderr, "error: out of memory\n"); return 1; }
+            policy_init_defaults(p);
         }
         apply_policy_opts(argc, argv, 3, p);
         int ret = (policy_save(repo, p) == OK) ? 0 : 1;
@@ -319,10 +488,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
             printf("(set $EDITOR to edit it directly)\n");
             return 0;
         }
-        /* Build editor command: editor <path> */
-        char cmd[5120];
-        snprintf(cmd, sizeof(cmd), "%s %s", editor, path);
-        return system(cmd) == 0 ? 0 : 1;
+        return launch_editor(editor, path) == 0 ? 0 : 1;
 
     } else {
         usage(); return 1;
@@ -330,11 +496,20 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_run(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t run_specs[] = {
+        { "--repo", 1 }, { "--path", 1 }, { "--exclude", 1 },
+        { "--no-gc", 0 },
+        { "--no-policy", 0 }, { "--quiet", 0 }, { "--verbose", 0 },
+        { "--verify-after", 0 }, { "--no-verify-after", 0 },
+    };
+    if (validate_options(argc, argv, 2,
+                         run_specs, sizeof(run_specs) / sizeof(run_specs[0]),
+                         NULL, 0)) return 1;
+
     int no_policy     = opt_has(argc, argv, 2, "--no-policy");
-    int no_pack       = opt_has(argc, argv, 2, "--no-pack");
     int no_gc         = opt_has(argc, argv, 2, "--no-gc");
-    int no_checkpoint = opt_has(argc, argv, 2, "--no-checkpoint");
     int quiet         = opt_has(argc, argv, 2, "--quiet");
+    int verbose       = opt_has(argc, argv, 2, "--verbose");
     int verify_after  = opt_has(argc, argv, 2, "--verify-after");
     int no_verify_after = opt_has(argc, argv, 2, "--no-verify-after");
 
@@ -379,17 +554,14 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         n_excl   = 0;
     }
 
-    /* Determine effective auto-pack: policy controls unless --no-pack */
-    int effective_no_pack = no_pack || (pol && !pol->auto_pack);
-
     int effective_verify = verify_after ||
                           (!no_verify_after && pol && pol->verify_after);
 
     backup_opts_t bopts = {
         .exclude      = excludes,
         .n_exclude    = n_excl,
-        .no_pack      = effective_no_pack,
         .quiet        = quiet,
+        .verbose      = verbose,
         .verify_after = effective_verify,
     };
 
@@ -398,24 +570,20 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     status_t st = backup_run_opts(repo, source_paths, n_source, &bopts);
     if (st != OK) { policy_free(pol); return 1; }
 
-    /* Post-backup: synthesise checkpoints at the configured interval */
-    if (!no_checkpoint && pol && pol->auto_checkpoint && pol->checkpoint_every > 0) {
-        if (!quiet) fprintf(stderr, "checkpointing every %d...\n", pol->checkpoint_every);
-        snapshot_synthesize_every(repo, (uint32_t)pol->checkpoint_every, NULL);
-    }
-
     /* Post-backup: GFS retention engine.
-     * Activated when keep_revs or any GFS tier is set.
-     * Handles prune, rev deletion, and GC internally. */
+     * Activated when keep_snaps or any GFS tier is set.
+     * Handles prune and GC internally. */
     int use_gfs = pol &&
-                  (pol->keep_revs > 0 || pol->keep_daily > 0 ||
+                  (pol->keep_snaps > 0 || pol->keep_daily > 0 ||
                    pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
                    pol->keep_yearly > 0);
     if (use_gfs && pol->auto_prune) {
         uint32_t head_id = 0;
         snapshot_read_head(repo, &head_id);
+        if (!quiet) log_msg("INFO", "post-backup: running retention (includes GC)");
         gfs_run(repo, pol, head_id, 0, quiet);
     } else if (!no_gc && pol && pol->auto_gc) {
+        if (!quiet) log_msg("INFO", "post-backup: running GC");
         repo_gc(repo, NULL, NULL);
     }
 
@@ -423,37 +591,121 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     return 0;
 }
 
+static void list_tags_for_snap(repo_t *repo, uint32_t snap_id, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+
+    char tdir[PATH_MAX];
+    if (snprintf(tdir, sizeof(tdir), "%s/tags", repo_path(repo)) >= (int)sizeof(tdir)) {
+        snprintf(out, out_sz, "-");
+        return;
+    }
+    DIR *d = opendir(tdir);
+    if (!d) {
+        snprintf(out, out_sz, "-");
+        return;
+    }
+
+    struct dirent *de;
+    int any = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        uint32_t id = 0;
+        if (tag_get(repo, de->d_name, &id) != OK || id != snap_id) continue;
+        if (!any) {
+            snprintf(out, out_sz, "%s", de->d_name);
+            any = 1;
+        } else {
+            size_t len = strlen(out);
+            size_t name_len = strlen(de->d_name);
+            if (len + 1 + name_len < out_sz) {
+                out[len] = ',';
+                out[len + 1] = '\0';
+                memcpy(out + len + 1, de->d_name, name_len + 1);
+            }
+        }
+    }
+    closedir(d);
+    if (!any) snprintf(out, out_sz, "-");
+}
+
 static int cmd_list(repo_t *repo, int argc, char **argv) {
-    (void)argc; (void)argv;
+    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--simple", 0 } };
+    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    int simple = opt_has(argc, argv, 2, "--simple");
+
     lock_shared(repo);
     uint32_t head = 0;
     snapshot_read_head(repo, &head);
+    if (!simple) {
+        printf("head  id        timestamp            ent      size     manifest  gfs   tag\n");
+    }
     for (uint32_t id = 1; id <= head; id++) {
+        char head_mark = (id == head) ? '*' : '-';
+
         snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) {
+        int has_snap = (snapshot_load(repo, id, &snap) == OK);
+        if (simple && !has_snap) {
             printf("snapshot %08u  [pruned]\n", id);
             continue;
         }
-        char timebuf[32] = "unknown";
-        if (snap->created_sec > 0) {
-            time_t t = (time_t)snap->created_sec;
-            struct tm *tm = localtime(&t);
-            if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
+
+        char timebuf[32] = "-";
+        uint32_t entries = 0;
+        uint64_t bytes = 0;
+        char gfsbuf[64] = "-";
+        if (has_snap) {
+            entries = snap->node_count;
+            for (uint32_t i = 0; i < snap->node_count; i++) {
+                if (snap->nodes[i].type == NODE_TYPE_REG)
+                    bytes += snap->nodes[i].size;
+            }
+            if (snap->created_sec > 0) {
+                time_t t = (time_t)snap->created_sec;
+                struct tm *tm = localtime(&t);
+                if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
+            }
+            if (snap->gfs_flags) gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
         }
-        if (snap->gfs_flags) {
-            char gfsbuf[64];
-            gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
-            printf("snapshot %08u  %s  [%s]  %u entries\n",
-                   id, timebuf, gfsbuf, snap->node_count);
+
+        if (simple) {
+            char sizebuf[16];
+            fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
+            if (snap->gfs_flags) {
+                printf("snapshot %08u  %s  %s  [%s]  %u entries\n",
+                       id, timebuf, sizebuf, gfsbuf, entries);
+            } else {
+                printf("snapshot %08u  %s  %s  %u entries\n", id, timebuf, sizebuf, entries);
+            }
+            snapshot_free(snap);
+            continue;
+        }
+
+        char tagbuf[256];
+        list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
+
+        if (has_snap) {
+            char sizebuf[16];
+            fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
+            printf("%c     %08u  %-19s  %7u  %-7s  %c         %-4s  %s\n",
+                   head_mark, id, timebuf, entries,
+                   sizebuf, 'Y', gfsbuf, tagbuf);
         } else {
-            printf("snapshot %08u  %s  %u entries\n", id, timebuf, snap->node_count);
+            printf("%c     %08u  %-19s  %7s  %-7s  %c         %-4s  %s\n",
+                   head_mark, id, "-", "-",
+                   "-", '-', "-", tagbuf);
         }
+
         snapshot_free(snap);
     }
     return 0;
 }
 
 static int cmd_ls(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--snapshot", 1 }, { "--path", 1 },
+    };
+    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
     lock_shared(repo);
     const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
     if (!snap_arg) {
@@ -470,23 +722,19 @@ static int cmd_ls(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_restore(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--dest", 1 }, { "--snapshot", 1 },
+        { "--file", 1 }, { "--verify", 0 }, { "--quiet", 0 },
+    };
+    if (validate_options(argc, argv, 2, specs, 6, NULL, 0)) return 1;
     lock_shared(repo);
     const char *dest = opt_get(argc, argv, 2, "--dest");
     if (!dest) { fprintf(stderr, "error: --dest required\n"); return 1; }
 
-    int at      = opt_has(argc, argv, 2, "--at");
     int verify  = opt_has(argc, argv, 2, "--verify");
     int quiet   = opt_has(argc, argv, 2, "--quiet");
     const char *file_arg = opt_get(argc, argv, 2, "--file");
     const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
-
-    /* --at without --snapshot is an error */
-    if (at && !snap_arg) {
-        fprintf(stderr, "error: --at requires --snapshot\n"
-                        "  (the reverse chain walks backward from a newer snapshot;\n"
-                        "   specify which historical snapshot you want to restore)\n");
-        return 1;
-    }
 
     uint32_t snap_id = 0;
     if (snap_arg) {
@@ -512,8 +760,6 @@ static int cmd_restore(repo_t *repo, int argc, char **argv) {
                 fprintf(stderr, "error: path '%s' not found in snapshot %u\n",
                         file_arg, snap_id);
         }
-    } else if (at) {
-        st = restore_snapshot_at(repo, snap_id, dest);
     } else if (snap_id > 0) {
         st = restore_snapshot(repo, snap_id, dest);
     } else {
@@ -544,6 +790,10 @@ static int cmd_restore(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_diff(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--from", 1 }, { "--to", 1 },
+    };
+    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
     lock_shared(repo);
     const char *from_arg = opt_get(argc, argv, 2, "--from");
     const char *to_arg   = opt_get(argc, argv, 2, "--to");
@@ -561,26 +811,62 @@ static int cmd_diff(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_prune(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--keep-snaps", 1 }, { "--keep-daily", 1 },
+        { "--keep-weekly", 1 }, { "--keep-monthly", 1 }, { "--keep-yearly", 1 },
+        { "--no-policy", 0 }, { "--dry-run", 0 },
+    };
+    if (validate_options(argc, argv, 2, specs, 8, NULL, 0)) return 1;
+
     int dry_run   = opt_has(argc, argv, 2, "--dry-run");
     int no_policy = opt_has(argc, argv, 2, "--no-policy");
 
     policy_t *pol = NULL;
     if (!no_policy) policy_load(repo, &pol);
-    if (!pol) pol = calloc(1, sizeof(policy_t));
+    if (!pol) {
+        pol = calloc(1, sizeof(policy_t));
+        if (!pol) return 1;
+        policy_init_defaults(pol);
+    }
 
     /* Command-line args override policy */
     const char *val;
-    if ((val = opt_get(argc, argv, 2, "--keep-revs")) != NULL)    pol->keep_revs   = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-daily")) != NULL)   pol->keep_daily  = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-weekly")) != NULL)  pol->keep_weekly = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-monthly")) != NULL) pol->keep_monthly = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-yearly")) != NULL)  pol->keep_yearly = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-snaps")) != NULL &&
+        !parse_nonneg_int(val, &pol->keep_snaps)) {
+        fprintf(stderr, "error: invalid --keep-snaps value '%s'\n", val);
+        policy_free(pol);
+        return 1;
+    }
+    if ((val = opt_get(argc, argv, 2, "--keep-daily")) != NULL &&
+        !parse_nonneg_int(val, &pol->keep_daily)) {
+        fprintf(stderr, "error: invalid --keep-daily value '%s'\n", val);
+        policy_free(pol);
+        return 1;
+    }
+    if ((val = opt_get(argc, argv, 2, "--keep-weekly")) != NULL &&
+        !parse_nonneg_int(val, &pol->keep_weekly)) {
+        fprintf(stderr, "error: invalid --keep-weekly value '%s'\n", val);
+        policy_free(pol);
+        return 1;
+    }
+    if ((val = opt_get(argc, argv, 2, "--keep-monthly")) != NULL &&
+        !parse_nonneg_int(val, &pol->keep_monthly)) {
+        fprintf(stderr, "error: invalid --keep-monthly value '%s'\n", val);
+        policy_free(pol);
+        return 1;
+    }
+    if ((val = opt_get(argc, argv, 2, "--keep-yearly")) != NULL &&
+        !parse_nonneg_int(val, &pol->keep_yearly)) {
+        fprintf(stderr, "error: invalid --keep-yearly value '%s'\n", val);
+        policy_free(pol);
+        return 1;
+    }
 
-    int any = pol->keep_revs > 0 || pol->keep_daily > 0 || pol->keep_weekly > 0 ||
+    int any = pol->keep_snaps > 0 || pol->keep_daily > 0 || pol->keep_weekly > 0 ||
               pol->keep_monthly > 0 || pol->keep_yearly > 0;
     if (!any) {
         fprintf(stderr, "error: no retention rules specified\n"
-                        "  use --keep-revs N, --keep-daily N, etc."
+                        "  use --keep-snaps N, --keep-daily N, etc."
                         " or configure policy\n");
         policy_free(pol);
         return 1;
@@ -596,55 +882,34 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_gc(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
     if (lock_or_die(repo)) return 1;
+    log_msg("INFO", "running GC");
     return repo_gc(repo, NULL, NULL) == OK ? 0 : 1;
 }
 
 static int cmd_pack(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
     if (lock_or_die(repo)) return 1;
+    log_msg("INFO", "running pack");
     return repo_pack(repo, NULL) == OK ? 0 : 1;
 }
 
-static int cmd_checkpoint(repo_t *repo, int argc, char **argv) {
-    if (lock_or_die(repo)) return 1;
-
-    const char *every_arg = opt_get(argc, argv, 2, "--every");
-    const char *snap_arg  = opt_get(argc, argv, 2, "--snapshot");
-
-    if (every_arg) {
-        uint32_t interval = (uint32_t)atoi(every_arg);
-        if (interval == 0) {
-            fprintf(stderr, "error: --every requires a positive integer\n");
-            return 1;
-        }
-        uint32_t count = 0;
-        if (snapshot_synthesize_every(repo, interval, &count) == OK)
-            fprintf(stderr, "synthesized %u checkpoint(s)\n", count);
-        else
-            return 1;
-    } else if (snap_arg) {
-        uint32_t snap_id = 0;
-        if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
-            fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
-            return 1;
-        }
-        if (snapshot_synthesize(repo, snap_id) != OK) return 1;
-    } else {
-        fprintf(stderr, "error: --snapshot <id> or --every <N> required\n");
-        return 1;
-    }
-    return 0;
-}
-
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
     lock_shared(repo);
     return repo_verify(repo) == OK ? 0 : 1;
 }
 
 static int cmd_stats(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
     lock_shared(repo);
     repo_stat_t s = {0};
@@ -654,8 +919,29 @@ static int cmd_stats(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_tag(repo_t *repo, int argc, char **argv) {
-    const char *sub = opt_subcmd(argc, argv, 2);
+    static const flag_spec_t global_flags[] = {
+        { "--repo", 1 },
+    };
+    const char *sub = find_subcmd(argc, argv, 2,
+                                  global_flags,
+                                  sizeof(global_flags) / sizeof(global_flags[0]));
     if (!sub) { usage(); return 1; }
+
+    if (strcmp(sub, "list") == 0) {
+        static const flag_spec_t specs[] = { { "--repo", 1 } };
+        static const char *const pos[] = { "list" };
+        if (validate_options(argc, argv, 2, specs, 1, pos, 1)) return 1;
+    } else if (strcmp(sub, "set") == 0) {
+        static const flag_spec_t specs[] = {
+            { "--repo", 1 }, { "--snapshot", 1 }, { "--name", 1 }, { "--preserve", 0 },
+        };
+        static const char *const pos[] = { "set" };
+        if (validate_options(argc, argv, 2, specs, 4, pos, 1)) return 1;
+    } else if (strcmp(sub, "delete") == 0) {
+        static const flag_spec_t specs[] = { { "--repo", 1 }, { "--name", 1 } };
+        static const char *const pos[] = { "delete" };
+        if (validate_options(argc, argv, 2, specs, 2, pos, 1)) return 1;
+    }
 
     if (strcmp(sub, "list") == 0) {
         return tag_list(repo) == OK ? 0 : 1;
@@ -710,7 +996,7 @@ int main(int argc, char *argv[]) {
     /* Catch missing or unrecognised subcommand before checking flags */
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "restore", "diff",
-        "prune", "gc", "pack", "checkpoint", "verify", "stats", "tag", NULL
+        "prune", "gc", "pack", "verify", "stats", "tag", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -745,7 +1031,6 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "prune")      == 0) ret = cmd_prune(repo, argc, argv);
     else if (strcmp(cmd, "gc")         == 0) ret = cmd_gc(repo, argc, argv);
     else if (strcmp(cmd, "pack")       == 0) ret = cmd_pack(repo, argc, argv);
-    else if (strcmp(cmd, "checkpoint") == 0) ret = cmd_checkpoint(repo, argc, argv);
     else if (strcmp(cmd, "verify")     == 0) ret = cmd_verify(repo, argc, argv);
     else if (strcmp(cmd, "stats")      == 0) ret = cmd_stats(repo, argc, argv);
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);

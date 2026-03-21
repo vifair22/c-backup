@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
 #include "diff.h"
-#include "restore.h"
 #include "snapshot.h"
 
 #include <stdio.h>
@@ -8,42 +7,45 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* Load a snapshot (live or pruned) as a flat (path, node) array      */
+/* Load a snapshot as a flat (path, node) array                        */
 /* ------------------------------------------------------------------ */
 
+typedef struct {
+    char  *path;
+    node_t node;
+} diff_entry_t;
+
 static status_t load_as_ws(repo_t *repo, uint32_t id,
-                            ws_entry_t **out_ws, uint32_t *out_cnt) {
-    /* Fast path: snapshot file exists */
+                            diff_entry_t **out_ws, uint32_t *out_cnt) {
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, id, &snap) == OK) {
-        pathmap_t *pm = NULL;
-        status_t st = pathmap_build(snap, &pm);
-        snapshot_free(snap);
-        if (st != OK) return st;
+    status_t st = snapshot_load(repo, id, &snap);
+    if (st != OK) return st;
 
-        uint32_t cnt = 0;
-        ws_entry_t *ws = calloc(pm->capacity, sizeof(ws_entry_t));
-        if (!ws) { pathmap_free(pm); return ERR_NOMEM; }
+    pathmap_t *pm = NULL;
+    st = pathmap_build(snap, &pm);
+    snapshot_free(snap);
+    if (st != OK) return st;
 
-        for (size_t i = 0; i < pm->capacity; i++) {
-            if (!pm->slots[i].key) continue;
-            ws[cnt].path = strdup(pm->slots[i].key);
-            if (!ws[cnt].path) {
-                for (uint32_t k = 0; k < cnt; k++) free(ws[k].path);
-                free(ws); pathmap_free(pm); return ERR_NOMEM;
-            }
-            ws[cnt].node = pm->slots[i].value;
-            cnt++;
+    uint32_t cnt = 0;
+    diff_entry_t *ws = calloc(pm->capacity, sizeof(*ws));
+    if (!ws) { pathmap_free(pm); return ERR_NOMEM; }
+
+    for (size_t i = 0; i < pm->capacity; i++) {
+        if (!pm->slots[i].key) continue;
+        ws[cnt].path = strdup(pm->slots[i].key);
+        if (!ws[cnt].path) {
+            for (uint32_t k = 0; k < cnt; k++) free(ws[k].path);
+            free(ws);
+            pathmap_free(pm);
+            return ERR_NOMEM;
         }
-        pathmap_free(pm);
-        *out_ws  = ws;
-        *out_cnt = cnt;
-        return OK;
+        ws[cnt].node = pm->slots[i].value;
+        cnt++;
     }
-
-    /* Slow path: build from reverse chain */
-    uint32_t anchor = 0;
-    return restore_build_ws(repo, id, out_ws, out_cnt, &anchor);
+    pathmap_free(pm);
+    *out_ws  = ws;
+    *out_cnt = cnt;
+    return OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -51,8 +53,8 @@ static status_t load_as_ws(repo_t *repo, uint32_t id,
 /* ------------------------------------------------------------------ */
 
 static int ws_path_cmp(const void *a, const void *b) {
-    return strcmp(((const ws_entry_t *)a)->path,
-                  ((const ws_entry_t *)b)->path);
+    return strcmp(((const diff_entry_t *)a)->path,
+                  ((const diff_entry_t *)b)->path);
 }
 
 /* ------------------------------------------------------------------ */
@@ -60,7 +62,7 @@ static int ws_path_cmp(const void *a, const void *b) {
 /* ------------------------------------------------------------------ */
 
 status_t snapshot_diff(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2) {
-    ws_entry_t *ws1 = NULL, *ws2 = NULL;
+    diff_entry_t *ws1 = NULL, *ws2 = NULL;
     uint32_t    cnt1 = 0,   cnt2 = 0;
 
     status_t st = load_as_ws(repo, snap_id1, &ws1, &cnt1);
@@ -77,8 +79,8 @@ status_t snapshot_diff(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2) {
     uint32_t n2 = 0;
     for (uint32_t i = 0; i < cnt2; i++) if (ws2[i].path) ws2[n2++] = ws2[i];
 
-    qsort(ws1, n1, sizeof(ws_entry_t), ws_path_cmp);
-    qsort(ws2, n2, sizeof(ws_entry_t), ws_path_cmp);
+    qsort(ws1, n1, sizeof(*ws1), ws_path_cmp);
+    qsort(ws2, n2, sizeof(*ws2), ws_path_cmp);
 
     /* Merge walk */
     uint32_t i = 0, j = 0;

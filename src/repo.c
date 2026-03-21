@@ -71,10 +71,44 @@ static status_t write_head(int repofd) {
     return OK;
 }
 
+static int dir_is_empty(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        closedir(d);
+        return 0;
+    }
+    closedir(d);
+    return 1;
+}
+
 status_t repo_init(const char *path) {
-    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
-        log_msg("ERROR", "cannot create repo directory");
-        return ERR_IO;
+    struct stat stbuf;
+    if (lstat(path, &stbuf) == 0) {
+        if (!S_ISDIR(stbuf.st_mode)) {
+            log_msg("ERROR", "repo path exists and is not a directory");
+            return ERR_IO;
+        }
+        int empty = dir_is_empty(path);
+        if (empty <= 0) {
+            if (empty == 0)
+                log_msg("ERROR", "repo directory must be empty");
+            else
+                log_msg("ERROR", "cannot inspect repo directory");
+            return ERR_IO;
+        }
+    } else {
+        if (errno != ENOENT) {
+            log_msg("ERROR", "cannot stat repo directory");
+            return ERR_IO;
+        }
+        if (mkdir(path, 0755) == -1) {
+            log_msg("ERROR", "cannot create repo directory");
+            return ERR_IO;
+        }
     }
 
     int repofd = open(path, O_RDONLY | O_DIRECTORY);
@@ -85,7 +119,6 @@ status_t repo_init(const char *path) {
     if ((st = mkdir_at(repofd, "objects"))   != OK) goto done;
     if ((st = mkdir_at(repofd, "packs"))     != OK) goto done;
     if ((st = mkdir_at(repofd, "snapshots")) != OK) goto done;
-    if ((st = mkdir_at(repofd, "reverse"))   != OK) goto done;
     if ((st = mkdir_at(repofd, "logs"))      != OK) goto done;
     if ((st = mkdir_at(repofd, "tmp"))       != OK) goto done;
     if ((st = write_head(repofd))            != OK) goto done;

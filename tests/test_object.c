@@ -4,6 +4,9 @@
 #include <cmocka.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../src/repo.h"
 #include "../src/object.h"
@@ -29,7 +32,7 @@ static int teardown(void **state) {
 
 static void test_store_and_load(void **state) {
     (void)state;
-    const char *data = "Hello, reverse backup!";
+    const char *data = "Hello, snapshot backup!";
     size_t len = strlen(data);
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
 
@@ -64,11 +67,30 @@ static void test_object_exists(void **state) {
     assert_true(object_exists(repo, hash));
 }
 
+static void test_repo_init_requires_empty_dir(void **state) {
+    (void)state;
+    const char *path = "/tmp/c_backup_nonempty_repo";
+    system("rm -rf /tmp/c_backup_nonempty_repo");
+    assert_int_equal(mkdir(path, 0755), 0);
+
+    char marker[256];
+    snprintf(marker, sizeof(marker), "%s/keep.txt", path);
+    FILE *f = fopen(marker, "w");
+    assert_non_null(f);
+    fputs("do not clobber\n", f);
+    fclose(f);
+
+    assert_int_not_equal(repo_init(path), OK);
+
+    system("rm -rf /tmp/c_backup_nonempty_repo");
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_store_and_load, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dedup,          setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_exists,  setup, teardown),
+        cmocka_unit_test(test_repo_init_requires_empty_dir),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

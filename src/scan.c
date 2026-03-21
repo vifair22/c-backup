@@ -19,6 +19,22 @@
 
 static uint64_t next_node_id = 1;
 
+static uint64_t inode_identity(dev_t dev, ino_t ino) {
+    uint64_t h = 1469598103934665603ULL;
+    uint64_t d = (uint64_t)dev;
+    uint64_t i = (uint64_t)ino;
+    for (int b = 0; b < 8; b++) {
+        h ^= (d >> (b * 8)) & 0xffu;
+        h *= 1099511628211ULL;
+    }
+    for (int b = 0; b < 8; b++) {
+        h ^= (i >> (b * 8)) & 0xffu;
+        h *= 1099511628211ULL;
+    }
+    if (h == 0) h = 1;
+    return h;
+}
+
 /* ------------------------------------------------------------------ */
 /* Inode map: inode_identity (uint64) → first node_id (uint64)        */
 /* Exposed as scan_imap_t so callers can share it across scan_tree()  */
@@ -71,7 +87,8 @@ static int imap_set(imap_t *m, uint64_t key, uint64_t val) {
     return 0;
 }
 
-static status_t result_append(scan_result_t *res, const scan_entry_t *e) {
+static status_t result_append(scan_result_t *res, const scan_entry_t *e,
+                              const scan_opts_t *opts) {
     if (res->count == res->capacity) {
         uint32_t newcap = res->capacity ? res->capacity * 2 : 64;
         scan_entry_t *tmp = realloc(res->entries, newcap * sizeof(*tmp));
@@ -80,6 +97,11 @@ static status_t result_append(scan_result_t *res, const scan_entry_t *e) {
         res->capacity = newcap;
     }
     res->entries[res->count++] = *e;
+    if (opts && opts->progress_cb) {
+        uint32_t every = opts->progress_every ? opts->progress_every : 5000;
+        if (res->count == 1 || (res->count % every) == 0)
+            opts->progress_cb(res->count, opts->progress_ctx);
+    }
     return OK;
 }
 
@@ -154,11 +176,23 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          const scan_opts_t *opts, scan_result_t *res);
 
 static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
-                               size_t strip_prefix_len, imap_t *imap,
-                               const scan_opts_t *opts, scan_result_t *res) {
+                                size_t strip_prefix_len, imap_t *imap,
+                                const scan_opts_t *opts, scan_result_t *res) {
     struct stat st;
     if (lstat(path, &st) == -1) {
-        log_msg("WARN", "lstat failed, skipping entry");
+        if (opts && opts->progress_clear_cb)
+            opts->progress_clear_cb(opts->progress_ctx);
+        if (opts && opts->verbose) {
+            char msg[PATH_MAX + 96];
+            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
+                         path, strerror(errno)) >= (int)sizeof(msg)) {
+                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
+            } else {
+                log_msg("WARN", msg);
+            }
+        } else {
+            log_msg("WARN", "lstat failed, skipping entry");
+        }
         return OK;
     }
 
@@ -171,7 +205,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
 
     node_t *nd = &e.node;
     nd->node_id        = next_node_id++;
-    nd->inode_identity = (uint64_t)st.st_dev ^ ((uint64_t)st.st_ino << 32);
+    nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
     nd->type           = stat_to_node_type(&st);
     nd->mode           = (uint32_t)st.st_mode;
     nd->uid            = (uint32_t)st.st_uid;
@@ -214,7 +248,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
 
     uint64_t this_node_id = nd->node_id;
 
-    if ((st2 = result_append(res, &e)) != OK) {
+    if ((st2 = result_append(res, &e, opts)) != OK) {
         free(e.path); free(e.xattr_data); free(e.acl_data); return st2;
     }
 
@@ -223,12 +257,19 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     return OK;
 }
 
-static int is_excluded(const char *name, const scan_opts_t *opts) {
+static int is_excluded(const char *full_path, const char *name, const scan_opts_t *opts) {
     if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
     for (int i = 0; i < opts->n_exclude; i++) {
-        if (fnmatch(opts->exclude[i], name, FNM_PATHNAME) == 0 ||
-            fnmatch(opts->exclude[i], name, 0) == 0)
-            return 1;
+        const char *pat = opts->exclude[i];
+        if (strchr(pat, '/')) {
+            if (fnmatch(pat, full_path, FNM_PATHNAME) == 0 ||
+                fnmatch(pat, full_path, 0) == 0)
+                return 1;
+        } else {
+            if (fnmatch(pat, name, FNM_PATHNAME) == 0 ||
+                fnmatch(pat, name, 0) == 0)
+                return 1;
+        }
     }
     return 0;
 }
@@ -237,13 +278,34 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
                          const scan_opts_t *opts, scan_result_t *res) {
     DIR *d = opendir(path);
-    if (!d) { log_msg("WARN", "cannot open directory"); return OK; }
+    if (!d) {
+        if (opts && opts->progress_clear_cb)
+            opts->progress_clear_cb(opts->progress_ctx);
+        if (opts && opts->verbose) {
+            char msg[PATH_MAX + 96];
+            if (snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)",
+                         path, strerror(errno)) >= (int)sizeof(msg)) {
+                log_msg("WARN", "cannot open directory: <path-too-long>");
+            } else {
+                log_msg("WARN", msg);
+            }
+        } else {
+            log_msg("WARN", "cannot open directory");
+        }
+        return OK;
+    }
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (is_excluded(de->d_name, opts)) continue;
         char child[PATH_MAX];
-        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) {
+            if (opts && opts->progress_clear_cb)
+                opts->progress_clear_cb(opts->progress_ctx);
+            log_msg("WARN", "path too long, skipping entry");
+            continue;
+        }
+        if (is_excluded(child, de->d_name, opts)) continue;
         status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
         if (st != OK) { closedir(d); return st; }
     }
@@ -268,6 +330,12 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
      */
     const char *last_slash = strrchr(root, '/');
     size_t strip_prefix_len = last_slash ? (size_t)(last_slash - root + 1) : 0;
+
+    const char *base = last_slash ? last_slash + 1 : root;
+    if (is_excluded(root, base, opts)) {
+        *out = res;
+        return OK;
+    }
 
     status_t st = scan_entry_at(root, 0, strip_prefix_len, imap, opts, res);
     if (st != OK) { scan_result_free(res); return st; }

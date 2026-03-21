@@ -2,11 +2,33 @@
 #include "policy.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+void policy_init_defaults(policy_t *p) {
+    if (!p) return;
+    memset(p, 0, sizeof(*p));
+    p->auto_pack       = 1;
+    p->auto_gc         = 1;
+    p->auto_prune      = 1;
+    p->keep_snaps      = 1;
+    p->verify_after    = 0;
+}
+
+static int parse_nonneg_int(const char *s, int *out) {
+    char *end = NULL;
+    long v;
+    if (!s || !*s || !out) return 0;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v < 0 || v > INT_MAX) return 0;
+    *out = (int)v;
+    return 1;
+}
 
 void policy_path(repo_t *repo, char *buf, size_t sz) {
     snprintf(buf, sz, "%s/policy.conf", repo_path(repo));
@@ -40,10 +62,8 @@ status_t policy_write_template(repo_t *repo) {
         "\n"
         "# --- Retention (GFS) ---\n"
         "\n"
-        "# Minimum number of reverse records to keep.\n"
-        "# Silently extended when needed to reach the oldest GFS anchor so that\n"
-        "# --at restore always has a valid chain to walk back through.\n"
-        "#keep_revs = 20\n"
+        "# Minimum number of recent full snapshots (.snap) to keep.\n"
+        "#keep_snaps = 1\n"
         "\n"
         "# Keep one snapshot per calendar day for the N most recent days.\n"
         "#keep_daily = 0\n"
@@ -57,24 +77,16 @@ status_t policy_write_template(repo_t *repo) {
         "# Keep one snapshot per year for the N most recent years.\n"
         "#keep_yearly = 0\n"
         "\n"
-        "# --- Checkpoints ---\n"
-        "\n"
-        "# Synthesise a checkpoint snapshot every N backups (0 = disabled).\n"
-        "#checkpoint_every = 0\n"
-        "\n"
         "# --- Automatic post-run operations ---\n"
         "\n"
         "# Pack loose objects into pack files after each backup.\n"
-        "#auto_pack = false\n"
+        "#auto_pack = true\n"
         "\n"
         "# Remove unreferenced objects after each backup.\n"
-        "#auto_gc = false\n"
+        "#auto_gc = true\n"
         "\n"
         "# Apply retention policy and delete old snapshots after each backup.\n"
-        "#auto_prune = false\n"
-        "\n"
-        "# Synthesise checkpoint snapshots after each backup (requires checkpoint_every).\n"
-        "#auto_checkpoint = false\n"
+        "#auto_prune = true\n"
         "\n"
         "# Verify that every object referenced by the new snapshot exists on disk\n"
         "# after each backup.  Catches write failures early at the cost of extra I/O.\n"
@@ -143,6 +155,7 @@ status_t policy_load(repo_t *repo, policy_t **out) {
 
     policy_t *p = calloc(1, sizeof(*p));
     if (!p) { fclose(f); return ERR_NOMEM; }
+    policy_init_defaults(p);
 
     char line[4096];
     while (fgets(line, sizeof(line), f)) {
@@ -170,26 +183,22 @@ status_t policy_load(repo_t *repo, policy_t **out) {
         } else if (strcmp(key, "exclude") == 0) {
             int r = split_tokens(val, &p->exclude);
             p->n_exclude = (r >= 0) ? r : 0;
-        } else if (strcmp(key, "keep_revs") == 0) {
-            p->keep_revs = atoi(val);
-        } else if (strcmp(key, "checkpoint_every") == 0) {
-            p->checkpoint_every = atoi(val);
+        } else if (strcmp(key, "keep_snaps") == 0) {
+            (void)parse_nonneg_int(val, &p->keep_snaps);
         } else if (strcmp(key, "keep_daily") == 0) {
-            p->keep_daily = atoi(val);
+            (void)parse_nonneg_int(val, &p->keep_daily);
         } else if (strcmp(key, "keep_weekly") == 0) {
-            p->keep_weekly = atoi(val);
+            (void)parse_nonneg_int(val, &p->keep_weekly);
         } else if (strcmp(key, "keep_monthly") == 0) {
-            p->keep_monthly = atoi(val);
+            (void)parse_nonneg_int(val, &p->keep_monthly);
         } else if (strcmp(key, "keep_yearly") == 0) {
-            p->keep_yearly = atoi(val);
+            (void)parse_nonneg_int(val, &p->keep_yearly);
         } else if (strcmp(key, "auto_pack") == 0) {
             p->auto_pack = parse_bool(val);
         } else if (strcmp(key, "auto_gc") == 0) {
             p->auto_gc = parse_bool(val);
         } else if (strcmp(key, "auto_prune") == 0) {
             p->auto_prune = parse_bool(val);
-        } else if (strcmp(key, "auto_checkpoint") == 0) {
-            p->auto_checkpoint = parse_bool(val);
         } else if (strcmp(key, "verify_after") == 0) {
             p->verify_after = parse_bool(val);
         }
@@ -223,8 +232,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     }
     fprintf(f, "\n");
 
-    fprintf(f, "keep_revs = %d\n",        p->keep_revs);
-    fprintf(f, "checkpoint_every = %d\n", p->checkpoint_every);
+    fprintf(f, "keep_snaps = %d\n",       p->keep_snaps);
     fprintf(f, "keep_daily = %d\n",       p->keep_daily);
     fprintf(f, "keep_weekly = %d\n",      p->keep_weekly);
     fprintf(f, "keep_monthly = %d\n",     p->keep_monthly);
@@ -232,7 +240,6 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     fprintf(f, "auto_pack = %s\n",        p->auto_pack        ? "true" : "false");
     fprintf(f, "auto_gc = %s\n",          p->auto_gc          ? "true" : "false");
     fprintf(f, "auto_prune = %s\n",       p->auto_prune       ? "true" : "false");
-    fprintf(f, "auto_checkpoint = %s\n",  p->auto_checkpoint  ? "true" : "false");
     fprintf(f, "verify_after = %s\n",     p->verify_after     ? "true" : "false");
 
     if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }

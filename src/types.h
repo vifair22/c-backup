@@ -19,11 +19,6 @@
 #define NODE_TYPE_CHR   6
 #define NODE_TYPE_BLK   7
 
-#define REV_OP_REMOVE   1
-#define REV_OP_RESTORE  2
-#define REV_OP_META     3
-#define REV_OP_LINK     4
-
 /* ---------- object store ---------- */
 
 typedef struct {
@@ -82,11 +77,3 @@ typedef struct {
     uint64_t offset;
     uint64_t length;
 } __attribute__((packed)) sparse_region_t;
-
-/* ---------- reverse record ---------- */
-
-typedef struct {
-    uint8_t  op_type;
-    uint16_t path_len;
-    /* followed by path_len bytes of path, then a node_t */
-} __attribute__((packed)) reverse_entry_t;

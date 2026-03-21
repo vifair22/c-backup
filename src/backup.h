@@ -11,10 +11,10 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count);
 
 /* Extended backup with options. */
 typedef struct {
-    const char **exclude;      /* fnmatch patterns to skip (matched against basename) */
+    const char **exclude;      /* basename patterns; patterns with '/' match full path */
     int          n_exclude;
-    int          no_pack;      /* skip automatic pack after backup (default: pack runs) */
     int          quiet;        /* suppress progress output to stderr */
+    int          verbose;      /* verbose warnings (e.g., list skipped unreadable paths) */
     int          verify_after; /* verify all objects exist after committing snapshot */
 } backup_opts_t;
 

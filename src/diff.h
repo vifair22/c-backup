@@ -6,7 +6,7 @@
 
 /*
  * Print the diff between two snapshots to stdout.
- * Works for both live and pruned snapshots.
+ * Works for snapshots with on-disk manifests.
  * Output lines: "A  path", "D  path", "M  path", "m  path"
  * (Added, Deleted, Modified-content, modified-Metadata-only)
  */

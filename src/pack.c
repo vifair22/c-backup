@@ -9,8 +9,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <lz4.h>
@@ -67,6 +70,80 @@ static int idx_disk_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
 }
 
+static int path_fmt(char *buf, size_t sz, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sz, fmt, ap);
+    va_end(ap);
+    return (n >= 0 && (size_t)n < sz) ? 0 : -1;
+}
+
+static int read_full_fd(int fd, void *buf, size_t n) {
+    uint8_t *p = buf;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, p + off, n - off);
+        if (r == 0) return -1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static size_t g_pack_line_len = 0;
+
+static int pack_progress_enabled(void) {
+    return isatty(STDERR_FILENO);
+}
+
+static void pack_line_set(const char *msg) {
+    size_t len = strlen(msg);
+    fprintf(stderr, "\r%s", msg);
+    if (g_pack_line_len > len) {
+        size_t pad = g_pack_line_len - len;
+        while (pad--) fputc(' ', stderr);
+        fputc('\r', stderr);
+        fputs(msg, stderr);
+    }
+    fflush(stderr);
+    g_pack_line_len = len;
+}
+
+static void pack_line_clear(void) {
+    if (g_pack_line_len == 0) return;
+    fputc('\r', stderr);
+    for (size_t i = 0; i < g_pack_line_len; i++) fputc(' ', stderr);
+    fputc('\r', stderr);
+    fflush(stderr);
+    g_pack_line_len = 0;
+}
+
+static int pack_tick_due(struct timespec *next_tick) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec < next_tick->tv_sec ||
+        (now.tv_sec == next_tick->tv_sec && now.tv_nsec < next_tick->tv_nsec))
+        return 0;
+    next_tick->tv_sec = now.tv_sec + 1;
+    next_tick->tv_nsec = now.tv_nsec;
+    return 1;
+}
+
+static double pack_elapsed_sec(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    time_t ds = now.tv_sec - start->tv_sec;
+    long dn = now.tv_nsec - start->tv_nsec;
+    return (double)ds + (double)dn / 1000000000.0;
+}
+
+static double pack_bps_to_mib(double bps) {
+    return bps / (1024.0 * 1024.0);
+}
+
 /* ------------------------------------------------------------------ */
 /* Hex helpers                                                         */
 /* ------------------------------------------------------------------ */
@@ -114,8 +191,8 @@ static status_t pack_cache_load(repo_t *repo) {
         if (sscanf(de->d_name, "pack-%08u.idx", &pack_num) != 1) continue;
 
         char idx_path[PATH_MAX];
-        snprintf(idx_path, sizeof(idx_path), "%s/packs/%s",
-                 repo_path(repo), de->d_name);
+        if (path_fmt(idx_path, sizeof(idx_path), "%s/packs/%s",
+                     repo_path(repo), de->d_name) != 0) continue;
 
         FILE *f = fopen(idx_path, "rb");
         if (!f) continue;
@@ -297,7 +374,13 @@ done:
 }
 
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
+    int show_progress = pack_progress_enabled();
+    struct timespec next_tick = {0};
+    struct timespec started_at = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
     /* Discard unreferenced loose objects before packing */
+    log_msg("INFO", "pack: phase 1/3 GC");
     repo_gc(repo, NULL, NULL);
 
     /* Determine the next sequential pack number */
@@ -310,7 +393,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                 struct dirent *de;
                 while ((de = readdir(d)) != NULL) {
                     uint32_t n;
-                    if (sscanf(de->d_name, "pack-%08u.dat", &n) == 1 &&
+                    int end = 0;
+                    if (sscanf(de->d_name, "pack-%08u.dat%n", &n, &end) == 1 &&
+                        de->d_name[end] == '\0' &&
                         n >= pack_num)
                         pack_num = n + 1;
                 }
@@ -322,6 +407,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     }
 
     /* Collect loose object hashes */
+    log_msg("INFO", "pack: phase 2/3 collecting loose objects");
     uint8_t *hashes = NULL;
     size_t   loose_cnt = 0;
     status_t st = collect_loose(repo, &hashes, &loose_cnt);
@@ -335,9 +421,19 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     }
 
     /* Prepare tmp paths for the new dat and idx files */
+    log_msg("INFO", "pack: phase 3/3 writing pack files");
+
+    uint64_t processed_payload_bytes = 0;
+    if (show_progress) {
+        clock_gettime(CLOCK_MONOTONIC, &started_at);
+    }
+
     char dat_tmp[PATH_MAX], idx_tmp[PATH_MAX];
-    snprintf(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX", repo_path(repo));
-    snprintf(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX", repo_path(repo));
+    if (path_fmt(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX", repo_path(repo)) != 0 ||
+        path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX", repo_path(repo)) != 0) {
+        free(hashes);
+        return ERR_IO;
+    }
 
     int dat_fd = mkstemp(dat_tmp);
     if (dat_fd == -1) { free(hashes); return ERR_IO; }
@@ -354,6 +450,10 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         free(hashes); return ERR_IO;
     }
 
+    /* Large buffered output reduces syscall overhead during pack writes. */
+    (void)setvbuf(dat_f, NULL, _IOFBF, 8u * 1024u * 1024u);
+    (void)setvbuf(idx_f, NULL, _IOFBF, 8u * 1024u * 1024u);
+
     /* Allocate idx entry array (same count as loose objects) */
     pack_idx_disk_entry_t *idx_entries = malloc(loose_cnt * sizeof(*idx_entries));
     if (!idx_entries) {
@@ -361,6 +461,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         unlink(dat_tmp); unlink(idx_tmp);
         free(hashes); return ERR_NOMEM;
     }
+
+    uint8_t *cpayload = NULL;
+    size_t cpayload_cap = 0;
 
     /* Write dat header (count filled in after we know the real total) */
     pack_dat_hdr_t dat_hdr = { PACK_DAT_MAGIC, PACK_VERSION, 0 };
@@ -372,28 +475,45 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     for (size_t i = 0; i < loose_cnt; i++) {
         const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
 
+        if (show_progress && pack_tick_due(&next_tick)) {
+            double sec = pack_elapsed_sec(&started_at);
+            double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "pack: writing %zu/%zu (%.1f MiB/s)",
+                     i, loose_cnt, pack_bps_to_mib(bps));
+            pack_line_set(line);
+        }
+
         /* Build loose file path */
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
         char loose_path[PATH_MAX];
-        snprintf(loose_path, sizeof(loose_path),
-                 "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2);
+        if (path_fmt(loose_path, sizeof(loose_path),
+                     "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
+            st = ERR_IO; goto cleanup;
+        }
 
-        FILE *lf = fopen(loose_path, "rb");
-        if (!lf) continue;   /* may have been deleted by concurrent GC — skip */
+        int lfd = open(loose_path, O_RDONLY);
+        if (lfd == -1) continue;   /* may have been deleted by concurrent GC — skip */
 
         /* Read loose object header */
         object_header_t lhdr;
-        if (fread(&lhdr, sizeof(lhdr), 1, lf) != 1) { fclose(lf); continue; }
+        if (read_full_fd(lfd, &lhdr, sizeof(lhdr)) != 0) { close(lfd); continue; }
 
-        /* Read compressed payload */
-        char *cpayload = malloc(lhdr.compressed_size);
-        if (!cpayload) { fclose(lf); st = ERR_NOMEM; goto cleanup; }
-        if (fread(cpayload, 1, (size_t)lhdr.compressed_size, lf)
-                != (size_t)lhdr.compressed_size) {
-            free(cpayload); fclose(lf); st = ERR_CORRUPT; goto cleanup;
+        if ((size_t)lhdr.compressed_size > cpayload_cap) {
+            size_t nc = (size_t)lhdr.compressed_size;
+            uint8_t *tmp = realloc(cpayload, nc);
+            if (!tmp) { close(lfd); st = ERR_NOMEM; goto cleanup; }
+            cpayload = tmp;
+            cpayload_cap = nc;
         }
-        fclose(lf);
+        if (read_full_fd(lfd, cpayload, (size_t)lhdr.compressed_size) != 0) {
+            close(lfd);
+            st = ERR_CORRUPT;
+            goto cleanup;
+        }
+        close(lfd);
 
         /* Record idx entry pointing at start of this dat entry */
         memcpy(idx_entries[packed].hash, hash, OBJECT_HASH_SIZE);
@@ -411,11 +531,21 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1 ||
             fwrite(cpayload, 1, (size_t)lhdr.compressed_size, dat_f)
                 != (size_t)lhdr.compressed_size) {
-            free(cpayload); st = ERR_IO; goto cleanup;
+            st = ERR_IO; goto cleanup;
         }
-        free(cpayload);
 
         dat_body_offset += sizeof(ehdr) + (uint64_t)lhdr.compressed_size;
+        processed_payload_bytes += (uint64_t)lhdr.compressed_size;
+    }
+
+    if (show_progress) {
+        double sec = pack_elapsed_sec(&started_at);
+        double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
+        char line[128];
+        snprintf(line, sizeof(line), "pack: writing %zu/%zu (%.1f MiB/s)",
+                 loose_cnt, loose_cnt, pack_bps_to_mib(bps));
+        pack_line_set(line);
+        pack_line_clear();
     }
 
     /* Patch the object count into the dat header */
@@ -440,10 +570,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     /* Atomically install both files */
     {
         char dat_final[PATH_MAX], idx_final[PATH_MAX];
-        snprintf(dat_final, sizeof(dat_final), "%s/packs/pack-%08u.dat",
-                 repo_path(repo), pack_num);
-        snprintf(idx_final, sizeof(idx_final), "%s/packs/pack-%08u.idx",
-                 repo_path(repo), pack_num);
+        if (path_fmt(dat_final, sizeof(dat_final), "%s/packs/pack-%08u.dat",
+                     repo_path(repo), pack_num) != 0 ||
+            path_fmt(idx_final, sizeof(idx_final), "%s/packs/pack-%08u.idx",
+                     repo_path(repo), pack_num) != 0) {
+            st = ERR_IO; goto cleanup;
+        }
         if (rename(dat_tmp, dat_final) != 0 ||
             rename(idx_tmp, idx_final) != 0) {
             st = ERR_IO; goto cleanup;
@@ -458,8 +590,10 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(idx_entries[i].hash, hex);
         char loose_path[PATH_MAX];
-        snprintf(loose_path, sizeof(loose_path),
-                 "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2);
+        if (path_fmt(loose_path, sizeof(loose_path),
+                     "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
+            st = ERR_IO; goto cleanup;
+        }
         unlink(loose_path);
     }
 
@@ -467,6 +601,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pack_cache_invalidate(repo);
 
     free(idx_entries);
+    free(cpayload);
     free(hashes);
 
     {
@@ -479,11 +614,13 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     return OK;
 
 cleanup:
+    if (show_progress) pack_line_clear();
     if (dat_f) fclose(dat_f);
     if (idx_f) fclose(idx_f);
     unlink(dat_tmp);
     unlink(idx_tmp);
     free(idx_entries);
+    free(cpayload);
     free(hashes);
     return st;
 }
@@ -500,6 +637,9 @@ status_t pack_gc(repo_t *repo,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
     uint32_t total_kept = 0, total_deleted = 0;
+    int show_progress = pack_progress_enabled();
+    struct timespec next_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
     int pack_dirfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
     if (pack_dirfd == -1) {
@@ -517,19 +657,29 @@ status_t pack_gc(repo_t *repo,
     struct dirent *de;
     while ((de = readdir(dir)) != NULL && npack < 4096) {
         uint32_t n;
-        if (sscanf(de->d_name, "pack-%08u.dat", &n) == 1)
+        int end = 0;
+        if (sscanf(de->d_name, "pack-%08u.dat%n", &n, &end) == 1 &&
+            de->d_name[end] == '\0')
             pack_nums[npack++] = n;
     }
     closedir(dir);   /* closes pack_dirfd too */
 
     for (uint32_t pi = 0; pi < npack; pi++) {
+        if (show_progress && pack_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "pack-gc: processing packs %u/%u", pi, npack);
+            pack_line_set(line);
+        }
         uint32_t pnum = pack_nums[pi];
 
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-                 repo_path(repo), pnum);
-        snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx",
-                 repo_path(repo), pnum);
+        if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
+                     repo_path(repo), pnum) != 0 ||
+            path_fmt(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx",
+                     repo_path(repo), pnum) != 0) {
+            continue;
+        }
 
         /* Read idx to learn entry count and offsets */
         FILE *idxf = fopen(idx_path, "rb");
@@ -573,10 +723,13 @@ status_t pack_gc(repo_t *repo,
 
         /* Partial rewrite: copy live entries into new tmp dat+idx */
         char dat_tmp[PATH_MAX], idx_tmp[PATH_MAX];
-        snprintf(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX",
-                 repo_path(repo));
-        snprintf(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
-                 repo_path(repo));
+        if (path_fmt(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX",
+                     repo_path(repo)) != 0 ||
+            path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
+                     repo_path(repo)) != 0) {
+            free(disk_idx);
+            return ERR_IO;
+        }
 
         int new_dat_fd = mkstemp(dat_tmp);
         int new_idx_fd = mkstemp(idx_tmp);
@@ -693,7 +846,14 @@ pack_fail:
         unlink(dat_tmp);
         unlink(idx_tmp);
         free(disk_idx);
-        return st;
+            return st;
+    }
+
+    if (show_progress) {
+        char line[128];
+        snprintf(line, sizeof(line), "pack-gc: processing packs %u/%u", npack, npack);
+        pack_line_set(line);
+        pack_line_clear();
     }
 
     /* All packs processed — invalidate cache so next lookup is fresh */

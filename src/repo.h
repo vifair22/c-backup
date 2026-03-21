@@ -23,8 +23,8 @@ void  *repo_pack_cache_data(const repo_t *repo);
 size_t repo_pack_cache_count(const repo_t *repo);
 
 /*
- * Exclusive lock — held during all write operations (run, prune, gc, pack,
- * checkpoint).  Fails immediately (ERR_IO) if another writer holds the lock.
+ * Exclusive lock — held during all write operations (run, prune, gc, pack).
+ * Fails immediately (ERR_IO) if another writer holds the lock.
  * The lock is released automatically by repo_close().
  */
 status_t repo_lock(repo_t *repo);

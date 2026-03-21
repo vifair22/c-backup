@@ -18,10 +18,8 @@
  * After each backup run, gfs_run():
  *   1. Detects which boundaries were crossed by the new snapshot
  *   2. Flags the appropriate snap(s) with GFS tier bits
- *   3. Prunes non-GFS snaps outside the rev retention window
- *   4. Deletes revs that satisfy BOTH: older than oldest GFS anchor
- *      AND outside the rev retention window
- *   5. Runs GC to reclaim objects no longer referenced
+ *   3. Prunes non-GFS snaps outside the snapshot retention window
+ *   4. Runs GC to reclaim objects no longer referenced
  */
 
 /* Working record for a single snapshot during GFS processing */
@@ -38,12 +36,6 @@ typedef struct {
  */
 status_t gfs_run(repo_t *repo, const policy_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet);
-
-/*
- * Synthesise a .snap for snap_id (if missing) then OR gfs_flags into it.
- * Verifies the snap loads correctly before returning OK.
- */
-status_t snapshot_synthesize_gfs(repo_t *repo, uint32_t snap_id, uint32_t gfs_flags);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);

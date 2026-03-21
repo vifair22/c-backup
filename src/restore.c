@@ -2,7 +2,6 @@
 #define _GNU_SOURCE
 #include "restore.h"
 #include "snapshot.h"
-#include "reverse.h"
 #include "object.h"
 #include "../vendor/log.h"
 
@@ -19,7 +18,7 @@
 #include <unistd.h>
 #include <acl/libacl.h>
 #include <sys/xattr.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 static void restore_fmt_bytes(uint64_t n, char *buf, size_t sz) {
     if      (n >= (uint64_t)1024*1024*1024)
@@ -172,6 +171,12 @@ static int path_is_safe(const char *rel) {
     return 1;
 }
 
+static int join_dest_path(char *out, size_t out_sz,
+                          const char *dest_path, const char *rel_path) {
+    int n = snprintf(out, out_sz, "%s/%s", dest_path, rel_path);
+    return (n >= 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
 /* Returns count of non-fatal metadata failures (permissions, ACL, xattr).
  * These are expected when not running as root and do not abort the restore. */
 static int apply_metadata(const char *full, const node_t *nd,
@@ -228,69 +233,71 @@ static int apply_metadata(const char *full, const node_t *nd,
 /* Core restore                                                        */
 /* ------------------------------------------------------------------ */
 
-static status_t do_restore(repo_t *repo, const snapshot_t *snap,
-                           const char *dest_path) {
-    snap_paths_t sp = {0};
-    status_t st = snap_paths_build(snap, &sp);
-    if (st != OK) return st;
+typedef struct {
+    const char *path;
+    const node_t *node;
+    uint64_t node_id;
+} restore_entry_t;
 
-    if (mkdir(dest_path, 0755) == -1 && errno != EEXIST) {
-        snap_paths_free(&sp); return ERR_IO;
-    }
+typedef struct {
+    uint32_t files;
+    uint64_t bytes;
+    uint32_t warns;
+} restore_stats_t;
 
-    /* ---- Pass 1: directories — multi-pass so parents always exist first ---- */
-    {
-        int progress = 1;
-        while (progress) {
-            progress = 0;
-            for (uint32_t i = 0; i < sp.count; i++) {
-                const snap_pe_t *pe = &sp.entries[i];
-                if (!pe->node || pe->node->type != NODE_TYPE_DIR) continue;
-                if (!path_is_safe(pe->path)) {
-                    log_msg("ERROR", "unsafe path in snapshot - skipping");
-                    continue;
-                }
-                char full[PATH_MAX];
-                snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-                if (mkdir(full, 0700) == 0) progress = 1;
-                else if (errno != EEXIST && errno != ENOENT) {
-                    st = ERR_IO; goto done;
-                }
+static status_t restore_make_dirs(const restore_entry_t *entries, uint32_t count,
+                                  const char *dest_path) {
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const restore_entry_t *e = &entries[i];
+            if (!e->node || e->node->type != NODE_TYPE_DIR) continue;
+            if (!path_is_safe(e->path)) {
+                log_msg("ERROR", "unsafe path in snapshot - skipping");
+                continue;
             }
+            char full[PATH_MAX];
+            if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
+                return ERR_IO;
+            if (mkdir(full, 0700) == 0) progress = 1;
+            else if (errno != EEXIST && errno != ENOENT) return ERR_IO;
         }
     }
+    return OK;
+}
 
-    /* ---- Pass 2: regular files, symlinks, special files ---- */
-    /* Track node_id -> first created absolute path for hard link detection */
+static status_t restore_materialize_nodes(repo_t *repo,
+                                          const restore_entry_t *entries,
+                                          uint32_t count,
+                                          const char *dest_path,
+                                          restore_stats_t *stats) {
     typedef struct { uint64_t node_id; char path[PATH_MAX]; } nl_entry_t;
-    nl_entry_t *nl_map = calloc(sp.count, sizeof(nl_entry_t));
-    uint32_t    nl_cnt  = 0;
-    if (!nl_map) { st = ERR_NOMEM; goto done; }
-    uint32_t restore_files = 0;
-    uint64_t restore_bytes = 0;
-    uint32_t warn_count    = 0;
+    nl_entry_t *nl_map = calloc(count, sizeof(nl_entry_t));
+    uint32_t nl_cnt = 0;
+    if (!nl_map) return ERR_NOMEM;
 
-    for (uint32_t i = 0; i < sp.count; i++) {
-        const snap_pe_t *pe = &sp.entries[i];
-        if (!pe->node || pe->node->type == NODE_TYPE_DIR) continue;
-        if (!path_is_safe(pe->path)) continue;
+    for (uint32_t i = 0; i < count; i++) {
+        const restore_entry_t *e = &entries[i];
+        if (!e->node || e->node->type == NODE_TYPE_DIR) continue;
+        if (!path_is_safe(e->path)) continue;
 
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-        const node_t *nd = pe->node;
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
+            free(nl_map);
+            return ERR_IO;
+        }
+        const node_t *nd = e->node;
 
-        /* Hard link: same node_id seen before — use link() */
         const char *hl_src = NULL;
         for (uint32_t k = 0; k < nl_cnt; k++) {
-            if (nl_map[k].node_id == pe->node_id) { hl_src = nl_map[k].path; break; }
+            if (nl_map[k].node_id == e->node_id) { hl_src = nl_map[k].path; break; }
         }
         if (hl_src) {
             if (link(hl_src, full) == -1 && errno != EEXIST) {
                 log_msg("WARN", "hard link failed; falling through to copy");
-                /* fall through to normal creation below */
             } else {
-                /* record and move on */
-                nl_map[nl_cnt].node_id = pe->node_id;
+                nl_map[nl_cnt].node_id = e->node_id;
                 snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
                 nl_cnt++;
                 continue;
@@ -300,27 +307,21 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         switch (nd->type) {
         case NODE_TYPE_REG: {
             int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd == -1) { free(nl_map); st = ERR_IO; goto done; }
+            if (fd == -1) { free(nl_map); return ERR_IO; }
             if (!hash_is_zero(nd->content_hash)) {
-                void *data = NULL; size_t len = 0;
-                uint8_t obj_type = 0;
+                void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
                 if (object_load(repo, nd->content_hash, &data, &len, &obj_type) != OK) {
-                    close(fd); free(nl_map); st = ERR_IO; goto done;
+                    close(fd); free(nl_map); return ERR_IO;
                 }
-                if (obj_type == OBJECT_TYPE_SPARSE &&
-                    len >= sizeof(sparse_hdr_t)) {
-                    /* sparse payload: [sparse_hdr][regions][data bytes] */
+                if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
                     const uint8_t *sp_p = (const uint8_t *)data;
                     sparse_hdr_t shdr;
                     memcpy(&shdr, sp_p, sizeof(shdr));
                     sp_p += sizeof(shdr);
                     if (shdr.magic == SPARSE_MAGIC &&
-                        len >= sizeof(sparse_hdr_t) +
-                               shdr.region_count * sizeof(sparse_region_t)) {
-                        /* ftruncate creates the holes */
+                        len >= sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
                         (void)ftruncate(fd, (off_t)nd->size);
-                        const sparse_region_t *rgns =
-                            (const sparse_region_t *)sp_p;
+                        const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
                         sp_p += shdr.region_count * sizeof(sparse_region_t);
                         const uint8_t *dptr = sp_p;
                         for (uint32_t r = 0; r < shdr.region_count; r++) {
@@ -335,20 +336,19 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
                     }
                 } else {
                     if (len > 0 && write(fd, data, len) != (ssize_t)len) {
-                        free(data); close(fd); free(nl_map); st = ERR_IO; goto done;
+                        free(data); close(fd); free(nl_map); return ERR_IO;
                     }
                 }
                 free(data);
             }
             if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                close(fd); free(nl_map); st = ERR_IO; goto done;
+                close(fd); free(nl_map); return ERR_IO;
             }
             fsync(fd);
             close(fd);
-            restore_files++;
-            restore_bytes += nd->size;
-            /* record this node_id -> path */
-            nl_map[nl_cnt].node_id = pe->node_id;
+            stats->files++;
+            stats->bytes += nd->size;
+            nl_map[nl_cnt].node_id = e->node_id;
             snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
             nl_cnt++;
             break;
@@ -360,9 +360,9 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
             unlink(full);
             if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
                 fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
+                stats->warns++;
             } else {
-                restore_files++;
+                stats->files++;
             }
             free(tdata);
             break;
@@ -370,9 +370,9 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         case NODE_TYPE_FIFO:
             if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
                 fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
+                stats->warns++;
             } else {
-                restore_files++;
+                stats->files++;
             }
             break;
         case NODE_TYPE_CHR:
@@ -381,58 +381,107 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
             mode_t m  = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
             if (mknod(full, m, dev) == -1 && errno != EEXIST) {
                 fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
+                stats->warns++;
             } else {
-                restore_files++;
+                stats->files++;
             }
             break;
         }
         default: break;
         }
     }
+
     free(nl_map);
+    return OK;
+}
+
+static status_t restore_apply_metadata_pass(repo_t *repo,
+                                            const restore_entry_t *entries,
+                                            uint32_t count,
+                                            const char *dest_path,
+                                            const node_t *root_dir_meta,
+                                            restore_stats_t *stats) {
+    for (uint32_t i = 0; i < count; i++) {
+        const restore_entry_t *e = &entries[i];
+        if (!e->node || e->node->type == NODE_TYPE_DIR) continue;
+        if (!path_is_safe(e->path)) continue;
+        char full[PATH_MAX];
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
+            return ERR_IO;
+        stats->warns += (uint32_t)apply_metadata(full, e->node, repo,
+                                                 e->node->type == NODE_TYPE_SYMLINK);
+    }
+    for (uint32_t i = count; i-- > 0;) {
+        const restore_entry_t *e = &entries[i];
+        if (!e->node || e->node->type != NODE_TYPE_DIR) continue;
+        if (!path_is_safe(e->path)) continue;
+        char full[PATH_MAX];
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
+            return ERR_IO;
+        stats->warns += (uint32_t)apply_metadata(full, e->node, repo, 0);
+    }
+    if (root_dir_meta)
+        stats->warns += (uint32_t)apply_metadata(dest_path, root_dir_meta, repo, 0);
+    return OK;
+}
+
+static status_t restore_entries(repo_t *repo,
+                                const restore_entry_t *entries,
+                                uint32_t count,
+                                const char *dest_path,
+                                const node_t *root_dir_meta) {
+    if (mkdir(dest_path, 0755) == -1 && errno != EEXIST)
+        return ERR_IO;
+
+    restore_stats_t stats = {0};
+    status_t st = restore_make_dirs(entries, count, dest_path);
+    if (st != OK) return st;
+
+    st = restore_materialize_nodes(repo, entries, count, dest_path, &stats);
+    if (st != OK) return st;
+
     {
         char sz[32];
-        restore_fmt_bytes(restore_bytes, sz, sizeof(sz));
-        fprintf(stderr, "restored: %u file(s)  %s\n", restore_files, sz);
+        restore_fmt_bytes(stats.bytes, sz, sizeof(sz));
+        fprintf(stderr, "restored: %u file(s)  %s\n", stats.files, sz);
     }
 
-    /* ---- Pass 3: metadata (ownership, perms, xattrs, ACLs, timestamps)
-     *              Apply to non-dirs first, then dirs in reverse order
-     *              so parent dir timestamps are set after their children.  ---- */
-    for (uint32_t i = 0; i < sp.count; i++) {
-        const snap_pe_t *pe = &sp.entries[i];
-        if (!pe->node || pe->node->type == NODE_TYPE_DIR) continue;
-        if (!path_is_safe(pe->path)) continue;
-        char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-        warn_count += (uint32_t)apply_metadata(full, pe->node, repo, pe->node->type == NODE_TYPE_SYMLINK);
-    }
-    /* dirs in reverse DFS order (leaves before roots) */
-    for (uint32_t i = sp.count; i-- > 0;) {
-        const snap_pe_t *pe = &sp.entries[i];
-        if (!pe->node || pe->node->type != NODE_TYPE_DIR) continue;
-        if (!path_is_safe(pe->path)) continue;
-        char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, pe->path);
-        warn_count += (uint32_t)apply_metadata(full, pe->node, repo, 0);
-    }
-    /* set metadata on dest_path root if the snapshot has a root-level dir node */
-    for (uint32_t i = 0; i < sp.count; i++) {
-        const snap_pe_t *pe = &sp.entries[i];
-        if (pe->node && pe->node->type == NODE_TYPE_DIR &&
-            strchr(pe->path, '/') == NULL) {
-            /* top-level entry — apply metadata to dest_path */
-            warn_count += (uint32_t)apply_metadata(dest_path, pe->node, repo, 0);
-            break;
-        }
-    }
-    if (warn_count > 0)
+    st = restore_apply_metadata_pass(repo, entries, count, dest_path, root_dir_meta, &stats);
+    if (st != OK) return st;
+
+    if (stats.warns > 0)
         fprintf(stderr, "warn: %u metadata/special-file error(s) — "
                 "ownership, permissions, xattrs, and/or special files may be incomplete "
-                "(try running as root)\n", warn_count);
+                "(try running as root)\n", stats.warns);
+    return OK;
+}
 
-done:
+static status_t do_restore(repo_t *repo, const snapshot_t *snap,
+                           const char *dest_path) {
+    snap_paths_t sp = {0};
+    status_t st = snap_paths_build(snap, &sp);
+    if (st != OK) return st;
+
+    restore_entry_t *entries = calloc(sp.count ? sp.count : 1, sizeof(*entries));
+    if (!entries) {
+        snap_paths_free(&sp);
+        return ERR_NOMEM;
+    }
+
+    const node_t *root_dir_meta = NULL;
+    for (uint32_t i = 0; i < sp.count; i++) {
+        entries[i].path = sp.entries[i].path;
+        entries[i].node = sp.entries[i].node;
+        entries[i].node_id = sp.entries[i].node_id;
+        if (!root_dir_meta && sp.entries[i].node &&
+            sp.entries[i].node->type == NODE_TYPE_DIR &&
+            strchr(sp.entries[i].path, '/') == NULL) {
+            root_dir_meta = sp.entries[i].node;
+        }
+    }
+
+    st = restore_entries(repo, entries, sp.count, dest_path, root_dir_meta);
+    free(entries);
     snap_paths_free(&sp);
     return st;
 }
@@ -461,355 +510,47 @@ status_t restore_snapshot(repo_t *repo, uint32_t snap_id, const char *dest_path)
     return st;
 }
 
-/*
- * Historical restore: reconstruct a past snapshot by walking backwards
- * through reverse records from HEAD down to target+1, then restore the
- * resulting state.
- *
- * Each reverse record for snapshot N describes how to undo N:
- *   REV_OP_REMOVE  — path was CREATED in N     → delete from working set
- *   REV_OP_RESTORE — path was MODIFIED in N    → replace with prev_node
- *   REV_OP_META    — metadata changed in N      → replace metadata fields
- */
-
-static int ws_find(ws_entry_t *ws, uint32_t n, const char *path) {
-    for (uint32_t i = 0; i < n; i++)
-        if (ws[i].path && strcmp(ws[i].path, path) == 0) return (int)i;
-    return -1;
-}
-
-/* Restore from a flat working-set rather than a snapshot_t.
- * We need to derive a path → node mapping and restore in the same
- * three-pass order (dirs → files → metadata in reverse).              */
-static status_t do_restore_ws(repo_t *repo,
-                               ws_entry_t *ws, uint32_t ws_cnt,
-                               const char *dest_path) {
-    if (mkdir(dest_path, 0755) == -1 && errno != EEXIST)
-        return ERR_IO;
-
-    status_t st = OK;
-
-    /* Pass 1: directories (sort by path depth so parents come first) */
-    /* Simple approach: iterate repeatedly until no new dirs created.
-     * For typical tree depths this converges in O(depth) passes.      */
-    int progress = 1;
-    while (progress) {
-        progress = 0;
-        for (uint32_t i = 0; i < ws_cnt; i++) {
-            if (!ws[i].path || ws[i].node.type != NODE_TYPE_DIR) continue;
-            if (!path_is_safe(ws[i].path)) continue;
-            char full[PATH_MAX];
-            snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-            if (mkdir(full, 0700) == 0) progress = 1;
-            else if (errno != EEXIST && errno != ENOENT) { st = ERR_IO; return st; }
-        }
-    }
-
-    /* Pass 2: non-directory files.  Reuse snap_pe_t logic via inline. */
-    typedef struct { uint64_t node_id; char path[PATH_MAX]; } nl_t;
-    nl_t *nl_map = calloc(ws_cnt, sizeof(nl_t));
-    uint32_t nl_cnt = 0;
-    if (!nl_map) return ERR_NOMEM;
-    uint32_t ws_restore_files = 0;
-    uint64_t ws_restore_bytes = 0;
-    uint32_t warn_count       = 0;
-
-    for (uint32_t i = 0; i < ws_cnt; i++) {
-        if (!ws[i].path || ws[i].node.type == NODE_TYPE_DIR) continue;
-        if (!path_is_safe(ws[i].path)) continue;
-        char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-        const node_t *nd = &ws[i].node;
-
-        /* Hard link? */
-        const char *hl_src = NULL;
-        for (uint32_t k = 0; k < nl_cnt; k++) {
-            if (nl_map[k].node_id == nd->node_id) { hl_src = nl_map[k].path; break; }
-        }
-        if (hl_src) {
-            if (link(hl_src, full) == -1 && errno != EEXIST)
-                log_msg("WARN", "hard link failed in historical restore");
-            else {
-                nl_map[nl_cnt].node_id = nd->node_id;
-                snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
-                nl_cnt++;
-            }
-            continue;
-        }
-
-        switch (nd->type) {
-        case NODE_TYPE_REG: {
-            int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd == -1) { free(nl_map); return ERR_IO; }
-            if (!hash_is_zero(nd->content_hash)) {
-                void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
-                if (object_load(repo, nd->content_hash, &data, &len, &obj_type) != OK) {
-                    close(fd); free(nl_map); return ERR_IO;
-                }
-                if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
-                    const uint8_t *sp_p = (const uint8_t *)data;
-                    sparse_hdr_t shdr; memcpy(&shdr, sp_p, sizeof(shdr)); sp_p += sizeof(shdr);
-                    if (shdr.magic == SPARSE_MAGIC &&
-                        len >= sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
-                        (void)ftruncate(fd, (off_t)nd->size);
-                        const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
-                        sp_p += shdr.region_count * sizeof(sparse_region_t);
-                        const uint8_t *dptr = sp_p;
-                        for (uint32_t r = 0; r < shdr.region_count; r++) {
-                            lseek(fd, (off_t)rgns[r].offset, SEEK_SET);
-                            size_t rem = (size_t)rgns[r].length;
-                            while (rem > 0) {
-                                ssize_t w = write(fd, dptr, rem);
-                                if (w <= 0) break;
-                                dptr += w; rem -= (size_t)w;
-                            }
-                        }
-                    }
-                } else {
-                    if (len > 0 && (size_t)write(fd, data, len) != len) {
-                        free(data); close(fd); free(nl_map); return ERR_IO;
-                    }
-                }
-                free(data);
-            }
-            if (nd->size > 0 && ftruncate(fd, (off_t)nd->size) == -1) {
-                close(fd); free(nl_map); return ERR_IO;
-            }
-            fsync(fd); close(fd);
-            ws_restore_files++;
-            ws_restore_bytes += nd->size;
-            nl_map[nl_cnt].node_id = nd->node_id;
-            snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full); nl_cnt++;
-            break;
-        }
-        case NODE_TYPE_SYMLINK: {
-            if (hash_is_zero(nd->content_hash)) break;
-            void *tdata = NULL; size_t tlen = 0;
-            if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
-            unlink(full);
-            if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
-            } else {
-                ws_restore_files++;
-            }
-            free(tdata); break;
-        }
-        case NODE_TYPE_FIFO:
-            if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
-            } else {
-                ws_restore_files++;
-            }
-            break;
-        case NODE_TYPE_CHR:
-        case NODE_TYPE_BLK: {
-            dev_t dev = makedev(nd->device.major, nd->device.minor);
-            mode_t m = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
-            if (mknod(full, m, dev) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
-                warn_count++;
-            } else {
-                ws_restore_files++;
-            }
-            break;
-        }
-        default: break;
-        }
-    }
-    free(nl_map);
-    {
-        char sz[32];
-        restore_fmt_bytes(ws_restore_bytes, sz, sizeof(sz));
-        fprintf(stderr, "restored: %u file(s)  %s\n", ws_restore_files, sz);
-    }
-
-    /* Pass 3: metadata */
-    for (uint32_t i = 0; i < ws_cnt; i++) {
-        if (!ws[i].path || ws[i].node.type == NODE_TYPE_DIR) continue;
-        if (!path_is_safe(ws[i].path)) continue;
-        char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-        warn_count += (uint32_t)apply_metadata(full, &ws[i].node, repo, ws[i].node.type == NODE_TYPE_SYMLINK);
-    }
-    /* dirs in reverse order */
-    for (uint32_t i = ws_cnt; i-- > 0;) {
-        if (!ws[i].path || ws[i].node.type != NODE_TYPE_DIR) continue;
-        if (!path_is_safe(ws[i].path)) continue;
-        char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
-        warn_count += (uint32_t)apply_metadata(full, &ws[i].node, repo, 0);
-    }
-    if (warn_count > 0)
-        fprintf(stderr, "warn: %u metadata/special-file error(s) — "
-                "ownership, permissions, xattrs, and/or special files may be incomplete "
-                "(try running as root)\n", warn_count);
-
-    return st;
-}
-
-/*
- * Build the working set for target_id.
- * Finds the nearest existing snapshot anchor > target_id to minimize
- * the reverse chain walk, falls back to HEAD if none closer exists.
- */
-status_t restore_build_ws(repo_t *repo, uint32_t target_id,
-                           ws_entry_t **out_ws, uint32_t *out_cnt,
-                           uint32_t *out_anchor_id) {
-    uint32_t head_id = 0;
-    if (snapshot_read_head(repo, &head_id) != OK || head_id == 0) {
-        log_msg("ERROR", "cannot read HEAD"); return ERR_IO;
-    }
-    if (target_id >= head_id) {
-        log_msg("ERROR", "target snapshot not found or is HEAD"); return ERR_INVALID;
-    }
-
-    /* Find nearest existing .snap anchor > target_id (minimises chain walk) */
-    uint32_t anchor_id = head_id;
-    for (uint32_t id = target_id + 1; id < head_id; id++) {
-        snapshot_t *probe = NULL;
-        if (snapshot_load(repo, id, &probe) == OK) {
-            snapshot_free(probe);
-            anchor_id = id;
-            break;
-        }
-    }
-
-    /* Load anchor snapshot and convert to mutable working set */
-    snapshot_t *anchor_snap = NULL;
-    if (snapshot_load(repo, anchor_id, &anchor_snap) != OK) {
-        log_msg("ERROR", "cannot load anchor snapshot"); return ERR_IO;
-    }
-
-    pathmap_t *pm = NULL;
-    status_t st = pathmap_build(anchor_snap, &pm);
-    snapshot_free(anchor_snap);
-    if (st != OK) return st;
-
-    uint32_t ws_cap = (uint32_t)(pm->capacity);
-    ws_entry_t *ws = calloc(ws_cap, sizeof(ws_entry_t));
-    if (!ws) { pathmap_free(pm); return ERR_NOMEM; }
-    uint32_t ws_cnt = 0;
-    for (size_t i = 0; i < pm->capacity; i++) {
-        if (!pm->slots[i].key) continue;
-        ws[ws_cnt].path = strdup(pm->slots[i].key);
-        if (!ws[ws_cnt].path) {
-            for (uint32_t k = 0; k < ws_cnt; k++) free(ws[k].path);
-            free(ws); pathmap_free(pm); return ERR_NOMEM;
-        }
-        ws[ws_cnt].node = pm->slots[i].value;
-        ws_cnt++;
-    }
-    pathmap_free(pm);
-
-    /* Apply reverse records from anchor_id down to target_id+1 */
-    for (uint32_t id = anchor_id; id > target_id; id--) {
-        rev_record_t *rev = NULL;
-        if (reverse_load(repo, id, &rev) != OK) continue;
-
-        for (uint32_t j = 0; j < rev->entry_count; j++) {
-            const rev_entry_t *re = &rev->entries[j];
-            int idx = ws_find(ws, ws_cnt, re->path);
-
-            switch (re->op_type) {
-            case REV_OP_REMOVE:
-                if (idx >= 0) { free(ws[idx].path); ws[idx].path = NULL; }
-                break;
-            case REV_OP_RESTORE:
-                if (idx >= 0) {
-                    ws[idx].node = re->prev_node;
-                } else {
-                    if (ws_cnt == ws_cap) {
-                        uint32_t nc = ws_cap * 2;
-                        ws_entry_t *tmp = realloc(ws, nc * sizeof(*ws));
-                        if (!tmp) { reverse_free(rev); st = ERR_NOMEM; goto fail; }
-                        ws = tmp; ws_cap = nc;
-                    }
-                    ws[ws_cnt].path = strdup(re->path);
-                    if (!ws[ws_cnt].path) { reverse_free(rev); st = ERR_NOMEM; goto fail; }
-                    ws[ws_cnt].node = re->prev_node;
-                    ws_cnt++;
-                }
-                break;
-            case REV_OP_META:
-                if (idx >= 0) {
-                    ws[idx].node.mode       = re->prev_node.mode;
-                    ws[idx].node.uid        = re->prev_node.uid;
-                    ws[idx].node.gid        = re->prev_node.gid;
-                    ws[idx].node.mtime_sec  = re->prev_node.mtime_sec;
-                    ws[idx].node.mtime_nsec = re->prev_node.mtime_nsec;
-                    memcpy(ws[idx].node.xattr_hash, re->prev_node.xattr_hash, OBJECT_HASH_SIZE);
-                    memcpy(ws[idx].node.acl_hash,   re->prev_node.acl_hash,   OBJECT_HASH_SIZE);
-                }
-                break;
-            default: break;
-            }
-        }
-        reverse_free(rev);
-    }
-
-    *out_ws       = ws;
-    *out_cnt      = ws_cnt;
-    *out_anchor_id = anchor_id;
-    return OK;
-
-fail:
-    for (uint32_t i = 0; i < ws_cnt; i++) free(ws[i].path);
-    free(ws);
-    return st;
-}
-
-status_t restore_snapshot_at(repo_t *repo, uint32_t target_id, const char *dest_path) {
-    /* Fast path: target snapshot file still exists */
-    snapshot_t *snap = NULL;
-    if (snapshot_load(repo, target_id, &snap) == OK) {
-        status_t st = do_restore(repo, snap, dest_path);
-        snapshot_free(snap);
-        return st;
-    }
-
-    /* Slow path: build working set via reverse chain */
-    ws_entry_t *ws = NULL;
-    uint32_t ws_cnt = 0, anchor_id = 0;
-    status_t st = restore_build_ws(repo, target_id, &ws, &ws_cnt, &anchor_id);
-    if (st != OK) return st;
-
-    fprintf(stderr, "restoring snapshot %u (via reverse chain from %u) -> %s\n",
-            target_id, anchor_id, dest_path);
-
-    st = do_restore_ws(repo, ws, ws_cnt, dest_path);
-
-    for (uint32_t i = 0; i < ws_cnt; i++) free(ws[i].path);
-    free(ws);
-    return st;
-}
+typedef struct {
+    char  *path;
+    node_t node;
+} verify_ws_entry_t;
 
 status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
-                              const char *dest_path) {
-    /* Load or reconstruct working set for this snapshot */
-    ws_entry_t *ws  = NULL;
+                               const char *dest_path) {
+    /* Load snapshot working set */
+    verify_ws_entry_t *ws  = NULL;
     uint32_t    cnt = 0;
 
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) == OK) {
-        pathmap_t *pm = NULL;
-        if (pathmap_build(snap, &pm) != OK) { snapshot_free(snap); return ERR_IO; }
-        snapshot_free(snap);
-        ws = calloc(pm->capacity, sizeof(ws_entry_t));
-        if (!ws) { pathmap_free(pm); return ERR_NOMEM; }
-        for (size_t i = 0; i < pm->capacity; i++) {
-            if (!pm->slots[i].key) continue;
-            ws[cnt].path = strdup(pm->slots[i].key);
-            ws[cnt].node = pm->slots[i].value;
-            cnt++;
-        }
-        pathmap_free(pm);
-    } else {
-        uint32_t anchor = 0;
-        status_t st = restore_build_ws(repo, snap_id, &ws, &cnt, &anchor);
-        if (st != OK) return st;
+    if (snapshot_load(repo, snap_id, &snap) != OK) {
+        return ERR_NOT_FOUND;
     }
+
+    pathmap_t *pm = NULL;
+    if (pathmap_build(snap, &pm) != OK) {
+        snapshot_free(snap);
+        return ERR_IO;
+    }
+    snapshot_free(snap);
+
+    ws = calloc(pm->capacity, sizeof(*ws));
+    if (!ws) {
+        pathmap_free(pm);
+        return ERR_NOMEM;
+    }
+    for (size_t i = 0; i < pm->capacity; i++) {
+        if (!pm->slots[i].key) continue;
+        ws[cnt].path = strdup(pm->slots[i].key);
+        if (!ws[cnt].path) {
+            for (uint32_t j = 0; j < cnt; j++) free(ws[j].path);
+            free(ws);
+            pathmap_free(pm);
+            return ERR_NOMEM;
+        }
+        ws[cnt].node = pm->slots[i].value;
+        cnt++;
+    }
+    pathmap_free(pm);
 
     int errors = 0;
     uint8_t read_hash[OBJECT_HASH_SIZE];
@@ -822,7 +563,10 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
         if (hash_is_zero(ws[i].node.content_hash)) continue;
 
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", dest_path, ws[i].path);
+        if (join_dest_path(full, sizeof(full), dest_path, ws[i].path) != 0) {
+            fprintf(stderr, "verify: path too long: %s\n", ws[i].path);
+            errors++; continue;
+        }
 
         /* Hash the restored file on disk */
         int fd = open(full, O_RDONLY);
@@ -830,14 +574,23 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
             fprintf(stderr, "verify: cannot open %s\n", full);
             errors++; continue;
         }
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+            if (ctx) EVP_MD_CTX_free(ctx);
+            fprintf(stderr, "verify: cannot init digest for %s\n", ws[i].path);
+            errors++; close(fd); continue;
+        }
         uint8_t buf[65536];
         ssize_t nr;
         while ((nr = read(fd, buf, sizeof(buf))) > 0)
-            SHA256_Update(&ctx, buf, (size_t)nr);
+            EVP_DigestUpdate(ctx, buf, (size_t)nr);
         close(fd);
-        SHA256_Final(read_hash, &ctx);
+        if (nr < 0 || EVP_DigestFinal_ex(ctx, read_hash, NULL) != 1) {
+            fprintf(stderr, "verify: cannot hash %s\n", ws[i].path);
+            EVP_MD_CTX_free(ctx);
+            errors++; continue;
+        }
+        EVP_MD_CTX_free(ctx);
 
         /* Compute the expected hash from the stored object.
          * For OBJECT_TYPE_FILE the object payload IS the raw bytes, so
@@ -872,8 +625,14 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
                     (const uint8_t *)obj_data + sizeof(shdr)
                     + shdr.region_count * sizeof(sparse_region_t);
 
-                SHA256_CTX ectx;
-                SHA256_Init(&ectx);
+                EVP_MD_CTX *ectx = EVP_MD_CTX_new();
+                if (!ectx || EVP_DigestInit_ex(ectx, EVP_sha256(), NULL) != 1) {
+                    if (ectx) EVP_MD_CTX_free(ectx);
+                    free(obj_data);
+                    fprintf(stderr, "verify: cannot init expected digest for %s\n", ws[i].path);
+                    errors++;
+                    continue;
+                }
                 uint64_t pos = 0;
                 for (uint32_t r = 0; r < shdr.region_count; r++) {
                     /* zeros covering the hole before this region */
@@ -881,10 +640,10 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
                     while (gap > 0) {
                         uint64_t chunk = gap < sizeof(zero_buf)
                                          ? gap : sizeof(zero_buf);
-                        SHA256_Update(&ectx, zero_buf, (size_t)chunk);
+                        EVP_DigestUpdate(ectx, zero_buf, (size_t)chunk);
                         gap -= chunk; pos += chunk;
                     }
-                    SHA256_Update(&ectx, rdata, (size_t)rgns[r].length);
+                    EVP_DigestUpdate(ectx, rdata, (size_t)rgns[r].length);
                     rdata += rgns[r].length;
                     pos   += rgns[r].length;
                 }
@@ -893,10 +652,17 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
                 while (tail > 0) {
                     uint64_t chunk = tail < sizeof(zero_buf)
                                      ? tail : sizeof(zero_buf);
-                    SHA256_Update(&ectx, zero_buf, (size_t)chunk);
+                    EVP_DigestUpdate(ectx, zero_buf, (size_t)chunk);
                     tail -= chunk;
                 }
-                SHA256_Final(expected_hash, &ectx);
+                if (EVP_DigestFinal_ex(ectx, expected_hash, NULL) != 1) {
+                    EVP_MD_CTX_free(ectx);
+                    free(obj_data);
+                    fprintf(stderr, "verify: cannot finalize expected digest for %s\n", ws[i].path);
+                    errors++;
+                    continue;
+                }
+                EVP_MD_CTX_free(ectx);
             }
         }
         free(obj_data);
@@ -921,7 +687,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
 /* Recursively create parent directories for dest_path/rel_path. */
 static void makedirs_for(const char *dest_path, const char *rel_path) {
     char buf[PATH_MAX];
-    snprintf(buf, sizeof(buf), "%s/%s", dest_path, rel_path);
+    if (join_dest_path(buf, sizeof(buf), dest_path, rel_path) != 0) return;
     char *last = strrchr(buf, '/');
     if (!last) return;
     *last = '\0';
@@ -1062,7 +828,7 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
     }
 #undef MATCHES
 
-    snapshot_t synth = {
+    snapshot_t subset = {
         .snap_id         = snap_id,
         .node_count      = n_nodes,
         .nodes           = nodes,
@@ -1071,7 +837,7 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
         .dirent_data_len = dirent_sz,
     };
 
-    st = do_restore(repo, &synth, dest_path);
+    st = do_restore(repo, &subset, dest_path);
 
     free(dirent_data);
     free(node_ids);
