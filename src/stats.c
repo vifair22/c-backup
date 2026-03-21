@@ -35,6 +35,18 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
 
     snapshot_read_head(repo, &out->snap_total);
 
+    if (out->snap_total > 0) {
+        snapshot_t *head = NULL;
+        if (snapshot_load(repo, out->snap_total, &head) == OK) {
+            out->head_entries = head->node_count;
+            for (uint32_t i = 0; i < head->node_count; i++) {
+                if (head->nodes[i].type == NODE_TYPE_REG)
+                    out->head_logical_bytes += head->nodes[i].size;
+            }
+            snapshot_free(head);
+        }
+    }
+
     /* Snapshots */
     {
         char dir[PATH_MAX];
@@ -109,19 +121,22 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
 
 void repo_stats_print(const repo_stat_t *s) {
     char buf[32];
-    printf("snapshots:       %u present", s->snap_count);
+    printf("snapshots:             %u present", s->snap_count);
     if (s->snap_total > 0) printf(" / %u total (HEAD)", s->snap_total);
     printf("\n");
 
+    fmt_bytes(s->head_logical_bytes, buf, sizeof(buf));
+    printf("head logical size:     %s  (%u entries)\n", buf, s->head_entries);
+
     fmt_bytes(s->snap_bytes, buf, sizeof(buf));
-    printf("manifests:       %u  (%s)\n", s->snap_count, buf);
+    printf("manifests physical:    %u  (%s)\n", s->snap_count, buf);
 
     fmt_bytes(s->loose_bytes, buf, sizeof(buf));
-    printf("loose objects:   %u  (%s)\n", s->loose_objects, buf);
+    printf("loose objects physical: %u  (%s)\n", s->loose_objects, buf);
 
     fmt_bytes(s->pack_bytes, buf, sizeof(buf));
-    printf("pack files:      %u  (%s)\n", s->pack_files, buf);
+    printf("pack files physical:   %u  (%s)\n", s->pack_files, buf);
 
     fmt_bytes(s->total_bytes, buf, sizeof(buf));
-    printf("total repo size: %s\n", buf);
+    printf("repo physical total:   %s\n", buf);
 }

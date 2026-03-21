@@ -157,7 +157,7 @@ Overrides at runtime:
 ```bash
 backup run --repo /mnt/backup/repo \
   --path /home/alice --exclude "*.cache" \
-  --no-pack --no-gc --verify-after --verbose
+  --verify-after --verbose
 ```
 
 Behavior summary:
@@ -172,6 +172,7 @@ Behavior summary:
 ```bash
 backup list --repo /mnt/backup/repo
 backup list --repo /mnt/backup/repo --simple
+backup list --repo /mnt/backup/repo --json
 ```
 
 Full table columns:
@@ -229,6 +230,7 @@ backup gc --repo /mnt/backup/repo
 backup pack --repo /mnt/backup/repo
 backup verify --repo /mnt/backup/repo
 backup stats --repo /mnt/backup/repo
+backup stats --repo /mnt/backup/repo --json
 ```
 
 ## 5.10 Tags
@@ -409,3 +411,16 @@ Tag files in `tags/` store:
 - Test restores regularly to a separate destination.
 - Prefer `--dry-run` before changing retention in production.
 - Use `verify_after=true` where write-integrity assurance matters more than runtime cost.
+
+---
+
+## 12) Performance tuning knobs
+
+- `CBACKUP_STORE_THREADS=<N>` controls parallel content-store workers in `backup run`.
+  - Default: detected CPU count
+  - Useful when source data sits on fast storage and hashing/compression is CPU-bound.
+- Pack GC includes automatic small-pack coalescing heuristics.
+  - Triggered when pack count grows large or small-pack ratio rises.
+  - Rewrite budget is capped to avoid long post-backup stalls.
+  - A snapshot-gap cooldown avoids coalescing every run.
+- For automation or dashboards, prefer `backup list --json` and `backup stats --json`.

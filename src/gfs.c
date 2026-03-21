@@ -190,7 +190,8 @@ static uint32_t find_daily_candidate(const gfs_snap_info_t *snaps, uint32_t n,
 /* ------------------------------------------------------------------ */
 
 status_t gfs_run(repo_t *repo, const policy_t *policy,
-                 uint32_t new_snap_id, int dry_run, int quiet) {
+                 uint32_t new_snap_id, int dry_run, int quiet,
+                 int run_gc) {
     if (new_snap_id == 0) return OK;
 
     /* Load all surviving snap metadata */
@@ -300,8 +301,10 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
     free(tier_expired);
     free(snaps);
 
-    /* Step 4: GC */
-    if (!dry_run)
+    /* Step 4: GC
+     * - Always for manual prune (run_gc=1)
+     * - For post-backup retention, only when snapshots were actually pruned */
+    if (!dry_run && (run_gc || pruned_snaps > 0))
         st = repo_gc(repo, NULL, NULL);
 
     return st;

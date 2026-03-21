@@ -102,9 +102,10 @@ static void test_repo_stats_counts_and_print(void **state) {
     char *out = capture_stats_output(&sp);
     assert_non_null(out);
     assert_non_null(strstr(out, "snapshots:"));
-    assert_non_null(strstr(out, "loose objects:"));
-    assert_non_null(strstr(out, "pack files:"));
-    assert_non_null(strstr(out, "total repo size:"));
+    assert_non_null(strstr(out, "head logical size:"));
+    assert_non_null(strstr(out, "loose objects physical:"));
+    assert_non_null(strstr(out, "pack files physical:"));
+    assert_non_null(strstr(out, "repo physical total:"));
     free(out);
 }
 

@@ -7,6 +7,8 @@
 typedef struct {
     uint32_t snap_count;       /* .snap files present */
     uint32_t snap_total;       /* highest snapshot ID (HEAD) */
+    uint32_t head_entries;     /* entries in HEAD manifest */
+    uint64_t head_logical_bytes; /* sum of regular-file sizes in HEAD */
     uint64_t snap_bytes;
     uint32_t loose_objects;
     uint64_t loose_bytes;

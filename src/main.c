@@ -166,6 +166,24 @@ static void fmt_bytes_short(uint64_t n, char *buf, size_t sz) {
         snprintf(buf, sz, "%lluB", (unsigned long long)n);
 }
 
+static void json_print_escaped(const char *s) {
+    if (!s) return;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '\\': fputs("\\\\", stdout); break;
+            case '"': fputs("\\\"", stdout); break;
+            case '\b': fputs("\\b", stdout); break;
+            case '\f': fputs("\\f", stdout); break;
+            case '\n': fputs("\\n", stdout); break;
+            case '\r': fputs("\\r", stdout); break;
+            case '\t': fputs("\\t", stdout); break;
+            default:
+                if (*p < 0x20) printf("\\u%04x", (unsigned)*p);
+                else fputc(*p, stdout);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Shared helpers                                                      */
 /* ------------------------------------------------------------------ */
@@ -230,9 +248,8 @@ static void usage(void) {
         "  backup policy   --repo <path> set [policy options]\n"
         "  backup policy   --repo <path> edit\n"
         "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
-        "                               [--no-gc]\n"
         "                               [--no-policy] [--quiet] [--verbose] [--verify-after]\n"
-        "  backup list     --repo <path> [--simple]\n"
+        "  backup list     --repo <path> [--simple] [--json]\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
         "  backup restore  --repo <path> --dest <path>\n"
         "                               [--snapshot <id|tag>] [--file <path>]\n"
@@ -244,7 +261,7 @@ static void usage(void) {
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
         "  backup verify   --repo <path>\n"
-        "  backup stats    --repo <path>\n"
+        "  backup stats    --repo <path> [--json]\n"
         "  backup tag      --repo <path> set --snapshot <id|tag> --name <name>"
                                             " [--preserve]\n"
         "  backup tag      --repo <path> list\n"
@@ -498,7 +515,6 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
 static int cmd_run(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t run_specs[] = {
         { "--repo", 1 }, { "--path", 1 }, { "--exclude", 1 },
-        { "--no-gc", 0 },
         { "--no-policy", 0 }, { "--quiet", 0 }, { "--verbose", 0 },
         { "--verify-after", 0 }, { "--no-verify-after", 0 },
     };
@@ -507,7 +523,6 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
                          NULL, 0)) return 1;
 
     int no_policy     = opt_has(argc, argv, 2, "--no-policy");
-    int no_gc         = opt_has(argc, argv, 2, "--no-gc");
     int quiet         = opt_has(argc, argv, 2, "--quiet");
     int verbose       = opt_has(argc, argv, 2, "--verbose");
     int verify_after  = opt_has(argc, argv, 2, "--verify-after");
@@ -580,9 +595,9 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     if (use_gfs && pol->auto_prune) {
         uint32_t head_id = 0;
         snapshot_read_head(repo, &head_id);
-        if (!quiet) log_msg("INFO", "post-backup: running retention (includes GC)");
-        gfs_run(repo, pol, head_id, 0, quiet);
-    } else if (!no_gc && pol && pol->auto_gc) {
+        if (!quiet) log_msg("INFO", "post-backup: running retention");
+        gfs_run(repo, pol, head_id, 0, quiet, 0);
+    } else if (pol && pol->auto_gc) {
         if (!quiet) log_msg("INFO", "post-backup: running GC");
         repo_gc(repo, NULL, NULL);
     }
@@ -630,15 +645,73 @@ static void list_tags_for_snap(repo_t *repo, uint32_t snap_id, char *out, size_t
 }
 
 static int cmd_list(repo_t *repo, int argc, char **argv) {
-    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--simple", 0 } };
-    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--simple", 0 }, { "--json", 0 }
+    };
+    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
     int simple = opt_has(argc, argv, 2, "--simple");
+    int json   = opt_has(argc, argv, 2, "--json");
+
+    if (simple && json) {
+        fprintf(stderr, "error: --simple and --json cannot be combined\n");
+        return 1;
+    }
 
     lock_shared(repo);
     uint32_t head = 0;
     snapshot_read_head(repo, &head);
+
+    if (json) {
+        printf("{\n  \"head\": %u,\n  \"snapshots\": [\n", head);
+        int first = 1;
+        for (uint32_t id = 1; id <= head; id++) {
+            snapshot_t *snap = NULL;
+            int has_snap = (snapshot_load(repo, id, &snap) == OK);
+            char timebuf[32] = "";
+            uint32_t entries = 0;
+            uint64_t bytes = 0;
+            char gfsbuf[64] = "";
+            char tagbuf[256];
+            list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
+
+            if (has_snap) {
+                entries = snap->node_count;
+                for (uint32_t i = 0; i < snap->node_count; i++) {
+                    if (snap->nodes[i].type == NODE_TYPE_REG)
+                        bytes += snap->nodes[i].size;
+                }
+                if (snap->created_sec > 0) {
+                    time_t t = (time_t)snap->created_sec;
+                    struct tm *tm = localtime(&t);
+                    if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
+                }
+                if (snap->gfs_flags) gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
+            }
+
+            if (!first) printf(",\n");
+            first = 0;
+            printf("    {\"id\": %u, \"is_head\": %s, \"manifest\": %s",
+                   id, (id == head) ? "true" : "false", has_snap ? "true" : "false");
+            if (has_snap) {
+                printf(", \"timestamp\": \"");
+                json_print_escaped(timebuf);
+                printf("\", \"entries\": %u, \"logical_bytes\": %llu",
+                       entries, (unsigned long long)bytes);
+                printf(", \"gfs\": \"");
+                json_print_escaped(gfsbuf[0] ? gfsbuf : "none");
+                printf("\"");
+            }
+            printf(", \"tags\": \"");
+            json_print_escaped(tagbuf);
+            printf("\"}");
+            snapshot_free(snap);
+        }
+        printf("\n  ]\n}\n");
+        return 0;
+    }
+
     if (!simple) {
-        printf("head  id        timestamp            ent      size     manifest  gfs   tag\n");
+        printf("head  id        timestamp            ent      logical  manifest  gfs   tag\n");
     }
     for (uint32_t id = 1; id <= head; id++) {
         char head_mark = (id == head) ? '*' : '-';
@@ -876,7 +949,7 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     uint32_t head_id = 0;
     snapshot_read_head(repo, &head_id);
-    int ret = gfs_run(repo, pol, head_id, dry_run, 0) == OK ? 0 : 1;
+    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 1) == OK ? 0 : 1;
     policy_free(pol);
     return ret;
 }
@@ -908,12 +981,27 @@ static int cmd_verify(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_stats(repo_t *repo, int argc, char **argv) {
-    static const flag_spec_t specs[] = { { "--repo", 1 } };
-    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
-    (void)argc; (void)argv;
+    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--json", 0 } };
+    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    int json = opt_has(argc, argv, 2, "--json");
     lock_shared(repo);
     repo_stat_t s = {0};
     if (repo_stats(repo, &s) != OK) return 1;
+    if (json) {
+        printf("{\n");
+        printf("  \"snapshots_present\": %u,\n", s.snap_count);
+        printf("  \"head_snapshot\": %u,\n", s.snap_total);
+        printf("  \"head_entries\": %u,\n", s.head_entries);
+        printf("  \"head_logical_bytes\": %llu,\n", (unsigned long long)s.head_logical_bytes);
+        printf("  \"manifest_bytes\": %llu,\n", (unsigned long long)s.snap_bytes);
+        printf("  \"loose_objects\": %u,\n", s.loose_objects);
+        printf("  \"loose_bytes\": %llu,\n", (unsigned long long)s.loose_bytes);
+        printf("  \"pack_files\": %u,\n", s.pack_files);
+        printf("  \"pack_bytes\": %llu,\n", (unsigned long long)s.pack_bytes);
+        printf("  \"repo_physical_bytes\": %llu\n", (unsigned long long)s.total_bytes);
+        printf("}\n");
+        return 0;
+    }
     repo_stats_print(&s);
     return 0;
 }
