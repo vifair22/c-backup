@@ -28,7 +28,7 @@ Typical repository tree:
 <repo>/
   format
   lock
-  policy.conf
+  policy.toml
   refs/
     HEAD
   tags/
@@ -145,6 +145,7 @@ Supported policy flags:
 - `--auto-gc/--no-auto-gc`
 - `--auto-prune/--no-auto-prune`
 - `--verify-after/--no-verify-after`
+- `--strict-meta/--no-strict-meta`
 
 ## 5.3 Run backup
 
@@ -181,6 +182,8 @@ Full table columns:
 - `id`
 - `timestamp`
 - `ent` (node count)
+- `logical` (sum of regular file sizes in that manifest)
+- `phys_new` (deduped physical bytes first introduced by that restore point)
 - `manifest` (`Y` if `.snap` present)
 - `gfs`
 - `tag`
@@ -233,7 +236,22 @@ backup stats --repo /mnt/backup/repo
 backup stats --repo /mnt/backup/repo --json
 ```
 
-## 5.10 Tags
+## 5.10 Snapshot delete
+
+```bash
+backup snapshot --repo /mnt/backup/repo delete --snapshot 42
+backup snapshot --repo /mnt/backup/repo delete --snapshot monthly-2026-03 --dry-run
+backup snapshot --repo /mnt/backup/repo delete --snapshot 42 --force --no-gc
+```
+
+Behavior:
+
+- Refuses deleting `HEAD` unless `--force`.
+- Refuses deleting snapshots with tags unless `--force`.
+- With `--force`, tags pointing to the snapshot are deleted first.
+- Runs GC after delete by default (use `--no-gc` to skip).
+
+## 5.11 Tags
 
 ```bash
 backup tag --repo /mnt/backup/repo set --snapshot 42 --name pre-upgrade
@@ -244,14 +262,14 @@ backup tag --repo /mnt/backup/repo delete --name pre-upgrade
 
 ---
 
-## 6) `policy.conf` reference
+## 6) `policy.toml` reference
 
-Stored at `<repo>/policy.conf` as `key = value` lines.
+Stored at `<repo>/policy.toml`.
 
 Fields:
 
-- `paths = /src1 /src2 ...`
-- `exclude = pattern1 pattern2 ...`
+- `paths = ["/src1", "/src2", ...]`
+- `exclude = ["pattern1", "pattern2", ...]`
 - `keep_snaps = N`
 - `keep_daily = N`
 - `keep_weekly = N`
@@ -261,6 +279,7 @@ Fields:
 - `auto_gc = true|false`
 - `auto_prune = true|false`
 - `verify_after = true|false`
+- `strict_meta = true|false`
 
 Runtime defaults (`policy_init_defaults`):
 
@@ -269,6 +288,7 @@ Runtime defaults (`policy_init_defaults`):
 - `auto_gc=true`
 - `auto_prune=true`
 - `verify_after=false`
+- `strict_meta=false`
 
 ---
 
@@ -276,9 +296,9 @@ Runtime defaults (`policy_init_defaults`):
 
 ### 7.1 Laptop / workstation
 
-```conf
-paths = /home/alice /etc
-exclude = .cache node_modules *.tmp *.swp
+```toml
+paths = ["/home/alice", "/etc"]
+exclude = [".cache", "node_modules", "*.tmp", "*.swp"]
 keep_snaps = 30
 keep_daily = 14
 keep_weekly = 8
@@ -287,13 +307,14 @@ auto_pack = true
 auto_gc = true
 auto_prune = true
 verify_after = false
+strict_meta = false
 ```
 
 ### 7.2 Server with longer history
 
-```conf
-paths = /srv /etc /var/lib
-exclude = *.tmp
+```toml
+paths = ["/srv", "/etc", "/var/lib"]
+exclude = ["*.tmp"]
 keep_snaps = 14
 keep_daily = 30
 keep_weekly = 26
@@ -303,12 +324,13 @@ auto_pack = true
 auto_gc = true
 auto_prune = true
 verify_after = true
+strict_meta = true
 ```
 
 ### 7.3 Conservative prune (keep many local manifests)
 
-```conf
-paths = /data
+```toml
+paths = ["/data"]
 keep_snaps = 180
 keep_daily = 0
 keep_weekly = 0
@@ -319,8 +341,8 @@ auto_prune = true
 
 ### 7.4 Disable automatic retention, run manually
 
-```conf
-paths = /data
+```toml
+paths = ["/data"]
 keep_snaps = 30
 keep_daily = 14
 auto_prune = false
@@ -340,12 +362,13 @@ These are useful for low-level debugging and tooling.
 
 ### 8.1 Snapshot file (`.snap`)
 
-Header (`SNAP_MAGIC="CBKP"`, version 2):
+Header (`SNAP_MAGIC="CBKP"`, version 3):
 
 - `magic` (u32)
 - `version` (u32)
 - `snap_id` (u32)
 - `created_sec` (u64)
+- `phys_new_bytes` (u64)
 - `node_count` (u32)
 - `dirent_count` (u32)
 - `dirent_data_len` (u64)
@@ -419,6 +442,11 @@ Tag files in `tags/` store:
 - `CBACKUP_STORE_THREADS=<N>` controls parallel content-store workers in `backup run`.
   - Default: detected CPU count
   - Useful when source data sits on fast storage and hashing/compression is CPU-bound.
+- `CBACKUP_PACK_THREADS=<N>` controls worker threads used by `pack`/post-run packing.
+  - Default: detected CPU count
+  - Packing uses worker threads for loose-object read/compress and a single writer thread.
+- `policy.strict_meta=true` enables strict xattr/ACL drift detection.
+  - More complete metadata detection, but slower scan/compare on large trees.
 - Pack GC includes automatic small-pack coalescing heuristics.
   - Triggered when pack count grows large or small-pack ratio rises.
   - Rewrite budget is capped to avoid long post-backup stalls.

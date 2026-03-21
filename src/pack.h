@@ -31,6 +31,11 @@ status_t pack_object_load(repo_t *repo,
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
 int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 
+/* Return packed physical bytes (entry header + compressed payload). */
+status_t pack_object_physical_size(repo_t *repo,
+                                   const uint8_t hash[OBJECT_HASH_SIZE],
+                                   uint64_t *out_bytes);
+
 /* Drop the cached pack index so it is reloaded on next access. */
 void pack_cache_invalidate(repo_t *repo);
 

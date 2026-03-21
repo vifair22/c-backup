@@ -49,6 +49,7 @@ typedef struct {
     const char **exclude;   /* basename patterns; patterns containing '/' match full path */
     int          n_exclude;
     int          verbose;
+    int          collect_meta; /* collect xattr/ACL blobs during scan (default: on) */
     void       (*progress_cb)(uint32_t scanned_entries, void *ctx);
     void       (*progress_clear_cb)(void *ctx);
     void        *progress_ctx;
@@ -62,4 +63,5 @@ typedef struct {
  */
 status_t scan_tree(const char *root, scan_imap_t *imap,
                    const scan_opts_t *opts, scan_result_t **out);
+status_t scan_entry_collect_metadata(scan_entry_t *e);
 void     scan_result_free(scan_result_t *res);

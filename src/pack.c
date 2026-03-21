@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <lz4.h>
 #include <openssl/sha.h>
@@ -76,6 +77,8 @@ typedef struct {
 #define PACK_COALESCE_MAX_BUDGET     (10ull * 1024ull * 1024ull * 1024ull)
 #define PACK_COALESCE_BUDGET_PCT     15u
 #define PACK_COALESCE_MIN_SNAP_GAP   10u
+
+#define PACK_WORKER_THREADS_MAX 32
 
 static int cache_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
@@ -219,6 +222,189 @@ static double pack_bps_to_mib(double bps) {
     return bps / (1024.0 * 1024.0);
 }
 
+typedef struct {
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t type;
+    uint8_t compression;
+    uint64_t uncompressed_size;
+    uint32_t compressed_size;
+    uint8_t *payload;
+} pack_work_item_t;
+
+typedef struct {
+    repo_t *repo;
+    const uint8_t *hashes;
+    size_t loose_cnt;
+
+    size_t next_index;
+    int stop;
+    status_t error;
+
+    pack_work_item_t *queue;
+    size_t q_cap;
+    size_t q_head;
+    size_t q_tail;
+    size_t q_count;
+
+    uint32_t workers_total;
+    uint32_t workers_done;
+
+    pthread_mutex_t mu;
+    pthread_cond_t cv_have_work;
+    pthread_cond_t cv_have_space;
+} pack_work_ctx_t;
+
+static uint32_t pack_worker_threads(void) {
+    const char *env = getenv("CBACKUP_PACK_THREADS");
+    if (env && *env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end && *end == '\0' && v > 0) {
+            if (v > PACK_WORKER_THREADS_MAX) v = PACK_WORKER_THREADS_MAX;
+            return (uint32_t)v;
+        }
+    }
+
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) n = 4;
+    if (n > PACK_WORKER_THREADS_MAX) n = PACK_WORKER_THREADS_MAX;
+    if (n < 1) n = 1;
+    return (uint32_t)n;
+}
+
+static int pack_queue_push(pack_work_ctx_t *ctx, const pack_work_item_t *it) {
+    pthread_mutex_lock(&ctx->mu);
+    while (!ctx->stop && ctx->q_count == ctx->q_cap)
+        pthread_cond_wait(&ctx->cv_have_space, &ctx->mu);
+    if (ctx->stop) {
+        pthread_mutex_unlock(&ctx->mu);
+        return 0;
+    }
+    ctx->queue[ctx->q_tail] = *it;
+    ctx->q_tail = (ctx->q_tail + 1) % ctx->q_cap;
+    ctx->q_count++;
+    pthread_cond_signal(&ctx->cv_have_work);
+    pthread_mutex_unlock(&ctx->mu);
+    return 1;
+}
+
+static void pack_worker_fail(pack_work_ctx_t *ctx, status_t st) {
+    pthread_mutex_lock(&ctx->mu);
+    if (ctx->error == OK) ctx->error = st;
+    ctx->stop = 1;
+    pthread_cond_broadcast(&ctx->cv_have_work);
+    pthread_cond_broadcast(&ctx->cv_have_space);
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+static void *pack_worker_main(void *arg) {
+    pack_work_ctx_t *ctx = (pack_work_ctx_t *)arg;
+    for (;;) {
+        size_t idx;
+        pthread_mutex_lock(&ctx->mu);
+        if (ctx->stop || ctx->next_index >= ctx->loose_cnt) {
+            pthread_mutex_unlock(&ctx->mu);
+            break;
+        }
+        idx = ctx->next_index++;
+        pthread_mutex_unlock(&ctx->mu);
+
+        const uint8_t *hash = ctx->hashes + idx * OBJECT_HASH_SIZE;
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        char loose_path[PATH_MAX];
+        if (path_fmt(loose_path, sizeof(loose_path),
+                     "%s/objects/%.2s/%s", repo_path(ctx->repo), hex, hex + 2) != 0) {
+            pack_worker_fail(ctx, ERR_IO);
+            break;
+        }
+
+        int fd = open(loose_path, O_RDONLY);
+        if (fd == -1) continue;
+
+        object_header_t hdr;
+        if (read_full_fd(fd, &hdr, sizeof(hdr)) != 0) {
+            close(fd);
+            pack_worker_fail(ctx, ERR_CORRUPT);
+            break;
+        }
+
+        uint8_t *payload = malloc((size_t)hdr.compressed_size);
+        if (!payload) {
+            close(fd);
+            pack_worker_fail(ctx, ERR_NOMEM);
+            break;
+        }
+        if (read_full_fd(fd, payload, (size_t)hdr.compressed_size) != 0) {
+            close(fd);
+            free(payload);
+            pack_worker_fail(ctx, ERR_CORRUPT);
+            break;
+        }
+        close(fd);
+
+        uint8_t compression = hdr.compression;
+        uint32_t compressed_size = (uint32_t)hdr.compressed_size;
+        uint64_t uncompressed_size = hdr.uncompressed_size;
+
+        if (compression == COMPRESS_NONE &&
+            hdr.compressed_size >= 4096 &&
+            hdr.compressed_size <= INT_MAX) {
+            int try_full = 1;
+            int sample_len = (hdr.compressed_size > 65536) ? 65536 : (int)hdr.compressed_size;
+            int sample_bound = LZ4_compressBound(sample_len);
+            if (sample_bound > 0 && sample_len > 0) {
+                char *sample = malloc((size_t)sample_bound);
+                if (sample) {
+                    int sc = LZ4_compress_default((const char *)payload, sample,
+                                                  sample_len, sample_bound);
+                    free(sample);
+                    if (sc <= 0 || (double)sc / (double)sample_len > 0.98)
+                        try_full = 0;
+                }
+            }
+
+            if (try_full) {
+                int bound = LZ4_compressBound((int)hdr.compressed_size);
+                if (bound > 0) {
+                    char *tmp = malloc((size_t)bound);
+                    if (tmp) {
+                        int csz = LZ4_compress_default((const char *)payload, tmp,
+                                                       (int)hdr.compressed_size, bound);
+                        if (csz > 0 && (uint32_t)csz < compressed_size) {
+                            free(payload);
+                            payload = (uint8_t *)tmp;
+                            compression = COMPRESS_LZ4;
+                            compressed_size = (uint32_t)csz;
+                        } else {
+                            free(tmp);
+                        }
+                    }
+                }
+            }
+        }
+
+        pack_work_item_t it;
+        memcpy(it.hash, hash, OBJECT_HASH_SIZE);
+        it.type = hdr.type;
+        it.compression = compression;
+        it.uncompressed_size = uncompressed_size;
+        it.compressed_size = compressed_size;
+        it.payload = payload;
+
+        if (!pack_queue_push(ctx, &it)) {
+            free(payload);
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&ctx->mu);
+    ctx->workers_done++;
+    pthread_cond_broadcast(&ctx->cv_have_work);
+    pthread_mutex_unlock(&ctx->mu);
+    return NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* Hex helpers                                                         */
 /* ------------------------------------------------------------------ */
@@ -329,10 +515,9 @@ int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     return bsearch(hash, arr, cnt, sizeof(*arr), cache_cmp) != NULL;
 }
 
-status_t pack_object_load(repo_t *repo,
-                          const uint8_t hash[OBJECT_HASH_SIZE],
-                          void **out_data, size_t *out_size,
-                          uint8_t *out_type) {
+static status_t pack_find_entry(repo_t *repo,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                pack_cache_entry_t **out_found) {
     if (pack_cache_load(repo) != OK) return ERR_IO;
 
     size_t cnt = repo_pack_cache_count(repo);
@@ -341,6 +526,46 @@ status_t pack_object_load(repo_t *repo,
     pack_cache_entry_t *arr = repo_pack_cache_data(repo);
     pack_cache_entry_t *found = bsearch(hash, arr, cnt, sizeof(*arr), cache_cmp);
     if (!found) return ERR_NOT_FOUND;
+    *out_found = found;
+    return OK;
+}
+
+status_t pack_object_physical_size(repo_t *repo,
+                                   const uint8_t hash[OBJECT_HASH_SIZE],
+                                   uint64_t *out_bytes) {
+    if (!out_bytes) return ERR_INVALID;
+    pack_cache_entry_t *found = NULL;
+    status_t st = pack_find_entry(repo, hash, &found);
+    if (st != OK) return st;
+
+    char dat_path[PATH_MAX];
+    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
+             repo_path(repo), found->pack_num);
+    FILE *f = fopen(dat_path, "rb");
+    if (!f) return ERR_IO;
+
+    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+        fclose(f);
+        return ERR_IO;
+    }
+
+    pack_dat_entry_hdr_t ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
+        fclose(f);
+        return ERR_CORRUPT;
+    }
+    fclose(f);
+    *out_bytes = (uint64_t)sizeof(ehdr) + (uint64_t)ehdr.compressed_size;
+    return OK;
+}
+
+status_t pack_object_load(repo_t *repo,
+                          const uint8_t hash[OBJECT_HASH_SIZE],
+                          void **out_data, size_t *out_size,
+                          uint8_t *out_type) {
+    pack_cache_entry_t *found = NULL;
+    status_t st = pack_find_entry(repo, hash, &found);
+    if (st != OK) return st;
 
     char dat_path[PATH_MAX];
     snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
@@ -448,11 +673,45 @@ done:
     return OK;
 }
 
+static int loose_objects_exist(repo_t *repo) {
+    int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    if (obj_fd == -1) return 0;
+
+    DIR *top = fdopendir(obj_fd);
+    if (!top) { close(obj_fd); return 0; }
+
+    int found = 0;
+    struct dirent *de;
+    while ((de = readdir(top)) != NULL && !found) {
+        if (de->d_name[0] == '.' || strlen(de->d_name) != 2) continue;
+        int sub_fd = openat(obj_fd, de->d_name, O_RDONLY | O_DIRECTORY);
+        if (sub_fd == -1) continue;
+        DIR *sub = fdopendir(sub_fd);
+        if (!sub) { close(sub_fd); continue; }
+
+        struct dirent *sde;
+        while ((sde = readdir(sub)) != NULL) {
+            if (sde->d_name[0] == '.') continue;
+            found = 1;
+            break;
+        }
+        closedir(sub);
+    }
+    closedir(top);
+    return found;
+}
+
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     int show_progress = pack_progress_enabled();
     struct timespec next_tick = {0};
     struct timespec started_at = {0};
     if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
+    if (!loose_objects_exist(repo)) {
+        log_msg("INFO", "pack: no loose objects to pack");
+        if (out_packed) *out_packed = 0;
+        return OK;
+    }
 
     /* Discard unreferenced loose objects before packing */
     log_msg("INFO", "pack: phase 1/3 GC");
@@ -517,9 +776,6 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         free(hashes); return ERR_NOMEM;
     }
 
-    uint8_t *cpayload = NULL;
-    size_t cpayload_cap = 0;
-
     /* Write dat header (count filled in after we know the real total) */
     pack_dat_hdr_t dat_hdr = { PACK_DAT_MAGIC, PACK_VERSION, 0 };
     if (fwrite(&dat_hdr, sizeof(dat_hdr), 1, dat_f) != 1) { st = ERR_IO; goto cleanup; }
@@ -527,71 +783,133 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     uint32_t packed = 0;
     uint64_t dat_body_offset = 0;   /* byte offset within the dat body */
 
-    for (size_t i = 0; i < loose_cnt; i++) {
-        const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
+    uint32_t n_workers = pack_worker_threads();
+    pack_work_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.repo = repo;
+    ctx.hashes = hashes;
+    ctx.loose_cnt = loose_cnt;
+    ctx.q_cap = (size_t)n_workers * 4u;
+    if (ctx.q_cap < 16) ctx.q_cap = 16;
+    ctx.queue = calloc(ctx.q_cap, sizeof(*ctx.queue));
+    if (!ctx.queue) { st = ERR_NOMEM; goto cleanup; }
+    pthread_mutex_init(&ctx.mu, NULL);
+    pthread_cond_init(&ctx.cv_have_work, NULL);
+    pthread_cond_init(&ctx.cv_have_space, NULL);
+    ctx.workers_total = n_workers;
+    ctx.error = OK;
 
-        if (show_progress && pack_tick_due(&next_tick)) {
-            double sec = pack_elapsed_sec(&started_at);
-            double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
-            char line[128];
-            snprintf(line, sizeof(line),
-                     "pack: writing %zu/%zu (%.1f MiB/s)",
-                     i, loose_cnt, pack_bps_to_mib(bps));
-            pack_line_set(line);
-        }
-
-        /* Build loose file path */
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        object_hash_to_hex(hash, hex);
-        char loose_path[PATH_MAX];
-        if (path_fmt(loose_path, sizeof(loose_path),
-                     "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
-            st = ERR_IO; goto cleanup;
-        }
-
-        int lfd = open(loose_path, O_RDONLY);
-        if (lfd == -1) continue;   /* may have been deleted by concurrent GC — skip */
-
-        /* Read loose object header */
-        object_header_t lhdr;
-        if (read_full_fd(lfd, &lhdr, sizeof(lhdr)) != 0) { close(lfd); continue; }
-
-        if ((size_t)lhdr.compressed_size > cpayload_cap) {
-            size_t nc = (size_t)lhdr.compressed_size;
-            uint8_t *tmp = realloc(cpayload, nc);
-            if (!tmp) { close(lfd); st = ERR_NOMEM; goto cleanup; }
-            cpayload = tmp;
-            cpayload_cap = nc;
-        }
-        if (read_full_fd(lfd, cpayload, (size_t)lhdr.compressed_size) != 0) {
-            close(lfd);
-            st = ERR_CORRUPT;
+    pthread_t tids[PACK_WORKER_THREADS_MAX];
+    for (uint32_t i = 0; i < n_workers; i++) {
+        if (pthread_create(&tids[i], NULL, pack_worker_main, &ctx) != 0) {
+            st = ERR_IO;
+            pthread_mutex_lock(&ctx.mu);
+            ctx.stop = 1;
+            pthread_cond_broadcast(&ctx.cv_have_work);
+            pthread_cond_broadcast(&ctx.cv_have_space);
+            pthread_mutex_unlock(&ctx.mu);
+            for (uint32_t j = 0; j < i; j++) pthread_join(tids[j], NULL);
+            pthread_cond_destroy(&ctx.cv_have_work);
+            pthread_cond_destroy(&ctx.cv_have_space);
+            pthread_mutex_destroy(&ctx.mu);
+            free(ctx.queue);
             goto cleanup;
         }
-        close(lfd);
+    }
 
-        /* Record idx entry pointing at start of this dat entry */
-        memcpy(idx_entries[packed].hash, hash, OBJECT_HASH_SIZE);
-        idx_entries[packed].dat_offset = sizeof(dat_hdr) + dat_body_offset;
-        packed++;
+    size_t consumed = 0;
+    for (;;) {
+        pack_work_item_t item;
+        int have_item = 0;
 
-        /* Write dat entry header */
-        pack_dat_entry_hdr_t ehdr;
-        memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
-        ehdr.type              = lhdr.type;
-        ehdr.compression       = lhdr.compression;
-        ehdr.uncompressed_size = lhdr.uncompressed_size;
-        ehdr.compressed_size   = (uint32_t)lhdr.compressed_size;
+        pthread_mutex_lock(&ctx.mu);
+        while (ctx.q_count == 0 && ctx.workers_done < ctx.workers_total && !ctx.stop)
+            pthread_cond_wait(&ctx.cv_have_work, &ctx.mu);
 
-        if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1 ||
-            fwrite(cpayload, 1, (size_t)lhdr.compressed_size, dat_f)
-                != (size_t)lhdr.compressed_size) {
-            st = ERR_IO; goto cleanup;
+        if (ctx.q_count > 0) {
+            item = ctx.queue[ctx.q_head];
+            ctx.q_head = (ctx.q_head + 1) % ctx.q_cap;
+            ctx.q_count--;
+            have_item = 1;
+            pthread_cond_signal(&ctx.cv_have_space);
         }
 
-        dat_body_offset += sizeof(ehdr) + (uint64_t)lhdr.compressed_size;
-        processed_payload_bytes += (uint64_t)lhdr.compressed_size;
+        int done = (ctx.workers_done == ctx.workers_total && ctx.q_count == 0);
+        status_t worker_err = ctx.error;
+        pthread_mutex_unlock(&ctx.mu);
+
+        if (have_item) {
+            if (show_progress && pack_tick_due(&next_tick)) {
+                double sec = pack_elapsed_sec(&started_at);
+                double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
+                char line[128];
+                snprintf(line, sizeof(line),
+                         "pack: writing %zu/%zu (%.1f MiB/s)",
+                         consumed, loose_cnt, pack_bps_to_mib(bps));
+                pack_line_set(line);
+            }
+
+            memcpy(idx_entries[packed].hash, item.hash, OBJECT_HASH_SIZE);
+            idx_entries[packed].dat_offset = sizeof(dat_hdr) + dat_body_offset;
+            packed++;
+
+            pack_dat_entry_hdr_t ehdr;
+            memcpy(ehdr.hash, item.hash, OBJECT_HASH_SIZE);
+            ehdr.type              = item.type;
+            ehdr.compression       = item.compression;
+            ehdr.uncompressed_size = item.uncompressed_size;
+            ehdr.compressed_size   = item.compressed_size;
+
+            if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1 ||
+                fwrite(item.payload, 1, (size_t)item.compressed_size, dat_f)
+                    != (size_t)item.compressed_size) {
+                free(item.payload);
+                pthread_mutex_lock(&ctx.mu);
+                ctx.stop = 1;
+                if (ctx.error == OK) ctx.error = ERR_IO;
+                pthread_cond_broadcast(&ctx.cv_have_work);
+                pthread_cond_broadcast(&ctx.cv_have_space);
+                pthread_mutex_unlock(&ctx.mu);
+                st = ERR_IO;
+                break;
+            }
+
+            dat_body_offset += sizeof(ehdr) + (uint64_t)item.compressed_size;
+            processed_payload_bytes += (uint64_t)item.compressed_size;
+            consumed++;
+            free(item.payload);
+            continue;
+        }
+
+        if (done) break;
+        if (worker_err != OK) { st = worker_err; break; }
     }
+
+    for (uint32_t i = 0; i < n_workers; i++) pthread_join(tids[i], NULL);
+
+    if (st == OK) {
+        pthread_mutex_lock(&ctx.mu);
+        if (ctx.error != OK) st = ctx.error;
+        pthread_mutex_unlock(&ctx.mu);
+    }
+
+    /* Free any queued payloads left after errors. */
+    for (;;) {
+        pthread_mutex_lock(&ctx.mu);
+        if (ctx.q_count == 0) { pthread_mutex_unlock(&ctx.mu); break; }
+        pack_work_item_t it = ctx.queue[ctx.q_head];
+        ctx.q_head = (ctx.q_head + 1) % ctx.q_cap;
+        ctx.q_count--;
+        pthread_mutex_unlock(&ctx.mu);
+        free(it.payload);
+    }
+
+    pthread_cond_destroy(&ctx.cv_have_work);
+    pthread_cond_destroy(&ctx.cv_have_space);
+    pthread_mutex_destroy(&ctx.mu);
+    free(ctx.queue);
+
+    if (st != OK) goto cleanup;
 
     if (show_progress) {
         double sec = pack_elapsed_sec(&started_at);
@@ -656,7 +974,6 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pack_cache_invalidate(repo);
 
     free(idx_entries);
-    free(cpayload);
     free(hashes);
 
     {
@@ -675,7 +992,6 @@ cleanup:
     unlink(dat_tmp);
     unlink(idx_tmp);
     free(idx_entries);
-    free(cpayload);
     free(hashes);
     return st;
 }

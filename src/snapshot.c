@@ -13,13 +13,14 @@
 #include <unistd.h>
 
 #define SNAP_MAGIC    0x43424B50u  /* "CBKP" */
-#define SNAP_VERSION  2u
+#define SNAP_VERSION  3u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
     uint32_t snap_id;
     uint64_t created_sec;
+    uint64_t phys_new_bytes;
     uint32_t node_count;
     uint32_t dirent_count;
     uint64_t dirent_data_len;
@@ -54,7 +55,7 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC || version != SNAP_VERSION) {
+    if (magic != SNAP_MAGIC || (version != 2u && version != SNAP_VERSION)) {
         close(fd); log_msg("ERROR", "invalid snapshot magic/version"); return ERR_CORRUPT;
     }
 
@@ -64,28 +65,38 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     /* Read the remaining header fields */
     uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
     uint32_t snap_flags = 0;
-    uint64_t created_sec = 0, dirent_data_len = 0;
+    uint64_t created_sec = 0, phys_new_bytes = 0, dirent_data_len = 0;
 
 #define RD32(v) (read(fd, &(v), 4) != 4)
 #define RD64(v) (read(fd, &(v), 8) != 8)
-    if (RD32(snap_id_f) || RD64(created_sec) ||
-        RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len) ||
-        RD32(gfs_flags)) {
+    if (RD32(snap_id_f) || RD64(created_sec)) {
+        close(fd); return ERR_CORRUPT;
+    }
+    if (version >= 3u) {
+        if (RD64(phys_new_bytes)) { close(fd); return ERR_CORRUPT; }
+    }
+    if (RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len) || RD32(gfs_flags)) {
         close(fd); return ERR_CORRUPT;
     }
 #undef RD32
 #undef RD64
 
     uint64_t payload_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
-    uint64_t expect_old = 40u + payload_sz;
-    uint64_t expect_new = 44u + payload_sz;
+    uint64_t expect_v2  = 40u + payload_sz;
+    uint64_t expect_v2f = 44u + payload_sz;
+    uint64_t expect_v3  = 52u + payload_sz;
     uint64_t fsz = (uint64_t)sb.st_size;
-    if (fsz == expect_new) {
+    if (version >= 3u) {
+        if (fsz != expect_v3 || read(fd, &snap_flags, sizeof(snap_flags)) != (ssize_t)sizeof(snap_flags)) {
+            close(fd);
+            return ERR_CORRUPT;
+        }
+    } else if (fsz == expect_v2f) {
         if (read(fd, &snap_flags, sizeof(snap_flags)) != (ssize_t)sizeof(snap_flags)) {
             close(fd);
             return ERR_CORRUPT;
         }
-    } else if (fsz != expect_old) {
+    } else if (fsz != expect_v2) {
         close(fd);
         return ERR_CORRUPT;
     }
@@ -94,6 +105,7 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     if (!snap) { close(fd); return ERR_NOMEM; }
     snap->snap_id         = snap_id_f;
     snap->created_sec     = created_sec;
+    snap->phys_new_bytes  = phys_new_bytes;
     snap->node_count      = node_count;
     snap->dirent_count    = dirent_count;
     snap->dirent_data_len = (size_t)dirent_data_len;
@@ -135,10 +147,12 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         .version         = SNAP_VERSION,
         .snap_id         = snap->snap_id,
         .created_sec     = snap->created_sec,
+        .phys_new_bytes  = snap->phys_new_bytes,
         .node_count      = snap->node_count,
         .dirent_count    = snap->dirent_count,
         .dirent_data_len = snap->dirent_data_len,
         .gfs_flags       = snap->gfs_flags,
+        .snap_flags      = snap->snap_flags,
     };
 
     status_t st = OK;
@@ -170,6 +184,26 @@ fail:
     return st;
 }
 
+status_t snapshot_delete(repo_t *repo, uint32_t snap_id) {
+    if (snap_id == 0) return ERR_INVALID;
+
+    char path[PATH_MAX];
+    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return ERR_IO;
+
+    if (unlink(path) == -1) {
+        if (errno == ENOENT) return ERR_NOT_FOUND;
+        return ERR_IO;
+    }
+
+    char dirpath[PATH_MAX];
+    if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo))
+        >= (int)sizeof(dirpath)) return ERR_IO;
+    int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+
+    return OK;
+}
+
 status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags) {
     char path[PATH_MAX];
     if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return ERR_IO;
@@ -182,11 +216,16 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC || version != SNAP_VERSION) { close(fd); return ERR_CORRUPT; }
+    if (magic != SNAP_MAGIC || (version != 2u && version != SNAP_VERSION)) {
+        close(fd);
+        return ERR_CORRUPT;
+    }
 
-    /* Skip past snap_id(4) + created_sec(8) + node_count(4) +
-     * dirent_count(4) + dirent_data_len(8) = 28 bytes to reach gfs_flags */
-    if (lseek(fd, 28, SEEK_CUR) == (off_t)-1) { close(fd); return ERR_IO; }
+    /* Skip to gfs_flags:
+     * v2: snap_id(4)+created(8)+node_count(4)+dirent_count(4)+dirent_len(8)=28
+     * v3: adds phys_new_bytes(8) => 36 */
+    off_t skip = (version >= 3u) ? 36 : 28;
+    if (lseek(fd, skip, SEEK_CUR) == (off_t)-1) { close(fd); return ERR_IO; }
 
     uint32_t flags = 0;
     if (read(fd, &flags, sizeof(flags)) != sizeof(flags)) { close(fd); return ERR_CORRUPT; }

@@ -170,6 +170,22 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
     return OK;
 }
 
+status_t scan_entry_collect_metadata(scan_entry_t *e) {
+    if (!e || !e->path) return ERR_INVALID;
+    if (e->xattr_data || e->xattr_len || e->acl_data || e->acl_len) return OK;
+
+    status_t st = collect_xattrs(e->path, &e->xattr_data, &e->xattr_len);
+    if (st != OK) return st;
+    st = collect_acl(e->path, &e->acl_data, &e->acl_len);
+    if (st != OK) {
+        free(e->xattr_data);
+        e->xattr_data = NULL;
+        e->xattr_len = 0;
+        return st;
+    }
+    return OK;
+}
+
 /* Forward declaration */
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
@@ -239,11 +255,14 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     }
 
     status_t st2;
-    if ((st2 = collect_xattrs(path, &e.xattr_data, &e.xattr_len)) != OK) {
-        free(e.path); return st2;
-    }
-    if ((st2 = collect_acl(path, &e.acl_data, &e.acl_len)) != OK) {
-        free(e.path); free(e.xattr_data); return st2;
+    int collect_meta = (!opts || opts->collect_meta);
+    if (collect_meta) {
+        if ((st2 = collect_xattrs(path, &e.xattr_data, &e.xattr_len)) != OK) {
+            free(e.path); return st2;
+        }
+        if ((st2 = collect_acl(path, &e.acl_data, &e.acl_len)) != OK) {
+            free(e.path); free(e.xattr_data); return st2;
+        }
     }
 
     uint64_t this_node_id = nd->node_id;

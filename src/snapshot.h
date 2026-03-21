@@ -22,6 +22,7 @@
 typedef struct {
     uint32_t    snap_id;
     uint64_t    created_sec;   /* wall-clock time when snapshot was written */
+    uint64_t    phys_new_bytes; /* deduped physical bytes first introduced by this snapshot */
     uint32_t    node_count;
     uint32_t    dirent_count;
     uint32_t    gfs_flags;     /* bitmask of GFS_* tier membership */
@@ -34,6 +35,7 @@ typedef struct {
 
 status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out);
 status_t snapshot_write(repo_t *repo, snapshot_t *snap);
+status_t snapshot_delete(repo_t *repo, uint32_t snap_id);
 void     snapshot_free(snapshot_t *snap);
 
 /*

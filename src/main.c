@@ -258,6 +258,8 @@ static void usage(void) {
         "  backup prune    --repo <path> [--keep-snaps N] [--keep-daily N]\n"
         "                               [--keep-weekly N] [--keep-monthly N]\n"
         "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
+        "  backup snapshot --repo <path> delete --snapshot <id|tag>\n"
+        "                               [--force] [--dry-run] [--no-gc]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
         "  backup verify   --repo <path>\n"
@@ -274,6 +276,7 @@ static void usage(void) {
         "                --auto-gc --no-auto-gc\n"
         "                --auto-prune --no-auto-prune\n"
         "                --verify-after --no-verify-after\n"
+        "                --strict-meta --no-strict-meta\n"
     );
 }
 
@@ -339,6 +342,8 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
     if (opt_has(argc, argv, start, "--no-auto-prune"))   p->auto_prune      = 0;
     if (opt_has(argc, argv, start, "--verify-after"))    p->verify_after    = 1;
     if (opt_has(argc, argv, start, "--no-verify-after")) p->verify_after    = 0;
+    if (opt_has(argc, argv, start, "--strict-meta"))     p->strict_meta     = 1;
+    if (opt_has(argc, argv, start, "--no-strict-meta"))  p->strict_meta     = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -363,6 +368,8 @@ static int cmd_init(int argc, char **argv) {
         { "--no-auto-prune", 0 },
         { "--verify-after", 0 },
         { "--no-verify-after", 0 },
+        { "--strict-meta", 0 },
+        { "--no-strict-meta", 0 },
     };
     if (validate_options(argc, argv, 2,
                          init_specs, sizeof(init_specs) / sizeof(init_specs[0]),
@@ -378,7 +385,7 @@ static int cmd_init(int argc, char **argv) {
         return 1;
     }
 
-    /* If any policy options were given, write policy.conf */
+    /* If any policy options were given, write policy.toml */
     int has_policy_opt =
         opt_has(argc, argv, 2, "--path") ||
         opt_has(argc, argv, 2, "--exclude") ||
@@ -392,7 +399,11 @@ static int cmd_init(int argc, char **argv) {
         opt_has(argc, argv, 2, "--auto-gc") ||
         opt_has(argc, argv, 2, "--no-auto-gc") ||
         opt_has(argc, argv, 2, "--auto-prune") ||
-        opt_has(argc, argv, 2, "--no-auto-prune");
+        opt_has(argc, argv, 2, "--no-auto-prune") ||
+        opt_has(argc, argv, 2, "--verify-after") ||
+        opt_has(argc, argv, 2, "--no-verify-after") ||
+        opt_has(argc, argv, 2, "--strict-meta") ||
+        opt_has(argc, argv, 2, "--no-strict-meta");
 
     repo_t *repo = NULL;
     if (repo_open(repo_arg, &repo) != OK) {
@@ -443,6 +454,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
             { "--auto-gc", 0 }, { "--no-auto-gc", 0 },
             { "--auto-prune", 0 }, { "--no-auto-prune", 0 },
             { "--verify-after", 0 }, { "--no-verify-after", 0 },
+            { "--strict-meta", 0 }, { "--no-strict-meta", 0 },
         };
         static const char *const pos[] = { "set" };
         if (validate_options(argc, argv, 2,
@@ -478,6 +490,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("auto_gc          = %s\n", p->auto_gc          ? "true" : "false");
         printf("auto_prune       = %s\n", p->auto_prune       ? "true" : "false");
         printf("verify_after     = %s\n", p->verify_after     ? "true" : "false");
+        printf("strict_meta      = %s\n", p->strict_meta      ? "true" : "false");
         policy_free(p);
         return 0;
 
@@ -578,6 +591,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         .quiet        = quiet,
         .verbose      = verbose,
         .verify_after = effective_verify,
+        .strict_meta  = (pol && pol->strict_meta),
     };
 
     if (lock_or_die(repo)) { policy_free(pol); return 1; }
@@ -644,6 +658,52 @@ static void list_tags_for_snap(repo_t *repo, uint32_t snap_id, char *out, size_t
     if (!any) snprintf(out, out_sz, "-");
 }
 
+static status_t delete_tags_for_snap(repo_t *repo, uint32_t snap_id,
+                                     int dry_run, int quiet,
+                                     uint32_t *out_deleted) {
+    if (out_deleted) *out_deleted = 0;
+
+    char tdir[PATH_MAX];
+    if (snprintf(tdir, sizeof(tdir), "%s/tags", repo_path(repo)) >= (int)sizeof(tdir))
+        return ERR_IO;
+
+    DIR *d = opendir(tdir);
+    if (!d) return OK;
+
+    uint32_t deleted = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        uint32_t id = 0;
+        if (tag_get(repo, de->d_name, &id) != OK || id != snap_id) continue;
+
+        if (dry_run) {
+            if (!quiet) fprintf(stderr, "dry-run: would delete tag '%s'\n", de->d_name);
+            deleted++;
+            continue;
+        }
+        if (tag_delete(repo, de->d_name) == OK) {
+            if (!quiet) fprintf(stderr, "deleted tag '%s'\n", de->d_name);
+            deleted++;
+        }
+    }
+    closedir(d);
+    if (out_deleted) *out_deleted = deleted;
+    return OK;
+}
+
+static uint32_t find_latest_existing_snapshot(repo_t *repo, uint32_t start_from) {
+    for (uint32_t id = start_from; id >= 1; id--) {
+        snapshot_t *s = NULL;
+        if (snapshot_load(repo, id, &s) == OK) {
+            snapshot_free(s);
+            return id;
+        }
+        if (id == 1) break;
+    }
+    return 0;
+}
+
 static int cmd_list(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = {
         { "--repo", 1 }, { "--simple", 0 }, { "--json", 0 }
@@ -670,6 +730,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
             char timebuf[32] = "";
             uint32_t entries = 0;
             uint64_t bytes = 0;
+            uint64_t phys_new = 0;
             char gfsbuf[64] = "";
             char tagbuf[256];
             list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
@@ -680,6 +741,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
                     if (snap->nodes[i].type == NODE_TYPE_REG)
                         bytes += snap->nodes[i].size;
                 }
+                phys_new = snap->phys_new_bytes;
                 if (snap->created_sec > 0) {
                     time_t t = (time_t)snap->created_sec;
                     struct tm *tm = localtime(&t);
@@ -695,8 +757,8 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
             if (has_snap) {
                 printf(", \"timestamp\": \"");
                 json_print_escaped(timebuf);
-                printf("\", \"entries\": %u, \"logical_bytes\": %llu",
-                       entries, (unsigned long long)bytes);
+                printf("\", \"entries\": %u, \"logical_bytes\": %llu, \"phys_new_bytes\": %llu",
+                       entries, (unsigned long long)bytes, (unsigned long long)phys_new);
                 printf(", \"gfs\": \"");
                 json_print_escaped(gfsbuf[0] ? gfsbuf : "none");
                 printf("\"");
@@ -711,7 +773,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
     }
 
     if (!simple) {
-        printf("head  id        timestamp            ent      logical  manifest  gfs   tag\n");
+        printf("head  id        timestamp            ent      logical  phys_new  manifest  gfs   tag\n");
     }
     for (uint32_t id = 1; id <= head; id++) {
         char head_mark = (id == head) ? '*' : '-';
@@ -726,6 +788,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
         char timebuf[32] = "-";
         uint32_t entries = 0;
         uint64_t bytes = 0;
+        uint64_t phys_new = 0;
         char gfsbuf[64] = "-";
         if (has_snap) {
             entries = snap->node_count;
@@ -733,6 +796,7 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
                 if (snap->nodes[i].type == NODE_TYPE_REG)
                     bytes += snap->nodes[i].size;
             }
+            phys_new = snap->phys_new_bytes;
             if (snap->created_sec > 0) {
                 time_t t = (time_t)snap->created_sec;
                 struct tm *tm = localtime(&t);
@@ -742,13 +806,15 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
         }
 
         if (simple) {
-            char sizebuf[16];
+            char sizebuf[16], physbuf[16];
             fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
+            fmt_bytes_short(phys_new, physbuf, sizeof(physbuf));
             if (snap->gfs_flags) {
-                printf("snapshot %08u  %s  %s  [%s]  %u entries\n",
-                       id, timebuf, sizebuf, gfsbuf, entries);
+                printf("snapshot %08u  %s  %s  +%s  [%s]  %u entries\n",
+                       id, timebuf, sizebuf, physbuf, gfsbuf, entries);
             } else {
-                printf("snapshot %08u  %s  %s  %u entries\n", id, timebuf, sizebuf, entries);
+                printf("snapshot %08u  %s  %s  +%s  %u entries\n",
+                       id, timebuf, sizebuf, physbuf, entries);
             }
             snapshot_free(snap);
             continue;
@@ -758,15 +824,16 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
         list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
 
         if (has_snap) {
-            char sizebuf[16];
+            char sizebuf[16], physbuf[16];
             fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
-            printf("%c     %08u  %-19s  %7u  %-7s  %c         %-4s  %s\n",
+            fmt_bytes_short(phys_new, physbuf, sizeof(physbuf));
+            printf("%c     %08u  %-19s  %7u  %-7s  %-8s  %c         %-4s  %s\n",
                    head_mark, id, timebuf, entries,
-                   sizebuf, 'Y', gfsbuf, tagbuf);
+                   sizebuf, physbuf, 'Y', gfsbuf, tagbuf);
         } else {
-            printf("%c     %08u  %-19s  %7s  %-7s  %c         %-4s  %s\n",
+            printf("%c     %08u  %-19s  %7s  %-7s  %-8s  %c         %-4s  %s\n",
                    head_mark, id, "-", "-",
-                   "-", '-', "-", tagbuf);
+                   "-", "-", '-', "-", tagbuf);
         }
 
         snapshot_free(snap);
@@ -881,6 +948,115 @@ static int cmd_diff(repo_t *repo, int argc, char **argv) {
         return 1;
     }
     return snapshot_diff(repo, id1, id2) == OK ? 0 : 1;
+}
+
+static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t global_flags[] = { { "--repo", 1 } };
+    const char *sub = find_subcmd(argc, argv, 2,
+                                  global_flags,
+                                  sizeof(global_flags) / sizeof(global_flags[0]));
+    if (!sub) { usage(); return 1; }
+
+    if (strcmp(sub, "delete") != 0) {
+        usage();
+        return 1;
+    }
+
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--snapshot", 1 },
+        { "--dry-run", 0 }, { "--no-gc", 0 }, { "--force", 0 },
+    };
+    static const char *const pos[] = { "delete" };
+    if (validate_options(argc, argv, 2, specs, 5, pos, 1)) return 1;
+
+    const char *snap_arg = opt_get(argc, argv, 3, "--snapshot");
+    if (!snap_arg) {
+        fprintf(stderr, "error: --snapshot required\n");
+        return 1;
+    }
+
+    int dry_run = opt_has(argc, argv, 3, "--dry-run");
+    int no_gc   = opt_has(argc, argv, 3, "--no-gc");
+    int force   = opt_has(argc, argv, 3, "--force");
+
+    if (dry_run) lock_shared(repo);
+    else if (lock_or_die(repo)) return 1;
+
+    uint32_t snap_id = 0;
+    if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+        fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+        return 1;
+    }
+
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK) {
+        fprintf(stderr, "error: snapshot %u manifest not found\n", snap_id);
+        return 1;
+    }
+    snapshot_free(snap);
+
+    uint32_t head = 0;
+    snapshot_read_head(repo, &head);
+    if (snap_id == head && !force) {
+        fprintf(stderr, "error: refusing to delete HEAD snapshot %u (use --force)\n", snap_id);
+        return 1;
+    }
+
+    char tagbuf[256];
+    list_tags_for_snap(repo, snap_id, tagbuf, sizeof(tagbuf));
+    int has_tags = strcmp(tagbuf, "-") != 0;
+    if (has_tags && !force) {
+        fprintf(stderr,
+                "error: snapshot %u has tag(s): %s (use --force to delete tags too)\n",
+                snap_id, tagbuf);
+        return 1;
+    }
+
+    if (dry_run) {
+        fprintf(stderr, "dry-run: would delete snapshot %u\n", snap_id);
+        if (snap_id == head)
+            fprintf(stderr, "dry-run: would move HEAD to previous existing snapshot\n");
+        if (has_tags) {
+            uint32_t n_deleted = 0;
+            delete_tags_for_snap(repo, snap_id, 1, 0, &n_deleted);
+        }
+        if (!no_gc)
+            fprintf(stderr, "dry-run: would run gc after deletion\n");
+        return 0;
+    }
+
+    if (has_tags) {
+        status_t st = delete_tags_for_snap(repo, snap_id, 0, 0, NULL);
+        if (st != OK) {
+            fprintf(stderr, "error: failed to delete tags for snapshot %u\n", snap_id);
+            return 1;
+        }
+    }
+
+    status_t st = snapshot_delete(repo, snap_id);
+    if (st != OK) {
+        fprintf(stderr, "error: failed to delete snapshot %u\n", snap_id);
+        return 1;
+    }
+    fprintf(stderr, "deleted snapshot %u\n", snap_id);
+
+    if (snap_id == head) {
+        uint32_t new_head = (head > 0) ? find_latest_existing_snapshot(repo, head - 1) : 0;
+        if (snapshot_write_head(repo, new_head) != OK) {
+            fprintf(stderr, "error: deleted snapshot but failed to update HEAD\n");
+            return 1;
+        }
+        fprintf(stderr, "HEAD -> %u\n", new_head);
+    }
+
+    if (!no_gc) {
+        log_msg("INFO", "snapshot delete: running GC");
+        if (repo_gc(repo, NULL, NULL) != OK) {
+            fprintf(stderr, "warning: snapshot deleted, but gc failed\n");
+        }
+    }
+
+    return 0;
 }
 
 static int cmd_prune(repo_t *repo, int argc, char **argv) {
@@ -1084,7 +1260,7 @@ int main(int argc, char *argv[]) {
     /* Catch missing or unrecognised subcommand before checking flags */
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "restore", "diff",
-        "prune", "gc", "pack", "verify", "stats", "tag", NULL
+        "prune", "snapshot", "gc", "pack", "verify", "stats", "tag", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -1117,6 +1293,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "restore")    == 0) ret = cmd_restore(repo, argc, argv);
     else if (strcmp(cmd, "diff")       == 0) ret = cmd_diff(repo, argc, argv);
     else if (strcmp(cmd, "prune")      == 0) ret = cmd_prune(repo, argc, argv);
+    else if (strcmp(cmd, "snapshot")   == 0) ret = cmd_snapshot(repo, argc, argv);
     else if (strcmp(cmd, "gc")         == 0) ret = cmd_gc(repo, argc, argv);
     else if (strcmp(cmd, "pack")       == 0) ret = cmd_pack(repo, argc, argv);
     else if (strcmp(cmd, "verify")     == 0) ret = cmd_verify(repo, argc, argv);

@@ -9,6 +9,8 @@ TESTS   := tests
 
 SRCS    := $(wildcard $(SRC)/*.c)
 OBJS    := $(patsubst $(SRC)/%.c, $(BUILD)/%.o, $(SRCS))
+VENDOR_OBJS := $(BUILD)/toml.o
+OBJS    += $(VENDOR_OBJS)
 MAIN_OBJ := $(BUILD)/main.o
 LIB_OBJS := $(filter-out $(MAIN_OBJ), $(OBJS))
 
@@ -27,6 +29,9 @@ $(BUILD):
 $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD)/toml.o: vendor/toml.c | $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
 -include $(OBJS:.o=.d)
 
 $(TARGET): $(OBJS)
@@ -36,7 +41,7 @@ $(TARGET): $(OBJS)
 $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lcmocka
 
-test: $(TEST_BINS)
+test: $(TARGET) $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t ==="; $$t; done
 
 clean:

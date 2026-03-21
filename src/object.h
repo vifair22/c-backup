@@ -15,6 +15,11 @@ status_t object_store(repo_t *repo, uint8_t type,
                       const void *data, size_t len,
                       uint8_t out_hash[OBJECT_HASH_SIZE]);
 
+status_t object_store_ex(repo_t *repo, uint8_t type,
+                         const void *data, size_t len,
+                         uint8_t out_hash[OBJECT_HASH_SIZE],
+                         int *out_is_new, uint64_t *out_phys_bytes);
+
 /*
  * Store a regular file, automatically detecting sparse regions.
  * Stores as OBJECT_TYPE_SPARSE if the file has holes, OBJECT_TYPE_FILE
@@ -22,6 +27,10 @@ status_t object_store(repo_t *repo, uint8_t type,
  */
 status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
                            uint8_t out_hash[OBJECT_HASH_SIZE]);
+
+status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
+                              uint8_t out_hash[OBJECT_HASH_SIZE],
+                              int *out_is_new, uint64_t *out_phys_bytes);
 
 /*
  * Load object data by hash.  Caller must free(*out_data).
@@ -38,3 +47,12 @@ int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /* Hex-encode a hash.  buf must be at least OBJECT_HASH_SIZE*2+1 bytes. */
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
+
+/*
+ * Return on-disk physical bytes used by a single object payload record.
+ * For loose objects: object_header_t + compressed payload bytes.
+ * For packed objects: pack_dat_entry_hdr_t + compressed payload bytes.
+ */
+status_t object_physical_size(repo_t *repo,
+                              const uint8_t hash[OBJECT_HASH_SIZE],
+                              uint64_t *out_bytes);

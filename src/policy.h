@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 /*
- * Repository backup policy.  Stored at repo/policy.conf as key = value text.
+ * Repository backup policy. Stored at repo/policy.toml.
  * Loaded on every `backup run`; absent policy is not an error for most commands.
  */
 typedef struct {
@@ -31,12 +31,13 @@ typedef struct {
     int  auto_gc;
     int  auto_prune;
     int  verify_after;      /* verify all objects exist after each backup */
+    int  strict_meta;       /* always scan/store xattr+ACL and detect meta-only drift */
 } policy_t;
 
-/* Load from repo/policy.conf.  Returns ERR_NOT_FOUND if file is absent. */
+/* Load from repo/policy.toml. Returns ERR_NOT_FOUND if file is absent. */
 status_t policy_load(repo_t *repo, policy_t **out);
 
-/* Write to repo/policy.conf (creates or overwrites, crash-safe). */
+/* Write to repo/policy.toml (creates or overwrites, crash-safe). */
 status_t policy_save(repo_t *repo, const policy_t *policy);
 
 /* Free a policy_t returned by policy_load. */
@@ -45,7 +46,7 @@ void policy_free(policy_t *policy);
 /* Write the full path to the policy file into buf. */
 void policy_path(repo_t *repo, char *buf, size_t sz);
 
-/* Create policy.conf with all options commented out (template).
+/* Create policy.toml with all options commented out (template).
  * No-op if the file already exists. */
 status_t policy_write_template(repo_t *repo);
 

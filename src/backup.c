@@ -167,11 +167,15 @@ static void fmt_eta(double sec, char *buf, size_t sz) {
 /* Store a file's content using sparse-aware storage. */
 static status_t store_file_content(repo_t *repo, const char *path,
                                    uint64_t file_size,
-                                   uint8_t out_hash[OBJECT_HASH_SIZE]) {
+                                   uint8_t out_hash[OBJECT_HASH_SIZE],
+                                   uint64_t *out_phys_new) {
     int fd = open(path, O_RDONLY);
     if (fd == -1) return ERR_IO;
-    status_t st = object_store_file(repo, fd, file_size, out_hash);
+    int is_new = 0;
+    uint64_t phys = 0;
+    status_t st = object_store_file_ex(repo, fd, file_size, out_hash, &is_new, &phys);
     close(fd);
+    if (out_phys_new) *out_phys_new = is_new ? phys : 0;
     return st;
 }
 
@@ -184,19 +188,6 @@ typedef struct {
     uint32_t  count;
     uint32_t  cap;
 } skipped_ids_t;
-
-static int skipped_add(skipped_ids_t *s, uint64_t id) {
-    if (id == 0) return 0;
-    if (s->count == s->cap) {
-        uint32_t nc = s->cap ? s->cap * 2 : 32;
-        uint64_t *tmp = realloc(s->ids, nc * sizeof(*tmp));
-        if (!tmp) return -1;
-        s->ids = tmp;
-        s->cap = nc;
-    }
-    s->ids[s->count++] = id;
-    return 0;
-}
 
 static int skipped_has(const skipped_ids_t *s, uint64_t id) {
     for (uint32_t i = 0; i < s->count; i++)
@@ -230,6 +221,7 @@ typedef struct {
     uint32_t       done;       /* number of queue items fully processed */
     uint64_t       total_bytes;
     uint64_t       bytes_done;
+    uint64_t       phys_new_bytes;
     int            show_progress;
     struct timespec started_at;
     struct timespec last_log_at;
@@ -266,8 +258,10 @@ static void *store_worker_fn(void *arg) {
         store_task_t *t = &pool->tasks[qi];
         scan_entry_t *e = &pool->entries[t->idx];
         uint64_t bytes_for_task = e->node.size;
+        uint64_t phys_new = 0;
         status_t st = store_file_content(pool->repo, e->path,
-                                         e->node.size, e->node.content_hash);
+                                         e->node.size, e->node.content_hash,
+                                         &phys_new);
         if (st != OK) {
             int err = errno;
             if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE) {
@@ -308,6 +302,7 @@ static void *store_worker_fn(void *arg) {
         pthread_mutex_lock(&pool->mu);
         pool->done++;
         pool->bytes_done += bytes_for_task;
+        pool->phys_new_bytes += phys_new;
         if (pool->show_progress) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -357,9 +352,14 @@ static void *store_worker_fn(void *arg) {
 }
 
 static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
-                                store_task_t *tasks, uint32_t queue_len,
-                                int show_progress, uint32_t *out_skipped) {
-    if (queue_len == 0) return OK;
+                                 store_task_t *tasks, uint32_t queue_len,
+                                 int show_progress, uint32_t *out_skipped,
+                                 uint64_t *out_phys_new_bytes) {
+    if (queue_len == 0) {
+        if (out_skipped) *out_skipped = 0;
+        if (out_phys_new_bytes) *out_phys_new_bytes = 0;
+        return OK;
+    }
 
     int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 1;
@@ -466,6 +466,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
     }
 
     if (out_skipped) *out_skipped = pool.skipped_transient;
+    if (out_phys_new_bytes) *out_phys_new_bytes = pool.phys_new_bytes;
 
     if (pool.skipped_transient > 0 && pool.first_skipped_path[0]) {
         char msg[PATH_MAX + 192];
@@ -522,6 +523,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         sopts.n_exclude = opts->n_exclude;
         sopts.verbose = opts->verbose;
     }
+    int strict_meta = (opts && opts->strict_meta);
+    sopts.collect_meta = strict_meta ? 1 : 0;
     if (tui) {
         clock_gettime(CLOCK_MONOTONIC, &scan_prog.next_update);
         sopts.progress_cb = scan_progress_cb;
@@ -530,7 +533,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         sopts.progress_every = 1;
         phase_line_setf("Phase 1: scanning");
     }
-    const scan_opts_t *sp = (opts && opts->n_exclude > 0) ? &sopts : NULL;
+    const scan_opts_t *sp = &sopts;
 
     scan_result_t *scan = NULL;
     for (int i = 0; i < path_count; i++) {
@@ -611,6 +614,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     log_msg("INFO", "Phase 3: compare and store");
 
     status_t st = OK;
+    int committed_snapshot = 0;
 
     skipped_ids_t skipped = {0};
     store_task_t *store_queue = malloc(scan->count * sizeof(*store_queue));
@@ -620,6 +624,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
     uint32_t n_new = 0, n_modified = 0, n_unchanged = 0, n_meta = 0, n_deleted = 0;
     uint32_t n_unreadable = 0;
+    uint64_t phys_new_bytes = 0;
 
     for (uint32_t i = 0; i < scan->count; i++) {
         scan_entry_t *e = &scan->entries[i];
@@ -631,36 +636,17 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         /* Hard link secondaries share the primary's objects — nothing to store */
         if (e->hardlink_to_node_id != 0) continue;
 
-        /* --- Step A: store xattr/acl --- */
-        if (e->xattr_len > 0) {
-            fail_ctx = "store xattrs";
-            st = object_store(repo, OBJECT_TYPE_XATTR,
-                              e->xattr_data, e->xattr_len, e->node.xattr_hash);
-            if (st != OK) goto done;
-            free(e->xattr_data);
-            e->xattr_data = NULL;
-            e->xattr_len = 0;
-        }
-        if (e->acl_len > 0) {
-            fail_ctx = "store ACLs";
-            st = object_store(repo, OBJECT_TYPE_ACL,
-                              e->acl_data, e->acl_len, e->node.acl_hash);
-            if (st != OK) goto done;
-            free(e->acl_data);
-            e->acl_data = NULL;
-            e->acl_len = 0;
-        }
-
-        /* --- Step B: look up in previous snapshot --- */
+        /* --- Step A: look up in previous snapshot --- */
         const node_t *prev = prev_map ? pathmap_lookup(prev_map, rel) : NULL;
         if (prev) pathmap_mark_seen(prev_map, rel);
 
-        /* --- Step C: classify change --- */
+        /* --- Step B: fast change classification --- */
         int change;
+        int content_same = 0;
+        int meta_basic_same = 0;
         if (!prev) {
             change = CHANGE_CREATED;
         } else {
-            int content_same;
             if (e->node.type == NODE_TYPE_REG) {
                 content_same = (e->node.size       == prev->size       &&
                                 e->node.mtime_sec  == prev->mtime_sec  &&
@@ -669,16 +655,65 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
             } else {
                 content_same = 1;
             }
-            int meta_same = (e->node.mode == prev->mode &&
-                             e->node.uid  == prev->uid  &&
-                             e->node.gid  == prev->gid  &&
-                             memcmp(e->node.xattr_hash, prev->xattr_hash,
-                                    OBJECT_HASH_SIZE) == 0 &&
-                             memcmp(e->node.acl_hash, prev->acl_hash,
-                                    OBJECT_HASH_SIZE) == 0);
-            if (content_same && meta_same)      change = CHANGE_UNCHANGED;
-            else if (content_same)              change = CHANGE_METADATA_ONLY;
-            else                                change = CHANGE_MODIFIED;
+            meta_basic_same = (e->node.mode == prev->mode &&
+                               e->node.uid  == prev->uid  &&
+                               e->node.gid  == prev->gid);
+
+            if (!strict_meta && content_same && meta_basic_same) {
+                memcpy(e->node.content_hash, prev->content_hash, OBJECT_HASH_SIZE);
+                memcpy(e->node.xattr_hash, prev->xattr_hash, OBJECT_HASH_SIZE);
+                memcpy(e->node.acl_hash, prev->acl_hash, OBJECT_HASH_SIZE);
+                change = CHANGE_UNCHANGED;
+            } else if (content_same) {
+                change = CHANGE_METADATA_ONLY;
+            } else {
+                change = CHANGE_MODIFIED;
+            }
+        }
+
+        /* --- Step C: collect/store xattr+ACL unless fast-unchanged --- */
+        if (strict_meta || !(prev && content_same && meta_basic_same)) {
+            fail_ctx = "collect metadata";
+            st = scan_entry_collect_metadata(e);
+            if (st != OK) goto done;
+
+            if (e->xattr_len > 0) {
+                fail_ctx = "store xattrs";
+                int is_new = 0;
+                uint64_t phys = 0;
+                st = object_store_ex(repo, OBJECT_TYPE_XATTR,
+                                     e->xattr_data, e->xattr_len, e->node.xattr_hash,
+                                     &is_new, &phys);
+                if (st != OK) goto done;
+                if (is_new) phys_new_bytes += phys;
+            }
+            if (e->acl_len > 0) {
+                fail_ctx = "store ACLs";
+                int is_new = 0;
+                uint64_t phys = 0;
+                st = object_store_ex(repo, OBJECT_TYPE_ACL,
+                                     e->acl_data, e->acl_len, e->node.acl_hash,
+                                     &is_new, &phys);
+                if (st != OK) goto done;
+                if (is_new) phys_new_bytes += phys;
+            }
+            free(e->xattr_data);
+            e->xattr_data = NULL;
+            e->xattr_len = 0;
+            free(e->acl_data);
+            e->acl_data = NULL;
+            e->acl_len = 0;
+
+            if (prev && content_same) {
+                int meta_same = (e->node.mode == prev->mode &&
+                                 e->node.uid  == prev->uid  &&
+                                 e->node.gid  == prev->gid  &&
+                                 memcmp(e->node.xattr_hash, prev->xattr_hash,
+                                        OBJECT_HASH_SIZE) == 0 &&
+                                 memcmp(e->node.acl_hash, prev->acl_hash,
+                                        OBJECT_HASH_SIZE) == 0);
+                change = meta_same ? CHANGE_UNCHANGED : CHANGE_METADATA_ONLY;
+            }
         }
 
         /* --- Step D: handle content ---
@@ -688,55 +723,28 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
             if (change == CHANGE_UNCHANGED || change == CHANGE_METADATA_ONLY) {
                 memcpy(e->node.content_hash, prev->content_hash, OBJECT_HASH_SIZE);
             } else if (e->node.size > 0) {
-                int fd = open(e->path, O_RDONLY);
-                if (fd == -1 &&
-                    (errno == EACCES || errno == EPERM || errno == ENOENT)) {
-                    n_unreadable++;
-                    if (opts && opts->verbose) {
-                        char msg[PATH_MAX + 128];
-                        if (snprintf(msg, sizeof(msg),
-                                     "cannot read file, skipping: %s (%s)",
-                                     e->path, strerror(errno)) >= (int)sizeof(msg)) {
-                            log_msg("WARN", "cannot read file, skipping: <path-too-long>");
-                        } else {
-                            log_msg("WARN", msg);
-                        }
-                    }
-                    if (prev) {
-                        e->node = *prev;
-                        change = CHANGE_UNCHANGED;
-                    } else {
-                        if (skipped_add(&skipped, e->node.node_id) != 0) {
-                            st = ERR_NOMEM;
-                            goto done;
-                        }
-                        e->node.type = 0;
-                        skip_entry = 1;
-                    }
-                } else if (fd == -1) {
-                    st = ERR_IO;
-                    goto done;
+                store_queue[store_qlen].idx = i;
+                if (prev) {
+                    store_queue[store_qlen].has_prev = 1;
+                    store_queue[store_qlen].prev = *prev;
                 } else {
-                    close(fd);
-                    store_queue[store_qlen].idx = i;
-                    if (prev) {
-                        store_queue[store_qlen].has_prev = 1;
-                        store_queue[store_qlen].prev = *prev;
-                    } else {
-                        store_queue[store_qlen].has_prev = 0;
-                        memset(&store_queue[store_qlen].prev, 0, sizeof(node_t));
-                    }
-                    store_qlen++;
+                    store_queue[store_qlen].has_prev = 0;
+                    memset(&store_queue[store_qlen].prev, 0, sizeof(node_t));
                 }
+                store_qlen++;
             }
         } else if (e->node.type == NODE_TYPE_SYMLINK && e->symlink_target) {
             if (change == CHANGE_UNCHANGED || change == CHANGE_METADATA_ONLY) {
                 memcpy(e->node.content_hash, prev->content_hash, OBJECT_HASH_SIZE);
             } else {
                 size_t tlen = strlen(e->symlink_target) + 1;
-                st = object_store(repo, OBJECT_TYPE_FILE,
-                                  e->symlink_target, tlen, e->node.content_hash);
+                int is_new = 0;
+                uint64_t phys = 0;
+                st = object_store_ex(repo, OBJECT_TYPE_FILE,
+                                     e->symlink_target, tlen, e->node.content_hash,
+                                     &is_new, &phys);
                 if (st != OK) goto done;
+                if (is_new) phys_new_bytes += phys;
             }
             free(e->symlink_target);
             e->symlink_target = NULL;
@@ -798,7 +806,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     }
     fail_ctx = "store file contents";
     st = store_parallel(repo, scan->entries, store_queue, store_qlen,
-                        tui, &n_transient_skipped_store);
+                        tui, &n_transient_skipped_store, &phys_new_bytes);
     if (st != OK) goto done;
     if (tui) phase_line_clear();
 
@@ -817,6 +825,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     if (!new_snap) { st = ERR_NOMEM; goto done; }
     new_snap->snap_id     = prev_id + 1;
     new_snap->created_sec = (uint64_t)time(NULL);
+    new_snap->phys_new_bytes = phys_new_bytes;
 
     /* Node table: primary nodes only (skip hard link secondaries) */
     uint32_t primary_count = 0;
@@ -886,6 +895,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     fail_ctx = "update HEAD";
     st = snapshot_write_head(repo, new_snap->snap_id);
     if (st == OK) {
+        committed_snapshot = 1;
         if (!opts || !opts->quiet)
             fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
                     new_snap->snap_id, scan->count,
@@ -945,8 +955,8 @@ done:
     snapshot_free(prev_snap);
     scan_result_free(scan);
 
-    /* Always pack after a successful backup so loose objects are transient. */
-    if (st == OK) {
+    /* Pack only when a new snapshot commit succeeded. */
+    if (st == OK && committed_snapshot) {
         log_msg("INFO", "Phase 8: packing objects");
         repo_pack(repo, NULL);   /* best-effort: ignore pack errors */
     }

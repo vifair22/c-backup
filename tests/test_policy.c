@@ -60,6 +60,7 @@ static void test_policy_defaults(void **state) {
     assert_int_equal(p.auto_prune, 1);
     assert_int_equal(p.keep_snaps, 1);
     assert_int_equal(p.verify_after, 0);
+    assert_int_equal(p.strict_meta, 0);
 }
 
 static void test_policy_save_load_roundtrip(void **state) {
@@ -92,6 +93,7 @@ static void test_policy_save_load_roundtrip(void **state) {
     p.auto_gc = 0;
     p.auto_prune = 1;
     p.verify_after = 1;
+    p.strict_meta = 1;
 
     assert_int_equal(policy_save(repo, &p), OK);
 
@@ -113,6 +115,7 @@ static void test_policy_save_load_roundtrip(void **state) {
     assert_int_equal(loaded->auto_gc, 0);
     assert_int_equal(loaded->auto_prune, 1);
     assert_int_equal(loaded->verify_after, 1);
+    assert_int_equal(loaded->strict_meta, 1);
     policy_free(loaded);
 
     free(p.paths[0]);

@@ -61,11 +61,39 @@ int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     return pack_object_exists(repo, hash);
 }
 
+status_t object_physical_size(repo_t *repo,
+                              const uint8_t hash[OBJECT_HASH_SIZE],
+                              uint64_t *out_bytes) {
+    if (!out_bytes) return ERR_INVALID;
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    int fd = open(path, O_RDONLY);
+    if (fd != -1) {
+        object_header_t hdr;
+        if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+            close(fd);
+            return ERR_CORRUPT;
+        }
+        close(fd);
+        *out_bytes = (uint64_t)sizeof(hdr) + hdr.compressed_size;
+        return OK;
+    }
+
+    return pack_object_physical_size(repo, hash, out_bytes);
+}
+
 /* Write a blob (already in memory) as an object. */
 static status_t write_object(repo_t *repo, uint8_t type,
                              const void *data, size_t len,
-                             uint8_t out_hash[OBJECT_HASH_SIZE]) {
+                             uint8_t out_hash[OBJECT_HASH_SIZE],
+                             int *out_is_new, uint64_t *out_phys_bytes) {
     sha256(data, len, out_hash);
+    if (out_is_new) *out_is_new = 0;
+    if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) return OK;
 
     int max_dst = LZ4_compressBound((int)len);
@@ -145,6 +173,8 @@ static status_t write_object(repo_t *repo, uint8_t type,
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
     close(subfd); free(compressed);
+    if (out_is_new) *out_is_new = 1;
+    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(hdr) + (uint64_t)payload_size;
     return st;
 fail:
     if (fd >= 0) close(fd);
@@ -155,7 +185,8 @@ fail:
 
 static status_t write_object_file_stream(repo_t *repo, int src_fd,
                                          uint64_t file_size,
-                                         uint8_t out_hash[OBJECT_HASH_SIZE]) {
+                                         uint8_t out_hash[OBJECT_HASH_SIZE],
+                                         int *out_is_new, uint64_t *out_phys_bytes) {
     enum { FILE_CHUNK = 1024 * 1024 };
     uint8_t *buf = malloc(FILE_CHUNK);
     if (!buf) return ERR_NOMEM;
@@ -248,6 +279,8 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         return ERR_IO;
     }
     EVP_MD_CTX_free(mdctx);
+    if (out_is_new) *out_is_new = 0;
+    if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) {
         close(tfd);
         unlink(tmppath);
@@ -322,13 +355,22 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     fsync(subfd);
     close(subfd);
     free(buf);
+    if (out_is_new) *out_is_new = 1;
+    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + got;
     return OK;
 }
 
 status_t object_store(repo_t *repo, uint8_t type,
                       const void *data, size_t len,
                       uint8_t out_hash[OBJECT_HASH_SIZE]) {
-    return write_object(repo, type, data, len, out_hash);
+    return object_store_ex(repo, type, data, len, out_hash, NULL, NULL);
+}
+
+status_t object_store_ex(repo_t *repo, uint8_t type,
+                         const void *data, size_t len,
+                         uint8_t out_hash[OBJECT_HASH_SIZE],
+                         int *out_is_new, uint64_t *out_phys_bytes) {
+    return write_object(repo, type, data, len, out_hash, out_is_new, out_phys_bytes);
 }
 
 /* ------------------------------------------------------------------ */
@@ -337,10 +379,17 @@ status_t object_store(repo_t *repo, uint8_t type,
 
 status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
                            uint8_t out_hash[OBJECT_HASH_SIZE]) {
+    return object_store_file_ex(repo, fd, file_size, out_hash, NULL, NULL);
+}
+
+status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
+                              uint8_t out_hash[OBJECT_HASH_SIZE],
+                              int *out_is_new, uint64_t *out_phys_bytes) {
     if (file_size == 0) {
         /* empty file */
         uint8_t empty = 0;
-        return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash);
+        return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
+                            out_is_new, out_phys_bytes);
     }
 
     /* Discover data regions using SEEK_DATA / SEEK_HOLE */
@@ -386,7 +435,8 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
     /* If the file isn't sparse (or the FS doesn't report holes), read it whole */
     if (!is_sparse || n_regions == 0) {
         free(regions);
-        return write_object_file_stream(repo, fd, file_size, out_hash);
+        return write_object_file_stream(repo, fd, file_size, out_hash,
+                                        out_is_new, out_phys_bytes);
     }
 
     /* Build sparse payload: [sparse_hdr][regions][data bytes] */
@@ -422,7 +472,8 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
     }
 
     free(regions);
-    status_t st = write_object(repo, OBJECT_TYPE_SPARSE, payload, payload_sz, out_hash);
+    status_t st = write_object(repo, OBJECT_TYPE_SPARSE, payload, payload_sz, out_hash,
+                               out_is_new, out_phys_bytes);
     free(payload);
     return st;
 }

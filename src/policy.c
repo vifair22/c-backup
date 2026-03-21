@@ -1,13 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include "policy.h"
 
-#include <ctype.h>
-#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "../vendor/toml.h"
 
 void policy_init_defaults(policy_t *p) {
     if (!p) return;
@@ -17,21 +17,11 @@ void policy_init_defaults(policy_t *p) {
     p->auto_prune      = 1;
     p->keep_snaps      = 1;
     p->verify_after    = 0;
-}
-
-static int parse_nonneg_int(const char *s, int *out) {
-    char *end = NULL;
-    long v;
-    if (!s || !*s || !out) return 0;
-    errno = 0;
-    v = strtol(s, &end, 10);
-    if (errno != 0 || *end != '\0' || v < 0 || v > INT_MAX) return 0;
-    *out = (int)v;
-    return 1;
+    p->strict_meta     = 0;
 }
 
 void policy_path(repo_t *repo, char *buf, size_t sz) {
-    snprintf(buf, sz, "%s/policy.conf", repo_path(repo));
+    snprintf(buf, sz, "%s/policy.toml", repo_path(repo));
 }
 
 status_t policy_write_template(repo_t *repo) {
@@ -48,49 +38,50 @@ status_t policy_write_template(repo_t *repo) {
     if (!f) return ERR_IO;
 
     fprintf(f,
-        "# c-backup policy configuration\n"
-        "# Uncomment and edit the options you want to use.\n"
-        "# All values shown are defaults.\n"
+        "# c-backup policy configuration (TOML)\n"
+        "# Uncomment and edit options.\n"
         "\n"
-        "# Source paths to back up (space-separated).\n"
-        "# Example: paths = /home/alice /etc\n"
-        "#paths = \n"
+        "# Source paths to back up.\n"
+        "# paths = [\"/home/alice\", \"/etc\"]\n"
         "\n"
-        "# Paths/patterns to exclude (fnmatch against basename, space-separated).\n"
-        "# Example: exclude = .git *.tmp *.swp\n"
-        "#exclude = \n"
+        "# Exclude patterns (fnmatch against basename; patterns with '/' match full path).\n"
+        "# exclude = [\".git\", \"*.tmp\", \"*.swp\"]\n"
         "\n"
         "# --- Retention (GFS) ---\n"
         "\n"
         "# Minimum number of recent full snapshots (.snap) to keep.\n"
-        "#keep_snaps = 1\n"
+        "# keep_snaps = 1\n"
         "\n"
         "# Keep one snapshot per calendar day for the N most recent days.\n"
-        "#keep_daily = 0\n"
+        "# keep_daily = 0\n"
         "\n"
         "# Keep one snapshot per week for the N most recent weeks.\n"
-        "#keep_weekly = 0\n"
+        "# keep_weekly = 0\n"
         "\n"
         "# Keep one snapshot per month for the N most recent months.\n"
-        "#keep_monthly = 0\n"
+        "# keep_monthly = 0\n"
         "\n"
         "# Keep one snapshot per year for the N most recent years.\n"
-        "#keep_yearly = 0\n"
+        "# keep_yearly = 0\n"
         "\n"
         "# --- Automatic post-run operations ---\n"
         "\n"
         "# Pack loose objects into pack files after each backup.\n"
-        "#auto_pack = true\n"
+        "# auto_pack = true\n"
         "\n"
         "# Remove unreferenced objects after each backup.\n"
-        "#auto_gc = true\n"
+        "# auto_gc = true\n"
         "\n"
         "# Apply retention policy and delete old snapshots after each backup.\n"
-        "#auto_prune = true\n"
+        "# auto_prune = true\n"
         "\n"
         "# Verify that every object referenced by the new snapshot exists on disk\n"
         "# after each backup.  Catches write failures early at the cost of extra I/O.\n"
-        "#verify_after = false\n"
+        "# verify_after = false\n"
+        "\n"
+        "# Strict metadata mode: always scan/store xattr+ACL and detect metadata-only\n"
+        "# drift even when content/mtime/inode look unchanged. Slower on large trees.\n"
+        "# strict_meta = false\n"
     );
 
     if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
@@ -107,45 +98,6 @@ void policy_free(policy_t *p) {
     free(p);
 }
 
-/* Split whitespace-separated tokens; returns count, -1 on alloc failure. */
-static int split_tokens(const char *s, char ***out_toks) {
-    const char *p = s;
-    int n = 0;
-    while (*p) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (*p) { n++; while (*p && !isspace((unsigned char)*p)) p++; }
-    }
-    if (n == 0) { *out_toks = NULL; return 0; }
-
-    char **toks = malloc((size_t)n * sizeof(char *));
-    if (!toks) return -1;
-
-    p = s;
-    int i = 0;
-    while (*p && i < n) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-        const char *start = p;
-        while (*p && !isspace((unsigned char)*p)) p++;
-        size_t len = (size_t)(p - start);
-        toks[i] = malloc(len + 1);
-        if (!toks[i]) {
-            for (int j = 0; j < i; j++) free(toks[j]);
-            free(toks);
-            return -1;
-        }
-        memcpy(toks[i], start, len);
-        toks[i][len] = '\0';
-        i++;
-    }
-    *out_toks = toks;
-    return n;
-}
-
-static int parse_bool(const char *s) {
-    return strcmp(s, "true") == 0 || strcmp(s, "yes") == 0 || strcmp(s, "1") == 0;
-}
-
 status_t policy_load(repo_t *repo, policy_t **out) {
     char path[PATH_MAX];
     policy_path(repo, path, sizeof(path));
@@ -153,59 +105,84 @@ status_t policy_load(repo_t *repo, policy_t **out) {
     FILE *f = fopen(path, "r");
     if (!f) return ERR_NOT_FOUND;
 
+    char errbuf[256] = {0};
+    toml_table_t *tab = toml_parse_file(f, errbuf, sizeof(errbuf));
+    fclose(f);
+    if (!tab) return ERR_IO;
+
     policy_t *p = calloc(1, sizeof(*p));
-    if (!p) { fclose(f); return ERR_NOMEM; }
+    if (!p) { toml_free(tab); return ERR_NOMEM; }
     policy_init_defaults(p);
 
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        char *s = line;
-        while (isspace((unsigned char)*s)) s++;
-        if (!*s || *s == '#') continue;
-
-        /* Split on " = " */
-        char *eq = strstr(s, " = ");
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = s;
-        char *val = eq + 3;
-
-        /* Trim trailing whitespace from key */
-        char *ke = key + strlen(key);
-        while (ke > key && isspace((unsigned char)*(ke - 1))) *--ke = '\0';
-
-        if (strcmp(key, "paths") == 0) {
-            int r = split_tokens(val, &p->paths);
-            p->n_paths = (r >= 0) ? r : 0;
-        } else if (strcmp(key, "exclude") == 0) {
-            int r = split_tokens(val, &p->exclude);
-            p->n_exclude = (r >= 0) ? r : 0;
-        } else if (strcmp(key, "keep_snaps") == 0) {
-            (void)parse_nonneg_int(val, &p->keep_snaps);
-        } else if (strcmp(key, "keep_daily") == 0) {
-            (void)parse_nonneg_int(val, &p->keep_daily);
-        } else if (strcmp(key, "keep_weekly") == 0) {
-            (void)parse_nonneg_int(val, &p->keep_weekly);
-        } else if (strcmp(key, "keep_monthly") == 0) {
-            (void)parse_nonneg_int(val, &p->keep_monthly);
-        } else if (strcmp(key, "keep_yearly") == 0) {
-            (void)parse_nonneg_int(val, &p->keep_yearly);
-        } else if (strcmp(key, "auto_pack") == 0) {
-            p->auto_pack = parse_bool(val);
-        } else if (strcmp(key, "auto_gc") == 0) {
-            p->auto_gc = parse_bool(val);
-        } else if (strcmp(key, "auto_prune") == 0) {
-            p->auto_prune = parse_bool(val);
-        } else if (strcmp(key, "verify_after") == 0) {
-            p->verify_after = parse_bool(val);
+    toml_array_t *arr = toml_array_in(tab, "paths");
+    if (arr) {
+        int n = toml_array_nelem(arr);
+        if (n > 0) {
+            p->paths = calloc((size_t)n, sizeof(char *));
+            if (!p->paths) { toml_free(tab); policy_free(p); return ERR_NOMEM; }
+            for (int i = 0; i < n; i++) {
+                toml_datum_t d = toml_string_at(arr, i);
+                if (d.ok && d.u.s) p->paths[p->n_paths++] = d.u.s;
+            }
         }
     }
-    fclose(f);
+
+    arr = toml_array_in(tab, "exclude");
+    if (arr) {
+        int n = toml_array_nelem(arr);
+        if (n > 0) {
+            p->exclude = calloc((size_t)n, sizeof(char *));
+            if (!p->exclude) { toml_free(tab); policy_free(p); return ERR_NOMEM; }
+            for (int i = 0; i < n; i++) {
+                toml_datum_t d = toml_string_at(arr, i);
+                if (d.ok && d.u.s) p->exclude[p->n_exclude++] = d.u.s;
+            }
+        }
+    }
+
+    toml_datum_t d;
+    d = toml_int_in(tab, "keep_snaps");
+    if (d.ok && d.u.i >= 0 && d.u.i <= INT_MAX) p->keep_snaps = (int)d.u.i;
+    d = toml_int_in(tab, "keep_daily");
+    if (d.ok && d.u.i >= 0 && d.u.i <= INT_MAX) p->keep_daily = (int)d.u.i;
+    d = toml_int_in(tab, "keep_weekly");
+    if (d.ok && d.u.i >= 0 && d.u.i <= INT_MAX) p->keep_weekly = (int)d.u.i;
+    d = toml_int_in(tab, "keep_monthly");
+    if (d.ok && d.u.i >= 0 && d.u.i <= INT_MAX) p->keep_monthly = (int)d.u.i;
+    d = toml_int_in(tab, "keep_yearly");
+    if (d.ok && d.u.i >= 0 && d.u.i <= INT_MAX) p->keep_yearly = (int)d.u.i;
+
+    d = toml_bool_in(tab, "auto_pack");
+    if (d.ok) p->auto_pack = d.u.b ? 1 : 0;
+    d = toml_bool_in(tab, "auto_gc");
+    if (d.ok) p->auto_gc = d.u.b ? 1 : 0;
+    d = toml_bool_in(tab, "auto_prune");
+    if (d.ok) p->auto_prune = d.u.b ? 1 : 0;
+    d = toml_bool_in(tab, "verify_after");
+    if (d.ok) p->verify_after = d.u.b ? 1 : 0;
+    d = toml_bool_in(tab, "strict_meta");
+    if (d.ok) p->strict_meta = d.u.b ? 1 : 0;
+
+    toml_free(tab);
     *out = p;
     return OK;
+}
+
+static void toml_write_escaped(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '\\': fputs("\\\\", f); break;
+            case '"':  fputs("\\\"", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default:
+                if (*p < 0x20) fprintf(f, "\\u%04x", (unsigned)*p);
+                else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
 }
 
 status_t policy_save(repo_t *repo, const policy_t *p) {
@@ -218,19 +195,19 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     FILE *f = fopen(tmp, "w");
     if (!f) return ERR_IO;
 
-    fprintf(f, "paths = ");
+    fprintf(f, "paths = [");
     for (int i = 0; i < p->n_paths; i++) {
-        if (i > 0) fprintf(f, " ");
-        fprintf(f, "%s", p->paths[i]);
+        if (i > 0) fprintf(f, ", ");
+        toml_write_escaped(f, p->paths[i]);
     }
-    fprintf(f, "\n");
+    fprintf(f, "]\n");
 
-    fprintf(f, "exclude = ");
+    fprintf(f, "exclude = [");
     for (int i = 0; i < p->n_exclude; i++) {
-        if (i > 0) fprintf(f, " ");
-        fprintf(f, "%s", p->exclude[i]);
+        if (i > 0) fprintf(f, ", ");
+        toml_write_escaped(f, p->exclude[i]);
     }
-    fprintf(f, "\n");
+    fprintf(f, "]\n");
 
     fprintf(f, "keep_snaps = %d\n",       p->keep_snaps);
     fprintf(f, "keep_daily = %d\n",       p->keep_daily);
@@ -241,6 +218,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     fprintf(f, "auto_gc = %s\n",          p->auto_gc          ? "true" : "false");
     fprintf(f, "auto_prune = %s\n",       p->auto_prune       ? "true" : "false");
     fprintf(f, "verify_after = %s\n",     p->verify_after     ? "true" : "false");
+    fprintf(f, "strict_meta = %s\n",      p->strict_meta      ? "true" : "false");
 
     if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
     if (rename(tmp, path) != 0) { unlink(tmp); return ERR_IO; }
