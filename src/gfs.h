@@ -40,21 +40,6 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet);
 
 /*
- * Detect which GFS tier boundaries were crossed between prev_ts and new_ts.
- * Returns a bitmask of GFS_* flags.  If prev_ts == 0 (first backup),
- * returns all applicable flags based on new_ts alone.
- */
-uint32_t gfs_detect_boundaries(uint64_t prev_ts, uint64_t new_ts);
-
-/*
- * Compute effective rev retention: max(policy->keep_revs,
- * distance from head_id to the oldest GFS-anchored snap in snaps[]).
- */
-uint32_t gfs_effective_keep_revs(const policy_t *policy,
-                                 uint32_t head_id,
-                                 const gfs_snap_info_t *snaps, uint32_t n);
-
-/*
  * Synthesise a .snap for snap_id (if missing) then OR gfs_flags into it.
  * Verifies the snap loads correctly before returning OK.
  */

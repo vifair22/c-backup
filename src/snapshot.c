@@ -13,7 +13,6 @@
 
 #define SNAP_MAGIC    0x43424B50u  /* "CBKP" */
 #define SNAP_VERSION  2u
-#define SNAP_VERSION1 1u           /* legacy — gfs_flags absent */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -52,23 +51,20 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC ||
-        (version != SNAP_VERSION && version != SNAP_VERSION1)) {
+    if (magic != SNAP_MAGIC || version != SNAP_VERSION) {
         close(fd); log_msg("ERROR", "invalid snapshot magic/version"); return ERR_CORRUPT;
     }
 
-    /* Read the remaining header fields individually */
+    /* Read the remaining header fields */
     uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
     uint64_t created_sec = 0, dirent_data_len = 0;
 
 #define RD32(v) (read(fd, &(v), 4) != 4)
 #define RD64(v) (read(fd, &(v), 8) != 8)
     if (RD32(snap_id_f) || RD64(created_sec) ||
-        RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len)) {
+        RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len) ||
+        RD32(gfs_flags)) {
         close(fd); return ERR_CORRUPT;
-    }
-    if (version == SNAP_VERSION) {
-        if (RD32(gfs_flags)) { close(fd); return ERR_CORRUPT; }
     }
 #undef RD32
 #undef RD64
@@ -160,14 +156,7 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC) { close(fd); return ERR_CORRUPT; }
-
-    if (version == SNAP_VERSION1) {
-        /* V1 has no gfs_flags field */
-        close(fd);
-        *out_flags = 0;
-        return OK;
-    }
+    if (magic != SNAP_MAGIC || version != SNAP_VERSION) { close(fd); return ERR_CORRUPT; }
 
     /* Skip past snap_id(4) + created_sec(8) + node_count(4) +
      * dirent_count(4) + dirent_data_len(8) = 28 bytes to reach gfs_flags */

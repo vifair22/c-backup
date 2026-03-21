@@ -109,8 +109,7 @@ static void usage(void) {
         "  backup policy   --repo <path> set [policy options]\n"
         "  backup policy   --repo <path> edit\n"
         "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
-        "                               [--no-pack] [--no-prune] [--no-gc]\n"
-        "                               [--no-checkpoint] [--no-gfs]\n"
+        "                               [--no-pack] [--no-gc] [--no-checkpoint]\n"
         "                               [--no-policy] [--quiet] [--verify-after]\n"
         "  backup list     --repo <path>\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
@@ -333,10 +332,8 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
 static int cmd_run(repo_t *repo, int argc, char **argv) {
     int no_policy     = opt_has(argc, argv, 2, "--no-policy");
     int no_pack       = opt_has(argc, argv, 2, "--no-pack");
-    int no_prune      = opt_has(argc, argv, 2, "--no-prune");
     int no_gc         = opt_has(argc, argv, 2, "--no-gc");
     int no_checkpoint = opt_has(argc, argv, 2, "--no-checkpoint");
-    int no_gfs        = opt_has(argc, argv, 2, "--no-gfs");
     int quiet         = opt_has(argc, argv, 2, "--quiet");
     int verify_after  = opt_has(argc, argv, 2, "--verify-after");
     int no_verify_after = opt_has(argc, argv, 2, "--no-verify-after");
@@ -401,7 +398,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     status_t st = backup_run_opts(repo, source_paths, n_source, &bopts);
     if (st != OK) { policy_free(pol); return 1; }
 
-    /* Post-backup: checkpoint (legacy, used when GFS is not active) */
+    /* Post-backup: synthesise checkpoints at the configured interval */
     if (!no_checkpoint && pol && pol->auto_checkpoint && pol->checkpoint_every > 0) {
         if (!quiet) fprintf(stderr, "checkpointing every %d...\n", pol->checkpoint_every);
         snapshot_synthesize_every(repo, (uint32_t)pol->checkpoint_every, NULL);
@@ -410,11 +407,11 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     /* Post-backup: GFS retention engine.
      * Activated when keep_revs or any GFS tier is set.
      * Handles prune, rev deletion, and GC internally. */
-    int use_gfs = !no_gfs && pol &&
+    int use_gfs = pol &&
                   (pol->keep_revs > 0 || pol->keep_daily > 0 ||
                    pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
                    pol->keep_yearly > 0);
-    if (use_gfs && pol->auto_prune && !no_prune) {
+    if (use_gfs && pol->auto_prune) {
         uint32_t head_id = 0;
         snapshot_read_head(repo, &head_id);
         gfs_run(repo, pol, head_id, 0, quiet);

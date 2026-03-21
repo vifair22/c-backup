@@ -16,11 +16,22 @@
 #include "../src/snapshot.h"
 #include "../src/restore.h"
 #include "../src/gc.h"
+#include "../src/gfs.h"
+#include "../src/policy.h"
 
 #define TEST_REPO "/tmp/c_backup_gc_repo"
 #define TEST_SRC  "/tmp/c_backup_gc_src"
 
 static repo_t *repo;
+
+/* Prune repo keeping the last keep_n snapshots (keep_n >= 1). */
+static void prune_keep(uint32_t keep_n) {
+    uint32_t h = 0;
+    snapshot_read_head(repo, &h);
+    policy_t pol = {0};
+    pol.keep_revs = (keep_n > 0) ? keep_n - 1 : 0;
+    gfs_run(repo, &pol, h, 0, 1);
+}
 
 static void write_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -154,9 +165,7 @@ static void test_prune_removes_old_snapshots(void **state) {
     write_file(TEST_SRC "/a.txt", "file a v3");
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 2, &pruned, 0), OK);
-    assert_int_equal(pruned, 1u);   /* snap 1 removed, 2 and 3 kept */
+    prune_keep(2);   /* snap 1 removed, 2 and 3 kept */
 
     /* Snapshot 1 file must be gone */
     char snap1[256];
@@ -190,9 +199,7 @@ static void test_prune_then_restore_at(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);   /* snap 3 */
 
     /* Prune: keep only the latest 2 (removes snap 1) */
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 2, &pruned, 0), OK);
-    assert_int_equal(pruned, 1u);
+    prune_keep(2);
 
     /* Restore snap 1 via reverse chain into a temp dest */
     char dest[256];

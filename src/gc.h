@@ -12,16 +12,6 @@
 status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted);
 
 /*
- * Delete snapshot files older than the most-recent keep_count snapshots.
- * Reverse records are preserved.  Runs GC afterwards to purge unreferenced
- * objects.  *out_pruned (may be NULL) receives the number of .snap files
- * removed.  keep_count must be >= 1.
- * If dry_run is non-zero, print what would be removed but make no changes.
- */
-status_t repo_prune(repo_t *repo, uint32_t keep_count, uint32_t *out_pruned,
-                    int dry_run);
-
-/*
  * Verify every object referenced by every surviving snapshot: loads and
  * decompresses each object, re-hashing its content to confirm integrity.
  * Returns OK if all objects are present and uncorrupted, ERR_CORRUPT

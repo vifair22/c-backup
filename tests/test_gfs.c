@@ -17,7 +17,6 @@
 #include "../src/policy.h"
 #include "../src/gfs.h"
 #include "../src/tag.h"
-#include "../src/gc.h"
 
 #define TEST_REPO "/tmp/c_backup_gfs_repo"
 #define TEST_SRC  "/tmp/c_backup_gfs_src"
@@ -98,125 +97,142 @@ static int snap_exists(uint32_t snap_id) {
 }
 
 /* ================================================================== */
-/* 1. gfs_detect_boundaries — pure unit tests (no repo)               */
+/* 1. Boundary detection — via observable GFS flags after gfs_run     */
 /* ================================================================== */
 
+/* Two snaps on the same calendar day → no GFS flag assigned. */
 static void test_detect_no_boundary_same_day(void **state) {
     (void)state;
-    /* Two timestamps on the same calendar day → no flags */
-    uint64_t t0 = TS_SUN_2025_01_05;
-    uint64_t t1 = TS_SUN_2025_01_05 + 3600; /* one hour later */
-    assert_int_equal(gfs_detect_boundaries(t0, t1), 0);
+    make_backups(2);
+    /* Both snaps are created within the same test run (same day). */
+    policy_t pol = {0};
+    pol.keep_revs = 5;
+    assert_int_equal(gfs_run(repo, &pol, 2, 0, 1), OK);
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
+    assert_int_equal(flags, 0u);
 }
 
+/* Sat → Mon boundary: snap 1 (Sat) gets GFS_DAILY only (not Sunday). */
 static void test_detect_daily_only(void **state) {
     (void)state;
-    /* Saturday → Monday: day changed, new day is NOT Sunday → only daily */
-    uint32_t flags = gfs_detect_boundaries(TS_SAT_2025_01_04, TS_MON_2025_01_06);
+    make_backups(2);
+    patch_snap_ts(1, TS_SAT_2025_01_04);
+    patch_snap_ts(2, TS_MON_2025_01_06);
+    policy_t pol = {0};
+    pol.keep_revs = 5;
+    assert_int_equal(gfs_run(repo, &pol, 2, 0, 1), OK);
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
     assert_true(flags & GFS_DAILY);
     assert_false(flags & GFS_WEEKLY);
     assert_false(flags & GFS_MONTHLY);
     assert_false(flags & GFS_YEARLY);
 }
 
+/* Sat → Sun (not last Sunday of month): snap 1 gets GFS_DAILY|GFS_WEEKLY. */
 static void test_detect_daily_and_weekly(void **state) {
     (void)state;
-    /* Saturday → Sunday (not last Sunday of month): daily + weekly */
-    uint32_t flags = gfs_detect_boundaries(TS_SAT_2025_01_04, TS_SUN_2025_01_05);
+    make_backups(2);
+    patch_snap_ts(1, TS_SAT_2025_01_04);
+    patch_snap_ts(2, TS_SUN_2025_01_05);
+    policy_t pol = {0};
+    pol.keep_revs = 5;
+    assert_int_equal(gfs_run(repo, &pol, 2, 0, 1), OK);
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
     assert_true(flags & GFS_DAILY);
     assert_true(flags & GFS_WEEKLY);
     assert_false(flags & GFS_MONTHLY);
     assert_false(flags & GFS_YEARLY);
 }
 
+/* Sat → last Sunday of January 2025: GFS_DAILY|GFS_WEEKLY|GFS_MONTHLY. */
 static void test_detect_daily_weekly_monthly(void **state) {
     (void)state;
-    /* Saturday → last Sunday of January 2025: daily + weekly + monthly, not yearly */
-    uint32_t flags = gfs_detect_boundaries(TS_SAT_2025_01_25, TS_SUN_2025_01_26);
+    make_backups(2);
+    patch_snap_ts(1, TS_SAT_2025_01_25);
+    patch_snap_ts(2, TS_SUN_2025_01_26);
+    policy_t pol = {0};
+    pol.keep_revs = 5;
+    assert_int_equal(gfs_run(repo, &pol, 2, 0, 1), OK);
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
     assert_true(flags & GFS_DAILY);
     assert_true(flags & GFS_WEEKLY);
     assert_true(flags & GFS_MONTHLY);
     assert_false(flags & GFS_YEARLY);
 }
 
+/* Sat Dec 28 → Sun Dec 29 2024: last Sunday of December → all 4 tiers. */
 static void test_detect_all_tiers_december(void **state) {
     (void)state;
-    /* Saturday Dec 28 → Sunday Dec 29 2024: last Sunday of December → all four tiers */
-    uint32_t flags = gfs_detect_boundaries(TS_SAT_2024_12_28, TS_SUN_2024_12_29);
+    make_backups(2);
+    patch_snap_ts(1, TS_SAT_2024_12_28);
+    patch_snap_ts(2, TS_SUN_2024_12_29);
+    policy_t pol = {0};
+    pol.keep_revs = 5;
+    assert_int_equal(gfs_run(repo, &pol, 2, 0, 1), OK);
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
     assert_true(flags & GFS_DAILY);
     assert_true(flags & GFS_WEEKLY);
     assert_true(flags & GFS_MONTHLY);
     assert_true(flags & GFS_YEARLY);
 }
 
-static void test_detect_first_backup_on_sunday(void **state) {
-    (void)state;
-    /* First backup (prev_ts=0) on a Sunday that is NOT the last Sunday → daily + weekly */
-    uint32_t flags = gfs_detect_boundaries(0, TS_SUN_2025_01_05);
-    assert_true(flags & GFS_DAILY);
-    assert_true(flags & GFS_WEEKLY);
-    assert_false(flags & GFS_MONTHLY);
-    assert_false(flags & GFS_YEARLY);
-}
-
-static void test_detect_first_backup_on_weekday(void **state) {
-    (void)state;
-    /* First backup on a non-Sunday → daily only */
-    uint32_t flags = gfs_detect_boundaries(0, TS_MON_2025_01_06);
-    assert_true(flags & GFS_DAILY);
-    assert_false(flags & GFS_WEEKLY);
-}
-
-static void test_detect_new_ts_zero(void **state) {
-    (void)state;
-    /* new_ts == 0 → always returns 0 regardless of prev */
-    assert_int_equal(gfs_detect_boundaries(TS_SAT_2025_01_04, 0), 0);
-    assert_int_equal(gfs_detect_boundaries(0, 0), 0);
-}
-
 /* ================================================================== */
-/* 2. gfs_effective_keep_revs — pure unit tests                       */
+/* 2. Rev-window extension — via observable snap presence             */
 /* ================================================================== */
 
+/* No GFS anchors: window is exactly keep_revs behind HEAD. */
 static void test_effective_keep_revs_no_anchors(void **state) {
     (void)state;
-    /* No GFS anchors: result == max(keep_revs, 0) == keep_revs */
+    /* 6 snaps, no anchors, keep_revs=4 → window_start=2, snap 1 pruned. */
+    make_backups(6);
     policy_t pol = {0};
-    pol.keep_revs = 5;
-
-    gfs_snap_info_t snaps[3] = {
-        {1, 1000, 0, 0},
-        {2, 2000, 0, 0},
-        {3, 3000, 0, 0},
-    };
-    uint32_t eff = gfs_effective_keep_revs(&pol, 3, snaps, 3);
-    assert_int_equal(eff, 5);
+    pol.keep_revs = 4;
+    assert_int_equal(gfs_run(repo, &pol, 6, 0, 1), OK);
+    assert_false(snap_exists(1));
+    assert_true(snap_exists(2));
+    assert_true(snap_exists(6));
 }
 
+/* Live GFS anchor stretches window beyond keep_revs. */
 static void test_effective_keep_revs_extends(void **state) {
     (void)state;
-    /* GFS anchor at id=1, head=10, distance=9 > keep_revs=3 → result == 9 */
+    /* 6 snaps, anchor at snap 1, keep_revs=2.
+     * gfs_effective_keep_revs: distance=6-1=5 > keep_revs=2 → eff=5.
+     * window_start = 6-5 = 1.  ALL snaps covered — none pruned. */
+    make_backups(6);
+    assert_int_equal(snapshot_set_gfs_flags(repo, 1, GFS_DAILY), OK);
     policy_t pol = {0};
-    pol.keep_revs = 3;
-
-    gfs_snap_info_t snaps[3] = {
-        {1,  1000, GFS_DAILY,  0},
-        {5,  5000, 0,          0},
-        {10, 9000, 0,          0},
-    };
-    uint32_t eff = gfs_effective_keep_revs(&pol, 10, snaps, 3);
-    assert_int_equal(eff, 9);
+    pol.keep_revs = 2;
+    assert_int_equal(gfs_run(repo, &pol, 6, 0, 1), OK);
+    for (uint32_t id = 1; id <= 6; id++)
+        assert_true(snap_exists(id));   /* window extended to cover anchor → all kept */
 }
 
-static void test_effective_keep_revs_zero_keep_revs(void **state) {
+/* Expired GFS anchor does NOT stretch the window (it is treated like plain snap). */
+static void test_effective_keep_revs_expired_not_extended(void **state) {
     (void)state;
-    /* keep_revs=0 defaults to base=1 */
+    /* 6 snaps, anchors at 1 and 3, keep_daily=1.
+     * Snap 3 is newest daily (0 newer) → live.
+     * Snap 1 has 1 newer daily → tier_expired; keep_daily=1 → 1 newer >= 1 → expired.
+     * keep_revs=2 → window_start=6-2=4. Snap 1 expired+outside → pruned. */
+    make_backups(6);
+    assert_int_equal(snapshot_set_gfs_flags(repo, 1, GFS_DAILY), OK);
+    assert_int_equal(snapshot_set_gfs_flags(repo, 3, GFS_DAILY), OK);
     policy_t pol = {0};
-    pol.keep_revs = 0;
-
-    gfs_snap_info_t snaps[1] = {{1, 1000, 0, 0}};
-    uint32_t eff = gfs_effective_keep_revs(&pol, 1, snaps, 1);
-    assert_int_equal(eff, 1);
+    pol.keep_daily = 1;
+    pol.keep_revs  = 2;
+    assert_int_equal(gfs_run(repo, &pol, 6, 0, 1), OK);
+    assert_false(snap_exists(1));  /* expired daily + outside window → pruned */
+    assert_false(snap_exists(2));  /* non-GFS + outside window → pruned */
+    assert_true(snap_exists(3));   /* live daily anchor */
+    assert_true(snap_exists(4));   /* inside rev window */
+    assert_true(snap_exists(5));
+    assert_true(snap_exists(6));   /* HEAD */
 }
 
 /* ================================================================== */
@@ -259,9 +275,10 @@ static void test_synthesize_gfs_creates_and_flags(void **state) {
     (void)state;
     make_backups(3);
 
-    /* Prune snap 1 away */
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 2, &pruned, 0), OK);
+    /* Prune snap 1 away (keep only last 2) */
+    { uint32_t h = 0; snapshot_read_head(repo, &h);
+      policy_t p = {0}; p.keep_revs = 1;
+      assert_int_equal(gfs_run(repo, &p, h, 0, 1), OK); }
     assert_false(snap_exists(1));
 
     /* synthesize_gfs should create the snap file and set the GFS flags */
@@ -488,20 +505,17 @@ static void test_tier_expiry_weekly_cap(void **state) {
 
 int main(void) {
     const struct CMUnitTest tests[] = {
-        /* Boundary detection */
-        cmocka_unit_test(test_detect_no_boundary_same_day),
-        cmocka_unit_test(test_detect_daily_only),
-        cmocka_unit_test(test_detect_daily_and_weekly),
-        cmocka_unit_test(test_detect_daily_weekly_monthly),
-        cmocka_unit_test(test_detect_all_tiers_december),
-        cmocka_unit_test(test_detect_first_backup_on_sunday),
-        cmocka_unit_test(test_detect_first_backup_on_weekday),
-        cmocka_unit_test(test_detect_new_ts_zero),
+        /* Integration: boundary detection */
+        cmocka_unit_test_setup_teardown(test_detect_no_boundary_same_day,     setup, teardown),
+        cmocka_unit_test_setup_teardown(test_detect_daily_only,               setup, teardown),
+        cmocka_unit_test_setup_teardown(test_detect_daily_and_weekly,         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_detect_daily_weekly_monthly,     setup, teardown),
+        cmocka_unit_test_setup_teardown(test_detect_all_tiers_december,       setup, teardown),
 
-        /* Effective keep-revs */
-        cmocka_unit_test(test_effective_keep_revs_no_anchors),
-        cmocka_unit_test(test_effective_keep_revs_extends),
-        cmocka_unit_test(test_effective_keep_revs_zero_keep_revs),
+        /* Integration: rev-window extension */
+        cmocka_unit_test_setup_teardown(test_effective_keep_revs_no_anchors,       setup, teardown),
+        cmocka_unit_test_setup_teardown(test_effective_keep_revs_extends,          setup, teardown),
+        cmocka_unit_test_setup_teardown(test_effective_keep_revs_expired_not_extended, setup, teardown),
 
         /* Integration: flags */
         cmocka_unit_test_setup_teardown(test_gfs_flags_persist,              setup, teardown),

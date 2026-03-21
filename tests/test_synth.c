@@ -16,12 +16,23 @@
 #include "../src/restore.h"
 #include "../src/gc.h"
 #include "../src/synth.h"
+#include "../src/gfs.h"
+#include "../src/policy.h"
 
 #define TEST_REPO "/tmp/c_backup_synth_repo"
 #define TEST_SRC  "/tmp/c_backup_synth_src"
 #define TEST_DEST "/tmp/c_backup_synth_dest"
 
 static repo_t *repo;
+
+/* Prune repo keeping the last keep_n snapshots (keep_n >= 1). */
+static void prune_keep(uint32_t keep_n) {
+    uint32_t h = 0;
+    snapshot_read_head(repo, &h);
+    policy_t pol = {0};
+    pol.keep_revs = (keep_n > 0) ? keep_n - 1 : 0;
+    gfs_run(repo, &pol, h, 0, 1);
+}
 
 static void write_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -100,9 +111,7 @@ static void test_synthesize_pruned_snapshot(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);               /* snap 3 */
 
     /* Prune to 2 — removes snap 1 */
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 2, &pruned, 0), OK);
-    assert_int_equal(pruned, 1u);
+    prune_keep(2);
 
     /* Snap 1 file is gone */
     char snap1[256];
@@ -147,15 +156,14 @@ static void test_synthesize_every(void **state) {
     }
 
     /* Prune to keep only the latest 2 (removes 1-3) */
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 2, &pruned, 0), OK);
-    assert_int_equal(pruned, 3u);
+    prune_keep(2);
 
     /* Synthesize every 2nd snapshot */
     uint32_t count = 0;
     assert_int_equal(snapshot_synthesize_every(repo, 2, &count), OK);
-    /* Snap 2 and 4 are multiples of 2; snap 2 was pruned so will be synthesized.
-     * Snap 4 was also pruned so will be synthesized. */
+    /* Snaps 2 and 4 are multiples of 2 up to head=5.
+     * Snap 2 was pruned → synthesized from reverse chain.
+     * Snap 4 still exists → synthesize is a no-op.  Either way count==2. */
     assert_true(count >= 2u);
 
     /* Snaps 2 and 4 must now be loadable */

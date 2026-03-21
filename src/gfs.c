@@ -75,7 +75,7 @@ static int tier_newer_count(const gfs_snap_info_t *snaps, uint32_t n, uint32_t i
 /* gfs_detect_boundaries                                               */
 /* ------------------------------------------------------------------ */
 
-uint32_t gfs_detect_boundaries(uint64_t prev_ts, uint64_t new_ts) {
+static uint32_t gfs_detect_boundaries(uint64_t prev_ts, uint64_t new_ts) {
     uint32_t flags = 0;
 
     if (new_ts == 0) return 0;
@@ -129,10 +129,10 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 /* gfs_effective_keep_revs                                             */
 /* ------------------------------------------------------------------ */
 
-uint32_t gfs_effective_keep_revs(const policy_t *policy,
+static uint32_t gfs_effective_keep_revs(const policy_t *policy,
                                  uint32_t head_id,
                                  const gfs_snap_info_t *snaps, uint32_t n) {
-    uint32_t base = (policy->keep_revs > 0) ? (uint32_t)policy->keep_revs : 1;
+    uint32_t base = (policy->keep_revs > 0) ? (uint32_t)policy->keep_revs : 0;
 
     /* Find the oldest non-expired GFS-anchored snap.
      * Expired anchors (whose tier keep_N has been exceeded) no longer

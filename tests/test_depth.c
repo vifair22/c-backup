@@ -28,6 +28,23 @@
 
 static repo_t *repo;
 
+/*
+ * Prune snap files keeping the last keep_n, then GC.
+ * Reverse (.rev) files are intentionally preserved so that
+ * restore_snapshot_at can still reconstruct pruned snapshots.
+ */
+static void prune_snaps_keep(uint32_t keep_n) {
+    uint32_t h = 0;
+    snapshot_read_head(repo, &h);
+    if (h <= keep_n) return;
+    for (uint32_t id = 1; id <= h - keep_n; id++) {
+        char path[256];
+        snprintf(path, sizeof(path), TEST_REPO "/snapshots/%08u.snap", id);
+        unlink(path);
+    }
+    repo_gc(repo, NULL, NULL);
+}
+
 static void write_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
     if (f) { fputs(content, f); fclose(f); }
@@ -272,9 +289,7 @@ static void test_many_snapshots_prune_restore_at(void **state) {
         assert_int_equal(backup_run(repo, paths, 1), OK);
     }
 
-    uint32_t pruned = 0;
-    assert_int_equal(repo_prune(repo, 5, &pruned, 0), OK);
-    assert_int_equal(pruned, (uint32_t)(N_SNAPS - 5));
+    prune_snaps_keep(5);
 
     assert_int_equal(repo_verify(repo), OK);
 
@@ -327,7 +342,7 @@ static void test_snapshot_depth_full_lifecycle(void **state) {
     }
 
     /* Prune, keeping last 5 */
-    assert_int_equal(repo_prune(repo, 5, NULL, 0), OK);
+    prune_snaps_keep(5);
     assert_int_equal(repo_verify(repo), OK);
 
     /* Latest restore must work */
