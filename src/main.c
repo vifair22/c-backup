@@ -118,9 +118,9 @@ static void usage(void) {
         "                               [--snapshot <id|tag>] [--at] [--file <path>]\n"
         "                               [--verify] [--quiet]\n"
         "  backup diff     --repo <path> --from <id|tag> --to <id|tag>\n"
-        "  backup prune    --repo <path> [--keep-daily N] [--keep-weekly N]\n"
-        "                               [--keep-monthly N] [--keep-yearly N]\n"
-        "                               [--no-policy] [--dry-run]\n"
+        "  backup prune    --repo <path> [--keep-revs N] [--keep-daily N]\n"
+        "                               [--keep-weekly N] [--keep-monthly N]\n"
+        "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
         "  backup checkpoint --repo <path> [--snapshot <id|tag>] [--every N]\n"
@@ -414,31 +414,12 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
                   (pol->keep_revs > 0 || pol->keep_daily > 0 ||
                    pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
                    pol->keep_yearly > 0);
-    if (use_gfs && pol->auto_prune) {
+    if (use_gfs && pol->auto_prune && !no_prune) {
         uint32_t head_id = 0;
         snapshot_read_head(repo, &head_id);
         gfs_run(repo, pol, head_id, 0, quiet);
-    } else {
-        /* Legacy sliding-window prune */
-        if (!no_prune && pol && pol->auto_prune) {
-            prune_policy_t pp = {
-                .keep_daily   = pol->keep_daily,
-                .keep_weekly  = pol->keep_weekly,
-                .keep_monthly = pol->keep_monthly,
-                .keep_yearly  = pol->keep_yearly,
-            };
-            int any = pp.keep_daily || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
-            if (any) {
-                uint32_t pruned = 0;
-                repo_prune_policy(repo, &pp, &pruned, 0);
-                if (!quiet && pruned > 0)
-                    fprintf(stderr, "pruned %u old snapshot(s)\n", pruned);
-            }
-        }
-
-        /* Post-backup: explicit gc (only if prune didn't already run gc) */
-        if (!no_gc && pol && pol->auto_gc && !(pol->auto_prune && !no_prune))
-            repo_gc(repo, NULL, NULL);
+    } else if (!no_gc && pol && pol->auto_gc) {
+        repo_gc(repo, NULL, NULL);
     }
 
     policy_free(pol);
@@ -585,52 +566,24 @@ static int cmd_diff(repo_t *repo, int argc, char **argv) {
 static int cmd_prune(repo_t *repo, int argc, char **argv) {
     int dry_run   = opt_has(argc, argv, 2, "--dry-run");
     int no_policy = opt_has(argc, argv, 2, "--no-policy");
-    int use_gfs   = opt_has(argc, argv, 2, "--gfs");
 
-    /* Load policy for defaults (unless suppressed) */
     policy_t *pol = NULL;
     if (!no_policy) policy_load(repo, &pol);
-
-    /* GFS mode: delegate entirely to gfs_run */
-    if (use_gfs) {
-        int has_gfs_policy = pol && (pol->keep_revs > 0 || pol->keep_daily > 0 ||
-                                     pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
-                                     pol->keep_yearly > 0);
-        if (!has_gfs_policy) {
-            fprintf(stderr, "error: --gfs requires keep_revs / keep_daily / "
-                            "keep_weekly / keep_monthly / keep_yearly in policy\n");
-            policy_free(pol);
-            return 1;
-        }
-        if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
-        uint32_t head_id = 0;
-        snapshot_read_head(repo, &head_id);
-        int ret = gfs_run(repo, pol, head_id, dry_run, 0) == OK ? 0 : 1;
-        policy_free(pol);
-        return ret;
-    }
-
-    prune_policy_t pp = {0};
-
-    /* Start from policy if available */
-    if (pol) {
-        pp.keep_daily   = pol->keep_daily;
-        pp.keep_weekly  = pol->keep_weekly;
-        pp.keep_monthly = pol->keep_monthly;
-        pp.keep_yearly  = pol->keep_yearly;
-    }
+    if (!pol) pol = calloc(1, sizeof(policy_t));
 
     /* Command-line args override policy */
     const char *val;
-    if ((val = opt_get(argc, argv, 2, "--keep-daily")) != NULL)   pp.keep_daily   = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-weekly")) != NULL)  pp.keep_weekly  = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-monthly")) != NULL) pp.keep_monthly = atoi(val);
-    if ((val = opt_get(argc, argv, 2, "--keep-yearly")) != NULL)  pp.keep_yearly  = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-revs")) != NULL)    pol->keep_revs   = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-daily")) != NULL)   pol->keep_daily  = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-weekly")) != NULL)  pol->keep_weekly = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-monthly")) != NULL) pol->keep_monthly = atoi(val);
+    if ((val = opt_get(argc, argv, 2, "--keep-yearly")) != NULL)  pol->keep_yearly = atoi(val);
 
-    int any = pp.keep_daily || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
+    int any = pol->keep_revs > 0 || pol->keep_daily > 0 || pol->keep_weekly > 0 ||
+              pol->keep_monthly > 0 || pol->keep_yearly > 0;
     if (!any) {
         fprintf(stderr, "error: no retention rules specified\n"
-                        "  use --keep-daily N, --keep-weekly N, etc."
+                        "  use --keep-revs N, --keep-daily N, etc."
                         " or configure policy\n");
         policy_free(pol);
         return 1;
@@ -638,7 +591,9 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
 
-    int ret = repo_prune_policy(repo, &pp, NULL, dry_run) == OK ? 0 : 1;
+    uint32_t head_id = 0;
+    snapshot_read_head(repo, &head_id);
+    int ret = gfs_run(repo, pol, head_id, dry_run, 0) == OK ? 0 : 1;
     policy_free(pol);
     return ret;
 }
