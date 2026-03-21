@@ -457,13 +457,6 @@ status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
     int *keep = calloc(n, sizeof(int));
     if (!keep) { free(snaps); return ERR_NOMEM; }
 
-    /* keep_last: the most recent keep_last snapshots by ID */
-    if (policy->keep_last > 0) {
-        uint32_t start = (n > (uint32_t)policy->keep_last)
-                         ? n - (uint32_t)policy->keep_last : 0;
-        for (uint32_t i = start; i < n; i++) keep[i] = 1;
-    }
-
     /* Reference "now" for bucket comparisons */
     time_t now_t = time(NULL);
     uint64_t now_ts = (uint64_t)now_t;
@@ -525,9 +518,8 @@ status_t repo_prune_policy(repo_t *repo, const prune_policy_t *policy,
     }
 
     /* If no rule is active at all, keep everything */
-    int any_rule = (policy->keep_last > 0 || policy->keep_daily > 0 ||
-                    policy->keep_weekly > 0 || policy->keep_monthly > 0 ||
-                    policy->keep_yearly > 0);
+    int any_rule = (policy->keep_daily > 0 || policy->keep_weekly > 0 ||
+                    policy->keep_monthly > 0 || policy->keep_yearly > 0);
     if (!any_rule) {
         free(keep); free(snaps);
         if (out_pruned) *out_pruned = 0;

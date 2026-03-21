@@ -118,7 +118,7 @@ static void usage(void) {
         "                               [--snapshot <id|tag>] [--at] [--file <path>]\n"
         "                               [--verify] [--quiet]\n"
         "  backup diff     --repo <path> --from <id|tag> --to <id|tag>\n"
-        "  backup prune    --repo <path> [--keep-last N] [--keep-weekly N]\n"
+        "  backup prune    --repo <path> [--keep-weekly N]\n"
         "                               [--keep-monthly N] [--keep-yearly N]\n"
         "                               [--no-policy] [--dry-run]\n"
         "  backup gc       --repo <path>\n"
@@ -133,8 +133,7 @@ static void usage(void) {
         "\n"
         "policy options: --path <p> --exclude <pat> --keep-revs N\n"
         "                --checkpoint-every N\n"
-        "                --keep-last N --keep-weekly N --keep-monthly N\n"
-        "                --keep-yearly N\n"
+        "                --keep-weekly N --keep-monthly N --keep-yearly N\n"
         "                --auto-pack --no-auto-pack\n"
         "                --auto-gc --no-auto-gc\n"
         "                --auto-prune --no-auto-prune\n"
@@ -185,8 +184,6 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
         p->keep_revs = atoi(val);
     if ((val = opt_get(argc, argv, start, "--checkpoint-every")) != NULL)
         p->checkpoint_every = atoi(val);
-    if ((val = opt_get(argc, argv, start, "--keep-last")) != NULL)
-        p->keep_last = atoi(val);
     if ((val = opt_get(argc, argv, start, "--keep-weekly")) != NULL)
         p->keep_weekly = atoi(val);
     if ((val = opt_get(argc, argv, start, "--keep-monthly")) != NULL)
@@ -227,7 +224,6 @@ static int cmd_init(int argc, char **argv) {
         opt_has(argc, argv, 2, "--exclude") ||
         opt_has(argc, argv, 2, "--keep-revs") ||
         opt_has(argc, argv, 2, "--checkpoint-every") ||
-        opt_has(argc, argv, 2, "--keep-last") ||
         opt_has(argc, argv, 2, "--keep-weekly") ||
         opt_has(argc, argv, 2, "--keep-monthly") ||
         opt_has(argc, argv, 2, "--keep-yearly") ||
@@ -285,7 +281,6 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("\n");
         printf("keep_revs        = %d\n", p->keep_revs);
         printf("checkpoint_every = %d\n", p->checkpoint_every);
-        printf("keep_last        = %d\n", p->keep_last);
         printf("keep_weekly      = %d\n", p->keep_weekly);
         printf("keep_monthly     = %d\n", p->keep_monthly);
         printf("keep_yearly      = %d\n", p->keep_yearly);
@@ -421,12 +416,11 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         /* Legacy sliding-window prune (keep_last only) */
         if (!no_prune && pol && pol->auto_prune) {
             prune_policy_t pp = {
-                .keep_last    = pol->keep_last,
                 .keep_weekly  = pol->keep_weekly,
                 .keep_monthly = pol->keep_monthly,
                 .keep_yearly  = pol->keep_yearly,
             };
-            int any = pp.keep_last || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
+            int any = pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
             if (any) {
                 uint32_t pruned = 0;
                 repo_prune_policy(repo, &pp, &pruned, 0);
@@ -612,7 +606,6 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     /* Start from policy if available */
     if (pol) {
-        pp.keep_last    = pol->keep_last;
         pp.keep_weekly  = pol->keep_weekly;
         pp.keep_monthly = pol->keep_monthly;
         pp.keep_yearly  = pol->keep_yearly;
@@ -620,15 +613,14 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     /* Command-line args override policy */
     const char *val;
-    if ((val = opt_get(argc, argv, 2, "--keep-last")) != NULL)    pp.keep_last    = atoi(val);
     if ((val = opt_get(argc, argv, 2, "--keep-weekly")) != NULL)  pp.keep_weekly  = atoi(val);
     if ((val = opt_get(argc, argv, 2, "--keep-monthly")) != NULL) pp.keep_monthly = atoi(val);
     if ((val = opt_get(argc, argv, 2, "--keep-yearly")) != NULL)  pp.keep_yearly  = atoi(val);
 
-    int any = pp.keep_last || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
+    int any = pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
     if (!any) {
         fprintf(stderr, "error: no retention rules specified\n"
-                        "  use --keep-last N, --keep-weekly N, etc."
+                        "  use --keep-weekly N, --keep-monthly N, etc."
                         " or configure policy\n");
         policy_free(pol);
         return 1;

@@ -45,9 +45,6 @@ status_t policy_write_template(repo_t *repo) {
         "# --at restore always has a valid chain to walk back through.\n"
         "#keep_revs = 20\n"
         "\n"
-        "# Keep the N most recent snapshots regardless of age (legacy sliding window).\n"
-        "#keep_last = 0\n"
-        "\n"
         "# Keep one snapshot per week for the N most recent weeks.\n"
         "#keep_weekly = 0\n"
         "\n"
@@ -174,8 +171,6 @@ status_t policy_load(repo_t *repo, policy_t **out) {
             p->keep_revs = atoi(val);
         } else if (strcmp(key, "checkpoint_every") == 0) {
             p->checkpoint_every = atoi(val);
-        } else if (strcmp(key, "keep_last") == 0) {
-            p->keep_last = atoi(val);
         } else if (strcmp(key, "keep_weekly") == 0) {
             p->keep_weekly = atoi(val);
         } else if (strcmp(key, "keep_monthly") == 0) {
@@ -225,7 +220,6 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
 
     fprintf(f, "keep_revs = %d\n",        p->keep_revs);
     fprintf(f, "checkpoint_every = %d\n", p->checkpoint_every);
-    fprintf(f, "keep_last = %d\n",        p->keep_last);
     fprintf(f, "keep_weekly = %d\n",      p->keep_weekly);
     fprintf(f, "keep_monthly = %d\n",     p->keep_monthly);
     fprintf(f, "keep_yearly = %d\n",      p->keep_yearly);

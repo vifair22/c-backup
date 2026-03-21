@@ -39,7 +39,6 @@ status_t repo_prune_resume_pending(repo_t *repo);
 
 /*
  * Fine-grained retention policy prune.
- * keep_last:    always keep this many most-recent snapshots (by ID).
  * keep_daily:   keep one snapshot per day for the last N calendar days.
  * keep_weekly:  keep one snapshot per ISO week for the last N weeks.
  * keep_monthly: keep one snapshot per calendar month for the last N months.
@@ -47,7 +46,6 @@ status_t repo_prune_resume_pending(repo_t *repo);
  * Runs GC after deleting.  *out_pruned (may be NULL) receives count removed.
  */
 typedef struct {
-    int keep_last;
     int keep_daily;
     int keep_weekly;
     int keep_monthly;

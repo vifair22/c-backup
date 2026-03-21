@@ -22,7 +22,6 @@ typedef struct {
     int  keep_revs;
 
     /* GFS retention (0 = disabled) */
-    int  keep_last;
     int  keep_weekly;
     int  keep_monthly;
     int  keep_yearly;
