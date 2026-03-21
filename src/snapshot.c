@@ -11,8 +11,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#define SNAP_MAGIC   0x43424B50u  /* "CBKP" */
-#define SNAP_VERSION 1u
+#define SNAP_MAGIC    0x43424B50u  /* "CBKP" */
+#define SNAP_VERSION  2u
+#define SNAP_VERSION1 1u           /* legacy — gfs_flags absent */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -22,7 +23,9 @@ typedef struct __attribute__((packed)) {
     uint32_t node_count;
     uint32_t dirent_count;
     uint64_t dirent_data_len;
+    uint32_t gfs_flags;
 } snap_file_header_t;
+
 
 static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
     return snprintf(buf, bufsz, "%s/snapshots/%08u.snap", repo_path(repo), id) >= 0 ? 0 : -1;
@@ -39,25 +42,47 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     int fd = open(path, O_RDONLY);
     if (fd == -1) { log_msg("ERROR", "cannot open snapshot file"); return ERR_IO; }
 
-    snap_file_header_t fhdr;
-    if (read(fd, &fhdr, sizeof(fhdr)) != sizeof(fhdr)) { close(fd); return ERR_CORRUPT; }
-    if (fhdr.magic != SNAP_MAGIC || fhdr.version != SNAP_VERSION) {
+    /* Read the magic + version first to decide which header size to read */
+    uint32_t magic = 0, version = 0;
+    if (read(fd, &magic,   sizeof(magic))   != sizeof(magic)   ||
+        read(fd, &version, sizeof(version)) != sizeof(version)) {
+        close(fd); return ERR_CORRUPT;
+    }
+    if (magic != SNAP_MAGIC ||
+        (version != SNAP_VERSION && version != SNAP_VERSION1)) {
         close(fd); log_msg("ERROR", "invalid snapshot magic/version"); return ERR_CORRUPT;
     }
 
+    /* Read the remaining header fields individually */
+    uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
+    uint64_t created_sec = 0, dirent_data_len = 0;
+
+#define RD32(v) (read(fd, &(v), 4) != 4)
+#define RD64(v) (read(fd, &(v), 8) != 8)
+    if (RD32(snap_id_f) || RD64(created_sec) ||
+        RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len)) {
+        close(fd); return ERR_CORRUPT;
+    }
+    if (version == SNAP_VERSION) {
+        if (RD32(gfs_flags)) { close(fd); return ERR_CORRUPT; }
+    }
+#undef RD32
+#undef RD64
+
     snapshot_t *snap = calloc(1, sizeof(*snap));
     if (!snap) { close(fd); return ERR_NOMEM; }
-    snap->snap_id         = fhdr.snap_id;
-    snap->created_sec     = fhdr.created_sec;
-    snap->node_count      = fhdr.node_count;
-    snap->dirent_count    = fhdr.dirent_count;
-    snap->dirent_data_len = (size_t)fhdr.dirent_data_len;
+    snap->snap_id         = snap_id_f;
+    snap->created_sec     = created_sec;
+    snap->node_count      = node_count;
+    snap->dirent_count    = dirent_count;
+    snap->dirent_data_len = (size_t)dirent_data_len;
+    snap->gfs_flags       = gfs_flags;
 
-    snap->nodes = malloc(fhdr.node_count * sizeof(node_t));
-    if (!snap->nodes && fhdr.node_count > 0) { free(snap); close(fd); return ERR_NOMEM; }
-    if (fhdr.node_count > 0 &&
-        read(fd, snap->nodes, fhdr.node_count * sizeof(node_t)) !=
-            (ssize_t)(fhdr.node_count * sizeof(node_t))) {
+    snap->nodes = malloc(node_count * sizeof(node_t));
+    if (!snap->nodes && node_count > 0) { free(snap); close(fd); return ERR_NOMEM; }
+    if (node_count > 0 &&
+        read(fd, snap->nodes, node_count * sizeof(node_t)) !=
+            (ssize_t)(node_count * sizeof(node_t))) {
         free(snap->nodes); free(snap); close(fd); return ERR_CORRUPT;
     }
 
@@ -90,6 +115,7 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         .node_count      = snap->node_count,
         .dirent_count    = snap->dirent_count,
         .dirent_data_len = snap->dirent_data_len,
+        .gfs_flags       = snap->gfs_flags,
     };
 
     status_t st = OK;
@@ -115,6 +141,50 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     return OK;
 fail:
     if (fd >= 0) { close(fd); unlink(tmppath); }
+    return st;
+}
+
+status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags) {
+    char path[PATH_MAX];
+    snap_path(repo, snap_id, path, sizeof(path));
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return ERR_IO;
+
+    uint32_t magic = 0, version = 0;
+    if (read(fd, &magic,   sizeof(magic))   != sizeof(magic)   ||
+        read(fd, &version, sizeof(version)) != sizeof(version)) {
+        close(fd); return ERR_CORRUPT;
+    }
+    if (magic != SNAP_MAGIC) { close(fd); return ERR_CORRUPT; }
+
+    if (version == SNAP_VERSION1) {
+        /* V1 has no gfs_flags field */
+        close(fd);
+        *out_flags = 0;
+        return OK;
+    }
+
+    /* Skip past snap_id(4) + created_sec(8) + node_count(4) +
+     * dirent_count(4) + dirent_data_len(8) = 28 bytes to reach gfs_flags */
+    if (lseek(fd, 28, SEEK_CUR) == (off_t)-1) { close(fd); return ERR_IO; }
+
+    uint32_t flags = 0;
+    if (read(fd, &flags, sizeof(flags)) != sizeof(flags)) { close(fd); return ERR_CORRUPT; }
+    close(fd);
+    *out_flags = flags;
+    return OK;
+}
+
+status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags) {
+    /* Load the full snap, OR in the new flags, rewrite atomically. */
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    snap->gfs_flags |= new_flags;
+    st = snapshot_write(repo, snap);
+    snapshot_free(snap);
     return st;
 }
 

@@ -221,3 +221,22 @@ status_t snapshot_synthesize_every(repo_t *repo, uint32_t interval,
     if (out_count) *out_count = count;
     return OK;
 }
+
+/* ------------------------------------------------------------------ */
+/* GFS-aware synthesis                                                 */
+/* ------------------------------------------------------------------ */
+
+status_t snapshot_synthesize_gfs(repo_t *repo, uint32_t snap_id,
+                                 uint32_t new_flags) {
+    status_t st = snapshot_synthesize(repo, snap_id);
+    if (st != OK) return st;
+
+    st = snapshot_set_gfs_flags(repo, snap_id, new_flags);
+    if (st != OK) return st;
+
+    /* Verify the snap loads correctly before caller acts on it */
+    snapshot_t *probe = NULL;
+    st = snapshot_load(repo, snap_id, &probe);
+    if (st == OK) snapshot_free(probe);
+    return st;
+}

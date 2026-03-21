@@ -6,6 +6,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* GFS tier membership flags stored in the snap file header. */
+#define GFS_DAILY    (1u << 0)
+#define GFS_WEEKLY   (1u << 1)
+#define GFS_MONTHLY  (1u << 2)
+#define GFS_YEARLY   (1u << 3)
+
 /*
  * In-memory snapshot representation.
  * node_table and dirent_table are flat arrays loaded from the .snap file.
@@ -15,6 +21,7 @@ typedef struct {
     uint64_t    created_sec;   /* wall-clock time when snapshot was written */
     uint32_t    node_count;
     uint32_t    dirent_count;
+    uint32_t    gfs_flags;     /* bitmask of GFS_* tier membership */
     node_t     *nodes;
     /* dirents are variable-size; stored as raw bytes */
     uint8_t    *dirent_data;
@@ -24,6 +31,15 @@ typedef struct {
 status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out);
 status_t snapshot_write(repo_t *repo, snapshot_t *snap);
 void     snapshot_free(snapshot_t *snap);
+
+/*
+ * Read or update only the gfs_flags field of an existing .snap file.
+ * snapshot_set_gfs_flags ORs new_flags into the existing flags (atomic
+ * via tmp + rename).  snapshot_read_gfs_flags reads without loading the
+ * full snapshot; returns ERR_IO if the file does not exist.
+ */
+status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags);
+status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags);
 
 /* HEAD helpers */
 status_t snapshot_read_head(repo_t *repo, uint32_t *out_id);

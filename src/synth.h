@@ -19,3 +19,10 @@ status_t snapshot_synthesize(repo_t *repo, uint32_t target_id);
  */
 status_t snapshot_synthesize_every(repo_t *repo, uint32_t interval,
                                    uint32_t *out_count);
+
+/*
+ * Synthesise a snapshot for snap_id (if missing), OR new_flags into its
+ * gfs_flags, then verify it loads.  Used by the GFS engine.
+ * Declared here to avoid a circular dependency between gfs.h and synth.h.
+ */
+status_t snapshot_synthesize_gfs(repo_t *repo, uint32_t snap_id, uint32_t new_flags);

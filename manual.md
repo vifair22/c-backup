@@ -20,21 +20,92 @@ A reverse-incremental filesystem backup tool for Linux, written in C.
 
 ## Concepts
 
-**Object store** — File contents and metadata blobs (xattrs, ACLs) are stored as content-addressed objects identified by their SHA-256 hash, compressed with LZ4. Identical content is stored only once regardless of how many files reference it or how many snapshots contain it.
+### Object store
 
-**Snapshot** — A complete description of the filesystem tree at one point in time. The latest snapshot is always a full state — restoring it requires no reconstruction. Each snapshot is a numbered binary file containing a node table (metadata for every file, directory, symlink, etc.) and a dirent table (the parent/child relationships that form the directory tree).
+File contents and metadata blobs (xattrs, ACLs) are stored as content-addressed objects, each identified by its SHA-256 hash and compressed with LZ4. Identical content is stored only once regardless of how many files reference it or how many snapshots contain it.
 
-**Reverse record** — For every snapshot after the first, a reverse record is stored. It describes how to undo that snapshot to recover the previous state. This is how historical restores work: start from the nearest full snapshot, then apply reverse records backward until the target snapshot's state is reconstructed.
+### How the reverse-incremental model works
 
-**Reverse-incremental model** — The most recent snapshot is the cheapest to restore because it is already fully materialised. Older snapshots cost proportionally more, since each step back requires applying one more reverse record. Storage cost for history is low: only changed data and reverse-record metadata are stored for old snapshots.
+Every `backup run` produces two things:
 
-**Pack files** — Loose objects (individual files under `objects/`) are automatically compacted into pack files (`.dat` + `.idx` pairs) under `packs/` after each backup. Packing improves lookup performance and reduces inode count. Loose and packed objects are transparent to all commands.
+1. **A snapshot** — a complete manifest of the current filesystem state: every file path, its metadata, and a hash pointing to its content in the object store. The snapshot is always a full description; it references the object store directly and requires no reconstruction to read.
 
-**Checkpoints** — Any point in the reverse chain can be materialised as a full `.snap` file using `checkpoint`. Once a checkpoint exists, `restore --at` walks back only to the nearest checkpoint rather than all the way to HEAD, making historical restores much faster. A typical pattern is `full,dif,dif,dif,full,dif,dif,dif,full,...`.
+2. **A reverse record** — a description of what the *previous* snapshot's files looked like for every path that changed. This is the "undo" recipe: applying it to the current snapshot reconstructs the state one step back in time.
 
-**Policy** — A file stored in the repository (`policy.conf`) that captures source paths, exclusion patterns, retention rules, and automation flags. `backup run` reads the policy automatically so you do not need to repeat flags on every invocation.
+After three daily backups the repository looks like this:
 
-**Tags** — Human-readable names that point to a snapshot ID. Tags can be used anywhere a snapshot number is accepted. A tag may be marked `preserve`, which prevents `prune` from deleting that snapshot.
+```
+Snapshot 1  (full)       ← day 1 state, .snap file present
+  ↑ reverse record 2     ← "to get back to day 1 from day 2, restore these old hashes"
+Snapshot 2  (full)       ← day 2 state, .snap file present
+  ↑ reverse record 3     ← "to get back to day 2 from day 3, restore these old hashes"
+Snapshot 3  (full, HEAD) ← day 3 state, .snap file present
+```
+
+**Restoring HEAD** (latest) is always direct: load the snapshot manifest, fetch the objects. No chain walking.
+
+**Restoring an older snapshot whose .snap file still exists** is also direct: load that snapshot manifest, fetch its objects.
+
+**Restoring a snapshot whose .snap file has been pruned** requires `--at`: the tool finds the nearest surviving .snap file ahead of the target, then walks the reverse records backward step by step until the target state is reconstructed in memory, then restores from that reconstructed state.
+
+The cost of a `--at` restore is proportional to the number of reverse records that must be walked. If survivors are spaced 7 snapshots apart, worst case is 6 steps. If they are spaced 365 apart (two yearly survivors with nothing in between), worst case is 364 steps.
+
+Reverse records are **never deleted by prune** — they are required to reconstruct any historical state. Only .snap manifest files are deleted. The GC retains every object referenced by any surviving snapshot or any reverse record.
+
+### GFS retention
+
+GFS (Grandfather-Father-Son) retention automatically selects one snapshot per calendar period to serve as a permanent anchor point. After each `backup run` the engine detects which tier boundaries were crossed and marks the appropriate snapshot with a GFS flag stored in its `.snap` file. GFS-flagged snapshots are never deleted.
+
+**Calendar boundaries (all UTC)**
+
+| Tier | Triggers when |
+|------|---------------|
+| Daily | A new calendar day has started since the previous backup |
+| Weekly | The new day is a Sunday |
+| Monthly | The new Sunday is the last Sunday of its calendar month |
+| Yearly | The month is December |
+
+Each tier is a promotion of the one below: a Sunday that is the last Sunday of December receives all four flags simultaneously.
+
+When a boundary fires, the GFS engine selects the most recent snapshot from the *previous* day (the snapshot that represents the "complete" state of that day) and writes its GFS flags into that snapshot's `.snap` file.
+
+**`keep_revs` — rolling retention window**
+
+`keep_revs N` keeps the N most recent snapshots regardless of GFS status. Snapshots outside this window that carry no GFS flag are deleted. The effective window is silently extended when needed so that it always reaches back to the oldest GFS-anchored snapshot — this guarantees that `restore --at` always has a valid reverse chain to walk.
+
+**Reverse record deletion**
+
+Reverse records are deleted only when **both** conditions are true:
+1. The record is older than the oldest GFS anchor; and
+2. The record is outside the `keep_revs` window.
+
+This ensures that every GFS-anchored snapshot remains restorable directly from its `.snap` file and that the reverse chain between anchors is intact for `restore --at`.
+
+**`backup list` output with GFS flags**
+
+GFS-anchored snapshots are shown with their tier in `backup list`:
+```
+snapshot 00000003  2024-03-17 00:00:31  [daily]         315 entries
+snapshot 00000007  2024-03-24 00:00:18  [daily+weekly]  318 entries
+```
+
+**Activation**
+
+The GFS engine runs automatically after `backup run` when `policy.auto_prune = true` and `keep_revs` or a GFS-related retention field (`keep_weekly`, `keep_monthly`, `keep_yearly`) is set. Pass `--no-gfs` to skip the GFS engine for a single run. Run the GFS engine manually with `backup prune --gfs`.
+
+### Checkpoints
+
+A checkpoint is a synthetic .snap file written for a snapshot that was previously pruned (or never had one). It short-circuits the reverse chain: once a checkpoint exists at snapshot N, a `--at` restore that would otherwise walk all the way back to HEAD only needs to walk back to N.
+
+`checkpoint --every N` creates checkpoints at every Nth snapshot ID (e.g. `--every 30` creates snapshots 30, 60, 90, …). With this in place, the maximum chain walk for any `--at` restore is N−1 steps regardless of how many snapshots have been pruned.
+
+### Policy
+
+A file stored in the repository (`policy.conf`) that captures source paths, exclusion patterns, retention rules, and automation flags. `backup run` reads it automatically so you do not need to repeat flags on every invocation.
+
+### Tags
+
+Human-readable names that point to a snapshot ID. Tags can be used anywhere a snapshot number is accepted. A tag may be marked `preserve`, which prevents `prune` from deleting that snapshot.
 
 ---
 
@@ -132,6 +203,7 @@ backup run --repo /mnt/backup/myrepo --no-prune --no-gc --quiet
 | `--quiet` | Suppress progress output. |
 | `--verify-after` | After committing the snapshot, verify every referenced object exists in the store. Overrides policy if policy has `verify_after = false`. |
 | `--no-verify-after` | Suppress verification even if policy has `verify_after = true`. |
+| `--no-gfs` | Skip the GFS retention engine even if policy would activate it. |
 
 Source paths are stored under their **basename** in the snapshot. For example, backing up `/home/alice` stores it as `alice/` in the snapshot tree. Multiple paths are stored as siblings.
 
@@ -140,8 +212,9 @@ The backup is incremental: only files that have changed since the previous snaps
 After a successful backup, `run` automatically:
 1. Packs loose objects (unless `--no-pack` or `policy.auto_pack = false`)
 2. Synthesises checkpoints at the configured interval (if `policy.auto_checkpoint = true`)
-3. Prunes old snapshots (if `policy.auto_prune = true` and a retention rule is set)
-4. Runs GC (if `policy.auto_gc = true` and prune did not already run it)
+3. Runs the GFS engine — detects calendar boundaries, flags GFS anchors, prunes non-anchor snapshots outside the `keep_revs` window, and runs GC (if `policy.auto_prune = true` and `keep_revs` or a GFS tier is set; skip with `--no-gfs`)
+4. Legacy prune (if `policy.auto_prune = true` and `keep_last` is set but no GFS fields are active)
+5. Runs GC (if `policy.auto_gc = true` and neither prune path ran it)
 
 **Exclusion patterns** match against the **basename** of each filesystem entry using `fnmatch(3)` shell-glob syntax. When a directory matches, its entire subtree is skipped.
 
@@ -159,10 +232,11 @@ Output format:
 ```
 snapshot 00000001  2024-03-15 09:42:11  312 entries
 snapshot 00000002  2024-03-15 14:07:33  315 entries
-snapshot 00000003  2024-03-16 08:00:01  315 entries
+snapshot 00000003  2024-03-17 00:00:18  [daily]         315 entries
+snapshot 00000004  2024-03-24 00:00:05  [daily+weekly]  318 entries
 ```
 
-Pruned snapshots (whose `.snap` file has been deleted) are shown as `[pruned]`.
+GFS-anchored snapshots display their tier flags in brackets. Pruned snapshots (whose `.snap` file has been deleted) are shown as `[pruned]`.
 
 ---
 
@@ -257,6 +331,10 @@ If there are no differences, prints `(no differences)`.
 Delete old snapshot files according to a retention policy, then run GC.
 
 ```
+# GFS engine (recommended for regular scheduled use)
+backup prune --repo /mnt/backup/myrepo --gfs
+
+# Legacy sliding-window prune
 backup prune --repo /mnt/backup/myrepo --keep-last 7 --keep-weekly 8 --keep-monthly 12 --keep-yearly 5
 backup prune --repo /mnt/backup/myrepo --keep-last 5 --dry-run
 backup prune --repo /mnt/backup/myrepo   # uses policy.conf
@@ -264,20 +342,21 @@ backup prune --repo /mnt/backup/myrepo   # uses policy.conf
 
 | Flag | Meaning |
 |------|---------|
-| `--keep-last N` | Always keep the N most recent snapshots by ID |
-| `--keep-weekly N` | Keep one snapshot per week (Mon–Sun) for the last N weeks |
-| `--keep-monthly N` | Keep one snapshot per calendar month for the last N months |
-| `--keep-yearly N` | Keep one snapshot per calendar year for the last N years |
+| `--gfs` | Run the GFS engine: detect calendar anchors, flag them, prune non-anchor snapshots outside `keep_revs`, delete eligible rev records, run GC. Requires `keep_revs` or a GFS tier to be set in policy. |
+| `--keep-last N` | Legacy: always keep the N most recent snapshots by ID |
+| `--keep-weekly N` | Legacy: keep one snapshot per week (Mon–Sun) for the last N weeks |
+| `--keep-monthly N` | Legacy: keep one snapshot per calendar month for the last N months |
+| `--keep-yearly N` | Legacy: keep one snapshot per calendar year for the last N years |
 | `--no-policy` | Ignore `policy.conf`; all retention rules must be on the command line |
-| `--dry-run` | Show which snapshots would be removed without deleting anything |
+| `--dry-run` | Show which snapshots and reverse records would be removed without deleting anything |
 
-Any combination of flags may be used; a snapshot is kept if it satisfies **any** rule. Snapshots not selected by any rule are deleted.
+**GFS mode (`--gfs`):** Uses the GFS engine (see [GFS retention](#gfs-retention)). Calendar anchor snapshots are never deleted. Non-anchor snapshots outside the `keep_revs` window are deleted. Reverse records are deleted only when outside the `keep_revs` window AND older than the oldest GFS anchor. GC runs automatically at the end.
 
-If no retention rules are provided on the command line and no policy is loaded, the command exits with an error rather than deleting everything.
+**Legacy mode:** Any combination of `--keep-*` flags may be used; a snapshot is kept if it satisfies any rule. Snapshots not selected by any rule are deleted. If no rules are provided on the command line and no policy is loaded, the command exits with an error rather than deleting everything.
 
-**Preserved tags** — A snapshot protected by a preserved tag is never deleted by prune. A warning is printed and the snapshot is skipped (non-fatal). See `tag set --preserve`.
+**Preserved tags** — A snapshot protected by a preserved tag is never deleted by either prune mode. See `tag set --preserve`.
 
-Only the `.snap` files are deleted. Reverse records for pruned snapshots are **retained** so that `restore --at` can still reconstruct any historical state.
+Only `.snap` files are deleted by legacy prune. `--gfs` additionally manages reverse records as described above.
 
 ---
 
@@ -395,31 +474,54 @@ backup policy --repo <path> edit
 |--------|---------|---------|
 | `--path <p>` | (none) | Source path. Repeatable. |
 | `--exclude <pat>` | (none) | Exclusion glob. Repeatable. |
+| `--keep-revs N` | 0 (off) | GFS: minimum rolling window of snapshots to keep. Silently extended to always reach the oldest GFS anchor. |
 | `--checkpoint-every N` | 0 (off) | Auto-synthesise checkpoints every N snapshots after `run`. |
-| `--keep-last N` | 0 (off) | Retention: keep N most recent snapshots. |
-| `--keep-weekly N` | 0 (off) | Retention: keep one per week for N weeks. |
-| `--keep-monthly N` | 0 (off) | Retention: keep one per month for N months. |
-| `--keep-yearly N` | 0 (off) | Retention: keep one per year for N years. |
+| `--keep-last N` | 0 (off) | Legacy retention: keep N most recent snapshots. |
+| `--keep-weekly N` | 0 (off) | GFS activation: also used as a signal to activate the GFS engine when combined with `keep_revs`. |
+| `--keep-monthly N` | 0 (off) | GFS activation signal (see above). |
+| `--keep-yearly N` | 0 (off) | GFS activation signal (see above). |
 | `--auto-pack` / `--no-auto-pack` | true | Pack objects after each `run`. |
 | `--auto-gc` / `--no-auto-gc` | false | Run GC after each `run`. |
-| `--auto-prune` / `--no-auto-prune` | false | Run prune after each `run`. |
+| `--auto-prune` / `--no-auto-prune` | false | Run prune/GFS after each `run`. |
 | `--auto-checkpoint` / `--no-auto-checkpoint` | false | Run checkpoint after each `run`. |
 | `--verify-after` / `--no-verify-after` | false | After committing each snapshot, confirm every object it references is present in the store. Recommended for mission-critical backups. |
 
-### GFS-style retention example
+### GFS retention example (recommended)
 
-Keep daily backups for 2 weeks, weekly for 3 months, monthly for 1 year, yearly for 5 years:
+Keep a rolling window of 20 recent snapshots, plus permanent GFS anchors (daily/weekly/monthly/yearly):
 
 ```
 backup policy --repo /mnt/backup/myrepo set \
-    --keep-last 14 \
-    --keep-weekly 12 \
-    --keep-monthly 12 \
-    --keep-yearly 5 \
-    --auto-prune \
-    --auto-checkpoint \
-    --checkpoint-every 7
+    --keep-revs 20 \
+    --auto-prune
 ```
+
+With this policy and daily backups, after each `backup run`:
+
+- The 20 most recent snapshots are always kept.
+- Each calendar day's last snapshot is permanently anchored as a **daily** GFS snapshot.
+- Each Sunday's daily snapshot is promoted to a **weekly** anchor.
+- The last Sunday of each month is promoted to a **monthly** anchor.
+- The last Sunday of December is promoted to a **yearly** anchor.
+- Snapshots outside the 20-snapshot window that carry no GFS flag are deleted.
+- Reverse records are deleted only when outside the 20-snapshot window *and* older than the oldest GFS anchor.
+
+**What this looks like over time** (running daily):
+
+| Age | What survives |
+|-----|--------------|
+| Last 20 days | All snapshots (rolling window) |
+| 21+ days | Only GFS-anchored snaps (daily/weekly/monthly/yearly) |
+| After a Sunday | That Sunday's snap is a weekly anchor — kept indefinitely |
+| After December | That December's last-Sunday snap is a yearly anchor — kept indefinitely |
+
+**Restoring any GFS-anchored snapshot is always direct** — its `.snap` file is preserved permanently. No reverse-chain walking is needed.
+
+**Restoring a non-anchored day** (e.g. a Wednesday from 3 months ago) requires `restore --at`. The tool walks the reverse chain back from the nearest surviving GFS anchor. Since weekly anchors exist for every Sunday, the worst-case walk from a monthly anchor is ~4 steps (Sunday gaps). Between yearly anchors in years with no monthly anchors, the walk can be longer; adding `--checkpoint-every 30` caps it at 29 steps regardless of age.
+
+### Legacy sliding-window retention
+
+The older `keep_last / keep_weekly / keep_monthly / keep_yearly` flags still work for configurations that do not use `keep_revs`. They select survivors purely by recency within a window and do not write GFS flags into snapshot files.
 
 ---
 
@@ -430,8 +532,8 @@ backup policy --repo /mnt/backup/myrepo set \
 ```sh
 backup init --repo /mnt/external/myrepo \
     --path /home/alice \
-    --keep-last 7 --keep-monthly 12 \
-    --auto-prune --auto-checkpoint --checkpoint-every 7
+    --keep-revs 20 \
+    --auto-prune
 ```
 
 ### Routine backup
@@ -466,9 +568,12 @@ backup run --repo /mnt/external/myrepo --quiet
 ### Manual retention run
 
 ```sh
+# GFS engine (recommended)
+backup prune --repo /mnt/external/myrepo --gfs
+
+# Legacy sliding-window
 backup prune --repo /mnt/external/myrepo \
     --keep-last 7 --keep-weekly 8 --keep-monthly 12 --keep-yearly 5
-backup checkpoint --repo /mnt/external/myrepo --every 10
 backup verify --repo /mnt/external/myrepo
 ```
 

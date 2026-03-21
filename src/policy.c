@@ -12,6 +12,80 @@ void policy_path(repo_t *repo, char *buf, size_t sz) {
     snprintf(buf, sz, "%s/policy.conf", repo_path(repo));
 }
 
+status_t policy_write_template(repo_t *repo) {
+    char path[PATH_MAX];
+    policy_path(repo, path, sizeof(path));
+
+    /* Don't overwrite an existing policy */
+    if (access(path, F_OK) == 0) return OK;
+
+    char tmp[PATH_MAX + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (!f) return ERR_IO;
+
+    fprintf(f,
+        "# c-backup policy configuration\n"
+        "# Uncomment and edit the options you want to use.\n"
+        "# All values shown are defaults.\n"
+        "\n"
+        "# Source paths to back up (space-separated).\n"
+        "# Example: paths = /home/alice /etc\n"
+        "#paths = \n"
+        "\n"
+        "# Paths/patterns to exclude (fnmatch against basename, space-separated).\n"
+        "# Example: exclude = .git *.tmp *.swp\n"
+        "#exclude = \n"
+        "\n"
+        "# --- Retention (GFS) ---\n"
+        "\n"
+        "# Minimum number of reverse records to keep.\n"
+        "# Silently extended when needed to reach the oldest GFS anchor so that\n"
+        "# --at restore always has a valid chain to walk back through.\n"
+        "#keep_revs = 20\n"
+        "\n"
+        "# Keep the N most recent snapshots regardless of age (legacy sliding window).\n"
+        "#keep_last = 0\n"
+        "\n"
+        "# Keep one snapshot per week for the N most recent weeks.\n"
+        "#keep_weekly = 0\n"
+        "\n"
+        "# Keep one snapshot per month for the N most recent months.\n"
+        "#keep_monthly = 0\n"
+        "\n"
+        "# Keep one snapshot per year for the N most recent years.\n"
+        "#keep_yearly = 0\n"
+        "\n"
+        "# --- Checkpoints ---\n"
+        "\n"
+        "# Synthesise a checkpoint snapshot every N backups (0 = disabled).\n"
+        "#checkpoint_every = 0\n"
+        "\n"
+        "# --- Automatic post-run operations ---\n"
+        "\n"
+        "# Pack loose objects into pack files after each backup.\n"
+        "#auto_pack = false\n"
+        "\n"
+        "# Remove unreferenced objects after each backup.\n"
+        "#auto_gc = false\n"
+        "\n"
+        "# Apply retention policy and delete old snapshots after each backup.\n"
+        "#auto_prune = false\n"
+        "\n"
+        "# Synthesise checkpoint snapshots after each backup (requires checkpoint_every).\n"
+        "#auto_checkpoint = false\n"
+        "\n"
+        "# Verify that every object referenced by the new snapshot exists on disk\n"
+        "# after each backup.  Catches write failures early at the cost of extra I/O.\n"
+        "#verify_after = false\n"
+    );
+
+    if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return ERR_IO; }
+    return OK;
+}
+
 void policy_free(policy_t *p) {
     if (!p) return;
     for (int i = 0; i < p->n_paths;   i++) free(p->paths[i]);
@@ -96,6 +170,8 @@ status_t policy_load(repo_t *repo, policy_t **out) {
         } else if (strcmp(key, "exclude") == 0) {
             int r = split_tokens(val, &p->exclude);
             p->n_exclude = (r >= 0) ? r : 0;
+        } else if (strcmp(key, "keep_revs") == 0) {
+            p->keep_revs = atoi(val);
         } else if (strcmp(key, "checkpoint_every") == 0) {
             p->checkpoint_every = atoi(val);
         } else if (strcmp(key, "keep_last") == 0) {
@@ -147,6 +223,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     }
     fprintf(f, "\n");
 
+    fprintf(f, "keep_revs = %d\n",        p->keep_revs);
     fprintf(f, "checkpoint_every = %d\n", p->checkpoint_every);
     fprintf(f, "keep_last = %d\n",        p->keep_last);
     fprintf(f, "keep_weekly = %d\n",      p->keep_weekly);

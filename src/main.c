@@ -11,6 +11,7 @@
 #include "stats.h"
 #include "tag.h"
 #include "policy.h"
+#include "gfs.h"
 #include "../vendor/log.h"
 
 #include <stdio.h>
@@ -91,8 +92,8 @@ static void usage(void) {
         "  backup policy   --repo <path> edit\n"
         "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
         "                               [--no-pack] [--no-prune] [--no-gc]\n"
-        "                               [--no-checkpoint] [--no-policy] [--quiet]\n"
-        "                               [--verify-after]\n"
+        "                               [--no-checkpoint] [--no-gfs]\n"
+        "                               [--no-policy] [--quiet] [--verify-after]\n"
         "  backup list     --repo <path>\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
         "  backup restore  --repo <path> --dest <path>\n"
@@ -112,7 +113,8 @@ static void usage(void) {
         "  backup tag      --repo <path> list\n"
         "  backup tag      --repo <path> delete --name <name>\n"
         "\n"
-        "policy options: --path <p> --exclude <pat> --checkpoint-every N\n"
+        "policy options: --path <p> --exclude <pat> --keep-revs N\n"
+        "                --checkpoint-every N\n"
         "                --keep-last N --keep-weekly N --keep-monthly N\n"
         "                --keep-yearly N\n"
         "                --auto-pack --no-auto-pack\n"
@@ -161,6 +163,8 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
         }
     }
 
+    if ((val = opt_get(argc, argv, start, "--keep-revs")) != NULL)
+        p->keep_revs = atoi(val);
     if ((val = opt_get(argc, argv, start, "--checkpoint-every")) != NULL)
         p->checkpoint_every = atoi(val);
     if ((val = opt_get(argc, argv, start, "--keep-last")) != NULL)
@@ -203,6 +207,7 @@ static int cmd_init(int argc, char **argv) {
     int has_policy_opt =
         opt_has(argc, argv, 2, "--path") ||
         opt_has(argc, argv, 2, "--exclude") ||
+        opt_has(argc, argv, 2, "--keep-revs") ||
         opt_has(argc, argv, 2, "--checkpoint-every") ||
         opt_has(argc, argv, 2, "--keep-last") ||
         opt_has(argc, argv, 2, "--keep-weekly") ||
@@ -217,24 +222,28 @@ static int cmd_init(int argc, char **argv) {
         opt_has(argc, argv, 2, "--auto-checkpoint") ||
         opt_has(argc, argv, 2, "--no-auto-checkpoint");
 
+    repo_t *repo = NULL;
+    if (repo_open(repo_arg, &repo) != OK) {
+        fprintf(stderr, "error: cannot open repository after init\n");
+        return 1;
+    }
+
+    /* Always write a commented-out template so `policy edit` has something to start from */
+    policy_write_template(repo);
+
+    int ret = 0;
     if (has_policy_opt) {
-        repo_t *repo = NULL;
-        if (repo_open(repo_arg, &repo) != OK) {
-            fprintf(stderr, "error: cannot open repository after init\n");
-            return 1;
-        }
         policy_t p = {0};
         apply_policy_opts(argc, argv, 2, &p);
-        int ret = (policy_save(repo, &p) == OK) ? 0 : 1;
+        ret = (policy_save(repo, &p) == OK) ? 0 : 1;
         /* Free any allocated strings in p */
         for (int i = 0; i < p.n_paths;   i++) free(p.paths[i]);
         for (int i = 0; i < p.n_exclude; i++) free(p.exclude[i]);
         free(p.paths);
         free(p.exclude);
-        repo_close(repo);
-        return ret;
     }
-    return 0;
+    repo_close(repo);
+    return ret;
 }
 
 static int cmd_policy(repo_t *repo, int argc, char **argv) {
@@ -256,6 +265,7 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         printf("exclude         = ");
         for (int i = 0; i < p->n_exclude; i++) printf("%s%s", i? " " : "", p->exclude[i]);
         printf("\n");
+        printf("keep_revs        = %d\n", p->keep_revs);
         printf("checkpoint_every = %d\n", p->checkpoint_every);
         printf("keep_last        = %d\n", p->keep_last);
         printf("keep_weekly      = %d\n", p->keep_weekly);
@@ -308,6 +318,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     int no_prune      = opt_has(argc, argv, 2, "--no-prune");
     int no_gc         = opt_has(argc, argv, 2, "--no-gc");
     int no_checkpoint = opt_has(argc, argv, 2, "--no-checkpoint");
+    int no_gfs        = opt_has(argc, argv, 2, "--no-gfs");
     int quiet         = opt_has(argc, argv, 2, "--quiet");
     int verify_after  = opt_has(argc, argv, 2, "--verify-after");
     int no_verify_after = opt_has(argc, argv, 2, "--no-verify-after");
@@ -372,32 +383,44 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     status_t st = backup_run_opts(repo, source_paths, n_source, &bopts);
     if (st != OK) { policy_free(pol); return 1; }
 
-    /* Post-backup: checkpoint */
+    /* Post-backup: checkpoint (legacy, used when GFS is not active) */
     if (!no_checkpoint && pol && pol->auto_checkpoint && pol->checkpoint_every > 0) {
         if (!quiet) fprintf(stderr, "checkpointing every %d...\n", pol->checkpoint_every);
         snapshot_synthesize_every(repo, (uint32_t)pol->checkpoint_every, NULL);
     }
 
-    /* Post-backup: prune */
-    if (!no_prune && pol && pol->auto_prune) {
-        prune_policy_t pp = {
-            .keep_last    = pol->keep_last,
-            .keep_weekly  = pol->keep_weekly,
-            .keep_monthly = pol->keep_monthly,
-            .keep_yearly  = pol->keep_yearly,
-        };
-        int any = pp.keep_last || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
-        if (any) {
-            uint32_t pruned = 0;
-            repo_prune_policy(repo, &pp, &pruned, 0);
-            if (!quiet && pruned > 0)
-                fprintf(stderr, "pruned %u old snapshot(s)\n", pruned);
+    /* Post-backup: GFS retention engine.
+     * Activated when keep_revs or any GFS tier (weekly/monthly/yearly) is set.
+     * Handles prune, rev deletion, and GC internally. */
+    int use_gfs = !no_gfs && pol &&
+                  (pol->keep_revs > 0 || pol->keep_weekly > 0 ||
+                   pol->keep_monthly > 0 || pol->keep_yearly > 0);
+    if (use_gfs && pol->auto_prune) {
+        uint32_t head_id = 0;
+        snapshot_read_head(repo, &head_id);
+        gfs_run(repo, pol, head_id, 0, quiet);
+    } else {
+        /* Legacy sliding-window prune (keep_last only) */
+        if (!no_prune && pol && pol->auto_prune) {
+            prune_policy_t pp = {
+                .keep_last    = pol->keep_last,
+                .keep_weekly  = pol->keep_weekly,
+                .keep_monthly = pol->keep_monthly,
+                .keep_yearly  = pol->keep_yearly,
+            };
+            int any = pp.keep_last || pp.keep_weekly || pp.keep_monthly || pp.keep_yearly;
+            if (any) {
+                uint32_t pruned = 0;
+                repo_prune_policy(repo, &pp, &pruned, 0);
+                if (!quiet && pruned > 0)
+                    fprintf(stderr, "pruned %u old snapshot(s)\n", pruned);
+            }
         }
-    }
 
-    /* Post-backup: explicit gc (only if prune didn't already run gc) */
-    if (!no_gc && pol && pol->auto_gc && !(pol->auto_prune && !no_prune))
-        repo_gc(repo, NULL, NULL);
+        /* Post-backup: explicit gc (only if prune didn't already run gc) */
+        if (!no_gc && pol && pol->auto_gc && !(pol->auto_prune && !no_prune))
+            repo_gc(repo, NULL, NULL);
+    }
 
     policy_free(pol);
     return 0;
@@ -420,7 +443,14 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
             struct tm *tm = localtime(&t);
             if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
         }
-        printf("snapshot %08u  %s  %u entries\n", id, timebuf, snap->node_count);
+        if (snap->gfs_flags) {
+            char gfsbuf[64];
+            gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
+            printf("snapshot %08u  %s  [%s]  %u entries\n",
+                   id, timebuf, gfsbuf, snap->node_count);
+        } else {
+            printf("snapshot %08u  %s  %u entries\n", id, timebuf, snap->node_count);
+        }
         snapshot_free(snap);
     }
     return 0;
@@ -536,10 +566,29 @@ static int cmd_diff(repo_t *repo, int argc, char **argv) {
 static int cmd_prune(repo_t *repo, int argc, char **argv) {
     int dry_run   = opt_has(argc, argv, 2, "--dry-run");
     int no_policy = opt_has(argc, argv, 2, "--no-policy");
+    int use_gfs   = opt_has(argc, argv, 2, "--gfs");
 
     /* Load policy for defaults (unless suppressed) */
     policy_t *pol = NULL;
     if (!no_policy) policy_load(repo, &pol);
+
+    /* GFS mode: delegate entirely to gfs_run */
+    if (use_gfs) {
+        int has_gfs_policy = pol && (pol->keep_revs > 0 || pol->keep_weekly > 0 ||
+                                     pol->keep_monthly > 0 || pol->keep_yearly > 0);
+        if (!has_gfs_policy) {
+            fprintf(stderr, "error: --gfs requires keep_revs / keep_weekly / "
+                            "keep_monthly / keep_yearly in policy\n");
+            policy_free(pol);
+            return 1;
+        }
+        if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
+        uint32_t head_id = 0;
+        snapshot_read_head(repo, &head_id);
+        int ret = gfs_run(repo, pol, head_id, dry_run, 0) == OK ? 0 : 1;
+        policy_free(pol);
+        return ret;
+    }
 
     prune_policy_t pp = {0};
 
@@ -676,10 +725,24 @@ int main(int argc, char *argv[]) {
     /* init does not need an open repo */
     if (strcmp(cmd, "init") == 0) return cmd_init(argc, argv);
 
+    /* Catch missing or unrecognised subcommand before checking flags */
+    static const char *const known_cmds[] = {
+        "policy", "run", "list", "ls", "restore", "diff",
+        "prune", "gc", "pack", "checkpoint", "verify", "stats", "tag", NULL
+    };
+    int known = 0;
+    for (int k = 0; known_cmds[k]; k++)
+        if (strcmp(cmd, known_cmds[k]) == 0) { known = 1; break; }
+    if (!known) {
+        fprintf(stderr, "error: unknown command '%s'\n", cmd);
+        usage();
+        return 1;
+    }
+
     /* All other commands need --repo */
     const char *repo_arg = opt_get(argc, argv, 2, "--repo");
     if (!repo_arg) {
-        fprintf(stderr, "error: --repo required\n");
+        fprintf(stderr, "error: --repo required for '%s'\n", cmd);
         usage();
         return 1;
     }

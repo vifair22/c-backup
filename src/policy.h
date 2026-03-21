@@ -17,6 +17,10 @@ typedef struct {
     char  **exclude;
     int     n_exclude;
 
+    /* Rev retention window: keep at least this many reverse records.
+     * Silently extended to cover the oldest GFS anchor when GFS is active. */
+    int  keep_revs;
+
     /* GFS retention (0 = disabled) */
     int  keep_last;
     int  keep_weekly;
@@ -45,3 +49,7 @@ void policy_free(policy_t *policy);
 
 /* Write the full path to the policy file into buf. */
 void policy_path(repo_t *repo, char *buf, size_t sz);
+
+/* Create policy.conf with all options commented out (template).
+ * No-op if the file already exists. */
+status_t policy_write_template(repo_t *repo);
