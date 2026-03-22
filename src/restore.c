@@ -360,29 +360,51 @@ static status_t restore_materialize_nodes(repo_t *repo,
             if (fd == -1) { free(nl_map); return ERR_IO; }
             if (!hash_is_zero(nd->content_hash)) {
                 void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
-                if (object_load(repo, nd->content_hash, &data, &len, &obj_type) != OK) {
-                    close(fd); free(nl_map); return ERR_IO;
-                }
+                status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
+                if (load_st != OK) { close(fd); free(nl_map); return load_st; }
                 if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
                     const uint8_t *sp_p = (const uint8_t *)data;
                     sparse_hdr_t shdr;
                     memcpy(&shdr, sp_p, sizeof(shdr));
                     sp_p += sizeof(shdr);
-                    if (shdr.magic == SPARSE_MAGIC &&
-                        len >= sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
-                        (void)ftruncate(fd, (off_t)nd->size);
-                        const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
-                        sp_p += shdr.region_count * sizeof(sparse_region_t);
-                        const uint8_t *dptr = sp_p;
-                        for (uint32_t r = 0; r < shdr.region_count; r++) {
-                            lseek(fd, (off_t)rgns[r].offset, SEEK_SET);
-                            size_t rem = (size_t)rgns[r].length;
-                            while (rem > 0) {
-                                ssize_t w = write(fd, dptr, rem);
-                                if (w <= 0) break;
-                                dptr += w; rem -= (size_t)w;
-                            }
+                    if (shdr.magic != SPARSE_MAGIC ||
+                        len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
+                        free(data); close(fd); free(nl_map); return ERR_CORRUPT;
+                    }
+                    if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
+                        free(data); close(fd); free(nl_map); return ERR_IO;
+                    }
+                    const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
+                    sp_p += shdr.region_count * sizeof(sparse_region_t);
+                    const uint8_t *dptr = sp_p;
+                    const uint8_t *dend = (const uint8_t *)data + len;
+                    uint64_t pos = 0;
+                    for (uint32_t r = 0; r < shdr.region_count; r++) {
+                        if (rgns[r].offset < pos ||
+                            rgns[r].offset > nd->size ||
+                            rgns[r].length > nd->size - rgns[r].offset) {
+                            free(data); close(fd); free(nl_map); return ERR_CORRUPT;
                         }
+                        if ((size_t)(dend - dptr) < (size_t)rgns[r].length) {
+                            free(data); close(fd); free(nl_map); return ERR_CORRUPT;
+                        }
+                        if (lseek(fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
+                            free(data); close(fd); free(nl_map); return ERR_IO;
+                        }
+                        size_t rem = (size_t)rgns[r].length;
+                        while (rem > 0) {
+                            ssize_t w = write(fd, dptr, rem);
+                            if (w < 0) {
+                                if (errno == EINTR) continue;
+                                free(data); close(fd); free(nl_map); return ERR_IO;
+                            }
+                            if (w == 0) {
+                                free(data); close(fd); free(nl_map); return ERR_IO;
+                            }
+                            dptr += w;
+                            rem -= (size_t)w;
+                        }
+                        pos = rgns[r].offset + rgns[r].length;
                     }
                 } else {
                     if (len > 0 && write(fd, data, len) != (ssize_t)len) {
@@ -572,9 +594,8 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
     uint32_t    cnt = 0;
 
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) != OK) {
-        return ERR_NOT_FOUND;
-    }
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
 
     pathmap_t *pm = NULL;
     if (pathmap_build(snap, &pm) != OK) {
@@ -753,6 +774,11 @@ static void makedirs_for(const char *dest_path, const char *rel_path) {
 
 status_t restore_file(repo_t *repo, uint32_t snap_id,
                       const char *file_path, const char *dest_path) {
+    char norm[PATH_MAX];
+    if (normalize_snapshot_path(file_path, norm, sizeof(norm)) != 0)
+        return ERR_INVALID;
+    if (!path_is_safe(norm)) return ERR_INVALID;
+
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
     if (st != OK) return st;
@@ -761,36 +787,35 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
     st = snap_paths_build(snap, &sp);
     if (st != OK) { snapshot_free(snap); return st; }
 
-    st = ERR_INVALID;
+    st = ERR_NOT_FOUND;
     for (uint32_t i = 0; i < sp.count; i++) {
-        if (strcmp(sp.entries[i].path, file_path) != 0) continue;
+        if (strcmp(sp.entries[i].path, norm) != 0) continue;
         if (!sp.entries[i].node) break;
         /* Directories are not "files" — signal caller to try restore_subtree */
         if (sp.entries[i].node->type == NODE_TYPE_DIR) { st = ERR_NOT_FOUND; break; }
-        if (!path_is_safe(file_path)) { st = ERR_INVALID; break; }
 
         /* Create a temporary snapshot containing just this one node + dirent */
         snapshot_t single = {
             .snap_id         = snap_id,
             .node_count      = 1,
             .nodes           = (node_t *)sp.entries[i].node,
-            .dirent_data_len = sizeof(dirent_rec_t) + strlen(file_path),
+            .dirent_data_len = sizeof(dirent_rec_t) + strlen(norm),
         };
-        /* Build a minimal dirent blob: parent=0, node_id, name=file_path */
-        size_t blobsz = sizeof(dirent_rec_t) + strlen(file_path);
+        /* Build a minimal dirent blob: parent=0, node_id, name=path */
+        size_t blobsz = sizeof(dirent_rec_t) + strlen(norm);
         single.dirent_data = malloc(blobsz);
         if (single.dirent_data) {
             dirent_rec_t dr = {
                 .parent_node = 0,
                 .node_id     = sp.entries[i].node_id,
-                .name_len    = (uint16_t)strlen(file_path),
+                .name_len    = (uint16_t)strlen(norm),
             };
             uint8_t *dp = single.dirent_data;
             memcpy(dp, &dr, sizeof(dr)); dp += sizeof(dr);
-            memcpy(dp, file_path, strlen(file_path));
+            memcpy(dp, norm, strlen(norm));
             single.dirent_count = 1;
             /* Pre-create intermediate parent directories */
-            makedirs_for(dest_path, file_path);
+            makedirs_for(dest_path, norm);
             st = do_restore(repo, &single, dest_path);
             free(single.dirent_data);
         } else {
@@ -808,6 +833,11 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
 
 status_t restore_subtree(repo_t *repo, uint32_t snap_id,
                          const char *subtree_path, const char *dest_path) {
+    char norm[PATH_MAX];
+    if (normalize_snapshot_path(subtree_path, norm, sizeof(norm)) != 0)
+        return ERR_INVALID;
+    if (!path_is_safe(norm)) return ERR_INVALID;
+
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
     if (st != OK) return st;
@@ -816,11 +846,11 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
     st = snap_paths_build(snap, &sp);
     if (st != OK) { snapshot_free(snap); return st; }
 
-    size_t pfx_len = strlen(subtree_path);
+    size_t pfx_len = strlen(norm);
 
 #define MATCHES(path) \
-    (strcmp((path), subtree_path) == 0 || \
-     (strncmp((path), subtree_path, pfx_len) == 0 && (path)[pfx_len] == '/'))
+    (strcmp((path), norm) == 0 || \
+     (strncmp((path), norm, pfx_len) == 0 && (path)[pfx_len] == '/'))
 
     /* Count matching entries and total dirent blob size */
     uint32_t nmatch = 0;

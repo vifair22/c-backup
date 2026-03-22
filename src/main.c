@@ -12,6 +12,7 @@
 #include "tag.h"
 #include "policy.h"
 #include "gfs.h"
+#include "xfer.h"
 #include "../vendor/log.h"
 
 #include <dirent.h>
@@ -325,8 +326,12 @@ static void usage(void) {
         "  backup diff     --repo <path> --from <id|tag|HEAD> --to <id|tag|HEAD>\n"
         "  backup grep     --repo <path> --snapshot <id|tag|HEAD> --pattern <regex>\n"
         "                               [--path-prefix <p>]\n"
-        "  backup export   --repo <path> --snapshot <id|tag|HEAD> --dest <dir>\n"
-        "  backup import   --repo <path> --src <dir> [--quiet]\n"
+        "  backup export   --repo <path> --output <file>\n"
+        "                               [--format tar|bundle] [--scope snapshot|repo]\n"
+        "                               [--snapshot <id|tag|HEAD>] [--compress gzip|lz4]\n"
+        "  backup import   --repo <path> --input <file.cbb>\n"
+        "                               [--dry-run] [--no-head-update] [--quiet]\n"
+        "  backup bundle   verify --input <file.cbb> [--quiet]\n"
         "  backup prune    --repo <path> [--keep-snaps N] [--keep-daily N]\n"
         "                               [--keep-weekly N] [--keep-monthly N]\n"
         "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
@@ -1250,42 +1255,125 @@ static int cmd_grep(repo_t *repo, int argc, char **argv) {
 
 static int cmd_export(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = {
-        { "--repo", 1 }, { "--snapshot", 1 }, { "--dest", 1 },
+        { "--repo", 1 }, { "--output", 1 }, { "--format", 1 },
+        { "--scope", 1 }, { "--snapshot", 1 }, { "--compress", 1 },
     };
-    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
+    if (validate_options(argc, argv, 2, specs, 6, NULL, 0)) return 1;
     lock_shared(repo);
+
+    const char *output = opt_get(argc, argv, 2, "--output");
+    if (!output) {
+        fprintf(stderr, "error: --output required\n");
+        return 1;
+    }
+
+    const char *format = opt_get(argc, argv, 2, "--format");
+    const char *scope = opt_get(argc, argv, 2, "--scope");
     const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
-    const char *dest = opt_get(argc, argv, 2, "--dest");
-    if (!snap_arg || !dest) {
-        fprintf(stderr, "error: --snapshot and --dest required\n");
+
+    if (!format) format = "bundle";
+    if (!scope) scope = "snapshot";
+
+    const char *compress = opt_get(argc, argv, 2, "--compress");
+    if (!compress) compress = (strcmp(format, "tar") == 0) ? "gzip" : "lz4";
+
+    int fmt_tar = strcmp(format, "tar") == 0;
+    int fmt_bundle = strcmp(format, "bundle") == 0;
+    if (!fmt_tar && !fmt_bundle) {
+        fprintf(stderr, "error: --format must be tar or bundle\n");
         return 1;
     }
+
+    int scope_snapshot = strcmp(scope, "snapshot") == 0;
+    int scope_repo = strcmp(scope, "repo") == 0;
+    if (!scope_snapshot && !scope_repo) {
+        fprintf(stderr, "error: --scope must be snapshot or repo\n");
+        return 1;
+    }
+
+    if (fmt_tar && !scope_snapshot) {
+        fprintf(stderr, "error: tar export supports --scope snapshot only\n");
+        return 1;
+    }
+
+    if (strcmp(compress, "gzip") != 0 && strcmp(compress, "lz4") != 0) {
+        fprintf(stderr, "error: --compress must be gzip or lz4\n");
+        return 1;
+    }
+    if (fmt_tar && strcmp(compress, "gzip") != 0) {
+        fprintf(stderr, "error: tar export currently supports gzip only\n");
+        return 1;
+    }
+    if (fmt_bundle && strcmp(compress, "lz4") != 0) {
+        fprintf(stderr, "error: bundle export currently supports lz4 only\n");
+        return 1;
+    }
+
     uint32_t snap_id = 0;
-    if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
-        fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
-        return 1;
+    if (scope_snapshot) {
+        if (!snap_arg) {
+            fprintf(stderr, "error: --snapshot required for --scope snapshot\n");
+            return 1;
+        }
+        if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+            fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+            return 1;
+        }
     }
-    return restore_snapshot(repo, snap_id, dest) == OK ? 0 : 1;
+
+    if (fmt_tar) {
+        return export_snapshot_targz(repo, snap_id, output) == OK ? 0 : 1;
+    }
+
+    xfer_scope_t xscope = scope_repo ? XFER_SCOPE_REPO : XFER_SCOPE_SNAPSHOT;
+    return export_bundle(repo, xscope, snap_id, output) == OK ? 0 : 1;
 }
 
 static int cmd_import(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = {
-        { "--repo", 1 }, { "--src", 1 }, { "--quiet", 0 },
+        { "--repo", 1 }, { "--input", 1 }, { "--dry-run", 0 },
+        { "--no-head-update", 0 }, { "--quiet", 0 },
     };
-    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
-    const char *src = opt_get(argc, argv, 2, "--src");
+    if (validate_options(argc, argv, 2, specs, 5, NULL, 0)) return 1;
+    const char *input = opt_get(argc, argv, 2, "--input");
+    int dry_run = opt_has(argc, argv, 2, "--dry-run");
+    int no_head_update = opt_has(argc, argv, 2, "--no-head-update");
     int quiet = opt_has(argc, argv, 2, "--quiet");
-    if (!src) { fprintf(stderr, "error: --src required\n"); return 1; }
-    char *src_abs = path_to_absolute(src);
-    if (!src_abs) { fprintf(stderr, "error: invalid --src path\n"); return 1; }
+    if (!input) { fprintf(stderr, "error: --input required\n"); return 1; }
 
-    if (lock_or_die(repo)) { free(src_abs); return 1; }
+    if (dry_run) lock_shared(repo);
+    else if (lock_or_die(repo)) return 1;
 
-    const char *paths[1] = { src_abs };
-    backup_opts_t bopts = { .quiet = quiet };
-    status_t st = backup_run_opts(repo, paths, 1, &bopts);
-    free(src_abs);
-    return st == OK ? 0 : 1;
+    return import_bundle(repo, input, dry_run, no_head_update, quiet) == OK ? 0 : 1;
+}
+
+static int cmd_bundle(int argc, char **argv) {
+    static const flag_spec_t global_flags[] = {
+        { "--input", 1 }, { "--quiet", 0 }
+    };
+    const char *sub = find_subcmd(argc, argv, 2,
+                                  global_flags,
+                                  sizeof(global_flags) / sizeof(global_flags[0]));
+    if (!sub) { usage(); return 1; }
+
+    if (strcmp(sub, "verify") == 0) {
+        static const flag_spec_t specs[] = {
+            { "--input", 1 }, { "--quiet", 0 }
+        };
+        static const char *const pos[] = { "verify" };
+        if (validate_options(argc, argv, 2, specs, 2, pos, 1)) return 1;
+
+        const char *input = opt_get(argc, argv, 3, "--input");
+        int quiet = opt_has(argc, argv, 3, "--quiet");
+        if (!input) {
+            fprintf(stderr, "error: --input required\n");
+            return 1;
+        }
+        return verify_bundle(input, quiet) == OK ? 0 : 1;
+    }
+
+    usage();
+    return 1;
 }
 
 static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
@@ -1638,7 +1726,7 @@ int main(int argc, char *argv[]) {
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
         "export", "import", "prune", "snapshot", "gc", "pack", "verify",
-        "doctor", "stats", "tag", NULL
+        "doctor", "stats", "tag", "bundle", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -1647,6 +1735,11 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "error: unknown command '%s'\n", cmd);
         usage();
         return 1;
+    }
+
+    /* bundle verify does not need a repo */
+    if (strcmp(cmd, "bundle") == 0) {
+        return cmd_bundle(argc, argv);
     }
 
     /* All other commands need --repo */

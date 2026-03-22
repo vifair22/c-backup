@@ -142,12 +142,79 @@ static void test_scan_missing_root_is_nonfatal(void **state) {
     scan_imap_free(imap);
 }
 
+static void test_scan_root_excluded_returns_empty(void **state) {
+    (void)state;
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+
+    const char *ex[] = { TEST_ROOT1 };
+    scan_opts_t opts = { .exclude = ex, .n_exclude = 1 };
+    scan_result_t *res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &res), OK);
+    assert_non_null(res);
+    int saw_payload = 0;
+    for (uint32_t i = 0; i < res->count; i++) {
+        const char *p = res->entries[i].path;
+        if (strstr(p, "keep.txt") || strstr(p, "nested.txt") || strstr(p, "/lnk") ||
+            strstr(p, "skip.tmp")) {
+            saw_payload = 1;
+            break;
+        }
+    }
+    assert_false(saw_payload);
+
+    scan_result_free(res);
+    scan_imap_free(imap);
+}
+
+static void test_scan_collect_meta_off_and_collect_on_demand(void **state) {
+    (void)state;
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+
+    scan_opts_t opts = { .collect_meta = 0 };
+    scan_result_t *res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &res), OK);
+    assert_non_null(res);
+
+    scan_entry_t *file = NULL;
+    for (uint32_t i = 0; i < res->count; i++) {
+        if (res->entries[i].node.type == NODE_TYPE_REG) {
+            file = &res->entries[i];
+            break;
+        }
+    }
+    assert_non_null(file);
+    assert_null(file->xattr_data);
+    assert_null(file->acl_data);
+    assert_int_equal(file->xattr_len, 0);
+    assert_int_equal(file->acl_len, 0);
+
+    assert_int_equal(scan_entry_collect_metadata(file), OK);
+    assert_int_equal(scan_entry_collect_metadata(file), OK);
+
+    scan_result_free(res);
+    scan_imap_free(imap);
+}
+
+static void test_scan_entry_collect_metadata_invalid_args(void **state) {
+    (void)state;
+    assert_int_equal(scan_entry_collect_metadata(NULL), ERR_INVALID);
+
+    scan_entry_t e;
+    memset(&e, 0, sizeof(e));
+    assert_int_equal(scan_entry_collect_metadata(&e), ERR_INVALID);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_scan_excludes_and_symlink, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_excludes_absolute_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_hardlink_across_roots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_missing_root_is_nonfatal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
+        cmocka_unit_test(test_scan_entry_collect_metadata_invalid_args),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

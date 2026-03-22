@@ -504,6 +504,8 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count) {
 
 status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count,
                          const backup_opts_t *opts) {
+    if (!repo || !source_paths || path_count <= 0) return ERR_INVALID;
+
     int tui = phase_ui_enabled(opts);
     const char *fail_ctx = "startup";
 

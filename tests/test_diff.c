@@ -111,10 +111,29 @@ static void test_snapshot_diff_no_changes(void **state) {
     free(out);
 }
 
+/* Diffing against a non-existent snapshot must return an error, not crash. */
+static void test_snapshot_diff_nonexistent_snap_returns_error(void **state) {
+    (void)state;
+    /* No backups run — no snapshots exist at all */
+    assert_int_equal(snapshot_diff(repo, 1, 2), ERR_NOT_FOUND);
+    assert_int_equal(snapshot_diff(repo, 999, 1), ERR_NOT_FOUND);
+}
+
+/* Diffing a valid first snap against a nonexistent second must fail cleanly. */
+static void test_snapshot_diff_second_snap_missing_returns_error(void **state) {
+    (void)state;
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    assert_int_equal(snapshot_diff(repo, 1, 999), ERR_NOT_FOUND);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_snapshot_diff_output, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_diff_no_changes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_snapshot_diff_nonexistent_snap_returns_error, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_snapshot_diff_second_snap_missing_returns_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

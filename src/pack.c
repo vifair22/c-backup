@@ -518,7 +518,8 @@ int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
 static status_t pack_find_entry(repo_t *repo,
                                 const uint8_t hash[OBJECT_HASH_SIZE],
                                 pack_cache_entry_t **out_found) {
-    if (pack_cache_load(repo) != OK) return ERR_IO;
+    status_t st = pack_cache_load(repo);
+    if (st != OK) return st;
 
     size_t cnt = repo_pack_cache_count(repo);
     if (cnt == 0) return ERR_NOT_FOUND;
@@ -590,6 +591,10 @@ status_t pack_object_load(repo_t *repo,
     void *data;
     size_t data_sz;
     if (ehdr.compression == COMPRESS_NONE) {
+        if (ehdr.uncompressed_size != ehdr.compressed_size) {
+            free(cpayload);
+            return ERR_CORRUPT;
+        }
         data    = cpayload;
         data_sz = (size_t)ehdr.uncompressed_size;
     } else if (ehdr.compression == COMPRESS_LZ4) {
@@ -599,7 +604,10 @@ status_t pack_object_load(repo_t *repo,
                                     (int)ehdr.compressed_size,
                                     (int)ehdr.uncompressed_size);
         free(cpayload);
-        if (r < 0) { free(out); return ERR_CORRUPT; }
+        if (r < 0 || (uint64_t)r != ehdr.uncompressed_size) {
+            free(out);
+            return ERR_CORRUPT;
+        }
         data    = out;
         data_sz = (size_t)ehdr.uncompressed_size;
     } else {

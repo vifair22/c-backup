@@ -1,0 +1,562 @@
+#define _POSIX_C_SOURCE 200809L
+#include "xfer.h"
+
+#include "object.h"
+#include "restore.h"
+#include "snapshot.h"
+#include "tag.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <lz4.h>
+#include <openssl/evp.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CBB_MAGIC "CBB1"
+#define CBB_VERSION 1u
+#define CBB_COMP_LZ4 1u
+
+#define CBB_REC_END    0u
+#define CBB_REC_FILE   1u
+#define CBB_REC_OBJECT 2u
+
+typedef struct __attribute__((packed)) {
+    char magic[4];
+    uint32_t version;
+    uint32_t scope;
+    uint32_t compression;
+    uint32_t reserved;
+} cbb_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t kind;
+    uint8_t obj_type;
+    uint16_t path_len;
+    uint64_t raw_len;
+    uint64_t comp_len;
+    uint8_t hash[OBJECT_HASH_SIZE];
+} cbb_rec_t;
+
+typedef struct {
+    uint8_t *buf;
+    size_t n;
+    size_t cap;
+} hashset_t;
+
+static int read_all(int fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int sha256_buf(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    unsigned dlen = 0;
+    int ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(ctx, data, len) == 1 &&
+             EVP_DigestFinal_ex(ctx, out, &dlen) == 1 &&
+             dlen == OBJECT_HASH_SIZE;
+    EVP_MD_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+static int path_is_safe_rel(const char *p) {
+    if (!p || !*p) return 0;
+    if (p[0] == '/') return 0;
+    if (strstr(p, "//")) return 0;
+    const char *s = p;
+    while (*s) {
+        if (s[0] == '.' && (s[1] == '/' || s[1] == '\0')) return 0;
+        if (s[0] == '.' && s[1] == '.' && (s[2] == '/' || s[2] == '\0')) return 0;
+        while (*s && *s != '/') s++;
+        if (*s == '/') s++;
+    }
+    return 1;
+}
+
+static void rm_rf_path(const char *path) {
+    if (!path || !*path) return;
+    char cmd[PATH_MAX + 32];
+    if (snprintf(cmd, sizeof(cmd), "rm -rf %s", path) >= (int)sizeof(cmd)) return;
+    int rc = system(cmd);
+    (void)rc;
+}
+
+static int mkdirs_parent(const char *path) {
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return -1;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    return 0;
+}
+
+static int read_file_bytes(const char *path, uint8_t **out, size_t *out_len, mode_t *out_mode) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) return -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    size_t n = (size_t)st.st_size;
+    uint8_t *buf = NULL;
+    if (n > 0) {
+        buf = malloc(n);
+        if (!buf) { close(fd); return -1; }
+        if (read_all(fd, buf, n) != 0) { free(buf); close(fd); return -1; }
+    }
+    close(fd);
+    *out = buf;
+    *out_len = n;
+    if (out_mode) *out_mode = st.st_mode & 0777;
+    return 0;
+}
+
+static int write_file_bytes(const char *path, const void *buf, size_t len, mode_t mode) {
+    if (mkdirs_parent(path) != 0) return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
+    if (fd < 0) return -1;
+    int rc = (len == 0 || write_all(fd, buf, len) == 0) ? 0 : -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    close(fd);
+    return rc;
+}
+
+static int hashset_has(const hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
+    for (size_t i = 0; i < hs->n; i++) {
+        if (memcmp(hs->buf + i * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE) == 0) return 1;
+    }
+    return 0;
+}
+
+static int hashset_add(hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
+    if (hashset_has(hs, h)) return 0;
+    if (hs->n == hs->cap) {
+        size_t nc = hs->cap ? hs->cap * 2 : 256;
+        uint8_t *nb = realloc(hs->buf, nc * OBJECT_HASH_SIZE);
+        if (!nb) return -1;
+        hs->buf = nb;
+        hs->cap = nc;
+    }
+    memcpy(hs->buf + hs->n * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE);
+    hs->n++;
+    return 0;
+}
+
+static int bundle_write_record(int fd, uint8_t kind, uint8_t obj_type,
+                               const char *path_or_null, mode_t mode,
+                               const uint8_t hash[OBJECT_HASH_SIZE],
+                               const uint8_t *raw, size_t raw_len) {
+    uint16_t path_len = path_or_null ? (uint16_t)strlen(path_or_null) : 0;
+    int bound = LZ4_compressBound((int)raw_len);
+    uint8_t *cbuf = NULL;
+    int comp_len = 0;
+    if (raw_len > 0) {
+        cbuf = malloc((size_t)bound);
+        if (!cbuf) return -1;
+        comp_len = LZ4_compress_default((const char *)raw, (char *)cbuf, (int)raw_len, bound);
+        if (comp_len <= 0) { free(cbuf); return -1; }
+    }
+
+    cbb_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.kind = kind;
+    rec.obj_type = obj_type;
+    rec.path_len = path_len;
+    rec.raw_len = raw_len;
+    rec.comp_len = (uint64_t)comp_len;
+    rec.hash[0] = 0;
+    if (hash) memcpy(rec.hash, hash, OBJECT_HASH_SIZE);
+    /* reuse low bits of mode by prefixing into reserved hash area for file records */
+    if (kind == CBB_REC_FILE) {
+        rec.hash[0] = (uint8_t)(mode & 0xFF);
+        rec.hash[1] = (uint8_t)((mode >> 8) & 0xFF);
+    }
+
+    if (write_all(fd, &rec, sizeof(rec)) != 0) { free(cbuf); return -1; }
+    if (path_len > 0 && write_all(fd, path_or_null, path_len) != 0) { free(cbuf); return -1; }
+    if (comp_len > 0 && write_all(fd, cbuf, (size_t)comp_len) != 0) { free(cbuf); return -1; }
+    free(cbuf);
+    return 0;
+}
+
+static int bundle_write_end(int fd) {
+    cbb_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.kind = CBB_REC_END;
+    return write_all(fd, &rec, sizeof(rec));
+}
+
+static int collect_hashes_from_snapshot(snapshot_t *snap, hashset_t *hs) {
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        node_t *n = &snap->nodes[i];
+        if (memcmp(n->content_hash, zero, OBJECT_HASH_SIZE) != 0 && hashset_add(hs, n->content_hash) != 0)
+            return -1;
+        if (memcmp(n->xattr_hash, zero, OBJECT_HASH_SIZE) != 0 && hashset_add(hs, n->xattr_hash) != 0)
+            return -1;
+        if (memcmp(n->acl_hash, zero, OBJECT_HASH_SIZE) != 0 && hashset_add(hs, n->acl_hash) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int write_repo_metadata_file(repo_t *repo, int out_fd, const char *rel_path) {
+    char full[PATH_MAX];
+    if (snprintf(full, sizeof(full), "%s/%s", repo_path(repo), rel_path) >= (int)sizeof(full))
+        return -1;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    mode_t mode = 0644;
+    if (read_file_bytes(full, &buf, &len, &mode) != 0) return -1;
+    int rc = bundle_write_record(out_fd, CBB_REC_FILE, 0, rel_path, mode, NULL, buf, len);
+    free(buf);
+    return rc;
+}
+
+static int export_repo_bundle(repo_t *repo, int out_fd) {
+    hashset_t hs = {0};
+
+    if (write_repo_metadata_file(repo, out_fd, "format") != 0) goto fail;
+    if (write_repo_metadata_file(repo, out_fd, "refs/HEAD") != 0) goto fail;
+
+    /* policy is optional */
+    {
+        char p[PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/policy.toml", repo_path(repo)) < (int)sizeof(p)) {
+            struct stat st;
+            if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) {
+                if (write_repo_metadata_file(repo, out_fd, "policy.toml") != 0) goto fail;
+            }
+        }
+    }
+
+    /* tags */
+    {
+        char tdir[PATH_MAX];
+        if (snprintf(tdir, sizeof(tdir), "%s/tags", repo_path(repo)) >= (int)sizeof(tdir)) goto fail;
+        DIR *d = opendir(tdir);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                char rel[PATH_MAX];
+                if (snprintf(rel, sizeof(rel), "tags/%s", de->d_name) >= (int)sizeof(rel)) continue;
+                if (write_repo_metadata_file(repo, out_fd, rel) != 0) { closedir(d); goto fail; }
+            }
+            closedir(d);
+        }
+    }
+
+    /* snapshots and reachable hashes */
+    {
+        char sdir[PATH_MAX];
+        if (snprintf(sdir, sizeof(sdir), "%s/snapshots", repo_path(repo)) >= (int)sizeof(sdir)) goto fail;
+        DIR *d = opendir(sdir);
+        if (!d) goto fail;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            size_t n = strlen(de->d_name);
+            if (n < 6 || strcmp(de->d_name + n - 5, ".snap") != 0) continue;
+            char rel[PATH_MAX];
+            if (snprintf(rel, sizeof(rel), "snapshots/%s", de->d_name) >= (int)sizeof(rel)) continue;
+            if (write_repo_metadata_file(repo, out_fd, rel) != 0) { closedir(d); goto fail; }
+
+            uint32_t id = 0;
+            if (sscanf(de->d_name, "%u", &id) == 1 && id > 0) {
+                snapshot_t *snap = NULL;
+                if (snapshot_load(repo, id, &snap) == OK) {
+                    if (collect_hashes_from_snapshot(snap, &hs) != 0) { snapshot_free(snap); closedir(d); goto fail; }
+                    snapshot_free(snap);
+                }
+            }
+        }
+        closedir(d);
+    }
+
+    for (size_t i = 0; i < hs.n; i++) {
+        const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
+        void *data = NULL;
+        size_t len = 0;
+        uint8_t type = 0;
+        if (object_load(repo, h, &data, &len, &type) != OK) goto fail;
+        int rc = bundle_write_record(out_fd, CBB_REC_OBJECT, type, NULL, 0, h, (const uint8_t *)data, len);
+        free(data);
+        if (rc != 0) goto fail;
+    }
+
+    free(hs.buf);
+    return 0;
+fail:
+    free(hs.buf);
+    return -1;
+}
+
+static int export_snapshot_bundle(repo_t *repo, uint32_t snap_id, int out_fd) {
+    hashset_t hs = {0};
+
+    if (write_repo_metadata_file(repo, out_fd, "format") != 0) goto fail;
+    {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "snapshots/%08u.snap", snap_id);
+        if (write_repo_metadata_file(repo, out_fd, rel) != 0) goto fail;
+    }
+
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK) goto fail;
+    if (collect_hashes_from_snapshot(snap, &hs) != 0) { snapshot_free(snap); goto fail; }
+    snapshot_free(snap);
+
+    /* include tags pointing to this snapshot */
+    {
+        char tdir[PATH_MAX];
+        if (snprintf(tdir, sizeof(tdir), "%s/tags", repo_path(repo)) < (int)sizeof(tdir)) {
+            DIR *d = opendir(tdir);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    uint32_t tid = 0;
+                    if (tag_get(repo, de->d_name, &tid) != OK || tid != snap_id) continue;
+                    char rel[PATH_MAX];
+                    if (snprintf(rel, sizeof(rel), "tags/%s", de->d_name) >= (int)sizeof(rel)) continue;
+                    if (write_repo_metadata_file(repo, out_fd, rel) != 0) { closedir(d); goto fail; }
+                }
+                closedir(d);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < hs.n; i++) {
+        const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
+        void *data = NULL;
+        size_t len = 0;
+        uint8_t type = 0;
+        if (object_load(repo, h, &data, &len, &type) != OK) goto fail;
+        int rc = bundle_write_record(out_fd, CBB_REC_OBJECT, type, NULL, 0, h, (const uint8_t *)data, len);
+        free(data);
+        if (rc != 0) goto fail;
+    }
+
+    free(hs.buf);
+    return 0;
+fail:
+    free(hs.buf);
+    return -1;
+}
+
+status_t export_bundle(repo_t *repo, xfer_scope_t scope, uint32_t snap_id,
+                       const char *output_path) {
+    int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return ERR_IO;
+
+    cbb_hdr_t hdr;
+    memcpy(hdr.magic, CBB_MAGIC, 4);
+    hdr.version = CBB_VERSION;
+    hdr.scope = (uint32_t)scope;
+    hdr.compression = CBB_COMP_LZ4;
+    hdr.reserved = 0;
+    if (write_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_IO; }
+
+    int rc = -1;
+    if (scope == XFER_SCOPE_REPO) rc = export_repo_bundle(repo, fd);
+    else if (scope == XFER_SCOPE_SNAPSHOT) rc = export_snapshot_bundle(repo, snap_id, fd);
+
+    if (rc == 0 && bundle_write_end(fd) == 0 && fsync(fd) == 0) {
+        close(fd);
+        return OK;
+    }
+    close(fd);
+    return ERR_IO;
+}
+
+static status_t process_bundle(repo_t *repo, const char *input_path,
+                               int apply, int dry_run, int no_head_update,
+                               int quiet, int *out_files, int *out_objs) {
+    int fd = open(input_path, O_RDONLY);
+    if (fd < 0) return ERR_IO;
+
+    cbb_hdr_t hdr;
+    if (read_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+    if (memcmp(hdr.magic, CBB_MAGIC, 4) != 0 || hdr.version != CBB_VERSION ||
+        hdr.compression != CBB_COMP_LZ4) {
+        close(fd);
+        return ERR_CORRUPT;
+    }
+
+    int imported_files = 0;
+    int imported_objs = 0;
+    while (1) {
+        cbb_rec_t rec;
+        if (read_all(fd, &rec, sizeof(rec)) != 0) { close(fd); return ERR_CORRUPT; }
+        if (rec.kind == CBB_REC_END) break;
+
+        if (rec.kind != CBB_REC_FILE && rec.kind != CBB_REC_OBJECT) {
+            close(fd);
+            return ERR_CORRUPT;
+        }
+
+        char path[PATH_MAX] = {0};
+        if (rec.path_len > 0) {
+            if (rec.path_len >= sizeof(path)) { close(fd); return ERR_CORRUPT; }
+            if (read_all(fd, path, rec.path_len) != 0) { close(fd); return ERR_CORRUPT; }
+            path[rec.path_len] = '\0';
+        }
+
+        if (rec.kind == CBB_REC_FILE) {
+            if (rec.path_len == 0 || !path_is_safe_rel(path)) { close(fd); return ERR_CORRUPT; }
+        } else if (rec.path_len != 0) {
+            close(fd);
+            return ERR_CORRUPT;
+        }
+
+        if (rec.comp_len > SIZE_MAX || rec.raw_len > SIZE_MAX) { close(fd); return ERR_CORRUPT; }
+        if (rec.comp_len > INT_MAX || rec.raw_len > INT_MAX) { close(fd); return ERR_CORRUPT; }
+        if (rec.comp_len == 0 && rec.raw_len != 0) { close(fd); return ERR_CORRUPT; }
+
+        uint8_t *cbuf = NULL;
+        uint8_t *raw = NULL;
+        if (rec.comp_len > 0) {
+            cbuf = malloc((size_t)rec.comp_len);
+            raw = malloc((size_t)rec.raw_len);
+            if (!cbuf || !raw) { free(cbuf); free(raw); close(fd); return ERR_NOMEM; }
+            if (read_all(fd, cbuf, (size_t)rec.comp_len) != 0) {
+                free(cbuf); free(raw); close(fd); return ERR_CORRUPT;
+            }
+            int dec = LZ4_decompress_safe((const char *)cbuf, (char *)raw,
+                                          (int)rec.comp_len, (int)rec.raw_len);
+            free(cbuf);
+            if (dec < 0 || (uint64_t)dec != rec.raw_len) {
+                free(raw);
+                close(fd);
+                return ERR_CORRUPT;
+            }
+        }
+
+        if (rec.kind == CBB_REC_OBJECT) {
+            uint8_t got[OBJECT_HASH_SIZE];
+            if (sha256_buf(raw, (size_t)rec.raw_len, got) != 0 ||
+                memcmp(got, rec.hash, OBJECT_HASH_SIZE) != 0) {
+                free(raw);
+                close(fd);
+                return ERR_CORRUPT;
+            }
+        }
+
+        if (rec.kind == CBB_REC_FILE) {
+            if (apply && !dry_run) {
+                if (!(no_head_update && strcmp(path, "refs/HEAD") == 0)) {
+                    char dst[PATH_MAX];
+                    if (snprintf(dst, sizeof(dst), "%s/%s", repo_path(repo), path) >= (int)sizeof(dst) ||
+                        write_file_bytes(dst, raw, (size_t)rec.raw_len,
+                                         (mode_t)(rec.hash[0] | (rec.hash[1] << 8))) != 0) {
+                        free(raw);
+                        close(fd);
+                        return ERR_IO;
+                    }
+                }
+            }
+            imported_files++;
+        } else if (rec.kind == CBB_REC_OBJECT) {
+            if (apply && !dry_run) {
+                uint8_t out[OBJECT_HASH_SIZE];
+                if (object_store(repo, rec.obj_type, raw, (size_t)rec.raw_len, out) != OK ||
+                    memcmp(out, rec.hash, OBJECT_HASH_SIZE) != 0) {
+                    free(raw);
+                    close(fd);
+                    return ERR_CORRUPT;
+                }
+            }
+            imported_objs++;
+        }
+
+        free(raw);
+    }
+
+    close(fd);
+    if (out_files) *out_files = imported_files;
+    if (out_objs) *out_objs = imported_objs;
+    if (apply && !quiet) fprintf(stderr, "import: files=%d objects=%d\n", imported_files, imported_objs);
+    if (!apply && !quiet) fprintf(stderr, "verify: files=%d objects=%d\n", imported_files, imported_objs);
+    return OK;
+}
+
+status_t verify_bundle(const char *input_path, int quiet) {
+    return process_bundle(NULL, input_path, 0, 1, 0, quiet, NULL, NULL);
+}
+
+status_t import_bundle(repo_t *repo, const char *input_path,
+                       int dry_run, int no_head_update, int quiet) {
+    /* Two-pass import: verify entire archive first, then apply.
+     * Prevents partial repo mutation on malformed bundles. */
+    status_t st = process_bundle(NULL, input_path, 0, 1, 0, quiet, NULL, NULL);
+    if (st != OK) return st;
+    return process_bundle(repo, input_path, 1, dry_run, no_head_update, quiet, NULL, NULL);
+}
+
+status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *output_path) {
+    char tmpl[] = "/tmp/c_backup_export.XXXXXX";
+    char *tmp = mkdtemp(tmpl);
+    if (!tmp) return ERR_IO;
+
+    status_t st = restore_snapshot(repo, snap_id, tmp);
+    if (st != OK) {
+        rm_rf_path(tmp);
+        return st;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        rm_rf_path(tmp);
+        return ERR_IO;
+    }
+    if (pid == 0) {
+        execlp("tar", "tar", "-czf", output_path, "-C", tmp, ".", (char *)NULL);
+        _exit(127);
+    }
+
+    int wst = 0;
+    if (waitpid(pid, &wst, 0) < 0 || !WIFEXITED(wst) || WEXITSTATUS(wst) != 0) st = ERR_IO;
+
+    rm_rf_path(tmp);
+    return st;
+}

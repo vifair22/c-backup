@@ -510,6 +510,10 @@ status_t object_load(repo_t *repo,
     void *data;
     size_t data_sz;
     if (hdr.compression == COMPRESS_NONE) {
+        if (hdr.uncompressed_size != hdr.compressed_size) {
+            free(cpayload);
+            return ERR_CORRUPT;
+        }
         data    = cpayload;
         data_sz = (size_t)hdr.uncompressed_size;
     } else if (hdr.compression == COMPRESS_LZ4) {
@@ -519,7 +523,11 @@ status_t object_load(repo_t *repo,
                                     (int)hdr.compressed_size,
                                     (int)hdr.uncompressed_size);
         free(cpayload);
-        if (r < 0) { free(out); log_msg("ERROR", "lz4 decompress failed"); return ERR_CORRUPT; }
+        if (r < 0 || (uint64_t)r != hdr.uncompressed_size) {
+            free(out);
+            log_msg("ERROR", "lz4 decompress failed");
+            return ERR_CORRUPT;
+        }
         data    = out;
         data_sz = (size_t)hdr.uncompressed_size;
     } else {

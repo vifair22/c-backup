@@ -250,12 +250,22 @@ backup grep --repo /mnt/backup/repo --snapshot HEAD --pattern "TODO" --path-pref
 ## 5.10 Export and import
 
 ```bash
-backup export --repo /mnt/backup/repo --snapshot 42 --dest /tmp/exported-tree
-backup import --repo /mnt/backup/repo --src /tmp/exported-tree
+backup export --repo /mnt/backup/repo --format tar --scope snapshot --snapshot HEAD \
+  --output /tmp/snapshot.tar.gz
+backup export --repo /mnt/backup/repo --format bundle --scope snapshot --snapshot 42 \
+  --output /tmp/snapshot.cbb
+backup export --repo /mnt/backup/repo --format bundle --scope repo \
+  --output /tmp/repo.cbb
+backup import --repo /mnt/backup/repo --input /tmp/repo.cbb
+backup bundle verify --input /tmp/repo.cbb
 ```
 
-- `export` materializes a snapshot to a filesystem tree.
-- `import` creates a new snapshot from a source tree.
+- `tar` export supports snapshot scope only and uses `gzip` compression.
+- `bundle` export supports snapshot and repo scopes; payload compression is `lz4`.
+- `import` accepts bundle files only (`.cbb`).
+- Defaults: `--format bundle`, `--scope snapshot`, `--compress lz4` (bundle) and `gzip` (tar).
+- `backup bundle verify` validates bundle structure and object hashes without importing.
+- Import runs a full verify pass before applying writes, to avoid partial mutation on malformed bundles.
 
 ## 5.11 Prune
 
