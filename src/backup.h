@@ -11,7 +11,7 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count);
 
 /* Extended backup with options. */
 typedef struct {
-    const char **exclude;      /* basename patterns; patterns with '/' match full path */
+    const char **exclude;      /* absolute subtractive path excludes */
     int          n_exclude;
     int          quiet;        /* suppress progress output to stderr */
     int          verbose;      /* verbose warnings (e.g., list skipped unreadable paths) */

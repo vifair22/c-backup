@@ -6,7 +6,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fnmatch.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -276,19 +275,20 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     return OK;
 }
 
-static int is_excluded(const char *full_path, const char *name, const scan_opts_t *opts) {
+static int path_has_prefix(const char *path, const char *prefix) {
+    if (!path || !prefix) return 0;
+    size_t plen = strlen(prefix);
+    while (plen > 1 && prefix[plen - 1] == '/') plen--;
+    if (strncmp(path, prefix, plen) != 0) return 0;
+    return path[plen] == '\0' || path[plen] == '/';
+}
+
+static int is_excluded(const char *full_path, const scan_opts_t *opts) {
     if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
     for (int i = 0; i < opts->n_exclude; i++) {
-        const char *pat = opts->exclude[i];
-        if (strchr(pat, '/')) {
-            if (fnmatch(pat, full_path, FNM_PATHNAME) == 0 ||
-                fnmatch(pat, full_path, 0) == 0)
-                return 1;
-        } else {
-            if (fnmatch(pat, name, FNM_PATHNAME) == 0 ||
-                fnmatch(pat, name, 0) == 0)
-                return 1;
-        }
+        const char *ex = opts->exclude[i];
+        if (!ex || ex[0] != '/') continue;
+        if (path_has_prefix(full_path, ex)) return 1;
     }
     return 0;
 }
@@ -324,7 +324,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
             log_msg("WARN", "path too long, skipping entry");
             continue;
         }
-        if (is_excluded(child, de->d_name, opts)) continue;
+        if (is_excluded(child, opts)) continue;
         status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
         if (st != OK) { closedir(d); return st; }
     }
@@ -350,8 +350,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     const char *last_slash = strrchr(root, '/');
     size_t strip_prefix_len = last_slash ? (size_t)(last_slash - root + 1) : 0;
 
-    const char *base = last_slash ? last_slash + 1 : root;
-    if (is_excluded(root, base, opts)) {
+    if (is_excluded(root, opts)) {
         *out = res;
         return OK;
     }

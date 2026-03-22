@@ -70,6 +70,68 @@ static int parse_nonneg_int(const char *s, int *out) {
     return 1;
 }
 
+static char *path_to_absolute(const char *in) {
+    if (!in || !*in) return NULL;
+    if (in[0] == '/') return strdup(in);
+
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) return NULL;
+    size_t need = strlen(cwd) + 1 + strlen(in) + 1;
+    char *out = malloc(need);
+    if (!out) return NULL;
+    snprintf(out, need, "%s/%s", cwd, in);
+    return out;
+}
+
+static void absolutize_list(char **items, int n) {
+    if (!items || n <= 0) return;
+    for (int i = 0; i < n; i++) {
+        if (!items[i]) continue;
+        char *abs = path_to_absolute(items[i]);
+        if (!abs) continue;
+        free(items[i]);
+        items[i] = abs;
+    }
+}
+
+static int build_abs_list(const char **in, int n,
+                          char ***out_owned, const char ***out_const) {
+    *out_owned = NULL;
+    *out_const = NULL;
+    if (n <= 0) return 1;
+
+    char **owned = calloc((size_t)n, sizeof(char *));
+    const char **view = calloc((size_t)n, sizeof(char *));
+    if (!owned || !view) {
+        free(owned);
+        free(view);
+        return 0;
+    }
+
+    for (int i = 0; i < n; i++) {
+        owned[i] = path_to_absolute(in[i]);
+        if (!owned[i]) {
+            for (int j = 0; j < i; j++) free(owned[j]);
+            free(owned);
+            free(view);
+            return 0;
+        }
+        view[i] = owned[i];
+    }
+
+    *out_owned = owned;
+    *out_const = view;
+    return 1;
+}
+
+static void free_abs_list(char **owned, const char **view, int n) {
+    if (owned) {
+        for (int i = 0; i < n; i++) free(owned[i]);
+        free(owned);
+    }
+    free((void *)view);
+}
+
 typedef struct {
     const char *name;
     int takes_value;
@@ -247,7 +309,7 @@ static void usage(void) {
         "  backup policy   --repo <path> get\n"
         "  backup policy   --repo <path> set [policy options]\n"
         "  backup policy   --repo <path> edit\n"
-        "  backup run      --repo <path> [--path <p>...] [--exclude <pat>...]\n"
+        "  backup run      --repo <path> [--path <abs>...] [--exclude <abs>...]\n"
         "                               [--no-policy] [--quiet] [--verbose] [--verify-after]\n"
         "  backup list     --repo <path> [--simple] [--json]\n"
         "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
@@ -269,7 +331,7 @@ static void usage(void) {
         "  backup tag      --repo <path> list\n"
         "  backup tag      --repo <path> delete --name <name>\n"
         "\n"
-        "policy options: --path <p> --exclude <pat> --keep-snaps N\n"
+        "policy options: --path <abs> --exclude <abs> --keep-snaps N\n"
         "                --keep-daily N --keep-weekly N --keep-monthly N\n"
         "                --keep-yearly N\n"
         "                --auto-pack --no-auto-pack\n"
@@ -300,6 +362,7 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
                 p->paths[i] = strdup(paths[i]);
                 if (p->paths[i]) p->n_paths++;
             }
+            absolutize_list(p->paths, p->n_paths);
         }
     }
 
@@ -315,6 +378,7 @@ static void apply_policy_opts(int argc, char **argv, int start, policy_t *p) {
                 p->exclude[i] = strdup(excl[i]);
                 if (p->exclude[i]) p->n_exclude++;
             }
+            absolutize_list(p->exclude, p->n_exclude);
         }
     }
 
@@ -551,6 +615,8 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
 
     const char **source_paths;
     int n_source;
+    char **source_owned = NULL;
+    const char **source_abs = NULL;
 
     if (np > 0) {
         /* --path overrides policy paths entirely */
@@ -561,7 +627,13 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         n_source     = pol->n_paths;
     } else {
         fprintf(stderr, "error: no source paths specified and no policy configured\n"
-                        "  use --path <dir> or set paths in policy\n");
+                        "  use --path <abs-dir> or set absolute paths in policy\n");
+        policy_free(pol);
+        return 1;
+    }
+
+    if (!build_abs_list(source_paths, n_source, &source_owned, &source_abs)) {
+        fprintf(stderr, "error: failed to normalize source paths\n");
         policy_free(pol);
         return 1;
     }
@@ -571,6 +643,8 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
     int ne = opt_multi(argc, argv, 2, "--exclude", excl_args, 256);
     const char **excludes;
     int n_excl;
+    char **exclude_owned = NULL;
+    const char **exclude_abs = NULL;
     if (ne > 0) {
         excludes = excl_args;
         n_excl   = ne;
@@ -582,11 +656,18 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         n_excl   = 0;
     }
 
+    if (n_excl > 0 && !build_abs_list(excludes, n_excl, &exclude_owned, &exclude_abs)) {
+        fprintf(stderr, "error: failed to normalize exclude paths\n");
+        free_abs_list(source_owned, source_abs, n_source);
+        policy_free(pol);
+        return 1;
+    }
+
     int effective_verify = verify_after ||
                           (!no_verify_after && pol && pol->verify_after);
 
     backup_opts_t bopts = {
-        .exclude      = excludes,
+        .exclude      = (n_excl > 0) ? exclude_abs : NULL,
         .n_exclude    = n_excl,
         .quiet        = quiet,
         .verbose      = verbose,
@@ -594,10 +675,20 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         .strict_meta  = (pol && pol->strict_meta),
     };
 
-    if (lock_or_die(repo)) { policy_free(pol); return 1; }
+    if (lock_or_die(repo)) {
+        free_abs_list(source_owned, source_abs, n_source);
+        free_abs_list(exclude_owned, exclude_abs, n_excl);
+        policy_free(pol);
+        return 1;
+    }
 
-    status_t st = backup_run_opts(repo, source_paths, n_source, &bopts);
-    if (st != OK) { policy_free(pol); return 1; }
+    status_t st = backup_run_opts(repo, source_abs, n_source, &bopts);
+    if (st != OK) {
+        free_abs_list(source_owned, source_abs, n_source);
+        free_abs_list(exclude_owned, exclude_abs, n_excl);
+        policy_free(pol);
+        return 1;
+    }
 
     /* Post-backup: GFS retention engine.
      * Activated when keep_snaps or any GFS tier is set.
@@ -616,6 +707,8 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         repo_gc(repo, NULL, NULL);
     }
 
+    free_abs_list(source_owned, source_abs, n_source);
+    free_abs_list(exclude_owned, exclude_abs, n_excl);
     policy_free(pol);
     return 0;
 }

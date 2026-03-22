@@ -123,7 +123,7 @@ With inline policy options:
 ```bash
 backup init --repo /mnt/backup/repo \
   --path /home/alice --path /etc \
-  --exclude .cache --exclude "*.tmp" \
+  --exclude /home/alice/.cache --exclude /home/alice/tmp \
   --keep-snaps 30 --keep-daily 14 --keep-weekly 8
 ```
 
@@ -137,8 +137,8 @@ backup policy --repo /mnt/backup/repo edit
 
 Supported policy flags:
 
-- `--path <p>` (repeatable)
-- `--exclude <pattern>` (repeatable)
+- `--path <abs-path>` (repeatable, additive includes)
+- `--exclude <abs-path>` (repeatable, subtractive path excludes)
 - `--keep-snaps N`
 - `--keep-daily N --keep-weekly N --keep-monthly N --keep-yearly N`
 - `--auto-pack/--no-auto-pack`
@@ -157,7 +157,7 @@ Overrides at runtime:
 
 ```bash
 backup run --repo /mnt/backup/repo \
-  --path /home/alice --exclude "*.cache" \
+  --path /home/alice --exclude /home/alice/.cache \
   --verify-after --verbose
 ```
 
@@ -269,7 +269,7 @@ Stored at `<repo>/policy.toml`.
 Fields:
 
 - `paths = ["/src1", "/src2", ...]`
-- `exclude = ["pattern1", "pattern2", ...]`
+- `exclude = ["/abs/path1", "/abs/path2", ...]`
 - `keep_snaps = N`
 - `keep_daily = N`
 - `keep_weekly = N`
@@ -298,7 +298,7 @@ Runtime defaults (`policy_init_defaults`):
 
 ```toml
 paths = ["/home/alice", "/etc"]
-exclude = [".cache", "node_modules", "*.tmp", "*.swp"]
+exclude = ["/home/alice/.cache", "/home/alice/node_modules"]
 keep_snaps = 30
 keep_daily = 14
 keep_weekly = 8
@@ -314,7 +314,7 @@ strict_meta = false
 
 ```toml
 paths = ["/srv", "/etc", "/var/lib"]
-exclude = ["*.tmp"]
+exclude = ["/srv/tmp"]
 keep_snaps = 14
 keep_daily = 30
 keep_weekly = 26

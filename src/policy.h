@@ -9,11 +9,11 @@
  * Loaded on every `backup run`; absent policy is not an error for most commands.
  */
 typedef struct {
-    /* Source paths to back up (space-separated in file) */
+    /* Absolute source paths to back up (TOML array in file) */
     char  **paths;
     int     n_paths;
 
-    /* fnmatch patterns to skip (space-separated in file) */
+    /* Absolute subtractive path excludes (TOML array in file) */
     char  **exclude;
     int     n_exclude;
 

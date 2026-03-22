@@ -46,7 +46,7 @@ void         scan_imap_free(scan_imap_t *m);
  * Options for scan_tree.  Pass NULL for defaults (no exclusions).
  */
 typedef struct {
-    const char **exclude;   /* basename patterns; patterns containing '/' match full path */
+    const char **exclude;   /* absolute subtractive path excludes */
     int          n_exclude;
     int          verbose;
     int          collect_meta; /* collect xattr/ACL blobs during scan (default: on) */

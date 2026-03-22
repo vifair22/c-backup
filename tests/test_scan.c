@@ -50,7 +50,7 @@ static void test_scan_excludes_and_symlink(void **state) {
     scan_imap_t *imap = scan_imap_new();
     assert_non_null(imap);
 
-    const char *ex[] = { "*.tmp" };
+    const char *ex[] = { TEST_ROOT1 "/skip.tmp" };
     scan_opts_t opts = { .exclude = ex, .n_exclude = 1 };
     scan_result_t *res = NULL;
     assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &res), OK);
