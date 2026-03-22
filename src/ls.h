@@ -7,7 +7,8 @@
 /*
  * List the contents of dir_path inside snapshot snap_id.
  * dir_path is repo-relative (e.g. "" or "." for root, "foo/bar" for a subdir).
- * Output goes to stdout in long format (like ls -l).
+ * Output goes to stdout in long format (like ls -lh).
  * Returns ERR_INVALID if the path does not name a directory in that snapshot.
  */
-status_t snapshot_ls(repo_t *repo, uint32_t snap_id, const char *dir_path);
+status_t snapshot_ls(repo_t *repo, uint32_t snap_id, const char *dir_path,
+                     int recursive, char type_filter, const char *name_glob);

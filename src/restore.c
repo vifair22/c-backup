@@ -171,6 +171,56 @@ static int path_is_safe(const char *rel) {
     return 1;
 }
 
+static int write_all_fd(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int write_hex_fd(int fd, const uint8_t *buf, size_t len, size_t *ioff) {
+    static const char hexdig[] = "0123456789abcdef";
+    char line[80];
+    size_t off = 0;
+    size_t base = ioff ? *ioff : 0;
+    while (off < len) {
+        size_t n = (len - off > 16) ? 16 : (len - off);
+        int pos = snprintf(line, sizeof(line), "%08zx: ", base + off);
+        if (pos < 0) return -1;
+        for (size_t i = 0; i < n; i++) {
+            unsigned b = buf[off + i];
+            line[pos++] = hexdig[(b >> 4) & 0xF];
+            line[pos++] = hexdig[b & 0xF];
+            line[pos++] = (i == 7) ? ' ' : ' ';
+        }
+        line[pos++] = '\n';
+        if (write_all_fd(fd, line, (size_t)pos) != 0) return -1;
+        off += n;
+    }
+    if (ioff) *ioff += len;
+    return 0;
+}
+
+static int normalize_snapshot_path(const char *in, char *out, size_t out_sz) {
+    if (!in || !*in || !out || out_sz == 0) return -1;
+    const char *s = in;
+    while (*s == '/') s++;
+    size_t len = strlen(s);
+    while (len > 0 && s[len - 1] == '/') len--;
+    if (len == 0 || len >= out_sz) return -1;
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return 0;
+}
+
 static int join_dest_path(char *out, size_t out_sz,
                           const char *dest_path, const char *rel_path) {
     int n = snprintf(out, out_sz, "%s/%s", dest_path, rel_path);
@@ -845,4 +895,176 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
     snap_paths_free(&sp);
     snapshot_free(snap);
     return st;
+}
+
+status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
+                             const char *file_path, int out_fd, int hex_mode) {
+    char norm[PATH_MAX];
+    if (normalize_snapshot_path(file_path, norm, sizeof(norm)) != 0)
+        return ERR_INVALID;
+    if (!path_is_safe(norm)) return ERR_INVALID;
+
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    snap_paths_t sp = {0};
+    st = snap_paths_build(snap, &sp);
+    if (st != OK) {
+        snapshot_free(snap);
+        return st;
+    }
+
+    const node_t *target = NULL;
+    for (uint32_t i = 0; i < sp.count; i++) {
+        if (strcmp(sp.entries[i].path, norm) != 0) continue;
+        target = sp.entries[i].node;
+        break;
+    }
+
+    if (!target) {
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return ERR_NOT_FOUND;
+    }
+    if (target->type != NODE_TYPE_REG) {
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return ERR_INVALID;
+    }
+    if (hash_is_zero(target->content_hash)) {
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return OK;
+    }
+
+    void *obj = NULL;
+    size_t obj_len = 0;
+    uint8_t obj_type = 0;
+    st = object_load(repo, target->content_hash, &obj, &obj_len, &obj_type);
+    if (st != OK) {
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return st;
+    }
+
+    if (obj_type == OBJECT_TYPE_SPARSE && obj_len >= sizeof(sparse_hdr_t)) {
+        sparse_hdr_t shdr;
+        memcpy(&shdr, obj, sizeof(shdr));
+        if (shdr.magic != SPARSE_MAGIC ||
+            obj_len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
+            free(obj);
+            snap_paths_free(&sp);
+            snapshot_free(snap);
+            return ERR_CORRUPT;
+        }
+
+        const sparse_region_t *rgns = (const sparse_region_t *)((uint8_t *)obj + sizeof(shdr));
+        const uint8_t *rdata = (const uint8_t *)obj + sizeof(shdr) +
+                               shdr.region_count * sizeof(sparse_region_t);
+        size_t remain = obj_len - (sizeof(shdr) + shdr.region_count * sizeof(sparse_region_t));
+        uint64_t pos = 0;
+        size_t hex_off = 0;
+        static const uint8_t zbuf[65536];
+
+        for (uint32_t i = 0; i < shdr.region_count; i++) {
+            if (rgns[i].offset < pos) {
+                free(obj);
+                snap_paths_free(&sp);
+                snapshot_free(snap);
+                return ERR_CORRUPT;
+            }
+            uint64_t gap = rgns[i].offset - pos;
+            while (gap > 0) {
+                size_t chunk = (size_t)(gap > sizeof(zbuf) ? sizeof(zbuf) : gap);
+                if (hex_mode) {
+                    if (write_hex_fd(out_fd, zbuf, chunk, &hex_off) != 0) {
+                        free(obj);
+                        snap_paths_free(&sp);
+                        snapshot_free(snap);
+                        return ERR_IO;
+                    }
+                } else if (write_all_fd(out_fd, zbuf, chunk) != 0) {
+                    free(obj);
+                    snap_paths_free(&sp);
+                    snapshot_free(snap);
+                    return ERR_IO;
+                }
+                gap -= chunk;
+                pos += chunk;
+            }
+
+            if (rgns[i].length > remain) {
+                free(obj);
+                snap_paths_free(&sp);
+                snapshot_free(snap);
+                return ERR_CORRUPT;
+            }
+            if (hex_mode) {
+                if (write_hex_fd(out_fd, rdata, (size_t)rgns[i].length, &hex_off) != 0) {
+                    free(obj);
+                    snap_paths_free(&sp);
+                    snapshot_free(snap);
+                    return ERR_IO;
+                }
+            } else if (write_all_fd(out_fd, rdata, (size_t)rgns[i].length) != 0) {
+                free(obj);
+                snap_paths_free(&sp);
+                snapshot_free(snap);
+                return ERR_IO;
+            }
+            rdata += rgns[i].length;
+            remain -= (size_t)rgns[i].length;
+            pos += rgns[i].length;
+        }
+
+        if (target->size < pos) {
+            free(obj);
+            snap_paths_free(&sp);
+            snapshot_free(snap);
+            return ERR_CORRUPT;
+        }
+        uint64_t tail = target->size - pos;
+        while (tail > 0) {
+            size_t chunk = (size_t)(tail > sizeof(zbuf) ? sizeof(zbuf) : tail);
+            if (hex_mode) {
+                if (write_hex_fd(out_fd, zbuf, chunk, &hex_off) != 0) {
+                    free(obj);
+                    snap_paths_free(&sp);
+                    snapshot_free(snap);
+                    return ERR_IO;
+                }
+            } else if (write_all_fd(out_fd, zbuf, chunk) != 0) {
+                free(obj);
+                snap_paths_free(&sp);
+                snapshot_free(snap);
+                return ERR_IO;
+            }
+            tail -= chunk;
+        }
+    } else {
+        if (hex_mode) {
+            if (write_hex_fd(out_fd, obj, obj_len, NULL) != 0) {
+                free(obj);
+                snap_paths_free(&sp);
+                snapshot_free(snap);
+                return ERR_IO;
+            }
+        } else if (write_all_fd(out_fd, obj, obj_len) != 0) {
+            free(obj);
+            snap_paths_free(&sp);
+            snapshot_free(snap);
+            return ERR_IO;
+        }
+    }
+
+    free(obj);
+    snap_paths_free(&sp);
+    snapshot_free(snap);
+    return OK;
+}
+
+status_t restore_cat_file(repo_t *repo, uint32_t snap_id,
+                          const char *file_path) {
+    return restore_cat_file_ex(repo, snap_id, file_path, STDOUT_FILENO, 0);
 }

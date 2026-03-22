@@ -25,7 +25,8 @@ static void write_file(const char *path, const char *content) {
 
 static int setup(void **state) {
     (void)state;
-    system("rm -rf " TEST_REPO " " TEST_SRC);
+    int rc = system("rm -rf " TEST_REPO " " TEST_SRC);
+    (void)rc;
     mkdir(TEST_SRC, 0755);
     write_file(TEST_SRC "/a.txt", "hello");
     write_file(TEST_SRC "/b.txt", "world");
@@ -39,7 +40,8 @@ static int setup(void **state) {
 static int teardown(void **state) {
     (void)state;
     repo_close(repo);
-    system("rm -rf " TEST_REPO " " TEST_SRC);
+    int rc = system("rm -rf " TEST_REPO " " TEST_SRC);
+    (void)rc;
     return 0;
 }
 
@@ -99,7 +101,7 @@ static void test_deleted_file_not_in_next_manifest(void **state) {
     assert_int_equal(pathmap_build(snap, &pm), OK);
     snapshot_free(snap);
 
-    assert_null(pathmap_lookup(pm, "c_backup_bkup_test_src/b.txt"));
+    assert_null(pathmap_lookup(pm, "tmp/c_backup_bkup_test_src/b.txt"));
     pathmap_free(pm);
 }
 

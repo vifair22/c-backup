@@ -14,10 +14,10 @@
 
 #include "../src/repo.h"
 #include "../src/backup.h"
-#include "../src/diff.h"
+#include "../src/restore.h"
 
-#define TEST_REPO "/tmp/c_backup_diff_repo"
-#define TEST_SRC  "/tmp/c_backup_diff_src"
+#define TEST_REPO "/tmp/c_backup_cat_repo"
+#define TEST_SRC  "/tmp/c_backup_cat_src"
 
 static repo_t *repo;
 
@@ -26,8 +26,8 @@ static void write_file(const char *path, const char *content) {
     if (f) { fputs(content, f); fclose(f); }
 }
 
-static char *capture_diff_output(uint32_t from_id, uint32_t to_id) {
-    char tmp[] = "/tmp/c_backup_diff_out.XXXXXX";
+static char *capture_cat_output(const char *path, uint32_t snap_id, status_t *out_st) {
+    char tmp[] = "/tmp/c_backup_cat_out.XXXXXX";
     int fd = mkstemp(tmp);
     if (fd < 0) return NULL;
 
@@ -38,11 +38,12 @@ static char *capture_diff_output(uint32_t from_id, uint32_t to_id) {
         close(old); close(fd); unlink(tmp); return NULL;
     }
 
-    assert_int_equal(snapshot_diff(repo, from_id, to_id), OK);
+    status_t st = restore_cat_file(repo, snap_id, path);
     fflush(stdout);
 
     dup2(old, STDOUT_FILENO);
     close(old);
+    if (out_st) *out_st = st;
 
     off_t end = lseek(fd, 0, SEEK_END);
     if (end < 0) { close(fd); unlink(tmp); return NULL; }
@@ -62,13 +63,15 @@ static int setup(void **state) {
     (void)state;
     int rc = system("rm -rf " TEST_REPO " " TEST_SRC);
     (void)rc;
+
     mkdir(TEST_SRC, 0755);
-    write_file(TEST_SRC "/a.txt", "one");
-    write_file(TEST_SRC "/b.txt", "meta");
-    write_file(TEST_SRC "/gone.txt", "bye");
+    write_file(TEST_SRC "/hello.txt", "hello from cat\n");
 
     if (repo_init(TEST_REPO) != OK) return -1;
     if (repo_open(TEST_REPO, &repo) != OK) return -1;
+
+    const char *paths[] = { TEST_SRC };
+    if (backup_run(repo, paths, 1) != OK) return -1;
     return 0;
 }
 
@@ -80,41 +83,44 @@ static int teardown(void **state) {
     return 0;
 }
 
-static void test_snapshot_diff_output(void **state) {
+static void test_cat_regular_file_absolute_path(void **state) {
     (void)state;
-    const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
-
-    write_file(TEST_SRC "/a.txt", "one-modified");
-    assert_int_equal(chmod(TEST_SRC "/b.txt", 0600), 0);
-    assert_int_equal(unlink(TEST_SRC "/gone.txt"), 0);
-    write_file(TEST_SRC "/new.txt", "new file");
-
-    assert_int_equal(backup_run(repo, paths, 1), OK);
-
-    char *out = capture_diff_output(1, 2);
+    status_t st = ERR_IO;
+    char *out = capture_cat_output("/tmp/c_backup_cat_src/hello.txt", 1, &st);
     assert_non_null(out);
-    assert_non_null(strstr(out, "M  tmp/c_backup_diff_src/a.txt\n"));
-    assert_non_null(strstr(out, "m  tmp/c_backup_diff_src/b.txt\n"));
-    assert_non_null(strstr(out, "D  tmp/c_backup_diff_src/gone.txt\n"));
-    assert_non_null(strstr(out, "A  tmp/c_backup_diff_src/new.txt\n"));
+    assert_int_equal(st, OK);
+    assert_string_equal(out, "hello from cat\n");
     free(out);
 }
 
-static void test_snapshot_diff_no_changes(void **state) {
+static void test_cat_regular_file_relative_path(void **state) {
     (void)state;
-    const char *paths[] = { TEST_SRC };
-    assert_int_equal(backup_run(repo, paths, 1), OK);
-    char *out = capture_diff_output(1, 1);
+    status_t st = ERR_IO;
+    char *out = capture_cat_output("tmp/c_backup_cat_src/hello.txt", 1, &st);
     assert_non_null(out);
-    assert_non_null(strstr(out, "(no differences)\n"));
+    assert_int_equal(st, OK);
+    assert_string_equal(out, "hello from cat\n");
     free(out);
+}
+
+static void test_cat_missing_file_returns_not_found(void **state) {
+    (void)state;
+    status_t st = restore_cat_file(repo, 1, "/tmp/c_backup_cat_src/missing.txt");
+    assert_int_equal(st, ERR_NOT_FOUND);
+}
+
+static void test_cat_directory_returns_invalid(void **state) {
+    (void)state;
+    status_t st = restore_cat_file(repo, 1, "/tmp/c_backup_cat_src");
+    assert_int_equal(st, ERR_INVALID);
 }
 
 int main(void) {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_setup_teardown(test_snapshot_diff_output, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_snapshot_diff_no_changes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cat_regular_file_absolute_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cat_regular_file_relative_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cat_missing_file_returns_not_found, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cat_directory_returns_invalid, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

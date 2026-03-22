@@ -26,7 +26,7 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
                           char *name_out, size_t name_sz);
 
 /*
- * Resolve either a decimal snap ID string or a tag name.
+ * Resolve either a decimal snap ID string, the literal HEAD, or a tag name.
  * Tries numeric parse first; if that yields 0 tries tag lookup.
  */
 status_t tag_resolve(repo_t *repo, const char *arg, uint32_t *out_id);

@@ -193,9 +193,27 @@ Full table columns:
 ```bash
 backup ls --repo /mnt/backup/repo --snapshot 42
 backup ls --repo /mnt/backup/repo --snapshot monthly-2026-03 --path /etc
+backup ls --repo /mnt/backup/repo --snapshot HEAD --path /home/alice --recursive --type f --name "*.conf"
 ```
 
-## 5.6 Restore
+- Size is human-readable by default (like `ls -h`; for example `4.0K`, `1.6M`).
+- `--recursive` includes descendants, not only direct children.
+- `--type` filters by node type (`f`,`d`,`l`,`p`,`c`,`b`).
+- `--name` filters displayed names with shell glob matching.
+
+## 5.6 Print file content from a snapshot
+
+```bash
+backup cat --repo /mnt/backup/repo --snapshot 42 --path /etc/hosts
+backup cat --repo /mnt/backup/repo --snapshot monthly-2026-03 --path home/alice/.bashrc
+backup cat --repo /mnt/backup/repo --snapshot HEAD --path var/log/dmesg --pager
+backup cat --repo /mnt/backup/repo --snapshot 42 --path boot/vmlinuz --hex
+```
+
+- `--pager` pipes output through `$PAGER` (or `less -R` by default).
+- `--hex` prints a hex dump instead of raw bytes.
+
+## 5.7 Restore
 
 ```bash
 backup restore --repo /mnt/backup/repo --dest /restore/out
@@ -206,7 +224,7 @@ backup restore --repo /mnt/backup/repo --snapshot 42 --file home/alice --dest /r
 backup restore --repo /mnt/backup/repo --snapshot 42 --dest /restore/out --verify
 ```
 
-## 5.7 Diff snapshots
+## 5.8 Diff snapshots
 
 ```bash
 backup diff --repo /mnt/backup/repo --from 41 --to 42
@@ -219,24 +237,46 @@ Output markers:
 - `M` content changed
 - `m` metadata-only changed
 
-## 5.8 Prune
+## 5.9 Grep in a snapshot
+
+```bash
+backup grep --repo /mnt/backup/repo --snapshot 42 --pattern "PermitRootLogin"
+backup grep --repo /mnt/backup/repo --snapshot HEAD --pattern "TODO" --path-prefix /home/alice/src
+```
+
+- Matches are printed as `path:line:content`.
+- Binary files and sparse payload objects are skipped.
+
+## 5.10 Export and import
+
+```bash
+backup export --repo /mnt/backup/repo --snapshot 42 --dest /tmp/exported-tree
+backup import --repo /mnt/backup/repo --src /tmp/exported-tree
+```
+
+- `export` materializes a snapshot to a filesystem tree.
+- `import` creates a new snapshot from a source tree.
+
+## 5.11 Prune
 
 ```bash
 backup prune --repo /mnt/backup/repo --keep-snaps 30 --keep-daily 14 --keep-weekly 8
 backup prune --repo /mnt/backup/repo --dry-run
 ```
 
-## 5.9 Maintenance
+## 5.12 Maintenance
 
 ```bash
 backup gc --repo /mnt/backup/repo
 backup pack --repo /mnt/backup/repo
 backup verify --repo /mnt/backup/repo
+backup verify --repo /mnt/backup/repo --deep
+backup doctor --repo /mnt/backup/repo
 backup stats --repo /mnt/backup/repo
 backup stats --repo /mnt/backup/repo --json
 ```
 
-## 5.10 Snapshot delete
+## 5.13 Snapshot delete
 
 ```bash
 backup snapshot --repo /mnt/backup/repo delete --snapshot 42
@@ -251,7 +291,7 @@ Behavior:
 - With `--force`, tags pointing to the snapshot are deleted first.
 - Runs GC after delete by default (use `--no-gc` to skip).
 
-## 5.11 Tags
+## 5.14 Tags
 
 ```bash
 backup tag --repo /mnt/backup/repo set --snapshot 42 --name pre-upgrade
@@ -259,6 +299,11 @@ backup tag --repo /mnt/backup/repo set --snapshot 42 --name legal-hold --preserv
 backup tag --repo /mnt/backup/repo list
 backup tag --repo /mnt/backup/repo delete --name pre-upgrade
 ```
+
+Snapshot selectors:
+
+- Any command that accepts `--snapshot <id|tag>` also accepts `--snapshot HEAD`.
+- `diff --from/--to` also accepts `HEAD`.
 
 ---
 

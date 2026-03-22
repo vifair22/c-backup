@@ -13,6 +13,7 @@
 
 #include "../src/repo.h"
 #include "../src/tag.h"
+#include "../src/snapshot.h"
 
 #define TEST_REPO "/tmp/c_backup_tag_repo"
 
@@ -52,7 +53,8 @@ static char *capture_tag_list_output(void) {
 
 static int setup(void **state) {
     (void)state;
-    system("rm -rf " TEST_REPO);
+    int rc = system("rm -rf " TEST_REPO);
+    (void)rc;
     if (repo_init(TEST_REPO) != OK) return -1;
     if (repo_open(TEST_REPO, &repo) != OK) return -1;
     return 0;
@@ -61,7 +63,8 @@ static int setup(void **state) {
 static int teardown(void **state) {
     (void)state;
     repo_close(repo);
-    system("rm -rf " TEST_REPO);
+    int rc = system("rm -rf " TEST_REPO);
+    (void)rc;
     return 0;
 }
 
@@ -77,6 +80,9 @@ static void test_tag_set_get_resolve_delete(void **state) {
     assert_int_equal(id, 12u);
     assert_int_equal(tag_resolve(repo, "99", &id), OK);
     assert_int_equal(id, 99u);
+    assert_int_equal(snapshot_write_head(repo, 12), OK);
+    assert_int_equal(tag_resolve(repo, "HEAD", &id), OK);
+    assert_int_equal(id, 12u);
 
     char name[64] = {0};
     assert_true(tag_snap_is_preserved(repo, 12, name, sizeof(name)));

@@ -41,7 +41,16 @@ static uint64_t inode_identity(dev_t dev, ino_t ino) {
 /* ------------------------------------------------------------------ */
 
 typedef struct { uint64_t key; uint64_t val; } imap_slot_t;
-struct scan_imap { imap_slot_t *s; size_t cap; size_t cnt; };
+struct scan_imap {
+    imap_slot_t *s;
+    size_t cap;
+    size_t cnt;
+
+    char     **dir_keys;  /* relative path (no leading slash) */
+    uint64_t  *dir_vals;  /* node_id */
+    size_t     dir_count;
+    size_t     dir_cap;
+};
 typedef struct scan_imap imap_t;  /* local alias */
 
 scan_imap_t *scan_imap_new(void) {
@@ -52,7 +61,14 @@ scan_imap_t *scan_imap_new(void) {
     m->cap = 256;
     return m;
 }
-void scan_imap_free(scan_imap_t *m) { if (m) { free(m->s); free(m); } }
+void scan_imap_free(scan_imap_t *m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->dir_count; i++) free(m->dir_keys[i]);
+    free(m->dir_keys);
+    free(m->dir_vals);
+    free(m->s);
+    free(m);
+}
 
 static uint64_t imap_get(const imap_t *m, uint64_t key) {
     if (!key) return 0;
@@ -83,6 +99,40 @@ static int imap_set(imap_t *m, uint64_t key, uint64_t val) {
     while (m->s[h].key && m->s[h].key != key) h = (h + 1) & (m->cap - 1);
     if (!m->s[h].key) m->cnt++;
     m->s[h].key = key; m->s[h].val = val;
+    return 0;
+}
+
+static uint64_t dirmap_get(const imap_t *m, const char *rel) {
+    for (size_t i = 0; i < m->dir_count; i++) {
+        if (strcmp(m->dir_keys[i], rel) == 0) return m->dir_vals[i];
+    }
+    return 0;
+}
+
+static int dirmap_set(imap_t *m, const char *rel, uint64_t node_id) {
+    if (m->dir_count == m->dir_cap) {
+        size_t nc = m->dir_cap ? m->dir_cap * 2 : 64;
+        char **nk = malloc(nc * sizeof(char *));
+        uint64_t *nv = malloc(nc * sizeof(uint64_t));
+        if (!nk || !nv) {
+            free(nk);
+            free(nv);
+            return -1;
+        }
+        if (m->dir_count) {
+            memcpy(nk, m->dir_keys, m->dir_count * sizeof(char *));
+            memcpy(nv, m->dir_vals, m->dir_count * sizeof(uint64_t));
+        }
+        free(m->dir_keys);
+        free(m->dir_vals);
+        m->dir_keys = nk;
+        m->dir_vals = nv;
+        m->dir_cap = nc;
+    }
+    m->dir_keys[m->dir_count] = strdup(rel);
+    if (!m->dir_keys[m->dir_count]) return -1;
+    m->dir_vals[m->dir_count] = node_id;
+    m->dir_count++;
     return 0;
 }
 
@@ -270,6 +320,12 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         free(e.path); free(e.xattr_data); free(e.acl_data); return st2;
     }
 
+    if (nd->type == NODE_TYPE_DIR && e.path && e.path[0] == '/' &&
+        e.strip_prefix_len == 1 && e.path[1] != '\0') {
+        const char *rel = e.path + 1;
+        if (!dirmap_get(imap, rel)) (void)dirmap_set(imap, rel, nd->node_id);
+    }
+
     if (S_ISDIR(st.st_mode))
         return scan_dir(path, this_node_id, strip_prefix_len, imap, opts, res);
     return OK;
@@ -338,24 +394,123 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     if (!res) return ERR_NOMEM;
 
     /*
-     * strip_prefix_len: strip everything up to and including the last '/'
-     * before the source root basename, so the stored relative path starts
-     * with basename(root).
+     * Tar-like relative-absolute layout: keep full absolute source path,
+     * but drop the leading '/'.
      *
-     * e.g. root="/home/alice" → strip_prefix_len = strlen("/home/") = 6
-     *      "/home/alice/file.txt" → rel = "alice/file.txt"
-     * e.g. root="/etc" → strip_prefix_len = 1 (just the leading '/')
-     *      "/etc/hosts" → rel = "etc/hosts"
+     *   /home/alice/file.txt -> home/alice/file.txt
+     *   /etc/hosts           -> etc/hosts
      */
-    const char *last_slash = strrchr(root, '/');
-    size_t strip_prefix_len = last_slash ? (size_t)(last_slash - root + 1) : 0;
+    size_t strip_prefix_len = (root[0] == '/') ? 1 : 0;
+
+    struct stat root_st;
+    if (lstat(root, &root_st) != 0) {
+        if (opts && opts->progress_clear_cb)
+            opts->progress_clear_cb(opts->progress_ctx);
+        if (opts && opts->verbose) {
+            char msg[PATH_MAX + 96];
+            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
+                         root, strerror(errno)) >= (int)sizeof(msg)) {
+                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
+            } else {
+                log_msg("WARN", msg);
+            }
+        } else {
+            log_msg("WARN", "lstat failed, skipping entry");
+        }
+        *out = res;
+        return OK;
+    }
+
+    uint64_t root_parent_id = 0;
+    if (root[0] == '/' && strip_prefix_len == 1) {
+        const char *rel = root + 1; /* no leading slash */
+        size_t len = strlen(rel);
+        while (len > 1 && rel[len - 1] == '/') len--;
+
+        for (size_t i = 0; i < len; i++) {
+            if (rel[i] != '/') continue;
+            size_t plen = i;
+            if (plen == 0) continue;
+
+            char parent_rel[PATH_MAX];
+            if (plen >= sizeof(parent_rel)) break;
+            memcpy(parent_rel, rel, plen);
+            parent_rel[plen] = '\0';
+
+            uint64_t existing = dirmap_get(imap, parent_rel);
+            if (existing) {
+                root_parent_id = existing;
+                continue;
+            }
+
+            char abs_path[PATH_MAX];
+            if (snprintf(abs_path, sizeof(abs_path), "/%s", parent_rel) >= (int)sizeof(abs_path))
+                break;
+
+            struct stat st;
+            if (lstat(abs_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+            scan_entry_t e = {0};
+            e.path = strdup(abs_path);
+            if (!e.path) { scan_result_free(res); return ERR_NOMEM; }
+            e.parent_node_id = root_parent_id;
+            e.strip_prefix_len = 1;
+            e.st = st;
+
+            node_t *nd = &e.node;
+            nd->node_id        = next_node_id++;
+            nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
+            nd->type           = NODE_TYPE_DIR;
+            nd->mode           = (uint32_t)st.st_mode;
+            nd->uid            = (uint32_t)st.st_uid;
+            nd->gid            = (uint32_t)st.st_gid;
+            nd->size           = (uint64_t)st.st_size;
+            nd->mtime_sec      = (uint64_t)st.st_mtim.tv_sec;
+            nd->mtime_nsec     = (uint64_t)st.st_mtim.tv_nsec;
+            nd->link_count     = (uint32_t)st.st_nlink;
+
+            status_t ast = result_append(res, &e, opts);
+            if (ast != OK) {
+                free(e.path);
+                scan_result_free(res);
+                return ast;
+            }
+            if (dirmap_set(imap, parent_rel, nd->node_id) != 0) {
+                scan_result_free(res);
+                return ERR_NOMEM;
+            }
+            root_parent_id = nd->node_id;
+        }
+    }
 
     if (is_excluded(root, opts)) {
         *out = res;
         return OK;
     }
 
-    status_t st = scan_entry_at(root, 0, strip_prefix_len, imap, opts, res);
+    /* Root may disappear between prefix synthesis and scan entry walk. */
+    if (lstat(root, &root_st) != 0) {
+        if (opts && opts->progress_clear_cb)
+            opts->progress_clear_cb(opts->progress_ctx);
+        if (opts && opts->verbose) {
+            char msg[PATH_MAX + 96];
+            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
+                         root, strerror(errno)) >= (int)sizeof(msg)) {
+                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
+            } else {
+                log_msg("WARN", msg);
+            }
+        } else {
+            log_msg("WARN", "lstat failed, skipping entry");
+        }
+        scan_result_free(res);
+        res = calloc(1, sizeof(*res));
+        if (!res) return ERR_NOMEM;
+        *out = res;
+        return OK;
+    }
+
+    status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts, res);
     if (st != OK) { scan_result_free(res); return st; }
     *out = res;
     return OK;

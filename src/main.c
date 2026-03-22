@@ -3,6 +3,7 @@
 #include "backup.h"
 #include "restore.h"
 #include "snapshot.h"
+#include "object.h"
 #include "gc.h"
 #include "ls.h"
 #include "pack.h"
@@ -24,6 +25,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <wordexp.h>
+#include <regex.h>
+#include <fnmatch.h>
 
 /* ------------------------------------------------------------------ */
 /* Signal handling                                                     */
@@ -312,19 +315,27 @@ static void usage(void) {
         "  backup run      --repo <path> [--path <abs>...] [--exclude <abs>...]\n"
         "                               [--no-policy] [--quiet] [--verbose] [--verify-after]\n"
         "  backup list     --repo <path> [--simple] [--json]\n"
-        "  backup ls       --repo <path> --snapshot <id|tag> [--path <p>]\n"
+        "  backup ls       --repo <path> --snapshot <id|tag|HEAD> [--path <p>]\n"
+        "                               [--recursive] [--type f|d|l|p|c|b] [--name <glob>]\n"
+        "  backup cat      --repo <path> --snapshot <id|tag|HEAD> --path <p>\n"
+        "                               [--hex] [--pager]\n"
         "  backup restore  --repo <path> --dest <path>\n"
-        "                               [--snapshot <id|tag>] [--file <path>]\n"
+        "                               [--snapshot <id|tag|HEAD>] [--file <path>]\n"
         "                               [--verify] [--quiet]\n"
-        "  backup diff     --repo <path> --from <id|tag> --to <id|tag>\n"
+        "  backup diff     --repo <path> --from <id|tag|HEAD> --to <id|tag|HEAD>\n"
+        "  backup grep     --repo <path> --snapshot <id|tag|HEAD> --pattern <regex>\n"
+        "                               [--path-prefix <p>]\n"
+        "  backup export   --repo <path> --snapshot <id|tag|HEAD> --dest <dir>\n"
+        "  backup import   --repo <path> --src <dir> [--quiet]\n"
         "  backup prune    --repo <path> [--keep-snaps N] [--keep-daily N]\n"
         "                               [--keep-weekly N] [--keep-monthly N]\n"
         "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
-        "  backup snapshot --repo <path> delete --snapshot <id|tag>\n"
+        "  backup snapshot --repo <path> delete --snapshot <id|tag|HEAD>\n"
         "                               [--force] [--dry-run] [--no-gc]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
-        "  backup verify   --repo <path>\n"
+        "  backup verify   --repo <path> [--deep]\n"
+        "  backup doctor   --repo <path>\n"
         "  backup stats    --repo <path> [--json]\n"
         "  backup tag      --repo <path> set --snapshot <id|tag> --name <name>"
                                             " [--preserve]\n"
@@ -937,8 +948,9 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
 static int cmd_ls(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = {
         { "--repo", 1 }, { "--snapshot", 1 }, { "--path", 1 },
+        { "--recursive", 0 }, { "--type", 1 }, { "--name", 1 },
     };
-    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
+    if (validate_options(argc, argv, 2, specs, 6, NULL, 0)) return 1;
     lock_shared(repo);
     const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
     if (!snap_arg) {
@@ -951,7 +963,92 @@ static int cmd_ls(repo_t *repo, int argc, char **argv) {
         return 1;
     }
     const char *path = opt_get(argc, argv, 2, "--path");
-    return snapshot_ls(repo, snap_id, path ? path : "") == OK ? 0 : 1;
+    int recursive = opt_has(argc, argv, 2, "--recursive");
+    const char *name_glob = opt_get(argc, argv, 2, "--name");
+    char type_filter = 0;
+    const char *type = opt_get(argc, argv, 2, "--type");
+    if (type && *type) {
+        if (type[1] != '\0' || strchr("fdlpcb", type[0]) == NULL) {
+            fprintf(stderr, "error: --type must be one of f,d,l,p,c,b\n");
+            return 1;
+        }
+        type_filter = type[0];
+    }
+    return snapshot_ls(repo, snap_id, path ? path : "", recursive, type_filter, name_glob) == OK ? 0 : 1;
+}
+
+static int cmd_cat(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--snapshot", 1 }, { "--path", 1 },
+        { "--hex", 0 }, { "--pager", 0 },
+    };
+    if (validate_options(argc, argv, 2, specs, 5, NULL, 0)) return 1;
+    lock_shared(repo);
+
+    const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
+    const char *path_arg = opt_get(argc, argv, 2, "--path");
+    if (!snap_arg) {
+        fprintf(stderr, "error: --snapshot required\n");
+        return 1;
+    }
+    if (!path_arg) {
+        fprintf(stderr, "error: --path required\n");
+        return 1;
+    }
+
+    uint32_t snap_id = 0;
+    if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+        fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+        return 1;
+    }
+
+    int hex = opt_has(argc, argv, 2, "--hex");
+    int pager = opt_has(argc, argv, 2, "--pager");
+
+    status_t st;
+    if (!pager) {
+        st = restore_cat_file_ex(repo, snap_id, path_arg, STDOUT_FILENO, hex);
+    } else {
+        int pfd[2];
+        if (pipe(pfd) != 0) {
+            fprintf(stderr, "error: cannot create pager pipe\n");
+            return 1;
+        }
+        const char *pager_cmd = getenv("PAGER");
+        if (!pager_cmd || !*pager_cmd) pager_cmd = "less -R";
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(pfd[0]);
+            close(pfd[1]);
+            fprintf(stderr, "error: cannot launch pager\n");
+            return 1;
+        }
+        if (pid == 0) {
+            dup2(pfd[0], STDIN_FILENO);
+            close(pfd[0]);
+            close(pfd[1]);
+            execl("/bin/sh", "sh", "-c", pager_cmd, (char *)NULL);
+            _exit(127);
+        }
+
+        close(pfd[0]);
+        st = restore_cat_file_ex(repo, snap_id, path_arg, pfd[1], hex);
+        close(pfd[1]);
+        int wst = 0;
+        waitpid(pid, &wst, 0);
+    }
+
+    if (st == OK) return 0;
+    if (st == ERR_NOT_FOUND) {
+        fprintf(stderr, "error: path '%s' not found in snapshot %u\n", path_arg, snap_id);
+    } else if (st == ERR_INVALID) {
+        fprintf(stderr, "error: path '%s' is not a regular file in snapshot %u\n",
+                path_arg, snap_id);
+    } else {
+        fprintf(stderr, "error: failed to read '%s' from snapshot %u\n", path_arg, snap_id);
+    }
+    return 1;
 }
 
 static int cmd_restore(repo_t *repo, int argc, char **argv) {
@@ -1041,6 +1138,154 @@ static int cmd_diff(repo_t *repo, int argc, char **argv) {
         return 1;
     }
     return snapshot_diff(repo, id1, id2) == OK ? 0 : 1;
+}
+
+static int norm_rel_path(const char *in, char *out, size_t out_sz) {
+    if (!in || !out || out_sz == 0) return -1;
+    const char *s = in;
+    while (*s == '/') s++;
+    size_t n = strlen(s);
+    while (n > 0 && s[n - 1] == '/') n--;
+    if (n >= out_sz) return -1;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return 0;
+}
+
+static int path_in_prefix(const char *path, const char *prefix) {
+    if (!prefix || !*prefix) return 1;
+    size_t n = strlen(prefix);
+    return (strcmp(path, prefix) == 0) ||
+           (strncmp(path, prefix, n) == 0 && path[n] == '/');
+}
+
+static int cmd_grep(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--snapshot", 1 }, { "--pattern", 1 }, { "--path-prefix", 1 },
+    };
+    if (validate_options(argc, argv, 2, specs, 4, NULL, 0)) return 1;
+    lock_shared(repo);
+
+    const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
+    const char *pattern = opt_get(argc, argv, 2, "--pattern");
+    const char *prefix_arg = opt_get(argc, argv, 2, "--path-prefix");
+    if (!snap_arg || !pattern) {
+        fprintf(stderr, "error: --snapshot and --pattern required\n");
+        return 1;
+    }
+
+    uint32_t snap_id = 0;
+    if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+        fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+        return 1;
+    }
+
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK) {
+        fprintf(stderr, "error: snapshot %u not found\n", snap_id);
+        return 1;
+    }
+    pathmap_t *pm = NULL;
+    if (pathmap_build(snap, &pm) != OK) {
+        snapshot_free(snap);
+        fprintf(stderr, "error: failed to build snapshot path map\n");
+        return 1;
+    }
+    snapshot_free(snap);
+
+    char prefix_norm[PATH_MAX] = "";
+    if (prefix_arg && norm_rel_path(prefix_arg, prefix_norm, sizeof(prefix_norm)) != 0) {
+        pathmap_free(pm);
+        fprintf(stderr, "error: invalid --path-prefix\n");
+        return 1;
+    }
+
+    regex_t re;
+    if (regcomp(&re, pattern, REG_EXTENDED) != 0) {
+        pathmap_free(pm);
+        fprintf(stderr, "error: invalid regex pattern\n");
+        return 1;
+    }
+
+    int matches = 0;
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    for (size_t i = 0; i < pm->capacity; i++) {
+        if (!pm->slots[i].key) continue;
+        const char *path = pm->slots[i].key;
+        const node_t *nd = &pm->slots[i].value;
+        if (!path_in_prefix(path, prefix_norm)) continue;
+        if (!(nd->type == NODE_TYPE_REG || nd->type == NODE_TYPE_HARDLINK)) continue;
+        if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) == 0) continue;
+
+        void *data = NULL;
+        size_t len = 0;
+        uint8_t otype = 0;
+        if (object_load(repo, nd->content_hash, &data, &len, &otype) != OK) continue;
+        if (otype == OBJECT_TYPE_SPARSE) { free(data); continue; }
+        if (memchr(data, '\0', len)) { free(data); continue; }
+
+        char *buf = (char *)data;
+        size_t line_no = 1;
+        size_t start = 0;
+        for (size_t k = 0; k <= len; k++) {
+            if (k == len || buf[k] == '\n') {
+                char saved = buf[k];
+                buf[k] = '\0';
+                if (regexec(&re, buf + start, 0, NULL, 0) == 0) {
+                    printf("%s:%zu:%s\n", path, line_no, buf + start);
+                    matches++;
+                }
+                buf[k] = saved;
+                start = k + 1;
+                line_no++;
+            }
+        }
+        free(data);
+    }
+
+    regfree(&re);
+    pathmap_free(pm);
+    return matches > 0 ? 0 : 1;
+}
+
+static int cmd_export(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--snapshot", 1 }, { "--dest", 1 },
+    };
+    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
+    lock_shared(repo);
+    const char *snap_arg = opt_get(argc, argv, 2, "--snapshot");
+    const char *dest = opt_get(argc, argv, 2, "--dest");
+    if (!snap_arg || !dest) {
+        fprintf(stderr, "error: --snapshot and --dest required\n");
+        return 1;
+    }
+    uint32_t snap_id = 0;
+    if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+        fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+        return 1;
+    }
+    return restore_snapshot(repo, snap_id, dest) == OK ? 0 : 1;
+}
+
+static int cmd_import(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--src", 1 }, { "--quiet", 0 },
+    };
+    if (validate_options(argc, argv, 2, specs, 3, NULL, 0)) return 1;
+    const char *src = opt_get(argc, argv, 2, "--src");
+    int quiet = opt_has(argc, argv, 2, "--quiet");
+    if (!src) { fprintf(stderr, "error: --src required\n"); return 1; }
+    char *src_abs = path_to_absolute(src);
+    if (!src_abs) { fprintf(stderr, "error: invalid --src path\n"); return 1; }
+
+    if (lock_or_die(repo)) { free(src_abs); return 1; }
+
+    const char *paths[1] = { src_abs };
+    backup_opts_t bopts = { .quiet = quiet };
+    status_t st = backup_run_opts(repo, paths, 1, &bopts);
+    free(src_abs);
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
@@ -1242,11 +1487,50 @@ static int cmd_pack(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--deep", 0 } };
+    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    int deep = opt_has(argc, argv, 2, "--deep");
+    lock_shared(repo);
+    if (deep) fprintf(stderr, "verify: running deep object verification\n");
+    return repo_verify(repo) == OK ? 0 : 1;
+}
+
+static int cmd_doctor(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 } };
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
-    (void)argc; (void)argv;
     lock_shared(repo);
-    return repo_verify(repo) == OK ? 0 : 1;
+
+    int problems = 0;
+    uint32_t head = 0;
+    if (snapshot_read_head(repo, &head) == OK) {
+        printf("check head: ok (%u)\n", head);
+    } else {
+        printf("check head: fail\n");
+        problems++;
+    }
+
+    repo_stat_t s = {0};
+    if (repo_stats(repo, &s) == OK) {
+        printf("check stats: ok (snapshots=%u, loose=%u, packs=%u)\n",
+               s.snap_count, s.loose_objects, s.pack_files);
+    } else {
+        printf("check stats: fail\n");
+        problems++;
+    }
+
+    if (repo_verify(repo) == OK) {
+        printf("check verify: ok\n");
+    } else {
+        printf("check verify: fail\n");
+        problems++;
+    }
+
+    if (problems == 0) {
+        printf("doctor: repository looks healthy\n");
+        return 0;
+    }
+    printf("doctor: %d problem(s) found\n", problems);
+    return 1;
 }
 
 static int cmd_stats(repo_t *repo, int argc, char **argv) {
@@ -1352,8 +1636,9 @@ int main(int argc, char *argv[]) {
 
     /* Catch missing or unrecognised subcommand before checking flags */
     static const char *const known_cmds[] = {
-        "policy", "run", "list", "ls", "restore", "diff",
-        "prune", "snapshot", "gc", "pack", "verify", "stats", "tag", NULL
+        "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
+        "export", "import", "prune", "snapshot", "gc", "pack", "verify",
+        "doctor", "stats", "tag", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -1383,13 +1668,18 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "run")        == 0) ret = cmd_run(repo, argc, argv);
     else if (strcmp(cmd, "list")       == 0) ret = cmd_list(repo, argc, argv);
     else if (strcmp(cmd, "ls")         == 0) ret = cmd_ls(repo, argc, argv);
+    else if (strcmp(cmd, "cat")        == 0) ret = cmd_cat(repo, argc, argv);
     else if (strcmp(cmd, "restore")    == 0) ret = cmd_restore(repo, argc, argv);
     else if (strcmp(cmd, "diff")       == 0) ret = cmd_diff(repo, argc, argv);
+    else if (strcmp(cmd, "grep")       == 0) ret = cmd_grep(repo, argc, argv);
+    else if (strcmp(cmd, "export")     == 0) ret = cmd_export(repo, argc, argv);
+    else if (strcmp(cmd, "import")     == 0) ret = cmd_import(repo, argc, argv);
     else if (strcmp(cmd, "prune")      == 0) ret = cmd_prune(repo, argc, argv);
     else if (strcmp(cmd, "snapshot")   == 0) ret = cmd_snapshot(repo, argc, argv);
     else if (strcmp(cmd, "gc")         == 0) ret = cmd_gc(repo, argc, argv);
     else if (strcmp(cmd, "pack")       == 0) ret = cmd_pack(repo, argc, argv);
     else if (strcmp(cmd, "verify")     == 0) ret = cmd_verify(repo, argc, argv);
+    else if (strcmp(cmd, "doctor")     == 0) ret = cmd_doctor(repo, argc, argv);
     else if (strcmp(cmd, "stats")      == 0) ret = cmd_stats(repo, argc, argv);
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);
     else {

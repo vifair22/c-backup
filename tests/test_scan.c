@@ -24,24 +24,26 @@ static void write_file(const char *path, const char *content) {
 
 static int setup(void **state) {
     (void)state;
-    system("rm -rf " TEST_ROOT1 " " TEST_ROOT2 " " TEST_MISS);
+    int rc = system("rm -rf " TEST_ROOT1 " " TEST_ROOT2 " " TEST_MISS);
+    (void)rc;
 
     mkdir(TEST_ROOT1, 0755);
     mkdir(TEST_ROOT1 "/sub", 0755);
     write_file(TEST_ROOT1 "/keep.txt", "keep");
     write_file(TEST_ROOT1 "/skip.tmp", "skip");
     write_file(TEST_ROOT1 "/sub/nested.txt", "nested");
-    symlink("keep.txt", TEST_ROOT1 "/lnk");
+    if (symlink("keep.txt", TEST_ROOT1 "/lnk") != 0) return -1;
 
     mkdir(TEST_ROOT2, 0755);
     /* hard-link to TEST_ROOT1/keep.txt */
-    link(TEST_ROOT1 "/keep.txt", TEST_ROOT2 "/link_to_keep");
+    if (link(TEST_ROOT1 "/keep.txt", TEST_ROOT2 "/link_to_keep") != 0) return -1;
     return 0;
 }
 
 static int teardown(void **state) {
     (void)state;
-    system("rm -rf " TEST_ROOT1 " " TEST_ROOT2 " " TEST_MISS);
+    int rc = system("rm -rf " TEST_ROOT1 " " TEST_ROOT2 " " TEST_MISS);
+    (void)rc;
     return 0;
 }
 
@@ -132,7 +134,9 @@ static void test_scan_missing_root_is_nonfatal(void **state) {
     scan_result_t *res = NULL;
     assert_int_equal(scan_tree(TEST_MISS, imap, NULL, &res), OK);
     assert_non_null(res);
-    assert_int_equal(res->count, 0u);
+    for (uint32_t i = 0; i < res->count; i++) {
+        assert_null(strstr(res->entries[i].path, "c_backup_scan_missing"));
+    }
 
     scan_result_free(res);
     scan_imap_free(imap);

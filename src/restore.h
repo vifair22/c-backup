@@ -22,10 +22,18 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
 status_t restore_subtree(repo_t *repo, uint32_t snap_id,
                          const char *subtree_path, const char *dest_path);
 
+/* Print a regular file from a snapshot to stdout (like cat). */
+status_t restore_cat_file(repo_t *repo, uint32_t snap_id,
+                          const char *file_path);
+
+/* Print a regular file from a snapshot to a file descriptor. */
+status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
+                             const char *file_path, int out_fd, int hex_mode);
+
 /*
  * After a restore, walk dest_path and verify every regular file's content
  * hash matches the snapshot.  Returns OK if all match, ERR_CORRUPT if any
  * mismatch.
  */
 status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
-                               const char *dest_path);
+                                const char *dest_path);

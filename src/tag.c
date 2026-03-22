@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "tag.h"
+#include "snapshot.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -154,6 +155,9 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
 }
 
 status_t tag_resolve(repo_t *repo, const char *arg, uint32_t *out_id) {
+    if (arg && (strcmp(arg, "HEAD") == 0 || strcmp(arg, "head") == 0)) {
+        return snapshot_read_head(repo, out_id);
+    }
     if (parse_u32_str(arg, out_id)) return OK;
     return tag_get(repo, arg, out_id);
 }
