@@ -19,6 +19,7 @@
 #include <pthread.h>
 
 #include <lz4.h>
+#include <lz4frame.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -671,8 +672,10 @@ status_t pack_object_load(repo_t *repo,
     if (ehdr.compression == COMPRESS_NONE && ehdr.compressed_size > PACK_STREAM_THRESHOLD) {
         fclose(f); return ERR_TOO_LARGE;
     }
-    /* LZ4 decompression is limited to INT_MAX; these objects should never exist
-     * since write_object guards the same limit, but be defensive. */
+    /* LZ4 frame and large single-call objects must go through the stream path. */
+    if (ehdr.compression == COMPRESS_LZ4_FRAME) {
+        fclose(f); return ERR_TOO_LARGE;
+    }
     if (ehdr.compression == COMPRESS_LZ4 &&
         (ehdr.compressed_size > (uint64_t)INT_MAX ||
          ehdr.uncompressed_size > (uint64_t)INT_MAX)) {
@@ -772,6 +775,63 @@ status_t pack_object_load_stream(repo_t *repo,
         int wr = write_full_fd(out_fd, out, (size_t)ehdr.uncompressed_size);
         free(out);
         return wr == 0 ? OK : ERR_IO;
+    }
+
+    if (ehdr.compression == COMPRESS_LZ4_FRAME) {
+        /* Stream-decompress LZ4 frame payload, verify hash over decompressed bytes. */
+        uint8_t *src = malloc(PACK_STREAM_THRESHOLD);
+        uint8_t *dst = malloc(PACK_STREAM_THRESHOLD);
+        LZ4F_dctx *dctx = NULL;
+        if (!src || !dst || LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION))) {
+            free(src); free(dst);
+            if (dctx) LZ4F_freeDecompressionContext(dctx);
+            fclose(f); return ERR_NOMEM;
+        }
+
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+            EVP_MD_CTX_free(mdctx);
+            LZ4F_freeDecompressionContext(dctx);
+            free(src); free(dst); fclose(f); return ERR_NOMEM;
+        }
+
+        uint64_t remaining = ehdr.compressed_size;
+        status_t fst = OK;
+        while (remaining > 0 && fst == OK) {
+            size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
+                          (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
+            if (fread(src, 1, want, f) != want) { fst = ERR_CORRUPT; break; }
+            size_t src_left = want;
+            uint8_t *srcp = src;
+            while (src_left > 0 && fst == OK) {
+                size_t dst_sz = PACK_STREAM_THRESHOLD;
+                size_t src_sz = src_left;
+                size_t ret = LZ4F_decompress(dctx, dst, &dst_sz, srcp, &src_sz, NULL);
+                if (LZ4F_isError(ret)) { fst = ERR_CORRUPT; break; }
+                if (dst_sz > 0) {
+                    if (EVP_DigestUpdate(mdctx, dst, dst_sz) != 1 ||
+                        write_full_fd(out_fd, dst, dst_sz) != 0)
+                        fst = ERR_IO;
+                }
+                srcp     += src_sz;
+                src_left -= src_sz;
+            }
+            remaining -= want;
+        }
+        fclose(f);
+        free(src); free(dst);
+        LZ4F_freeDecompressionContext(dctx);
+
+        if (fst == OK) {
+            uint8_t got[OBJECT_HASH_SIZE];
+            unsigned int dl = OBJECT_HASH_SIZE;
+            if (EVP_DigestFinal_ex(mdctx, got, &dl) != 1 ||
+                dl != OBJECT_HASH_SIZE ||
+                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
+                fst = ERR_CORRUPT;
+        }
+        EVP_MD_CTX_free(mdctx);
+        return fst;
     }
 
     if (ehdr.compression != COMPRESS_NONE) { fclose(f); return ERR_CORRUPT; }

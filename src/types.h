@@ -8,8 +8,9 @@
 #define OBJECT_TYPE_ACL     3
 #define OBJECT_TYPE_SPARSE  4   /* sparse file: region table prepended to data */
 
-#define COMPRESS_NONE 0
-#define COMPRESS_LZ4  1
+#define COMPRESS_NONE      0
+#define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
+#define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */
 
 #define NODE_TYPE_REG   1
 #define NODE_TYPE_DIR   2
