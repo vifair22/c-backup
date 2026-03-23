@@ -24,32 +24,90 @@ static void ts_to_tm(uint64_t ts, struct tm *out) {
     gmtime_r(&t, out);
 }
 
-/* 0 = Sunday, 6 = Saturday */
-static int weekday(uint64_t ts) {
+/*
+ * Portable timegm — converts a UTC struct tm to a Unix timestamp.
+ * Does not modify the struct tm or consult the local timezone.
+ */
+static int is_leap_year(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+static time_t tm_to_utc(const struct tm *tm) {
+    static const int mdays[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    int y  = tm->tm_year + 1900;
+    int m  = tm->tm_mon; /* 0-11 */
+    int y0 = y - 1;
+    /* Days from epoch to Jan 1 of year y */
+    long ydays = (long)(y - 1970) * 365
+               + (y0 / 4   - 1969 / 4)
+               - (y0 / 100 - 1969 / 100)
+               + (y0 / 400 - 1969 / 400);
+    /* Days within the year up to start of month m */
+    long yday = mdays[m] + (m > 1 && is_leap_year(y) ? 1 : 0);
+    long days = ydays + yday + tm->tm_mday - 1;
+    return (time_t)(days * 86400L
+                  + tm->tm_hour * 3600
+                  + tm->tm_min  * 60
+                  + tm->tm_sec);
+}
+
+/* Return the cal_day of the Sunday that ends the Mon-Sun week containing day. */
+static int64_t week_sunday_of(int64_t day) {
+    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
     ts_to_tm(ts, &tm);
-    return tm.tm_wday;
+    /* tm_wday: 0=Sun, 1=Mon, ..., 6=Sat */
+    if (tm.tm_wday == 0) return day;
+    return day + (7 - tm.tm_wday);
 }
 
-static int is_sunday(uint64_t ts) {
-    return weekday(ts) == 0;
-}
-
-/* True if the Sunday at ts is the last Sunday of its calendar month. */
-static int is_last_sunday_of_month(uint64_t ts) {
-    struct tm tm, nm;
-    ts_to_tm(ts, &tm);
-    ts_to_tm(ts + 7 * 86400, &nm);
-    return nm.tm_mon != tm.tm_mon;
-}
-
-static int is_december(uint64_t ts) {
+/* Return the cal_day of the first day of the month containing day. */
+static int64_t month_start_of(int64_t day) {
+    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
     ts_to_tm(ts, &tm);
-    return tm.tm_mon == 11;
+    tm.tm_mday = 1;
+    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tm) / 86400);
 }
 
-/* Highest GFS tier flag set in a snapshot */
+/* Return the cal_day of the last day of the month containing day. */
+static int64_t month_end_of(int64_t day) {
+    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
+    struct tm tm;
+    ts_to_tm(ts, &tm);
+    tm.tm_mon++;
+    if (tm.tm_mon >= 12) { tm.tm_mon = 0; tm.tm_year++; }
+    tm.tm_mday = 1;
+    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tm) / 86400) - 1;
+}
+
+/* Return the cal_day of Jan 1 of the year containing day. */
+static int64_t year_start_of(int64_t day) {
+    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
+    struct tm tm;
+    ts_to_tm(ts, &tm);
+    tm.tm_mon = 0; tm.tm_mday = 1;
+    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tm) / 86400);
+}
+
+/* Return the cal_day of Dec 31 of the year containing day. */
+static int64_t year_end_of(int64_t day) {
+    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
+    struct tm tm;
+    ts_to_tm(ts, &tm);
+    tm.tm_year++;
+    tm.tm_mon = 0; tm.tm_mday = 1;
+    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tm) / 86400) - 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tier helpers                                                         */
+/* ------------------------------------------------------------------ */
+
 static uint32_t highest_tier(uint32_t flags) {
     if (flags & GFS_YEARLY)  return GFS_YEARLY;
     if (flags & GFS_MONTHLY) return GFS_MONTHLY;
@@ -58,7 +116,6 @@ static uint32_t highest_tier(uint32_t flags) {
     return 0;
 }
 
-/* Count snaps with the same highest_tier as snaps[idx] that have a higher ID */
 static int tier_newer_count(const gfs_snap_info_t *snaps, uint32_t n, uint32_t idx) {
     uint32_t tier = highest_tier(snaps[idx].gfs_flags);
     int count = 0;
@@ -68,35 +125,6 @@ static int tier_newer_count(const gfs_snap_info_t *snaps, uint32_t n, uint32_t i
             count++;
     }
     return count;
-}
-
-/* ------------------------------------------------------------------ */
-/* gfs_detect_boundaries                                               */
-/* ------------------------------------------------------------------ */
-
-static uint32_t gfs_detect_boundaries(uint64_t prev_ts, uint64_t new_ts) {
-    uint32_t flags = 0;
-
-    if (new_ts == 0) return 0;
-
-    /* Daily: calendar day changed (or first backup) */
-    if (prev_ts == 0 || cal_day(new_ts) != cal_day(prev_ts))
-        flags |= GFS_DAILY;
-
-    /* Weekly: daily boundary crossed and the new day is Sunday.
-     * On first backup: check if new_ts is itself a Sunday. */
-    if ((flags & GFS_DAILY) && is_sunday(new_ts))
-        flags |= GFS_WEEKLY;
-
-    /* Monthly: weekly boundary crossed and it is the last Sunday of its month */
-    if ((flags & GFS_WEEKLY) && is_last_sunday_of_month(new_ts))
-        flags |= GFS_MONTHLY;
-
-    /* Yearly: monthly boundary crossed and the month is December */
-    if ((flags & GFS_MONTHLY) && is_december(new_ts))
-        flags |= GFS_YEARLY;
-
-    return flags;
 }
 
 /* ------------------------------------------------------------------ */
@@ -125,7 +153,7 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal: load all snap metadata into a gfs_snap_info_t array      */
+/* load_snap_infos                                                     */
 /* ------------------------------------------------------------------ */
 
 static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
@@ -154,35 +182,35 @@ static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal: find the highest-ID snap whose day == cal_day(ref_ts)-1  */
-/* Falls back to the highest-ID snap before today if none found.       */
+/* Election helper                                                     */
 /* ------------------------------------------------------------------ */
 
-static uint32_t find_daily_candidate(const gfs_snap_info_t *snaps, uint32_t n,
-                                     uint64_t new_ts) {
-    int64_t yesterday = cal_day(new_ts) - 1;
-    uint32_t best_id  = 0;
+/*
+ * Find the index in snaps[] of the latest snap (highest ts, then
+ * highest id as tiebreak) whose cal_day falls in [d_start, d_end].
+ * If required_flag != 0, the snap must have that flag set in
+ * its current (in-memory) gfs_flags.
+ * Returns UINT32_MAX if no qualifying snap is found.
+ */
+static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
+                                   int64_t d_start, int64_t d_end,
+                                   uint32_t required_flag) {
+    uint32_t best_idx = UINT32_MAX;
     uint64_t best_ts  = 0;
+    uint32_t best_id  = 0;
 
     for (uint32_t i = 0; i < n; i++) {
+        if (required_flag != 0 && !(snaps[i].gfs_flags & required_flag)) continue;
         int64_t d = cal_day(snaps[i].ts);
-        if (d == yesterday) {
-            if (snaps[i].id > best_id) { best_id = snaps[i].id; best_ts = snaps[i].ts; }
+        if (d < d_start || d > d_end) continue;
+        if (snaps[i].ts > best_ts ||
+            (snaps[i].ts == best_ts && snaps[i].id > best_id)) {
+            best_ts  = snaps[i].ts;
+            best_id  = snaps[i].id;
+            best_idx = i;
         }
     }
-
-    /* Fallback: most recent snap before today */
-    if (best_id == 0) {
-        int64_t today = cal_day(new_ts);
-        for (uint32_t i = 0; i < n; i++) {
-            if (cal_day(snaps[i].ts) < today && snaps[i].id > best_id) {
-                best_id = snaps[i].id; best_ts = snaps[i].ts;
-            }
-        }
-    }
-
-    (void)best_ts;
-    return best_id;
+    return best_idx;
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,59 +219,114 @@ static uint32_t find_daily_candidate(const gfs_snap_info_t *snaps, uint32_t n,
 
 status_t gfs_run(repo_t *repo, const policy_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int run_gc) {
+                 int run_gc, int full_scan) {
     if (new_snap_id == 0) return OK;
 
-    /* Load all surviving snap metadata */
     gfs_snap_info_t *snaps = NULL;
     uint32_t n = 0;
     status_t st = load_snap_infos(repo, new_snap_id, &snaps, &n);
     if (st != OK) return st;
 
-    /* Locate the new snap's timestamp and the previous snap's timestamp */
-    uint64_t new_ts  = 0;
-    uint64_t prev_ts = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].id == new_snap_id) new_ts = snaps[i].ts;
-        if (snaps[i].id == new_snap_id - 1) prev_ts = snaps[i].ts;
+    /* Save original flags so we can detect what changed at flush time. */
+    uint32_t *orig_flags = calloc(n, sizeof(uint32_t));
+    if (!orig_flags) { free(snaps); return ERR_NOMEM; }
+    for (uint32_t i = 0; i < n; i++) orig_flags[i] = snaps[i].gfs_flags;
+
+    /* Full scan: clear all in-memory flags; flush will overwrite on disk. */
+    if (full_scan) {
+        for (uint32_t i = 0; i < n; i++) snaps[i].gfs_flags = 0;
     }
 
-    /* Step 1: detect boundaries */
-    uint32_t boundary = gfs_detect_boundaries(prev_ts, new_ts);
+    /* Determine scan interval [scan_start_day, scan_end_day).
+     * scan_end_day is exclusive — the current day is not yet closed.
+     * For incremental: start from the day of the most recent surviving
+     * snap before new_snap_id (robust against ID gaps from pruning).
+     * For full scan: start from epoch (day 0). */
+    uint64_t new_ts  = 0;
+    uint64_t prev_ts = 0;
+    uint32_t prev_id = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (snaps[i].id == new_snap_id) {
+            new_ts = snaps[i].ts;
+        } else if (snaps[i].id < new_snap_id && snaps[i].id > prev_id) {
+            prev_id = snaps[i].id;
+            prev_ts = snaps[i].ts;
+        }
+    }
+    if (new_ts == 0) { free(orig_flags); free(snaps); return OK; }
 
-    /* Step 2: find candidate and assign flags */
-    if (boundary & GFS_DAILY) {
-        uint32_t cand = find_daily_candidate(snaps, n, new_ts);
-        if (cand > 0) {
-            uint32_t tier = GFS_DAILY;
-            if (boundary & GFS_WEEKLY)  tier |= GFS_WEEKLY;
-            if (boundary & GFS_MONTHLY) tier |= GFS_MONTHLY;
-            if (boundary & GFS_YEARLY)  tier |= GFS_YEARLY;
+    int64_t scan_end_day   = cal_day(new_ts);
+    int64_t scan_start_day = full_scan ? 0 : cal_day(prev_ts);
 
-            if (!dry_run) {
-                st = snapshot_set_gfs_flags(repo, cand, tier);
-                if (st != OK) {
-                    log_msg("WARN", "gfs: could not set GFS flags on anchor snap");
-                    st = OK;
-                } else {
-                    for (uint32_t i = 0; i < n; i++) {
-                        if (snaps[i].id == cand) { snaps[i].gfs_flags |= tier; break; }
-                    }
-                    if (!quiet) {
-                        char tbuf[64];
-                        gfs_flags_str(tier, tbuf, sizeof(tbuf));
-                        fprintf(stderr, "gfs: snap %08u flagged [%s]\n", cand, tbuf);
-                    }
-                }
+    /* ---- Pass 1: Daily election ----
+     * For each closed day in the scan interval, elect the latest snap
+     * of that day as the daily anchor. */
+    for (int64_t d = scan_start_day; d < scan_end_day; d++) {
+        uint32_t idx = find_best_in_range(snaps, n, d, d, 0);
+        if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_DAILY;
+    }
+
+    /* ---- Pass 2: Weekly election (Mon–Sun windows) ----
+     * For each complete week whose Sunday falls in the scan interval,
+     * elect the latest daily anchor within that week. */
+    int64_t sun = week_sunday_of(scan_start_day);
+    for (; sun < scan_end_day; sun += 7) {
+        int64_t mon = sun - 6;
+        uint32_t idx = find_best_in_range(snaps, n, mon, sun, GFS_DAILY);
+        if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_WEEKLY;
+    }
+
+    /* ---- Pass 3: Monthly election ----
+     * For each complete month whose last day falls in the scan interval,
+     * elect the latest weekly anchor within that month. */
+    {
+        int64_t ms = month_start_of(scan_start_day);
+        for (;;) {
+            int64_t me = month_end_of(ms);
+            if (me >= scan_end_day) break;
+            uint32_t idx = find_best_in_range(snaps, n, ms, me, GFS_WEEKLY);
+            if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_MONTHLY;
+            ms = me + 1;
+        }
+    }
+
+    /* ---- Pass 4: Yearly election ----
+     * For each complete year whose last day falls in the scan interval,
+     * elect the latest monthly anchor within that year. */
+    {
+        int64_t ys = year_start_of(scan_start_day);
+        for (;;) {
+            int64_t ye = year_end_of(ys);
+            if (ye >= scan_end_day) break;
+            uint32_t idx = find_best_in_range(snaps, n, ys, ye, GFS_MONTHLY);
+            if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_YEARLY;
+            ys = ye + 1;
+        }
+    }
+
+    /* ---- Flush changed flags to disk ---- */
+    if (!dry_run) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (snaps[i].gfs_flags == orig_flags[i]) continue;
+            st = snapshot_replace_gfs_flags(repo, snaps[i].id, snaps[i].gfs_flags);
+            if (st != OK) {
+                log_msg("WARN", "gfs: could not update GFS flags on snap");
+                st = OK;
+            } else if (!quiet) {
+                char tbuf[64];
+                gfs_flags_str(snaps[i].gfs_flags, tbuf, sizeof(tbuf));
+                fprintf(stderr, "gfs: snap %08u flagged [%s]\n",
+                        snaps[i].id, tbuf);
             }
         }
     }
 
-    /* Step 2b: mark tier-expired GFS snaps.
-     * A GFS snap is expired when keep_N > 0 for its tier and there are
-     * already >= keep_N newer snaps at the same (highest) tier. */
+    /* ---- Prune ----
+     * A GFS snap is tier-expired when keep_N > 0 for its highest tier
+     * and there are already >= keep_N newer snaps at the same tier. */
     int *tier_expired = calloc(n, sizeof(int));
-    if (!tier_expired) { free(snaps); return ERR_NOMEM; }
+    if (!tier_expired) { free(orig_flags); free(snaps); return ERR_NOMEM; }
+
     for (uint32_t i = 0; i < n; i++) {
         if (snaps[i].gfs_flags == 0) continue;
         uint32_t tier = highest_tier(snaps[i].gfs_flags);
@@ -258,9 +341,6 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
             tier_expired[i] = 1;
     }
 
-    /* Step 3: prune snaps outside the snapshot window.
-     * Keep snap if: HEAD, non-expired GFS anchor, within snapshot window, or preserved.
-     * Tier-expired GFS snaps are treated like non-GFS and pruned outside the window. */
     uint32_t snap_window = (policy->keep_snaps > 0) ? (uint32_t)policy->keep_snaps : 0;
     uint32_t snap_window_start = 1;
     if (snap_window > 0) {
@@ -271,10 +351,10 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
 
     for (uint32_t i = 0; i < n; i++) {
         uint32_t id = snaps[i].id;
-        if (id == new_snap_id)                          continue;   /* HEAD always kept */
-        if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;  /* live GFS anchor */
-        if (id >= snap_window_start)                    continue;   /* within snapshot window */
-        if (snaps[i].preserved)                         continue;   /* preserved tag */
+        if (id == new_snap_id)                            continue;
+        if (snaps[i].gfs_flags != 0 && !tier_expired[i]) continue;
+        if (id >= snap_window_start)                      continue;
+        if (snaps[i].preserved)                           continue;
 
         if (dry_run) {
             fprintf(stderr, "  would remove snap %08u\n", id);
@@ -293,17 +373,13 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
                     "gfs (dry-run): would remove %u snap(s); snap window=%u\n",
                     pruned_snaps, snap_window);
         else
-            fprintf(stderr,
-                    "gfs: removed %u snap(s)\n",
-                    pruned_snaps);
+            fprintf(stderr, "gfs: removed %u snap(s)\n", pruned_snaps);
     }
 
     free(tier_expired);
+    free(orig_flags);
     free(snaps);
 
-    /* Step 4: GC
-     * - Always for manual prune (run_gc=1)
-     * - For post-backup retention, only when snapshots were actually pruned */
     if (!dry_run && (run_gc || pruned_snaps > 0))
         st = repo_gc(repo, NULL, NULL);
 

@@ -229,6 +229,18 @@ status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_fla
     return st;
 }
 
+status_t snapshot_replace_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t flags) {
+    /* Load the full snap, set flags exactly (no OR), rewrite atomically. */
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    snap->gfs_flags = flags;
+    st = snapshot_write(repo, snap);
+    snapshot_free(snap);
+    return st;
+}
+
 void snapshot_free(snapshot_t *snap) {
     if (!snap) return;
     free(snap->nodes);

@@ -45,6 +45,7 @@ void     snapshot_free(snapshot_t *snap);
  * full snapshot; returns ERR_IO if the file does not exist.
  */
 status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags);
+status_t snapshot_replace_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t flags);
 status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags);
 
 /* HEAD helpers */

@@ -340,6 +340,7 @@ static void usage(void) {
         "                               [--keep-yearly N] [--no-policy] [--dry-run]\n"
         "  backup snapshot --repo <path> delete --snapshot <id|tag|HEAD>\n"
         "                               [--force] [--dry-run] [--no-gc]\n"
+        "  backup gfs      --repo <path> [--dry-run]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
         "  backup verify   --repo <path> [--deep]\n"
@@ -720,7 +721,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         uint32_t head_id = 0;
         snapshot_read_head(repo, &head_id);
         if (!quiet) log_msg("INFO", "post-backup: running retention");
-        gfs_run(repo, pol, head_id, 0, quiet, 0);
+        gfs_run(repo, pol, head_id, 0, quiet, 0, 0);
     } else if (pol && pol->auto_gc) {
         if (!quiet) log_msg("INFO", "post-backup: running GC");
         repo_gc(repo, NULL, NULL);
@@ -1554,7 +1555,37 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     uint32_t head_id = 0;
     snapshot_read_head(repo, &head_id);
-    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 1) == OK ? 0 : 1;
+    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 1, 1) == OK ? 0 : 1;
+    policy_free(pol);
+    return ret;
+}
+
+static int cmd_gfs(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = {
+        { "--repo", 1 }, { "--dry-run", 0 },
+    };
+    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+
+    int dry_run = opt_has(argc, argv, 2, "--dry-run");
+
+    policy_t *pol = NULL;
+    policy_load(repo, &pol);
+    if (!pol) {
+        fprintf(stderr, "error: no policy configured — set keep-daily/weekly/monthly/yearly first\n");
+        return 1;
+    }
+
+    uint32_t head_id = 0;
+    snapshot_read_head(repo, &head_id);
+    if (head_id == 0) {
+        fprintf(stderr, "error: repository has no snapshots\n");
+        policy_free(pol);
+        return 1;
+    }
+
+    if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
+
+    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 0, 1) == OK ? 0 : 1;
     policy_free(pol);
     return ret;
 }
@@ -1728,7 +1759,7 @@ int main(int argc, char *argv[]) {
     /* Catch missing or unrecognised subcommand before checking flags */
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
-        "export", "import", "prune", "snapshot", "gc", "pack", "verify",
+        "export", "import", "prune", "snapshot", "gfs", "gc", "pack", "verify",
         "doctor", "stats", "tag", "bundle", NULL
     };
     int known = 0;
@@ -1772,6 +1803,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "import")     == 0) ret = cmd_import(repo, argc, argv);
     else if (strcmp(cmd, "prune")      == 0) ret = cmd_prune(repo, argc, argv);
     else if (strcmp(cmd, "snapshot")   == 0) ret = cmd_snapshot(repo, argc, argv);
+    else if (strcmp(cmd, "gfs")        == 0) ret = cmd_gfs(repo, argc, argv);
     else if (strcmp(cmd, "gc")         == 0) ret = cmd_gc(repo, argc, argv);
     else if (strcmp(cmd, "pack")       == 0) ret = cmd_pack(repo, argc, argv);
     else if (strcmp(cmd, "verify")     == 0) ret = cmd_verify(repo, argc, argv);

@@ -34,9 +34,15 @@ typedef struct {
  * Main entry point.  Call after each successful backup_run_opts.
  * new_snap_id is the ID just committed (== HEAD).
  */
+/*
+ * full_scan=0: incremental — process only windows closed since the
+ *              previous snapshot.
+ * full_scan=1: clear all existing GFS flags and recompute from scratch
+ *              across the full history.  Use for manual `backup gfs` runs.
+ */
 status_t gfs_run(repo_t *repo, const policy_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int run_gc);
+                 int run_gc, int full_scan);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);
