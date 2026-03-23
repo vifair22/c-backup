@@ -186,6 +186,8 @@ static int bundle_write_record(int fd, uint8_t kind, uint8_t obj_type,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                const uint8_t *raw, size_t raw_len) {
     uint16_t path_len = path_or_null ? (uint16_t)strlen(path_or_null) : 0;
+    /* LZ4 API is limited to INT_MAX — large objects must go through Phase 3 streaming. */
+    if (raw_len > (size_t)INT_MAX) return -1;
     int bound = LZ4_compressBound((int)raw_len);
     uint8_t *cbuf = NULL;
     int comp_len = 0;
@@ -216,6 +218,43 @@ static int bundle_write_record(int fd, uint8_t kind, uint8_t obj_type,
     if (comp_len > 0 && write_all(fd, cbuf, (size_t)comp_len) != 0) { free(cbuf); return -1; }
     free(cbuf);
     return 0;
+}
+
+/*
+ * Export a single object to the bundle fd.
+ * Small objects are LZ4-compressed.  Objects that exceed INT_MAX bytes are
+ * stored raw (comp_len == 0) and streamed directly.
+ */
+static int bundle_write_object(int out_fd, const uint8_t hash[OBJECT_HASH_SIZE],
+                                repo_t *repo) {
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = object_load(repo, hash, &data, &len, &type);
+    if (st == OK) {
+        int rc = bundle_write_record(out_fd, CBB_REC_OBJECT, type, NULL, 0,
+                                     hash, (const uint8_t *)data, len);
+        free(data);
+        return rc;
+    }
+    if (st != ERR_TOO_LARGE) return -1;
+
+    /* Large object: get size+type from header, then stream raw. */
+    uint64_t raw_size = 0;
+    if (object_get_info(repo, hash, &raw_size, &type) != OK) return -1;
+
+    cbb_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.kind     = CBB_REC_OBJECT;
+    rec.obj_type = type;
+    rec.raw_len  = raw_size;
+    rec.comp_len = 0;   /* 0 means uncompressed raw follows */
+    memcpy(rec.hash, hash, OBJECT_HASH_SIZE);
+    if (write_all(out_fd, &rec, sizeof(rec)) != 0) return -1;
+
+    uint64_t streamed = 0;
+    if (object_load_stream(repo, hash, out_fd, &streamed, NULL) != OK) return -1;
+    return (streamed == raw_size) ? 0 : -1;
 }
 
 static int bundle_write_end(int fd) {
@@ -315,13 +354,7 @@ static int export_repo_bundle(repo_t *repo, int out_fd) {
 
     for (size_t i = 0; i < hs.n; i++) {
         const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
-        void *data = NULL;
-        size_t len = 0;
-        uint8_t type = 0;
-        if (object_load(repo, h, &data, &len, &type) != OK) goto fail;
-        int rc = bundle_write_record(out_fd, CBB_REC_OBJECT, type, NULL, 0, h, (const uint8_t *)data, len);
-        free(data);
-        if (rc != 0) goto fail;
+        if (bundle_write_object(out_fd, h, repo) != 0) goto fail;
     }
 
     free(hs.buf);
@@ -368,13 +401,7 @@ static int export_snapshot_bundle(repo_t *repo, uint32_t snap_id, int out_fd) {
 
     for (size_t i = 0; i < hs.n; i++) {
         const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
-        void *data = NULL;
-        size_t len = 0;
-        uint8_t type = 0;
-        if (object_load(repo, h, &data, &len, &type) != OK) goto fail;
-        int rc = bundle_write_record(out_fd, CBB_REC_OBJECT, type, NULL, 0, h, (const uint8_t *)data, len);
-        free(data);
-        if (rc != 0) goto fail;
+        if (bundle_write_object(out_fd, h, repo) != 0) goto fail;
     }
 
     free(hs.buf);
@@ -449,9 +476,35 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
             return ERR_CORRUPT;
         }
 
-        if (rec.comp_len > SIZE_MAX || rec.raw_len > SIZE_MAX) { close(fd); return ERR_CORRUPT; }
-        if (rec.comp_len > INT_MAX || rec.raw_len > INT_MAX) { close(fd); return ERR_CORRUPT; }
-        if (rec.comp_len == 0 && rec.raw_len != 0) { close(fd); return ERR_CORRUPT; }
+        /*
+         * comp_len == 0 && raw_len > 0: raw (uncompressed) record.
+         * Only supported for CBB_REC_OBJECT.  Large raw objects are streamed
+         * directly via object_store_fd to avoid OOM.
+         */
+        if (rec.comp_len == 0 && rec.raw_len > 0) {
+            if (rec.kind != CBB_REC_OBJECT) { close(fd); return ERR_CORRUPT; }
+            if (apply && !dry_run) {
+                status_t ist = object_store_fd(repo, rec.obj_type, fd,
+                                               rec.raw_len, rec.hash);
+                if (ist != OK) { close(fd); return ist; }
+            } else {
+                /* dry-run / verify: skip over the raw payload bytes */
+                uint8_t skip[4096];
+                uint64_t rem = rec.raw_len;
+                while (rem > 0) {
+                    size_t want = (rem < sizeof(skip)) ? (size_t)rem : sizeof(skip);
+                    if (read_all(fd, skip, want) != 0) { close(fd); return ERR_CORRUPT; }
+                    rem -= (uint64_t)want;
+                }
+            }
+            imported_objs++;
+            continue;
+        }
+
+        /* comp_len > 0: LZ4-compressed record.  Both sizes must fit INT_MAX. */
+        if (rec.comp_len > (uint64_t)INT_MAX || rec.raw_len > (uint64_t)INT_MAX) {
+            close(fd); return ERR_CORRUPT;
+        }
 
         uint8_t *cbuf = NULL;
         uint8_t *raw = NULL;

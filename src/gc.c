@@ -94,7 +94,11 @@ static status_t ref_push(uint8_t **refs, size_t *cap, size_t *cnt,
     return OK;
 }
 
-/* Collect all object hashes referenced by surviving snapshots. */
+/*
+ * Collect all object hashes referenced by surviving snapshots.
+ * NOTE: peak memory here is O(snapshots × nodes × 3 hashes).
+ * With millions of files across many snapshots this can be significant.
+ */
 static status_t collect_refs(repo_t *repo,
                               uint8_t **out_refs, size_t *out_cnt) {
     uint32_t head = 0;

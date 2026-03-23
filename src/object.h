@@ -60,6 +60,22 @@ status_t object_load_stream(repo_t *repo,
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
 
 /*
+ * Read object size and type from the header without loading the payload.
+ * Works for both loose and packed objects.
+ */
+status_t object_get_info(repo_t *repo,
+                         const uint8_t hash[OBJECT_HASH_SIZE],
+                         uint64_t *out_size, uint8_t *out_type);
+
+/*
+ * Stream `size` bytes from src_fd into the object store as type `type`,
+ * stored uncompressed (COMPRESS_NONE).  Verifies SHA-256 against expected_hash.
+ * Used by the xfer importer for large objects that exceed INT_MAX.
+ */
+status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
+                          const uint8_t expected_hash[OBJECT_HASH_SIZE]);
+
+/*
  * Return on-disk physical bytes used by a single object payload record.
  * For loose objects: object_header_t + compressed payload bytes.
  * For packed objects: pack_dat_entry_hdr_t + compressed payload bytes.

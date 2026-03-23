@@ -128,14 +128,19 @@ static status_t write_object(repo_t *repo, uint8_t type,
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) return OK;
 
-    int max_dst = LZ4_compressBound((int)len);
-    char *compressed = malloc((size_t)max_dst);
-    if (!compressed) return ERR_NOMEM;
-    int comp_size = LZ4_compress_default(data, compressed, (int)len, max_dst);
-
+    /* LZ4 API is limited to INT_MAX — skip compression for larger objects. */
     const void *payload; size_t payload_size; uint8_t compression;
-    if (comp_size > 0 && (size_t)comp_size < len) {
-        payload = compressed; payload_size = (size_t)comp_size; compression = COMPRESS_LZ4;
+    char *compressed = NULL;
+    if (len <= (size_t)INT_MAX) {
+        int max_dst = LZ4_compressBound((int)len);
+        compressed = malloc((size_t)max_dst);
+        if (!compressed) return ERR_NOMEM;
+        int comp_size = LZ4_compress_default(data, compressed, (int)len, max_dst);
+        if (comp_size > 0 && (size_t)comp_size < len) {
+            payload = compressed; payload_size = (size_t)comp_size; compression = COMPRESS_LZ4;
+        } else {
+            payload = data; payload_size = len; compression = COMPRESS_NONE;
+        }
     } else {
         payload = data; payload_size = len; compression = COMPRESS_NONE;
     }
@@ -672,7 +677,12 @@ status_t object_load(repo_t *repo,
         data    = cpayload;
         data_sz = (size_t)hdr.uncompressed_size;
     } else if (hdr.compression == COMPRESS_LZ4) {
-        char *out = malloc(hdr.uncompressed_size);
+        if (hdr.compressed_size > (uint64_t)INT_MAX ||
+            hdr.uncompressed_size > (uint64_t)INT_MAX) {
+            free(cpayload);
+            return ERR_TOO_LARGE;
+        }
+        char *out = malloc((size_t)hdr.uncompressed_size);
         if (!out) { free(cpayload); return ERR_NOMEM; }
         int r = LZ4_decompress_safe(cpayload, out,
                                     (int)hdr.compressed_size,
@@ -715,16 +725,12 @@ status_t object_load_stream(repo_t *repo,
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
-        /* Not a loose object — try pack files.
-         * Pack compressed_size is uint32_t (≤ 4 GB), safe to load in RAM. */
-        void *data = NULL; size_t data_sz = 0; uint8_t type = 0;
-        status_t st = pack_object_load(repo, hash, &data, &data_sz, &type);
+        /* Not a loose object — try pack files (streaming to handle large objects). */
+        uint64_t psz = 0; uint8_t ptype = 0;
+        status_t st = pack_object_load_stream(repo, hash, out_fd, &psz, &ptype);
         if (st != OK) return st;
-        int wr = write_full(out_fd, data, data_sz);
-        free(data);
-        if (wr != 0) return ERR_IO;
-        if (out_size) *out_size = (uint64_t)data_sz;
-        if (out_type) *out_type = type;
+        if (out_size) *out_size = psz;
+        if (out_type) *out_type = ptype;
         return OK;
     }
 
@@ -769,7 +775,12 @@ status_t object_load_stream(repo_t *repo,
         return st;
 
     } else if (hdr.compression == COMPRESS_LZ4) {
-        /* Compressed payloads are always small — load, decompress, write. */
+        /* LZ4 API is limited to INT_MAX — objects larger than that cannot be LZ4-compressed. */
+        if (hdr.compressed_size > (uint64_t)INT_MAX ||
+            hdr.uncompressed_size > (uint64_t)INT_MAX) {
+            close(fd);
+            return ERR_TOO_LARGE;
+        }
         char *cpayload = malloc((size_t)hdr.compressed_size);
         if (!cpayload) { close(fd); return ERR_NOMEM; }
         if (read_full(fd, cpayload, (size_t)hdr.compressed_size) != 0) {
@@ -797,4 +808,123 @@ status_t object_load_stream(repo_t *repo,
         close(fd);
         return ERR_CORRUPT;
     }
+}
+
+status_t object_get_info(repo_t *repo,
+                         const uint8_t hash[OBJECT_HASH_SIZE],
+                         uint64_t *out_size, uint8_t *out_type) {
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+        return pack_object_get_info(repo, hash, out_size, out_type);
+
+    object_header_t hdr;
+    int rc = read_full(fd, &hdr, sizeof(hdr));
+    close(fd);
+    if (rc != 0) return ERR_CORRUPT;
+
+    if (out_size) *out_size = hdr.uncompressed_size;
+    if (out_type) *out_type = hdr.type;
+    return OK;
+}
+
+/*
+ * Stream `size` bytes from src_fd into the object store as object type `type`.
+ * The data is stored uncompressed (COMPRESS_NONE).  The SHA-256 of the raw
+ * bytes is computed while streaming and verified against expected_hash.
+ * Returns OK, ERR_NOMEM, ERR_IO, or ERR_CORRUPT (hash mismatch).
+ */
+status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
+                          const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
+    /* Check existence first to avoid redundant work. */
+    if (object_exists(repo, expected_hash)) return OK;
+
+    char tmppath[PATH_MAX];
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) return ERR_IO;
+
+    int tfd = mkstemp(tmppath);
+    if (tfd == -1) return ERR_IO;
+
+    object_header_t hdr = {
+        .type              = type,
+        .compression       = COMPRESS_NONE,
+        .uncompressed_size = size,
+        .compressed_size   = size,
+    };
+    memcpy(hdr.hash, expected_hash, OBJECT_HASH_SIZE);
+    if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+        close(tfd); unlink(tmppath); return ERR_IO;
+    }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) { close(tfd); unlink(tmppath); return ERR_NOMEM; }
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return ERR_IO;
+    }
+
+    uint8_t *buf = malloc(STREAM_CHUNK);
+    if (!buf) {
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return ERR_NOMEM;
+    }
+
+    uint64_t remaining = size;
+    status_t st = OK;
+    while (remaining > 0) {
+        size_t want = (remaining < STREAM_CHUNK) ? (size_t)remaining : STREAM_CHUNK;
+        ssize_t r = read(src_fd, buf, want);
+        if (r <= 0) { st = ERR_IO; break; }
+        if (EVP_DigestUpdate(mdctx, buf, (size_t)r) != 1) { st = ERR_IO; break; }
+        if (write_full(tfd, buf, (size_t)r) != 0) { st = ERR_IO; break; }
+        remaining -= (uint64_t)r;
+    }
+    free(buf);
+
+    if (st == OK) {
+        uint8_t got[OBJECT_HASH_SIZE];
+        unsigned int dlen = OBJECT_HASH_SIZE;
+        if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
+            dlen != OBJECT_HASH_SIZE ||
+            memcmp(got, expected_hash, OBJECT_HASH_SIZE) != 0)
+            st = ERR_CORRUPT;
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    if (st != OK) { close(tfd); unlink(tmppath); return st; }
+    if (fsync(tfd) != 0) { close(tfd); unlink(tmppath); return ERR_IO; }
+    close(tfd);
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(expected_hash, subdir, fname);
+    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    if (objfd == -1) { unlink(tmppath); return ERR_IO; }
+    if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
+        close(objfd); unlink(tmppath); return ERR_IO;
+    }
+    if (errno == EEXIST) errno = 0;
+    close(objfd);
+
+    char dstpath[PATH_MAX];
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)
+        >= (int)sizeof(dstpath)) { unlink(tmppath); return ERR_IO; }
+    if (rename(tmppath, dstpath) == -1) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && object_exists(repo, expected_hash)) {
+            unlink(tmppath);
+            return OK;
+        }
+        unlink(tmppath); return ERR_IO;
+    }
+
+    /* fsync the object directory */
+    char dirpath[PATH_MAX];
+    if (snprintf(dirpath, sizeof(dirpath), "%s/objects/%s", repo_path(repo), subdir)
+        < (int)sizeof(dirpath)) {
+        int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { fsync(dfd); close(dfd); }
+    }
+    return OK;
 }

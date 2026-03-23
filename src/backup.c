@@ -189,10 +189,27 @@ typedef struct {
     uint32_t  cap;
 } skipped_ids_t;
 
+static int skipped_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
 static int skipped_has(const skipped_ids_t *s, uint64_t id) {
-    for (uint32_t i = 0; i < s->count; i++)
-        if (s->ids[i] == id) return 1;
-    return 0;
+    if (s->count == 0) return 0;
+    return bsearch(&id, s->ids, s->count, sizeof(uint64_t), skipped_cmp) != NULL;
+}
+
+static status_t skipped_add(skipped_ids_t *s, uint64_t id) {
+    if (s->count == s->cap) {
+        uint32_t nc = s->cap ? s->cap * 2 : 16;
+        uint64_t *tmp = realloc(s->ids, nc * sizeof(*tmp));
+        if (!tmp) return ERR_NOMEM;
+        s->ids = tmp;
+        s->cap = nc;
+    }
+    s->ids[s->count++] = id;
+    return OK;
 }
 
 static void deleted_cb(const char *path, const node_t *node, void *ctx_) {
@@ -548,8 +565,13 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         } else {
             for (uint32_t j = 0; j < partial->count; j++) {
                 if (scan->count == scan->capacity) {
+                    if (scan->capacity > UINT32_MAX / 2) {
+                        scan_imap_free(imap);
+                        scan_result_free(scan); scan_result_free(partial);
+                        return ERR_NOMEM;
+                    }
                     uint32_t nc = scan->capacity * 2;
-                    scan_entry_t *tmp = realloc(scan->entries, nc * sizeof(*tmp));
+                    scan_entry_t *tmp = realloc(scan->entries, (size_t)nc * sizeof(*tmp));
                     if (!tmp) {
                         scan_imap_free(imap);
                         scan_result_free(scan); scan_result_free(partial);
@@ -817,6 +839,20 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                 "warning: skipped %u file(s) that changed/disappeared during store\n",
                 n_transient_skipped_store);
     }
+
+    /* Populate skipped set: new primary entries whose storage failed.
+     * Their hardlink secondaries must be excluded from the dirent table. */
+    for (uint32_t i = 0; i < store_qlen; i++) {
+        if (!store_queue[i].has_prev &&
+            scan->entries[store_queue[i].idx].node.type == 0) {
+            uint64_t nid = scan->entries[store_queue[i].idx].node.node_id;
+            if (nid) {
+                st = skipped_add(&skipped, nid);
+                if (st != OK) goto done;
+            }
+        }
+    }
+    qsort(skipped.ids, skipped.count, sizeof(*skipped.ids), skipped_cmp);
 
     /* ----------------------------------------------------------------
      * Phase 4 & 5: Build new snapshot

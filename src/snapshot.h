@@ -12,9 +12,6 @@
 #define GFS_MONTHLY  (1u << 2)
 #define GFS_YEARLY   (1u << 3)
 
-/* Snapshot flags stored in the snap file header. */
-#define SNAP_FLAG_SYNTHETIC (1u << 0)
-
 /*
  * In-memory snapshot representation.
  * node_table and dirent_table are flat arrays loaded from the .snap file.
