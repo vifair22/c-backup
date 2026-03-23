@@ -80,6 +80,10 @@ typedef struct {
 
 #define PACK_WORKER_THREADS_MAX 32
 
+/* Objects above this threshold are streamed chunk-by-chunk rather than
+ * loaded entirely into memory.  Matches STREAM_CHUNK in object.c. */
+#define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
+
 static int cache_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
 }
@@ -254,6 +258,12 @@ typedef struct {
     pthread_cond_t cv_have_space;
 } pack_work_ctx_t;
 
+typedef struct {
+    pack_work_ctx_t *ctx;
+    uint8_t         *comp_buf;      /* LZ4_compressBound(PACK_STREAM_THRESHOLD) bytes */
+    int              comp_buf_size;
+} pack_worker_arg_t;
+
 static uint32_t pack_worker_threads(void) {
     const char *env = getenv("CBACKUP_PACK_THREADS");
     if (env && *env) {
@@ -298,7 +308,8 @@ static void pack_worker_fail(pack_work_ctx_t *ctx, status_t st) {
 }
 
 static void *pack_worker_main(void *arg) {
-    pack_work_ctx_t *ctx = (pack_work_ctx_t *)arg;
+    pack_worker_arg_t *warg = (pack_worker_arg_t *)arg;
+    pack_work_ctx_t   *ctx  = warg->ctx;
     for (;;) {
         size_t idx;
         pthread_mutex_lock(&ctx->mu);
@@ -343,54 +354,52 @@ static void *pack_worker_main(void *arg) {
         }
         close(fd);
 
-        uint8_t compression = hdr.compression;
-        uint32_t compressed_size = (uint32_t)hdr.compressed_size;
+        uint8_t  compression       = hdr.compression;
+        uint32_t compressed_size   = (uint32_t)hdr.compressed_size;
         uint64_t uncompressed_size = hdr.uncompressed_size;
 
+        /* Attempt LZ4 compression on uncompressed payloads via pre-allocated comp_buf. */
         if (compression == COMPRESS_NONE &&
             hdr.compressed_size >= 4096 &&
-            hdr.compressed_size <= INT_MAX) {
+            hdr.compressed_size <= (uint64_t)INT_MAX) {
             int try_full = 1;
             int sample_len = (hdr.compressed_size > 65536) ? 65536 : (int)hdr.compressed_size;
-            int sample_bound = LZ4_compressBound(sample_len);
-            if (sample_bound > 0 && sample_len > 0) {
-                char *sample = malloc((size_t)sample_bound);
-                if (sample) {
-                    int sc = LZ4_compress_default((const char *)payload, sample,
-                                                  sample_len, sample_bound);
-                    free(sample);
-                    if (sc <= 0 || (double)sc / (double)sample_len > 0.98)
-                        try_full = 0;
-                }
-            }
+
+            /* Sample probe — write into comp_buf, no malloc needed. */
+            int sc = LZ4_compress_default((const char *)payload,
+                                          (char *)warg->comp_buf,
+                                          sample_len, warg->comp_buf_size);
+            if (sc <= 0 || (double)sc / (double)sample_len > 0.98)
+                try_full = 0;
 
             if (try_full) {
-                int bound = LZ4_compressBound((int)hdr.compressed_size);
-                if (bound > 0) {
-                    char *tmp = malloc((size_t)bound);
-                    if (tmp) {
-                        int csz = LZ4_compress_default((const char *)payload, tmp,
-                                                       (int)hdr.compressed_size, bound);
-                        if (csz > 0 && (uint32_t)csz < compressed_size) {
-                            free(payload);
-                            payload = (uint8_t *)tmp;
-                            compression = COMPRESS_LZ4;
-                            compressed_size = (uint32_t)csz;
-                        } else {
-                            free(tmp);
-                        }
+                /* Full compression — overwrite comp_buf with result. */
+                int csz = LZ4_compress_default((const char *)payload,
+                                               (char *)warg->comp_buf,
+                                               (int)hdr.compressed_size,
+                                               warg->comp_buf_size);
+                if (csz > 0 && (uint32_t)csz < compressed_size) {
+                    /* Compression helps: copy to exact-sized buffer for the queue item. */
+                    uint8_t *cpayload = malloc((size_t)csz);
+                    if (cpayload) {
+                        memcpy(cpayload, warg->comp_buf, (size_t)csz);
+                        free(payload);
+                        payload         = cpayload;
+                        compression     = COMPRESS_LZ4;
+                        compressed_size = (uint32_t)csz;
                     }
+                    /* If malloc fails, keep the uncompressed payload. */
                 }
             }
         }
 
         pack_work_item_t it;
         memcpy(it.hash, hash, OBJECT_HASH_SIZE);
-        it.type = hdr.type;
-        it.compression = compression;
+        it.type              = hdr.type;
+        it.compression       = compression;
         it.uncompressed_size = uncompressed_size;
-        it.compressed_size = compressed_size;
-        it.payload = payload;
+        it.compressed_size   = compressed_size;
+        it.payload           = payload;
 
         if (!pack_queue_push(ctx, &it)) {
             free(payload);
@@ -709,6 +718,65 @@ static int loose_objects_exist(repo_t *repo) {
     return found;
 }
 
+/* Stream a large loose object directly into the pack dat file without buffering
+ * the entire payload in RAM.  The caller has already verified that
+ * hdr.compressed_size <= UINT32_MAX.  idx_out is filled with the object's hash
+ * and absolute dat offset.  *dat_body_offset and *processed_bytes are advanced. */
+static status_t stream_large_to_pack(repo_t *repo, const uint8_t *hash,
+                                     FILE *dat_f,
+                                     pack_idx_disk_entry_t *idx_out,
+                                     uint64_t *dat_body_offset,
+                                     uint64_t *processed_bytes)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char loose_path[PATH_MAX];
+    if (path_fmt(loose_path, sizeof(loose_path),
+                 "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0)
+        return ERR_IO;
+
+    int fd = open(loose_path, O_RDONLY);
+    if (fd == -1) return ERR_IO;
+
+    object_header_t hdr;
+    if (read_full_fd(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+
+    memcpy(idx_out->hash, hash, OBJECT_HASH_SIZE);
+    idx_out->dat_offset = sizeof(pack_dat_hdr_t) + *dat_body_offset;
+
+    pack_dat_entry_hdr_t ehdr;
+    memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
+    ehdr.type              = hdr.type;
+    ehdr.compression       = hdr.compression;
+    ehdr.uncompressed_size = hdr.uncompressed_size;
+    ehdr.compressed_size   = (uint32_t)hdr.compressed_size; /* caller verified <= UINT32_MAX */
+
+    if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) { close(fd); return ERR_IO; }
+
+    uint8_t *chunk = malloc(PACK_STREAM_THRESHOLD);
+    if (!chunk) { close(fd); return ERR_NOMEM; }
+
+    uint64_t remaining = hdr.compressed_size;
+    while (remaining > 0) {
+        size_t n = (remaining > PACK_STREAM_THRESHOLD) ?
+                   (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
+        if (read_full_fd(fd, chunk, n) != 0) {
+            free(chunk); close(fd); return ERR_CORRUPT;
+        }
+        if (fwrite(chunk, 1, n, dat_f) != n) {
+            free(chunk); close(fd); return ERR_IO;
+        }
+        remaining -= n;
+    }
+
+    free(chunk);
+    close(fd);
+
+    *dat_body_offset  += sizeof(ehdr) + hdr.compressed_size;
+    *processed_bytes  += hdr.compressed_size;
+    return OK;
+}
+
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     int show_progress = pack_progress_enabled();
     struct timespec next_tick = {0};
@@ -730,7 +798,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     /* Collect loose object hashes */
     log_msg("INFO", "pack: phase 2/3 collecting loose objects");
-    uint8_t *hashes = NULL;
+    uint8_t *hashes       = NULL;
+    uint8_t *small_hashes = NULL;
+    uint8_t *large_hashes = NULL;
     size_t   loose_cnt = 0;
     status_t st = collect_loose(repo, &hashes, &loose_cnt);
     if (st != OK) return st;
@@ -789,27 +859,109 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     if (fwrite(&dat_hdr, sizeof(dat_hdr), 1, dat_f) != 1) { st = ERR_IO; goto cleanup; }
 
     uint32_t packed = 0;
-    uint64_t dat_body_offset = 0;   /* byte offset within the dat body */
+    uint64_t dat_body_offset = 0;
 
     uint32_t n_workers = pack_worker_threads();
+
+    /* --- Partition pass: classify objects as large (streamed) or small (worker pool) --- */
+    small_hashes = malloc(loose_cnt * OBJECT_HASH_SIZE);
+    large_hashes = malloc(loose_cnt * OBJECT_HASH_SIZE);
+    if (!small_hashes || !large_hashes) {
+        free(small_hashes); free(large_hashes);
+        st = ERR_NOMEM; goto cleanup;
+    }
+    size_t small_cnt = 0, large_cnt = 0;
+
+    for (size_t i = 0; i < loose_cnt; i++) {
+        const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        char loose_path[PATH_MAX];
+        if (path_fmt(loose_path, sizeof(loose_path),
+                     "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
+            free(small_hashes); free(large_hashes);
+            st = ERR_IO; goto cleanup;
+        }
+        int pfd = open(loose_path, O_RDONLY);
+        if (pfd == -1) continue;  /* deleted between collect and now */
+        object_header_t ohdr;
+        int rd = read_full_fd(pfd, &ohdr, sizeof(ohdr));
+        close(pfd);
+        if (rd != 0) {
+            free(small_hashes); free(large_hashes);
+            st = ERR_CORRUPT; goto cleanup;
+        }
+        if (ohdr.compressed_size > (uint64_t)UINT32_MAX) {
+            /* Object too large for pack format; leave as loose. */
+            continue;
+        }
+        if (ohdr.compressed_size > PACK_STREAM_THRESHOLD) {
+            memcpy(large_hashes + large_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
+            large_cnt++;
+        } else {
+            memcpy(small_hashes + small_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
+            small_cnt++;
+        }
+    }
+
+    /* --- Stream large objects directly to pack file (no full-object RAM buffer) --- */
+    for (size_t i = 0; i < large_cnt && st == OK; i++) {
+        if (show_progress && pack_tick_due(&next_tick)) {
+            double sec = pack_elapsed_sec(&started_at);
+            double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
+            char line[128];
+            snprintf(line, sizeof(line), "pack: writing %u/%zu (%.1f MiB/s)",
+                     packed, large_cnt + small_cnt, pack_bps_to_mib(bps));
+            pack_line_set(line);
+        }
+        st = stream_large_to_pack(repo, large_hashes + i * OBJECT_HASH_SIZE,
+                                  dat_f, &idx_entries[packed],
+                                  &dat_body_offset, &processed_payload_bytes);
+        if (st == OK) packed++;
+    }
+    free(large_hashes); large_hashes = NULL;
+
+    if (st != OK) { free(small_hashes); goto cleanup; }
+
+    /* --- Worker pool: compress and pack small objects --- */
     pack_work_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.repo = repo;
-    ctx.hashes = hashes;
-    ctx.loose_cnt = loose_cnt;
-    ctx.q_cap = (size_t)n_workers * 4u;
+    ctx.repo          = repo;
+    ctx.hashes        = small_hashes;
+    ctx.loose_cnt     = small_cnt;
+    ctx.q_cap         = (size_t)n_workers * 4u;
     if (ctx.q_cap < 16) ctx.q_cap = 16;
-    ctx.queue = calloc(ctx.q_cap, sizeof(*ctx.queue));
-    if (!ctx.queue) { st = ERR_NOMEM; goto cleanup; }
+    ctx.queue         = calloc(ctx.q_cap, sizeof(*ctx.queue));
+    if (!ctx.queue) { free(small_hashes); st = ERR_NOMEM; goto cleanup; }
     pthread_mutex_init(&ctx.mu, NULL);
     pthread_cond_init(&ctx.cv_have_work, NULL);
     pthread_cond_init(&ctx.cv_have_space, NULL);
     ctx.workers_total = n_workers;
-    ctx.error = OK;
+    ctx.error         = OK;
+
+    /* Allocate per-worker pre-allocated compression buffers. */
+    int comp_buf_size = LZ4_compressBound((int)PACK_STREAM_THRESHOLD);
+    pack_worker_arg_t wargs[PACK_WORKER_THREADS_MAX];
+    memset(wargs, 0, sizeof(wargs));
+    uint32_t wargs_alloc = 0;
+    for (uint32_t i = 0; i < n_workers; i++) {
+        wargs[i].ctx           = &ctx;
+        wargs[i].comp_buf_size = comp_buf_size;
+        wargs[i].comp_buf      = malloc((size_t)comp_buf_size);
+        if (!wargs[i].comp_buf) {
+            for (uint32_t j = 0; j < i; j++) free(wargs[j].comp_buf);
+            pthread_cond_destroy(&ctx.cv_have_work);
+            pthread_cond_destroy(&ctx.cv_have_space);
+            pthread_mutex_destroy(&ctx.mu);
+            free(ctx.queue); free(small_hashes);
+            st = ERR_NOMEM; goto cleanup;
+        }
+        wargs_alloc++;
+    }
 
     pthread_t tids[PACK_WORKER_THREADS_MAX];
     for (uint32_t i = 0; i < n_workers; i++) {
-        if (pthread_create(&tids[i], NULL, pack_worker_main, &ctx) != 0) {
+        if (pthread_create(&tids[i], NULL, pack_worker_main, &wargs[i]) != 0) {
             st = ERR_IO;
             pthread_mutex_lock(&ctx.mu);
             ctx.stop = 1;
@@ -817,15 +969,15 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             pthread_cond_broadcast(&ctx.cv_have_space);
             pthread_mutex_unlock(&ctx.mu);
             for (uint32_t j = 0; j < i; j++) pthread_join(tids[j], NULL);
+            for (uint32_t j = 0; j < wargs_alloc; j++) free(wargs[j].comp_buf);
             pthread_cond_destroy(&ctx.cv_have_work);
             pthread_cond_destroy(&ctx.cv_have_space);
             pthread_mutex_destroy(&ctx.mu);
-            free(ctx.queue);
+            free(ctx.queue); free(small_hashes);
             goto cleanup;
         }
     }
 
-    size_t consumed = 0;
     for (;;) {
         pack_work_item_t item;
         int have_item = 0;
@@ -852,8 +1004,8 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                 double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
                 char line[128];
                 snprintf(line, sizeof(line),
-                         "pack: writing %zu/%zu (%.1f MiB/s)",
-                         consumed, loose_cnt, pack_bps_to_mib(bps));
+                         "pack: writing %u/%zu (%.1f MiB/s)",
+                         packed, large_cnt + small_cnt, pack_bps_to_mib(bps));
                 pack_line_set(line);
             }
 
@@ -882,9 +1034,8 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                 break;
             }
 
-            dat_body_offset += sizeof(ehdr) + (uint64_t)item.compressed_size;
+            dat_body_offset         += sizeof(ehdr) + (uint64_t)item.compressed_size;
             processed_payload_bytes += (uint64_t)item.compressed_size;
-            consumed++;
             free(item.payload);
             continue;
         }
@@ -915,7 +1066,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pthread_cond_destroy(&ctx.cv_have_work);
     pthread_cond_destroy(&ctx.cv_have_space);
     pthread_mutex_destroy(&ctx.mu);
+    for (uint32_t i = 0; i < wargs_alloc; i++) free(wargs[i].comp_buf);
     free(ctx.queue);
+    free(small_hashes);
 
     if (st != OK) goto cleanup;
 
@@ -1001,6 +1154,10 @@ cleanup:
     unlink(idx_tmp);
     free(idx_entries);
     free(hashes);
+    /* large_hashes and small_hashes are freed inline before goto cleanup;
+     * these free(NULL) calls are harmless safety nets for the early-exit paths. */
+    free(large_hashes);
+    free(small_hashes);
     return st;
 }
 
@@ -1338,24 +1495,39 @@ status_t pack_gc(repo_t *repo,
     if (!dir) { close(pack_dirfd); return ERR_IO; }
 
     /* Collect pack numbers to process (avoid modifying dir while iterating) */
-    uint32_t pack_nums[4096];
-    uint32_t npack = 0;
+    size_t pack_cap = 256, npack = 0;
+    uint32_t *pack_nums = malloc(pack_cap * sizeof(*pack_nums));
+    if (!pack_nums) {
+        closedir(dir);
+        if (out_kept)    *out_kept    = 0;
+        if (out_deleted) *out_deleted = 0;
+        return ERR_NOMEM;
+    }
     struct dirent *de;
-    while ((de = readdir(dir)) != NULL && npack < 4096) {
+    while ((de = readdir(dir)) != NULL) {
         uint32_t n;
-        if (parse_pack_dat_name(de->d_name, &n))
-            pack_nums[npack++] = n;
+        if (!parse_pack_dat_name(de->d_name, &n)) continue;
+        if (npack == pack_cap) {
+            size_t nc = pack_cap * 2;
+            uint32_t *tmp = realloc(pack_nums, nc * sizeof(*pack_nums));
+            if (!tmp) { free(pack_nums); closedir(dir); return ERR_NOMEM; }
+            pack_nums = tmp;
+            pack_cap = nc;
+        }
+        pack_nums[npack++] = n;
     }
     closedir(dir);   /* closes pack_dirfd too */
 
-    for (uint32_t pi = 0; pi < npack; pi++) {
+    for (size_t pi = 0; pi < npack; pi++) {
         if (show_progress && pack_tick_due(&next_tick)) {
             char line[128];
             snprintf(line, sizeof(line),
-                     "pack-gc: processing packs %u/%u", pi, npack);
+                     "pack-gc: processing packs %zu/%zu", pi, npack);
             pack_line_set(line);
         }
         uint32_t pnum = pack_nums[pi];
+        char *gc_payload = NULL;
+        size_t gc_payload_cap = 0;
 
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
         if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
@@ -1375,7 +1547,7 @@ status_t pack_gc(repo_t *repo,
         }
         uint32_t count = ihdr.count;
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
-        if (!disk_idx) { fclose(idxf); return ERR_NOMEM; }
+        if (!disk_idx) { fclose(idxf); free(pack_nums); return ERR_NOMEM; }
         if (fread(disk_idx, sizeof(*disk_idx), count, idxf) != count) {
             free(disk_idx); fclose(idxf); continue;
         }
@@ -1421,6 +1593,7 @@ status_t pack_gc(repo_t *repo,
             if (new_dat_fd >= 0) { close(new_dat_fd); unlink(dat_tmp); }
             if (new_idx_fd >= 0) { close(new_idx_fd); unlink(idx_tmp); }
             free(disk_idx);
+            free(pack_nums);
             return ERR_IO;
         }
 
@@ -1430,6 +1603,7 @@ status_t pack_gc(repo_t *repo,
             if (new_dat) fclose(new_dat); else { close(new_dat_fd); unlink(dat_tmp); }
             if (new_idx) fclose(new_idx); else { close(new_idx_fd); unlink(idx_tmp); }
             free(disk_idx);
+            free(pack_nums);
             return ERR_IO;
         }
 
@@ -1466,16 +1640,19 @@ status_t pack_gc(repo_t *repo,
             if (fread(&ehdr, sizeof(ehdr), 1, old_dat) != 1) {
                 st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
             }
-            char *cpayload = malloc(ehdr.compressed_size);
-            if (!cpayload) { st = ERR_NOMEM; free(new_disk_idx); goto pack_fail; }
-            if (fread(cpayload, 1, ehdr.compressed_size, old_dat) != ehdr.compressed_size) {
-                free(cpayload); st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
+            if ((size_t)ehdr.compressed_size > gc_payload_cap) {
+                char *tmp = realloc(gc_payload, (size_t)ehdr.compressed_size);
+                if (!tmp) { st = ERR_NOMEM; free(new_disk_idx); goto pack_fail; }
+                gc_payload = tmp;
+                gc_payload_cap = (size_t)ehdr.compressed_size;
+            }
+            if (fread(gc_payload, 1, ehdr.compressed_size, old_dat) != ehdr.compressed_size) {
+                st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
             }
             if (fwrite(&ehdr, sizeof(ehdr), 1, new_dat) != 1 ||
-                fwrite(cpayload, 1, ehdr.compressed_size, new_dat) != ehdr.compressed_size) {
-                free(cpayload); st = ERR_IO; free(new_disk_idx); goto pack_fail;
+                fwrite(gc_payload, 1, ehdr.compressed_size, new_dat) != ehdr.compressed_size) {
+                st = ERR_IO; free(new_disk_idx); goto pack_fail;
             }
-            free(cpayload);
 
             memcpy(new_disk_idx[live_count].hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
             new_disk_idx[live_count].dat_offset = new_offset;
@@ -1483,6 +1660,8 @@ status_t pack_gc(repo_t *repo,
             new_offset += sizeof(ehdr) + ehdr.compressed_size;
             total_kept++;
         }
+        free(gc_payload);
+        gc_payload = NULL;
 
         /* Patch dat header count */
         if (fseeko(new_dat, 0, SEEK_SET) != 0) {
@@ -1524,18 +1703,20 @@ status_t pack_gc(repo_t *repo,
         continue;
 
 pack_fail:
+        free(gc_payload);
         if (new_dat) fclose(new_dat);
         if (new_idx) fclose(new_idx);
         if (old_dat) fclose(old_dat);
         unlink(dat_tmp);
         unlink(idx_tmp);
         free(disk_idx);
+        free(pack_nums);
             return st;
     }
 
     if (show_progress) {
         char line[128];
-        snprintf(line, sizeof(line), "pack-gc: processing packs %u/%u", npack, npack);
+        snprintf(line, sizeof(line), "pack-gc: processing packs %zu/%zu", npack, npack);
         pack_line_set(line);
         pack_line_clear();
     }
@@ -1550,5 +1731,6 @@ pack_fail:
 
     if (out_kept)    *out_kept    = total_kept;
     if (out_deleted) *out_deleted = total_deleted;
+    free(pack_nums);
     return OK;
 }

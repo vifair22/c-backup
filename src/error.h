@@ -6,5 +6,6 @@ typedef enum {
     ERR_CORRUPT,
     ERR_NOMEM,
     ERR_INVALID,
-    ERR_NOT_FOUND
+    ERR_NOT_FOUND,
+    ERR_TOO_LARGE
 } status_t;

@@ -361,6 +361,10 @@ static status_t restore_materialize_nodes(repo_t *repo,
             if (!hash_is_zero(nd->content_hash)) {
                 void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
                 status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
+                if (load_st == ERR_TOO_LARGE) {
+                    /* Large regular file: stream directly to the destination fd. */
+                    load_st = object_load_stream(repo, nd->content_hash, fd, NULL, NULL);
+                }
                 if (load_st != OK) { close(fd); free(nl_map); return load_st; }
                 if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
                     const uint8_t *sp_p = (const uint8_t *)data;
@@ -671,10 +675,16 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
          * so we reconstruct the expected hash by streaming through
          * the regions and filling gaps with zeros. */
         void *obj_data = NULL; size_t obj_len = 0; uint8_t obj_type = 0;
-        if (object_load(repo, ws[i].node.content_hash,
-                        &obj_data, &obj_len, &obj_type) != OK) {
-            fprintf(stderr, "verify: cannot load object for %s\n", ws[i].path);
-            errors++; continue;
+        {
+            status_t oload_st = object_load(repo, ws[i].node.content_hash,
+                                            &obj_data, &obj_len, &obj_type);
+            if (oload_st == ERR_TOO_LARGE) {
+                /* Large regular file: expected hash == content_hash by definition. */
+                /* obj_data=NULL, obj_len=0 — SPARSE branch will be skipped below. */
+            } else if (oload_st != OK) {
+                fprintf(stderr, "verify: cannot load object for %s\n", ws[i].path);
+                errors++; continue;
+            }
         }
 
         if (obj_type != OBJECT_TYPE_SPARSE ||
@@ -977,6 +987,13 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
     size_t obj_len = 0;
     uint8_t obj_type = 0;
     st = object_load(repo, target->content_hash, &obj, &obj_len, &obj_type);
+    if (st == ERR_TOO_LARGE) {
+        /* Large regular file: stream directly to the output fd. */
+        st = object_load_stream(repo, target->content_hash, out_fd, NULL, NULL);
+        snap_paths_free(&sp);
+        snapshot_free(snap);
+        return st;
+    }
     if (st != OK) {
         snap_paths_free(&sp);
         snapshot_free(snap);

@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 #include <lz4.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -35,6 +37,36 @@ void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf) {
         buf[i * 2 + 1] = hx[hash[i] & 0xf];
     }
     buf[OBJECT_HASH_SIZE * 2] = '\0';
+}
+
+static int read_full(int fd, void *buf, size_t n) {
+    uint8_t *p = buf;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = read(fd, p + done, n - done);
+        if (r == 0) return -1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+static int write_full(int fd, const void *buf, size_t n) {
+    const uint8_t *p = buf;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = write(fd, p + done, n - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) return -1;
+        done += (size_t)w;
+    }
+    return 0;
 }
 
 static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) {
@@ -183,23 +215,89 @@ fail:
     return st;
 }
 
+/* ------------------------------------------------------------------ */
+/* Double-buffered streaming: reader thread fills one slot while the   */
+/* processor (main thread) hashes + writes the other.                 */
+/* ------------------------------------------------------------------ */
+
+#define STREAM_CHUNK ((size_t)(16 * 1024 * 1024))  /* 16 MiB per slot */
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cond;
+    int             src_fd;
+    uint64_t        file_size;
+    uint8_t        *bufs[2];
+    size_t          lens[2];
+    int             is_last[2];
+    int             state[2];   /* 0 = empty (reader fills), 1 = full (processor reads) */
+    status_t        reader_st;
+    int             abort;
+} dbl_buf_t;
+
+static void *dbl_reader_fn(void *arg) {
+    dbl_buf_t *d      = arg;
+    uint64_t   offset = 0;
+    int        slot   = 0;
+
+    posix_fadvise(d->src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    while (offset < d->file_size) {
+        size_t want = STREAM_CHUNK;
+        if ((uint64_t)want > d->file_size - offset)
+            want = (size_t)(d->file_size - offset);
+
+        /* Wait for slot to become empty */
+        pthread_mutex_lock(&d->mu);
+        while (d->state[slot] != 0 && !d->abort)
+            pthread_cond_wait(&d->cond, &d->mu);
+        if (d->abort) { pthread_mutex_unlock(&d->mu); return NULL; }
+        pthread_mutex_unlock(&d->mu);
+
+        /* Read without the lock held */
+        size_t got = 0;
+        while (got < want) {
+            ssize_t r = read(d->src_fd, d->bufs[slot] + got, want - got);
+            if (r <= 0) {
+                if (r == 0) errno = ESTALE;
+                pthread_mutex_lock(&d->mu);
+                d->reader_st = ERR_IO;
+                d->abort     = 1;
+                pthread_cond_broadcast(&d->cond);
+                pthread_mutex_unlock(&d->mu);
+                return NULL;
+            }
+            got += (size_t)r;
+        }
+
+        /* Source pages are now in our buffer; no need to keep them in cache */
+        posix_fadvise(d->src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
+        offset += (uint64_t)got;
+
+        pthread_mutex_lock(&d->mu);
+        d->lens[slot]    = got;
+        d->is_last[slot] = (offset >= d->file_size);
+        d->state[slot]   = 1;
+        pthread_cond_broadcast(&d->cond);
+        pthread_mutex_unlock(&d->mu);
+
+        slot ^= 1;
+    }
+    return NULL;
+}
+
 static status_t write_object_file_stream(repo_t *repo, int src_fd,
                                          uint64_t file_size,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
                                          int *out_is_new, uint64_t *out_phys_bytes) {
-    enum { FILE_CHUNK = 1024 * 1024 };
-    uint8_t *buf = malloc(FILE_CHUNK);
-    if (!buf) return ERR_NOMEM;
-
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
         >= (int)sizeof(tmppath)) {
-        free(buf);
         return ERR_IO;
     }
 
     int tfd = mkstemp(tmppath);
-    if (tfd == -1) { free(buf); return ERR_IO; }
+    if (tfd == -1) return ERR_IO;
 
     object_header_t hdr = {
         .type              = OBJECT_TYPE_FILE,
@@ -211,62 +309,123 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         if (errno == 0) errno = EIO;
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) {
-        close(tfd);
-        unlink(tmppath);
-        free(buf);
-        return ERR_NOMEM;
-    }
+    if (!mdctx) { close(tfd); unlink(tmppath); return ERR_NOMEM; }
     if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
         EVP_MD_CTX_free(mdctx);
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
-    uint64_t got = 0;
-    status_t st = OK;
-    while (got < file_size) {
-        size_t want = (size_t)(file_size - got);
-        if (want > FILE_CHUNK) want = FILE_CHUNK;
-        ssize_t r = read(src_fd, buf, want);
-        if (r == 0) {
-            errno = ESTALE;
-            st = ERR_IO;
-            break;
-        }
-        if (r < 0) { st = ERR_IO; break; }
-
-        if (EVP_DigestUpdate(mdctx, buf, (size_t)r) != 1) {
-            st = ERR_IO;
-            break;
-        }
-        if (write(tfd, buf, (size_t)r) != r) {
-            if (errno == 0) errno = EIO;
-            st = ERR_IO;
-            break;
-        }
-        got += (uint64_t)r;
+    /* Allocate double-buffer slots */
+    dbl_buf_t dbl;
+    dbl.src_fd     = src_fd;
+    dbl.file_size  = file_size;
+    dbl.reader_st  = OK;
+    dbl.abort      = 0;
+    dbl.lens[0]    = 0;   dbl.lens[1]    = 0;
+    dbl.is_last[0] = 0;   dbl.is_last[1] = 0;
+    dbl.state[0]   = 0;   dbl.state[1]   = 0;
+    dbl.bufs[0] = malloc(STREAM_CHUNK);
+    dbl.bufs[1] = malloc(STREAM_CHUNK);
+    if (!dbl.bufs[0] || !dbl.bufs[1]) {
+        free(dbl.bufs[0]);
+        free(dbl.bufs[1]);
+        EVP_MD_CTX_free(mdctx);
+        close(tfd);
+        unlink(tmppath);
+        return ERR_NOMEM;
     }
+    pthread_mutex_init(&dbl.mu, NULL);
+    pthread_cond_init(&dbl.cond, NULL);
+
+    pthread_t reader_thr;
+    if (pthread_create(&reader_thr, NULL, dbl_reader_fn, &dbl) != 0) {
+        free(dbl.bufs[0]);
+        free(dbl.bufs[1]);
+        pthread_mutex_destroy(&dbl.mu);
+        pthread_cond_destroy(&dbl.cond);
+        EVP_MD_CTX_free(mdctx);
+        close(tfd);
+        unlink(tmppath);
+        return ERR_IO;
+    }
+
+    /* Processor: hash + write each slot, overlapped with reader fetching the next */
+    status_t st            = OK;
+    int      slot          = 0;
+    uint64_t total_written = 0;
+    off_t    write_off     = (off_t)sizeof(hdr);
+
+    for (;;) {
+        pthread_mutex_lock(&dbl.mu);
+        while (dbl.state[slot] != 1 && !dbl.abort)
+            pthread_cond_wait(&dbl.cond, &dbl.mu);
+        int      do_abort = dbl.abort;
+        status_t rdr_st   = dbl.reader_st;
+        size_t   len      = dbl.lens[slot];
+        int      is_last  = dbl.is_last[slot];
+        pthread_mutex_unlock(&dbl.mu);
+
+        if (do_abort) {
+            st = (rdr_st != OK) ? rdr_st : ERR_IO;
+            break;
+        }
+
+        if (EVP_DigestUpdate(mdctx, dbl.bufs[slot], len) != 1) {
+            pthread_mutex_lock(&dbl.mu);
+            dbl.abort = 1;
+            pthread_cond_broadcast(&dbl.cond);
+            pthread_mutex_unlock(&dbl.mu);
+            st = ERR_IO;
+            break;
+        }
+        if (write(tfd, dbl.bufs[slot], len) != (ssize_t)len) {
+            if (errno == 0) errno = EIO;
+            pthread_mutex_lock(&dbl.mu);
+            dbl.abort = 1;
+            pthread_cond_broadcast(&dbl.cond);
+            pthread_mutex_unlock(&dbl.mu);
+            st = ERR_IO;
+            break;
+        }
+
+        /* Spread writeback incrementally; avoid accumulating 200 GB of dirty pages */
+        posix_fadvise(tfd, write_off, (off_t)len, POSIX_FADV_DONTNEED);
+        write_off     += (off_t)len;
+        total_written += (uint64_t)len;
+
+        pthread_mutex_lock(&dbl.mu);
+        dbl.state[slot] = 0;  /* mark empty so reader can refill */
+        pthread_cond_broadcast(&dbl.cond);
+        pthread_mutex_unlock(&dbl.mu);
+
+        if (is_last) break;
+        slot ^= 1;
+    }
+
+    pthread_join(reader_thr, NULL);
+    if (st == OK && dbl.reader_st != OK) st = dbl.reader_st;
+
+    pthread_cond_destroy(&dbl.cond);
+    pthread_mutex_destroy(&dbl.mu);
+    free(dbl.bufs[1]);
+    free(dbl.bufs[0]);
 
     if (st != OK) {
         EVP_MD_CTX_free(mdctx);
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return st;
     }
 
@@ -275,34 +434,31 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         EVP_MD_CTX_free(mdctx);
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
     EVP_MD_CTX_free(mdctx);
+
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) {
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return OK;
     }
 
-    hdr.uncompressed_size = got;
-    hdr.compressed_size   = got;
+    hdr.uncompressed_size = total_written;
+    hdr.compressed_size   = total_written;
     memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
     if (pwrite(tfd, &hdr, sizeof(hdr), 0) != sizeof(hdr)) {
         if (errno == 0) errno = EIO;
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
     if (fsync(tfd) == -1) {
         close(tfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
     close(tfd);
@@ -313,13 +469,11 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
     if (objfd == -1) {
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
         close(objfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
     if (errno == EEXIST) errno = 0;
@@ -327,7 +481,6 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     close(objfd);
     if (subfd == -1) {
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
@@ -336,27 +489,23 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         >= (int)sizeof(dstpath)) {
         close(subfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             close(subfd);
             unlink(tmppath);
-            free(buf);
             return OK;
         }
         close(subfd);
         unlink(tmppath);
-        free(buf);
         return ERR_IO;
     }
 
     fsync(subfd);
     close(subfd);
-    free(buf);
     if (out_is_new) *out_is_new = 1;
-    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + got;
+    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
     return OK;
 }
 
@@ -498,11 +647,17 @@ status_t object_load(repo_t *repo,
     }
 
     object_header_t hdr;
-    if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) { close(fd); return ERR_CORRUPT; }
+    if (read_full(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
 
-    char *cpayload = malloc(hdr.compressed_size);
+    /* Large uncompressed objects must be loaded via object_load_stream. */
+    if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_CHUNK) {
+        close(fd);
+        return ERR_TOO_LARGE;
+    }
+
+    char *cpayload = malloc((size_t)hdr.compressed_size);
     if (!cpayload) { close(fd); return ERR_NOMEM; }
-    if (read(fd, cpayload, hdr.compressed_size) != (ssize_t)hdr.compressed_size) {
+    if (read_full(fd, cpayload, (size_t)hdr.compressed_size) != 0) {
         free(cpayload); close(fd); return ERR_CORRUPT;
     }
     close(fd);
@@ -545,4 +700,101 @@ status_t object_load(repo_t *repo,
     *out_size = data_sz;
     if (out_type) *out_type = hdr.type;
     return OK;
+}
+
+status_t object_load_stream(repo_t *repo,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             int out_fd,
+                             uint64_t *out_size,
+                             uint8_t *out_type)
+{
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        /* Not a loose object — try pack files.
+         * Pack compressed_size is uint32_t (≤ 4 GB), safe to load in RAM. */
+        void *data = NULL; size_t data_sz = 0; uint8_t type = 0;
+        status_t st = pack_object_load(repo, hash, &data, &data_sz, &type);
+        if (st != OK) return st;
+        int wr = write_full(out_fd, data, data_sz);
+        free(data);
+        if (wr != 0) return ERR_IO;
+        if (out_size) *out_size = (uint64_t)data_sz;
+        if (out_type) *out_type = type;
+        return OK;
+    }
+
+    object_header_t hdr;
+    if (read_full(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+
+    if (out_type) *out_type = hdr.type;
+    if (out_size) *out_size = hdr.uncompressed_size;
+
+    if (hdr.compression == COMPRESS_NONE) {
+        /* Stream payload to out_fd in chunks, hashing as we go. */
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        if (!mdctx) { close(fd); return ERR_NOMEM; }
+        if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+            EVP_MD_CTX_free(mdctx); close(fd); return ERR_IO;
+        }
+
+        uint8_t *buf = malloc(STREAM_CHUNK);
+        if (!buf) { EVP_MD_CTX_free(mdctx); close(fd); return ERR_NOMEM; }
+
+        uint64_t remaining = hdr.compressed_size;
+        status_t st = OK;
+        while (remaining > 0 && st == OK) {
+            size_t want = (remaining > STREAM_CHUNK) ? STREAM_CHUNK : (size_t)remaining;
+            if (read_full(fd, buf, want) != 0)           { st = ERR_CORRUPT; break; }
+            if (EVP_DigestUpdate(mdctx, buf, want) != 1) { st = ERR_IO;      break; }
+            if (write_full(out_fd, buf, want) != 0)      { st = ERR_IO;      break; }
+            remaining -= want;
+        }
+        free(buf);
+        close(fd);
+
+        if (st == OK) {
+            uint8_t got[OBJECT_HASH_SIZE];
+            unsigned dlen = 0;
+            if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
+                dlen != OBJECT_HASH_SIZE ||
+                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
+                st = ERR_CORRUPT;
+        }
+        EVP_MD_CTX_free(mdctx);
+        return st;
+
+    } else if (hdr.compression == COMPRESS_LZ4) {
+        /* Compressed payloads are always small — load, decompress, write. */
+        char *cpayload = malloc((size_t)hdr.compressed_size);
+        if (!cpayload) { close(fd); return ERR_NOMEM; }
+        if (read_full(fd, cpayload, (size_t)hdr.compressed_size) != 0) {
+            free(cpayload); close(fd); return ERR_CORRUPT;
+        }
+        close(fd);
+
+        char *out = malloc((size_t)hdr.uncompressed_size);
+        if (!out) { free(cpayload); return ERR_NOMEM; }
+        int r = LZ4_decompress_safe(cpayload, out,
+                                    (int)hdr.compressed_size,
+                                    (int)hdr.uncompressed_size);
+        free(cpayload);
+        if (r < 0 || (uint64_t)r != hdr.uncompressed_size) { free(out); return ERR_CORRUPT; }
+
+        uint8_t got[OBJECT_HASH_SIZE];
+        sha256(out, (size_t)hdr.uncompressed_size, got);
+        if (memcmp(got, hash, OBJECT_HASH_SIZE) != 0) { free(out); return ERR_CORRUPT; }
+
+        int wr = write_full(out_fd, out, (size_t)hdr.uncompressed_size);
+        free(out);
+        return wr != 0 ? ERR_IO : OK;
+
+    } else {
+        close(fd);
+        return ERR_CORRUPT;
+    }
 }

@@ -45,6 +45,17 @@ status_t object_load(repo_t *repo,
 /* Check whether an object already exists (avoids re-hashing). */
 int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 
+/*
+ * Stream object content to out_fd without buffering the entire payload in RAM.
+ * Safe for large OBJECT_TYPE_FILE objects that would fail object_load with
+ * ERR_TOO_LARGE.  out_size and out_type may be NULL.
+ */
+status_t object_load_stream(repo_t *repo,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             int out_fd,
+                             uint64_t *out_size,
+                             uint8_t *out_type);
+
 /* Hex-encode a hash.  buf must be at least OBJECT_HASH_SIZE*2+1 bytes. */
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
 
