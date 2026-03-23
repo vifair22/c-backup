@@ -285,7 +285,10 @@ static int launch_editor(const char *editor, const char *path) {
     }
     for (size_t i = 0; i < we.we_wordc; i++)
         argv_exec[i] = we.we_wordv[i];
-    argv_exec[we.we_wordc] = (char *)path;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+    argv_exec[we.we_wordc] = (char *)path;  /* execvp takes char*const[], not const char* */
+#pragma GCC diagnostic pop
     argv_exec[argc_exec] = NULL;
 
     pid_t pid = fork();
@@ -639,7 +642,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         source_paths = path_args;
         n_source     = np;
     } else if (pol && pol->n_paths > 0) {
-        source_paths = (const char **)pol->paths;
+        source_paths = (const char **)(void *)pol->paths;
         n_source     = pol->n_paths;
     } else {
         fprintf(stderr, "error: no source paths specified and no policy configured\n"
@@ -665,7 +668,7 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         excludes = excl_args;
         n_excl   = ne;
     } else if (pol) {
-        excludes = (const char **)pol->exclude;
+        excludes = (const char **)(void *)pol->exclude;
         n_excl   = pol->n_exclude;
     } else {
         excludes = NULL;

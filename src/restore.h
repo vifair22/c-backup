@@ -2,7 +2,7 @@
 
 #include "error.h"
 #include "repo.h"
-#include "types.h"
+//#include "types.h"
 #include <stdint.h>
 
 /* Restore latest snapshot to dest_path. */

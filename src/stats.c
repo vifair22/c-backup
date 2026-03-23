@@ -12,7 +12,8 @@
 
 static uint64_t file_size_at(const char *dir, const char *name) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path))
+        return 0;
     struct stat st;
     if (stat(path, &st) == 0) return (uint64_t)st.st_size;
     return 0;
@@ -78,7 +79,8 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
             while ((de = readdir(top)) != NULL) {
                 if (de->d_name[0] == '.' || strlen(de->d_name) != 2) continue;
                 char subdir[PATH_MAX];
-                snprintf(subdir, sizeof(subdir), "%s/%s", objdir, de->d_name);
+                if (snprintf(subdir, sizeof(subdir), "%s/%s", objdir, de->d_name)
+                        >= (int)sizeof(subdir)) continue;
                 DIR *sub = opendir(subdir);
                 if (!sub) continue;
                 struct dirent *sde;

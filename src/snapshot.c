@@ -257,7 +257,7 @@ status_t snapshot_write_head(repo_t *repo, uint32_t snap_id) {
     if (fd == -1) return ERR_IO;
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%u\n", snap_id);
-    if (write(fd, buf, n) != n) { close(fd); unlink(tmppath); return ERR_IO; }
+    if (write(fd, buf, (size_t)n) != (ssize_t)n) { close(fd); unlink(tmppath); return ERR_IO; }
     if (fsync(fd) == -1) { close(fd); unlink(tmppath); return ERR_IO; }
     close(fd);
     char dstpath[PATH_MAX];

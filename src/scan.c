@@ -165,8 +165,9 @@ static uint8_t stat_to_node_type(const struct stat *st) {
 }
 
 static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len) {
-    ssize_t list_sz = llistxattr(path, NULL, 0);
-    if (list_sz <= 0) { *out = NULL; *out_len = 0; return OK; }
+    ssize_t list_sz_s = llistxattr(path, NULL, 0);
+    if (list_sz_s <= 0) { *out = NULL; *out_len = 0; return OK; }
+    size_t list_sz = (size_t)list_sz_s;
 
     char *names = malloc(list_sz);
     if (!names) return ERR_NOMEM;
@@ -189,12 +190,12 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
         uint16_t nlen = (uint16_t)strlen(n) + 1;
         memcpy(p, &nlen, sizeof(nlen)); p += sizeof(nlen);
         memcpy(p, n, nlen); p += nlen;
-        char *vbuf = malloc(vsz);
+        char *vbuf = malloc((size_t)vsz);
         if (!vbuf) { free(buf); free(names); return ERR_NOMEM; }
-        lgetxattr(path, n, vbuf, vsz);
+        lgetxattr(path, n, vbuf, (size_t)vsz);
         uint32_t v32 = (uint32_t)vsz;
         memcpy(p, &v32, sizeof(v32)); p += sizeof(v32);
-        memcpy(p, vbuf, vsz); p += vsz;
+        memcpy(p, vbuf, (size_t)vsz); p += (size_t)vsz;
         free(vbuf);
     }
     free(names);
@@ -206,10 +207,11 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
 static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
     acl_t acl = acl_get_file(path, ACL_TYPE_ACCESS);
     if (!acl) { *out = NULL; *out_len = 0; return OK; }
-    ssize_t sz;
-    char *txt = acl_to_text(acl, &sz);
+    ssize_t sz_s;
+    char *txt = acl_to_text(acl, &sz_s);
     acl_free(acl);
     if (!txt) { *out = NULL; *out_len = 0; return OK; }
+    size_t sz = (size_t)sz_s;
     uint8_t *buf = malloc(sz);
     if (!buf) { acl_free(txt); return ERR_NOMEM; }
     memcpy(buf, txt, sz);

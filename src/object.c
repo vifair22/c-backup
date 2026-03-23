@@ -97,7 +97,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
     if (object_exists(repo, out_hash)) return OK;
 
     int max_dst = LZ4_compressBound((int)len);
-    char *compressed = malloc(max_dst);
+    char *compressed = malloc((size_t)max_dst);
     if (!compressed) return ERR_NOMEM;
     int comp_size = LZ4_compress_default(data, compressed, (int)len, max_dst);
 

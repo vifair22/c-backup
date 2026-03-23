@@ -794,11 +794,16 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
         /* Directories are not "files" — signal caller to try restore_subtree */
         if (sp.entries[i].node->type == NODE_TYPE_DIR) { st = ERR_NOT_FOUND; break; }
 
+        /* snapshot_t.nodes is node_t* but this node is not modified — cast is safe. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+        node_t *node_nc = (node_t *)sp.entries[i].node;
+#pragma GCC diagnostic pop
         /* Create a temporary snapshot containing just this one node + dirent */
         snapshot_t single = {
             .snap_id         = snap_id,
             .node_count      = 1,
-            .nodes           = (node_t *)sp.entries[i].node,
+            .nodes           = node_nc,
             .dirent_data_len = sizeof(dirent_rec_t) + strlen(norm),
         };
         /* Build a minimal dirent blob: parent=0, node_id, name=path */
