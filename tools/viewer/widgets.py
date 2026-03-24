@@ -90,7 +90,8 @@ def update_sparse_map(canvas: tk.Canvas, stats: tk.Label,
 
 
 def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
-                        filename: str | None = None) -> None:
+                        filename: str | None = None,
+                        decode_as_symlink: bool = False) -> None:
     """Open a tabbed Toplevel with Info / Content / Sparse Map for an object."""
     from .parsers import find_object, decompress_payload, HAS_LZ4, parse_sparse_regions
     from .formats import fmt_size, hex_dump, hex_hash
@@ -122,9 +123,32 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
     kind, location, otype, comp, uncomp_sz, comp_sz, payload = result
     ratio_str = f"{comp_sz / uncomp_sz:.4f}" if uncomp_sz and comp_sz else "—"
 
+    # Decode symlink target from the already-loaded payload — no extra I/O.
+    symlink_target = None
+    if decode_as_symlink:
+        try:
+            raw_data = decompress_payload(payload, comp, uncomp_sz) if comp != COMPRESS_NONE else payload
+            if raw_data:
+                symlink_target = raw_data.rstrip(b"\x00").decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    # For loose objects, read pack_skip_ver from the header for display.
+    pack_skip_ver = None
+    if kind == "loose":
+        from .parsers import parse_loose_object
+        from .constants import PROBER_VERSION
+        try:
+            meta = parse_loose_object(location)
+            pack_skip_ver = meta.get("pack_skip_ver")
+        except Exception:
+            pass
+
     rows = []
     if filename:
         rows.append(("Filename", filename))
+    if symlink_target is not None:
+        rows.append(("Symlink target", symlink_target))
     rows += [
         ("Hash",              raw_hash.hex()),
         ("Location",          f"{kind}  —  {location}"),
@@ -134,6 +158,14 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
         ("Compressed size",   f"{fmt_size(comp_sz)}  ({comp_sz:,} bytes)"),
         ("Ratio",             ratio_str),
     ]
+    if pack_skip_ver is not None:
+        if pack_skip_ver == 0:
+            skip_str = "0  (unevaluated)"
+        elif pack_skip_ver == PROBER_VERSION:
+            skip_str = f"{pack_skip_ver}  (skip — incompressible)"
+        else:
+            skip_str = f"{pack_skip_ver}  (stale skip marker)"
+        rows.append(("Pack skip ver", skip_str))
 
     # card-style container
     card = ttk.LabelFrame(info_outer, text="Object metadata", padding=(PAD * 2, PAD))

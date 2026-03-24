@@ -12,6 +12,10 @@
 #define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
 #define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */
 
+#define OBJECT_MAGIC        0x42434F4Au  /* "BCOJ" */
+#define OBJECT_HDR_VERSION  1u
+#define PROBER_VERSION      1u
+
 #define NODE_TYPE_REG   1
 #define NODE_TYPE_DIR   2
 #define NODE_TYPE_SYMLINK 3
@@ -23,12 +27,15 @@
 /* ---------- object store ---------- */
 
 typedef struct {
+    uint32_t magic;
+    uint8_t  version;
     uint8_t  type;
     uint8_t  compression;
+    uint8_t  pack_skip_ver;     /* 0=unevaluated; N=skip by prober vN */
     uint64_t uncompressed_size;
     uint64_t compressed_size;
     uint8_t  hash[OBJECT_HASH_SIZE];
-} __attribute__((packed)) object_header_t;
+} __attribute__((packed)) object_header_t;  /* 56 bytes */
 
 /* ---------- snapshot ---------- */
 

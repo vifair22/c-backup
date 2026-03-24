@@ -279,8 +279,11 @@ class SnapshotsTab:
                 messagebox.showinfo("Empty file",
                                     f"{filename}\n\nThis file is empty (0 bytes).")
             return   # directory / special file — no content object
+
         from ..widgets import show_object_preview
-        show_object_preview(self._frame, raw_hash, self._scan, filename=filename)
+        is_symlink = nd["type"] == NODE_TYPE_SYMLINK
+        show_object_preview(self._frame, raw_hash, self._scan,
+                            filename=filename, decode_as_symlink=is_symlink)
 
     def _on_dir_right_click(self, event: tk.Event) -> None:
         item = self._dir_tree.identify_row(event.y)

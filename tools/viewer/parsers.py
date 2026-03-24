@@ -14,6 +14,7 @@ from .constants import (
     PACK_VERSION_V1,
     COMPRESS_NONE, COMPRESS_LZ4, COMPRESS_LZ4_FRAME,
     OBJECT_TYPE_SPARSE,
+    OBJECT_MAGIC, OBJECT_HDR_VERSION,
 )
 
 try:
@@ -274,23 +275,29 @@ def dat_read_entry_at(dat_path: str, dat_offset: int) -> dict:
 # Loose objects  (objects/<xx>/<62-hex-chars>)
 # ---------------------------------------------------------------------------
 #
-# object_header_t (50 bytes):
-#   uint8 type, uint8 compression, uint64 uncompressed_size,
-#   int64 compressed_size, uint8[32] hash
+# object_header_t (56 bytes):
+#   uint32 magic, uint8 version, uint8 type, uint8 compression,
+#   uint8 pack_skip_ver, uint64 uncompressed_size,
+#   uint64 compressed_size, uint8[32] hash
 
-OBJ_HDR_FMT  = f"<BBQq{OBJECT_HASH_SIZE}s"
-OBJ_HDR_SIZE = struct.calcsize(OBJ_HDR_FMT)
+OBJ_HDR_FMT  = f"<IBBBBQQ{OBJECT_HASH_SIZE}s"
+OBJ_HDR_SIZE = struct.calcsize(OBJ_HDR_FMT)   # 56
 
 
 def parse_loose_object(path: str) -> dict:
     with open(path, "rb") as f:
         raw = read_exact(f, OBJ_HDR_SIZE)
-        otype, comp, uncomp_sz, comp_sz, h = struct.unpack(OBJ_HDR_FMT, raw)
+        magic, version, otype, comp, pack_skip_ver, uncomp_sz, comp_sz, h = \
+            struct.unpack(OBJ_HDR_FMT, raw)
         payload_len = os.path.getsize(path) - OBJ_HDR_SIZE
+    if magic != OBJECT_MAGIC:
+        raise ValueError(f"Bad object magic 0x{magic:08X} (expected 0x{OBJECT_MAGIC:08X})")
     return {
         "hash":              h,
         "type":              otype,
         "compression":       comp,
+        "pack_skip_ver":     pack_skip_ver,
+        "version":           version,
         "uncompressed_size": uncomp_sz,
         "compressed_size":   comp_sz,
         "payload_len":       payload_len,
@@ -344,7 +351,10 @@ def find_object(raw_hash: bytes, scan: dict):
 def load_loose_object(path: str):
     """Returns (type, compression, uncomp_size, comp_size, hash_bytes, payload_bytes)."""
     with open(path, "rb") as f:
-        otype, comp, uncomp_sz, comp_sz, h = struct.unpack(OBJ_HDR_FMT, read_exact(f, OBJ_HDR_SIZE))
+        magic, _version, otype, comp, _skip, uncomp_sz, comp_sz, h = \
+            struct.unpack(OBJ_HDR_FMT, read_exact(f, OBJ_HDR_SIZE))
+        if magic != OBJECT_MAGIC:
+            raise ValueError(f"Bad object magic 0x{magic:08X}")
         payload = f.read(comp_sz)
     return otype, comp, uncomp_sz, comp_sz, h, payload
 

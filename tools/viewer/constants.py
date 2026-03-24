@@ -14,6 +14,11 @@ PACK_IDX_MAGIC  = 0x42504B49  # "BPKI"
 PACK_VERSION_V1 = 1
 PACK_VERSION_V2 = 2
 
+# Loose object header magic / version (types.h)
+OBJECT_MAGIC        = 0x42434F4A  # "BCOJ"
+OBJECT_HDR_VERSION  = 1
+PROBER_VERSION      = 1
+
 # Compression types (types.h)
 COMPRESS_NONE      = 0
 COMPRESS_LZ4       = 1

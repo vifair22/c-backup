@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -95,6 +96,14 @@ typedef struct {
 /* Objects above this threshold are streamed chunk-by-chunk rather than
  * loaded entirely into memory.  Matches STREAM_CHUNK in object.c. */
 #define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
+
+/* Maximum plausible object size: 128 GiB */
+#define OBJECT_SIZE_MAX ((uint64_t)(128ull * 1024ull * 1024ull * 1024ull))
+
+/* Sweeper intelligence constants */
+#define PACK_SIZE_THRESHOLD  ((uint64_t)(16 * 1024 * 1024))  /* 16 MiB */
+#define PACK_RATIO_THRESHOLD 0.90                             /* skip if ratio >= this */
+#define PACK_PROBE_SIZE      (64 * 1024)                      /* 64 KiB probe */
 
 static int cache_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
@@ -398,6 +407,12 @@ static void *pack_worker_main(void *arg) {
         }
         close(fd);
 
+        /* Skip objects already marked as incompressible by the prober */
+        if (hdr.pack_skip_ver == PROBER_VERSION) {
+            free(payload);
+            continue;
+        }
+
         uint8_t  compression       = hdr.compression;
         uint64_t compressed_size   = hdr.compressed_size;
         uint64_t uncompressed_size = hdr.uncompressed_size;
@@ -406,6 +421,30 @@ static void *pack_worker_main(void *arg) {
         if (compression == COMPRESS_NONE &&
             hdr.compressed_size >= 4096 &&
             hdr.compressed_size <= (uint64_t)INT_MAX) {
+
+            /* For large objects (>= PACK_SIZE_THRESHOLD), probe first. */
+            if (hdr.uncompressed_size >= PACK_SIZE_THRESHOLD) {
+                int sample_len = (hdr.compressed_size > PACK_PROBE_SIZE)
+                                 ? PACK_PROBE_SIZE : (int)hdr.compressed_size;
+                int sc = LZ4_compress_default((const char *)payload,
+                                              (char *)warg->comp_buf,
+                                              sample_len, warg->comp_buf_size);
+                if (sc > 0 && (double)sc / (double)sample_len >= PACK_RATIO_THRESHOLD) {
+                    /* Incompressible: mark in the loose file and skip */
+                    uint8_t sv = PROBER_VERSION;
+                    int wfd = open(loose_path, O_WRONLY);
+                    if (wfd >= 0) {
+                        ssize_t pw = pwrite(wfd, &sv, 1,
+                                            offsetof(object_header_t, pack_skip_ver));
+                        (void)pw;
+                        close(wfd);
+                    }
+                    free(payload);
+                    continue;
+                }
+                /* Compressible: fall through to full compression below */
+            }
+
             int try_full = 1;
             int sample_len = (hdr.compressed_size > 65536) ? 65536 : (int)hdr.compressed_size;
 
@@ -1082,6 +1121,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     (void)setvbuf(idx_f, NULL, _IOFBF, 8u * 1024u * 1024u);
 
     /* Allocate idx entry array (same count as loose objects) */
+    if (loose_cnt > 10000000u || loose_cnt > SIZE_MAX / sizeof(pack_idx_disk_entry_t)) {
+        /* unreasonably large count from on-disk data */
+        fclose(dat_f); fclose(idx_f);
+        unlink(dat_tmp); unlink(idx_tmp);
+        free(hashes); return ERR_CORRUPT;
+    }
     pack_idx_disk_entry_t *idx_entries = malloc(loose_cnt * sizeof(*idx_entries));
     if (!idx_entries) {
         fclose(dat_f); fclose(idx_f);
@@ -1145,7 +1190,60 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                      packed, large_cnt + small_cnt, pack_bps_to_mib(bps));
             pack_line_set(line);
         }
-        st = stream_large_to_pack(repo, large_hashes + i * OBJECT_HASH_SIZE,
+
+        const uint8_t *lhash = large_hashes + i * OBJECT_HASH_SIZE;
+        char lhex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(lhash, lhex);
+        char loose_path[PATH_MAX];
+        if (path_fmt(loose_path, sizeof(loose_path),
+                     "%s/objects/%.2s/%s", repo_path(repo), lhex, lhex + 2) != 0) {
+            st = ERR_IO; break;
+        }
+
+        /* Check skip marker and probe compressibility */
+        {
+            int pfd = open(loose_path, O_RDONLY);
+            if (pfd < 0) continue;  /* deleted between passes */
+            object_header_t phdr;
+            int phdr_ok = (read_full_fd(pfd, &phdr, sizeof(phdr)) == 0);
+            int skip = 0;
+            if (phdr_ok && phdr.pack_skip_ver == PROBER_VERSION) {
+                skip = 1;
+            } else if (phdr_ok && phdr.pack_skip_ver == 0 &&
+                       phdr.compression == COMPRESS_NONE) {
+                /* probe compressibility */
+                size_t probe_len = (size_t)(phdr.compressed_size < PACK_PROBE_SIZE
+                                           ? phdr.compressed_size : PACK_PROBE_SIZE);
+                uint8_t *pbuf = malloc(probe_len);
+                if (pbuf && read_full_fd(pfd, pbuf, probe_len) == 0) {
+                    int cbound = LZ4_compressBound((int)probe_len);
+                    char *cbuf = malloc((size_t)cbound);
+                    if (cbuf) {
+                        int csz = LZ4_compress_default((char *)pbuf, cbuf,
+                                                       (int)probe_len, cbound);
+                        if (csz > 0 &&
+                            (double)csz / (double)probe_len >= PACK_RATIO_THRESHOLD) {
+                            skip = 1;
+                            /* Write skip marker in-place */
+                            uint8_t sv = PROBER_VERSION;
+                            int wfd = open(loose_path, O_WRONLY);
+                            if (wfd >= 0) {
+                                ssize_t pw = pwrite(wfd, &sv, 1,
+                                                    offsetof(object_header_t, pack_skip_ver));
+                                (void)pw;
+                                close(wfd);
+                            }
+                        }
+                        free(cbuf);
+                    }
+                }
+                free(pbuf);
+            }
+            close(pfd);
+            if (skip) continue;
+        }
+
+        st = stream_large_to_pack(repo, lhash,
                                   dat_f, &idx_entries[packed],
                                   &dat_body_offset, &processed_payload_bytes);
         if (st == OK) packed++;
@@ -1341,9 +1439,20 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                      repo_path(repo), pack_num) != 0) {
             st = ERR_IO; goto cleanup;
         }
-        if (rename(dat_tmp, dat_final) != 0 ||
-            rename(idx_tmp, idx_final) != 0) {
+        if (rename(dat_tmp, dat_final) != 0) {
             st = ERR_IO; goto cleanup;
+        }
+        if (rename(idx_tmp, idx_final) != 0) {
+            rename(dat_final, dat_tmp);  /* roll back dat rename */
+            st = ERR_IO; goto cleanup;
+        }
+        /* Verify both files landed correctly */
+        {
+            struct stat dst_stat;
+            if (stat(dat_final, &dst_stat) != 0 || dst_stat.st_size == 0 ||
+                stat(idx_final, &dst_stat) != 0 || dst_stat.st_size == 0) {
+                st = ERR_IO; goto cleanup;
+            }
         }
         /* fsync packs/ dir */
         int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
@@ -1474,8 +1583,49 @@ static status_t collect_pack_meta(repo_t *repo,
     return OK;
 }
 
+/* Resume any interrupted coalesce deletions by scanning for .deleting-NNNNNNNN
+ * marker files in the packs/ directory and re-attempting the listed deletions. */
+static void pack_resume_deleting(repo_t *repo) {
+    char packs_dir[PATH_MAX];
+    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo))
+        >= (int)sizeof(packs_dir))
+        return;
+
+    DIR *dir = opendir(packs_dir);
+    if (!dir) return;
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        uint32_t marker_num;
+        if (sscanf(de->d_name, ".deleting-%08u", &marker_num) != 1) continue;
+
+        char marker_path[PATH_MAX];
+        if (snprintf(marker_path, sizeof(marker_path), "%s/%s",
+                     packs_dir, de->d_name) >= (int)sizeof(marker_path))
+            continue;
+
+        FILE *mf = fopen(marker_path, "r");
+        if (!mf) continue;
+
+        uint32_t pnum;
+        while (fscanf(mf, "%u", &pnum) == 1) {
+            char dat_path[PATH_MAX], idx_path[PATH_MAX];
+            if (snprintf(dat_path, sizeof(dat_path), "%s/pack-%08u.dat",
+                         packs_dir, pnum) < (int)sizeof(dat_path))
+                unlink(dat_path);
+            if (snprintf(idx_path, sizeof(idx_path), "%s/pack-%08u.idx",
+                         packs_dir, pnum) < (int)sizeof(idx_path))
+                unlink(idx_path);
+        }
+        fclose(mf);
+        unlink(marker_path);
+    }
+    closedir(dir);
+}
+
 static status_t maybe_coalesce_packs(repo_t *repo,
                                      const uint8_t *refs, size_t refs_cnt) {
+    pack_resume_deleting(repo);
     pack_meta_t *meta = NULL;
     size_t pack_cnt = 0;
     uint64_t total_dat = 0;
@@ -1623,6 +1773,9 @@ static status_t maybe_coalesce_packs(repo_t *repo,
             pack_dat_entry_hdr_t ehdr;
             if (read_entry_hdr(datf, &ehdr, dat_version) != 0) { rc = ERR_CORRUPT; break; }
             if (ehdr.compressed_size > cpayload_cap) {
+                if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
+                    rc = ERR_CORRUPT; break;
+                }
                 uint8_t *tmp = realloc(cpayload, (size_t)ehdr.compressed_size);
                 if (!tmp) { rc = ERR_NOMEM; break; }
                 cpayload = tmp;
@@ -1673,14 +1826,40 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     if (rc == OK) {
         char dat_final[PATH_MAX], idx_final[PATH_MAX];
         if (path_fmt(dat_final, sizeof(dat_final), "%s/packs/pack-%08u.dat", repo_path(repo), new_pack_num) != 0 ||
-            path_fmt(idx_final, sizeof(idx_final), "%s/packs/pack-%08u.idx", repo_path(repo), new_pack_num) != 0 ||
-            rename(dat_tmp, dat_final) != 0 ||
-            rename(idx_tmp, idx_final) != 0) {
+            path_fmt(idx_final, sizeof(idx_final), "%s/packs/pack-%08u.idx", repo_path(repo), new_pack_num) != 0) {
             rc = ERR_IO;
+        } else if (rename(dat_tmp, dat_final) != 0) {
+            rc = ERR_IO;
+        } else if (rename(idx_tmp, idx_final) != 0) {
+            rename(dat_final, dat_tmp);  /* roll back */
+            rc = ERR_IO;
+        } else {
+            /* Phase E: verify both files landed correctly */
+            struct stat coal_stat;
+            if (stat(dat_final, &coal_stat) != 0 || coal_stat.st_size == 0 ||
+                stat(idx_final, &coal_stat) != 0 || coal_stat.st_size == 0) {
+                rc = ERR_IO;
+            }
         }
     }
 
     if (rc == OK) {
+        /* Write deletion recovery marker before removing old packs */
+        char del_marker[PATH_MAX];
+        if (path_fmt(del_marker, sizeof(del_marker), "%s/packs/.deleting-%08u",
+                     repo_path(repo), new_pack_num) == 0) {
+            FILE *dm = fopen(del_marker, "w");
+            if (dm) {
+                for (size_t ci = 0; ci < n_cand; ci++)
+                    fprintf(dm, "%u\n", cand[ci].num);
+                fflush(dm);
+                fsync(fileno(dm));
+                fclose(dm);
+            }
+        } else {
+            del_marker[0] = '\0';
+        }
+
         for (size_t ci = 0; ci < n_cand; ci++) {
             char dat_path[PATH_MAX], idx_path[PATH_MAX];
             if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat", repo_path(repo), cand[ci].num) != 0 ||
@@ -1690,6 +1869,9 @@ static status_t maybe_coalesce_packs(repo_t *repo,
             unlink(dat_path);
             unlink(idx_path);
         }
+
+        if (del_marker[0] != '\0') unlink(del_marker);
+
         int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
         if (pfd >= 0) { fsync(pfd); close(pfd); }
         pack_cache_invalidate(repo);
@@ -1713,6 +1895,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 status_t pack_gc(repo_t *repo,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
+    pack_resume_deleting(repo);
     uint32_t total_kept = 0, total_deleted = 0;
     int show_progress = pack_progress_enabled();
     struct timespec next_tick = {0};
@@ -1782,6 +1965,9 @@ status_t pack_gc(repo_t *repo,
         }
         uint32_t dat_version = ihdr.version;
         uint32_t count = ihdr.count;
+        if (count > 10000000u) {
+            fclose(idxf); free(pack_nums); return ERR_CORRUPT;
+        }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
         if (!disk_idx) { fclose(idxf); free(pack_nums); return ERR_NOMEM; }
         if (fread(disk_idx, sizeof(*disk_idx), count, idxf) != count) {
@@ -1877,6 +2063,9 @@ status_t pack_gc(repo_t *repo,
                 st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
             }
             if ((size_t)ehdr.compressed_size > gc_payload_cap) {
+                if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
+                    st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
+                }
                 char *tmp = realloc(gc_payload, (size_t)ehdr.compressed_size);
                 if (!tmp) { st = ERR_NOMEM; free(new_disk_idx); goto pack_fail; }
                 gc_payload = tmp;
@@ -1927,9 +2116,19 @@ status_t pack_gc(repo_t *repo,
         fclose(new_idx); new_idx = NULL;
 
         /* Replace old pack with new */
-        if (rename(dat_tmp, dat_path) != 0 ||
-            rename(idx_tmp, idx_path) != 0) {
+        if (rename(dat_tmp, dat_path) != 0) {
             st = ERR_IO; goto pack_fail;
+        }
+        if (rename(idx_tmp, idx_path) != 0) {
+            rename(dat_path, dat_tmp);  /* roll back dat rename */
+            st = ERR_IO; goto pack_fail;
+        }
+        {
+            struct stat gc_dst_stat;
+            if (stat(dat_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0 ||
+                stat(idx_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0) {
+                st = ERR_IO; goto pack_fail;
+            }
         }
         {
             int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);

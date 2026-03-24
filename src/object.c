@@ -112,6 +112,7 @@ status_t object_physical_size(repo_t *repo,
             return ERR_CORRUPT;
         }
         close(fd);
+        if (hdr.magic != OBJECT_MAGIC) return ERR_CORRUPT;
         *out_bytes = (uint64_t)sizeof(hdr) + hdr.compressed_size;
         return OK;
     }
@@ -129,26 +130,17 @@ static status_t write_object(repo_t *repo, uint8_t type,
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) return OK;
 
-    /* LZ4 API is limited to INT_MAX — skip compression for larger objects. */
-    const void *payload; size_t payload_size; uint8_t compression;
+    /* Always store uncompressed; the pack sweeper handles compression. */
+    const void *payload = data;
+    size_t payload_size = len;
     char *compressed = NULL;
-    if (len <= (size_t)INT_MAX) {
-        int max_dst = LZ4_compressBound((int)len);
-        compressed = malloc((size_t)max_dst);
-        if (!compressed) return ERR_NOMEM;
-        int comp_size = LZ4_compress_default(data, compressed, (int)len, max_dst);
-        if (comp_size > 0 && (size_t)comp_size < len) {
-            payload = compressed; payload_size = (size_t)comp_size; compression = COMPRESS_LZ4;
-        } else {
-            payload = data; payload_size = len; compression = COMPRESS_NONE;
-        }
-    } else {
-        payload = data; payload_size = len; compression = COMPRESS_NONE;
-    }
 
     object_header_t hdr = {
+        .magic             = OBJECT_MAGIC,
+        .version           = OBJECT_HDR_VERSION,
         .type              = type,
-        .compression       = compression,
+        .compression       = COMPRESS_NONE,
+        .pack_skip_ver     = 0,
         .uncompressed_size = (uint64_t)len,
         .compressed_size   = (uint64_t)payload_size,
     };
@@ -300,41 +292,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
                                          uint64_t file_size,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
                                          int *out_is_new, uint64_t *out_phys_bytes) {
-    /* ----------------------------------------------------------------
-     * Probe: read up to PROBE_SIZE bytes and test LZ4F compressibility.
-     * LZ4F_compressBound includes per-block header but not the frame
-     * header; add LZ4F_HEADER_SIZE_MAX to be safe.
-     * ---------------------------------------------------------------- */
-    if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) return ERR_IO;
-
-    size_t probe_len = (file_size < PROBE_SIZE) ? (size_t)file_size : PROBE_SIZE;
-    int use_lz4f = 0;
-
-    if (probe_len > 0) {
-        uint8_t *pbuf = malloc(probe_len);
-        size_t   cbnd = LZ4F_compressBound(probe_len, NULL) + LZ4F_HEADER_SIZE_MAX + 64;
-        uint8_t *cbuf = pbuf ? malloc(cbnd) : NULL;
-        if (pbuf && cbuf) {
-            ssize_t got = read(src_fd, pbuf, probe_len);
-            if (got == (ssize_t)probe_len) {
-                LZ4F_cctx *pctx = NULL;
-                if (LZ4F_isError(LZ4F_createCompressionContext(&pctx, LZ4F_VERSION))) {
-                    pctx = NULL;
-                }
-                if (pctx) {
-                    size_t w  = LZ4F_compressBegin(pctx, cbuf, cbnd, NULL);
-                    w        += LZ4F_compressUpdate(pctx, cbuf + w, cbnd - w,
-                                                    pbuf, probe_len, NULL);
-                    w        += LZ4F_compressEnd(pctx, cbuf + w, cbnd - w, NULL);
-                    LZ4F_freeCompressionContext(pctx);
-                    if (!LZ4F_isError(w))
-                        use_lz4f = ((double)w / (double)probe_len) < PROBE_RATIO_MAX;
-                }
-            }
-        }
-        free(cbuf);
-        free(pbuf);
-    }
+    /* Always store uncompressed; the pack sweeper handles compression. */
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) return ERR_IO;
 
     /* ----------------------------------------------------------------
@@ -349,8 +307,11 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     if (tfd == -1) return ERR_IO;
 
     object_header_t hdr = {
+        .magic             = OBJECT_MAGIC,
+        .version           = OBJECT_HDR_VERSION,
         .type              = OBJECT_TYPE_FILE,
-        .compression       = use_lz4f ? COMPRESS_LZ4_FRAME : COMPRESS_NONE,
+        .compression       = COMPRESS_NONE,
+        .pack_skip_ver     = 0,
         .uncompressed_size = file_size,
         .compressed_size   = 0,   /* patched below */
     };
@@ -359,29 +320,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         close(tfd); unlink(tmppath); return ERR_IO;
     }
 
-    /* LZ4F context and dst buffer (allocated only when use_lz4f) */
-    uint64_t   total_written = 0;
-    LZ4F_cctx *cctx   = NULL;
-    uint8_t   *lz4dst = NULL;
-    size_t     lz4cap = 0;
-    if (use_lz4f) {
-        if (LZ4F_isError(LZ4F_createCompressionContext(&cctx, LZ4F_VERSION))) {
-            close(tfd); unlink(tmppath); return ERR_NOMEM;
-        }
-        lz4cap = LZ4F_compressBound(STREAM_CHUNK, NULL) + LZ4F_HEADER_SIZE_MAX + 64;
-        lz4dst = malloc(lz4cap);
-        if (!lz4dst) {
-            LZ4F_freeCompressionContext(cctx);
-            close(tfd); unlink(tmppath); return ERR_NOMEM;
-        }
-        /* Write LZ4 frame header; count its bytes in total_written */
-        size_t fhdr_sz = LZ4F_compressBegin(cctx, lz4dst, lz4cap, NULL);
-        if (LZ4F_isError(fhdr_sz) || write_full(tfd, lz4dst, fhdr_sz) != 0) {
-            free(lz4dst); LZ4F_freeCompressionContext(cctx);
-            close(tfd); unlink(tmppath); return ERR_IO;
-        }
-        total_written += fhdr_sz;
-    }
+    uint64_t total_written = 0;
 
     /* ----------------------------------------------------------------
      * Hash context + double-buffered reader thread
@@ -389,8 +328,6 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
         EVP_MD_CTX_free(mdctx);
-        free(lz4dst);
-        if (cctx) LZ4F_freeCompressionContext(cctx);
         close(tfd); unlink(tmppath); return ERR_NOMEM;
     }
 
@@ -407,8 +344,6 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     if (!dbl.bufs[0] || !dbl.bufs[1]) {
         free(dbl.bufs[0]); free(dbl.bufs[1]);
         EVP_MD_CTX_free(mdctx);
-        free(lz4dst);
-        if (cctx) LZ4F_freeCompressionContext(cctx);
         close(tfd); unlink(tmppath); return ERR_NOMEM;
     }
     pthread_mutex_init(&dbl.mu, NULL);
@@ -420,8 +355,6 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         pthread_mutex_destroy(&dbl.mu);
         pthread_cond_destroy(&dbl.cond);
         EVP_MD_CTX_free(mdctx);
-        free(lz4dst);
-        if (cctx) LZ4F_freeCompressionContext(cctx);
         close(tfd); unlink(tmppath); return ERR_IO;
     }
 
@@ -449,26 +382,14 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
             st = ERR_IO; goto abort_reader;
         }
 
-        if (use_lz4f) {
-            /* Compress chunk → write compressed bytes */
-            size_t csz = LZ4F_compressUpdate(cctx, lz4dst, lz4cap,
-                                              dbl.bufs[slot], len, NULL);
-            if (LZ4F_isError(csz) || write_full(tfd, lz4dst, csz) != 0) {
-                st = ERR_IO; goto abort_reader;
-            }
-            posix_fadvise(tfd, write_off, (off_t)csz, POSIX_FADV_DONTNEED);
-            write_off     += (off_t)csz;
-            total_written += csz;
-        } else {
-            /* Write raw bytes */
-            if (write(tfd, dbl.bufs[slot], len) != (ssize_t)len) {
-                if (errno == 0) errno = EIO;
-                st = ERR_IO; goto abort_reader;
-            }
-            posix_fadvise(tfd, write_off, (off_t)len, POSIX_FADV_DONTNEED);
-            write_off     += (off_t)len;
-            total_written += len;
+        /* Write raw bytes (always uncompressed) */
+        if (write(tfd, dbl.bufs[slot], len) != (ssize_t)len) {
+            if (errno == 0) errno = EIO;
+            st = ERR_IO; goto abort_reader;
         }
+        posix_fadvise(tfd, write_off, (off_t)len, POSIX_FADV_DONTNEED);
+        write_off     += (off_t)len;
+        total_written += len;
 
         pthread_mutex_lock(&dbl.mu);
         dbl.state[slot] = 0;
@@ -494,16 +415,7 @@ abort_reader:
     free(dbl.bufs[1]);
     free(dbl.bufs[0]);
 
-    /* Write LZ4 frame end mark */
-    if (st == OK && use_lz4f) {
-        size_t esz = LZ4F_compressEnd(cctx, lz4dst, lz4cap, NULL);
-        if (LZ4F_isError(esz) || write_full(tfd, lz4dst, esz) != 0)
-            st = ERR_IO;
-        else
-            total_written += esz;
-    }
-    free(lz4dst);
-    if (cctx) LZ4F_freeCompressionContext(cctx);
+    /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
 
     if (st != OK) {
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return st;
@@ -704,6 +616,7 @@ status_t object_load(repo_t *repo,
 
     object_header_t hdr;
     if (read_full(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+    if (hdr.magic != OBJECT_MAGIC) { close(fd); return ERR_CORRUPT; }
 
     /* Large uncompressed objects must be loaded via object_load_stream. */
     if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_CHUNK) {
@@ -790,6 +703,7 @@ status_t object_load_stream(repo_t *repo,
 
     object_header_t hdr;
     if (read_full(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+    if (hdr.magic != OBJECT_MAGIC) { close(fd); return ERR_CORRUPT; }
 
     if (out_type) *out_type = hdr.type;
     if (out_size) *out_size = hdr.uncompressed_size;
@@ -936,6 +850,7 @@ status_t object_get_info(repo_t *repo,
     int rc = read_full(fd, &hdr, sizeof(hdr));
     close(fd);
     if (rc != 0) return ERR_CORRUPT;
+    if (hdr.magic != OBJECT_MAGIC) return ERR_CORRUPT;
 
     if (out_size) *out_size = hdr.uncompressed_size;
     if (out_type) *out_type = hdr.type;
@@ -961,8 +876,11 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
     if (tfd == -1) return ERR_IO;
 
     object_header_t hdr = {
+        .magic             = OBJECT_MAGIC,
+        .version           = OBJECT_HDR_VERSION,
         .type              = type,
         .compression       = COMPRESS_NONE,
+        .pack_skip_ver     = 0,
         .uncompressed_size = size,
         .compressed_size   = size,
     };
