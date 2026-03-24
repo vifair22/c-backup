@@ -37,7 +37,7 @@ def set_text(widget: tk.Text, text: str) -> None:
     widget.config(state=tk.DISABLED)
 
 
-_PREVIEW_LIMIT  = 64 * 1024
+from .constants import UI_SIZE_LIMIT as _PREVIEW_LIMIT
 _COLOR_DATA     = "#4e79a7"
 _COLOR_HOLE     = "#e0e0e0"
 

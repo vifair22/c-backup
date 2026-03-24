@@ -6,12 +6,12 @@ from ..parsers import load_loose_object, parse_sparse_regions, decompress_payloa
 from ..formats import fmt_size, hex_hash, hex_dump
 from ..constants import (
     OBJECT_TYPE_NAMES, COMPRESS_NAMES,
-    OBJECT_TYPE_SPARSE, COMPRESS_NONE,
+    OBJECT_TYPE_SPARSE, COMPRESS_NONE, UI_SIZE_LIMIT,
 )
 from ..widgets import (make_text_widget, set_text, make_sparse_canvas,
                        update_sparse_map, PAD, FONT_MONO, FONT_BOLD)
 
-_PREVIEW_LIMIT = 64 * 1024   # decompress up to 64 KB for content preview
+_PREVIEW_LIMIT = UI_SIZE_LIMIT
 
 
 class LooseTab:

@@ -15,7 +15,7 @@ class ViewerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("c-backup Repository Viewer")
-        self.geometry("1200x750")
+        self.geometry("1200x850")
         self.repo_path: str | None = None
         self._scan: dict | None = None
         self._build_menu()
@@ -48,15 +48,15 @@ class ViewerApp(tk.Tk):
 
         self._tabs = {
             "overview":   OverviewTab(nb),
-            "snapshots":  SnapshotsTab(nb),
-            "packs":      PacksTab(nb),
-            "loose":      LooseTab(nb),
-            "tags":       TagsTab(nb),
-            "policy":     PolicyTab(nb),
-            "lookup":     LookupTab(nb),
-            "diff":       DiffTab(nb),
             "analytics":  AnalyticsTab(nb),
             "search":     SearchTab(nb),
+            "diff":       DiffTab(nb),
+            "snapshots":  SnapshotsTab(nb),
+            "loose":      LooseTab(nb),
+            "packs":      PacksTab(nb),
+            "tags":       TagsTab(nb),
+            "lookup":     LookupTab(nb),
+            "policy":     PolicyTab(nb),
         }
         self._nb = nb
         self._wire_navigation()

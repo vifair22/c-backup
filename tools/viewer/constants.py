@@ -14,6 +14,9 @@ PACK_IDX_MAGIC  = 0x42504B49  # "BPKI"
 PACK_VERSION_V1 = 1
 PACK_VERSION_V2 = 2
 
+# UI content preview / diff size cap
+UI_SIZE_LIMIT = 2 * 1024 * 1024   # 2 MiB
+
 # Loose object header magic / version (types.h)
 OBJECT_MAGIC        = 0x42434F4A  # "BCOJ"
 OBJECT_HDR_VERSION  = 1

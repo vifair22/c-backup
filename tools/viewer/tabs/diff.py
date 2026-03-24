@@ -1,9 +1,12 @@
+import difflib
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from ..parsers import parse_snap, parse_snap_header, build_path_map
+from ..parsers import (parse_snap, parse_snap_header, build_path_map,
+                       find_object, decompress_payload, HAS_LZ4)
 from ..formats import fmt_size, fmt_time, hex_hash
-from ..widgets import PAD, FONT_MONO
+from ..widgets import PAD, FONT_MONO, make_text_widget
+from ..constants import COMPRESS_NONE, UI_SIZE_LIMIT
 
 
 class DiffTab:
@@ -11,6 +14,9 @@ class DiffTab:
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="Diff")
         self._snap_paths: list[str] = []
+        self._snap_a = None
+        self._snap_b = None
+        self._scan: dict = {}
         self._build()
 
     def _build(self) -> None:
@@ -52,6 +58,7 @@ class DiffTab:
         self._tree.tag_configure("deleted",  foreground="#8B0000")
         self._tree.tag_configure("modified", foreground="#8B4500")
         self._tree.tag_configure("meta",     foreground="#00008B")
+        self._tree.bind("<Double-1>", self._on_dbl)
 
         sb_y = ttk.Scrollbar(self._frame, orient=tk.VERTICAL,
                               command=self._tree.yview)
@@ -63,6 +70,7 @@ class DiffTab:
         self._tree.pack(fill=tk.BOTH, expand=True)
 
     def populate(self, scan: dict) -> None:
+        self._scan = scan
         self._snap_paths = scan["snapshots"]
         labels = []
         for path in self._snap_paths:
@@ -94,6 +102,8 @@ class DiffTab:
             messagebox.showerror("Parse error", str(e))
             return
 
+        self._snap_a = snap_a
+        self._snap_b = snap_b
         map_a = build_path_map(snap_a)
         map_b = build_path_map(snap_b)
         all_paths = sorted(set(map_a) | set(map_b))
@@ -136,3 +146,144 @@ class DiffTab:
                   f"~{counts['modified']} modified  "
                   f"{counts['meta']} meta-only")
         )
+
+    # ------------------------------------------------------------------ #
+    # Double-click → file diff popup                                       #
+    # ------------------------------------------------------------------ #
+
+    def _on_dbl(self, _event) -> None:
+        sel = self._tree.selection()
+        if not sel or not self._snap_a or not self._snap_b:
+            return
+        vals  = self._tree.item(sel[0])["values"]
+        status, path = str(vals[0]), str(vals[1])
+
+        map_a = build_path_map(self._snap_a)
+        map_b = build_path_map(self._snap_b)
+        self._show_file_diff(path, status, map_a.get(path), map_b.get(path))
+
+    def _show_file_diff(self, path: str, status: str, na: dict | None, nb: dict | None) -> None:
+        win = tk.Toplevel(self._frame)
+        win.title(f"diff  {path}")
+        win.geometry("980x640")
+        win.resizable(True, True)
+
+        bar = tk.Frame(win)
+        bar.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+        color = {"added": "#006400", "deleted": "#8B0000",
+                 "modified": "#8B4500", "meta-only": "#00008B"}.get(status, "black")
+        tk.Label(bar, text=f"[{status}]  {path}",
+                 font=FONT_MONO, fg=color).pack(side=tk.LEFT)
+
+        text = make_text_widget(win)
+        text.tag_configure("add",    foreground="#005500", background="#e6ffec")
+        text.tag_configure("rem",    foreground="#8B0000", background="#ffebe9")
+        text.tag_configure("hunk",   foreground="#0000CD",
+                           font=(FONT_MONO[0], FONT_MONO[1], "bold"))
+        text.tag_configure("header", font=(FONT_MONO[0], FONT_MONO[1], "bold"))
+        text.tag_configure("meta",   foreground="#00008B")
+
+        lines = self._build_diff_lines(path, status, na, nb)
+
+        text.config(state=tk.NORMAL)
+        for line, tag in lines:
+            text.insert(tk.END, line, (tag,) if tag else ())
+        text.config(state=tk.DISABLED)
+
+    def _load_content(self, node: dict | None) -> bytes | None:
+        """Load and decompress a node's content object. Returns b"" for empty files.
+        Raises RuntimeError if lz4 is required but not installed."""
+        if node is None:
+            return None
+        h = node["content_hash"]
+        if h == bytes(32):
+            return b""
+        result = find_object(h, self._scan)
+        if not result:
+            return None
+        _, _, _, comp, uncomp_sz, _, payload = result
+        if comp != COMPRESS_NONE and not HAS_LZ4:
+            raise RuntimeError(
+                "lz4 Python package is not installed — cannot decompress this object.\n"
+                "Install it with:  pip install lz4"
+            )
+        return decompress_payload(payload, comp, uncomp_sz) if comp != COMPRESS_NONE else payload
+
+    def _build_diff_lines(self, path: str, status: str,
+                          na: dict | None, nb: dict | None) -> list:
+        """Return a list of (text, tag) pairs for the diff popup."""
+        if status == "meta-only":
+            return self._meta_diff_lines(na, nb)
+
+        try:
+            old_data = self._load_content(na)
+            new_data = self._load_content(nb)
+        except RuntimeError as exc:
+            return [(str(exc) + "\n", "meta")]
+
+        old_label = f"a{path}"
+        new_label = f"b{path}"
+        if na is None:
+            old_label = "/dev/null"
+        if nb is None:
+            new_label = "/dev/null"
+
+        if old_data is None and new_data is None:
+            return [("(could not load object content — object missing from repo)\n", "meta")]
+
+        old_bytes = old_data if old_data is not None else b""
+        new_bytes = new_data if new_data is not None else b""
+
+        if len(old_bytes) > UI_SIZE_LIMIT or len(new_bytes) > UI_SIZE_LIMIT:
+            big = max(len(old_bytes), len(new_bytes))
+            return [(f"File too large to diff inline  "
+                     f"({fmt_size(big)} > {fmt_size(UI_SIZE_LIMIT)})\n", "meta")]
+
+        # Try text diff first
+        try:
+            old_lines = old_bytes.decode("utf-8").splitlines(keepends=True)
+            new_lines = new_bytes.decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError:
+            # Binary
+            if old_bytes == new_bytes:
+                return [("Binary files identical\n", "meta")]
+            return [
+                (f"Binary files {old_label} and {new_label} differ\n", "header"),
+                (f"  old: {fmt_size(len(old_bytes))}  ({len(old_bytes):,} bytes)\n", "rem"),
+                (f"  new: {fmt_size(len(new_bytes))}  ({len(new_bytes):,} bytes)\n", "add"),
+            ]
+
+        chunks = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=old_label, tofile=new_label,
+            lineterm="",
+        ))
+        if not chunks:
+            return [("(no differences in text content)\n", "meta")]
+
+        result = []
+        for line in chunks:
+            if line.startswith("---") or line.startswith("+++"):
+                result.append((line + "\n", "header"))
+            elif line.startswith("@@"):
+                result.append((line + "\n", "hunk"))
+            elif line.startswith("+"):
+                result.append((line + "\n", "add"))
+            elif line.startswith("-"):
+                result.append((line + "\n", "rem"))
+            else:
+                result.append((line + "\n", ""))
+        return result
+
+    @staticmethod
+    def _meta_diff_lines(na: dict, nb: dict) -> list:
+        lines = []
+        for field, fmt in (("mode",     lambda n: f"{n['mode']:o}"),
+                           ("uid",      lambda n: str(n["uid"])),
+                           ("gid",      lambda n: str(n["gid"])),
+                           ("mtime",    lambda n: str(n["mtime_sec"]))):
+            va, vb = fmt(na), fmt(nb)
+            if va != vb:
+                lines.append((f"- {field}: {va}\n", "rem"))
+                lines.append((f"+ {field}: {vb}\n", "add"))
+        return lines or [("(no metadata differences found)\n", "meta")]
