@@ -314,9 +314,11 @@ static void *phase3_progress_fn(void *arg) {
                    : 0.0;
         char eta[32];
         fmt_eta(rem, eta, sizeof(eta));
-        phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
+        phase_line_setf("Phase 3: %u/%u files  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
                         done_now, pool->queue_len,
-                        ema_bps / (1024.0 * 1024.0), ema_speed, eta);
+                        (double)seen           / (1024.0 * 1024.0 * 1024.0),
+                        (double)pool->total_bytes / (1024.0 * 1024.0 * 1024.0),
+                        ema_bps / (1024.0 * 1024.0), eta);
     }
     return NULL;
 }
@@ -539,13 +541,14 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
 
     if (pool.show_progress) {
         double sec = elapsed_sec(&pool.started_at);
-        double bps   = sec > 0.0 ? (double)pool.bytes_done / sec : 0.0;
-        double speed = sec > 0.0 ? (double)pool.done        / sec : 0.0;
+        double bps = sec > 0.0 ? (double)pool.bytes_done / sec : 0.0;
         char eta[32];
         fmt_eta(0.0, eta, sizeof(eta));
-        phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
+        phase_line_setf("Phase 3: %u/%u files  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
                         pool.done, pool.queue_len,
-                        bps / (1024.0 * 1024.0), speed, eta);
+                        (double)pool.bytes_done   / (1024.0 * 1024.0 * 1024.0),
+                        (double)pool.total_bytes  / (1024.0 * 1024.0 * 1024.0),
+                        bps / (1024.0 * 1024.0), eta);
     }
 
     free(threads);
