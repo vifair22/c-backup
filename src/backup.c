@@ -267,6 +267,7 @@ typedef struct {
     status_t         first_error;
     /* ---- decoupled progress thread ---- */
     _Atomic uint64_t bytes_in_flight;  /* per-chunk, no lock needed */
+    _Atomic uint32_t files_active;     /* workers currently mid-file */
     _Atomic int      progress_stop;
     pthread_t        progress_thr;
 } store_pool_t;
@@ -292,7 +293,8 @@ static void *phase3_progress_fn(void *arg) {
         uint64_t bd       = pool->bytes_done;
         uint32_t done_now = pool->done;
         pthread_mutex_unlock(&pool->mu);
-        uint64_t seen = bd + (uint64_t)atomic_load(&pool->bytes_in_flight);
+        uint64_t seen    = bd + (uint64_t)atomic_load(&pool->bytes_in_flight);
+        uint32_t active  = (uint32_t)atomic_load(&pool->files_active);
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -314,11 +316,18 @@ static void *phase3_progress_fn(void *arg) {
                    : 0.0;
         char eta[32];
         fmt_eta(rem, eta, sizeof(eta));
-        phase_line_setf("Phase 3: %u/%u files  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
-                        done_now, pool->queue_len,
-                        (double)seen           / (1024.0 * 1024.0 * 1024.0),
-                        (double)pool->total_bytes / (1024.0 * 1024.0 * 1024.0),
-                        ema_bps / (1024.0 * 1024.0), eta);
+        if (active > 0)
+            phase_line_setf("Phase 3: %u/%u objects  %u writing  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
+                            done_now, pool->queue_len, active,
+                            (double)seen              / (1024.0 * 1024.0 * 1024.0),
+                            (double)pool->total_bytes / (1024.0 * 1024.0 * 1024.0),
+                            ema_bps / (1024.0 * 1024.0), eta);
+        else
+            phase_line_setf("Phase 3: %u/%u objects  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
+                            done_now, pool->queue_len,
+                            (double)seen              / (1024.0 * 1024.0 * 1024.0),
+                            (double)pool->total_bytes / (1024.0 * 1024.0 * 1024.0),
+                            ema_bps / (1024.0 * 1024.0), eta);
     }
     return NULL;
 }
@@ -335,6 +344,8 @@ static void *store_worker_fn(void *arg) {
         scan_entry_t *e = &pool->entries[t->idx];
         uint64_t bytes_for_task = e->node.size;
         uint64_t phys_new = 0;
+
+        atomic_fetch_add(&pool->files_active, 1);
 
         /* Per-call context tracks how many bytes this callback chain adds to
          * bytes_in_flight so we can retire exactly that amount on completion. */
@@ -383,8 +394,9 @@ static void *store_worker_fn(void *arg) {
             }
         }
 
-        /* Retire in-flight bytes now that they're counted in bytes_done. */
+        /* Retire in-flight bytes and mark this file no longer active. */
         atomic_fetch_sub(&pool->bytes_in_flight, cb_ctx.accumulated);
+        atomic_fetch_sub(&pool->files_active, 1);
 
         pthread_mutex_lock(&pool->mu);
         pool->done++;
@@ -434,6 +446,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         pool.total_bytes += entries[tasks[i].idx].node.size;
     clock_gettime(CLOCK_MONOTONIC, &pool.started_at);
     atomic_init(&pool.bytes_in_flight, 0);
+    atomic_init(&pool.files_active,    0);
     atomic_init(&pool.progress_stop,   0);
     pthread_mutex_init(&pool.mu, NULL);
 
@@ -544,7 +557,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         double bps = sec > 0.0 ? (double)pool.bytes_done / sec : 0.0;
         char eta[32];
         fmt_eta(0.0, eta, sizeof(eta));
-        phase_line_setf("Phase 3: %u/%u files  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
+        phase_line_setf("Phase 3: %u/%u objects  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
                         pool.done, pool.queue_len,
                         (double)pool.bytes_done   / (1024.0 * 1024.0 * 1024.0),
                         (double)pool.total_bytes  / (1024.0 * 1024.0 * 1024.0),

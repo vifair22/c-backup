@@ -336,8 +336,11 @@ static void *pack_progress_fn(void *arg) {
         char eta[32];
         pack_fmt_eta(rem, eta, sizeof(eta));
         char line[128];
-        snprintf(line, sizeof(line), "pack: writing %u/%zu (%.1f MiB/s, ETA %s)",
+        snprintf(line, sizeof(line),
+                 "pack: %u/%zu objects  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
                  cur_objs, prog->total_count,
+                 (double)cur_bytes        / (1024.0 * 1024.0 * 1024.0),
+                 (double)prog->total_bytes / (1024.0 * 1024.0 * 1024.0),
                  pack_bps_to_mib(ema_bps), eta);
         pack_line_set(line);
     }
