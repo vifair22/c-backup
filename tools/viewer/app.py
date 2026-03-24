@@ -64,9 +64,10 @@ class ViewerApp(tk.Tk):
     def _wire_navigation(self) -> None:
         snaps_tab  = self._tabs["snapshots"]
         search_tab = self._tabs["search"]
+        snaps_idx  = list(self._tabs.keys()).index("snapshots")
 
         def nav(snap_id: int, full_path: str) -> None:
-            self._nb.select(1)   # Snapshots tab
+            self._nb.select(snaps_idx)
             snaps_tab.navigate_to_path(snap_id, full_path)
 
         search_tab.set_navigate_callback(nav)
