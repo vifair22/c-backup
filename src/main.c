@@ -1609,11 +1609,9 @@ static int cmd_pack(repo_t *repo, int argc, char **argv) {
 }
 
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
-    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--deep", 0 } };
-    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
-    int deep = opt_has(argc, argv, 2, "--deep");
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     lock_shared(repo);
-    if (deep) fprintf(stderr, "verify: running deep object verification\n");
     return repo_verify(repo) == OK ? 0 : 1;
 }
 

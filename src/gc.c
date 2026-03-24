@@ -44,6 +44,15 @@ static void gc_line_clear(void) {
     g_gc_line_len = 0;
 }
 
+static void fmt_eta(double sec, char *buf, size_t sz) {
+    if (sec < 1.0) { snprintf(buf, sz, "<1s"); return; }
+    unsigned long s = (unsigned long)sec;
+    unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
+    if (h > 0)      snprintf(buf, sz, "%luh%lum", h, m);
+    else if (m > 0) snprintf(buf, sz, "%lum%lus", m, r);
+    else            snprintf(buf, sz, "%lus", r);
+}
+
 static int gc_tick_due(struct timespec *next_tick) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -282,7 +291,32 @@ status_t repo_verify(repo_t *repo) {
     }
 
     uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    int show_progress = gc_progress_enabled();
+
+    /* Pass 1: count total object references so we can show meaningful progress. */
+    uint64_t total_objs = 0;
+    for (uint32_t id = 1; id <= head; id++) {
+        snapshot_t *snap = NULL;
+        if (snapshot_load(repo, id, &snap) != OK) continue;
+        for (uint32_t j = 0; j < snap->node_count; j++) {
+            const node_t *nd = &snap->nodes[j];
+            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) total_objs++;
+            if (memcmp(nd->xattr_hash,   zero, OBJECT_HASH_SIZE) != 0) total_objs++;
+            if (memcmp(nd->acl_hash,     zero, OBJECT_HASH_SIZE) != 0) total_objs++;
+        }
+        snapshot_free(snap);
+    }
+
+    /* Pass 2: verify each object with progress display. */
     int errors = 0;
+    uint64_t done_objs = 0;
+    uint64_t bytes_done = 0;
+
+    struct timespec t_start, next_tick;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    next_tick = t_start;
+
+    int null_fd = show_progress ? open("/dev/null", O_WRONLY) : -1;
 
     for (uint32_t id = 1; id <= head; id++) {
         snapshot_t *snap = NULL;
@@ -293,15 +327,34 @@ status_t repo_verify(repo_t *repo) {
         for (uint32_t j = 0; j < snap->node_count; j++) {
             const node_t *nd = &snap->nodes[j];
 
-            /* Verify content object: load and decompress, which re-hashes */
+            /* Verify content object: load and decompress, which re-hashes.
+             * Large objects (ERR_TOO_LARGE from object_load) are verified via
+             * object_load_stream writing to /dev/null. */
             if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) {
                 void *data = NULL; size_t sz = 0;
                 status_t obj_st = object_load(repo, nd->content_hash,
                                               &data, &sz, NULL);
-                free(data);
+                if (obj_st == OK) {
+                    bytes_done += sz;
+                    free(data);
+                } else if (obj_st == ERR_TOO_LARGE) {
+                    int vfd = (null_fd >= 0) ? null_fd : open("/dev/null", O_WRONLY);
+                    uint64_t stream_sz = 0;
+                    if (vfd == -1) {
+                        obj_st = ERR_IO;
+                    } else {
+                        obj_st = object_load_stream(repo, nd->content_hash,
+                                                    vfd, &stream_sz, NULL);
+                        if (null_fd < 0) close(vfd);
+                    }
+                    if (obj_st == OK) bytes_done += stream_sz;
+                } else {
+                    free(data);
+                }
                 if (obj_st != OK) {
                     char hex[OBJECT_HASH_SIZE * 2 + 1];
                     char emsg[128];
+                    if (show_progress) gc_line_clear();
                     object_hash_to_hex(nd->content_hash, hex);
                     snprintf(emsg, sizeof(emsg),
                              "verify: snap %u node %llu %s: %s",
@@ -310,28 +363,62 @@ status_t repo_verify(repo_t *repo) {
                     log_msg("ERROR", emsg);
                     errors++;
                 }
+                done_objs++;
             }
 
             if (memcmp(nd->xattr_hash, zero, OBJECT_HASH_SIZE) != 0) {
                 void *data = NULL; size_t sz = 0;
-                if (object_load(repo, nd->xattr_hash, &data, &sz, NULL) != OK) {
+                status_t obj_st = object_load(repo, nd->xattr_hash, &data, &sz, NULL);
+                if (obj_st == OK) {
+                    bytes_done += sz;
+                } else {
+                    if (show_progress) gc_line_clear();
                     log_msg("ERROR", "verify: missing or corrupt xattr object");
                     errors++;
                 }
                 free(data);
+                done_objs++;
             }
 
             if (memcmp(nd->acl_hash, zero, OBJECT_HASH_SIZE) != 0) {
                 void *data = NULL; size_t sz = 0;
-                if (object_load(repo, nd->acl_hash, &data, &sz, NULL) != OK) {
+                status_t obj_st = object_load(repo, nd->acl_hash, &data, &sz, NULL);
+                if (obj_st == OK) {
+                    bytes_done += sz;
+                } else {
+                    if (show_progress) gc_line_clear();
                     log_msg("ERROR", "verify: missing or corrupt acl object");
                     errors++;
                 }
                 free(data);
+                done_objs++;
+            }
+
+            if (show_progress && gc_tick_due(&next_tick) && done_objs > 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double elapsed = (double)(now.tv_sec  - t_start.tv_sec) +
+                                 (double)(now.tv_nsec - t_start.tv_nsec) * 1e-9;
+                double rate    = (elapsed > 0.0) ? (double)done_objs / elapsed : 0.0;
+                double eta_sec = (rate > 0.0 && total_objs > done_objs)
+                                 ? (double)(total_objs - done_objs) / rate : 0.0;
+                char eta[32];
+                fmt_eta(eta_sec, eta, sizeof(eta));
+                char line[128];
+                snprintf(line, sizeof(line),
+                         "verify: %llu/%llu objects  %.1f GiB  %.0f obj/s  ETA %s",
+                         (unsigned long long)done_objs,
+                         (unsigned long long)total_objs,
+                         (double)bytes_done / (1024.0 * 1024.0 * 1024.0),
+                         rate, eta);
+                gc_line_set(line);
             }
         }
         snapshot_free(snap);
     }
+
+    if (null_fd >= 0) close(null_fd);
+    if (show_progress) gc_line_clear();
 
     if (errors == 0) {
         char emsg[64];

@@ -33,11 +33,12 @@ LIB_OBJS := $(filter-out $(MAIN_OBJ), $(OBJS))
 
 TARGET        := $(BUILD)/backup
 TARGET_STATIC := $(BUILD)/backup-static
+TARGET_ASAN   := $(BUILD)/backup-asan
 
 TEST_SRCS := $(wildcard $(TESTS)/*.c)
 TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(TEST_SRCS))
 
-.PHONY: all static clean test
+.PHONY: all static asan clean test
 
 all: $(TARGET)
 
@@ -59,6 +60,24 @@ $(TARGET): $(OBJS)
 static: $(TARGET_STATIC)
 $(TARGET_STATIC): $(OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ -Wl,-Bstatic $(LDFLAGS) -Wl,-Bdynamic
+
+# ASAN build: unusual libs (lz4, ssl, acl) linked statically so the binary
+# runs on machines that lack those .so files.  libc/libpthread stay dynamic
+# (required by ASAN).  libasan itself is embedded via -static-libasan so the
+# target machine does not need libasan.so either.
+ASAN_CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O1 -g -fsanitize=address -fno-omit-frame-pointer
+ASAN_OBJS    := $(patsubst $(BUILD)/%.o, $(BUILD)/%-asan.o, $(OBJS))
+
+$(BUILD)/%-asan.o: $(SRC)/%.c | $(BUILD)
+	$(CC) $(ASAN_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/toml-asan.o: vendor/toml.c | $(BUILD)
+	$(CC) -std=c11 -O1 -g -I src -I vendor -MMD -MP -c $< -o $@
+
+asan: $(TARGET_ASAN)
+$(TARGET_ASAN): $(ASAN_OBJS)
+	$(CC) $(ASAN_CFLAGS) -static-libasan $^ -o $@ \
+	    -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread
 
 TEST_CFLAGS := -std=c11 -Wall -Wextra -O2 -Wno-unused-result -I src -I vendor
 # Test binaries link lib objects (not main.o) + cmocka

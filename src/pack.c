@@ -1224,7 +1224,8 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         char loose_path[PATH_MAX];
         if (path_fmt(loose_path, sizeof(loose_path),
                      "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
-            free(small_hashes); free(large_hashes);
+            free(small_hashes); small_hashes = NULL;
+            free(large_hashes); large_hashes = NULL;
             st = ERR_IO; goto cleanup;
         }
         int pfd = open(loose_path, O_RDONLY);
@@ -1233,7 +1234,8 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         int rd = read_full_fd(pfd, &ohdr, sizeof(ohdr));
         close(pfd);
         if (rd != 0) {
-            free(small_hashes); free(large_hashes);
+            free(small_hashes); small_hashes = NULL;
+            free(large_hashes); large_hashes = NULL;
             st = ERR_CORRUPT; goto cleanup;
         }
         total_bytes_for_pack += ohdr.compressed_size;
