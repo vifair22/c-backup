@@ -32,6 +32,18 @@ status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes);
 
+/* Per-chunk progress callback invoked from the write path after each ~16 MiB
+ * chunk is written.  chunk_bytes is the bytes in that chunk; ctx is caller-
+ * supplied.  May be NULL (no callback). */
+typedef void (*xfer_progress_fn)(uint64_t chunk_bytes, void *ctx);
+
+/* Like object_store_file_ex but fires cb(chunk_bytes, cb_ctx) per chunk.
+ * Useful for sub-second progress updates during large-file transfers. */
+status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
+                              uint8_t out_hash[OBJECT_HASH_SIZE],
+                              int *out_is_new, uint64_t *out_phys_bytes,
+                              xfer_progress_fn cb, void *cb_ctx);
+
 /*
  * Load object data by hash.  Caller must free(*out_data).
  * out_size is the uncompressed payload size.

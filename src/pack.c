@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include <lz4.h>
 #include <lz4frame.h>
@@ -277,6 +278,70 @@ static double pack_elapsed_sec(const struct timespec *start) {
 
 static double pack_bps_to_mib(double bps) {
     return bps / (1024.0 * 1024.0);
+}
+
+static double pack_elapsed_between(const struct timespec *a, const struct timespec *b) {
+    time_t ds = b->tv_sec - a->tv_sec;
+    long   dn = b->tv_nsec - a->tv_nsec;
+    return (double)ds + (double)dn / 1000000000.0;
+}
+
+static void pack_fmt_eta(double sec, char *buf, size_t sz) {
+    if (sec < 1.0) { snprintf(buf, sz, "<1s"); return; }
+    unsigned long s = (unsigned long)sec;
+    unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
+    if (h) snprintf(buf, sz, "%luh%lum", h, m);
+    else if (m) snprintf(buf, sz, "%lum%lus", m, r);
+    else snprintf(buf, sz, "%lus", r);
+}
+
+/* Decoupled progress tracking for the pack write phase. */
+typedef struct {
+    _Atomic uint64_t bytes_processed;   /* updated per chunk by streaming + writer */
+    _Atomic uint32_t objects_packed;    /* updated per object by main writer loop */
+    _Atomic int      stop;
+    struct timespec  started_at;
+    size_t           total_count;       /* total objects to pack */
+    uint64_t         total_bytes;       /* sum of all object sizes (for ETA) */
+} pack_prog_t;
+
+static void *pack_progress_fn(void *arg) {
+    pack_prog_t *prog = arg;
+    uint64_t last_bytes = 0;
+    struct timespec last_t = prog->started_at;
+    double ema_bps = 0.0;
+
+    for (;;) {
+        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&req, NULL);
+        if (atomic_load(&prog->stop)) break;
+
+        uint64_t cur_bytes = atomic_load(&prog->bytes_processed);
+        uint32_t cur_objs  = atomic_load(&prog->objects_packed);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double dt = pack_elapsed_between(&last_t, &now);
+        if (dt > 0.0) {
+            double inst = (double)(cur_bytes - last_bytes) / dt;
+            if (ema_bps <= 0.0) ema_bps = inst;
+            else                 ema_bps = 0.12 * inst + 0.88 * ema_bps;
+        }
+        last_bytes = cur_bytes;
+        last_t     = now;
+
+        double rem = (ema_bps > 0.0 && prog->total_bytes > cur_bytes)
+                   ? (double)(prog->total_bytes - cur_bytes) / ema_bps
+                   : 0.0;
+        char eta[32];
+        pack_fmt_eta(rem, eta, sizeof(eta));
+        char line[128];
+        snprintf(line, sizeof(line), "pack: writing %u/%zu (%.1f MiB/s, ETA %s)",
+                 cur_objs, prog->total_count,
+                 pack_bps_to_mib(ema_bps), eta);
+        pack_line_set(line);
+    }
+    return NULL;
 }
 
 typedef struct {
@@ -1000,7 +1065,8 @@ static status_t stream_large_to_pack(repo_t *repo, const uint8_t *hash,
                                      FILE *dat_f,
                                      pack_idx_disk_entry_t *idx_out,
                                      uint64_t *dat_body_offset,
-                                     uint64_t *processed_bytes)
+                                     uint64_t *processed_bytes,
+                                     _Atomic uint64_t *bytes_atomic)
 {
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(hash, hex);
@@ -1040,6 +1106,7 @@ static status_t stream_large_to_pack(repo_t *repo, const uint8_t *hash,
         if (fwrite(chunk, 1, n, dat_f) != n) {
             free(chunk); close(fd); return ERR_IO;
         }
+        if (bytes_atomic) atomic_fetch_add(bytes_atomic, (uint64_t)n);
         remaining -= n;
     }
 
@@ -1053,9 +1120,6 @@ static status_t stream_large_to_pack(repo_t *repo, const uint8_t *hash,
 
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     int show_progress = pack_progress_enabled();
-    struct timespec next_tick = {0};
-    struct timespec started_at = {0};
-    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
     if (!loose_objects_exist(repo)) {
         log_msg("INFO", "pack: no loose objects to pack");
@@ -1090,9 +1154,6 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     log_msg("INFO", "pack: phase 3/3 writing pack files");
 
     uint64_t processed_payload_bytes = 0;
-    if (show_progress) {
-        clock_gettime(CLOCK_MONOTONIC, &started_at);
-    }
 
     char dat_tmp[PATH_MAX], idx_tmp[PATH_MAX];
     if (path_fmt(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX", repo_path(repo)) != 0 ||
@@ -1151,6 +1212,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         st = ERR_NOMEM; goto cleanup;
     }
     size_t small_cnt = 0, large_cnt = 0;
+    uint64_t total_bytes_for_pack = 0;
 
     for (size_t i = 0; i < loose_cnt; i++) {
         const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
@@ -1171,6 +1233,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             free(small_hashes); free(large_hashes);
             st = ERR_CORRUPT; goto cleanup;
         }
+        total_bytes_for_pack += ohdr.compressed_size;
         if (ohdr.compressed_size > PACK_STREAM_THRESHOLD) {
             memcpy(large_hashes + large_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
             large_cnt++;
@@ -1180,16 +1243,23 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         }
     }
 
+    /* Spawn decoupled progress thread now that we know total count/bytes. */
+    pack_prog_t prog;
+    atomic_init(&prog.bytes_processed, 0);
+    atomic_init(&prog.objects_packed,  0);
+    atomic_init(&prog.stop,            0);
+    clock_gettime(CLOCK_MONOTONIC, &prog.started_at);
+    prog.total_count = small_cnt + large_cnt;
+    prog.total_bytes = total_bytes_for_pack;
+    int prog_thr_started = 0;
+    pthread_t prog_thr;
+    if (show_progress) {
+        if (pthread_create(&prog_thr, NULL, pack_progress_fn, &prog) == 0)
+            prog_thr_started = 1;
+    }
+
     /* --- Stream large objects directly to pack file (no full-object RAM buffer) --- */
     for (size_t i = 0; i < large_cnt && st == OK; i++) {
-        if (show_progress && pack_tick_due(&next_tick)) {
-            double sec = pack_elapsed_sec(&started_at);
-            double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
-            char line[128];
-            snprintf(line, sizeof(line), "pack: writing %u/%zu (%.1f MiB/s)",
-                     packed, large_cnt + small_cnt, pack_bps_to_mib(bps));
-            pack_line_set(line);
-        }
 
         const uint8_t *lhash = large_hashes + i * OBJECT_HASH_SIZE;
         char lhex[OBJECT_HASH_SIZE * 2 + 1];
@@ -1245,8 +1315,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
         st = stream_large_to_pack(repo, lhash,
                                   dat_f, &idx_entries[packed],
-                                  &dat_body_offset, &processed_payload_bytes);
-        if (st == OK) packed++;
+                                  &dat_body_offset, &processed_payload_bytes,
+                                  &prog.bytes_processed);
+        if (st == OK) {
+            packed++;
+            atomic_fetch_add(&prog.objects_packed, 1);
+        }
     }
     free(large_hashes); large_hashes = NULL;
 
@@ -1328,16 +1402,6 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         pthread_mutex_unlock(&ctx.mu);
 
         if (have_item) {
-            if (show_progress && pack_tick_due(&next_tick)) {
-                double sec = pack_elapsed_sec(&started_at);
-                double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
-                char line[128];
-                snprintf(line, sizeof(line),
-                         "pack: writing %u/%zu (%.1f MiB/s)",
-                         packed, large_cnt + small_cnt, pack_bps_to_mib(bps));
-                pack_line_set(line);
-            }
-
             memcpy(idx_entries[packed].hash, item.hash, OBJECT_HASH_SIZE);
             idx_entries[packed].dat_offset = sizeof(dat_hdr) + dat_body_offset;
             packed++;
@@ -1365,6 +1429,8 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
             dat_body_offset         += sizeof(ehdr) + (uint64_t)item.compressed_size;
             processed_payload_bytes += (uint64_t)item.compressed_size;
+            atomic_fetch_add(&prog.bytes_processed, (uint64_t)item.compressed_size);
+            atomic_fetch_add(&prog.objects_packed,  1);
             free(item.payload);
             continue;
         }
@@ -1399,10 +1465,16 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     free(ctx.queue);
     free(small_hashes);
 
+    /* Stop progress thread before touching the display. */
+    if (prog_thr_started) {
+        atomic_store(&prog.stop, 1);
+        pthread_join(prog_thr, NULL);
+    }
+
     if (st != OK) goto cleanup;
 
     if (show_progress) {
-        double sec = pack_elapsed_sec(&started_at);
+        double sec = pack_elapsed_sec(&prog.started_at);
         double bps = (sec > 0.0) ? ((double)processed_payload_bytes / sec) : 0.0;
         char line[128];
         snprintf(line, sizeof(line), "pack: writing %zu/%zu (%.1f MiB/s)",

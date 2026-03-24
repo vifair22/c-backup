@@ -291,7 +291,9 @@ static void *dbl_reader_fn(void *arg) {
 static status_t write_object_file_stream(repo_t *repo, int src_fd,
                                          uint64_t file_size,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
-                                         int *out_is_new, uint64_t *out_phys_bytes) {
+                                         int *out_is_new, uint64_t *out_phys_bytes,
+                                         xfer_progress_fn progress_cb,
+                                         void *progress_ctx) {
     /* Always store uncompressed; the pack sweeper handles compression. */
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) return ERR_IO;
 
@@ -390,6 +392,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         posix_fadvise(tfd, write_off, (off_t)len, POSIX_FADV_DONTNEED);
         write_off     += (off_t)len;
         total_written += len;
+        if (progress_cb) progress_cb((uint64_t)len, progress_ctx);
 
         pthread_mutex_lock(&dbl.mu);
         dbl.state[slot] = 0;
@@ -553,7 +556,7 @@ status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
     if (!is_sparse || n_regions == 0) {
         free(regions);
         return write_object_file_stream(repo, fd, file_size, out_hash,
-                                        out_is_new, out_phys_bytes);
+                                        out_is_new, out_phys_bytes, NULL, NULL);
     }
 
     /* Build sparse payload: [sparse_hdr][regions][data bytes] */
@@ -593,6 +596,34 @@ status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
                                out_is_new, out_phys_bytes);
     free(payload);
     return st;
+}
+
+status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
+                              uint8_t out_hash[OBJECT_HASH_SIZE],
+                              int *out_is_new, uint64_t *out_phys_bytes,
+                              xfer_progress_fn cb, void *cb_ctx) {
+    if (file_size == 0) {
+        uint8_t empty = 0;
+        return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
+                            out_is_new, out_phys_bytes);
+    }
+    /* Sparse-aware: detect holes and fall back to write_object for sparse files
+     * (sparse files are in-memory; callback fires only for the streaming path). */
+    off_t pos = lseek(fd, 0, SEEK_DATA);
+    int is_sparse = (pos != -1 && pos != 0) ||
+                    (pos == -1 && errno == ENXIO);
+    if (!is_sparse && pos != -1) {
+        /* Check whether any holes exist inside the file */
+        off_t hole = lseek(fd, pos == -1 ? 0 : pos, SEEK_HOLE);
+        if (hole != -1 && (uint64_t)hole < file_size) is_sparse = 1;
+    }
+    if (is_sparse) {
+        /* Delegate to the full sparse-aware path (no per-chunk callback). */
+        return object_store_file_ex(repo, fd, file_size, out_hash,
+                                    out_is_new, out_phys_bytes);
+    }
+    return write_object_file_stream(repo, fd, file_size, out_hash,
+                                    out_is_new, out_phys_bytes, cb, cb_ctx);
 }
 
 /* ------------------------------------------------------------------ */

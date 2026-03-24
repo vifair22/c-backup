@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -164,16 +165,32 @@ static void fmt_eta(double sec, char *buf, size_t sz) {
 #define CHANGE_MODIFIED      2
 #define CHANGE_METADATA_ONLY 3
 
-/* Store a file's content using sparse-aware storage. */
-static status_t store_file_content(repo_t *repo, const char *path,
-                                   uint64_t file_size,
-                                   uint8_t out_hash[OBJECT_HASH_SIZE],
-                                   uint64_t *out_phys_new) {
+/* Per-worker context for the per-chunk progress callback. */
+typedef struct {
+    /* Pool's shared in-flight counter.  Incremented per chunk, then
+     * decremented by the same amount when the file write loop finishes. */
+    _Atomic uint64_t *bytes_in_flight;
+    uint64_t          accumulated;   /* how much this callback chain added */
+} store_cb_ctx_t;
+
+static void store_chunk_cb(uint64_t chunk_bytes, void *ctx) {
+    store_cb_ctx_t *c = ctx;
+    atomic_fetch_add(c->bytes_in_flight, chunk_bytes);
+    c->accumulated += chunk_bytes;
+}
+
+/* Store a file's content using sparse-aware storage (with per-chunk callback). */
+static status_t store_file_content_cb(repo_t *repo, const char *path,
+                                      uint64_t file_size,
+                                      uint8_t out_hash[OBJECT_HASH_SIZE],
+                                      uint64_t *out_phys_new,
+                                      xfer_progress_fn cb, void *cb_ctx) {
     int fd = open(path, O_RDONLY);
     if (fd == -1) return ERR_IO;
     int is_new = 0;
     uint64_t phys = 0;
-    status_t st = object_store_file_ex(repo, fd, file_size, out_hash, &is_new, &phys);
+    status_t st = object_store_file_cb(repo, fd, file_size, out_hash,
+                                       &is_new, &phys, cb, cb_ctx);
     close(fd);
     if (out_phys_new) *out_phys_new = is_new ? phys : 0;
     return st;
@@ -241,32 +258,72 @@ typedef struct {
     uint64_t       phys_new_bytes;
     int            show_progress;
     struct timespec started_at;
-    struct timespec last_log_at;
-    struct timespec next_log_at;
-    uint32_t       last_log_done;
-    uint64_t       last_log_bytes;
-    double         ema_speed;
-    double         ema_bps;
     uint32_t       skipped_transient;
     char           first_skipped_path[PATH_MAX];
     int            first_skipped_errno;
     char           first_error_path[PATH_MAX];
     int            first_error_errno;
-    pthread_mutex_t mu;
-    status_t        first_error;
+    pthread_mutex_t  mu;
+    status_t         first_error;
+    /* ---- decoupled progress thread ---- */
+    _Atomic uint64_t bytes_in_flight;  /* per-chunk, no lock needed */
+    _Atomic int      progress_stop;
+    pthread_t        progress_thr;
 } store_pool_t;
+
+/* Dedicated 1-second progress thread for Phase 3.
+ * Samples bytes_done (mutex) + bytes_in_flight (atomic) every second,
+ * computing an EMA rate and ETA independently of when files complete. */
+static void *phase3_progress_fn(void *arg) {
+    store_pool_t *pool = arg;
+    uint64_t      last_seen = 0;
+    uint32_t      last_done = 0;
+    struct timespec last_t;
+    clock_gettime(CLOCK_MONOTONIC, &last_t);
+    double ema_bps = 0.0, ema_speed = 0.0;
+
+    for (;;) {
+        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&req, NULL);
+        if (atomic_load(&pool->progress_stop)) break;
+
+        /* Sample completed bytes under lock + in-flight bytes atomically. */
+        pthread_mutex_lock(&pool->mu);
+        uint64_t bd       = pool->bytes_done;
+        uint32_t done_now = pool->done;
+        pthread_mutex_unlock(&pool->mu);
+        uint64_t seen = bd + (uint64_t)atomic_load(&pool->bytes_in_flight);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double dt = elapsed_between(&last_t, &now);
+        if (dt > 0.0) {
+            double inst_bps   = (double)(seen    - last_seen) / dt;
+            double inst_speed = (double)(done_now - last_done) / dt;
+            if (ema_bps <= 0.0)   ema_bps   = inst_bps;
+            else                   ema_bps   = 0.12 * inst_bps   + 0.88 * ema_bps;
+            if (ema_speed <= 0.0) ema_speed = inst_speed;
+            else                   ema_speed = 0.12 * inst_speed + 0.88 * ema_speed;
+        }
+        last_seen = seen;
+        last_done = done_now;
+        last_t    = now;
+
+        double rem = (ema_bps > 0.0 && pool->total_bytes > seen)
+                   ? (double)(pool->total_bytes - seen) / ema_bps
+                   : 0.0;
+        char eta[32];
+        fmt_eta(rem, eta, sizeof(eta));
+        phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
+                        done_now, pool->queue_len,
+                        ema_bps / (1024.0 * 1024.0), ema_speed, eta);
+    }
+    return NULL;
+}
 
 static void *store_worker_fn(void *arg) {
     store_pool_t *pool = arg;
     for (;;) {
-        int do_log = 0;
-        uint32_t done_now = 0;
-        uint32_t total_now = 0;
-        uint64_t bytes_done_now = 0;
-        uint64_t bytes_total_now = 0;
-        double speed_now = 0.0;
-        double bps_now = 0.0;
-
         pthread_mutex_lock(&pool->mu);
         uint32_t qi = pool->next++;
         pthread_mutex_unlock(&pool->mu);
@@ -276,9 +333,17 @@ static void *store_worker_fn(void *arg) {
         scan_entry_t *e = &pool->entries[t->idx];
         uint64_t bytes_for_task = e->node.size;
         uint64_t phys_new = 0;
-        status_t st = store_file_content(pool->repo, e->path,
-                                         e->node.size, e->node.content_hash,
-                                         &phys_new);
+
+        /* Per-call context tracks how many bytes this callback chain adds to
+         * bytes_in_flight so we can retire exactly that amount on completion. */
+        store_cb_ctx_t cb_ctx = {
+            .bytes_in_flight = &pool->bytes_in_flight,
+            .accumulated     = 0,
+        };
+        status_t st = store_file_content_cb(pool->repo, e->path,
+                                            e->node.size, e->node.content_hash,
+                                            &phys_new,
+                                            store_chunk_cb, &cb_ctx);
         if (st != OK) {
             int err = errno;
             if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE) {
@@ -316,54 +381,14 @@ static void *store_worker_fn(void *arg) {
             }
         }
 
+        /* Retire in-flight bytes now that they're counted in bytes_done. */
+        atomic_fetch_sub(&pool->bytes_in_flight, cb_ctx.accumulated);
+
         pthread_mutex_lock(&pool->mu);
         pool->done++;
         pool->bytes_done += bytes_for_task;
         pool->phys_new_bytes += phys_new;
-        if (pool->show_progress) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (ts_ge(&now, &pool->next_log_at)) {
-                double dt = elapsed_between(&pool->last_log_at, &now);
-                uint32_t delta = pool->done - pool->last_log_done;
-                uint64_t delta_bytes = pool->bytes_done - pool->last_log_bytes;
-                if (dt > 0.0) {
-                    double inst = (double)delta / dt;
-                    if (pool->ema_speed <= 0.0) pool->ema_speed = inst;
-                    else pool->ema_speed = (0.12 * inst) + (0.88 * pool->ema_speed);
-
-                    double inst_bps = (double)delta_bytes / dt;
-                    if (pool->ema_bps <= 0.0) pool->ema_bps = inst_bps;
-                    else pool->ema_bps = (0.12 * inst_bps) + (0.88 * pool->ema_bps);
-                }
-
-                do_log = 1;
-                done_now = pool->done;
-                total_now = pool->queue_len;
-                speed_now = pool->ema_speed;
-                bps_now = pool->ema_bps;
-                bytes_done_now = pool->bytes_done;
-                bytes_total_now = pool->total_bytes;
-
-                pool->last_log_done = pool->done;
-                pool->last_log_bytes = pool->bytes_done;
-                pool->last_log_at = now;
-                pool->next_log_at = ts_add_ms(now, 1000);
-            }
-        }
         pthread_mutex_unlock(&pool->mu);
-
-        if (do_log) {
-            double rem = (bps_now > 0.0 && bytes_total_now > bytes_done_now)
-                       ? ((double)(bytes_total_now - bytes_done_now) / bps_now)
-                       : 0.0;
-            char eta[32];
-            fmt_eta(rem, eta, sizeof(eta));
-            phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
-                            done_now, total_now,
-                            bps_now / (1024.0 * 1024.0),
-                            speed_now, eta);
-        }
     }
     return (void *)0;
 }
@@ -392,30 +417,34 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
     if ((uint32_t)nthreads > queue_len) nthreads = (int)queue_len;
 
     store_pool_t pool = {
-        .repo        = repo,
-        .entries     = entries,
-        .tasks       = tasks,
-        .queue_len   = queue_len,
-        .next        = 0,
-        .done        = 0,
-        .total_bytes = 0,
-        .bytes_done  = 0,
+        .repo          = repo,
+        .entries       = entries,
+        .tasks         = tasks,
+        .queue_len     = queue_len,
+        .next          = 0,
+        .done          = 0,
+        .total_bytes   = 0,
+        .bytes_done    = 0,
         .show_progress = show_progress,
-        .first_error = OK,
+        .first_error   = OK,
     };
     for (uint32_t i = 0; i < queue_len; i++)
         pool.total_bytes += entries[tasks[i].idx].node.size;
     clock_gettime(CLOCK_MONOTONIC, &pool.started_at);
-    pool.last_log_at = pool.started_at;
-    pool.next_log_at = ts_add_ms(pool.started_at, 1000);
-    pool.last_log_done = 0;
-    pool.last_log_bytes = 0;
-    pool.ema_speed = 0.0;
-    pool.ema_bps = 0.0;
+    atomic_init(&pool.bytes_in_flight, 0);
+    atomic_init(&pool.progress_stop,   0);
     pthread_mutex_init(&pool.mu, NULL);
 
     pthread_t *threads = malloc((size_t)nthreads * sizeof(pthread_t));
     if (!threads) { pthread_mutex_destroy(&pool.mu); return ERR_NOMEM; }
+
+    /* Spawn the decoupled progress thread before the workers so it catches
+     * activity from the very first chunk. */
+    int progress_thr_started = 0;
+    if (pool.show_progress) {
+        if (pthread_create(&pool.progress_thr, NULL, phase3_progress_fn, &pool) == 0)
+            progress_thr_started = 1;
+    }
 
     int n_started = 0;
     for (int i = 0; i < nthreads; i++) {
@@ -424,14 +453,22 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
     }
 
     if (n_started == 0) {
-        if (pool.show_progress) phase_line_clear();
+        if (progress_thr_started) {
+            atomic_store(&pool.progress_stop, 1);
+            pthread_join(pool.progress_thr, NULL);
+        }
+        phase_line_clear();
         log_msg("ERROR", "failed to start store worker thread");
         free(threads);
         pthread_mutex_destroy(&pool.mu);
         return ERR_IO;
     }
     if (n_started < nthreads) {
-        if (pool.show_progress) phase_line_clear();
+        if (progress_thr_started) {
+            atomic_store(&pool.progress_stop, 1);
+            pthread_join(pool.progress_thr, NULL);
+        }
+        phase_line_clear();
         log_msg("ERROR", "failed to start all requested store workers");
         for (int i = 0; i < n_started; i++) {
             (void)pthread_join(threads[i], NULL);
@@ -445,7 +482,6 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         void *ret = NULL;
         if (pthread_join(threads[i], &ret) != 0) {
             if (pool.first_error == OK) pool.first_error = ERR_IO;
-            if (pool.show_progress) phase_line_clear();
             log_msg("ERROR", "store worker thread join failed");
             continue;
         }
@@ -454,14 +490,20 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         }
     }
 
+    /* Stop the progress thread before touching the display for error messages. */
+    if (progress_thr_started) {
+        atomic_store(&pool.progress_stop, 1);
+        pthread_join(pool.progress_thr, NULL);
+    }
+
     if (pool.done < queue_len && pool.first_error == OK) {
         pool.first_error = ERR_IO;
-        if (pool.show_progress) phase_line_clear();
+        phase_line_clear();
         log_msg("ERROR", "store worker exited early before queue completion");
     }
 
     if (pool.first_error != OK) {
-        if (pool.show_progress) phase_line_clear();
+        phase_line_clear();
         if (pool.first_error_path[0]) {
             char msg[PATH_MAX + 160];
             if (pool.first_error_errno != 0) {
@@ -497,10 +539,8 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
 
     if (pool.show_progress) {
         double sec = elapsed_sec(&pool.started_at);
-        double speed = pool.ema_speed > 0.0 ? pool.ema_speed
-                     : ((sec > 0.0) ? ((double)pool.done / sec) : 0.0);
-        double bps = pool.ema_bps > 0.0 ? pool.ema_bps
-                   : ((sec > 0.0) ? ((double)pool.bytes_done / sec) : 0.0);
+        double bps   = sec > 0.0 ? (double)pool.bytes_done / sec : 0.0;
+        double speed = sec > 0.0 ? (double)pool.done        / sec : 0.0;
         char eta[32];
         fmt_eta(0.0, eta, sizeof(eta));
         phase_line_setf("Phase 3: storing %u/%u (%.1f MiB/s, %.0f obj/s, ETA %s)",
