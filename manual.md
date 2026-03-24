@@ -1,359 +1,1428 @@
-# c-backup Manual
+# c-backup Technical Manual
 
-`c-backup` is a deduplicating filesystem backup tool for Linux, written in C.
+## Revision History
 
-It stores history as **snapshot manifests** (`.snap` files) that reference immutable content objects. Restores are direct from manifests.
-
----
-
-## 1) Glossary
-
-- **Restore Point**: a snapshot ID (or tag) you can restore.
-- **Manifest**: on-disk snapshot file (`snapshots/XXXXXXXX.snap`) describing paths, metadata, and object hashes.
-- **HEAD**: the latest snapshot ID (`refs/HEAD`).
-- **Object**: content-addressed blob keyed by SHA-256.
-- **Loose Object**: object stored under `objects/aa/<hash-suffix>`.
-- **Pack**: compacted object store (`packs/pack-*.dat` + `packs/pack-*.idx`).
-- **GFS**: Grandfather-Father-Son calendar retention tiers (daily/weekly/monthly/yearly).
-- **Anchor**: snapshot with one or more GFS tier flags.
-- **Preserved tag**: a tag created with `--preserve`; pruning will keep that snapshot.
+| Date | Notes |
+|------|-------|
+| 2026-03-24 | Initial |
 
 ---
 
-## 2) Repository layout
+## Table of Contents
 
-Typical repository tree:
+1. [Introduction](#1-introduction)
+2. [Glossary](#2-glossary)
+3. [Repository Layout](#3-repository-layout)
+4. [Storage Model](#4-storage-model)
+   - 4.1 Snapshot model
+   - 4.2 Content-addressed object store
+   - 4.3 Deduplication
+   - 4.4 Locking model
+5. [Data Flow: Source to Store to Pack](#5-data-flow-source-to-store-to-pack)
+   - 5.1 Backup phase walk-through
+   - 5.2 Object write path
+   - 5.3 Compression strategy — stage 1 disabled, sweeper handles it
+   - 5.4 Pack write path
+   - 5.5 Object read path
+6. [On-Disk File Formats](#6-on-disk-file-formats)
+   - 6.1 Snapshot manifest (`.snap`)
+   - 6.2 Loose object file
+   - 6.3 Pack data file (`.dat`)
+   - 6.4 Pack index file (`.idx`)
+   - 6.5 Bundle file (`.cbb`)
+   - 6.6 Tag files
+   - 6.7 Policy file (`policy.toml`)
+   - 6.8 Administrative files
+7. [Pack System](#7-pack-system)
+   - 7.1 Pack creation (`repo_pack`)
+   - 7.2 Sweeper intelligence — compressibility probing
+   - 7.3 Large object streaming
+   - 7.4 Worker pool (small objects)
+   - 7.5 Pack index cache
+   - 7.6 Pack object loading
+8. [Garbage Collection](#8-garbage-collection)
+   - 8.1 Reference collection
+   - 8.2 Loose object GC
+   - 8.3 Pack GC (`pack_gc`)
+   - 8.4 Prune-resume safety mechanism
+9. [Pack Coalescing](#9-pack-coalescing)
+   - 9.1 Trigger conditions
+   - 9.2 Candidate selection and budget
+   - 9.3 Coalesce write procedure
+   - 9.4 Crash-safety and deletion recovery marker
+10. [GFS Retention Engine](#10-gfs-retention-engine)
+    - 10.1 Tier boundaries
+    - 10.2 Promotion rules
+    - 10.3 Prune decision logic
+11. [Restore](#11-restore)
+    - 11.1 Full snapshot restore
+    - 11.2 Single file / subtree restore
+    - 11.3 Sparse file reconstruction
+    - 11.4 Metadata replay
+12. [Export and Import](#12-export-and-import)
+    - 12.1 TAR export
+    - 12.2 Bundle export
+    - 12.3 Bundle import
+    - 12.4 Bundle verify
+13. [CLI Reference](#13-cli-reference)
+    - 13.1 `init`
+    - 13.2 `run`
+    - 13.3 `list`
+    - 13.4 `ls`
+    - 13.5 `cat`
+    - 13.6 `restore`
+    - 13.7 `diff`
+    - 13.8 `grep`
+    - 13.9 `export` / `import` / `bundle verify`
+    - 13.10 `prune`
+    - 13.11 `gc`
+    - 13.12 `pack`
+    - 13.13 `verify`
+    - 13.14 `doctor`
+    - 13.15 `stats`
+    - 13.16 `snapshot delete`
+    - 13.17 `tag`
+    - 13.18 `policy`
+    - 13.19 `gfs`
+14. [policy.toml Reference](#14-policytoml-reference)
+15. [Viewer GUI](#15-viewer-gui)
+    - 15.1 Architecture
+    - 15.2 Launching
+    - 15.3 Tab reference
+16. [Performance Tuning](#16-performance-tuning)
+17. [Common Configurations](#17-common-configurations)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Safety and Operational Notes](#19-safety-and-operational-notes)
 
-```text
+---
+
+## 1. Introduction
+
+`c-backup` is a deduplicating filesystem backup tool for Linux, written in C. It is designed around four core constraints:
+
+1. **Arbitrary size** — individual files and total repository data may be of arbitrary size. No hardcoded limit short of available disk space applies.
+2. **Files exceed RAM** — the system cannot assume that any single file fits in memory. Large objects are handled through streaming paths throughout the write and read stacks.
+3. **Ungodly file counts require fast traversal** — repositories with millions of inodes are expected. Path maps use open-addressing hash tables; snapshot comparisons are O(n) not O(n²).
+4. **Incompressible files must back out of compression fast** — the sweeper intelligence layer probes a 64 KiB sample before committing to LZ4 compression. Objects that will not compress are flagged with a skip marker so they are never re-probed.
+
+History is stored as **snapshot manifests** (`.snap` files) that reference immutable content objects. Each object is identified by its SHA-256 hash and stored exactly once regardless of how many snapshots reference it. Restores are manifest-driven and never require any GC or pack maintenance to be current.
+
+---
+
+## 2. Glossary
+
+| Term | Definition |
+|------|-----------|
+| **Restore Point** | A snapshot ID (or tag name) you can restore. Synonymous with snapshot. |
+| **Snapshot / Manifest** | On-disk file `snapshots/XXXXXXXX.snap` that describes all paths, metadata, and object hash references for one backup run. |
+| **HEAD** | The ID of the most recently committed snapshot, stored in `refs/HEAD`. |
+| **Object** | An immutable content-addressed blob, keyed by its SHA-256 hash. |
+| **Loose Object** | An object stored as an individual file under `objects/XX/<rest-of-hash>`. |
+| **Pack** | A compacted store: `packs/pack-NNNNNNNN.dat` (payload) plus `packs/pack-NNNNNNNN.idx` (sorted hash→offset index). |
+| **Pack Entry** | One object record inside a `.dat` file: a 50-byte entry header followed by the compressed (or raw) payload. |
+| **GFS** | Grandfather-Father-Son calendar-based retention: daily / weekly / monthly / yearly tiers. |
+| **Anchor** | A snapshot that has been assigned one or more GFS tier flags and is therefore retained past the rolling window. |
+| **Tag** | A named human-readable label pointing to a snapshot ID, stored as a file in `tags/`. |
+| **Preserved Tag** | A tag created with `--preserve`; any `prune` run will keep the tagged snapshot indefinitely. |
+| **Pack Skip Marker** | A one-byte field (`pack_skip_ver`) in the loose object header that records the prober version that determined the object is incompressible. Objects with a set skip marker are not re-probed. |
+| **Coalesce** | The process of merging multiple small pack files into a single larger pack file, triggered by `pack_gc`. |
+| **prune-pending** | A crash-safety file listing snapshot IDs whose `.snap` files should be deleted. Written before any deletion so interrupted prunes can be resumed. |
+| **CBB / Bundle** | The native binary bundle format (`.cbb`) used for export and import, identified by magic `CBB1`. |
+| **node_t** | The packed 161-byte structure describing one filesystem object (file, dir, symlink, etc.) within a snapshot. |
+| **dirent_rec_t** | Variable-length record encoding the parent→child directory relationship within a snapshot. |
+
+---
+
+## 3. Repository Layout
+
+```
 <repo>/
-  format
-  lock
-  policy.toml
-  refs/
-    HEAD
-  tags/
-    <name>
-  snapshots/
-    00000001.snap
-    00000002.snap
-  objects/
-    aa/
-      0123...
-  packs/
-    pack-00000000.dat
-    pack-00000000.idx
-  logs/
-  tmp/
+│
+├── format                    # ASCII marker "c-backup-1"
+├── lock                      # Lock file; not deleted; used for flock(2)
+├── policy.toml               # Retention and backup policy
+├── prune-pending             # (transient) Crash-safety file for interrupted prunes
+│
+├── refs/
+│   └── HEAD                  # ASCII decimal snapshot ID of the latest snapshot
+│
+├── tags/
+│   └── <name>                # One file per tag; contains "snapshot = N\npreserve = true|false"
+│
+├── snapshots/
+│   ├── 00000001.snap
+│   ├── 00000002.snap
+│   └── ...
+│
+├── objects/
+│   └── aa/
+│       └── <remaining 62 hex chars>   # Loose object file
+│
+├── packs/
+│   ├── pack-00000000.dat     # Pack data file
+│   ├── pack-00000000.idx     # Pack index file
+│   ├── .deleting-NNNNNNNN   # (transient) Coalesce deletion recovery marker
+│   └── ...
+│
+├── logs/
+│   ├── pack-coalesce.state   # Last HEAD ID at which coalesce ran
+│   └── ...                   # Structured log output (if enabled)
+│
+└── tmp/
+    └── ...                   # Temp files for crash-safe writes (mkstemp + rename)
 ```
 
-Notes:
+**Key invariants:**
 
-- `format` stores the repo format marker (`c-backup-1`).
-- `lock` is used for writer/read coordination.
-- `tmp/` is used for crash-safe temp writes.
-- `snapshots/` contains restore-point manifests.
+- `format` is written by `backup init` and checked by `repo_open`. An absent or wrong `format` file causes the open to fail.
+- `lock` is never deleted. Exclusive locks use `F_WRLCK`; shared locks use `F_RDLCK` via `fcntl(2)`. Readers block on any active exclusive writer.
+- `tmp/` is used exclusively for `mkstemp()`-based crash-safe writes. Files are written to `tmp/`, fsynced, then atomically renamed to their final location. The directory is never purged by the tool; stale temp files are left harmless (not referenced by any index).
+- Object files are split into 256 two-hex-character subdirectories (`00/` through `ff/`) under `objects/`, limiting directory entry count per bucket.
+- Pack numbers are monotonically increasing integers formatted as zero-padded eight-digit decimal strings. The next pack number is always `max(existing) + 1`.
 
 ---
 
-## 3) Storage model and restore behavior
+## 4. Storage Model
 
-### 3.1 Snapshot model
+### 4.1 Snapshot Model
 
-Each successful `backup run` writes one manifest with:
+Each successful `backup run` writes exactly one snapshot manifest. The manifest is self-contained: given only the manifest file and the object store, the full filesystem tree for that backup can be reconstructed. The manifest contains:
 
-- snapshot metadata (`snap_id`, creation time, flags)
-- node table (file/dir/symlink/special metadata)
-- dirent tree for path reconstruction
+- A fixed 52-byte header with metadata (timestamp, GFS tier flags, node count, etc.)
+- A flat array of `node_t` structures (one per filesystem object)
+- A raw dirent blob (sequence of variable-length `dirent_rec_t` + name bytes)
 
-### 3.2 Deduplication
+Snapshot IDs are sequential integers starting at 1. `HEAD` always holds the highest committed snapshot. Pruned snapshots leave gaps in the sequence; `snapshot_load` silently skips missing IDs.
 
-Regular file payloads are hashed (SHA-256) and stored once.
+### 4.2 Content-Addressed Object Store
 
-- unchanged file content reuses existing hashes
-- changed files add only new object blobs
-- metadata-only changes update manifest records without duplicating payload blobs
+Every content blob — file data, xattrs, ACL data — is stored as an object identified by its SHA-256 hash. The store is append-only at the logical level: objects are written once and never modified in place.
 
-### 3.3 Restore
+Three object types exist for file content:
 
-Restores are manifest-driven:
+| Type byte | Name | Description |
+|-----------|------|-------------|
+| `1` | `OBJECT_TYPE_FILE` | Regular (dense) file payload |
+| `2` | `OBJECT_TYPE_XATTR` | Serialized extended attributes blob |
+| `3` | `OBJECT_TYPE_ACL` | Raw ACL blob |
+| `4` | `OBJECT_TYPE_SPARSE` | Sparse file: region table prepended to data regions |
 
-- `backup restore` for full restore point
-- `backup restore --file <path>` for one file or subtree
-- optional `--verify` rehashes restored regular files against object-backed expectations
+Each `node_t` carries three hash fields: `content_hash`, `xattr_hash`, `acl_hash`. An all-zero hash indicates "no object" (no content, no xattrs, no ACL). These zero hashes are never stored and are skipped during GC reference collection.
 
-If a target manifest is missing (pruned or deleted), restoring that snapshot fails.
+### 4.3 Deduplication
 
----
+Deduplication is content-hash-based and operates at the object (file) level, not at the block or chunk level. Before writing an object, `object_exists` checks both loose storage and the pack cache. If the hash is already present anywhere in the store, the write is skipped entirely. The new snapshot's `node_t` records the existing hash, and no additional storage is consumed.
 
-## 4) Retention (GFS + window)
+This means:
+- An unchanged file between two backup runs consumes zero incremental storage for its content.
+- A metadata-only change (permissions, timestamps, xattrs) stores only a new xattr/ACL object if those changed; the content object is re-referenced.
+- An identical file at different paths within the same or different snapshots stores one object.
 
-Retention is controlled by:
+### 4.4 Locking Model
 
-- rolling window: `keep_snaps`
-- calendar tiers: `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`
+The lock file at `<repo>/lock` is used for all coordination:
 
-GFS tier boundaries are UTC calendar-based:
+- **Exclusive lock** (`F_WRLCK`): required for all write operations — `run`, `prune`, `gc`, `pack`, `snapshot delete`, `tag set/delete`. Fails immediately with `ERR_IO` if another writer holds the lock.
+- **Shared lock** (`F_RDLCK`): acquired for read-only operations — `restore`, `list`, `diff`, `verify`, `stats`, `ls`. Blocks until any exclusive writer finishes. If acquisition fails, the operation proceeds with a warning (non-fatal).
 
-- **daily**: day boundary crossed
-- **weekly**: Sunday daily promoted to weekly
-- **monthly**: last Sunday of month promoted to monthly
-- **yearly**: December monthly promoted to yearly
-
-`backup prune` (and post-run auto-prune) keeps snapshots if any of these hold:
-
-- it is HEAD
-- it is a live (not tier-expired) GFS anchor
-- it is inside the `keep_snaps` window
-- it has a preserved tag
-
-Then GC runs to remove objects no longer referenced by surviving manifests.
+Exclusive lock acquisition automatically calls `repo_prune_resume_pending` before returning, completing any interrupted prune from a prior session.
 
 ---
 
-## 5) Commands
+## 5. Data Flow: Source to Store to Pack
 
-## 5.1 Initialize repo
+### 5.1 Backup Phase Walk-Through
 
-```bash
-backup init --repo /mnt/backup/repo
+`backup run` executes in eight sequential phases:
+
+**Phase 1 — Scan**
+
+Each source path is walked recursively by `scan_tree`. The scan produces a flat `scan_result_t` array of `scan_entry_t` structures. Each entry records the full absolute path, stripped repo-relative path, stat result, node type, xattr blob, ACL blob, and (for hard links) the node ID of the primary inode.
+
+A shared `scan_imap_t` (inode map) is passed to all `scan_tree` calls so hard links spanning multiple source roots are correctly detected and deduplicated. Hard-link secondaries record `hardlink_to_node_id` pointing at the primary; they do not store a separate content object.
+
+Progress is reported to stderr at 1-second intervals: `Phase 1: scanning (N entries)`.
+
+**Phase 2 — Load Previous Snapshot**
+
+If a previous snapshot exists (HEAD > 0), it is loaded and a `pathmap_t` (open-addressing hash table keyed by repo-relative path) is built from its dirent tree. This map is used in Phase 3 to classify changes.
+
+`pathmap_build_progress` fires a callback every 1 second: `Phase 2: loading previous snapshot (N/M)`.
+
+**Phase 3 — Compare and Store**
+
+Each scanned entry is compared against the previous snapshot pathmap. Changes are classified:
+
+| Code | Meaning |
+|------|---------|
+| `CHANGE_UNCHANGED` | Same content hash and metadata — re-reference existing objects |
+| `CHANGE_CREATED` | New path not present in previous snapshot |
+| `CHANGE_MODIFIED` | Content hash changed |
+| `CHANGE_METADATA_ONLY` | Same content hash, different metadata (mode/uid/gid/mtime/xattr/ACL) |
+
+Regular files classified as `CREATED` or `MODIFIED` are submitted to the parallel store pool. The pool dispatches file store tasks across `CBACKUP_STORE_THREADS` worker threads (default: CPU count).
+
+Each worker calls `object_store_file_cb`, which:
+1. Opens the file read-only
+2. Detects sparse regions via `lseek(SEEK_HOLE)` / `lseek(SEEK_DATA)`
+3. If sparse: builds a `sparse_hdr_t` + `sparse_region_t[]` table prepended to the data regions; stores as `OBJECT_TYPE_SPARSE`
+4. If dense: streams the file through the object write path
+
+A per-chunk progress callback (`store_chunk_cb`) fires after each ~16 MiB chunk is written to disk. This callback atomically adds the chunk byte count to the pool's `bytes_in_flight` counter without waiting for file completion. A dedicated progress thread (`phase3_progress_fn`) wakes every 1 second and reads `bytes_done + bytes_in_flight` as the monotonically increasing "seen" byte count, computing an EMA-based throughput rate and ETA.
+
+Display format:
+```
+Phase 3: N/M objects  K writing  X.X/Y.Y GiB  Z.Z MiB/s  ETA HHmMSs
 ```
 
-With inline policy options:
+Where `K writing` shows the number of in-flight files (incremented at task start, decremented at completion). When no files are actively in flight this field is suppressed.
 
-```bash
-backup init --repo /mnt/backup/repo \
-  --path /home/alice --path /etc \
-  --exclude /home/alice/.cache --exclude /home/alice/tmp \
-  --keep-snaps 30 --keep-daily 14 --keep-weekly 8
+On file completion, the worker subtracts its accumulated `bytes_in_flight` contribution from the pool's counter and adds the full `file_size` to `bytes_done`. The net change to `bytes_done + bytes_in_flight` is zero, avoiding double-counting.
+
+Files that change on disk between scan and store (detected by a second `stat` or a short read) are added to a `skipped` set and excluded from the snapshot. This is logged as a warning.
+
+**Phase 4 / 5 — Build Snapshot Structures**
+
+`node_t` structures are assembled for all entries. Hard-link secondaries are not added to the node array (they share the primary's `node_id`); instead, both primary and secondary appear in the dirent table, with the secondary's `node_id` pointing at the primary.
+
+**Phase 6 — Commit**
+
+`snapshot_write` writes the `.snap` file via `mkstemp` + `fsync` + `rename`. `snapshot_write_head` updates `refs/HEAD`. Only after both succeed is the backup considered committed.
+
+**Phase 7 — Optional Verify**
+
+If `verify_after = true` (policy or `--verify-after` flag), every node in the new snapshot is checked: `object_exists` is called for each non-zero `content_hash`, `xattr_hash`, and `acl_hash`. Any missing object produces an error. This confirms that all data made it to disk.
+
+**Phase 8 — Post-Run Pack**
+
+If `auto_pack = true`, `repo_pack` is called. Pack errors are non-fatal to the backup result; the committed snapshot is intact regardless.
+
+### 5.2 Object Write Path
+
+The core object write function (`write_object` / `write_object_file_stream`) follows this sequence:
+
+1. **Hash** — SHA-256 is computed over the raw content bytes.
+2. **Existence check** — `object_exists` checks loose storage and the pack cache. If found, return immediately.
+3. **Deduplication is complete** — no write occurs.
+4. **Stage 1 compression is disabled** — loose objects are always written as `COMPRESS_NONE`. The object header records `compression = COMPRESS_NONE` and `compressed_size = uncompressed_size`. Compression is handled entirely by the pack sweeper (see §7.2).
+5. **Write to temp file** — `mkstemp` under `tmp/`, write the 56-byte `object_header_t`, then the raw payload.
+6. **fsync** — the temp file descriptor is fsynced.
+7. **Rename** — `rename(tmp_path, final_path)`. The final path is `objects/XX/<rest>` where `XX` is the first two hex characters of the hash.
+8. **Directory fsync** — the containing `objects/XX/` directory is fsynced to persist the directory entry.
+
+For large streaming files (`write_object_file_stream`), the payload is written in `STREAM_CHUNK` (16 MiB) pieces. After each chunk write, `progress_cb(chunk_bytes, ctx)` is invoked if a callback was supplied. The SHA-256 hash is computed rolling across all chunks.
+
+### 5.3 Compression Strategy
+
+**Stage 1 (write-time) compression is disabled.** All loose objects are stored uncompressed (`COMPRESS_NONE`). This provides three benefits:
+
+- Write throughput is not limited by compression CPU time. For multi-gigabyte files this is decisive.
+- Incompressible content (already-compressed video, images, archives) does not waste CPU on a futile compression attempt.
+- Compression can be done in parallel at pack time with full knowledge of object sizes.
+
+**Stage 2 (pack-time) compression** is performed by the pack sweeper (§7.2). The sweeper probes each object's compressibility before committing to compression. Incompressible objects are stored in the pack as `COMPRESS_NONE` and permanently flagged with a skip marker in the loose object header so they are never re-probed.
+
+Objects that compress well are stored in packs as `COMPRESS_LZ4` (single-call block API, for objects ≤ INT_MAX bytes) or `COMPRESS_LZ4_FRAME` (streaming LZ4 frame API, for very large objects). LZ4 is chosen for its extremely low decompression latency and predictable throughput.
+
+### 5.4 Pack Write Path
+
+See §7 (Pack System) for the detailed pack creation sequence.
+
+### 5.5 Object Read Path
+
+`object_load` resolves an object hash through two tiers in order:
+
+1. **Loose** — `objects/XX/<rest>` is opened directly. The 56-byte header is read and validated (magic, version, hash match). The compressed payload is loaded, decompressed, and the hash of the decompressed content is verified.
+2. **Pack** — if not found loose, `pack_object_load` is called. The pack cache (an in-RAM sorted array of `pack_cache_entry_t`) is consulted via `bsearch`. The matching entry's `pack_num` and `dat_offset` direct a seek into the `.dat` file. The per-entry header is read, the compressed payload loaded and decompressed, and the hash verified.
+
+For objects too large to decompress into RAM (those exceeding the 16 MiB `STREAM_CHUNK` threshold, or any `COMPRESS_LZ4_FRAME` object), `object_load` returns `ERR_TOO_LARGE`. Callers that need to handle large objects use `object_load_stream` (loose) or `pack_object_load_stream` (packed), both of which stream the decompressed payload directly to a destination file descriptor in 16 MiB chunks.
+
+---
+
+## 6. On-Disk File Formats
+
+### 6.1 Snapshot Manifest (`.snap`)
+
+Stored at `snapshots/XXXXXXXX.snap` where `XXXXXXXX` is the zero-padded decimal snapshot ID.
+
+**File header** (52 bytes, little-endian):
+
+```
+Offset  Size  Field
+     0     4  magic          = 0x43424B50 ("CBKP")
+     4     4  version        = 3
+     8     4  snap_id        (decimal snapshot number)
+    12     8  created_sec    (UTC Unix timestamp of backup completion)
+    20     8  phys_new_bytes (deduped physical bytes first introduced by this snapshot)
+    28     4  node_count     (number of node_t records that follow)
+    32     4  dirent_count   (number of dirent_rec_t records in the dirent blob)
+    36     8  dirent_data_len (byte length of the raw dirent blob)
+    44     4  gfs_flags      (bitmask: bit 0=daily, 1=weekly, 2=monthly, 3=yearly)
+    48     4  snap_flags     (reserved; currently 0)
 ```
 
-## 5.2 Policy
+**Node array** (`node_count × 161 bytes`):
 
-```bash
-backup policy --repo /mnt/backup/repo get
-backup policy --repo /mnt/backup/repo set --keep-snaps 60 --auto-prune
-backup policy --repo /mnt/backup/repo edit
+Each `node_t` is a packed structure of exactly 161 bytes:
+
+```
+Offset  Size  Field
+     0     8  node_id           (monotonically assigned 64-bit ID within this snapshot)
+     8     1  type              (1=reg, 2=dir, 3=symlink, 4=hardlink, 5=fifo, 6=chr, 7=blk)
+     9     4  mode              (st_mode)
+    13     4  uid
+    17     4  gid
+    21     8  size              (st_size; logical bytes for regular files)
+    29     8  mtime_sec
+    37     8  mtime_nsec
+    45    32  content_hash      (SHA-256 of file content; all-zeros if no content)
+    77    32  xattr_hash        (SHA-256 of xattr blob; all-zeros if none)
+   109    32  acl_hash          (SHA-256 of ACL blob; all-zeros if none)
+   141     4  link_count        (st_nlink)
+   145     8  inode_identity    (st_dev << 32 | st_ino, for hard-link detection)
+   153     4  union_a           (dev major for chr/blk; symlink target_len for symlink; 0 otherwise)
+   157     4  union_b           (dev minor for chr/blk; 0 otherwise)
 ```
 
-Supported policy flags:
+**Dirent blob** (`dirent_data_len` bytes):
 
-- `--path <abs-path>` (repeatable, additive includes)
-- `--exclude <abs-path>` (repeatable, subtractive path excludes)
-- `--keep-snaps N`
-- `--keep-daily N --keep-weekly N --keep-monthly N --keep-yearly N`
-- `--auto-pack/--no-auto-pack`
-- `--auto-gc/--no-auto-gc`
-- `--auto-prune/--no-auto-prune`
-- `--verify-after/--no-verify-after`
-- `--strict-meta/--no-strict-meta`
+A sequence of variable-length records, each consisting of:
 
-## 5.3 Run backup
-
-```bash
-backup run --repo /mnt/backup/repo
+```
+8 bytes  parent_node   (node_id of parent directory; 0 for source-root entries)
+8 bytes  node_id       (node_id of this entry, matching a node_t above)
+2 bytes  name_len      (byte length of the name that follows)
+N bytes  name          (UTF-8 filename, not null-terminated)
 ```
 
-Overrides at runtime:
+There is no padding or alignment between records. The total blob length is `dirent_data_len` bytes.
 
-```bash
-backup run --repo /mnt/backup/repo \
-  --path /home/alice --exclude /home/alice/.cache \
-  --verify-after --verbose
+### 6.2 Loose Object File
+
+Stored at `objects/<HH>/<rest>` where `<HH>` is the first two hex characters of the SHA-256 hash and `<rest>` is the remaining 62 hex characters.
+
+**Object header** (56 bytes, packed):
+
+```
+Offset  Size  Field
+     0     4  magic              = 0x42434F4A ("BCOJ")
+     4     1  version            = 1
+     5     1  type               (OBJECT_TYPE_FILE=1, XATTR=2, ACL=3, SPARSE=4)
+     6     1  compression        (COMPRESS_NONE=0, COMPRESS_LZ4=1, COMPRESS_LZ4_FRAME=2)
+     7     1  pack_skip_ver      (0=unevaluated; N=skip marker written by prober version N)
+     8     8  uncompressed_size  (original payload byte count)
+    16     8  compressed_size    (on-disk payload byte count; equals uncompressed_size when COMPRESS_NONE)
+    24    32  hash               (SHA-256 of uncompressed payload)
 ```
 
-Behavior summary:
+**Payload** (`compressed_size` bytes):
 
-- loads policy unless `--no-policy`
-- scans inputs and writes next snapshot manifest if changes exist
-- if retention is configured and `auto_prune=true`, runs GFS prune (+ GC)
-- otherwise may run post-run GC when enabled
+The raw payload immediately follows the header with no padding. For `COMPRESS_NONE`, this is the literal file/xattr/ACL data. For `COMPRESS_LZ4`, this is a single LZ4 block-API compressed buffer. For `COMPRESS_LZ4_FRAME`, this is a complete LZ4 frame stream.
 
-## 5.4 List snapshots
+**Sparse file payload format:**
 
-```bash
-backup list --repo /mnt/backup/repo
-backup list --repo /mnt/backup/repo --simple
-backup list --repo /mnt/backup/repo --json
+When `type = OBJECT_TYPE_SPARSE`, the uncompressed payload begins with a sparse header:
+
+```
+4 bytes  magic         = 0x53505253 ("SPRS")
+4 bytes  region_count  (number of sparse_region_t records that follow)
 ```
 
-Full table columns:
+Followed by `region_count` region descriptors (16 bytes each):
 
-- `head` (`*` at HEAD)
-- `id`
-- `timestamp`
-- `ent` (node count)
-- `logical` (sum of regular file sizes in that manifest)
-- `phys_new` (deduped physical bytes first introduced by that restore point)
-- `manifest` (`Y` if `.snap` present)
-- `gfs`
-- `tag`
-
-## 5.5 Browse snapshot tree
-
-```bash
-backup ls --repo /mnt/backup/repo --snapshot 42
-backup ls --repo /mnt/backup/repo --snapshot monthly-2026-03 --path /etc
-backup ls --repo /mnt/backup/repo --snapshot HEAD --path /home/alice --recursive --type f --name "*.conf"
+```
+8 bytes  offset   (byte offset of data region within the original file)
+8 bytes  length   (byte count of data region)
 ```
 
-- Size is human-readable by default (like `ls -h`; for example `4.0K`, `1.6M`).
-- `--recursive` includes descendants, not only direct children.
-- `--type` filters by node type (`f`,`d`,`l`,`p`,`c`,`b`).
-- `--name` filters displayed names with shell glob matching.
+Followed immediately by the concatenated raw data bytes from all regions. Holes between regions are implicit (all-zero bytes not stored). On restore, data regions are written at their offsets, and holes are created by seeking past them (or by punching holes if the filesystem supports it).
 
-## 5.6 Print file content from a snapshot
+### 6.3 Pack Data File (`.dat`)
 
-```bash
-backup cat --repo /mnt/backup/repo --snapshot 42 --path /etc/hosts
-backup cat --repo /mnt/backup/repo --snapshot monthly-2026-03 --path home/alice/.bashrc
-backup cat --repo /mnt/backup/repo --snapshot HEAD --path var/log/dmesg --pager
-backup cat --repo /mnt/backup/repo --snapshot 42 --path boot/vmlinuz --hex
+**File header** (12 bytes):
+
+```
+Offset  Size  Field
+     0     4  magic    = 0x42504B44 ("BPKD")
+     4     4  version  (1 = V1, 2 = current V2)
+     8     4  count    (number of object entries; written last after packing completes)
 ```
 
-- `--pager` pipes output through `$PAGER` (or `less -R` by default).
-- `--hex` prints a hex dump instead of raw bytes.
+**Object entry** (V2, 50-byte entry header + payload):
 
-## 5.7 Restore
-
-```bash
-backup restore --repo /mnt/backup/repo --dest /restore/out
-backup restore --repo /mnt/backup/repo --snapshot 42 --dest /restore/out
-backup restore --repo /mnt/backup/repo --snapshot release-q1 --dest /restore/out
-backup restore --repo /mnt/backup/repo --snapshot 42 --file etc/hosts --dest /restore/out
-backup restore --repo /mnt/backup/repo --snapshot 42 --file home/alice --dest /restore/out
-backup restore --repo /mnt/backup/repo --snapshot 42 --dest /restore/out --verify
+```
+Offset  Size  Field
+     0    32  hash               (SHA-256 of uncompressed payload)
+    32     1  type               (same values as loose object type)
+    33     1  compression        (COMPRESS_NONE=0, COMPRESS_LZ4=1, COMPRESS_LZ4_FRAME=2)
+    34     8  uncompressed_size
+    42     8  compressed_size
+    50  compressed_size  payload
 ```
 
-## 5.8 Diff snapshots
+**V1 entry header** (46 bytes): identical except `compressed_size` was a `uint32_t` at offset 42, limiting pack entries to 4 GiB each. V1 packs are fully readable; V1 entries are upgraded to V2 headers when rewritten during GC or coalesce.
 
-```bash
-backup diff --repo /mnt/backup/repo --from 41 --to 42
+Entries are laid out sequentially with no padding between them. The file is not seekable by entry number; all seeks use absolute offsets from the `.idx` file.
+
+### 6.4 Pack Index File (`.idx`)
+
+**File header** (12 bytes):
+
 ```
+Offset  Size  Field
+     0     4  magic    = 0x42504B49 ("BPKI")
+     4     4  version  (1 or 2, matches the associated .dat)
+     8     4  count    (number of index entries)
+```
+
+**Index entries** (40 bytes each, sorted ascending by hash):
+
+```
+Offset  Size  Field
+     0    32  hash        (SHA-256 of the object)
+    32     8  dat_offset  (absolute byte offset of the entry header in the .dat file)
+```
+
+The entire index is sorted by hash, enabling O(log n) binary search lookups. In-memory the index is cached as a `pack_cache_entry_t` array (with `pack_num` and `pack_version` added). The cache covers all packs in a single sorted array, also binary-searched.
+
+### 6.5 Bundle File (`.cbb`)
+
+The native binary bundle format used for `export` and `import`. Magic string `CBB1`.
+
+**File header** (20 bytes, packed):
+
+```
+Offset  Size  Field
+     0     4  magic        = "CBB1"
+     4     4  version      = 1
+     8     4  scope        (1=snapshot, 2=repo)
+    12     4  compression  (0=none, 1=LZ4)
+    16     4  reserved     = 0
+```
+
+**Records** (repeated until `CBB_REC_END`):
+
+Each record begins with a fixed record header (57 bytes):
+
+```
+Offset  Size  Field
+     0     1  kind       (0=end, 1=file, 2=object)
+     1     1  obj_type   (for kind=2: OBJECT_TYPE_*)
+     2     2  path_len   (byte count of path string that follows)
+     4     8  raw_len    (uncompressed payload byte count)
+    12     8  comp_len   (stored payload byte count; equals raw_len if compression=none)
+    20    32  hash       (SHA-256 of uncompressed payload)
+```
+
+Immediately following the record header:
+- `path_len` bytes of path string (relative, no null terminator)
+- `comp_len` bytes of payload (LZ4-compressed or raw)
+
+**kind = CBB_REC_FILE**: A repository metadata file (e.g., a `.snap` file or the `refs/HEAD` file). The `path` is the file's path relative to the repository root.
+
+**kind = CBB_REC_OBJECT**: One object blob. The `path` is empty (path_len = 0). The payload is the object's raw content (not wrapped in an `object_header_t`).
+
+**kind = CBB_REC_END**: No path, no payload. Marks end of stream.
+
+**Scope = SNAPSHOT**: Contains the snapshot's `.snap` file, the `refs/HEAD` file, all tags pointing to that snapshot, and all objects referenced by the snapshot (content, xattr, ACL).
+
+**Scope = REPO**: Contains every `.snap` file present in the repository, `refs/HEAD`, all tag files, and every object referenced by any surviving snapshot.
+
+**Import safety**: `import_bundle` performs a full dry-run pass (verifying all record hashes) before applying any writes. If any record fails hash verification, no changes are made to the repository.
+
+### 6.6 Tag Files
+
+Stored at `tags/<name>`. Plain text, two lines:
+
+```
+snapshot = <decimal-id>
+preserve = true|false
+```
+
+`preserve = true` causes the snapshot to survive any `prune` run regardless of retention settings. Preserved snapshots can only be deleted by explicitly passing `--force` to `backup snapshot delete`.
+
+### 6.7 Policy File (`policy.toml`)
+
+Stored at `<repo>/policy.toml`. TOML format. All fields are optional; defaults apply where omitted. See §14 for the complete field reference.
+
+### 6.8 Administrative Files
+
+| File | Purpose |
+|------|---------|
+| `format` | Contains the ASCII string `c-backup-1`. Checked on every `repo_open`. |
+| `lock` | Lock file; never deleted. All concurrent-access coordination flows through `flock(2)` on this file descriptor. |
+| `refs/HEAD` | Contains the ASCII decimal ID of the current HEAD snapshot, newline-terminated. |
+| `prune-pending` | Written before any snapshot deletion during a prune run. Lists one snapshot ID per line. Consumed and deleted by `repo_prune_resume_pending` on the next exclusive lock acquisition. |
+| `logs/pack-coalesce.state` | Contains the HEAD snapshot ID at which the last coalesce completed. Used to enforce the minimum-snapshot-gap cooldown. |
+| `packs/.deleting-NNNNNNNN` | Deletion recovery marker written by `maybe_coalesce_packs` before removing old pack files. Contains pack numbers of packs to delete. Rescanned and completed by `pack_resume_deleting` on next call. |
+
+---
+
+## 7. Pack System
+
+Packing consolidates loose objects into large sequential pack files, improving storage density, reducing filesystem inode count, and enabling compression of data that could not be compressed at write time.
+
+### 7.1 Pack Creation (`repo_pack`)
+
+`repo_pack` is the primary entry point. It proceeds in three internal phases:
+
+**Phase 1/3 — Pre-pack GC**
+
+`repo_gc` is called before collecting loose objects. This ensures that unreferenced objects are deleted from loose storage and from existing packs before the new pack is written. Packing unreferenced objects would waste space.
+
+**Phase 2/3 — Collect Loose Objects**
+
+`collect_loose` walks the `objects/` tree and collects all loose object hashes into an array. The array is partitioned into two groups:
+
+- **Large objects** (`compressed_size > 16 MiB`): streamed directly to the pack without loading into RAM.
+- **Small objects** (`compressed_size ≤ 16 MiB`): processed by the worker pool.
+
+The partition pass also reads each loose object's 56-byte header to accumulate `total_bytes_for_pack` for the progress display.
+
+**Phase 3/3 — Write Pack Files**
+
+Two temp files are created in `tmp/` via `mkstemp`: `pack-dat.XXXXXX` (data) and `pack-idx.XXXXXX` (index).
+
+The data file header is written first with `count = 0`; after all objects are packed, the file is seeked back to offset 0 and the real count is patched in.
+
+Large objects and small objects are then written in sequence (large first, then small via the worker pool). After all workers complete, the index entries are sorted by hash and the `.idx` file is written.
+
+Both files are fsynced. The `.dat` file is renamed to `packs/pack-NNNNNNNN.dat` and the `.idx` to `packs/pack-NNNNNNNN.idx`. After rename, both files are stat-checked to confirm they are non-empty.
+
+The `packs/` directory is then fsynced to persist the directory entries. All loose object files that were successfully packed are unlinked. The in-memory pack cache is invalidated so it will be rebuilt from the new index on next access.
+
+### 7.2 Sweeper Intelligence — Compressibility Probing
+
+Before committing any loose object to the pack, the sweeper checks whether it is worth compressing:
+
+1. **Skip marker check**: Read the `pack_skip_ver` field of the object header. If it equals `PROBER_VERSION` (currently `1`), this object was previously probed and found incompressible. Skip it — do not add to pack.
+
+2. **Probe**: If `pack_skip_ver == 0` and the object is stored as `COMPRESS_NONE`, read up to 64 KiB of the payload (the probe window). Attempt to compress the probe buffer with `LZ4_compress_default`.
+
+3. **Ratio evaluation**: Compute `compressed_probe_size / probe_size`. If this ratio ≥ `0.90` (i.e., the compressed output is 90% or more of the original size), the object is considered **incompressible**.
+
+4. **Skip marker write**: For incompressible objects, write `PROBER_VERSION` (1 byte) into the `pack_skip_ver` field of the on-disk loose object header using `pwrite`. This is an in-place patch — the file is not rewritten. Future pack runs skip this object immediately without reprobing.
+
+5. **Compress and pack**: Objects that compress well (ratio < 0.90) are compressed with LZ4 and stored in the pack as `COMPRESS_LZ4` (small) or `COMPRESS_LZ4_FRAME` (large streaming). The compressed bytes — potentially significantly smaller than the originals — are what land in the `.dat` file.
+
+**Important**: Skip-marked objects remain as loose objects indefinitely. They are excluded from packs. This is intentional: packing them without compression gains nothing (same bytes on disk) and would only waste inodes being freed. If disk space for loose objects becomes a concern, the pack command may be re-evaluated in a future version to optionally include incompressible content.
+
+### 7.3 Large Object Streaming
+
+Objects with `compressed_size > 16 MiB` bypass the worker pool entirely. They are handled by `stream_large_to_pack`, which:
+
+1. Opens the loose object file and reads the 56-byte header.
+2. Checks the skip marker and probes compressibility (same logic as §7.2).
+3. If skippable: closes the file and continues.
+4. Copies the compressed payload from the loose file to the `.dat` file in 16 MiB chunks without loading the entire object into RAM.
+5. After each chunk write, atomically increments the `pack_prog_t.bytes_processed` counter so the progress thread sees sub-second byte-level updates.
+6. Writes the entry header with the original `type`, `compression`, `uncompressed_size`, and `compressed_size` from the loose header.
+
+These objects are stored as-is in the pack — whatever compression format was applied when they were originally written (for most loose objects this is `COMPRESS_NONE`, since stage-1 compression is disabled). The pack does not re-compress large objects.
+
+### 7.4 Worker Pool (Small Objects)
+
+Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads (default: CPU count, max 32). Architecture:
+
+- A bounded queue of `pack_work_item_t` structures (capacity: `n_workers × 4`, minimum 16) is shared between workers (producers) and the main thread (consumer/writer).
+- Each worker has a pre-allocated compression buffer of `LZ4_compressBound(16 MiB)` bytes.
+- Workers read a loose object, probe its compressibility, compress with LZ4 if beneficial, and push a `pack_work_item_t` (containing the compressed payload and metadata) onto the bounded queue.
+- The main thread pops items from the queue and writes them sequentially to the `.dat` file, maintaining the ordered `idx_entries` array.
+- Workers signal `cv_have_work` when an item is available; the main thread signals `cv_have_space` when a slot is freed.
+
+This producer-consumer design means CPU-bound compression (workers) and I/O-bound writing (main thread) overlap, saturating both CPU and I/O when the system has multi-core capacity.
+
+### 7.5 Pack Index Cache
+
+The pack index cache (`pack_cache_entry_t` array) is a single unified sorted array covering all `.idx` files in the repository. It is loaded lazily on first access by `pack_cache_load`:
+
+1. Open the `packs/` directory and enumerate all `pack-NNNNNNNN.idx` files.
+2. For each `.idx` file, read the header and validate magic/version.
+3. Read all `pack_idx_disk_entry_t` records, appending them to the in-RAM array with `pack_num` and `pack_version` annotations.
+4. Sort the entire array by hash using `qsort` with `memcmp`.
+
+Lookups use `bsearch` against this sorted array — O(log N) across all packed objects.
+
+The cache is invalidated (`repo_set_pack_cache(repo, NULL, 0)`) whenever the pack set changes: after `repo_pack` completes, after `pack_gc` rewrites or deletes packs, and after coalescing. The next lookup will transparently reload from disk.
+
+### 7.6 Pack Object Loading
+
+**`pack_object_load`** (in-RAM): Used for objects that fit in memory.
+- Locates the entry via the cache.
+- Seeks to `dat_offset` in the `.dat` file.
+- Reads and validates the entry header.
+- For `COMPRESS_LZ4_FRAME` or oversized objects, returns `ERR_TOO_LARGE` — caller must use the stream path.
+- For `COMPRESS_LZ4`: loads the compressed payload, calls `LZ4_decompress_safe`.
+- For `COMPRESS_NONE`: returns the payload buffer directly.
+- Computes SHA-256 of the decompressed data and compares against the hash from the entry header. Returns `ERR_CORRUPT` on mismatch.
+
+**`pack_object_load_stream`** (streaming): Used for large objects.
+- Same lookup and header read.
+- For `COMPRESS_LZ4`: loads into RAM (these are guaranteed ≤ INT_MAX), decompresses, verifies hash, writes to `out_fd`.
+- For `COMPRESS_LZ4_FRAME`: allocates two 16 MiB buffers, creates an `LZ4F_dctx`, and streams the compressed payload through `LZ4F_decompress`, writing decompressed chunks to `out_fd` while computing a rolling SHA-256 hash. Verifies the final hash after the last chunk.
+- For `COMPRESS_NONE`: reads in 16 MiB chunks, writes each chunk to `out_fd`, computes rolling SHA-256, verifies after last chunk.
+
+---
+
+## 8. Garbage Collection
+
+### 8.1 Reference Collection
+
+`collect_refs` builds the complete set of object hashes that are referenced by any surviving snapshot:
+
+1. Read `HEAD` to get the highest snapshot ID.
+2. Iterate snapshot IDs 1 through HEAD. For each, call `snapshot_load`. Snapshots whose `.snap` files are absent (pruned) are silently skipped.
+3. For each node in each snapshot, push `content_hash`, `xattr_hash`, and `acl_hash` into a growing `uint8_t` array. All-zero hashes are skipped.
+4. Sort the array with `qsort` and deduplicate in-place.
+
+The resulting sorted array is the authoritative reference set. Any object not in this set is unreferenced and eligible for deletion.
+
+**Memory note**: Peak memory for reference collection is O(snapshots × nodes × 3 × 32 bytes). For a repository with 100 snapshots and 1 million nodes each, this is approximately 9.6 GB before deduplication. In practice, deduplication reduces this significantly, but reference collection is the primary RAM-scaling concern for very large histories.
+
+### 8.2 Loose Object GC
+
+After building the reference set, `repo_gc` walks the `objects/` directory tree:
+
+1. For each loose object file (identified by its two-level path), decode the hash from the directory and filename components.
+2. `bsearch` the hash against the sorted reference set.
+3. If not found: `unlinkat` the file.
+4. If found: retain.
+
+Progress is reported to stderr at 1-second intervals when stdout is a TTY: `gc: scanning loose objects (N scanned, M deleted)`.
+
+### 8.3 Pack GC (`pack_gc`)
+
+After loose GC, `pack_gc` processes each pack file independently:
+
+For each pack:
+
+1. Read the `.idx` file to enumerate all entries.
+2. For each entry, `bsearch` its hash against the reference set.
+3. Count live (referenced) and dead (unreferenced) entries.
+
+**Case A — All entries dead**: Delete both `.dat` and `.idx` files immediately.
+
+**Case B — No entries dead**: No action. The pack is already fully clean.
+
+**Case C — Mixed (some live, some dead)**: Rewrite the pack:
+1. Create new temp `.dat` and `.idx` files in `tmp/`.
+2. Copy only the live entries (header + payload) from the old pack to the new pack, with sequential offsets.
+3. Build a new sorted index.
+4. fsync both new files.
+5. Rename new `.dat` over the old `.dat` filename.
+6. Rename new `.idx` over the old `.idx` filename.
+
+After processing all packs, `maybe_coalesce_packs` is called (§9).
+
+**Final log line**: GC logs a summary: `gc: refs=N, loose kept/deleted=K/D, pack kept/deleted=K/D, total kept/deleted=K/D`.
+
+### 8.4 Prune-Resume Safety Mechanism
+
+`repo_prune_resume_pending` is called automatically on every exclusive lock acquisition. It handles interrupted prunes:
+
+1. Check for `<repo>/prune-pending`. If absent, return immediately (no pending prune).
+2. Read the list of snapshot IDs from the file.
+3. For each ID, check whether a preserved tag exists. If so, skip with a warning.
+4. Otherwise, `unlink` the `.snap` file.
+5. Run `repo_gc` to reclaim objects freed by the deletions.
+6. Delete `prune-pending`.
+
+The `prune-pending` file is written before any `.snap` deletion. Even if the process is killed between writing `prune-pending` and completing all deletions, the next exclusive lock acquisition will complete the work.
+
+---
+
+## 9. Pack Coalescing
+
+Coalescing merges small pack files into a single larger pack, reducing the number of open file handles during lookup and improving locality for sequential reads.
+
+### 9.1 Trigger Conditions
+
+`maybe_coalesce_packs` triggers if **either** of:
+
+- **Count trigger**: Total pack count > 32 (`PACK_COALESCE_TARGET_COUNT`)
+- **Ratio trigger**: ≥ 8 small packs exist AND small packs make up ≥ 30% of all packs
+
+A pack is "small" if its `.dat` file is < 64 MiB (`PACK_COALESCE_SMALL_BYTES`).
+
+Additionally, a **snapshot-gap cooldown** applies: coalescing is skipped if the current HEAD is fewer than 10 snapshots ahead of the last coalesced HEAD (recorded in `logs/pack-coalesce.state`). This prevents coalescing from running on every backup when the repository is actively growing.
+
+### 9.2 Candidate Selection and Budget
+
+Candidate packs are selected from the small-pack population, sorted smallest-first. The two newest packs (by pack number) are always excluded from candidates; they are considered "hot" and likely to receive objects from the next backup run.
+
+A byte budget limits how much data will be rewritten in a single coalesce:
+
+```
+budget = min(PACK_COALESCE_MAX_BUDGET, max(256 MiB, total_dat_bytes × 15%))
+```
+
+Where `PACK_COALESCE_MAX_BUDGET = 10 GiB`. Candidates are added in size order until the budget would be exceeded. At least 2 candidates are required; if fewer candidates fit the budget, coalescing is skipped.
+
+### 9.3 Coalesce Write Procedure
+
+1. Determine the next pack number.
+2. Create temp `.dat` and `.idx` files.
+3. For each candidate pack, in order:
+   a. Open its `.idx` and `.dat` files.
+   b. For each entry in the index, check its hash against the reference set. Skip dead entries.
+   c. Copy live entry header + payload to the new `.dat` file (always writing V2 entry headers).
+4. Write and sort the new `.idx`.
+5. fsync both files.
+6. Rename `.dat` and `.idx` to their final pack names.
+7. Stat-check both renamed files to confirm non-zero size.
+
+### 9.4 Crash-Safety and Deletion Recovery Marker
+
+Before deleting the source packs, a **deletion recovery marker** is written at `packs/.deleting-NNNNNNNN` (where `NNNNNNNN` is the new coalesced pack number). This file lists the pack numbers of the old packs that are about to be deleted (one per line).
+
+The source pack files are then unlinked. After successful deletion, the marker file itself is unlinked.
+
+If the process is killed between the marker write and the deletion completion, `pack_resume_deleting` (called at the start of the next `maybe_coalesce_packs` invocation) will find the marker, re-attempt the deletions, and clean up the marker. This ensures no orphaned source packs can accumulate.
+
+After successful coalescing, `coalesce_state_write` updates `logs/pack-coalesce.state` with the current HEAD ID for the cooldown check.
+
+---
+
+## 10. GFS Retention Engine
+
+### 10.1 Tier Boundaries
+
+GFS tiers are computed using UTC calendar boundaries:
+
+| Tier | Boundary |
+|------|----------|
+| **daily** | Last backup in a UTC calendar day |
+| **weekly** | The Sunday daily of a given week |
+| **monthly** | The last Sunday of the calendar month |
+| **yearly** | The December monthly of the year |
+
+Tier flags are stored as a bitmask in `gfs_flags` (bits 0–3) in the `.snap` header and can be updated independently of the snapshot content.
+
+### 10.2 Promotion Rules
+
+After each backup run, `gfs_run` processes the snapshot history:
+
+- **daily**: A snapshot becomes a daily anchor if it is the last snapshot before a new calendar day boundary.
+- **weekly**: The daily anchor for Sunday is promoted to weekly.
+- **monthly**: The weekly anchor for the last Sunday of a month is promoted to monthly.
+- **yearly**: The monthly anchor for December is promoted to yearly.
+
+`gfs_run` can run in two modes:
+- **Incremental** (`full_scan=0`): Processes only windows closed since the previous snapshot. This is the fast path called after each `backup run`.
+- **Full recompute** (`full_scan=1`): Clears all existing GFS flags and recomputes them from scratch across the entire history. Used by `backup gfs` for manual correction.
+
+### 10.3 Prune Decision Logic
+
+A snapshot is **retained** (not pruned) if any of these conditions hold:
+
+1. It is HEAD.
+2. It is within the `keep_snaps` rolling window (the most recent N snapshots).
+3. It holds a GFS tier flag for a tier that is still within its configured keep limit (`keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`). Tiers that have exceeded their window are expired and no longer protect the snapshot.
+4. It has a preserved tag (`preserve = true`).
+
+All other snapshots are pruned: their `.snap` files are listed in `prune-pending`, then deleted, then GC is run to reclaim the unreferenced objects.
+
+A setting of `0` for any GFS tier (e.g., `keep_daily = 0`) disables that tier entirely. A setting of `keep_snaps = 1` keeps only HEAD in the rolling window.
+
+---
+
+## 11. Restore
+
+### 11.1 Full Snapshot Restore
+
+`backup restore --dest <path>` (without `--file`) restores the entire snapshot tree:
+
+1. Load the snapshot manifest.
+2. For each `node_t` in the snapshot (in node_id order), create the corresponding filesystem object at `<dest>/<repo-relative-path>`.
+3. For directories: `mkdir`.
+4. For regular files and sparse files: load the content object (using the stream path for large objects), write the payload. For sparse files, reconstruct the hole structure by seeking and writing data regions.
+5. For symlinks: `symlink(target, path)`.
+6. For hard links: the primary is written first; secondaries are created with `link(primary_path, secondary_path)`.
+7. For character/block devices: `mknod` (requires root or `CAP_MKNOD`).
+8. For FIFOs: `mkfifo`.
+9. After content is written, apply metadata: `chown`, `chmod`, `lsetxattr`, ACL apply, `utimensat`. Failures on non-root restores are logged as warnings but do not abort.
+
+Symlink targets are extracted from the object's payload (stored in the content object for symlinks).
+
+### 11.2 Single File / Subtree Restore
+
+`--file <path>` selects a single file or directory subtree:
+
+- **Exact file match**: Locates the `node_t` with matching repo-relative path. Restores just that file.
+- **Directory subtree**: Prefix-match against all dirent paths. Collects all matching nodes. Creates a flat output structure with the full repo-relative path as the filename (parent directories are created as needed).
+
+### 11.3 Sparse File Reconstruction
+
+When restoring an `OBJECT_TYPE_SPARSE` object:
+1. Load/stream the object payload.
+2. Parse the `sparse_hdr_t` and `sparse_region_t[]` table at the start of the payload.
+3. For each region, `lseek` to `region.offset` and `write` the corresponding data bytes from the payload.
+4. Holes (gaps between regions) are created implicitly by the seek-ahead. On filesystems supporting sparse files (`SEEK_HOLE`/`SEEK_DATA`), the file will physically have holes. On filesystems without sparse file support, holes are zero-filled by the OS.
+
+### 11.4 Metadata Replay
+
+After writing content, restore applies:
+
+- **Owner**: `chown(uid, gid)` — requires root or matching UID.
+- **Mode**: `chmod(mode)` — requires root or file owner.
+- **Extended attributes**: `lsetxattr` for each name/value pair decoded from the xattr object.
+- **ACL**: ACL bytes are re-applied via the system ACL library if present.
+- **Timestamps**: `utimensat` with `AT_SYMLINK_NOFOLLOW` to set `mtime_sec`/`mtime_nsec`.
+
+With `policy.strict_meta = true`, xattr and ACL changes are detected during scan (not just at content-hash change). With `strict_meta = false` (default), xattr/ACL data is stored at creation time but drift may not be detected on every run unless the file content also changes.
+
+---
+
+## 12. Export and Import
+
+### 12.1 TAR Export
+
+`backup export --format tar --scope snapshot` materializes the snapshot through the restore engine into a temporary directory, then archives it with `tar czf`. The temp directory is cleaned up after archiving. Supported scope: snapshot only. Compression: gzip.
+
+### 12.2 Bundle Export
+
+`backup export --format bundle` writes a `.cbb` file.
+
+**Snapshot scope**: Emits `CBB_REC_FILE` records for the snapshot's `.snap` file, `refs/HEAD`, and all tag files pointing to the snapshot. Emits `CBB_REC_OBJECT` records for every object referenced by the snapshot (content, xattr, ACL objects). Duplicate objects are tracked via a `hashset_t` and emitted only once.
+
+**Repo scope**: Same as snapshot scope but iterates all surviving snapshots, all tag files, and all referenced objects. A single hashset prevents duplicate object emission across snapshots.
+
+Object payloads in bundles are optionally LZ4-compressed independently of their on-disk compression format. The bundle compression flag in the header controls this.
+
+### 12.3 Bundle Import
+
+`import_bundle` reads a `.cbb` file:
+
+1. **Validate header**: Check magic `CBB1` and version.
+2. **Dry-run pass**: Read all records sequentially. For `CBB_REC_OBJECT` records: compute SHA-256 of the payload and compare to the record's `hash` field. For `CBB_REC_FILE` records: verify hash. Any mismatch aborts the entire import with no changes to the repository.
+3. **Apply pass**: Re-read all records from the beginning and apply:
+   - `CBB_REC_FILE`: Write the file to its repository-relative path, creating intermediate directories as needed.
+   - `CBB_REC_OBJECT`: Call `object_store_fd` to write the object into the object store if not already present.
+4. Update HEAD if the imported snapshot is newer than the current HEAD (unless `--no-head-update` is passed).
+
+The two-pass approach guarantees atomicity at the verification level: either all objects arrive intact or none are written.
+
+### 12.4 Bundle Verify
+
+`backup bundle verify --input <path>` runs only the dry-run pass described above without importing. Reports any hash mismatches and exits with a non-zero status if any are found. Useful for validating bundle integrity before transport or storage.
+
+---
+
+## 13. CLI Reference
+
+All commands take `--repo <path>` to specify the repository directory, except `init` and `bundle verify` which do not require an open repository.
+
+Signal handling: `SIGINT` and `SIGTERM` are caught and result in a clean exit. In-progress writes complete normally; the process does not exit mid-write.
+
+### 13.1 `init`
+
+```
+backup init --repo <path> [OPTIONS]
+```
+
+Creates a new repository at `<path>`. The directory must not already exist or must be empty. Creates the full directory tree (`objects/`, `packs/`, `snapshots/`, `refs/`, `tags/`, `logs/`, `tmp/`), writes the `format` file, and writes an initial `policy.toml` if any policy flags are supplied.
+
+When this command completes, the repository is ready for `backup run`. No lock is held during init since no concurrent access is possible for a brand-new repository.
+
+**Options**: All `policy` flags are accepted at init time as a convenience (`--path`, `--exclude`, `--keep-snaps`, `--keep-daily`, `--keep-weekly`, `--keep-monthly`, `--keep-yearly`, `--auto-pack`, `--auto-gc`, `--auto-prune`, `--verify-after`, `--strict-meta`).
+
+### 13.2 `run`
+
+```
+backup run --repo <path> [OPTIONS]
+```
+
+Runs a full backup. Acquires an exclusive lock. Executes all eight phases (§5.1). When complete:
+
+- HEAD is updated to the new snapshot ID.
+- If `auto_prune = true` (policy default), `gfs_run` is called with `auto_gc=1` and `auto_prune=1`.
+- Otherwise, if `auto_gc = true` and no prune ran, `repo_gc` is called standalone.
+- If `auto_pack = true`, `repo_pack` is called.
+
+Progress is reported to stderr if stderr is a TTY. Use `--quiet` to suppress all progress output.
+
+The result you observe when this command completes successfully:
+- A new `.snap` file exists in `snapshots/`.
+- `refs/HEAD` points to the new snapshot.
+- All changed file content, xattrs, and ACL data are durably written to the object store.
+- If packing ran, previously loose objects have been merged into a pack file and the loose files have been unlinked.
+
+**Options**:
+
+| Flag | Description |
+|------|-------------|
+| `--path <abs-path>` | Override or supplement policy source paths (repeatable) |
+| `--exclude <abs-path>` | Override or supplement policy excludes (repeatable) |
+| `--verify-after` | Check all stored objects after commit |
+| `--no-verify-after` | Override policy `verify_after = true` |
+| `--no-policy` | Ignore `policy.toml` entirely |
+| `--quiet` | Suppress progress output |
+| `--verbose` | Log skipped unreadable paths |
+
+### 13.3 `list`
+
+```
+backup list --repo <path> [--simple | --json]
+```
+
+Lists all snapshots in the repository. Acquires a shared lock. Reads snapshot headers (not full manifests) for performance.
+
+**Default table columns**:
+
+| Column | Meaning |
+|--------|---------|
+| `head` | `*` marks HEAD |
+| `id` | Decimal snapshot ID |
+| `timestamp` | UTC creation time |
+| `ent` | Node count |
+| `logical` | Sum of regular file sizes in the manifest |
+| `phys_new` | Deduped physical bytes first introduced by this snapshot |
+| `manifest` | `Y` if the `.snap` file is present on disk |
+| `gfs` | Active tier flags (e.g., `daily`, `weekly+monthly`) |
+| `tag` | Tag name(s) pointing to this snapshot |
+
+`--simple`: Prints only ID and timestamp, one line per snapshot.
+
+`--json`: Emits a JSON array of objects with all fields. Suitable for scripted consumption.
+
+### 13.4 `ls`
+
+```
+backup ls --repo <path> --snapshot <id|tag|HEAD> [OPTIONS]
+```
+
+Lists the directory tree within a snapshot. Acquires a shared lock. Loads the full snapshot manifest.
+
+| Option | Description |
+|--------|-------------|
+| `--path <abs-path>` | Show only this path and its contents |
+| `--recursive` | Include all descendants, not only direct children |
+| `--type <f\|d\|l\|p\|c\|b>` | Filter by node type |
+| `--name <glob>` | Filter displayed names by shell glob |
+
+Size is shown in human-readable format by default (e.g., `4.0K`, `1.6M`, `2.3G`).
+
+### 13.5 `cat`
+
+```
+backup cat --repo <path> --snapshot <id|tag|HEAD> --path <rel-path> [OPTIONS]
+```
+
+Prints the content of one file from the snapshot to stdout. Acquires a shared lock.
+
+| Option | Description |
+|--------|-------------|
+| `--pager` | Pipe output through `$PAGER` (defaults to `less -R`) |
+| `--hex` | Print a hex dump instead of raw bytes |
+
+For sparse files, the full logical content (data regions + zero-filled holes) is emitted in order. For large files, the stream path is used to avoid loading the entire object into RAM. Binary files are safe to cat; use `--hex` for inspection.
+
+### 13.6 `restore`
+
+```
+backup restore --repo <path> [--snapshot <id|tag|HEAD>] --dest <path> [OPTIONS]
+```
+
+Restores a snapshot. Acquires a shared lock. If `--snapshot` is omitted, HEAD is used.
+
+| Option | Description |
+|--------|-------------|
+| `--file <rel-path>` | Restore only this file or directory subtree |
+| `--verify` | After restoring each regular file, re-hash it and compare to the stored hash |
+
+The `--dest` directory is created if it does not exist. Existing files in `--dest` are overwritten without warning. Paths with absolute components or traversal sequences (`../`) are rejected before writing begins.
+
+When `--verify` is specified, every restored regular file is re-read from disk and its SHA-256 is compared to the stored `content_hash`. Any mismatch is reported as an error. This confirms that the restore wrote the correct bytes and that neither the object store nor the destination filesystem is corrupted.
+
+### 13.7 `diff`
+
+```
+backup diff --repo <path> --from <id|tag|HEAD> --to <id|tag|HEAD>
+```
+
+Compares two snapshots. Acquires a shared lock. Loads both manifests and builds a pathmap of the `from` snapshot. Iterates the `to` snapshot and compares paths.
 
 Output markers:
 
-- `A` added
-- `D` deleted
-- `M` content changed
-- `m` metadata-only changed
+| Marker | Meaning |
+|--------|---------|
+| `A` | Path added in `to` (not present in `from`) |
+| `D` | Path deleted from `to` (present in `from`) |
+| `M` | Content changed (`content_hash` differs) |
+| `m` | Metadata changed only (mode, uid, gid, mtime, xattr, or ACL differ; content hash same) |
 
-## 5.9 Grep in a snapshot
+### 13.8 `grep`
 
-```bash
-backup grep --repo /mnt/backup/repo --snapshot 42 --pattern "PermitRootLogin"
-backup grep --repo /mnt/backup/repo --snapshot HEAD --pattern "TODO" --path-prefix /home/alice/src
+```
+backup grep --repo <path> --snapshot <id|tag|HEAD> --pattern <regex> [OPTIONS]
 ```
 
-- Matches are printed as `path:line:content`.
-- Binary files and sparse payload objects are skipped.
+Searches text content within a snapshot. Acquires a shared lock. For each regular file node, loads the content object and searches for `--pattern` (POSIX extended regex).
 
-## 5.10 Export and import
+| Option | Description |
+|--------|-------------|
+| `--path-prefix <abs-path>` | Limit search to paths under this prefix |
 
-```bash
-backup export --repo /mnt/backup/repo --format tar --scope snapshot --snapshot HEAD \
-  --output /tmp/snapshot.tar.gz
-backup export --repo /mnt/backup/repo --format bundle --scope snapshot --snapshot 42 \
-  --output /tmp/snapshot.cbb
-backup export --repo /mnt/backup/repo --format bundle --scope repo \
-  --output /tmp/repo.cbb
-backup import --repo /mnt/backup/repo --input /tmp/repo.cbb
-backup bundle verify --input /tmp/repo.cbb
+Output format: `path:line:content` for each match. Binary objects and sparse payload objects are silently skipped.
+
+### 13.9 `export` / `import` / `bundle verify`
+
+```
+backup export --repo <path> [OPTIONS]
+backup import --repo <path> --input <file>
+backup bundle verify --input <file>
 ```
 
-- `tar` export supports snapshot scope only and uses `gzip` compression.
-- `bundle` export supports snapshot and repo scopes; payload compression is `lz4`.
-- `import` accepts bundle files only (`.cbb`).
-- Defaults: `--format bundle`, `--scope snapshot`, `--compress lz4` (bundle) and `gzip` (tar).
-- `backup bundle verify` validates bundle structure and object hashes without importing.
-- Import runs a full verify pass before applying writes, to avoid partial mutation on malformed bundles.
+See §12 for full format description.
 
-## 5.11 Prune
+**Export options**:
 
-```bash
-backup prune --repo /mnt/backup/repo --keep-snaps 30 --keep-daily 14 --keep-weekly 8
-backup prune --repo /mnt/backup/repo --dry-run
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--format <tar\|bundle>` | `bundle` | Output format |
+| `--scope <snapshot\|repo>` | `snapshot` | What to include |
+| `--snapshot <id\|tag\|HEAD>` | `HEAD` | Snapshot to export (snapshot scope only) |
+| `--output <path>` | required | Output file path |
+| `--compress <lz4\|none>` | `lz4` | Payload compression (bundle only) |
+
+**Import options**:
+
+| Option | Description |
+|--------|-------------|
+| `--input <path>` | Input `.cbb` file |
+| `--dry-run` | Verify hashes but do not write anything |
+| `--no-head-update` | Do not update HEAD after import |
+| `--quiet` | Suppress progress output |
+
+**`backup bundle verify`** does not require an open repository. It validates the bundle structure and all record hashes without performing any writes. Use this to check bundle integrity before import.
+
+### 13.10 `prune`
+
+```
+backup prune --repo <path> [OPTIONS]
 ```
 
-## 5.12 Maintenance
+Applies retention policy and removes expired snapshots. Acquires an exclusive lock. Runs `gfs_run` with `auto_gc=1` and `auto_prune=1`.
 
-```bash
-backup gc --repo /mnt/backup/repo
-backup pack --repo /mnt/backup/repo
-backup verify --repo /mnt/backup/repo
-backup verify --repo /mnt/backup/repo --deep
-backup doctor --repo /mnt/backup/repo
-backup stats --repo /mnt/backup/repo
-backup stats --repo /mnt/backup/repo --json
+| Option | Description |
+|--------|-------------|
+| `--keep-snaps N` | Override rolling window |
+| `--keep-daily N` | Override daily tier count |
+| `--keep-weekly N` | Override weekly tier count |
+| `--keep-monthly N` | Override monthly tier count |
+| `--keep-yearly N` | Override yearly tier count |
+| `--dry-run` | Show what would be pruned without deleting |
+
+When this command completes, all expired snapshot manifests have been deleted, GC has run, and storage has been reclaimed for any objects that were referenced only by the deleted snapshots.
+
+### 13.11 `gc`
+
+```
+backup gc --repo <path>
 ```
 
-## 5.13 Snapshot delete
+Runs garbage collection. Acquires an exclusive lock. Calls `repo_gc` which:
+1. Collects all object hashes referenced by surviving snapshots.
+2. Deletes unreferenced loose objects.
+3. Rewrites packs to remove unreferenced entries.
+4. Runs pack coalescing if thresholds are met.
 
-```bash
-backup snapshot --repo /mnt/backup/repo delete --snapshot 42
-backup snapshot --repo /mnt/backup/repo delete --snapshot monthly-2026-03 --dry-run
-backup snapshot --repo /mnt/backup/repo delete --snapshot 42 --force --no-gc
+When this command completes, the repository contains no objects that are not referenced by at least one surviving snapshot.
+
+### 13.12 `pack`
+
+```
+backup pack --repo <path>
 ```
 
-Behavior:
+Packs all loose objects. Acquires an exclusive lock. Calls `repo_pack` which first runs GC (to avoid packing objects about to be deleted), then processes all loose objects into a new pack file.
 
-- Refuses deleting `HEAD` unless `--force`.
-- Refuses deleting snapshots with tags unless `--force`.
-- With `--force`, tags pointing to the snapshot are deleted first.
-- Runs GC after delete by default (use `--no-gc` to skip).
+When this command completes, all loose objects (except skip-marked incompressible ones) have been merged into a single new pack file and the loose files have been unlinked.
 
-## 5.14 Tags
-
-```bash
-backup tag --repo /mnt/backup/repo set --snapshot 42 --name pre-upgrade
-backup tag --repo /mnt/backup/repo set --snapshot 42 --name legal-hold --preserve
-backup tag --repo /mnt/backup/repo list
-backup tag --repo /mnt/backup/repo delete --name pre-upgrade
+Progress during packing:
+```
+pack: N/M objects  X.X/Y.Y GiB  Z.Z MiB/s  ETA HHmMSs
 ```
 
-Snapshot selectors:
+### 13.13 `verify`
 
-- Any command that accepts `--snapshot <id|tag>` also accepts `--snapshot HEAD`.
-- `diff --from/--to` also accepts `HEAD`.
+```
+backup verify --repo <path> [--deep]
+```
+
+Verifies repository integrity. Acquires a shared lock. Calls `repo_verify`, which loads every surviving snapshot and attempts to load and decompress every content, xattr, and ACL object referenced by any node. A SHA-256 hash is computed over the decompressed data and compared to the stored hash.
+
+Returns zero exit status if all objects are present and uncorrupted. Returns non-zero and logs errors for any missing or corrupt objects.
+
+`--deep` is accepted for forward compatibility but is currently informational only (no additional checks beyond `repo_verify` are implemented in this version).
+
+When this command completes with exit status 0, you can be confident that every file in every surviving snapshot can be restored correctly.
+
+### 13.14 `doctor`
+
+```
+backup doctor --repo <path>
+```
+
+Performs a high-level health check. Acquires a shared lock. Checks:
+1. Whether HEAD can be read and a snapshot exists.
+2. `repo_stats` — confirms the store is readable.
+3. `repo_verify` — runs a full integrity check.
+
+Reports the number of problems found. Exit status 0 means no problems detected.
+
+### 13.15 `stats`
+
+```
+backup stats --repo <path> [--json]
+```
+
+Reports repository statistics. Acquires a shared lock.
+
+Fields reported:
+
+| Field | Description |
+|-------|-------------|
+| `snap_count` | Number of `.snap` files present |
+| `snap_total` | HEAD snapshot ID |
+| `head_entries` | Node count in HEAD manifest |
+| `head_logical_bytes` | Sum of regular file sizes in HEAD |
+| `snap_bytes` | Byte total of all `.snap` files |
+| `loose_objects` | Count of loose object files |
+| `loose_bytes` | Byte total of loose object files |
+| `pack_files` | Number of `.dat` pack files |
+| `pack_bytes` | Combined byte size of `.dat` + `.idx` files |
+| `total_bytes` | `snap_bytes + loose_bytes + pack_bytes` |
+
+`--json` emits these fields as a JSON object. Use this for dashboards and monitoring.
+
+### 13.16 `snapshot delete`
+
+```
+backup snapshot --repo <path> delete --snapshot <id|tag|HEAD> [OPTIONS]
+```
+
+Deletes a specific snapshot. Acquires an exclusive lock.
+
+| Option | Description |
+|--------|-------------|
+| `--force` | Allow deleting HEAD; allow deleting snapshots with tags (tags are removed first) |
+| `--no-gc` | Skip GC after deletion |
+| `--dry-run` | Show what would happen without deleting |
+
+Without `--force`, attempting to delete HEAD or a snapshot with tags fails with an error. This prevents accidental destruction of important history.
+
+When this command completes (without `--no-gc`), the deleted snapshot's `.snap` file has been removed and GC has run to reclaim any objects that were referenced only by the deleted snapshot.
+
+### 13.17 `tag`
+
+```
+backup tag --repo <path> set --snapshot <id|tag|HEAD> --name <name> [--preserve]
+backup tag --repo <path> list
+backup tag --repo <path> delete --name <name>
+```
+
+Manages named snapshot tags.
+
+`set`: Creates or updates a tag. The `--preserve` flag marks the tag as preserved, preventing pruning. Without `--preserve`, the tag is informational only and does not protect the snapshot from pruning.
+
+`list`: Lists all tags with their snapshot IDs and preserve flags.
+
+`delete`: Removes a tag file. Does not affect the snapshot.
+
+Snapshot selectors accept tag names wherever `--snapshot` is used: `backup restore --snapshot my-tag` resolves to the snapshot ID stored in the tag file.
+
+### 13.18 `policy`
+
+```
+backup policy --repo <path> get
+backup policy --repo <path> set [OPTIONS]
+backup policy --repo <path> edit
+```
+
+`get`: Prints the current `policy.toml` content.
+
+`set`: Updates policy fields non-destructively (only specified fields are changed). All fields listed in §14 are settable.
+
+`edit`: Opens `policy.toml` in `$EDITOR`.
+
+### 13.19 `gfs`
+
+```
+backup gfs --repo <path> [--dry-run] [--full-scan] [--quiet]
+```
+
+Runs GFS tier assignment manually. Acquires an exclusive lock.
+
+`--full-scan`: Clears all existing GFS flags and recomputes them from scratch across the entire history. Use after changing retention configuration to correct tier assignments retroactively.
+
+`--dry-run`: Reports what tier changes would be made without writing anything.
 
 ---
 
-## 6) `policy.toml` reference
+## 14. `policy.toml` Reference
 
-Stored at `<repo>/policy.toml`.
+Stored at `<repo>/policy.toml`. All fields are optional; the table below shows defaults applied by `policy_init_defaults` when a field is absent.
 
-Fields:
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `paths` | `[string]` | `[]` | Absolute source paths to back up |
+| `exclude` | `[string]` | `[]` | Absolute subtractive path excludes |
+| `keep_snaps` | integer | `1` | Rolling window: keep the N most recent snapshots |
+| `keep_daily` | integer | `0` | Keep N daily anchors (0 = tier disabled) |
+| `keep_weekly` | integer | `0` | Keep N weekly anchors |
+| `keep_monthly` | integer | `0` | Keep N monthly anchors |
+| `keep_yearly` | integer | `0` | Keep N yearly anchors |
+| `auto_pack` | boolean | `true` | Run `pack` automatically after each `backup run` |
+| `auto_gc` | boolean | `true` | Run `gc` automatically when no prune ran |
+| `auto_prune` | boolean | `true` | Run GFS prune automatically after each `backup run` |
+| `verify_after` | boolean | `false` | Verify all objects after committing each snapshot |
+| `strict_meta` | boolean | `false` | Force full xattr/ACL scan on every run (not just when content changes) |
 
-- `paths = ["/src1", "/src2", ...]`
-- `exclude = ["/abs/path1", "/abs/path2", ...]`
-- `keep_snaps = N`
-- `keep_daily = N`
-- `keep_weekly = N`
-- `keep_monthly = N`
-- `keep_yearly = N`
-- `auto_pack = true|false`
-- `auto_gc = true|false`
-- `auto_prune = true|false`
-- `verify_after = true|false`
-- `strict_meta = true|false`
+**Notes on `keep_snaps`**: A value of `1` means only HEAD is kept in the rolling window. Higher values keep recent history even when no GFS tiers are configured. This is independent of GFS: a snapshot may be kept by the rolling window even after its GFS tier expires, or by a GFS tier even after it falls outside the rolling window.
 
-Runtime defaults (`policy_init_defaults`):
+**Notes on `exclude`**: Excludes are subtractive from the source paths. An exclude of `/home/alice/.cache` applied to a source path of `/home/alice` will omit the `.cache` subtree entirely. Excludes must be absolute paths.
 
-- `keep_snaps=1`
-- `auto_pack=true`
-- `auto_gc=true`
-- `auto_prune=true`
-- `verify_after=false`
-- `strict_meta=false`
+**Notes on `auto_pack` and `auto_gc`**: When `auto_prune = true`, GFS prune always runs GC internally. Setting `auto_gc = true` with `auto_prune = true` is redundant but harmless. When `auto_prune = false` and `auto_gc = true`, a standalone GC is run after each backup to collect any objects that may have become unreferenced.
 
 ---
 
-## 7) Common configurations
+## 15. Viewer GUI
 
-### 7.1 Laptop / workstation
+### 15.1 Architecture
+
+The viewer is a Python/Tkinter application at `tools/viewer/`. It reads repository files directly using pure-Python binary parsers in `parsers.py` — no dependency on the `backup` binary. The parsers and the C binary maintain parallel implementations of the same on-disk formats.
+
+All parse functions return plain Python dicts. GUI components are completely separated from parsing logic. The viewer is read-only; it makes no writes to the repository.
+
+LZ4 decompression in the viewer requires the `lz4` Python package (`pip install lz4`). If not available, compressed object content cannot be displayed, but structural information (headers, hashes, sizes) is still accessible.
+
+### 15.2 Launching
+
+```
+cd tools/viewer
+python -m viewer <optional-repo-path>
+```
+
+Or, from the project root:
+
+```
+python -m tools.viewer <optional-repo-path>
+```
+
+The window opens at 1200×850 pixels. Use **File → Open Repository** to select a repository directory, or **File → Open Single File** to inspect an individual `.snap`, `.idx`, or `.dat` file without opening a full repository.
+
+### 15.3 Tab Reference
+
+**Overview**
+
+Displays a summary table of all snapshots: ID, creation time, node count, logical bytes, physical new bytes, GFS tier flags, tags, and whether the `.snap` file is present. Clicking a row navigates the Snapshots tab to that snapshot. Also shows high-level repository statistics (loose objects, pack files, total storage).
+
+**Analytics**
+
+Three chart sections, each with a horizontal bar chart:
+
+*Compressibility* — Two bars as percentages of total object count:
+- **Compressible** (solid bar, green): Objects stored with LZ4 compression or uncompressed objects without a skip marker (i.e., potentially compressible).
+- **Incompressible / skip-marked** (stacked bar, orange sections): Objects with `pack_skip_ver` set (skip-marked as incompressible) and packed objects whose `compressed_size / uncompressed_size ≥ 0.90` (high-ratio; nearly no compression benefit).
+
+*Uncompressed size by type* — One bar per object type (file, sparse, xattr, ACL), height proportional to aggregate uncompressed bytes. Provides insight into what type of content dominates storage.
+
+*Pack vs. loose* — Three stacked bars showing the proportion of objects stored in packs, as loose objects, and as loose skip-marked objects. Useful for assessing whether a `backup pack` run is needed.
+
+A text summary above the charts shows absolute counts and byte totals for each category.
+
+**Search**
+
+Full-text search across all snapshot path names. Enter a substring or glob pattern to find which snapshots contain a given path. Clicking a result navigates directly to that path within the Snapshots tab.
+
+**Diff**
+
+Select two snapshots and display a side-by-side diff of their path manifests. Change markers (`A`, `D`, `M`, `m`) match the CLI `backup diff` output.
+
+**Snapshots**
+
+The main file browser. Select a snapshot from the left panel; the right panel shows the directory tree. Drill into directories, view file metadata (size, mode, uid, gid, mtime, hash). If LZ4 is installed, text file content can be previewed in a sub-pane.
+
+Supports navigation from Search and Overview tabs.
+
+**Loose**
+
+Lists all loose object files in the `objects/` directory. Shows hash, type, compression, skip-marker status, and sizes. Useful for monitoring how much data is awaiting packing.
+
+**Packs**
+
+Lists all pack files. For each pack, shows the pack number, object count, `.dat` file size, and `.idx` file size. Selecting a pack expands its object list: hash, type, compression, uncompressed size, and compressed size for each entry.
+
+**Tags**
+
+Lists all tags with their snapshot ID and preserve flag.
+
+**Lookup**
+
+Enter any SHA-256 hash (hex) to locate the object: reports whether it is loose or packed, which pack file (if packed), the object type, compression, and sizes. If LZ4 is installed and the object is small enough, the content is displayed.
+
+**Policy**
+
+Displays the parsed `policy.toml` in a human-readable table.
+
+---
+
+## 16. Performance Tuning
+
+### Thread Counts
+
+**`CBACKUP_STORE_THREADS=N`** — Worker threads for Phase 3 content storage during `backup run`.
+- Default: CPU count as reported by the OS.
+- Each worker independently hashes, compresses (disabled; stored raw), and writes one file at a time.
+- Increase when source data is on fast storage (NVMe) and I/O throughput exceeds single-thread write speed.
+- Decrease to reduce I/O pressure on slow disks or when backing up over a network filesystem.
+
+**`CBACKUP_PACK_THREADS=N`** — Worker threads for `backup pack` / post-run packing.
+- Default: CPU count.
+- Each worker reads one loose object, probes compressibility, compresses if beneficial, and pushes the result to the main writer thread.
+- Compression is CPU-bound; using all available cores maximizes throughput.
+- The writer thread is a single serializer; all pack workers feed it via the bounded queue.
+
+### Policy Settings
+
+**`verify_after = true`** — Reads back every written object and re-hashes it after each backup. Provides strong write-integrity assurance at the cost of an additional I/O pass over all newly written data. Recommended for critical backups where silent write corruption is a concern.
+
+**`strict_meta = true`** — Forces xattr and ACL comparison on every file every run, rather than only when file content changes. Produces more accurate metadata-change detection at the cost of a slower compare phase for large directory trees with many files.
+
+**`auto_pack = true`** (default) — Packing after each run keeps loose object count low, which improves future GC performance. Disable only when running backup in rapid succession (e.g., hourly) and you want to batch-pack less frequently via a separate `backup pack` cron job.
+
+### Pack Coalescing Tuning
+
+Coalescing is automatic and budget-limited. The defaults work well for most repositories. Key constants (source only; not user-configurable):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `PACK_COALESCE_TARGET_COUNT` | 32 | Pack count that triggers coalescing |
+| `PACK_COALESCE_SMALL_BYTES` | 64 MiB | A pack is "small" if below this |
+| `PACK_COALESCE_MIN_SMALL` | 8 | Minimum small packs to trigger ratio check |
+| `PACK_COALESCE_MIN_RATIO_PCT` | 30% | Small-pack ratio that triggers coalescing |
+| `PACK_COALESCE_MAX_BUDGET` | 10 GiB | Maximum bytes to rewrite in one coalesce |
+| `PACK_COALESCE_BUDGET_PCT` | 15% | Fraction of total dat bytes as coalesce budget |
+| `PACK_COALESCE_MIN_SNAP_GAP` | 10 | Minimum snapshot count between coalescings |
+
+### JSON Output for Automation
+
+For monitoring dashboards and scripted consumers, prefer:
+- `backup list --json` for snapshot history
+- `backup stats --json` for storage metrics
+
+These outputs are stable and suitable for piping to `jq` or direct JSON parsing.
+
+---
+
+## 17. Common Configurations
+
+### 17.1 Laptop / Workstation
 
 ```toml
 paths = ["/home/alice", "/etc"]
-exclude = ["/home/alice/.cache", "/home/alice/node_modules"]
+exclude = ["/home/alice/.cache", "/home/alice/node_modules", "/home/alice/.local/share/Trash"]
 keep_snaps = 30
 keep_daily = 14
 keep_weekly = 8
@@ -365,11 +1434,13 @@ verify_after = false
 strict_meta = false
 ```
 
-### 7.2 Server with longer history
+Balanced for fast daily backups. 30-day rolling window ensures recent history is always accessible even if GFS tiers have expired.
+
+### 17.2 Server with Long History
 
 ```toml
 paths = ["/srv", "/etc", "/var/lib"]
-exclude = ["/srv/tmp"]
+exclude = ["/srv/tmp", "/var/lib/mysql/binlog"]
 keep_snaps = 14
 keep_daily = 30
 keep_weekly = 26
@@ -382,7 +1453,9 @@ verify_after = true
 strict_meta = true
 ```
 
-### 7.3 Conservative prune (keep many local manifests)
+`verify_after = true` catches silent write errors. `strict_meta = true` tracks permission and xattr drift even when file content is unchanged. Deep GFS tiers cover five years of monthly history.
+
+### 17.3 Conservative Prune (Keep Many Local Manifests)
 
 ```toml
 paths = ["/data"]
@@ -394,7 +1467,9 @@ keep_yearly = 0
 auto_prune = true
 ```
 
-### 7.4 Disable automatic retention, run manually
+Disables all GFS tiers; relies entirely on the rolling window. Six months of daily snapshots are kept. No GFS overhead.
+
+### 17.4 Manual Retention Control
 
 ```toml
 paths = ["/data"]
@@ -403,107 +1478,270 @@ keep_daily = 14
 auto_prune = false
 ```
 
-Run on demand:
+Prune runs only when explicitly invoked:
 
 ```bash
 backup prune --repo /mnt/backup/repo
 ```
 
----
+Use `--dry-run` first to preview the effect before committing.
 
-## 8) On-disk format notes (implementation detail)
+### 17.5 Legal Hold Pattern
 
-These are useful for low-level debugging and tooling.
+For snapshots that must never be deleted regardless of retention policy:
 
-### 8.1 Snapshot file (`.snap`)
+```bash
+backup tag --repo /mnt/backup/repo set --snapshot 42 --name legal-hold-2026-q1 --preserve
+```
 
-Header (`SNAP_MAGIC="CBKP"`, version 3):
+A preserved tag survives any prune run. To release the hold and allow normal pruning:
 
-- `magic` (u32)
-- `version` (u32)
-- `snap_id` (u32)
-- `created_sec` (u64)
-- `phys_new_bytes` (u64)
-- `node_count` (u32)
-- `dirent_count` (u32)
-- `dirent_data_len` (u64)
-- `gfs_flags` (u32)
-- `snap_flags` (u32)
-
-Payload:
-
-- `node_count * node_t`
-- raw dirent blob (`dirent_data_len` bytes, sequence of `dirent_rec_t + name bytes`)
-
-### 8.2 Loose object file
-
-`object_header_t` + payload.
-
-Header fields include:
-
-- object `type`
-- `compression` (`none`/`lz4`)
-- uncompressed/compressed sizes
-- SHA-256 hash
-
-### 8.3 Pack files
-
-- `.dat`: `PACK_DAT_MAGIC` (`BPKD`), version, object count, then object entries.
-- `.idx`: `PACK_IDX_MAGIC` (`BPKI`), version, sorted hash→offset table.
-
-### 8.4 Tags
-
-Tag files in `tags/` store:
-
-- `snapshot = <id>`
-- `preserve = true|false`
+```bash
+backup tag --repo /mnt/backup/repo delete --name legal-hold-2026-q1
+```
 
 ---
 
-## 9) Implementation/operational notes
+## 18. Troubleshooting
 
-- **Crash-safe writes**: key files are written via temp file + `fsync` + `rename`.
-- **Single-writer model**: write commands take an exclusive lock; read commands take shared lock.
-- **Prune + GC coupling**: retention removes manifests first, then GC prunes unreachable objects.
-- **Path safety in restore**: absolute paths and traversal components are rejected.
-- **Metadata replay**: restore applies ownership/mode/xattrs/ACL/timestamps best-effort; non-root restores may warn.
-- **Sparse file support**: sparse payload type is preserved and reconstructed on restore.
-- **Calendar anchoring in UTC**: GFS tier boundaries use UTC calendar semantics.
+### `error: --repo required`
+
+Add `--repo <path>` to your command.
+
+### `no source paths specified`
+
+Either set `paths = [...]` in `policy.toml` or pass `--path <abs-path>` on the command line with `backup run`.
+
+### `restore failed for old snapshot ID`
+
+The snapshot was pruned. Check `backup list` to see which snapshots are still present (`manifest = Y`). If you need to recover a pruned snapshot and have a bundle backup, import it with `backup import`.
+
+### `unexpected prune result`
+
+Run `backup prune --dry-run` to preview which snapshots would be removed. Verify your `keep_*` settings match your intent. Remember:
+- `keep_snaps = 1` keeps only HEAD plus any GFS anchors.
+- A GFS tier count of 0 disables that tier entirely (no daily/weekly/etc. anchors are created).
+- Preserved tags protect their snapshots regardless of rolling window and GFS tier expiry.
+
+### `storage not shrinking after prune`
+
+`prune` removes snapshot manifests and runs GC. If GC did not remove many objects, it means the surviving snapshots still reference nearly all the same objects. This is expected if recent backups have small deltas relative to the pruned history. Confirm by checking `backup stats` before and after.
+
+If storage is not shrinking at all after prune + GC, ensure `auto_gc = true` or run `backup gc` explicitly.
+
+### `pack contains no loose objects after backup`
+
+If `auto_pack = true` and `backup run` reports that packing found no loose objects, the objects may all have been skip-marked (incompressible). This is expected for repositories containing primarily compressed media files. The skip-marked loose objects remain as loose files. Run `backup stats` to verify `loose_objects` count.
+
+### `verify reports corrupt or missing objects`
+
+1. Run `backup doctor --repo <path>` for a comprehensive report.
+2. Check whether the missing objects were in a pack that was deleted. Review recent GC/pack log output.
+3. If objects are in loose storage but report corrupt, the file may have been modified in place (filesystem corruption). `object_load` verifies the SHA-256 of decompressed content; a mismatch indicates the payload was corrupted after writing.
+4. For packs: `pack_object_load` and `pack_object_load_stream` both verify SHA-256 after loading. A corrupt pack entry will return `ERR_CORRUPT`.
+
+### `pack_gc` behavior when GC purges entries
+
+When `backup gc` processes packs:
+- A pack where **all** entries are unreferenced has both its `.dat` and `.idx` files deleted outright.
+- A pack where **no** entries are unreferenced is left completely untouched.
+- A pack where **some** entries are unreferenced is **fully rewritten** to a new pair of `.dat` / `.idx` files containing only the live entries, then renamed over the original files. The old files do not persist.
+
+This rewrite does not merge multiple packs; each pack is processed independently. Cross-pack consolidation is handled separately by `maybe_coalesce_packs` (§9).
+
+### `bundle verify fails`
+
+The bundle file is damaged or was truncated during transfer. The SHA-256 of each record's payload is checked against the hash stored in the record header. Verify the file's own checksum (`sha256sum`) against a known-good value if one is available, or re-export the bundle.
 
 ---
 
-## 10) Troubleshooting quick checks
+## 19. Safety and Operational Notes
 
-- `error: --repo required` → add `--repo <path>`.
-- `no source paths specified` → set `policy paths` or pass `--path` in `backup run`.
-- restore failed for old ID → manifest likely pruned/missing; check `backup list`.
-- unexpected prune result → run `backup prune --dry-run` and verify `keep_*` settings.
-- size not shrinking after prune → run `backup gc` (or ensure prune completed fully).
-- need immutable keep point → create a preserved tag (`backup tag ... --preserve`).
+### Crash Safety
+
+Every critical write follows the pattern: `mkstemp` → `write` → `fsync` → `rename`. The final `rename` is atomic on POSIX filesystems (ext4, xfs, btrfs, etc.). If the process is killed at any point:
+
+- If before the rename: the temp file exists in `tmp/` and will be ignored (it is not indexed).
+- If after the rename: the file is fully written and fsynced.
+
+Additionally:
+- `prune-pending` ensures interrupted prunes are completed on next startup.
+- `.deleting-NNNNNNNN` markers ensure interrupted coalesce deletions are completed on next `pack_gc` call.
+- HEAD is only written after the snapshot file is fully durable.
+
+### Single-Writer Model
+
+The lock file prevents concurrent writers. Two `backup run` processes against the same repository will result in the second failing immediately with a lock error. There is no queuing.
+
+Concurrent readers (e.g., `backup list`, `backup restore`) are safe during any operation and use shared locks that block only during brief exclusive critical sections.
+
+### Path Safety in Restore
+
+All restore paths are validated before any filesystem writes begin. Paths with leading `/`, double slashes `//`, or traversal components (`.` or `..` as path components) are rejected. This prevents a maliciously crafted snapshot from writing files outside `--dest`.
+
+### Preserving Critical Snapshots
+
+- Use `backup tag --preserve` for legal hold, release snapshots, or any snapshot that must survive indefinitely regardless of retention policy changes.
+- Test restores periodically to a separate destination to confirm recoverability.
+- Use `backup verify` periodically to confirm object integrity, especially on aging storage.
+
+### `auto_prune` and `keep_snaps = 1`
+
+With the default `keep_snaps = 1`, every `backup run` will prune the second-most-recent snapshot unless it holds a GFS anchor or preserved tag. If no GFS tiers are configured, only HEAD survives each run. This is aggressive but intentional for space-constrained use cases. Increase `keep_snaps` or configure GFS tiers for any use case where point-in-time recovery matters.
+
+### Incompressible Content
+
+Large files that are already compressed (video, audio, archive files, database files) will be stored in loose format indefinitely because the sweeper marks them with skip markers. These objects are stored verbatim without compression overhead. This is correct behavior: attempting to compress pre-compressed data at best wastes CPU and at worst produces slightly larger output. The loose + skip-marked state for these objects is permanent and correct.
+
+### Memory Scaling
+
+The primary RAM-scaling concern for very large repositories is GC reference collection (§8.1). Peak memory is proportional to `number_of_snapshots × nodes_per_snapshot × 3 × 32 bytes`. For a 100-snapshot repository with 1 million nodes per snapshot and good deduplication, this is typically 1–4 GB before deduplication. Post-deduplication the working set is much smaller, but the peak during `qsort` of the full array must be accommodated.
+
+The pack index cache is the secondary RAM consumer: it holds 44 bytes per packed object across all packs. For 10 million packed objects this is approximately 440 MB.
 
 ---
 
-## 11) Safety tips
+## 20. Object Lookup Algorithms
 
-- Keep at least one of: higher `keep_snaps`, GFS tiers, or preserved tags for legal/critical restore points.
-- Test restores regularly to a separate destination.
-- Prefer `--dry-run` before changing retention in production.
-- Use `verify_after=true` where write-integrity assurance matters more than runtime cost.
+This section describes how the runtime locates any object — loose or packed — in O(log N) time or better, regardless of how many packs and loose files exist in the repository.
+
+### 20.1 Two-Tier Lookup Pipeline
+
+Every object lookup follows a fixed two-step policy:
+
+1. **Loose first**: attempt a direct filesystem `open()` using the hash-derived path. Succeeds in O(1).
+2. **Pack cache second**: if the file is absent, search the unified in-RAM pack index. Succeeds in O(log N) across all packs simultaneously.
+
+The loose-first policy means freshly written objects (which are always initially loose) are found without any index scan.
+
+### 20.2 Loose Object Addressing — O(1) Direct Open
+
+Loose objects are stored under:
+
+```
+objects/<HH>/<62-hex>
+```
+
+where `<HH>` is the first two hex characters of the SHA-256 hash and `<62-hex>` is the remaining 62 characters. With this two-level fanout each of the 256 first-level directories holds on average 1/256th of all loose objects, keeping directory entry counts manageable even for very large repositories.
+
+Finding a loose object requires no index or search — the runtime constructs the path directly from the hash bytes, calls `openat()`, and either gets a file descriptor or `ENOENT`. The operation is O(1) regardless of repository size.
+
+### 20.3 Pack Index Cache — O(log N) Across All Packs
+
+#### Structure
+
+Each pack pair (`pack-NNNNNNNN.dat` / `pack-NNNNNNNN.idx`) has an index file whose disk format is a sequential array of 40-byte entries:
+
+```
+pack_idx_disk_entry_t (40 bytes each, sorted by hash):
+  uint8_t  hash[32]      SHA-256 hash of the object
+  uint64_t dat_offset    absolute byte offset in the .dat file
+```
+
+Entries are sorted by hash at write time. This allows binary search directly on the `.idx` file if needed, but the runtime never searches individual `.idx` files at query time — it uses the unified in-RAM cache instead.
+
+#### Cache Loading (`pack_cache_load`)
+
+On first access after startup (or after any invalidation), the runtime:
+
+1. Opens `packs/` and enumerates all `pack-NNNNNNNN.idx` files.
+2. For each index file, reads the header (`pack_idx_hdr_t`) to verify the magic number and version, then reads all `pack_idx_disk_entry_t` records sequentially.
+3. Appends each entry to a single flat `pack_cache_entry_t` array, augmenting each record with `pack_num` and `pack_version` (which pack file it came from).
+4. After all packs are processed, calls `qsort()` on the combined array, sorting all entries from all packs together by hash.
+5. Stores the sorted array and its count in the `repo_t` object.
+
+The result is one contiguous, sorted array spanning every pack in the repository. A `pack_cache_entry_t` is 44 bytes:
+
+```
+pack_cache_entry_t (44 bytes):
+  uint8_t  hash[32]      SHA-256 hash
+  uint64_t dat_offset    byte offset in the .dat file
+  uint32_t pack_num      which pack (NNNNNNNN)
+  uint32_t pack_version  V1 or current
+```
+
+#### Lookup (`pack_find_entry`)
+
+To locate a packed object, the runtime calls `bsearch()` against the full array using `memcmp` on the 32-byte hash as the comparator. One `bsearch()` call covers every pack simultaneously in O(log N) where N is the total number of packed objects across all packs.
+
+On a hit, `pack_find_entry` returns a pointer to the matching `pack_cache_entry_t`, which contains the `.dat` file number and the exact byte offset. The caller opens `packs/pack-NNNNNNNN.dat` and seeks directly to `dat_offset` — no sequential scan of the data file is needed.
+
+#### Cache Invalidation
+
+The cache is invalidated (set to NULL) whenever the pack set changes:
+
+- After `repo_pack` writes a new pack and its index.
+- After `repo_coalesce` renames a newly merged pack into place.
+- After GC deletes or rewrites one or more packs.
+
+The next lookup after invalidation triggers a full reload. Because loading is O(P · E) where P is the number of packs and E is entries per pack, and is only triggered once per pack-modifying operation, the amortized cost over many lookups is negligible.
+
+#### Memory Cost
+
+The cache holds 44 bytes per packed object. For reference: 10 million packed objects consume approximately 440 MB of RAM. For repositories with very large object counts, the pack index cache is the primary RAM consumer (see §19 Memory Scaling).
+
+### 20.4 Snapshot `.snap` Files — Binary Search on Disk
+
+Snapshot metadata files (`snapshots/NNNNNNNN.snap`) contain the full serialized node array and dirent array for a snapshot. When a snapshot must be opened for restore or comparison, the runtime `mmap()`s or reads the file sequentially; there is no per-object binary search within a `.snap` file because snapshots are loaded whole.
+
+The snapshot file begins with a header that records `node_count` and `dirent_count`. The runtime uses these counts to allocate exactly the right amount of memory and reads both arrays in two sequential passes. Loading is O(node_count + dirent_count) and is performed once per operation, not once per file.
+
+### 20.5 Snapshot Pathmap — O(1) Path Lookup
+
+Change detection in Phase 3 (`backup run`) requires knowing, for each file discovered on the live filesystem, whether an identical file existed in the previous snapshot and whether its content hash has changed. A linear scan of the previous snapshot's node array would be O(N) per file, making the overall complexity O(N²) for large trees.
+
+To avoid this, the runtime builds a `pathmap_t` from the previous snapshot before Phase 3 begins.
+
+#### Data Structure
+
+`pathmap_t` is an open-addressing hash table with power-of-two capacity:
+
+```c
+typedef struct {
+    char    *key;     /* heap-allocated repo-relative path string */
+    node_t   value;   /* copy of the node_t from the snapshot */
+    int      seen;    /* set to 1 when the live tree visits this path */
+} pm_slot_t;
+```
+
+The table is initially sized at `max(16, node_count × 2)` slots (always a power of two) and resizes at 70% load factor.
+
+#### Hash Function
+
+Path strings are hashed with 64-bit FNV-1a:
+
+```c
+static uint64_t pm_fnv1a(const char *s) {
+    uint64_t h = 14695981039346656037ULL;  /* FNV offset basis */
+    while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+```
+
+The bucket index is `h & (capacity - 1)`. Collisions are resolved by linear probing: increment the index modulo capacity until an empty slot is found.
+
+#### Build Phase (`pathmap_build`)
+
+Path strings do not exist explicitly in the snapshot; only `dirent_rec_t` records (parent node ID, node ID, name) are stored. `pathmap_build` reconstructs full paths by walking the dirent tree from roots to leaves, using a temporary flat array sorted by node ID to enable O(log N) parent lookups during reconstruction. The final `pm_insert_node` call stores the full path string and a copy of the `node_t` in the hash table.
+
+Total build cost is O(N log N) due to the sort, where N is node count.
+
+#### Lookup (`pathmap_lookup`)
+
+```c
+const node_t *pathmap_lookup(const pathmap_t *m, const char *path);
+```
+
+Computes `pm_fnv1a(path)`, probes linearly until a match or empty slot, and returns a pointer to the embedded `node_t` or NULL. Expected O(1).
+
+#### Deletion Detection (`pathmap_foreach_unseen`)
+
+As Phase 3 visits each live filesystem path, it calls `pathmap_mark_seen()` to set `slot.seen = 1`. After the live tree walk completes, `pathmap_foreach_unseen()` iterates all slots and fires a callback for every entry whose `seen` flag is still 0 — these are files that existed in the previous snapshot but are no longer present on disk (deletions). This scan is O(capacity) ≈ O(N).
+
+#### Result
+
+The combination of `pathmap_build` + `pathmap_lookup` reduces change detection from O(N²) to O(N log N) for the build phase and O(N) for the query phase, making Phase 3 scale to repositories with millions of files.
 
 ---
 
-## 12) Performance tuning knobs
-
-- `CBACKUP_STORE_THREADS=<N>` controls parallel content-store workers in `backup run`.
-  - Default: detected CPU count
-  - Useful when source data sits on fast storage and hashing/compression is CPU-bound.
-- `CBACKUP_PACK_THREADS=<N>` controls worker threads used by `pack`/post-run packing.
-  - Default: detected CPU count
-  - Packing uses worker threads for loose-object read/compress and a single writer thread.
-- `policy.strict_meta=true` enables strict xattr/ACL drift detection.
-  - More complete metadata detection, but slower scan/compare on large trees.
-- Pack GC includes automatic small-pack coalescing heuristics.
-  - Triggered when pack count grows large or small-pack ratio rises.
-  - Rewrite budget is capped to avoid long post-backup stalls.
-  - A snapshot-gap cooldown avoids coalescing every run.
-- For automation or dashboards, prefer `backup list --json` and `backup stats --json`.
+*End of c-backup Technical Manual*
