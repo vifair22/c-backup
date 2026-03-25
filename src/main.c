@@ -256,7 +256,8 @@ static void json_print_escaped(const char *s) {
 
 static int lock_or_die(repo_t *repo) {
     if (repo_lock(repo) != OK) {
-        fprintf(stderr, "error: cannot acquire repository lock\n");
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "cannot acquire repository lock");
         return 1;
     }
     repo_prune_resume_pending(repo);  /* complete any prune interrupted by crash */
@@ -343,7 +344,7 @@ static void usage(void) {
         "  backup gfs      --repo <path> [--dry-run]\n"
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
-        "  backup verify   --repo <path> [--deep]\n"
+        "  backup verify   --repo <path> [--repair]\n"
         "  backup doctor   --repo <path>\n"
         "  backup stats    --repo <path> [--json]\n"
         "  backup tag      --repo <path> set --snapshot <id|tag> --name <name>"
@@ -465,7 +466,8 @@ static int cmd_init(int argc, char **argv) {
         return 1;
     }
     if (repo_init(repo_arg) != OK) {
-        fprintf(stderr, "error: cannot initialise repository '%s'\n", repo_arg);
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "cannot initialise repository");
         return 1;
     }
 
@@ -491,7 +493,8 @@ static int cmd_init(int argc, char **argv) {
 
     repo_t *repo = NULL;
     if (repo_open(repo_arg, &repo) != OK) {
-        fprintf(stderr, "error: cannot open repository after init\n");
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "cannot open repository after init");
         return 1;
     }
 
@@ -557,7 +560,11 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
             fprintf(stdout, "(no policy configured)\n");
             return 0;
         }
-        if (st != OK) { fprintf(stderr, "error: cannot read policy\n"); return 1; }
+        if (st != OK) {
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "cannot read policy");
+            return 1;
+        }
 
         printf("paths           = ");
         for (int i = 0; i < p->n_paths; i++) printf("%s%s", i?  " " : "", p->paths[i]);
@@ -590,7 +597,8 @@ static int cmd_policy(repo_t *repo, int argc, char **argv) {
         int ret = (policy_save(repo, p) == OK) ? 0 : 1;
         policy_free(p);
         if (ret == 0) fprintf(stderr, "policy updated\n");
-        else          fprintf(stderr, "error: cannot write policy\n");
+        else          fprintf(stderr, "error: %s\n",
+                              err_msg()[0] ? err_msg() : "cannot write policy");
         return ret;
 
     } else if (strcmp(sub, "edit") == 0) {
@@ -704,6 +712,8 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
 
     status_t st = backup_run_opts(repo, source_abs, n_source, &bopts);
     if (st != OK) {
+        if (err_msg()[0])
+            log_msg("ERROR", err_msg());
         free_abs_list(source_owned, source_abs, n_source);
         free_abs_list(exclude_owned, exclude_abs, n_excl);
         policy_free(pol);
@@ -1055,7 +1065,9 @@ static int cmd_cat(repo_t *repo, int argc, char **argv) {
         fprintf(stderr, "error: path '%s' is not a regular file in snapshot %u\n",
                 path_arg, snap_id);
     } else {
-        fprintf(stderr, "error: failed to read '%s' from snapshot %u\n", path_arg, snap_id);
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg()
+                : "failed to read file from snapshot");
     }
     return 1;
 }
@@ -1112,14 +1124,16 @@ static int cmd_restore(repo_t *repo, int argc, char **argv) {
     }
 
     if (st != OK) {
-        if (!quiet) fprintf(stderr, "error: restore failed\n");
+        if (!quiet) fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "restore failed");
         return 1;
     }
 
     if (verify && snap_id > 0) {
         st = restore_verify_dest(repo, snap_id, dest);
         if (st != OK) {
-            fprintf(stderr, "error: post-restore verification failed\n");
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "post-restore verification failed");
             return 1;
         }
         if (!quiet) fprintf(stderr, "verify: OK\n");
@@ -1191,13 +1205,15 @@ static int cmd_grep(repo_t *repo, int argc, char **argv) {
 
     snapshot_t *snap = NULL;
     if (snapshot_load(repo, snap_id, &snap) != OK) {
-        fprintf(stderr, "error: snapshot %u not found\n", snap_id);
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "snapshot not found");
         return 1;
     }
     pathmap_t *pm = NULL;
     if (pathmap_build(snap, &pm) != OK) {
         snapshot_free(snap);
-        fprintf(stderr, "error: failed to build snapshot path map\n");
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "failed to build snapshot path map");
         return 1;
     }
     snapshot_free(snap);
@@ -1326,11 +1342,19 @@ static int cmd_export(repo_t *repo, int argc, char **argv) {
     }
 
     if (fmt_tar) {
-        return export_snapshot_targz(repo, snap_id, output) == OK ? 0 : 1;
+        status_t st = export_snapshot_targz(repo, snap_id, output);
+        if (st != OK)
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "export failed");
+        return st == OK ? 0 : 1;
     }
 
     xfer_scope_t xscope = scope_repo ? XFER_SCOPE_REPO : XFER_SCOPE_SNAPSHOT;
-    return export_bundle(repo, xscope, snap_id, output) == OK ? 0 : 1;
+    status_t st = export_bundle(repo, xscope, snap_id, output);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "export failed");
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_import(repo_t *repo, int argc, char **argv) {
@@ -1348,7 +1372,11 @@ static int cmd_import(repo_t *repo, int argc, char **argv) {
     if (dry_run) lock_shared(repo);
     else if (lock_or_die(repo)) return 1;
 
-    return import_bundle(repo, input, dry_run, no_head_update, quiet) == OK ? 0 : 1;
+    status_t st = import_bundle(repo, input, dry_run, no_head_update, quiet);
+    if (st != OK && !quiet)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "import failed");
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_bundle(int argc, char **argv) {
@@ -1373,7 +1401,11 @@ static int cmd_bundle(int argc, char **argv) {
             fprintf(stderr, "error: --input required\n");
             return 1;
         }
-        return verify_bundle(input, quiet) == OK ? 0 : 1;
+        status_t st = verify_bundle(input, quiet);
+        if (st != OK && !quiet)
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "bundle verification failed");
+        return st == OK ? 0 : 1;
     }
 
     usage();
@@ -1458,14 +1490,16 @@ static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
     if (has_tags) {
         status_t st = delete_tags_for_snap(repo, snap_id, 0, 0, NULL);
         if (st != OK) {
-            fprintf(stderr, "error: failed to delete tags for snapshot %u\n", snap_id);
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to delete tags");
             return 1;
         }
     }
 
     status_t st = snapshot_delete(repo, snap_id);
     if (st != OK) {
-        fprintf(stderr, "error: failed to delete snapshot %u\n", snap_id);
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "failed to delete snapshot");
         return 1;
     }
     fprintf(stderr, "deleted snapshot %u\n", snap_id);
@@ -1473,7 +1507,8 @@ static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
     if (snap_id == head) {
         uint32_t new_head = (head > 0) ? find_latest_existing_snapshot(repo, head - 1) : 0;
         if (snapshot_write_head(repo, new_head) != OK) {
-            fprintf(stderr, "error: deleted snapshot but failed to update HEAD\n");
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to update HEAD");
             return 1;
         }
         fprintf(stderr, "HEAD -> %u\n", new_head);
@@ -1482,7 +1517,8 @@ static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
     if (!no_gc) {
         log_msg("INFO", "snapshot delete: running GC");
         if (repo_gc(repo, NULL, NULL) != OK) {
-            fprintf(stderr, "warning: snapshot deleted, but gc failed\n");
+            fprintf(stderr, "warning: snapshot deleted, but gc failed: %s\n",
+                    err_msg()[0] ? err_msg() : "unknown error");
         }
     }
 
@@ -1555,9 +1591,12 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     uint32_t head_id = 0;
     snapshot_read_head(repo, &head_id);
-    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 1, 1) == OK ? 0 : 1;
+    status_t st = gfs_run(repo, pol, head_id, dry_run, 0, 1, 1);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "prune failed");
     policy_free(pol);
-    return ret;
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_gfs(repo_t *repo, int argc, char **argv) {
@@ -1585,9 +1624,12 @@ static int cmd_gfs(repo_t *repo, int argc, char **argv) {
 
     if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
 
-    int ret = gfs_run(repo, pol, head_id, dry_run, 0, 0, 1) == OK ? 0 : 1;
+    status_t st2 = gfs_run(repo, pol, head_id, dry_run, 0, 0, 1);
+    if (st2 != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "gfs failed");
     policy_free(pol);
-    return ret;
+    return st2 == OK ? 0 : 1;
 }
 
 static int cmd_gc(repo_t *repo, int argc, char **argv) {
@@ -1596,7 +1638,11 @@ static int cmd_gc(repo_t *repo, int argc, char **argv) {
     (void)argc; (void)argv;
     if (lock_or_die(repo)) return 1;
     log_msg("INFO", "running GC");
-    return repo_gc(repo, NULL, NULL) == OK ? 0 : 1;
+    status_t st = repo_gc(repo, NULL, NULL);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "gc failed");
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_pack(repo_t *repo, int argc, char **argv) {
@@ -1605,14 +1651,36 @@ static int cmd_pack(repo_t *repo, int argc, char **argv) {
     (void)argc; (void)argv;
     if (lock_or_die(repo)) return 1;
     log_msg("INFO", "running pack");
-    return repo_pack(repo, NULL) == OK ? 0 : 1;
+    status_t st = repo_pack(repo, NULL);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "pack failed");
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
-    static const flag_spec_t specs[] = { { "--repo", 1 } };
-    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
-    lock_shared(repo);
-    return repo_verify(repo) == OK ? 0 : 1;
+    static const flag_spec_t specs[] = { { "--repo", 1 }, { "--repair", 0 } };
+    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    int repair = opt_has(argc, argv, 2, "--repair");
+    if (repair) {
+        if (lock_or_die(repo)) return 1;
+    } else {
+        lock_shared(repo);
+    }
+    verify_opts_t vopts = {0};
+    vopts.repair = repair;
+    status_t st = repo_verify(repo, &vopts);
+    char smsg[160];
+    snprintf(smsg, sizeof(smsg),
+             "verify: checked %llu objects, %llu parity repairs, %llu uncorrectable",
+             (unsigned long long)vopts.objects_checked,
+             (unsigned long long)vopts.parity_repaired,
+             (unsigned long long)vopts.parity_corrupt);
+    log_msg("INFO", smsg);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "verification failed");
+    return st == OK ? 0 : 1;
 }
 
 static int cmd_doctor(repo_t *repo, int argc, char **argv) {
@@ -1638,10 +1706,11 @@ static int cmd_doctor(repo_t *repo, int argc, char **argv) {
         problems++;
     }
 
-    if (repo_verify(repo) == OK) {
+    if (repo_verify(repo, NULL) == OK) {
         printf("check verify: ok\n");
     } else {
-        printf("check verify: fail\n");
+        printf("check verify: fail%s%s\n",
+               err_msg()[0] ? ": " : "", err_msg());
         problems++;
     }
 
@@ -1659,7 +1728,11 @@ static int cmd_stats(repo_t *repo, int argc, char **argv) {
     int json = opt_has(argc, argv, 2, "--json");
     lock_shared(repo);
     repo_stat_t s = {0};
-    if (repo_stats(repo, &s) != OK) return 1;
+    if (repo_stats(repo, &s) != OK) {
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "failed to collect stats");
+        return 1;
+    }
     if (json) {
         printf("{\n");
         printf("  \"snapshots_present\": %u,\n", s.snap_count);
@@ -1705,7 +1778,11 @@ static int cmd_tag(repo_t *repo, int argc, char **argv) {
     }
 
     if (strcmp(sub, "list") == 0) {
-        return tag_list(repo) == OK ? 0 : 1;
+        status_t st = tag_list(repo);
+        if (st != OK)
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to list tags");
+        return st == OK ? 0 : 1;
 
     } else if (strcmp(sub, "set") == 0) {
         const char *snap_arg = opt_get(argc, argv, 3, "--snapshot");
@@ -1720,12 +1797,20 @@ static int cmd_tag(repo_t *repo, int argc, char **argv) {
             fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
             return 1;
         }
-        return tag_set(repo, name, snap_id, preserve) == OK ? 0 : 1;
+        status_t tst = tag_set(repo, name, snap_id, preserve);
+        if (tst != OK)
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to set tag");
+        return tst == OK ? 0 : 1;
 
     } else if (strcmp(sub, "delete") == 0) {
         const char *name = opt_get(argc, argv, 3, "--name");
         if (!name) { fprintf(stderr, "error: --name required\n"); return 1; }
-        return tag_delete(repo, name) == OK ? 0 : 1;
+        status_t dst = tag_delete(repo, name);
+        if (dst != OK)
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to delete tag");
+        return dst == OK ? 0 : 1;
 
     } else {
         usage(); return 1;
@@ -1784,7 +1869,8 @@ int main(int argc, char *argv[]) {
 
     repo_t *repo = NULL;
     if (repo_open(repo_arg, &repo) != OK) {
-        log_msg("ERROR", "cannot open repository");
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "cannot open repository");
         return 1;
     }
 

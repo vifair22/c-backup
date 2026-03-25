@@ -5,3 +5,6 @@ backup
 .cache
 **/__pycache__/**
 tools/.venv
+.claude
+AGENTS.md
+CLAUDE.md

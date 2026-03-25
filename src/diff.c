@@ -28,7 +28,7 @@ static status_t load_as_ws(repo_t *repo, uint32_t id,
 
     uint32_t cnt = 0;
     diff_entry_t *ws = calloc(pm->capacity, sizeof(*ws));
-    if (!ws) { pathmap_free(pm); return ERR_NOMEM; }
+    if (!ws) { pathmap_free(pm); return set_error(ERR_NOMEM, "diff: alloc workspace failed"); }
 
     for (size_t i = 0; i < pm->capacity; i++) {
         if (!pm->slots[i].key) continue;
@@ -37,7 +37,7 @@ static status_t load_as_ws(repo_t *repo, uint32_t id,
             for (uint32_t k = 0; k < cnt; k++) free(ws[k].path);
             free(ws);
             pathmap_free(pm);
-            return ERR_NOMEM;
+            return set_error(ERR_NOMEM, "diff: strdup path failed");
         }
         ws[cnt].node = pm->slots[i].value;
         cnt++;

@@ -35,7 +35,7 @@ status_t policy_write_template(repo_t *repo) {
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
     FILE *f = fopen(tmp, "w");
-    if (!f) return ERR_IO;
+    if (!f) return set_error_errno(ERR_IO, "policy_write_template: fopen(%s)", tmp);
 
     fprintf(f,
         "# c-backup policy configuration (TOML)\n"
@@ -84,8 +84,8 @@ status_t policy_write_template(repo_t *repo) {
         "# strict_meta = false\n"
     );
 
-    if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return ERR_IO; }
+    if (fclose(f) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: fclose"); }
+    if (rename(tmp, path) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: rename(%s)", path); }
     return OK;
 }
 
@@ -103,15 +103,15 @@ status_t policy_load(repo_t *repo, policy_t **out) {
     policy_path(repo, path, sizeof(path));
 
     FILE *f = fopen(path, "r");
-    if (!f) return ERR_NOT_FOUND;
+    if (!f) return set_error(ERR_NOT_FOUND, "policy_load: %s not found", path);
 
     char errbuf[256] = {0};
     toml_table_t *tab = toml_parse_file(f, errbuf, sizeof(errbuf));
     fclose(f);
-    if (!tab) return ERR_IO;
+    if (!tab) return set_error(ERR_IO, "policy_load: parse error: %s", errbuf);
 
     policy_t *p = calloc(1, sizeof(*p));
-    if (!p) { toml_free(tab); return ERR_NOMEM; }
+    if (!p) { toml_free(tab); return set_error(ERR_NOMEM, "policy_load: alloc failed"); }
     policy_init_defaults(p);
 
     toml_array_t *arr = toml_array_in(tab, "paths");
@@ -119,7 +119,7 @@ status_t policy_load(repo_t *repo, policy_t **out) {
         int n = toml_array_nelem(arr);
         if (n > 0) {
             p->paths = calloc((size_t)n, sizeof(char *));
-            if (!p->paths) { toml_free(tab); policy_free(p); return ERR_NOMEM; }
+            if (!p->paths) { toml_free(tab); policy_free(p); return set_error(ERR_NOMEM, "policy_load: alloc paths failed"); }
             for (int i = 0; i < n; i++) {
                 toml_datum_t d = toml_string_at(arr, i);
                 if (d.ok && d.u.s) p->paths[p->n_paths++] = d.u.s;
@@ -132,7 +132,7 @@ status_t policy_load(repo_t *repo, policy_t **out) {
         int n = toml_array_nelem(arr);
         if (n > 0) {
             p->exclude = calloc((size_t)n, sizeof(char *));
-            if (!p->exclude) { toml_free(tab); policy_free(p); return ERR_NOMEM; }
+            if (!p->exclude) { toml_free(tab); policy_free(p); return set_error(ERR_NOMEM, "policy_load: alloc exclude failed"); }
             for (int i = 0; i < n; i++) {
                 toml_datum_t d = toml_string_at(arr, i);
                 if (d.ok && d.u.s) p->exclude[p->n_exclude++] = d.u.s;
@@ -193,7 +193,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
     FILE *f = fopen(tmp, "w");
-    if (!f) return ERR_IO;
+    if (!f) return set_error_errno(ERR_IO, "policy_save: fopen(%s)", tmp);
 
     fprintf(f, "paths = [");
     for (int i = 0; i < p->n_paths; i++) {
@@ -220,7 +220,7 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     fprintf(f, "verify_after = %s\n",     p->verify_after     ? "true" : "false");
     fprintf(f, "strict_meta = %s\n",      p->strict_meta      ? "true" : "false");
 
-    if (fclose(f) != 0) { unlink(tmp); return ERR_IO; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return ERR_IO; }
+    if (fclose(f) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_save: fclose"); }
+    if (rename(tmp, path) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_save: rename(%s)", path); }
     return OK;
 }

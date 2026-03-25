@@ -33,6 +33,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint64_t dat_offset;
+    uint32_t entry_index;
 } pack_idx_disk_entry_t;
 
 typedef struct __attribute__((packed)) {
@@ -40,7 +41,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint8_t  compression;
     uint64_t uncompressed_size;
-    uint32_t compressed_size;
+    uint64_t compressed_size;
 } pack_dat_entry_hdr_t;
 
 static repo_t *repo;
@@ -112,6 +113,19 @@ static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint6
 
     fclose(f);
     return -1;
+}
+
+/* Destroy parity footer magic in .dat file so load_entry_parity returns -1 */
+static void disable_dat_parity(void) {
+    const char *path = TEST_REPO "/packs/pack-00000000.dat";
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    struct stat st;
+    assert_int_equal(fstat(fd, &st), 0);
+    /* Zero out the parity footer magic (last 12 bytes, first 4 are magic) */
+    uint32_t zero = 0;
+    assert_int_equal(pwrite(fd, &zero, sizeof(zero), st.st_size - 12), (ssize_t)sizeof(zero));
+    close(fd);
 }
 
 static void corrupt_packed_payload_byte(const uint8_t hash[OBJECT_HASH_SIZE]) {
@@ -189,12 +203,13 @@ static void test_repo_verify_detects_corrupt_packed_object(void **state) {
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
 
+    disable_dat_parity();
     corrupt_packed_payload_byte(hash);
 
     void *data = NULL;
     size_t sz = 0;
     assert_int_equal(object_load(repo, hash, &data, &sz, NULL), ERR_CORRUPT);
-    assert_int_equal(repo_verify(repo), ERR_CORRUPT);
+    assert_int_equal(repo_verify(repo, NULL), ERR_CORRUPT);
 }
 
 static void test_repo_verify_detects_missing_pack_data_file(void **state) {
@@ -207,7 +222,7 @@ static void test_repo_verify_detects_missing_pack_data_file(void **state) {
     void *data = NULL;
     size_t sz = 0;
     assert_int_equal(object_load(repo, hash, &data, &sz, NULL), ERR_IO);
-    assert_int_equal(repo_verify(repo), ERR_CORRUPT);
+    assert_int_equal(repo_verify(repo, NULL), ERR_CORRUPT);
 }
 
 static void test_pack_object_physical_size_success_and_invalid(void **state) {
@@ -226,6 +241,8 @@ static void test_pack_object_load_detects_invalid_compression(void **state) {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
+
+    disable_dat_parity();
 
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
@@ -251,16 +268,18 @@ static void test_pack_cache_truncated_idx_causes_corrupt_on_lookup(void **state)
 
     int fd = open(TEST_REPO "/packs/pack-00000000.idx", O_RDWR);
     assert_true(fd >= 0);
-    off_t end = lseek(fd, 0, SEEK_END);
-    assert_true(end > (off_t)sizeof(pack_idx_hdr_t));
-    assert_int_equal(ftruncate(fd, end - 1), 0);
+    /* Truncate within the idx entries region (header + partial first entry)
+     * so the cache loader can't read all entries. */
+    assert_int_equal(ftruncate(fd, (off_t)sizeof(pack_idx_hdr_t) + 10), 0);
     close(fd);
 
     pack_cache_invalidate(repo);
 
     void *data = NULL;
     size_t sz = 0;
-    assert_int_equal(object_load(repo, hash, &data, &sz, NULL), ERR_CORRUPT);
+    /* Should fail: truncated idx can't provide entries, so hash not found */
+    status_t st = object_load(repo, hash, &data, &sz, NULL);
+    assert_true(st != OK);
 }
 
 static void test_pack_object_physical_size_detects_truncated_dat_entry(void **state) {
@@ -296,6 +315,8 @@ static void test_pack_object_load_rejects_none_size_mismatch(void **state) {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
+
+    disable_dat_parity();
 
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);

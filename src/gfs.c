@@ -159,7 +159,7 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
                                 gfs_snap_info_t **out, uint32_t *out_n) {
     gfs_snap_info_t *arr = malloc(head_id * sizeof(gfs_snap_info_t));
-    if (!arr) return ERR_NOMEM;
+    if (!arr) return set_error(ERR_NOMEM, "load_snap_infos: alloc failed for %u entries", head_id);
     uint32_t n = 0;
 
     for (uint32_t id = 1; id <= head_id; id++) {
@@ -229,7 +229,7 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
 
     /* Save original flags so we can detect what changed at flush time. */
     uint32_t *orig_flags = calloc(n, sizeof(uint32_t));
-    if (!orig_flags) { free(snaps); return ERR_NOMEM; }
+    if (!orig_flags) { free(snaps); return set_error(ERR_NOMEM, "gfs_run: alloc orig_flags failed"); }
     for (uint32_t i = 0; i < n; i++) orig_flags[i] = snaps[i].gfs_flags;
 
     /* Full scan: clear all in-memory flags; flush will overwrite on disk. */
@@ -325,7 +325,7 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
      * A GFS snap is tier-expired when keep_N > 0 for its highest tier
      * and there are already >= keep_N newer snaps at the same tier. */
     int *tier_expired = calloc(n, sizeof(int));
-    if (!tier_expired) { free(orig_flags); free(snaps); return ERR_NOMEM; }
+    if (!tier_expired) { free(orig_flags); free(snaps); return set_error(ERR_NOMEM, "gfs_run: alloc tier_expired failed"); }
 
     for (uint32_t i = 0; i < n; i++) {
         if (snaps[i].gfs_flags == 0) continue;

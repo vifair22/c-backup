@@ -34,6 +34,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint64_t dat_offset;
+    uint32_t entry_index;
 } pack_idx_disk_entry_t;
 
 typedef struct __attribute__((packed)) {
@@ -41,7 +42,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint8_t  compression;
     uint64_t uncompressed_size;
-    uint32_t compressed_size;
+    uint64_t compressed_size;
 } pack_dat_entry_hdr_t;
 
 static void write_file(const char *path, const char *content) {
@@ -122,6 +123,18 @@ static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint6
 
     fclose(f);
     return -1;
+}
+
+/* Destroy parity footer magic in .dat so load_entry_parity returns -1 */
+static void disable_dat_parity(void) {
+    const char *path = TEST_REPO "/packs/pack-00000000.dat";
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    struct stat st;
+    assert_int_equal(fstat(fd, &st), 0);
+    uint32_t zero = 0;
+    assert_int_equal(pwrite(fd, &zero, sizeof(zero), st.st_size - 12), (ssize_t)sizeof(zero));
+    close(fd);
 }
 
 static void corrupt_packed_payload_byte(const uint8_t hash[OBJECT_HASH_SIZE]) {
@@ -247,7 +260,7 @@ static void test_restore_by_id(void **state) {
 static void test_restore_latest_no_snapshots(void **state) {
     (void)state;
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_latest(repo, TEST_DEST), ERR_IO);
+    assert_int_equal(restore_latest(repo, TEST_DEST), ERR_NOT_FOUND);
 }
 
 static void test_restore_verify_dest_detects_mismatch(void **state) {
@@ -296,6 +309,7 @@ static void test_restore_snapshot_corrupt_object_fails_corrupt(void **state) {
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
+    disable_dat_parity();
     corrupt_packed_payload_byte(hash);
 
     mkdir(TEST_DEST, 0755);

@@ -147,14 +147,14 @@ status_t snapshot_ls(repo_t *repo, uint32_t snap_id, const char *dir_path,
         while (*s == '/') s++;
         size_t len = strlen(s);
         while (len > 0 && s[len - 1] == '/') len--;
-        if (len >= sizeof(norm)) { snapshot_free(snap); return ERR_INVALID; }
+        if (len >= sizeof(norm)) { snapshot_free(snap); return set_error(ERR_INVALID, "ls: path too long"); }
         memcpy(norm, s, len);
         norm[len] = '\0';
     }
 
     /* Build flat dirent list from the snapshot's binary dirent_data */
     ls_dirent_t *flat = calloc(snap->dirent_count + 1, sizeof(ls_dirent_t));
-    if (!flat) { snapshot_free(snap); return ERR_NOMEM; }
+    if (!flat) { snapshot_free(snap); return set_error(ERR_NOMEM, "ls: alloc dirent list failed"); }
     uint32_t n_flat = 0;
 
     const uint8_t *p   = snap->dirent_data;

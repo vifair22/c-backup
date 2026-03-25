@@ -93,3 +93,9 @@ void pathmap_foreach_unseen(const pathmap_t *map,
                             void *ctx);
 
 void pathmap_free(pathmap_t *map);
+
+/*
+ * Attempt to repair a snapshot file in-place using its parity data.
+ * Returns: >0 = bytes corrected, 0 = no corruption found, <0 = error.
+ */
+int snapshot_repair(repo_t *repo, uint32_t snap_id);

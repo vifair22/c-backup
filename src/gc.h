@@ -11,13 +11,22 @@
  */
 status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted);
 
+typedef struct {
+    uint64_t objects_checked;
+    uint64_t parity_repaired;
+    uint64_t parity_corrupt;
+    uint64_t bytes_checked;
+    int      repair;        /* if true, rewrite corrected files to disk */
+} verify_opts_t;
+
 /*
  * Verify every object referenced by every surviving snapshot: loads and
  * decompresses each object, re-hashing its content to confirm integrity.
+ * If opts is non-NULL, populates parity stats and honours the repair flag.
  * Returns OK if all objects are present and uncorrupted, ERR_CORRUPT
  * if any are missing or have hash mismatches.
  */
-status_t repo_verify(repo_t *repo);
+status_t repo_verify(repo_t *repo, verify_opts_t *opts);
 
 /*
  * Complete any prune that was interrupted before GC could run.

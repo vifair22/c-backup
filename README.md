@@ -26,7 +26,8 @@ A deduplicating filesystem backup tool for Linux, written in C.
 | LZ4 compression | Per-object compression with 64 KiB probing; skip markers prevent re-probing incompressible content |
 | Sparse file support | Holes are preserved using a region table; no sparse-to-dense bloat |
 | Metadata fidelity | Stores mode, uid, gid, mtime, xattrs, POSIX ACLs, symlink targets, hardlink relationships, device numbers |
-| Pack files | Loose objects are coalesced into pack files with binary-searchable indexes |
+| Pack files | Loose objects are coalesced into pack files with binary-searchable indexes; multi-object packs are capped at 256 MiB, large compressible files get dedicated single-object packs |
+| Parity error correction | Reed-Solomon RS(255,239) corrects up to 512-byte burst errors per object; XOR parity repairs single-byte header corruption; CRC-32C provides fast detection; `verify --repair` rewrites corrected files to disk |
 | GFS retention | Grandfather-Father-Son calendar tiers: daily / weekly / monthly / yearly |
 | Crash safety | All writes go to `tmp/` via `mkstemp`, fsynced, then atomically renamed |
 | Export / Import | Native `.cbb` bundles for offline transfer; tar.gz export for interoperability |
@@ -96,6 +97,9 @@ backup prune --repo /mnt/backup/myrepo
 
 # Verify all object hashes
 backup verify --repo /mnt/backup/myrepo
+
+# Verify and repair bit-rot via parity
+backup verify --repo /mnt/backup/myrepo --repair
 
 # Tag a snapshot
 backup tag --repo /mnt/backup/myrepo --snapshot 42 --name release-2025

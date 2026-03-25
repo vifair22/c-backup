@@ -3,6 +3,7 @@
 #include "restore.h"
 #include "snapshot.h"
 #include "object.h"
+#include "util.h"
 #include "../vendor/log.h"
 
 #include <errno.h>
@@ -86,7 +87,7 @@ static status_t snap_paths_build(const snapshot_t *snap, snap_paths_t *out) {
     if (snap->dirent_count == 0) return OK;
 
     dr_entry_t *flat = calloc(snap->dirent_count, sizeof(dr_entry_t));
-    if (!flat) return ERR_NOMEM;
+    if (!flat) return set_error(ERR_NOMEM, "snap_paths_build: alloc failed for dirent flat array");
     uint32_t n_flat = 0;
 
     const uint8_t *p   = snap->dirent_data;
@@ -138,7 +139,7 @@ static status_t snap_paths_build(const snapshot_t *snap, snap_paths_t *out) {
 oom:
     for (uint32_t i = 0; i < n_flat; i++) { free(flat[i].name); free(flat[i].full_path); }
     free(flat);
-    return ERR_NOMEM;
+    return set_error(ERR_NOMEM, "snap_paths_build: alloc failed for path entries");
 }
 
 static void snap_paths_free(snap_paths_t *sp) {
@@ -171,20 +172,8 @@ static int path_is_safe(const char *rel) {
     return 1;
 }
 
-static int write_all_fd(int fd, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
+/* write_all_fd: uses io_write_full from util.h */
+#define write_all_fd io_write_full
 
 static int write_hex_fd(int fd, const uint8_t *buf, size_t len, size_t *ioff) {
     static const char hexdig[] = "0123456789abcdef";
@@ -304,14 +293,15 @@ static status_t restore_make_dirs(const restore_entry_t *entries, uint32_t count
             const restore_entry_t *e = &entries[i];
             if (!e->node || e->node->type != NODE_TYPE_DIR) continue;
             if (!path_is_safe(e->path)) {
-                log_msg("ERROR", "unsafe path in snapshot - skipping");
+                set_error(ERR_INVALID, "unsafe path in snapshot: %s", e->path);
+                log_msg("ERROR", err_msg());
                 continue;
             }
             char full[PATH_MAX];
             if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
-                return ERR_IO;
+                return set_error(ERR_IO, "restore_make_dirs: path too long: %s", e->path);
             if (mkdir(full, 0700) == 0) progress = 1;
-            else if (errno != EEXIST && errno != ENOENT) return ERR_IO;
+            else if (errno != EEXIST && errno != ENOENT) return set_error_errno(ERR_IO, "restore_make_dirs: mkdir(%s)", full);
         }
     }
     return OK;
@@ -325,7 +315,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
     typedef struct { uint64_t node_id; char path[PATH_MAX]; } nl_entry_t;
     nl_entry_t *nl_map = calloc(count, sizeof(nl_entry_t));
     uint32_t nl_cnt = 0;
-    if (!nl_map) return ERR_NOMEM;
+    if (!nl_map) return set_error(ERR_NOMEM, "restore_materialize_nodes: alloc failed for hardlink map");
 
     for (uint32_t i = 0; i < count; i++) {
         const restore_entry_t *e = &entries[i];
@@ -335,7 +325,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
         char full[PATH_MAX];
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
             free(nl_map);
-            return ERR_IO;
+            return set_error(ERR_IO, "restore: path too long: %s", e->path);
         }
         const node_t *nd = e->node;
 
@@ -345,7 +335,11 @@ static status_t restore_materialize_nodes(repo_t *repo,
         }
         if (hl_src) {
             if (link(hl_src, full) == -1 && errno != EEXIST) {
-                log_msg("WARN", "hard link failed; falling through to copy");
+                {
+                    char emsg[128];
+                    snprintf(emsg, sizeof(emsg), "hard link failed: %s; falling through to copy", strerror(errno));
+                    log_msg("WARN", emsg);
+                }
             } else {
                 nl_map[nl_cnt].node_id = e->node_id;
                 snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
@@ -357,13 +351,16 @@ static status_t restore_materialize_nodes(repo_t *repo,
         switch (nd->type) {
         case NODE_TYPE_REG: {
             int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd == -1) { free(nl_map); return ERR_IO; }
+            if (fd == -1) { free(nl_map); return set_error_errno(ERR_IO, "restore: open(%s)", full); }
             if (!hash_is_zero(nd->content_hash)) {
                 void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
                 status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
                 if (load_st == ERR_TOO_LARGE) {
-                    /* Large regular file: stream directly to the destination fd. */
-                    load_st = object_load_stream(repo, nd->content_hash, fd, NULL, NULL);
+                    /* Large regular file: stream directly to the destination fd.
+                     * Pass &obj_type so sparse type detection still works. */
+                    uint64_t stream_sz = 0;
+                    load_st = object_load_stream(repo, nd->content_hash, fd,
+                                                 &stream_sz, &obj_type);
                 }
                 if (load_st != OK) { close(fd); free(nl_map); return load_st; }
                 if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
@@ -373,10 +370,10 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     sp_p += sizeof(shdr);
                     if (shdr.magic != SPARSE_MAGIC ||
                         len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
-                        free(data); close(fd); free(nl_map); return ERR_CORRUPT;
+                        free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
                     }
                     if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                        free(data); close(fd); free(nl_map); return ERR_IO;
+                        free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate(%s)", full);
                     }
                     const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
                     sp_p += shdr.region_count * sizeof(sparse_region_t);
@@ -387,23 +384,23 @@ static status_t restore_materialize_nodes(repo_t *repo,
                         if (rgns[r].offset < pos ||
                             rgns[r].offset > nd->size ||
                             rgns[r].length > nd->size - rgns[r].offset) {
-                            free(data); close(fd); free(nl_map); return ERR_CORRUPT;
+                            free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u out of bounds for %s", r, full);
                         }
                         if ((size_t)(dend - dptr) < (size_t)rgns[r].length) {
-                            free(data); close(fd); free(nl_map); return ERR_CORRUPT;
+                            free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u data truncated for %s", r, full);
                         }
                         if (lseek(fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
-                            free(data); close(fd); free(nl_map); return ERR_IO;
+                            free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: lseek(%s)", full);
                         }
                         size_t rem = (size_t)rgns[r].length;
                         while (rem > 0) {
                             ssize_t w = write(fd, dptr, rem);
                             if (w < 0) {
                                 if (errno == EINTR) continue;
-                                free(data); close(fd); free(nl_map); return ERR_IO;
+                                free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: write sparse region to %s", full);
                             }
                             if (w == 0) {
-                                free(data); close(fd); free(nl_map); return ERR_IO;
+                                free(data); close(fd); free(nl_map); return set_error(ERR_IO, "restore: zero-length write to %s", full);
                             }
                             dptr += w;
                             rem -= (size_t)w;
@@ -412,13 +409,13 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     }
                 } else {
                     if (len > 0 && write(fd, data, len) != (ssize_t)len) {
-                        free(data); close(fd); free(nl_map); return ERR_IO;
+                        free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: write(%s)", full);
                     }
                 }
                 free(data);
             }
             if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                close(fd); free(nl_map); return ERR_IO;
+                close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate final(%s)", full);
             }
             fsync(fd);
             close(fd);
@@ -483,7 +480,7 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
         if (!path_is_safe(e->path)) continue;
         char full[PATH_MAX];
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
-            return ERR_IO;
+            return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
         stats->warns += (uint32_t)apply_metadata(full, e->node, repo,
                                                  e->node->type == NODE_TYPE_SYMLINK);
     }
@@ -493,7 +490,7 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
         if (!path_is_safe(e->path)) continue;
         char full[PATH_MAX];
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
-            return ERR_IO;
+            return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
         stats->warns += (uint32_t)apply_metadata(full, e->node, repo, 0);
     }
     if (root_dir_meta)
@@ -507,7 +504,7 @@ static status_t restore_entries(repo_t *repo,
                                 const char *dest_path,
                                 const node_t *root_dir_meta) {
     if (mkdir(dest_path, 0755) == -1 && errno != EEXIST)
-        return ERR_IO;
+        return set_error_errno(ERR_IO, "restore: mkdir(%s)", dest_path);
 
     restore_stats_t stats = {0};
     status_t st = restore_make_dirs(entries, count, dest_path);
@@ -541,7 +538,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
     restore_entry_t *entries = calloc(sp.count ? sp.count : 1, sizeof(*entries));
     if (!entries) {
         snap_paths_free(&sp);
-        return ERR_NOMEM;
+        return set_error(ERR_NOMEM, "do_restore: alloc failed for restore entries");
     }
 
     const node_t *root_dir_meta = NULL;
@@ -569,8 +566,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
 status_t restore_latest(repo_t *repo, const char *dest_path) {
     uint32_t head_id = 0;
     if (snapshot_read_head(repo, &head_id) != OK || head_id == 0) {
-        log_msg("ERROR", "no snapshots in repository");
-        return ERR_IO;
+        return set_error(ERR_NOT_FOUND, "no snapshots in repository");
     }
     return restore_snapshot(repo, head_id, dest_path);
 }
@@ -604,14 +600,14 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
     pathmap_t *pm = NULL;
     if (pathmap_build(snap, &pm) != OK) {
         snapshot_free(snap);
-        return ERR_IO;
+        return set_error(ERR_IO, "restore_verify: pathmap_build failed for snap %u", snap_id);
     }
     snapshot_free(snap);
 
     ws = calloc(pm->capacity, sizeof(*ws));
     if (!ws) {
         pathmap_free(pm);
-        return ERR_NOMEM;
+        return set_error(ERR_NOMEM, "restore_verify: alloc failed for working set");
     }
     for (size_t i = 0; i < pm->capacity; i++) {
         if (!pm->slots[i].key) continue;
@@ -620,7 +616,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
             for (uint32_t j = 0; j < cnt; j++) free(ws[j].path);
             free(ws);
             pathmap_free(pm);
-            return ERR_NOMEM;
+            return set_error(ERR_NOMEM, "restore_verify: alloc failed for path entry");
         }
         ws[cnt].node = pm->slots[i].value;
         cnt++;
@@ -762,7 +758,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
         return OK;
     }
     fprintf(stderr, "verify: %d error(s) found\n", errors);
-    return ERR_CORRUPT;
+    return set_error(ERR_CORRUPT, "verify: %d file(s) failed hash check in snap %u", errors, snap_id);
 }
 
 /* Recursively create parent directories for dest_path/rel_path. */
@@ -786,8 +782,8 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
                       const char *file_path, const char *dest_path) {
     char norm[PATH_MAX];
     if (normalize_snapshot_path(file_path, norm, sizeof(norm)) != 0)
-        return ERR_INVALID;
-    if (!path_is_safe(norm)) return ERR_INVALID;
+        return set_error(ERR_INVALID, "restore_file: invalid path: %s", file_path);
+    if (!path_is_safe(norm)) return set_error(ERR_INVALID, "restore_file: unsafe path: %s", norm);
 
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
@@ -834,7 +830,7 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
             st = do_restore(repo, &single, dest_path);
             free(single.dirent_data);
         } else {
-            st = ERR_NOMEM;
+            st = set_error(ERR_NOMEM, "restore_file: alloc failed for single-file dirent blob");
         }
         break;
     }
@@ -850,8 +846,8 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
                          const char *subtree_path, const char *dest_path) {
     char norm[PATH_MAX];
     if (normalize_snapshot_path(subtree_path, norm, sizeof(norm)) != 0)
-        return ERR_INVALID;
-    if (!path_is_safe(norm)) return ERR_INVALID;
+        return set_error(ERR_INVALID, "restore_subtree: invalid path: %s", subtree_path);
+    if (!path_is_safe(norm)) return set_error(ERR_INVALID, "restore_subtree: unsafe path: %s", norm);
 
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
@@ -879,7 +875,7 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
     if (nmatch == 0) {
         snap_paths_free(&sp);
         snapshot_free(snap);
-        return ERR_NOT_FOUND;
+        return set_error(ERR_NOT_FOUND, "restore_subtree: no entries match '%s' in snap %u", norm, snap_id);
     }
 
     /* Collect unique nodes for matching entries */
@@ -889,7 +885,7 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
     if (!node_ids || !nodes || !dirent_data) {
         free(node_ids); free(nodes); free(dirent_data);
         snap_paths_free(&sp); snapshot_free(snap);
-        return ERR_NOMEM;
+        return set_error(ERR_NOMEM, "restore_subtree: alloc failed for subtree working set");
     }
 
     uint32_t n_nodes = 0;
@@ -946,8 +942,8 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                              const char *file_path, int out_fd, int hex_mode) {
     char norm[PATH_MAX];
     if (normalize_snapshot_path(file_path, norm, sizeof(norm)) != 0)
-        return ERR_INVALID;
-    if (!path_is_safe(norm)) return ERR_INVALID;
+        return set_error(ERR_INVALID, "restore_cat: invalid path: %s", file_path);
+    if (!path_is_safe(norm)) return set_error(ERR_INVALID, "restore_cat: unsafe path: %s", norm);
 
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
@@ -970,12 +966,12 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
     if (!target) {
         snap_paths_free(&sp);
         snapshot_free(snap);
-        return ERR_NOT_FOUND;
+        return set_error(ERR_NOT_FOUND, "restore_cat: '%s' not found in snap %u", norm, snap_id);
     }
     if (target->type != NODE_TYPE_REG) {
         snap_paths_free(&sp);
         snapshot_free(snap);
-        return ERR_INVALID;
+        return set_error(ERR_INVALID, "restore_cat: '%s' is not a regular file", norm);
     }
     if (hash_is_zero(target->content_hash)) {
         snap_paths_free(&sp);
@@ -1008,7 +1004,7 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
             free(obj);
             snap_paths_free(&sp);
             snapshot_free(snap);
-            return ERR_CORRUPT;
+            return set_error(ERR_CORRUPT, "restore_cat: invalid sparse header for '%s'", norm);
         }
 
         const sparse_region_t *rgns = (const sparse_region_t *)((uint8_t *)obj + sizeof(shdr));
@@ -1024,7 +1020,7 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                 free(obj);
                 snap_paths_free(&sp);
                 snapshot_free(snap);
-                return ERR_CORRUPT;
+                return set_error(ERR_CORRUPT, "restore_cat: sparse region %u out of order for '%s'", i, norm);
             }
             uint64_t gap = rgns[i].offset - pos;
             while (gap > 0) {
@@ -1034,13 +1030,13 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                         free(obj);
                         snap_paths_free(&sp);
                         snapshot_free(snap);
-                        return ERR_IO;
+                        return set_error_errno(ERR_IO, "restore_cat: write sparse gap for '%s'", norm);
                     }
                 } else if (write_all_fd(out_fd, zbuf, chunk) != 0) {
                     free(obj);
                     snap_paths_free(&sp);
                     snapshot_free(snap);
-                    return ERR_IO;
+                    return set_error_errno(ERR_IO, "restore_cat: write sparse gap for '%s'", norm);
                 }
                 gap -= chunk;
                 pos += chunk;
@@ -1050,20 +1046,20 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                 free(obj);
                 snap_paths_free(&sp);
                 snapshot_free(snap);
-                return ERR_CORRUPT;
+                return set_error(ERR_CORRUPT, "restore_cat: sparse region %u data truncated for '%s'", i, norm);
             }
             if (hex_mode) {
                 if (write_hex_fd(out_fd, rdata, (size_t)rgns[i].length, &hex_off) != 0) {
                     free(obj);
                     snap_paths_free(&sp);
                     snapshot_free(snap);
-                    return ERR_IO;
+                    return set_error_errno(ERR_IO, "restore_cat: write sparse region %u for '%s'", i, norm);
                 }
             } else if (write_all_fd(out_fd, rdata, (size_t)rgns[i].length) != 0) {
                 free(obj);
                 snap_paths_free(&sp);
                 snapshot_free(snap);
-                return ERR_IO;
+                return set_error_errno(ERR_IO, "restore_cat: write sparse region %u for '%s'", i, norm);
             }
             rdata += rgns[i].length;
             remain -= (size_t)rgns[i].length;
@@ -1074,7 +1070,7 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
             free(obj);
             snap_paths_free(&sp);
             snapshot_free(snap);
-            return ERR_CORRUPT;
+            return set_error(ERR_CORRUPT, "restore_cat: sparse regions exceed file size for '%s'", norm);
         }
         uint64_t tail = target->size - pos;
         while (tail > 0) {
@@ -1084,13 +1080,13 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                     free(obj);
                     snap_paths_free(&sp);
                     snapshot_free(snap);
-                    return ERR_IO;
+                    return set_error_errno(ERR_IO, "restore_cat: write trailing zeros for '%s'", norm);
                 }
             } else if (write_all_fd(out_fd, zbuf, chunk) != 0) {
                 free(obj);
                 snap_paths_free(&sp);
                 snapshot_free(snap);
-                return ERR_IO;
+                return set_error_errno(ERR_IO, "restore_cat: write trailing zeros for '%s'", norm);
             }
             tail -= chunk;
         }
@@ -1100,13 +1096,13 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
                 free(obj);
                 snap_paths_free(&sp);
                 snapshot_free(snap);
-                return ERR_IO;
+                return set_error_errno(ERR_IO, "restore_cat: write output for '%s'", norm);
             }
         } else if (write_all_fd(out_fd, obj, obj_len) != 0) {
             free(obj);
             snap_paths_free(&sp);
             snapshot_free(snap);
-            return ERR_IO;
+            return set_error_errno(ERR_IO, "restore_cat: write output for '%s'", norm);
         }
     }
 

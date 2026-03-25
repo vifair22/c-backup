@@ -87,5 +87,19 @@ $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 test: $(TARGET) $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t ==="; $$t; done
 
+# ASAN test binaries
+ASAN_LIB_OBJS := $(filter-out $(BUILD)/main-asan.o, $(ASAN_OBJS))
+ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result -I src -I vendor
+ASAN_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%-asan, $(TEST_SRCS))
+
+$(BUILD)/%-asan: $(TESTS)/%.c $(ASAN_LIB_OBJS) | $(BUILD)
+	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
+	    -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread -lcmocka
+
+test-asan: $(TARGET) $(TARGET_ASAN) $(ASAN_TEST_BINS)
+	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
+
+.PHONY: test-asan
+
 clean:
 	rm -rf $(BUILD)

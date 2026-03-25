@@ -95,7 +95,8 @@ static void test_cli_happy_and_error_paths(void **state) {
     assert_int_equal(run_cmd(BIN " import --repo " TEST_REPO2 " --input " TEST_BUNDLE " --no-head-update"), 0);
 
     assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO), 0);
-    assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO " --deep"), 0);
+    assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO " --repair"), 0);
+    assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO " --deep"), 1);  /* --deep not supported */
     assert_int_equal(run_cmd(BIN " doctor --repo " TEST_REPO), 0);
 
     assert_int_equal(run_cmd(BIN " prune --repo " TEST_REPO " --dry-run --keep-snaps 1 --keep-daily 0 --keep-weekly 0 --keep-monthly 0 --keep-yearly 0"), 0);

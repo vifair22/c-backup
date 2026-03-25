@@ -13,7 +13,7 @@
 #define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */
 
 #define OBJECT_MAGIC        0x42434F4Au  /* "BCOJ" */
-#define OBJECT_HDR_VERSION  1u
+#define OBJECT_HDR_VERSION  2u
 #define PROBER_VERSION      1u
 
 #define NODE_TYPE_REG   1

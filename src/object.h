@@ -95,3 +95,11 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
 status_t object_physical_size(repo_t *repo,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_bytes);
+
+/*
+ * Attempt to repair a loose object file in-place using its parity data.
+ * Reads the file, applies XOR/RS parity correction, writes corrected bytes
+ * back via pwrite.  Only works on version-2 loose objects with parity trailers.
+ * Returns: >0 = bytes corrected, 0 = no corruption found, <0 = error or not repairable.
+ */
+int object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);

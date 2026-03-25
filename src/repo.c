@@ -25,10 +25,8 @@ struct repo {
 };
 
 static status_t mkdir_at(int base, const char *name) {
-    if (mkdirat(base, name, 0755) == -1 && errno != EEXIST) {
-        log_msg("ERROR", "mkdirat failed");
-        return ERR_IO;
-    }
+    if (mkdirat(base, name, 0755) == -1 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "mkdirat '%s'", name);
     return OK;
 }
 
@@ -36,34 +34,47 @@ static status_t write_format(int repofd) {
     int fd = openat(repofd, "format", O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd == -1) {
         if (errno == EEXIST) return OK;   /* already initialised */
-        log_msg("ERROR", "cannot create format file");
-        return ERR_IO;
+        return set_error_errno(ERR_IO, "cannot create format file");
     }
     if (write(fd, FORMAT_VERSION, strlen(FORMAT_VERSION)) < 0) {
+        int e = errno;
         close(fd);
-        return ERR_IO;
+        errno = e;
+        return set_error_errno(ERR_IO, "cannot write format file");
     }
-    if (fsync(fd) == -1) { close(fd); return ERR_IO; }
+    if (fsync(fd) == -1) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return set_error_errno(ERR_IO, "fsync format file");
+    }
     close(fd);
     return OK;
 }
 
 static status_t write_head(int repofd) {
     /* refs/ subdir */
-    if (mkdirat(repofd, "refs", 0755) == -1 && errno != EEXIST) return ERR_IO;
+    if (mkdirat(repofd, "refs", 0755) == -1 && errno != EEXIST)
+        return set_error_errno(ERR_IO, "mkdirat 'refs'");
 
     /* open refs/HEAD – create only if missing */
     int refsfd = openat(repofd, "refs", O_RDONLY | O_DIRECTORY);
-    if (refsfd == -1) return ERR_IO;
+    if (refsfd == -1)
+        return set_error_errno(ERR_IO, "openat 'refs'");
     int fd = openat(refsfd, "HEAD", O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd == -1) {
         if (errno == EEXIST) { close(refsfd); return OK; }
+        int e = errno;
         close(refsfd);
-        return ERR_IO;
+        errno = e;
+        return set_error_errno(ERR_IO, "openat 'refs/HEAD'");
     }
     const char *empty = "0\n";
     if (write(fd, empty, strlen(empty)) < 0) {
-        close(fd); close(refsfd); return ERR_IO;
+        int e = errno;
+        close(fd); close(refsfd);
+        errno = e;
+        return set_error_errno(ERR_IO, "write 'refs/HEAD'");
     }
     fsync(fd);
     close(fd);
@@ -88,31 +99,25 @@ static int dir_is_empty(const char *path) {
 status_t repo_init(const char *path) {
     struct stat stbuf;
     if (lstat(path, &stbuf) == 0) {
-        if (!S_ISDIR(stbuf.st_mode)) {
-            log_msg("ERROR", "repo path exists and is not a directory");
-            return ERR_IO;
-        }
+        if (!S_ISDIR(stbuf.st_mode))
+            return set_error(ERR_IO, "repo path exists and is not a directory: %s", path);
         int empty = dir_is_empty(path);
         if (empty <= 0) {
             if (empty == 0)
-                log_msg("ERROR", "repo directory must be empty");
+                return set_error(ERR_IO, "repo directory must be empty: %s", path);
             else
-                log_msg("ERROR", "cannot inspect repo directory");
-            return ERR_IO;
+                return set_error_errno(ERR_IO, "cannot inspect repo directory '%s'", path);
         }
     } else {
-        if (errno != ENOENT) {
-            log_msg("ERROR", "cannot stat repo directory");
-            return ERR_IO;
-        }
-        if (mkdir(path, 0755) == -1) {
-            log_msg("ERROR", "cannot create repo directory");
-            return ERR_IO;
-        }
+        if (errno != ENOENT)
+            return set_error_errno(ERR_IO, "cannot stat '%s'", path);
+        if (mkdir(path, 0755) == -1)
+            return set_error_errno(ERR_IO, "cannot create directory '%s'", path);
     }
 
     int repofd = open(path, O_RDONLY | O_DIRECTORY);
-    if (repofd == -1) { log_msg("ERROR", "cannot open repo dir"); return ERR_IO; }
+    if (repofd == -1)
+        return set_error_errno(ERR_IO, "cannot open '%s'", path);
 
     status_t st = OK;
     if ((st = write_format(repofd))         != OK) goto done;
@@ -132,29 +137,30 @@ done:
 
 status_t repo_open(const char *path, repo_t **out) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
-    if (fd == -1) {
-        log_msg("ERROR", "cannot open repository");
-        return ERR_IO;
-    }
+    if (fd == -1)
+        return set_error_errno(ERR_IO, "cannot open repository '%s'", path);
 
     /* validate format file */
     int fmt = openat(fd, "format", O_RDONLY);
     if (fmt == -1) {
-        log_msg("ERROR", "not a valid repository (missing format file)");
         close(fd);
-        return ERR_CORRUPT;
+        return set_error(ERR_CORRUPT, "not a valid repository (missing format file): %s", path);
     }
     char buf[32] = {0};
-    if (read(fmt, buf, sizeof(buf) - 1) < 0) { close(fmt); close(fd); return ERR_IO; }
+    if (read(fmt, buf, sizeof(buf) - 1) < 0) {
+        int e = errno;
+        close(fmt); close(fd);
+        errno = e;
+        return set_error_errno(ERR_IO, "cannot read format file in '%s'", path);
+    }
     close(fmt);
     if (strncmp(buf, FORMAT_VERSION, strlen(FORMAT_VERSION) - 1) != 0) {
-        log_msg("ERROR", "unsupported repository format");
         close(fd);
-        return ERR_CORRUPT;
+        return set_error(ERR_CORRUPT, "unsupported repository format in '%s'", path);
     }
 
     repo_t *r = malloc(sizeof(*r));
-    if (!r) { close(fd); return ERR_NOMEM; }
+    if (!r) { close(fd); return set_error(ERR_NOMEM, "repo_open: alloc failed"); }
     r->path           = strdup(path);
     r->dirfd          = fd;
     r->lock_fd        = -1;
@@ -206,18 +212,16 @@ status_t repo_lock(repo_t *repo) {
     snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
 
     int fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
-    if (fd == -1) {
-        log_msg("ERROR", "cannot open lock file");
-        return ERR_IO;
-    }
+    if (fd == -1)
+        return set_error_errno(ERR_IO, "cannot open lock file '%s'", lock_path);
 
     if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        int e = errno;
         close(fd);
-        if (errno == EWOULDBLOCK)
-            log_msg("ERROR", "repository is locked by another process");
-        else
-            log_msg("ERROR", "flock failed");
-        return ERR_IO;
+        if (e == EWOULDBLOCK)
+            return set_error(ERR_IO, "repository is locked by another process");
+        errno = e;
+        return set_error_errno(ERR_IO, "flock '%s'", lock_path);
     }
 
     repo->lock_fd = fd;

@@ -141,7 +141,7 @@ static status_t result_append(scan_result_t *res, const scan_entry_t *e,
     if (res->count == res->capacity) {
         uint32_t newcap = res->capacity ? res->capacity * 2 : 64;
         scan_entry_t *tmp = realloc(res->entries, newcap * sizeof(*tmp));
-        if (!tmp) return ERR_NOMEM;
+        if (!tmp) return set_error(ERR_NOMEM, "scan: realloc entries failed (%u)", newcap);
         res->entries  = tmp;
         res->capacity = newcap;
     }
@@ -170,8 +170,8 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     size_t list_sz = (size_t)list_sz_s;
 
     char *names = malloc(list_sz);
-    if (!names) return ERR_NOMEM;
-    if (llistxattr(path, names, list_sz) < 0) { free(names); return ERR_IO; }
+    if (!names) return set_error(ERR_NOMEM, "collect_xattrs: alloc failed");
+    if (llistxattr(path, names, list_sz) < 0) { free(names); return set_error_errno(ERR_IO, "llistxattr(%s)", path); }
 
     size_t total = 0;
     for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
@@ -182,7 +182,7 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     if (total == 0) { free(names); *out = NULL; *out_len = 0; return OK; }
 
     uint8_t *buf = malloc(total);
-    if (!buf) { free(names); return ERR_NOMEM; }
+    if (!buf) { free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
     uint8_t *p = buf;
     for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
         ssize_t vsz = lgetxattr(path, n, NULL, 0);
@@ -191,7 +191,7 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
         memcpy(p, &nlen, sizeof(nlen)); p += sizeof(nlen);
         memcpy(p, n, nlen); p += nlen;
         char *vbuf = malloc((size_t)vsz);
-        if (!vbuf) { free(buf); free(names); return ERR_NOMEM; }
+        if (!vbuf) { free(buf); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc value buf failed"); }
         lgetxattr(path, n, vbuf, (size_t)vsz);
         uint32_t v32 = (uint32_t)vsz;
         memcpy(p, &v32, sizeof(v32)); p += sizeof(v32);
@@ -213,7 +213,7 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
     if (!txt) { *out = NULL; *out_len = 0; return OK; }
     size_t sz = (size_t)sz_s;
     uint8_t *buf = malloc(sz);
-    if (!buf) { acl_free(txt); return ERR_NOMEM; }
+    if (!buf) { acl_free(txt); return set_error(ERR_NOMEM, "collect_acl: alloc failed"); }
     memcpy(buf, txt, sz);
     acl_free(txt);
     *out     = buf;
@@ -222,7 +222,7 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
 }
 
 status_t scan_entry_collect_metadata(scan_entry_t *e) {
-    if (!e || !e->path) return ERR_INVALID;
+    if (!e || !e->path) return set_error(ERR_INVALID, "scan_entry_collect_metadata: null entry");
     if (e->xattr_data || e->xattr_len || e->acl_data || e->acl_len) return OK;
 
     status_t st = collect_xattrs(e->path, &e->xattr_data, &e->xattr_len);
@@ -265,7 +265,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
 
     scan_entry_t e = {0};
     e.path             = strdup(path);
-    if (!e.path) return ERR_NOMEM;
+    if (!e.path) return set_error(ERR_NOMEM, "scan: strdup failed for '%s'", path);
     e.parent_node_id   = parent_node_id;
     e.strip_prefix_len = strip_prefix_len;
     e.st               = st;
@@ -393,7 +393,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
 status_t scan_tree(const char *root, scan_imap_t *imap,
                    const scan_opts_t *opts, scan_result_t **out) {
     scan_result_t *res = calloc(1, sizeof(*res));
-    if (!res) return ERR_NOMEM;
+    if (!res) return set_error(ERR_NOMEM, "scan_tree: alloc result failed");
 
     /*
      * Tar-like relative-absolute layout: keep full absolute source path,
@@ -454,7 +454,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
 
             scan_entry_t e = {0};
             e.path = strdup(abs_path);
-            if (!e.path) { scan_result_free(res); return ERR_NOMEM; }
+            if (!e.path) { scan_result_free(res); return set_error(ERR_NOMEM, "scan_tree: strdup failed"); }
             e.parent_node_id = root_parent_id;
             e.strip_prefix_len = 1;
             e.st = st;
@@ -479,7 +479,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
             }
             if (dirmap_set(imap, parent_rel, nd->node_id) != 0) {
                 scan_result_free(res);
-                return ERR_NOMEM;
+                return set_error(ERR_NOMEM, "scan_tree: dirmap_set failed");
             }
             root_parent_id = nd->node_id;
         }
@@ -507,7 +507,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         }
         scan_result_free(res);
         res = calloc(1, sizeof(*res));
-        if (!res) return ERR_NOMEM;
+        if (!res) return set_error(ERR_NOMEM, "scan_tree: realloc result failed");
         *out = res;
         return OK;
     }

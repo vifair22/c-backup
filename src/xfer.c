@@ -5,6 +5,7 @@
 #include "restore.h"
 #include "snapshot.h"
 #include "tag.h"
+#include "util.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -52,35 +53,9 @@ typedef struct {
     size_t cap;
 } hashset_t;
 
-static int read_all(int fd, void *buf, size_t len) {
-    uint8_t *p = (uint8_t *)buf;
-    while (len > 0) {
-        ssize_t n = read(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int write_all(int fd, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
+/* read_all / write_all: uses io_read_full / io_write_full from util.h */
+#define read_all  io_read_full
+#define write_all io_write_full
 
 static int sha256_buf(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
@@ -414,7 +389,7 @@ fail:
 status_t export_bundle(repo_t *repo, xfer_scope_t scope, uint32_t snap_id,
                        const char *output_path) {
     int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return ERR_IO;
+    if (fd < 0) return set_error_errno(ERR_IO, "export: open(%s)", output_path);
 
     cbb_hdr_t hdr;
     memcpy(hdr.magic, CBB_MAGIC, 4);
@@ -422,7 +397,7 @@ status_t export_bundle(repo_t *repo, xfer_scope_t scope, uint32_t snap_id,
     hdr.scope = (uint32_t)scope;
     hdr.compression = CBB_COMP_LZ4;
     hdr.reserved = 0;
-    if (write_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_IO; }
+    if (write_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return set_error_errno(ERR_IO, "export: write header"); }
 
     int rc = -1;
     if (scope == XFER_SCOPE_REPO) rc = export_repo_bundle(repo, fd);
@@ -433,47 +408,47 @@ status_t export_bundle(repo_t *repo, xfer_scope_t scope, uint32_t snap_id,
         return OK;
     }
     close(fd);
-    return ERR_IO;
+    return set_error(ERR_IO, "export: write failed for '%s'", output_path);
 }
 
 static status_t process_bundle(repo_t *repo, const char *input_path,
                                int apply, int dry_run, int no_head_update,
                                int quiet, int *out_files, int *out_objs) {
     int fd = open(input_path, O_RDONLY);
-    if (fd < 0) return ERR_IO;
+    if (fd < 0) return set_error_errno(ERR_IO, "bundle: open(%s)", input_path);
 
     cbb_hdr_t hdr;
-    if (read_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return ERR_CORRUPT; }
+    if (read_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return set_error(ERR_CORRUPT, "bundle: truncated header in '%s'", input_path); }
     if (memcmp(hdr.magic, CBB_MAGIC, 4) != 0 || hdr.version != CBB_VERSION ||
         hdr.compression != CBB_COMP_LZ4) {
         close(fd);
-        return ERR_CORRUPT;
+        return set_error(ERR_CORRUPT, "bundle: invalid magic/version in '%s'", input_path);
     }
 
     int imported_files = 0;
     int imported_objs = 0;
     while (1) {
         cbb_rec_t rec;
-        if (read_all(fd, &rec, sizeof(rec)) != 0) { close(fd); return ERR_CORRUPT; }
+        if (read_all(fd, &rec, sizeof(rec)) != 0) { close(fd); return set_error(ERR_CORRUPT, "bundle: truncated record"); }
         if (rec.kind == CBB_REC_END) break;
 
         if (rec.kind != CBB_REC_FILE && rec.kind != CBB_REC_OBJECT) {
             close(fd);
-            return ERR_CORRUPT;
+            return set_error(ERR_CORRUPT, "bundle: unknown record kind %u", (unsigned)rec.kind);
         }
 
         char path[PATH_MAX] = {0};
         if (rec.path_len > 0) {
-            if (rec.path_len >= sizeof(path)) { close(fd); return ERR_CORRUPT; }
-            if (read_all(fd, path, rec.path_len) != 0) { close(fd); return ERR_CORRUPT; }
+            if (rec.path_len >= sizeof(path)) { close(fd); return set_error(ERR_CORRUPT, "bundle: path_len %u too large", (unsigned)rec.path_len); }
+            if (read_all(fd, path, rec.path_len) != 0) { close(fd); return set_error(ERR_CORRUPT, "bundle: truncated path data"); }
             path[rec.path_len] = '\0';
         }
 
         if (rec.kind == CBB_REC_FILE) {
-            if (rec.path_len == 0 || !path_is_safe_rel(path)) { close(fd); return ERR_CORRUPT; }
+            if (rec.path_len == 0 || !path_is_safe_rel(path)) { close(fd); return set_error(ERR_CORRUPT, "bundle: unsafe file path '%s'", path); }
         } else if (rec.path_len != 0) {
             close(fd);
-            return ERR_CORRUPT;
+            return set_error(ERR_CORRUPT, "bundle: object record has unexpected path");
         }
 
         /*
@@ -482,7 +457,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
          * directly via object_store_fd to avoid OOM.
          */
         if (rec.comp_len == 0 && rec.raw_len > 0) {
-            if (rec.kind != CBB_REC_OBJECT) { close(fd); return ERR_CORRUPT; }
+            if (rec.kind != CBB_REC_OBJECT) { close(fd); return set_error(ERR_CORRUPT, "bundle: raw record is not an object"); }
             if (apply && !dry_run) {
                 status_t ist = object_store_fd(repo, rec.obj_type, fd,
                                                rec.raw_len, rec.hash);
@@ -493,7 +468,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
                 uint64_t rem = rec.raw_len;
                 while (rem > 0) {
                     size_t want = (rem < sizeof(skip)) ? (size_t)rem : sizeof(skip);
-                    if (read_all(fd, skip, want) != 0) { close(fd); return ERR_CORRUPT; }
+                    if (read_all(fd, skip, want) != 0) { close(fd); return set_error(ERR_CORRUPT, "bundle: truncated raw payload"); }
                     rem -= (uint64_t)want;
                 }
             }
@@ -503,7 +478,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
 
         /* comp_len > 0: LZ4-compressed record.  Both sizes must fit INT_MAX. */
         if (rec.comp_len > (uint64_t)INT_MAX || rec.raw_len > (uint64_t)INT_MAX) {
-            close(fd); return ERR_CORRUPT;
+            close(fd); return set_error(ERR_CORRUPT, "bundle: record size exceeds INT_MAX");
         }
 
         uint8_t *cbuf = NULL;
@@ -511,9 +486,9 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
         if (rec.comp_len > 0) {
             cbuf = malloc((size_t)rec.comp_len);
             raw = malloc((size_t)rec.raw_len);
-            if (!cbuf || !raw) { free(cbuf); free(raw); close(fd); return ERR_NOMEM; }
+            if (!cbuf || !raw) { free(cbuf); free(raw); close(fd); return set_error(ERR_NOMEM, "bundle: alloc failed for record (%llu bytes)", (unsigned long long)rec.raw_len); }
             if (read_all(fd, cbuf, (size_t)rec.comp_len) != 0) {
-                free(cbuf); free(raw); close(fd); return ERR_CORRUPT;
+                free(cbuf); free(raw); close(fd); return set_error(ERR_CORRUPT, "bundle: truncated compressed data");
             }
             int dec = LZ4_decompress_safe((const char *)cbuf, (char *)raw,
                                           (int)rec.comp_len, (int)rec.raw_len);
@@ -521,7 +496,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
             if (dec < 0 || (uint64_t)dec != rec.raw_len) {
                 free(raw);
                 close(fd);
-                return ERR_CORRUPT;
+                return set_error(ERR_CORRUPT, "bundle: LZ4 decompress failed (expected %llu, got %d)", (unsigned long long)rec.raw_len, dec);
             }
         }
 
@@ -531,7 +506,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
                 memcmp(got, rec.hash, OBJECT_HASH_SIZE) != 0) {
                 free(raw);
                 close(fd);
-                return ERR_CORRUPT;
+                return set_error(ERR_CORRUPT, "bundle: object hash mismatch");
             }
         }
 
@@ -544,7 +519,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
                                          (mode_t)(rec.hash[0] | (rec.hash[1] << 8))) != 0) {
                         free(raw);
                         close(fd);
-                        return ERR_IO;
+                        return set_error_errno(ERR_IO, "bundle: write file '%s'", path);
                     }
                 }
             }
@@ -556,7 +531,7 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
                     memcmp(out, rec.hash, OBJECT_HASH_SIZE) != 0) {
                     free(raw);
                     close(fd);
-                    return ERR_CORRUPT;
+                    return set_error(ERR_CORRUPT, "bundle: object store/hash mismatch on import");
                 }
             }
             imported_objs++;
@@ -589,7 +564,7 @@ status_t import_bundle(repo_t *repo, const char *input_path,
 status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *output_path) {
     char tmpl[] = "/tmp/c_backup_export.XXXXXX";
     char *tmp = mkdtemp(tmpl);
-    if (!tmp) return ERR_IO;
+    if (!tmp) return set_error_errno(ERR_IO, "export_targz: mkdtemp");
 
     status_t st = restore_snapshot(repo, snap_id, tmp);
     if (st != OK) {
@@ -600,7 +575,7 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
     pid_t pid = fork();
     if (pid < 0) {
         rm_rf_path(tmp);
-        return ERR_IO;
+        return set_error_errno(ERR_IO, "export_targz: fork");
     }
     if (pid == 0) {
         execlp("tar", "tar", "-czf", output_path, "-C", tmp, ".", (char *)NULL);

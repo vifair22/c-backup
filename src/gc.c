@@ -5,6 +5,8 @@
 #include "pack.h"
 #include "snapshot.h"
 #include "object.h"
+#include "parity.h"
+#include "util.h"
 #include "../vendor/log.h"
 
 #include <dirent.h>
@@ -18,75 +20,10 @@
 
 static size_t g_gc_line_len = 0;
 
-static int gc_progress_enabled(void) {
-    return isatty(STDERR_FILENO);
-}
-
-static void gc_line_set(const char *msg) {
-    size_t len = strlen(msg);
-    fprintf(stderr, "\r%s", msg);
-    if (g_gc_line_len > len) {
-        size_t pad = g_gc_line_len - len;
-        while (pad--) fputc(' ', stderr);
-        fputc('\r', stderr);
-        fputs(msg, stderr);
-    }
-    fflush(stderr);
-    g_gc_line_len = len;
-}
-
-static void gc_line_clear(void) {
-    if (g_gc_line_len == 0) return;
-    fputc('\r', stderr);
-    for (size_t i = 0; i < g_gc_line_len; i++) fputc(' ', stderr);
-    fputc('\r', stderr);
-    fflush(stderr);
-    g_gc_line_len = 0;
-}
-
-static void fmt_eta(double sec, char *buf, size_t sz) {
-    if (sec < 1.0) { snprintf(buf, sz, "<1s"); return; }
-    unsigned long s = (unsigned long)sec;
-    unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
-    if (h > 0)      snprintf(buf, sz, "%luh%lum", h, m);
-    else if (m > 0) snprintf(buf, sz, "%lum%lus", m, r);
-    else            snprintf(buf, sz, "%lus", r);
-}
-
-static int gc_tick_due(struct timespec *next_tick) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (now.tv_sec < next_tick->tv_sec ||
-        (now.tv_sec == next_tick->tv_sec && now.tv_nsec < next_tick->tv_nsec))
-        return 0;
-    next_tick->tv_sec = now.tv_sec + 1;
-    next_tick->tv_nsec = now.tv_nsec;
-    return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Shared helpers                                                      */
-/* ------------------------------------------------------------------ */
-
-static int hash_cmp(const void *a, const void *b) {
-    return memcmp(a, b, OBJECT_HASH_SIZE);
-}
-
-static int hex_decode(const char *hex, size_t hexlen, uint8_t *out) {
-    if (hexlen != OBJECT_HASH_SIZE * 2) return -1;
-    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
-        unsigned hi, lo;
-        char hc = hex[i * 2], lc = hex[i * 2 + 1];
-        if      (hc >= '0' && hc <= '9') hi = (unsigned)(hc - '0');
-        else if (hc >= 'a' && hc <= 'f') hi = (unsigned)(hc - 'a') + 10u;
-        else return -1;
-        if      (lc >= '0' && lc <= '9') lo = (unsigned)(lc - '0');
-        else if (lc >= 'a' && lc <= 'f') lo = (unsigned)(lc - 'a') + 10u;
-        else return -1;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return 0;
-}
+#define gc_progress_enabled() progress_enabled()
+#define gc_line_set(msg)      progress_line_set(&g_gc_line_len, (msg))
+#define gc_line_clear()       progress_line_clear(&g_gc_line_len)
+#define gc_tick_due(t)        tick_due(t)
 
 static status_t ref_push(uint8_t **refs, size_t *cap, size_t *cnt,
                           const uint8_t hash[OBJECT_HASH_SIZE],
@@ -95,7 +32,7 @@ static status_t ref_push(uint8_t **refs, size_t *cap, size_t *cnt,
     if (*cnt == *cap) {
         size_t nc = *cap * 2;
         uint8_t *tmp = realloc(*refs, nc * OBJECT_HASH_SIZE);
-        if (!tmp) return ERR_NOMEM;
+        if (!tmp) return set_error(ERR_NOMEM, "gc: realloc refs failed");
         *refs = tmp; *cap = nc;
     }
     memcpy(*refs + *cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
@@ -115,7 +52,7 @@ static status_t collect_refs(repo_t *repo,
 
     size_t cap = 256, cnt = 0;
     uint8_t *refs = malloc(cap * OBJECT_HASH_SIZE);
-    if (!refs) return ERR_NOMEM;
+    if (!refs) return set_error(ERR_NOMEM, "gc: alloc refs failed");
 
     uint8_t zero[OBJECT_HASH_SIZE] = {0};
     status_t st = OK;
@@ -175,7 +112,7 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
     if (obj_fd == -1) { free(refs); return OK; }
 
     DIR *top = fdopendir(obj_fd);
-    if (!top) { close(obj_fd); free(refs); return ERR_IO; }
+    if (!top) { close(obj_fd); free(refs); return set_error_errno(ERR_IO, "gc: fdopendir(objects)"); }
 
     struct dirent *de;
     while ((de = readdir(top)) != NULL) {
@@ -283,7 +220,28 @@ status_t repo_prune_resume_pending(repo_t *repo) {
 
 /* ------------------------------------------------------------------ */
 
-status_t repo_verify(repo_t *repo) {
+/* Check if parity repairs occurred since 'before' and repair the object on disk. */
+static void maybe_repair_object(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE],
+                                 parity_stats_t before, int do_repair) {
+    if (!do_repair) return;
+    parity_stats_t after = parity_stats_get();
+    if (after.repaired > before.repaired) {
+        int rc = object_repair(repo, hash);
+        if (rc > 0) {
+            log_msg("INFO", "verify: repaired loose object on disk");
+        } else {
+            rc = pack_object_repair(repo, hash);
+            if (rc > 0)
+                log_msg("INFO", "verify: repaired packed object on disk");
+        }
+    }
+}
+
+status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
+    /* Snapshot parity stats before the verify run. */
+    parity_stats_t ps_before = parity_stats_get();
+    int do_repair = (opts && opts->repair);
+
     uint32_t head = 0;
     if (snapshot_read_head(repo, &head) != OK || head == 0) {
         log_msg("INFO", "verify: no snapshots found");
@@ -319,10 +277,19 @@ status_t repo_verify(repo_t *repo) {
     int null_fd = show_progress ? open("/dev/null", O_WRONLY) : -1;
 
     for (uint32_t id = 1; id <= head; id++) {
+        parity_stats_t snap_before = parity_stats_get();
         snapshot_t *snap = NULL;
         if (snapshot_load(repo, id, &snap) != OK) {
             /* Pruned snapshots are expected to be missing — skip silently */
             continue;
+        }
+        if (do_repair) {
+            parity_stats_t snap_after = parity_stats_get();
+            if (snap_after.repaired > snap_before.repaired) {
+                int rc = snapshot_repair(repo, id);
+                if (rc > 0)
+                    log_msg("INFO", "verify: repaired snapshot on disk");
+            }
         }
         for (uint32_t j = 0; j < snap->node_count; j++) {
             const node_t *nd = &snap->nodes[j];
@@ -331,10 +298,12 @@ status_t repo_verify(repo_t *repo) {
              * Large objects (ERR_TOO_LARGE from object_load) are verified via
              * object_load_stream writing to /dev/null. */
             if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                parity_stats_t obj_before = parity_stats_get();
                 void *data = NULL; size_t sz = 0;
                 status_t obj_st = object_load(repo, nd->content_hash,
                                               &data, &sz, NULL);
                 if (obj_st == OK) {
+                    maybe_repair_object(repo, nd->content_hash, obj_before, do_repair);
                     bytes_done += sz;
                     free(data);
                 } else if (obj_st == ERR_TOO_LARGE) {
@@ -353,27 +322,32 @@ status_t repo_verify(repo_t *repo) {
                 }
                 if (obj_st != OK) {
                     char hex[OBJECT_HASH_SIZE * 2 + 1];
-                    char emsg[128];
                     if (show_progress) gc_line_clear();
                     object_hash_to_hex(nd->content_hash, hex);
-                    snprintf(emsg, sizeof(emsg),
-                             "verify: snap %u node %llu %s: %s",
-                             id, (unsigned long long)nd->node_id, hex,
-                             obj_st == ERR_CORRUPT ? "corrupt" : "missing");
-                    log_msg("ERROR", emsg);
+                    set_error(obj_st, "verify: snap %u node %llu %s: %s",
+                              id, (unsigned long long)nd->node_id, hex,
+                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
+                    log_msg("ERROR", err_msg());
                     errors++;
                 }
                 done_objs++;
             }
 
             if (memcmp(nd->xattr_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                parity_stats_t xa_before = parity_stats_get();
                 void *data = NULL; size_t sz = 0;
                 status_t obj_st = object_load(repo, nd->xattr_hash, &data, &sz, NULL);
                 if (obj_st == OK) {
+                    maybe_repair_object(repo, nd->xattr_hash, xa_before, do_repair);
                     bytes_done += sz;
                 } else {
+                    char xhex[OBJECT_HASH_SIZE * 2 + 1];
                     if (show_progress) gc_line_clear();
-                    log_msg("ERROR", "verify: missing or corrupt xattr object");
+                    object_hash_to_hex(nd->xattr_hash, xhex);
+                    set_error(obj_st, "verify: snap %u node %llu xattr %s: %s",
+                              id, (unsigned long long)nd->node_id, xhex,
+                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
+                    log_msg("ERROR", err_msg());
                     errors++;
                 }
                 free(data);
@@ -381,13 +355,20 @@ status_t repo_verify(repo_t *repo) {
             }
 
             if (memcmp(nd->acl_hash, zero, OBJECT_HASH_SIZE) != 0) {
+                parity_stats_t acl_before = parity_stats_get();
                 void *data = NULL; size_t sz = 0;
                 status_t obj_st = object_load(repo, nd->acl_hash, &data, &sz, NULL);
                 if (obj_st == OK) {
+                    maybe_repair_object(repo, nd->acl_hash, acl_before, do_repair);
                     bytes_done += sz;
                 } else {
+                    char ahex[OBJECT_HASH_SIZE * 2 + 1];
                     if (show_progress) gc_line_clear();
-                    log_msg("ERROR", "verify: missing or corrupt acl object");
+                    object_hash_to_hex(nd->acl_hash, ahex);
+                    set_error(obj_st, "verify: snap %u node %llu acl %s: %s",
+                              id, (unsigned long long)nd->node_id, ahex,
+                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
+                    log_msg("ERROR", err_msg());
                     errors++;
                 }
                 free(data);
@@ -420,14 +401,20 @@ status_t repo_verify(repo_t *repo) {
     if (null_fd >= 0) close(null_fd);
     if (show_progress) gc_line_clear();
 
+    /* Populate parity stats for caller. */
+    if (opts) {
+        parity_stats_t ps_after = parity_stats_get();
+        opts->objects_checked  = done_objs;
+        opts->bytes_checked    = bytes_done;
+        opts->parity_repaired  = ps_after.repaired - ps_before.repaired;
+        opts->parity_corrupt   = ps_after.uncorrectable - ps_before.uncorrectable;
+    }
+
     if (errors == 0) {
-        char emsg[64];
-        snprintf(emsg, sizeof(emsg), "verify: %u snapshot(s) OK", head);
-        log_msg("INFO", emsg);
+        char imsg[64];
+        snprintf(imsg, sizeof(imsg), "verify: %u snapshot(s) OK", head);
+        log_msg("INFO", imsg);
         return OK;
     }
-    char emsg[64];
-    snprintf(emsg, sizeof(emsg), "verify: %d error(s) found", errors);
-    log_msg("ERROR", emsg);
-    return ERR_CORRUPT;
+    return set_error(ERR_CORRUPT, "verify: %d error(s) found", errors);
 }

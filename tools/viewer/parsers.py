@@ -9,12 +9,13 @@ import struct
 
 from .constants import (
     OBJECT_HASH_SIZE,
-    SNAP_MAGIC, SNAP_VERSION_V3, SNAP_VERSION_V4,
+    SNAP_MAGIC, SNAP_VERSION_V3, SNAP_VERSION_V4, SNAP_VERSION_V5,
     PACK_DAT_MAGIC, PACK_IDX_MAGIC,
-    PACK_VERSION_V1,
+    PACK_VERSION_V1, PACK_VERSION_V3,
     COMPRESS_NONE, COMPRESS_LZ4, COMPRESS_LZ4_FRAME,
     OBJECT_TYPE_SPARSE,
     OBJECT_MAGIC, OBJECT_HDR_VERSION,
+    PARITY_MAGIC,
 )
 
 try:
@@ -82,11 +83,11 @@ def _read_snap_header(f) -> tuple:
     magic, version = fields[0], fields[1]
     if magic != SNAP_MAGIC:
         raise ValueError(f"Bad snap magic 0x{magic:08X}")
-    if version not in (SNAP_VERSION_V3, SNAP_VERSION_V4):
+    if version not in (SNAP_VERSION_V3, SNAP_VERSION_V4, SNAP_VERSION_V5):
         raise ValueError(f"Unsupported snap version {version}")
 
     compressed_payload_len = 0
-    if version == SNAP_VERSION_V4:
+    if version in (SNAP_VERSION_V4, SNAP_VERSION_V5):
         (compressed_payload_len,) = struct.unpack(
             SNAP_V4_EXT_FMT, read_exact(f, SNAP_V4_EXT_SIZE))
 
@@ -195,6 +196,10 @@ IDX_HDR_SIZE  = struct.calcsize(IDX_HDR_FMT)
 IDX_ENTRY_FMT = f"<{OBJECT_HASH_SIZE}sQ"
 IDX_ENTRY_SIZE = struct.calcsize(IDX_ENTRY_FMT)
 
+# v3 idx entry: hash[32] + dat_offset[8] + entry_index[4] = 44 bytes
+IDX_ENTRY_V3_FMT  = f"<{OBJECT_HASH_SIZE}sQI"
+IDX_ENTRY_V3_SIZE = struct.calcsize(IDX_ENTRY_V3_FMT)
+
 
 def parse_pack_idx(path: str) -> dict:
     with open(path, "rb") as f:
@@ -202,9 +207,16 @@ def parse_pack_idx(path: str) -> dict:
         if magic != PACK_IDX_MAGIC:
             raise ValueError(f"Bad idx magic 0x{magic:08X}")
         entries = []
-        for _ in range(count):
-            h, offset = struct.unpack(IDX_ENTRY_FMT, read_exact(f, IDX_ENTRY_SIZE))
-            entries.append({"hash": h, "dat_offset": offset})
+        if version == PACK_VERSION_V3:
+            for _ in range(count):
+                h, offset, entry_index = struct.unpack(
+                    IDX_ENTRY_V3_FMT, read_exact(f, IDX_ENTRY_V3_SIZE))
+                entries.append({"hash": h, "dat_offset": offset,
+                                "entry_index": entry_index})
+        else:
+            for _ in range(count):
+                h, offset = struct.unpack(IDX_ENTRY_FMT, read_exact(f, IDX_ENTRY_SIZE))
+                entries.append({"hash": h, "dat_offset": offset})
     return {"version": version, "count": count, "entries": entries}
 
 
@@ -262,15 +274,17 @@ def idx_bisect(idx_path: str, raw_hash: bytes) -> int | None:
     O(log n) seeks — never reads the whole file.
     """
     with open(idx_path, "rb") as f:
-        magic, _version, count = struct.unpack(IDX_HDR_FMT, read_exact(f, IDX_HDR_SIZE))
+        magic, version, count = struct.unpack(IDX_HDR_FMT, read_exact(f, IDX_HDR_SIZE))
         if magic != PACK_IDX_MAGIC:
             raise ValueError(f"Bad idx magic 0x{magic:08X}")
         if count == 0:
             return None
+        entry_size = IDX_ENTRY_V3_SIZE if version == PACK_VERSION_V3 else IDX_ENTRY_SIZE
         lo, hi = 0, count - 1
         while lo <= hi:
             mid = (lo + hi) // 2
-            f.seek(IDX_HDR_SIZE + mid * IDX_ENTRY_SIZE)
+            f.seek(IDX_HDR_SIZE + mid * entry_size)
+            # Read just hash + dat_offset (first 40 bytes) regardless of version
             h, dat_offset = struct.unpack(IDX_ENTRY_FMT, read_exact(f, IDX_ENTRY_SIZE))
             if h == raw_hash:
                 return dat_offset

@@ -8,20 +8,25 @@ OBJECT_HASH_SIZE = 32
 SNAP_MAGIC       = 0x43424B50   # "CBKP"
 SNAP_VERSION_V3  = 3
 SNAP_VERSION_V4  = 4
-SNAP_VERSION     = SNAP_VERSION_V4  # current write version
+SNAP_VERSION_V5  = 5
+SNAP_VERSION     = SNAP_VERSION_V5  # current write version
 
 # Pack files
 PACK_DAT_MAGIC  = 0x42504B44  # "BPKD"
 PACK_IDX_MAGIC  = 0x42504B49  # "BPKI"
 PACK_VERSION_V1 = 1
 PACK_VERSION_V2 = 2
+PACK_VERSION_V3 = 3
+
+# Parity trailer magic (appended to v3 packs, v5 snaps, v2 objects)
+PARITY_MAGIC = 0x50415249  # "PARI"
 
 # UI content preview / diff size cap
 UI_SIZE_LIMIT = 2 * 1024 * 1024   # 2 MiB
 
 # Loose object header magic / version (types.h)
 OBJECT_MAGIC        = 0x42434F4A  # "BCOJ"
-OBJECT_HDR_VERSION  = 1
+OBJECT_HDR_VERSION  = 2
 PROBER_VERSION      = 1
 
 # Compression types (types.h)

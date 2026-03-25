@@ -110,6 +110,21 @@ static void test_repo_init_requires_empty_dir(void **state) {
     (void)rc;
 }
 
+static void strip_parity_trailer(const char *path) {
+    /* Truncate object file to header + payload, removing the parity trailer. */
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    object_header_t hdr;
+    assert_int_equal(read(fd, &hdr, sizeof(hdr)), (ssize_t)sizeof(hdr));
+    off_t data_end = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size;
+    assert_int_equal(ftruncate(fd, data_end), 0);
+    /* Also set version back to 1 so load doesn't look for parity */
+    hdr.version = 1;
+    assert_int_equal(lseek(fd, 0, SEEK_SET), 0);
+    assert_int_equal(write(fd, &hdr, sizeof(hdr)), (ssize_t)sizeof(hdr));
+    close(fd);
+}
+
 static void test_object_load_detects_hash_mismatch(void **state) {
     (void)state;
     const char *data = "integrity check payload";
@@ -119,7 +134,8 @@ static void test_object_load_detects_hash_mismatch(void **state) {
     char path[512];
     object_hash_path(hash, path);
 
-    /* Flip one payload byte after object_header_t. */
+    /* Strip parity trailer so corruption can't be repaired, then flip payload byte. */
+    strip_parity_trailer(path);
     flip_byte_at(path, (off_t)sizeof(object_header_t));
 
     void *out = NULL;
@@ -135,6 +151,9 @@ static void test_object_load_detects_unknown_compression(void **state) {
 
     char path[512];
     object_hash_path(hash, path);
+
+    /* Strip parity trailer so header corruption can't be repaired. */
+    strip_parity_trailer(path);
 
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
@@ -159,11 +178,15 @@ static void test_object_load_detects_truncated_payload(void **state) {
     char path[512];
     object_hash_path(hash, path);
 
+    /* Strip parity trailer first, then truncate within the payload region. */
+    strip_parity_trailer(path);
+
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
     off_t end = lseek(fd, 0, SEEK_END);
     assert_true(end > (off_t)sizeof(object_header_t));
-    assert_int_equal(ftruncate(fd, end - 1), 0);
+    /* Truncate within the payload (not just the trailer). */
+    assert_int_equal(ftruncate(fd, (off_t)sizeof(object_header_t) + 1), 0);
     close(fd);
 
     void *out = NULL;
@@ -179,6 +202,9 @@ static void test_object_load_rejects_none_size_mismatch(void **state) {
 
     char path[512];
     object_hash_path(hash, path);
+
+    /* Strip parity trailer so header corruption can't be repaired. */
+    strip_parity_trailer(path);
 
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
@@ -244,22 +270,22 @@ static void test_object_physical_size_edge_cases(void **state) {
     assert_int_equal(object_physical_size(repo, missing, &bytes), ERR_NOT_FOUND);
 }
 
-static void test_object_physical_size_detects_corrupt_header(void **state) {
+static void test_object_physical_size_returns_file_size(void **state) {
     (void)state;
-    const char *data = "corrupt-hdr-check";
+    const char *data = "phys-size-with-trailer";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
 
-    int fd = open(path, O_RDWR);
-    assert_true(fd >= 0);
-    assert_int_equal(ftruncate(fd, (off_t)(sizeof(object_header_t) - 1)), 0);
-    close(fd);
+    struct stat st;
+    assert_int_equal(stat(path, &st), 0);
 
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(repo, hash, &bytes), ERR_CORRUPT);
+    assert_int_equal(object_physical_size(repo, hash, &bytes), OK);
+    /* physical_size should return the full file size including parity trailer */
+    assert_int_equal(bytes, (uint64_t)st.st_size);
 }
 
 int main(void) {
@@ -273,7 +299,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_object_load_rejects_none_size_mismatch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_store_file_sparse_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_physical_size_edge_cases, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_object_physical_size_detects_corrupt_header, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_object_physical_size_returns_file_size, setup, teardown),
         cmocka_unit_test(test_repo_init_requires_empty_dir),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

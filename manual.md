@@ -345,14 +345,14 @@ For objects too large to decompress into RAM (those exceeding the 16 MiB `STREAM
 
 Stored at `snapshots/XXXXXXXX.snap` where `XXXXXXXX` is the zero-padded decimal snapshot ID.
 
-Two header versions exist. Version 3 (legacy, read-only) has a 52-byte header with an uncompressed payload. Version 4 (current) has a 60-byte header and an optionally LZ4-compressed payload.
+Three header versions exist. Version 3 (legacy, read-only) has a 52-byte header with an uncompressed payload. Version 4 has a 60-byte header and an optionally LZ4-compressed payload. Version 5 (current) is identical to V4 but includes a parity trailer appended after the payload.
 
 **v4 file header** (60 bytes, little-endian):
 
 ```
 Offset  Size  Field
      0     4  magic                  = 0x43424B50 ("CBKP")
-     4     4  version                = 4
+     4     4  version                = 4 or 5 (5 = with parity trailer)
      8     4  snap_id                (decimal snapshot number)
     12     8  created_sec            (UTC Unix timestamp of backup completion)
     20     8  phys_new_bytes         (deduped physical bytes first introduced by this snapshot)
@@ -427,7 +427,7 @@ Stored at `objects/<HH>/<rest>` where `<HH>` is the first two hex characters of 
 ```
 Offset  Size  Field
      0     4  magic              = 0x42434F4A ("BCOJ")
-     4     1  version            = 1
+     4     1  version            = 1 (legacy) or 2 (with parity trailer)
      5     1  type               (OBJECT_TYPE_FILE=1, XATTR=2, ACL=3, SPARSE=4)
      6     1  compression        (COMPRESS_NONE=0, COMPRESS_LZ4=1, COMPRESS_LZ4_FRAME=2)
      7     1  pack_skip_ver      (0=unevaluated; N=skip marker written by prober version N)
@@ -439,6 +439,8 @@ Offset  Size  Field
 **Payload** (`compressed_size` bytes):
 
 The raw payload immediately follows the header with no padding. For `COMPRESS_NONE`, this is the literal file/xattr/ACL data. For `COMPRESS_LZ4`, this is a single LZ4 block-API compressed buffer. For `COMPRESS_LZ4_FRAME`, this is a complete LZ4 frame stream.
+
+**Version 2 parity trailer** (appended after payload): XOR parity over header (260 B) + RS(255,239) interleaved parity over compressed payload + CRC-32C (4 B) + RS data length (4 B) + parity footer (12 B). See section 21 for details.
 
 **Sparse file payload format:**
 
@@ -465,11 +467,11 @@ Followed immediately by the concatenated raw data bytes from all regions. Holes 
 ```
 Offset  Size  Field
      0     4  magic    = 0x42504B44 ("BPKD")
-     4     4  version  (1 = V1, 2 = current V2)
+     4     4  version  (1 = V1, 2 = V2, 3 = current V3 with parity)
      8     4  count    (number of object entries; written last after packing completes)
 ```
 
-**Object entry** (V2, 50-byte entry header + payload):
+**Object entry** (V2/V3, 50-byte entry header + payload):
 
 ```
 Offset  Size  Field
@@ -485,6 +487,8 @@ Offset  Size  Field
 
 Entries are laid out sequentially with no padding between them. The file is not seekable by entry number; all seeks use absolute offsets from the `.idx` file.
 
+**V3 parity trailer** (appended after all entries): File header CRC (4 B), then per-entry parity blocks (XOR header parity + RS payload parity + CRC + lengths), then entry offset table for O(1) lookup, then entry count, then parity footer (12 B). See section 21 for details.
+
 ### 6.4 Pack Index File (`.idx`)
 
 **File header** (12 bytes):
@@ -492,11 +496,11 @@ Entries are laid out sequentially with no padding between them. The file is not 
 ```
 Offset  Size  Field
      0     4  magic    = 0x42504B49 ("BPKI")
-     4     4  version  (1 or 2, matches the associated .dat)
+     4     4  version  (1, 2, or 3; matches the associated .dat)
      8     4  count    (number of index entries)
 ```
 
-**Index entries** (40 bytes each, sorted ascending by hash):
+**V1/V2 index entries** (40 bytes each, sorted ascending by hash):
 
 ```
 Offset  Size  Field
@@ -504,7 +508,18 @@ Offset  Size  Field
     32     8  dat_offset  (absolute byte offset of the entry header in the .dat file)
 ```
 
-The entire index is sorted by hash, enabling O(log n) binary search lookups. In-memory the index is cached as a `pack_cache_entry_t` array (with `pack_num` and `pack_version` added). The cache covers all packs in a single sorted array, also binary-searched.
+**V3 index entries** (44 bytes each, sorted ascending by hash):
+
+```
+Offset  Size  Field
+     0    32  hash         (SHA-256 of the object)
+    32     8  dat_offset   (absolute byte offset of the entry header in the .dat file)
+    40     4  entry_index  (position in .dat entry order, used for parity trailer lookup)
+```
+
+The entire index is sorted by hash, enabling O(log n) binary search lookups. In-memory the index is cached as a `pack_cache_entry_t` array (with `pack_num`, `pack_version`, and `entry_index` added). The cache covers all packs in a single sorted array, also binary-searched.
+
+**V3 parity trailer** (appended after entries): File header CRC (4 B), XOR parity over all entries as one blob (260 B), per-entry CRCs (4 B each), parity footer (12 B).
 
 ### 6.5 Bundle File (`.cbb`)
 
@@ -602,15 +617,16 @@ The partition pass also reads each loose object's 56-byte header to accumulate `
 
 **Phase 3/3 — Write Pack Files**
 
-Two temp files are created in `tmp/` via `mkstemp`: `pack-dat.XXXXXX` (data) and `pack-idx.XXXXXX` (index).
+Pack creation produces multiple pack files according to size-based rules:
 
-The data file header is written first with `count = 0`; after all objects are packed, the file is seeked back to offset 0 and the real count is patched in.
+- **Large compressible objects** (compressed_size > 16 MiB, passes probe): each gets its own **dedicated single-object pack**. This preserves compression benefits while keeping the blast radius of corruption to exactly one file.
+- **Small/medium objects** (compressed_size ≤ 16 MiB): packed together into **multi-object packs** that are capped at **256 MiB** (`PACK_MAX_MULTI_BYTES`). When adding the next object would exceed the cap, the current pack is finalized and a new one is started with the next sequential pack number.
 
-Large objects and small objects are then written in sequence (large first, then small via the worker pool). After all workers complete, the index entries are sorted by hash and the `.idx` file is written.
+For each pack (whether single-object or multi-object), two temp files are created in `tmp/` via `mkstemp`. The data file header is written first with `count = 0`; after all objects are written, the file is seeked back to offset 0 and the real count is patched in. The index entries are sorted by hash and the `.idx` file is written.
 
 Both files are fsynced. The `.dat` file is renamed to `packs/pack-NNNNNNNN.dat` and the `.idx` to `packs/pack-NNNNNNNN.idx`. After rename, both files are stat-checked to confirm they are non-empty.
 
-The `packs/` directory is then fsynced to persist the directory entries. All loose object files that were successfully packed are unlinked. The in-memory pack cache is invalidated so it will be rebuilt from the new index on next access.
+The `packs/` directory is then fsynced to persist the directory entries. Loose object files are unlinked after their pack is committed. The in-memory pack cache is invalidated so it will be rebuilt from the new index on next access.
 
 ### 7.2 Sweeper Intelligence — Compressibility Probing
 
@@ -630,16 +646,18 @@ Before committing any loose object to the pack, the sweeper checks whether it is
 
 ### 7.3 Large Object Streaming
 
-Objects with `compressed_size > 16 MiB` bypass the worker pool entirely. They are handled by `stream_large_to_pack`, which:
+Objects with `compressed_size > 16 MiB` bypass the worker pool entirely. Each compressible large object gets its own **dedicated single-object pack file**, which is opened, written, and finalized independently. This means a corrupt pack only affects one large file. The flow for each large object:
 
-1. Opens the loose object file and reads the 56-byte header.
-2. Checks the skip marker and probes compressibility (same logic as §7.2).
-3. If skippable: closes the file and continues.
-4. Copies the compressed payload from the loose file to the `.dat` file in 16 MiB chunks without loading the entire object into RAM.
-5. After each chunk write, atomically increments the `pack_prog_t.bytes_processed` counter so the progress thread sees sub-second byte-level updates.
-6. Writes the entry header with the original `type`, `compression`, `uncompressed_size`, and `compressed_size` from the loose header.
+1. Checks the skip marker and probes compressibility (same logic as §7.2). If skippable: continues to the next object.
+2. Opens a new pack via `open_new_pack` with a fresh sequential pack number.
+3. `stream_large_to_pack` opens the loose object, reads the 56-byte header, writes the entry header, then copies the payload in 16 MiB chunks without loading the entire object into RAM.
+4. After each chunk write, atomically increments the `pack_prog_t.bytes_processed` counter so the progress thread sees sub-second byte-level updates.
+5. The pack is finalized immediately via `finalize_pack` (patch count, sort/write index, fsync, atomic rename, verify).
+6. The loose object file is unlinked inline.
 
 These objects are stored as-is in the pack — whatever compression format was applied when they were originally written (for most loose objects this is `COMPRESS_NONE`, since stage-1 compression is disabled). The pack does not re-compress large objects.
+
+Single-object packs for large files are always > 64 MiB (since the objects are > 16 MiB and compressible), so they are excluded by the `PACK_COALESCE_SMALL_BYTES` threshold during coalescing.
 
 ### 7.4 Worker Pool (Small Objects)
 
@@ -648,7 +666,7 @@ Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads 
 - A bounded queue of `pack_work_item_t` structures (capacity: `n_workers × 4`, minimum 16) is shared between workers (producers) and the main thread (consumer/writer).
 - Each worker has a pre-allocated compression buffer of `LZ4_compressBound(16 MiB)` bytes.
 - Workers read a loose object, probe its compressibility, compress with LZ4 if beneficial, and push a `pack_work_item_t` (containing the compressed payload and metadata) onto the bounded queue.
-- The main thread pops items from the queue and writes them sequentially to the `.dat` file, maintaining the ordered `idx_entries` array.
+- The main thread pops items from the queue and writes them sequentially to the `.dat` file, maintaining the ordered `idx_entries` array. Before writing each item, it checks whether adding it would exceed the **256 MiB** multi-object pack cap (`PACK_MAX_MULTI_BYTES`). If so, the current pack is finalized, loose objects for that segment are deleted, and a new pack is opened with the next sequential pack number.
 - Workers signal `cv_have_work` when an item is available; the main thread signals `cv_have_space` when a slot is freed.
 
 This producer-consumer design means CPU-bound compression (workers) and I/O-bound writing (main thread) overlap, saturating both CPU and I/O when the system has multi-core capacity.
@@ -754,7 +772,7 @@ The `prune-pending` file is written before any `.snap` deletion. Even if the pro
 
 ## 9. Pack Coalescing
 
-Coalescing merges small pack files into a single larger pack, reducing the number of open file handles during lookup and improving locality for sequential reads.
+Coalescing merges small multi-object pack files into larger packs, reducing the number of open file handles during lookup and improving locality for sequential reads. Output packs respect the 256 MiB cap (`PACK_MAX_MULTI_BYTES`) — if the merged data exceeds this limit, multiple output packs are created.
 
 ### 9.1 Trigger Conditions
 
@@ -763,7 +781,7 @@ Coalescing merges small pack files into a single larger pack, reducing the numbe
 - **Count trigger**: Total pack count > 32 (`PACK_COALESCE_TARGET_COUNT`)
 - **Ratio trigger**: ≥ 8 small packs exist AND small packs make up ≥ 30% of all packs
 
-A pack is "small" if its `.dat` file is < 64 MiB (`PACK_COALESCE_SMALL_BYTES`).
+A pack is "small" if its `.dat` file is < 64 MiB (`PACK_COALESCE_SMALL_BYTES`). Additionally, **single-object packs** (`count == 1`) are always excluded from coalescing to preserve their dedicated-pack property (efficient GC deletion without rewrite).
 
 Additionally, a **snapshot-gap cooldown** applies: coalescing is skipped if the current HEAD is fewer than 10 snapshots ahead of the last coalesced HEAD (recorded in `logs/pack-coalesce.state`). This prevents coalescing from running on every backup when the repository is actively growing.
 
@@ -781,16 +799,13 @@ Where `PACK_COALESCE_MAX_BUDGET = 10 GiB`. Candidates are added in size order un
 
 ### 9.3 Coalesce Write Procedure
 
-1. Determine the next pack number.
-2. Create temp `.dat` and `.idx` files.
-3. For each candidate pack, in order:
+1. Determine the next pack number and open the first output pack.
+2. For each candidate pack, in order:
    a. Open its `.idx` and `.dat` files.
    b. For each entry in the index, check its hash against the reference set. Skip dead entries.
-   c. Copy live entry header + payload to the new `.dat` file (always writing V2 entry headers).
-4. Write and sort the new `.idx`.
-5. fsync both files.
-6. Rename `.dat` and `.idx` to their final pack names.
-7. Stat-check both renamed files to confirm non-zero size.
+   c. Before writing each live entry, check if adding it would exceed 256 MiB (`PACK_MAX_MULTI_BYTES`). If so, finalize the current output pack and open a new one with the next sequential pack number.
+   d. Copy live entry header + payload to the current output `.dat` file (always writing V2 entry headers).
+3. Finalize the last output pack (sort/write `.idx`, fsync, atomic rename, stat-check).
 
 ### 9.4 Crash-Safety and Deletion Recovery Marker
 
@@ -1156,9 +1171,9 @@ When this command completes, the repository contains no objects that are not ref
 backup pack --repo <path>
 ```
 
-Packs all loose objects. Acquires an exclusive lock. Calls `repo_pack` which first runs GC (to avoid packing objects about to be deleted), then processes all loose objects into a new pack file.
+Packs all loose objects. Acquires an exclusive lock. Calls `repo_pack` which first runs GC (to avoid packing objects about to be deleted), then processes all loose objects into one or more pack files.
 
-When this command completes, all loose objects (except skip-marked incompressible ones) have been merged into a single new pack file and the loose files have been unlinked.
+Multi-object packs are capped at 256 MiB; large compressible objects (> 16 MiB) each get their own dedicated single-object pack. When this command completes, all loose objects (except skip-marked incompressible ones) have been merged into pack files and the loose files have been unlinked.
 
 Progress during packing:
 ```
@@ -1168,14 +1183,20 @@ pack: N/M objects  X.X/Y.Y GiB  Z.Z MiB/s  ETA HHmMSs
 ### 13.13 `verify`
 
 ```
-backup verify --repo <path> [--deep]
+backup verify --repo <path> [--deep] [--repair]
 ```
 
-Verifies repository integrity. Acquires a shared lock. Calls `repo_verify`, which loads every surviving snapshot and attempts to load and decompress every content, xattr, and ACL object referenced by any node. A SHA-256 hash is computed over the decompressed data and compared to the stored hash.
+Verifies repository integrity. Without `--repair`, acquires a shared lock. With `--repair`, acquires an exclusive lock.
 
-Returns zero exit status if all objects are present and uncorrupted. Returns non-zero and logs errors for any missing or corrupt objects.
+Calls `repo_verify`, which loads every surviving snapshot and attempts to load and decompress every content, xattr, and ACL object referenced by any node. A SHA-256 hash is computed over the decompressed data and compared to the stored hash.
 
-`--deep` is accepted for forward compatibility but is currently informational only (no additional checks beyond `repo_verify` are implemented in this version).
+If parity data is present (format version 2 objects, version 3 packs, version 5 snapshots), corruption is automatically detected via CRC-32C and corrected in memory via XOR or Reed-Solomon parity. The object is then verified against its SHA-256 hash as usual.
+
+With `--repair`, any object that was corrected via parity during the verify pass is rewritten to disk using `pwrite()`, making the repair permanent. This covers loose objects, packed objects, and snapshots.
+
+On completion, reports: objects checked, parity repairs made, and uncorrectable corruptions found.
+
+Returns zero exit status if all objects are present and uncorrupted (including those corrected by parity). Returns non-zero and logs errors for any missing or uncorrectable objects.
 
 When this command completes with exit status 0, you can be confident that every file in every surviving snapshot can be restored correctly.
 
@@ -1426,6 +1447,8 @@ Coalescing is automatic and budget-limited. The defaults work well for most repo
 | `PACK_COALESCE_MAX_BUDGET` | 10 GiB | Maximum bytes to rewrite in one coalesce |
 | `PACK_COALESCE_BUDGET_PCT` | 15% | Fraction of total dat bytes as coalesce budget |
 | `PACK_COALESCE_MIN_SNAP_GAP` | 10 | Minimum snapshot count between coalescings |
+| `PACK_MAX_MULTI_BYTES` | 256 MiB | Maximum body size for multi-object packs (creation and coalescing) |
+| `PACK_STREAM_THRESHOLD` | 16 MiB | Objects above this are streamed; each gets a dedicated single-object pack |
 
 ### JSON Output for Automation
 
@@ -1762,6 +1785,106 @@ As Phase 3 visits each live filesystem path, it calls `pathmap_mark_seen()` to s
 #### Result
 
 The combination of `pathmap_build` + `pathmap_lookup` reduces change detection from O(N²) to O(N log N) for the build phase and O(N) for the query phase, making Phase 3 scale to repositories with millions of files.
+
+## 21. Parity Error Correction
+
+c-backup protects all on-disk data against bit rot using a layered parity system. Every file written to the repository includes a parity trailer that enables both detection and correction of storage corruption without requiring redundant copies of the data.
+
+### 21.1 Threat Model
+
+In a deduplicating backup, each object is stored exactly once. A single corrupt sector can destroy data that hundreds of snapshots reference. Traditional backup tools detect this via SHA-256 verification at restore time — but by then the only copy is already damaged. Parity error correction allows the data to be repaired in-place before it is needed.
+
+### 21.2 Detection Layer: CRC-32C
+
+All headers and payloads are protected by CRC-32C checksums (software lookup table, 256 entries). CRC-32C provides fast corruption detection: if the CRC matches, the data is overwhelmingly likely to be intact and no further parity processing is needed. This makes the common case (no corruption) essentially free.
+
+### 21.3 Header Correction: XOR Interleaved Parity
+
+Headers (object headers, pack entry headers, snapshot headers) are protected by XOR interleaved parity with stride 256. For data up to 256 bytes, this guarantees single-byte correction. The parity record is 260 bytes: 4 bytes CRC-32C + 256 bytes XOR parity.
+
+When a header CRC fails, the XOR parity identifies and corrects the corrupted byte. If more than one byte is corrupted, the damage is detected but not correctable.
+
+### 21.4 Payload Correction: Reed-Solomon RS(255,239)
+
+Payloads (compressed object data, snapshot manifests) are protected by Reed-Solomon coding in GF(2^8):
+
+| Parameter | Value |
+|-----------|-------|
+| Codeword length (N) | 255 bytes |
+| Data per codeword (K) | 239 bytes |
+| Parity per codeword (2t) | 16 bytes |
+| Correction capacity (t) | 8 bytes per codeword |
+| Interleave depth (D) | 64 |
+| Burst correction | 512 contiguous bytes (one disk sector) |
+| Overhead | 6.7% of payload size |
+
+The interleaving scheme writes data column-by-column into a matrix of D columns (one per codeword). A contiguous 512-byte burst on disk spans at most 8 bytes in any single codeword (512 / 64 = 8), which is exactly the correction capacity.
+
+**GF(2^8) implementation:** Field polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D, same as AES). Two 256-entry lookup tables for fast multiply. Decoder uses Berlekamp-Massey for error locator, Chien search for error positions, and Forney algorithm for error values.
+
+### 21.5 On-Disk Trailer Format
+
+All parity data is appended as a trailer after the existing file content. The trailer ends with a 12-byte footer:
+
+```
+[original file content]
+[--- parity trailer ---]
+  ... parity data ...
+  parity_footer_t {
+      magic: 0x50415249 ("PARI")
+      version: 1
+      trailer_size: total trailer bytes including this footer
+  }
+```
+
+Old-format readers never reach the trailer because they read only the bytes specified by the header. New-format files are rejected by old binaries at the version check.
+
+### 21.6 Format Versions
+
+| Format | Old Version | New Version | Change |
+|--------|-------------|-------------|--------|
+| Loose object | 1 | 2 | Parity trailer (header XOR + payload RS + CRC) |
+| Pack .dat/.idx | 2 | 3 | Per-entry parity in .dat trailer; 44-byte idx entries with `entry_index` |
+| Snapshot | V4 | V5 | Parity trailer (header XOR + payload RS + CRC) |
+
+Backward compatibility: version 1/2 objects, version 1/2 packs, and V4 snapshots remain fully readable. Parity is simply not available for these files.
+
+### 21.7 Overhead
+
+| File Size | RS Parity (6.7%) | Header Parity | Total Overhead |
+|-----------|------------------|---------------|----------------|
+| 1 KiB | 67 B | 260 B | 327 B (31.9%) |
+| 10 KiB | 670 B | 260 B | 930 B (9.1%) |
+| 100 KiB | 6.7 KiB | 260 B | 7.0 KiB (7.0%) |
+| 1 MiB | 68.5 KiB | 260 B | 68.8 KiB (6.7%) |
+| 16 MiB | 1.1 MiB | 260 B | 1.1 MiB (6.7%) |
+
+For typical repositories dominated by files larger than 10 KiB, overhead converges to approximately 6.7%.
+
+### 21.8 Read Path Behavior
+
+On every object load (loose, packed, or snapshot), the following sequence runs:
+
+1. Read header and payload.
+2. CRC-32C fast check on payload. If CRC passes, proceed directly to SHA-256 verification (common case — no parity work needed).
+3. If CRC fails: attempt XOR parity repair on header, RS parity decode on payload.
+4. If repair succeeds: log a warning, increment the `parity_repaired` counter, proceed to SHA-256 verification.
+5. If repair fails: log an error, increment the `parity_uncorrectable` counter, return `ERR_CORRUPT`.
+6. SHA-256 remains the final authoritative verification — parity is a correction layer, not a replacement for cryptographic integrity checks.
+
+### 21.9 Active Repair (`verify --repair`)
+
+`backup verify --repair` acquires an exclusive lock and runs the full verify pass. For any object whose parity counters indicate a correction was made during loading:
+
+- **Loose objects:** `object_repair()` opens the file O_RDWR, re-applies XOR/RS corrections, and writes corrected bytes back at their original offsets via `pwrite()`.
+- **Packed objects:** `pack_object_repair()` opens the .dat file O_RDWR, locates the entry via the pack cache, and applies the same corrections via `pwrite()`.
+- **Snapshots:** `snapshot_repair()` opens the .snap file O_RDWR and applies corrections via `pwrite()`.
+
+All repair functions `fsync()` after writing corrections. The parity data itself is not modified — it remains valid for detecting future corruption.
+
+### 21.10 Source Module
+
+All parity algorithms are implemented in `src/parity.c` / `src/parity.h` (~800 lines of C). The module is self-contained with no external dependencies beyond the C standard library. Global parity statistics (`parity_stats_t`) use atomic counters for thread safety.
 
 ---
 

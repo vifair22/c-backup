@@ -4,6 +4,7 @@
 #include "object.h"
 #include "pack.h"
 #include "snapshot.h"
+#include "util.h"
 #include "../vendor/log.h"
 
 #include <fcntl.h>
@@ -60,26 +61,11 @@ static void phase_line_setf(const char *fmt, ...) {
     if (n < 0) return;
     size_t len = (size_t)n;
     if (len >= sizeof(msg)) len = sizeof(msg) - 1;
-
-    fprintf(stderr, "\r%s", msg);
-    if (g_phase_line_len > len) {
-        size_t pad = g_phase_line_len - len;
-        while (pad--) fputc(' ', stderr);
-        fputc('\r', stderr);
-        fputs(msg, stderr);
-    }
-    fflush(stderr);
-    g_phase_line_len = len;
+    msg[len] = '\0';
+    progress_line_set(&g_phase_line_len, msg);
 }
 
-static void phase_line_clear(void) {
-    if (g_phase_line_len == 0) return;
-    fputc('\r', stderr);
-    for (size_t i = 0; i < g_phase_line_len; i++) fputc(' ', stderr);
-    fputc('\r', stderr);
-    fflush(stderr);
-    g_phase_line_len = 0;
-}
+#define phase_line_clear() progress_line_clear(&g_phase_line_len)
 
 typedef struct {
     struct timespec next_update;
@@ -116,13 +102,7 @@ static void phase2_progress_cb(uint32_t done, uint32_t total, void *ctx) {
     phase_line_setf("Phase 2: loading previous snapshot (%u/%u)", done, total);
 }
 
-static double elapsed_sec(const struct timespec *start) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    time_t ds = now.tv_sec - start->tv_sec;
-    long dn = now.tv_nsec - start->tv_nsec;
-    return (double)ds + (double)dn / 1000000000.0;
-}
+/* elapsed_sec: uses elapsed_sec from util.h */
 
 static double elapsed_between(const struct timespec *a, const struct timespec *b) {
     time_t ds = b->tv_sec - a->tv_sec;
@@ -145,19 +125,7 @@ static struct timespec ts_add_ms(struct timespec t, long ms) {
     return t;
 }
 
-static void fmt_eta(double sec, char *buf, size_t sz) {
-    if (sec < 1.0) {
-        snprintf(buf, sz, "<1s");
-        return;
-    }
-    unsigned long s = (unsigned long)sec;
-    unsigned long h = s / 3600;
-    unsigned long m = (s % 3600) / 60;
-    unsigned long r = s % 60;
-    if (h > 0) snprintf(buf, sz, "%luh%lum", h, m);
-    else if (m > 0) snprintf(buf, sz, "%lum%lus", m, r);
-    else snprintf(buf, sz, "%lus", r);
-}
+/* fmt_eta: uses fmt_eta from util.h */
 
 /* Change classification */
 #define CHANGE_UNCHANGED     0
@@ -186,7 +154,7 @@ static status_t store_file_content_cb(repo_t *repo, const char *path,
                                       uint64_t *out_phys_new,
                                       xfer_progress_fn cb, void *cb_ctx) {
     int fd = open(path, O_RDONLY);
-    if (fd == -1) return ERR_IO;
+    if (fd == -1) return set_error_errno(ERR_IO, "store: open(%s)", path);
     int is_new = 0;
     uint64_t phys = 0;
     status_t st = object_store_file_cb(repo, fd, file_size, out_hash,
@@ -221,7 +189,7 @@ static status_t skipped_add(skipped_ids_t *s, uint64_t id) {
     if (s->count == s->cap) {
         uint32_t nc = s->cap ? s->cap * 2 : 16;
         uint64_t *tmp = realloc(s->ids, nc * sizeof(*tmp));
-        if (!tmp) return ERR_NOMEM;
+        if (!tmp) return set_error(ERR_NOMEM, "skipped_add: realloc failed");
         s->ids = tmp;
         s->cap = nc;
     }
@@ -451,7 +419,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
     pthread_mutex_init(&pool.mu, NULL);
 
     pthread_t *threads = malloc((size_t)nthreads * sizeof(pthread_t));
-    if (!threads) { pthread_mutex_destroy(&pool.mu); return ERR_NOMEM; }
+    if (!threads) { pthread_mutex_destroy(&pool.mu); return set_error(ERR_NOMEM, "store_parallel: alloc threads failed"); }
 
     /* Spawn the decoupled progress thread before the workers so it catches
      * activity from the very first chunk. */
@@ -473,7 +441,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
             pthread_join(pool.progress_thr, NULL);
         }
         phase_line_clear();
-        log_msg("ERROR", "failed to start store worker thread");
+        set_error(ERR_IO, "failed to start store worker thread");
         free(threads);
         pthread_mutex_destroy(&pool.mu);
         return ERR_IO;
@@ -484,7 +452,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
             pthread_join(pool.progress_thr, NULL);
         }
         phase_line_clear();
-        log_msg("ERROR", "failed to start all requested store workers");
+        set_error(ERR_IO, "failed to start all requested store workers");
         for (int i = 0; i < n_started; i++) {
             (void)pthread_join(threads[i], NULL);
         }
@@ -497,7 +465,7 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         void *ret = NULL;
         if (pthread_join(threads[i], &ret) != 0) {
             if (pool.first_error == OK) pool.first_error = ERR_IO;
-            log_msg("ERROR", "store worker thread join failed");
+            set_error(ERR_IO, "store worker thread join failed");
             continue;
         }
         if (ret != 0 && pool.first_error == OK) {
@@ -514,28 +482,25 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
     if (pool.done < queue_len && pool.first_error == OK) {
         pool.first_error = ERR_IO;
         phase_line_clear();
-        log_msg("ERROR", "store worker exited early before queue completion");
+        set_error(ERR_IO, "store worker exited early before queue completion");
     }
 
     if (pool.first_error != OK) {
         phase_line_clear();
         if (pool.first_error_path[0]) {
-            char msg[PATH_MAX + 160];
             if (pool.first_error_errno != 0) {
-                snprintf(msg, sizeof(msg),
-                         "store failed at path '%s': %s (%s)",
-                         pool.first_error_path, status_name(pool.first_error),
-                         strerror(pool.first_error_errno));
+                set_error(pool.first_error,
+                          "store failed at path '%s': %s (%s)",
+                          pool.first_error_path, status_name(pool.first_error),
+                          strerror(pool.first_error_errno));
             } else {
-                snprintf(msg, sizeof(msg),
-                         "store failed at path '%s': %s",
-                         pool.first_error_path, status_name(pool.first_error));
+                set_error(pool.first_error,
+                          "store failed at path '%s': %s",
+                          pool.first_error_path, status_name(pool.first_error));
             }
-            log_msg("ERROR", msg);
-        } else {
-            char msg[96];
-            snprintf(msg, sizeof(msg), "store failed: %s", status_name(pool.first_error));
-            log_msg("ERROR", msg);
+        } else if (_err_buf[0] == '\0') {
+            set_error(pool.first_error, "store failed: %s",
+                      status_name(pool.first_error));
         }
     }
 
@@ -577,7 +542,7 @@ status_t backup_run(repo_t *repo, const char **source_paths, int path_count) {
 
 status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count,
                          const backup_opts_t *opts) {
-    if (!repo || !source_paths || path_count <= 0) return ERR_INVALID;
+    if (!repo || !source_paths || path_count <= 0) return set_error(ERR_INVALID, "backup: invalid arguments");
 
     int tui = phase_ui_enabled(opts);
     const char *fail_ctx = "startup";
@@ -588,7 +553,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     log_msg("INFO", "Phase 1: scanning");
 
     scan_imap_t *imap = scan_imap_new();
-    if (!imap) return ERR_NOMEM;
+    if (!imap) return set_error(ERR_NOMEM, "backup: alloc inode map failed");
 
     /* Build scan_opts_t from backup_opts_t */
     scan_opts_t sopts = {0};
@@ -624,14 +589,14 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                     if (scan->capacity > UINT32_MAX / 2) {
                         scan_imap_free(imap);
                         scan_result_free(scan); scan_result_free(partial);
-                        return ERR_NOMEM;
+                        return set_error(ERR_NOMEM, "backup: scan capacity overflow");
                     }
                     uint32_t nc = scan->capacity * 2;
                     scan_entry_t *tmp = realloc(scan->entries, (size_t)nc * sizeof(*tmp));
                     if (!tmp) {
                         scan_imap_free(imap);
                         scan_result_free(scan); scan_result_free(partial);
-                        return ERR_NOMEM;
+                        return set_error(ERR_NOMEM, "backup: realloc scan entries failed");
                     }
                     scan->entries  = tmp;
                     scan->capacity = nc;
@@ -644,7 +609,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         }
     }
     scan_imap_free(imap);
-    if (!scan) return ERR_INVALID;
+    if (!scan) return set_error(ERR_INVALID, "backup: no scan results");
 
     /* Print scan summary */
     {
@@ -1038,10 +1003,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
 done:
     if (tui) phase_line_clear();
-    if (st != OK) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "backup failed in %s: %s", fail_ctx, status_name(st));
-        log_msg("ERROR", msg);
+    if (st != OK && _err_buf[0] == '\0') {
+        set_error(st, "backup failed in %s: %s", fail_ctx, status_name(st));
     }
     free(skipped.ids);
     free(store_queue);

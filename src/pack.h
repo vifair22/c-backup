@@ -8,7 +8,8 @@
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
 #define PACK_VERSION_V1  1u            /* compressed_size was uint32_t */
-#define PACK_VERSION     2u            /* compressed_size is uint64_t  */
+#define PACK_VERSION_V2  2u            /* compressed_size is uint64_t  */
+#define PACK_VERSION     3u            /* parity trailers + idx entry_index */
 
 /*
  * Pack all loose objects into a new pack file.
@@ -57,6 +58,12 @@ status_t pack_object_get_info(repo_t *repo,
 
 /* Drop the cached pack index so it is reloaded on next access. */
 void pack_cache_invalidate(repo_t *repo);
+
+/*
+ * Attempt to repair a packed object's entry in-place via pwrite().
+ * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
+ */
+int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
