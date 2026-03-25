@@ -5,8 +5,10 @@ On-disk constants mirroring types.h / pack.c / snapshot.c
 OBJECT_HASH_SIZE = 32
 
 # Snap file
-SNAP_MAGIC   = 0x43424B50   # "CBKP"
-SNAP_VERSION = 3
+SNAP_MAGIC       = 0x43424B50   # "CBKP"
+SNAP_VERSION_V3  = 3
+SNAP_VERSION_V4  = 4
+SNAP_VERSION     = SNAP_VERSION_V4  # current write version
 
 # Pack files
 PACK_DAT_MAGIC  = 0x42504B44  # "BPKD"

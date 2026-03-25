@@ -11,9 +11,15 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <lz4.h>
 
-#define SNAP_MAGIC    0x43424B50u  /* "CBKP" */
-#define SNAP_VERSION  3u
+#define SNAP_MAGIC          0x43424B50u  /* "CBKP" */
+#define SNAP_VERSION_V3     3u
+#define SNAP_VERSION_V4     4u
+#define SNAP_VERSION        SNAP_VERSION_V4  /* current write version */
+
+/* Compress payload when LZ4 ratio is below this threshold (saves >10%) */
+#define SNAP_COMPRESS_RATIO 0.90
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -49,20 +55,19 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
         return ERR_IO;
     }
 
-    /* Read and validate fixed v3 header prefix. */
     uint32_t magic = 0, version = 0;
     if (read(fd, &magic,   sizeof(magic))   != sizeof(magic)   ||
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC || version != SNAP_VERSION) {
+    if (magic != SNAP_MAGIC ||
+        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4)) {
         close(fd); log_msg("ERROR", "invalid snapshot magic/version"); return ERR_CORRUPT;
     }
 
     struct stat sb;
     if (fstat(fd, &sb) == -1) { close(fd); return ERR_IO; }
 
-    /* Read the remaining header fields */
     uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
     uint32_t snap_flags = 0;
     uint64_t created_sec = 0, phys_new_bytes = 0, dirent_data_len = 0;
@@ -75,16 +80,23 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     if (RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len) || RD32(gfs_flags)) {
         close(fd); return ERR_CORRUPT;
     }
+    if (RD32(snap_flags)) { close(fd); return ERR_CORRUPT; }
 #undef RD32
 #undef RD64
 
-    uint64_t payload_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
-    uint64_t expect_v3  = 52u + payload_sz;
-    uint64_t fsz = (uint64_t)sb.st_size;
-    if (fsz != expect_v3 ||
-        read(fd, &snap_flags, sizeof(snap_flags)) != (ssize_t)sizeof(snap_flags)) {
-        close(fd);
-        return ERR_CORRUPT;
+    /* v4 appends compressed_payload_len (8 bytes) to the base 52-byte header.
+     * 0 = payload stored uncompressed; >0 = LZ4-compressed payload size. */
+    uint64_t compressed_payload_len = 0;
+    if (version == SNAP_VERSION_V4) {
+        if (read(fd, &compressed_payload_len, 8) != 8) { close(fd); return ERR_CORRUPT; }
+    }
+
+    uint64_t uncompressed_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
+    uint64_t hdr_sz          = (version == SNAP_VERSION_V3) ? 52u : 60u;
+    uint64_t stored_sz       = (compressed_payload_len > 0)
+                               ? compressed_payload_len : uncompressed_sz;
+    if ((uint64_t)sb.st_size != hdr_sz + stored_sz) {
+        close(fd); return ERR_CORRUPT;
     }
 
     snapshot_t *snap = calloc(1, sizeof(*snap));
@@ -98,25 +110,68 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
     snap->gfs_flags       = gfs_flags;
     snap->snap_flags      = snap_flags;
 
-    snap->nodes = malloc(node_count * sizeof(node_t));
-    if (!snap->nodes && node_count > 0) { free(snap); close(fd); return ERR_NOMEM; }
-    if (node_count > 0 &&
-        read(fd, snap->nodes, node_count * sizeof(node_t)) !=
-            (ssize_t)(node_count * sizeof(node_t))) {
-        free(snap->nodes); free(snap); close(fd); return ERR_CORRUPT;
+    if (compressed_payload_len > 0) {
+        /* v4 compressed: read compressed blob, decompress into nodes+dirent_data */
+        if (compressed_payload_len > (uint64_t)INT_MAX ||
+            uncompressed_sz > (uint64_t)INT_MAX) {
+            free(snap); close(fd); return ERR_CORRUPT;
+        }
+        char *cbuf = malloc((size_t)compressed_payload_len);
+        if (!cbuf) { free(snap); close(fd); return ERR_NOMEM; }
+        if (read(fd, cbuf, (size_t)compressed_payload_len) !=
+                (ssize_t)compressed_payload_len) {
+            free(cbuf); free(snap); close(fd); return ERR_CORRUPT;
+        }
+        close(fd);
+
+        char *ubuf = malloc(uncompressed_sz > 0 ? (size_t)uncompressed_sz : 1);
+        if (!ubuf) { free(cbuf); free(snap); return ERR_NOMEM; }
+        int r = LZ4_decompress_safe(cbuf, ubuf,
+                                    (int)compressed_payload_len,
+                                    (int)uncompressed_sz);
+        free(cbuf);
+        if (r < 0 || (uint64_t)r != uncompressed_sz) {
+            free(ubuf); free(snap);
+            log_msg("ERROR", "snapshot lz4 decompress failed");
+            return ERR_CORRUPT;
+        }
+
+        size_t nodes_sz = (size_t)node_count * sizeof(node_t);
+        snap->nodes = malloc(nodes_sz > 0 ? nodes_sz : 1);
+        if (!snap->nodes && node_count > 0) { free(ubuf); free(snap); return ERR_NOMEM; }
+        if (nodes_sz > 0) memcpy(snap->nodes, ubuf, nodes_sz);
+
+        snap->dirent_data = malloc(snap->dirent_data_len > 0 ? snap->dirent_data_len : 1);
+        if (!snap->dirent_data && snap->dirent_data_len > 0) {
+            free(snap->nodes); free(ubuf); free(snap); return ERR_NOMEM;
+        }
+        if (snap->dirent_data_len > 0)
+            memcpy(snap->dirent_data, ubuf + nodes_sz, snap->dirent_data_len);
+        free(ubuf);
+    } else {
+        /* v3 or uncompressed v4: read payload directly */
+        snap->nodes = malloc(node_count * sizeof(node_t) > 0
+                             ? node_count * sizeof(node_t) : 1);
+        if (!snap->nodes && node_count > 0) { free(snap); close(fd); return ERR_NOMEM; }
+        if (node_count > 0 &&
+            read(fd, snap->nodes, node_count * sizeof(node_t)) !=
+                (ssize_t)(node_count * sizeof(node_t))) {
+            free(snap->nodes); free(snap); close(fd); return ERR_CORRUPT;
+        }
+
+        snap->dirent_data = malloc(snap->dirent_data_len > 0 ? snap->dirent_data_len : 1);
+        if (!snap->dirent_data && snap->dirent_data_len > 0) {
+            free(snap->nodes); free(snap); close(fd); return ERR_NOMEM;
+        }
+        if (snap->dirent_data_len > 0 &&
+            read(fd, snap->dirent_data, snap->dirent_data_len) !=
+                (ssize_t)snap->dirent_data_len) {
+            free(snap->dirent_data); free(snap->nodes); free(snap); close(fd);
+            return ERR_CORRUPT;
+        }
+        close(fd);
     }
 
-    snap->dirent_data = malloc(snap->dirent_data_len);
-    if (!snap->dirent_data && snap->dirent_data_len > 0) {
-        free(snap->nodes); free(snap); close(fd); return ERR_NOMEM;
-    }
-    if (snap->dirent_data_len > 0 &&
-        read(fd, snap->dirent_data, snap->dirent_data_len) !=
-            (ssize_t)snap->dirent_data_len) {
-        free(snap->dirent_data); free(snap->nodes); free(snap); close(fd); return ERR_CORRUPT;
-    }
-
-    close(fd);
     *out = snap;
     return OK;
 }
@@ -128,9 +183,38 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     int fd = mkstemp(tmppath);
     if (fd == -1) return ERR_IO;
 
+    /* Build contiguous uncompressed payload: nodes[] followed by dirent_data. */
+    size_t   nodes_sz    = snap->node_count * sizeof(node_t);
+    size_t   payload_sz  = nodes_sz + snap->dirent_data_len;
+    uint8_t *payload     = malloc(payload_sz > 0 ? payload_sz : 1);
+    if (!payload) { close(fd); unlink(tmppath); return ERR_NOMEM; }
+    if (nodes_sz > 0)
+        memcpy(payload, snap->nodes, nodes_sz);
+    if (snap->dirent_data_len > 0)
+        memcpy(payload + nodes_sz, snap->dirent_data, snap->dirent_data_len);
+
+    /* Attempt LZ4 compression if payload fits within LZ4 block limits. */
+    uint8_t *compressed          = NULL;
+    uint64_t compressed_payload_len = 0;
+    if (payload_sz > 0 && payload_sz <= (size_t)INT_MAX) {
+        int cbound = LZ4_compressBound((int)payload_sz);
+        compressed = malloc((size_t)cbound);
+        if (compressed) {
+            int csz = LZ4_compress_default((const char *)payload, (char *)compressed,
+                                           (int)payload_sz, cbound);
+            if (csz > 0 &&
+                (double)csz / (double)payload_sz < SNAP_COMPRESS_RATIO) {
+                compressed_payload_len = (uint64_t)csz;
+            } else {
+                free(compressed);
+                compressed = NULL;
+            }
+        }
+    }
+
     snap_file_header_t fhdr = {
         .magic           = SNAP_MAGIC,
-        .version         = SNAP_VERSION,
+        .version         = SNAP_VERSION_V4,
         .snap_id         = snap->snap_id,
         .created_sec     = snap->created_sec,
         .phys_new_bytes  = snap->phys_new_bytes,
@@ -142,31 +226,41 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     };
 
     status_t st = OK;
+    /* Write 52-byte base header + 8-byte compressed_payload_len = 60-byte v4 header */
     if (write(fd, &fhdr, sizeof(fhdr)) != sizeof(fhdr)) { st = ERR_IO; goto fail; }
-    if (snap->node_count > 0 &&
-        write(fd, snap->nodes, snap->node_count * sizeof(node_t)) !=
-            (ssize_t)(snap->node_count * sizeof(node_t))) { st = ERR_IO; goto fail; }
-    if (snap->dirent_data_len > 0 &&
-        write(fd, snap->dirent_data, snap->dirent_data_len) !=
-            (ssize_t)snap->dirent_data_len) { st = ERR_IO; goto fail; }
+    if (write(fd, &compressed_payload_len, 8) != 8) { st = ERR_IO; goto fail; }
+
+    if (compressed_payload_len > 0) {
+        if (write(fd, compressed, (size_t)compressed_payload_len) !=
+                (ssize_t)compressed_payload_len) { st = ERR_IO; goto fail; }
+    } else if (payload_sz > 0) {
+        if (write(fd, payload, payload_sz) != (ssize_t)payload_sz) {
+            st = ERR_IO; goto fail;
+        }
+    }
+
     if (fsync(fd) == -1) { st = ERR_IO; goto fail; }
     close(fd); fd = -1;
+    free(compressed); compressed = NULL;
+    free(payload);    payload    = NULL;
 
     char dstpath[PATH_MAX];
     if (snap_path(repo, snap->snap_id, dstpath, sizeof(dstpath)) != 0) {
-        st = ERR_IO; goto fail;
+        return ERR_IO;
     }
-    if (rename(tmppath, dstpath) == -1) { st = ERR_IO; goto fail; }
+    if (rename(tmppath, dstpath) == -1) { return ERR_IO; }
     {
         char dirpath[PATH_MAX];
         if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo))
-            >= (int)sizeof(dirpath)) { st = ERR_IO; goto fail; }
+            >= (int)sizeof(dirpath)) return ERR_IO;
         int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
     return OK;
 fail:
     if (fd >= 0) { close(fd); unlink(tmppath); }
+    free(compressed);
+    free(payload);
     return st;
 }
 
@@ -202,12 +296,13 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
         read(fd, &version, sizeof(version)) != sizeof(version)) {
         close(fd); return ERR_CORRUPT;
     }
-    if (magic != SNAP_MAGIC || version != SNAP_VERSION) {
+    if (magic != SNAP_MAGIC ||
+        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4)) {
         close(fd);
         return ERR_CORRUPT;
     }
 
-    /* Skip to gfs_flags in fixed v3 header. */
+    /* gfs_flags is at the same offset in both v3 and v4 base headers. */
     if (lseek(fd, 36, SEEK_CUR) == (off_t)-1) { close(fd); return ERR_IO; }
 
     uint32_t flags = 0;

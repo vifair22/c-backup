@@ -345,23 +345,44 @@ For objects too large to decompress into RAM (those exceeding the 16 MiB `STREAM
 
 Stored at `snapshots/XXXXXXXX.snap` where `XXXXXXXX` is the zero-padded decimal snapshot ID.
 
-**File header** (52 bytes, little-endian):
+Two header versions exist. Version 3 (legacy, read-only) has a 52-byte header with an uncompressed payload. Version 4 (current) has a 60-byte header and an optionally LZ4-compressed payload.
+
+**v4 file header** (60 bytes, little-endian):
+
+```
+Offset  Size  Field
+     0     4  magic                  = 0x43424B50 ("CBKP")
+     4     4  version                = 4
+     8     4  snap_id                (decimal snapshot number)
+    12     8  created_sec            (UTC Unix timestamp of backup completion)
+    20     8  phys_new_bytes         (deduped physical bytes first introduced by this snapshot)
+    28     4  node_count             (number of node_t records in the payload)
+    32     4  dirent_count           (number of dirent_rec_t records in the dirent blob)
+    36     8  dirent_data_len        (byte length of the raw dirent blob)
+    44     4  gfs_flags              (bitmask: bit 0=daily, 1=weekly, 2=monthly, 3=yearly)
+    48     4  snap_flags             (reserved; currently 0)
+    52     8  compressed_payload_len (0 = payload stored uncompressed; >0 = LZ4 block size)
+```
+
+The payload immediately follows the header. When `compressed_payload_len > 0` the payload
+is a single LZ4 block; decompress it with the known uncompressed size of
+`node_count × 161 + dirent_data_len` bytes. When `compressed_payload_len == 0` the payload
+is stored raw. Compression is applied when the LZ4 ratio is below 0.90 (saves more than 10%).
+For large snapshots this typically achieves 3–5× reduction due to repetitive zero hash fields
+and common path prefixes in the dirent blob.
+
+**v3 file header** (52 bytes, legacy — recognised on read, never written):
 
 ```
 Offset  Size  Field
      0     4  magic          = 0x43424B50 ("CBKP")
      4     4  version        = 3
-     8     4  snap_id        (decimal snapshot number)
-    12     8  created_sec    (UTC Unix timestamp of backup completion)
-    20     8  phys_new_bytes (deduped physical bytes first introduced by this snapshot)
-    28     4  node_count     (number of node_t records that follow)
-    32     4  dirent_count   (number of dirent_rec_t records in the dirent blob)
-    36     8  dirent_data_len (byte length of the raw dirent blob)
-    44     4  gfs_flags      (bitmask: bit 0=daily, 1=weekly, 2=monthly, 3=yearly)
-    48     4  snap_flags     (reserved; currently 0)
+     8    44  (same fields as v4 offsets 8–51)
 ```
 
-**Node array** (`node_count × 161 bytes`):
+Payload follows immediately after the 52-byte header, always uncompressed.
+
+**Node array** (`node_count × 161 bytes`, within the payload):
 
 Each `node_t` is a packed structure of exactly 161 bytes:
 

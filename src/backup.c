@@ -359,7 +359,7 @@ static void *store_worker_fn(void *arg) {
                                             store_chunk_cb, &cb_ctx);
         if (st != OK) {
             int err = errno;
-            if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE) {
+            if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE || err == EIO) {
                 pthread_mutex_lock(&pool->mu);
                 pool->skipped_transient++;
                 if (pool->first_skipped_path[0] == '\0') {

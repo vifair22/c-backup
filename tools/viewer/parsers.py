@@ -9,7 +9,7 @@ import struct
 
 from .constants import (
     OBJECT_HASH_SIZE,
-    SNAP_MAGIC, SNAP_VERSION,
+    SNAP_MAGIC, SNAP_VERSION_V3, SNAP_VERSION_V4,
     PACK_DAT_MAGIC, PACK_IDX_MAGIC,
     PACK_VERSION_V1,
     COMPRESS_NONE, COMPRESS_LZ4, COMPRESS_LZ4_FRAME,
@@ -39,14 +39,21 @@ def read_exact(f, n: int) -> bytes:
 # Snapshot  (.snap)
 # ---------------------------------------------------------------------------
 #
-# snap_file_header_t (packed, 52 bytes):
+# v3 snap_file_header_t (packed, 52 bytes):
 #   uint32 magic, uint32 version, uint32 snap_id,
 #   uint64 created_sec, uint64 phys_new_bytes,
 #   uint32 node_count, uint32 dirent_count, uint64 dirent_data_len,
 #   uint32 gfs_flags, uint32 snap_flags
+#
+# v4 header (60 bytes): same base 52 bytes + uint64 compressed_payload_len
+#   compressed_payload_len == 0  → payload stored uncompressed
+#   compressed_payload_len >  0  → payload is an LZ4 block of that size
 
 SNAP_HDR_FMT  = "<IIIQQIIQII"
 SNAP_HDR_SIZE = struct.calcsize(SNAP_HDR_FMT)   # 52
+
+SNAP_V4_EXT_FMT  = "<Q"   # compressed_payload_len
+SNAP_V4_EXT_SIZE = struct.calcsize(SNAP_V4_EXT_FMT)  # 8
 
 # node_t (packed, 161 bytes):
 #   uint64 node_id, uint8 type, uint32 mode, uint32 uid, uint32 gid,
@@ -63,23 +70,42 @@ DIRENT_HDR = struct.Struct("<QQH")
 
 
 def _read_snap_header(f) -> tuple:
-    """Read and validate the fixed 52-byte snap header. Returns unpacked fields."""
+    """Read and validate the snap header.
+
+    Returns (fields_52, version, compressed_payload_len) where fields_52 is
+    the 10-tuple from the base 52-byte header.  For v3 compressed_payload_len
+    is always 0.  File pointer is left just after the header (ready to read
+    the payload).
+    """
     raw = read_exact(f, SNAP_HDR_SIZE)
     fields = struct.unpack(SNAP_HDR_FMT, raw)
     magic, version = fields[0], fields[1]
     if magic != SNAP_MAGIC:
         raise ValueError(f"Bad snap magic 0x{magic:08X}")
-    if version != SNAP_VERSION:
+    if version not in (SNAP_VERSION_V3, SNAP_VERSION_V4):
         raise ValueError(f"Unsupported snap version {version}")
-    return fields  # (magic, version, snap_id, created_sec, phys_new_bytes,
-                   #  node_count, dirent_count, dirent_data_len, gfs_flags, snap_flags)
+
+    compressed_payload_len = 0
+    if version == SNAP_VERSION_V4:
+        (compressed_payload_len,) = struct.unpack(
+            SNAP_V4_EXT_FMT, read_exact(f, SNAP_V4_EXT_SIZE))
+
+    return fields, version, compressed_payload_len
+
+
+def _decompress_payload(raw: bytes, uncompressed_size: int) -> bytes:
+    """LZ4-decompress a snap payload block."""
+    if not HAS_LZ4:
+        raise RuntimeError("lz4 package required to read v4 compressed snapshots")
+    return lz4.block.decompress(raw, uncompressed_size=uncompressed_size)
 
 
 def parse_snap_header(path: str) -> dict:
-    """Read only the 52-byte header — fast path for overview lists."""
+    """Read only the base 52-byte header — fast path for overview lists."""
     with open(path, "rb") as f:
+        fields, _version, _cplen = _read_snap_header(f)
         (_, _, snap_id, created_sec, phys_new_bytes,
-         node_count, dirent_count, _, gfs_flags, snap_flags) = _read_snap_header(f)
+         node_count, dirent_count, _, gfs_flags, snap_flags) = fields
     return {
         "snap_id":        snap_id,
         "created_sec":    created_sec,
@@ -93,57 +119,67 @@ def parse_snap_header(path: str) -> dict:
 
 def parse_snap(path: str) -> dict:
     with open(path, "rb") as f:
+        fields, version, compressed_payload_len = _read_snap_header(f)
         (_, _, snap_id, created_sec, phys_new_bytes,
          node_count, dirent_count, dirent_data_len,
-         gfs_flags, snap_flags) = _read_snap_header(f)
+         gfs_flags, snap_flags) = fields
 
-        # Fix 1: single read + iter_unpack instead of per-node read + unpack
-        raw_nodes = f.read(node_count * NODE_SIZE)
-        nodes = [
-            {
-                "node_id":        node_id,
-                "type":           ntype,
-                "mode":           mode,
-                "uid":            uid,
-                "gid":            gid,
-                "size":           size,
-                "mtime_sec":      mtime_sec,
-                "mtime_nsec":     mtime_nsec,
-                "content_hash":   content_hash,
-                "xattr_hash":     xattr_hash,
-                "acl_hash":       acl_hash,
-                "link_count":     link_count,
-                "inode_identity": inode_identity,
-                "union_a":        union_a,
-                "union_b":        union_b,
-            }
-            for (node_id, ntype, mode, uid, gid, size, mtime_sec, mtime_nsec,
-                 content_hash, xattr_hash, acl_hash,
-                 link_count, inode_identity, union_a, union_b)
-            in struct.iter_unpack(NODE_FMT, raw_nodes)
-        ]
+        uncompressed_size = node_count * NODE_SIZE + dirent_data_len
 
-        dirent_data = f.read(dirent_data_len)
+        if compressed_payload_len > 0:
+            raw_payload = _decompress_payload(
+                f.read(compressed_payload_len), uncompressed_size)
+        else:
+            raw_payload = f.read(uncompressed_size)
+
+    nodes_bytes  = raw_payload[:node_count * NODE_SIZE]
+    dirent_bytes = raw_payload[node_count * NODE_SIZE:]
+
+    nodes = [
+        {
+            "node_id":        node_id,
+            "type":           ntype,
+            "mode":           mode,
+            "uid":            uid,
+            "gid":            gid,
+            "size":           size,
+            "mtime_sec":      mtime_sec,
+            "mtime_nsec":     mtime_nsec,
+            "content_hash":   content_hash,
+            "xattr_hash":     xattr_hash,
+            "acl_hash":       acl_hash,
+            "link_count":     link_count,
+            "inode_identity": inode_identity,
+            "union_a":        union_a,
+            "union_b":        union_b,
+        }
+        for (node_id, ntype, mode, uid, gid, size, mtime_sec, mtime_nsec,
+             content_hash, xattr_hash, acl_hash,
+             link_count, inode_identity, union_a, union_b)
+        in struct.iter_unpack(NODE_FMT, nodes_bytes)
+    ]
 
     dirents = []
     offset = 0
-    while offset + DIRENT_HDR.size <= len(dirent_data):
-        parent_node, did, name_len = DIRENT_HDR.unpack_from(dirent_data, offset)
+    while offset + DIRENT_HDR.size <= len(dirent_bytes):
+        parent_node, did, name_len = DIRENT_HDR.unpack_from(dirent_bytes, offset)
         offset += DIRENT_HDR.size
-        name = dirent_data[offset:offset + name_len].decode("utf-8", errors="replace")
+        name = dirent_bytes[offset:offset + name_len].decode("utf-8", errors="replace")
         offset += name_len
         dirents.append({"parent_node": parent_node, "node_id": did, "name": name})
 
     return {
-        "snap_id":        snap_id,
-        "created_sec":    created_sec,
-        "phys_new_bytes": phys_new_bytes,
-        "node_count":     node_count,
-        "dirent_count":   dirent_count,
-        "gfs_flags":      gfs_flags,
-        "snap_flags":     snap_flags,
-        "nodes":          nodes,
-        "dirents":        dirents,
+        "snap_id":                 snap_id,
+        "snap_version":            version,
+        "compressed_payload_len":  compressed_payload_len,
+        "created_sec":             created_sec,
+        "phys_new_bytes":          phys_new_bytes,
+        "node_count":              node_count,
+        "dirent_count":            dirent_count,
+        "gfs_flags":               gfs_flags,
+        "snap_flags":              snap_flags,
+        "nodes":                   nodes,
+        "dirents":                 dirents,
     }
 
 

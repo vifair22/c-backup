@@ -183,8 +183,17 @@ class SnapshotsTab:
         self._populate_dir_tree(s)
 
     def _populate_header(self, s: dict) -> None:
+        ver = s.get("snap_version", 3)
+        cplen = s.get("compressed_payload_len", 0)
+        if ver >= 4 and cplen > 0:
+            fmt_str = f"v{ver} (LZ4 compressed, {fmt_size(cplen)} on disk)"
+        elif ver >= 4:
+            fmt_str = f"v{ver} (uncompressed)"
+        else:
+            fmt_str = f"v{ver} (legacy)"
         lines = [
             f"Snap ID        : {s['snap_id']}",
+            f"Snap format    : {fmt_str}",
             f"Created        : {fmt_time(s['created_sec'])}",
             f"New bytes      : {fmt_size(s['phys_new_bytes'])}",
             f"Node count     : {s['node_count']}",

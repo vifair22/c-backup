@@ -1238,14 +1238,31 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             free(large_hashes); large_hashes = NULL;
             st = ERR_CORRUPT; goto cleanup;
         }
-        total_bytes_for_pack += ohdr.compressed_size;
         if (ohdr.compressed_size > PACK_STREAM_THRESHOLD) {
+            /* Skip objects already marked as incompressible — they stay loose. */
+            if (ohdr.pack_skip_ver == PROBER_VERSION) continue;
             memcpy(large_hashes + large_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
             large_cnt++;
         } else {
             memcpy(small_hashes + small_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
             small_cnt++;
         }
+        total_bytes_for_pack += ohdr.compressed_size;
+    }
+
+    /* Nothing to pack — all loose objects are skip-marked incompressible files. */
+    if (small_cnt == 0 && large_cnt == 0) {
+        free(small_hashes);
+        free(large_hashes);
+        free(idx_entries);
+        free(hashes);
+        fclose(dat_f);
+        fclose(idx_f);
+        unlink(dat_tmp);
+        unlink(idx_tmp);
+        log_msg("INFO", "pack: no packable objects (all loose objects are skip-marked)");
+        if (out_packed) *out_packed = 0;
+        return OK;
     }
 
     /* Spawn decoupled progress thread now that we know total count/bytes. */
