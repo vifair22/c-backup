@@ -1,7 +1,8 @@
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from ..parsers import parse_snap, find_object, decompress_payload, HAS_LZ4
+from ..parsers import parse_snap, parse_snap_header, find_object, decompress_payload, HAS_LZ4
 from ..formats import fmt_size, fmt_time, fmt_mode, gfs_flags_str, hex_hash
 from ..constants import (NODE_TYPE_NAMES, NODE_TYPE_REG, NODE_TYPE_DIR,
                          NODE_TYPE_SYMLINK, NODE_TYPE_CHR, NODE_TYPE_BLK,
@@ -23,9 +24,11 @@ class SnapshotsTab:
         self._current_snap: dict | None = None
         self._scan: dict | None = None
         self._all_nodes: list[dict] = []
+        self._node_map: dict[int, dict] = {}   # node_id → node dict (O(1) lookup)
         self._dir_children: dict[int, list] = {}
         self._node_type_map: dict[int, int] = {}
         self._empty_node_ids: set[int] = set()
+        self._load_generation: int = 0         # incremented on each load to discard stale results
         self._build()
 
     # ---- build ----
@@ -44,6 +47,8 @@ class SnapshotsTab:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._list.pack(fill=tk.BOTH, expand=True)
         self._list.bind("<<ListboxSelect>>", self._on_select)
+        self._loading_label = tk.Label(left, text="", fg="gray", font=FONT_MONO)
+        self._loading_label.pack(anchor="w", padx=PAD)
 
         # Right: sub-notebook
         right = ttk.Frame(pane)
@@ -147,9 +152,10 @@ class SnapshotsTab:
         self._head_id    = scan.get("head_id")
         self._snap_id_to_path = {}
         self._list.delete(0, tk.END)
+        # Use parse_snap_header (reads only the 52-byte header, no payload decode)
         for path in self._snap_paths:
             try:
-                s = parse_snap(path)
+                s = parse_snap_header(path)
                 label = f"{s['snap_id']:>6}  {fmt_time(s['created_sec'])}"
                 if s["snap_id"] == self._head_id:
                     label += " [HEAD]"
@@ -171,13 +177,38 @@ class SnapshotsTab:
         self._load(path)
 
     def _load(self, path: str) -> None:
-        try:
-            s = parse_snap(path)
-        except Exception as e:
-            messagebox.showerror("Parse error", str(e))
+        """Start a background thread to parse the snapshot; update UI when done."""
+        self._load_generation += 1
+        gen = self._load_generation
+        self._loading_label.config(text="Loading…")
+        self._list.config(state=tk.DISABLED)
+
+        def _worker() -> None:
+            try:
+                s = parse_snap(path)
+            except Exception as e:
+                err = str(e)
+                self._frame.after(0, lambda: self._on_load_error(err, gen))
+                return
+            self._frame.after(0, lambda: self._finish_load(s, gen))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_load_error(self, err: str, gen: int) -> None:
+        if gen != self._load_generation:
             return
+        self._loading_label.config(text="")
+        self._list.config(state=tk.NORMAL)
+        messagebox.showerror("Parse error", err)
+
+    def _finish_load(self, s: dict, gen: int) -> None:
+        if gen != self._load_generation:
+            return   # user selected a different snapshot before this one finished
+        self._loading_label.config(text="")
+        self._list.config(state=tk.NORMAL)
         self._current_snap = s
         self._all_nodes = s["nodes"]
+        self._node_map  = {n["node_id"]: n for n in s["nodes"]}
         self._filter_var.set("")          # clears and triggers _apply_filter
         self._populate_header(s)
         self._populate_dir_tree(s)
@@ -215,8 +246,9 @@ class SnapshotsTab:
         shown = visible[:NODE_PAGE_SIZE]
         total = len(visible)
 
-        for row in self._node_tree.get_children():
-            self._node_tree.delete(row)
+        rows = self._node_tree.get_children()
+        if rows:
+            self._node_tree.delete(*rows)
         for nd in shown:
             self._node_tree.insert("", tk.END, values=(
                 nd["node_id"],
@@ -240,7 +272,7 @@ class SnapshotsTab:
         if not sel or not self._current_snap:
             return
         node_id = int(self._node_tree.item(sel[0])["values"][0])
-        nd = next((n for n in self._current_snap["nodes"] if n["node_id"] == node_id), None)
+        nd = self._node_map.get(node_id)
         if not nd:
             return
         lines = [
@@ -279,7 +311,7 @@ class SnapshotsTab:
         item = sel[0]
         node_id  = int(self._dir_tree.item(item)["values"][1])
         filename = self._dir_tree.item(item)["text"]
-        nd = next((n for n in self._current_snap["nodes"] if n["node_id"] == node_id), None)
+        nd = self._node_map.get(node_id)
         if not nd:
             return
         raw_hash = nd["content_hash"]
@@ -300,8 +332,7 @@ class SnapshotsTab:
             return
         self._dir_tree.selection_set(item)
         node_id = int(self._dir_tree.item(item)["values"][1])
-        nd = next((n for n in (self._current_snap or {}).get("nodes", [])
-                   if n["node_id"] == node_id), None)
+        nd = self._node_map.get(node_id)
         has_content = nd is not None and nd["content_hash"] != bytes(32)
         self._dir_ctx.entryconfig("Export file…",
                                   state=tk.NORMAL if has_content else tk.DISABLED)
@@ -314,8 +345,7 @@ class SnapshotsTab:
         item = sel[0]
         node_id  = int(self._dir_tree.item(item)["values"][1])
         filename = self._dir_tree.item(item)["text"]
-        nd = next((n for n in self._current_snap["nodes"]
-                   if n["node_id"] == node_id), None)
+        nd = self._node_map.get(node_id)
         if nd is None or nd["content_hash"] == bytes(32):
             messagebox.showinfo("No content", "This item has no file content to export.")
             return
@@ -365,8 +395,9 @@ class SnapshotsTab:
         return NODE_TYPE_NAMES.get(ntype, "") if ntype else ""
 
     def _populate_dir_tree(self, s: dict) -> None:
-        for row in self._dir_tree.get_children():
-            self._dir_tree.delete(row)
+        rows = self._dir_tree.get_children()
+        if rows:
+            self._dir_tree.delete(*rows)
 
         self._dir_children = {}
         for d in s["dirents"]:

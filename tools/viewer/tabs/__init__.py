@@ -8,9 +8,10 @@ from .lookup     import LookupTab
 from .diff       import DiffTab
 from .analytics  import AnalyticsTab
 from .search     import SearchTab
+from .gfs_tree   import GFSTreeTab
 
 __all__ = [
     "OverviewTab", "SnapshotsTab", "PacksTab",
     "LooseTab", "TagsTab", "PolicyTab", "LookupTab",
-    "DiffTab", "AnalyticsTab", "SearchTab",
+    "DiffTab", "AnalyticsTab", "SearchTab", "GFSTreeTab",
 ]

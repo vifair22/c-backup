@@ -1,4 +1,5 @@
 import difflib
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -8,6 +9,8 @@ from ..formats import fmt_size, fmt_time, hex_hash
 from ..widgets import PAD, FONT_MONO, make_text_widget
 from ..constants import COMPRESS_NONE, UI_SIZE_LIMIT
 
+_DIFF_ROW_CAP = 5000
+
 
 class DiffTab:
     def __init__(self, nb: ttk.Notebook):
@@ -16,7 +19,10 @@ class DiffTab:
         self._snap_paths: list[str] = []
         self._snap_a = None
         self._snap_b = None
+        self._map_a: dict | None = None
+        self._map_b: dict | None = None
         self._scan: dict = {}
+        self._compare_gen: int = 0
         self._build()
 
     def _build(self) -> None:
@@ -35,7 +41,8 @@ class DiffTab:
                                      width=32, state="readonly")
         self._b_combo.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(bar, text="Compare", command=self._compare).pack(side=tk.LEFT, padx=8)
+        self._compare_btn = tk.Button(bar, text="Compare", command=self._compare)
+        self._compare_btn.pack(side=tk.LEFT, padx=8)
         self._status = tk.Label(bar, text="")
         self._status.pack(side=tk.LEFT)
 
@@ -95,56 +102,97 @@ class DiffTab:
         if ai < 0 or bi < 0:
             messagebox.showwarning("Select snaps", "Select both snapshots.")
             return
-        try:
-            snap_a = parse_snap(self._snap_paths[ai])
-            snap_b = parse_snap(self._snap_paths[bi])
-        except Exception as e:
-            messagebox.showerror("Parse error", str(e))
-            return
 
+        self._compare_gen += 1
+        gen = self._compare_gen
+        self._status.config(text="Comparing…")
+        self._compare_btn.config(state=tk.DISABLED)
+        rows = self._tree.get_children()
+        if rows:
+            self._tree.delete(*rows)
+
+        path_a = self._snap_paths[ai]
+        path_b = self._snap_paths[bi]
+
+        def _worker() -> None:
+            try:
+                snap_a = parse_snap(path_a)
+                snap_b = parse_snap(path_b)
+            except Exception as e:
+                err = str(e)
+                self._frame.after(0, lambda: self._on_compare_error(err, gen))
+                return
+
+            map_a = build_path_map(snap_a)
+            map_b = build_path_map(snap_b)
+            all_paths = sorted(set(map_a) | set(map_b))
+
+            counts = {"added": 0, "deleted": 0, "modified": 0, "meta": 0}
+            result_rows: list[tuple] = []    # (values_tuple, tag)
+
+            for path in all_paths:
+                na, nb = map_a.get(path), map_b.get(path)
+                if na is None:
+                    status, tag = "added",    "added"
+                    old_sz, new_sz = "—", fmt_size(nb["size"])
+                    old_h,  new_h  = "—", hex_hash(nb["content_hash"])[:14]
+                elif nb is None:
+                    status, tag = "deleted",  "deleted"
+                    old_sz, new_sz = fmt_size(na["size"]), "—"
+                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], "—"
+                elif na["content_hash"] != nb["content_hash"]:
+                    status, tag = "modified", "modified"
+                    old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
+                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], hex_hash(nb["content_hash"])[:14]
+                elif (na["mode"] != nb["mode"] or na["uid"] != nb["uid"] or
+                      na["gid"] != nb["gid"] or na["mtime_sec"] != nb["mtime_sec"]):
+                    status, tag = "meta-only", "meta"
+                    old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
+                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], "(same)"
+                else:
+                    continue
+
+                counts[tag if tag != "meta" else "meta"] += 1
+                if len(result_rows) < _DIFF_ROW_CAP:
+                    result_rows.append(((status, path, old_sz, new_sz, old_h, new_h), tag))
+
+            self._frame.after(0, lambda: self._finish_compare(
+                snap_a, snap_b, map_a, map_b, counts, result_rows, gen))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_compare_error(self, err: str, gen: int) -> None:
+        if gen != self._compare_gen:
+            return
+        self._compare_btn.config(state=tk.NORMAL)
+        self._status.config(text="")
+        messagebox.showerror("Parse error", err)
+
+    def _finish_compare(self, snap_a, snap_b, map_a, map_b,
+                        counts, result_rows, gen) -> None:
+        if gen != self._compare_gen:
+            return
+        self._compare_btn.config(state=tk.NORMAL)
         self._snap_a = snap_a
         self._snap_b = snap_b
-        map_a = build_path_map(snap_a)
-        map_b = build_path_map(snap_b)
-        all_paths = sorted(set(map_a) | set(map_b))
+        self._map_a  = map_a
+        self._map_b  = map_b
 
-        for row in self._tree.get_children():
-            self._tree.delete(row)
+        for vals, tag in result_rows:
+            self._tree.insert("", tk.END, values=vals, tags=(tag,))
 
-        counts = {"added": 0, "deleted": 0, "modified": 0, "meta": 0}
-        for path in all_paths:
-            na, nb = map_a.get(path), map_b.get(path)
-            if na is None:
-                status, tag = "added",    "added"
-                old_sz, new_sz = "—", fmt_size(nb["size"])
-                old_h,  new_h  = "—", hex_hash(nb["content_hash"])[:14]
-            elif nb is None:
-                status, tag = "deleted",  "deleted"
-                old_sz, new_sz = fmt_size(na["size"]), "—"
-                old_h,  new_h  = hex_hash(na["content_hash"])[:14], "—"
-            elif na["content_hash"] != nb["content_hash"]:
-                status, tag = "modified", "modified"
-                old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
-                old_h,  new_h  = hex_hash(na["content_hash"])[:14], hex_hash(nb["content_hash"])[:14]
-            elif (na["mode"] != nb["mode"] or na["uid"] != nb["uid"] or
-                  na["gid"] != nb["gid"] or na["mtime_sec"] != nb["mtime_sec"]):
-                status, tag = "meta-only", "meta"
-                old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
-                old_h,  new_h  = hex_hash(na["content_hash"])[:14], "(same)"
-            else:
-                continue  # unchanged
-
-            counts[tag if tag != "meta" else "meta"] += 1
-            self._tree.insert("", tk.END,
-                              values=(status, path, old_sz, new_sz, old_h, new_h),
-                              tags=(tag,))
+        total_changes = sum(counts.values())
+        cap_note = ""
+        if total_changes > _DIFF_ROW_CAP:
+            cap_note = f"  (showing {len(result_rows)} of {total_changes:,})"
 
         self._status.config(
             text=(f"snap {snap_a['snap_id']} → {snap_b['snap_id']}:  "
-                  f"+{counts['added']} added  "
-                  f"-{counts['deleted']} deleted  "
-                  f"~{counts['modified']} modified  "
-                  f"{counts['meta']} meta-only")
+                  f"+{counts['added']:,} added  "
+                  f"-{counts['deleted']:,} deleted  "
+                  f"~{counts['modified']:,} modified  "
+                  f"{counts['meta']:,} meta-only"
+                  f"{cap_note}")
         )
 
     # ------------------------------------------------------------------ #
@@ -158,9 +206,12 @@ class DiffTab:
         vals  = self._tree.item(sel[0])["values"]
         status, path = str(vals[0]), str(vals[1])
 
-        map_a = build_path_map(self._snap_a)
-        map_b = build_path_map(self._snap_b)
-        self._show_file_diff(path, status, map_a.get(path), map_b.get(path))
+        # Use cached path maps from the compare (avoid rebuilding)
+        if self._map_a is None or self._map_b is None:
+            self._map_a = build_path_map(self._snap_a)
+            self._map_b = build_path_map(self._snap_b)
+
+        self._show_file_diff(path, status, self._map_a.get(path), self._map_b.get(path))
 
     def _show_file_diff(self, path: str, status: str, na: dict | None, nb: dict | None) -> None:
         win = tk.Toplevel(self._frame)

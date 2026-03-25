@@ -7,7 +7,7 @@ from .widgets import PAD
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
     LooseTab, TagsTab, PolicyTab, LookupTab,
-    DiffTab, AnalyticsTab, SearchTab,
+    DiffTab, AnalyticsTab, SearchTab, GFSTreeTab,
 )
 
 
@@ -57,6 +57,7 @@ class ViewerApp(tk.Tk):
             "tags":       TagsTab(nb),
             "lookup":     LookupTab(nb),
             "policy":     PolicyTab(nb),
+            "gfs_tree":   GFSTreeTab(nb),
         }
         self._nb = nb
         self._wire_navigation()

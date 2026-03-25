@@ -1,6 +1,8 @@
 import bisect
+import math
 import os
 import struct
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -69,6 +71,11 @@ class PacksTab:
         self._map_segments: list[tuple] = []
         self._seg_starts:   list[int]   = []   # parallel list for bisect
         self._map_total_bytes: int = 0
+        # Display-space coordinates (log or linear depending on scale mode)
+        self._display_segments: list[tuple] = []
+        self._display_starts:   list[int]   = []
+        self._display_total: int = 0
+        self._load_generation: int = 0         # discard stale threaded results
         self._build()
 
     # ---- build ----
@@ -116,6 +123,8 @@ class PacksTab:
         bar.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
         self._entry_count_label = tk.Label(bar, text="", font=FONT_MONO)
         self._entry_count_label.pack(side=tk.LEFT)
+        self._dat_loading_label = tk.Label(bar, text="", fg="gray", font=FONT_MONO)
+        self._dat_loading_label.pack(side=tk.LEFT, padx=8)
 
         cols = [
             ("hash",          260, True),
@@ -145,6 +154,11 @@ class PacksTab:
         self._entry_tree.bind("<Button-3>", self._on_right_click)
 
     def _build_idx_tree(self) -> None:
+        idx_bar = tk.Frame(self._idx_frame)
+        idx_bar.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+        self._idx_count_label = tk.Label(idx_bar, text="", font=FONT_MONO)
+        self._idx_count_label.pack(side=tk.LEFT)
+
         self._idx_tree = ttk.Treeview(self._idx_frame,
                                       columns=("hash", "dat_offset"),
                                       show="headings", selectmode="browse")
@@ -173,12 +187,19 @@ class PacksTab:
         ctrl = tk.Frame(self._map_frame)
         ctrl.pack(side=tk.TOP, fill=tk.X, padx=PAD, pady=(0, 4))
 
-        tk.Label(ctrl, text="Row width:").pack(side=tk.LEFT)
+        tk.Label(ctrl, text="Scale:").pack(side=tk.LEFT)
+        self._scale_var = tk.StringVar(value="Log")
+        scale_box = ttk.Combobox(ctrl, textvariable=self._scale_var,
+                                 values=["Linear", "Log"], width=7, state="readonly")
+        scale_box.pack(side=tk.LEFT, padx=4)
+        scale_box.bind("<<ComboboxSelected>>", lambda _: self._on_scale_change())
+
+        tk.Label(ctrl, text="  Row width:").pack(side=tk.LEFT)
         self._bpr_var = tk.StringVar(value="auto")
-        bpr_box = ttk.Combobox(ctrl, textvariable=self._bpr_var,
-                               values=_BPR_LABELS, width=9, state="readonly")
-        bpr_box.pack(side=tk.LEFT, padx=4)
-        bpr_box.bind("<<ComboboxSelected>>", lambda _: self._redraw_pack_map())
+        self._bpr_combo = ttk.Combobox(ctrl, textvariable=self._bpr_var,
+                                       values=_BPR_LABELS, width=9, state="disabled")
+        self._bpr_combo.pack(side=tk.LEFT, padx=4)
+        self._bpr_combo.bind("<<ComboboxSelected>>", lambda _: self._redraw_pack_map())
 
         tk.Label(ctrl, text="  Row height:").pack(side=tk.LEFT)
         self._rh_var = tk.StringVar(value="8")
@@ -250,13 +271,37 @@ class PacksTab:
             self.load_idx(idx_path)
 
     def load_dat(self, path: str) -> None:
+        """Parse the .dat file in a background thread to avoid freezing the UI."""
         self._current_dat = path
-        try:
-            d = parse_pack_dat(path)
-        except Exception as e:
-            messagebox.showerror("Parse error", str(e))
+        self._load_generation += 1
+        gen = self._load_generation
+        self._dat_loading_label.config(text="Loading…")
+        self._entry_count_label.config(text="")
+
+        def _worker() -> None:
+            try:
+                d   = parse_pack_dat(path)
+                fsz = os.path.getsize(path)
+            except Exception as e:
+                err = str(e)
+                self._entry_frame.after(0,
+                    lambda: self._on_dat_error(err, gen))
+                return
+            self._entry_frame.after(0,
+                lambda: self._finish_load_dat(path, d, fsz, gen))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_dat_error(self, err: str, gen: int) -> None:
+        if gen != self._load_generation:
             return
-        file_size = os.path.getsize(path)
+        self._dat_loading_label.config(text="")
+        messagebox.showerror("Parse error", err)
+
+    def _finish_load_dat(self, path: str, d: dict, file_size: int, gen: int) -> None:
+        if gen != self._load_generation:
+            return
+        self._dat_loading_label.config(text="")
         lines = [
             f"File    : {path}",
             f"Size    : {fmt_size(file_size)}",
@@ -268,8 +313,9 @@ class PacksTab:
         set_text(self._hdr_text, "\n".join(lines))
 
         # Paginate treeview
-        for row in self._entry_tree.get_children():
-            self._entry_tree.delete(row)
+        rows = self._entry_tree.get_children()
+        if rows:
+            self._entry_tree.delete(*rows)
         shown = self._entries[:_ENTRY_PAGE]
         total = len(self._entries)
         for e in shown:
@@ -289,6 +335,7 @@ class PacksTab:
         self._entry_count_label.config(text=label)
 
         self._build_map_segments(d["version"], file_size)
+        self._compute_display_coords()
         self._map_canvas.after(50, self._redraw_pack_map)
 
     def load_idx(self, path: str) -> None:
@@ -297,13 +344,20 @@ class PacksTab:
         except Exception as e:
             messagebox.showerror("Parse error", str(e))
             return
-        for row in self._idx_tree.get_children():
-            self._idx_tree.delete(row)
-        for e in idx["entries"]:
+        rows = self._idx_tree.get_children()
+        if rows:
+            self._idx_tree.delete(*rows)
+        entries = idx["entries"]
+        total   = len(entries)
+        shown   = entries[:_ENTRY_PAGE]
+        for e in shown:
             self._idx_tree.insert("", tk.END, values=(
                 hex_hash(e["hash"]),
                 f"0x{e['dat_offset']:X}",
             ))
+        label = (f"Showing {_ENTRY_PAGE} of {total} entries"
+                 if total > _ENTRY_PAGE else f"{total} entries")
+        self._idx_count_label.config(text=label)
 
     # ---- pack map segments ----
 
@@ -359,9 +413,66 @@ class PacksTab:
         self._seg_starts    = [s[0] for s in segs]
         self._map_total_bytes = file_size
 
+    # ---- display coordinate mapping ----
+
+    def _compute_display_coords(self) -> None:
+        """Build the display-space coordinate system for the pack map.
+
+        In Linear mode, display coords == byte offsets (identity).
+        In Log mode, each segment's visual width is proportional to
+        log2(1 + byte_size).  This compresses huge objects and enlarges
+        tiny ones so that every segment is visible — like Windows Disk
+        Management does for partition sizes.
+        """
+        if not self._map_segments:
+            self._display_segments = []
+            self._display_starts   = []
+            self._display_total    = 0
+            return
+
+        if self._scale_var.get() == "Linear":
+            self._display_segments = self._map_segments
+            self._display_starts   = self._seg_starts
+            self._display_total    = self._map_total_bytes
+            return
+
+        # Log-compressed scale.
+        # Compute log2(1 + size) for each segment, then scale the results
+        # into a large integer space so the existing grid math (which uses
+        # integer // and %) works without modification.
+        SCALE = 10_000_000
+        log_sizes = [math.log2(1 + (end - start))
+                     for start, end, _, _, _ in self._map_segments]
+        total_log = sum(log_sizes) or 1.0
+
+        cumulative = 0
+        display_segs:   list[tuple] = []
+        display_starts: list[int]   = []
+        for i, (_, _, color, text, idx) in enumerate(self._map_segments):
+            visual = max(1, int(log_sizes[i] / total_log * SCALE))
+            display_starts.append(cumulative)
+            display_segs.append((cumulative, cumulative + visual, color, text, idx))
+            cumulative += visual
+
+        self._display_segments = display_segs
+        self._display_starts   = display_starts
+        self._display_total    = cumulative
+
+    def _on_scale_change(self) -> None:
+        is_log = self._scale_var.get() != "Linear"
+        self._bpr_combo.config(state="disabled" if is_log else "readonly")
+        if is_log:
+            self._bpr_var.set("auto")
+        self._compute_display_coords()
+        self._redraw_pack_map()
+
     # ---- drawing ----
 
-    def _get_bpr(self) -> int:
+    def _get_display_bpr(self) -> int:
+        """Return the display-units-per-row value for the current settings."""
+        if self._scale_var.get() != "Linear":
+            # Log mode: always auto (byte-based presets are meaningless)
+            return max(1, self._display_total // 500)
         val = self._bpr_var.get()
         if val == "auto":
             return max(512, self._map_total_bytes // 500)
@@ -378,38 +489,60 @@ class PacksTab:
 
     def _redraw_pack_map(self) -> None:
         self._map_canvas.delete("all")
-        if not self._map_segments or not self._map_total_bytes:
+        if not self._display_segments or not self._display_total:
             return
         W     = self._map_canvas.winfo_width() or 700
-        bpr   = self._get_bpr()
+        bpr   = self._get_display_bpr()
         row_h = self._get_row_height()
-        total = self._map_total_bytes
-        n_rows   = (total + bpr - 1) // bpr
+        total = self._display_total
+        n_rows    = (total + bpr - 1) // bpr
         content_h = n_rows * row_h
-        self._map_content_h = content_h   # used by _byte_at for scroll maths
+        self._map_content_h = content_h
 
         self._map_canvas.configure(scrollregion=(0, 0, W, content_h))
-        self._map_info_label.config(
-            text=f"{n_rows} rows  ·  {fmt_size(bpr)}/row  ·  "
-                 f"{fmt_size(total)} total")
 
-        for start, end, color, _, _ in self._map_segments:
-            self._draw_segment(start, end, color, bpr, W, row_h)
+        if self._scale_var.get() == "Linear":
+            self._map_info_label.config(
+                text=f"{n_rows} rows  ·  {fmt_size(bpr)}/row  ·  "
+                     f"{fmt_size(self._map_total_bytes)} total")
+        else:
+            self._map_info_label.config(
+                text=f"{n_rows} rows  ·  log scale  ·  "
+                     f"{fmt_size(self._map_total_bytes)} total")
+
+        for d_start, d_end, color, _, _ in self._display_segments:
+            self._draw_segment(d_start, d_end, color, bpr, W, row_h)
+
+    @staticmethod
+    def _guide_color(hex_color: str) -> str:
+        """Blend a segment color 35% toward the canvas background (#1e1e1e)."""
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        # bg = 0x1e = 30
+        r = int(r + (30 - r) * 0.35)
+        g = int(g + (30 - g) * 0.35)
+        b = int(b + (30 - b) * 0.35)
+        return f"#{r:02x}{g:02x}{b:02x}"
 
     def _draw_segment(self, start: int, end: int, color: str,
                       bpr: int, W: int, row_h: int) -> None:
         """Draw one segment onto the 2D grid.
-        At most 3 create_rectangle calls regardless of how many rows it spans.
-        Outline matches canvas background so segment boundaries appear as 1-px gaps.
+
+        Sub-rectangles (first partial row, middle full rows, last partial row)
+        are drawn WITHOUT outlines so there is no solid line at internal row
+        wraps.  Instead, dashed guides mark internal wraps and segment
+        boundaries are visible through colour differences between neighbours.
+        Single-row segments keep a thin border for clarity.
         """
         if start >= end:
             return
         first_row = start // bpr
         last_row  = (end - 1) // bpr
-        border    = "#1e1e1e"   # == canvas bg → 1-px dark gap at every edge
+        border    = "#1e1e1e"   # == canvas bg
 
-        def _x(byte_in_row: int) -> int:
-            return int(W * byte_in_row / bpr)
+        def _x(offset_in_row: int) -> int:
+            return int(W * offset_in_row / bpr)
 
         if first_row == last_row:
             x0 = _x(start % bpr)
@@ -419,32 +552,74 @@ class PacksTab:
                 x0, y0, x1, y0 + row_h, fill=color, outline=border)
             return
 
+        # Multi-row: draw sub-rectangles with NO outline so internal
+        # shared edges don't produce solid lines.
+        s_x0 = _x(start % bpr)
+        e_x1 = max(1, _x((end - 1) % bpr + 1))
+
         # First partial row
-        x0 = _x(start % bpr)
         y0 = first_row * row_h
-        self._map_canvas.create_rectangle(x0, y0, W, y0 + row_h, fill=color, outline=border)
+        self._map_canvas.create_rectangle(
+            s_x0, y0, W, y0 + row_h, fill=color, outline="")
 
         # All full middle rows as one rectangle
         if last_row > first_row + 1:
             y_mid0 = (first_row + 1) * row_h
             y_mid1 = last_row * row_h
-            self._map_canvas.create_rectangle(0, y_mid0, W, y_mid1, fill=color, outline=border)
+            self._map_canvas.create_rectangle(
+                0, y_mid0, W, y_mid1, fill=color, outline="")
 
         # Last partial row
-        x1 = max(1, _x((end - 1) % bpr + 1))
         y0 = last_row * row_h
-        self._map_canvas.create_rectangle(0, y0, x1, y0 + row_h, fill=color, outline=border)
+        self._map_canvas.create_rectangle(
+            0, y0, e_x1, y0 + row_h, fill=color, outline="")
+
+        # Outer perimeter — thin border only on the segment's exterior edges.
+        fy0 = first_row * row_h
+        fy1 = fy0 + row_h
+        ly0 = last_row * row_h
+        ly1 = ly0 + row_h
+
+        # Top edge of first row
+        self._map_canvas.create_line(s_x0, fy0, W, fy0, fill=border)
+        # Right edge (full height)
+        self._map_canvas.create_line(W, fy0, W, ly0, fill=border)
+        # Left step at first_row → first_row+1 (if first row is partial)
+        if s_x0 > 0:
+            self._map_canvas.create_line(s_x0, fy0, s_x0, fy1, fill=border)
+            self._map_canvas.create_line(0, fy1, s_x0, fy1, fill=border)
+        # Left edge of middle + last rows
+        self._map_canvas.create_line(0, fy1, 0, ly1, fill=border)
+        # Bottom edge of last row
+        self._map_canvas.create_line(0, ly1, e_x1, ly1, fill=border)
+        # Right step at last_row (if last row is partial)
+        if e_x1 < W:
+            self._map_canvas.create_line(e_x1, ly0, e_x1, ly1, fill=border)
+            self._map_canvas.create_line(e_x1, ly0, W, ly0, fill=border)
+
+        # Dashed row guides at every internal row wrap, clipped to the
+        # segment's horizontal extent so they don't overlap the solid
+        # perimeter on rows shared with other segments.
+        n_guides = last_row - first_row
+        if n_guides <= 2000:
+            guide = self._guide_color(color)
+            for row in range(first_row + 1, last_row + 1):
+                y = row * row_h
+                gx0 = s_x0 if row == first_row + 1 else 0
+                gx1 = e_x1 if row == last_row else W
+                self._map_canvas.create_line(
+                    gx0, y, gx1, y, fill=guide, dash=(6, 2))
 
     # ---- interaction ----
 
-    def _byte_at(self, event: tk.Event) -> int:
-        """Convert a canvas mouse event to a byte offset in the pack file.
+    def _display_offset_at(self, event: tk.Event) -> int:
+        """Convert a canvas mouse event to a display-space offset.
 
         Uses explicit yview fraction × content-height rather than canvasy() to
         avoid floating-point precision issues with very tall scroll regions.
         """
         W         = self._map_canvas.winfo_width() or 700
-        bpr       = self._get_bpr()
+        bpr       = self._get_display_bpr()
         row_h     = self._get_row_height()
         content_h = getattr(self, "_map_content_h", 0)
         if content_h > 0:
@@ -454,30 +629,30 @@ class PacksTab:
             cy = float(self._map_canvas.canvasy(event.y))
         row = max(0, int(cy / row_h))
         col = max(0.0, min(1.0, event.x / W))
-        return min(row * bpr + int(col * bpr), self._map_total_bytes - 1)
+        return min(row * bpr + int(col * bpr), max(self._display_total - 1, 0))
 
-    def _segment_at(self, byte_pos: int):
-        """O(log n) lookup of the segment covering byte_pos."""
-        idx = bisect.bisect_right(self._seg_starts, byte_pos) - 1
-        if 0 <= idx < len(self._map_segments):
-            seg = self._map_segments[idx]
-            if seg[0] <= byte_pos < seg[1]:
+    def _segment_at(self, display_pos: int):
+        """O(log n) lookup of the display segment covering display_pos."""
+        idx = bisect.bisect_right(self._display_starts, display_pos) - 1
+        if 0 <= idx < len(self._display_segments):
+            seg = self._display_segments[idx]
+            if seg[0] <= display_pos < seg[1]:
                 return seg
         return None
 
     def _on_map_motion(self, event: tk.Event) -> None:
-        if not self._map_segments or not self._map_total_bytes:
+        if not self._display_segments or not self._display_total:
             return
-        seg = self._segment_at(self._byte_at(event))
+        seg = self._segment_at(self._display_offset_at(event))
         if seg:
             self._map_detail.config(text=seg[3], fg="black")
         else:
             self._map_detail.config(text="", fg="gray")
 
     def _on_map_click(self, event: tk.Event) -> None:
-        if not self._map_segments or not self._map_total_bytes:
+        if not self._display_segments or not self._display_total:
             return
-        seg = self._segment_at(self._byte_at(event))
+        seg = self._segment_at(self._display_offset_at(event))
         if seg and seg[4] is not None:
             entry_idx = seg[4]
             if entry_idx < len(self._entries):

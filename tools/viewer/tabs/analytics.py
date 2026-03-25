@@ -1,3 +1,5 @@
+import math
+import threading
 import tkinter as tk
 from tkinter import ttk
 
@@ -60,113 +62,126 @@ class AnalyticsTab:
         self._loc_canvas.bind("<Configure>", lambda _: self._redraw_loc())
 
     def populate(self, scan: dict) -> None:
-        stats = {t: {"count": 0, "uncomp": 0, "comp": 0} for t in _TYPES}
+        set_text(self._text, "Loading…")
 
-        pack    = {"count": 0, "uncomp": 0, "comp": 0}
-        loose   = {"count": 0, "uncomp": 0, "comp": 0}
-        skip    = {"count": 0, "uncomp": 0, "comp": 0}   # loose + pack_skip_ver set
-        hiratio = {"count": 0, "uncomp": 0, "comp": 0}   # pack entries ratio >= 0.90
+        def _worker() -> None:
+            stats = {t: {"count": 0, "uncomp": 0, "comp": 0} for t in _TYPES}
 
-        for dat_path in scan.get("pack_dat", []):
-            try:
-                d = parse_pack_dat(dat_path)
-            except Exception:
-                continue
-            for e in d["entries"]:
-                t = e["type"]
+            pack    = {"count": 0, "uncomp": 0, "comp": 0}
+            loose   = {"count": 0, "uncomp": 0, "comp": 0}
+            skip    = {"count": 0, "uncomp": 0, "comp": 0}
+            hiratio = {"count": 0, "uncomp": 0, "comp": 0}
+
+            for dat_path in scan.get("pack_dat", []):
+                try:
+                    d = parse_pack_dat(dat_path)
+                except Exception:
+                    continue
+                for e in d["entries"]:
+                    t = e["type"]
+                    if t in stats:
+                        stats[t]["count"]  += 1
+                        stats[t]["uncomp"] += e["uncompressed_size"]
+                        stats[t]["comp"]   += e["compressed_size"]
+                    pack["count"]  += 1
+                    pack["uncomp"] += e["uncompressed_size"]
+                    pack["comp"]   += e["compressed_size"]
+                    if (e["uncompressed_size"] > 0 and
+                            e["compressed_size"] / e["uncompressed_size"] >= 0.90):
+                        hiratio["count"]  += 1
+                        hiratio["uncomp"] += e["uncompressed_size"]
+                        hiratio["comp"]   += e["compressed_size"]
+
+            for loose_path in scan.get("loose", []):
+                try:
+                    obj = parse_loose_object(loose_path)
+                except Exception:
+                    continue
+                t = obj["type"]
                 if t in stats:
                     stats[t]["count"]  += 1
-                    stats[t]["uncomp"] += e["uncompressed_size"]
-                    stats[t]["comp"]   += e["compressed_size"]
-                pack["count"]  += 1
-                pack["uncomp"] += e["uncompressed_size"]
-                pack["comp"]   += e["compressed_size"]
-                if (e["uncompressed_size"] > 0 and
-                        e["compressed_size"] / e["uncompressed_size"] >= 0.90):
-                    hiratio["count"]  += 1
-                    hiratio["uncomp"] += e["uncompressed_size"]
-                    hiratio["comp"]   += e["compressed_size"]
+                    stats[t]["uncomp"] += obj["uncompressed_size"]
+                    stats[t]["comp"]   += obj["compressed_size"]
+                loose["count"]  += 1
+                loose["uncomp"] += obj["uncompressed_size"]
+                loose["comp"]   += obj["compressed_size"]
+                if obj.get("pack_skip_ver", 0) == PROBER_VERSION:
+                    skip["count"]  += 1
+                    skip["uncomp"] += obj["uncompressed_size"]
+                    skip["comp"]   += obj["compressed_size"]
 
-        for loose_path in scan.get("loose", []):
-            try:
-                obj = parse_loose_object(loose_path)
-            except Exception:
-                continue
-            t = obj["type"]
-            if t in stats:
-                stats[t]["count"]  += 1
-                stats[t]["uncomp"] += obj["uncompressed_size"]
-                stats[t]["comp"]   += obj["compressed_size"]
-            loose["count"]  += 1
-            loose["uncomp"] += obj["uncompressed_size"]
-            loose["comp"]   += obj["compressed_size"]
-            if obj.get("pack_skip_ver", 0) == PROBER_VERSION:
-                skip["count"]  += 1
-                skip["uncomp"] += obj["uncompressed_size"]
-                skip["comp"]   += obj["compressed_size"]
+            total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
+            total_comp   = sum(s["comp"]   for s in stats.values()) or 1
+            total_count  = sum(s["count"]  for s in stats.values())
+            savings      = total_uncomp - total_comp
 
-        total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
-        total_comp   = sum(s["comp"]   for s in stats.values()) or 1
-        total_count  = sum(s["count"]  for s in stats.values())
-        savings      = total_uncomp - total_comp
+            lines = [
+                f"{'Type':<8}  {'Count':>7}  {'Uncompressed':>14}  {'Compressed':>12}  {'Ratio':>6}",
+                "\u2500" * 58,
+            ]
+            for t in _TYPES:
+                s = stats[t]
+                ratio = f"{s['comp'] / s['uncomp']:.3f}" if s["uncomp"] else "\u2014"
+                lines.append(
+                    f"{OBJECT_TYPE_NAMES.get(t, t):<8}  {s['count']:>7}"
+                    f"  {fmt_size(s['uncomp']):>14}  {fmt_size(s['comp']):>12}  {ratio:>6}"
+                )
+            lines += [
+                "\u2500" * 58,
+                f"{'TOTAL':<8}  {total_count:>7}  {fmt_size(total_uncomp):>14}"
+                f"  {fmt_size(total_comp):>12}  {total_comp / total_uncomp:.3f}",
+                "",
+                f"Space saved : {fmt_size(savings)}"
+                f"  ({100 * (1 - total_comp / total_uncomp):.1f}% reduction)",
+            ]
 
-        lines = [
-            f"{'Type':<8}  {'Count':>7}  {'Uncompressed':>14}  {'Compressed':>12}  {'Ratio':>6}",
-            "─" * 58,
-        ]
-        for t in _TYPES:
-            s = stats[t]
-            ratio = f"{s['comp'] / s['uncomp']:.3f}" if s["uncomp"] else "—"
-            lines.append(
-                f"{OBJECT_TYPE_NAMES.get(t, t):<8}  {s['count']:>7}"
-                f"  {fmt_size(s['uncomp']):>14}  {fmt_size(s['comp']):>12}  {ratio:>6}"
-            )
-        lines += [
-            "─" * 58,
-            f"{'TOTAL':<8}  {total_count:>7}  {fmt_size(total_uncomp):>14}"
-            f"  {fmt_size(total_comp):>12}  {total_comp / total_uncomp:.3f}",
-            "",
-            f"Space saved : {fmt_size(savings)}"
-            f"  ({100 * (1 - total_comp / total_uncomp):.1f}% reduction)",
-        ]
+            total_all        = pack["count"]  + loose["count"]
+            total_all_uncomp = pack["uncomp"] + loose["uncomp"]
+            incomp_count     = skip["count"]  + hiratio["count"]
+            incomp_uncomp    = skip["uncomp"] + hiratio["uncomp"]
+            comp_count       = total_all        - incomp_count
+            comp_uncomp      = total_all_uncomp - incomp_uncomp
 
-        total_all        = pack["count"]  + loose["count"]
-        total_all_uncomp = pack["uncomp"] + loose["uncomp"]
-        incomp_count     = skip["count"]  + hiratio["count"]
-        incomp_uncomp    = skip["uncomp"] + hiratio["uncomp"]
-        comp_count       = total_all        - incomp_count
-        comp_uncomp      = total_all_uncomp - incomp_uncomp
+            lines += [
+                "",
+                f"{'Category':<20}  {'Count':>7}  {'Uncompressed':>14}",
+                "\u2500" * 46,
+                f"{'Compressible':<20}  {comp_count:>7}  {fmt_size(comp_uncomp):>14}",
+                f"{'Incompressible':<20}  {incomp_count:>7}  {fmt_size(incomp_uncomp):>14}",
+                f"{'  skip-marked':<20}  {skip['count']:>7}  {fmt_size(skip['uncomp']):>14}",
+                f"{'  high-ratio pack':<20}  {hiratio['count']:>7}  {fmt_size(hiratio['uncomp']):>14}",
+            ]
 
-        lines += [
-            "",
-            f"{'Category':<20}  {'Count':>7}  {'Uncompressed':>14}",
-            "─" * 46,
-            f"{'Compressible':<20}  {comp_count:>7}  {fmt_size(comp_uncomp):>14}",
-            f"{'Incompressible':<20}  {incomp_count:>7}  {fmt_size(incomp_uncomp):>14}",
-            f"{'  skip-marked':<20}  {skip['count']:>7}  {fmt_size(skip['uncomp']):>14}",
-            f"{'  high-ratio pack':<20}  {hiratio['count']:>7}  {fmt_size(hiratio['uncomp']):>14}",
-        ]
+            chart_data = [(t, stats[t]["uncomp"], stats[t]["count"]) for t in _TYPES]
+            loose_only_count = loose["count"] - skip["count"]
+            loose_only_bytes = loose["uncomp"] - skip["uncomp"]
+            loc_data = [
+                ("Pack",         pack["uncomp"],       pack["count"],       _COLOR_PACK),
+                ("Loose",        loose_only_bytes,      loose_only_count,    _COLOR_LOOSE),
+                ("Loose (skip)", skip["uncomp"],        skip["count"],       _COLOR_LOOSE_SKIP),
+            ]
+            compress_data = {
+                "total":          total_all,
+                "comp_count":     comp_count,
+                "comp_uncomp":    comp_uncomp,
+                "skip_count":     skip["count"],
+                "skip_uncomp":    skip["uncomp"],
+                "hiratio_count":  hiratio["count"],
+                "hiratio_uncomp": hiratio["uncomp"],
+                "incomp_count":   incomp_count,
+                "incomp_uncomp":  incomp_uncomp,
+            }
+
+            self._frame.after(0, lambda: self._display(
+                lines, chart_data, loc_data, compress_data))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _display(self, lines, chart_data, loc_data, compress_data) -> None:
         set_text(self._text, "\n".join(lines))
-
-        self._chart_data = [(t, stats[t]["uncomp"], stats[t]["count"]) for t in _TYPES]
-        loose_only_count = loose["count"] - skip["count"]
-        loose_only_bytes = loose["uncomp"] - skip["uncomp"]
-        self._loc_data = [
-            ("Pack",         pack["uncomp"],       pack["count"],       _COLOR_PACK),
-            ("Loose",        loose_only_bytes,      loose_only_count,    _COLOR_LOOSE),
-            ("Loose (skip)", skip["uncomp"],        skip["count"],       _COLOR_LOOSE_SKIP),
-        ]
-        self._compress_data = {
-            "total":          total_all,
-            "comp_count":     comp_count,
-            "comp_uncomp":    comp_uncomp,
-            "skip_count":     skip["count"],
-            "skip_uncomp":    skip["uncomp"],
-            "hiratio_count":  hiratio["count"],
-            "hiratio_uncomp": hiratio["uncomp"],
-            "incomp_count":   incomp_count,
-            "incomp_uncomp":  incomp_uncomp,
-        }
+        self._chart_data    = chart_data
+        self._loc_data      = loc_data
+        self._compress_data = compress_data
         self._redraw()
         self._redraw_loc()
         self._redraw_compress()
@@ -217,8 +232,6 @@ class AnalyticsTab:
             return
         W = self._loc_canvas.winfo_width() or 600
         bar_h, gap = 24, 8
-        # margin_l must fit the longest label ("Loose (skip)" ≈ 84 px at mono-10)
-        # margin_r must fit the size label ("999.9 GiB" ≈ 72 px) plus padding
         margin_l, margin_r = 104, 84
 
         total = sum(v for _, v, _, _ in self._loc_data) or 1
@@ -247,10 +260,30 @@ class AnalyticsTab:
                 self._loc_canvas.create_text(margin_l + filled + 6, y + bar_h // 2,
                                              anchor="w", text=bar_label,
                                              font=FONT_MONO, fill="black")
-            # Size label — left-aligned just right of the bar
             self._loc_canvas.create_text(margin_l + bar_w + 6, y + bar_h // 2,
                                          anchor="w", text=fmt_size(val),
                                          font=FONT_MONO)
+
+    @staticmethod
+    def _log_widths(counts: list[int], total_px: int) -> list[int]:
+        """Map counts to pixel widths using log compression.
+
+        Ensures every non-zero segment gets at least a few visible pixels
+        while still conveying relative proportions.
+        """
+        logs = [math.log2(1 + c) for c in counts]
+        log_total = sum(logs) or 1
+        widths = [int(total_px * v / log_total) for v in logs]
+        # Give every non-zero segment at least 4 px
+        for i, c in enumerate(counts):
+            if c > 0 and widths[i] < 4:
+                widths[i] = 4
+        # Clamp total to total_px
+        overflow = sum(widths) - total_px
+        if overflow > 0:
+            biggest = max(range(len(widths)), key=lambda j: widths[j])
+            widths[biggest] = max(4, widths[biggest] - overflow)
+        return widths
 
     def _redraw_compress(self) -> None:
         self._compress_canvas.delete("all")
@@ -282,24 +315,39 @@ class AnalyticsTab:
             self._compress_canvas.create_rectangle(margin_l, y,
                                                    margin_l + bar_w, y + bar_h,
                                                    fill="#eee", outline="#ccc")
-            # draw stacked segments
-            x = margin_l
-            for seg_count, seg_color in segments:
-                seg_w = int(bar_w * seg_count / total)
-                if seg_w > 0:
-                    self._compress_canvas.create_rectangle(
-                        x, y, x + seg_w, y + bar_h,
-                        fill=seg_color, outline="")
-                    x += seg_w
 
-            if filled > 40:
-                self._compress_canvas.create_text(
-                    margin_l + filled // 2, y + bar_h // 2,
-                    anchor="center", text=bar_label, font=FONT_MONO, fill="white")
-            else:
-                self._compress_canvas.create_text(
-                    margin_l + filled + 6, y + bar_h // 2,
-                    anchor="w", text=bar_label, font=FONT_MONO, fill="black")
+            # Log-compress sub-segment widths so small segments stay visible
+            seg_counts = [sc for sc, _ in segments]
+            seg_colors = [sc for _, sc in segments]
+            seg_widths = self._log_widths(seg_counts, filled)
+
+            x = margin_l
+            multi = len(segments) > 1
+            for sw, seg_color, seg_count in zip(seg_widths, seg_colors, seg_counts):
+                if sw > 0:
+                    self._compress_canvas.create_rectangle(
+                        x, y, x + sw, y + bar_h,
+                        fill=seg_color, outline="")
+                    # Per-segment label for multi-segment bars
+                    if multi and seg_count > 0 and sw > 40:
+                        spct = 100.0 * seg_count / total
+                        stxt = f"{seg_count:,} ({spct:.1f}%)"
+                        self._compress_canvas.create_text(
+                            x + sw // 2, y + bar_h // 2,
+                            anchor="center", text=stxt,
+                            font=FONT_MONO, fill="white")
+                    x += sw
+
+            # Single-segment bars get one overall label
+            if not multi:
+                if filled > 40:
+                    self._compress_canvas.create_text(
+                        margin_l + filled // 2, y + bar_h // 2,
+                        anchor="center", text=bar_label, font=FONT_MONO, fill="white")
+                else:
+                    self._compress_canvas.create_text(
+                        margin_l + filled + 6, y + bar_h // 2,
+                        anchor="w", text=bar_label, font=FONT_MONO, fill="black")
 
             self._compress_canvas.create_text(margin_l + bar_w + 6, y + bar_h // 2,
                                               anchor="w", text=fmt_size(uncomp),

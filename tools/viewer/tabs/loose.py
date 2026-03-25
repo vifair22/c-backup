@@ -70,7 +70,7 @@ class LooseTab:
         self._list.delete(0, tk.END)
         for path in self._loose_paths:
             parts = path.split(os.sep)
-            self._list.insert(tk.END, parts[-2] + parts[-1])
+            self._list.insert(tk.END, parts[-2] + "/" + parts[-1])
 
     # ---- selection ----
 

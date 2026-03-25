@@ -1,3 +1,4 @@
+import threading
 import tkinter as tk
 from tkinter import ttk
 
@@ -6,6 +7,8 @@ from ..formats import fmt_size, fmt_time, hex_hash
 from ..constants import NODE_TYPE_NAMES
 from ..widgets import PAD, FONT_MONO
 
+_RESULT_CAP = 5000
+
 
 class SearchTab:
     def __init__(self, nb: ttk.Notebook):
@@ -13,6 +16,7 @@ class SearchTab:
         nb.add(self._frame, text="File Search")
         self._scan: dict | None = None
         self._navigate_cb = None
+        self._search_gen: int = 0
         self._build()
 
     def set_navigate_callback(self, cb) -> None:
@@ -26,7 +30,8 @@ class SearchTab:
         entry = tk.Entry(bar, textvariable=self._var, font=FONT_MONO, width=40)
         entry.pack(side=tk.LEFT, padx=4)
         entry.bind("<Return>", lambda _: self._search())
-        tk.Button(bar, text="Search", command=self._search).pack(side=tk.LEFT)
+        self._search_btn = tk.Button(bar, text="Search", command=self._search)
+        self._search_btn.pack(side=tk.LEFT)
         self._count_label = tk.Label(bar, text="")
         self._count_label.pack(side=tk.LEFT, padx=8)
 
@@ -64,27 +69,57 @@ class SearchTab:
         fragment = self._var.get().strip()
         if not fragment or not self._scan:
             return
-        for row in self._tree.get_children():
-            self._tree.delete(row)
-        total = 0
-        for snap_path in self._scan.get("snapshots", []):
-            try:
-                s = parse_snap(snap_path)
-            except Exception:
-                continue
-            for path, node in find_paths_matching(s, fragment):
-                if node is None:
+        rows = self._tree.get_children()
+        if rows:
+            self._tree.delete(*rows)
+
+        self._search_gen += 1
+        gen = self._search_gen
+        self._count_label.config(text="Searching…")
+        self._search_btn.config(state=tk.DISABLED)
+
+        snap_paths = list(self._scan.get("snapshots", []))
+
+        def _worker() -> None:
+            results: list[tuple] = []
+            for snap_path in snap_paths:
+                try:
+                    s = parse_snap(snap_path)
+                except Exception:
                     continue
-                total += 1
-                self._tree.insert("", tk.END, values=(
-                    s["snap_id"],
-                    fmt_time(s["created_sec"]),
-                    path,
-                    NODE_TYPE_NAMES.get(node["type"], str(node["type"])),
-                    fmt_size(node["size"]),
-                    hex_hash(node["content_hash"])[:20] + "…",
-                ))
-        self._count_label.config(text=f"{total} result(s)")
+                for path, node in find_paths_matching(s, fragment):
+                    if node is None:
+                        continue
+                    results.append((
+                        s["snap_id"],
+                        fmt_time(s["created_sec"]),
+                        path,
+                        NODE_TYPE_NAMES.get(node["type"], str(node["type"])),
+                        fmt_size(node["size"]),
+                        hex_hash(node["content_hash"])[:20] + "…",
+                    ))
+                    if len(results) >= _RESULT_CAP:
+                        break
+                if len(results) >= _RESULT_CAP:
+                    break
+            self._frame.after(0, lambda: self._finish_search(results, gen))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_search(self, results: list[tuple], gen: int) -> None:
+        if gen != self._search_gen:
+            return
+        self._search_btn.config(state=tk.NORMAL)
+        # Group by path so the same filename across snapshots appears together,
+        # secondary sort by snap_id within each group.
+        results.sort(key=lambda r: (r[2], r[0]))
+        for vals in results:
+            self._tree.insert("", tk.END, values=vals)
+        total = len(results)
+        if total >= _RESULT_CAP:
+            self._count_label.config(text=f"{total}+ results (capped at {_RESULT_CAP})")
+        else:
+            self._count_label.config(text=f"{total} result(s)")
 
     def _on_result_dbl(self, _event) -> None:
         sel = self._tree.selection()
