@@ -2,6 +2,17 @@
 
 #include <stdint.h>
 
+/* Stack safety assumptions:
+ *
+ * - No recursive functions: path reconstruction in snapshot.c and restore.c
+ *   uses iterative traversal with heap-allocated stacks.
+ * - No VLAs or alloca(): all variable-size buffers go through malloc.
+ * - Fixed stack buffers are limited to PATH_MAX (4 KiB) per frame.
+ * - Production builds use -fstack-protector-strong (canary detection)
+ *   and -fstack-clash-protection (guard page probing).
+ * - The default Linux stack limit (typically 8 MiB) is assumed sufficient.
+ */
+
 #define OBJECT_HASH_SIZE 32
 #define OBJECT_TYPE_FILE    1
 #define OBJECT_TYPE_XATTR   2

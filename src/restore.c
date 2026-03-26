@@ -67,24 +67,57 @@ static dr_entry_t *find_dr_by_id(dr_entry_t *arr, uint32_t n, uint64_t id) {
     return NULL;
 }
 
+/* Iteratively build the full path for a dirent entry.
+ * Walks ancestors to find the nearest cached path (or root), collects the
+ * chain on a heap-allocated stack, then concatenates from root to leaf. */
 static char *build_dr_path(dr_entry_t *arr, uint32_t n, dr_entry_t *e) {
     if (e->full_path) return e->full_path;
-    if (e->parent_node_id == 0) {
-        e->full_path = strdup(e->name);
-        return e->full_path;
+
+    /* Collect the ancestor chain that still needs path construction. */
+    size_t stk_cap = 32;
+    size_t stk_len = 0;
+    dr_entry_t **stk = malloc(stk_cap * sizeof(*stk));
+    if (!stk) return NULL;
+
+    dr_entry_t *cur = e;
+    while (cur && !cur->full_path && cur->parent_node_id != 0) {
+        if (stk_len == stk_cap) {
+            stk_cap *= 2;
+            dr_entry_t **tmp = realloc(stk, stk_cap * sizeof(*stk));
+            if (!tmp) { free(stk); return NULL; }
+            stk = tmp;
+        }
+        stk[stk_len++] = cur;
+        cur = find_dr_by_id(arr, n, cur->parent_node_id);
     }
-    dr_entry_t *parent = find_dr_by_id(arr, n, e->parent_node_id);
-    if (!parent) { e->full_path = strdup(e->name); return e->full_path; }
-    char *pp = build_dr_path(arr, n, parent);
-    if (!pp) return NULL;
-    size_t plen = strlen(pp), nlen = strlen(e->name);
-    char *fp = malloc(plen + 1 + nlen + 1);
-    if (!fp) return NULL;
-    memcpy(fp, pp, plen);
-    fp[plen] = '/';
-    memcpy(fp + plen + 1, e->name, nlen + 1);
-    e->full_path = fp;
-    return fp;
+
+    /* cur is either NULL, a root (parent_node_id==0), or already cached. */
+    if (cur && !cur->full_path) {
+        cur->full_path = strdup(cur->name);
+        if (!cur->full_path) { free(stk); return NULL; }
+    }
+
+    /* Walk back from root toward e, building paths incrementally. */
+    for (size_t i = stk_len; i-- > 0; ) {
+        dr_entry_t *child = stk[i];
+        if (cur && cur->full_path) {
+            size_t plen = strlen(cur->full_path);
+            size_t nlen = strlen(child->name);
+            char *fp = malloc(plen + 1 + nlen + 1);
+            if (!fp) { free(stk); return NULL; }
+            memcpy(fp, cur->full_path, plen);
+            fp[plen] = '/';
+            memcpy(fp + plen + 1, child->name, nlen + 1);
+            child->full_path = fp;
+        } else {
+            child->full_path = strdup(child->name);
+            if (!child->full_path) { free(stk); return NULL; }
+        }
+        cur = child;
+    }
+
+    free(stk);
+    return e->full_path;
 }
 
 static status_t snap_paths_build(const snapshot_t *snap, snap_paths_t *out) {

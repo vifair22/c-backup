@@ -1,5 +1,7 @@
 CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 -msse4.2 -mavx2 \
+           -fstack-protector-strong \
+           -fstack-clash-protection \
            -Wshadow \
            -Wunused \
            -Wunused-function \

@@ -40,7 +40,7 @@ static void sigint_handler(int sig) {
      * flock) via the OS.  The repo is always consistent because every
      * write uses the mkstemp → fsync → rename pattern. */
     static const char msg[] =
-        "\ninterrupted — repository is consistent\n";
+        "\ninterrupted\n";
     if (write(STDERR_FILENO, msg, sizeof(msg) - 1)) { /* best-effort */ }
     _exit(130);
 }
@@ -63,6 +63,8 @@ static int opt_has(int argc, char **argv, int start, const char *flag) {
     return 0;
 }
 
+/* Parse a non-negative decimal integer from string s into *out.
+ * Returns 1 on success, 0 on failure (NULL, empty, negative, overflow). */
 static int parse_nonneg_int(const char *s, int *out) {
     char *end = NULL;
     long v;
@@ -74,6 +76,8 @@ static int parse_nonneg_int(const char *s, int *out) {
     return 1;
 }
 
+/* Convert a path to absolute form. If already absolute, returns a dup.
+ * Otherwise prepends cwd. Caller must free the result. */
 static char *path_to_absolute(const char *in) {
     if (!in || !*in) return NULL;
     if (in[0] == '/') return strdup(in);
@@ -87,6 +91,8 @@ static char *path_to_absolute(const char *in) {
     return out;
 }
 
+/* Convert each path in items[0..n-1] to absolute form in-place.
+ * Frees the old string and replaces it with the absolute version. */
 static void absolutize_list(char **items, int n) {
     if (!items || n <= 0) return;
     for (int i = 0; i < n; i++) {
@@ -98,6 +104,10 @@ static void absolutize_list(char **items, int n) {
     }
 }
 
+/* Build parallel owned/const arrays of absolute paths from input strings.
+ * out_owned holds heap-allocated copies (caller frees via free_abs_list).
+ * out_const holds const pointers into out_owned for APIs needing const char**.
+ * Returns 1 on success, 0 on allocation failure. */
 static int build_abs_list(const char **in, int n,
                           char ***out_owned, const char ***out_const) {
     *out_owned = NULL;
@@ -128,6 +138,7 @@ static int build_abs_list(const char **in, int n,
     return 1;
 }
 
+/* Free the parallel arrays produced by build_abs_list. */
 static void free_abs_list(char **owned, const char **view, int n) {
     if (owned) {
         for (int i = 0; i < n; i++) free(owned[i]);
@@ -136,15 +147,21 @@ static void free_abs_list(char **owned, const char **view, int n) {
     free((void *)view);
 }
 
+/* Describes one known CLI flag for validation.
+ * name: the flag string (e.g. "--repo").
+ * takes_value: 1 if the flag consumes the next argv token as its argument. */
 typedef struct {
     const char *name;
     int takes_value;
 } flag_spec_t;
 
+/* Return 1 if s looks like a flag (starts with "--"). */
 static int is_flag_token(const char *s) {
     return s && s[0] == '-' && s[1] == '-';
 }
 
+/* Look up whether a flag consumes a value argument.
+ * Returns the takes_value field from the matching spec, or 0 if unknown. */
 static int flag_takes_value(const char *flag,
                             const flag_spec_t *specs, size_t n_specs) {
     for (size_t i = 0; i < n_specs; i++) {
@@ -154,7 +171,9 @@ static int flag_takes_value(const char *flag,
     return 0;
 }
 
-/* Find first positional token after skipping known global flags. */
+/* Find the first positional (non-flag) token in argv[start..], skipping
+ * over known flags and their values. Used to locate subcommands like
+ * "set", "delete", "list" that follow global flags such as --repo. */
 static const char *find_subcmd(int argc, char **argv, int start,
                                const flag_spec_t *specs, size_t n_specs) {
     for (int i = start; i < argc; i++) {
@@ -168,6 +187,7 @@ static const char *find_subcmd(int argc, char **argv, int start,
     return NULL;
 }
 
+/* Return 1 if tok matches one of the known positional subcommand names. */
 static int is_known_positional(const char *tok,
                                const char *const *positionals,
                                size_t n_positional) {
@@ -176,6 +196,9 @@ static int is_known_positional(const char *tok,
     return 0;
 }
 
+/* Validate argv[start..] against a whitelist of known flags and positionals.
+ * Rejects unknown flags, flags missing required values, and unexpected bare
+ * arguments. Returns 0 if valid, 1 if an error was printed to stderr. */
 static int validate_options(int argc, char **argv, int start,
                             const flag_spec_t *specs, size_t n_specs,
                             const char *const *positionals, size_t n_positional) {

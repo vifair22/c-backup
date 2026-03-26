@@ -707,33 +707,58 @@ static uintptr_t id_map_get(const id_map_t *m, uint64_t key) {
     return 0;
 }
 
-/* Recursively build the full path for a dirent entry. */
+/* Iteratively build the full path for a dirent entry.
+ * Walks ancestors to find the nearest entry with a cached full_path (or a
+ * root), collects the chain on a heap-allocated stack, then concatenates
+ * from root to leaf, caching each intermediate result. */
 static char *build_full_path(const id_map_t *idx, dr_flat_t *e) {
-    if (e->full_path) return e->full_path;   /* already built */
+    if (e->full_path) return e->full_path;
 
-    if (e->parent_node_id == 0) {
-        e->full_path = strdup(e->name);
-        return e->full_path;
+    /* Collect the ancestor chain that still needs path construction. */
+    size_t stk_cap = 32;
+    size_t stk_len = 0;
+    dr_flat_t **stk = malloc(stk_cap * sizeof(*stk));
+    if (!stk) return NULL;
+
+    dr_flat_t *cur = e;
+    while (cur && !cur->full_path && cur->parent_node_id != 0) {
+        if (stk_len == stk_cap) {
+            stk_cap *= 2;
+            dr_flat_t **tmp = realloc(stk, stk_cap * sizeof(*stk));
+            if (!tmp) { free(stk); return NULL; }
+            stk = tmp;
+        }
+        stk[stk_len++] = cur;
+        cur = (dr_flat_t *)id_map_get(idx, cur->parent_node_id);
     }
 
-    dr_flat_t *parent = (dr_flat_t *)id_map_get(idx, e->parent_node_id);
-    if (!parent) {
-        e->full_path = strdup(e->name);
-        return e->full_path;
+    /* cur is either NULL, a root (parent_node_id==0), or already cached. */
+    if (cur && !cur->full_path) {
+        cur->full_path = strdup(cur->name);
+        if (!cur->full_path) { free(stk); return NULL; }
     }
 
-    char *parent_path = build_full_path(idx, parent);
-    if (!parent_path) return NULL;
+    /* Walk back from root toward e, building paths incrementally. */
+    for (size_t i = stk_len; i-- > 0; ) {
+        dr_flat_t *child = stk[i];
+        if (cur && cur->full_path) {
+            size_t plen = strlen(cur->full_path);
+            size_t nlen = strlen(child->name);
+            char *fp = malloc(plen + 1 + nlen + 1);
+            if (!fp) { free(stk); return NULL; }
+            memcpy(fp, cur->full_path, plen);
+            fp[plen] = '/';
+            memcpy(fp + plen + 1, child->name, nlen + 1);
+            child->full_path = fp;
+        } else {
+            child->full_path = strdup(child->name);
+            if (!child->full_path) { free(stk); return NULL; }
+        }
+        cur = child;
+    }
 
-    size_t plen = strlen(parent_path);
-    size_t nlen = strlen(e->name);
-    char *fp = malloc(plen + 1 + nlen + 1);
-    if (!fp) return NULL;
-    memcpy(fp, parent_path, plen);
-    fp[plen] = '/';
-    memcpy(fp + plen + 1, e->name, nlen + 1);
-    e->full_path = fp;
-    return fp;
+    free(stk);
+    return e->full_path;
 }
 
 status_t pathmap_build_progress(const snapshot_t *snap, pathmap_t **out,
