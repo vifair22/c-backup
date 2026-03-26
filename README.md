@@ -53,11 +53,29 @@ For the Python viewer: `pip install lz4` (optional — structural info is readab
 ```sh
 make          # builds build/backup
 make static   # builds build/backup-static (statically linked)
+make asan     # builds build/backup-asan (AddressSanitizer, -O1 -g)
 make test     # builds and runs all tests (requires cmocka)
 make clean    # removes build/
 ```
 
 Requires GCC and C11.
+
+### Benchmarks
+
+```sh
+make bench            # run all benchmarks (micro + phases)
+make bench-micro      # micro-level: SHA-256, CRC32C, LZ4, RS encode/decode
+make bench-phases     # phase-level: scan, backup, pack, verify, gc, restore
+```
+
+Both benchmark binaries support name filtering and listing:
+
+```sh
+build/bench_micro sha256       # run only benchmarks matching "sha256"
+build/bench_micro -l           # list available micro benchmarks
+build/bench_phases pack        # run only benchmarks matching "pack"
+build/bench_phases -l          # list available phase benchmarks
+```
 
 ---
 

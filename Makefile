@@ -38,7 +38,7 @@ TARGET_ASAN   := $(BUILD)/backup-asan
 TEST_SRCS := $(wildcard $(TESTS)/*.c)
 TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(TEST_SRCS))
 
-.PHONY: all static asan clean test
+.PHONY: all static asan clean test bench bench-micro bench-phases
 
 all: $(TARGET)
 
@@ -86,6 +86,26 @@ $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 
 test: $(TARGET) $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "=== $$t ==="; $$t; done
+
+# Benchmark binaries (no cmocka)
+BENCH     := bench
+BENCH_CFLAGS := -std=c11 -Wall -Wextra -O2 -msse4.2 -mavx2 -Wno-unused-result -I src -I vendor
+
+$(BUILD)/bench_micro: $(BENCH)/micro.c $(LIB_OBJS) | $(BUILD)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/bench_phases: $(BENCH)/phases.c $(LIB_OBJS) | $(BUILD)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)
+
+bench: $(BUILD)/bench_micro $(BUILD)/bench_phases
+	@echo "=== micro ===" && $(BUILD)/bench_micro
+	@echo "=== phases ===" && $(BUILD)/bench_phases
+
+bench-micro: $(BUILD)/bench_micro
+	$(BUILD)/bench_micro
+
+bench-phases: $(BUILD)/bench_phases
+	$(BUILD)/bench_phases
 
 # ASAN test binaries
 ASAN_LIB_OBJS := $(filter-out $(BUILD)/main-asan.o, $(ASAN_OBJS))

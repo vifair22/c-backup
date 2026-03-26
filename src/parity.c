@@ -265,6 +265,14 @@ static __m128i rs_gen_fb_vec[256] __attribute__((aligned(16)));
 #ifdef __AVX2__
 static __m256i rs_gen_lo[RS_2T] __attribute__((aligned(32)));
 static __m256i rs_gen_hi[RS_2T] __attribute__((aligned(32)));
+
+/* Split-nibble tables for AVX2 syndrome computation.  For each evaluation
+ * root α^i (i=0..15), syn_lo[i] and syn_hi[i] allow vpshufb GF multiply:
+ *   syn_lo[i][nibble] = gf_mul(α^i, nibble)
+ *   syn_hi[i][nibble] = gf_mul(α^i, nibble << 4)
+ * Used by the decode fast path to check syndromes without de-interleaving. */
+static __m256i rs_syn_lo[RS_2T] __attribute__((aligned(32)));
+static __m256i rs_syn_hi[RS_2T] __attribute__((aligned(32)));
 #endif
 #endif
 
@@ -314,6 +322,21 @@ static void rs_gen_build(void)
         __m128i hi128 = _mm_loadu_si128((const __m128i *)hi);
         rs_gen_lo[j] = _mm256_broadcastsi128_si256(lo128);
         rs_gen_hi[j] = _mm256_broadcastsi128_si256(hi128);
+    }
+
+    /* Build split-nibble tables for AVX2 syndrome computation.
+     * Syndrome i evaluates the codeword polynomial at root α^i. */
+    for (int i = 0; i < RS_2T; i++) {
+        uint8_t root = gf_exp[i];
+        uint8_t lo[16], hi[16];
+        for (int n = 0; n < 16; n++) {
+            lo[n] = gf_mul(root, (uint8_t)n);
+            hi[n] = gf_mul(root, (uint8_t)(n << 4));
+        }
+        __m128i lo128 = _mm_loadu_si128((const __m128i *)lo);
+        __m128i hi128 = _mm_loadu_si128((const __m128i *)hi);
+        rs_syn_lo[i] = _mm256_broadcastsi128_si256(lo128);
+        rs_syn_hi[i] = _mm256_broadcastsi128_si256(hi128);
     }
 #endif
 #endif
@@ -622,6 +645,78 @@ static void rs_encode_batch32(const uint8_t *src, size_t group_len,
         memcpy(par + cw * RS_2T, out, RS_2T);
     }
 }
+
+/* Check if 32 interleaved codewords have all-zero syndromes (no errors).
+ *
+ * Operates directly on the interleaved data layout — no de-interleave needed.
+ * For each of 16 syndromes, maintains a __m256i accumulator across 32 codewords.
+ * Horner evaluation: acc = gf_mul(acc, α^i) ^ data[j] for each position j.
+ *
+ * Data positions (j=0..238): contiguous 32-byte loads from src[j*64 + offset].
+ * Parity positions (j=239..254): gathered from par[(offset+d)*16 + p] stride.
+ *
+ * Returns 1 if all 32 codewords are clean, 0 if any has non-zero syndromes.
+ */
+static int rs_syndrome_check_batch32(const uint8_t *src, size_t group_len,
+                                     const uint8_t *par, int batch_offset)
+{
+    __m256i acc[RS_2T];
+    for (int i = 0; i < RS_2T; i++)
+        acc[i] = _mm256_setzero_si256();
+
+    __m256i mask_lo = _mm256_set1_epi8(0x0F);
+
+    /* Data positions: j = 0 .. RS_K-1 */
+    for (size_t j = 0; j < (size_t)RS_K; j++) {
+        __m256i data_v;
+        size_t offset = j * (size_t)RS_INTERLEAVE + (size_t)batch_offset;
+        if (offset + 32 <= group_len) {
+            data_v = _mm256_loadu_si256((const __m256i *)(src + offset));
+        } else {
+            uint8_t tmp[32];
+            memset(tmp, 0, sizeof(tmp));
+            size_t avail = (offset < group_len) ? group_len - offset : 0;
+            if (avail > 32) avail = 32;
+            if (avail > 0) memcpy(tmp, src + offset, avail);
+            data_v = _mm256_loadu_si256((const __m256i *)tmp);
+        }
+
+        for (int i = 0; i < RS_2T; i++) {
+            __m256i a_lo = _mm256_and_si256(acc[i], mask_lo);
+            __m256i a_hi = _mm256_and_si256(_mm256_srli_epi16(acc[i], 4), mask_lo);
+            acc[i] = _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(rs_syn_lo[i], a_lo),
+                    _mm256_shuffle_epi8(rs_syn_hi[i], a_hi)),
+                data_v);
+        }
+    }
+
+    /* Parity positions: j = RS_K .. RS_N-1 (16 positions) */
+    for (int p = 0; p < RS_2T; p++) {
+        /* Gather parity byte p from 32 codewords (stride = RS_2T) */
+        uint8_t tmp[32];
+        for (int d = 0; d < 32; d++)
+            tmp[d] = par[(batch_offset + d) * RS_2T + p];
+        __m256i par_v = _mm256_loadu_si256((const __m256i *)tmp);
+
+        for (int i = 0; i < RS_2T; i++) {
+            __m256i a_lo = _mm256_and_si256(acc[i], mask_lo);
+            __m256i a_hi = _mm256_and_si256(_mm256_srli_epi16(acc[i], 4), mask_lo);
+            acc[i] = _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(rs_syn_lo[i], a_lo),
+                    _mm256_shuffle_epi8(rs_syn_hi[i], a_hi)),
+                par_v);
+        }
+    }
+
+    /* All clean iff every syndrome byte across all 32 codewords is zero */
+    __m256i any = _mm256_setzero_si256();
+    for (int i = 0; i < RS_2T; i++)
+        any = _mm256_or_si256(any, acc[i]);
+    return _mm256_testz_si256(any, any);
+}
 #endif
 
 void rs_parity_encode(const void *data, size_t len, void *parity_out)
@@ -693,6 +788,19 @@ int rs_parity_decode(void *data, size_t len, const void *parity)
     while (remaining > 0) {
         size_t group_len = remaining < RS_GROUP_DATA ? remaining : RS_GROUP_DATA;
 
+#if defined(RS_SIMD) && defined(__AVX2__)
+        /* Fast path: check syndromes directly on interleaved data.
+         * Avoids de-interleave, full decode, and re-interleave when clean. */
+        if (rs_syndrome_check_batch32(dst, group_len, par, 0) &&
+            rs_syndrome_check_batch32(dst, group_len, par, 32)) {
+            dst += group_len;
+            par += RS_GROUP_PAR;
+            remaining -= group_len;
+            continue;
+        }
+        /* Errors detected — fall through to scalar decode+repair */
+#endif
+
         /* De-interleave into D codewords (data + parity). */
         uint8_t cw[RS_INTERLEAVE][RS_N];
         memset(cw, 0, sizeof(cw));
@@ -718,8 +826,7 @@ int rs_parity_decode(void *data, size_t len, const void *parity)
         }
 
         /* Re-interleave corrected data back. */
-        if (total_corrected > 0 || 1) {
-            /* Always write back — simpler and handles any corrections. */
+        if (total_corrected > 0) {
             for (size_t i = 0; i < group_len; i++)
                 dst[i] = cw[i % RS_INTERLEAVE][i / RS_INTERLEAVE];
         }
