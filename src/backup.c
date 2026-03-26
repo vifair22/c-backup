@@ -2,7 +2,6 @@
 #include "backup.h"
 #include "scan.h"
 #include "object.h"
-#include "pack.h"
 #include "snapshot.h"
 #include "util.h"
 #include "../vendor/log.h"
@@ -604,6 +603,18 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                 scan->entries[scan->count++] = partial->entries[j];
                 memset(&partial->entries[j], 0, sizeof(partial->entries[j]));
             }
+            /* Merge warnings from partial into scan */
+            for (uint32_t w = 0; w < partial->warn_count; w++) {
+                if (scan->warn_count == scan->warn_cap) {
+                    uint32_t nc = scan->warn_cap ? scan->warn_cap * 2 : 16;
+                    char **tmp = realloc(scan->warnings, (size_t)nc * sizeof(char *));
+                    if (!tmp) break; /* drop warnings on OOM — non-fatal */
+                    scan->warnings = tmp;
+                    scan->warn_cap = nc;
+                }
+                scan->warnings[scan->warn_count++] = partial->warnings[w];
+                partial->warnings[w] = NULL; /* transferred ownership */
+            }
             partial->count = 0;
             scan_result_free(partial);
         }
@@ -622,6 +633,11 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         fmt_bytes(total_bytes, sz, sizeof(sz));
         if (!opts || !opts->quiet)
             fprintf(stderr, "scan:    %u file(s)  %s\n", scan->count, sz);
+        if (scan->warn_count > 0 && (!opts || !opts->quiet)) {
+            fprintf(stderr, "scan:    %u warning(s):\n", scan->warn_count);
+            for (uint32_t w = 0; w < scan->warn_count; w++)
+                fprintf(stderr, "  %s\n", scan->warnings[w]);
+        }
     }
 
     /* ----------------------------------------------------------------
@@ -659,7 +675,6 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     log_msg("INFO", "Phase 3: compare and store");
 
     status_t st = OK;
-    int committed_snapshot = 0;
 
     skipped_ids_t skipped = {0};
     store_task_t *store_queue = malloc(scan->count * sizeof(*store_queue));
@@ -671,9 +686,15 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     uint32_t n_unreadable = 0;
     uint64_t phys_new_bytes = 0;
 
+    struct timespec cmp_tick = {0};
+    if (tui) clock_gettime(CLOCK_MONOTONIC, &cmp_tick);
+
     for (uint32_t i = 0; i < scan->count; i++) {
         scan_entry_t *e = &scan->entries[i];
         int skip_entry = 0;
+
+        if (tui && tick_due(&cmp_tick))
+            phase_line_setf("Phase 3: comparing %u/%u entries", i + 1, scan->count);
 
         /* Repo-relative path */
         const char *rel = e->path + e->strip_prefix_len;
@@ -820,6 +841,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         n_deleted = dctx.count;
     }
 
+    if (tui) phase_line_clear();
+
     if (!opts || !opts->quiet) {
         fprintf(stderr, "changes: %u new  %u modified  %u unchanged  %u meta-only  %u deleted\n",
                 n_new, n_modified, n_unchanged, n_meta, n_deleted);
@@ -954,7 +977,6 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     fail_ctx = "update HEAD";
     st = snapshot_write_head(repo, new_snap->snap_id);
     if (st == OK) {
-        committed_snapshot = 1;
         if (!opts || !opts->quiet)
             fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
                     new_snap->snap_id, scan->count,
@@ -967,6 +989,8 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         if (opts && opts->verify_after) {
             log_msg("INFO", "Phase 7: verifying stored objects");
             uint32_t missing = 0;
+            struct timespec v_tick = {0};
+            if (tui) clock_gettime(CLOCK_MONOTONIC, &v_tick);
             for (uint32_t i = 0; i < new_snap->node_count; i++) {
                 const node_t *nd = &new_snap->nodes[i];
                 int j;
@@ -977,18 +1001,25 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                     if (nd->acl_hash[j])     a_zero = 0;
                 }
                 if (!c_zero && !object_exists(repo, nd->content_hash)) {
+                    if (tui) phase_line_clear();
                     missing++;
                     fprintf(stderr, "error: missing content object for node %u\n", i);
                 }
                 if (!x_zero && !object_exists(repo, nd->xattr_hash)) {
+                    if (tui) phase_line_clear();
                     missing++;
                     fprintf(stderr, "error: missing xattr object for node %u\n", i);
                 }
                 if (!a_zero && !object_exists(repo, nd->acl_hash)) {
+                    if (tui) phase_line_clear();
                     missing++;
                     fprintf(stderr, "error: missing acl object for node %u\n", i);
                 }
+                if (tui && tick_due(&v_tick))
+                    phase_line_setf("Phase 7: verifying (%u/%u nodes)",
+                                    i + 1, new_snap->node_count);
             }
+            if (tui) phase_line_clear();
             if (missing > 0) {
                 fprintf(stderr, "error: %u object(s) missing — "
                         "repository may be corrupt\n", missing);
@@ -1011,12 +1042,6 @@ done:
     pathmap_free(prev_map);
     snapshot_free(prev_snap);
     scan_result_free(scan);
-
-    /* Pack only when a new snapshot commit succeeded. */
-    if (st == OK && committed_snapshot) {
-        log_msg("INFO", "Phase 8: packing objects");
-        repo_pack(repo, NULL);   /* best-effort: ignore pack errors */
-    }
 
     return st;
 }

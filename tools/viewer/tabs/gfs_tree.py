@@ -3,7 +3,7 @@ import datetime
 from tkinter import ttk
 import tkinter as tk
 
-from ..parsers import parse_snap_header
+from ..parsers import parse_snap_header, ParseError
 from ..formats import fmt_size, fmt_time, gfs_flags_str
 from ..constants import GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY
 from ..widgets import PAD, FONT_MONO, FONT_BOLD
@@ -111,7 +111,7 @@ class GFSTreeTab:
         for path in scan.get("snapshots", []):
             try:
                 snaps.append(parse_snap_header(path))
-            except Exception:
+            except ParseError:
                 pass
 
         if not snaps:

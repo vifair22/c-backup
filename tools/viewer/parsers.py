@@ -25,6 +25,9 @@ try:
 except ImportError:
     HAS_LZ4 = False
 
+# Common exception tuple for binary parsing operations (file I/O + struct + decompression)
+ParseError = (OSError, ValueError, struct.error, RuntimeError)
+
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
@@ -68,6 +71,47 @@ NODE_SIZE = struct.calcsize(NODE_FMT)            # 161
 
 # dirent_rec_t: uint64 parent_node, uint64 node_id, uint16 name_len, char name[]
 DIRENT_HDR = struct.Struct("<QQH")
+
+_NODE_KEYS = (
+    "node_id", "type", "mode", "uid", "gid", "size", "mtime_sec", "mtime_nsec",
+    "content_hash", "xattr_hash", "acl_hash",
+    "link_count", "inode_identity", "union_a", "union_b",
+)
+_NODE_STRUCT = struct.Struct(NODE_FMT)
+
+
+class SnapNodes:
+    """Lazy, memory-efficient accessor for the node array in a snapshot.
+
+    Stores the raw packed bytes and parses individual nodes on demand,
+    avoiding the creation of 1M+ dicts upfront.
+    """
+
+    __slots__ = ("_buf", "_count")
+
+    def __init__(self, buf: bytes, count: int):
+        self._buf = buf
+        self._count = count
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(self._count))]
+        if i < 0:
+            i += self._count
+        if not 0 <= i < self._count:
+            raise IndexError(f"node index {i} out of range")
+        offset = i * NODE_SIZE
+        vals = _NODE_STRUCT.unpack_from(self._buf, offset)
+        return dict(zip(_NODE_KEYS, vals))
+
+    def __iter__(self):
+        for i in range(self._count):
+            offset = i * NODE_SIZE
+            vals = _NODE_STRUCT.unpack_from(self._buf, offset)
+            yield dict(zip(_NODE_KEYS, vals))
 
 
 def _read_snap_header(f) -> tuple:
@@ -136,29 +180,7 @@ def parse_snap(path: str) -> dict:
     nodes_bytes  = raw_payload[:node_count * NODE_SIZE]
     dirent_bytes = raw_payload[node_count * NODE_SIZE:]
 
-    nodes = [
-        {
-            "node_id":        node_id,
-            "type":           ntype,
-            "mode":           mode,
-            "uid":            uid,
-            "gid":            gid,
-            "size":           size,
-            "mtime_sec":      mtime_sec,
-            "mtime_nsec":     mtime_nsec,
-            "content_hash":   content_hash,
-            "xattr_hash":     xattr_hash,
-            "acl_hash":       acl_hash,
-            "link_count":     link_count,
-            "inode_identity": inode_identity,
-            "union_a":        union_a,
-            "union_b":        union_b,
-        }
-        for (node_id, ntype, mode, uid, gid, size, mtime_sec, mtime_nsec,
-             content_hash, xattr_hash, acl_hash,
-             link_count, inode_identity, union_a, union_b)
-        in struct.iter_unpack(NODE_FMT, nodes_bytes)
-    ]
+    nodes = SnapNodes(nodes_bytes, node_count)
 
     dirents = []
     offset = 0
@@ -266,6 +288,53 @@ def parse_pack_dat(path: str) -> dict:
             f.seek(comp_sz, 1)
 
     return {"version": version, "count": count, "entries": entries}
+
+
+def iter_pack_dat(path: str) -> tuple:
+    """Streaming pack .dat reader.
+
+    Returns (header, entry_generator) where header is a dict with keys
+    "version" and "count", and entry_generator yields one entry dict at a
+    time (same fields as parse_pack_dat entries).
+
+    The file handle is kept open for the lifetime of the generator; callers
+    must consume or discard the generator to release it.
+    """
+    f = open(path, "rb")
+    try:
+        magic, version, count = struct.unpack(DAT_HDR_FMT, read_exact(f, DAT_HDR_SIZE))
+        if magic != PACK_DAT_MAGIC:
+            f.close()
+            raise ValueError(f"Bad dat magic 0x{magic:08X}")
+    except (OSError, ValueError, struct.error):
+        f.close()
+        raise
+
+    header = {"version": version, "count": count}
+
+    def _entries():
+        try:
+            for _ in range(count):
+                if version == PACK_VERSION_V1:
+                    h, otype, comp, uncomp_sz, comp_sz = struct.unpack(
+                        DAT_ENTRY_V1_FMT, read_exact(f, DAT_ENTRY_V1_SIZE))
+                else:
+                    h, otype, comp, uncomp_sz, comp_sz = struct.unpack(
+                        DAT_ENTRY_V2_FMT, read_exact(f, DAT_ENTRY_V2_SIZE))
+
+                yield {
+                    "hash":              h,
+                    "type":              otype,
+                    "compression":       comp,
+                    "uncompressed_size": uncomp_sz,
+                    "compressed_size":   comp_sz,
+                    "payload_offset":    f.tell(),
+                }
+                f.seek(comp_sz, 1)
+        finally:
+            f.close()
+
+    return header, _entries()
 
 
 def idx_bisect(idx_path: str, raw_hash: bytes) -> int | None:
@@ -386,14 +455,14 @@ def find_object(raw_hash: bytes, scan: dict):
     for idx_path in scan.get("pack_idx", []):
         try:
             dat_offset = idx_bisect(idx_path, raw_hash)
-        except Exception:
+        except ParseError:
             continue
         if dat_offset is not None:
             dat_path = idx_path.replace(".idx", ".dat")
             try:
                 otype, comp, uncomp_sz, comp_sz, h, payload = load_pack_object(dat_path, dat_offset)
                 return ("pack", dat_path, otype, comp, uncomp_sz, comp_sz, payload)
-            except Exception:
+            except ParseError:
                 continue
     return None
 
@@ -544,7 +613,7 @@ def scan_repo(repo_path: str) -> dict:
             result["has_head"] = True
             try:
                 result["head_id"] = int(open(head_path).read().strip())
-            except Exception:
+            except (OSError, ValueError):
                 pass
             break
 

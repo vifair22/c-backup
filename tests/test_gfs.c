@@ -110,7 +110,7 @@ static policy_t make_policy(int snaps, int daily, int weekly, int monthly, int y
 
 /* Simulate incremental post-backup gfs_run for a specific snap. */
 static void run_gfs(uint32_t snap_id, const policy_t *pol) {
-    assert_int_equal(gfs_run(repo, pol, snap_id, 0, 1, 0, 0), OK);
+    assert_int_equal(gfs_run(repo, pol, snap_id, 0, 1, 0, NULL), OK);
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,7 +271,7 @@ static void test_full_scan_retroactive(void **state) {
     assert_int_equal(set_snap_ts(s3, TS_MAR23_NOON), OK);
 
     policy_t pol = make_policy(10, 7, 4, 3, 1);
-    assert_int_equal(gfs_run(repo, &pol, s3, 0, 1, 0, 1), OK); /* full_scan=1 */
+    assert_int_equal(gfs_run(repo, &pol, s3, 0, 1, 1, NULL), OK); /* full_scan=1 */
 
     assert_true((flags_of(s1) & GFS_DAILY)  != 0);
     assert_true((flags_of(s2) & GFS_DAILY)  != 0);
@@ -290,7 +290,7 @@ static void test_dry_run_does_not_modify(void **state) {
     assert_int_equal(set_snap_ts(s2, TS_MAR23_NOON), OK);
 
     policy_t pol = make_policy(1, 1, 1, 1, 1);
-    assert_int_equal(gfs_run(repo, &pol, s2, 1, 1, 0, 0), OK); /* dry_run=1 */
+    assert_int_equal(gfs_run(repo, &pol, s2, 1, 1, 0, NULL), OK); /* dry_run=1 */
 
     assert_int_equal(flags_of(s1), 0);
     snapshot_t *s = NULL;
@@ -320,7 +320,7 @@ static void test_prune_expired_daily(void **state) {
     assert_int_equal(set_snap_ts(s5, TS_MAR23_NOON), OK);
 
     policy_t pol = make_policy(1, 1, 0, 0, 0);
-    assert_int_equal(gfs_run(repo, &pol, s5, 0, 1, 0, 1), OK); /* full_scan */
+    assert_int_equal(gfs_run(repo, &pol, s5, 0, 1, 1, NULL), OK); /* full_scan */
 
     snapshot_t *s = NULL;
     assert_true(snapshot_load(repo, s1, &s) != OK); /* expired daily, pruned */

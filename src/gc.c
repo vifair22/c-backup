@@ -57,6 +57,10 @@ static status_t collect_refs(repo_t *repo,
     uint8_t zero[OBJECT_HASH_SIZE] = {0};
     status_t st = OK;
 
+    int show_progress = gc_progress_enabled();
+    struct timespec next_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
     /* Surviving snapshot files */
     for (uint32_t id = 1; id <= head; id++) {
         snapshot_t *snap = NULL;
@@ -70,7 +74,16 @@ static status_t collect_refs(repo_t *repo,
             }
         }
         snapshot_free(snap);
+        if (show_progress && gc_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "gc: collecting refs (%u/%u snapshots, %zu refs)",
+                     id, head, cnt);
+            gc_line_set(line);
+        }
     }
+
+    if (show_progress) gc_line_clear();
 
     /* Sort and deduplicate */
     qsort(refs, cnt, OBJECT_HASH_SIZE, hash_cmp);
@@ -213,7 +226,6 @@ status_t repo_prune_resume_pending(repo_t *repo) {
     if (deleted > 0)
         fprintf(stderr, "prune-resume: completed %u pending deletion(s)\n", deleted);
 
-    repo_gc(repo, NULL, NULL);
     unlink(pending_path);
     return OK;
 }

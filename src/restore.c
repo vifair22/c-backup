@@ -21,6 +21,12 @@
 #include <sys/xattr.h>
 #include <openssl/evp.h>
 
+static size_t g_restore_line_len = 0;
+#define restore_progress_enabled() progress_enabled()
+#define restore_line_set(msg) progress_line_set(&g_restore_line_len, (msg))
+#define restore_line_clear()  progress_line_clear(&g_restore_line_len)
+#define restore_tick_due(t)   tick_due(t)
+
 static void restore_fmt_bytes(uint64_t n, char *buf, size_t sz) {
     if      (n >= (uint64_t)1024*1024*1024)
         snprintf(buf, sz, "%.1f GB", (double)n / (1024.0*1024*1024));
@@ -307,15 +313,98 @@ static status_t restore_make_dirs(const restore_entry_t *entries, uint32_t count
     return OK;
 }
 
+/* Open-addressed hash table for hardlink node_id → path lookup. */
+typedef struct { uint64_t key; uint32_t val_idx; } nl_hslot_t;
+typedef struct {
+    nl_hslot_t *slots;
+    size_t      cap;
+    size_t      cnt;
+    char       (*paths)[PATH_MAX];
+    uint32_t    path_cnt;
+    uint32_t    path_cap;
+} nl_htab_t;
+
+static nl_htab_t *nl_htab_new(uint32_t hint) {
+    nl_htab_t *h = calloc(1, sizeof(*h));
+    if (!h) return NULL;
+    size_t cap = 256;
+    while (cap < (size_t)hint * 2) cap *= 2;
+    h->slots = calloc(cap, sizeof(*h->slots));
+    h->cap = cap;
+    h->path_cap = hint > 0 ? hint : 64;
+    h->paths = malloc((size_t)h->path_cap * PATH_MAX);
+    if (!h->slots || !h->paths) {
+        free(h->slots); free(h->paths); free(h); return NULL;
+    }
+    return h;
+}
+
+static void nl_htab_free(nl_htab_t *h) {
+    if (!h) return;
+    free(h->slots); free(h->paths); free(h);
+}
+
+static const char *nl_htab_get(const nl_htab_t *h, uint64_t key) {
+    if (!key) return NULL;
+    size_t idx = (size_t)((key * 11400714819323198485ULL) >> 32) & (h->cap - 1);
+    for (size_t i = 0; i < h->cap; i++) {
+        size_t si = (idx + i) & (h->cap - 1);
+        if (!h->slots[si].key) return NULL;
+        if (h->slots[si].key == key) return h->paths[h->slots[si].val_idx];
+    }
+    return NULL;
+}
+
+static int nl_htab_grow(nl_htab_t *h) {
+    size_t nc = h->cap * 2;
+    nl_hslot_t *ns = calloc(nc, sizeof(*ns));
+    if (!ns) return -1;
+    for (size_t i = 0; i < h->cap; i++) {
+        if (!h->slots[i].key) continue;
+        size_t si = (size_t)((h->slots[i].key * 11400714819323198485ULL) >> 32) & (nc - 1);
+        while (ns[si].key) si = (si + 1) & (nc - 1);
+        ns[si] = h->slots[i];
+    }
+    free(h->slots); h->slots = ns; h->cap = nc;
+    return 0;
+}
+
+static int nl_htab_set(nl_htab_t *h, uint64_t key, const char *path) {
+    if (!key) return 0;
+    if (h->cnt * 10 >= h->cap * 7) {
+        if (nl_htab_grow(h) != 0) return -1;
+    }
+    /* Ensure path storage capacity */
+    if (h->path_cnt == h->path_cap) {
+        uint32_t nc = h->path_cap * 2;
+        char (*np)[PATH_MAX] = realloc(h->paths, (size_t)nc * PATH_MAX);
+        if (!np) return -1;
+        h->paths = np; h->path_cap = nc;
+    }
+    uint32_t pi = h->path_cnt;
+    snprintf(h->paths[pi], PATH_MAX, "%s", path);
+    h->path_cnt++;
+
+    size_t si = (size_t)((key * 11400714819323198485ULL) >> 32) & (h->cap - 1);
+    while (h->slots[si].key && h->slots[si].key != key) si = (si + 1) & (h->cap - 1);
+    if (!h->slots[si].key) h->cnt++;
+    h->slots[si].key = key;
+    h->slots[si].val_idx = pi;
+    return 0;
+}
+
 static status_t restore_materialize_nodes(repo_t *repo,
                                           const restore_entry_t *entries,
                                           uint32_t count,
                                           const char *dest_path,
                                           restore_stats_t *stats) {
-    typedef struct { uint64_t node_id; char path[PATH_MAX]; } nl_entry_t;
-    nl_entry_t *nl_map = calloc(count, sizeof(nl_entry_t));
-    uint32_t nl_cnt = 0;
+    nl_htab_t *nl_map = nl_htab_new(count / 4 > 64 ? count / 4 : 64);
     if (!nl_map) return set_error(ERR_NOMEM, "restore_materialize_nodes: alloc failed for hardlink map");
+
+    int show_progress = restore_progress_enabled();
+    struct timespec next_tick = {0};
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+    uint32_t done = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         const restore_entry_t *e = &entries[i];
@@ -324,15 +413,12 @@ static status_t restore_materialize_nodes(repo_t *repo,
 
         char full[PATH_MAX];
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
-            free(nl_map);
+            nl_htab_free(nl_map);
             return set_error(ERR_IO, "restore: path too long: %s", e->path);
         }
         const node_t *nd = e->node;
 
-        const char *hl_src = NULL;
-        for (uint32_t k = 0; k < nl_cnt; k++) {
-            if (nl_map[k].node_id == e->node_id) { hl_src = nl_map[k].path; break; }
-        }
+        const char *hl_src = nl_htab_get(nl_map, e->node_id);
         if (hl_src) {
             if (link(hl_src, full) == -1 && errno != EEXIST) {
                 {
@@ -341,9 +427,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     log_msg("WARN", emsg);
                 }
             } else {
-                nl_map[nl_cnt].node_id = e->node_id;
-                snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
-                nl_cnt++;
+                nl_htab_set(nl_map, e->node_id, full);
                 continue;
             }
         }
@@ -351,7 +435,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
         switch (nd->type) {
         case NODE_TYPE_REG: {
             int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd == -1) { free(nl_map); return set_error_errno(ERR_IO, "restore: open(%s)", full); }
+            if (fd == -1) { nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: open(%s)", full); }
             if (!hash_is_zero(nd->content_hash)) {
                 void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
                 status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
@@ -362,7 +446,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     load_st = object_load_stream(repo, nd->content_hash, fd,
                                                  &stream_sz, &obj_type);
                 }
-                if (load_st != OK) { close(fd); free(nl_map); return load_st; }
+                if (load_st != OK) { close(fd); nl_htab_free(nl_map); return load_st; }
                 if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
                     const uint8_t *sp_p = (const uint8_t *)data;
                     sparse_hdr_t shdr;
@@ -370,10 +454,10 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     sp_p += sizeof(shdr);
                     if (shdr.magic != SPARSE_MAGIC ||
                         len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
-                        free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
+                        free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
                     }
                     if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                        free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate(%s)", full);
+                        free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate(%s)", full);
                     }
                     const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
                     sp_p += shdr.region_count * sizeof(sparse_region_t);
@@ -384,23 +468,23 @@ static status_t restore_materialize_nodes(repo_t *repo,
                         if (rgns[r].offset < pos ||
                             rgns[r].offset > nd->size ||
                             rgns[r].length > nd->size - rgns[r].offset) {
-                            free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u out of bounds for %s", r, full);
+                            free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u out of bounds for %s", r, full);
                         }
                         if ((size_t)(dend - dptr) < (size_t)rgns[r].length) {
-                            free(data); close(fd); free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u data truncated for %s", r, full);
+                            free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u data truncated for %s", r, full);
                         }
                         if (lseek(fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
-                            free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: lseek(%s)", full);
+                            free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: lseek(%s)", full);
                         }
                         size_t rem = (size_t)rgns[r].length;
                         while (rem > 0) {
                             ssize_t w = write(fd, dptr, rem);
                             if (w < 0) {
                                 if (errno == EINTR) continue;
-                                free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: write sparse region to %s", full);
+                                free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: write sparse region to %s", full);
                             }
                             if (w == 0) {
-                                free(data); close(fd); free(nl_map); return set_error(ERR_IO, "restore: zero-length write to %s", full);
+                                free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_IO, "restore: zero-length write to %s", full);
                             }
                             dptr += w;
                             rem -= (size_t)w;
@@ -409,21 +493,19 @@ static status_t restore_materialize_nodes(repo_t *repo,
                     }
                 } else {
                     if (len > 0 && write(fd, data, len) != (ssize_t)len) {
-                        free(data); close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: write(%s)", full);
+                        free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: write(%s)", full);
                     }
                 }
                 free(data);
             }
             if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                close(fd); free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate final(%s)", full);
+                close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate final(%s)", full);
             }
             fsync(fd);
             close(fd);
             stats->files++;
             stats->bytes += nd->size;
-            nl_map[nl_cnt].node_id = e->node_id;
-            snprintf(nl_map[nl_cnt].path, PATH_MAX, "%s", full);
-            nl_cnt++;
+            nl_htab_set(nl_map, e->node_id, full);
             break;
         }
         case NODE_TYPE_SYMLINK: {
@@ -462,9 +544,18 @@ static status_t restore_materialize_nodes(repo_t *repo,
         }
         default: break;
         }
+
+        done++;
+        if (show_progress && restore_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line), "restore: %u/%u files  %.1f GiB",
+                     done, count, (double)stats->bytes / (1024.0*1024.0*1024.0));
+            restore_line_set(line);
+        }
     }
 
-    free(nl_map);
+    if (show_progress) restore_line_clear();
+    nl_htab_free(nl_map);
     return OK;
 }
 
@@ -474,6 +565,11 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
                                             const char *dest_path,
                                             const node_t *root_dir_meta,
                                             restore_stats_t *stats) {
+    int show_progress = restore_progress_enabled();
+    struct timespec next_tick = {0};
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+    uint32_t meta_done = 0;
+
     for (uint32_t i = 0; i < count; i++) {
         const restore_entry_t *e = &entries[i];
         if (!e->node || e->node->type == NODE_TYPE_DIR) continue;
@@ -483,6 +579,12 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
             return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
         stats->warns += (uint32_t)apply_metadata(full, e->node, repo,
                                                  e->node->type == NODE_TYPE_SYMLINK);
+        meta_done++;
+        if (show_progress && restore_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line), "restore: metadata %u/%u", meta_done, count);
+            restore_line_set(line);
+        }
     }
     for (uint32_t i = count; i-- > 0;) {
         const restore_entry_t *e = &entries[i];
@@ -492,7 +594,14 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
             return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
         stats->warns += (uint32_t)apply_metadata(full, e->node, repo, 0);
+        meta_done++;
+        if (show_progress && restore_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line), "restore: metadata %u/%u", meta_done, count);
+            restore_line_set(line);
+        }
     }
+    if (show_progress) restore_line_clear();
     if (root_dir_meta)
         stats->warns += (uint32_t)apply_metadata(dest_path, root_dir_meta, repo, 0);
     return OK;

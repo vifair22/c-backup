@@ -2,7 +2,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from ..parsers import parse_snap, parse_snap_header, find_object, decompress_payload, HAS_LZ4
+from ..parsers import parse_snap, parse_snap_header, find_object, decompress_payload, HAS_LZ4, ParseError
 from ..formats import fmt_size, fmt_time, fmt_mode, gfs_flags_str, hex_hash
 from ..constants import (NODE_TYPE_NAMES, NODE_TYPE_REG, NODE_TYPE_DIR,
                          NODE_TYPE_SYMLINK, NODE_TYPE_CHR, NODE_TYPE_BLK,
@@ -160,7 +160,7 @@ class SnapshotsTab:
                 if s["snap_id"] == self._head_id:
                     label += " [HEAD]"
                 self._snap_id_to_path[s["snap_id"]] = path
-            except Exception:
+            except ParseError:
                 import os
                 label = os.path.basename(path) + " [ERR]"
             self._list.insert(tk.END, label)
@@ -186,7 +186,7 @@ class SnapshotsTab:
         def _worker() -> None:
             try:
                 s = parse_snap(path)
-            except Exception as e:
+            except ParseError as e:
                 err = str(e)
                 self._frame.after(0, lambda: self._on_load_error(err, gen))
                 return

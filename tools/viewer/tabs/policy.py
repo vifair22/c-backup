@@ -166,7 +166,7 @@ class PolicyTab:
             self._status_label.config(text=f"{fmt_str}{self._policy_path}", fg="gray")
             try:
                 data = _load_toml(self._policy_path)
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 self._status_label.config(text=f"Error loading policy.toml: {e}", fg="red")
                 data = dict(_DEFAULTS)
 

@@ -30,6 +30,10 @@ typedef struct {
     scan_entry_t *entries;
     uint32_t      count;
     uint32_t      capacity;
+    /* Non-fatal warnings accumulated during scan (skipped entries, etc.) */
+    char        **warnings;
+    uint32_t      warn_count;
+    uint32_t      warn_cap;
 } scan_result_t;
 
 /*

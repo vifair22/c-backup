@@ -67,6 +67,7 @@ static int setup(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
+    assert_int_equal(repo_pack(repo, NULL), OK);
     return 0;
 }
 

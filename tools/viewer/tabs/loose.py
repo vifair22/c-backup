@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from ..parsers import load_loose_object, parse_sparse_regions, decompress_payload, HAS_LZ4
+from ..parsers import load_loose_object, parse_sparse_regions, decompress_payload, HAS_LZ4, ParseError
 from ..formats import fmt_size, hex_hash, hex_dump
 from ..constants import (
     OBJECT_TYPE_NAMES, COMPRESS_NAMES,
@@ -81,7 +81,7 @@ class LooseTab:
         path = self._loose_paths[sel[0]]
         try:
             otype, comp, uncomp_sz, comp_sz, h, payload = load_loose_object(path)
-        except Exception as e:
+        except ParseError as e:
             messagebox.showerror("Parse error", str(e))
             return
         self._current = (otype, comp, uncomp_sz, comp_sz, h, payload)

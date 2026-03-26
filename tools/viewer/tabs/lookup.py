@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import parse_snap, idx_bisect, dat_read_entry_at, load_loose_object
+from ..parsers import parse_snap, idx_bisect, dat_read_entry_at, load_loose_object, ParseError
 from ..formats import fmt_size, hex_hash
 from ..constants import OBJECT_HASH_SIZE, OBJECT_TYPE_NAMES, COMPRESS_NAMES
 from ..widgets import make_text_widget, set_text, FONT_MONO, PAD
@@ -64,7 +64,7 @@ class LookupTab:
                     f"  Uncomp size: {fmt_size(uncomp_sz)} ({uncomp_sz} bytes)",
                     f"  Comp size  : {fmt_size(comp_sz)} ({comp_sz} bytes)",
                 ]
-            except Exception as e:
+            except ParseError as e:
                 lines.append(f"  (parse error: {e})")
         else:
             lines.append("Not found in loose object store.")
@@ -81,7 +81,7 @@ class LookupTab:
                 if dat_offset is None:
                     continue
                 e = dat_read_entry_at(dat_path, dat_offset)
-            except Exception:
+            except ParseError:
                 continue
             found_pack = True
             lines += [
@@ -114,7 +114,7 @@ class LookupTab:
             for snap_path in snap_paths:
                 try:
                     s = parse_snap(snap_path)
-                except Exception:
+                except ParseError:
                     continue
                 for nd in s["nodes"]:
                     for field, key in (("content", "content_hash"),

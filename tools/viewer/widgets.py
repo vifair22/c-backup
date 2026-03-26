@@ -130,18 +130,18 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
             raw_data = decompress_payload(payload, comp, uncomp_sz) if comp != COMPRESS_NONE else payload
             if raw_data:
                 symlink_target = raw_data.rstrip(b"\x00").decode("utf-8", errors="replace")
-        except Exception:
+        except (OSError, ValueError, RuntimeError):
             pass
 
     # For loose objects, read pack_skip_ver from the header for display.
     pack_skip_ver = None
     if kind == "loose":
-        from .parsers import parse_loose_object
+        from .parsers import parse_loose_object, ParseError
         from .constants import PROBER_VERSION
         try:
             meta = parse_loose_object(location)
             pack_skip_ver = meta.get("pack_skip_ver")
-        except Exception:
+        except ParseError:
             pass
 
     rows = []

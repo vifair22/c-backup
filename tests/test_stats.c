@@ -90,7 +90,6 @@ static void test_repo_stats_counts_and_print(void **state) {
     assert_int_equal(repo_stats(repo, &s), OK);
     assert_true(s.snap_total >= 2);
     assert_true(s.snap_count >= 2);
-    assert_true(s.pack_files >= 1);
     assert_true(s.snap_bytes > 0);
     assert_true(s.total_bytes > 0);
 

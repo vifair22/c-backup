@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from ..parsers import (
-    parse_pack_dat, parse_pack_idx,
+    parse_pack_dat, parse_pack_idx, ParseError,
     DAT_HDR_FMT, DAT_HDR_SIZE,
     DAT_ENTRY_V2_FMT, DAT_ENTRY_V2_SIZE,
     DAT_ENTRY_V1_FMT, DAT_ENTRY_V1_SIZE,
@@ -282,7 +282,7 @@ class PacksTab:
             try:
                 d   = parse_pack_dat(path)
                 fsz = os.path.getsize(path)
-            except Exception as e:
+            except ParseError as e:
                 err = str(e)
                 self._entry_frame.after(0,
                     lambda: self._on_dat_error(err, gen))
@@ -341,7 +341,7 @@ class PacksTab:
     def load_idx(self, path: str) -> None:
         try:
             idx = parse_pack_idx(path)
-        except Exception as e:
+        except ParseError as e:
             messagebox.showerror("Parse error", str(e))
             return
         rows = self._idx_tree.get_children()

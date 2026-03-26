@@ -720,21 +720,35 @@ static int cmd_run(repo_t *repo, int argc, char **argv) {
         return 1;
     }
 
-    /* Post-backup: GFS retention engine.
-     * Activated when keep_snaps or any GFS tier is set.
-     * Handles prune and GC internally. */
-    int use_gfs = pol &&
-                  (pol->keep_snaps > 0 || pol->keep_daily > 0 ||
-                   pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
-                   pol->keep_yearly > 0);
-    if (use_gfs && pol->auto_prune) {
-        uint32_t head_id = 0;
-        snapshot_read_head(repo, &head_id);
-        if (!quiet) log_msg("INFO", "post-backup: running retention");
-        gfs_run(repo, pol, head_id, 0, quiet, 0, 0);
-    } else if (pol && pol->auto_gc) {
-        if (!quiet) log_msg("INFO", "post-backup: running GC");
-        repo_gc(repo, NULL, NULL);
+    /* Post-backup maintenance runbook.
+     * Prune always implies GC (reclaim storage after snapshot deletion).
+     * auto_gc without prune handles reclaim after manual snapshot deletes.
+     * GC runs once — before pack if auto_pack, standalone otherwise. */
+    if (pol) {
+        int use_gfs = (pol->keep_snaps > 0 || pol->keep_daily > 0 ||
+                       pol->keep_weekly > 0 || pol->keep_monthly > 0 ||
+                       pol->keep_yearly > 0);
+        uint32_t pruned = 0;
+        int did_gc = 0;
+        if (use_gfs && pol->auto_prune) {
+            uint32_t head_id = 0;
+            snapshot_read_head(repo, &head_id);
+            if (!quiet) log_msg("INFO", "post-backup: running retention");
+            gfs_run(repo, pol, head_id, 0, quiet, 0, &pruned);
+            if (pruned > 0) {
+                repo_gc(repo, NULL, NULL);
+                did_gc = 1;
+            }
+        }
+        if (pol->auto_pack) {
+            if (!quiet) log_msg("INFO", "post-backup: packing loose objects");
+            pack_resume_installing(repo);
+            if (!did_gc) repo_gc(repo, NULL, NULL);
+            repo_pack(repo, NULL);
+        } else if (pol->auto_gc && !did_gc) {
+            if (!quiet) log_msg("INFO", "post-backup: running GC");
+            repo_gc(repo, NULL, NULL);
+        }
     }
 
     free_abs_list(source_owned, source_abs, n_source);
@@ -1591,7 +1605,10 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 
     uint32_t head_id = 0;
     snapshot_read_head(repo, &head_id);
-    status_t st = gfs_run(repo, pol, head_id, dry_run, 0, 1, 1);
+    uint32_t pruned = 0;
+    status_t st = gfs_run(repo, pol, head_id, dry_run, 0, 1, &pruned);
+    if (st == OK && !dry_run && pruned > 0)
+        repo_gc(repo, NULL, NULL);
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "prune failed");
@@ -1624,7 +1641,10 @@ static int cmd_gfs(repo_t *repo, int argc, char **argv) {
 
     if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
 
-    status_t st2 = gfs_run(repo, pol, head_id, dry_run, 0, 0, 1);
+    uint32_t pruned = 0;
+    status_t st2 = gfs_run(repo, pol, head_id, dry_run, 0, 1, &pruned);
+    if (st2 == OK && !dry_run && pruned > 0)
+        repo_gc(repo, NULL, NULL);
     if (st2 != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "gfs failed");
@@ -1650,6 +1670,9 @@ static int cmd_pack(repo_t *repo, int argc, char **argv) {
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
     if (lock_or_die(repo)) return 1;
+    pack_resume_installing(repo);
+    log_msg("INFO", "running GC");
+    repo_gc(repo, NULL, NULL);
     log_msg("INFO", "running pack");
     status_t st = repo_pack(repo, NULL);
     if (st != OK)

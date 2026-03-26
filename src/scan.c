@@ -136,6 +136,20 @@ static int dirmap_set(imap_t *m, const char *rel, uint64_t node_id) {
     return 0;
 }
 
+static void scan_warn(scan_result_t *res, const char *msg) {
+    if (!res) return;
+    if (res->warn_count == res->warn_cap) {
+        uint32_t nc = res->warn_cap ? res->warn_cap * 2 : 16;
+        char **tmp = realloc(res->warnings, nc * sizeof(char *));
+        if (!tmp) return; /* drop warning on OOM — non-fatal */
+        res->warnings = tmp;
+        res->warn_cap = nc;
+    }
+    char *dup = strdup(msg);
+    if (!dup) return;
+    res->warnings[res->warn_count++] = dup;
+}
+
 static status_t result_append(scan_result_t *res, const scan_entry_t *e,
                               const scan_opts_t *opts) {
     if (res->count == res->capacity) {
@@ -249,17 +263,10 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     if (lstat(path, &st) == -1) {
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
-        if (opts && opts->verbose) {
-            char msg[PATH_MAX + 96];
-            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
-                         path, strerror(errno)) >= (int)sizeof(msg)) {
-                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
-            } else {
-                log_msg("WARN", msg);
-            }
-        } else {
-            log_msg("WARN", "lstat failed, skipping entry");
-        }
+        char msg[PATH_MAX + 96];
+        snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", path, strerror(errno));
+        scan_warn(res, msg);
+        log_msg("WARN", msg);
         return OK;
     }
 
@@ -358,17 +365,10 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
     if (!d) {
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
-        if (opts && opts->verbose) {
-            char msg[PATH_MAX + 96];
-            if (snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)",
-                         path, strerror(errno)) >= (int)sizeof(msg)) {
-                log_msg("WARN", "cannot open directory: <path-too-long>");
-            } else {
-                log_msg("WARN", msg);
-            }
-        } else {
-            log_msg("WARN", "cannot open directory");
-        }
+        char msg[PATH_MAX + 96];
+        snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)", path, strerror(errno));
+        scan_warn(res, msg);
+        log_msg("WARN", msg);
         return OK;
     }
     struct dirent *de;
@@ -379,6 +379,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         if (n < 0 || (size_t)n >= sizeof(child)) {
             if (opts && opts->progress_clear_cb)
                 opts->progress_clear_cb(opts->progress_ctx);
+            scan_warn(res, "path too long, skipping entry");
             log_msg("WARN", "path too long, skipping entry");
             continue;
         }
@@ -408,17 +409,10 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     if (lstat(root, &root_st) != 0) {
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
-        if (opts && opts->verbose) {
-            char msg[PATH_MAX + 96];
-            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
-                         root, strerror(errno)) >= (int)sizeof(msg)) {
-                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
-            } else {
-                log_msg("WARN", msg);
-            }
-        } else {
-            log_msg("WARN", "lstat failed, skipping entry");
-        }
+        char msg[PATH_MAX + 96];
+        snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", root, strerror(errno));
+        scan_warn(res, msg);
+        log_msg("WARN", msg);
         *out = res;
         return OK;
     }
@@ -494,20 +488,13 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     if (lstat(root, &root_st) != 0) {
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
-        if (opts && opts->verbose) {
-            char msg[PATH_MAX + 96];
-            if (snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)",
-                         root, strerror(errno)) >= (int)sizeof(msg)) {
-                log_msg("WARN", "lstat failed, skipping: <path-too-long>");
-            } else {
-                log_msg("WARN", msg);
-            }
-        } else {
-            log_msg("WARN", "lstat failed, skipping entry");
-        }
+        char msg[PATH_MAX + 96];
+        snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", root, strerror(errno));
+        log_msg("WARN", msg);
         scan_result_free(res);
         res = calloc(1, sizeof(*res));
         if (!res) return set_error(ERR_NOMEM, "scan_tree: realloc result failed");
+        scan_warn(res, msg);
         *out = res;
         return OK;
     }
@@ -527,5 +514,7 @@ void scan_result_free(scan_result_t *res) {
         free(res->entries[i].acl_data);
     }
     free(res->entries);
+    for (uint32_t i = 0; i < res->warn_count; i++) free(res->warnings[i]);
+    free(res->warnings);
     free(res);
 }

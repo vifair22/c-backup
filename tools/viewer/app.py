@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .parsers import scan_repo
+from .parsers import scan_repo, ParseError
 from .widgets import PAD
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
@@ -111,7 +111,7 @@ class ViewerApp(tk.Tk):
     def load_repo(self, path: str) -> None:
         try:
             self._scan = scan_repo(path)
-        except Exception as e:
+        except OSError as e:
             messagebox.showerror("Error", str(e))
             return
         self.repo_path = path

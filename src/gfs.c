@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gfs.h"
-#include "gc.h"
 #include "tag.h"
 #include "../vendor/log.h"
 
@@ -219,7 +218,7 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 
 status_t gfs_run(repo_t *repo, const policy_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int run_gc, int full_scan) {
+                 int full_scan, uint32_t *out_pruned) {
     if (new_snap_id == 0) return OK;
 
     gfs_snap_info_t *snaps = NULL;
@@ -380,8 +379,7 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
     free(orig_flags);
     free(snaps);
 
-    if (!dry_run && (run_gc || pruned_snaps > 0))
-        st = repo_gc(repo, NULL, NULL);
+    if (out_pruned) *out_pruned = pruned_snaps;
 
     return st;
 }

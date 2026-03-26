@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import parse_snap_header, parse_pack_dat
+from ..parsers import parse_snap_header, iter_pack_dat, ParseError
 from ..formats import fmt_size, fmt_time, gfs_flags_str
 from ..widgets import make_text_widget, set_text, PAD, FONT_BOLD
 
@@ -43,7 +43,7 @@ class OverviewTab:
                             f"  {s['snap_id']:>8}  {fmt_time(s['created_sec']):>19}"
                             f"  {s['node_count']:>7}  {gfs:>25}  {fmt_size(s['phys_new_bytes'])}"
                         )
-                    except Exception as e:
+                    except ParseError as e:
                         lines.append(f"  {os.path.basename(path):30}  ERROR: {e}")
 
             if scan["pack_dat"]:
@@ -51,12 +51,13 @@ class OverviewTab:
                 lines.append(f"  {'File':30}  {'Ver':>3}  {'Objects':>7}  {'Size':>10}")
                 for path in scan["pack_dat"]:
                     try:
-                        d = parse_pack_dat(path)
+                        hdr, entries = iter_pack_dat(path)
+                        entries.close()   # don't need entries, release file handle
                         sz = os.path.getsize(path)
                         lines.append(
-                            f"  {os.path.basename(path):30}  v{d['version']:>2}  {d['count']:>7}  {fmt_size(sz):>10}"
+                            f"  {os.path.basename(path):30}  v{hdr['version']:>2}  {hdr['count']:>7}  {fmt_size(sz):>10}"
                         )
-                    except Exception as e:
+                    except ParseError as e:
                         lines.append(f"  {os.path.basename(path):30}  ERROR: {e}")
 
             self._frame.after(0, lambda: set_text(self._text, "\n".join(lines)))

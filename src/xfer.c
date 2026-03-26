@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 500
 #define _POSIX_C_SOURCE 200809L
 #include "xfer.h"
 
@@ -10,6 +11,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <limits.h>
 #include <lz4.h>
 #include <openssl/evp.h>
@@ -21,6 +23,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static size_t g_xfer_line_len = 0;
+#define xfer_progress_enabled() progress_enabled()
+#define xfer_line_set(msg)      progress_line_set(&g_xfer_line_len, (msg))
+#define xfer_line_clear()       progress_line_clear(&g_xfer_line_len)
+#define xfer_tick_due(t)        tick_due(t)
 
 #define CBB_MAGIC "CBB1"
 #define CBB_VERSION 1u
@@ -59,14 +67,15 @@ typedef struct {
 
 static int sha256_buf(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    if (!ctx) return -1;
+    if (!ctx) { set_error(ERR_NOMEM, "sha256_buf: EVP_MD_CTX_new failed"); return -1; }
     unsigned dlen = 0;
     int ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
              EVP_DigestUpdate(ctx, data, len) == 1 &&
              EVP_DigestFinal_ex(ctx, out, &dlen) == 1 &&
              dlen == OBJECT_HASH_SIZE;
     EVP_MD_CTX_free(ctx);
-    return ok ? 0 : -1;
+    if (!ok) { set_error(ERR_IO, "sha256_buf: digest computation failed"); return -1; }
+    return 0;
 }
 
 static int path_is_safe_rel(const char *p) {
@@ -83,21 +92,35 @@ static int path_is_safe_rel(const char *p) {
     return 1;
 }
 
+static int rm_rf_cb(const char *fpath, const struct stat *sb,
+                    int typeflag, struct FTW *ftwbuf) {
+    (void)sb; (void)ftwbuf;
+    if (typeflag == FTW_DP)
+        rmdir(fpath);
+    else
+        unlink(fpath);
+    return 0;
+}
+
 static void rm_rf_path(const char *path) {
     if (!path || !*path) return;
-    char cmd[PATH_MAX + 32];
-    if (snprintf(cmd, sizeof(cmd), "rm -rf %s", path) >= (int)sizeof(cmd)) return;
-    int rc = system(cmd);
-    (void)rc;
+    nftw(path, rm_rf_cb, 64, FTW_DEPTH | FTW_PHYS);
+    rmdir(path);
 }
 
 static int mkdirs_parent(const char *path) {
     char tmp[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
+        set_error(ERR_IO, "mkdirs_parent: path too long");
+        return -1;
+    }
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+            set_error_errno(ERR_IO, "mkdirs_parent: mkdir(%s)", tmp);
+            return -1;
+        }
         *p = '/';
     }
     return 0;
@@ -105,18 +128,18 @@ static int mkdirs_parent(const char *path) {
 
 static int read_file_bytes(const char *path, uint8_t **out, size_t *out_len, mode_t *out_mode) {
     struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    if (!S_ISREG(st.st_mode)) return -1;
+    if (stat(path, &st) != 0) { set_error_errno(ERR_IO, "read_file_bytes: stat(%s)", path); return -1; }
+    if (!S_ISREG(st.st_mode)) { set_error(ERR_IO, "read_file_bytes: not a regular file: %s", path); return -1; }
 
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) { set_error_errno(ERR_IO, "read_file_bytes: open(%s)", path); return -1; }
 
     size_t n = (size_t)st.st_size;
     uint8_t *buf = NULL;
     if (n > 0) {
         buf = malloc(n);
-        if (!buf) { close(fd); return -1; }
-        if (read_all(fd, buf, n) != 0) { free(buf); close(fd); return -1; }
+        if (!buf) { close(fd); set_error(ERR_NOMEM, "read_file_bytes: alloc %zu bytes", n); return -1; }
+        if (read_all(fd, buf, n) != 0) { free(buf); close(fd); set_error_errno(ERR_IO, "read_file_bytes: read(%s)", path); return -1; }
     }
     close(fd);
     *out = buf;
@@ -128,9 +151,10 @@ static int read_file_bytes(const char *path, uint8_t **out, size_t *out_len, mod
 static int write_file_bytes(const char *path, const void *buf, size_t len, mode_t mode) {
     if (mkdirs_parent(path) != 0) return -1;
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
-    if (fd < 0) return -1;
+    if (fd < 0) { set_error_errno(ERR_IO, "write_file_bytes: open(%s)", path); return -1; }
     int rc = (len == 0 || write_all(fd, buf, len) == 0) ? 0 : -1;
-    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) { set_error_errno(ERR_IO, "write_file_bytes: fsync(%s)", path); rc = -1; }
+    if (rc != 0 && errno) set_error_errno(ERR_IO, "write_file_bytes: write(%s)", path);
     close(fd);
     return rc;
 }
@@ -147,7 +171,7 @@ static int hashset_add(hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
     if (hs->n == hs->cap) {
         size_t nc = hs->cap ? hs->cap * 2 : 256;
         uint8_t *nb = realloc(hs->buf, nc * OBJECT_HASH_SIZE);
-        if (!nb) return -1;
+        if (!nb) { set_error(ERR_NOMEM, "hashset_add: realloc failed (%zu entries)", nc); return -1; }
         hs->buf = nb;
         hs->cap = nc;
     }
@@ -162,15 +186,15 @@ static int bundle_write_record(int fd, uint8_t kind, uint8_t obj_type,
                                const uint8_t *raw, size_t raw_len) {
     uint16_t path_len = path_or_null ? (uint16_t)strlen(path_or_null) : 0;
     /* LZ4 API is limited to INT_MAX — large objects must go through Phase 3 streaming. */
-    if (raw_len > (size_t)INT_MAX) return -1;
+    if (raw_len > (size_t)INT_MAX) { set_error(ERR_TOO_LARGE, "bundle_write_record: raw_len %zu exceeds INT_MAX", raw_len); return -1; }
     int bound = LZ4_compressBound((int)raw_len);
     uint8_t *cbuf = NULL;
     int comp_len = 0;
     if (raw_len > 0) {
         cbuf = malloc((size_t)bound);
-        if (!cbuf) return -1;
+        if (!cbuf) { set_error(ERR_NOMEM, "bundle_write_record: alloc %d bytes", bound); return -1; }
         comp_len = LZ4_compress_default((const char *)raw, (char *)cbuf, (int)raw_len, bound);
-        if (comp_len <= 0) { free(cbuf); return -1; }
+        if (comp_len <= 0) { free(cbuf); set_error(ERR_IO, "bundle_write_record: LZ4 compress failed"); return -1; }
     }
 
     cbb_rec_t rec;
@@ -188,9 +212,9 @@ static int bundle_write_record(int fd, uint8_t kind, uint8_t obj_type,
         rec.hash[1] = (uint8_t)((mode >> 8) & 0xFF);
     }
 
-    if (write_all(fd, &rec, sizeof(rec)) != 0) { free(cbuf); return -1; }
-    if (path_len > 0 && write_all(fd, path_or_null, path_len) != 0) { free(cbuf); return -1; }
-    if (comp_len > 0 && write_all(fd, cbuf, (size_t)comp_len) != 0) { free(cbuf); return -1; }
+    if (write_all(fd, &rec, sizeof(rec)) != 0) { free(cbuf); set_error_errno(ERR_IO, "bundle_write_record: write rec header"); return -1; }
+    if (path_len > 0 && write_all(fd, path_or_null, path_len) != 0) { free(cbuf); set_error_errno(ERR_IO, "bundle_write_record: write path"); return -1; }
+    if (comp_len > 0 && write_all(fd, cbuf, (size_t)comp_len) != 0) { free(cbuf); set_error_errno(ERR_IO, "bundle_write_record: write compressed data"); return -1; }
     free(cbuf);
     return 0;
 }
@@ -212,11 +236,11 @@ static int bundle_write_object(int out_fd, const uint8_t hash[OBJECT_HASH_SIZE],
         free(data);
         return rc;
     }
-    if (st != ERR_TOO_LARGE) return -1;
+    if (st != ERR_TOO_LARGE) { set_error(ERR_IO, "bundle_write_object: object_load failed"); return -1; }
 
     /* Large object: get size+type from header, then stream raw. */
     uint64_t raw_size = 0;
-    if (object_get_info(repo, hash, &raw_size, &type) != OK) return -1;
+    if (object_get_info(repo, hash, &raw_size, &type) != OK) { set_error(ERR_IO, "bundle_write_object: object_get_info failed for large object"); return -1; }
 
     cbb_rec_t rec;
     memset(&rec, 0, sizeof(rec));
@@ -225,11 +249,12 @@ static int bundle_write_object(int out_fd, const uint8_t hash[OBJECT_HASH_SIZE],
     rec.raw_len  = raw_size;
     rec.comp_len = 0;   /* 0 means uncompressed raw follows */
     memcpy(rec.hash, hash, OBJECT_HASH_SIZE);
-    if (write_all(out_fd, &rec, sizeof(rec)) != 0) return -1;
+    if (write_all(out_fd, &rec, sizeof(rec)) != 0) { set_error_errno(ERR_IO, "bundle_write_object: write large rec header"); return -1; }
 
     uint64_t streamed = 0;
-    if (object_load_stream(repo, hash, out_fd, &streamed, NULL) != OK) return -1;
-    return (streamed == raw_size) ? 0 : -1;
+    if (object_load_stream(repo, hash, out_fd, &streamed, NULL) != OK) { set_error(ERR_IO, "bundle_write_object: stream failed"); return -1; }
+    if (streamed != raw_size) { set_error(ERR_CORRUPT, "bundle_write_object: streamed %llu != expected %llu", (unsigned long long)streamed, (unsigned long long)raw_size); return -1; }
+    return 0;
 }
 
 static int bundle_write_end(int fd) {
@@ -255,12 +280,14 @@ static int collect_hashes_from_snapshot(snapshot_t *snap, hashset_t *hs) {
 
 static int write_repo_metadata_file(repo_t *repo, int out_fd, const char *rel_path) {
     char full[PATH_MAX];
-    if (snprintf(full, sizeof(full), "%s/%s", repo_path(repo), rel_path) >= (int)sizeof(full))
+    if (snprintf(full, sizeof(full), "%s/%s", repo_path(repo), rel_path) >= (int)sizeof(full)) {
+        set_error(ERR_IO, "write_repo_metadata_file: path too long for '%s'", rel_path);
         return -1;
+    }
     uint8_t *buf = NULL;
     size_t len = 0;
     mode_t mode = 0644;
-    if (read_file_bytes(full, &buf, &len, &mode) != 0) return -1;
+    if (read_file_bytes(full, &buf, &len, &mode) != 0) return -1; /* error already set */
     int rc = bundle_write_record(out_fd, CBB_REC_FILE, 0, rel_path, mode, NULL, buf, len);
     free(buf);
     return rc;
@@ -327,9 +354,23 @@ static int export_repo_bundle(repo_t *repo, int out_fd) {
         closedir(d);
     }
 
-    for (size_t i = 0; i < hs.n; i++) {
-        const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
-        if (bundle_write_object(out_fd, h, repo) != 0) goto fail;
+    {
+        int show_prog = xfer_progress_enabled();
+        struct timespec xtick = {0};
+        if (show_prog) clock_gettime(CLOCK_MONOTONIC, &xtick);
+        for (size_t i = 0; i < hs.n; i++) {
+            const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
+            if (bundle_write_object(out_fd, h, repo) != 0) {
+                if (show_prog) xfer_line_clear();
+                goto fail;
+            }
+            if (show_prog && xfer_tick_due(&xtick)) {
+                char line[128];
+                snprintf(line, sizeof(line), "export: %zu/%zu objects", i + 1, hs.n);
+                xfer_line_set(line);
+            }
+        }
+        if (show_prog) xfer_line_clear();
     }
 
     free(hs.buf);
@@ -374,9 +415,23 @@ static int export_snapshot_bundle(repo_t *repo, uint32_t snap_id, int out_fd) {
         }
     }
 
-    for (size_t i = 0; i < hs.n; i++) {
-        const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
-        if (bundle_write_object(out_fd, h, repo) != 0) goto fail;
+    {
+        int show_prog = xfer_progress_enabled();
+        struct timespec xtick = {0};
+        if (show_prog) clock_gettime(CLOCK_MONOTONIC, &xtick);
+        for (size_t i = 0; i < hs.n; i++) {
+            const uint8_t *h = hs.buf + i * OBJECT_HASH_SIZE;
+            if (bundle_write_object(out_fd, h, repo) != 0) {
+                if (show_prog) xfer_line_clear();
+                goto fail;
+            }
+            if (show_prog && xfer_tick_due(&xtick)) {
+                char line[128];
+                snprintf(line, sizeof(line), "export: %zu/%zu objects", i + 1, hs.n);
+                xfer_line_set(line);
+            }
+        }
+        if (show_prog) xfer_line_clear();
     }
 
     free(hs.buf);
@@ -427,6 +482,10 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
 
     int imported_files = 0;
     int imported_objs = 0;
+    int show_progress = xfer_progress_enabled();
+    struct timespec bp_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &bp_tick);
+
     while (1) {
         cbb_rec_t rec;
         if (read_all(fd, &rec, sizeof(rec)) != 0) { close(fd); return set_error(ERR_CORRUPT, "bundle: truncated record"); }
@@ -473,6 +532,12 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
                 }
             }
             imported_objs++;
+            if (show_progress && xfer_tick_due(&bp_tick)) {
+                char line[128];
+                snprintf(line, sizeof(line), "bundle: %d files, %d objects",
+                         imported_files, imported_objs);
+                xfer_line_set(line);
+            }
             continue;
         }
 
@@ -538,8 +603,16 @@ static status_t process_bundle(repo_t *repo, const char *input_path,
         }
 
         free(raw);
+
+        if (show_progress && xfer_tick_due(&bp_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line), "bundle: %d files, %d objects",
+                     imported_files, imported_objs);
+            xfer_line_set(line);
+        }
     }
 
+    if (show_progress) xfer_line_clear();
     close(fd);
     if (out_files) *out_files = imported_files;
     if (out_objs) *out_objs = imported_objs;
@@ -562,7 +635,11 @@ status_t import_bundle(repo_t *repo, const char *input_path,
 }
 
 status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *output_path) {
-    char tmpl[] = "/tmp/c_backup_export.XXXXXX";
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+    char tmpl[PATH_MAX];
+    if (snprintf(tmpl, sizeof(tmpl), "%s/c_backup_export.XXXXXX", tmpdir) >= (int)sizeof(tmpl))
+        return set_error(ERR_IO, "export_targz: TMPDIR path too long");
     char *tmp = mkdtemp(tmpl);
     if (!tmp) return set_error_errno(ERR_IO, "export_targz: mkdtemp");
 
@@ -572,18 +649,43 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
         return st;
     }
 
+    /* Pipe to capture tar's stderr for error context */
+    int errpipe[2];
+    if (pipe(errpipe) != 0) {
+        rm_rf_path(tmp);
+        return set_error_errno(ERR_IO, "export_targz: pipe");
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
+        close(errpipe[0]); close(errpipe[1]);
         rm_rf_path(tmp);
         return set_error_errno(ERR_IO, "export_targz: fork");
     }
     if (pid == 0) {
+        close(errpipe[0]);
+        dup2(errpipe[1], STDERR_FILENO);
+        close(errpipe[1]);
         execlp("tar", "tar", "-czf", output_path, "-C", tmp, ".", (char *)NULL);
         _exit(127);
     }
 
+    close(errpipe[1]);
+    char errbuf[512] = {0};
+    ssize_t nr = read(errpipe[0], errbuf, sizeof(errbuf) - 1);
+    if (nr > 0) errbuf[nr] = '\0';
+    close(errpipe[0]);
+
     int wst = 0;
-    if (waitpid(pid, &wst, 0) < 0 || !WIFEXITED(wst) || WEXITSTATUS(wst) != 0) st = ERR_IO;
+    if (waitpid(pid, &wst, 0) < 0 || !WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+        int code = WIFEXITED(wst) ? WEXITSTATUS(wst) : -1;
+        if (code == 127)
+            st = set_error(ERR_IO, "export_targz: tar not found in PATH");
+        else if (errbuf[0])
+            st = set_error(ERR_IO, "export_targz: tar failed (exit %d): %s", code, errbuf);
+        else
+            st = set_error(ERR_IO, "export_targz: tar failed (exit %d)", code);
+    }
 
     rm_rf_path(tmp);
     return st;

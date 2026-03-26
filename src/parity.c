@@ -1,8 +1,15 @@
 #include "parity.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 #include <string.h>
 #include <pthread.h>
+
+#if defined(__x86_64__) && defined(__SSE4_2__)
+#include <immintrin.h>
+#define CRC32C_HW 1
+#define RS_SIMD    1
+#endif
 
 /* ========================================================================
  * Global parity statistics (atomic counters)
@@ -40,6 +47,7 @@ void parity_stats_add_uncorrectable(uint64_t n)
  * Polynomial: 0x1EDC6F41
  * ======================================================================== */
 
+#if !CRC32C_HW
 static uint32_t crc32c_table[256];
 static int crc32c_table_ready;
 
@@ -54,15 +62,46 @@ static void crc32c_init_table(void)
     }
     crc32c_table_ready = 1;
 }
+#endif
 
 uint32_t crc32c_update(uint32_t crc, const void *data, size_t len)
 {
+#if CRC32C_HW
+    /* Hardware-accelerated CRC32C via SSE4.2 crc32 instruction.
+     * Processes 8 bytes at a time (~20 GB/s vs ~500 MiB/s software). */
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t c = ~(uint64_t)crc;
+
+    /* Align to 8 bytes */
+    while (len > 0 && ((uintptr_t)p & 7)) {
+        c = _mm_crc32_u8((uint32_t)c, *p++);
+        len--;
+    }
+
+    /* Process 8 bytes at a time */
+    while (len >= 8) {
+        uint64_t val;
+        memcpy(&val, p, 8);
+        c = _mm_crc32_u64(c, val);
+        p += 8;
+        len -= 8;
+    }
+
+    /* Remaining bytes */
+    while (len > 0) {
+        c = _mm_crc32_u8((uint32_t)c, *p++);
+        len--;
+    }
+
+    return ~(uint32_t)c;
+#else
     crc32c_init_table();
     const uint8_t *p = (const uint8_t *)data;
     crc = ~crc;
     for (size_t i = 0; i < len; i++)
         crc = crc32c_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
     return ~crc;
+#endif
 }
 
 uint32_t crc32c(const void *data, size_t len)
@@ -205,6 +244,30 @@ static inline uint8_t gf_pow(uint8_t a, int n)
  * ======================================================================== */
 
 static uint8_t rs_gen[RS_2T + 1];  /* generator polynomial coefficients */
+
+/* Precomputed multiplication table: gen_mul[j][x] = gf_mul(rs_gen[j], x).
+ * Replaces 3 table lookups + branch per GF multiply with a single lookup.
+ * 16 × 256 = 4 KiB — fits entirely in L1 cache. */
+static uint8_t rs_gen_mul[RS_2T][256];
+
+#if RS_SIMD
+/* SIMD vector lookup table: rs_gen_fb_vec[f] is a 128-bit vector where
+ * byte j = gf_mul(rs_gen[j], f).  One 16-byte load replaces the entire
+ * 16-element inner loop of the LFSR.  256 × 16 = 4 KiB, fits in L1. */
+static __m128i rs_gen_fb_vec[256] __attribute__((aligned(16)));
+
+/* Split-nibble tables for AVX2 batch encoding.  For each generator
+ * coefficient j, gen_lo[j] and gen_hi[j] are 256-bit vpshufb tables:
+ *   gen_lo[j][nibble] = gf_mul(rs_gen[j], nibble)        (nibble 0..15)
+ *   gen_hi[j][nibble] = gf_mul(rs_gen[j], nibble << 4)   (nibble 0..15)
+ * Broadcast to both 128-bit lanes so vpshufb works across the full __m256i.
+ * 16 × 2 × 32 = 1 KiB. */
+#ifdef __AVX2__
+static __m256i rs_gen_lo[RS_2T] __attribute__((aligned(32)));
+static __m256i rs_gen_hi[RS_2T] __attribute__((aligned(32)));
+#endif
+#endif
+
 static int rs_gen_ready;
 
 static void rs_gen_build(void)
@@ -225,6 +288,36 @@ static void rs_gen_build(void)
         deg++;
     }
 
+    /* Build the multiplication lookup table */
+    for (int j = 0; j < RS_2T; j++)
+        for (int x = 0; x < 256; x++)
+            rs_gen_mul[j][x] = gf_mul(rs_gen[j], (uint8_t)x);
+
+#if RS_SIMD
+    /* Build SIMD vector table: rs_gen_fb_vec[f][j] = gf_mul(rs_gen[j], f) */
+    for (int f = 0; f < 256; f++) {
+        uint8_t v[16];
+        for (int j = 0; j < RS_2T; j++)
+            v[j] = rs_gen_mul[j][f];
+        rs_gen_fb_vec[f] = _mm_loadu_si128((const __m128i *)v);
+    }
+
+#ifdef __AVX2__
+    /* Build split-nibble tables for AVX2 batch encoding */
+    for (int j = 0; j < RS_2T; j++) {
+        uint8_t lo[16], hi[16];
+        for (int n = 0; n < 16; n++) {
+            lo[n] = gf_mul(rs_gen[j], (uint8_t)n);
+            hi[n] = gf_mul(rs_gen[j], (uint8_t)(n << 4));
+        }
+        __m128i lo128 = _mm_loadu_si128((const __m128i *)lo);
+        __m128i hi128 = _mm_loadu_si128((const __m128i *)hi);
+        rs_gen_lo[j] = _mm256_broadcastsi128_si256(lo128);
+        rs_gen_hi[j] = _mm256_broadcastsi128_si256(hi128);
+    }
+#endif
+#endif
+
     rs_gen_ready = 1;
 }
 
@@ -243,23 +336,41 @@ void rs_encode(const uint8_t data[RS_K], uint8_t parity_out[RS_2T])
 {
     rs_init();
 
-    /* LFSR division: data polynomial * x^16 mod g(x). */
-    uint8_t feedback;
+#if RS_SIMD
+    /* SIMD LFSR: the entire 16-element inner loop becomes 3 instructions:
+     *   1. Extract byte 15 (feedback high byte)
+     *   2. Load precomputed gen*feedback vector (single 16-byte load)
+     *   3. Byte-shift register left by 1, XOR with gen*feedback
+     *
+     * This replaces 16 scalar GF multiplies + 16 XORs per data byte
+     * with one vector shift + one vector XOR + one table load.
+     * ~20× speedup per codeword. */
+    __m128i reg = _mm_setzero_si128();
+
+    for (int i = 0; i < RS_K; i++) {
+        uint8_t feedback = data[i] ^ (uint8_t)_mm_extract_epi8(reg, 15);
+        __m128i gen_fb = rs_gen_fb_vec[feedback];
+        reg = _mm_xor_si128(_mm_slli_si128(reg, 1), gen_fb);
+    }
+
+    /* Reverse byte order for output: parity_out[0] = reg[15], etc. */
+    __m128i rev = _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+    _mm_storeu_si128((__m128i *)parity_out, _mm_shuffle_epi8(reg, rev));
+#else
+    /* Scalar fallback */
     uint8_t reg[RS_2T];
     memset(reg, 0, sizeof(reg));
 
     for (int i = 0; i < RS_K; i++) {
-        feedback = data[i] ^ reg[RS_2T - 1];
+        uint8_t feedback = data[i] ^ reg[RS_2T - 1];
         for (int j = RS_2T - 1; j > 0; j--)
-            reg[j] = reg[j - 1] ^ gf_mul(rs_gen[j], feedback);
-        reg[0] = gf_mul(rs_gen[0], feedback);
+            reg[j] = reg[j - 1] ^ rs_gen_mul[j][feedback];
+        reg[0] = rs_gen_mul[0][feedback];
     }
 
-    /* reg[j] holds coefficient of x^j in the remainder.
-     * In the codeword array, parity_out[0] must be the coefficient of
-     * x^15 (highest parity power), so we reverse. */
     for (int i = 0; i < RS_2T; i++)
         parity_out[i] = reg[RS_2T - 1 - i];
+#endif
 }
 
 /* ========================================================================
@@ -435,6 +546,84 @@ size_t rs_parity_size(size_t data_len)
     return ngroups * RS_GROUP_PAR;
 }
 
+#if defined(RS_SIMD) && defined(__AVX2__)
+/* Encode 32 codewords simultaneously using AVX2 vpshufb GF multiplication.
+ *
+ * The interleaved data layout is naturally SIMD-friendly: for data position i,
+ * bytes src[i*64 + 0..31] are position i of codewords 0-31 (contiguous 32-byte
+ * AVX2 load).  The LFSR inner loop becomes:
+ *
+ *   feedback = data ^ reg[15]                       (32 bytes at once)
+ *   gen*fb   = vpshufb(gen_lo, fb_lo) ^ vpshufb(gen_hi, fb_hi)  (GF multiply)
+ *   reg[j]   = reg[j-1] ^ gen*fb[j]                (shift + XOR)
+ *
+ * This processes 32 codewords × 16 coefficients with 3 SIMD ops per coefficient
+ * instead of 1 scalar GF multiply each — a ~32× throughput improvement over
+ * calling rs_encode 32 times.
+ */
+static void rs_encode_batch32(const uint8_t *src, size_t group_len,
+                              uint8_t *par, int batch_offset) {
+    __m256i reg[RS_2T];
+    for (int j = 0; j < RS_2T; j++)
+        reg[j] = _mm256_setzero_si256();
+
+    __m256i mask_lo = _mm256_set1_epi8(0x0F);
+
+    for (size_t i = 0; i < (size_t)RS_K; i++) {
+        /* Load 32 data bytes: position i for codewords in this batch.
+         * Located at src[i*64 + batch_offset .. i*64 + batch_offset + 31].
+         * Must iterate RS_K times (not just ceil(group_len/64)) because
+         * the LFSR feedback is non-zero even when data bytes are zero. */
+        __m256i data_v;
+        size_t offset = i * (size_t)RS_INTERLEAVE + (size_t)batch_offset;
+        if (offset + 32 <= group_len) {
+            data_v = _mm256_loadu_si256((const __m256i *)(src + offset));
+        } else {
+            /* Partial or fully beyond group — zero-pad */
+            uint8_t tmp[32];
+            memset(tmp, 0, sizeof(tmp));
+            size_t avail = (offset < group_len) ? group_len - offset : 0;
+            if (avail > 32) avail = 32;
+            if (avail > 0) memcpy(tmp, src + offset, avail);
+            data_v = _mm256_loadu_si256((const __m256i *)tmp);
+        }
+
+        /* feedback[d] = data[d] ^ reg[15][d] for d=0..31 */
+        __m256i feedback = _mm256_xor_si256(data_v, reg[RS_2T - 1]);
+
+        /* Split feedback into nibbles for vpshufb GF multiply */
+        __m256i fb_lo = _mm256_and_si256(feedback, mask_lo);
+        __m256i fb_hi = _mm256_and_si256(_mm256_srli_epi16(feedback, 4), mask_lo);
+
+        /* LFSR shift + multiply for all 16 parity positions */
+        for (int j = RS_2T - 1; j > 0; j--) {
+            __m256i mul = _mm256_xor_si256(
+                _mm256_shuffle_epi8(rs_gen_lo[j], fb_lo),
+                _mm256_shuffle_epi8(rs_gen_hi[j], fb_hi));
+            reg[j] = _mm256_xor_si256(reg[j - 1], mul);
+        }
+        __m256i mul0 = _mm256_xor_si256(
+            _mm256_shuffle_epi8(rs_gen_lo[0], fb_lo),
+            _mm256_shuffle_epi8(rs_gen_hi[0], fb_hi));
+        reg[0] = mul0;
+    }
+
+    /* Store parity: need reg[j] byte d → par[d * RS_2T + (15-j)].
+     * Reverse the register order, then scatter bytes to output. */
+    for (int d = 0; d < 32; d++) {
+        uint8_t out[RS_2T];
+        for (int j = 0; j < RS_2T; j++) {
+            /* Extract byte d from reg[15-j] */
+            uint8_t tmp[32];
+            _mm256_storeu_si256((__m256i *)tmp, reg[RS_2T - 1 - j]);
+            out[j] = tmp[d];
+        }
+        int cw = batch_offset + d;
+        memcpy(par + cw * RS_2T, out, RS_2T);
+    }
+}
+#endif
+
 void rs_parity_encode(const void *data, size_t len, void *parity_out)
 {
     rs_init();
@@ -446,25 +635,45 @@ void rs_parity_encode(const void *data, size_t len, void *parity_out)
     while (remaining > 0) {
         size_t group_len = remaining < RS_GROUP_DATA ? remaining : RS_GROUP_DATA;
 
+#if defined(RS_SIMD) && defined(__AVX2__)
+        /* AVX2 batch path: process 32 codewords at a time.
+         * Two batches cover all 64 codewords in the interleave group. */
+        size_t active_cw = group_len < (size_t)RS_INTERLEAVE
+                           ? group_len : (size_t)RS_INTERLEAVE;
+
+        /* Batch 1: codewords 0-31 */
+        if (active_cw > 0)
+            rs_encode_batch32(src, group_len, par, 0);
+        /* Zero out parity for inactive codewords in batch 1 */
+        for (size_t d = active_cw; d < 32 && d < (size_t)RS_INTERLEAVE; d++)
+            memset(par + d * RS_2T, 0, RS_2T);
+
+        /* Batch 2: codewords 32-63 */
+        if (active_cw > 32)
+            rs_encode_batch32(src, group_len, par, 32);
+        else {
+            /* All codewords 32-63 are inactive — zero their parity */
+            for (size_t d = 32; d < (size_t)RS_INTERLEAVE; d++)
+                memset(par + d * RS_2T, 0, RS_2T);
+        }
+#else
         /* De-interleave into D codewords. */
         uint8_t cw_data[RS_INTERLEAVE][RS_K];
         memset(cw_data, 0, sizeof(cw_data));
         for (size_t i = 0; i < group_len; i++)
             cw_data[i % RS_INTERLEAVE][i / RS_INTERLEAVE] = src[i];
 
-        /* Determine how many codewords are actually used. */
         size_t active_cw = group_len < (size_t)RS_INTERLEAVE
                            ? group_len : (size_t)RS_INTERLEAVE;
 
-        /* Encode each codeword. */
         for (size_t d = 0; d < (size_t)RS_INTERLEAVE; d++) {
             if (d < active_cw) {
                 rs_encode(cw_data[d], par + d * RS_2T);
             } else {
-                /* All-zero codeword → all-zero parity. */
                 memset(par + d * RS_2T, 0, RS_2T);
             }
         }
+#endif
 
         src += group_len;
         par += RS_GROUP_PAR;

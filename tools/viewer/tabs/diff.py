@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from ..parsers import (parse_snap, parse_snap_header, build_path_map,
-                       find_object, decompress_payload, HAS_LZ4)
+                       find_object, decompress_payload, HAS_LZ4, ParseError)
 from ..formats import fmt_size, fmt_time, hex_hash
 from ..widgets import PAD, FONT_MONO, make_text_widget
 from ..constants import COMPRESS_NONE, UI_SIZE_LIMIT
@@ -84,7 +84,7 @@ class DiffTab:
             try:
                 h = parse_snap_header(path)
                 labels.append(f"{h['snap_id']:>6}  {fmt_time(h['created_sec'])}")
-            except Exception:
+            except ParseError:
                 import os
                 labels.append(os.path.basename(path))
         self._a_combo["values"] = labels
@@ -118,7 +118,7 @@ class DiffTab:
             try:
                 snap_a = parse_snap(path_a)
                 snap_b = parse_snap(path_b)
-            except Exception as e:
+            except ParseError as e:
                 err = str(e)
                 self._frame.after(0, lambda: self._on_compare_error(err, gen))
                 return

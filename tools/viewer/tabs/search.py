@@ -2,7 +2,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import parse_snap, find_paths_matching
+from ..parsers import parse_snap, find_paths_matching, ParseError
 from ..formats import fmt_size, fmt_time, hex_hash
 from ..constants import NODE_TYPE_NAMES
 from ..widgets import PAD, FONT_MONO
@@ -85,7 +85,7 @@ class SearchTab:
             for snap_path in snap_paths:
                 try:
                     s = parse_snap(snap_path)
-                except Exception:
+                except ParseError:
                     continue
                 for path, node in find_paths_matching(s, fragment):
                     if node is None:

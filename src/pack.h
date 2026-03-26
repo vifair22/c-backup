@@ -13,10 +13,15 @@
 
 /*
  * Pack all loose objects into a new pack file.
- * Runs GC first so only referenced blobs are packed.
  * *out_packed (may be NULL) receives the number of objects packed.
  */
 status_t repo_pack(repo_t *repo, uint32_t *out_packed);
+
+/*
+ * Complete any interrupted pack installs from a previous crash.
+ * Call before repo_pack() to recover staging directories.
+ */
+void pack_resume_installing(repo_t *repo);
 
 /* --- used by object.c -------------------------------------------- */
 

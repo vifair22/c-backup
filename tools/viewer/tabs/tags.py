@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from ..parsers import parse_tag
+from ..parsers import parse_tag, ParseError
 from ..widgets import make_text_widget, set_text, PAD, FONT_MONO, FONT_BOLD
 
 
@@ -44,7 +44,7 @@ class TagsTab:
         path = self._tag_paths[sel[0]]
         try:
             tag = parse_tag(path)
-        except Exception as e:
+        except ParseError as e:
             messagebox.showerror("Parse error", str(e))
             return
         lines = [f"File     : {path}", f"Name     : {os.path.basename(path)}"]

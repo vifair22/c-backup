@@ -138,6 +138,16 @@ static void test_scan_missing_root_is_nonfatal(void **state) {
         assert_null(strstr(res->entries[i].path, "c_backup_scan_missing"));
     }
 
+    /* Missing root should produce a warning */
+    assert_true(res->warn_count > 0);
+    int found_lstat_warn = 0;
+    for (uint32_t i = 0; i < res->warn_count; i++) {
+        if (strstr(res->warnings[i], "lstat failed") &&
+            strstr(res->warnings[i], "c_backup_scan_missing"))
+            found_lstat_warn = 1;
+    }
+    assert_true(found_lstat_warn);
+
     scan_result_free(res);
     scan_imap_free(imap);
 }
@@ -197,6 +207,31 @@ static void test_scan_collect_meta_off_and_collect_on_demand(void **state) {
     scan_imap_free(imap);
 }
 
+static void test_scan_warns_on_unreadable_dir(void **state) {
+    (void)state;
+    /* Create a directory we can't read */
+    mkdir(TEST_ROOT1 "/noperm", 0000);
+
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+
+    scan_result_t *res = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, NULL, &res), OK);
+    assert_non_null(res);
+
+    int found_warn = 0;
+    for (uint32_t i = 0; i < res->warn_count; i++) {
+        if (strstr(res->warnings[i], "cannot open directory") &&
+            strstr(res->warnings[i], "noperm"))
+            found_warn = 1;
+    }
+    assert_true(found_warn);
+
+    scan_result_free(res);
+    scan_imap_free(imap);
+    chmod(TEST_ROOT1 "/noperm", 0755);
+}
+
 static void test_scan_entry_collect_metadata_invalid_args(void **state) {
     (void)state;
     assert_int_equal(scan_entry_collect_metadata(NULL), ERR_INVALID);
@@ -214,6 +249,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_scan_missing_root_is_nonfatal, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),
         cmocka_unit_test(test_scan_entry_collect_metadata_invalid_args),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

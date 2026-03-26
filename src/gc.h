@@ -29,9 +29,9 @@ typedef struct {
 status_t repo_verify(repo_t *repo, verify_opts_t *opts);
 
 /*
- * Complete any prune that was interrupted before GC could run.
+ * Complete any prune that was interrupted.
  * Reads repo/prune-pending (if it exists), deletes any listed snap files
- * that have not already been removed, runs GC, then removes the file.
+ * that have not already been removed, then removes the marker file.
  * Called automatically on every exclusive lock acquisition.
  */
 status_t repo_prune_resume_pending(repo_t *repo);

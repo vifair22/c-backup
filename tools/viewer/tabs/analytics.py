@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import parse_pack_dat, parse_loose_object
+from ..parsers import iter_pack_dat, parse_loose_object, ParseError
 from ..formats import fmt_size
 from ..constants import (
     OBJECT_TYPE_NAMES,
@@ -74,10 +74,10 @@ class AnalyticsTab:
 
             for dat_path in scan.get("pack_dat", []):
                 try:
-                    d = parse_pack_dat(dat_path)
-                except Exception:
+                    _hdr, entries = iter_pack_dat(dat_path)
+                except ParseError:
                     continue
-                for e in d["entries"]:
+                for e in entries:
                     t = e["type"]
                     if t in stats:
                         stats[t]["count"]  += 1
@@ -95,7 +95,7 @@ class AnalyticsTab:
             for loose_path in scan.get("loose", []):
                 try:
                     obj = parse_loose_object(loose_path)
-                except Exception:
+                except ParseError:
                     continue
                 t = obj["type"]
                 if t in stats:

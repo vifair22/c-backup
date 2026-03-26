@@ -306,6 +306,7 @@ static void test_restore_snapshot_corrupt_object_fails_corrupt(void **state) {
     (void)state;
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
+    assert_int_equal(repo_pack(repo, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);

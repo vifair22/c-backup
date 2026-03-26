@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 \
+CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 -msse4.2 -mavx2 \
            -Wshadow \
            -Wunused \
            -Wunused-function \

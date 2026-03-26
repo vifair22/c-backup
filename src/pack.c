@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "pack.h"
 #include "parity.h"
-#include "gc.h"
 #include "object.h"
 #include "repo.h"
 #include "snapshot.h"
@@ -95,7 +95,7 @@ typedef struct {
 } pack_meta_t;
 
 #define PACK_COALESCE_TARGET_COUNT   32u
-#define PACK_COALESCE_SMALL_BYTES    (64ull * 1024ull * 1024ull)
+#define PACK_COALESCE_SMALL_BYTES    PACK_MAX_MULTI_BYTES
 #define PACK_COALESCE_MIN_SMALL      8u
 #define PACK_COALESCE_MIN_RATIO_PCT  30u
 #define PACK_COALESCE_MAX_BUDGET     (10ull * 1024ull * 1024ull * 1024ull)
@@ -108,10 +108,10 @@ typedef struct {
  * loaded entirely into memory.  Matches STREAM_CHUNK in object.c. */
 #define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
 
-/* Maximum body size for multi-object packs.  When adding the next small
- * object would exceed this limit, the current pack is finalized and a new
- * one is started.  Single large compressible objects always get their own
- * dedicated pack (no cap — the blast radius is exactly one file). */
+/* Maximum body size for multi-object packs.  When adding the next object
+ * would exceed this limit, the current pack is finalized and a new one is
+ * started.  Both large (streamed) and small (worker-compressed) objects
+ * are batched into shared packs up to this cap. */
 #define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
 
 /* Maximum plausible object size: 128 GiB */
@@ -126,7 +126,6 @@ typedef struct {
 #define cache_cmp hash_cmp
 
 /* Forward declarations for startup recovery */
-static void pack_resume_installing(repo_t *repo);
 static void pack_resume_deleting(repo_t *repo);
 
 static int idx_disk_cmp(const void *a, const void *b) {
@@ -311,11 +310,36 @@ typedef struct {
     uint64_t uncompressed_size;
     uint64_t compressed_size;
     uint8_t *payload;
+    /* Pre-computed parity (computed by worker threads in parallel) */
+    parity_record_t hdr_par;
+    uint32_t payload_crc;
+    uint8_t *rs_parity;     /* NULL if compressed_size==0, else rs_parity_size() bytes */
+    size_t   rs_par_sz;
 } pack_work_item_t;
+
+/* Accumulated parity data for one entry in the current pack. */
+typedef struct {
+    parity_record_t hdr_par;
+    uint32_t payload_crc;
+    uint8_t *rs_parity;
+    size_t   rs_par_sz;
+    uint32_t rs_data_len;   /* = (uint32_t)compressed_size */
+} pack_entry_parity_t;
+
+/* Cached metadata from the partition pass — avoids re-reading headers later. */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint8_t  type;
+    uint8_t  compression;
+    uint64_t compressed_size;
+    uint64_t uncompressed_size;
+    uint8_t  skip_ver;
+} pack_obj_meta_t;
 
 typedef struct {
     repo_t *repo;
-    const uint8_t *hashes;
+    const pack_obj_meta_t *meta;
+    const uint32_t *indices;
     size_t loose_cnt;
 
     size_t next_index;
@@ -398,7 +422,8 @@ static void *pack_worker_main(void *arg) {
         idx = ctx->next_index++;
         pthread_mutex_unlock(&ctx->mu);
 
-        const uint8_t *hash = ctx->hashes + idx * OBJECT_HASH_SIZE;
+        const pack_obj_meta_t *m = &ctx->meta[ctx->indices[idx]];
+        const uint8_t *hash = m->hash;
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
         char loose_path[PATH_MAX];
@@ -411,20 +436,20 @@ static void *pack_worker_main(void *arg) {
         int fd = open(loose_path, O_RDONLY);
         if (fd == -1) continue;
 
-        object_header_t hdr;
-        if (read_full_fd(fd, &hdr, sizeof(hdr)) != 0) {
+        /* Skip past the on-disk header — metadata is already cached in m */
+        if (lseek(fd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
             close(fd);
             pack_worker_fail(ctx, ERR_CORRUPT);
             break;
         }
 
-        uint8_t *payload = malloc((size_t)hdr.compressed_size);
+        uint8_t *payload = malloc((size_t)m->compressed_size);
         if (!payload) {
             close(fd);
             pack_worker_fail(ctx, ERR_NOMEM);
             break;
         }
-        if (read_full_fd(fd, payload, (size_t)hdr.compressed_size) != 0) {
+        if (read_full_fd(fd, payload, (size_t)m->compressed_size) != 0) {
             close(fd);
             free(payload);
             pack_worker_fail(ctx, ERR_CORRUPT);
@@ -433,24 +458,24 @@ static void *pack_worker_main(void *arg) {
         close(fd);
 
         /* Skip objects already marked as incompressible by the prober */
-        if (hdr.pack_skip_ver == PROBER_VERSION) {
+        if (m->skip_ver == PROBER_VERSION) {
             free(payload);
             continue;
         }
 
-        uint8_t  compression       = hdr.compression;
-        uint64_t compressed_size   = hdr.compressed_size;
-        uint64_t uncompressed_size = hdr.uncompressed_size;
+        uint8_t  compression       = m->compression;
+        uint64_t compressed_size   = m->compressed_size;
+        uint64_t uncompressed_size = m->uncompressed_size;
 
         /* Attempt LZ4 compression on uncompressed payloads via pre-allocated comp_buf. */
         if (compression == COMPRESS_NONE &&
-            hdr.compressed_size >= 4096 &&
-            hdr.compressed_size <= (uint64_t)INT_MAX) {
+            m->compressed_size >= 4096 &&
+            m->compressed_size <= (uint64_t)INT_MAX) {
 
             /* For large objects (>= PACK_SIZE_THRESHOLD), probe first. */
-            if (hdr.uncompressed_size >= PACK_SIZE_THRESHOLD) {
-                int sample_len = (hdr.compressed_size > PACK_PROBE_SIZE)
-                                 ? PACK_PROBE_SIZE : (int)hdr.compressed_size;
+            if (m->uncompressed_size >= PACK_SIZE_THRESHOLD) {
+                int sample_len = (m->compressed_size > PACK_PROBE_SIZE)
+                                 ? PACK_PROBE_SIZE : (int)m->compressed_size;
                 int sc = LZ4_compress_default((const char *)payload,
                                               (char *)warg->comp_buf,
                                               sample_len, warg->comp_buf_size);
@@ -471,7 +496,7 @@ static void *pack_worker_main(void *arg) {
             }
 
             int try_full = 1;
-            int sample_len = (hdr.compressed_size > 65536) ? 65536 : (int)hdr.compressed_size;
+            int sample_len = (m->compressed_size > 65536) ? 65536 : (int)m->compressed_size;
 
             /* Sample probe — write into comp_buf, no malloc needed. */
             int sc = LZ4_compress_default((const char *)payload,
@@ -484,7 +509,7 @@ static void *pack_worker_main(void *arg) {
                 /* Full compression — overwrite comp_buf with result. */
                 int csz = LZ4_compress_default((const char *)payload,
                                                (char *)warg->comp_buf,
-                                               (int)hdr.compressed_size,
+                                               (int)m->compressed_size,
                                                warg->comp_buf_size);
                 if (csz > 0 && (uint64_t)csz < compressed_size) {
                     /* Compression helps: copy to exact-sized buffer for the queue item. */
@@ -503,13 +528,44 @@ static void *pack_worker_main(void *arg) {
 
         pack_work_item_t it;
         memcpy(it.hash, hash, OBJECT_HASH_SIZE);
-        it.type              = hdr.type;
+        it.type              = m->type;
         it.compression       = compression;
         it.uncompressed_size = uncompressed_size;
         it.compressed_size   = compressed_size;
         it.payload           = payload;
 
+        /* Compute parity in the worker thread (parallelized across all workers) */
+        {
+            pack_dat_entry_hdr_t ehdr;
+            memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
+            ehdr.type              = it.type;
+            ehdr.compression       = compression;
+            ehdr.uncompressed_size = uncompressed_size;
+            ehdr.compressed_size   = compressed_size;
+            parity_record_compute(&ehdr, sizeof(ehdr), &it.hdr_par);
+        }
+        size_t csize = (size_t)compressed_size;
+        if (csize > 0) {
+            it.payload_crc = crc32c(payload, csize);
+            it.rs_par_sz   = rs_parity_size(csize);
+            if (it.rs_par_sz > 0) {
+                it.rs_parity = malloc(it.rs_par_sz);
+                if (it.rs_parity) {
+                    rs_parity_encode(payload, csize, it.rs_parity);
+                } else {
+                    it.rs_par_sz = 0; /* fallback: will be computed later */
+                }
+            } else {
+                it.rs_parity = NULL;
+            }
+        } else {
+            it.payload_crc = 0;
+            it.rs_par_sz   = 0;
+            it.rs_parity   = NULL;
+        }
+
         if (!pack_queue_push(ctx, &it)) {
+            free(it.rs_parity);
             free(payload);
             break;
         }
@@ -1302,6 +1358,10 @@ static status_t collect_loose(repo_t *repo,
     DIR *top = fdopendir(obj_fd);
     if (!top) { close(obj_fd); free(hashes); return set_error_errno(ERR_IO, "collect_loose: fdopendir(objects)"); }
 
+    int show_progress = pack_progress_enabled();
+    struct timespec next_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
+
     status_t st = OK;
     struct dirent *de;
     while ((de = readdir(top)) != NULL) {
@@ -1328,9 +1388,17 @@ static status_t collect_loose(repo_t *repo,
             if (hex_decode(hexhash, (size_t)hlen,
                            hashes + cnt * OBJECT_HASH_SIZE) == 0)
                 cnt++;
+
+            if (show_progress && pack_tick_due(&next_tick)) {
+                char msg[80];
+                snprintf(msg, sizeof(msg),
+                         "pack: collecting loose objects (%zu found)", cnt);
+                pack_line_set(msg);
+            }
         }
         closedir(sub);
     }
+    if (show_progress) pack_line_clear();
 
 done:
     closedir(top);
@@ -1535,6 +1603,62 @@ static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
     return OK;
 }
 
+/* Write dat parity trailer from pre-computed parity data (no re-read). */
+static status_t write_dat_parity_precomputed(FILE *dat_f,
+                                             const pack_dat_hdr_t *dat_hdr,
+                                             const pack_entry_parity_t *parity,
+                                             uint32_t packed) {
+    /* 1. File header CRC */
+    uint32_t fhdr_crc = crc32c(dat_hdr, sizeof(*dat_hdr));
+    if (fwrite(&fhdr_crc, sizeof(fhdr_crc), 1, dat_f) != 1)
+        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite header CRC failed");
+
+    /* 2. Per-entry parity blocks + build offset table */
+    uint64_t *entry_offsets = malloc((size_t)packed * sizeof(*entry_offsets));
+    if (!entry_offsets)
+        return set_error(ERR_NOMEM, "write_dat_parity_pre: entry_offsets alloc failed");
+
+    size_t cur_trailer_pos = sizeof(fhdr_crc);
+
+    for (uint32_t i = 0; i < packed; i++) {
+        entry_offsets[i] = (uint64_t)cur_trailer_pos;
+
+        const pack_entry_parity_t *ep = &parity[i];
+        uint32_t entry_par_sz = (uint32_t)(sizeof(ep->hdr_par) + ep->rs_par_sz + 4 + 4 + 4);
+
+        if (fwrite(&ep->hdr_par, sizeof(ep->hdr_par), 1, dat_f) != 1 ||
+            (ep->rs_par_sz > 0 &&
+             fwrite(ep->rs_parity, 1, ep->rs_par_sz, dat_f) != ep->rs_par_sz) ||
+            fwrite(&ep->payload_crc, sizeof(ep->payload_crc), 1, dat_f) != 1 ||
+            fwrite(&ep->rs_data_len, sizeof(ep->rs_data_len), 1, dat_f) != 1 ||
+            fwrite(&entry_par_sz, sizeof(entry_par_sz), 1, dat_f) != 1) {
+            free(entry_offsets);
+            return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite block %u failed", i);
+        }
+        cur_trailer_pos += entry_par_sz;
+    }
+
+    /* 3. entry_parity_offsets table + entry_count */
+    if (packed > 0 &&
+        fwrite(entry_offsets, sizeof(*entry_offsets), packed, dat_f) != packed) {
+        free(entry_offsets);
+        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_offsets failed");
+    }
+    free(entry_offsets);
+    if (fwrite(&packed, sizeof(packed), 1, dat_f) != 1)
+        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_count failed");
+
+    /* 4. Parity footer */
+    uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
+                             sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
+                             sizeof(parity_footer_t));
+    parity_footer_t footer = { PARITY_FOOTER_MAGIC, PARITY_VERSION, trailer_size };
+    if (fwrite(&footer, sizeof(footer), 1, dat_f) != 1)
+        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite footer failed");
+
+    return OK;
+}
+
 /* Write parity trailer for a .idx file.  idx_f must be positioned after
  * the idx entries.  entries_blob / entries_sz is the raw idx entries data. */
 static status_t write_idx_parity(FILE *idx_f, const pack_idx_hdr_t *idx_hdr,
@@ -1569,6 +1693,109 @@ static status_t write_idx_parity(FILE *idx_f, const pack_idx_hdr_t *idx_hdr,
     return OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* Parallel RS parity computation                                      */
+/*                                                                      */
+/* After streaming large objects to the dat file, their payloads sit    */
+/* hot in page cache.  We spawn N threads to compute RS parity in      */
+/* parallel via pread() — no file position contention, no extra I/O.   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int                          fd;      /* dat file fd (shared, via pread) */
+    pack_entry_parity_t         *parity;
+    const pack_idx_disk_entry_t *idx;
+    uint32_t                     start;
+    uint32_t                     end;
+} rs_parallel_arg_t;
+
+static void *rs_parallel_worker(void *arg) {
+    rs_parallel_arg_t *a = (rs_parallel_arg_t *)arg;
+    rs_init();
+
+    /* Per-thread read buffer: one RS group (15296 bytes) at a time.
+     * Avoids huge allocations for multi-MiB objects. */
+    const size_t group_data = (size_t)(RS_K * RS_INTERLEAVE);  /* 15296 */
+    const size_t group_par  = (size_t)(RS_INTERLEAVE * RS_2T); /* 1024  */
+    uint8_t group_buf[RS_K * RS_INTERLEAVE];
+
+    for (uint32_t i = a->start; i < a->end; i++) {
+        pack_entry_parity_t *ep = &a->parity[i];
+        size_t csize  = (size_t)ep->rs_data_len;
+        size_t rs_sz  = ep->rs_par_sz;
+        if (rs_sz == 0 || csize == 0) continue;
+        if (ep->rs_parity) continue;  /* already computed (e.g. by worker) */
+
+        uint8_t *rs_buf = malloc(rs_sz);
+        if (!rs_buf) continue;
+
+        off_t base = (off_t)(a->idx[i].dat_offset + sizeof(pack_dat_entry_hdr_t));
+        size_t remaining = csize;
+        size_t rs_off = 0;
+
+        while (remaining > 0) {
+            size_t chunk = (remaining < group_data) ? remaining : group_data;
+            ssize_t got = pread(a->fd, group_buf, chunk, base);
+            if (got != (ssize_t)chunk) { free(rs_buf); rs_buf = NULL; break; }
+            rs_parity_encode(group_buf, chunk, rs_buf + rs_off);
+            rs_off    += group_par;
+            base      += (off_t)chunk;
+            remaining -= chunk;
+        }
+
+        ep->rs_parity = rs_buf;
+    }
+    return NULL;
+}
+
+/* Compute RS parity for entries that have rs_parity == NULL.
+ * dat_f must be flushed before calling.  Uses pread() so FILE* position
+ * is unchanged.  n_threads == 0 means use all available cores. */
+static void compute_rs_parallel(FILE *dat_f,
+                                pack_entry_parity_t *parity,
+                                const pack_idx_disk_entry_t *idx,
+                                uint32_t count,
+                                uint32_t n_threads) {
+    if (count == 0) return;
+
+    int fd = fileno(dat_f);
+    if (fd < 0) return;
+
+    if (n_threads == 0) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n <= 0) n = 4;
+        if (n > PACK_WORKER_THREADS_MAX) n = PACK_WORKER_THREADS_MAX;
+        n_threads = (uint32_t)n;
+    }
+    if (n_threads > count) n_threads = count;
+
+    pthread_t *tids = malloc(n_threads * sizeof(*tids));
+    rs_parallel_arg_t *args = malloc(n_threads * sizeof(*args));
+    if (!tids || !args) {
+        /* Fallback: single-threaded */
+        free(tids); free(args);
+        rs_parallel_arg_t single = { fd, parity, idx, 0, count };
+        rs_parallel_worker(&single);
+        return;
+    }
+
+    uint32_t per_thread = count / n_threads;
+    uint32_t extra      = count % n_threads;
+    uint32_t offset     = 0;
+
+    for (uint32_t t = 0; t < n_threads; t++) {
+        uint32_t chunk = per_thread + (t < extra ? 1 : 0);
+        args[t] = (rs_parallel_arg_t){ fd, parity, idx, offset, offset + chunk };
+        offset += chunk;
+        pthread_create(&tids[t], NULL, rs_parallel_worker, &args[t]);
+    }
+    for (uint32_t t = 0; t < n_threads; t++)
+        pthread_join(tids[t], NULL);
+
+    free(tids);
+    free(args);
+}
+
 static int idx_offset_cmp(const void *a, const void *b) {
     const pack_idx_disk_entry_t *ea = a;
     const pack_idx_disk_entry_t *eb = b;
@@ -1581,7 +1808,8 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
                               char *dat_tmp, char *idx_tmp,
                               pack_dat_hdr_t *dat_hdr,
                               pack_idx_disk_entry_t *idx_entries,
-                              uint32_t packed, uint32_t pack_num)
+                              uint32_t packed, uint32_t pack_num,
+                              const pack_entry_parity_t *precomputed_parity)
 {
     status_t st = OK;
 
@@ -1590,17 +1818,21 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
     dat_hdr->count = packed;
     if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = ERR_IO; goto fail; }
 
-    /* Write dat parity trailer — need entries sorted by dat_offset (write order) */
+    /* Write dat parity trailer */
     if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = ERR_IO; goto fail; }
-    {
+    if (precomputed_parity) {
+        /* Fast path: parity was computed in parallel by workers, no re-read */
+        st = write_dat_parity_precomputed(*dat_f, dat_hdr, precomputed_parity, packed);
+    } else {
+        /* Fallback: re-read dat file to compute parity (used by GC path) */
         pack_idx_disk_entry_t *by_offset = malloc((size_t)packed * sizeof(*by_offset));
         if (!by_offset) { st = ERR_NOMEM; goto fail; }
         memcpy(by_offset, idx_entries, (size_t)packed * sizeof(*by_offset));
         qsort(by_offset, packed, sizeof(*by_offset), idx_offset_cmp);
         st = write_dat_parity(*dat_f, dat_hdr, by_offset, packed);
         free(by_offset);
-        if (st != OK) goto fail;
     }
+    if (st != OK) goto fail;
 
     if (fflush(*dat_f) != 0 || fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
     fclose(*dat_f); *dat_f = NULL;
@@ -1687,9 +1919,9 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
             goto fail;
         }
 
-        /* fsync packs/ and remove the now-empty staging dir */
-        int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
-        if (pfd >= 0) { fsync(pfd); close(pfd); }
+        /* Remove the now-empty staging dir.  The packs/ directory fsync
+         * is deferred and done once after all packs are written — safe
+         * because pack_resume_installing() replays incomplete installs. */
         rmdir(stage_dir);
     }
 
@@ -1703,71 +1935,53 @@ fail:
     return st;
 }
 
-/* Stream a large loose object directly into the pack dat file without buffering
- * the entire payload in RAM.  idx_out is filled with the object's hash and
- * absolute dat offset.  *dat_body_offset and *processed_bytes are advanced. */
-static status_t stream_large_to_pack(repo_t *repo, const uint8_t *hash,
-                                     FILE *dat_f,
-                                     pack_idx_disk_entry_t *idx_out,
-                                     uint64_t *dat_body_offset,
-                                     uint64_t *processed_bytes,
-                                     _Atomic uint64_t *bytes_atomic)
-{
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
-    char loose_path[PATH_MAX];
-    if (path_fmt(loose_path, sizeof(loose_path),
-                 "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0)
-        return set_error(ERR_IO, "stream_large_to_pack: path too long");
+/* Batch-unlink loose objects by opening each objects/XX/ bucket directory once.
+ * Reduces directory opens from O(n) to O(256) max. */
+static void unlink_loose_batch(repo_t *repo,
+                               const pack_idx_disk_entry_t *entries,
+                               uint32_t count) {
+    if (count == 0) return;
 
-    int fd = open(loose_path, O_RDONLY);
-    if (fd == -1) return set_error_errno(ERR_IO, "stream_large_to_pack: open(%s)", loose_path);
-
-    object_header_t hdr;
-    if (read_full_fd(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return set_error(ERR_CORRUPT, "stream_large_to_pack: bad object header in %s", loose_path); }
-
-    memcpy(idx_out->hash, hash, OBJECT_HASH_SIZE);
-    idx_out->dat_offset = sizeof(pack_dat_hdr_t) + *dat_body_offset;
-
-    pack_dat_entry_hdr_t ehdr;
-    memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
-    ehdr.type              = hdr.type;
-    ehdr.compression       = hdr.compression;
-    ehdr.uncompressed_size = hdr.uncompressed_size;
-    ehdr.compressed_size   = hdr.compressed_size;
-
-    if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) { close(fd); return set_error_errno(ERR_IO, "stream_large_to_pack: fwrite entry header failed"); }
-
-    uint8_t *chunk = malloc(PACK_STREAM_THRESHOLD);
-    if (!chunk) { close(fd); return set_error(ERR_NOMEM, "stream_large_to_pack: chunk buffer alloc failed"); }
-
-    uint64_t remaining = hdr.compressed_size;
-    while (remaining > 0) {
-        size_t n = (remaining > PACK_STREAM_THRESHOLD) ?
-                   (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
-        if (read_full_fd(fd, chunk, n) != 0) {
-            free(chunk); close(fd); return set_error(ERR_CORRUPT, "stream_large_to_pack: short read from %s", loose_path);
+    /* Sort a copy of hashes by first byte (bucket) for locality.
+     * We use the idx_entries directly — first byte of hash = bucket. */
+    int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    if (obj_fd < 0) {
+        /* Fallback: individual unlinks */
+        for (uint32_t i = 0; i < count; i++) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(entries[i].hash, hex);
+            char path[PATH_MAX];
+            if (path_fmt(path, sizeof(path),
+                         "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) == 0)
+                unlink(path);
         }
-        if (fwrite(chunk, 1, n, dat_f) != n) {
-            free(chunk); close(fd); return set_error_errno(ERR_IO, "stream_large_to_pack: fwrite payload chunk failed");
-        }
-        if (bytes_atomic) atomic_fetch_add(bytes_atomic, (uint64_t)n);
-        remaining -= n;
+        return;
     }
 
-    free(chunk);
-    close(fd);
+    /* Group by first byte of hash (the XX bucket).  Iterate all 256
+     * buckets, open each directory once, unlink matching entries. */
+    for (unsigned bucket = 0; bucket < 256; bucket++) {
+        int bfd = -1;
+        for (uint32_t i = 0; i < count; i++) {
+            if (entries[i].hash[0] != (uint8_t)bucket) continue;
+            if (bfd < 0) {
+                char bname[3];
+                snprintf(bname, sizeof(bname), "%02x", bucket);
+                bfd = openat(obj_fd, bname, O_RDONLY | O_DIRECTORY);
+                if (bfd < 0) break;  /* bucket doesn't exist */
+            }
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(entries[i].hash, hex);
+            unlinkat(bfd, hex + 2, 0);
+        }
+        if (bfd >= 0) close(bfd);
+    }
 
-    *dat_body_offset  += sizeof(ehdr) + hdr.compressed_size;
-    *processed_bytes  += hdr.compressed_size;
-    return OK;
+    close(obj_fd);
 }
 
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     int show_progress = pack_progress_enabled();
-
-    /* Complete any interrupted pack installs from a previous crash */
-    pack_resume_installing(repo);
 
     if (!loose_objects_exist(repo)) {
         log_msg("INFO", "pack: no loose objects to pack");
@@ -1775,15 +1989,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         return OK;
     }
 
-    /* Discard unreferenced loose objects before packing */
-    log_msg("INFO", "pack: phase 1/3 GC");
-    repo_gc(repo, NULL, NULL);
-
     /* Collect loose object hashes */
-    log_msg("INFO", "pack: phase 2/3 collecting loose objects");
+    log_msg("INFO", "pack: phase 1/2 collecting loose objects");
     uint8_t *hashes       = NULL;
-    uint8_t *small_hashes = NULL;
-    uint8_t *large_hashes = NULL;
     size_t   loose_cnt = 0;
     status_t st = collect_loose(repo, &hashes, &loose_cnt);
     if (st != OK) return st;
@@ -1795,7 +2003,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         return OK;
     }
 
-    log_msg("INFO", "pack: phase 3/3 writing pack files");
+    log_msg("INFO", "pack: phase 2/2 writing pack files");
 
     uint64_t processed_payload_bytes = 0;
     FILE *dat_f = NULL, *idx_f = NULL;
@@ -1809,21 +2017,31 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pack_idx_disk_entry_t *idx_entries = malloc(loose_cnt * sizeof(*idx_entries));
     if (!idx_entries) { free(hashes); return set_error(ERR_NOMEM, "repo_pack: idx_entries alloc failed"); }
 
+    /* Parity accumulator: sized to loose_cnt (upper bound per pack).
+     * rs_parity pointers start NULL; populated as entries are written. */
+    pack_entry_parity_t *entry_parity = calloc(loose_cnt, sizeof(*entry_parity));
+    if (!entry_parity) { free(idx_entries); free(hashes); return set_error(ERR_NOMEM, "repo_pack: entry_parity alloc failed"); }
+
     uint32_t packed = 0;           /* total objects packed across all packs */
     uint32_t packs_created = 0;    /* number of pack files created */
     uint32_t pack_num = next_pack_num(repo);
 
     uint32_t n_workers = pack_worker_threads();
 
-    /* --- Partition pass: classify objects as large (streamed) or small (worker pool) --- */
-    small_hashes = malloc(loose_cnt * OBJECT_HASH_SIZE);
-    large_hashes = malloc(loose_cnt * OBJECT_HASH_SIZE);
-    if (!small_hashes || !large_hashes) {
-        free(small_hashes); free(large_hashes);
+    /* --- Partition pass: classify objects as large (streamed) or small (worker pool).
+     *     Cache every header into pack_obj_meta_t so later passes skip re-reads. --- */
+    pack_obj_meta_t *meta = malloc(loose_cnt * sizeof(*meta));
+    uint32_t *small_indices = malloc(loose_cnt * sizeof(*small_indices));
+    uint32_t *large_indices = malloc(loose_cnt * sizeof(*large_indices));
+    if (!meta || !small_indices || !large_indices) {
+        free(meta); free(small_indices); free(large_indices);
         st = ERR_NOMEM; goto cleanup;
     }
-    size_t small_cnt = 0, large_cnt = 0;
+    size_t meta_cnt = 0, small_cnt = 0, large_cnt = 0;
     uint64_t total_bytes_for_pack = 0;
+
+    struct timespec part_tick = {0};
+    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &part_tick);
 
     for (size_t i = 0; i < loose_cnt; i++) {
         const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
@@ -1832,8 +2050,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         char loose_path[PATH_MAX];
         if (path_fmt(loose_path, sizeof(loose_path),
                      "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
-            free(small_hashes); small_hashes = NULL;
-            free(large_hashes); large_hashes = NULL;
+            free(meta); meta = NULL;
+            free(small_indices); small_indices = NULL;
+            free(large_indices); large_indices = NULL;
             st = ERR_IO; goto cleanup;
         }
         int pfd = open(loose_path, O_RDONLY);
@@ -1842,26 +2061,45 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         int rd = read_full_fd(pfd, &ohdr, sizeof(ohdr));
         close(pfd);
         if (rd != 0) {
-            free(small_hashes); small_hashes = NULL;
-            free(large_hashes); large_hashes = NULL;
+            free(meta); meta = NULL;
+            free(small_indices); small_indices = NULL;
+            free(large_indices); large_indices = NULL;
             st = ERR_CORRUPT; goto cleanup;
         }
+
+        /* Populate cached metadata */
+        uint32_t mi = (uint32_t)meta_cnt;
+        memcpy(meta[mi].hash, hash, OBJECT_HASH_SIZE);
+        meta[mi].type              = ohdr.type;
+        meta[mi].compression       = ohdr.compression;
+        meta[mi].compressed_size   = ohdr.compressed_size;
+        meta[mi].uncompressed_size = ohdr.uncompressed_size;
+        meta[mi].skip_ver          = ohdr.pack_skip_ver;
+        meta_cnt++;
+
         if (ohdr.compressed_size > PACK_STREAM_THRESHOLD) {
             /* Skip objects already marked as incompressible — they stay loose. */
             if (ohdr.pack_skip_ver == PROBER_VERSION) continue;
-            memcpy(large_hashes + large_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
-            large_cnt++;
+            large_indices[large_cnt++] = mi;
         } else {
-            memcpy(small_hashes + small_cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
-            small_cnt++;
+            small_indices[small_cnt++] = mi;
         }
         total_bytes_for_pack += ohdr.compressed_size;
+
+        if (show_progress && pack_tick_due(&part_tick)) {
+            char msg[80];
+            snprintf(msg, sizeof(msg),
+                     "pack: classifying objects (%zu/%zu)", i + 1, loose_cnt);
+            pack_line_set(msg);
+        }
     }
+    if (show_progress) pack_line_clear();
 
     /* Nothing to pack — all loose objects are skip-marked incompressible files. */
     if (small_cnt == 0 && large_cnt == 0) {
-        free(small_hashes);
-        free(large_hashes);
+        free(meta);
+        free(small_indices);
+        free(large_indices);
         free(idx_entries);
         free(hashes);
         log_msg("INFO", "pack: no packable objects (all loose objects are skip-marked)");
@@ -1884,33 +2122,27 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             prog_thr_started = 1;
     }
 
-    /* --- Stream large objects: each gets its own dedicated pack --- */
-    for (size_t i = 0; i < large_cnt && st == OK; i++) {
-
-        const uint8_t *lhash = large_hashes + i * OBJECT_HASH_SIZE;
-        char lhex[OBJECT_HASH_SIZE * 2 + 1];
-        object_hash_to_hex(lhash, lhex);
-        char loose_path[PATH_MAX];
-        if (path_fmt(loose_path, sizeof(loose_path),
-                     "%s/objects/%.2s/%s", repo_path(repo), lhex, lhex + 2) != 0) {
-            st = ERR_IO; break;
-        }
-
-        /* Check skip marker and probe compressibility */
-        {
-            int pfd = open(loose_path, O_RDONLY);
-            if (pfd < 0) continue;  /* deleted between passes */
-            object_header_t phdr;
-            int phdr_ok = (read_full_fd(pfd, &phdr, sizeof(phdr)) == 0);
-            int skip = 0;
-            if (phdr_ok && phdr.pack_skip_ver == PROBER_VERSION) {
-                skip = 1;
-            } else if (phdr_ok && phdr.pack_skip_ver == 0 &&
-                       phdr.compression == COMPRESS_NONE) {
-                /* probe compressibility */
-                size_t probe_len = (size_t)(phdr.compressed_size < PACK_PROBE_SIZE
-                                           ? phdr.compressed_size : PACK_PROBE_SIZE);
+    /* --- Probe pass: filter out incompressible large objects before streaming --- */
+    if (large_cnt > 0) {
+        size_t new_large_cnt = 0;
+        for (size_t i = 0; i < large_cnt; i++) {
+            pack_obj_meta_t *lm = &meta[large_indices[i]];
+            if (lm->skip_ver == 0 && lm->compression == COMPRESS_NONE) {
+                char hex[OBJECT_HASH_SIZE * 2 + 1];
+                object_hash_to_hex(lm->hash, hex);
+                char loose_path[PATH_MAX];
+                if (path_fmt(loose_path, sizeof(loose_path),
+                             "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0)
+                    continue;
+                int pfd = open(loose_path, O_RDONLY);
+                if (pfd < 0) continue;
+                if (lseek(pfd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
+                    close(pfd); continue;
+                }
+                size_t probe_len = (size_t)(lm->compressed_size < PACK_PROBE_SIZE
+                                           ? lm->compressed_size : PACK_PROBE_SIZE);
                 uint8_t *pbuf = malloc(probe_len);
+                int skip = 0;
                 if (pbuf && read_full_fd(pfd, pbuf, probe_len) == 0) {
                     int cbound = LZ4_compressBound((int)probe_len);
                     char *cbuf = malloc((size_t)cbound);
@@ -1920,7 +2152,6 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                         if (csz > 0 &&
                             (double)csz / (double)probe_len >= PACK_RATIO_THRESHOLD) {
                             skip = 1;
-                            /* Write skip marker in-place */
                             uint8_t sv = PROBER_VERSION;
                             int wfd = open(loose_path, O_WRONLY);
                             if (wfd >= 0) {
@@ -1934,45 +2165,224 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                     }
                 }
                 free(pbuf);
+                close(pfd);
+                if (skip) continue;
             }
-            close(pfd);
-            if (skip) continue;
+            large_indices[new_large_cnt++] = large_indices[i];
+        }
+        large_cnt = new_large_cnt;
+    }
+
+    /* --- Stream large objects into shared packs (split at 256 MiB) --- */
+    uint32_t lg_packed = 0;
+    uint64_t lg_body_offset = 0;
+    pack_dat_hdr_t lg_dat_hdr;
+    int lg_pack_open = 0;
+
+    /* Sliding prefetch window: pre-open files and trigger kernel readahead
+     * so data is in page cache by the time we stream it.  The window
+     * depth is configurable; 8 gives good overlap on NVMe. */
+#define PREFETCH_DEPTH 8
+    int pf_fds[PREFETCH_DEPTH];
+    for (int k = 0; k < PREFETCH_DEPTH; k++) pf_fds[k] = -1;
+
+    /* Fill the prefetch window */
+    for (size_t p = 0; p < PREFETCH_DEPTH && p < large_cnt; p++) {
+        const pack_obj_meta_t *pm = &meta[large_indices[p]];
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(pm->hash, hex);
+        char lp[PATH_MAX];
+        if (path_fmt(lp, sizeof(lp), "%s/objects/%.2s/%s",
+                     repo_path(repo), hex, hex + 2) == 0) {
+            pf_fds[p] = open(lp, O_RDONLY);
+            if (pf_fds[p] >= 0) {
+                lseek(pf_fds[p], (off_t)sizeof(object_header_t), SEEK_SET);
+                posix_fadvise(pf_fds[p], (off_t)sizeof(object_header_t),
+                              (off_t)pm->compressed_size, POSIX_FADV_SEQUENTIAL);
+                posix_fadvise(pf_fds[p], (off_t)sizeof(object_header_t),
+                              (off_t)pm->compressed_size, POSIX_FADV_WILLNEED);
+            }
+        }
+    }
+    size_t pf_next_open = (large_cnt < PREFETCH_DEPTH) ? large_cnt : PREFETCH_DEPTH;
+
+    for (size_t i = 0; i < large_cnt && st == OK; i++) {
+        const pack_obj_meta_t *lm = &meta[large_indices[i]];
+        uint64_t obj_compressed_size = lm->compressed_size;
+
+        /* Consume the prefetched fd for this object */
+        size_t slot = i % PREFETCH_DEPTH;
+        int cur_fd = pf_fds[slot];
+        pf_fds[slot] = -1;
+
+        /* Advance the prefetch window: open the next file in the vacated slot */
+        if (pf_next_open < large_cnt) {
+            const pack_obj_meta_t *nm = &meta[large_indices[pf_next_open]];
+            char nhex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(nm->hash, nhex);
+            char np[PATH_MAX];
+            if (path_fmt(np, sizeof(np), "%s/objects/%.2s/%s",
+                         repo_path(repo), nhex, nhex + 2) == 0) {
+                pf_fds[slot] = open(np, O_RDONLY);
+                if (pf_fds[slot] >= 0) {
+                    lseek(pf_fds[slot], (off_t)sizeof(object_header_t), SEEK_SET);
+                    posix_fadvise(pf_fds[slot], (off_t)sizeof(object_header_t),
+                                  (off_t)nm->compressed_size, POSIX_FADV_SEQUENTIAL);
+                    posix_fadvise(pf_fds[slot], (off_t)sizeof(object_header_t),
+                                  (off_t)nm->compressed_size, POSIX_FADV_WILLNEED);
+                }
+            }
+            pf_next_open++;
         }
 
-        /* Open a dedicated single-object pack */
-        pack_dat_hdr_t lg_dat_hdr;
-        st = open_new_pack(repo, pack_num, &dat_f, &idx_f,
-                           dat_tmp, idx_tmp, &lg_dat_hdr);
-        if (st != OK) break;
+        /* If we don't have a prefetched fd, open fresh */
+        if (cur_fd < 0) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(lm->hash, hex);
+            char lp[PATH_MAX];
+            if (path_fmt(lp, sizeof(lp), "%s/objects/%.2s/%s",
+                         repo_path(repo), hex, hex + 2) != 0) {
+                st = ERR_IO; break;
+            }
+            cur_fd = open(lp, O_RDONLY);
+            if (cur_fd < 0) continue;
+            lseek(cur_fd, (off_t)sizeof(object_header_t), SEEK_SET);
+        }
 
-        uint64_t lg_body_offset = 0;
-        st = stream_large_to_pack(repo, lhash,
-                                  dat_f, &idx_entries[0],
-                                  &lg_body_offset, &processed_payload_bytes,
-                                  &prog.bytes_processed);
-        idx_entries[0].entry_index = 0;
+        uint64_t entry_bytes = sizeof(pack_dat_entry_hdr_t) + obj_compressed_size;
+
+        /* Split: finalize current pack if adding this object would exceed cap */
+        if (lg_pack_open && lg_packed > 0 &&
+            lg_body_offset + entry_bytes > PACK_MAX_MULTI_BYTES) {
+            /* Parallel RS: compute deferred parity from page cache */
+            fflush(dat_f);
+            compute_rs_parallel(dat_f, entry_parity, idx_entries,
+                                lg_packed, n_workers);
+            st = finalize_pack(repo, &dat_f, &idx_f, dat_tmp, idx_tmp,
+                               &lg_dat_hdr, idx_entries, lg_packed, pack_num,
+                               entry_parity);
+            for (uint32_t ep = 0; ep < lg_packed; ep++) free(entry_parity[ep].rs_parity);
+            if (st != OK) { close(cur_fd); break; }
+            unlink_loose_batch(repo, idx_entries, lg_packed);
+            packed += lg_packed;
+            pack_num++;
+            packs_created++;
+            lg_packed = 0;
+            lg_body_offset = 0;
+            lg_pack_open = 0;
+        }
+
+        /* Open a new pack if none is open */
+        if (!lg_pack_open) {
+            st = open_new_pack(repo, pack_num, &dat_f, &idx_f,
+                               dat_tmp, idx_tmp, &lg_dat_hdr);
+            if (st != OK) { close(cur_fd); break; }
+            lg_pack_open = 1;
+        }
+
+        /* Stream from prefetched fd to pack, computing CRC + RS parity inline. */
+        memcpy(idx_entries[lg_packed].hash, lm->hash, OBJECT_HASH_SIZE);
+        idx_entries[lg_packed].dat_offset = sizeof(pack_dat_hdr_t) + lg_body_offset;
+
+        pack_dat_entry_hdr_t ehdr;
+        memcpy(ehdr.hash, lm->hash, OBJECT_HASH_SIZE);
+        ehdr.type              = lm->type;
+        ehdr.compression       = lm->compression;
+        ehdr.uncompressed_size = lm->uncompressed_size;
+        ehdr.compressed_size   = lm->compressed_size;
+
+        if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
+            close(cur_fd); st = ERR_IO; break;
+        }
+
+        /* Compute entry header parity */
+        parity_record_t lg_hdr_par;
+        parity_record_compute(&ehdr, sizeof(ehdr), &lg_hdr_par);
+
+        /* Stream payload: read → write → CRC only.
+         * RS parity is deferred to a parallel phase after all large objects
+         * in the pack are written (data stays hot in page cache). */
+        uint32_t running_crc = 0;
+        uint8_t stream_buf[256 * 1024]; /* 256 KiB I/O chunks */
+
+        uint64_t remaining = lm->compressed_size;
+        while (remaining > 0) {
+            size_t want = (remaining > sizeof(stream_buf)) ?
+                          sizeof(stream_buf) : (size_t)remaining;
+            ssize_t got = read(cur_fd, stream_buf, want);
+            if (got <= 0) {
+                if (got < 0 && errno == EINTR) continue;
+                st = (got == 0) ? ERR_CORRUPT : ERR_IO;
+                break;
+            }
+
+            if (fwrite(stream_buf, 1, (size_t)got, dat_f) != (size_t)got) {
+                st = ERR_IO; break;
+            }
+
+            running_crc = crc32c_update(running_crc, stream_buf, (size_t)got);
+            atomic_fetch_add(&prog.bytes_processed, (uint64_t)got);
+            remaining -= (uint64_t)got;
+        }
+
+        /* Release source pages from cache */
+        posix_fadvise(cur_fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(cur_fd);
+
         if (st != OK) {
             fclose(dat_f); dat_f = NULL;
             fclose(idx_f); idx_f = NULL;
             unlink(dat_tmp); unlink(idx_tmp);
+            lg_pack_open = 0;
             break;
         }
 
-        st = finalize_pack(repo, &dat_f, &idx_f, dat_tmp, idx_tmp,
-                           &lg_dat_hdr, idx_entries, 1, pack_num);
-        if (st != OK) break;
+        /* Store header parity + CRC; RS parity is NULL — computed in parallel later */
+        size_t csize = (size_t)lm->compressed_size;
+        entry_parity[lg_packed].hdr_par     = lg_hdr_par;
+        entry_parity[lg_packed].payload_crc = running_crc;
+        entry_parity[lg_packed].rs_parity   = NULL;
+        entry_parity[lg_packed].rs_par_sz   = rs_parity_size(csize);
+        entry_parity[lg_packed].rs_data_len = (uint32_t)csize;
 
-        /* Delete the loose object now that its pack is committed */
-        unlink(loose_path);
+        lg_body_offset        += sizeof(ehdr) + lm->compressed_size;
+        processed_payload_bytes += lm->compressed_size;
 
-        packed++;
-        pack_num++;
-        packs_created++;
+        idx_entries[lg_packed].entry_index = lg_packed;
+        lg_packed++;
         atomic_fetch_add(&prog.objects_packed, 1);
     }
-    free(large_hashes); large_hashes = NULL;
 
-    if (st != OK) { free(small_hashes); goto cleanup; }
+    /* Clean up any remaining prefetch fds */
+    for (int k = 0; k < PREFETCH_DEPTH; k++) {
+        if (pf_fds[k] >= 0) close(pf_fds[k]);
+    }
+
+    /* Finalize any remaining open large-object pack */
+    if (st == OK && lg_pack_open && lg_packed > 0) {
+        /* Parallel RS: compute deferred parity from page cache */
+        fflush(dat_f);
+        compute_rs_parallel(dat_f, entry_parity, idx_entries,
+                            lg_packed, n_workers);
+        st = finalize_pack(repo, &dat_f, &idx_f, dat_tmp, idx_tmp,
+                           &lg_dat_hdr, idx_entries, lg_packed, pack_num,
+                           entry_parity);
+        for (uint32_t ep = 0; ep < lg_packed; ep++) free(entry_parity[ep].rs_parity);
+        if (st == OK) {
+            unlink_loose_batch(repo, idx_entries, lg_packed);
+            packed += lg_packed;
+            pack_num++;
+            packs_created++;
+        }
+    } else if (lg_pack_open && st != OK) {
+        if (dat_f) { fclose(dat_f); dat_f = NULL; }
+        if (idx_f) { fclose(idx_f); idx_f = NULL; }
+        if (dat_tmp[0]) unlink(dat_tmp);
+        if (idx_tmp[0]) unlink(idx_tmp);
+    }
+    free(large_indices); large_indices = NULL;
+
+    if (st != OK) goto cleanup;
 
     /* --- Worker pool: compress and pack small objects --- */
     if (small_cnt > 0) {
@@ -1980,12 +2390,13 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pack_work_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.repo          = repo;
-    ctx.hashes        = small_hashes;
+    ctx.meta          = meta;
+    ctx.indices       = small_indices;
     ctx.loose_cnt     = small_cnt;
-    ctx.q_cap         = (size_t)n_workers * 4u;
-    if (ctx.q_cap < 16) ctx.q_cap = 16;
+    ctx.q_cap         = (size_t)n_workers * 16u;
+    if (ctx.q_cap < 64) ctx.q_cap = 64;
     ctx.queue         = calloc(ctx.q_cap, sizeof(*ctx.queue));
-    if (!ctx.queue) { free(small_hashes); st = ERR_NOMEM; goto cleanup; }
+    if (!ctx.queue) { st = ERR_NOMEM; goto cleanup; }
     pthread_mutex_init(&ctx.mu, NULL);
     pthread_cond_init(&ctx.cv_have_work, NULL);
     pthread_cond_init(&ctx.cv_have_space, NULL);
@@ -2006,7 +2417,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             pthread_cond_destroy(&ctx.cv_have_work);
             pthread_cond_destroy(&ctx.cv_have_space);
             pthread_mutex_destroy(&ctx.mu);
-            free(ctx.queue); free(small_hashes);
+            free(ctx.queue);
             st = ERR_NOMEM; goto cleanup;
         }
         wargs_alloc++;
@@ -2026,7 +2437,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             pthread_cond_destroy(&ctx.cv_have_work);
             pthread_cond_destroy(&ctx.cv_have_space);
             pthread_mutex_destroy(&ctx.mu);
-            free(ctx.queue); free(small_hashes);
+            free(ctx.queue);
             goto cleanup;
         }
     }
@@ -2046,7 +2457,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         pthread_cond_destroy(&ctx.cv_have_work);
         pthread_cond_destroy(&ctx.cv_have_space);
         pthread_mutex_destroy(&ctx.mu);
-        free(ctx.queue); free(small_hashes);
+        free(ctx.queue);
         goto cleanup;
     }
 
@@ -2079,19 +2490,13 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             /* Split: if this object would push us over the cap, finalize
              * the current pack and start a new one. */
             if (sm_packed > 0 && dat_body_offset + item_total > PACK_MAX_MULTI_BYTES) {
-                /* Delete loose objects in the current pack segment */
-                for (uint32_t d = 0; d < sm_packed; d++) {
-                    char dhex[OBJECT_HASH_SIZE * 2 + 1];
-                    object_hash_to_hex(idx_entries[d].hash, dhex);
-                    char dpath[PATH_MAX];
-                    if (path_fmt(dpath, sizeof(dpath),
-                                 "%s/objects/%.2s/%s", repo_path(repo), dhex, dhex + 2) == 0)
-                        unlink(dpath);
-                }
+                unlink_loose_batch(repo, idx_entries, sm_packed);
 
                 st = finalize_pack(repo, &dat_f, &idx_f, dat_tmp, idx_tmp,
-                                   &sm_dat_hdr, idx_entries, sm_packed, pack_num);
-                if (st != OK) { free(item.payload); break; }
+                                   &sm_dat_hdr, idx_entries, sm_packed, pack_num,
+                                   entry_parity);
+                for (uint32_t ep = 0; ep < sm_packed; ep++) free(entry_parity[ep].rs_parity);
+                if (st != OK) { free(item.payload); free(item.rs_parity); break; }
 
                 packed += sm_packed;
                 pack_num++;
@@ -2119,6 +2524,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1 ||
                 fwrite(item.payload, 1, (size_t)item.compressed_size, dat_f)
                     != (size_t)item.compressed_size) {
+                free(item.rs_parity);
                 free(item.payload);
                 pthread_mutex_lock(&ctx.mu);
                 ctx.stop = 1;
@@ -2129,6 +2535,13 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                 st = ERR_IO;
                 break;
             }
+
+            /* Store worker's pre-computed parity (ownership transfer of rs_parity) */
+            entry_parity[sm_packed - 1].hdr_par     = item.hdr_par;
+            entry_parity[sm_packed - 1].payload_crc = item.payload_crc;
+            entry_parity[sm_packed - 1].rs_parity   = item.rs_parity;  /* take ownership */
+            entry_parity[sm_packed - 1].rs_par_sz   = item.rs_par_sz;
+            entry_parity[sm_packed - 1].rs_data_len = (uint32_t)item.compressed_size;
 
             dat_body_offset         += sizeof(ehdr) + (uint64_t)item.compressed_size;
             processed_payload_bytes += (uint64_t)item.compressed_size;
@@ -2158,6 +2571,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         ctx.q_head = (ctx.q_head + 1) % ctx.q_cap;
         ctx.q_count--;
         pthread_mutex_unlock(&ctx.mu);
+        free(it.rs_parity);
         free(it.payload);
     }
 
@@ -2166,22 +2580,16 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pthread_mutex_destroy(&ctx.mu);
     for (uint32_t i = 0; i < wargs_alloc; i++) free(wargs[i].comp_buf);
     free(ctx.queue);
-    free(small_hashes);
+    free(small_indices);
 
     /* Finalize the last multi-object pack (if any objects remain) */
     if (st == OK && sm_packed > 0) {
-        /* Delete loose objects for this final segment */
-        for (uint32_t d = 0; d < sm_packed; d++) {
-            char dhex[OBJECT_HASH_SIZE * 2 + 1];
-            object_hash_to_hex(idx_entries[d].hash, dhex);
-            char dpath[PATH_MAX];
-            if (path_fmt(dpath, sizeof(dpath),
-                         "%s/objects/%.2s/%s", repo_path(repo), dhex, dhex + 2) == 0)
-                unlink(dpath);
-        }
+        unlink_loose_batch(repo, idx_entries, sm_packed);
 
         st = finalize_pack(repo, &dat_f, &idx_f, dat_tmp, idx_tmp,
-                           &sm_dat_hdr, idx_entries, sm_packed, pack_num);
+                           &sm_dat_hdr, idx_entries, sm_packed, pack_num,
+                           entry_parity);
+        for (uint32_t ep = 0; ep < sm_packed; ep++) free(entry_parity[ep].rs_parity);
         if (st == OK) {
             packed += sm_packed;
             packs_created++;
@@ -2195,7 +2603,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     } else {
         /* No small objects — just free */
-        free(small_hashes);
+        free(small_indices);
     }
 
     /* Stop progress thread before touching the display. */
@@ -2216,11 +2624,19 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         pack_line_clear();
     }
 
+    /* Single packs/ dir fsync after all packs are written — replaces
+     * per-pack fsync that was previously in finalize_pack(). */
+    {
+        int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
+        if (pfd >= 0) { fsync(pfd); close(pfd); }
+    }
+
     /* Invalidate the pack index cache so the new packs are picked up */
     pack_cache_invalidate(repo);
 
     free(idx_entries);
     free(hashes);
+    free(meta);
 
     {
         char msg[128];
@@ -2238,11 +2654,13 @@ cleanup:
     if (dat_tmp[0]) unlink(dat_tmp);
     if (idx_tmp[0]) unlink(idx_tmp);
     free(idx_entries);
+    free(entry_parity);
     free(hashes);
-    /* large_hashes and small_hashes are freed inline before goto cleanup;
+    /* meta/indices are freed inline before goto cleanup;
      * these free(NULL) calls are harmless safety nets for the early-exit paths. */
-    free(large_hashes);
-    free(small_hashes);
+    free(meta);
+    free(large_indices);
+    free(small_indices);
     return st;
 }
 
@@ -2353,7 +2771,7 @@ static status_t collect_pack_meta(repo_t *repo,
  *   - If files remain in staging dir: move them to packs/
  *   - If staging dir is incomplete (only one file): remove it entirely
  *     since the temp source files are gone and we can't finish the install */
-static void pack_resume_installing(repo_t *repo) {
+void pack_resume_installing(repo_t *repo) {
     char packs_dir[PATH_MAX];
     if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo))
         >= (int)sizeof(packs_dir))
@@ -2505,8 +2923,6 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     for (size_t i = 0; i < pack_cnt; i++) {
         if (meta[i].num + 1 >= max_num) continue;
         if (meta[i].dat_bytes >= PACK_COALESCE_SMALL_BYTES) continue;
-        /* Preserve dedicated single-object packs (created for large files) */
-        if (meta[i].count == 1) continue;
         if (cand_bytes + meta[i].dat_bytes > budget) break;
         cand[n_cand++] = meta[i];
         cand_bytes += meta[i].dat_bytes;
@@ -2594,26 +3010,14 @@ static status_t maybe_coalesce_packs(repo_t *repo,
             if (fseeko(datf, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) { rc = ERR_IO; break; }
             pack_dat_entry_hdr_t ehdr;
             if (read_entry_hdr(datf, &ehdr, dat_version) != 0) { rc = ERR_CORRUPT; break; }
-            if (ehdr.compressed_size > cpayload_cap) {
-                if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
-                    rc = ERR_CORRUPT; break;
-                }
-                uint8_t *tmp = realloc(cpayload, (size_t)ehdr.compressed_size);
-                if (!tmp) { rc = ERR_NOMEM; break; }
-                cpayload = tmp;
-                cpayload_cap = (size_t)ehdr.compressed_size;
-            }
-            if (fread(cpayload, 1, (size_t)ehdr.compressed_size, datf) != (size_t)ehdr.compressed_size) {
-                rc = ERR_CORRUPT;
-                break;
-            }
 
             uint64_t entry_total = sizeof(ehdr) + ehdr.compressed_size;
 
             /* Split: finalize current pack if adding this entry would exceed cap */
             if (live_count > 0 && body_offset + entry_total > PACK_MAX_MULTI_BYTES) {
                 rc = finalize_pack(repo, &new_dat, &new_idx, dat_tmp, idx_tmp,
-                                   &dhdr, new_disk_idx, live_count, new_pack_num);
+                                   &dhdr, new_disk_idx, live_count, new_pack_num,
+                                   NULL);
                 if (rc != OK) break;
                 total_live += live_count;
                 packs_written++;
@@ -2626,12 +3030,47 @@ static status_t maybe_coalesce_packs(repo_t *repo,
                 if (rc != OK) break;
             }
 
-            /* Always write v2 entry headers when rewriting */
-            if (fwrite(&ehdr, sizeof(ehdr), 1, new_dat) != 1 ||
-                fwrite(cpayload, 1, (size_t)ehdr.compressed_size, new_dat) != (size_t)ehdr.compressed_size) {
-                rc = ERR_IO;
-                break;
+            /* Write entry header */
+            if (fwrite(&ehdr, sizeof(ehdr), 1, new_dat) != 1) {
+                rc = ERR_IO; break;
             }
+
+            if (ehdr.compressed_size > PACK_STREAM_THRESHOLD) {
+                /* Stream large entry in chunks to avoid buffering in RAM */
+                uint64_t remaining = ehdr.compressed_size;
+                while (remaining > 0) {
+                    size_t n = (remaining > PACK_STREAM_THRESHOLD)
+                               ? (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
+                    if (!cpayload || cpayload_cap < (size_t)PACK_STREAM_THRESHOLD) {
+                        uint8_t *tmp = realloc(cpayload, (size_t)PACK_STREAM_THRESHOLD);
+                        if (!tmp) { rc = ERR_NOMEM; break; }
+                        cpayload = tmp;
+                        cpayload_cap = (size_t)PACK_STREAM_THRESHOLD;
+                    }
+                    if (fread(cpayload, 1, n, datf) != n) { rc = ERR_CORRUPT; break; }
+                    if (fwrite(cpayload, 1, n, new_dat) != n) { rc = ERR_IO; break; }
+                    remaining -= n;
+                }
+                if (rc != OK) break;
+            } else {
+                /* Small entry: buffer entire payload */
+                if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
+                    rc = ERR_CORRUPT; break;
+                }
+                if (ehdr.compressed_size > cpayload_cap) {
+                    uint8_t *tmp = realloc(cpayload, (size_t)ehdr.compressed_size);
+                    if (!tmp) { rc = ERR_NOMEM; break; }
+                    cpayload = tmp;
+                    cpayload_cap = (size_t)ehdr.compressed_size;
+                }
+                if (fread(cpayload, 1, (size_t)ehdr.compressed_size, datf) != (size_t)ehdr.compressed_size) {
+                    rc = ERR_CORRUPT; break;
+                }
+                if (fwrite(cpayload, 1, (size_t)ehdr.compressed_size, new_dat) != (size_t)ehdr.compressed_size) {
+                    rc = ERR_IO; break;
+                }
+            }
+
             memcpy(new_disk_idx[live_count].hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
             new_disk_idx[live_count].dat_offset = sizeof(dhdr) + body_offset;
             new_disk_idx[live_count].entry_index = live_count;
@@ -2648,7 +3087,8 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     /* Finalize the last output pack */
     if (rc == OK && live_count > 0) {
         rc = finalize_pack(repo, &new_dat, &new_idx, dat_tmp, idx_tmp,
-                           &dhdr, new_disk_idx, live_count, new_pack_num);
+                           &dhdr, new_disk_idx, live_count, new_pack_num,
+                           NULL);
         if (rc == OK) {
             total_live += live_count;
             packs_written++;
@@ -2696,7 +3136,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
         char msg[160];
         snprintf(msg, sizeof(msg),
-                 "pack-coalesce: merged %zu small pack(s) into %u pack(s) (%u objects)",
+                 "pack-coalesce: merged %zu pack(s) into %u pack(s) (%u objects)",
                  n_cand, packs_written, total_live);
         log_msg("INFO", msg);
     } else if (rc != OK) {
