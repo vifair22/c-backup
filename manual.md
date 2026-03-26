@@ -4,6 +4,7 @@
 
 | Date | Notes |
 |------|-------|
+| 2026-03-26 | Build/bench section, verify --deep removal, GFS Tree viewer tab, post-backup runbook accuracy |
 | 2026-03-24 | Initial |
 
 ---
@@ -89,10 +90,15 @@
     - 15.1 Architecture
     - 15.2 Launching
     - 15.3 Tab reference
-16. [Performance Tuning](#16-performance-tuning)
-17. [Common Configurations](#17-common-configurations)
-18. [Troubleshooting](#18-troubleshooting)
-19. [Safety and Operational Notes](#19-safety-and-operational-notes)
+16. [Build System and Benchmarks](#16-build-system-and-benchmarks)
+    - 16.1 Build targets
+    - 16.2 Benchmarks
+17. [Performance Tuning](#17-performance-tuning)
+18. [Common Configurations](#18-common-configurations)
+19. [Troubleshooting](#19-troubleshooting)
+20. [Safety and Operational Notes](#20-safety-and-operational-notes)
+21. [Object Lookup Algorithms](#21-object-lookup-algorithms)
+22. [Parity Error Correction](#22-parity-error-correction)
 
 ---
 
@@ -440,7 +446,7 @@ Offset  Size  Field
 
 The raw payload immediately follows the header with no padding. For `COMPRESS_NONE`, this is the literal file/xattr/ACL data. For `COMPRESS_LZ4`, this is a single LZ4 block-API compressed buffer. For `COMPRESS_LZ4_FRAME`, this is a complete LZ4 frame stream.
 
-**Version 2 parity trailer** (appended after payload): XOR parity over header (260 B) + RS(255,239) interleaved parity over compressed payload + CRC-32C (4 B) + RS data length (4 B) + parity footer (12 B). See section 21 for details.
+**Version 2 parity trailer** (appended after payload): XOR parity over header (260 B) + RS(255,239) interleaved parity over compressed payload + CRC-32C (4 B) + RS data length (4 B) + parity footer (12 B). See section 22 for details.
 
 **Sparse file payload format:**
 
@@ -487,7 +493,7 @@ Offset  Size  Field
 
 Entries are laid out sequentially with no padding between them. The file is not seekable by entry number; all seeks use absolute offsets from the `.idx` file.
 
-**V3 parity trailer** (appended after all entries): File header CRC (4 B), then per-entry parity blocks (XOR header parity + RS payload parity + CRC + lengths), then entry offset table for O(1) lookup, then entry count, then parity footer (12 B). See section 21 for details.
+**V3 parity trailer** (appended after all entries): File header CRC (4 B), then per-entry parity blocks (XOR header parity + RS payload parity + CRC + lengths), then entry offset table for O(1) lookup, then entry count, then parity footer (12 B). See section 22 for details.
 
 ### 6.4 Pack Index File (`.idx`)
 
@@ -968,12 +974,13 @@ When this command completes, the repository is ready for `backup run`. No lock i
 backup run --repo <path> [OPTIONS]
 ```
 
-Runs a full backup. Acquires an exclusive lock. Executes all eight phases (§5.1). When complete:
+Runs a full backup. Acquires an exclusive lock. Executes all eight phases (§5.1). When complete, a post-backup maintenance runbook runs:
 
-- HEAD is updated to the new snapshot ID.
-- If `auto_prune = true` (policy default), `gfs_run` is called with `auto_gc=1` and `auto_prune=1`.
-- Otherwise, if `auto_gc = true` and no prune ran, `repo_gc` is called standalone.
-- If `auto_pack = true`, `repo_pack` is called.
+1. If `auto_prune = true` and any GFS/retention tier is configured, `gfs_run` assigns tier flags and prunes expired snapshots. If snapshots were actually pruned, `repo_gc` runs to reclaim freed objects.
+2. If `auto_pack = true`, any interrupted pack installs are resumed (`pack_resume_installing`), then GC runs (if it did not already run in step 1), and `repo_pack` packs all loose objects.
+3. Otherwise, if `auto_gc = true` and GC has not yet run, `repo_gc` runs standalone.
+
+GC runs at most once per backup. Packing always follows GC to avoid packing objects that are about to be deleted.
 
 Progress is reported to stderr if stderr is a TTY. Use `--quiet` to suppress all progress output.
 
@@ -1183,7 +1190,7 @@ pack: N/M objects  X.X/Y.Y GiB  Z.Z MiB/s  ETA HHmMSs
 ### 13.13 `verify`
 
 ```
-backup verify --repo <path> [--deep] [--repair]
+backup verify --repo <path> [--repair]
 ```
 
 Verifies repository integrity. Without `--repair`, acquires a shared lock. With `--repair`, acquires an exclusive lock.
@@ -1404,13 +1411,51 @@ Lists all tags with their snapshot ID and preserve flag.
 
 Enter any SHA-256 hash (hex) to locate the object: reports whether it is loose or packed, which pack file (if packed), the object type, compression, and sizes. If LZ4 is installed and the object is small enough, the content is displayed.
 
+**GFS Tree**
+
+Displays all snapshots organized in a calendar hierarchy: year → month → individual snapshots. Each snapshot row is colour-coded by its highest GFS tier (yearly = amber, monthly = blue, weekly = green, daily = teal, untagged = grey). Columns show snap ID, date/time, GFS tier flags, node count, and physical new bytes. A summary line at the top reports tier counts across the entire repository.
+
 **Policy**
 
 Displays the parsed `policy.toml` in a human-readable table.
 
 ---
 
-## 16. Performance Tuning
+## 16. Build System and Benchmarks
+
+### 16.1 Build Targets
+
+The project uses a plain GNU Makefile. All output goes to `build/`.
+
+| Target | Output | Description |
+|--------|--------|-------------|
+| `make` | `build/backup` | Dynamic build with `-O2` and strict warnings |
+| `make static` | `build/backup-static` | Statically linked build |
+| `make asan` | `build/backup-asan` | AddressSanitizer build (`-O1 -g -fsanitize=address`) |
+| `make test` | `build/test_*` | Build and run all cmocka unit tests |
+| `make test-asan` | `build/test_*-asan` | Build and run all tests under AddressSanitizer |
+| `make bench` | — | Build and run all benchmarks |
+| `make bench-micro` | `build/bench_micro` | Microbenchmarks only |
+| `make bench-phases` | `build/bench_phases` | Per-phase timing benchmarks only |
+| `make clean` | — | Remove `build/` |
+
+Individual test binaries can be run directly (e.g., `build/test_restore`, `build/test_parity`). Test binary names mirror source names under `tests/`.
+
+Compiler flags include `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wnull-dereference -Wmissing-prototypes` and more. Vendor code (`vendor/`) is compiled with relaxed flags. SSE 4.2 and AVX2 are enabled for CRC-32C and hashing performance.
+
+### 16.2 Benchmarks
+
+Two benchmark suites live under `bench/`:
+
+**`bench/micro.c`** — Microbenchmarks for core primitives: SHA-256 throughput, CRC-32C throughput, LZ4 compression/decompression, Reed-Solomon encode/decode, XOR parity, and object store/load round-trips. Useful for profiling the cost of individual operations on the current hardware.
+
+**`bench/phases.c`** — End-to-end per-phase timing for the backup and restore pipelines. Creates a temporary repository, generates synthetic test data, runs a full backup cycle (scan, compare, store, pack), then a full restore, reporting wall-clock time for each phase. Useful for identifying bottlenecks in the overall pipeline.
+
+Both benchmarks link against the full library (everything except `main.o`) and run without cmocka.
+
+---
+
+## 17. Performance Tuning
 
 ### Thread Counts
 
@@ -1460,9 +1505,9 @@ These outputs are stable and suitable for piping to `jq` or direct JSON parsing.
 
 ---
 
-## 17. Common Configurations
+## 18. Common Configurations
 
-### 17.1 Laptop / Workstation
+### 18.1 Laptop / Workstation
 
 ```toml
 paths = ["/home/alice", "/etc"]
@@ -1480,7 +1525,7 @@ strict_meta = false
 
 Balanced for fast daily backups. 30-day rolling window ensures recent history is always accessible even if GFS tiers have expired.
 
-### 17.2 Server with Long History
+### 18.2 Server with Long History
 
 ```toml
 paths = ["/srv", "/etc", "/var/lib"]
@@ -1499,7 +1544,7 @@ strict_meta = true
 
 `verify_after = true` catches silent write errors. `strict_meta = true` tracks permission and xattr drift even when file content is unchanged. Deep GFS tiers cover five years of monthly history.
 
-### 17.3 Conservative Prune (Keep Many Local Manifests)
+### 18.3 Conservative Prune (Keep Many Local Manifests)
 
 ```toml
 paths = ["/data"]
@@ -1513,7 +1558,7 @@ auto_prune = true
 
 Disables all GFS tiers; relies entirely on the rolling window. Six months of daily snapshots are kept. No GFS overhead.
 
-### 17.4 Manual Retention Control
+### 18.4 Manual Retention Control
 
 ```toml
 paths = ["/data"]
@@ -1530,7 +1575,7 @@ backup prune --repo /mnt/backup/repo
 
 Use `--dry-run` first to preview the effect before committing.
 
-### 17.5 Legal Hold Pattern
+### 18.5 Legal Hold Pattern
 
 For snapshots that must never be deleted regardless of retention policy:
 
@@ -1546,7 +1591,7 @@ backup tag --repo /mnt/backup/repo delete --name legal-hold-2026-q1
 
 ---
 
-## 18. Troubleshooting
+## 19. Troubleshooting
 
 ### `error: --repo required`
 
@@ -1599,7 +1644,7 @@ The bundle file is damaged or was truncated during transfer. The SHA-256 of each
 
 ---
 
-## 19. Safety and Operational Notes
+## 20. Safety and Operational Notes
 
 ### Crash Safety
 
@@ -1645,11 +1690,11 @@ The pack index cache is the secondary RAM consumer: it holds 44 bytes per packed
 
 ---
 
-## 20. Object Lookup Algorithms
+## 21. Object Lookup Algorithms
 
 This section describes how the runtime locates any object — loose or packed — in O(log N) time or better, regardless of how many packs and loose files exist in the repository.
 
-### 20.1 Two-Tier Lookup Pipeline
+### 21.1 Two-Tier Lookup Pipeline
 
 Every object lookup follows a fixed two-step policy:
 
@@ -1658,7 +1703,7 @@ Every object lookup follows a fixed two-step policy:
 
 The loose-first policy means freshly written objects (which are always initially loose) are found without any index scan.
 
-### 20.2 Loose Object Addressing — O(1) Direct Open
+### 21.2 Loose Object Addressing — O(1) Direct Open
 
 Loose objects are stored under:
 
@@ -1670,7 +1715,7 @@ where `<HH>` is the first two hex characters of the SHA-256 hash and `<62-hex>` 
 
 Finding a loose object requires no index or search — the runtime constructs the path directly from the hash bytes, calls `openat()`, and either gets a file descriptor or `ENOENT`. The operation is O(1) regardless of repository size.
 
-### 20.3 Pack Index Cache — O(log N) Across All Packs
+### 21.3 Pack Index Cache — O(log N) Across All Packs
 
 #### Structure
 
@@ -1722,15 +1767,15 @@ The next lookup after invalidation triggers a full reload. Because loading is O(
 
 #### Memory Cost
 
-The cache holds 44 bytes per packed object. For reference: 10 million packed objects consume approximately 440 MB of RAM. For repositories with very large object counts, the pack index cache is the primary RAM consumer (see §19 Memory Scaling).
+The cache holds 44 bytes per packed object. For reference: 10 million packed objects consume approximately 440 MB of RAM. For repositories with very large object counts, the pack index cache is the primary RAM consumer (see §20 Memory Scaling).
 
-### 20.4 Snapshot `.snap` Files — Binary Search on Disk
+### 21.4 Snapshot `.snap` Files — Binary Search on Disk
 
 Snapshot metadata files (`snapshots/NNNNNNNN.snap`) contain the full serialized node array and dirent array for a snapshot. When a snapshot must be opened for restore or comparison, the runtime `mmap()`s or reads the file sequentially; there is no per-object binary search within a `.snap` file because snapshots are loaded whole.
 
 The snapshot file begins with a header that records `node_count` and `dirent_count`. The runtime uses these counts to allocate exactly the right amount of memory and reads both arrays in two sequential passes. Loading is O(node_count + dirent_count) and is performed once per operation, not once per file.
 
-### 20.5 Snapshot Pathmap — O(1) Path Lookup
+### 21.5 Snapshot Pathmap — O(1) Path Lookup
 
 Change detection in Phase 3 (`backup run`) requires knowing, for each file discovered on the live filesystem, whether an identical file existed in the previous snapshot and whether its content hash has changed. A linear scan of the previous snapshot's node array would be O(N) per file, making the overall complexity O(N²) for large trees.
 
@@ -1786,25 +1831,25 @@ As Phase 3 visits each live filesystem path, it calls `pathmap_mark_seen()` to s
 
 The combination of `pathmap_build` + `pathmap_lookup` reduces change detection from O(N²) to O(N log N) for the build phase and O(N) for the query phase, making Phase 3 scale to repositories with millions of files.
 
-## 21. Parity Error Correction
+## 22. Parity Error Correction
 
 c-backup protects all on-disk data against bit rot using a layered parity system. Every file written to the repository includes a parity trailer that enables both detection and correction of storage corruption without requiring redundant copies of the data.
 
-### 21.1 Threat Model
+### 22.1 Threat Model
 
 In a deduplicating backup, each object is stored exactly once. A single corrupt sector can destroy data that hundreds of snapshots reference. Traditional backup tools detect this via SHA-256 verification at restore time — but by then the only copy is already damaged. Parity error correction allows the data to be repaired in-place before it is needed.
 
-### 21.2 Detection Layer: CRC-32C
+### 22.2 Detection Layer: CRC-32C
 
 All headers and payloads are protected by CRC-32C checksums (software lookup table, 256 entries). CRC-32C provides fast corruption detection: if the CRC matches, the data is overwhelmingly likely to be intact and no further parity processing is needed. This makes the common case (no corruption) essentially free.
 
-### 21.3 Header Correction: XOR Interleaved Parity
+### 22.3 Header Correction: XOR Interleaved Parity
 
 Headers (object headers, pack entry headers, snapshot headers) are protected by XOR interleaved parity with stride 256. For data up to 256 bytes, this guarantees single-byte correction. The parity record is 260 bytes: 4 bytes CRC-32C + 256 bytes XOR parity.
 
 When a header CRC fails, the XOR parity identifies and corrects the corrupted byte. If more than one byte is corrupted, the damage is detected but not correctable.
 
-### 21.4 Payload Correction: Reed-Solomon RS(255,239)
+### 22.4 Payload Correction: Reed-Solomon RS(255,239)
 
 Payloads (compressed object data, snapshot manifests) are protected by Reed-Solomon coding in GF(2^8):
 
@@ -1822,7 +1867,7 @@ The interleaving scheme writes data column-by-column into a matrix of D columns 
 
 **GF(2^8) implementation:** Field polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D, same as AES). Two 256-entry lookup tables for fast multiply. Decoder uses Berlekamp-Massey for error locator, Chien search for error positions, and Forney algorithm for error values.
 
-### 21.5 On-Disk Trailer Format
+### 22.5 On-Disk Trailer Format
 
 All parity data is appended as a trailer after the existing file content. The trailer ends with a 12-byte footer:
 
@@ -1839,7 +1884,7 @@ All parity data is appended as a trailer after the existing file content. The tr
 
 Old-format readers never reach the trailer because they read only the bytes specified by the header. New-format files are rejected by old binaries at the version check.
 
-### 21.6 Format Versions
+### 22.6 Format Versions
 
 | Format | Old Version | New Version | Change |
 |--------|-------------|-------------|--------|
@@ -1849,7 +1894,7 @@ Old-format readers never reach the trailer because they read only the bytes spec
 
 Backward compatibility: version 1/2 objects, version 1/2 packs, and V4 snapshots remain fully readable. Parity is simply not available for these files.
 
-### 21.7 Overhead
+### 22.7 Overhead
 
 | File Size | RS Parity (6.7%) | Header Parity | Total Overhead |
 |-----------|------------------|---------------|----------------|
@@ -1861,7 +1906,7 @@ Backward compatibility: version 1/2 objects, version 1/2 packs, and V4 snapshots
 
 For typical repositories dominated by files larger than 10 KiB, overhead converges to approximately 6.7%.
 
-### 21.8 Read Path Behavior
+### 22.8 Read Path Behavior
 
 On every object load (loose, packed, or snapshot), the following sequence runs:
 
@@ -1872,7 +1917,7 @@ On every object load (loose, packed, or snapshot), the following sequence runs:
 5. If repair fails: log an error, increment the `parity_uncorrectable` counter, return `ERR_CORRUPT`.
 6. SHA-256 remains the final authoritative verification — parity is a correction layer, not a replacement for cryptographic integrity checks.
 
-### 21.9 Active Repair (`verify --repair`)
+### 22.9 Active Repair (`verify --repair`)
 
 `backup verify --repair` acquires an exclusive lock and runs the full verify pass. For any object whose parity counters indicate a correction was made during loading:
 
@@ -1882,7 +1927,7 @@ On every object load (loose, packed, or snapshot), the following sequence runs:
 
 All repair functions `fsync()` after writing corrections. The parity data itself is not modified — it remains valid for detecting future corruption.
 
-### 21.10 Source Module
+### 22.10 Source Module
 
 All parity algorithms are implemented in `src/parity.c` / `src/parity.h` (~800 lines of C). The module is self-contained with no external dependencies beyond the C standard library. Global parity statistics (`parity_stats_t`) use atomic counters for thread safety.
 
