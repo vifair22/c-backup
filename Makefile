@@ -37,8 +37,10 @@ TARGET        := $(BUILD)/backup
 TARGET_STATIC := $(BUILD)/backup-static
 TARGET_ASAN   := $(BUILD)/backup-asan
 
-TEST_SRCS := $(wildcard $(TESTS)/*.c)
-TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(TEST_SRCS))
+FAULT_SRCS  := $(wildcard $(TESTS)/test_*_fault.c)
+TEST_SRCS   := $(filter-out $(FAULT_SRCS), $(filter-out $(TESTS)/fault_inject.c, $(wildcard $(TESTS)/*.c)))
+TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(TEST_SRCS))
+FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(FAULT_SRCS))
 
 .PHONY: all static asan clean test bench bench-micro bench-phases
 
@@ -86,8 +88,14 @@ TEST_CFLAGS := -std=c11 -Wall -Wextra -O2 -Wno-unused-result -I src -I vendor
 $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lcmocka
 
-test: $(TARGET) $(TEST_BINS)
-	@for t in $(TEST_BINS); do echo "=== $$t ==="; $$t; done
+FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
+              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync
+
+$(BUILD)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(LIB_OBJS) | $(BUILD)
+	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(LDFLAGS) -lcmocka
+
+test: $(TARGET) $(TEST_BINS) $(FAULT_BINS)
+	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
 
 # Benchmark binaries (no cmocka)
 BENCH     := bench
@@ -112,7 +120,8 @@ bench-phases: $(BUILD)/bench_phases
 # ASAN test binaries
 ASAN_LIB_OBJS := $(filter-out $(BUILD)/main-asan.o, $(ASAN_OBJS))
 ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result -I src -I vendor
-ASAN_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%-asan, $(TEST_SRCS))
+ASAN_TEST_SRCS := $(TEST_SRCS)
+ASAN_TEST_BINS := $(patsubst $(TESTS)/%.c, $(BUILD)/%-asan, $(ASAN_TEST_SRCS))
 
 $(BUILD)/%-asan: $(TESTS)/%.c $(ASAN_LIB_OBJS) | $(BUILD)
 	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \

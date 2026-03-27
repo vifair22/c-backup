@@ -2291,38 +2291,152 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         ehdr.uncompressed_size = lm->uncompressed_size;
         ehdr.compressed_size   = lm->compressed_size;
 
-        if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
-            close(cur_fd); st = ERR_IO; break;
-        }
-
-        /* Compute entry header parity */
-        parity_record_t lg_hdr_par;
-        parity_record_compute(&ehdr, sizeof(ehdr), &lg_hdr_par);
-
-        /* Stream payload: read → write → CRC only.
-         * RS parity is deferred to a parallel phase after all large objects
-         * in the pack are written (data stays hot in page cache). */
+        uint64_t actual_compressed_size = lm->compressed_size;
         uint32_t running_crc = 0;
         uint8_t stream_buf[256 * 1024]; /* 256 KiB I/O chunks */
 
-        uint64_t remaining = lm->compressed_size;
-        while (remaining > 0) {
-            size_t want = (remaining > sizeof(stream_buf)) ?
-                          sizeof(stream_buf) : (size_t)remaining;
-            ssize_t got = read(cur_fd, stream_buf, want);
-            if (got <= 0) {
-                if (got < 0 && errno == EINTR) continue;
-                st = (got == 0) ? ERR_CORRUPT : ERR_IO;
+        if (lm->compression == COMPRESS_NONE) {
+            /* LZ4F streaming compression for large compressible objects */
+            LZ4F_cctx *cctx = NULL;
+            size_t comp_bound = LZ4F_compressBound(sizeof(stream_buf), NULL);
+            uint8_t *comp_buf = malloc(comp_bound);
+            LZ4F_errorCode_t lz4err = LZ4F_createCompressionContext(&cctx, LZ4F_VERSION);
+
+            if (!comp_buf || LZ4F_isError(lz4err)) {
+                /* Fallback: store uncompressed */
+                free(comp_buf);
+                if (cctx) LZ4F_freeCompressionContext(cctx);
+                goto raw_copy;
+            }
+
+            /* Write placeholder entry header — will patch compressed_size later */
+            ehdr.compression = COMPRESS_LZ4_FRAME;
+            ehdr.compressed_size = 0;
+            off_t ehdr_offset = (off_t)(sizeof(pack_dat_hdr_t) + lg_body_offset);
+
+            if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
+                free(comp_buf);
+                LZ4F_freeCompressionContext(cctx);
+                close(cur_fd); st = ERR_IO; break;
+            }
+
+            uint64_t compressed_written = 0;
+
+            /* Write LZ4 frame header */
+            size_t hdr_sz = LZ4F_compressBegin(cctx, comp_buf, comp_bound, NULL);
+            if (LZ4F_isError(hdr_sz)) {
+                free(comp_buf);
+                LZ4F_freeCompressionContext(cctx);
+                close(cur_fd); st = ERR_IO; break;
+            }
+            if (fwrite(comp_buf, 1, hdr_sz, dat_f) != hdr_sz) {
+                free(comp_buf);
+                LZ4F_freeCompressionContext(cctx);
+                close(cur_fd); st = ERR_IO; break;
+            }
+            running_crc = crc32c_update(running_crc, comp_buf, hdr_sz);
+            compressed_written += hdr_sz;
+
+            /* Stream: read → compress → write */
+            uint64_t remaining = lm->compressed_size; /* == uncompressed for COMPRESS_NONE */
+            while (remaining > 0) {
+                size_t want = (remaining > sizeof(stream_buf)) ?
+                              sizeof(stream_buf) : (size_t)remaining;
+                ssize_t got = read(cur_fd, stream_buf, want);
+                if (got <= 0) {
+                    if (got < 0 && errno == EINTR) continue;
+                    st = (got == 0) ? ERR_CORRUPT : ERR_IO;
+                    break;
+                }
+
+                size_t out_sz = LZ4F_compressUpdate(cctx, comp_buf, comp_bound,
+                                                    stream_buf, (size_t)got, NULL);
+                if (LZ4F_isError(out_sz)) { st = ERR_IO; break; }
+
+                if (out_sz > 0) {
+                    if (fwrite(comp_buf, 1, out_sz, dat_f) != out_sz) {
+                        st = ERR_IO; break;
+                    }
+                    running_crc = crc32c_update(running_crc, comp_buf, out_sz);
+                    compressed_written += out_sz;
+                }
+
+                atomic_fetch_add(&prog.bytes_processed, (uint64_t)got);
+                remaining -= (uint64_t)got;
+            }
+
+            if (st == OK) {
+                /* Write LZ4 frame footer */
+                size_t end_sz = LZ4F_compressEnd(cctx, comp_buf, comp_bound, NULL);
+                if (LZ4F_isError(end_sz)) {
+                    st = ERR_IO;
+                } else if (fwrite(comp_buf, 1, end_sz, dat_f) != end_sz) {
+                    st = ERR_IO;
+                } else {
+                    running_crc = crc32c_update(running_crc, comp_buf, end_sz);
+                    compressed_written += end_sz;
+                }
+            }
+
+            free(comp_buf);
+            LZ4F_freeCompressionContext(cctx);
+
+            if (st != OK) {
+                close(cur_fd);
+                fclose(dat_f); dat_f = NULL;
+                fclose(idx_f); idx_f = NULL;
+                unlink(dat_tmp); unlink(idx_tmp);
+                lg_pack_open = 0;
                 break;
             }
 
-            if (fwrite(stream_buf, 1, (size_t)got, dat_f) != (size_t)got) {
-                st = ERR_IO; break;
+            /* Patch entry header with actual compressed size */
+            actual_compressed_size = compressed_written;
+            ehdr.compressed_size = actual_compressed_size;
+            fflush(dat_f);
+            if (fseeko(dat_f, ehdr_offset, SEEK_SET) != 0) {
+                close(cur_fd); st = ERR_IO;
+                fclose(dat_f); dat_f = NULL;
+                fclose(idx_f); idx_f = NULL;
+                unlink(dat_tmp); unlink(idx_tmp);
+                lg_pack_open = 0;
+                break;
+            }
+            if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
+                close(cur_fd); st = ERR_IO;
+                fclose(dat_f); dat_f = NULL;
+                fclose(idx_f); idx_f = NULL;
+                unlink(dat_tmp); unlink(idx_tmp);
+                lg_pack_open = 0;
+                break;
+            }
+            fseeko(dat_f, 0, SEEK_END);
+        } else {
+raw_copy:
+            /* Raw-copy path for already-compressed objects */
+            if (fwrite(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
+                close(cur_fd); st = ERR_IO; break;
             }
 
-            running_crc = crc32c_update(running_crc, stream_buf, (size_t)got);
-            atomic_fetch_add(&prog.bytes_processed, (uint64_t)got);
-            remaining -= (uint64_t)got;
+            uint64_t remaining = lm->compressed_size;
+            while (remaining > 0) {
+                size_t want = (remaining > sizeof(stream_buf)) ?
+                              sizeof(stream_buf) : (size_t)remaining;
+                ssize_t got = read(cur_fd, stream_buf, want);
+                if (got <= 0) {
+                    if (got < 0 && errno == EINTR) continue;
+                    st = (got == 0) ? ERR_CORRUPT : ERR_IO;
+                    break;
+                }
+
+                if (fwrite(stream_buf, 1, (size_t)got, dat_f) != (size_t)got) {
+                    st = ERR_IO; break;
+                }
+
+                running_crc = crc32c_update(running_crc, stream_buf, (size_t)got);
+                atomic_fetch_add(&prog.bytes_processed, (uint64_t)got);
+                remaining -= (uint64_t)got;
+            }
         }
 
         /* Release source pages from cache */
@@ -2337,16 +2451,20 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
             break;
         }
 
+        /* Recompute entry header parity with final header (patched compressed_size) */
+        parity_record_t lg_hdr_par;
+        parity_record_compute(&ehdr, sizeof(ehdr), &lg_hdr_par);
+
         /* Store header parity + CRC; RS parity is NULL — computed in parallel later */
-        size_t csize = (size_t)lm->compressed_size;
+        size_t csize = (size_t)actual_compressed_size;
         entry_parity[lg_packed].hdr_par     = lg_hdr_par;
         entry_parity[lg_packed].payload_crc = running_crc;
         entry_parity[lg_packed].rs_parity   = NULL;
         entry_parity[lg_packed].rs_par_sz   = rs_parity_size(csize);
         entry_parity[lg_packed].rs_data_len = (uint32_t)csize;
 
-        lg_body_offset        += sizeof(ehdr) + lm->compressed_size;
-        processed_payload_bytes += lm->compressed_size;
+        lg_body_offset        += sizeof(ehdr) + actual_compressed_size;
+        processed_payload_bytes += actual_compressed_size;
 
         idx_entries[lg_packed].entry_index = lg_packed;
         lg_packed++;
@@ -2580,7 +2698,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     pthread_mutex_destroy(&ctx.mu);
     for (uint32_t i = 0; i < wargs_alloc; i++) free(wargs[i].comp_buf);
     free(ctx.queue);
-    free(small_indices);
+    free(small_indices); small_indices = NULL;
 
     /* Finalize the last multi-object pack (if any objects remain) */
     if (st == OK && sm_packed > 0) {
@@ -2603,7 +2721,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     } else {
         /* No small objects — just free */
-        free(small_indices);
+        free(small_indices); small_indices = NULL;
     }
 
     /* Stop progress thread before touching the display. */

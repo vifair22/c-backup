@@ -14,6 +14,7 @@
 
 #include "../src/backup.h"
 #include "../src/repo.h"
+#include "../src/object.h"
 #include "../src/snapshot.h"
 #include "../src/tag.h"
 #include "../src/xfer.h"
@@ -349,6 +350,78 @@ static void test_verify_bundle_rejects_unknown_record_kind(void **state) {
     assert_int_equal(verify_bundle("/tmp/c_backup_xfer_badkind.cbb", 1), ERR_CORRUPT);
 }
 
+/* Large object (>16 MiB) export/import via streaming.
+ * Exercises bundle_write_object's ERR_TOO_LARGE fallback (L239-L257)
+ * and import_bundle's raw record path (L518-L541). */
+static void test_large_object_bundle_roundtrip(void **state) {
+    (void)state;
+
+    /* Create a large compressible file */
+    const size_t file_size = 17u * 1024u * 1024u;
+    {
+        FILE *f = fopen(SRC_DATA "/large.bin", "w");
+        assert_non_null(f);
+        const char pattern[] = "LARGE_EXPORT_TEST_DATA_01234567\n";
+        size_t plen = sizeof(pattern) - 1;
+        size_t remaining = file_size;
+        while (remaining > 0) {
+            size_t n = remaining < plen ? remaining : plen;
+            fwrite(pattern, 1, n, f);
+            remaining -= n;
+        }
+        fclose(f);
+    }
+
+    /* Backup the large file into source repo */
+    repo_t *src = NULL;
+    assert_int_equal(repo_open(SRC_REPO, &src), OK);
+    const char *paths[] = { SRC_DATA };
+    assert_int_equal(backup_run(src, paths, 1), OK);
+
+    /* Export snapshot 2 (has the large file) as bundle */
+    const char *bundle_path = "/tmp/c_backup_xfer_large.cbb";
+    assert_int_equal(export_bundle(src, XFER_SCOPE_SNAPSHOT, 2, bundle_path), OK);
+    repo_close(src);
+
+    /* Verify the bundle file is valid */
+    assert_int_equal(verify_bundle(bundle_path, 1), OK);
+
+    /* Import into destination repo */
+    repo_t *dst = NULL;
+    assert_int_equal(repo_open(DST_REPO, &dst), OK);
+    assert_int_equal(import_bundle(dst, bundle_path, 0, 0, 1), OK);
+
+    /* Verify the imported snapshot exists and contains the large file */
+    snapshot_t *snap = NULL;
+    assert_int_equal(snapshot_load(dst, 2, &snap), OK);
+    assert_non_null(snap);
+
+    /* Find the large file's content hash and verify it loads */
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    int found_large = 0;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        if (snap->nodes[i].type == NODE_TYPE_REG &&
+            snap->nodes[i].size == (uint64_t)file_size &&
+            memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+            /* Stream-load the object to verify it was imported correctly */
+            int null_fd = open("/dev/null", O_WRONLY);
+            assert_true(null_fd >= 0);
+            uint64_t ssz = 0;
+            assert_int_equal(object_load_stream(dst, snap->nodes[i].content_hash,
+                                                 null_fd, &ssz, NULL), OK);
+            close(null_fd);
+            assert_true(ssz == (uint64_t)file_size);
+            found_large = 1;
+            break;
+        }
+    }
+    snapshot_free(snap);
+    assert_true(found_large);
+
+    repo_close(dst);
+    unlink(bundle_path);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_export_snapshot_bundle_import_roundtrip, setup, teardown),
@@ -361,6 +434,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_import_bundle_detects_object_hash_corruption, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_bundle_rejects_path_traversal_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_bundle_rejects_unknown_record_kind, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_object_bundle_roundtrip, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

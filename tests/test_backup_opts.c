@@ -405,6 +405,149 @@ static void test_deep_directory_structure(void **state) {
     verify_file_matches(TEST_DEST TEST_SRC "/a/b/c/d/deepest.txt", "deepest level\n", 14);
 }
 
+/* Progress env var override: exercises phase3 progress thread, scan/phase2
+ * progress callbacks, and all phase_line_setf calls by forcing progress
+ * output even when stderr is not a tty. */
+static void test_progress_env_override(void **state) {
+    (void)state;
+
+    setenv("CBACKUP_PROGRESS", "1", 1);
+    setenv("CBACKUP_STORE_THREADS", "1", 1);
+
+    /* Redirect stderr to /dev/null so progress output doesn't pollute test */
+    int saved_stderr = dup(STDERR_FILENO);
+    assert_true(saved_stderr >= 0);
+    int devnull = open("/dev/null", O_WRONLY);
+    assert_true(devnull >= 0);
+    dup2(devnull, STDERR_FILENO);
+    close(devnull);
+
+    /* Create 35 unique files to force store phase with progress */
+    for (int i = 0; i < 35; i++) {
+        char path[256], content[128];
+        snprintf(path, sizeof(path), TEST_SRC "/progress_%03d.txt", i);
+        snprintf(content, sizeof(content),
+                 "progress env test content %d unique %d\n", i, i * 37 + 13);
+        write_file(path, content, strlen(content));
+    }
+
+    const char *paths[] = { TEST_SRC };
+    backup_opts_t opts = { .quiet = 0 };
+    status_t st = backup_run_opts(repo, paths, 1, &opts);
+
+    /* Restore stderr */
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    unsetenv("CBACKUP_PROGRESS");
+    unsetenv("CBACKUP_STORE_THREADS");
+
+    assert_int_equal(st, OK);
+    assert_int_equal(repo_verify(repo, NULL), OK);
+}
+
+/* File becomes unreadable between scan and store phases.
+ * Triggers the EACCES transient error path in store_worker (L329-L361),
+ * skipped_add/skipped_cmp, and skipped_has. */
+static void test_transient_eacces_during_store(void **state) {
+    (void)state;
+
+    write_file(TEST_SRC "/readable.txt", "readable\n", 9);
+    write_file(TEST_SRC "/unreadable.txt", "will be unreadable\n", 19);
+
+    /* First backup — both files stored successfully */
+    const char *paths[] = { TEST_SRC };
+    backup_opts_t opts = { .quiet = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    /* Make one file unreadable + modify it so it's detected as changed */
+    write_file(TEST_SRC "/unreadable.txt", "modified and locked\n", 20);
+    chmod(TEST_SRC "/unreadable.txt", 0000);
+
+    /* Second backup — scan succeeds (stat works on 000 files),
+     * but store worker gets EACCES and should skip gracefully */
+    status_t st = backup_run_opts(repo, paths, 1, &opts);
+    assert_int_equal(st, OK);
+
+    /* Restore permissions so teardown can clean up */
+    chmod(TEST_SRC "/unreadable.txt", 0644);
+
+    /* Verify repo integrity */
+    assert_int_equal(repo_verify(repo, NULL), OK);
+}
+
+/* Multiple files disappear between scan and store — tests skipped_add
+ * growth (realloc path) and skipped_has (bsearch) with multiple entries */
+static void test_transient_multiple_vanished(void **state) {
+    (void)state;
+
+    /* Create initial files */
+    for (int i = 0; i < 20; i++) {
+        char path[256], content[64];
+        snprintf(path, sizeof(path), "%s/vanish_%02d.txt", TEST_SRC, i);
+        snprintf(content, sizeof(content), "vanish content %d\n", i);
+        write_file(path, content, strlen(content));
+    }
+    write_file(TEST_SRC "/keeper.txt", "stays around\n", 13);
+
+    const char *paths[] = { TEST_SRC };
+    backup_opts_t opts = { .quiet = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    /* Modify + make unreadable: forces re-store attempt → EACCES */
+    for (int i = 0; i < 20; i++) {
+        char path[256], content[64];
+        snprintf(path, sizeof(path), "%s/vanish_%02d.txt", TEST_SRC, i);
+        snprintf(content, sizeof(content), "modified vanish %d\n", i);
+        write_file(path, content, strlen(content));
+        chmod(path, 0000);
+    }
+
+    status_t st = backup_run_opts(repo, paths, 1, &opts);
+    assert_int_equal(st, OK);
+
+    /* Cleanup */
+    for (int i = 0; i < 20; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/vanish_%02d.txt", TEST_SRC, i);
+        chmod(path, 0644);
+    }
+    assert_int_equal(repo_verify(repo, NULL), OK);
+}
+
+/*
+ * Multi-path backup with enough entries to trigger scan merge realloc.
+ * The scan result starts with capacity=64. Creating 63 files in src1
+ * yields 64 entries (63 files + 1 dir), exactly filling capacity.
+ * Then merging src2 entries triggers the realloc at backup.c L594.
+ */
+static void test_multipath_merge_realloc(void **state) {
+    (void)state;
+    /* Create 63 files in src1 → 64 scan entries (63 files + root dir) */
+    for (int i = 0; i < 63; i++) {
+        char path[256], content[64];
+        snprintf(path, sizeof(path), "%s/mr_%02d.txt", TEST_SRC, i);
+        snprintf(content, sizeof(content), "merge realloc %d", i);
+        write_file(path, content, strlen(content));
+    }
+    /* Create a few files in src2 → triggers merge realloc */
+    for (int i = 0; i < 5; i++) {
+        char path[256], content[64];
+        snprintf(path, sizeof(path), "%s/mr2_%d.txt", TEST_SRC2, i);
+        snprintf(content, sizeof(content), "merge src2 %d", i);
+        write_file(path, content, strlen(content));
+    }
+    const char *paths[] = { TEST_SRC, TEST_SRC2 };
+    backup_opts_t opts = { .quiet = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 2, &opts), OK);
+
+    /* Verify both source trees are in the snapshot */
+    snapshot_t *snap = NULL;
+    assert_int_equal(snapshot_load(repo, 1, &snap), OK);
+    /* 63 + 5 files + dirs + symlinks etc — just check we have a reasonable count */
+    assert_true(snap->node_count >= 68);
+    snapshot_free(snap);
+}
+
 /* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
@@ -428,6 +571,10 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_many_files_parallel_store, setup_pipeline, teardown_pipeline),
         cmocka_unit_test_setup_teardown(test_all_change_types, setup_pipeline, teardown_pipeline),
         cmocka_unit_test_setup_teardown(test_deep_directory_structure, setup_pipeline, teardown_pipeline),
+        cmocka_unit_test_setup_teardown(test_progress_env_override, setup_pipeline, teardown_pipeline),
+        cmocka_unit_test_setup_teardown(test_transient_eacces_during_store, setup_pipeline, teardown_pipeline),
+        cmocka_unit_test_setup_teardown(test_transient_multiple_vanished, setup_pipeline, teardown_pipeline),
+        cmocka_unit_test_setup_teardown(test_multipath_merge_realloc, setup_pipeline, teardown_pipeline),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

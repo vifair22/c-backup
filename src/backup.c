@@ -48,7 +48,8 @@ static int ts_ge(const struct timespec *a, const struct timespec *b);
 static struct timespec ts_add_ms(struct timespec t, long ms);
 
 static int phase_ui_enabled(const backup_opts_t *opts) {
-    return (!opts || !opts->quiet) && isatty(STDERR_FILENO);
+    return (!opts || !opts->quiet) &&
+           (getenv("CBACKUP_PROGRESS") || isatty(STDERR_FILENO));
 }
 
 static void phase_line_setf(const char *fmt, ...) {

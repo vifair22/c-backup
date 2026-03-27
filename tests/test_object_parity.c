@@ -415,6 +415,131 @@ static void test_repair_clean_returns_zero(void **state) {
     assert_int_equal(repaired, 0);
 }
 
+/* snapshot_repair: repair corrupted snapshot header via explicit API */
+static void test_snapshot_repair_header(void **state) {
+    (void)state;
+    snapshot_t snap = {0};
+    snap.snap_id = 10;
+    snap.created_sec = 1111111111;
+    snap.node_count = 0;
+    snap.dirent_count = 0;
+    assert_int_equal(snapshot_write(repo, &snap), OK);
+
+    char snap_path[512];
+    snprintf(snap_path, sizeof(snap_path), "%s/snapshots/00000010.snap", TEST_REPO);
+    flip_byte(snap_path, 10);
+
+    int repaired = snapshot_repair(repo, 10);
+    assert_true(repaired > 0);
+
+    /* Verify load succeeds after repair */
+    snapshot_t *loaded = NULL;
+    assert_int_equal(snapshot_load(repo, 10, &loaded), OK);
+    assert_non_null(loaded);
+    assert_int_equal(loaded->created_sec, 1111111111);
+    snapshot_free(loaded);
+}
+
+/* snapshot_repair: repair corrupted snapshot payload via RS parity */
+static void test_snapshot_repair_payload(void **state) {
+    (void)state;
+    node_t nodes[3];
+    memset(nodes, 0, sizeof(nodes));
+    nodes[0].node_id = 1;
+    nodes[0].type = NODE_TYPE_DIR;
+    nodes[1].node_id = 2;
+    nodes[1].type = NODE_TYPE_REG;
+    nodes[1].size = 100;
+    nodes[2].node_id = 3;
+    nodes[2].type = NODE_TYPE_REG;
+    nodes[2].size = 200;
+
+    uint8_t dirent_data[128];
+    memset(dirent_data, 0xAB, sizeof(dirent_data));
+
+    snapshot_t snap = {0};
+    snap.snap_id = 11;
+    snap.created_sec = 2222222222ULL;
+    snap.node_count = 3;
+    snap.dirent_count = 2;
+    snap.nodes = nodes;
+    snap.dirent_data = dirent_data;
+    snap.dirent_data_len = sizeof(dirent_data);
+    assert_int_equal(snapshot_write(repo, &snap), OK);
+
+    /* Corrupt a payload byte (beyond header) */
+    char snap_path[512];
+    snprintf(snap_path, sizeof(snap_path), "%s/snapshots/00000011.snap", TEST_REPO);
+    struct stat st;
+    assert_int_equal(stat(snap_path, &st), 0);
+
+    if (st.st_size > 80) {
+        flip_byte(snap_path, 70);
+
+        int repaired = snapshot_repair(repo, 11);
+        assert_true(repaired > 0);
+
+        snapshot_t *loaded = NULL;
+        assert_int_equal(snapshot_load(repo, 11, &loaded), OK);
+        assert_non_null(loaded);
+        assert_int_equal(loaded->node_count, 3);
+        snapshot_free(loaded);
+    }
+}
+
+/* snapshot_repair: clean snapshot returns 0 */
+static void test_snapshot_repair_clean(void **state) {
+    (void)state;
+    snapshot_t snap = {0};
+    snap.snap_id = 12;
+    snap.created_sec = 3333333333ULL;
+    snap.node_count = 0;
+    snap.dirent_count = 0;
+    assert_int_equal(snapshot_write(repo, &snap), OK);
+
+    int repaired = snapshot_repair(repo, 12);
+    assert_int_equal(repaired, 0);
+}
+
+/* snapshot_find_node: find existing and non-existing nodes */
+static void test_snapshot_find_node(void **state) {
+    (void)state;
+    node_t nodes[2];
+    memset(nodes, 0, sizeof(nodes));
+    nodes[0].node_id = 42;
+    nodes[0].type = NODE_TYPE_DIR;
+    nodes[0].size = 0;
+    nodes[1].node_id = 99;
+    nodes[1].type = NODE_TYPE_REG;
+    nodes[1].size = 512;
+
+    snapshot_t snap = {0};
+    snap.snap_id = 13;
+    snap.created_sec = 4444444444ULL;
+    snap.node_count = 2;
+    snap.nodes = nodes;
+    snap.dirent_count = 0;
+    assert_int_equal(snapshot_write(repo, &snap), OK);
+
+    snapshot_t *loaded = NULL;
+    assert_int_equal(snapshot_load(repo, 13, &loaded), OK);
+    assert_non_null(loaded);
+
+    const node_t *found42 = snapshot_find_node(loaded, 42);
+    assert_non_null(found42);
+    assert_int_equal(found42->type, NODE_TYPE_DIR);
+
+    const node_t *found99 = snapshot_find_node(loaded, 99);
+    assert_non_null(found99);
+    assert_int_equal(found99->type, NODE_TYPE_REG);
+    assert_int_equal(found99->size, 512);
+
+    const node_t *notfound = snapshot_find_node(loaded, 9999);
+    assert_null(notfound);
+
+    snapshot_free(loaded);
+}
+
 /* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
@@ -438,6 +563,12 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_load_v1_no_parity, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_repair_header_and_payload, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_repair_clean_returns_zero, setup_basic, teardown_basic),
+
+        /* snapshot_repair + snapshot_find_node */
+        cmocka_unit_test_setup_teardown(test_snapshot_repair_header, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_snapshot_repair_payload, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_snapshot_repair_clean, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_snapshot_find_node, setup_basic, teardown_basic),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

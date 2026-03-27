@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,6 +82,7 @@ static inline int hex_decode(const char *hex, size_t hexlen, uint8_t *out) {
 /* ------------------------------------------------------------------ */
 
 static inline int progress_enabled(void) {
+    if (getenv("CBACKUP_PROGRESS")) return 1;
     return isatty(STDERR_FILENO);
 }
 

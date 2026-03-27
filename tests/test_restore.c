@@ -11,6 +11,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/xattr.h>
+#include <acl/libacl.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "../src/repo.h"
 #include "../src/backup.h"
@@ -18,6 +22,8 @@
 #include "../src/snapshot.h"
 #include "../src/object.h"
 #include "../src/pack.h"
+#include "../src/parity.h"
+#include "../src/gc.h"
 
 #define TEST_REPO  "/tmp/c_backup_rst_repo"
 #define TEST_SRC   "/tmp/c_backup_rst_src"
@@ -527,7 +533,359 @@ static void test_restore_cat_sparse_hex_output(void **state) {
     assert_non_null(strstr(outbuf, "00 00 00 00"));
 }
 
+/* Empty file: exercises hash_is_zero() skip + ftruncate at line 534 */
+static void test_restore_empty_file_roundtrip(void **state) {
+    (void)state;
+    /* Create an empty file */
+    int fd = open(TEST_SRC "/empty.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(fd >= 0);
+    close(fd);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/empty.txt", TEST_DEST);
+    struct stat st;
+    assert_int_equal(stat(path, &st), 0);
+    assert_int_equal(st.st_size, 0);
+}
+
+/* FIFO: exercises mkfifo() path in restore */
+static void test_restore_fifo_roundtrip(void **state) {
+    (void)state;
+    assert_int_equal(mkfifo(TEST_SRC "/testfifo", 0644), 0);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/testfifo", TEST_DEST);
+    struct stat st;
+    assert_int_equal(lstat(path, &st), 0);
+    assert_true(S_ISFIFO(st.st_mode));
+}
+
+/* Hardlink: exercises nl_htab and link() in restore */
+static void test_restore_hardlink_inode_identity(void **state) {
+    (void)state;
+    write_file(TEST_SRC "/hlprimary.txt", "hardlink content");
+    assert_int_equal(link(TEST_SRC "/hlprimary.txt", TEST_SRC "/hlsecondary.txt"), 0);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char p1[256], p2[256];
+    snprintf(p1, sizeof(p1), "%s/tmp/c_backup_rst_src/hlprimary.txt", TEST_DEST);
+    snprintf(p2, sizeof(p2), "%s/tmp/c_backup_rst_src/hlsecondary.txt", TEST_DEST);
+
+    /* Both files should exist and contain the same data */
+    char *c1 = read_file_str(p1);
+    char *c2 = read_file_str(p2);
+    assert_non_null(c1);
+    assert_non_null(c2);
+    assert_string_equal(c1, "hardlink content");
+    assert_string_equal(c2, "hardlink content");
+    free(c1);
+    free(c2);
+
+    /* After restore, hardlinks should share an inode */
+    struct stat st1, st2;
+    assert_int_equal(stat(p1, &st1), 0);
+    assert_int_equal(stat(p2, &st2), 0);
+    assert_int_equal(st1.st_ino, st2.st_ino);
+}
+
+/* Permissions: exercises chmod path in apply_metadata */
+static void test_restore_permissions_roundtrip(void **state) {
+    (void)state;
+    write_file(TEST_SRC "/perm755.txt", "exec");
+    write_file(TEST_SRC "/perm600.txt", "private");
+    write_file(TEST_SRC "/perm444.txt", "readonly");
+    chmod(TEST_SRC "/perm755.txt", 0755);
+    chmod(TEST_SRC "/perm600.txt", 0600);
+    chmod(TEST_SRC "/perm444.txt", 0444);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/perm755.txt", TEST_DEST);
+    assert_int_equal(stat(path, &st), 0);
+    assert_int_equal(st.st_mode & 0777, 0755);
+
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/perm600.txt", TEST_DEST);
+    assert_int_equal(stat(path, &st), 0);
+    assert_int_equal(st.st_mode & 0777, 0600);
+
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/perm444.txt", TEST_DEST);
+    assert_int_equal(stat(path, &st), 0);
+    assert_int_equal(st.st_mode & 0777, 0444);
+}
+
+/* Xattr: exercises xattr restoration loop in apply_metadata */
+static void test_restore_xattr_roundtrip(void **state) {
+    (void)state;
+    write_file(TEST_SRC "/xattr.txt", "xattr test data");
+
+    const char *val = "testvalue";
+    int rc = setxattr(TEST_SRC "/xattr.txt", "user.testkey", val, strlen(val), 0);
+    if (rc != 0) {
+        skip();  /* filesystem doesn't support xattrs */
+    }
+
+    backup_opts_t opts = { .quiet = 1, .strict_meta = 1 };
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/xattr.txt", TEST_DEST);
+
+    /* Verify content */
+    char *content = read_file_str(path);
+    assert_non_null(content);
+    assert_string_equal(content, "xattr test data");
+    free(content);
+
+    /* Verify xattr was restored */
+    char buf[64] = {0};
+    ssize_t xlen = getxattr(path, "user.testkey", buf, sizeof(buf));
+    assert_int_equal(xlen, (ssize_t)strlen(val));
+    assert_memory_equal(buf, val, strlen(val));
+}
+
+/* ACL: exercises ACL restoration in apply_metadata */
+static void test_restore_acl_roundtrip(void **state) {
+    (void)state;
+    write_file(TEST_SRC "/aclfile.txt", "acl test data");
+
+    acl_t acl = acl_from_text("u::rw-,g::r--,o::---,u:nobody:r--,m::r--");
+    if (!acl) {
+        skip();  /* ACL not supported */
+    }
+    int rc = acl_set_file(TEST_SRC "/aclfile.txt", ACL_TYPE_ACCESS, acl);
+    acl_free(acl);
+    if (rc != 0) {
+        skip();  /* ACL set failed */
+    }
+
+    backup_opts_t opts = { .quiet = 1, .strict_meta = 1 };
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/aclfile.txt", TEST_DEST);
+
+    /* Verify content */
+    char *content = read_file_str(path);
+    assert_non_null(content);
+    assert_string_equal(content, "acl test data");
+    free(content);
+
+    /* Verify ACL was restored — at minimum, the file should have an ACL */
+    acl_t restored = acl_get_file(path, ACL_TYPE_ACCESS);
+    assert_non_null(restored);
+    char *acl_text = acl_to_text(restored, NULL);
+    /* Should contain the "nobody" user entry we set */
+    if (acl_text) {
+        assert_non_null(strstr(acl_text, "nobody"));
+        acl_free(acl_text);
+    }
+    acl_free(restored);
+}
+
+/* Incremental: two backups, restore each, verify isolation */
+static void test_restore_incremental_snapshots(void **state) {
+    (void)state;
+    const char *paths[] = { TEST_SRC };
+    /* Snap 1: default files from setup */
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Add a file for snap 2 */
+    write_file(TEST_SRC "/extra.txt", "added in snap 2");
+    sleep(1);
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Restore snap 1: should NOT have extra.txt */
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/extra.txt", TEST_DEST);
+    struct stat st;
+    assert_int_not_equal(stat(path, &st), 0);  /* should not exist */
+
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/hello.txt", TEST_DEST);
+    char *c = read_file_str(path);
+    assert_non_null(c);
+    assert_string_equal(c, "hello world");
+    free(c);
+
+    /* Clean and restore snap 2: should have extra.txt */
+    int rc = system("rm -rf " TEST_DEST);
+    (void)rc;
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/extra.txt", TEST_DEST);
+    c = read_file_str(path);
+    assert_non_null(c);
+    assert_string_equal(c, "added in snap 2");
+    free(c);
+}
+
+/* Verify after pack: backup → pack → restore from pack → verify */
+static void test_restore_verify_after_pack(void **state) {
+    (void)state;
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Pack all loose objects */
+    assert_int_equal(repo_pack(repo, NULL), OK);
+
+    /* Restore from packed objects */
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    /* Verify restore integrity */
+    assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
+
+    /* Spot check content */
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/hello.txt", TEST_DEST);
+    char *c = read_file_str(path);
+    assert_non_null(c);
+    assert_string_equal(c, "hello world");
+    free(c);
+}
+
+/* 200+ hardlinked files: triggers imap resize (scan.c, initial cap=256,
+ * resize at 70%=180 entries) and nl_htab_grow (restore.c) */
+static void test_many_hardlinks_resize(void **state) {
+    (void)state;
+
+    char hldir[256];
+    snprintf(hldir, sizeof(hldir), "%s/hldir", TEST_SRC);
+    mkdir(hldir, 0755);
+
+    /* Create 200 source files, each with one hardlink → link_count=2 */
+    for (int i = 0; i < 200; i++) {
+        char src[512], lnk[512];
+        snprintf(src, sizeof(src), "%s/file_%03d.txt", hldir, i);
+        snprintf(lnk, sizeof(lnk), "%s/link_%03d.txt", hldir, i);
+        char content[64];
+        snprintf(content, sizeof(content), "hardlink test %d\n", i);
+        write_file(src, content);
+        assert_int_equal(link(src, lnk), 0);
+    }
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Restore — exercises nl_htab_grow for hardlink reconstruction */
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    /* Verify a few hardlinks were restored correctly */
+    for (int i = 0; i < 200; i += 50) {
+        char src_path[512], lnk_path[512];
+        snprintf(src_path, sizeof(src_path), "%s%s/hldir/file_%03d.txt",
+                 TEST_DEST, TEST_SRC, i);
+        snprintf(lnk_path, sizeof(lnk_path), "%s%s/hldir/link_%03d.txt",
+                 TEST_DEST, TEST_SRC, i);
+        struct stat s1, s2;
+        assert_int_equal(stat(src_path, &s1), 0);
+        assert_int_equal(stat(lnk_path, &s2), 0);
+        /* Same inode = hardlink preserved */
+        assert_int_equal(s1.st_ino, s2.st_ino);
+    }
+}
+
+/*
+ * Sparse file with trailing hole: data at start, hole at end.
+ * Exercises restore_cat trailing zeros path (restore.c L1218-1234)
+ * and verify_dest sparse file hash reconstruction (L847-884).
+ */
+static void test_restore_sparse_trailing_hole(void **state) {
+    (void)state;
+    /* Create sparse file: 4096 bytes of data at offset 0, then trailing hole */
+    int sfd = open(TEST_SRC "/sparse_tail.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(sfd >= 0);
+    char data[4096];
+    memset(data, 'Z', sizeof(data));
+    assert_int_equal(write(sfd, data, sizeof(data)), (ssize_t)sizeof(data));
+    /* Extend file with a trailing hole via ftruncate */
+    assert_int_equal(ftruncate(sfd, 256 * 1024), 0);  /* 256 KiB total */
+    close(sfd);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Verify the object is stored as sparse */
+    node_t nd;
+    assert_int_equal(load_node_for_path(1, "tmp/c_backup_rst_src/sparse_tail.bin", &nd), 0);
+    assert_int_equal(nd.size, 256u * 1024u);
+    void *obj = NULL; size_t obj_len = 0; uint8_t obj_type = 0;
+    assert_int_equal(object_load(repo, nd.content_hash, &obj, &obj_len, &obj_type), OK);
+    free(obj);
+    assert_int_equal(obj_type, OBJECT_TYPE_SPARSE);
+
+    /* Restore and verify */
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
+
+    /* Cat the sparse file to a real file (pipe would block on 256 KiB) */
+    int catfd = open(TEST_DEST "/cat_sparse_tail.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(catfd >= 0);
+    assert_int_equal(restore_cat_file_ex(repo, 1, "tmp/c_backup_rst_src/sparse_tail.bin", catfd, 0), OK);
+    close(catfd);
+
+    /* Read and check: first 4096 bytes are 'Z', rest are zeros */
+    int rfd = open(TEST_DEST "/cat_sparse_tail.bin", O_RDONLY);
+    assert_true(rfd >= 0);
+    char buf[4096];
+    ssize_t r = read(rfd, buf, sizeof(buf));
+    assert_int_equal(r, (ssize_t)sizeof(buf));
+    for (int i = 0; i < 4096; i++) assert_int_equal(buf[i], 'Z');
+
+    /* Next bytes should be zeros (trailing hole) */
+    char zbuf[256];
+    r = read(rfd, zbuf, sizeof(zbuf));
+    assert_true(r > 0);
+    for (ssize_t i = 0; i < r; i++) assert_int_equal(zbuf[i], 0);
+    close(rfd);
+
+    /* Also verify the restored file on disk */
+    char rpath[PATH_MAX];
+    snprintf(rpath, sizeof(rpath), "%s%s/sparse_tail.bin", TEST_DEST, TEST_SRC);
+    struct stat st;
+    assert_int_equal(stat(rpath, &st), 0);
+    assert_int_equal((uint64_t)st.st_size, 256u * 1024u);
+}
+
 int main(void) {
+    rs_init();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_restore_latest_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_symlink,          setup, teardown),
@@ -545,6 +903,16 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_restore_cat_file_ex_hex_and_bad_fd, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_sparse_file_cat_and_verify, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_cat_sparse_hex_output, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_empty_file_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_fifo_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_hardlink_inode_identity, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_permissions_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_xattr_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_acl_roundtrip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_incremental_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_verify_after_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_many_hardlinks_resize, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_sparse_trailing_hole, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

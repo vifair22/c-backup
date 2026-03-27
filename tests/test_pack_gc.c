@@ -1076,6 +1076,99 @@ static void test_load_from_v1_pack(void **state) {
 }
 
 /* ================================================================== */
+/* Pack worker failure coverage                                        */
+/* ================================================================== */
+
+/* Helper: find the first loose object file path and return its hash.
+ * Returns 0 on success, -1 if no loose objects found. */
+static int find_first_loose_object(char *out_path, size_t path_sz) {
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", TEST_REPO);
+    DIR *top = opendir(obj_dir);
+    if (!top) return -1;
+    struct dirent *sub;
+    while ((sub = readdir(top)) != NULL) {
+        if (sub->d_name[0] == '.') continue;
+        if (strlen(sub->d_name) != 2) continue;
+        char sub_path[PATH_MAX];
+        snprintf(sub_path, sizeof(sub_path), "%s/%s", obj_dir, sub->d_name);
+        DIR *sd = opendir(sub_path);
+        if (!sd) continue;
+        struct dirent *ent;
+        while ((ent = readdir(sd)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            snprintf(out_path, path_sz, "%s/%s", sub_path, ent->d_name);
+            closedir(sd);
+            closedir(top);
+            return 0;
+        }
+        closedir(sd);
+    }
+    closedir(top);
+    return -1;
+}
+
+/*
+ * Truncate a loose object so the worker reads fewer bytes than expected.
+ * This triggers pack_worker_fail(ctx, ERR_CORRUPT) via read_full_fd.
+ */
+static void test_pack_worker_corrupt_truncated_object(void **state) {
+    (void)state;
+    /* Create several files and backup to produce loose objects */
+    for (int i = 0; i < 5; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/wf_%d.txt", TEST_SRC, i);
+        char content[128];
+        snprintf(content, sizeof(content), "worker fail test %d unique %d", i, i * 37 + 11);
+        write_file_str(path, content);
+    }
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Find and truncate a loose object to trigger read_full_fd failure */
+    char loose[PATH_MAX];
+    assert_int_equal(find_first_loose_object(loose, sizeof(loose)), 0);
+
+    struct stat st;
+    assert_int_equal(stat(loose, &st), 0);
+    assert_true(st.st_size > (off_t)sizeof(object_header_t));
+
+    /* Truncate to just the header — payload is gone, worker will short-read */
+    assert_int_equal(truncate(loose, (off_t)sizeof(object_header_t)), 0);
+
+    /* Pack should fail because worker can't read the full payload */
+    status_t pack_st = repo_pack(repo, NULL);
+    /* The worker sets ERR_CORRUPT; repo_pack may return ERR_CORRUPT or ERR_IO */
+    assert_true(pack_st != OK);
+}
+
+/*
+ * Delete a loose object entirely so the worker's open() returns -1.
+ * The worker should skip it (continue) without failure — the object
+ * simply vanishes between scan and pack.
+ */
+static void test_pack_worker_missing_object_skipped(void **state) {
+    (void)state;
+    for (int i = 0; i < 5; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/wm_%d.txt", TEST_SRC, i);
+        char content[128];
+        snprintf(content, sizeof(content), "worker missing test %d unique %d", i, i * 43 + 7);
+        write_file_str(path, content);
+    }
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    /* Delete one loose object — worker open() fails, should skip */
+    char loose[PATH_MAX];
+    assert_int_equal(find_first_loose_object(loose, sizeof(loose)), 0);
+    assert_int_equal(unlink(loose), 0);
+
+    /* Pack should succeed, just with fewer objects packed */
+    assert_int_equal(repo_pack(repo, NULL), OK);
+}
+
+/* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
 
@@ -1119,6 +1212,10 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_pack_with_invalid_thread_env, setup_empty, teardown),
         cmocka_unit_test_setup_teardown(test_pack_with_thread_count_capped, setup_empty, teardown),
         cmocka_unit_test_setup_teardown(test_load_from_v1_pack, setup_empty, teardown),
+
+        /* Pack worker failure coverage */
+        cmocka_unit_test_setup_teardown(test_pack_worker_corrupt_truncated_object, setup_empty, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_worker_missing_object_skipped, setup_empty, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
