@@ -10,6 +10,7 @@
 
 #include "../src/repo.h"
 #include "../src/snapshot.h"
+#include "../src/gfs.h"
 
 #define TEST_REPO "/tmp/c_backup_snap_test"
 
@@ -213,6 +214,59 @@ static void test_snapshot_flags_and_delete_edges(void **state) {
     assert_int_equal(snapshot_load(repo, 1, &gone), ERR_NOT_FOUND);
 }
 
+/*
+ * Regression test: snap_patch_gfs_flags must write the header parity record
+ * into the trailer, not at offset 60 (which is the payload start).
+ * Previously, setting GFS flags corrupted the compressed payload.
+ */
+static void test_gfs_flags_preserve_payload(void **state) {
+    (void)state;
+
+    /* Write a snapshot with enough nodes to trigger LZ4 compression. */
+    enum { NCOUNT = 200 };
+    node_t nodes[NCOUNT];
+    memset(nodes, 0, sizeof(nodes));
+    for (int i = 0; i < NCOUNT; i++) {
+        nodes[i].node_id = (uint64_t)(i + 1);
+        nodes[i].type    = NODE_TYPE_REG;
+        nodes[i].mode    = 0644;
+        nodes[i].size    = (uint64_t)(i * 100);
+    }
+
+    snapshot_t snap = {0};
+    snap.snap_id    = 1;
+    snap.node_count = NCOUNT;
+    snap.nodes      = nodes;
+    assert_int_equal(snapshot_write(repo, &snap), OK);
+
+    /* Load and verify original payload. */
+    snapshot_t *loaded = NULL;
+    assert_int_equal(snapshot_load(repo, 1, &loaded), OK);
+    assert_int_equal(loaded->node_count, (uint32_t)NCOUNT);
+    assert_int_equal(loaded->nodes[50].size, 5000u);
+    snapshot_free(loaded);
+
+    /* Set GFS flags — this is where the old bug corrupted the payload. */
+    assert_int_equal(snapshot_set_gfs_flags(repo, 1, GFS_DAILY | GFS_WEEKLY), OK);
+
+    /* Verify flags persisted. */
+    uint32_t flags = 0;
+    assert_int_equal(snapshot_read_gfs_flags(repo, 1, &flags), OK);
+    assert_true((flags & GFS_DAILY) != 0);
+    assert_true((flags & GFS_WEEKLY) != 0);
+
+    /* Reload and verify payload is still intact — not corrupted by flag write. */
+    loaded = NULL;
+    assert_int_equal(snapshot_load(repo, 1, &loaded), OK);
+    assert_int_equal(loaded->node_count, (uint32_t)NCOUNT);
+    for (int i = 0; i < NCOUNT; i++) {
+        assert_int_equal(loaded->nodes[i].node_id, (uint64_t)(i + 1));
+        assert_int_equal(loaded->nodes[i].size, (uint64_t)(i * 100));
+    }
+    assert_int_equal(loaded->gfs_flags & GFS_DAILY, GFS_DAILY);
+    snapshot_free(loaded);
+}
+
 static void test_snapshot_head_and_gfs_corrupt_inputs(void **state) {
     (void)state;
 
@@ -243,6 +297,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_snapshot_load_rejects_truncated_header, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pathmap_build_and_unseen_iteration, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_flags_and_delete_edges, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gfs_flags_preserve_payload, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_head_and_gfs_corrupt_inputs, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

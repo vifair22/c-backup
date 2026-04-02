@@ -529,8 +529,28 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
         return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite gfs_flags snap %u", snap_id);
     }
 
-    /* V5: recompute header parity record (covers the 60-byte header) */
+    /* V5: recompute header parity record (covers the 60-byte header).
+     * The header parity lives at the START of the parity trailer, not at
+     * offset 60 (that's the payload).  Locate the trailer via the footer. */
     if (version == SNAP_VERSION_V5) {
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) {
+            close(fd);
+            return set_error_errno(ERR_IO, "snap_patch_gfs_flags: fstat snap %u", snap_id);
+        }
+        parity_footer_t pftr;
+        off_t fend = (off_t)sb.st_size;
+        if (fend < (off_t)sizeof(pftr) ||
+            pread(fd, &pftr, sizeof(pftr), fend - (off_t)sizeof(pftr))
+                != (ssize_t)sizeof(pftr) ||
+            pftr.magic != PARITY_FOOTER_MAGIC) {
+            /* No valid parity footer — nothing to update. */
+            fdatasync(fd);
+            close(fd);
+            return OK;
+        }
+        off_t tstart = fend - (off_t)pftr.trailer_size;
+
         uint8_t hdr_buf[60];
         if (pread(fd, hdr_buf, 60, 0) != 60) {
             close(fd);
@@ -538,7 +558,7 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
         }
         parity_record_t hdr_par;
         parity_record_compute(hdr_buf, 60, &hdr_par);
-        if (pwrite(fd, &hdr_par, sizeof(hdr_par), 60) != (ssize_t)sizeof(hdr_par)) {
+        if (pwrite(fd, &hdr_par, sizeof(hdr_par), tstart) != (ssize_t)sizeof(hdr_par)) {
             close(fd);
             return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite parity snap %u", snap_id);
         }
