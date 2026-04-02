@@ -294,6 +294,65 @@ status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **o
     return snapshot_load_impl(repo, snap_id, out, 1);
 }
 
+status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
+    char path[PATH_MAX];
+    if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
+        return set_error(ERR_IO, "snapshot_load_header_only: path overflow for snap %u", snap_id);
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        if (errno == ENOENT)
+            return set_error(ERR_NOT_FOUND, "snapshot %u not found", snap_id);
+        return set_error_errno(ERR_IO, "cannot open snapshot %u", snap_id);
+    }
+
+    uint32_t magic = 0, version = 0;
+    if (read(fd, &magic,   sizeof(magic))   != sizeof(magic)   ||
+        read(fd, &version, sizeof(version)) != sizeof(version)) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "snapshot %u: truncated header", snap_id);
+    }
+    if (magic != SNAP_MAGIC ||
+        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
+         version != SNAP_VERSION_V5)) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "snapshot %u: invalid magic/version", snap_id);
+    }
+
+    uint32_t snap_id_f = 0, node_count = 0, dirent_count = 0, gfs_flags = 0;
+    uint32_t snap_flags = 0;
+    uint64_t created_sec = 0, phys_new_bytes = 0, dirent_data_len = 0;
+
+#define RD32(v) (read(fd, &(v), 4) != 4)
+#define RD64(v) (read(fd, &(v), 8) != 8)
+    if (RD32(snap_id_f) || RD64(created_sec) || RD64(phys_new_bytes)) {
+        close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated header fields", snap_id);
+    }
+    if (RD32(node_count) || RD32(dirent_count) || RD64(dirent_data_len) || RD32(gfs_flags)) {
+        close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated header counts", snap_id);
+    }
+    if (RD32(snap_flags)) { close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated snap_flags", snap_id); }
+#undef RD32
+#undef RD64
+
+    close(fd);
+
+    snapshot_t *snap = calloc(1, sizeof(*snap));
+    if (!snap) return set_error(ERR_NOMEM, "snapshot %u: alloc failed", snap_id);
+    snap->snap_id         = snap_id_f;
+    snap->version         = version;
+    snap->created_sec     = created_sec;
+    snap->phys_new_bytes  = phys_new_bytes;
+    snap->node_count      = node_count;
+    snap->dirent_count    = dirent_count;
+    snap->dirent_data_len = (size_t)dirent_data_len;
+    snap->gfs_flags       = gfs_flags;
+    snap->snap_flags      = snap_flags;
+
+    *out = snap;
+    return OK;
+}
+
 status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/snap.XXXXXX", repo_path(repo))

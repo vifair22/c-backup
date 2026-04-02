@@ -25,6 +25,48 @@
 #include <openssl/evp.h>
 
 /* ------------------------------------------------------------------ */
+/* Session snapshot cache                                              */
+/* ------------------------------------------------------------------ */
+
+/* Single-slot cache: keeps the last loaded snapshot alive so repeated
+ * snap_dir_children calls for the same snap_id don't reload + decompress
+ * the entire snapshot each time.  Only active during json_api_session(). */
+static snapshot_t *_cached_snap  = NULL;
+static uint32_t    _cached_snap_id = 0;
+static int         _cache_active = 0;
+
+static snapshot_t *session_snap_get(repo_t *repo, uint32_t snap_id)
+{
+    if (_cache_active && _cached_snap && _cached_snap_id == snap_id)
+        return _cached_snap;
+
+    /* Evict old entry */
+    if (_cached_snap) {
+        snapshot_free(_cached_snap);
+        _cached_snap = NULL;
+    }
+
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK)
+        return NULL;
+
+    if (_cache_active) {
+        _cached_snap = snap;
+        _cached_snap_id = snap_id;
+    }
+    return snap;
+}
+
+static void session_snap_cache_clear(void)
+{
+    if (_cached_snap) {
+        snapshot_free(_cached_snap);
+        _cached_snap = NULL;
+    }
+    _cached_snap_id = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -218,8 +260,16 @@ static cJSON *handle_snap(repo_t *repo, const cJSON *params)
         return set_error(ERR_INVALID, "snap: missing 'id' param"), NULL;
 
     uint32_t snap_id = (uint32_t)jid->valuedouble;
+
+    int from_cache = 0;
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+    if (_cache_active) {
+        snap = session_snap_get(repo, snap_id);
+        if (snap) from_cache = 1;
+    }
+    if (!snap) {
+        if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+    }
 
     cJSON *d = cJSON_CreateObject();
     snap_add_header_fields(d, snap);
@@ -255,7 +305,7 @@ static cJSON *handle_snap(repo_t *repo, const cJSON *params)
         }
     }
 
-    snapshot_free(snap);
+    if (!from_cache) snapshot_free(snap);
     return d;
 }
 
@@ -268,7 +318,7 @@ static cJSON *handle_snap_header(repo_t *repo, const cJSON *params)
 
     uint32_t snap_id = (uint32_t)jid->valuedouble;
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+    if (snapshot_load_header_only(repo, snap_id, &snap) != OK) return NULL;
 
     cJSON *d = cJSON_CreateObject();
     snap_add_header_fields(d, snap);
@@ -289,8 +339,16 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
     uint32_t snap_id     = (uint32_t)jid->valuedouble;
     uint64_t parent_node = (uint64_t)jpn->valuedouble;
 
+    /* Use session cache if active (avoids reloading 500K-entry snap per expansion) */
+    int from_cache = 0;
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+    if (_cache_active) {
+        snap = session_snap_get(repo, snap_id);
+        if (snap) from_cache = 1;
+    }
+    if (!snap) {
+        if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+    }
 
     /* Pass 1: collect set of all parent_node values (to answer has_children).
      * Use a simple open-addressing hash set of uint64_t. */
@@ -299,7 +357,7 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
     int *pset_occ  = calloc(set_cap, sizeof(int));
     if (!pset || !pset_occ) {
         free(pset); free(pset_occ);
-        snapshot_free(snap);
+        if (!from_cache) snapshot_free(snap);
         return set_error(ERR_NOMEM, "snap_dir_children: alloc failed"), NULL;
     }
 
@@ -370,7 +428,7 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
 
     free(pset);
     free(pset_occ);
-    snapshot_free(snap);
+    if (!from_cache) snapshot_free(snap);
     return d;
 }
 
@@ -1696,6 +1754,9 @@ int json_api_session(repo_t *repo)
     /* Shared lock for the lifetime of the session */
     repo_lock_shared(repo);
 
+    /* Enable snapshot cache for the session lifetime */
+    _cache_active = 1;
+
     char *line = NULL;
     size_t line_cap = 0;
     ssize_t line_len;
@@ -1754,5 +1815,7 @@ int json_api_session(repo_t *repo)
     }
 
     free(line);
+    session_snap_cache_clear();
+    _cache_active = 0;
     return 0;
 }

@@ -263,6 +263,7 @@ class Session:
                 req["params"] = {k: v for k, v in params.items()
                                  if v is not None}
 
+            _log_rpc("session", action, params)
             t0 = time.monotonic()
             line_out = json.dumps(req, separators=(",", ":")) + "\n"
             try:
@@ -403,6 +404,14 @@ def call(repo_spec: str, action: str, **params) -> dict:
 _SLOW_THRESHOLD = 5.0
 
 
+def _log_rpc(mode: str, action: str, params: dict) -> None:
+    p = ""
+    if params:
+        p = " " + " ".join(f"{k}={v}" for k, v in params.items()
+                            if v is not None)
+    print(f"[RPC] {mode}  {action}{p}")
+
+
 def _log_slow(mode: str, action: str, params: dict, elapsed: float) -> None:
     p = ""
     if params:
@@ -427,6 +436,7 @@ def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
         cmd = ["ssh"] + _ssh_base_opts(host) + [host,
                REMOTE_BIN, "--json", repo_path]
 
+    _log_rpc("oneshot", action, params)
     t0 = time.monotonic()
     try:
         proc = subprocess.run(

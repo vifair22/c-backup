@@ -418,7 +418,7 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
     for (uint32_t id = 1; id <= head; id++) {
         parity_stats_t snap_before = parity_stats_get();
         snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) continue;
+        if (snapshot_load_nodes_only(repo, id, &snap) != OK) continue;
         if (do_repair) {
             parity_stats_t snap_after = parity_stats_get();
             if (snap_after.repaired > snap_before.repaired) {

@@ -163,7 +163,7 @@ static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
 
     for (uint32_t id = 1; id <= head_id; id++) {
         snapshot_t *s = NULL;
-        if (snapshot_load(repo, id, &s) != OK) continue;
+        if (snapshot_load_header_only(repo, id, &s) != OK) continue;
         arr[n].id        = id;
         arr[n].ts        = s->created_sec;
         arr[n].gfs_flags = s->gfs_flags;

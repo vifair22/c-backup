@@ -841,7 +841,7 @@ static status_t delete_tags_for_snap(repo_t *repo, uint32_t snap_id,
 static uint32_t find_latest_existing_snapshot(repo_t *repo, uint32_t start_from) {
     for (uint32_t id = start_from; id >= 1; id--) {
         snapshot_t *s = NULL;
-        if (snapshot_load(repo, id, &s) == OK) {
+        if (snapshot_load_header_only(repo, id, &s) == OK) {
             snapshot_free(s);
             return id;
         }
@@ -912,72 +912,69 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
         return 0;
     }
 
+    snap_list_t *sl = NULL;
+    if (snapshot_list_all(repo, &sl) != OK) {
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "failed to list snapshots");
+        return 1;
+    }
+
     if (!simple) {
         printf("head  id        timestamp            ent      logical  phys_new  manifest  gfs   tag\n");
     }
-    for (uint32_t id = 1; id <= head; id++) {
-        char head_mark = (id == head) ? '*' : '-';
 
-        snapshot_t *snap = NULL;
-        int has_snap = (snapshot_load(repo, id, &snap) == OK);
-        if (simple && !has_snap) {
-            printf("snapshot %08u  [pruned]\n", id);
+    /* Walk 1..head, using sl->snaps[] for existing snapshots and showing
+     * pruned gaps.  si tracks position in the sorted snap list. */
+    uint32_t si = 0;
+    for (uint32_t id = 1; id <= head; id++) {
+        const snap_info_t *info = NULL;
+        if (si < sl->count && sl->snaps[si].id == id)
+            info = &sl->snaps[si++];
+
+        if (!info) {
+            if (simple) {
+                printf("snapshot %08u  [pruned]\n", id);
+            } else {
+                char head_mark = (id == head) ? '*' : '-';
+                char tagbuf[256];
+                list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
+                printf("%c     %08u  %-19s  %7s  %-7s  %-8s  %c         %-4s  %s\n",
+                       head_mark, id, "-", "-", "-", "-", '-', "-", tagbuf);
+            }
             continue;
         }
 
+        char head_mark = (id == head) ? '*' : '-';
         char timebuf[32] = "-";
-        uint32_t entries = 0;
-        uint64_t bytes = 0;
-        uint64_t phys_new = 0;
-        char gfsbuf[64] = "-";
-        if (has_snap) {
-            entries = snap->node_count;
-            for (uint32_t i = 0; i < snap->node_count; i++) {
-                if (snap->nodes[i].type == NODE_TYPE_REG)
-                    bytes += snap->nodes[i].size;
-            }
-            phys_new = snap->phys_new_bytes;
-            if (snap->created_sec > 0) {
-                time_t t = (time_t)snap->created_sec;
-                struct tm *tm = localtime(&t);
-                if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
-            }
-            if (snap->gfs_flags) gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
+        if (info->created_sec > 0) {
+            time_t t = (time_t)info->created_sec;
+            struct tm *tm = localtime(&t);
+            if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
         }
+        char gfsbuf[64] = "-";
+        if (info->gfs_flags) gfs_flags_str(info->gfs_flags, gfsbuf, sizeof(gfsbuf));
+
+        char sizebuf[16], physbuf[16];
+        fmt_bytes_short(info->logical_bytes, sizebuf, sizeof(sizebuf));
+        fmt_bytes_short(info->phys_new_bytes, physbuf, sizeof(physbuf));
 
         if (simple) {
-            char sizebuf[16], physbuf[16];
-            fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
-            fmt_bytes_short(phys_new, physbuf, sizeof(physbuf));
-            if (snap->gfs_flags) {
+            if (info->gfs_flags) {
                 printf("snapshot %08u  %s  %s  +%s  [%s]  %u entries\n",
-                       id, timebuf, sizebuf, physbuf, gfsbuf, entries);
+                       id, timebuf, sizebuf, physbuf, gfsbuf, info->node_count);
             } else {
                 printf("snapshot %08u  %s  %s  +%s  %u entries\n",
-                       id, timebuf, sizebuf, physbuf, entries);
+                       id, timebuf, sizebuf, physbuf, info->node_count);
             }
-            snapshot_free(snap);
-            continue;
-        }
-
-        char tagbuf[256];
-        list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
-
-        if (has_snap) {
-            char sizebuf[16], physbuf[16];
-            fmt_bytes_short(bytes, sizebuf, sizeof(sizebuf));
-            fmt_bytes_short(phys_new, physbuf, sizeof(physbuf));
-            printf("%c     %08u  %-19s  %7u  %-7s  %-8s  %c         %-4s  %s\n",
-                   head_mark, id, timebuf, entries,
-                   sizebuf, physbuf, 'Y', gfsbuf, tagbuf);
         } else {
-            printf("%c     %08u  %-19s  %7s  %-7s  %-8s  %c         %-4s  %s\n",
-                   head_mark, id, "-", "-",
-                   "-", "-", '-', "-", tagbuf);
+            char tagbuf[256];
+            list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
+            printf("%c     %08u  %-19s  %7u  %-7s  %-8s  %c         %-4s  %s\n",
+                   head_mark, id, timebuf, info->node_count,
+                   sizebuf, physbuf, 'Y', gfsbuf, tagbuf);
         }
-
-        snapshot_free(snap);
     }
+    snap_list_free(sl);
     return 0;
 }
 
@@ -1468,7 +1465,7 @@ static int cmd_snapshot(repo_t *repo, int argc, char **argv) {
     }
 
     snapshot_t *snap = NULL;
-    if (snapshot_load(repo, snap_id, &snap) != OK) {
+    if (snapshot_load_header_only(repo, snap_id, &snap) != OK) {
         fprintf(stderr, "error: snapshot %u manifest not found\n", snap_id);
         return 1;
     }

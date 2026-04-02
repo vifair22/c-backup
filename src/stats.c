@@ -38,7 +38,7 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
 
     if (out->snap_total > 0) {
         snapshot_t *head = NULL;
-        if (snapshot_load(repo, out->snap_total, &head) == OK) {
+        if (snapshot_load_nodes_only(repo, out->snap_total, &head) == OK) {
             out->head_entries = head->node_count;
             for (uint32_t i = 0; i < head->node_count; i++) {
                 if (head->nodes[i].type == NODE_TYPE_REG)

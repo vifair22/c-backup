@@ -36,6 +36,7 @@ typedef struct {
 
 status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out);
 status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **out);
+status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **out);
 status_t snapshot_write(repo_t *repo, snapshot_t *snap);
 status_t snapshot_delete(repo_t *repo, uint32_t snap_id);
 void     snapshot_free(snapshot_t *snap);
