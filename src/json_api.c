@@ -199,6 +199,18 @@ static cJSON *handle_list(repo_t *repo, const cJSON *params)
 }
 
 /* --- snap --------------------------------------------------------- */
+static void snap_add_header_fields(cJSON *d, const snapshot_t *snap)
+{
+    cJSON_AddNumberToObject(d, "snap_id",       snap->snap_id);
+    cJSON_AddNumberToObject(d, "version",       snap->version);
+    cJSON_AddNumberToObject(d, "created_sec",   (double)snap->created_sec);
+    cJSON_AddNumberToObject(d, "phys_new_bytes",(double)snap->phys_new_bytes);
+    cJSON_AddNumberToObject(d, "node_count",    snap->node_count);
+    cJSON_AddNumberToObject(d, "dirent_count",  snap->dirent_count);
+    cJSON_AddNumberToObject(d, "gfs_flags",     snap->gfs_flags);
+    cJSON_AddNumberToObject(d, "snap_flags",    snap->snap_flags);
+}
+
 static cJSON *handle_snap(repo_t *repo, const cJSON *params)
 {
     const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
@@ -210,13 +222,7 @@ static cJSON *handle_snap(repo_t *repo, const cJSON *params)
     if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
 
     cJSON *d = cJSON_CreateObject();
-    cJSON_AddNumberToObject(d, "snap_id",       snap->snap_id);
-    cJSON_AddNumberToObject(d, "created_sec",   (double)snap->created_sec);
-    cJSON_AddNumberToObject(d, "phys_new_bytes",(double)snap->phys_new_bytes);
-    cJSON_AddNumberToObject(d, "node_count",    snap->node_count);
-    cJSON_AddNumberToObject(d, "dirent_count",  snap->dirent_count);
-    cJSON_AddNumberToObject(d, "gfs_flags",     snap->gfs_flags);
-    cJSON_AddNumberToObject(d, "snap_flags",    snap->snap_flags);
+    snap_add_header_fields(d, snap);
 
     /* Nodes */
     cJSON *nodes = cJSON_AddArrayToObject(d, "nodes");
@@ -249,6 +255,121 @@ static cJSON *handle_snap(repo_t *repo, const cJSON *params)
         }
     }
 
+    snapshot_free(snap);
+    return d;
+}
+
+/* --- snap_header: header only, no nodes/dirents -------------------- */
+static cJSON *handle_snap_header(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
+    if (!cJSON_IsNumber(jid))
+        return set_error(ERR_INVALID, "snap_header: missing 'id' param"), NULL;
+
+    uint32_t snap_id = (uint32_t)jid->valuedouble;
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    snap_add_header_fields(d, snap);
+    snapshot_free(snap);
+    return d;
+}
+
+/* --- snap_dir_children: lazy dir tree expansion --------------------- */
+static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
+    const cJSON *jpn = cJSON_GetObjectItemCaseSensitive(params, "parent_node");
+    if (!cJSON_IsNumber(jid))
+        return set_error(ERR_INVALID, "snap_dir_children: missing 'id' param"), NULL;
+    if (!cJSON_IsNumber(jpn))
+        return set_error(ERR_INVALID, "snap_dir_children: missing 'parent_node' param"), NULL;
+
+    uint32_t snap_id     = (uint32_t)jid->valuedouble;
+    uint64_t parent_node = (uint64_t)jpn->valuedouble;
+
+    snapshot_t *snap = NULL;
+    if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
+
+    /* Pass 1: collect set of all parent_node values (to answer has_children).
+     * Use a simple open-addressing hash set of uint64_t. */
+    size_t set_cap = snap->dirent_count < 16 ? 32 : snap->dirent_count * 2;
+    uint64_t *pset = calloc(set_cap, sizeof(uint64_t));
+    int *pset_occ  = calloc(set_cap, sizeof(int));
+    if (!pset || !pset_occ) {
+        free(pset); free(pset_occ);
+        snapshot_free(snap);
+        return set_error(ERR_NOMEM, "snap_dir_children: alloc failed"), NULL;
+    }
+
+    if (snap->dirent_data && snap->dirent_data_len > 0) {
+        const uint8_t *p   = snap->dirent_data;
+        const uint8_t *end = p + snap->dirent_data_len;
+        while (p + sizeof(dirent_rec_t) <= end) {
+            const dirent_rec_t *rec = (const dirent_rec_t *)p;
+            p += sizeof(dirent_rec_t);
+            if (p + rec->name_len > end) break;
+            /* Insert rec->parent_node into hash set */
+            uint64_t pn = rec->parent_node;
+            size_t slot = (size_t)(pn * 0x9E3779B97F4A7C15ULL >> 32) & (set_cap - 1);
+            while (pset_occ[slot] && pset[slot] != pn)
+                slot = (slot + 1) & (set_cap - 1);
+            pset[slot] = pn;
+            pset_occ[slot] = 1;
+            p += rec->name_len;
+        }
+    }
+
+    /* Pass 2: find children of parent_node, emit with node metadata */
+    cJSON *d = cJSON_CreateObject();
+    cJSON *children = cJSON_AddArrayToObject(d, "children");
+
+    if (snap->dirent_data && snap->dirent_data_len > 0) {
+        const uint8_t *p   = snap->dirent_data;
+        const uint8_t *end = p + snap->dirent_data_len;
+        while (p + sizeof(dirent_rec_t) <= end) {
+            const dirent_rec_t *rec = (const dirent_rec_t *)p;
+            p += sizeof(dirent_rec_t);
+            if (p + rec->name_len > end) break;
+
+            if ((uint64_t)rec->parent_node == parent_node) {
+                cJSON *child = cJSON_CreateObject();
+                cJSON_AddNumberToObject(child, "node_id", (double)rec->node_id);
+
+                char *name = malloc((size_t)rec->name_len + 1);
+                if (name) {
+                    memcpy(name, p, rec->name_len);
+                    name[rec->name_len] = '\0';
+                    cJSON_AddStringToObject(child, "name", name);
+                    free(name);
+                }
+
+                const node_t *nd = snapshot_find_node(snap, rec->node_id);
+                if (nd) {
+                    cJSON_AddNumberToObject(child, "type", nd->type);
+                    cJSON_AddNumberToObject(child, "size", (double)nd->size);
+                    cJSON_AddNumberToObject(child, "mode", nd->mode);
+                }
+
+                /* has_children: check if this node_id exists as a parent */
+                uint64_t nid = rec->node_id;
+                size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & (set_cap - 1);
+                int hc = 0;
+                while (pset_occ[slot]) {
+                    if (pset[slot] == nid) { hc = 1; break; }
+                    slot = (slot + 1) & (set_cap - 1);
+                }
+                cJSON_AddBoolToObject(child, "has_children", hc);
+
+                cJSON_AddItemToArray(children, child);
+            }
+            p += rec->name_len;
+        }
+    }
+
+    free(pset);
+    free(pset_occ);
     snapshot_free(snap);
     return d;
 }
@@ -1475,6 +1596,8 @@ static const action_entry_t actions[] = {
     { "stats",            handle_stats },
     { "list",             handle_list },
     { "snap",             handle_snap },
+    { "snap_header",      handle_snap_header },
+    { "snap_dir_children", handle_snap_dir_children },
     { "tags",             handle_tags },
     { "policy",           handle_policy },
     { "save_policy",      handle_save_policy },

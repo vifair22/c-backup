@@ -18,6 +18,7 @@
  */
 typedef struct {
     uint32_t    snap_id;
+    uint32_t    version;       /* on-disk format version (V3/V4/V5) */
     uint64_t    created_sec;   /* wall-clock time when snapshot was written */
     uint64_t    phys_new_bytes; /* deduped physical bytes first introduced by this snapshot */
     uint32_t    node_count;

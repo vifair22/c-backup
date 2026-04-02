@@ -23,12 +23,12 @@ class SnapshotsTab:
         self._repo_path: str | None = None
         self._snap_ids: list[int] = []
         self._snap_headers: list[dict] = []
-        self._current_snap: dict | None = None
+        self._current_snap_id: int | None = None
+        self._current_header: dict | None = None
+        # Legacy full-snap data (loaded on demand for Nodes tab)
         self._all_nodes: list[dict] = []
-        self._node_map: dict[int, dict] = {}   # node_id → node dict (O(1) lookup)
-        self._dir_children: dict[int, list] = {}
-        self._node_type_map: dict[int, int] = {}
-        self._empty_node_ids: set[int] = set()
+        self._node_map: dict[int, dict] = {}
+        self._nodes_loaded_for: int | None = None
         self._load_generation: int = 0
         self._build()
 
@@ -204,12 +204,18 @@ class SnapshotsTab:
 
         def _worker() -> None:
             try:
-                s = call(repo_path, "snap", id=snap_id)
+                hdr = call(repo_path, "snap_header", id=snap_id)
             except RPCError as e:
                 err = str(e)
                 ui_call(lambda: self._on_load_error(err, gen))
                 return
-            ui_call(lambda: self._finish_load(s, gen))
+            # Also fetch root children for the dir tree
+            try:
+                root = call(repo_path, "snap_dir_children",
+                            id=snap_id, parent_node=0)
+            except RPCError:
+                root = {"children": []}
+            ui_call(lambda: self._finish_load(snap_id, hdr, root, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -220,21 +226,25 @@ class SnapshotsTab:
         self._list.config(state=tk.NORMAL)
         messagebox.showerror("Parse error", err)
 
-    def _finish_load(self, s: dict, gen: int) -> None:
+    def _finish_load(self, snap_id: int, hdr: dict,
+                     root: dict, gen: int) -> None:
         if gen != self._load_generation:
             return
         self._loading_label.config(text="")
         self._list.config(state=tk.NORMAL)
-        self._current_snap = s
-        self._all_nodes = s.get("nodes", [])
-        self._node_map  = {int(n["node_id"]): n for n in self._all_nodes}
+        self._current_snap_id = snap_id
+        self._current_header = hdr
+        self._all_nodes = []
+        self._node_map = {}
+        self._nodes_loaded_for = None
         self._filter_var.set("")
-        self._populate_header(s)
-        self._populate_dir_tree(s)
+        self._populate_header(hdr)
+        self._populate_dir_tree(root)
 
     def _populate_header(self, s: dict) -> None:
         lines = [
             f"Snap ID        : {s.get('snap_id', '?')}",
+            f"Version        : {s.get('version', '?')}",
             f"Created        : {fmt_time(int(s.get('created_sec', 0)))}",
             f"New bytes      : {fmt_size(int(s.get('phys_new_bytes', 0)))}",
             f"Node count     : {s.get('node_count', 0)}",
@@ -244,8 +254,26 @@ class SnapshotsTab:
         ]
         set_text(self._hdr_text, "\n".join(lines))
 
-    # filter + paginate node tree
+    # ---- Nodes tab (lazy: loads full snap only when needed) ----
+
+    def _ensure_nodes_loaded(self) -> None:
+        """Load the full snap (nodes only) if not already loaded for current snap."""
+        if (self._nodes_loaded_for == self._current_snap_id
+                and self._all_nodes):
+            return
+        if not self._repo_path or not self._current_snap_id:
+            return
+        try:
+            s = call(self._repo_path, "snap", id=self._current_snap_id)
+            self._all_nodes = s.get("nodes", [])
+            self._node_map = {int(n["node_id"]): n for n in self._all_nodes}
+            self._nodes_loaded_for = self._current_snap_id
+        except RPCError:
+            self._all_nodes = []
+            self._node_map = {}
+
     def _apply_filter(self) -> None:
+        self._ensure_nodes_loaded()
         prefix = self._filter_var.get().strip().lower()
         if prefix:
             visible = [nd for nd in self._all_nodes
@@ -279,7 +307,7 @@ class SnapshotsTab:
 
     def _on_node_select(self, _event) -> None:
         sel = self._node_tree.selection()
-        if not sel or not self._current_snap:
+        if not sel or not self._current_snap_id:
             return
         node_id = int(self._node_tree.item(sel[0])["values"][0])
         nd = self._node_map.get(node_id)
@@ -307,7 +335,7 @@ class SnapshotsTab:
 
     def _on_node_dbl(self, _event) -> None:
         sel = self._node_tree.selection()
-        if not sel or not self._current_snap:
+        if not sel or not self._current_snap_id:
             return
         node_id = int(self._node_tree.item(sel[0])["values"][0])
         self._snap_nb.select(2)   # Directory tree tab
@@ -315,11 +343,16 @@ class SnapshotsTab:
 
     def _on_dir_dbl(self, _event) -> None:
         sel = self._dir_tree.selection()
-        if not sel or not self._current_snap or not self._repo_path:
+        if not sel or not self._current_snap_id or not self._repo_path:
             return
         item = sel[0]
         node_id  = int(self._dir_tree.item(item)["values"][1])
         filename = self._dir_tree.item(item)["text"]
+
+        # Get content hash from dir tree stored data or via node lookup
+        content_hash = self._dir_tree.item(item).get("tags", [""])[0] if False else None
+        # We need to look up the node — use snap_dir_children data or call object_locate
+        self._ensure_nodes_loaded()
         nd = self._node_map.get(node_id)
         if not nd:
             return
@@ -341,6 +374,7 @@ class SnapshotsTab:
             return
         self._dir_tree.selection_set(item)
         node_id = int(self._dir_tree.item(item)["values"][1])
+        self._ensure_nodes_loaded()
         nd = self._node_map.get(node_id)
         has_content = nd is not None and nd["content_hash"] != ZERO_HASH
         self._dir_ctx.entryconfig("Export file…",
@@ -349,11 +383,12 @@ class SnapshotsTab:
 
     def _export_dir_item(self) -> None:
         sel = self._dir_tree.selection()
-        if not sel or not self._current_snap or not self._repo_path:
+        if not sel or not self._current_snap_id or not self._repo_path:
             return
         item = sel[0]
         node_id  = int(self._dir_tree.item(item)["values"][1])
         filename = self._dir_tree.item(item)["text"]
+        self._ensure_nodes_loaded()
         nd = self._node_map.get(node_id)
         if nd is None or nd["content_hash"] == ZERO_HASH:
             messagebox.showinfo("No content", "This item has no file content to export.")
@@ -377,43 +412,37 @@ class SnapshotsTab:
         except OSError as e:
             messagebox.showerror("Write error", str(e))
 
-    # ---- dir tree population ----
+    # ---- dir tree (lazy via snap_dir_children RPC) ----
 
-    def _dir_tag(self, node_id: int) -> str:
-        ntype = self._node_type_map.get(node_id)
+    def _dir_tag_from_child(self, child: dict) -> str:
+        ntype = int(child.get("type", 0))
         if ntype == NODE_TYPE_DIR:
             return "dir"
         if ntype == NODE_TYPE_SYMLINK:
             return "symlink"
-        if node_id in self._empty_node_ids:
+        if ntype == NODE_TYPE_REG and int(child.get("size", 1)) == 0:
             return "empty"
         return ""
 
-    def _kind_label(self, node_id: int) -> str:
-        ntype = self._node_type_map.get(node_id)
-        return NODE_TYPE_NAMES.get(ntype, "") if ntype else ""
+    def _kind_label_from_child(self, child: dict) -> str:
+        ntype = int(child.get("type", 0))
+        return NODE_TYPE_NAMES.get(ntype, "")
 
-    def _populate_dir_tree(self, s: dict) -> None:
+    def _populate_dir_tree(self, root_data: dict) -> None:
         rows = self._dir_tree.get_children()
         if rows:
             self._dir_tree.delete(*rows)
 
-        self._dir_children = {}
-        for d in s.get("dirents", []):
-            self._dir_children.setdefault(int(d["parent_node"]), []).append(d)
-
-        self._node_type_map  = {int(n["node_id"]): int(n["type"]) for n in s.get("nodes", [])}
-        self._empty_node_ids = {int(n["node_id"]) for n in s.get("nodes", [])
-                                if int(n["type"]) == NODE_TYPE_REG and int(n["size"]) == 0}
-
-        for d in sorted(self._dir_children.get(0, []), key=lambda x: x["name"]):
-            nid = int(d["node_id"])
-            tag = self._dir_tag(nid)
-            item = self._dir_tree.insert("", tk.END,
-                                         text=d["name"],
-                                         values=(self._kind_label(nid), nid),
-                                         tags=(tag,) if tag else ())
-            if nid in self._dir_children:
+        for child in sorted(root_data.get("children", []),
+                            key=lambda x: x.get("name", "")):
+            nid = int(child["node_id"])
+            tag = self._dir_tag_from_child(child)
+            item = self._dir_tree.insert(
+                "", tk.END,
+                text=child.get("name", "?"),
+                values=(self._kind_label_from_child(child), nid),
+                tags=(tag,) if tag else ())
+            if child.get("has_children"):
                 self._dir_tree.insert(item, tk.END, text=_DIR_SENTINEL)
 
     def _on_dir_open(self, _event) -> None:
@@ -426,19 +455,33 @@ class SnapshotsTab:
 
     def _expand_item(self, item: str) -> None:
         children = self._dir_tree.get_children(item)
-        if (len(children) == 1 and
+        if not (len(children) == 1 and
                 self._dir_tree.item(children[0])["text"] == _DIR_SENTINEL):
-            self._dir_tree.delete(children[0])
-            node_id = int(self._dir_tree.item(item)["values"][1])
-            for d in sorted(self._dir_children.get(node_id, []), key=lambda x: x["name"]):
-                nid = int(d["node_id"])
-                tag = self._dir_tag(nid)
-                child = self._dir_tree.insert(item, tk.END,
-                                              text=d["name"],
-                                              values=(self._kind_label(nid), nid),
-                                              tags=(tag,) if tag else ())
-                if nid in self._dir_children:
-                    self._dir_tree.insert(child, tk.END, text=_DIR_SENTINEL)
+            return
+        self._dir_tree.delete(children[0])
+
+        node_id = int(self._dir_tree.item(item)["values"][1])
+        if not self._repo_path or not self._current_snap_id:
+            return
+
+        try:
+            data = call(self._repo_path, "snap_dir_children",
+                        id=self._current_snap_id, parent_node=node_id)
+        except RPCError:
+            return
+
+        for child in sorted(data.get("children", []),
+                            key=lambda x: x.get("name", "")):
+            nid = int(child["node_id"])
+            tag = self._dir_tag_from_child(child)
+            new_item = self._dir_tree.insert(
+                item, tk.END,
+                text=child.get("name", "?"),
+                values=(self._kind_label_from_child(child), nid),
+                tags=(tag,) if tag else ())
+            if child.get("has_children"):
+                self._dir_tree.insert(new_item, tk.END, text=_DIR_SENTINEL)
+
         self._dir_tree.item(item, open=True)
 
     # ---- navigation helpers ----
@@ -450,7 +493,7 @@ class SnapshotsTab:
         self._list.selection_clear(0, tk.END)
         self._list.selection_set(idx)
         self._list.see(idx)
-        if not self._current_snap or self._current_snap.get("snap_id") != snap_id:
+        if self._current_snap_id != snap_id:
             self._load(snap_id)
         self._snap_nb.select(2)
         self._frame.after(50, lambda p=full_path: self._reveal_by_path(p))
@@ -478,11 +521,22 @@ class SnapshotsTab:
             self._dir_tree.see(last_item)
 
     def _reveal_by_node_id(self, target_node_id: int) -> None:
-        if not self._current_snap:
+        """Navigate to a node by ID — requires loading full snap for path resolution."""
+        if not self._current_snap_id or not self._repo_path:
             return
+
+        # Need the full snap to build parent chain
+        try:
+            s = call(self._repo_path, "snap", id=self._current_snap_id)
+        except RPCError:
+            return
+
         parent_of: dict[int, int] = {}
-        for d in self._current_snap.get("dirents", []):
-            parent_of[int(d["node_id"])] = int(d["parent_node"])
+        name_of: dict[int, str] = {}
+        for d in s.get("dirents", []):
+            nid = int(d["node_id"])
+            parent_of[nid] = int(d["parent_node"])
+            name_of[nid] = d.get("name", "?")
 
         chain: list[int] = []
         nid = target_node_id
@@ -493,22 +547,6 @@ class SnapshotsTab:
             nid = parent_of[nid]
         chain.reverse()
 
-        parent_item = ""
-        last_item   = None
-        for node_id in chain:
-            if parent_item != "":
-                self._expand_item(parent_item)
-            item = None
-            for child in self._dir_tree.get_children(parent_item):
-                vals = self._dir_tree.item(child)["values"]
-                if vals and int(vals[1]) == node_id:
-                    item = child
-                    break
-            if item is None:
-                break
-            parent_item = item
-            last_item   = item
-
-        if last_item:
-            self._dir_tree.selection_set(last_item)
-            self._dir_tree.see(last_item)
+        # Build path and use _reveal_by_path
+        path = "/".join(name_of.get(n, "?") for n in chain)
+        self._reveal_by_path(path)

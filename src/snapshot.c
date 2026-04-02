@@ -176,6 +176,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
     snapshot_t *snap = calloc(1, sizeof(*snap));
     if (!snap) { close(fd); return set_error(ERR_NOMEM, "snapshot %u: alloc failed", snap_id); }
     snap->snap_id         = snap_id_f;
+    snap->version         = version;
     snap->created_sec     = created_sec;
     snap->phys_new_bytes  = phys_new_bytes;
     snap->node_count      = node_count;
