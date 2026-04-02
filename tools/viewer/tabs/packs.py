@@ -23,6 +23,12 @@ _C_LZ4       = "#f28e2b"
 _C_LZ4_FRAME      = "#e15759"
 _C_LZ4_FRAME_FLAT = "#f0c060"   # lz4-frame with ratio ≥ 1.0 (no compression benefit)
 _C_UNKNOWN        = "#cccccc"
+_C_FHDR_CRC       = "#76b7b2"   # teal – file header CRC
+_C_HDR_PARITY     = "#b07aa1"   # purple – XOR header parity
+_C_RS_PARITY      = "#59a14f"   # green – Reed-Solomon parity
+_C_PAR_CRC        = "#edc948"   # gold – payload CRC + metadata
+_C_OFFSET_TBL     = "#9c755f"   # brown – parity offset table
+_C_PAR_FOOTER     = "#4e79a7"   # steel blue – parity footer
 
 _COMP_COLOR = {
     COMPRESS_NONE:      _C_NONE,
@@ -30,13 +36,22 @@ _COMP_COLOR = {
     COMPRESS_LZ4_FRAME: _C_LZ4_FRAME,
 }
 
-_LEGEND = [
+_LEGEND_ROW1 = [
     (_C_FILE_HDR,       "File header"),
     (_C_ENTRY_HDR,      "Entry header"),
-    (_C_NONE,           "Payload — uncompressed"),
-    (_C_LZ4,            "Payload — lz4-block"),
+    (_C_NONE,           "Payload — none"),
+    (_C_LZ4,            "Payload — lz4"),
     (_C_LZ4_FRAME,      "Payload — lz4-frame"),
-    (_C_LZ4_FRAME_FLAT, "Payload — lz4-frame (ratio ≥ 0.99)"),
+    (_C_LZ4_FRAME_FLAT, "Payload — lz4-frame (flat)"),
+]
+
+_LEGEND_ROW2 = [
+    (_C_FHDR_CRC,       "File hdr CRC"),
+    (_C_HDR_PARITY,     "XOR parity"),
+    (_C_RS_PARITY,      "RS parity"),
+    (_C_PAR_CRC,        "Payload CRC"),
+    (_C_OFFSET_TBL,     "Offset table"),
+    (_C_PAR_FOOTER,     "Parity footer"),
 ]
 
 _BPR_PRESETS = [
@@ -69,6 +84,7 @@ class PacksTab:
         self._display_starts:   list[int]   = []
         self._display_total: int = 0
         self._load_generation: int = 0
+        self._trailer: dict | None = None
         self._build()
 
     # ---- build ----
@@ -169,14 +185,17 @@ class PacksTab:
         self._idx_tree.pack(fill=tk.BOTH, expand=True)
 
     def _build_pack_map(self) -> None:
-        legend = tk.Frame(self._map_frame)
-        legend.pack(side=tk.TOP, fill=tk.X, padx=PAD, pady=(PAD, 4))
-        for color, label in _LEGEND:
-            swatch = tk.Frame(legend, bg=color, width=18, height=18,
-                              relief=tk.GROOVE, bd=1)
-            swatch.pack(side=tk.LEFT, padx=(0, 4))
-            tk.Label(legend, text=label,
-                     font=FONT_BOLD).pack(side=tk.LEFT, padx=(0, 16))
+        legend_box = tk.Frame(self._map_frame)
+        legend_box.pack(side=tk.TOP, fill=tk.X, padx=PAD, pady=(PAD, 4))
+        for row_items in (_LEGEND_ROW1, _LEGEND_ROW2):
+            row = tk.Frame(legend_box)
+            row.pack(fill=tk.X, pady=(0, 2))
+            for color, label in row_items:
+                swatch = tk.Frame(row, bg=color, width=18, height=18,
+                                  relief=tk.GROOVE, bd=1)
+                swatch.pack(side=tk.LEFT, padx=(0, 4))
+                tk.Label(row, text=label,
+                         font=FONT_BOLD).pack(side=tk.LEFT, padx=(0, 12))
 
         ctrl = tk.Frame(self._map_frame)
         ctrl.pack(side=tk.TOP, fill=tk.X, padx=PAD, pady=(0, 4))
@@ -445,6 +464,7 @@ class PacksTab:
             f"Objects : {d.get('count', '?')}",
         ]
         self._entries = d.get("entries", [])
+        self._trailer = d.get("trailer")
         set_text(self._hdr_text, "\n".join(lines))
 
         # Paginate treeview
@@ -541,9 +561,66 @@ class PacksTab:
                          f"{fmt_size(uncomp_sz)} uncompressed{ratio_str}",
                          i))
 
-        # Trailing bytes
+        # Parity trailer
         last_end = segs[-1][1] if segs else PACK_DAT_HDR_SIZE
-        if last_end < file_size:
+        trailer = self._trailer
+        if trailer:
+            tstart = int(trailer["start"])
+
+            # Gap between last payload and trailer start
+            if tstart > last_end:
+                segs.append((last_end, tstart, _C_UNKNOWN,
+                             f"Gap  ({fmt_size(tstart - last_end)})", None))
+
+            # File header CRC (4 bytes at trailer start)
+            segs.append((tstart, tstart + 4, _C_FHDR_CRC,
+                         "File header CRC32C  (4 B)", None))
+
+            # Per-entry parity blocks
+            for i, ep in enumerate(trailer.get("entry_parity", [])):
+                off = int(ep["offset"])
+                sz  = int(ep["size"])
+                hps = min(int(ep["hdr_parity_size"]), sz)
+                rss = int(ep["rs_parity_size"])
+                meta_sz = sz - hps - rss
+
+                h_short = ""
+                if i < len(self._entries):
+                    h_short = self._entries[i]["hash"][:16] + "…"
+
+                segs.append((off, off + hps, _C_HDR_PARITY,
+                             f"Entry {i}  XOR header parity  ({hps} B)"
+                             f"  —  {h_short}", i))
+                if rss > 0:
+                    segs.append((off + hps, off + hps + rss, _C_RS_PARITY,
+                                 f"Entry {i}  RS parity  "
+                                 f"({fmt_size(rss)})  —  {h_short}", i))
+                if meta_sz > 0:
+                    segs.append((off + hps + rss, off + sz, _C_PAR_CRC,
+                                 f"Entry {i}  payload CRC + metadata  "
+                                 f"({meta_sz} B)  —  {h_short}", i))
+
+            # Offset table
+            if "offset_table_offset" in trailer:
+                ot_off = int(trailer["offset_table_offset"])
+                ot_sz  = int(trailer["offset_table_size"])
+                segs.append((ot_off, ot_off + ot_sz, _C_OFFSET_TBL,
+                             f"Parity offset table  ({fmt_size(ot_sz)})"
+                             f"  —  {ot_sz // 8} entries × 8 B", None))
+
+            # Entry count (4 bytes)
+            if "entry_count_offset" in trailer:
+                ec = int(trailer["entry_count_offset"])
+                segs.append((ec, ec + 4, _C_PAR_FOOTER,
+                             "Trailer entry count  (4 B)", None))
+
+            # Parity footer (12 bytes)
+            if "footer_offset" in trailer:
+                ft = int(trailer["footer_offset"])
+                segs.append((ft, ft + 12, _C_PAR_FOOTER,
+                             "Parity footer  (12 B)  —  "
+                             "magic / version / trailer_size", None))
+        elif last_end < file_size:
             segs.append((last_end, file_size, _C_UNKNOWN,
                          f"Trailing / unaccounted  "
                          f"({fmt_size(file_size - last_end)})  "

@@ -6,6 +6,7 @@
 #include "object.h"
 #include "pack.h"
 #include "pack_index.h"
+#include "parity.h"
 #include "policy.h"
 #include "repo.h"
 #include "snapshot.h"
@@ -14,6 +15,7 @@
 #include "../vendor/cJSON.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -717,7 +719,7 @@ static cJSON *handle_pack_entries(repo_t *repo, const cJSON *params)
     cJSON_AddNumberToObject(d, "version", version);
     cJSON_AddNumberToObject(d, "count",   count);
 
-    /* Include the .dat file size (try flat path, then sharded) */
+    /* Include the .dat file size and parity trailer layout */
     {
         char fpath[PATH_MAX];
         snprintf(fpath, sizeof(fpath), "%s/packs/%s",
@@ -734,6 +736,83 @@ static cJSON *handle_pack_entries(repo_t *repo, const cJSON *params)
         }
         if (sb.st_size > 0)
             cJSON_AddNumberToObject(d, "file_size", (double)sb.st_size);
+
+        /* Parity trailer layout for pack map visualisation */
+        if (sb.st_size > 0) {
+            int fd = open(fpath, O_RDONLY);
+            if (fd >= 0) {
+                off_t fend = sb.st_size;
+                parity_footer_t pftr;
+                ssize_t pr = pread(fd, &pftr, sizeof(pftr),
+                                   fend - (off_t)sizeof(pftr));
+                if (pr == (ssize_t)sizeof(pftr) &&
+                    pftr.magic == PARITY_FOOTER_MAGIC &&
+                    (off_t)pftr.trailer_size <= fend) {
+
+                    off_t tstart = fend - (off_t)pftr.trailer_size;
+                    cJSON *trailer = cJSON_AddObjectToObject(d, "trailer");
+                    cJSON_AddNumberToObject(trailer, "start",
+                                            (double)tstart);
+                    cJSON_AddNumberToObject(trailer, "fhdr_crc_offset",
+                                            (double)tstart);
+
+                    uint32_t tcount = 0;
+                    if (pread(fd, &tcount, sizeof(tcount), fend - 16)
+                            == (ssize_t)sizeof(tcount) &&
+                        tcount > 0 && tcount <= 1000000u) {
+
+                        off_t otable = fend - 16
+                                       - (off_t)(8u * tcount);
+                        cJSON_AddNumberToObject(trailer,
+                            "offset_table_offset", (double)otable);
+                        cJSON_AddNumberToObject(trailer,
+                            "offset_table_size",
+                            (double)(8u * tcount));
+                        cJSON_AddNumberToObject(trailer,
+                            "entry_count_offset",
+                            (double)(fend - 16));
+                        cJSON_AddNumberToObject(trailer,
+                            "footer_offset",
+                            (double)(fend - 12));
+
+                        size_t otsz = (size_t)8u * tcount;
+                        uint64_t *offsets = calloc((size_t)tcount, 8);
+                        if (offsets &&
+                            pread(fd, offsets, otsz, otable)
+                                == (ssize_t)otsz) {
+                            cJSON *parr = cJSON_AddArrayToObject(
+                                              trailer, "entry_parity");
+                            for (uint32_t i = 0; i < tcount; i++) {
+                                off_t bs = tstart + (off_t)offsets[i];
+                                off_t be = (i + 1 < tcount)
+                                    ? tstart + (off_t)offsets[i + 1]
+                                    : otable;
+                                if (be <= bs) continue;
+                                uint32_t bsz = (uint32_t)(be - bs);
+
+                                cJSON *item = cJSON_CreateObject();
+                                cJSON_AddNumberToObject(item, "offset",
+                                                        (double)bs);
+                                cJSON_AddNumberToObject(item, "size",
+                                                        (double)bsz);
+                                /* hdr_parity=260, trailing 12 bytes:
+                                 * payload CRC(4)+rs_data_len(4)+
+                                 * entry_par_size(4) */
+                                uint32_t rs_sz = bsz > 272
+                                    ? bsz - 272 : 0;
+                                cJSON_AddNumberToObject(item,
+                                    "hdr_parity_size", 260);
+                                cJSON_AddNumberToObject(item,
+                                    "rs_parity_size", (double)rs_sz);
+                                cJSON_AddItemToArray(parr, item);
+                            }
+                        }
+                        free(offsets);
+                    }
+                }
+                close(fd);
+            }
+        }
     }
 
     return d;
