@@ -30,6 +30,7 @@ extern size_t  __real_fwrite(const void *, size_t, size_t, FILE *);
 extern int     __real_fseeko(FILE *, off_t, int);
 extern int     __real_fsync(int);
 extern int     __real_fdatasync(int);
+extern int     __real_sync_file_range(int, off_t, off_t, unsigned int);
 
 static inline void fault_reset_all(void) {
     fault_malloc_at = -1;

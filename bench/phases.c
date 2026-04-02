@@ -968,6 +968,282 @@ static void bench_restore(void)
 REGISTER("restore_500_4K", bench_restore);
 
 /* ------------------------------------------------------------------ */
+/* Pack Index (Opt 1)                                                  */
+/* ------------------------------------------------------------------ */
+
+#include "pack_index.h"
+
+static void bench_pack_index_rebuild(void)
+{
+    bench_cleanup();
+    create_tree(BENCH_SRC, 1000, 4096);
+
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    backup_opts_t opts = {0};
+    opts.quiet = 1;
+    const char *paths[] = { BENCH_SRC };
+    backup_run_opts(repo, paths, 1, &opts);
+    repo_pack(repo, NULL);
+
+    /* Delete index, then time rebuild */
+    char idx_path[PATH_MAX];
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", BENCH_REPO);
+    unlink(idx_path);
+
+    int iters = 20;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        unlink(idx_path);
+        pack_index_rebuild(repo);
+    }
+    double elapsed = now_sec() - t0;
+
+    report("pack_index_rebuild (1k objs)", (double)iters / elapsed, "rebuilds/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("pack_index_rebuild", bench_pack_index_rebuild);
+
+static void bench_pack_index_lookup(void)
+{
+    bench_cleanup();
+    create_tree(BENCH_SRC, 1000, 4096);
+
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    backup_opts_t opts = {0};
+    opts.quiet = 1;
+    const char *paths[] = { BENCH_SRC };
+    backup_run_opts(repo, paths, 1, &opts);
+    repo_pack(repo, NULL);
+
+    /* Collect content hashes from snapshot */
+    snapshot_t *snap = NULL;
+    uint32_t head = 0;
+    snapshot_read_head(repo, &head);
+    snapshot_load(repo, head, &snap);
+
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    uint8_t hashes[2048][OBJECT_HASH_SIZE];
+    int nhashes = 0;
+    for (uint32_t i = 0; i < snap->node_count && nhashes < 2048; i++) {
+        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0)
+            memcpy(hashes[nhashes++], snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
+    }
+    snapshot_free(snap);
+
+    pack_index_t *idx = pack_index_open(repo);
+    if (!idx || nhashes == 0) {
+        repo_close(repo);
+        bench_cleanup();
+        return;
+    }
+
+    /* Warmup */
+    for (int i = 0; i < nhashes; i++)
+        pack_index_lookup(idx, hashes[i]);
+
+    uint64_t iters = 0;
+    double t0 = now_sec(), elapsed;
+    do {
+        for (int i = 0; i < nhashes; i++)
+            pack_index_lookup(idx, hashes[i]);
+        iters++;
+        elapsed = now_sec() - t0;
+    } while (elapsed < 1.0);
+
+    double lookups = (double)iters * (double)nhashes;
+    report("pack_index_lookup", lookups / elapsed / 1e6, "Mlookups/s", elapsed);
+
+    pack_index_close(idx);
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("pack_index_lookup", bench_pack_index_lookup);
+
+/* ------------------------------------------------------------------ */
+/* Restore packed (Opt 4: pack-ordered reads)                          */
+/* ------------------------------------------------------------------ */
+
+static void bench_restore_packed_1k(void)
+{
+    bench_cleanup();
+    create_tree(BENCH_SRC, 1000, 4096);
+
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    backup_opts_t opts = {0};
+    opts.quiet = 1;
+    const char *paths[] = { BENCH_SRC };
+    backup_run_opts(repo, paths, 1, &opts);
+    repo_pack(repo, NULL);
+
+    mkdir(BENCH_DST, 0755);
+    double t0 = now_sec();
+    restore_snapshot(repo, 1, BENCH_DST);
+    double elapsed = now_sec() - t0;
+
+    double mib = (1000.0 * 4096.0) / (1024.0 * 1024.0) / elapsed;
+    report("restore_1k_4K_packed", mib, "MiB/s", elapsed);
+    report("restore_1k_4K_packed", 1000.0 / elapsed, "files/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("restore_1k_4K_packed", bench_restore_packed_1k);
+
+/* ------------------------------------------------------------------ */
+/* Verify packed multi-snap (Opt 5: dedup + pack-ordered)              */
+/* ------------------------------------------------------------------ */
+
+static void bench_verify_multi_snap(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 5, 10);
+    repo_pack(repo, NULL);
+
+    verify_opts_t vopts = {0};
+    double t0 = now_sec();
+    repo_verify(repo, &vopts);
+    double elapsed = now_sec() - t0;
+
+    report("verify_5snap_1k_packed", (double)vopts.objects_checked / elapsed, "objects/s", elapsed);
+    double mib = (double)vopts.bytes_checked / (1024.0 * 1024.0) / elapsed;
+    report("verify_5snap_1k_packed", mib, "MiB/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("verify_5snap_1k_packed", bench_verify_multi_snap);
+
+/* ------------------------------------------------------------------ */
+/* Object load with parity (Opt 6: sequential trailer read)            */
+/* ------------------------------------------------------------------ */
+
+static void bench_object_load_parity(void)
+{
+    bench_cleanup();
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    /* Store 500 loose objects (4K each, with v2 parity trailers) */
+    int count = 500;
+    size_t obj_sz = 4096;
+    uint8_t *data = malloc(obj_sz);
+    uint8_t stored_hashes[500][OBJECT_HASH_SIZE];
+    uint64_t s = 0xfeedface12345678ULL;
+
+    for (int i = 0; i < count; i++) {
+        for (size_t j = 0; j < obj_sz; j++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            data[j] = (uint8_t)(s >> 32);
+        }
+        int is_new = 0;
+        uint64_t phys = 0;
+        object_store_ex(repo, 1, data, obj_sz, stored_hashes[i], &is_new, &phys);
+    }
+    free(data);
+
+    /* Warm cache */
+    for (int i = 0; i < count; i++) {
+        void *d = NULL; size_t sz = 0;
+        object_load(repo, stored_hashes[i], &d, &sz, NULL);
+        free(d);
+    }
+
+    /* Time object_load (exercises parity trailer read) */
+    uint64_t total_bytes = 0;
+    double t0 = now_sec();
+    for (int i = 0; i < count; i++) {
+        void *d = NULL; size_t sz = 0;
+        object_load(repo, stored_hashes[i], &d, &sz, NULL);
+        total_bytes += sz;
+        free(d);
+    }
+    double elapsed = now_sec() - t0;
+
+    double mib = (double)total_bytes / (1024.0 * 1024.0) / elapsed;
+    report("object_load_loose_parity_500", mib, "MiB/s", elapsed);
+    report("object_load_loose_parity_500", (double)count / elapsed, "objects/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("object_load_parity", bench_object_load_parity);
+
+/* ------------------------------------------------------------------ */
+/* pack_resolve_location (Opt 4/5 foundation)                          */
+/* ------------------------------------------------------------------ */
+
+static void bench_pack_resolve(void)
+{
+    bench_cleanup();
+    create_tree(BENCH_SRC, 1000, 4096);
+
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    backup_opts_t opts = {0};
+    opts.quiet = 1;
+    const char *paths[] = { BENCH_SRC };
+    backup_run_opts(repo, paths, 1, &opts);
+    repo_pack(repo, NULL);
+
+    /* Collect hashes */
+    snapshot_t *snap = NULL;
+    uint32_t head = 0;
+    snapshot_read_head(repo, &head);
+    snapshot_load(repo, head, &snap);
+
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    uint8_t hashes[2048][OBJECT_HASH_SIZE];
+    int nhashes = 0;
+    for (uint32_t i = 0; i < snap->node_count && nhashes < 2048; i++) {
+        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0)
+            memcpy(hashes[nhashes++], snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
+    }
+    snapshot_free(snap);
+
+    /* Warmup */
+    for (int i = 0; i < nhashes; i++) {
+        uint32_t pn; uint64_t off;
+        pack_resolve_location(repo, hashes[i], &pn, &off);
+    }
+
+    uint64_t iters = 0;
+    double t0 = now_sec(), elapsed;
+    do {
+        for (int i = 0; i < nhashes; i++) {
+            uint32_t pn; uint64_t off;
+            pack_resolve_location(repo, hashes[i], &pn, &off);
+        }
+        iters++;
+        elapsed = now_sec() - t0;
+    } while (elapsed < 1.0);
+
+    double resolves = (double)iters * (double)nhashes;
+    report("pack_resolve_location", resolves / elapsed / 1e6, "Mresolves/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("pack_resolve", bench_pack_resolve);
+
+/* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 

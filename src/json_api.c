@@ -580,7 +580,7 @@ static cJSON *handle_scan(repo_t *repo, const cJSON *params)
         cJSON_AddNumberToObject(d, "loose_objects", n);
     }
 
-    /* Count pack files (.dat) and collect names */
+    /* Count pack files (.dat) and collect names (flat + sharded layout) */
     {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/packs", base);
@@ -589,17 +589,52 @@ static cJSON *handle_scan(repo_t *repo, const cJSON *params)
         if (dir) {
             struct dirent *de;
             while ((de = readdir(dir)) != NULL) {
+                if (de->d_name[0] == '.') continue;
                 size_t len = strlen(de->d_name);
                 if (len > 4 && strcmp(de->d_name + len - 4, ".dat") == 0) {
+                    /* Flat-layout .dat file */
                     cJSON *pk = cJSON_CreateObject();
                     cJSON_AddStringToObject(pk, "name", de->d_name);
-                    /* Get file size */
-                    char fpath[PATH_MAX + 256];
-                    snprintf(fpath, sizeof(fpath), "%s/%s", path, de->d_name);
+                    char fpath[PATH_MAX];
+                    int fr = snprintf(fpath, sizeof(fpath), "%s/%s",
+                                      path, de->d_name);
                     struct stat st;
-                    if (stat(path, &st) == 0)
+                    if (fr > 0 && (size_t)fr < sizeof(fpath) &&
+                        stat(fpath, &st) == 0)
                         cJSON_AddNumberToObject(pk, "size", (double)st.st_size);
                     cJSON_AddItemToArray(parr, pk);
+                } else if (len == 4) {
+                    /* Shard subdirectory */
+                    char subdir[PATH_MAX];
+                    int r = snprintf(subdir, sizeof(subdir), "%s/%s", path,
+                                     de->d_name);
+                    if (r < 0 || (size_t)r >= sizeof(subdir)) continue;
+                    struct stat sb;
+                    if (stat(subdir, &sb) != 0 || !S_ISDIR(sb.st_mode))
+                        continue;
+                    DIR *sd = opendir(subdir);
+                    if (!sd) continue;
+                    struct dirent *se;
+                    while ((se = readdir(sd)) != NULL) {
+                        size_t slen = strlen(se->d_name);
+                        if (slen > 4 &&
+                            strcmp(se->d_name + slen - 4, ".dat") == 0) {
+                            cJSON *pk = cJSON_CreateObject();
+                            cJSON_AddStringToObject(pk, "name",
+                                                    se->d_name);
+                            char fpath[PATH_MAX];
+                            int fr2 = snprintf(fpath, sizeof(fpath),
+                                               "%s/%s", subdir,
+                                               se->d_name);
+                            struct stat st2;
+                            if (fr2 > 0 && (size_t)fr2 < sizeof(fpath)
+                                && stat(fpath, &st2) == 0)
+                                cJSON_AddNumberToObject(pk, "size",
+                                                        (double)st2.st_size);
+                            cJSON_AddItemToArray(parr, pk);
+                        }
+                    }
+                    closedir(sd);
                 }
             }
             closedir(dir);
@@ -681,12 +716,24 @@ static cJSON *handle_pack_entries(repo_t *repo, const cJSON *params)
     cJSON_AddNumberToObject(d, "version", version);
     cJSON_AddNumberToObject(d, "count",   count);
 
-    /* Include the .dat file size */
-    char fpath[PATH_MAX + 256];
-    snprintf(fpath, sizeof(fpath), "%s/packs/%s", repo_path(repo), jname->valuestring);
-    struct stat sb;
-    if (stat(fpath, &sb) == 0)
-        cJSON_AddNumberToObject(d, "file_size", (double)sb.st_size);
+    /* Include the .dat file size (try flat path, then sharded) */
+    {
+        char fpath[PATH_MAX];
+        snprintf(fpath, sizeof(fpath), "%s/packs/%s",
+                 repo_path(repo), jname->valuestring);
+        struct stat sb;
+        if (stat(fpath, &sb) != 0) {
+            uint32_t pnum;
+            if (parse_pack_dat_name(jname->valuestring, &pnum) &&
+                pack_dat_path_resolve(fpath, sizeof(fpath),
+                                      repo_path(repo), pnum) == 0)
+                stat(fpath, &sb);  /* retry with sharded path */
+            else
+                sb.st_size = 0;
+        }
+        if (sb.st_size > 0)
+            cJSON_AddNumberToObject(d, "file_size", (double)sb.st_size);
+    }
 
     return d;
 }
@@ -825,6 +872,38 @@ static void ape_cb(const pack_entry_info_t *info, void *ctx)
     cJSON_AddItemToArray(c->arr, item);
 }
 
+static void ape_scan_dir(repo_t *repo, const char *dirpath,
+                         cJSON *arr, uint32_t *total_count)
+{
+    DIR *dir = opendir(dirpath);
+    if (!dir) return;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        size_t len = strlen(de->d_name);
+        if (len > 4 && strcmp(de->d_name + len - 4, ".dat") == 0) {
+            uint32_t version = 0, count = 0;
+            struct ape_ctx ctx = { .arr = arr, .pack_name = de->d_name };
+            status_t st = pack_enumerate_dat(repo, de->d_name,
+                                              &version, &count, ape_cb, &ctx);
+            if (st == OK)
+                *total_count += count;
+            else
+                err_clear();
+        } else if (len == 4) {
+            /* Shard subdirectory */
+            char subdir[PATH_MAX];
+            int r = snprintf(subdir, sizeof(subdir), "%s/%s", dirpath,
+                             de->d_name);
+            if (r < 0 || (size_t)r >= sizeof(subdir)) continue;
+            struct stat sb;
+            if (stat(subdir, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+            ape_scan_dir(repo, subdir, arr, total_count);
+        }
+    }
+    closedir(dir);
+}
+
 static cJSON *handle_all_pack_entries(repo_t *repo, const cJSON *params)
 {
     (void)params;
@@ -836,25 +915,7 @@ static cJSON *handle_all_pack_entries(repo_t *repo, const cJSON *params)
     cJSON *arr = cJSON_AddArrayToObject(d, "entries");
     uint32_t total_count = 0;
 
-    DIR *dir = opendir(packs_dir);
-    if (!dir) return d;
-
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        size_t len = strlen(de->d_name);
-        if (len <= 4 || strcmp(de->d_name + len - 4, ".dat") != 0)
-            continue;
-
-        uint32_t version = 0, count = 0;
-        struct ape_ctx ctx = { .arr = arr, .pack_name = de->d_name };
-        status_t st = pack_enumerate_dat(repo, de->d_name,
-                                          &version, &count, ape_cb, &ctx);
-        if (st == OK)
-            total_count += count;
-        else
-            err_clear();
-    }
-    closedir(dir);
+    ape_scan_dir(repo, packs_dir, arr, &total_count);
 
     cJSON_AddNumberToObject(d, "count", total_count);
     return d;

@@ -65,6 +65,16 @@ status_t pack_object_get_info(repo_t *repo,
 void pack_cache_invalidate(repo_t *repo);
 
 /*
+ * Resolve a hash to its pack location.  Returns OK and fills out_pack_num +
+ * out_dat_offset on success.  Returns ERR_NOT_FOUND if the hash is not in
+ * any pack (i.e. the object is loose or missing).
+ */
+status_t pack_resolve_location(repo_t *repo,
+                               const uint8_t hash[OBJECT_HASH_SIZE],
+                               uint32_t *out_pack_num,
+                               uint64_t *out_dat_offset);
+
+/*
  * Attempt to repair a packed object's entry in-place via pwrite().
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
  */
@@ -159,3 +169,12 @@ typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
 status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_idx_entry_cb cb, void *ctx);
+
+/* --- path helpers (shared with json_api.c) ------------------------- */
+
+/* Resolve a pack_num to its .dat path (sharded first, flat fallback). */
+int pack_dat_path_resolve(char *buf, size_t sz, const char *repo,
+                          uint32_t pack_num);
+
+/* Parse "pack-NNNNNNNN.dat" → pack_num.  Returns 1 on success, 0 on fail. */
+int parse_pack_dat_name(const char *name, uint32_t *out_num);

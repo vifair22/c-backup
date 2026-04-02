@@ -93,7 +93,8 @@ $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lcmocka
 
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
-              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync
+              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
+              -Wl,--wrap=sync_file_range
 
 $(BUILD)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(LDFLAGS) -lcmocka

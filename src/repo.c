@@ -14,12 +14,15 @@
 #include <unistd.h>
 
 #define FORMAT_VERSION "c-backup-1\n"
-#define DAT_CACHE_SLOTS 8
+
+/* Dynamic open-addressing hash table for .dat FILE* handles.
+ * No eviction — all handles stay open until repo_close() or flush.
+ * Grows at 75% load factor.  Minimum 128 slots. */
+#define DAT_CACHE_MIN_SLOTS 128
 
 typedef struct {
-    uint32_t pack_num;
-    FILE    *fp;
-    uint32_t age;       /* monotonic counter for LRU eviction */
+    uint32_t pack_num;   /* 0 = empty slot (pack_num 0 is valid but rare) */
+    FILE    *fp;         /* NULL = empty slot */
 } dat_cache_slot_t;
 
 struct repo {
@@ -29,9 +32,10 @@ struct repo {
     /* pack index cache, owned by pack.c, freed on close */
     void   *pack_cache;
     size_t  pack_cache_cnt;
-    /* pack .dat fd cache for bulk lookups */
-    dat_cache_slot_t dat_cache[DAT_CACHE_SLOTS];
-    uint32_t         dat_cache_tick;
+    /* Dynamic .dat file handle cache (open-addressing hash table) */
+    dat_cache_slot_t *dat_cache;
+    uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
+    uint32_t          dat_cache_count;  /* occupied slots */
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -174,10 +178,15 @@ status_t repo_open(const char *path, repo_t **out) {
     r->path           = strdup(path);
     r->dirfd          = fd;
     r->lock_fd        = -1;
-    r->pack_cache     = NULL;
-    r->pack_cache_cnt = 0;
-    memset(r->dat_cache, 0, sizeof(r->dat_cache));
-    r->dat_cache_tick = 0;
+    r->pack_cache      = NULL;
+    r->pack_cache_cnt  = 0;
+    r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
+    r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
+    r->dat_cache_count = 0;
+    if (!r->dat_cache) {
+        close(fd); free(r->path); free(r);
+        return set_error(ERR_NOMEM, "repo_open: dat_cache alloc failed");
+    }
     *out = r;
     return OK;
 }
@@ -186,6 +195,8 @@ void repo_close(repo_t *repo) {
     if (!repo) return;
     repo_unlock(repo);
     repo_dat_cache_flush(repo);
+    free(repo->dat_cache);
+    repo->dat_cache = NULL;
     close(repo->dirfd);
     free(repo->path);
     free(repo->pack_cache);
@@ -214,48 +225,78 @@ size_t repo_pack_cache_count(const repo_t *repo) {
     return repo->pack_cache_cnt;
 }
 
+/* Hash function for pack_num → slot index */
+static inline uint32_t dat_cache_hash(uint32_t pack_num) {
+    /* Knuth multiplicative hash */
+    return pack_num * 2654435761u;
+}
+
+static void dat_cache_grow(repo_t *repo) {
+    uint32_t old_cap = repo->dat_cache_mask + 1;
+    uint32_t new_cap = old_cap * 2;
+    dat_cache_slot_t *new_tbl = calloc(new_cap, sizeof(dat_cache_slot_t));
+    if (!new_tbl) return;  /* best effort — keep old table */
+
+    uint32_t new_mask = new_cap - 1;
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (!repo->dat_cache[i].fp) continue;
+        uint32_t idx = dat_cache_hash(repo->dat_cache[i].pack_num) & new_mask;
+        while (new_tbl[idx].fp)
+            idx = (idx + 1) & new_mask;
+        new_tbl[idx] = repo->dat_cache[i];
+    }
+
+    free(repo->dat_cache);
+    repo->dat_cache      = new_tbl;
+    repo->dat_cache_mask = new_mask;
+}
+
 FILE *repo_dat_cache_checkout(repo_t *repo, uint32_t pack_num) {
-    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
-        if (repo->dat_cache[i].fp && repo->dat_cache[i].pack_num == pack_num) {
-            FILE *fp = repo->dat_cache[i].fp;
-            repo->dat_cache[i].fp = NULL;
+    if (!repo->dat_cache) return NULL;
+    uint32_t mask = repo->dat_cache_mask;
+    uint32_t idx = dat_cache_hash(pack_num) & mask;
+    for (;;) {
+        dat_cache_slot_t *s = &repo->dat_cache[idx];
+        if (!s->fp) return NULL;  /* empty slot → miss */
+        if (s->pack_num == pack_num) {
+            FILE *fp = s->fp;
+            s->fp = NULL;
+            repo->dat_cache_count--;
             return fp;
         }
+        idx = (idx + 1) & mask;
     }
-    return NULL;
 }
 
 void repo_dat_cache_return(repo_t *repo, uint32_t pack_num, FILE *fp) {
     if (!fp) return;
-    /* Find an empty slot */
-    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
-        if (!repo->dat_cache[i].fp) {
-            repo->dat_cache[i].fp       = fp;
-            repo->dat_cache[i].pack_num = pack_num;
-            repo->dat_cache[i].age      = ++repo->dat_cache_tick;
-            return;
-        }
-    }
-    /* All slots full — evict oldest */
-    int oldest = 0;
-    for (int i = 1; i < DAT_CACHE_SLOTS; i++) {
-        if (repo->dat_cache[i].age < repo->dat_cache[oldest].age)
-            oldest = i;
-    }
-    fclose(repo->dat_cache[oldest].fp);
-    repo->dat_cache[oldest].fp       = fp;
-    repo->dat_cache[oldest].pack_num = pack_num;
-    repo->dat_cache[oldest].age      = ++repo->dat_cache_tick;
+    if (!repo->dat_cache) { fclose(fp); return; }
+
+    /* Grow at 75% load factor */
+    uint32_t cap = repo->dat_cache_mask + 1;
+    if (repo->dat_cache_count * 4 >= cap * 3)
+        dat_cache_grow(repo);
+
+    uint32_t mask = repo->dat_cache_mask;
+    uint32_t idx = dat_cache_hash(pack_num) & mask;
+    while (repo->dat_cache[idx].fp)
+        idx = (idx + 1) & mask;
+
+    repo->dat_cache[idx].fp       = fp;
+    repo->dat_cache[idx].pack_num = pack_num;
+    repo->dat_cache_count++;
 }
 
 void repo_dat_cache_flush(repo_t *repo) {
-    if (!repo) return;
-    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+    if (!repo || !repo->dat_cache) return;
+    uint32_t cap = repo->dat_cache_mask + 1;
+    for (uint32_t i = 0; i < cap; i++) {
         if (repo->dat_cache[i].fp) {
             fclose(repo->dat_cache[i].fp);
             repo->dat_cache[i].fp = NULL;
         }
     }
+    repo->dat_cache_count = 0;
 }
 
 /* ------------------------------------------------------------------ */

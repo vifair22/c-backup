@@ -354,8 +354,46 @@ static void maybe_repair_object(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZ
     }
 }
 
+/* Entry for pack-ordered verification. */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint32_t snap_id;     /* first snapshot referencing this hash (for error msg) */
+    uint64_t node_id;     /* first node referencing this hash (for error msg) */
+    uint8_t  hash_type;   /* 0=content, 1=xattr, 2=acl */
+    uint32_t pack_num;
+    uint64_t dat_offset;
+} verify_entry_t;
+
+static int verify_entry_cmp(const void *a, const void *b) {
+    const verify_entry_t *va = a, *vb = b;
+    if (va->pack_num != vb->pack_num)
+        return va->pack_num < vb->pack_num ? -1 : 1;
+    if (va->dat_offset != vb->dat_offset)
+        return va->dat_offset < vb->dat_offset ? -1 : 1;
+    return 0;
+}
+
+/* Extended gc_hs_insert that returns 1 if hash was already present, 0 if newly inserted. */
+static int gc_hs_insert_check(gc_hashset_t *hs, const uint8_t hash[OBJECT_HASH_SIZE]) {
+    if (hs->n >= hs->cap / 2) {
+        if (gc_hs_grow(hs) != 0) return -1;
+    }
+    size_t mask = hs->tbl_cap - 1;
+    uint64_t hv = gc_hs_hash(hash);
+    size_t slot = (size_t)(hv & mask);
+    while (hs->table[slot] != UINT32_MAX) {
+        if (memcmp(hs->buf + (size_t)hs->table[slot] * OBJECT_HASH_SIZE,
+                   hash, OBJECT_HASH_SIZE) == 0)
+            return 1;  /* already present */
+        slot = (slot + 1) & mask;
+    }
+    memcpy(hs->buf + hs->n * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
+    hs->table[slot] = (uint32_t)hs->n;
+    hs->n++;
+    return 0;
+}
+
 status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
-    /* Snapshot parity stats before the verify run. */
     parity_stats_t ps_before = parity_stats_get();
     int do_repair = (opts && opts->repair);
 
@@ -368,38 +406,19 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
     uint8_t zero[OBJECT_HASH_SIZE] = {0};
     int show_progress = gc_progress_enabled();
 
-    /* Pass 1: count total object references so we can show meaningful progress. */
-    uint64_t total_objs = 0;
-    for (uint32_t id = 1; id <= head; id++) {
-        snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) continue;
-        for (uint32_t j = 0; j < snap->node_count; j++) {
-            const node_t *nd = &snap->nodes[j];
-            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) total_objs++;
-            if (memcmp(nd->xattr_hash,   zero, OBJECT_HASH_SIZE) != 0) total_objs++;
-            if (memcmp(nd->acl_hash,     zero, OBJECT_HASH_SIZE) != 0) total_objs++;
-        }
-        snapshot_free(snap);
-    }
+    /* --- Collect unique hashes across all snapshots --- */
+    gc_hashset_t hs;
+    if (gc_hs_init(&hs, 4096) != 0)
+        return set_error(ERR_NOMEM, "verify: hashset init failed");
 
-    /* Pass 2: verify each object with progress display. */
-    int errors = 0;
-    uint64_t done_objs = 0;
-    uint64_t bytes_done = 0;
-
-    struct timespec t_start, next_tick;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
-    next_tick = t_start;
-
-    int null_fd = show_progress ? open("/dev/null", O_WRONLY) : -1;
+    size_t ve_cap = 4096, ve_cnt = 0;
+    verify_entry_t *ve = malloc(ve_cap * sizeof(*ve));
+    if (!ve) { gc_hs_free(&hs); return set_error(ERR_NOMEM, "verify: alloc verify entries"); }
 
     for (uint32_t id = 1; id <= head; id++) {
         parity_stats_t snap_before = parity_stats_get();
         snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) {
-            /* Pruned snapshots are expected to be missing — skip silently */
-            continue;
-        }
+        if (snapshot_load(repo, id, &snap) != OK) continue;
         if (do_repair) {
             parity_stats_t snap_after = parity_stats_get();
             if (snap_after.repaired > snap_before.repaired) {
@@ -408,117 +427,123 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
                     log_msg("INFO", "verify: repaired snapshot on disk");
             }
         }
+
         for (uint32_t j = 0; j < snap->node_count; j++) {
             const node_t *nd = &snap->nodes[j];
+            const uint8_t *hashes[3] = { nd->content_hash, nd->xattr_hash, nd->acl_hash };
+            for (int h = 0; h < 3; h++) {
+                if (memcmp(hashes[h], zero, OBJECT_HASH_SIZE) == 0) continue;
+                int rc = gc_hs_insert_check(&hs, hashes[h]);
+                if (rc < 0) {
+                    snapshot_free(snap); free(ve); gc_hs_free(&hs);
+                    return set_error(ERR_NOMEM, "verify: hashset insert OOM");
+                }
+                if (rc == 1) continue;  /* duplicate — already queued */
 
-            /* Verify content object: load and decompress, which re-hashes.
-             * Large objects (ERR_TOO_LARGE from object_load) are verified via
-             * object_load_stream writing to /dev/null. */
-            if (memcmp(nd->content_hash, zero, OBJECT_HASH_SIZE) != 0) {
-                parity_stats_t obj_before = parity_stats_get();
-                void *data = NULL; size_t sz = 0;
-                status_t obj_st = object_load(repo, nd->content_hash,
-                                              &data, &sz, NULL);
-                if (obj_st == OK) {
-                    maybe_repair_object(repo, nd->content_hash, obj_before, do_repair);
-                    bytes_done += sz;
-                    free(data);
-                } else if (obj_st == ERR_TOO_LARGE) {
-                    int vfd = (null_fd >= 0) ? null_fd : open("/dev/null", O_WRONLY);
-                    uint64_t stream_sz = 0;
-                    if (vfd == -1) {
-                        obj_st = ERR_IO;
-                    } else {
-                        obj_st = object_load_stream(repo, nd->content_hash,
-                                                    vfd, &stream_sz, NULL);
-                        if (null_fd < 0) close(vfd);
+                /* New unique hash — add verify entry */
+                if (ve_cnt == ve_cap) {
+                    ve_cap *= 2;
+                    verify_entry_t *tmp = realloc(ve, ve_cap * sizeof(*tmp));
+                    if (!tmp) {
+                        snapshot_free(snap); free(ve); gc_hs_free(&hs);
+                        return set_error(ERR_NOMEM, "verify: realloc verify entries");
                     }
-                    if (obj_st == OK) bytes_done += stream_sz;
-                } else {
-                    free(data);
+                    ve = tmp;
                 }
-                if (obj_st != OK) {
-                    char hex[OBJECT_HASH_SIZE * 2 + 1];
-                    if (show_progress) gc_line_clear();
-                    object_hash_to_hex(nd->content_hash, hex);
-                    set_error(obj_st, "verify: snap %u node %llu %s: %s",
-                              id, (unsigned long long)nd->node_id, hex,
-                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
-                    log_msg("ERROR", err_msg());
-                    errors++;
-                }
-                done_objs++;
-            }
-
-            if (memcmp(nd->xattr_hash, zero, OBJECT_HASH_SIZE) != 0) {
-                parity_stats_t xa_before = parity_stats_get();
-                void *data = NULL; size_t sz = 0;
-                status_t obj_st = object_load(repo, nd->xattr_hash, &data, &sz, NULL);
-                if (obj_st == OK) {
-                    maybe_repair_object(repo, nd->xattr_hash, xa_before, do_repair);
-                    bytes_done += sz;
-                } else {
-                    char xhex[OBJECT_HASH_SIZE * 2 + 1];
-                    if (show_progress) gc_line_clear();
-                    object_hash_to_hex(nd->xattr_hash, xhex);
-                    set_error(obj_st, "verify: snap %u node %llu xattr %s: %s",
-                              id, (unsigned long long)nd->node_id, xhex,
-                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
-                    log_msg("ERROR", err_msg());
-                    errors++;
-                }
-                free(data);
-                done_objs++;
-            }
-
-            if (memcmp(nd->acl_hash, zero, OBJECT_HASH_SIZE) != 0) {
-                parity_stats_t acl_before = parity_stats_get();
-                void *data = NULL; size_t sz = 0;
-                status_t obj_st = object_load(repo, nd->acl_hash, &data, &sz, NULL);
-                if (obj_st == OK) {
-                    maybe_repair_object(repo, nd->acl_hash, acl_before, do_repair);
-                    bytes_done += sz;
-                } else {
-                    char ahex[OBJECT_HASH_SIZE * 2 + 1];
-                    if (show_progress) gc_line_clear();
-                    object_hash_to_hex(nd->acl_hash, ahex);
-                    set_error(obj_st, "verify: snap %u node %llu acl %s: %s",
-                              id, (unsigned long long)nd->node_id, ahex,
-                              obj_st == ERR_CORRUPT ? "corrupt" : "missing");
-                    log_msg("ERROR", err_msg());
-                    errors++;
-                }
-                free(data);
-                done_objs++;
-            }
-
-            if (show_progress && gc_tick_due(&next_tick) && done_objs > 0) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                double elapsed = (double)(now.tv_sec  - t_start.tv_sec) +
-                                 (double)(now.tv_nsec - t_start.tv_nsec) * 1e-9;
-                double rate    = (elapsed > 0.0) ? (double)done_objs / elapsed : 0.0;
-                double eta_sec = (rate > 0.0 && total_objs > done_objs)
-                                 ? (double)(total_objs - done_objs) / rate : 0.0;
-                char eta[32];
-                fmt_eta(eta_sec, eta, sizeof(eta));
-                char line[128];
-                snprintf(line, sizeof(line),
-                         "verify: %llu/%llu objects  %.1f GiB  %.0f obj/s  ETA %s",
-                         (unsigned long long)done_objs,
-                         (unsigned long long)total_objs,
-                         (double)bytes_done / (1024.0 * 1024.0 * 1024.0),
-                         rate, eta);
-                gc_line_set(line);
+                verify_entry_t *entry = &ve[ve_cnt++];
+                memcpy(entry->hash, hashes[h], OBJECT_HASH_SIZE);
+                entry->snap_id   = id;
+                entry->node_id   = nd->node_id;
+                entry->hash_type = (uint8_t)h;
+                entry->pack_num  = UINT32_MAX;
+                entry->dat_offset = 0;
+                (void)pack_resolve_location(repo, hashes[h],
+                                            &entry->pack_num, &entry->dat_offset);
             }
         }
         snapshot_free(snap);
     }
+    gc_hs_free(&hs);
+
+    /* Sort by (pack_num, dat_offset) for sequential I/O */
+    if (ve_cnt > 1)
+        qsort(ve, ve_cnt, sizeof(*ve), verify_entry_cmp);
+
+    /* --- Verify each unique object in pack-sorted order --- */
+    int errors = 0;
+    uint64_t done_objs = 0, total_objs = (uint64_t)ve_cnt;
+    uint64_t bytes_done = 0;
+
+    struct timespec t_start, next_tick;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    next_tick = t_start;
+
+    int null_fd = show_progress ? open("/dev/null", O_WRONLY) : -1;
+    static const char *hash_type_names[] = { "", "xattr ", "acl " };
+
+    for (size_t vi = 0; vi < ve_cnt; vi++) {
+        const verify_entry_t *entry = &ve[vi];
+        parity_stats_t obj_before = parity_stats_get();
+        void *data = NULL; size_t sz = 0;
+        status_t obj_st = object_load(repo, entry->hash, &data, &sz, NULL);
+
+        if (obj_st == OK) {
+            maybe_repair_object(repo, entry->hash, obj_before, do_repair);
+            bytes_done += sz;
+            free(data);
+        } else if (obj_st == ERR_TOO_LARGE) {
+            int vfd = (null_fd >= 0) ? null_fd : open("/dev/null", O_WRONLY);
+            uint64_t stream_sz = 0;
+            if (vfd == -1) {
+                obj_st = ERR_IO;
+            } else {
+                obj_st = object_load_stream(repo, entry->hash,
+                                            vfd, &stream_sz, NULL);
+                if (null_fd < 0) close(vfd);
+            }
+            if (obj_st == OK) bytes_done += stream_sz;
+        } else {
+            free(data);
+        }
+
+        if (obj_st != OK) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            if (show_progress) gc_line_clear();
+            object_hash_to_hex(entry->hash, hex);
+            set_error(obj_st, "verify: snap %u node %llu %s%s: %s",
+                      entry->snap_id, (unsigned long long)entry->node_id,
+                      hash_type_names[entry->hash_type], hex,
+                      obj_st == ERR_CORRUPT ? "corrupt" : "missing");
+            log_msg("ERROR", err_msg());
+            errors++;
+        }
+        done_objs++;
+
+        if (show_progress && gc_tick_due(&next_tick) && done_objs > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec  - t_start.tv_sec) +
+                             (double)(now.tv_nsec - t_start.tv_nsec) * 1e-9;
+            double rate    = (elapsed > 0.0) ? (double)done_objs / elapsed : 0.0;
+            double eta_sec = (rate > 0.0 && total_objs > done_objs)
+                             ? (double)(total_objs - done_objs) / rate : 0.0;
+            char eta[32];
+            fmt_eta(eta_sec, eta, sizeof(eta));
+            char line[128];
+            snprintf(line, sizeof(line),
+                     "verify: %llu/%llu objects  %.1f GiB  %.0f obj/s  ETA %s",
+                     (unsigned long long)done_objs,
+                     (unsigned long long)total_objs,
+                     (double)bytes_done / (1024.0 * 1024.0 * 1024.0),
+                     rate, eta);
+            gc_line_set(line);
+        }
+    }
 
     if (null_fd >= 0) close(null_fd);
     if (show_progress) gc_line_clear();
+    free(ve);
 
-    /* Populate parity stats for caller. */
     if (opts) {
         parity_stats_t ps_after = parity_stats_get();
         opts->objects_checked  = done_objs;

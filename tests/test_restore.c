@@ -31,6 +31,16 @@
 
 static repo_t *repo;
 
+/* Build a pack file path, supporting both sharded (packs/XXXX/) and flat layouts. */
+static int test_pack_path(char *out, size_t out_sz, uint32_t pack_num,
+                          const char *ext) {
+    int n = snprintf(out, out_sz, "%s/packs/%04x/pack-%08u.%s",
+                     TEST_REPO, pack_num / 256, pack_num, ext);
+    if (n > 0 && (size_t)n < out_sz && access(out, F_OK) == 0) return 0;
+    n = snprintf(out, out_sz, "%s/packs/pack-%08u.%s", TEST_REPO, pack_num, ext);
+    return (n > 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
 /* Pack on-disk structs are now defined in pack.h */
 
 static void write_file(const char *path, const char *content) {
@@ -92,7 +102,9 @@ static int load_node_for_path(uint32_t snap_id, const char *path, node_t *out) {
 }
 
 static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t *out_off) {
-    FILE *f = fopen(TEST_REPO "/packs/pack-00000000.idx", "rb");
+    char idx_path[PATH_MAX];
+    if (test_pack_path(idx_path, sizeof(idx_path), 0, "idx") != 0) return -1;
+    FILE *f = fopen(idx_path, "rb");
     if (!f) return -1;
 
     pack_idx_hdr_t hdr;
@@ -115,7 +127,8 @@ static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint6
 
 /* Destroy parity footer magic in .dat so load_entry_parity returns -1 */
 static void disable_dat_parity(void) {
-    const char *path = TEST_REPO "/packs/pack-00000000.dat";
+    char path[PATH_MAX];
+    assert_int_equal(test_pack_path(path, sizeof(path), 0, "dat"), 0);
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
     struct stat st;
@@ -129,7 +142,9 @@ static void corrupt_packed_payload_byte(const uint8_t hash[OBJECT_HASH_SIZE]) {
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.dat", O_RDWR);
+    char dat_path[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_path, sizeof(dat_path), 0, "dat"), 0);
+    int fd = open(dat_path, O_RDWR);
     assert_true(fd >= 0);
 
     off_t payload_off = (off_t)off + (off_t)sizeof(pack_dat_entry_hdr_t);

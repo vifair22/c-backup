@@ -4,6 +4,7 @@
 
 | Date | Notes |
 |------|-------|
+| 2026-04-02 | HDD I/O optimizations: global pack index, pack sharding, dynamic DAT cache, async writeback, inode-sorted scan, pack-worker hash sort, pack-ordered restore/verify, parity read consolidation, `reindex` and `migrate-packs` commands |
 | 2026-03-26 | Build/bench section, verify --deep removal, GFS Tree viewer tab, post-backup runbook accuracy |
 | 2026-03-24 | Initial |
 
@@ -85,6 +86,8 @@
     - 13.17 `tag`
     - 13.18 `policy`
     - 13.19 `gfs`
+    - 13.20 `reindex`
+    - 13.21 `migrate-packs`
 14. [policy.toml Reference](#14-policytoml-reference)
 15. [Viewer GUI](#15-viewer-gui)
     - 15.1 Architecture
@@ -124,7 +127,7 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 | **HEAD** | The ID of the most recently committed snapshot, stored in `refs/HEAD`. |
 | **Object** | An immutable content-addressed blob, keyed by its SHA-256 hash. |
 | **Loose Object** | An object stored as an individual file under `objects/XX/<rest-of-hash>`. |
-| **Pack** | A compacted store: `packs/pack-NNNNNNNN.dat` (payload) plus `packs/pack-NNNNNNNN.idx` (sorted hash→offset index). |
+| **Pack** | A compacted store: `.dat` (payload) plus `.idx` (sorted hash→offset index), stored in sharded subdirectories under `packs/NNNN/`. |
 | **Pack Entry** | One object record inside a `.dat` file: a 50-byte entry header followed by the compressed (or raw) payload. |
 | **GFS** | Grandfather-Father-Son calendar-based retention: daily / weekly / monthly / yearly tiers. |
 | **Anchor** | A snapshot that has been assigned one or more GFS tier flags and is therefore retained past the rolling window. |
@@ -165,9 +168,14 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 │       └── <remaining 62 hex chars>   # Loose object file
 │
 ├── packs/
-│   ├── pack-00000000.dat     # Pack data file
-│   ├── pack-00000000.idx     # Pack index file
-│   ├── .deleting-NNNNNNNN   # (transient) Coalesce deletion recovery marker
+│   ├── pack-index              # Global pack index (merged view of all .idx files)
+│   ├── 0000/                   # Shard directory (pack_num / 256, hex)
+│   │   ├── pack-00000001.dat   # Pack data file
+│   │   ├── pack-00000001.idx   # Pack index file
+│   │   └── ...
+│   ├── 0001/
+│   │   └── ...
+│   ├── .deleting-NNNNNNNN     # (transient) Coalesce deletion recovery marker
 │   └── ...
 │
 ├── logs/
@@ -185,6 +193,8 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 - `tmp/` is used exclusively for `mkstemp()`-based crash-safe writes. Files are written to `tmp/`, fsynced, then atomically renamed to their final location. The directory is never purged by the tool; stale temp files are left harmless (not referenced by any index).
 - Object files are split into 256 two-hex-character subdirectories (`00/` through `ff/`) under `objects/`, limiting directory entry count per bucket.
 - Pack numbers are monotonically increasing integers formatted as zero-padded eight-digit decimal strings. The next pack number is always `max(existing) + 1`.
+- Pack files are stored in sharded subdirectories under `packs/`: `packs/NNNN/pack-NNNNNNNN.{dat,idx}` where `NNNN = pack_num / 256` (4-char zero-padded hex). Each shard holds at most 256 packs (512 files). Legacy flat-layout packs (`packs/pack-NNNNNNNN.*`) are found via fallback when the sharded path does not exist.
+- `packs/pack-index` is a global index merging all per-pack `.idx` entries. It is rebuilt automatically after `pack`, `gc`, and `coalesce` operations. If absent or stale, the runtime falls back to scanning individual `.idx` files.
 
 ---
 
@@ -243,7 +253,7 @@ Exclusive lock acquisition automatically calls `repo_prune_resume_pending` befor
 
 **Phase 1 — Scan**
 
-Each source path is walked recursively by `scan_tree`. The scan produces a flat `scan_result_t` array of `scan_entry_t` structures. Each entry records the full absolute path, stripped repo-relative path, stat result, node type, xattr blob, ACL blob, and (for hard links) the node ID of the primary inode.
+Each source path is walked recursively by `scan_tree`. Within each directory, entries are batched from `readdir()`, sorted by `d_ino` (inode number), and then processed in inode order. On ext4 and similar filesystems where `readdir` returns entries in htree (filename hash) order, this reordering converts random inode-table seeks into sequential reads, significantly improving scan throughput on spinning disks. The scan produces a flat `scan_result_t` array of `scan_entry_t` structures. Each entry records the full absolute path, stripped repo-relative path, stat result, node type, xattr blob, ACL blob, and (for hard links) the node ID of the primary inode.
 
 A shared `scan_imap_t` (inode map) is passed to all `scan_tree` calls so hard links spanning multiple source roots are correctly detected and deduplicated. Hard-link secondaries record `hardlink_to_node_id` pointing at the primary; they do not store a separate content object.
 
@@ -312,7 +322,7 @@ The core object write function (`write_object` / `write_object_file_stream`) fol
 3. **Deduplication is complete** — no write occurs.
 4. **Stage 1 compression is disabled** — loose objects are always written as `COMPRESS_NONE`. The object header records `compression = COMPRESS_NONE` and `compressed_size = uncompressed_size`. Compression is handled entirely by the pack sweeper (see §7.2).
 5. **Write to temp file** — `mkstemp` under `tmp/`, write the 56-byte `object_header_t`, then the raw payload.
-6. **fsync** — the temp file descriptor is fsynced.
+6. **Async writeback** — on Linux, `sync_file_range(SYNC_FILE_RANGE_WRITE)` initiates non-blocking writeback of the temp file. On non-Linux systems, `fdatasync()` is used as a fallback. Because the object is not visible until the subsequent `rename`, a crash before writeback completes simply loses the temp file — no corruption is possible.
 7. **Rename** — `rename(tmp_path, final_path)`. The final path is `objects/XX/<rest>` where `XX` is the first two hex characters of the hash.
 8. **Directory fsync** — the containing `objects/XX/` directory is fsynced to persist the directory entry.
 
@@ -630,9 +640,9 @@ Pack creation produces multiple pack files according to size-based rules:
 
 For each pack (whether single-object or multi-object), two temp files are created in `tmp/` via `mkstemp`. The data file header is written first with `count = 0`; after all objects are written, the file is seeked back to offset 0 and the real count is patched in. The index entries are sorted by hash and the `.idx` file is written.
 
-Both files are fsynced. The `.dat` file is renamed to `packs/pack-NNNNNNNN.dat` and the `.idx` to `packs/pack-NNNNNNNN.idx`. After rename, both files are stat-checked to confirm they are non-empty.
+Both files are fsynced. The `.dat` file is renamed to its sharded location (`packs/NNNN/pack-NNNNNNNN.dat`) and the `.idx` likewise. After rename, both files are stat-checked to confirm they are non-empty.
 
-The `packs/` directory is then fsynced to persist the directory entries. Loose object files are unlinked after their pack is committed. The in-memory pack cache is invalidated so it will be rebuilt from the new index on next access.
+The shard directory is then fsynced to persist the directory entries. Loose object files are unlinked after their pack is committed. The in-memory pack cache is invalidated and the global pack index is rebuilt so subsequent lookups reflect the new pack.
 
 ### 7.2 Sweeper Intelligence — Compressibility Probing
 
@@ -667,7 +677,7 @@ Single-object packs for large files are always > 64 MiB (since the objects are >
 
 ### 7.4 Worker Pool (Small Objects)
 
-Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads (default: CPU count, max 32). Architecture:
+Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads (default: CPU count, max 32). Before dispatch, the work indices are sorted by object hash so that workers read `objects/XX/` directories in sequential order, converting random seeks into near-sequential I/O on spinning disks. Architecture:
 
 - A bounded queue of `pack_work_item_t` structures (capacity: `n_workers × 4`, minimum 16) is shared between workers (producers) and the main thread (consumer/writer).
 - Each worker has a pre-allocated compression buffer of `LZ4_compressBound(16 MiB)` bytes.
@@ -679,9 +689,35 @@ This producer-consumer design means CPU-bound compression (workers) and I/O-boun
 
 ### 7.5 Pack Index Cache
 
-The pack index cache (`pack_cache_entry_t` array) is a single unified sorted array covering all `.idx` files in the repository. It is loaded lazily on first access by `pack_cache_load`:
+#### Global Pack Index (`packs/pack-index`)
 
-1. Open the `packs/` directory and enumerate all `pack-NNNNNNNN.idx` files.
+A pre-built binary index that merges all per-pack `.idx` entries into a single mmap-friendly file. On-disk format:
+
+```
+Header (16 bytes):
+  magic:        u32  (0x42504D49 "BPMI")
+  version:      u32  (1)
+  entry_count:  u32
+  pack_count:   u32
+
+Fanout table (256 × u32 = 1024 bytes):
+  fanout[i] = count of entries with hash[0] <= i
+
+Sorted entries (entry_count × 48 bytes):
+  hash[32] + pack_num[4] + dat_offset[8] + pack_version[4]
+
+CRC32C + RS parity trailer + parity_footer_t
+```
+
+The global index is mmap'd read-only. Lookups use the fanout table to narrow the search range (entries whose first hash byte matches), then binary search within that range. Zero allocation, one page fault on first access per 4 KiB page.
+
+The index is rebuilt automatically after every pack-modifying operation (`pack`, `gc`, `coalesce`, crash recovery). Staleness detection compares `hdr->pack_count` against the actual count of `.idx` files on disk; a mismatch triggers fallback to the legacy per-pack scan. Per-pack `.idx` files are retained as the rebuild source and for pack-level operations (GC, coalesce).
+
+#### In-RAM Fallback Cache
+
+When the global index is unavailable (missing, corrupt, or stale), the runtime falls back to loading individual `.idx` files into a unified sorted `pack_cache_entry_t` array:
+
+1. Walk the `packs/` directory (two-level sharded structure, with flat-layout fallback) and enumerate all `.idx` files.
 2. For each `.idx` file, read the header and validate magic/version.
 3. Read all `pack_idx_disk_entry_t` records, appending them to the in-RAM array with `pack_num` and `pack_version` annotations.
 4. Sort the entire array by hash using `qsort` with `memcmp`.
@@ -689,6 +725,10 @@ The pack index cache (`pack_cache_entry_t` array) is a single unified sorted arr
 Lookups use `bsearch` against this sorted array — O(log N) across all packed objects.
 
 The cache is invalidated (`repo_set_pack_cache(repo, NULL, 0)`) whenever the pack set changes: after `repo_pack` completes, after `pack_gc` rewrites or deletes packs, and after coalescing. The next lookup will transparently reload from disk.
+
+#### DAT File Handle Cache
+
+Pack data files are accessed via a dynamically-sized open-addressing hash map keyed by `pack_num`. All handles remain open until `repo_close()`. The table starts at 128 slots and grows at 75% load factor. This eliminates the repeated `fopen`/`fclose` overhead that a fixed-size LRU cache would cause when thousands of packs are in use.
 
 ### 7.6 Pack Object Loading
 
@@ -872,17 +912,20 @@ A setting of `0` for any GFS tier (e.g., `keep_daily = 0`) disables that tier en
 
 ### 11.1 Full Snapshot Restore
 
-`backup restore --dest <path>` (without `--file`) restores the entire snapshot tree:
+`backup restore --dest <path>` (without `--file`) restores the entire snapshot tree. Restore uses a two-pass strategy that sorts I/O by on-disk location to minimize random seeks:
 
-1. Load the snapshot manifest.
-2. For each `node_t` in the snapshot (in node_id order), create the corresponding filesystem object at `<dest>/<repo-relative-path>`.
-3. For directories: `mkdir`.
-4. For regular files and sparse files: load the content object (using the stream path for large objects), write the payload. For sparse files, reconstruct the hole structure by seeking and writing data regions.
-5. For symlinks: `symlink(target, path)`.
-6. For hard links: the primary is written first; secondaries are created with `link(primary_path, secondary_path)`.
-7. For character/block devices: `mknod` (requires root or `CAP_MKNOD`).
-8. For FIFOs: `mkfifo`.
-9. After content is written, apply metadata: `chown`, `chmod`, `lsetxattr`, ACL apply, `utimensat`. Failures on non-root restores are logged as warnings but do not abort.
+**Pre-scan:** All content hashes are resolved to their pack location `(pack_num, dat_offset)` via the global pack index or fallback cache. Entries are classified as primaries (first occurrence of a `node_id`) or hardlink secondaries. Primaries are sorted by `(pack_num, dat_offset)` so that reads sweep each pack file sequentially.
+
+**Pass 1 — Primaries (pack-sorted):** Non-hardlink entries are restored in pack-sorted order:
+
+1. For directories: `mkdir`.
+2. For regular files and sparse files: load the content object (using the stream path for large objects), write the payload. For sparse files, reconstruct the hole structure by seeking and writing data regions.
+3. For symlinks: `symlink(target, path)`.
+4. For character/block devices: `mknod` (requires root or `CAP_MKNOD`).
+5. For FIFOs: `mkfifo`.
+6. After content is written, apply metadata: `chown`, `chmod`, `lsetxattr`, ACL apply, `utimensat`. Failures on non-root restores are logged as warnings but do not abort.
+
+**Pass 2 — Hardlinks:** Secondaries are created with `link(primary_path, secondary_path)`. All primaries are guaranteed to exist from Pass 1.
 
 Symlink targets are extracted from the object's payload (stored in the content object for symlinks).
 
@@ -1195,7 +1238,7 @@ backup verify --repo <path> [--repair]
 
 Verifies repository integrity. Without `--repair`, acquires a shared lock. With `--repair`, acquires an exclusive lock.
 
-Calls `repo_verify`, which loads every surviving snapshot and attempts to load and decompress every content, xattr, and ACL object referenced by any node. A SHA-256 hash is computed over the decompressed data and compared to the stored hash.
+Calls `repo_verify`, which loads every surviving snapshot and collects all unique content, xattr, and ACL hashes across all nodes, deduplicating so each object is verified exactly once regardless of how many snapshots reference it. The unique hashes are resolved to pack locations and sorted by `(pack_num, dat_offset)` so that verification sweeps each pack file sequentially. Each object is loaded, decompressed, and its SHA-256 hash is compared to the stored hash.
 
 If parity data is present (format version 2 objects, version 3 packs, version 5 snapshots), corruption is automatically detected via CRC-32C and corrected in memory via XOR or Reed-Solomon parity. The object is then verified against its SHA-256 hash as usual.
 
@@ -1306,6 +1349,22 @@ Runs GFS tier assignment manually. Acquires an exclusive lock.
 `--full-scan`: Clears all existing GFS flags and recomputes them from scratch across the entire history. Use after changing retention configuration to correct tier assignments retroactively.
 
 `--dry-run`: Reports what tier changes would be made without writing anything.
+
+### 13.20 `reindex`
+
+```
+backup reindex --repo <path>
+```
+
+Rebuilds the global pack index (`packs/pack-index`) from all per-pack `.idx` files. Acquires an exclusive lock. Use after manual pack manipulation, repository migration, or if the global index is suspected corrupt. The runtime already rebuilds the index automatically after `pack`, `gc`, and `coalesce`, so this command is primarily for repair and migration scenarios.
+
+### 13.21 `migrate-packs`
+
+```
+backup migrate-packs --repo <path>
+```
+
+Moves flat-layout pack files (`packs/pack-NNNNNNNN.{dat,idx}`) into sharded subdirectories (`packs/NNNN/pack-NNNNNNNN.{dat,idx}`). Acquires an exclusive lock. After moving all files, rebuilds the global pack index. New packs are always created in sharded directories; this command is only needed for repositories created before pack sharding was introduced. Running it on an already-sharded repository is harmless (no files to move).
 
 ---
 
@@ -1699,7 +1758,7 @@ This section describes how the runtime locates any object — loose or packed �
 Every object lookup follows a fixed two-step policy:
 
 1. **Loose first**: attempt a direct filesystem `open()` using the hash-derived path. Succeeds in O(1).
-2. **Pack cache second**: if the file is absent, search the unified in-RAM pack index. Succeeds in O(log N) across all packs simultaneously.
+2. **Pack index second**: if the file is absent, search the global pack index (mmap'd `packs/pack-index`) using a fanout table + binary search. If the global index is unavailable, fall back to the unified in-RAM `pack_cache_entry_t` array loaded from individual `.idx` files. Either path succeeds in O(log N) across all packs simultaneously.
 
 The loose-first policy means freshly written objects (which are always initially loose) are found without any index scan.
 
@@ -1715,9 +1774,15 @@ where `<HH>` is the first two hex characters of the SHA-256 hash and `<62-hex>` 
 
 Finding a loose object requires no index or search — the runtime constructs the path directly from the hash bytes, calls `openat()`, and either gets a file descriptor or `ENOENT`. The operation is O(1) regardless of repository size.
 
-### 21.3 Pack Index Cache — O(log N) Across All Packs
+### 21.3 Pack Index — O(log N) Across All Packs
 
-#### Structure
+#### Global Pack Index (Primary Path)
+
+The preferred lookup path uses the mmap'd global pack index (`packs/pack-index`). The fanout table provides O(1) range narrowing: `fanout[hash[0]-1]` to `fanout[hash[0]]` gives the subset of entries sharing the same first hash byte. Binary search within that range locates the entry. Each entry is 48 bytes containing the hash, pack number, dat offset, and pack version. Because the file is mmap'd, only the pages actually touched during lookup are faulted into memory.
+
+The global index is rebuilt after every pack-modifying operation (`pack`, `gc`, `coalesce`, crash recovery). If it is missing, corrupt, or stale (pack count mismatch), the runtime falls back to the in-RAM cache.
+
+#### Per-Pack `.idx` Structure
 
 Each pack pair (`pack-NNNNNNNN.dat` / `pack-NNNNNNNN.idx`) has an index file whose disk format is a sequential array of 40-byte entries:
 
@@ -1727,17 +1792,17 @@ pack_idx_disk_entry_t (40 bytes each, sorted by hash):
   uint64_t dat_offset    absolute byte offset in the .dat file
 ```
 
-Entries are sorted by hash at write time. This allows binary search directly on the `.idx` file if needed, but the runtime never searches individual `.idx` files at query time — it uses the unified in-RAM cache instead.
+Entries are sorted by hash at write time. Per-pack `.idx` files are the rebuild source for the global index and are used directly by pack-level operations (GC, coalesce).
 
-#### Cache Loading (`pack_cache_load`)
+#### In-RAM Fallback Cache (`pack_cache_load`)
 
-On first access after startup (or after any invalidation), the runtime:
+When the global index is unavailable, the runtime loads individual `.idx` files into a unified sorted array on first access:
 
-1. Opens `packs/` and enumerates all `pack-NNNNNNNN.idx` files.
-2. For each index file, reads the header (`pack_idx_hdr_t`) to verify the magic number and version, then reads all `pack_idx_disk_entry_t` records sequentially.
-3. Appends each entry to a single flat `pack_cache_entry_t` array, augmenting each record with `pack_num` and `pack_version` (which pack file it came from).
-4. After all packs are processed, calls `qsort()` on the combined array, sorting all entries from all packs together by hash.
-5. Stores the sorted array and its count in the `repo_t` object.
+1. Walk the `packs/` directory (two-level sharded structure, with flat-layout fallback) and enumerate all `.idx` files.
+2. For each index file, read the header (`pack_idx_hdr_t`) to verify the magic number and version, then read all `pack_idx_disk_entry_t` records sequentially.
+3. Append each entry to a single flat `pack_cache_entry_t` array, augmenting each record with `pack_num` and `pack_version` (which pack file it came from).
+4. After all packs are processed, call `qsort()` on the combined array, sorting all entries from all packs together by hash.
+5. Store the sorted array and its count in the `repo_t` object.
 
 The result is one contiguous, sorted array spanning every pack in the repository. A `pack_cache_entry_t` is 44 bytes:
 
@@ -1751,19 +1816,19 @@ pack_cache_entry_t (44 bytes):
 
 #### Lookup (`pack_find_entry`)
 
-To locate a packed object, the runtime calls `bsearch()` against the full array using `memcmp` on the 32-byte hash as the comparator. One `bsearch()` call covers every pack simultaneously in O(log N) where N is the total number of packed objects across all packs.
+To locate a packed object, the runtime first attempts the global index (fanout + binary search on the mmap). If unavailable, it calls `bsearch()` against the in-RAM array using `memcmp` on the 32-byte hash as the comparator. Either path covers every pack simultaneously in O(log N) where N is the total number of packed objects across all packs.
 
-On a hit, `pack_find_entry` returns a pointer to the matching `pack_cache_entry_t`, which contains the `.dat` file number and the exact byte offset. The caller opens `packs/pack-NNNNNNNN.dat` and seeks directly to `dat_offset` — no sequential scan of the data file is needed.
+On a hit, `pack_find_entry` returns a pointer to the matching `pack_cache_entry_t`, which contains the `.dat` file number and the exact byte offset. The caller opens the `.dat` file (via the DAT file handle cache, which keeps all handles open) and seeks directly to `dat_offset` — no sequential scan of the data file is needed.
 
 #### Cache Invalidation
 
-The cache is invalidated (set to NULL) whenever the pack set changes:
+The in-RAM cache is invalidated (set to NULL) whenever the pack set changes:
 
 - After `repo_pack` writes a new pack and its index.
 - After `repo_coalesce` renames a newly merged pack into place.
 - After GC deletes or rewrites one or more packs.
 
-The next lookup after invalidation triggers a full reload. Because loading is O(P · E) where P is the number of packs and E is entries per pack, and is only triggered once per pack-modifying operation, the amortized cost over many lookups is negligible.
+At each of these points, the global pack index is also rebuilt. The next lookup after invalidation will use the fresh global index. If that fails, a full in-RAM reload is triggered. Because loading is O(P · E) where P is the number of packs and E is entries per pack, and is only triggered once per pack-modifying operation, the amortized cost over many lookups is negligible.
 
 #### Memory Cost
 
@@ -1911,11 +1976,12 @@ For typical repositories dominated by files larger than 10 KiB, overhead converg
 On every object load (loose, packed, or snapshot), the following sequence runs:
 
 1. Read header and payload.
-2. CRC-32C fast check on payload. If CRC passes, proceed directly to SHA-256 verification (common case — no parity work needed).
-3. If CRC fails: attempt XOR parity repair on header, RS parity decode on payload.
-4. If repair succeeds: log a warning, increment the `parity_repaired` counter, proceed to SHA-256 verification.
-5. If repair fails: log an error, increment the `parity_uncorrectable` counter, return `ERR_CORRUPT`.
-6. SHA-256 remains the final authoritative verification — parity is a correction layer, not a replacement for cryptographic integrity checks.
+2. Read the parity trailer in a single sequential `read()` immediately after the payload — the file position is already at the trailer start, so no seeks are needed. The trailer size is computed from the header's `compressed_size` field. If the trailer is absent or malformed (pre-parity format), parity checking is skipped.
+3. CRC-32C fast check on payload. If CRC passes, proceed directly to SHA-256 verification (common case — no parity work needed).
+4. If CRC fails: attempt XOR parity repair on header, RS parity decode on payload.
+5. If repair succeeds: log a warning, increment the `parity_repaired` counter, proceed to SHA-256 verification.
+6. If repair fails: log an error, increment the `parity_uncorrectable` counter, return `ERR_CORRUPT`.
+7. SHA-256 remains the final authoritative verification — parity is a correction layer, not a replacement for cryptographic integrity checks.
 
 ### 22.9 Active Repair (`verify --repair`)
 

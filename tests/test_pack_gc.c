@@ -73,6 +73,19 @@ static void write_compressible_file(const char *path, size_t len) {
     close(fd);
 }
 
+/* Build a pack file path, supporting both sharded (packs/XXXX/) and flat layouts.
+ * ext should be "dat" or "idx". */
+static int test_pack_path(char *out, size_t out_sz, uint32_t pack_num,
+                          const char *ext) {
+    /* Try sharded first */
+    int n = snprintf(out, out_sz, "%s/packs/%04x/pack-%08u.%s",
+                     TEST_REPO, pack_num / 256, pack_num, ext);
+    if (n > 0 && (size_t)n < out_sz && access(out, F_OK) == 0) return 0;
+    /* Flat fallback */
+    n = snprintf(out, out_sz, "%s/packs/pack-%08u.%s", TEST_REPO, pack_num, ext);
+    return (n > 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
 static void cleanup(void) {
     int rc = system("rm -rf " TEST_REPO " " TEST_SRC " " TEST_DEST);
     (void)rc;
@@ -130,7 +143,9 @@ static int first_content_hash_from_snapshot(uint8_t out[OBJECT_HASH_SIZE]) {
 }
 
 static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint64_t *out_off) {
-    FILE *f = fopen(TEST_REPO "/packs/pack-00000000.idx", "rb");
+    char idx_buf[PATH_MAX];
+    if (test_pack_path(idx_buf, sizeof(idx_buf), 0, "idx") != 0) return -1;
+    FILE *f = fopen(idx_buf, "rb");
     if (!f) return -1;
 
     pack_idx_hdr_t hdr;
@@ -152,7 +167,8 @@ static int find_pack_offset_for_hash(const uint8_t hash[OBJECT_HASH_SIZE], uint6
 }
 
 static void disable_dat_parity(void) {
-    const char *path = TEST_REPO "/packs/pack-00000000.dat";
+    char path[PATH_MAX];
+    assert_int_equal(test_pack_path(path, sizeof(path), 0, "dat"), 0);
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
     struct stat st;
@@ -166,7 +182,9 @@ static void corrupt_packed_payload_byte(const uint8_t hash[OBJECT_HASH_SIZE]) {
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.dat", O_RDWR);
+    char dat_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_buf, sizeof(dat_buf), 0, "dat"), 0);
+    int fd = open(dat_buf, O_RDWR);
     assert_true(fd >= 0);
 
     off_t payload_off = (off_t)off + (off_t)sizeof(pack_dat_entry_hdr_t);
@@ -188,7 +206,24 @@ static int count_pack_dat_files(void) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         size_t n = strlen(de->d_name);
-        if (n >= 4 && strcmp(de->d_name + n - 4, ".dat") == 0) count++;
+        if (n >= 4 && strcmp(de->d_name + n - 4, ".dat") == 0) {
+            count++;
+        } else if (de->d_name[0] != '.') {
+            /* Recurse into shard subdirectories */
+            char sub[PATH_MAX];
+            snprintf(sub, sizeof(sub), TEST_REPO "/packs/%s", de->d_name);
+            struct stat sb;
+            if (stat(sub, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+            DIR *sd = opendir(sub);
+            if (!sd) continue;
+            struct dirent *se;
+            while ((se = readdir(sd)) != NULL) {
+                size_t sn = strlen(se->d_name);
+                if (sn >= 4 && strcmp(se->d_name + sn - 4, ".dat") == 0)
+                    count++;
+            }
+            closedir(sd);
+        }
     }
     closedir(d);
     return count;
@@ -212,9 +247,9 @@ static void copy_file_bytes(const char *src, const char *dst) {
 
 static void clone_base_pack(uint32_t max_pack_num) {
     for (uint32_t n = 1; n <= max_pack_num; n++) {
-        char src_dat[256], src_idx[256], dst_dat[256], dst_idx[256];
-        snprintf(src_dat, sizeof(src_dat), TEST_REPO "/packs/pack-%08u.dat", 0u);
-        snprintf(src_idx, sizeof(src_idx), TEST_REPO "/packs/pack-%08u.idx", 0u);
+        char src_dat[PATH_MAX], src_idx[PATH_MAX], dst_dat[256], dst_idx[256];
+        assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
+        assert_int_equal(test_pack_path(src_idx, sizeof(src_idx), 0, "idx"), 0);
         snprintf(dst_dat, sizeof(dst_dat), TEST_REPO "/packs/pack-%08u.dat", n);
         snprintf(dst_idx, sizeof(dst_idx), TEST_REPO "/packs/pack-%08u.idx", n);
         copy_file_bytes(src_dat, dst_dat);
@@ -262,7 +297,9 @@ static void test_repo_verify_detects_missing_pack_data_file(void **state) {
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
 
-    assert_int_equal(unlink(TEST_REPO "/packs/pack-00000000.dat"), 0);
+    char dat_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_buf, sizeof(dat_buf), 0, "dat"), 0);
+    assert_int_equal(unlink(dat_buf), 0);
 
     void *data = NULL;
     size_t sz = 0;
@@ -291,7 +328,9 @@ static void test_pack_object_load_detects_invalid_compression(void **state) {
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.dat", O_RDWR);
+    char dat_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_buf, sizeof(dat_buf), 0, "dat"), 0);
+    int fd = open(dat_buf, O_RDWR);
     assert_true(fd >= 0);
 
     off_t comp_off = (off_t)off + (off_t)OBJECT_HASH_SIZE + 1;
@@ -310,7 +349,9 @@ static void test_pack_cache_truncated_idx_causes_corrupt_on_lookup(void **state)
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.idx", O_RDWR);
+    char idx_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(idx_buf, sizeof(idx_buf), 0, "idx"), 0);
+    int fd = open(idx_buf, O_RDWR);
     assert_true(fd >= 0);
     assert_int_equal(ftruncate(fd, (off_t)sizeof(pack_idx_hdr_t) + 10), 0);
     close(fd);
@@ -331,7 +372,9 @@ static void test_pack_object_physical_size_detects_truncated_dat_entry(void **st
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.dat", O_RDWR);
+    char dat_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_buf, sizeof(dat_buf), 0, "dat"), 0);
+    int fd = open(dat_buf, O_RDWR);
     assert_true(fd >= 0);
     off_t trunc_to = (off_t)off + (off_t)sizeof(pack_dat_entry_hdr_t) - 1;
     assert_int_equal(ftruncate(fd, trunc_to), 0);
@@ -361,7 +404,9 @@ static void test_pack_object_load_rejects_none_size_mismatch(void **state) {
     uint64_t off = 0;
     assert_int_equal(find_pack_offset_for_hash(hash, &off), 0);
 
-    int fd = open(TEST_REPO "/packs/pack-00000000.dat", O_RDWR);
+    char dat_buf[PATH_MAX];
+    assert_int_equal(test_pack_path(dat_buf, sizeof(dat_buf), 0, "dat"), 0);
+    int fd = open(dat_buf, O_RDWR);
     assert_true(fd >= 0);
 
     assert_int_equal(lseek(fd, (off_t)off, SEEK_SET), (off_t)off);
@@ -941,14 +986,17 @@ static void test_load_from_v1_pack(void **state) {
     int comp_sz = LZ4_compress_default(data2, comp_buf, (int)dlen2, comp_bound);
     assert_true(comp_sz > 0);
 
-    /* Create packs directory */
-    char packs_dir[PATH_MAX];
+    /* Create packs shard directory */
+    char packs_dir[PATH_MAX], shard_dir[PATH_MAX];
     snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo));
     mkdir(packs_dir, 0755);
+    snprintf(shard_dir, sizeof(shard_dir), "%s/packs/%04x", repo_path(repo), 99u / 256u);
+    mkdir(shard_dir, 0755);
 
     /* Write v1 .dat file with 2 entries */
     char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-00000099.dat", repo_path(repo));
+    snprintf(dat_path, sizeof(dat_path), "%s/packs/%04x/pack-%08u.dat",
+             repo_path(repo), 99u / 256u, 99u);
     FILE *datf = fopen(dat_path, "wb");
     assert_non_null(datf);
 
@@ -987,7 +1035,8 @@ static void test_load_from_v1_pack(void **state) {
 
     /* Write v1 .idx file — entries must be sorted by hash */
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-00000099.idx", repo_path(repo));
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/%04x/pack-%08u.idx",
+             repo_path(repo), 99u / 256u, 99u);
     FILE *idxf = fopen(idx_path, "wb");
     assert_non_null(idxf);
 

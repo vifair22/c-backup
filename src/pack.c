@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "pack.h"
+#include "pack_index.h"
 #include "parity.h"
 #include "object.h"
 #include "repo.h"
@@ -93,7 +94,51 @@ static int path_fmt(char *buf, size_t sz, const char *fmt, ...) {
     return (n >= 0 && (size_t)n < sz) ? 0 : -1;
 }
 
-static int parse_pack_dat_name(const char *name, uint32_t *out_num) {
+/* ---- Sharded pack path helpers ----
+ * New layout:  packs/XXXX/pack-NNNNNNNN.{dat,idx}
+ *   where XXXX = pack_num / 256 (4-char zero-padded hex)
+ * Legacy flat: packs/pack-NNNNNNNN.{dat,idx}
+ *
+ * pack_dat_path / pack_idx_path build the *sharded* path (for writes).
+ * pack_dat_path_resolve / pack_idx_path_resolve try sharded first,
+ * fall back to flat (for reads). */
+
+static int pack_dat_path(char *buf, size_t sz, const char *repo,
+                         uint32_t pack_num) {
+    return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.dat",
+                    repo, pack_num / 256, pack_num);
+}
+
+static int pack_idx_path(char *buf, size_t sz, const char *repo,
+                         uint32_t pack_num) {
+    return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.idx",
+                    repo, pack_num / 256, pack_num);
+}
+
+/* Build sharded path; if file doesn't exist, try flat layout. */
+int pack_dat_path_resolve(char *buf, size_t sz, const char *repo,
+                          uint32_t pack_num) {
+    if (pack_dat_path(buf, sz, repo, pack_num) != 0) return -1;
+    if (access(buf, F_OK) == 0) return 0;
+    return path_fmt(buf, sz, "%s/packs/pack-%08u.dat", repo, pack_num);
+}
+
+static int pack_idx_path_resolve(char *buf, size_t sz, const char *repo,
+                                 uint32_t pack_num) {
+    if (pack_idx_path(buf, sz, repo, pack_num) != 0) return -1;
+    if (access(buf, F_OK) == 0) return 0;
+    return path_fmt(buf, sz, "%s/packs/pack-%08u.idx", repo, pack_num);
+}
+
+/* Ensure the shard directory exists for a pack_num. */
+static void pack_ensure_shard_dir(const char *repo, uint32_t pack_num) {
+    char shard[PATH_MAX];
+    if (path_fmt(shard, sizeof(shard), "%s/packs/%04x",
+                 repo, pack_num / 256) == 0)
+        (void)mkdir(shard, 0755);  /* EEXIST is fine */
+}
+
+int parse_pack_dat_name(const char *name, uint32_t *out_num) {
     int end = 0;
     uint32_t n;
     if (sscanf(name, "pack-%08u.dat%n", &n, &end) == 1 && name[end] == '\0') {
@@ -103,19 +148,79 @@ static int parse_pack_dat_name(const char *name, uint32_t *out_num) {
     return 0;
 }
 
+/* Walk packs/ directory (both flat and sharded) collecting pack numbers
+ * from .dat files.  Calls cb(pack_num, ctx) for each found pack. */
+typedef void (*pack_num_cb)(uint32_t pack_num, void *ctx);
+
+static void pack_for_each_num(const char *packs_dir, pack_num_cb cb,
+                               void *ctx) {
+    DIR *dir = opendir(packs_dir);
+    if (!dir) return;
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        uint32_t n;
+        /* Flat layout: pack-NNNNNNNN.dat */
+        if (parse_pack_dat_name(de->d_name, &n)) {
+            cb(n, ctx);
+            continue;
+        }
+        /* Shard subdir: 4-char hex */
+        if (de->d_type == DT_DIR || de->d_type == DT_UNKNOWN) {
+            unsigned shard_val;
+            int end = 0;
+            if (sscanf(de->d_name, "%04x%n", &shard_val, &end) != 1 ||
+                end != 4 || de->d_name[4] != '\0')
+                continue;
+
+            char subdir[PATH_MAX];
+            if (path_fmt(subdir, sizeof(subdir), "%s/%s",
+                         packs_dir, de->d_name) != 0)
+                continue;
+
+            DIR *sdir = opendir(subdir);
+            if (!sdir) continue;
+            struct dirent *sde;
+            while ((sde = readdir(sdir)) != NULL) {
+                if (parse_pack_dat_name(sde->d_name, &n))
+                    cb(n, ctx);
+            }
+            closedir(sdir);
+        }
+    }
+    closedir(dir);
+}
+
+/* Callback for pack_for_each_num: collect pack numbers into a dynamic array */
+typedef struct {
+    uint32_t *nums;
+    size_t    cap;
+    size_t    cnt;
+} collect_pack_nums_ctx_t;
+
+static void collect_pack_num_cb(uint32_t pack_num, void *ctx) {
+    collect_pack_nums_ctx_t *c = ctx;
+    if (c->cnt == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 256;
+        uint32_t *tmp = realloc(c->nums, nc * sizeof(*tmp));
+        if (!tmp) return;  /* best effort */
+        c->nums = tmp;
+        c->cap = nc;
+    }
+    c->nums[c->cnt++] = pack_num;
+}
+
+static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
+    uint32_t *max = ctx;
+    if (pack_num >= *max) *max = pack_num + 1;
+}
+
 static uint32_t next_pack_num(repo_t *repo) {
     uint32_t pack_num = 0;
-    int pd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
-    if (pd < 0) return 0;
-    DIR *d = fdopendir(pd);
-    if (!d) { close(pd); return 0; }
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        uint32_t n;
-        if (parse_pack_dat_name(de->d_name, &n) && n >= pack_num)
-            pack_num = n + 1;
-    }
-    closedir(d);
+    char packs_dir[PATH_MAX];
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+        return 0;
+    pack_for_each_num(packs_dir, max_pack_num_cb, &pack_num);
     return pack_num;
 }
 
@@ -540,28 +645,57 @@ static void *pack_worker_main(void *arg) {
 static status_t pack_cache_load(repo_t *repo) {
     if (repo_pack_cache_data(repo) != NULL) return OK;  /* already loaded */
 
-    int pack_dirfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
-    if (pack_dirfd == -1) {
-        /* No packs/ dir or not accessible — treat as empty */
-        repo_set_pack_cache(repo, malloc(1), 0);   /* sentinel: non-NULL, cnt=0 */
+    /* Fast path: try the global pack index first. */
+    pack_index_t *gidx = pack_index_open(repo);
+    if (gidx) {
+        uint32_t n = gidx->hdr->entry_count;
+        pack_cache_entry_t *entries = malloc((n ? n : 1) * sizeof(*entries));
+        if (entries) {
+            for (uint32_t i = 0; i < n; i++) {
+                const pack_index_entry_t *ge = &gidx->entries[i];
+                memcpy(entries[i].hash, ge->hash, OBJECT_HASH_SIZE);
+                entries[i].dat_offset   = ge->dat_offset;
+                entries[i].pack_num     = ge->pack_num;
+                entries[i].pack_version = ge->pack_version;
+                entries[i].entry_index  = ge->entry_index;
+            }
+            /* Already sorted by hash in the global index. */
+            repo_set_pack_cache(repo, entries, n);
+            pack_index_close(gidx);
+            return OK;
+        }
+        pack_index_close(gidx);
+        /* malloc failed — fall through to legacy path */
+    }
+
+    /* Legacy path: scan all per-pack .idx files (flat + sharded). */
+    char legacy_packs_dir[PATH_MAX];
+    if (path_fmt(legacy_packs_dir, sizeof(legacy_packs_dir), "%s/packs",
+                 repo_path(repo)) != 0) {
+        repo_set_pack_cache(repo, malloc(1), 0);
         return OK;
     }
 
-    DIR *dir = fdopendir(pack_dirfd);
-    if (!dir) { close(pack_dirfd); return OK; }
+    /* Collect all pack numbers via two-level walk */
+    collect_pack_nums_ctx_t legacy_cpn = { NULL, 0, 0 };
+    legacy_cpn.nums = malloc(256 * sizeof(*legacy_cpn.nums));
+    if (!legacy_cpn.nums) {
+        repo_set_pack_cache(repo, malloc(1), 0);
+        return OK;
+    }
+    legacy_cpn.cap = 256;
+    pack_for_each_num(legacy_packs_dir, collect_pack_num_cb, &legacy_cpn);
 
     pack_cache_entry_t *entries = NULL;
     size_t cap = 0, cnt = 0;
     status_t st = OK;
 
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        uint32_t pack_num;
-        if (sscanf(de->d_name, "pack-%08u.idx", &pack_num) != 1) continue;
-
+    for (size_t pi = 0; pi < legacy_cpn.cnt && st == OK; pi++) {
+        uint32_t pack_num = legacy_cpn.nums[pi];
         char idx_path[PATH_MAX];
-        if (path_fmt(idx_path, sizeof(idx_path), "%s/packs/%s",
-                     repo_path(repo), de->d_name) != 0) continue;
+        if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
+                                  repo_path(repo), pack_num) != 0)
+            continue;
 
         FILE *f = fopen(idx_path, "rb");
         if (!f) continue;
@@ -622,9 +756,8 @@ static status_t pack_cache_load(repo_t *repo) {
             free(disk_buf);
         }
         fclose(f);
-        if (st != OK) break;
     }
-    closedir(dir);   /* also closes pack_dirfd */
+    free(legacy_cpn.nums);
 
     if (st != OK) { free(entries); return st; }
 
@@ -643,6 +776,12 @@ static status_t pack_cache_load(repo_t *repo) {
 void pack_cache_invalidate(repo_t *repo) {
     repo_dat_cache_flush(repo);
     repo_set_pack_cache(repo, NULL, 0);
+
+    /* Remove stale global pack index so next load falls through to
+     * the per-pack .idx scan and rebuilds fresh state. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/packs/pack-index", repo_path(repo));
+    (void)unlink(path);
 }
 
 /* ------------------------------------------------------------------ */
@@ -673,14 +812,27 @@ static status_t pack_find_entry(repo_t *repo,
     return OK;
 }
 
+status_t pack_resolve_location(repo_t *repo,
+                               const uint8_t hash[OBJECT_HASH_SIZE],
+                               uint32_t *out_pack_num,
+                               uint64_t *out_dat_offset) {
+    pack_cache_entry_t *found = NULL;
+    status_t st = pack_find_entry(repo, hash, &found);
+    if (st != OK || !found) return st != OK ? st : ERR_NOT_FOUND;
+    *out_pack_num  = found->pack_num;
+    *out_dat_offset = found->dat_offset;
+    return OK;
+}
+
 /* ---- .dat file handle cache helpers ---- */
 
 static FILE *dat_open_or_checkout(repo_t *repo, uint32_t pack_num) {
     FILE *f = repo_dat_cache_checkout(repo, pack_num);
     if (f) return f;
     char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), pack_num);
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              repo_path(repo), pack_num) != 0)
+        return NULL;
     return fopen(dat_path, "rb");
 }
 
@@ -840,8 +992,9 @@ status_t pack_object_load(repo_t *repo,
 
     uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), pnum);
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              repo_path(repo), pnum) != 0)
+        return set_error(ERR_IO, "pack_object_load: path too long for pack-%08u.dat", pnum);
     FILE *f = dat_open_or_checkout(repo, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load: fopen(%s)", dat_path);
 
@@ -1031,8 +1184,9 @@ status_t pack_object_load_stream(repo_t *repo,
 
     uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), pnum);
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              repo_path(repo), pnum) != 0)
+        return set_error(ERR_IO, "pack_object_load_stream: path too long for pack-%08u.dat", pnum);
     FILE *f = dat_open_or_checkout(repo, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load_stream: fopen(%s)", dat_path);
 
@@ -1844,10 +1998,10 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
         char dat_final[PATH_MAX], idx_final[PATH_MAX];
         char stage_dir[PATH_MAX];
         char stage_dat[PATH_MAX], stage_idx[PATH_MAX];
-        if (path_fmt(dat_final, sizeof(dat_final), "%s/packs/pack-%08u.dat",
-                     repo_path(repo), pack_num) != 0 ||
-            path_fmt(idx_final, sizeof(idx_final), "%s/packs/pack-%08u.idx",
-                     repo_path(repo), pack_num) != 0 ||
+        if (pack_dat_path(dat_final, sizeof(dat_final),
+                          repo_path(repo), pack_num) != 0 ||
+            pack_idx_path(idx_final, sizeof(idx_final),
+                          repo_path(repo), pack_num) != 0 ||
             path_fmt(stage_dir, sizeof(stage_dir), "%s/packs/.installing-%08u",
                      repo_path(repo), pack_num) != 0 ||
             path_fmt(stage_dat, sizeof(stage_dat), "%s/packs/.installing-%08u/pack-%08u.dat",
@@ -1856,6 +2010,9 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
                      repo_path(repo), pack_num, pack_num) != 0) {
             st = set_error(ERR_IO, "finalize_pack: path too long"); goto fail;
         }
+
+        /* Ensure the shard subdirectory exists */
+        pack_ensure_shard_dir(repo_path(repo), pack_num);
 
         if (mkdir(stage_dir, 0755) != 0) {
             st = set_error_errno(ERR_IO, "finalize_pack: mkdir(%s)", stage_dir);
@@ -1956,6 +2113,13 @@ static void unlink_loose_batch(repo_t *repo,
     }
 
     close(obj_fd);
+}
+
+/* qsort_r comparator: sort index array by hash via meta array (context). */
+static int pack_idx_hash_cmp(const void *a, const void *b, void *arg) {
+    const pack_obj_meta_t *meta = arg;
+    return memcmp(meta[*(const uint32_t *)a].hash,
+                  meta[*(const uint32_t *)b].hash, OBJECT_HASH_SIZE);
 }
 
 status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
@@ -2481,6 +2645,12 @@ raw_copy:
 
     if (st != OK) goto cleanup;
 
+    /* Sort small_indices by hash so workers read objects/XX/ in directory order,
+     * converting random seeks into sequential I/O on spinning disks. */
+    if (small_cnt > 1)
+        qsort_r(small_indices, small_cnt, sizeof(uint32_t),
+                pack_idx_hash_cmp, meta);
+
     /* --- Worker pool: compress and pack small objects --- */
     if (small_cnt > 0) {
 
@@ -2730,6 +2900,7 @@ raw_copy:
 
     /* Invalidate the pack index cache so the new packs are picked up */
     pack_cache_invalidate(repo);
+    pack_index_rebuild(repo);
 
     free(idx_entries);
     free(entry_parity);
@@ -2808,25 +2979,30 @@ static status_t collect_pack_meta(repo_t *repo,
     *out_total_dat = 0;
     *out_small_cnt = 0;
 
-    int pack_dirfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
-    if (pack_dirfd == -1) return OK;
-    DIR *dir = fdopendir(pack_dirfd);
-    if (!dir) { close(pack_dirfd); return set_error_errno(ERR_IO, "collect_pack_meta: fdopendir(packs)"); }
+    char packs_dir[PATH_MAX];
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+        return OK;
 
-    size_t cap = 32, cnt = 0;
+    /* Collect pack numbers via two-level walk */
+    size_t num_cap = 256, num_cnt = 0;
+    uint32_t *pack_nums = malloc(num_cap * sizeof(*pack_nums));
+    if (!pack_nums) return set_error(ERR_NOMEM, "collect_pack_meta: alloc failed");
+
+    collect_pack_nums_ctx_t cpn = { pack_nums, num_cap, 0 };
+    pack_for_each_num(packs_dir, collect_pack_num_cb, &cpn);
+    pack_nums = cpn.nums;
+    num_cnt = cpn.cnt;
+
+    size_t cap = num_cnt ? num_cnt : 1, cnt = 0;
     pack_meta_t *arr = malloc(cap * sizeof(*arr));
-    if (!arr) { closedir(dir); return set_error(ERR_NOMEM, "collect_pack_meta: alloc failed"); }
+    if (!arr) { free(pack_nums); return set_error(ERR_NOMEM, "collect_pack_meta: alloc failed"); }
 
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        uint32_t n;
-        if (!parse_pack_dat_name(de->d_name, &n)) continue;
-
+    for (size_t i = 0; i < num_cnt; i++) {
+        uint32_t n = pack_nums[i];
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat", repo_path(repo), n) != 0 ||
-            path_fmt(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx", repo_path(repo), n) != 0) {
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), n) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), n) != 0)
             continue;
-        }
 
         struct stat st;
         if (stat(dat_path, &st) != 0) continue;
@@ -2842,13 +3018,6 @@ static status_t collect_pack_meta(repo_t *repo,
         }
         fclose(idxf);
 
-        if (cnt == cap) {
-            size_t nc = cap * 2;
-            pack_meta_t *tmp = realloc(arr, nc * sizeof(*arr));
-            if (!tmp) { free(arr); closedir(dir); return set_error(ERR_NOMEM, "collect_pack_meta: realloc failed"); }
-            arr = tmp;
-            cap = nc;
-        }
         arr[cnt].num = n;
         arr[cnt].count = ihdr.count;
         arr[cnt].dat_bytes = (uint64_t)st.st_size;
@@ -2856,7 +3025,7 @@ static status_t collect_pack_meta(repo_t *repo,
         if (arr[cnt].dat_bytes < PACK_COALESCE_SMALL_BYTES) (*out_small_cnt)++;
         cnt++;
     }
-    closedir(dir);
+    free(pack_nums);
 
     *out_meta = arr;
     *out_cnt = cnt;
@@ -2892,9 +3061,12 @@ void pack_resume_installing(repo_t *repo) {
         char dat_final[PATH_MAX], idx_final[PATH_MAX];
         if (path_fmt(stage_dat, sizeof(stage_dat), "%s/pack-%08u.dat", stage_dir, pack_num) != 0 ||
             path_fmt(stage_idx, sizeof(stage_idx), "%s/pack-%08u.idx", stage_dir, pack_num) != 0 ||
-            path_fmt(dat_final, sizeof(dat_final), "%s/pack-%08u.dat", packs_dir, pack_num) != 0 ||
-            path_fmt(idx_final, sizeof(idx_final), "%s/pack-%08u.idx", packs_dir, pack_num) != 0)
+            pack_dat_path(dat_final, sizeof(dat_final), repo_path(repo), pack_num) != 0 ||
+            pack_idx_path(idx_final, sizeof(idx_final), repo_path(repo), pack_num) != 0)
             continue;
+
+        /* Ensure the shard subdirectory exists for final paths */
+        pack_ensure_shard_dir(repo_path(repo), pack_num);
 
         /* Check what's already in packs/ vs staging */
         int dat_staged = (access(stage_dat, F_OK) == 0);
@@ -2935,6 +3107,8 @@ remove_stage:
     /* fsync packs/ to persist any completed installs */
     int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
     if (pfd >= 0) { fsync(pfd); close(pfd); }
+
+    pack_index_rebuild(repo);
 }
 
 /* Resume any interrupted coalesce deletions by scanning for .deleting-NNNNNNNN
@@ -2964,17 +3138,20 @@ static void pack_resume_deleting(repo_t *repo) {
         uint32_t pnum;
         while (fscanf(mf, "%u", &pnum) == 1) {
             char dat_path[PATH_MAX], idx_path[PATH_MAX];
-            if (snprintf(dat_path, sizeof(dat_path), "%s/pack-%08u.dat",
-                         packs_dir, pnum) < (int)sizeof(dat_path))
+            /* Try sharded path first, then flat fallback */
+            if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                                      repo_path(repo), pnum) == 0)
                 unlink(dat_path);
-            if (snprintf(idx_path, sizeof(idx_path), "%s/pack-%08u.idx",
-                         packs_dir, pnum) < (int)sizeof(idx_path))
+            if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
+                                      repo_path(repo), pnum) == 0)
                 unlink(idx_path);
         }
         fclose(mf);
         unlink(marker_path);
     }
     closedir(dir);
+
+    pack_index_rebuild(repo);
 }
 
 static status_t maybe_coalesce_packs(repo_t *repo,
@@ -3061,8 +3238,8 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
     for (size_t ci = 0; rc == OK && ci < n_cand; ci++) {
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat", repo_path(repo), cand[ci].num) != 0 ||
-            path_fmt(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx", repo_path(repo), cand[ci].num) != 0) {
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), cand[ci].num) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), cand[ci].num) != 0) {
             rc = ERR_IO;
             break;
         }
@@ -3217,12 +3394,10 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
         for (size_t ci = 0; ci < n_cand; ci++) {
             char dat_path[PATH_MAX], idx_path[PATH_MAX];
-            if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat", repo_path(repo), cand[ci].num) != 0 ||
-                path_fmt(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx", repo_path(repo), cand[ci].num) != 0) {
-                continue;
-            }
-            unlink(dat_path);
-            unlink(idx_path);
+            if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), cand[ci].num) == 0)
+                unlink(dat_path);
+            if (pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), cand[ci].num) == 0)
+                unlink(idx_path);
         }
 
         if (del_marker[0] != '\0') unlink(del_marker);
@@ -3230,6 +3405,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
         int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
         if (pfd >= 0) { fsync(pfd); close(pfd); }
         pack_cache_invalidate(repo);
+        pack_index_rebuild(repo);
         coalesce_state_write(repo, head);
 
         char msg[160];
@@ -3256,8 +3432,9 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
         return -1;
 
     char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), found->pack_num);
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              repo_path(repo), found->pack_num) != 0)
+        return -1;
 
     /* Open read-only FILE* for load_entry_parity and reading current data */
     FILE *f = fopen(dat_path, "rb");
@@ -3345,39 +3522,26 @@ status_t pack_gc(repo_t *repo,
     struct timespec next_tick = {0};
     if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
-    int pack_dirfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
-    if (pack_dirfd == -1) {
+    char gc_packs_dir[PATH_MAX];
+    if (path_fmt(gc_packs_dir, sizeof(gc_packs_dir), "%s/packs", repo_path(repo)) != 0) {
         if (out_kept)    *out_kept    = 0;
         if (out_deleted) *out_deleted = 0;
         return OK;
     }
 
-    DIR *dir = fdopendir(pack_dirfd);
-    if (!dir) { close(pack_dirfd); return set_error_errno(ERR_IO, "pack_gc: fdopendir(packs)"); }
-
-    /* Collect pack numbers to process (avoid modifying dir while iterating) */
-    size_t pack_cap = 256, npack = 0;
-    uint32_t *pack_nums = malloc(pack_cap * sizeof(*pack_nums));
-    if (!pack_nums) {
-        closedir(dir);
+    /* Collect pack numbers via two-level walk */
+    size_t npack = 0;
+    collect_pack_nums_ctx_t gc_cpn = { NULL, 0, 0 };
+    gc_cpn.nums = malloc(256 * sizeof(*gc_cpn.nums));
+    if (!gc_cpn.nums) {
         if (out_kept)    *out_kept    = 0;
         if (out_deleted) *out_deleted = 0;
         return set_error(ERR_NOMEM, "pack_gc: pack_nums alloc failed");
     }
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        uint32_t n;
-        if (!parse_pack_dat_name(de->d_name, &n)) continue;
-        if (npack == pack_cap) {
-            size_t nc = pack_cap * 2;
-            uint32_t *tmp = realloc(pack_nums, nc * sizeof(*pack_nums));
-            if (!tmp) { free(pack_nums); closedir(dir); return set_error(ERR_NOMEM, "pack_gc: pack_nums realloc failed"); }
-            pack_nums = tmp;
-            pack_cap = nc;
-        }
-        pack_nums[npack++] = n;
-    }
-    closedir(dir);   /* closes pack_dirfd too */
+    gc_cpn.cap = 256;
+    pack_for_each_num(gc_packs_dir, collect_pack_num_cb, &gc_cpn);
+    uint32_t *pack_nums = gc_cpn.nums;
+    npack = gc_cpn.cnt;
 
     for (size_t pi = 0; pi < npack; pi++) {
         if (show_progress && pack_tick_due(&next_tick)) {
@@ -3391,10 +3555,8 @@ status_t pack_gc(repo_t *repo,
         size_t gc_payload_cap = 0;
 
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (path_fmt(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-                     repo_path(repo), pnum) != 0 ||
-            path_fmt(idx_path, sizeof(idx_path), "%s/packs/pack-%08u.idx",
-                     repo_path(repo), pnum) != 0) {
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), pnum) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), pnum) != 0) {
             continue;
         }
 
@@ -3625,8 +3787,10 @@ pack_fail:
         log_msg("WARN", "pack-coalesce: skipped due to error");
 
     /* All packs processed — invalidate cache so next lookup is fresh */
-    if (total_deleted > 0)
+    if (total_deleted > 0) {
         pack_cache_invalidate(repo);
+        pack_index_rebuild(repo);
+    }
 
     if (out_kept)    *out_kept    = total_kept;
     if (out_deleted) *out_deleted = total_deleted;
@@ -3646,7 +3810,15 @@ status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
     snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), dat_name);
 
     FILE *f = fopen(path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_enumerate_dat: open %s", dat_name);
+    if (!f) {
+        /* Try sharded path: parse pack_num from name */
+        uint32_t pnum;
+        if (parse_pack_dat_name(dat_name, &pnum) &&
+            pack_dat_path_resolve(path, sizeof(path), repo_path(repo), pnum) == 0)
+            f = fopen(path, "rb");
+        if (!f)
+            return set_error_errno(ERR_IO, "pack_enumerate_dat: open %s", dat_name);
+    }
 
     pack_dat_hdr_t hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_DAT_MAGIC) {
@@ -3708,7 +3880,17 @@ status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
     snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), idx_name);
 
     FILE *f = fopen(path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_enumerate_idx: open %s", idx_name);
+    if (!f) {
+        /* Try sharded path: parse pack_num from name */
+        uint32_t pnum;
+        int end = 0;
+        if (sscanf(idx_name, "pack-%08u.idx%n", &pnum, &end) == 1 &&
+            idx_name[end] == '\0' &&
+            pack_idx_path_resolve(path, sizeof(path), repo_path(repo), pnum) == 0)
+            f = fopen(path, "rb");
+        if (!f)
+            return set_error_errno(ERR_IO, "pack_enumerate_idx: open %s", idx_name);
+    }
 
     pack_idx_hdr_t hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_IDX_MAGIC) {

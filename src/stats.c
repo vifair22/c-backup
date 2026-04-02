@@ -97,7 +97,7 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
         }
     }
 
-    /* Pack files */
+    /* Pack files (flat + sharded layout) */
     {
         char pdir[PATH_MAX];
         snprintf(pdir, sizeof(pdir), "%s/packs", root);
@@ -112,6 +112,27 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
                     if (strcmp(suffix, "dat") == 0) out->pack_files++;
                     out->pack_bytes  += sz;
                     out->total_bytes += sz;
+                } else if (strlen(de->d_name) == 4) {
+                    /* Shard subdirectory */
+                    char subdir[PATH_MAX];
+                    if (snprintf(subdir, sizeof(subdir), "%s/%s", pdir,
+                                 de->d_name) >= (int)sizeof(subdir))
+                        continue;
+                    struct stat sb;
+                    if (stat(subdir, &sb) != 0 || !S_ISDIR(sb.st_mode))
+                        continue;
+                    DIR *sd = opendir(subdir);
+                    if (!sd) continue;
+                    struct dirent *se;
+                    while ((se = readdir(sd)) != NULL) {
+                        if (sscanf(se->d_name, "pack-%08u.%7s", &num, suffix) == 2) {
+                            uint64_t sz = file_size_at(subdir, se->d_name);
+                            if (strcmp(suffix, "dat") == 0) out->pack_files++;
+                            out->pack_bytes  += sz;
+                            out->total_bytes += sz;
+                        }
+                    }
+                    closedir(sd);
                 }
             }
             closedir(d);

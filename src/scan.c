@@ -367,6 +367,21 @@ static int is_excluded(const char *full_path, const scan_opts_t *opts) {
     return 0;
 }
 
+/* Dirent batch entry for inode-sorted readdir.
+ * On HDD, sorting by d_ino before lstat() groups inodes sequentially
+ * on disk, reducing seek time from random to near-sequential. */
+typedef struct {
+    char   name[NAME_MAX + 1];
+    ino_t  d_ino;
+} scan_dirent_t;
+
+static int scan_dirent_cmp(const void *a, const void *b) {
+    const scan_dirent_t *da = a, *db = b;
+    if (da->d_ino < db->d_ino) return -1;
+    if (da->d_ino > db->d_ino) return  1;
+    return 0;
+}
+
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
                          const scan_opts_t *opts, scan_result_t *res) {
@@ -380,12 +395,44 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         log_msg("WARN", msg);
         return OK;
     }
+
+    /* Phase 1: batch all directory entries */
+    size_t cap = 256, cnt = 0;
+    scan_dirent_t *batch = malloc(cap * sizeof(*batch));
+    if (!batch) { closedir(d); return set_error(ERR_NOMEM, "scan_dir: dirent batch alloc"); }
+
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        char child[PATH_MAX];
-        size_t plen = strlen(path);
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == '\0' ||
+             (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+            continue;
+        if (cnt == cap) {
+            size_t nc = cap * 2;
+            scan_dirent_t *tmp = realloc(batch, nc * sizeof(*tmp));
+            if (!tmp) { free(batch); closedir(d); return set_error(ERR_NOMEM, "scan_dir: dirent batch realloc"); }
+            batch = tmp;
+            cap = nc;
+        }
         size_t nlen = strlen(de->d_name);
+        if (nlen > NAME_MAX) nlen = NAME_MAX;
+        memcpy(batch[cnt].name, de->d_name, nlen);
+        batch[cnt].name[nlen] = '\0';
+        batch[cnt].d_ino = de->d_ino;
+        cnt++;
+    }
+    closedir(d);
+
+    /* Phase 2: sort by inode number */
+    if (cnt > 1)
+        qsort(batch, cnt, sizeof(*batch), scan_dirent_cmp);
+
+    /* Phase 3: process in inode order */
+    size_t plen = strlen(path);
+    status_t st = OK;
+    for (size_t i = 0; i < cnt && st == OK; i++) {
+        size_t nlen = strlen(batch[i].name);
+        char child[PATH_MAX];
         if (plen + 1 + nlen >= sizeof(child)) {
             if (opts && opts->progress_clear_cb)
                 opts->progress_clear_cb(opts->progress_ctx);
@@ -395,13 +442,12 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         }
         memcpy(child, path, plen);
         child[plen] = '/';
-        memcpy(child + plen + 1, de->d_name, nlen + 1);
+        memcpy(child + plen + 1, batch[i].name, nlen + 1);
         if (is_excluded(child, opts)) continue;
-        status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
-        if (st != OK) { closedir(d); return st; }
+        st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
     }
-    closedir(d);
-    return OK;
+    free(batch);
+    return st;
 }
 
 status_t scan_tree(const char *root, scan_imap_t *imap,

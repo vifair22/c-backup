@@ -7,6 +7,7 @@
 #include "gc.h"
 #include "ls.h"
 #include "pack.h"
+#include "pack_index.h"
 #include "diff.h"
 #include "stats.h"
 #include "tag.h"
@@ -19,6 +20,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -1666,6 +1668,77 @@ static int cmd_gc(repo_t *repo, int argc, char **argv) {
     return st == OK ? 0 : 1;
 }
 
+static int cmd_reindex(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
+    (void)argc; (void)argv;
+    if (lock_or_die(repo)) return 1;
+    log_msg("INFO", "rebuilding global pack index");
+    status_t st = pack_index_rebuild(repo);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "reindex failed");
+    return st == OK ? 0 : 1;
+}
+
+static int cmd_migrate_packs(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
+    (void)argc; (void)argv;
+    if (lock_or_die(repo)) return 1;
+
+    char packs_dir[PATH_MAX];
+    snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo));
+
+    DIR *d = opendir(packs_dir);
+    if (!d) {
+        log_msg("INFO", "migrate-packs: no packs directory");
+        return 0;
+    }
+
+    uint32_t moved = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        uint32_t pn = 0;
+        if (sscanf(de->d_name, "pack-%08u.dat", &pn) != 1) continue;
+        /* Only move flat-layout files (directly under packs/) */
+        char shard[PATH_MAX];
+        int r = snprintf(shard, sizeof(shard), "%s/%04x", packs_dir, pn / 256);
+        if (r < 0 || (size_t)r >= sizeof(shard)) continue;
+        (void)mkdir(shard, 0755);
+
+        const char *exts[] = { "dat", "idx" };
+        for (int e = 0; e < 2; e++) {
+            char old_path[PATH_MAX], new_path[PATH_MAX];
+            r = snprintf(old_path, sizeof(old_path), "%s/pack-%08u.%s",
+                         packs_dir, pn, exts[e]);
+            if (r < 0 || (size_t)r >= sizeof(old_path)) continue;
+            r = snprintf(new_path, sizeof(new_path), "%s/%04x/pack-%08u.%s",
+                         packs_dir, pn / 256, pn, exts[e]);
+            if (r < 0 || (size_t)r >= sizeof(new_path)) continue;
+            if (rename(old_path, new_path) == 0) {
+                if (e == 0) moved++;
+            } else if (errno != ENOENT) {
+                fprintf(stderr, "warn: rename %s -> %s: %s\n",
+                        old_path, new_path, strerror(errno));
+            }
+        }
+    }
+    closedir(d);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "migrate-packs: moved %u pack(s) to sharded layout", moved);
+    log_msg("INFO", msg);
+
+    /* Rebuild global index with new paths */
+    log_msg("INFO", "rebuilding global pack index");
+    status_t st = pack_index_rebuild(repo);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "reindex after migration failed");
+    return st == OK ? 0 : 1;
+}
+
 static int cmd_pack(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 } };
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
@@ -1886,7 +1959,7 @@ int main(int argc, char *argv[]) {
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
         "export", "import", "prune", "snapshot", "gfs", "gc", "pack", "verify",
-        "doctor", "stats", "tag", "bundle", NULL
+        "doctor", "stats", "tag", "bundle", "reindex", "migrate-packs", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -1937,6 +2010,8 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "doctor")     == 0) ret = cmd_doctor(repo, argc, argv);
     else if (strcmp(cmd, "stats")      == 0) ret = cmd_stats(repo, argc, argv);
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);
+    else if (strcmp(cmd, "reindex")    == 0) ret = cmd_reindex(repo, argc, argv);
+    else if (strcmp(cmd, "migrate-packs") == 0) ret = cmd_migrate_packs(repo, argc, argv);
     else {
         fprintf(stderr, "unknown command: %s\n", cmd);
         usage();

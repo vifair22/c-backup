@@ -33,6 +33,16 @@
 
 static repo_t *repo;
 
+/* Build a pack file path, supporting both sharded (packs/XXXX/) and flat layouts. */
+static int test_pack_path(char *out, size_t out_sz, uint32_t pack_num,
+                          const char *ext) {
+    int n = snprintf(out, out_sz, "%s/packs/%04x/pack-%08u.%s",
+                     TEST_REPO, pack_num / 256, pack_num, ext);
+    if (n > 0 && (size_t)n < out_sz && access(out, F_OK) == 0) return 0;
+    n = snprintf(out, out_sz, "%s/packs/pack-%08u.%s", TEST_REPO, pack_num, ext);
+    return (n > 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
 static void cleanup(void) {
     int rc = system("rm -rf " TEST_REPO " " TEST_SRC " " TEST_DEST);
     (void)rc;
@@ -86,8 +96,23 @@ static int count_packs(void) {
     int count = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (strstr(ent->d_name, ".dat") != NULL)
+        /* Flat layout: pack-NNNNNNNN.dat */
+        if (strstr(ent->d_name, ".dat") != NULL) {
             count++;
+            continue;
+        }
+        /* Shard subdir: 4-char hex */
+        if (ent->d_name[0] == '.' || strlen(ent->d_name) != 4) continue;
+        char sub[512];
+        snprintf(sub, sizeof(sub), "%s/%s", pack_dir, ent->d_name);
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *se;
+        while ((se = readdir(sd)) != NULL) {
+            if (strstr(se->d_name, ".dat") != NULL)
+                count++;
+        }
+        closedir(sd);
     }
     closedir(d);
     return count;
@@ -188,8 +213,8 @@ static void test_coalesce_count_trigger(void **state) {
 
     /* Clone the pack to create 34 total */
     char src_dat[256], src_idx[256];
-    snprintf(src_dat, sizeof(src_dat), "%s/packs/pack-00000000.dat", TEST_REPO);
-    snprintf(src_idx, sizeof(src_idx), "%s/packs/pack-00000000.idx", TEST_REPO);
+    assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
+    assert_int_equal(test_pack_path(src_idx, sizeof(src_idx), 0, "idx"), 0);
     for (int i = 1; i < 34; i++) {
         char dst_dat[256], dst_idx[256];
         snprintf(dst_dat, sizeof(dst_dat), "%s/packs/pack-%08d.dat", TEST_REPO, i);
@@ -220,8 +245,8 @@ static void test_coalesce_ratio_trigger(void **state) {
 
     /* Clone to 10 packs */
     char src_dat[256], src_idx[256];
-    snprintf(src_dat, sizeof(src_dat), "%s/packs/pack-00000000.dat", TEST_REPO);
-    snprintf(src_idx, sizeof(src_idx), "%s/packs/pack-00000000.idx", TEST_REPO);
+    assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
+    assert_int_equal(test_pack_path(src_idx, sizeof(src_idx), 0, "idx"), 0);
     for (int i = 1; i < 10; i++) {
         char dst_dat[256], dst_idx[256];
         snprintf(dst_dat, sizeof(dst_dat), "%s/packs/pack-%08d.dat", TEST_REPO, i);
@@ -279,8 +304,8 @@ static void test_resume_installing_both(void **state) {
     assert_int_equal(mkdir(staging, 0755), 0);
 
     char src_dat[256], src_idx[256], dst_dat[256], dst_idx[256];
-    snprintf(src_dat, sizeof(src_dat), "%s/packs/pack-00000000.dat", TEST_REPO);
-    snprintf(src_idx, sizeof(src_idx), "%s/packs/pack-00000000.idx", TEST_REPO);
+    assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
+    assert_int_equal(test_pack_path(src_idx, sizeof(src_idx), 0, "idx"), 0);
     snprintf(dst_dat, sizeof(dst_dat), "%s/pack-00000099.dat", staging);
     snprintf(dst_idx, sizeof(dst_idx), "%s/pack-00000099.idx", staging);
     copy_file_bytes(src_dat, dst_dat);
@@ -293,9 +318,10 @@ static void test_resume_installing_both(void **state) {
     struct stat st;
     assert_int_not_equal(stat(staging, &st), 0);
 
-    /* And the pack should be in place */
+    /* And the pack should be in place (sharded path) */
     char final_dat[256];
-    snprintf(final_dat, sizeof(final_dat), "%s/packs/pack-00000099.dat", TEST_REPO);
+    snprintf(final_dat, sizeof(final_dat), "%s/packs/%04x/pack-%08u.dat",
+             TEST_REPO, 99u / 256, 99u);
     assert_int_equal(stat(final_dat, &st), 0);
 }
 
@@ -317,7 +343,7 @@ static void test_resume_installing_partial(void **state) {
     assert_int_equal(mkdir(staging, 0755), 0);
 
     char src_dat[256], dst_dat[256];
-    snprintf(src_dat, sizeof(src_dat), "%s/packs/pack-00000000.dat", TEST_REPO);
+    assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
     snprintf(dst_dat, sizeof(dst_dat), "%s/pack-00000098.dat", staging);
     copy_file_bytes(src_dat, dst_dat);
 
@@ -327,10 +353,14 @@ static void test_resume_installing_partial(void **state) {
     struct stat st;
     assert_int_not_equal(stat(staging, &st), 0);
 
-    /* Pack 98 should NOT have been installed */
+    /* Pack 98 should NOT have been installed (check both sharded and flat) */
     char final_dat[256];
+    snprintf(final_dat, sizeof(final_dat), "%s/packs/%04x/pack-%08u.dat",
+             TEST_REPO, 98u / 256, 98u);
+    int dat_exists = (stat(final_dat, &st) == 0);
     snprintf(final_dat, sizeof(final_dat), "%s/packs/pack-00000098.dat", TEST_REPO);
-    assert_int_not_equal(stat(final_dat, &st), 0);
+    dat_exists = dat_exists || (stat(final_dat, &st) == 0);
+    assert_false(dat_exists);
 }
 
 /* .deleting-NNNNNNNN marker → listed pack numbers deleted */
@@ -345,8 +375,8 @@ static void test_resume_deleting_replays(void **state) {
 
     /* Clone pack 0 to pack 50 */
     char src_dat[256], src_idx[256];
-    snprintf(src_dat, sizeof(src_dat), "%s/packs/pack-00000000.dat", TEST_REPO);
-    snprintf(src_idx, sizeof(src_idx), "%s/packs/pack-00000000.idx", TEST_REPO);
+    assert_int_equal(test_pack_path(src_dat, sizeof(src_dat), 0, "dat"), 0);
+    assert_int_equal(test_pack_path(src_idx, sizeof(src_idx), 0, "idx"), 0);
     char dst_dat[256], dst_idx[256];
     snprintf(dst_dat, sizeof(dst_dat), "%s/packs/pack-00000050.dat", TEST_REPO);
     snprintf(dst_idx, sizeof(dst_idx), "%s/packs/pack-00000050.idx", TEST_REPO);

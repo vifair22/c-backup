@@ -101,11 +101,29 @@ static int find_pack_dat(char *out, size_t out_sz) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         size_t nlen = strlen(de->d_name);
+        /* Flat layout */
         if (nlen > 4 && strcmp(de->d_name + nlen - 4, ".dat") == 0) {
             snprintf(out, out_sz, "%s/%s", pack_dir, de->d_name);
             closedir(d);
             return 0;
         }
+        /* Shard subdir */
+        if (de->d_name[0] == '.' || nlen != 4) continue;
+        char sub[512];
+        snprintf(sub, sizeof(sub), "%s/%s", pack_dir, de->d_name);
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *se;
+        while ((se = readdir(sd)) != NULL) {
+            size_t slen = strlen(se->d_name);
+            if (slen > 4 && strcmp(se->d_name + slen - 4, ".dat") == 0) {
+                snprintf(out, out_sz, "%s/%s", sub, se->d_name);
+                closedir(sd);
+                closedir(d);
+                return 0;
+            }
+        }
+        closedir(sd);
     }
     closedir(d);
     return -1;

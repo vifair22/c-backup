@@ -67,3 +67,10 @@ int __wrap_fdatasync(int fd) {
     fault_fsync_at--;
     return __real_fdatasync(fd);
 }
+
+int __wrap_sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flags) {
+    /* When fsync fault is armed, fail sync_file_range but DON'T consume the
+     * counter — let the fdatasync fallback in async_writeback() also fail. */
+    if (fault_fsync_at >= 0) { errno = EIO; return -1; }
+    return __real_sync_file_range(fd, offset, nbytes, flags);
+}

@@ -3,6 +3,7 @@
 #include "restore.h"
 #include "snapshot.h"
 #include "object.h"
+#include "pack.h"
 #include "util.h"
 #include "../vendor/log.h"
 
@@ -496,6 +497,163 @@ static int nl_htab_set(nl_htab_t *h, uint64_t key, const char *path) {
     return 0;
 }
 
+/* Materialize a single non-directory entry.  Returns OK on success. */
+static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
+                                  const char *full, nl_htab_t *nl_map,
+                                  restore_stats_t *stats) {
+    const node_t *nd = e->node;
+    switch (nd->type) {
+    case NODE_TYPE_REG: {
+        int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd == -1) return set_error_errno(ERR_IO, "restore: open(%s)", full);
+        if (!hash_is_zero(nd->content_hash)) {
+            void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
+            status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
+            if (load_st == ERR_TOO_LARGE) {
+                uint64_t stream_sz = 0;
+                load_st = object_load_stream(repo, nd->content_hash, fd,
+                                             &stream_sz, &obj_type);
+            }
+            if (load_st != OK) { close(fd); return load_st; }
+            if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
+                const uint8_t *sp_p = (const uint8_t *)data;
+                sparse_hdr_t shdr;
+                memcpy(&shdr, sp_p, sizeof(shdr));
+                sp_p += sizeof(shdr);
+                if (shdr.magic != SPARSE_MAGIC ||
+                    len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
+                    free(data); close(fd); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
+                }
+                if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
+                    free(data); close(fd); return set_error_errno(ERR_IO, "restore: ftruncate(%s)", full);
+                }
+                const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
+                sp_p += shdr.region_count * sizeof(sparse_region_t);
+                const uint8_t *dptr = sp_p;
+                const uint8_t *dend = (const uint8_t *)data + len;
+                uint64_t pos = 0;
+                for (uint32_t r = 0; r < shdr.region_count; r++) {
+                    if (rgns[r].offset < pos ||
+                        rgns[r].offset > nd->size ||
+                        rgns[r].length > nd->size - rgns[r].offset) {
+                        free(data); close(fd); return set_error(ERR_CORRUPT, "restore: sparse region %u out of bounds for %s", r, full);
+                    }
+                    if ((size_t)(dend - dptr) < (size_t)rgns[r].length) {
+                        free(data); close(fd); return set_error(ERR_CORRUPT, "restore: sparse region %u data truncated for %s", r, full);
+                    }
+                    if (lseek(fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
+                        free(data); close(fd); return set_error_errno(ERR_IO, "restore: lseek(%s)", full);
+                    }
+                    size_t rem = (size_t)rgns[r].length;
+                    while (rem > 0) {
+                        ssize_t w = write(fd, dptr, rem);
+                        if (w < 0) {
+                            if (errno == EINTR) continue;
+                            free(data); close(fd); return set_error_errno(ERR_IO, "restore: write sparse region to %s", full);
+                        }
+                        if (w == 0) {
+                            free(data); close(fd); return set_error(ERR_IO, "restore: zero-length write to %s", full);
+                        }
+                        dptr += w;
+                        rem -= (size_t)w;
+                    }
+                    pos = rgns[r].offset + rgns[r].length;
+                }
+            } else {
+                if (len > 0 && write(fd, data, len) != (ssize_t)len) {
+                    free(data); close(fd); return set_error_errno(ERR_IO, "restore: write(%s)", full);
+                }
+            }
+            free(data);
+        }
+        if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
+            close(fd); return set_error_errno(ERR_IO, "restore: ftruncate final(%s)", full);
+        }
+        fsync(fd);
+        close(fd);
+        stats->files++;
+        stats->bytes += nd->size;
+        nl_htab_set(nl_map, e->node_id, full);
+        break;
+    }
+    case NODE_TYPE_SYMLINK: {
+        if (hash_is_zero(nd->content_hash)) break;
+        void *tdata = NULL; size_t tlen = 0;
+        if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
+        unlink(full);
+        if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
+            fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
+            stats->warns++;
+        } else {
+            stats->files++;
+        }
+        free(tdata);
+        break;
+    }
+    case NODE_TYPE_FIFO:
+        if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
+            fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
+            stats->warns++;
+        } else {
+            stats->files++;
+        }
+        break;
+    case NODE_TYPE_CHR:
+    case NODE_TYPE_BLK: {
+        dev_t dev = makedev(nd->device.major, nd->device.minor);
+        mode_t m  = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
+        if (mknod(full, m, dev) == -1 && errno != EEXIST) {
+            fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
+            stats->warns++;
+        } else {
+            stats->files++;
+        }
+        break;
+    }
+    default: break;
+    }
+    return OK;
+}
+
+/* Sort key for pack-ordered restore. */
+typedef struct {
+    uint32_t pack_num;     /* UINT32_MAX = loose/non-pack object */
+    uint64_t dat_offset;
+    uint32_t orig_index;
+} restore_sort_key_t;
+
+static int restore_sort_cmp(const void *a, const void *b) {
+    const restore_sort_key_t *ka = a, *kb = b;
+    if (ka->pack_num != kb->pack_num)
+        return ka->pack_num < kb->pack_num ? -1 : 1;
+    if (ka->dat_offset != kb->dat_offset)
+        return ka->dat_offset < kb->dat_offset ? -1 : 1;
+    return ka->orig_index < kb->orig_index ? -1 :
+           ka->orig_index > kb->orig_index ?  1 : 0;
+}
+
+/* Simple node_id set for identifying hardlinks during pre-scan.
+ * Uses open addressing with 0 as empty sentinel (inode 0 is invalid). */
+typedef struct { uint64_t *keys; uint32_t mask; } nid_set_t;
+
+static nid_set_t nid_set_new(uint32_t hint) {
+    uint32_t cap = 128;
+    while (cap < hint * 2) cap *= 2;
+    nid_set_t s = { .keys = calloc(cap, sizeof(uint64_t)), .mask = cap - 1 };
+    return s;
+}
+
+/* Returns 1 if id was already present, 0 if newly inserted. */
+static int nid_set_test_and_add(nid_set_t *s, uint64_t id) {
+    if (id == 0) return 0;
+    uint32_t h = (uint32_t)(id * 0x9E3779B97F4A7C15ULL >> 32) & s->mask;
+    for (;;) {
+        if (s->keys[h] == id) return 1;
+        if (s->keys[h] == 0) { s->keys[h] = id; return 0; }
+        h = (h + 1) & s->mask;
+    }
+}
+
 static status_t restore_materialize_nodes(repo_t *repo,
                                           const restore_entry_t *entries,
                                           uint32_t count,
@@ -504,162 +662,119 @@ static status_t restore_materialize_nodes(repo_t *repo,
     nl_htab_t *nl_map = nl_htab_new(count / 4 > 64 ? count / 4 : 64);
     if (!nl_map) return set_error(ERR_NOMEM, "restore_materialize_nodes: alloc failed for hardlink map");
 
-    int show_progress = restore_progress_enabled();
-    struct timespec next_tick = {0};
-    clock_gettime(CLOCK_MONOTONIC, &next_tick);
-    uint32_t done = 0;
+    /* --- Pre-scan: classify entries into primaries and hardlinks --- */
+    nid_set_t seen = nid_set_new(count);
+    if (!seen.keys) { nl_htab_free(nl_map); return set_error(ERR_NOMEM, "restore: nid_set alloc"); }
+
+    restore_sort_key_t *sort_keys = malloc(count * sizeof(*sort_keys));
+    uint32_t *hl_indices = malloc(count * sizeof(*hl_indices));
+    if (!sort_keys || !hl_indices) {
+        free(sort_keys); free(hl_indices); free(seen.keys);
+        nl_htab_free(nl_map);
+        return set_error(ERR_NOMEM, "restore: sort key alloc");
+    }
+    uint32_t primary_cnt = 0, hl_cnt = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         const restore_entry_t *e = &entries[i];
         if (!e->node || e->node->type == NODE_TYPE_DIR) continue;
         if (!path_is_safe(e->path)) continue;
 
+        if (nid_set_test_and_add(&seen, e->node_id)) {
+            /* Subsequent occurrence — hardlink, defer to pass 2 */
+            hl_indices[hl_cnt++] = i;
+        } else {
+            /* First occurrence — primary, resolve pack location for sorting */
+            restore_sort_key_t *k = &sort_keys[primary_cnt++];
+            k->orig_index = i;
+            k->pack_num   = UINT32_MAX;
+            k->dat_offset = 0;
+            if (e->node->type == NODE_TYPE_REG &&
+                !hash_is_zero(e->node->content_hash)) {
+                (void)pack_resolve_location(repo, e->node->content_hash,
+                                            &k->pack_num, &k->dat_offset);
+            }
+        }
+    }
+    free(seen.keys);
+
+    /* Sort primaries by (pack_num, dat_offset) for sequential I/O */
+    if (primary_cnt > 1)
+        qsort(sort_keys, primary_cnt, sizeof(*sort_keys), restore_sort_cmp);
+
+    int show_progress = restore_progress_enabled();
+    struct timespec next_tick = {0};
+    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+    uint32_t done = 0;
+    uint32_t total = primary_cnt + hl_cnt;
+    status_t st = OK;
+
+    /* --- Pass 1: restore primaries in pack-sorted order --- */
+    for (uint32_t si = 0; si < primary_cnt; si++) {
+        uint32_t i = sort_keys[si].orig_index;
+        const restore_entry_t *e = &entries[i];
+
         char full[PATH_MAX];
         if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
-            nl_htab_free(nl_map);
-            return set_error(ERR_IO, "restore: path too long: %s", e->path);
+            st = set_error(ERR_IO, "restore: path too long: %s", e->path);
+            goto cleanup;
         }
-        const node_t *nd = e->node;
+        st = restore_one_entry(repo, e, full, nl_map, stats);
+        if (st != OK) goto cleanup;
+
+        done++;
+        if (show_progress && restore_tick_due(&next_tick)) {
+            char line[128];
+            snprintf(line, sizeof(line), "restore: %u/%u files  %.1f GiB",
+                     done, total, (double)stats->bytes / (1024.0*1024.0*1024.0));
+            restore_line_set(line);
+        }
+    }
+
+    /* --- Pass 2: hardlinks (link to already-restored primaries) --- */
+    for (uint32_t hi = 0; hi < hl_cnt; hi++) {
+        uint32_t i = hl_indices[hi];
+        const restore_entry_t *e = &entries[i];
+
+        char full[PATH_MAX];
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
+            st = set_error(ERR_IO, "restore: path too long: %s", e->path);
+            goto cleanup;
+        }
 
         const char *hl_src = nl_htab_get(nl_map, e->node_id);
         if (hl_src) {
             if (link(hl_src, full) == -1 && errno != EEXIST) {
-                {
-                    char emsg[128];
-                    snprintf(emsg, sizeof(emsg), "hard link failed: %s; falling through to copy", strerror(errno));
-                    log_msg("WARN", emsg);
-                }
+                char emsg[128];
+                snprintf(emsg, sizeof(emsg), "hard link failed: %s; falling through to copy", strerror(errno));
+                log_msg("WARN", emsg);
+                /* Fall through to full restore */
+                st = restore_one_entry(repo, e, full, nl_map, stats);
+                if (st != OK) goto cleanup;
             } else {
                 nl_htab_set(nl_map, e->node_id, full);
-                continue;
             }
-        }
-
-        switch (nd->type) {
-        case NODE_TYPE_REG: {
-            int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (fd == -1) { nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: open(%s)", full); }
-            if (!hash_is_zero(nd->content_hash)) {
-                void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
-                status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
-                if (load_st == ERR_TOO_LARGE) {
-                    /* Large regular file: stream directly to the destination fd.
-                     * Pass &obj_type so sparse type detection still works. */
-                    uint64_t stream_sz = 0;
-                    load_st = object_load_stream(repo, nd->content_hash, fd,
-                                                 &stream_sz, &obj_type);
-                }
-                if (load_st != OK) { close(fd); nl_htab_free(nl_map); return load_st; }
-                if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
-                    const uint8_t *sp_p = (const uint8_t *)data;
-                    sparse_hdr_t shdr;
-                    memcpy(&shdr, sp_p, sizeof(shdr));
-                    sp_p += sizeof(shdr);
-                    if (shdr.magic != SPARSE_MAGIC ||
-                        len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
-                        free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
-                    }
-                    if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                        free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate(%s)", full);
-                    }
-                    const sparse_region_t *rgns = (const sparse_region_t *)sp_p;
-                    sp_p += shdr.region_count * sizeof(sparse_region_t);
-                    const uint8_t *dptr = sp_p;
-                    const uint8_t *dend = (const uint8_t *)data + len;
-                    uint64_t pos = 0;
-                    for (uint32_t r = 0; r < shdr.region_count; r++) {
-                        if (rgns[r].offset < pos ||
-                            rgns[r].offset > nd->size ||
-                            rgns[r].length > nd->size - rgns[r].offset) {
-                            free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u out of bounds for %s", r, full);
-                        }
-                        if ((size_t)(dend - dptr) < (size_t)rgns[r].length) {
-                            free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_CORRUPT, "restore: sparse region %u data truncated for %s", r, full);
-                        }
-                        if (lseek(fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
-                            free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: lseek(%s)", full);
-                        }
-                        size_t rem = (size_t)rgns[r].length;
-                        while (rem > 0) {
-                            ssize_t w = write(fd, dptr, rem);
-                            if (w < 0) {
-                                if (errno == EINTR) continue;
-                                free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: write sparse region to %s", full);
-                            }
-                            if (w == 0) {
-                                free(data); close(fd); nl_htab_free(nl_map); return set_error(ERR_IO, "restore: zero-length write to %s", full);
-                            }
-                            dptr += w;
-                            rem -= (size_t)w;
-                        }
-                        pos = rgns[r].offset + rgns[r].length;
-                    }
-                } else {
-                    if (len > 0 && write(fd, data, len) != (ssize_t)len) {
-                        free(data); close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: write(%s)", full);
-                    }
-                }
-                free(data);
-            }
-            if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
-                close(fd); nl_htab_free(nl_map); return set_error_errno(ERR_IO, "restore: ftruncate final(%s)", full);
-            }
-            fsync(fd);
-            close(fd);
-            stats->files++;
-            stats->bytes += nd->size;
-            nl_htab_set(nl_map, e->node_id, full);
-            break;
-        }
-        case NODE_TYPE_SYMLINK: {
-            if (hash_is_zero(nd->content_hash)) break;
-            void *tdata = NULL; size_t tlen = 0;
-            if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
-            unlink(full);
-            if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
-                stats->warns++;
-            } else {
-                stats->files++;
-            }
-            free(tdata);
-            break;
-        }
-        case NODE_TYPE_FIFO:
-            if (mkfifo(full, (mode_t)nd->mode) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: mkfifo failed: %s: %s\n", full, strerror(errno));
-                stats->warns++;
-            } else {
-                stats->files++;
-            }
-            break;
-        case NODE_TYPE_CHR:
-        case NODE_TYPE_BLK: {
-            dev_t dev = makedev(nd->device.major, nd->device.minor);
-            mode_t m  = (nd->type == NODE_TYPE_CHR ? S_IFCHR : S_IFBLK) | (mode_t)nd->mode;
-            if (mknod(full, m, dev) == -1 && errno != EEXIST) {
-                fprintf(stderr, "warn: mknod failed: %s: %s\n", full, strerror(errno));
-                stats->warns++;
-            } else {
-                stats->files++;
-            }
-            break;
-        }
-        default: break;
+        } else {
+            /* Primary not found (shouldn't happen), restore normally */
+            st = restore_one_entry(repo, e, full, nl_map, stats);
+            if (st != OK) goto cleanup;
         }
 
         done++;
         if (show_progress && restore_tick_due(&next_tick)) {
             char line[128];
             snprintf(line, sizeof(line), "restore: %u/%u files  %.1f GiB",
-                     done, count, (double)stats->bytes / (1024.0*1024.0*1024.0));
+                     done, total, (double)stats->bytes / (1024.0*1024.0*1024.0));
             restore_line_set(line);
         }
     }
 
+cleanup:
     if (show_progress) restore_line_clear();
+    free(sort_keys);
+    free(hl_indices);
     nl_htab_free(nl_map);
-    return OK;
+    return st;
 }
 
 static status_t restore_apply_metadata_pass(repo_t *repo,
