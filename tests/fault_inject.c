@@ -60,3 +60,10 @@ int __wrap_fsync(int fd) {
     fault_fsync_at--;
     return __real_fsync(fd);
 }
+
+int __wrap_fdatasync(int fd) {
+    if (fault_fsync_at < 0) return __real_fdatasync(fd);
+    if (fault_fsync_at == 0) { fault_fsync_at = -1; errno = EIO; return -1; }
+    fault_fsync_at--;
+    return __real_fdatasync(fd);
+}

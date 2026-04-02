@@ -2,6 +2,8 @@
 Shared tkinter widget helpers used by every tab.
 """
 
+import base64
+import struct
 import tkinter as tk
 from tkinter import ttk
 
@@ -89,60 +91,92 @@ def update_sparse_map(canvas: tk.Canvas, stats: tk.Label,
     canvas.after(80, _draw)
 
 
-def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
+def parse_sparse_regions(payload: bytes) -> list | None:
+    """Decode the sparse map header from decompressed SPARSE object payload.
+    Returns a list of (offset, length) tuples, or None on parse failure.
+    """
+    SPARSE_MAGIC = 0x53505253
+    SH = struct.Struct("<II")
+    SR = struct.Struct("<QQ")
+    if len(payload) < SH.size:
+        return None
+    magic, region_count = SH.unpack_from(payload)
+    if magic != SPARSE_MAGIC:
+        return None
+    regions = []
+    for i in range(region_count):
+        off_r = SH.size + i * SR.size
+        if off_r + SR.size > len(payload):
+            break
+        offset, length = SR.unpack_from(payload, off_r)
+        regions.append((offset, length))
+    return regions
+
+
+def show_object_preview(parent_widget, hash_hex: str, repo_path: str,
                         filename: str | None = None,
                         decode_as_symlink: bool = False) -> None:
-    """Open a tabbed Toplevel with Info / Content / Sparse Map for an object."""
-    from .parsers import find_object, decompress_payload, HAS_LZ4, parse_sparse_regions
-    from .formats import fmt_size, hex_dump, hex_hash
+    """Open a tabbed Toplevel with Info / Content / Sparse Map for an object.
+
+    Uses the JSON RPC API to load object data from the C binary.
+    """
+    from .rpc import call, RPCError
+    from .formats import fmt_size, hex_dump
     from .constants import (OBJECT_TYPE_NAMES, COMPRESS_NAMES,
-                            COMPRESS_NONE, OBJECT_TYPE_SPARSE)
+                            OBJECT_TYPE_SPARSE, ZERO_HASH)
 
     win = tk.Toplevel(parent_widget)
-    win.title(filename if filename else f"Object  {raw_hash.hex()[:20]}…")
+    win.title(filename if filename else f"Object  {hash_hex[:20]}…")
     win.geometry("860x580")
     win.resizable(True, True)
 
     nb = ttk.Notebook(win)
     nb.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=PAD)
 
-    # ── resolve object ────────────────────────────────────────────────────
-    result = find_object(raw_hash, scan)
+    # ── Locate object ─────────────────────────────────────────────────
+    try:
+        loc = call(repo_path, "object_locate", hash=hash_hex)
+    except RPCError as e:
+        info_outer = ttk.Frame(nb)
+        nb.add(info_outer, text="Info")
+        tk.Label(info_outer, text=f"Error: {e}",
+                 fg="red", font=FONT_BOLD).pack(padx=PAD * 2, pady=PAD, anchor="w")
+        return
 
-    # ── Info tab ──────────────────────────────────────────────────────────
-    info_outer = ttk.Frame(nb)
-    nb.add(info_outer, text="Info")
-
-    if result is None:
+    if not loc.get("found"):
+        info_outer = ttk.Frame(nb)
+        nb.add(info_outer, text="Info")
         tk.Label(info_outer, text="Object not found in repository.",
                  fg="red", font=FONT_BOLD).pack(padx=PAD * 2, pady=PAD, anchor="w")
-        tk.Label(info_outer, text=raw_hash.hex(),
+        tk.Label(info_outer, text=hash_hex,
                  font=FONT_MONO).pack(padx=PAD * 2, anchor="w")
         return
 
-    kind, location, otype, comp, uncomp_sz, comp_sz, payload = result
-    ratio_str = f"{comp_sz / uncomp_sz:.4f}" if uncomp_sz and comp_sz else "—"
+    otype = loc.get("type", 0)
+    uncomp_sz = int(loc.get("uncompressed_size", 0))
 
-    # Decode symlink target from the already-loaded payload — no extra I/O.
+    # ── Load content ──────────────────────────────────────────────────
+    content_data = None
+    truncated = False
+    max_bytes = min(uncomp_sz, _PREVIEW_LIMIT) if uncomp_sz > 0 else _PREVIEW_LIMIT
+    try:
+        cr = call(repo_path, "object_content", hash=hash_hex, max_bytes=max_bytes)
+        content_data = base64.b64decode(cr.get("content_base64", ""))
+        truncated = cr.get("truncated", False)
+    except RPCError:
+        pass
+
+    # Decode symlink target
     symlink_target = None
-    if decode_as_symlink:
+    if decode_as_symlink and content_data:
         try:
-            raw_data = decompress_payload(payload, comp, uncomp_sz) if comp != COMPRESS_NONE else payload
-            if raw_data:
-                symlink_target = raw_data.rstrip(b"\x00").decode("utf-8", errors="replace")
-        except (OSError, ValueError, RuntimeError):
+            symlink_target = content_data.rstrip(b"\x00").decode("utf-8", errors="replace")
+        except (ValueError, RuntimeError):
             pass
 
-    # For loose objects, read pack_skip_ver from the header for display.
-    pack_skip_ver = None
-    if kind == "loose":
-        from .parsers import parse_loose_object, ParseError
-        from .constants import PROBER_VERSION
-        try:
-            meta = parse_loose_object(location)
-            pack_skip_ver = meta.get("pack_skip_ver")
-        except ParseError:
-            pass
+    # ── Info tab ──────────────────────────────────────────────────────
+    info_outer = ttk.Frame(nb)
+    nb.add(info_outer, text="Info")
 
     rows = []
     if filename:
@@ -150,24 +184,11 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
     if symlink_target is not None:
         rows.append(("Symlink target", symlink_target))
     rows += [
-        ("Hash",              raw_hash.hex()),
-        ("Location",          f"{kind}  —  {location}"),
+        ("Hash",              hash_hex),
         ("Object type",       OBJECT_TYPE_NAMES.get(otype, str(otype))),
-        ("Compression",       COMPRESS_NAMES.get(comp, str(comp))),
         ("Uncompressed size", f"{fmt_size(uncomp_sz)}  ({uncomp_sz:,} bytes)"),
-        ("Compressed size",   f"{fmt_size(comp_sz)}  ({comp_sz:,} bytes)"),
-        ("Ratio",             ratio_str),
     ]
-    if pack_skip_ver is not None:
-        if pack_skip_ver == 0:
-            skip_str = "0  (unevaluated)"
-        elif pack_skip_ver == PROBER_VERSION:
-            skip_str = f"{pack_skip_ver}  (skip — incompressible)"
-        else:
-            skip_str = f"{pack_skip_ver}  (stale skip marker)"
-        rows.append(("Pack skip ver", skip_str))
 
-    # card-style container
     card = ttk.LabelFrame(info_outer, text="Object metadata", padding=(PAD * 2, PAD))
     card.pack(fill=tk.X, padx=PAD * 3, pady=PAD * 3, anchor="n")
 
@@ -182,9 +203,8 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
 
     card.columnconfigure(1, weight=1)
 
-    # ── Text / Hex tabs ───────────────────────────────────────────────────
+    # ── Text / Hex tabs ───────────────────────────────────────────────
     def _labeled_text_tab(label: str):
-        """Tab with a status bar above a clean text widget."""
         frame = ttk.Frame(nb)
         nb.add(frame, text=label)
         bar = tk.Frame(frame, bd=1, relief=tk.FLAT)
@@ -197,54 +217,41 @@ def show_object_preview(parent_widget, raw_hash: bytes, scan: dict,
     text_widget, text_status = _labeled_text_tab("Text")
     hex_widget,  hex_status  = _labeled_text_tab("Hex")
 
-    if not HAS_LZ4 and comp != COMPRESS_NONE:
-        msg = "Install the 'lz4' Python package to decompress this object."
-        set_text(text_widget, msg)
-        set_text(hex_widget,  msg)
-    elif uncomp_sz > _PREVIEW_LIMIT:
-        msg = f"Object too large to preview ({fmt_size(uncomp_sz)}, limit {fmt_size(_PREVIEW_LIMIT)})."
+    if content_data is None:
+        msg = "Could not load object content."
         set_text(text_widget, msg)
         set_text(hex_widget,  msg)
     else:
-        data = decompress_payload(payload, comp, uncomp_sz)
-        if data is None:
-            set_text(text_widget, "(decompression failed)")
-            set_text(hex_widget,  "(decompression failed)")
-        else:
-            size_str = f"{fmt_size(len(data))}  ({len(data):,} bytes)"
-            hex_status.config(text=size_str)
+        prefix_note = ""
+        if uncomp_sz > len(content_data):
+            prefix_note = f"  (showing first {fmt_size(len(content_data))} of {fmt_size(uncomp_sz)})"
+        size_str = f"{fmt_size(len(content_data))}  ({len(content_data):,} bytes){prefix_note}"
+        hex_status.config(text=size_str)
 
-            # Text tab — raw decoded content only
-            try:
-                decoded = data.decode("utf-8")
-                body = decoded[:4096]
-                suffix = (f"\n… {len(decoded) - 4096:,} more chars not shown"
-                          if len(decoded) > 4096 else "")
-                text_status.config(text=f"{size_str}  —  UTF-8")
-                set_text(text_widget, body + suffix)
-            except UnicodeDecodeError:
-                text_status.config(text=f"{size_str}  —  binary")
-                set_text(text_widget, "(binary data — not valid UTF-8)")
+        try:
+            decoded = content_data.decode("utf-8")
+            body = decoded[:4096]
+            suffix = (f"\n… {len(decoded) - 4096:,} more chars not shown"
+                      if len(decoded) > 4096 else "")
+            text_status.config(text=f"{size_str}  —  UTF-8")
+            set_text(text_widget, body + suffix)
+        except UnicodeDecodeError:
+            text_status.config(text=f"{size_str}  —  binary")
+            set_text(text_widget, "(binary data — not valid UTF-8)")
 
-            # Hex tab — raw hex dump only
-            set_text(hex_widget, hex_dump(data))
+        set_text(hex_widget, hex_dump(content_data))
 
-    # ── Sparse Map tab (any SPARSE object) ────────────────────────────────
-    if otype == OBJECT_TYPE_SPARSE:
+    # ── Sparse Map tab (SPARSE objects) ───────────────────────────────
+    if otype == OBJECT_TYPE_SPARSE and content_data:
         sparse_frame = ttk.Frame(nb)
         nb.add(sparse_frame, text="Sparse Map")
         sp_canvas, sp_stats = make_sparse_canvas(sparse_frame)
 
-        # Decompress if needed before parsing the region list
-        sparse_raw = payload if comp == COMPRESS_NONE else decompress_payload(payload, comp, uncomp_sz)
-        if sparse_raw is None:
-            sp_stats.config(text="(decompression failed — cannot parse sparse map)")
+        regions = parse_sparse_regions(content_data)
+        if regions is None:
+            sp_stats.config(text="(could not parse sparse header)")
         else:
-            regions = parse_sparse_regions(sparse_raw)
-            if regions is None:
-                sp_stats.config(text="(could not parse sparse header)")
-            else:
-                update_sparse_map(sp_canvas, sp_stats, regions, uncomp_sz)
+            update_sparse_map(sp_canvas, sp_stats, regions, uncomp_sz)
 
 
 def make_tree(parent, columns: list[tuple], height: int | None = None) -> ttk.Treeview:

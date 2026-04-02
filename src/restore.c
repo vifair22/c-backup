@@ -61,16 +61,59 @@ typedef struct {
     char    *full_path;   /* built on demand */
 } dr_entry_t;
 
-static dr_entry_t *find_dr_by_id(dr_entry_t *arr, uint32_t n, uint64_t id) {
-    for (uint32_t i = 0; i < n; i++)
-        if (arr[i].node_id == id) return &arr[i];
-    return NULL;
+/* Hash map: node_id → index, for O(1) lookups instead of O(n) scans */
+typedef struct {
+    uint64_t *keys;
+    uint32_t *vals;
+    size_t    cap;     /* always power of 2 */
+} id_index_t;
+
+static int id_index_build(id_index_t *m, uint64_t *ids, uint32_t *indices, uint32_t n) {
+    size_t cap = 16;
+    while (cap < (size_t)n * 2) cap *= 2;
+    m->keys = malloc(cap * sizeof(uint64_t));
+    m->vals = malloc(cap * sizeof(uint32_t));
+    if (!m->keys || !m->vals) { free(m->keys); free(m->vals); return -1; }
+    memset(m->keys, 0, cap * sizeof(uint64_t));
+    m->cap = cap;
+    size_t mask = cap - 1;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t h = (size_t)(ids[i] * 0x9E3779B97F4A7C15ULL) & mask;
+        while (m->keys[h] != 0) h = (h + 1) & mask;
+        m->keys[h] = ids[i];
+        m->vals[h] = indices[i];
+    }
+    return 0;
+}
+
+static uint32_t id_index_get(const id_index_t *m, uint64_t id) {
+    if (!m->keys || id == 0) return UINT32_MAX;
+    size_t mask = m->cap - 1;
+    size_t h = (size_t)(id * 0x9E3779B97F4A7C15ULL) & mask;
+    while (m->keys[h] != 0) {
+        if (m->keys[h] == id) return m->vals[h];
+        h = (h + 1) & mask;
+    }
+    return UINT32_MAX;
+}
+
+static void id_index_free(id_index_t *m) {
+    free(m->keys);
+    free(m->vals);
+    m->keys = NULL;
+    m->vals = NULL;
+}
+
+static dr_entry_t *find_dr_by_id(dr_entry_t *arr, const id_index_t *idx, uint64_t id) {
+    uint32_t i = id_index_get(idx, id);
+    if (i == UINT32_MAX) return NULL;
+    return &arr[i];
 }
 
 /* Iteratively build the full path for a dirent entry.
  * Walks ancestors to find the nearest cached path (or root), collects the
  * chain on a heap-allocated stack, then concatenates from root to leaf. */
-static char *build_dr_path(dr_entry_t *arr, uint32_t n, dr_entry_t *e) {
+static char *build_dr_path(dr_entry_t *arr, const id_index_t *dr_idx, dr_entry_t *e) {
     if (e->full_path) return e->full_path;
 
     /* Collect the ancestor chain that still needs path construction. */
@@ -88,7 +131,7 @@ static char *build_dr_path(dr_entry_t *arr, uint32_t n, dr_entry_t *e) {
             stk = tmp;
         }
         stk[stk_len++] = cur;
-        cur = find_dr_by_id(arr, n, cur->parent_node_id);
+        cur = find_dr_by_id(arr, dr_idx, cur->parent_node_id);
     }
 
     /* cur is either NULL, a root (parent_node_id==0), or already cached. */
@@ -150,25 +193,47 @@ static status_t snap_paths_build(const snapshot_t *snap, snap_paths_t *out) {
         n_flat++;
     }
 
+    /* Build hash maps for O(1) lookups */
+    id_index_t dr_idx = {0};
+    {
+        uint64_t *ids = malloc(n_flat * sizeof(uint64_t));
+        uint32_t *idxs = malloc(n_flat * sizeof(uint32_t));
+        if (!ids || !idxs) { free(ids); free(idxs); goto oom; }
+        for (uint32_t i = 0; i < n_flat; i++) { ids[i] = flat[i].node_id; idxs[i] = i; }
+        if (id_index_build(&dr_idx, ids, idxs, n_flat) != 0) { free(ids); free(idxs); goto oom; }
+        free(ids); free(idxs);
+    }
+
+    id_index_t node_idx = {0};
+    {
+        uint64_t *ids = malloc(snap->node_count * sizeof(uint64_t));
+        uint32_t *idxs = malloc(snap->node_count * sizeof(uint32_t));
+        if (!ids || !idxs) { free(ids); free(idxs); id_index_free(&dr_idx); goto oom; }
+        for (uint32_t i = 0; i < snap->node_count; i++) { ids[i] = snap->nodes[i].node_id; idxs[i] = i; }
+        if (id_index_build(&node_idx, ids, idxs, snap->node_count) != 0) { free(ids); free(idxs); id_index_free(&dr_idx); goto oom; }
+        free(ids); free(idxs);
+    }
+
     snap_pe_t *entries = malloc(n_flat * sizeof(snap_pe_t));
-    if (!entries) goto oom;
+    if (!entries) { id_index_free(&dr_idx); id_index_free(&node_idx); goto oom; }
 
     for (uint32_t i = 0; i < n_flat; i++) {
-        char *fp = build_dr_path(flat, n_flat, &flat[i]);
-        if (!fp) { free(entries); goto oom; }
+        char *fp = build_dr_path(flat, &dr_idx, &flat[i]);
+        if (!fp) { free(entries); id_index_free(&dr_idx); id_index_free(&node_idx); goto oom; }
 
-        /* find the node */
+        /* find the node via hash map */
         const node_t *nd = NULL;
-        for (uint32_t j = 0; j < snap->node_count; j++) {
-            if (snap->nodes[j].node_id == flat[i].node_id) { nd = &snap->nodes[j]; break; }
-        }
+        uint32_t ni = id_index_get(&node_idx, flat[i].node_id);
+        if (ni != UINT32_MAX) nd = &snap->nodes[ni];
 
         entries[i].node_id = flat[i].node_id;
         entries[i].node    = nd;
         entries[i].path    = strdup(fp);
-        if (!entries[i].path) { free(entries); goto oom; }
+        if (!entries[i].path) { free(entries); id_index_free(&dr_idx); id_index_free(&node_idx); goto oom; }
     }
 
+    id_index_free(&dr_idx);
+    id_index_free(&node_idx);
     for (uint32_t i = 0; i < n_flat; i++) { free(flat[i].name); free(flat[i].full_path); }
     free(flat);
     out->entries = entries;
@@ -251,8 +316,13 @@ static int normalize_snapshot_path(const char *in, char *out, size_t out_sz) {
 
 static int join_dest_path(char *out, size_t out_sz,
                           const char *dest_path, const char *rel_path) {
-    int n = snprintf(out, out_sz, "%s/%s", dest_path, rel_path);
-    return (n >= 0 && (size_t)n < out_sz) ? 0 : -1;
+    size_t dlen = strlen(dest_path);
+    size_t rlen = strlen(rel_path);
+    if (dlen + 1 + rlen >= out_sz) return -1;
+    memcpy(out, dest_path, dlen);
+    out[dlen] = '/';
+    memcpy(out + dlen + 1, rel_path, rlen + 1);
+    return 0;
 }
 
 /* Returns count of non-fatal metadata failures (permissions, ACL, xattr).

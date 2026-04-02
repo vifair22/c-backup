@@ -187,31 +187,40 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     if (!names) return set_error(ERR_NOMEM, "collect_xattrs: alloc failed");
     if (llistxattr(path, names, list_sz) < 0) { free(names); return set_error_errno(ERR_IO, "llistxattr(%s)", path); }
 
-    size_t total = 0;
-    for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
-        ssize_t vsz = lgetxattr(path, n, NULL, 0);
-        if (vsz < 0) continue;
-        total += sizeof(uint16_t) + strlen(n) + 1 + sizeof(uint32_t) + (size_t)vsz;
-    }
-    if (total == 0) { free(names); *out = NULL; *out_len = 0; return OK; }
+    /* Count attributes and probe sizes in a single pass */
+    size_t attr_count = 0;
+    for (char *n = names; n < names + list_sz; n += strlen(n) + 1)
+        attr_count++;
 
-    uint8_t *buf = malloc(total);
-    if (!buf) { free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
-    uint8_t *p = buf;
-    for (char *n = names; n < names + list_sz; n += strlen(n) + 1) {
+    ssize_t *sizes = malloc(attr_count * sizeof(ssize_t));
+    if (!sizes) { free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc sizes failed"); }
+
+    size_t total = 0, idx = 0;
+    for (char *n = names; n < names + list_sz; n += strlen(n) + 1, idx++) {
         ssize_t vsz = lgetxattr(path, n, NULL, 0);
-        if (vsz < 0) continue;
+        sizes[idx] = vsz;
+        if (vsz >= 0)
+            total += sizeof(uint16_t) + strlen(n) + 1 + sizeof(uint32_t) + (size_t)vsz;
+    }
+    if (total == 0) { free(sizes); free(names); *out = NULL; *out_len = 0; return OK; }
+
+    /* Second pass: read values directly into the output buffer using cached sizes */
+    uint8_t *buf = malloc(total);
+    if (!buf) { free(sizes); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
+    uint8_t *p = buf;
+    idx = 0;
+    for (char *n = names; n < names + list_sz; n += strlen(n) + 1, idx++) {
+        if (sizes[idx] < 0) continue;
         uint16_t nlen = (uint16_t)strlen(n) + 1;
         memcpy(p, &nlen, sizeof(nlen)); p += sizeof(nlen);
         memcpy(p, n, nlen); p += nlen;
-        char *vbuf = malloc((size_t)vsz);
-        if (!vbuf) { free(buf); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc value buf failed"); }
-        lgetxattr(path, n, vbuf, (size_t)vsz);
-        uint32_t v32 = (uint32_t)vsz;
+        uint32_t v32 = (uint32_t)sizes[idx];
         memcpy(p, &v32, sizeof(v32)); p += sizeof(v32);
-        memcpy(p, vbuf, (size_t)vsz); p += (size_t)vsz;
-        free(vbuf);
+        if (sizes[idx] > 0)
+            lgetxattr(path, n, p, (size_t)sizes[idx]);
+        p += (size_t)sizes[idx];
     }
+    free(sizes);
     free(names);
     *out     = buf;
     *out_len = (size_t)(p - buf);
@@ -375,14 +384,18 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
     while ((de = readdir(d)) != NULL) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         char child[PATH_MAX];
-        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
-        if (n < 0 || (size_t)n >= sizeof(child)) {
+        size_t plen = strlen(path);
+        size_t nlen = strlen(de->d_name);
+        if (plen + 1 + nlen >= sizeof(child)) {
             if (opts && opts->progress_clear_cb)
                 opts->progress_clear_cb(opts->progress_ctx);
             scan_warn(res, "path too long, skipping entry");
             log_msg("WARN", "path too long, skipping entry");
             continue;
         }
+        memcpy(child, path, plen);
+        child[plen] = '/';
+        memcpy(child + plen + 1, de->d_name, nlen + 1);
         if (is_excluded(child, opts)) continue;
         status_t st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
         if (st != OK) { closedir(d); return st; }

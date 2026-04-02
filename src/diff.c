@@ -7,125 +7,235 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* Load a snapshot as a flat (path, node) array                        */
+/* Hash helpers (same as snapshot.c's static versions)                  */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char  *path;
-    node_t node;
-} diff_entry_t;
+    uint64_t  key;
+    uintptr_t val;
+} id_slot_t;
 
-static status_t load_as_ws(repo_t *repo, uint32_t id,
-                            diff_entry_t **out_ws, uint32_t *out_cnt) {
-    snapshot_t *snap = NULL;
-    status_t st = snapshot_load(repo, id, &snap);
-    if (st != OK) return st;
+static uint64_t id_hash_u64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
 
-    pathmap_t *pm = NULL;
-    st = pathmap_build(snap, &pm);
-    snapshot_free(snap);
-    if (st != OK) return st;
+static uint64_t pm_fnv1a(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
+    return h;
+}
 
-    uint32_t cnt = 0;
-    diff_entry_t *ws = calloc(pm->capacity, sizeof(*ws));
-    if (!ws) { pathmap_free(pm); return set_error(ERR_NOMEM, "diff: alloc workspace failed"); }
+/* ------------------------------------------------------------------ */
+/* Core: collect structured diff result                                */
+/*                                                                     */
+/* Strategy: build a pathmap for each snapshot, then iterate+probe     */
+/* instead of copy+sort+merge. Only changed entries (typically a tiny  */
+/* fraction of the total) produce allocations.                         */
+/* ------------------------------------------------------------------ */
 
-    for (size_t i = 0; i < pm->capacity; i++) {
-        if (!pm->slots[i].key) continue;
-        ws[cnt].path = strdup(pm->slots[i].key);
-        if (!ws[cnt].path) {
-            for (uint32_t k = 0; k < cnt; k++) free(ws[k].path);
-            free(ws);
-            pathmap_free(pm);
-            return set_error(ERR_NOMEM, "diff: strdup path failed");
-        }
-        ws[cnt].node = pm->slots[i].value;
-        cnt++;
+static status_t result_push(diff_result_t *r, char change,
+                             const char *path,
+                             const node_t *old_node,
+                             const node_t *new_node)
+{
+    if (r->count == r->capacity) {
+        uint32_t newcap = r->capacity ? r->capacity * 2 : 256;
+        diff_change_t *tmp = realloc(r->changes, (size_t)newcap * sizeof(*tmp));
+        if (!tmp) return set_error(ERR_NOMEM, "diff: result realloc failed");
+        r->changes  = tmp;
+        r->capacity = newcap;
     }
-    pathmap_free(pm);
-    *out_ws  = ws;
-    *out_cnt = cnt;
+    diff_change_t *c = &r->changes[r->count++];
+    c->change = change;
+    c->path   = strdup(path);
+    if (!c->path) return set_error(ERR_NOMEM, "diff: strdup change path failed");
+
+    static const node_t zero_node;
+    c->old_node = old_node ? *old_node : zero_node;
+    c->new_node = new_node ? *new_node : zero_node;
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* Sorting                                                             */
-/* ------------------------------------------------------------------ */
-
-static int ws_path_cmp(const void *a, const void *b) {
-    return strcmp(((const diff_entry_t *)a)->path,
-                  ((const diff_entry_t *)b)->path);
+static int change_path_cmp(const void *a, const void *b) {
+    return strcmp(((const diff_change_t *)a)->path,
+                  ((const diff_change_t *)b)->path);
 }
 
-/* ------------------------------------------------------------------ */
-/* Public                                                              */
-/* ------------------------------------------------------------------ */
+/* Build a pathmap from snap using a shared dirent structure.
+ * If ref_snap has identical dirent data, reuse its dirent parsing
+ * but look up nodes from snap's node array. */
+static status_t build_pathmap_shared(const snapshot_t *snap,
+                                      const snapshot_t *ref_snap,
+                                      const pathmap_t *ref_pm,
+                                      pathmap_t **out)
+{
+    /* Dirent data identical → paths are the same, only nodes differ.
+     * Clone ref_pm's keys, look up each path's node_id in snap. */
+    (void)ref_snap;
 
-status_t snapshot_diff(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2) {
-    diff_entry_t *ws1 = NULL, *ws2 = NULL;
-    uint32_t    cnt1 = 0,   cnt2 = 0;
-
-    status_t st = load_as_ws(repo, snap_id1, &ws1, &cnt1);
-    if (st != OK) return st;
-    st = load_as_ws(repo, snap_id2, &ws2, &cnt2);
-    if (st != OK) {
-        for (uint32_t i = 0; i < cnt1; i++) free(ws1[i].path);
-        free(ws1); return st;
+    /* Build node_id → node pointer map for snap */
+    size_t ncap = 16;
+    while (ncap < snap->node_count * 2u) ncap <<= 1;
+    id_slot_t *nidx = calloc(ncap, sizeof(id_slot_t));
+    if (!nidx) return set_error(ERR_NOMEM, "diff: shared nidx alloc");
+    size_t nmask = ncap - 1;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        uint64_t nid = snap->nodes[i].node_id;
+        size_t h = (size_t)(id_hash_u64(nid) & (uint64_t)nmask);
+        while (nidx[h].key != 0) h = (h + 1) & nmask;
+        nidx[h].key = nid;
+        nidx[h].val = (uintptr_t)&snap->nodes[i];
     }
 
-    /* Compact out NULL paths and sort both arrays by path */
-    uint32_t n1 = 0;
-    for (uint32_t i = 0; i < cnt1; i++) if (ws1[i].path) ws1[n1++] = ws1[i];
-    uint32_t n2 = 0;
-    for (uint32_t i = 0; i < cnt2; i++) if (ws2[i].path) ws2[n2++] = ws2[i];
+    /* Build new pathmap with same capacity as ref */
+    pathmap_t *m = calloc(1, sizeof(*m));
+    if (!m) { free(nidx); return set_error(ERR_NOMEM, "diff: shared pm alloc"); }
+    m->slots = calloc(ref_pm->capacity, sizeof(pm_slot_t));
+    m->capacity = ref_pm->capacity;
+    if (!m->slots) { free(m); free(nidx); return set_error(ERR_NOMEM, "diff: shared slots alloc"); }
 
-    qsort(ws1, n1, sizeof(*ws1), ws_path_cmp);
-    qsort(ws2, n2, sizeof(*ws2), ws_path_cmp);
+    /* Copy paths from ref, but look up node in snap */
+    for (size_t i = 0; i < ref_pm->capacity; i++) {
+        if (!ref_pm->slots[i].key) continue;
+        /* The node_id for this path must be the same (same dirent data) */
+        uint64_t nid = ref_pm->slots[i].value.node_id;
+        const node_t *nd = NULL;
+        size_t h = (size_t)(id_hash_u64(nid) & (uint64_t)nmask);
+        while (nidx[h].key != 0) {
+            if (nidx[h].key == nid) { nd = (const node_t *)nidx[h].val; break; }
+            h = (h + 1) & nmask;
+        }
+        /* Insert into new map: reuse the path string via strdup */
+        size_t mh = (size_t)(pm_fnv1a(ref_pm->slots[i].key) & (uint64_t)(m->capacity - 1));
+        while (m->slots[mh].key) mh = (mh + 1) & (m->capacity - 1);
+        m->slots[mh].key = strdup(ref_pm->slots[i].key);
+        if (!m->slots[mh].key) { free(nidx); pathmap_free(m); return set_error(ERR_NOMEM, "diff: shared strdup"); }
+        m->slots[mh].value = nd ? *nd : ref_pm->slots[i].value;
+        m->slots[mh].seen = 0;
+        m->count++;
+    }
 
-    /* Merge walk */
-    uint32_t i = 0, j = 0;
-    int any = 0;
-    while (i < n1 || j < n2) {
-        int cmp;
-        if      (i >= n1) cmp =  1;
-        else if (j >= n2) cmp = -1;
-        else              cmp = strcmp(ws1[i].path, ws2[j].path);
+    free(nidx);
+    *out = m;
+    return OK;
+}
 
-        if (cmp < 0) {
-            /* present in snap1 but not snap2 → Deleted */
-            printf("D  %s\n", ws1[i].path);
-            i++; any = 1;
-        } else if (cmp > 0) {
-            /* present in snap2 but not snap1 → Added */
-            printf("A  %s\n", ws2[j].path);
-            j++; any = 1;
+status_t snapshot_diff_collect(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2,
+                                diff_result_t **out)
+{
+    /* Load both snapshots */
+    snapshot_t *snap1 = NULL;
+    status_t st = snapshot_load(repo, snap_id1, &snap1);
+    if (st != OK) return st;
+
+    snapshot_t *snap2 = NULL;
+    st = snapshot_load(repo, snap_id2, &snap2);
+    if (st != OK) { snapshot_free(snap1); return st; }
+
+    /* Build pathmaps — share path construction if dirent data matches */
+    pathmap_t *pm1 = NULL;
+    st = pathmap_build(snap1, &pm1);
+    if (st != OK) { snapshot_free(snap1); snapshot_free(snap2); return st; }
+
+    pathmap_t *pm2 = NULL;
+    int shared = (snap1->dirent_data_len == snap2->dirent_data_len &&
+                  snap1->dirent_data_len > 0 &&
+                  memcmp(snap1->dirent_data, snap2->dirent_data,
+                         snap1->dirent_data_len) == 0);
+    if (shared) {
+        st = build_pathmap_shared(snap2, snap1, pm1, &pm2);
+    } else {
+        st = pathmap_build(snap2, &pm2);
+    }
+    snapshot_free(snap1);
+    snapshot_free(snap2);
+    if (st != OK) { pathmap_free(pm1); return st; }
+
+    /* Allocate result */
+    diff_result_t *r = calloc(1, sizeof(*r));
+    if (!r) {
+        pathmap_free(pm1); pathmap_free(pm2);
+        return set_error(ERR_NOMEM, "diff: result alloc failed");
+    }
+
+    /* Iterate pm2: find Added and Modified entries */
+    for (size_t i = 0; i < pm2->capacity; i++) {
+        if (!pm2->slots[i].key) continue;
+        const char *path = pm2->slots[i].key;
+        const node_t *n2 = &pm2->slots[i].value;
+        const node_t *n1 = pathmap_lookup(pm1, path);
+
+        if (!n1) {
+            st = result_push(r, 'A', path, NULL, n2);
+            if (st != OK) goto cleanup;
         } else {
-            /* present in both — compare */
-            const node_t *nd1 = &ws1[i].node;
-            const node_t *nd2 = &ws2[j].node;
-
-            int content_changed = (memcmp(nd1->content_hash, nd2->content_hash,
+            pathmap_mark_seen(pm1, path);
+            int content_changed = (memcmp(n1->content_hash, n2->content_hash,
                                           OBJECT_HASH_SIZE) != 0);
             int meta_changed    = (!content_changed &&
-                                   (nd1->mode != nd2->mode ||
-                                    nd1->uid  != nd2->uid  ||
-                                    nd1->gid  != nd2->gid  ||
-                                    nd1->mtime_sec != nd2->mtime_sec));
+                                   (n1->mode != n2->mode ||
+                                    n1->uid  != n2->uid  ||
+                                    n1->gid  != n2->gid  ||
+                                    n1->mtime_sec != n2->mtime_sec));
             if (content_changed) {
-                printf("M  %s\n", ws1[i].path);
-                any = 1;
+                st = result_push(r, 'M', path, n1, n2);
+                if (st != OK) goto cleanup;
             } else if (meta_changed) {
-                printf("m  %s\n", ws1[i].path);
-                any = 1;
+                st = result_push(r, 'm', path, n1, n2);
+                if (st != OK) goto cleanup;
             }
-            i++; j++;
         }
     }
 
-    if (!any) printf("(no differences)\n");
+    /* Iterate pm1: unseen entries are Deleted */
+    for (size_t i = 0; i < pm1->capacity; i++) {
+        if (!pm1->slots[i].key || pm1->slots[i].seen) continue;
+        st = result_push(r, 'D', pm1->slots[i].key, &pm1->slots[i].value, NULL);
+        if (st != OK) goto cleanup;
+    }
 
-    for (uint32_t k = 0; k < cnt1; k++) free(ws1[k].path);
-    for (uint32_t k = 0; k < cnt2; k++) free(ws2[k].path);
-    free(ws1); free(ws2);
+    /* Sort by path for consistent output */
+    if (r->count > 1)
+        qsort(r->changes, r->count, sizeof(*r->changes), change_path_cmp);
+
+    *out = r;
+    st = OK;
+
+cleanup:
+    pathmap_free(pm1);
+    pathmap_free(pm2);
+    if (st != OK && r) { diff_result_free(r); }
+    return st;
+}
+
+void diff_result_free(diff_result_t *r)
+{
+    if (!r) return;
+    for (uint32_t i = 0; i < r->count; i++)
+        free(r->changes[i].path);
+    free(r->changes);
+    free(r);
+}
+
+/* ------------------------------------------------------------------ */
+/* CLI wrapper: prints to stdout (unchanged behavior)                  */
+/* ------------------------------------------------------------------ */
+
+status_t snapshot_diff(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2) {
+    diff_result_t *r = NULL;
+    status_t st = snapshot_diff_collect(repo, snap_id1, snap_id2, &r);
+    if (st != OK) return st;
+
+    for (uint32_t i = 0; i < r->count; i++)
+        printf("%c  %s\n", r->changes[i].change, r->changes[i].path);
+
+    if (r->count == 0) printf("(no differences)\n");
+
+    diff_result_free(r);
     return OK;
 }

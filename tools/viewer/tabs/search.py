@@ -2,8 +2,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import parse_snap, find_paths_matching, ParseError
-from ..formats import fmt_size, fmt_time, hex_hash
+from ..rpc import call, RPCError
+from ..formats import fmt_size, fmt_time
 from ..constants import NODE_TYPE_NAMES
 from ..widgets import PAD, FONT_MONO
 
@@ -14,7 +14,8 @@ class SearchTab:
     def __init__(self, nb: ttk.Notebook):
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="File Search")
-        self._scan: dict | None = None
+        self._repo_path: str | None = None
+        self._snap_list: list[dict] = []
         self._navigate_cb = None
         self._search_gen: int = 0
         self._build()
@@ -32,6 +33,11 @@ class SearchTab:
         entry.bind("<Return>", lambda _: self._search())
         self._search_btn = tk.Button(bar, text="Search", command=self._search)
         self._search_btn.pack(side=tk.LEFT)
+
+        self._all_snaps_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="All snapshots",
+                        variable=self._all_snaps_var).pack(side=tk.LEFT, padx=(8, 0))
+
         self._count_label = tk.Label(bar, text="")
         self._count_label.pack(side=tk.LEFT, padx=8)
 
@@ -59,15 +65,22 @@ class SearchTab:
         self._tree.pack(fill=tk.BOTH, expand=True)
         self._tree.bind("<Double-1>", self._on_result_dbl)
         tk.Label(self._frame,
-                 text="Double-click a result → jump to snapshot dir tree",
+                 text="Double-click a result \u2192 jump to snapshot dir tree",
                  fg="gray").pack(anchor="w", padx=PAD)
 
-    def populate(self, scan: dict) -> None:
-        self._scan = scan
+    def populate(self, repo_path: str) -> None:
+        self._repo_path = repo_path
+        try:
+            data = call(repo_path, "list")
+            self._snap_list = data.get("snapshots", [])
+        except RPCError:
+            self._snap_list = []
+        self._snap_by_id = {int(s["id"]): s for s in self._snap_list}
+        self._head_id = int(self._snap_list[-1]["id"]) if self._snap_list else None
 
     def _search(self) -> None:
         fragment = self._var.get().strip()
-        if not fragment or not self._scan:
+        if not fragment or not self._repo_path:
             return
         rows = self._tree.get_children()
         if rows:
@@ -75,33 +88,36 @@ class SearchTab:
 
         self._search_gen += 1
         gen = self._search_gen
-        self._count_label.config(text="Searching…")
+        self._count_label.config(text="Searching\u2026")
         self._search_btn.config(state=tk.DISABLED)
 
-        snap_paths = list(self._scan.get("snapshots", []))
+        repo_path = self._repo_path
+        snap_by_id = dict(self._snap_by_id)
+        all_snaps = self._all_snaps_var.get()
+        head_id = self._head_id
 
         def _worker() -> None:
             results: list[tuple] = []
-            for snap_path in snap_paths:
-                try:
-                    s = parse_snap(snap_path)
-                except ParseError:
-                    continue
-                for path, node in find_paths_matching(s, fragment):
-                    if node is None:
-                        continue
-                    results.append((
-                        s["snap_id"],
-                        fmt_time(s["created_sec"]),
-                        path,
-                        NODE_TYPE_NAMES.get(node["type"], str(node["type"])),
-                        fmt_size(node["size"]),
-                        hex_hash(node["content_hash"])[:20] + "…",
-                    ))
-                    if len(results) >= _RESULT_CAP:
-                        break
-                if len(results) >= _RESULT_CAP:
-                    break
+            try:
+                params: dict = {"query": fragment, "max_results": _RESULT_CAP}
+                if not all_snaps and head_id is not None:
+                    params["id"] = head_id
+                sr = call(repo_path, "search", **params)
+            except RPCError:
+                sr = {"results": []}
+            for r in sr.get("results", []):
+                snap_id = int(r.get("snap_id", 0))
+                snap = snap_by_id.get(snap_id, {})
+                node = r.get("node", {})
+                results.append((
+                    snap_id,
+                    fmt_time(int(snap.get("created_sec", 0))),
+                    r["path"],
+                    NODE_TYPE_NAMES.get(int(node.get("type", 0)),
+                                        str(node.get("type", "?"))),
+                    fmt_size(int(node.get("size", 0))),
+                    node.get("content_hash", "")[:20] + "\u2026",
+                ))
             self._frame.after(0, lambda: self._finish_search(results, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -110,8 +126,6 @@ class SearchTab:
         if gen != self._search_gen:
             return
         self._search_btn.config(state=tk.NORMAL)
-        # Group by path so the same filename across snapshots appears together,
-        # secondary sort by snap_id within each group.
         results.sort(key=lambda r: (r[2], r[0]))
         for vals in results:
             self._tree.insert("", tk.END, values=vals)

@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #include "../src/repo.h"
 #include "../src/object.h"
@@ -569,6 +570,128 @@ static void test_pack_mixed_lz4_lz4frame(void **state) {
     assert_true((size_t)st.st_size == large_size);
 }
 
+/*
+ * Test: incompressibility skip-marker is written for large random objects.
+ * Exercises pack.c probe pass (lines 2125-2174) and the skip_ver pwrite.
+ * After packing, the loose object should still exist with pack_skip_ver set.
+ */
+static void test_pack_incompressible_skip_marker(void **state) {
+    (void)state;
+    /* 17 MiB of PRNG data → exceeds PACK_STREAM_THRESHOLD (16 MiB) → large path */
+    const size_t file_size = 17u * 1024u * 1024u;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/random_large.bin", TEST_SRC);
+    create_prng_file(path, file_size);
+
+    /* Backup so the object is stored loose */
+    const char *paths[] = { TEST_SRC };
+    backup_opts_t opts = { .quiet = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    /* Get the content hash from snapshot */
+    snapshot_t *snap = NULL;
+    assert_int_equal(snapshot_load(repo, 1, &snap), OK);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    int found = 0;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+            memcpy(hash, snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
+            found = 1;
+            break;
+        }
+    }
+    snapshot_free(snap);
+    assert_true(found);
+
+    /* Verify object is loose and pack_skip_ver is 0 before packing */
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char obj_path[PATH_MAX];
+    snprintf(obj_path, sizeof(obj_path), "%s/objects/%.2s/%s",
+             repo_path(repo), hex, hex + 2);
+    struct stat st;
+    assert_int_equal(stat(obj_path, &st), 0);
+
+    int fd = open(obj_path, O_RDONLY);
+    assert_true(fd >= 0);
+    object_header_t ohdr;
+    assert_int_equal(read(fd, &ohdr, sizeof(ohdr)), (ssize_t)sizeof(ohdr));
+    close(fd);
+    assert_int_equal(ohdr.pack_skip_ver, 0);
+
+    /* Pack — the probe should detect incompressibility and write skip marker */
+    assert_int_equal(repo_pack(repo, NULL), OK);
+
+    /* Object should still be loose (not packed) with skip marker set */
+    assert_int_equal(stat(obj_path, &st), 0);  /* still exists */
+
+    fd = open(obj_path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(read(fd, &ohdr, sizeof(ohdr)), (ssize_t)sizeof(ohdr));
+    close(fd);
+    assert_int_equal(ohdr.pack_skip_ver, PROBER_VERSION);
+
+    /* Second pack should skip this object entirely (line 2082) */
+    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(stat(obj_path, &st), 0);  /* still loose */
+}
+
+/*
+ * Test: incompressibility skip-marker for small-path objects (worker probe).
+ * Objects at exactly 16 MiB go through the small-object worker path but
+ * still get probed because uncompressed_size >= PACK_SIZE_THRESHOLD.
+ */
+static void test_pack_incompressible_skip_marker_worker(void **state) {
+    (void)state;
+    /* Exactly 16 MiB — compressed_size == 16 MiB == PACK_STREAM_THRESHOLD,
+     * NOT > PACK_STREAM_THRESHOLD, so it goes to small_indices and the
+     * worker path probe at pack.c:475-493. */
+    const size_t file_size = 16u * 1024u * 1024u;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/random_16m.bin", TEST_SRC);
+    create_prng_file(path, file_size);
+
+    const char *paths[] = { TEST_SRC };
+    backup_opts_t opts = { .quiet = 1 };
+    assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
+
+    snapshot_t *snap = NULL;
+    assert_int_equal(snapshot_load(repo, 1, &snap), OK);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint8_t zero[OBJECT_HASH_SIZE] = {0};
+    int found = 0;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0) {
+            memcpy(hash, snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
+            found = 1;
+            break;
+        }
+    }
+    snapshot_free(snap);
+    assert_true(found);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char obj_path[PATH_MAX];
+    snprintf(obj_path, sizeof(obj_path), "%s/objects/%.2s/%s",
+             repo_path(repo), hex, hex + 2);
+
+    /* Pack — worker probe should detect incompressibility */
+    assert_int_equal(repo_pack(repo, NULL), OK);
+
+    /* Object should still be loose with skip marker set */
+    struct stat st;
+    assert_int_equal(stat(obj_path, &st), 0);
+
+    int fd = open(obj_path, O_RDONLY);
+    assert_true(fd >= 0);
+    object_header_t ohdr;
+    assert_int_equal(read(fd, &ohdr, sizeof(ohdr)), (ssize_t)sizeof(ohdr));
+    close(fd);
+    assert_int_equal(ohdr.pack_skip_ver, PROBER_VERSION);
+}
+
 /* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
@@ -602,6 +725,10 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_pack_large_lz4frame_content_verify,
                                         setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_pack_mixed_lz4_lz4frame,
+                                        setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_pack_incompressible_skip_marker,
+                                        setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_pack_incompressible_skip_marker_worker,
                                         setup_basic, teardown_basic),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

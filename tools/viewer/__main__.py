@@ -13,7 +13,8 @@ def main() -> None:
         if os.path.isdir(path):
             app.load_repo(path)
         else:
-            app._open_single_file(path)
+            print(f"Error: {path} is not a directory", file=sys.stderr)
+            sys.exit(1)
     app.mainloop()
 
 

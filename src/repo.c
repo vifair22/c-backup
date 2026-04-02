@@ -14,6 +14,13 @@
 #include <unistd.h>
 
 #define FORMAT_VERSION "c-backup-1\n"
+#define DAT_CACHE_SLOTS 8
+
+typedef struct {
+    uint32_t pack_num;
+    FILE    *fp;
+    uint32_t age;       /* monotonic counter for LRU eviction */
+} dat_cache_slot_t;
 
 struct repo {
     char   *path;
@@ -22,6 +29,9 @@ struct repo {
     /* pack index cache, owned by pack.c, freed on close */
     void   *pack_cache;
     size_t  pack_cache_cnt;
+    /* pack .dat fd cache for bulk lookups */
+    dat_cache_slot_t dat_cache[DAT_CACHE_SLOTS];
+    uint32_t         dat_cache_tick;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -166,6 +176,8 @@ status_t repo_open(const char *path, repo_t **out) {
     r->lock_fd        = -1;
     r->pack_cache     = NULL;
     r->pack_cache_cnt = 0;
+    memset(r->dat_cache, 0, sizeof(r->dat_cache));
+    r->dat_cache_tick = 0;
     *out = r;
     return OK;
 }
@@ -173,6 +185,7 @@ status_t repo_open(const char *path, repo_t **out) {
 void repo_close(repo_t *repo) {
     if (!repo) return;
     repo_unlock(repo);
+    repo_dat_cache_flush(repo);
     close(repo->dirfd);
     free(repo->path);
     free(repo->pack_cache);
@@ -199,6 +212,50 @@ void *repo_pack_cache_data(const repo_t *repo) {
 
 size_t repo_pack_cache_count(const repo_t *repo) {
     return repo->pack_cache_cnt;
+}
+
+FILE *repo_dat_cache_checkout(repo_t *repo, uint32_t pack_num) {
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+        if (repo->dat_cache[i].fp && repo->dat_cache[i].pack_num == pack_num) {
+            FILE *fp = repo->dat_cache[i].fp;
+            repo->dat_cache[i].fp = NULL;
+            return fp;
+        }
+    }
+    return NULL;
+}
+
+void repo_dat_cache_return(repo_t *repo, uint32_t pack_num, FILE *fp) {
+    if (!fp) return;
+    /* Find an empty slot */
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+        if (!repo->dat_cache[i].fp) {
+            repo->dat_cache[i].fp       = fp;
+            repo->dat_cache[i].pack_num = pack_num;
+            repo->dat_cache[i].age      = ++repo->dat_cache_tick;
+            return;
+        }
+    }
+    /* All slots full — evict oldest */
+    int oldest = 0;
+    for (int i = 1; i < DAT_CACHE_SLOTS; i++) {
+        if (repo->dat_cache[i].age < repo->dat_cache[oldest].age)
+            oldest = i;
+    }
+    fclose(repo->dat_cache[oldest].fp);
+    repo->dat_cache[oldest].fp       = fp;
+    repo->dat_cache[oldest].pack_num = pack_num;
+    repo->dat_cache[oldest].age      = ++repo->dat_cache_tick;
+}
+
+void repo_dat_cache_flush(repo_t *repo) {
+    if (!repo) return;
+    for (int i = 0; i < DAT_CACHE_SLOTS; i++) {
+        if (repo->dat_cache[i].fp) {
+            fclose(repo->dat_cache[i].fp);
+            repo->dat_cache[i].fp = NULL;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */

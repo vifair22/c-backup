@@ -1,8 +1,7 @@
-import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from ..parsers import parse_tag, ParseError
+from ..rpc import call, RPCError
 from ..widgets import make_text_widget, set_text, PAD, FONT_MONO, FONT_BOLD
 
 
@@ -10,7 +9,8 @@ class TagsTab:
     def __init__(self, nb: ttk.Notebook):
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="Tags")
-        self._tag_paths: list[str] = []
+        self._repo_path: str | None = None
+        self._tags: list[dict] = []
         self._build()
 
     def _build(self) -> None:
@@ -31,23 +31,26 @@ class TagsTab:
         pane.add(right, weight=4)
         self._text = make_text_widget(right)
 
-    def populate(self, scan: dict) -> None:
-        self._tag_paths = scan["tags"]
+    def populate(self, repo_path: str) -> None:
+        self._repo_path = repo_path
         self._list.delete(0, tk.END)
-        for path in self._tag_paths:
-            self._list.insert(tk.END, os.path.basename(path))
+        try:
+            data = call(repo_path, "tags")
+            self._tags = data.get("tags", [])
+        except RPCError as e:
+            self._tags = []
+            set_text(self._text, f"Error loading tags: {e}")
+            return
+        for tag in self._tags:
+            self._list.insert(tk.END, tag.get("name", "?"))
 
     def _on_select(self, _event) -> None:
         sel = self._list.curselection()
         if not sel:
             return
-        path = self._tag_paths[sel[0]]
-        try:
-            tag = parse_tag(path)
-        except ParseError as e:
-            messagebox.showerror("Parse error", str(e))
-            return
-        lines = [f"File     : {path}", f"Name     : {os.path.basename(path)}"]
+        tag = self._tags[sel[0]]
+        lines = [f"Name     : {tag.get('name', '?')}"]
         for k, v in tag.items():
-            lines.append(f"{k:8} : {v}")
+            if k != "name":
+                lines.append(f"{k:8} : {v}")
         set_text(self._text, "\n".join(lines))

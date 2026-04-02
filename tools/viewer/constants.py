@@ -1,35 +1,17 @@
 """
-On-disk constants mirroring types.h / pack.c / snapshot.c
+Display-side constants for the viewer UI.
+
+On-disk format constants (magic numbers, struct layouts) are no longer needed —
+the C binary handles all parsing via the JSON RPC API.
 """
 
 OBJECT_HASH_SIZE = 32
-
-# Snap file
-SNAP_MAGIC       = 0x43424B50   # "CBKP"
-SNAP_VERSION_V3  = 3
-SNAP_VERSION_V4  = 4
-SNAP_VERSION_V5  = 5
-SNAP_VERSION     = SNAP_VERSION_V5  # current write version
-
-# Pack files
-PACK_DAT_MAGIC  = 0x42504B44  # "BPKD"
-PACK_IDX_MAGIC  = 0x42504B49  # "BPKI"
-PACK_VERSION_V1 = 1
-PACK_VERSION_V2 = 2
-PACK_VERSION_V3 = 3
-
-# Parity trailer magic (appended to v3 packs, v5 snaps, v2 objects)
-PARITY_MAGIC = 0x50415249  # "PARI"
+ZERO_HASH = "0" * 64
 
 # UI content preview / diff size cap
 UI_SIZE_LIMIT = 2 * 1024 * 1024   # 2 MiB
 
-# Loose object header magic / version (types.h)
-OBJECT_MAGIC        = 0x42434F4A  # "BCOJ"
-OBJECT_HDR_VERSION  = 2
-PROBER_VERSION      = 1
-
-# Compression types (types.h)
+# Compression types (types.h) — used to interpret numeric fields from RPC
 COMPRESS_NONE      = 0
 COMPRESS_LZ4       = 1
 COMPRESS_LZ4_FRAME = 2
@@ -54,6 +36,12 @@ GFS_DAILY   = 1 << 0
 GFS_WEEKLY  = 1 << 1
 GFS_MONTHLY = 1 << 2
 GFS_YEARLY  = 1 << 3
+
+# Prober version for skip markers
+PROBER_VERSION = 1
+
+# Pack file header size (3 × uint32 = 12 bytes, constant across versions)
+PACK_DAT_HDR_SIZE = 12
 
 # Human-readable name tables
 OBJECT_TYPE_NAMES = {

@@ -516,6 +516,421 @@ static void bench_gc(void)
 REGISTER("gc_500_4K", bench_gc);
 
 /* ------------------------------------------------------------------ */
+/* Snapshot read hot paths                                             */
+/* ------------------------------------------------------------------ */
+
+#include "diff.h"
+#include "ls.h"
+
+/*
+ * Helper: create a repo with N snapshots, each containing `nfiles` files.
+ * Between snapshots, modifies `n_changed` files so diffs are non-trivial.
+ * Returns the repo (caller must close + cleanup).
+ */
+static repo_t *create_multi_snap_repo(int nfiles, size_t file_size,
+                                       int n_snaps, int n_changed)
+{
+    bench_cleanup();
+    create_tree(BENCH_SRC, nfiles, file_size);
+    repo_init(BENCH_REPO);
+    repo_t *repo;
+    repo_open(BENCH_REPO, &repo);
+    repo_lock(repo);
+
+    backup_opts_t opts = {0};
+    opts.quiet = 1;
+    const char *paths[] = { BENCH_SRC };
+
+    for (int s = 0; s < n_snaps; s++) {
+        backup_run_opts(repo, paths, 1, &opts);
+        /* Modify some files for next snapshot */
+        if (s < n_snaps - 1 && n_changed > 0) {
+            for (int i = 0; i < n_changed; i++) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/%02x/file_%06d.dat",
+                         BENCH_SRC, (s * n_changed + i) % 256, (s * n_changed + i) % nfiles);
+                create_file(path, file_size);
+            }
+        }
+    }
+    return repo;
+}
+
+/* --- snapshot_load (full) --- */
+
+static void bench_snap_load_1k(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
+
+    snapshot_t *snap = NULL;
+    /* warmup */
+    snapshot_load(repo, 1, &snap);
+    snapshot_free(snap); snap = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_load(repo, 1, &snap);
+        snapshot_free(snap); snap = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("snap_load_1k_files", (double)iters / elapsed, "loads/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("snap_load_1k", bench_snap_load_1k);
+
+static void bench_snap_load_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    snapshot_t *snap = NULL;
+    snapshot_load(repo, 1, &snap);
+    snapshot_free(snap); snap = NULL;
+
+    int iters = 20;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_load(repo, 1, &snap);
+        snapshot_free(snap); snap = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("snap_load_10k_files", (double)iters / elapsed, "loads/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("snap_load_10k", bench_snap_load_10k);
+
+/* --- snapshot_load_nodes_only --- */
+
+static void bench_snap_load_nodes_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    snapshot_t *snap = NULL;
+    snapshot_load_nodes_only(repo, 1, &snap);
+    snapshot_free(snap); snap = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_load_nodes_only(repo, 1, &snap);
+        snapshot_free(snap); snap = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("snap_load_nodes_only_10k", (double)iters / elapsed, "loads/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("snap_load_nodes_only_10k", bench_snap_load_nodes_10k);
+
+/* --- snapshot_list_all --- */
+
+static void bench_snap_list_all(void)
+{
+    repo_t *repo = create_multi_snap_repo(500, 4096, 10, 5);
+
+    snap_list_t *sl = NULL;
+    snapshot_list_all(repo, &sl);
+    snap_list_free(sl); sl = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_list_all(repo, &sl);
+        snap_list_free(sl); sl = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("snap_list_all (10 snaps)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("snap_list_all", bench_snap_list_all);
+
+/* --- pathmap_build --- */
+
+static void bench_pathmap_1k(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
+
+    snapshot_t *snap = NULL;
+    snapshot_load(repo, 1, &snap);
+
+    pathmap_t *pm = NULL;
+    /* warmup */
+    pathmap_build(snap, &pm);
+    pathmap_free(pm); pm = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        pathmap_build(snap, &pm);
+        pathmap_free(pm); pm = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("pathmap_build_1k", (double)iters / elapsed, "builds/s", elapsed);
+    report("pathmap_build_1k", (double)iters * 1000.0 / elapsed / 1e6, "M entries/s", elapsed);
+
+    snapshot_free(snap);
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("pathmap_1k", bench_pathmap_1k);
+
+static void bench_pathmap_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    snapshot_t *snap = NULL;
+    snapshot_load(repo, 1, &snap);
+
+    pathmap_t *pm = NULL;
+    pathmap_build(snap, &pm);
+    pathmap_free(pm); pm = NULL;
+
+    int iters = 20;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        pathmap_build(snap, &pm);
+        pathmap_free(pm); pm = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("pathmap_build_10k", (double)iters / elapsed, "builds/s", elapsed);
+    report("pathmap_build_10k", (double)iters * 10000.0 / elapsed / 1e6, "M entries/s", elapsed);
+
+    snapshot_free(snap);
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("pathmap_10k", bench_pathmap_10k);
+
+/* --- snapshot_ls_collect --- */
+
+static void bench_ls_collect_1k(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
+
+    ls_result_t *r = NULL;
+    /* warmup */
+    snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
+    ls_result_free(r); r = NULL;
+
+    int iters = 30;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
+        ls_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("ls_collect_1k (recursive)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("ls_collect_1k", bench_ls_collect_1k);
+
+static void bench_ls_collect_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    ls_result_t *r = NULL;
+    snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
+    ls_result_free(r); r = NULL;
+
+    int iters = 10;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
+        ls_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("ls_collect_10k (recursive)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("ls_collect_10k", bench_ls_collect_10k);
+
+static void bench_ls_collect_10k_nonrec(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    ls_result_t *r = NULL;
+    snapshot_ls_collect(repo, 1, "", 0, 0, NULL, &r);
+    ls_result_free(r); r = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_ls_collect(repo, 1, "", 0, 0, NULL, &r);
+        ls_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("ls_collect_10k (non-recursive)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("ls_collect_10k_nonrec", bench_ls_collect_10k_nonrec);
+
+static void bench_ls_collect_10k_subdir(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    /* List a single subdirectory (e.g. "00") */
+    ls_result_t *r = NULL;
+    snapshot_ls_collect(repo, 1, "00", 0, 0, NULL, &r);
+    ls_result_free(r); r = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_ls_collect(repo, 1, "00", 0, 0, NULL, &r);
+        ls_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("ls_collect_10k (subdir non-rec)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("ls_collect_10k_subdir", bench_ls_collect_10k_subdir);
+
+/* --- snapshot_search --- */
+
+static void bench_search_1k(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
+
+    search_result_t *r = NULL;
+    snapshot_search(repo, 1, "file_0001", 5000, &r);
+    search_result_free(r); r = NULL;
+
+    int iters = 50;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_search(repo, 1, "file_0001", 5000, &r);
+        search_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("search_1k (substring)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("search_1k", bench_search_1k);
+
+static void bench_search_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
+
+    search_result_t *r = NULL;
+    snapshot_search(repo, 1, "file_0001", 5000, &r);
+    search_result_free(r); r = NULL;
+
+    int iters = 20;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_search(repo, 1, "file_0001", 5000, &r);
+        search_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("search_10k (substring)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("search_10k", bench_search_10k);
+
+static void bench_search_multi_snap(void)
+{
+    /* 5 snapshots with 1K files each, search across all */
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 5, 10);
+
+    search_result_t *r = NULL;
+    int iters = 30;
+    double t0 = now_sec();
+    for (int it = 0; it < iters; it++) {
+        for (uint32_t sid = 1; sid <= 5; sid++) {
+            snapshot_search(repo, sid, "file_0001", 5000, &r);
+            search_result_free(r); r = NULL;
+        }
+    }
+    double elapsed = now_sec() - t0;
+
+    report("search_multi (5×1k snaps)", (double)iters / elapsed, "full-scans/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("search_multi", bench_search_multi_snap);
+
+/* --- snapshot_diff_collect --- */
+
+static void bench_diff_1k(void)
+{
+    repo_t *repo = create_multi_snap_repo(1000, 4096, 2, 50);
+
+    diff_result_t *r = NULL;
+    /* warmup */
+    snapshot_diff_collect(repo, 1, 2, &r);
+    diff_result_free(r); r = NULL;
+
+    int iters = 30;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_diff_collect(repo, 1, 2, &r);
+        diff_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("diff_collect_1k (50 changes)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("diff_1k", bench_diff_1k);
+
+static void bench_diff_10k(void)
+{
+    repo_t *repo = create_multi_snap_repo(10000, 256, 2, 200);
+
+    diff_result_t *r = NULL;
+    snapshot_diff_collect(repo, 1, 2, &r);
+    diff_result_free(r); r = NULL;
+
+    int iters = 10;
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        snapshot_diff_collect(repo, 1, 2, &r);
+        diff_result_free(r); r = NULL;
+    }
+    double elapsed = now_sec() - t0;
+
+    report("diff_collect_10k (200 changes)", (double)iters / elapsed, "calls/s", elapsed);
+
+    repo_close(repo);
+    bench_cleanup();
+}
+REGISTER("diff_10k", bench_diff_10k);
+
+/* ------------------------------------------------------------------ */
 /* Restore                                                             */
 /* ------------------------------------------------------------------ */
 

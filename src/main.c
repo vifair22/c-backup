@@ -13,6 +13,8 @@
 #include "policy.h"
 #include "gfs.h"
 #include "xfer.h"
+#include "json_api.h"
+#include "../vendor/cJSON.h"
 #include "../vendor/log.h"
 
 #include <dirent.h>
@@ -253,24 +255,6 @@ static void fmt_bytes_short(uint64_t n, char *buf, size_t sz) {
         snprintf(buf, sz, "%.1fK", (double)n / 1024.0);
     else
         snprintf(buf, sz, "%lluB", (unsigned long long)n);
-}
-
-static void json_print_escaped(const char *s) {
-    if (!s) return;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        switch (*p) {
-            case '\\': fputs("\\\\", stdout); break;
-            case '"': fputs("\\\"", stdout); break;
-            case '\b': fputs("\\b", stdout); break;
-            case '\f': fputs("\\f", stdout); break;
-            case '\n': fputs("\\n", stdout); break;
-            case '\r': fputs("\\r", stdout); break;
-            case '\t': fputs("\\t", stdout); break;
-            default:
-                if (*p < 0x20) printf("\\u%04x", (unsigned)*p);
-                else fputc(*p, stdout);
-        }
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -882,53 +866,47 @@ static int cmd_list(repo_t *repo, int argc, char **argv) {
     snapshot_read_head(repo, &head);
 
     if (json) {
-        printf("{\n  \"head\": %u,\n  \"snapshots\": [\n", head);
-        int first = 1;
-        for (uint32_t id = 1; id <= head; id++) {
-            snapshot_t *snap = NULL;
-            int has_snap = (snapshot_load(repo, id, &snap) == OK);
-            char timebuf[32] = "";
-            uint32_t entries = 0;
-            uint64_t bytes = 0;
-            uint64_t phys_new = 0;
-            char gfsbuf[64] = "";
-            char tagbuf[256];
-            list_tags_for_snap(repo, id, tagbuf, sizeof(tagbuf));
-
-            if (has_snap) {
-                entries = snap->node_count;
-                for (uint32_t i = 0; i < snap->node_count; i++) {
-                    if (snap->nodes[i].type == NODE_TYPE_REG)
-                        bytes += snap->nodes[i].size;
-                }
-                phys_new = snap->phys_new_bytes;
-                if (snap->created_sec > 0) {
-                    time_t t = (time_t)snap->created_sec;
+        snap_list_t *sl = NULL;
+        if (snapshot_list_all(repo, &sl) != OK) {
+            fprintf(stderr, "error: %s\n",
+                    err_msg()[0] ? err_msg() : "failed to list snapshots");
+            return 1;
+        }
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "head", sl->head);
+        cJSON *arr = cJSON_AddArrayToObject(root, "snapshots");
+        for (uint32_t i = 0; i < sl->count; i++) {
+            const snap_info_t *si = &sl->snaps[i];
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddNumberToObject(item, "id", si->id);
+            cJSON_AddBoolToObject(item, "is_head", si->id == sl->head);
+            cJSON_AddBoolToObject(item, "manifest", si->has_manifest);
+            if (si->has_manifest) {
+                char timebuf[32] = "";
+                if (si->created_sec > 0) {
+                    time_t t = (time_t)si->created_sec;
                     struct tm *tm = localtime(&t);
                     if (tm) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm);
                 }
-                if (snap->gfs_flags) gfs_flags_str(snap->gfs_flags, gfsbuf, sizeof(gfsbuf));
+                cJSON_AddStringToObject(item, "timestamp", timebuf);
+                cJSON_AddNumberToObject(item, "entries", si->node_count);
+                cJSON_AddNumberToObject(item, "logical_bytes", (double)si->logical_bytes);
+                cJSON_AddNumberToObject(item, "phys_new_bytes", (double)si->phys_new_bytes);
+                char gfsbuf[64] = "";
+                if (si->gfs_flags) gfs_flags_str(si->gfs_flags, gfsbuf, sizeof(gfsbuf));
+                cJSON_AddStringToObject(item, "gfs", gfsbuf[0] ? gfsbuf : "none");
             }
-
-            if (!first) printf(",\n");
-            first = 0;
-            printf("    {\"id\": %u, \"is_head\": %s, \"manifest\": %s",
-                   id, (id == head) ? "true" : "false", has_snap ? "true" : "false");
-            if (has_snap) {
-                printf(", \"timestamp\": \"");
-                json_print_escaped(timebuf);
-                printf("\", \"entries\": %u, \"logical_bytes\": %llu, \"phys_new_bytes\": %llu",
-                       entries, (unsigned long long)bytes, (unsigned long long)phys_new);
-                printf(", \"gfs\": \"");
-                json_print_escaped(gfsbuf[0] ? gfsbuf : "none");
-                printf("\"");
-            }
-            printf(", \"tags\": \"");
-            json_print_escaped(tagbuf);
-            printf("\"}");
-            snapshot_free(snap);
+            char tagbuf[256];
+            list_tags_for_snap(repo, si->id, tagbuf, sizeof(tagbuf));
+            cJSON_AddStringToObject(item, "tags", tagbuf);
+            cJSON_AddItemToArray(arr, item);
         }
-        printf("\n  ]\n}\n");
+        char *out = cJSON_Print(root);
+        fputs(out, stdout);
+        fputc('\n', stdout);
+        free(out);
+        cJSON_Delete(root);
+        snap_list_free(sl);
         return 0;
     }
 
@@ -1780,18 +1758,22 @@ static int cmd_stats(repo_t *repo, int argc, char **argv) {
         return 1;
     }
     if (json) {
-        printf("{\n");
-        printf("  \"snapshots_present\": %u,\n", s.snap_count);
-        printf("  \"head_snapshot\": %u,\n", s.snap_total);
-        printf("  \"head_entries\": %u,\n", s.head_entries);
-        printf("  \"head_logical_bytes\": %llu,\n", (unsigned long long)s.head_logical_bytes);
-        printf("  \"manifest_bytes\": %llu,\n", (unsigned long long)s.snap_bytes);
-        printf("  \"loose_objects\": %u,\n", s.loose_objects);
-        printf("  \"loose_bytes\": %llu,\n", (unsigned long long)s.loose_bytes);
-        printf("  \"pack_files\": %u,\n", s.pack_files);
-        printf("  \"pack_bytes\": %llu,\n", (unsigned long long)s.pack_bytes);
-        printf("  \"repo_physical_bytes\": %llu\n", (unsigned long long)s.total_bytes);
-        printf("}\n");
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "snapshots_present",  s.snap_count);
+        cJSON_AddNumberToObject(root, "head_snapshot",      s.snap_total);
+        cJSON_AddNumberToObject(root, "head_entries",       s.head_entries);
+        cJSON_AddNumberToObject(root, "head_logical_bytes", (double)s.head_logical_bytes);
+        cJSON_AddNumberToObject(root, "manifest_bytes",     (double)s.snap_bytes);
+        cJSON_AddNumberToObject(root, "loose_objects",      s.loose_objects);
+        cJSON_AddNumberToObject(root, "loose_bytes",        (double)s.loose_bytes);
+        cJSON_AddNumberToObject(root, "pack_files",         s.pack_files);
+        cJSON_AddNumberToObject(root, "pack_bytes",         (double)s.pack_bytes);
+        cJSON_AddNumberToObject(root, "repo_physical_bytes",(double)s.total_bytes);
+        char *out = cJSON_Print(root);
+        fputs(out, stdout);
+        fputc('\n', stdout);
+        free(out);
+        cJSON_Delete(root);
         return 0;
     }
     repo_stats_print(&s);
@@ -1879,6 +1861,21 @@ int main(int argc, char *argv[]) {
     sigaction(SIGTERM, &sa, NULL);
 
     if (argc < 2) { usage(); return 1; }
+
+    /* --json mode: JSON RPC via stdin/stdout */
+    if (argc >= 3 && strcmp(argv[1], "--json") == 0) {
+        repo_t *repo = NULL;
+        if (repo_open(argv[2], &repo) != OK) {
+            fprintf(stdout,
+                    "{\"status\":\"error\",\"message\":\"cannot open repository: %s\"}\n",
+                    err_msg()[0] ? err_msg() : "unknown error");
+            fflush(stdout);
+            return 1;
+        }
+        int ret = json_api_dispatch(repo);
+        repo_close(repo);
+        return ret;
+    }
 
     const char *cmd = argv[1];
 

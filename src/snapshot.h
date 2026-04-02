@@ -28,9 +28,13 @@ typedef struct {
     /* dirents are variable-size; stored as raw bytes */
     uint8_t    *dirent_data;
     size_t      dirent_data_len;
+    /* Internal: if non-NULL, nodes and dirent_data point into this
+     * buffer (zero-copy decompression). snapshot_free frees it. */
+    void       *_backing;
 } snapshot_t;
 
 status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out);
+status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **out);
 status_t snapshot_write(repo_t *repo, snapshot_t *snap);
 status_t snapshot_delete(repo_t *repo, uint32_t snap_id);
 void     snapshot_free(snapshot_t *snap);
@@ -99,3 +103,29 @@ void pathmap_free(pathmap_t *map);
  * Returns: >0 = bytes corrected, 0 = no corruption found, <0 = error.
  */
 int snapshot_repair(repo_t *repo, uint32_t snap_id);
+
+/* ---------- snapshot list ----------
+ *
+ * Enumerate all snapshots with header metadata.
+ * Core logic used by both CLI (cmd_list) and JSON API.
+ */
+typedef struct {
+    uint32_t id;
+    int      has_manifest;
+    uint64_t created_sec;
+    uint32_t node_count;
+    uint32_t dirent_count;
+    uint64_t phys_new_bytes;
+    uint32_t gfs_flags;
+    uint32_t snap_flags;
+    uint64_t logical_bytes;   /* sum of regular file sizes */
+} snap_info_t;
+
+typedef struct {
+    uint32_t     head;
+    snap_info_t *snaps;
+    uint32_t     count;
+} snap_list_t;
+
+status_t snapshot_list_all(repo_t *repo, snap_list_t **out);
+void     snap_list_free(snap_list_t *l);

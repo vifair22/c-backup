@@ -37,44 +37,7 @@
 #define TEST_SRC  "/tmp/c_backup_packgc_src"
 #define TEST_DEST "/tmp/c_backup_packgc_dest"
 
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t count;
-} pack_idx_hdr_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint64_t dat_offset;
-    uint32_t entry_index;
-} pack_idx_disk_entry_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint8_t  type;
-    uint8_t  compression;
-    uint64_t uncompressed_size;
-    uint64_t compressed_size;
-} pack_dat_entry_hdr_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t count;
-} pack_dat_hdr_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint8_t  type;
-    uint8_t  compression;
-    uint64_t uncompressed_size;
-    uint32_t compressed_size;
-} pack_dat_entry_hdr_v1_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint64_t dat_offset;
-} pack_idx_disk_entry_v2_t;
+/* Pack on-disk structs are now defined in pack.h */
 
 static repo_t *repo;
 

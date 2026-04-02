@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from .parsers import scan_repo, ParseError
+from .rpc import RPCError
 from .widgets import PAD
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
@@ -17,7 +17,6 @@ class ViewerApp(tk.Tk):
         self.title("c-backup Repository Viewer")
         self.geometry("1200x850")
         self.repo_path: str | None = None
-        self._scan: dict | None = None
         self._build_menu()
         self._build_layout()
 
@@ -27,8 +26,6 @@ class ViewerApp(tk.Tk):
         mb = tk.Menu(self)
         file_menu = tk.Menu(mb, tearoff=0)
         file_menu.add_command(label="Open Repository…", command=self._open_repo)
-        file_menu.add_separator()
-        file_menu.add_command(label="Open Single File…", command=self._open_file)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=file_menu)
@@ -73,49 +70,19 @@ class ViewerApp(tk.Tk):
 
         search_tab.set_navigate_callback(nav)
 
-    # ---- open repo / file ----
+    # ---- open repo ----
 
     def _open_repo(self) -> None:
         path = filedialog.askdirectory(title="Select repository directory")
         if path:
             self.load_repo(path)
 
-    def _open_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Open file",
-            filetypes=[
-                ("All supported", "*.snap *.idx *.dat"),
-                ("Snapshot", "*.snap"),
-                ("Pack index", "*.idx"),
-                ("Pack data", "*.dat"),
-                ("All files", "*"),
-            ],
-        )
-        if path:
-            self._open_single_file(path)
-
-    def _open_single_file(self, path: str) -> None:
-        fn = os.path.basename(path)
-        if fn.endswith(".snap"):
-            self._tabs["snapshots"].load_path(path)
-            self._nb.select(1)   # snapshots tab index
-        elif fn.endswith(".idx"):
-            self._tabs["packs"].load_idx(path)
-            self._nb.select(2)
-        elif fn.endswith(".dat"):
-            self._tabs["packs"].load_dat(path)
-            self._nb.select(2)
-        else:
-            messagebox.showinfo("Unknown", f"Don't know how to decode:\n{fn}")
-
     def load_repo(self, path: str) -> None:
-        try:
-            self._scan = scan_repo(path)
-        except OSError as e:
-            messagebox.showerror("Error", str(e))
+        if not os.path.isdir(path):
+            messagebox.showerror("Error", f"Not a directory: {path}")
             return
         self.repo_path = path
         self._repo_var.set(path)
         for tab in self._tabs.values():
-            tab.populate(self._scan)
+            tab.populate(path)
         self.title(f"c-backup Viewer — {path}")

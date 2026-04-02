@@ -27,54 +27,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
-/* ------------------------------------------------------------------ */
-/* On-disk structures                                                  */
-/* ------------------------------------------------------------------ */
-
-/* Pack data file header (12 bytes) */
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t count;
-} __attribute__((packed)) pack_dat_hdr_t;
-
-/* Per-object header inside the .dat body — v2 (current) */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint8_t  type;                     /*  1 */
-    uint8_t  compression;              /*  1 */
-    uint64_t uncompressed_size;        /*  8 */
-    uint64_t compressed_size;          /*  8 */
-} __attribute__((packed)) pack_dat_entry_hdr_t;  /* 50 bytes */
-
-/* V1 entry header — used only when reading existing v1 packs */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint8_t  type;                     /*  1 */
-    uint8_t  compression;              /*  1 */
-    uint64_t uncompressed_size;        /*  8 */
-    uint32_t compressed_size;          /*  4 */
-} __attribute__((packed)) pack_dat_entry_hdr_v1_t;  /* 46 bytes */
-
-/* Pack index file header (12 bytes) */
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t count;
-} __attribute__((packed)) pack_idx_hdr_t;
-
-/* On-disk index entry v2 (40 bytes, sorted by hash) — used for reading old packs */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 — absolute byte offset in .dat */
-} __attribute__((packed)) pack_idx_disk_entry_v2_t;
-
-/* On-disk index entry v3 (44 bytes, sorted by hash) — current write format */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 — absolute byte offset in .dat */
-    uint32_t entry_index;              /*  4 — position in .dat entry order */
-} __attribute__((packed)) pack_idx_disk_entry_t;
+/* On-disk structures are defined in pack.h */
 
 /* ------------------------------------------------------------------ */
 /* In-memory cache entry (one per object across all packs)            */
@@ -624,36 +577,49 @@ static status_t pack_cache_load(repo_t *repo) {
         if (hdr.count > 10000000u) { fclose(f); continue; }
 
         int is_v3 = (hdr.version == PACK_VERSION);
-        for (uint32_t i = 0; i < hdr.count; i++) {
-            uint8_t  ehash[OBJECT_HASH_SIZE];
-            uint64_t eoff;
-            uint32_t eidx = UINT32_MAX;
 
-            if (is_v3) {
-                pack_idx_disk_entry_t de3;
-                if (fread(&de3, sizeof(de3), 1, f) != 1) { st = ERR_CORRUPT; break; }
-                memcpy(ehash, de3.hash, OBJECT_HASH_SIZE);
-                eoff = de3.dat_offset;
-                eidx = de3.entry_index;
-            } else {
-                pack_idx_disk_entry_v2_t de2;
-                if (fread(&de2, sizeof(de2), 1, f) != 1) { st = ERR_CORRUPT; break; }
-                memcpy(ehash, de2.hash, OBJECT_HASH_SIZE);
-                eoff = de2.dat_offset;
-            }
+        /* Ensure capacity for all entries in this pack at once */
+        if (cnt + hdr.count > cap) {
+            size_t nc = cap ? cap : 256;
+            while (nc < cnt + hdr.count) nc *= 2;
+            pack_cache_entry_t *tmp = realloc(entries, nc * sizeof(*tmp));
+            if (!tmp) { st = ERR_NOMEM; fclose(f); break; }
+            entries = tmp; cap = nc;
+        }
 
-            if (cnt == cap) {
-                size_t nc = cap ? cap * 2 : 256;
-                pack_cache_entry_t *tmp = realloc(entries, nc * sizeof(*tmp));
-                if (!tmp) { st = ERR_NOMEM; break; }
-                entries = tmp; cap = nc;
+        /* Bulk-read all index entries in one fread call */
+        if (is_v3) {
+            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_t);
+            pack_idx_disk_entry_t *disk_buf = malloc(disk_sz);
+            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
+            if (fread(disk_buf, sizeof(pack_idx_disk_entry_t), hdr.count, f) != hdr.count) {
+                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
             }
-            memcpy(entries[cnt].hash, ehash, OBJECT_HASH_SIZE);
-            entries[cnt].dat_offset   = eoff;
-            entries[cnt].pack_num     = pack_num;
-            entries[cnt].pack_version = hdr.version;
-            entries[cnt].entry_index  = eidx;
-            cnt++;
+            for (uint32_t i = 0; i < hdr.count; i++) {
+                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
+                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
+                entries[cnt].pack_num     = pack_num;
+                entries[cnt].pack_version = hdr.version;
+                entries[cnt].entry_index  = disk_buf[i].entry_index;
+                cnt++;
+            }
+            free(disk_buf);
+        } else {
+            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v2_t);
+            pack_idx_disk_entry_v2_t *disk_buf = malloc(disk_sz);
+            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
+            if (fread(disk_buf, sizeof(pack_idx_disk_entry_v2_t), hdr.count, f) != hdr.count) {
+                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
+            }
+            for (uint32_t i = 0; i < hdr.count; i++) {
+                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
+                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
+                entries[cnt].pack_num     = pack_num;
+                entries[cnt].pack_version = hdr.version;
+                entries[cnt].entry_index  = UINT32_MAX;
+                cnt++;
+            }
+            free(disk_buf);
         }
         fclose(f);
         if (st != OK) break;
@@ -675,6 +641,7 @@ static status_t pack_cache_load(repo_t *repo) {
 }
 
 void pack_cache_invalidate(repo_t *repo) {
+    repo_dat_cache_flush(repo);
     repo_set_pack_cache(repo, NULL, 0);
 }
 
@@ -706,6 +673,21 @@ static status_t pack_find_entry(repo_t *repo,
     return OK;
 }
 
+/* ---- .dat file handle cache helpers ---- */
+
+static FILE *dat_open_or_checkout(repo_t *repo, uint32_t pack_num) {
+    FILE *f = repo_dat_cache_checkout(repo, pack_num);
+    if (f) return f;
+    char dat_path[PATH_MAX];
+    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
+             repo_path(repo), pack_num);
+    return fopen(dat_path, "rb");
+}
+
+static void dat_return_or_close(repo_t *repo, uint32_t pack_num, FILE *f) {
+    repo_dat_cache_return(repo, pack_num, f);
+}
+
 status_t pack_object_physical_size(repo_t *repo,
                                    const uint8_t hash[OBJECT_HASH_SIZE],
                                    uint64_t *out_bytes) {
@@ -714,23 +696,20 @@ status_t pack_object_physical_size(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
-    char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), found->pack_num);
-    FILE *f = fopen(dat_path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen(%s)", dat_path);
+    FILE *f = dat_open_or_checkout(repo, found->pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%08u.dat", found->pack_num);
 
     if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
         fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko(%s)", dat_path);
+        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%08u.dat", found->pack_num);
     }
 
     pack_dat_entry_hdr_t ehdr;
     if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in %s", dat_path);
+        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found->pack_num);
     }
-    fclose(f);
+    dat_return_or_close(repo, found->pack_num, f);
     /* Physical size accounts for the on-disk header size of the actual version */
     size_t hdr_sz = (found->pack_version == PACK_VERSION_V1)
                     ? sizeof(pack_dat_entry_hdr_v1_t)
@@ -745,24 +724,21 @@ status_t pack_object_get_info(repo_t *repo,
                               uint8_t *out_type) {
     pack_cache_entry_t *found = NULL;
     status_t st = pack_find_entry(repo, hash, &found);
-    if (st != OK) return st;
+    if (st != OK || !found) return st != OK ? st : ERR_NOT_FOUND;
 
-    char dat_path[PATH_MAX];
-    snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), found->pack_num);
-    FILE *f = fopen(dat_path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen(%s)", dat_path);
+    FILE *f = dat_open_or_checkout(repo, found->pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%08u.dat", found->pack_num);
 
     if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
-        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko(%s)", dat_path);
+        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found->pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
     if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in %s", dat_path);
+        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found->pack_num);
     }
-    fclose(f);
+    dat_return_or_close(repo, found->pack_num, f);
 
-    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in %s", dat_path);
+    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in pack-%08u.dat", found->pack_num);
     if (out_uncompressed_size) *out_uncompressed_size = ehdr.uncompressed_size;
     if (out_type) *out_type = ehdr.type;
     return OK;
@@ -862,10 +838,11 @@ status_t pack_object_load(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
+    uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
     snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), found->pack_num);
-    FILE *f = fopen(dat_path, "rb");
+             repo_path(repo), pnum);
+    FILE *f = dat_open_or_checkout(repo, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load: fopen(%s)", dat_path);
 
     if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
@@ -917,7 +894,7 @@ status_t pack_object_load(repo_t *repo,
                     != (size_t)ehdr.compressed_size) {
                     free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
                 }
-                fclose(f); f = NULL;
+                dat_return_or_close(repo, pnum, f); f = NULL;
 
                 /* CRC fast-check on compressed payload */
                 uint32_t got_crc = crc32c(cpayload, (size_t)ehdr.compressed_size);
@@ -1003,7 +980,7 @@ status_t pack_object_load(repo_t *repo,
     if (fread(cpayload, 1, (size_t)ehdr.compressed_size, f) != (size_t)ehdr.compressed_size) {
         free(cpayload); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
     }
-    fclose(f);
+    dat_return_or_close(repo, pnum, f);
 
     void *data;
     size_t data_sz;
@@ -1052,10 +1029,11 @@ status_t pack_object_load_stream(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
+    uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
     snprintf(dat_path, sizeof(dat_path), "%s/packs/pack-%08u.dat",
-             repo_path(repo), found->pack_num);
-    FILE *f = fopen(dat_path, "rb");
+             repo_path(repo), pnum);
+    FILE *f = dat_open_or_checkout(repo, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load_stream: fopen(%s)", dat_path);
 
     if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
@@ -1109,7 +1087,7 @@ status_t pack_object_load_stream(repo_t *repo,
         if (fread(cpayload, 1, (size_t)ehdr.compressed_size, f) != (size_t)ehdr.compressed_size) {
             free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 payload in %s", dat_path);
         }
-        fclose(f);
+        dat_return_or_close(repo, pnum, f);
 
         /* CRC fast-check + RS repair on compressed payload */
         if (have_parity) {
@@ -1188,7 +1166,7 @@ status_t pack_object_load_stream(repo_t *repo,
             }
             remaining -= want;
         }
-        fclose(f);
+        dat_return_or_close(repo, pnum, f);
         free(src); free(dst);
         LZ4F_freeDecompressionContext(dctx);
 
@@ -1296,7 +1274,7 @@ status_t pack_object_load_stream(repo_t *repo,
         }
 
         free(rs_par); rs_par = NULL;
-        fclose(f);
+        dat_return_or_close(repo, pnum, f);
 
         if (stream_st == OK) {
             uint8_t got[OBJECT_HASH_SIZE];
@@ -1327,7 +1305,7 @@ status_t pack_object_load_stream(repo_t *repo,
         remaining -= want;
     }
     free(buf);
-    fclose(f);
+    dat_return_or_close(repo, pnum, f);
 
     if (stream_st == OK) {
         uint8_t got[OBJECT_HASH_SIZE];
@@ -2101,6 +2079,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         free(small_indices);
         free(large_indices);
         free(idx_entries);
+        free(entry_parity);
         free(hashes);
         log_msg("INFO", "pack: no packable objects (all loose objects are skip-marked)");
         if (out_packed) *out_packed = 0;
@@ -2583,7 +2562,7 @@ raw_copy:
     uint32_t sm_packed = 0;          /* objects in current pack segment */
 
     for (;;) {
-        pack_work_item_t item;
+        pack_work_item_t item = {0};
         int have_item = 0;
 
         pthread_mutex_lock(&ctx.mu);
@@ -2753,6 +2732,7 @@ raw_copy:
     pack_cache_invalidate(repo);
 
     free(idx_entries);
+    free(entry_parity);
     free(hashes);
     free(meta);
 
@@ -3651,5 +3631,122 @@ pack_fail:
     if (out_kept)    *out_kept    = total_kept;
     if (out_deleted) *out_deleted = total_deleted;
     free(pack_nums);
+    return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read-only enumeration of pack .dat and .idx files                   */
+/* ------------------------------------------------------------------ */
+
+status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
+                             uint32_t *out_version, uint32_t *out_count,
+                             pack_dat_entry_cb cb, void *ctx)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), dat_name);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return set_error_errno(ERR_IO, "pack_enumerate_dat: open %s", dat_name);
+
+    pack_dat_hdr_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_DAT_MAGIC) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_dat: bad header in %s", dat_name);
+    }
+    if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
+        hdr.version != PACK_VERSION) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_dat: unknown version %u in %s",
+                         hdr.version, dat_name);
+    }
+
+    if (out_version) *out_version = hdr.version;
+    if (out_count)   *out_count   = hdr.count;
+
+    if (!cb) { fclose(f); return OK; }
+
+    uint64_t offset = sizeof(hdr);
+    for (uint32_t i = 0; i < hdr.count; i++) {
+        pack_entry_info_t info;
+
+        if (hdr.version == PACK_VERSION_V1) {
+            pack_dat_entry_hdr_v1_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+            memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
+            info.type              = eh.type;
+            info.compression       = eh.compression;
+            info.uncompressed_size = eh.uncompressed_size;
+            info.compressed_size   = (uint64_t)eh.compressed_size;
+            info.payload_offset    = offset + sizeof(eh);
+            offset += sizeof(eh) + (uint64_t)eh.compressed_size;
+            if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
+        } else {
+            pack_dat_entry_hdr_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+            memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
+            info.type              = eh.type;
+            info.compression       = eh.compression;
+            info.uncompressed_size = eh.uncompressed_size;
+            info.compressed_size   = eh.compressed_size;
+            info.payload_offset    = offset + sizeof(eh);
+            offset += sizeof(eh) + eh.compressed_size;
+            if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
+        }
+
+        cb(&info, ctx);
+    }
+
+    fclose(f);
+    return OK;
+}
+
+status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
+                             uint32_t *out_version, uint32_t *out_count,
+                             pack_idx_entry_cb cb, void *ctx)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), idx_name);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return set_error_errno(ERR_IO, "pack_enumerate_idx: open %s", idx_name);
+
+    pack_idx_hdr_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_IDX_MAGIC) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_idx: bad header in %s", idx_name);
+    }
+    if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
+        hdr.version != PACK_VERSION) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_idx: unknown version %u in %s",
+                         hdr.version, idx_name);
+    }
+
+    if (out_version) *out_version = hdr.version;
+    if (out_count)   *out_count   = hdr.count;
+
+    if (!cb) { fclose(f); return OK; }
+
+    for (uint32_t i = 0; i < hdr.count; i++) {
+        pack_idx_info_t info;
+
+        if (hdr.version <= PACK_VERSION_V2) {
+            pack_idx_disk_entry_v2_t e;
+            if (fread(&e, sizeof(e), 1, f) != 1) break;
+            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
+            info.dat_offset  = e.dat_offset;
+            info.entry_index = 0;
+        } else {
+            pack_idx_disk_entry_t e;
+            if (fread(&e, sizeof(e), 1, f) != 1) break;
+            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
+            info.dat_offset  = e.dat_offset;
+            info.entry_index = e.entry_index;
+        }
+
+        cb(&info, ctx);
+    }
+
+    fclose(f);
     return OK;
 }

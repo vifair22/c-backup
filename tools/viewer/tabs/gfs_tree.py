@@ -3,7 +3,7 @@ import datetime
 from tkinter import ttk
 import tkinter as tk
 
-from ..parsers import parse_snap_header, ParseError
+from ..rpc import call, RPCError
 from ..formats import fmt_size, fmt_time, gfs_flags_str
 from ..constants import GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY
 from ..widgets import PAD, FONT_MONO, FONT_BOLD
@@ -104,28 +104,28 @@ class GFSTreeTab:
 
     # --------------------------------------------------------------- populate
 
-    def populate(self, scan: dict) -> None:
+    def populate(self, repo_path: str) -> None:
         self._tree.delete(*self._tree.get_children())
 
-        snaps: list[dict] = []
-        for path in scan.get("snapshots", []):
-            try:
-                snaps.append(parse_snap_header(path))
-            except ParseError:
-                pass
+        try:
+            data = call(repo_path, "list")
+        except RPCError:
+            self._summary.config(text="Error loading snapshot list.")
+            return
 
+        snaps = data.get("snapshots", [])
         if not snaps:
             self._summary.config(text="No snapshots found.")
             return
 
-        snaps.sort(key=lambda s: s["snap_id"])
+        snaps.sort(key=lambda s: s["id"])
 
         # Counters
-        n_yearly   = sum(1 for s in snaps if s["gfs_flags"] & GFS_YEARLY)
-        n_monthly  = sum(1 for s in snaps if s["gfs_flags"] & GFS_MONTHLY)
-        n_weekly   = sum(1 for s in snaps if s["gfs_flags"] & GFS_WEEKLY)
-        n_daily    = sum(1 for s in snaps if s["gfs_flags"] & GFS_DAILY)
-        n_untagged = sum(1 for s in snaps if not s["gfs_flags"])
+        n_yearly   = sum(1 for s in snaps if int(s["gfs_flags"]) & GFS_YEARLY)
+        n_monthly  = sum(1 for s in snaps if int(s["gfs_flags"]) & GFS_MONTHLY)
+        n_weekly   = sum(1 for s in snaps if int(s["gfs_flags"]) & GFS_WEEKLY)
+        n_daily    = sum(1 for s in snaps if int(s["gfs_flags"]) & GFS_DAILY)
+        n_untagged = sum(1 for s in snaps if not int(s["gfs_flags"]))
 
         self._summary.config(
             text=(
@@ -139,7 +139,7 @@ class GFSTreeTab:
         # Group: year_str → month_str → [snap], newest first
         year_map: dict[str, dict[str, list[dict]]] = {}
         for s in snaps:
-            dt = datetime.datetime.fromtimestamp(s["created_sec"])
+            dt = datetime.datetime.fromtimestamp(int(s["created_sec"]))
             y  = dt.strftime("%Y")
             m  = dt.strftime("%B %Y")          # e.g. "March 2026"
             year_map.setdefault(y, {}).setdefault(m, []).append(s)
@@ -170,8 +170,8 @@ class GFSTreeTab:
                     open=True,
                 )
 
-                for s in sorted(month_snaps, key=lambda x: x["snap_id"], reverse=True):
-                    flags     = s["gfs_flags"]
+                for s in sorted(month_snaps, key=lambda x: x["id"], reverse=True):
+                    flags     = int(s["gfs_flags"])
                     flags_str = gfs_flags_str(flags) if flags else "—"
                     tag       = _snap_tag(flags)
 
@@ -179,11 +179,11 @@ class GFSTreeTab:
                         mo_node, "end",
                         text="",
                         values=(
-                            f"#{s['snap_id']:04d}",
-                            fmt_time(s["created_sec"]),
+                            f"#{int(s['id']):04d}",
+                            fmt_time(int(s["created_sec"])),
                             flags_str,
-                            f"{s['node_count']:,}",
-                            fmt_size(s["phys_new_bytes"]),
+                            f"{int(s.get('node_count', 0)):,}",
+                            fmt_size(int(s.get("phys_new_bytes", 0))),
                         ),
                         tags=(tag,),
                     )

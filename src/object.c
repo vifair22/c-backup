@@ -17,8 +17,6 @@
 
 #include <pthread.h>
 
-#include <lz4.h>
-#include <lz4frame.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -197,7 +195,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
     }
     /* ---- End parity trailer ---- */
 
-    if (fsync(fd) == -1) { st = set_error_errno(ERR_IO, "write_object: fsync"); goto fail; }
+    if (fdatasync(fd) == -1) { st = set_error_errno(ERR_IO, "write_object: fdatasync"); goto fail; }
     close(fd); fd = -1;
 
     uint64_t total_phys = (uint64_t)sizeof(hdr) + (uint64_t)payload_size
@@ -214,13 +212,6 @@ static status_t write_object(repo_t *repo, uint8_t type,
         }
         st = set_error_errno(ERR_IO, "rename(%s, %s)", tmppath, dstpath);
         goto fail;
-    }
-    {
-        char dirpath[PATH_MAX];
-        if (snprintf(dirpath, sizeof(dirpath), "%s/objects/%s", repo_path(repo), subdir)
-            >= (int)sizeof(dirpath)) { st = set_error(ERR_IO, "write_object: dirpath too long"); goto fail; }
-        int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
     close(subfd); free(compressed);
     if (out_is_new) *out_is_new = 1;
@@ -241,16 +232,21 @@ fail:
 #define STREAM_CHUNK ((size_t)(16 * 1024 * 1024))  /* 16 MiB per slot */
 
 typedef struct {
-    pthread_mutex_t mu;
+    /* Synchronization — own cache line */
+    pthread_mutex_t mu  __attribute__((aligned(64)));
     pthread_cond_t  cond;
-    int             src_fd;
-    uint64_t        file_size;
-    uint8_t        *bufs[2];
-    size_t          lens[2];
+
+    /* Reader-written fields — own cache line to avoid false sharing */
+    size_t          lens[2]     __attribute__((aligned(64)));
     int             is_last[2];
     int             state[2];   /* 0 = empty (reader fills), 1 = full (processor reads) */
     status_t        reader_st;
     int             abort;
+
+    /* Shared / read-mostly */
+    int             src_fd;
+    uint64_t        file_size;
+    uint8_t        *bufs[2];
 } dbl_buf_t;
 
 static void *dbl_reader_fn(void *arg) {
@@ -386,6 +382,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     status_t st            = OK;
     int      slot      = 0;
     off_t    write_off = (off_t)sizeof(hdr) + (off_t)total_written;
+    uint32_t stream_crc = 0;   /* CRC accumulated inline, used by parity trailer */
 
     for (;;) {
         pthread_mutex_lock(&dbl.mu);
@@ -409,7 +406,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
             if (errno == 0) errno = EIO;
             st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto abort_reader;
         }
-        posix_fadvise(tfd, write_off, (off_t)len, POSIX_FADV_DONTNEED);
+        stream_crc = crc32c_update(stream_crc, dbl.bufs[slot], len);
         write_off     += (off_t)len;
         total_written += len;
         if (progress_cb) progress_cb((uint64_t)len, progress_ctx);
@@ -485,28 +482,29 @@ abort_reader:
             if (!rs_par_buf) { close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", rs_sz); }
         }
 
-        uint32_t stream_crc = 0;
+        /* CRC was accumulated inline during the write loop (stream_crc).
+         * RS parity still requires a re-read in group-aligned chunks. */
         size_t remaining_p = payload_len;
         off_t read_pos = (off_t)sizeof(hdr);
         size_t rs_par_off = 0;
+        size_t group_data = RS_K * (size_t)RS_INTERLEAVE;  /* 15296 */
 
-        while (remaining_p > 0) {
-            size_t group_data = RS_K * (size_t)RS_INTERLEAVE;  /* 15296 */
-            size_t chunk = remaining_p < group_data ? remaining_p : group_data;
-            uint8_t *tmp_buf = malloc(chunk);
-            if (!tmp_buf) { free(rs_par_buf); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", chunk); }
-            if (pread(tfd, tmp_buf, chunk, read_pos) != (ssize_t)chunk) {
-                free(tmp_buf); free(rs_par_buf); close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: pread parity chunk");
-            }
-            stream_crc = crc32c_update(stream_crc, tmp_buf, chunk);
-            if (rs_par_buf) {
+        if (rs_par_buf) {
+            uint8_t *tmp_buf = malloc(group_data);
+            if (!tmp_buf) { free(rs_par_buf); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", group_data); }
+
+            while (remaining_p > 0) {
+                size_t chunk = remaining_p < group_data ? remaining_p : group_data;
+                if (pread(tfd, tmp_buf, chunk, read_pos) != (ssize_t)chunk) {
+                    free(tmp_buf); free(rs_par_buf); close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: pread parity chunk");
+                }
                 size_t grp_par = rs_parity_size(chunk);
                 rs_parity_encode(tmp_buf, chunk, rs_par_buf + rs_par_off);
                 rs_par_off += grp_par;
+                read_pos += (off_t)chunk;
+                remaining_p -= chunk;
             }
             free(tmp_buf);
-            read_pos += (off_t)chunk;
-            remaining_p -= chunk;
         }
 
         if (rs_par_buf && rs_sz > 0) {
@@ -536,7 +534,10 @@ abort_reader:
     }
     /* ---- End parity trailer ---- */
 
-    if (fsync(tfd) == -1) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: fsync"); }
+    /* Evict payload pages now that parity re-read is complete */
+    posix_fadvise(tfd, (off_t)sizeof(hdr), (off_t)total_written, POSIX_FADV_DONTNEED);
+
+    if (fdatasync(tfd) == -1) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: fdatasync"); }
     close(tfd);
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
@@ -564,7 +565,6 @@ abort_reader:
         close(subfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: rename(%s, %s)", tmppath, dstpath);
     }
 
-    fsync(subfd);
     close(subfd);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
@@ -835,34 +835,12 @@ status_t object_load(repo_t *repo,
         }
         data    = cpayload;
         data_sz = (size_t)hdr.uncompressed_size;
-    } else if (hdr.compression == COMPRESS_LZ4_FRAME) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        free(cpayload);
-        return set_error(ERR_TOO_LARGE, "object %s: LZ4 frame requires streaming load", hex);
-    } else if (hdr.compression == COMPRESS_LZ4) {
-        if (hdr.compressed_size > (uint64_t)INT_MAX ||
-            hdr.uncompressed_size > (uint64_t)INT_MAX) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-            free(cpayload);
-            return set_error(ERR_TOO_LARGE, "object %s: exceeds LZ4 INT_MAX limit", hex);
-        }
-        char *out = malloc((size_t)hdr.uncompressed_size);
-        if (!out) { free(cpayload); return set_error(ERR_NOMEM, "malloc(%zu)", (size_t)hdr.uncompressed_size); }
-        int r = LZ4_decompress_safe(cpayload, out,
-                                    (int)hdr.compressed_size,
-                                    (int)hdr.uncompressed_size);
-        free(cpayload);
-        if (r < 0 || (uint64_t)r != hdr.uncompressed_size) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1];
-            object_hash_to_hex(hash, hex);
-            free(out);
-            return set_error(ERR_CORRUPT, "object %s: lz4 decompress failed", hex);
-        }
-        data    = out;
-        data_sz = (size_t)hdr.uncompressed_size;
     } else {
+        /* Loose objects are always COMPRESS_NONE — compression happens at
+         * pack time.  Any other value indicates corruption. */
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        free(cpayload); return set_error(ERR_CORRUPT, "object %s: unknown compression %u", hex, hdr.compression);
+        free(cpayload);
+        return set_error(ERR_CORRUPT, "object %s: unexpected compression %u in loose object", hex, hdr.compression);
     }
 
     /* verify hash */
@@ -982,106 +960,12 @@ status_t object_load_stream(repo_t *repo,
         EVP_MD_CTX_free(mdctx);
         return st;
 
-    } else if (hdr.compression == COMPRESS_LZ4) {
-        /* LZ4 API is limited to INT_MAX — objects larger than that cannot be LZ4-compressed. */
-        if (hdr.compressed_size > (uint64_t)INT_MAX ||
-            hdr.uncompressed_size > (uint64_t)INT_MAX) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-            close(fd);
-            return set_error(ERR_TOO_LARGE, "object %s: exceeds LZ4 INT_MAX limit", hex);
-        }
-        char *cpayload = malloc((size_t)hdr.compressed_size);
-        if (!cpayload) { close(fd); return set_error(ERR_NOMEM, "malloc(%zu)", (size_t)hdr.compressed_size); }
-        if (io_read_full(fd, cpayload, (size_t)hdr.compressed_size) != 0) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-            free(cpayload); close(fd); return set_error(ERR_CORRUPT, "object %s: truncated LZ4 payload", hex);
-        }
-        close(fd);
-
-        char *out = malloc((size_t)hdr.uncompressed_size);
-        if (!out) { free(cpayload); return set_error(ERR_NOMEM, "malloc(%zu)", (size_t)hdr.uncompressed_size); }
-        int r = LZ4_decompress_safe(cpayload, out,
-                                    (int)hdr.compressed_size,
-                                    (int)hdr.uncompressed_size);
-        free(cpayload);
-        if (r < 0 || (uint64_t)r != hdr.uncompressed_size) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-            free(out); return set_error(ERR_CORRUPT, "object %s: LZ4 decompress failed", hex);
-        }
-
-        uint8_t got[OBJECT_HASH_SIZE];
-        sha256(out, (size_t)hdr.uncompressed_size, got);
-        if (memcmp(got, hash, OBJECT_HASH_SIZE) != 0) {
-            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-            free(out); return set_error(ERR_CORRUPT, "object %s: hash mismatch (LZ4)", hex);
-        }
-
-        int wr = io_write_full(out_fd, out, (size_t)hdr.uncompressed_size);
-        free(out);
-        return wr != 0 ? set_error_errno(ERR_IO, "load_stream: write LZ4 output") : OK;
-
-    } else if (hdr.compression == COMPRESS_LZ4_FRAME) {
-        /* Stream-decompress LZ4 frame payload, verify hash over decompressed bytes. */
-        uint8_t *src = malloc(STREAM_CHUNK);
-        uint8_t *dst = malloc(STREAM_CHUNK);
-        LZ4F_dctx *dctx = NULL;
-        if (!src || !dst || LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION))) {
-            free(src); free(dst);
-            if (dctx) LZ4F_freeDecompressionContext(dctx);
-            close(fd); return set_error(ERR_NOMEM, "LZ4F decompression context");
-        }
-
-        EVP_MD_CTX *fmdctx = EVP_MD_CTX_new();
-        if (!fmdctx || EVP_DigestInit_ex(fmdctx, EVP_sha256(), NULL) != 1) {
-            EVP_MD_CTX_free(fmdctx);
-            LZ4F_freeDecompressionContext(dctx);
-            free(src); free(dst);
-            close(fd); return set_error(ERR_NOMEM, "EVP_MD_CTX_new (LZ4F)");
-        }
-
-        uint64_t remaining = hdr.compressed_size;
-        status_t fst = OK;
-        while (remaining > 0 && fst == OK) {
-            size_t want = (remaining > STREAM_CHUNK) ? STREAM_CHUNK : (size_t)remaining;
-            if (io_read_full(fd, src, want) != 0) { fst = set_error(ERR_CORRUPT, "load_stream: truncated LZ4F payload"); break; }
-            size_t src_left = want;
-            uint8_t *srcp = src;
-            while (src_left > 0 && fst == OK) {
-                size_t dst_sz  = STREAM_CHUNK;
-                size_t src_sz  = src_left;
-                size_t ret = LZ4F_decompress(dctx, dst, &dst_sz, srcp, &src_sz, NULL);
-                if (LZ4F_isError(ret)) { fst = set_error(ERR_CORRUPT, "load_stream: LZ4F decompress error"); break; }
-                if (dst_sz > 0) {
-                    if (EVP_DigestUpdate(fmdctx, dst, dst_sz) != 1 ||
-                        io_write_full(out_fd, dst, dst_sz) != 0)
-                        fst = set_error_errno(ERR_IO, "load_stream: write LZ4F output");
-                }
-                srcp     += src_sz;
-                src_left -= src_sz;
-            }
-            remaining -= want;
-        }
-        close(fd);
-        free(src); free(dst);
-        LZ4F_freeDecompressionContext(dctx);
-
-        if (fst == OK) {
-            uint8_t got[OBJECT_HASH_SIZE];
-            unsigned int dl = OBJECT_HASH_SIZE;
-            if (EVP_DigestFinal_ex(fmdctx, got, &dl) != 1 ||
-                dl != OBJECT_HASH_SIZE ||
-                memcmp(got, hash, OBJECT_HASH_SIZE) != 0) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-                fst = set_error(ERR_CORRUPT, "object %s: hash mismatch (LZ4F)", hex);
-            }
-        }
-        EVP_MD_CTX_free(fmdctx);
-        return fst;
-
     } else {
+        /* Loose objects are always COMPRESS_NONE — compression happens at
+         * pack time.  Any other value indicates corruption. */
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
         close(fd);
-        return set_error(ERR_CORRUPT, "object %s: unknown compression %u", hex, hdr.compression);
+        return set_error(ERR_CORRUPT, "object %s: unexpected compression %u in loose object", hex, hdr.compression);
     }
 }
 
@@ -1182,7 +1066,7 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
     EVP_MD_CTX_free(mdctx);
 
     if (st != OK) { close(tfd); unlink(tmppath); return st; }
-    if (fsync(tfd) != 0) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: fsync"); }
+    if (fdatasync(tfd) != 0) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: fdatasync"); }
     close(tfd);
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
@@ -1206,13 +1090,6 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
         unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: rename(%s, %s)", tmppath, dstpath);
     }
 
-    /* fsync the object directory */
-    char dirpath[PATH_MAX];
-    if (snprintf(dirpath, sizeof(dirpath), "%s/objects/%s", repo_path(repo), subdir)
-        < (int)sizeof(dirpath)) {
-        int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
-    }
     return OK;
 }
 

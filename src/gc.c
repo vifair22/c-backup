@@ -25,86 +25,191 @@ static size_t g_gc_line_len = 0;
 #define gc_line_clear()       progress_line_clear(&g_gc_line_len)
 #define gc_tick_due(t)        tick_due(t)
 
-static status_t ref_push(uint8_t **refs, size_t *cap, size_t *cnt,
-                          const uint8_t hash[OBJECT_HASH_SIZE],
-                          const uint8_t zero[OBJECT_HASH_SIZE]) {
-    if (memcmp(hash, zero, OBJECT_HASH_SIZE) == 0) return OK;
-    if (*cnt == *cap) {
-        size_t nc = *cap * 2;
-        uint8_t *tmp = realloc(*refs, nc * OBJECT_HASH_SIZE);
-        if (!tmp) return set_error(ERR_NOMEM, "gc: realloc refs failed");
-        *refs = tmp; *cap = nc;
+/* ---- Deduplicating hash set for GC ref collection ---- */
+
+typedef struct {
+    uint8_t  *buf;      /* flat array of unique hashes, n * OBJECT_HASH_SIZE */
+    size_t    n, cap;   /* count / allocated hash slots in buf */
+    uint32_t *table;    /* open-addressing index table (UINT32_MAX = empty) */
+    size_t    tbl_cap;  /* always a power of 2 */
+} gc_hashset_t;
+
+static int gc_hs_init(gc_hashset_t *hs, size_t initial_cap) {
+    hs->cap = initial_cap;
+    hs->n   = 0;
+    hs->buf = malloc(hs->cap * OBJECT_HASH_SIZE);
+    hs->tbl_cap = initial_cap * 2;  /* load factor ~50% */
+    hs->table   = malloc(hs->tbl_cap * sizeof(uint32_t));
+    if (!hs->buf || !hs->table) { free(hs->buf); free(hs->table); return -1; }
+    memset(hs->table, 0xFF, hs->tbl_cap * sizeof(uint32_t));  /* fill with UINT32_MAX */
+    return 0;
+}
+
+static void gc_hs_free(gc_hashset_t *hs) {
+    free(hs->buf);
+    free(hs->table);
+}
+
+static uint64_t gc_hs_hash(const uint8_t h[OBJECT_HASH_SIZE]) {
+    uint64_t v;
+    memcpy(&v, h, sizeof(v));  /* first 8 bytes of SHA-256 — uniformly distributed */
+    return v;
+}
+
+static int gc_hs_grow(gc_hashset_t *hs) {
+    /* Double buf capacity */
+    size_t nc = hs->cap * 2;
+    uint8_t *nb = realloc(hs->buf, nc * OBJECT_HASH_SIZE);
+    if (!nb) return -1;
+    hs->buf = nb;
+    hs->cap = nc;
+
+    /* Rebuild table at 2x new capacity */
+    size_t new_tbl_cap = nc * 2;
+    uint32_t *nt = malloc(new_tbl_cap * sizeof(uint32_t));
+    if (!nt) return -1;
+    memset(nt, 0xFF, new_tbl_cap * sizeof(uint32_t));
+    size_t mask = new_tbl_cap - 1;
+    for (size_t i = 0; i < hs->n; i++) {
+        uint64_t hv = gc_hs_hash(hs->buf + i * OBJECT_HASH_SIZE);
+        size_t slot = (size_t)(hv & mask);
+        while (nt[slot] != UINT32_MAX) slot = (slot + 1) & mask;
+        nt[slot] = (uint32_t)i;
     }
-    memcpy(*refs + *cnt * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
-    (*cnt)++;
+    free(hs->table);
+    hs->table   = nt;
+    hs->tbl_cap = new_tbl_cap;
+    return 0;
+}
+
+/* Insert hash if not already present. Returns 0 on success, -1 on OOM. */
+static int gc_hs_insert(gc_hashset_t *hs, const uint8_t hash[OBJECT_HASH_SIZE]) {
+    if (hs->n >= hs->cap / 2) {  /* grow at 50% load */
+        if (gc_hs_grow(hs) != 0) return -1;
+    }
+    size_t mask = hs->tbl_cap - 1;
+    uint64_t hv = gc_hs_hash(hash);
+    size_t slot = (size_t)(hv & mask);
+    while (hs->table[slot] != UINT32_MAX) {
+        if (memcmp(hs->buf + (size_t)hs->table[slot] * OBJECT_HASH_SIZE,
+                   hash, OBJECT_HASH_SIZE) == 0)
+            return 0;  /* already present */
+        slot = (slot + 1) & mask;
+    }
+    /* Insert new entry */
+    memcpy(hs->buf + hs->n * OBJECT_HASH_SIZE, hash, OBJECT_HASH_SIZE);
+    hs->table[slot] = (uint32_t)hs->n;
+    hs->n++;
+    return 0;
+}
+
+/* ---- Snapshot enumeration via opendir ---- */
+
+static status_t enumerate_snap_ids(repo_t *repo,
+                                    uint32_t **out_ids, size_t *out_count) {
+    char snap_dir[PATH_MAX];
+    snprintf(snap_dir, sizeof(snap_dir), "%s/snapshots", repo_path(repo));
+    DIR *d = opendir(snap_dir);
+    if (!d) { *out_ids = NULL; *out_count = 0; return OK; }
+
+    size_t cap = 64, n = 0;
+    uint32_t *ids = malloc(cap * sizeof(uint32_t));
+    if (!ids) { closedir(d); return set_error(ERR_NOMEM, "gc: alloc snap ids failed"); }
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        uint32_t id = 0;
+        if (sscanf(de->d_name, "%08u.snap", &id) != 1) continue;
+        /* Verify it's an exact match (not e.g. "00000001.snap.bak") */
+        if (strlen(de->d_name) != 13) continue;  /* "XXXXXXXX.snap" = 13 chars */
+        if (n == cap) {
+            cap *= 2;
+            uint32_t *tmp = realloc(ids, cap * sizeof(uint32_t));
+            if (!tmp) { free(ids); closedir(d); return set_error(ERR_NOMEM, "gc: realloc snap ids failed"); }
+            ids = tmp;
+        }
+        ids[n++] = id;
+    }
+    closedir(d);
+
+    /* Sort so progress display is monotonic */
+    if (n > 1) {
+        for (size_t i = 1; i < n; i++) {
+            uint32_t key = ids[i];
+            size_t j = i;
+            while (j > 0 && ids[j - 1] > key) { ids[j] = ids[j - 1]; j--; }
+            ids[j] = key;
+        }
+    }
+
+    *out_ids   = ids;
+    *out_count = n;
     return OK;
 }
 
+/* ---- collect_refs: hash-set + opendir + nodes-only load ---- */
+
 /*
  * Collect all object hashes referenced by surviving snapshots.
- * NOTE: peak memory here is O(snapshots × nodes × 3 hashes).
- * With millions of files across many snapshots this can be significant.
+ * Uses a deduplicating hash set so memory is O(unique_objects), not
+ * O(snapshots × nodes).
  */
 static status_t collect_refs(repo_t *repo,
                               uint8_t **out_refs, size_t *out_cnt) {
-    uint32_t head = 0;
-    snapshot_read_head(repo, &head);
+    uint32_t *snap_ids = NULL;
+    size_t    snap_count = 0;
+    status_t st = enumerate_snap_ids(repo, &snap_ids, &snap_count);
+    if (st != OK) return st;
 
-    size_t cap = 256, cnt = 0;
-    uint8_t *refs = malloc(cap * OBJECT_HASH_SIZE);
-    if (!refs) return set_error(ERR_NOMEM, "gc: alloc refs failed");
+    gc_hashset_t hs;
+    if (gc_hs_init(&hs, 4096) != 0) {
+        free(snap_ids);
+        return set_error(ERR_NOMEM, "gc: hashset init failed");
+    }
 
     uint8_t zero[OBJECT_HASH_SIZE] = {0};
-    status_t st = OK;
 
     int show_progress = gc_progress_enabled();
     struct timespec next_tick = {0};
     if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
-    /* Surviving snapshot files */
-    for (uint32_t id = 1; id <= head; id++) {
+    for (size_t si = 0; si < snap_count; si++) {
         snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) continue;
+        if (snapshot_load_nodes_only(repo, snap_ids[si], &snap) != OK) continue;
         for (uint32_t j = 0; j < snap->node_count; j++) {
             const node_t *nd = &snap->nodes[j];
-            if ((st = ref_push(&refs, &cap, &cnt, nd->content_hash, zero)) != OK ||
-                (st = ref_push(&refs, &cap, &cnt, nd->xattr_hash,   zero)) != OK ||
-                (st = ref_push(&refs, &cap, &cnt, nd->acl_hash,     zero)) != OK) {
-                snapshot_free(snap); goto done;
+            const uint8_t *hashes[3] = { nd->content_hash, nd->xattr_hash, nd->acl_hash };
+            for (int h = 0; h < 3; h++) {
+                if (memcmp(hashes[h], zero, OBJECT_HASH_SIZE) == 0) continue;
+                if (gc_hs_insert(&hs, hashes[h]) != 0) {
+                    snapshot_free(snap);
+                    gc_hs_free(&hs);
+                    free(snap_ids);
+                    return set_error(ERR_NOMEM, "gc: hashset insert OOM");
+                }
             }
         }
         snapshot_free(snap);
         if (show_progress && gc_tick_due(&next_tick)) {
             char line[128];
             snprintf(line, sizeof(line),
-                     "gc: collecting refs (%u/%u snapshots, %zu refs)",
-                     id, head, cnt);
+                     "gc: collecting refs (%zu/%zu snapshots, %zu unique refs)",
+                     si + 1, snap_count, hs.n);
             gc_line_set(line);
         }
     }
+    free(snap_ids);
 
     if (show_progress) gc_line_clear();
 
-    /* Sort and deduplicate */
-    qsort(refs, cnt, OBJECT_HASH_SIZE, hash_cmp);
-    size_t uniq = 0;
-    for (size_t i = 0; i < cnt; i++) {
-        if (uniq == 0 || memcmp(refs + (uniq - 1) * OBJECT_HASH_SIZE,
-                                refs + i * OBJECT_HASH_SIZE,
-                                OBJECT_HASH_SIZE) != 0) {
-            if (uniq != i)
-                memcpy(refs + uniq * OBJECT_HASH_SIZE,
-                       refs + i  * OBJECT_HASH_SIZE, OBJECT_HASH_SIZE);
-            uniq++;
-        }
-    }
-    *out_refs = refs;
-    *out_cnt  = uniq;
-    return OK;
+    /* Sort the unique hashes for bsearch in the sweep phase */
+    qsort(hs.buf, hs.n, OBJECT_HASH_SIZE, hash_cmp);
 
-done:
-    free(refs);
-    return st;
+    /* Transfer ownership of the buffer to caller; free only the table */
+    *out_refs = hs.buf;
+    *out_cnt  = hs.n;
+    free(hs.table);
+    return OK;
 }
 
 /* ------------------------------------------------------------------ */

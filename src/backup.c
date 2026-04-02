@@ -83,6 +83,7 @@ static void scan_progress_clear_cb(void *ctx) {
 static void scan_progress_cb(uint32_t scanned_entries, void *ctx) {
     scan_progress_state_t *st = ctx;
     if (st) {
+        if (scanned_entries != 1 && (scanned_entries & 0xFF) != 0) return;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (scanned_entries != 1 && !ts_ge(&now, &st->next_update)) return;
@@ -94,6 +95,7 @@ static void scan_progress_cb(uint32_t scanned_entries, void *ctx) {
 static void phase2_progress_cb(uint32_t done, uint32_t total, void *ctx) {
     phase2_progress_state_t *st = ctx;
     if (st) {
+        if (done != 0 && done != total && (done & 0xFF) != 0) return;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (done != 0 && done != total && !ts_ge(&now, &st->next_update)) return;
@@ -219,11 +221,11 @@ typedef struct {
     scan_entry_t  *entries;    /* full scan array */
     store_task_t  *tasks;      /* entries needing content store */
     uint32_t       queue_len;
-    uint32_t       next;       /* next queue slot to claim */
-    uint32_t       done;       /* number of queue items fully processed */
+    _Atomic uint32_t next;       /* next queue slot to claim (lock-free) */
+    _Atomic uint32_t done;       /* number of queue items fully processed */
     uint64_t       total_bytes;
-    uint64_t       bytes_done;
-    uint64_t       phys_new_bytes;
+    _Atomic uint64_t bytes_done;
+    _Atomic uint64_t phys_new_bytes;
     int            show_progress;
     struct timespec started_at;
     uint32_t       skipped_transient;
@@ -256,11 +258,9 @@ static void *phase3_progress_fn(void *arg) {
         nanosleep(&req, NULL);
         if (atomic_load(&pool->progress_stop)) break;
 
-        /* Sample completed bytes under lock + in-flight bytes atomically. */
-        pthread_mutex_lock(&pool->mu);
-        uint64_t bd       = pool->bytes_done;
-        uint32_t done_now = pool->done;
-        pthread_mutex_unlock(&pool->mu);
+        /* Sample completed bytes + in-flight bytes atomically. */
+        uint64_t bd       = atomic_load(&pool->bytes_done);
+        uint32_t done_now = atomic_load(&pool->done);
         uint64_t seen    = bd + (uint64_t)atomic_load(&pool->bytes_in_flight);
         uint32_t active  = (uint32_t)atomic_load(&pool->files_active);
 
@@ -303,9 +303,7 @@ static void *phase3_progress_fn(void *arg) {
 static void *store_worker_fn(void *arg) {
     store_pool_t *pool = arg;
     for (;;) {
-        pthread_mutex_lock(&pool->mu);
-        uint32_t qi = pool->next++;
-        pthread_mutex_unlock(&pool->mu);
+        uint32_t qi = atomic_fetch_add(&pool->next, 1);
         if (qi >= pool->queue_len) break;
 
         store_task_t *t = &pool->tasks[qi];
@@ -366,11 +364,9 @@ static void *store_worker_fn(void *arg) {
         atomic_fetch_sub(&pool->bytes_in_flight, cb_ctx.accumulated);
         atomic_fetch_sub(&pool->files_active, 1);
 
-        pthread_mutex_lock(&pool->mu);
-        pool->done++;
-        pool->bytes_done += bytes_for_task;
-        pool->phys_new_bytes += phys_new;
-        pthread_mutex_unlock(&pool->mu);
+        atomic_fetch_add(&pool->done, 1);
+        atomic_fetch_add(&pool->bytes_done, bytes_for_task);
+        atomic_fetch_add(&pool->phys_new_bytes, phys_new);
     }
     return (void *)0;
 }
@@ -926,27 +922,13 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
                 new_snap->nodes[ni++] = scan->entries[i].node;
     }
 
-    /* Build dirent table: all entries; secondaries reference the primary node_id */
-    size_t dirent_buf_sz = 0;
+    /* Build dirent table in a single pass with dynamically grown buffer */
+    size_t dirent_buf_cap = scan->count * (sizeof(dirent_rec_t) + 16);  /* estimate avg name ~16 */
+    size_t dirent_buf_sz  = 0;
     uint32_t dirent_count = 0;
-    for (uint32_t i = 0; i < scan->count; i++) {
-        if (scan->entries[i].node.type == 0) continue;
-        if (scan->entries[i].hardlink_to_node_id != 0 &&
-            skipped_has(&skipped, scan->entries[i].hardlink_to_node_id)) continue;
-        const char *name = strrchr(scan->entries[i].path, '/');
-        name = name ? name + 1 : scan->entries[i].path;
-        dirent_buf_sz += sizeof(dirent_rec_t) + strlen(name);
-        dirent_count++;
-    }
-    new_snap->dirent_data     = malloc(dirent_buf_sz ? dirent_buf_sz : 1);
-    new_snap->dirent_data_len = dirent_buf_sz;
-    new_snap->dirent_count    = dirent_count;
+    uint8_t *dirent_buf   = malloc(dirent_buf_cap ? dirent_buf_cap : 1);
+    if (!dirent_buf) { snapshot_free(new_snap); st = ERR_NOMEM; goto done; }
 
-    if (!new_snap->dirent_data) {
-        snapshot_free(new_snap); st = ERR_NOMEM; goto done;
-    }
-
-    uint8_t *dp = new_snap->dirent_data;
     for (uint32_t i = 0; i < scan->count; i++) {
         const scan_entry_t *e = &scan->entries[i];
         if (e->node.type == 0) continue;
@@ -955,6 +937,13 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         const char *name = strrchr(e->path, '/');
         name = name ? name + 1 : e->path;
         uint16_t nlen = (uint16_t)strlen(name);
+        size_t entry_sz = sizeof(dirent_rec_t) + nlen;
+        if (dirent_buf_sz + entry_sz > dirent_buf_cap) {
+            dirent_buf_cap = (dirent_buf_cap + entry_sz) * 2;
+            uint8_t *nb = realloc(dirent_buf, dirent_buf_cap);
+            if (!nb) { free(dirent_buf); snapshot_free(new_snap); st = ERR_NOMEM; goto done; }
+            dirent_buf = nb;
+        }
         uint64_t nid  = e->hardlink_to_node_id ? e->hardlink_to_node_id
                                                 : e->node.node_id;
         dirent_rec_t dr = {
@@ -962,9 +951,14 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
             .node_id     = nid,
             .name_len    = nlen,
         };
-        memcpy(dp, &dr, sizeof(dr)); dp += sizeof(dr);
-        memcpy(dp, name, nlen);      dp += nlen;
+        memcpy(dirent_buf + dirent_buf_sz, &dr, sizeof(dr));
+        memcpy(dirent_buf + dirent_buf_sz + sizeof(dr), name, nlen);
+        dirent_buf_sz += entry_sz;
+        dirent_count++;
     }
+    new_snap->dirent_data     = dirent_buf;
+    new_snap->dirent_data_len = dirent_buf_sz;
+    new_snap->dirent_count    = dirent_count;
 
     /* ----------------------------------------------------------------
      * Phase 6: Commit (objects → snapshot → HEAD)

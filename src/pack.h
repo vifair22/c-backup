@@ -79,3 +79,83 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 status_t pack_gc(repo_t *repo,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted);
+
+/* ------------------------------------------------------------------ */
+/* On-disk pack structures (shared between pack.c and json_api.c)      */
+/* ------------------------------------------------------------------ */
+
+/* Pack data file header (12 bytes) */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+} __attribute__((packed)) pack_dat_hdr_t;
+
+/* Per-object header inside the .dat body — v2/v3 (current) */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
+    uint8_t  type;                     /*  1 */
+    uint8_t  compression;              /*  1 */
+    uint64_t uncompressed_size;        /*  8 */
+    uint64_t compressed_size;          /*  8 */
+} __attribute__((packed)) pack_dat_entry_hdr_t;  /* 50 bytes */
+
+/* V1 entry header — used only when reading existing v1 packs */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
+    uint8_t  type;                     /*  1 */
+    uint8_t  compression;              /*  1 */
+    uint64_t uncompressed_size;        /*  8 */
+    uint32_t compressed_size;          /*  4 */
+} __attribute__((packed)) pack_dat_entry_hdr_v1_t;  /* 46 bytes */
+
+/* Pack index file header (12 bytes) */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+} __attribute__((packed)) pack_idx_hdr_t;
+
+/* On-disk index entry v2 (40 bytes, sorted by hash) */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
+    uint64_t dat_offset;               /*  8 */
+} __attribute__((packed)) pack_idx_disk_entry_v2_t;
+
+/* On-disk index entry v3 (44 bytes, sorted by hash) — current write format */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
+    uint64_t dat_offset;               /*  8 */
+    uint32_t entry_index;              /*  4 */
+} __attribute__((packed)) pack_idx_disk_entry_t;
+
+/* ------------------------------------------------------------------ */
+/* Pack enumeration (read-only iteration)                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint8_t  type;
+    uint8_t  compression;
+    uint64_t uncompressed_size;
+    uint64_t compressed_size;
+    uint64_t payload_offset;
+} pack_entry_info_t;
+
+typedef void (*pack_dat_entry_cb)(const pack_entry_info_t *info, void *ctx);
+
+status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
+                             uint32_t *out_version, uint32_t *out_count,
+                             pack_dat_entry_cb cb, void *ctx);
+
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t dat_offset;
+    uint32_t entry_index;
+} pack_idx_info_t;
+
+typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
+
+status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
+                             uint32_t *out_version, uint32_t *out_count,
+                             pack_idx_entry_cb cb, void *ctx);

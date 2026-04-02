@@ -1,13 +1,13 @@
+import base64
 import difflib
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from ..parsers import (parse_snap, parse_snap_header, build_path_map,
-                       find_object, decompress_payload, HAS_LZ4, ParseError)
-from ..formats import fmt_size, fmt_time, hex_hash
+from ..rpc import call, RPCError
+from ..formats import fmt_size, fmt_time
 from ..widgets import PAD, FONT_MONO, make_text_widget
-from ..constants import COMPRESS_NONE, UI_SIZE_LIMIT
+from ..constants import UI_SIZE_LIMIT, ZERO_HASH
 
 _DIFF_ROW_CAP = 5000
 
@@ -16,13 +16,12 @@ class DiffTab:
     def __init__(self, nb: ttk.Notebook):
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="Diff")
-        self._snap_paths: list[str] = []
-        self._snap_a = None
-        self._snap_b = None
-        self._map_a: dict | None = None
-        self._map_b: dict | None = None
-        self._scan: dict = {}
+        self._repo_path: str | None = None
+        self._snap_list: list[dict] = []
+        self._diff_changes: list[dict] = []
         self._compare_gen: int = 0
+        self._snap_a_id: int | None = None
+        self._snap_b_id: int | None = None
         self._build()
 
     def _build(self) -> None:
@@ -76,17 +75,17 @@ class DiffTab:
         sb_x.pack(side=tk.BOTTOM, fill=tk.X)
         self._tree.pack(fill=tk.BOTH, expand=True)
 
-    def populate(self, scan: dict) -> None:
-        self._scan = scan
-        self._snap_paths = scan["snapshots"]
+    def populate(self, repo_path: str) -> None:
+        self._repo_path = repo_path
+        try:
+            data = call(repo_path, "list")
+            self._snap_list = data.get("snapshots", [])
+        except RPCError:
+            self._snap_list = []
+
         labels = []
-        for path in self._snap_paths:
-            try:
-                h = parse_snap_header(path)
-                labels.append(f"{h['snap_id']:>6}  {fmt_time(h['created_sec'])}")
-            except ParseError:
-                import os
-                labels.append(os.path.basename(path))
+        for s in self._snap_list:
+            labels.append(f"{int(s['id']):>6}  {fmt_time(int(s['created_sec']))}")
         self._a_combo["values"] = labels
         self._b_combo["values"] = labels
         if len(labels) >= 2:
@@ -111,44 +110,50 @@ class DiffTab:
         if rows:
             self._tree.delete(*rows)
 
-        path_a = self._snap_paths[ai]
-        path_b = self._snap_paths[bi]
+        id_a = int(self._snap_list[ai]["id"])
+        id_b = int(self._snap_list[bi]["id"])
+        self._snap_a_id = id_a
+        self._snap_b_id = id_b
+        repo_path = self._repo_path
 
         def _worker() -> None:
             try:
-                snap_a = parse_snap(path_a)
-                snap_b = parse_snap(path_b)
-            except ParseError as e:
+                result = call(repo_path, "diff", id1=id_a, id2=id_b)
+            except RPCError as e:
                 err = str(e)
                 self._frame.after(0, lambda: self._on_compare_error(err, gen))
                 return
 
-            map_a = build_path_map(snap_a)
-            map_b = build_path_map(snap_b)
-            all_paths = sorted(set(map_a) | set(map_b))
-
+            changes = result.get("changes", [])
             counts = {"added": 0, "deleted": 0, "modified": 0, "meta": 0}
-            result_rows: list[tuple] = []    # (values_tuple, tag)
+            result_rows: list[tuple] = []
 
-            for path in all_paths:
-                na, nb = map_a.get(path), map_b.get(path)
-                if na is None:
-                    status, tag = "added",    "added"
-                    old_sz, new_sz = "—", fmt_size(nb["size"])
-                    old_h,  new_h  = "—", hex_hash(nb["content_hash"])[:14]
-                elif nb is None:
-                    status, tag = "deleted",  "deleted"
-                    old_sz, new_sz = fmt_size(na["size"]), "—"
-                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], "—"
-                elif na["content_hash"] != nb["content_hash"]:
+            for c in changes:
+                change = c["change"]
+                path   = c["path"]
+                old_n  = c.get("old_node")
+                new_n  = c.get("new_node")
+
+                if change == "A":
+                    status, tag = "added", "added"
+                    old_sz, new_sz = "—", fmt_size(int(new_n["size"])) if new_n else "—"
+                    old_h,  new_h  = "—", new_n["content_hash"][:14] if new_n else "—"
+                elif change == "D":
+                    status, tag = "deleted", "deleted"
+                    old_sz, new_sz = fmt_size(int(old_n["size"])) if old_n else "—", "—"
+                    old_h,  new_h  = old_n["content_hash"][:14] if old_n else "—", "—"
+                elif change == "M":
                     status, tag = "modified", "modified"
-                    old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
-                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], hex_hash(nb["content_hash"])[:14]
-                elif (na["mode"] != nb["mode"] or na["uid"] != nb["uid"] or
-                      na["gid"] != nb["gid"] or na["mtime_sec"] != nb["mtime_sec"]):
+                    old_sz = fmt_size(int(old_n["size"])) if old_n else "—"
+                    new_sz = fmt_size(int(new_n["size"])) if new_n else "—"
+                    old_h  = old_n["content_hash"][:14] if old_n else "—"
+                    new_h  = new_n["content_hash"][:14] if new_n else "—"
+                elif change == "m":
                     status, tag = "meta-only", "meta"
-                    old_sz, new_sz = fmt_size(na["size"]), fmt_size(nb["size"])
-                    old_h,  new_h  = hex_hash(na["content_hash"])[:14], "(same)"
+                    old_sz = fmt_size(int(old_n["size"])) if old_n else "—"
+                    new_sz = fmt_size(int(new_n["size"])) if new_n else "—"
+                    old_h  = old_n["content_hash"][:14] if old_n else "—"
+                    new_h  = "(same)"
                 else:
                     continue
 
@@ -157,7 +162,7 @@ class DiffTab:
                     result_rows.append(((status, path, old_sz, new_sz, old_h, new_h), tag))
 
             self._frame.after(0, lambda: self._finish_compare(
-                snap_a, snap_b, map_a, map_b, counts, result_rows, gen))
+                changes, counts, result_rows, id_a, id_b, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -168,15 +173,11 @@ class DiffTab:
         self._status.config(text="")
         messagebox.showerror("Parse error", err)
 
-    def _finish_compare(self, snap_a, snap_b, map_a, map_b,
-                        counts, result_rows, gen) -> None:
+    def _finish_compare(self, changes, counts, result_rows, id_a, id_b, gen) -> None:
         if gen != self._compare_gen:
             return
         self._compare_btn.config(state=tk.NORMAL)
-        self._snap_a = snap_a
-        self._snap_b = snap_b
-        self._map_a  = map_a
-        self._map_b  = map_b
+        self._diff_changes = changes
 
         for vals, tag in result_rows:
             self._tree.insert("", tk.END, values=vals, tags=(tag,))
@@ -187,7 +188,7 @@ class DiffTab:
             cap_note = f"  (showing {len(result_rows)} of {total_changes:,})"
 
         self._status.config(
-            text=(f"snap {snap_a['snap_id']} → {snap_b['snap_id']}:  "
+            text=(f"snap {id_a} → {id_b}:  "
                   f"+{counts['added']:,} added  "
                   f"-{counts['deleted']:,} deleted  "
                   f"~{counts['modified']:,} modified  "
@@ -201,19 +202,26 @@ class DiffTab:
 
     def _on_dbl(self, _event) -> None:
         sel = self._tree.selection()
-        if not sel or not self._snap_a or not self._snap_b:
+        if not sel or not self._repo_path:
             return
         vals  = self._tree.item(sel[0])["values"]
         status, path = str(vals[0]), str(vals[1])
 
-        # Use cached path maps from the compare (avoid rebuilding)
-        if self._map_a is None or self._map_b is None:
-            self._map_a = build_path_map(self._snap_a)
-            self._map_b = build_path_map(self._snap_b)
+        # Find the matching change entry
+        change_entry = None
+        for c in self._diff_changes:
+            if c["path"] == path:
+                change_entry = c
+                break
+        if not change_entry:
+            return
 
-        self._show_file_diff(path, status, self._map_a.get(path), self._map_b.get(path))
+        self._show_file_diff(path, status,
+                             change_entry.get("old_node"),
+                             change_entry.get("new_node"))
 
-    def _show_file_diff(self, path: str, status: str, na: dict | None, nb: dict | None) -> None:
+    def _show_file_diff(self, path: str, status: str,
+                        old_n: dict | None, new_n: dict | None) -> None:
         win = tk.Toplevel(self._frame)
         win.title(f"diff  {path}")
         win.geometry("980x640")
@@ -234,7 +242,7 @@ class DiffTab:
         text.tag_configure("header", font=(FONT_MONO[0], FONT_MONO[1], "bold"))
         text.tag_configure("meta",   foreground="#00008B")
 
-        lines = self._build_diff_lines(path, status, na, nb)
+        lines = self._build_diff_lines(path, status, old_n, new_n)
 
         text.config(state=tk.NORMAL)
         for line, tag in lines:
@@ -242,41 +250,31 @@ class DiffTab:
         text.config(state=tk.DISABLED)
 
     def _load_content(self, node: dict | None) -> bytes | None:
-        """Load and decompress a node's content object. Returns b"" for empty files.
-        Raises RuntimeError if lz4 is required but not installed."""
-        if node is None:
+        if node is None or not self._repo_path:
             return None
-        h = node["content_hash"]
-        if h == bytes(32):
+        h = node.get("content_hash", ZERO_HASH)
+        if h == ZERO_HASH:
             return b""
-        result = find_object(h, self._scan)
-        if not result:
+        try:
+            cr = call(self._repo_path, "object_content", hash=h,
+                      max_bytes=UI_SIZE_LIMIT)
+            return base64.b64decode(cr.get("content_base64", ""))
+        except RPCError:
             return None
-        _, _, _, comp, uncomp_sz, _, payload = result
-        if comp != COMPRESS_NONE and not HAS_LZ4:
-            raise RuntimeError(
-                "lz4 Python package is not installed — cannot decompress this object.\n"
-                "Install it with:  pip install lz4"
-            )
-        return decompress_payload(payload, comp, uncomp_sz) if comp != COMPRESS_NONE else payload
 
     def _build_diff_lines(self, path: str, status: str,
-                          na: dict | None, nb: dict | None) -> list:
-        """Return a list of (text, tag) pairs for the diff popup."""
+                          old_n: dict | None, new_n: dict | None) -> list:
         if status == "meta-only":
-            return self._meta_diff_lines(na, nb)
+            return self._meta_diff_lines(old_n, new_n)
 
-        try:
-            old_data = self._load_content(na)
-            new_data = self._load_content(nb)
-        except RuntimeError as exc:
-            return [(str(exc) + "\n", "meta")]
+        old_data = self._load_content(old_n)
+        new_data = self._load_content(new_n)
 
         old_label = f"a{path}"
         new_label = f"b{path}"
-        if na is None:
+        if old_n is None:
             old_label = "/dev/null"
-        if nb is None:
+        if new_n is None:
             new_label = "/dev/null"
 
         if old_data is None and new_data is None:
@@ -290,12 +288,10 @@ class DiffTab:
             return [(f"File too large to diff inline  "
                      f"({fmt_size(big)} > {fmt_size(UI_SIZE_LIMIT)})\n", "meta")]
 
-        # Try text diff first
         try:
             old_lines = old_bytes.decode("utf-8").splitlines(keepends=True)
             new_lines = new_bytes.decode("utf-8").splitlines(keepends=True)
         except UnicodeDecodeError:
-            # Binary
             if old_bytes == new_bytes:
                 return [("Binary files identical\n", "meta")]
             return [
@@ -327,13 +323,13 @@ class DiffTab:
         return result
 
     @staticmethod
-    def _meta_diff_lines(na: dict, nb: dict) -> list:
+    def _meta_diff_lines(old_n: dict, new_n: dict) -> list:
         lines = []
-        for field, fmt in (("mode",     lambda n: f"{n['mode']:o}"),
-                           ("uid",      lambda n: str(n["uid"])),
-                           ("gid",      lambda n: str(n["gid"])),
-                           ("mtime",    lambda n: str(n["mtime_sec"]))):
-            va, vb = fmt(na), fmt(nb)
+        for field, fmt in (("mode",     lambda n: f"{int(n['mode']):o}"),
+                           ("uid",      lambda n: str(int(n["uid"]))),
+                           ("gid",      lambda n: str(int(n["gid"]))),
+                           ("mtime",    lambda n: str(int(n["mtime_sec"])))):
+            va, vb = fmt(old_n), fmt(new_n)
             if va != vb:
                 lines.append((f"- {field}: {va}\n", "rem"))
                 lines.append((f"+ {field}: {vb}\n", "add"))

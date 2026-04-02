@@ -46,7 +46,8 @@ static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
 /* Snapshot I/O                                                        */
 /* ------------------------------------------------------------------ */
 
-status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
+static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
+                                    snapshot_t **out, int skip_dirent) {
     char path[PATH_MAX];
     if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
         return set_error(ERR_IO, "snapshot_load: path overflow for snap %u", snap_id);
@@ -240,18 +241,17 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
             return set_error(ERR_CORRUPT, "snapshot %u: lz4 decompress failed", snap_id);
         }
 
+        /* Zero-copy: point nodes and dirent_data directly into ubuf */
         size_t nodes_sz = (size_t)node_count * sizeof(node_t);
-        snap->nodes = malloc(nodes_sz > 0 ? nodes_sz : 1);
-        if (!snap->nodes && node_count > 0) { free(ubuf); free(snap); return set_error(ERR_NOMEM, "snapshot %u: nodes alloc failed", snap_id); }
-        if (nodes_sz > 0) memcpy(snap->nodes, ubuf, nodes_sz);
+        snap->_backing = ubuf;
+        snap->nodes = (node_t *)ubuf;
 
-        snap->dirent_data = malloc(snap->dirent_data_len > 0 ? snap->dirent_data_len : 1);
-        if (!snap->dirent_data && snap->dirent_data_len > 0) {
-            free(snap->nodes); free(ubuf); free(snap); return set_error(ERR_NOMEM, "snapshot %u: dirent_data alloc failed", snap_id);
+        if (skip_dirent) {
+            snap->dirent_data = NULL;
+            snap->dirent_data_len = 0;
+        } else {
+            snap->dirent_data = (uint8_t *)ubuf + nodes_sz;
         }
-        if (snap->dirent_data_len > 0)
-            memcpy(snap->dirent_data, ubuf + nodes_sz, snap->dirent_data_len);
-        free(ubuf);
     } else {
         /* v3 or uncompressed v4: read payload directly */
         snap->nodes = malloc(node_count * sizeof(node_t) > 0
@@ -263,21 +263,34 @@ status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
             free(snap->nodes); free(snap); close(fd); return set_error(ERR_CORRUPT, "snapshot %u: short read on nodes", snap_id);
         }
 
-        snap->dirent_data = malloc(snap->dirent_data_len > 0 ? snap->dirent_data_len : 1);
-        if (!snap->dirent_data && snap->dirent_data_len > 0) {
-            free(snap->nodes); free(snap); close(fd); return set_error(ERR_NOMEM, "snapshot %u: dirent_data alloc failed", snap_id);
-        }
-        if (snap->dirent_data_len > 0 &&
-            read(fd, snap->dirent_data, snap->dirent_data_len) !=
-                (ssize_t)snap->dirent_data_len) {
-            free(snap->dirent_data); free(snap->nodes); free(snap); close(fd);
-            return set_error(ERR_CORRUPT, "snapshot %u: short read on dirent_data", snap_id);
+        if (skip_dirent) {
+            snap->dirent_data = NULL;
+            snap->dirent_data_len = 0;
+        } else {
+            snap->dirent_data = malloc(snap->dirent_data_len > 0 ? snap->dirent_data_len : 1);
+            if (!snap->dirent_data && snap->dirent_data_len > 0) {
+                free(snap->nodes); free(snap); close(fd); return set_error(ERR_NOMEM, "snapshot %u: dirent_data alloc failed", snap_id);
+            }
+            if (snap->dirent_data_len > 0 &&
+                read(fd, snap->dirent_data, snap->dirent_data_len) !=
+                    (ssize_t)snap->dirent_data_len) {
+                free(snap->dirent_data); free(snap->nodes); free(snap); close(fd);
+                return set_error(ERR_CORRUPT, "snapshot %u: short read on dirent_data", snap_id);
+            }
         }
         close(fd);
     }
 
     *out = snap;
     return OK;
+}
+
+status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
+    return snapshot_load_impl(repo, snap_id, out, 0);
+}
+
+status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
+    return snapshot_load_impl(repo, snap_id, out, 1);
 }
 
 status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
@@ -476,34 +489,83 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
     return OK;
 }
 
-status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags) {
-    /* Load the full snap, OR in the new flags, rewrite atomically. */
-    snapshot_t *snap = NULL;
-    status_t st = snapshot_load(repo, snap_id, &snap);
-    if (st != OK) return st;
+/*
+ * In-place gfs_flags update — avoids full decompress + recompress.
+ * gfs_flags is at byte offset 44 in all snapshot versions.
+ * For V5 files, also recomputes the header parity record at byte 60.
+ */
+static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
+                                      uint32_t flags, int use_or) {
+    char path[PATH_MAX];
+    if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
+        return set_error(ERR_IO, "snap_patch_gfs_flags: path overflow");
 
-    snap->gfs_flags |= new_flags;
-    st = snapshot_write(repo, snap);
-    snapshot_free(snap);
-    return st;
+    int fd = open(path, O_RDWR);
+    if (fd == -1)
+        return set_error_errno(ERR_IO, "snap_patch_gfs_flags: cannot open snap %u", snap_id);
+
+    /* Read magic + version to determine format */
+    uint32_t magic = 0, version = 0;
+    if (pread(fd, &magic, 4, 0) != 4 || pread(fd, &version, 4, 4) != 4 ||
+        magic != SNAP_MAGIC ||
+        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
+         version != SNAP_VERSION_V5)) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: bad magic/version snap %u", snap_id);
+    }
+
+    /* Read current flags, apply change */
+    uint32_t cur_flags = 0;
+    if (pread(fd, &cur_flags, 4, 44) != 4) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: cannot read gfs_flags snap %u", snap_id);
+    }
+
+    uint32_t new_flags = use_or ? (cur_flags | flags) : flags;
+    if (new_flags == cur_flags) { close(fd); return OK; }  /* no change needed */
+
+    if (pwrite(fd, &new_flags, 4, 44) != 4) {
+        close(fd);
+        return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite gfs_flags snap %u", snap_id);
+    }
+
+    /* V5: recompute header parity record (covers the 60-byte header) */
+    if (version == SNAP_VERSION_V5) {
+        uint8_t hdr_buf[60];
+        if (pread(fd, hdr_buf, 60, 0) != 60) {
+            close(fd);
+            return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: cannot re-read header snap %u", snap_id);
+        }
+        parity_record_t hdr_par;
+        parity_record_compute(hdr_buf, 60, &hdr_par);
+        if (pwrite(fd, &hdr_par, sizeof(hdr_par), 60) != (ssize_t)sizeof(hdr_par)) {
+            close(fd);
+            return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite parity snap %u", snap_id);
+        }
+    }
+
+    fdatasync(fd);
+    close(fd);
+    return OK;
+}
+
+status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags) {
+    return snap_patch_gfs_flags(repo, snap_id, new_flags, 1);
 }
 
 status_t snapshot_replace_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t flags) {
-    /* Load the full snap, set flags exactly (no OR), rewrite atomically. */
-    snapshot_t *snap = NULL;
-    status_t st = snapshot_load(repo, snap_id, &snap);
-    if (st != OK) return st;
-
-    snap->gfs_flags = flags;
-    st = snapshot_write(repo, snap);
-    snapshot_free(snap);
-    return st;
+    return snap_patch_gfs_flags(repo, snap_id, flags, 0);
 }
 
 void snapshot_free(snapshot_t *snap) {
     if (!snap) return;
-    free(snap->nodes);
-    free(snap->dirent_data);
+    if (snap->_backing) {
+        /* nodes and dirent_data point into _backing — only free once */
+        free(snap->_backing);
+    } else {
+        free(snap->nodes);
+        free(snap->dirent_data);
+    }
     free(snap);
 }
 
@@ -554,9 +616,6 @@ const node_t *snapshot_find_node(const snapshot_t *snap, uint64_t node_id) {
 /* Path map implementation                                             */
 /* ------------------------------------------------------------------ */
 
-#define PM_LOAD_MAX_NUM 7
-#define PM_LOAD_MAX_DEN 10   /* resize when count > capacity * 0.7 */
-
 static uint64_t pm_fnv1a(const char *s) {
     uint64_t h = 14695981039346656037ULL;
     while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
@@ -569,26 +628,9 @@ static size_t pm_next_pow2(size_t n) {
     return p;
 }
 
-static int pm_resize(pathmap_t *m) {
-    size_t newcap = m->capacity * 2;
-    pm_slot_t *newslots = calloc(newcap, sizeof(pm_slot_t));
-    if (!newslots) return -1;
-    for (size_t i = 0; i < m->capacity; i++) {
-        if (!m->slots[i].key) continue;
-        size_t h = (size_t)(pm_fnv1a(m->slots[i].key) & (uint64_t)(newcap - 1));
-        while (newslots[h].key) h = (h + 1) & (newcap - 1);
-        newslots[h] = m->slots[i];
-    }
-    free(m->slots);
-    m->slots    = newslots;
-    m->capacity = newcap;
-    return 0;
-}
-
 static int pm_insert_node(pathmap_t *m, const char *key, const node_t *value) {
-    if (m->count * PM_LOAD_MAX_DEN >= m->capacity * PM_LOAD_MAX_NUM) {
-        if (pm_resize(m) != 0) return -1;
-    }
+    /* No resize needed: pathmap_build_progress pre-allocates capacity at
+     * 2x node_count, so the load factor can never exceed ~50%. */
     size_t h = (size_t)(pm_fnv1a(key) & (uint64_t)(m->capacity - 1));
     while (m->slots[h].key) {
         if (strcmp(m->slots[h].key, key) == 0) {
@@ -963,4 +1005,69 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
         fsync(fd);
     close(fd);
     return total_fixed;
+}
+
+/* ------------------------------------------------------------------ */
+/* snapshot_list_all — enumerate all snapshots with header metadata     */
+/* ------------------------------------------------------------------ */
+
+status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
+{
+    uint32_t head = 0;
+    snapshot_read_head(repo, &head);
+
+    /* Count existing snapshots first */
+    uint32_t cap = head < 64 ? 64 : head;
+    snap_info_t *arr = calloc(cap, sizeof(*arr));
+    if (!arr) return set_error(ERR_NOMEM, "snapshot_list_all: alloc failed");
+
+    uint32_t count = 0;
+    for (uint32_t id = 1; id <= head; id++) {
+        snapshot_t *snap = NULL;
+        if (snapshot_load_nodes_only(repo, id, &snap) != OK) {
+            err_clear();
+            continue;
+        }
+
+        if (count >= cap) {
+            cap *= 2;
+            snap_info_t *tmp = realloc(arr, cap * sizeof(*arr));
+            if (!tmp) { free(arr); snapshot_free(snap); return set_error(ERR_NOMEM, "snapshot_list_all: realloc failed"); }
+            arr = tmp;
+        }
+
+        snap_info_t *si = &arr[count++];
+        si->id            = snap->snap_id;
+        si->has_manifest  = 1;
+        si->created_sec   = snap->created_sec;
+        si->node_count    = snap->node_count;
+        si->dirent_count  = snap->dirent_count;
+        si->phys_new_bytes = snap->phys_new_bytes;
+        si->gfs_flags     = snap->gfs_flags;
+        si->snap_flags    = snap->snap_flags;
+
+        uint64_t logical = 0;
+        for (uint32_t i = 0; i < snap->node_count; i++) {
+            if (snap->nodes[i].type == NODE_TYPE_REG)
+                logical += snap->nodes[i].size;
+        }
+        si->logical_bytes = logical;
+
+        snapshot_free(snap);
+    }
+
+    snap_list_t *l = calloc(1, sizeof(*l));
+    if (!l) { free(arr); return set_error(ERR_NOMEM, "snapshot_list_all: alloc list failed"); }
+    l->head  = head;
+    l->snaps = arr;
+    l->count = count;
+    *out = l;
+    return OK;
+}
+
+void snap_list_free(snap_list_t *l)
+{
+    if (!l) return;
+    free(l->snaps);
+    free(l);
 }

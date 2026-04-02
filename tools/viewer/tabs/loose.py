@@ -1,15 +1,16 @@
-import os
+import base64
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from ..parsers import load_loose_object, parse_sparse_regions, decompress_payload, HAS_LZ4, ParseError
-from ..formats import fmt_size, hex_hash, hex_dump
+from ..rpc import call, RPCError
+from ..formats import fmt_size, hex_dump
 from ..constants import (
     OBJECT_TYPE_NAMES, COMPRESS_NAMES,
-    OBJECT_TYPE_SPARSE, COMPRESS_NONE, UI_SIZE_LIMIT,
+    OBJECT_TYPE_SPARSE, UI_SIZE_LIMIT, ZERO_HASH,
 )
 from ..widgets import (make_text_widget, set_text, make_sparse_canvas,
-                       update_sparse_map, PAD, FONT_MONO, FONT_BOLD)
+                       update_sparse_map, parse_sparse_regions,
+                       PAD, FONT_MONO, FONT_BOLD)
 
 _PREVIEW_LIMIT = UI_SIZE_LIMIT
 
@@ -18,8 +19,10 @@ class LooseTab:
     def __init__(self, nb: ttk.Notebook):
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="Loose Objects")
-        self._loose_paths: list[str] = []
-        self._current: tuple | None = None   # (otype, comp, uncomp_sz, comp_sz, h, payload)
+        self._repo_path: str | None = None
+        self._objects: list[dict] = []
+        self._current_hash: str | None = None
+        self._current_data: bytes | None = None
         self._build()
 
     def _build(self) -> None:
@@ -65,35 +68,53 @@ class LooseTab:
 
     # ---- populate ----
 
-    def populate(self, scan: dict) -> None:
-        self._loose_paths = scan["loose"]
+    def populate(self, repo_path: str) -> None:
+        self._repo_path = repo_path
         self._list.delete(0, tk.END)
-        for path in self._loose_paths:
-            parts = path.split(os.sep)
-            self._list.insert(tk.END, parts[-2] + "/" + parts[-1])
+        try:
+            data = call(repo_path, "loose_list")
+            self._objects = data.get("objects", [])
+        except RPCError as e:
+            self._objects = []
+            set_text(self._info_text, f"Error loading loose objects: {e}")
+            return
+        for obj in self._objects:
+            h = obj.get("hash", "")
+            self._list.insert(tk.END, h[:2] + "/" + h[2:])
 
     # ---- selection ----
 
     def _on_select(self, _event) -> None:
         sel = self._list.curselection()
-        if not sel:
+        if not sel or not self._repo_path:
             return
-        path = self._loose_paths[sel[0]]
-        try:
-            otype, comp, uncomp_sz, comp_sz, h, payload = load_loose_object(path)
-        except ParseError as e:
-            messagebox.showerror("Parse error", str(e))
-            return
-        self._current = (otype, comp, uncomp_sz, comp_sz, h, payload)
-        self._populate_info(path, otype, comp, uncomp_sz, comp_sz, h, payload)
-        self._populate_preview(comp, uncomp_sz, payload)
-        self._populate_sparse(otype, comp, uncomp_sz, payload)
+        obj = self._objects[sel[0]]
+        hash_hex   = obj["hash"]
+        otype      = int(obj["type"])
+        comp       = int(obj["compression"])
+        uncomp_sz  = int(obj["uncompressed_size"])
+        comp_sz    = int(obj["compressed_size"])
 
-    def _populate_info(self, path, otype, comp, uncomp_sz, comp_sz, h, payload) -> None:
+        self._current_hash = hash_hex
+
+        # Load content via RPC
+        self._current_data = None
+        max_bytes = min(uncomp_sz, _PREVIEW_LIMIT) if uncomp_sz > 0 else _PREVIEW_LIMIT
+        try:
+            cr = call(self._repo_path, "object_content", hash=hash_hex,
+                      max_bytes=max_bytes)
+            self._current_data = base64.b64decode(cr.get("content_base64", ""))
+        except RPCError:
+            pass
+
+        self._populate_info(hash_hex, otype, comp, uncomp_sz, comp_sz)
+        self._populate_preview(uncomp_sz)
+        self._populate_sparse(otype, uncomp_sz)
+
+    def _populate_info(self, hash_hex, otype, comp, uncomp_sz, comp_sz) -> None:
         ratio = f"{comp_sz / uncomp_sz:.3f}" if uncomp_sz and comp_sz else "—"
         lines = [
-            f"File               : {path}",
-            f"Hash (in header)   : {hex_hash(h)}",
+            f"Hash (in header)   : {hash_hex}",
             f"Object type        : {OBJECT_TYPE_NAMES.get(otype, otype)}",
             f"Compression        : {COMPRESS_NAMES.get(comp, comp)}",
             f"Uncompressed size  : {fmt_size(uncomp_sz)} ({uncomp_sz} bytes)",
@@ -101,29 +122,19 @@ class LooseTab:
             f"Ratio              : {ratio}",
             "",
         ]
-        if not HAS_LZ4 and comp != COMPRESS_NONE:
-            lines.append("Install the 'lz4' Python package to decompress payload.")
         set_text(self._info_text, "\n".join(lines))
 
-    def _populate_preview(self, comp, uncomp_sz, payload) -> None:
-        """Hex dump + text decode for small objects."""
-        if not HAS_LZ4 and comp != COMPRESS_NONE:
-            set_text(self._prev_text, "(lz4 not installed — cannot decompress)")
-            return
-        if uncomp_sz > _PREVIEW_LIMIT:
-            set_text(self._prev_text,
-                     f"Object too large to preview ({fmt_size(uncomp_sz)}).\n"
-                     f"Use Export to save the decompressed payload to a file.")
+    def _populate_preview(self, uncomp_sz) -> None:
+        if self._current_data is None:
+            set_text(self._prev_text, "(could not load object content)")
             return
 
-        data = decompress_payload(payload, comp, uncomp_sz)
-        if data is None:
-            set_text(self._prev_text, "(decompression failed)")
-            return
+        data = self._current_data
+        truncated = uncomp_sz > len(data)
+        lines = [f"Decompressed size: {fmt_size(uncomp_sz)}"
+                 + (f"  (showing first {fmt_size(len(data))})" if truncated else ""),
+                 ""]
 
-        lines = [f"Decompressed size: {fmt_size(len(data))}", ""]
-
-        # Attempt UTF-8 text decode
         try:
             text = data.decode("utf-8")
             lines += ["── UTF-8 text ──────────────────────────────────────────", text[:4096]]
@@ -139,7 +150,7 @@ class LooseTab:
 
         set_text(self._prev_text, "\n".join(lines))
 
-    def _populate_sparse(self, otype, comp, uncomp_sz, payload) -> None:
+    def _populate_sparse(self, otype, uncomp_sz) -> None:
         self._sparse_canvas.delete("all")
         self._sparse_info.config(text="")
 
@@ -147,12 +158,11 @@ class LooseTab:
             self._sparse_info.config(text="(only available for SPARSE objects)")
             return
 
-        sparse_raw = payload if comp == COMPRESS_NONE else decompress_payload(payload, comp, uncomp_sz)
-        if sparse_raw is None:
-            self._sparse_info.config(text="(decompression failed — cannot parse sparse map)")
+        if self._current_data is None:
+            self._sparse_info.config(text="(could not load content)")
             return
 
-        regions = parse_sparse_regions(sparse_raw)
+        regions = parse_sparse_regions(self._current_data)
         if regions is None:
             self._sparse_info.config(text="(could not parse sparse header)")
             return
@@ -162,26 +172,23 @@ class LooseTab:
     # ---- export ----
 
     def _export(self) -> None:
-        if not self._current:
+        if not self._current_hash or not self._repo_path:
             messagebox.showinfo("Nothing selected", "Select an object first.")
             return
-        otype, comp, uncomp_sz, comp_sz, h, payload = self._current
+        # Load full content (no size limit) for export
+        try:
+            cr = call(self._repo_path, "object_content", hash=self._current_hash)
+            data = base64.b64decode(cr.get("content_base64", ""))
+        except RPCError as e:
+            messagebox.showerror("Error", f"Could not load object: {e}")
+            return
+
         dest = filedialog.asksaveasfilename(
             title="Save decompressed payload",
-            initialfile=f"{hex_hash(h)}.bin",
+            initialfile=f"{self._current_hash[:16]}.bin",
         )
         if not dest:
             return
-        if comp != COMPRESS_NONE:
-            if not HAS_LZ4:
-                messagebox.showerror("Error", "lz4 not installed — cannot decompress.")
-                return
-            data = decompress_payload(payload, comp, uncomp_sz)
-            if data is None:
-                messagebox.showerror("Error", "Decompression failed.")
-                return
-        else:
-            data = payload
         try:
             with open(dest, "wb") as f:
                 f.write(data)

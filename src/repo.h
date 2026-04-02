@@ -22,6 +22,13 @@ void   repo_set_pack_cache(repo_t *repo, void *data, size_t cnt);
 void  *repo_pack_cache_data(const repo_t *repo);
 size_t repo_pack_cache_count(const repo_t *repo);
 
+/* Pack .dat file handle cache — avoids repeated open/close on bulk lookups. */
+#include <stdio.h>
+#include <stdint.h>
+FILE  *repo_dat_cache_checkout(repo_t *repo, uint32_t pack_num);
+void   repo_dat_cache_return(repo_t *repo, uint32_t pack_num, FILE *fp);
+void   repo_dat_cache_flush(repo_t *repo);
+
 /*
  * Exclusive lock — held during all write operations (run, prune, gc, pack).
  * Fails immediately (ERR_IO) if another writer holds the lock.

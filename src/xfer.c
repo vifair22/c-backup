@@ -56,9 +56,11 @@ typedef struct __attribute__((packed)) {
 } cbb_rec_t;
 
 typedef struct {
-    uint8_t *buf;
+    uint8_t *buf;       /* flat array of stored hashes (for iteration) */
     size_t n;
     size_t cap;
+    uint32_t *table;    /* open-addressing hash table: indices into buf, UINT32_MAX = empty */
+    size_t tbl_cap;     /* always a power of 2 */
 } hashset_t;
 
 /* read_all / write_all: uses io_read_full / io_write_full from util.h */
@@ -159,15 +161,48 @@ static int write_file_bytes(const char *path, const void *buf, size_t len, mode_
     return rc;
 }
 
-static int hashset_has(const hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
+/* Hash table uses first 8 bytes of SHA-256 as probe key (uniformly distributed) */
+static size_t hs_probe(const hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
+    uint64_t k;
+    memcpy(&k, h, sizeof(k));
+    return (size_t)(k & (uint64_t)(hs->tbl_cap - 1));
+}
+
+static int hs_grow_table(hashset_t *hs) {
+    size_t new_cap = hs->tbl_cap ? hs->tbl_cap * 2 : 512;
+    uint32_t *nt = malloc(new_cap * sizeof(uint32_t));
+    if (!nt) { set_error(ERR_NOMEM, "hashset: table alloc %zu", new_cap); return -1; }
+    memset(nt, 0xFF, new_cap * sizeof(uint32_t));  /* fill with UINT32_MAX */
+    size_t mask = new_cap - 1;
+    /* Re-insert existing entries */
     for (size_t i = 0; i < hs->n; i++) {
-        if (memcmp(hs->buf + i * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE) == 0) return 1;
+        uint64_t k;
+        memcpy(&k, hs->buf + i * OBJECT_HASH_SIZE, sizeof(k));
+        size_t slot = (size_t)(k & (uint64_t)mask);
+        while (nt[slot] != UINT32_MAX) slot = (slot + 1) & mask;
+        nt[slot] = (uint32_t)i;
     }
+    free(hs->table);
+    hs->table = nt;
+    hs->tbl_cap = new_cap;
     return 0;
 }
 
 static int hashset_add(hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
-    if (hashset_has(hs, h)) return 0;
+    /* Grow table if load factor > 50% */
+    if (hs->n * 2 >= hs->tbl_cap) {
+        if (hs_grow_table(hs) != 0) return -1;
+    }
+    /* Check for duplicate */
+    size_t mask = hs->tbl_cap - 1;
+    size_t slot = hs_probe(hs, h);
+    for (;;) {
+        uint32_t idx = hs->table[slot];
+        if (idx == UINT32_MAX) break;
+        if (memcmp(hs->buf + (size_t)idx * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE) == 0) return 0;
+        slot = (slot + 1) & mask;
+    }
+    /* Grow buf if needed */
     if (hs->n == hs->cap) {
         size_t nc = hs->cap ? hs->cap * 2 : 256;
         uint8_t *nb = realloc(hs->buf, nc * OBJECT_HASH_SIZE);
@@ -175,6 +210,7 @@ static int hashset_add(hashset_t *hs, const uint8_t h[OBJECT_HASH_SIZE]) {
         hs->buf = nb;
         hs->cap = nc;
     }
+    hs->table[slot] = (uint32_t)hs->n;
     memcpy(hs->buf + hs->n * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE);
     hs->n++;
     return 0;
@@ -373,9 +409,11 @@ static int export_repo_bundle(repo_t *repo, int out_fd) {
         if (show_prog) xfer_line_clear();
     }
 
+    free(hs.table);
     free(hs.buf);
     return 0;
 fail:
+    free(hs.table);
     free(hs.buf);
     return -1;
 }
@@ -434,9 +472,11 @@ static int export_snapshot_bundle(repo_t *repo, uint32_t snap_id, int out_fd) {
         if (show_prog) xfer_line_clear();
     }
 
+    free(hs.table);
     free(hs.buf);
     return 0;
 fail:
+    free(hs.table);
     free(hs.buf);
     return -1;
 }

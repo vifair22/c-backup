@@ -6,10 +6,6 @@ import datetime
 from .constants import GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY
 
 
-def hex_hash(b: bytes) -> str:
-    return b.hex()
-
-
 def fmt_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":

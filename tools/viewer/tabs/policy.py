@@ -2,6 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from ..rpc import call, RPCError
 from ..widgets import PAD, FONT_MONO, FONT_BOLD
 
 _BOOL_FIELDS = [
@@ -25,41 +26,6 @@ _DEFAULTS = {
     "keep_monthly": 0, "keep_yearly": 0,
     "paths": [], "exclude": [],
 }
-
-
-def _load_toml(path: str) -> dict:
-    try:
-        import tomllib
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except ImportError:
-        pass
-    # Simple fallback: handles the flat TOML format written by c-backup
-    result: dict = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if v.startswith("["):
-                inner = v[1:v.rfind("]")]
-                result[k] = [s.strip().strip('"') for s in inner.split(",")
-                              if s.strip().strip('"')]
-            elif v == "true":
-                result[k] = True
-            elif v == "false":
-                result[k] = False
-            else:
-                try:
-                    result[k] = int(v)
-                except ValueError:
-                    result[k] = v.strip('"')
-    return result
 
 
 class PolicyTab:
@@ -148,27 +114,32 @@ class PolicyTab:
 
         inner.columnconfigure(1, weight=1)
 
-    def populate(self, scan: dict) -> None:
-        repo = scan["repo_path"]
-        self._policy_path = os.path.join(repo, "policy.toml")
+    def populate(self, repo_path: str) -> None:
+        self._policy_path = os.path.join(repo_path, "policy.toml")
 
-        fmt_path = os.path.join(repo, "format")
         fmt_str = ""
-        if os.path.exists(fmt_path):
-            fmt_str = f"Format: {open(fmt_path).read().strip()}  |  "
+        try:
+            scan = call(repo_path, "scan")
+            fmt_val = scan.get("format")
+            if fmt_val:
+                fmt_str = f"Format: {fmt_val}  |  "
+        except RPCError:
+            pass
 
-        if not os.path.exists(self._policy_path):
+        # Load policy via RPC
+        try:
+            data = call(repo_path, "policy")
+        except RPCError:
+            data = None
+
+        if data is None or data == {}:
+            # policy action returns null when file doesn't exist
             self._status_label.config(
                 text=f"{fmt_str}No policy.toml — defaults shown. Save to create.",
                 fg="gray")
-            data: dict = dict(_DEFAULTS)
+            data = dict(_DEFAULTS)
         else:
             self._status_label.config(text=f"{fmt_str}{self._policy_path}", fg="gray")
-            try:
-                data = _load_toml(self._policy_path)
-            except (OSError, ValueError) as e:
-                self._status_label.config(text=f"Error loading policy.toml: {e}", fg="red")
-                data = dict(_DEFAULTS)
 
         self._paths_text.delete("1.0", tk.END)
         self._paths_text.insert("1.0", "\n".join(data.get("paths", [])))

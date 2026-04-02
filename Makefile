@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 -msse4.2 -mavx2 \
+CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O3 -flto=auto -march=znver3 -mtune=znver3 \
            -fstack-protector-strong \
            -fstack-clash-protection \
            -Wshadow \
@@ -20,7 +20,7 @@ CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 -msse4.2 -mavx2 \
            -Wconversion \
            -Wsign-conversion \
            -I src -I vendor
-LDFLAGS := -llz4 -lssl -lcrypto -lacl -lpthread
+LDFLAGS := -flto=auto -llz4 -lssl -lcrypto -lacl -lpthread
 
 BUILD   := build
 SRC     := src
@@ -28,7 +28,7 @@ TESTS   := tests
 
 SRCS    := $(wildcard $(SRC)/*.c)
 OBJS    := $(patsubst $(SRC)/%.c, $(BUILD)/%.o, $(SRCS))
-VENDOR_OBJS := $(BUILD)/toml.o
+VENDOR_OBJS := $(BUILD)/toml.o $(BUILD)/cJSON.o
 OBJS    += $(VENDOR_OBJS)
 MAIN_OBJ := $(BUILD)/main.o
 LIB_OBJS := $(filter-out $(MAIN_OBJ), $(OBJS))
@@ -52,8 +52,10 @@ $(BUILD):
 $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-VENDOR_CFLAGS := -std=c11 -O2 -I src -I vendor
+VENDOR_CFLAGS := -std=c11 -O3 -flto=auto -march=znver3 -I src -I vendor
 $(BUILD)/toml.o: vendor/toml.c | $(BUILD)
+	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
+$(BUILD)/cJSON.o: vendor/cJSON.c | $(BUILD)
 	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 
 -include $(OBJS:.o=.d)
@@ -69,7 +71,7 @@ $(TARGET_STATIC): $(OBJS)
 # runs on machines that lack those .so files.  libc/libpthread stay dynamic
 # (required by ASAN).  libasan itself is embedded via -static-libasan so the
 # target machine does not need libasan.so either.
-ASAN_CFLAGS  := $(filter-out -O2,$(CFLAGS)) -O1 -g -fsanitize=address -fno-omit-frame-pointer
+ASAN_CFLAGS  := $(filter-out -O3 -flto=auto,$(CFLAGS)) -O1 -g -fsanitize=address -fno-omit-frame-pointer
 ASAN_OBJS    := $(patsubst $(BUILD)/%.o, $(BUILD)/%-asan.o, $(OBJS))
 
 $(BUILD)/%-asan.o: $(SRC)/%.c | $(BUILD)
@@ -77,19 +79,21 @@ $(BUILD)/%-asan.o: $(SRC)/%.c | $(BUILD)
 
 $(BUILD)/toml-asan.o: vendor/toml.c | $(BUILD)
 	$(CC) -std=c11 -O1 -g -I src -I vendor -MMD -MP -c $< -o $@
+$(BUILD)/cJSON-asan.o: vendor/cJSON.c | $(BUILD)
+	$(CC) -std=c11 -O1 -g -I src -I vendor -MMD -MP -c $< -o $@
 
 asan: $(TARGET_ASAN)
 $(TARGET_ASAN): $(ASAN_OBJS)
 	$(CC) $(ASAN_CFLAGS) -static-libasan $^ -o $@ \
 	    -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread
 
-TEST_CFLAGS := -std=c11 -Wall -Wextra -O2 -Wno-unused-result -I src -I vendor
+TEST_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result -I src -I vendor
 # Test binaries link lib objects (not main.o) + cmocka
 $(BUILD)/%: $(TESTS)/%.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(LDFLAGS) -lcmocka
 
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
-              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync
+              -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync
 
 $(BUILD)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(LDFLAGS) -lcmocka
@@ -99,7 +103,7 @@ test: $(TARGET) $(TEST_BINS) $(FAULT_BINS)
 
 # Benchmark binaries (no cmocka)
 BENCH     := bench
-BENCH_CFLAGS := -std=c11 -Wall -Wextra -O2 -msse4.2 -mavx2 -Wno-unused-result -I src -I vendor
+BENCH_CFLAGS := -std=c11 -Wall -Wextra -O3 -flto=auto -march=znver3 -mtune=znver3 -Wno-unused-result -I src -I vendor
 
 $(BUILD)/bench_micro: $(BENCH)/micro.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)

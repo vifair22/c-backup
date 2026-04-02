@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from ..parsers import iter_pack_dat, parse_loose_object, ParseError
+from ..rpc import call, RPCError
 from ..formats import fmt_size
 from ..constants import (
     OBJECT_TYPE_NAMES,
@@ -61,7 +61,7 @@ class AnalyticsTab:
         self._loc_canvas.pack(fill=tk.X, padx=PAD, pady=(0, PAD))
         self._loc_canvas.bind("<Configure>", lambda _: self._redraw_loc())
 
-    def populate(self, scan: dict) -> None:
+    def populate(self, repo_path: str) -> None:
         set_text(self._text, "Loading…")
 
         def _worker() -> None:
@@ -72,43 +72,47 @@ class AnalyticsTab:
             skip    = {"count": 0, "uncomp": 0, "comp": 0}
             hiratio = {"count": 0, "uncomp": 0, "comp": 0}
 
-            for dat_path in scan.get("pack_dat", []):
-                try:
-                    _hdr, entries = iter_pack_dat(dat_path)
-                except ParseError:
-                    continue
-                for e in entries:
-                    t = e["type"]
-                    if t in stats:
-                        stats[t]["count"]  += 1
-                        stats[t]["uncomp"] += e["uncompressed_size"]
-                        stats[t]["comp"]   += e["compressed_size"]
-                    pack["count"]  += 1
-                    pack["uncomp"] += e["uncompressed_size"]
-                    pack["comp"]   += e["compressed_size"]
-                    if (e["uncompressed_size"] > 0 and
-                            e["compressed_size"] / e["uncompressed_size"] >= 0.90):
-                        hiratio["count"]  += 1
-                        hiratio["uncomp"] += e["uncompressed_size"]
-                        hiratio["comp"]   += e["compressed_size"]
-
-            for loose_path in scan.get("loose", []):
-                try:
-                    obj = parse_loose_object(loose_path)
-                except ParseError:
-                    continue
-                t = obj["type"]
+            # All pack entries in a single RPC call
+            try:
+                pack_data = call(repo_path, "all_pack_entries")
+            except RPCError:
+                pack_data = {"entries": []}
+            for e in pack_data.get("entries", []):
+                t = int(e["type"])
+                uncomp = int(e["uncompressed_size"])
+                comp   = int(e["compressed_size"])
                 if t in stats:
                     stats[t]["count"]  += 1
-                    stats[t]["uncomp"] += obj["uncompressed_size"]
-                    stats[t]["comp"]   += obj["compressed_size"]
+                    stats[t]["uncomp"] += uncomp
+                    stats[t]["comp"]   += comp
+                pack["count"]  += 1
+                pack["uncomp"] += uncomp
+                pack["comp"]   += comp
+                if uncomp > 0 and comp / uncomp >= 0.90:
+                    hiratio["count"]  += 1
+                    hiratio["uncomp"] += uncomp
+                    hiratio["comp"]   += comp
+
+            # Loose objects
+            try:
+                loose_data = call(repo_path, "loose_list")
+            except RPCError:
+                loose_data = {"objects": []}
+            for obj in loose_data.get("objects", []):
+                t      = int(obj["type"])
+                uncomp = int(obj["uncompressed_size"])
+                comp   = int(obj["compressed_size"])
+                if t in stats:
+                    stats[t]["count"]  += 1
+                    stats[t]["uncomp"] += uncomp
+                    stats[t]["comp"]   += comp
                 loose["count"]  += 1
-                loose["uncomp"] += obj["uncompressed_size"]
-                loose["comp"]   += obj["compressed_size"]
-                if obj.get("pack_skip_ver", 0) == PROBER_VERSION:
+                loose["uncomp"] += uncomp
+                loose["comp"]   += comp
+                if int(obj.get("pack_skip_ver", 0)) == PROBER_VERSION:
                     skip["count"]  += 1
-                    skip["uncomp"] += obj["uncompressed_size"]
-                    skip["comp"]   += obj["compressed_size"]
+                    skip["uncomp"] += uncomp
+                    skip["comp"]   += comp
 
             total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
             total_comp   = sum(s["comp"]   for s in stats.values()) or 1
@@ -266,19 +270,12 @@ class AnalyticsTab:
 
     @staticmethod
     def _log_widths(counts: list[int], total_px: int) -> list[int]:
-        """Map counts to pixel widths using log compression.
-
-        Ensures every non-zero segment gets at least a few visible pixels
-        while still conveying relative proportions.
-        """
         logs = [math.log2(1 + c) for c in counts]
         log_total = sum(logs) or 1
         widths = [int(total_px * v / log_total) for v in logs]
-        # Give every non-zero segment at least 4 px
         for i, c in enumerate(counts):
             if c > 0 and widths[i] < 4:
                 widths[i] = 4
-        # Clamp total to total_px
         overflow = sum(widths) - total_px
         if overflow > 0:
             biggest = max(range(len(widths)), key=lambda j: widths[j])
@@ -316,7 +313,6 @@ class AnalyticsTab:
                                                    margin_l + bar_w, y + bar_h,
                                                    fill="#eee", outline="#ccc")
 
-            # Log-compress sub-segment widths so small segments stay visible
             seg_counts = [sc for sc, _ in segments]
             seg_colors = [sc for _, sc in segments]
             seg_widths = self._log_widths(seg_counts, filled)
@@ -328,7 +324,6 @@ class AnalyticsTab:
                     self._compress_canvas.create_rectangle(
                         x, y, x + sw, y + bar_h,
                         fill=seg_color, outline="")
-                    # Per-segment label for multi-segment bars
                     if multi and seg_count > 0 and sw > 40:
                         spct = 100.0 * seg_count / total
                         stxt = f"{seg_count:,} ({spct:.1f}%)"
@@ -338,7 +333,6 @@ class AnalyticsTab:
                             font=FONT_MONO, fill="white")
                     x += sw
 
-            # Single-segment bars get one overall label
             if not multi:
                 if filled > 40:
                     self._compress_canvas.create_text(
