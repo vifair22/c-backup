@@ -168,7 +168,7 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 │       └── <remaining 62 hex chars>   # Loose object file
 │
 ├── packs/
-│   ├── pack-index              # Global pack index (merged view of all .idx files)
+│   ├── pack-index.pidx              # Global pack index (merged view of all .idx files)
 │   ├── 0000/                   # Shard directory (pack_num / 256, hex)
 │   │   ├── pack-00000001.dat   # Pack data file
 │   │   ├── pack-00000001.idx   # Pack index file
@@ -194,7 +194,7 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 - Object files are split into 256 two-hex-character subdirectories (`00/` through `ff/`) under `objects/`, limiting directory entry count per bucket.
 - Pack numbers are monotonically increasing integers formatted as zero-padded eight-digit decimal strings. The next pack number is always `max(existing) + 1`.
 - Pack files are stored in sharded subdirectories under `packs/`: `packs/NNNN/pack-NNNNNNNN.{dat,idx}` where `NNNN = pack_num / 256` (4-char zero-padded hex). Each shard holds at most 256 packs (512 files). Legacy flat-layout packs (`packs/pack-NNNNNNNN.*`) are found via fallback when the sharded path does not exist.
-- `packs/pack-index` is a global index merging all per-pack `.idx` entries. It is rebuilt automatically after `pack`, `gc`, and `coalesce` operations. If absent or stale, the runtime falls back to scanning individual `.idx` files.
+- `packs/pack-index.pidx` is a global index merging all per-pack `.idx` entries. It is rebuilt automatically after `pack`, `gc`, and `coalesce` operations. If absent or stale, the runtime falls back to scanning individual `.idx` files.
 
 ---
 
@@ -689,7 +689,7 @@ This producer-consumer design means CPU-bound compression (workers) and I/O-boun
 
 ### 7.5 Pack Index Cache
 
-#### Global Pack Index (`packs/pack-index`)
+#### Global Pack Index (`packs/pack-index.pidx`)
 
 A pre-built binary index that merges all per-pack `.idx` entries into a single mmap-friendly file. On-disk format:
 
@@ -1356,7 +1356,7 @@ Runs GFS tier assignment manually. Acquires an exclusive lock.
 backup reindex --repo <path>
 ```
 
-Rebuilds the global pack index (`packs/pack-index`) from all per-pack `.idx` files. Acquires an exclusive lock. Use after manual pack manipulation, repository migration, or if the global index is suspected corrupt. The runtime already rebuilds the index automatically after `pack`, `gc`, and `coalesce`, so this command is primarily for repair and migration scenarios.
+Rebuilds the global pack index (`packs/pack-index.pidx`) from all per-pack `.idx` files. Acquires an exclusive lock. Use after manual pack manipulation, repository migration, or if the global index is suspected corrupt. The runtime already rebuilds the index automatically after `pack`, `gc`, and `coalesce`, so this command is primarily for repair and migration scenarios.
 
 ### 13.21 `migrate-packs`
 
@@ -1758,7 +1758,7 @@ This section describes how the runtime locates any object — loose or packed �
 Every object lookup follows a fixed two-step policy:
 
 1. **Loose first**: attempt a direct filesystem `open()` using the hash-derived path. Succeeds in O(1).
-2. **Pack index second**: if the file is absent, search the global pack index (mmap'd `packs/pack-index`) using a fanout table + binary search. If the global index is unavailable, fall back to the unified in-RAM `pack_cache_entry_t` array loaded from individual `.idx` files. Either path succeeds in O(log N) across all packs simultaneously.
+2. **Pack index second**: if the file is absent, search the global pack index (mmap'd `packs/pack-index.pidx`) using a fanout table + binary search. If the global index is unavailable, fall back to the unified in-RAM `pack_cache_entry_t` array loaded from individual `.idx` files. Either path succeeds in O(log N) across all packs simultaneously.
 
 The loose-first policy means freshly written objects (which are always initially loose) are found without any index scan.
 
@@ -1778,7 +1778,7 @@ Finding a loose object requires no index or search — the runtime constructs th
 
 #### Global Pack Index (Primary Path)
 
-The preferred lookup path uses the mmap'd global pack index (`packs/pack-index`). The fanout table provides O(1) range narrowing: `fanout[hash[0]-1]` to `fanout[hash[0]]` gives the subset of entries sharing the same first hash byte. Binary search within that range locates the entry. Each entry is 48 bytes containing the hash, pack number, dat offset, and pack version. Because the file is mmap'd, only the pages actually touched during lookup are faulted into memory.
+The preferred lookup path uses the mmap'd global pack index (`packs/pack-index.pidx`). The fanout table provides O(1) range narrowing: `fanout[hash[0]-1]` to `fanout[hash[0]]` gives the subset of entries sharing the same first hash byte. Binary search within that range locates the entry. Each entry is 48 bytes containing the hash, pack number, dat offset, and pack version. Because the file is mmap'd, only the pages actually touched during lookup are faulted into memory.
 
 The global index is rebuilt after every pack-modifying operation (`pack`, `gc`, `coalesce`, crash recovery). If it is missing, corrupt, or stale (pack count mismatch), the runtime falls back to the in-RAM cache.
 

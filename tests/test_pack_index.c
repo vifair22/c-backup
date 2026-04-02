@@ -109,7 +109,7 @@ static void test_packs_are_sharded(void **state) {
 static void test_pack_index_exists(void **state) {
     (void)state;
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
     assert_int_equal(access(idx_path, F_OK), 0);
 }
 
@@ -165,7 +165,7 @@ static void test_pack_index_lookup(void **state) {
 static void test_pack_index_rebuild(void **state) {
     (void)state;
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
 
     /* Delete the index */
     unlink(idx_path);
@@ -186,7 +186,7 @@ static void test_pack_index_rebuild(void **state) {
 static void test_pack_index_fallback(void **state) {
     (void)state;
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
 
     /* Delete the global index */
     unlink(idx_path);
@@ -297,7 +297,7 @@ static void test_verify_pack_ordered(void **state) {
 static void test_reindex_command(void **state) {
     (void)state;
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
 
     /* Delete and rebuild (simulates `backup reindex`) */
     unlink(idx_path);
@@ -364,7 +364,7 @@ static void test_migrate_packs(void **state) {
 
     /* Delete global index (it has sharded paths) */
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
     unlink(idx_path);
     pack_cache_invalidate(repo);
 
@@ -447,7 +447,7 @@ static void test_migrate_packs(void **state) {
 static void test_pack_index_corrupt_fallback(void **state) {
     (void)state;
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", TEST_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", TEST_REPO);
 
     /* Corrupt the magic bytes */
     FILE *f = fopen(idx_path, "r+b");

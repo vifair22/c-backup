@@ -101,10 +101,13 @@ class PacksTab:
         self._nb.add(self._idx_frame, text="Index (.idx)")
         self._map_frame   = ttk.Frame(self._nb)
         self._nb.add(self._map_frame, text="Pack Map")
+        self._gidx_frame  = ttk.Frame(self._nb)
+        self._nb.add(self._gidx_frame, text="Global Index")
 
         self._build_entry_tree()
         self._build_idx_tree()
         self._build_pack_map()
+        self._build_global_index()
 
     def _make_text_tab(self, label: str) -> tk.Text:
         frame = ttk.Frame(self._nb)
@@ -237,6 +240,136 @@ class PacksTab:
         self._map_canvas.bind("<Button-5>",
                               lambda _: self._map_canvas.yview_scroll(3, "units"))
 
+    def _build_global_index(self) -> None:
+        # Header info
+        self._gidx_hdr_text = make_text_widget(
+            self._gidx_frame, height=6)
+        self._gidx_hdr_text.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+
+        # Fanout bar chart canvas
+        fan_lbl = tk.Label(self._gidx_frame, text="Fanout distribution",
+                           font=FONT_BOLD)
+        fan_lbl.pack(anchor="w", padx=PAD, pady=(PAD, 0))
+        self._fan_canvas = tk.Canvas(self._gidx_frame, bg="white",
+                                     height=120, highlightthickness=0)
+        self._fan_canvas.pack(fill=tk.X, padx=PAD, pady=(0, PAD))
+        self._fan_canvas.bind("<Configure>", lambda _: self._redraw_fanout())
+        self._fan_canvas.bind("<Motion>", self._on_fan_motion)
+        self._fan_data: list[int] = []
+
+        # Entries tree (paginated)
+        bar = tk.Frame(self._gidx_frame)
+        bar.pack(fill=tk.X, padx=PAD, pady=(0, 0))
+        self._gidx_count_label = tk.Label(bar, text="", font=FONT_MONO)
+        self._gidx_count_label.pack(side=tk.LEFT)
+        self._gidx_loading = tk.Label(bar, text="", fg="gray", font=FONT_MONO)
+        self._gidx_loading.pack(side=tk.LEFT, padx=8)
+
+        cols = [
+            ("hash",         260, True),
+            ("pack_num",      80, False),
+            ("dat_offset",   110, False),
+            ("pack_version",  80, False),
+            ("entry_index",   80, False),
+        ]
+        col_ids = [c[0] for c in cols]
+        self._gidx_tree = ttk.Treeview(self._gidx_frame, columns=col_ids,
+                                        show="headings", selectmode="browse")
+        for name, width, stretch in cols:
+            self._gidx_tree.heading(name, text=name.replace("_", " ").title())
+            self._gidx_tree.column(name, width=width, stretch=stretch)
+        sb = ttk.Scrollbar(self._gidx_frame, orient=tk.VERTICAL,
+                            command=self._gidx_tree.yview)
+        self._gidx_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._gidx_tree.pack(fill=tk.BOTH, expand=True)
+
+    def _load_global_index(self) -> None:
+        if not self._repo_path:
+            return
+        self._gidx_loading.config(text="Loading…")
+        repo_path = self._repo_path
+
+        def _worker() -> None:
+            try:
+                d = call(repo_path, "global_pack_index")
+            except RPCError:
+                self._gidx_frame.after(0, lambda: self._gidx_loading.config(
+                    text="No global index available"))
+                return
+            self._gidx_frame.after(0, lambda: self._finish_gidx(d))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_gidx(self, d: dict) -> None:
+        self._gidx_loading.config(text="")
+        hdr = d.get("header", {})
+        lines = [
+            f"Magic       : 0x{int(hdr.get('magic', 0)):08X}",
+            f"Version     : {hdr.get('version', '?')}",
+            f"Entry count : {hdr.get('entry_count', '?'):,}",
+            f"Pack count  : {hdr.get('pack_count', '?'):,}",
+        ]
+        set_text(self._gidx_hdr_text, "\n".join(lines))
+
+        # Fanout
+        self._fan_data = [int(x) for x in d.get("fanout", [])]
+        self._redraw_fanout()
+
+        # Entries
+        rows = self._gidx_tree.get_children()
+        if rows:
+            self._gidx_tree.delete(*rows)
+        entries = d.get("entries", [])
+        total = int(hdr.get("entry_count", len(entries)))
+        shown = entries[:_ENTRY_PAGE]
+        for e in shown:
+            self._gidx_tree.insert("", tk.END, values=(
+                e["hash"],
+                e["pack_num"],
+                f"0x{int(e['dat_offset']):X}",
+                e["pack_version"],
+                e["entry_index"],
+            ))
+        label = (f"Showing {min(_ENTRY_PAGE, len(shown))} of {total:,} entries"
+                 if total > _ENTRY_PAGE else f"{total:,} entries")
+        self._gidx_count_label.config(text=label)
+
+    def _redraw_fanout(self) -> None:
+        c = self._fan_canvas
+        c.delete("all")
+        if not self._fan_data or len(self._fan_data) < 256:
+            return
+        W = c.winfo_width() or 700
+        H = c.winfo_height() or 120
+        # Compute bucket sizes (fanout is cumulative)
+        buckets = []
+        for i in range(256):
+            prev = self._fan_data[i - 1] if i > 0 else 0
+            buckets.append(self._fan_data[i] - prev)
+        mx = max(buckets) if buckets else 1
+        if mx == 0:
+            mx = 1
+        bar_w = W / 256.0
+        for i, count in enumerate(buckets):
+            h = int(H * count / mx) if mx else 0
+            x0 = int(i * bar_w)
+            x1 = int((i + 1) * bar_w)
+            c.create_rectangle(x0, H - h, x1, H, fill="#5ba3d0", outline="")
+
+    def _on_fan_motion(self, event: tk.Event) -> None:
+        if not self._fan_data or len(self._fan_data) < 256:
+            return
+        W = self._fan_canvas.winfo_width() or 700
+        idx = min(255, max(0, int(event.x * 256 / W)))
+        prev = self._fan_data[idx - 1] if idx > 0 else 0
+        count = self._fan_data[idx] - prev
+        self._fan_canvas.delete("tip")
+        self._fan_canvas.create_text(
+            event.x + 10, max(10, event.y - 10),
+            text=f"0x{idx:02X}: {count:,} entries",
+            anchor="w", font=FONT_MONO, tag="tip")
+
     # ---- populate ----
 
     def populate(self, repo_path: str) -> None:
@@ -251,6 +384,8 @@ class PacksTab:
                 self._list.insert(tk.END, pk["name"])
         except RPCError:
             pass
+
+        self._load_global_index()
 
     # ---- events ----
 

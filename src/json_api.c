@@ -5,6 +5,7 @@
 #include "ls.h"
 #include "object.h"
 #include "pack.h"
+#include "pack_index.h"
 #include "policy.h"
 #include "repo.h"
 #include "snapshot.h"
@@ -1060,6 +1061,66 @@ static cJSON *handle_object_refs(repo_t *repo, const cJSON *params)
     return d;
 }
 
+/* --- global_pack_index -------------------------------------------- */
+static cJSON *handle_global_pack_index(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    pack_index_t *pidx = pack_index_open(repo);
+    if (!pidx)
+        return set_error(ERR_NOT_FOUND, "global pack index not available"), NULL;
+
+    cJSON *d = cJSON_CreateObject();
+
+    /* Header */
+    cJSON *hdr = cJSON_AddObjectToObject(d, "header");
+    cJSON_AddNumberToObject(hdr, "magic",       pidx->hdr->magic);
+    cJSON_AddNumberToObject(hdr, "version",     pidx->hdr->version);
+    cJSON_AddNumberToObject(hdr, "entry_count", pidx->hdr->entry_count);
+    cJSON_AddNumberToObject(hdr, "pack_count",  pidx->hdr->pack_count);
+
+    /* Fanout (256 entries) */
+    cJSON *fan = cJSON_AddArrayToObject(d, "fanout");
+    for (int i = 0; i < 256; i++)
+        cJSON_AddItemToArray(fan, cJSON_CreateNumber((double)pidx->fanout[i]));
+
+    /* Entries — paginated */
+    uint32_t offset = 0, limit = 1000;
+    if (params) {
+        const cJSON *joff = cJSON_GetObjectItemCaseSensitive(params, "offset");
+        if (cJSON_IsNumber(joff) && joff->valuedouble >= 0)
+            offset = (uint32_t)joff->valuedouble;
+        const cJSON *jlim = cJSON_GetObjectItemCaseSensitive(params, "limit");
+        if (cJSON_IsNumber(jlim) && jlim->valuedouble > 0)
+            limit = (uint32_t)jlim->valuedouble;
+    }
+    if (limit > 5000) limit = 5000;
+    uint32_t total = pidx->hdr->entry_count;
+    if (offset > total) offset = total;
+    uint32_t end = offset + limit;
+    if (end > total) end = total;
+
+    cJSON *arr = cJSON_AddArrayToObject(d, "entries");
+    char hex[65];
+    for (uint32_t i = offset; i < end; i++) {
+        const pack_index_entry_t *e = &pidx->entries[i];
+        cJSON *item = cJSON_CreateObject();
+        hash_hex(e->hash, hex);
+        cJSON_AddStringToObject(item, "hash", hex);
+        cJSON_AddNumberToObject(item, "pack_num",     e->pack_num);
+        cJSON_AddNumberToObject(item, "dat_offset",   (double)e->dat_offset);
+        cJSON_AddNumberToObject(item, "pack_version", e->pack_version);
+        cJSON_AddNumberToObject(item, "entry_index",  e->entry_index);
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    cJSON_AddNumberToObject(d, "offset",      offset);
+    cJSON_AddNumberToObject(d, "limit",       limit);
+    cJSON_AddBoolToObject(d,   "has_more",    end < total);
+
+    pack_index_close(pidx);
+    return d;
+}
+
 /* ------------------------------------------------------------------ */
 /* Dispatch table                                                      */
 /* ------------------------------------------------------------------ */
@@ -1087,7 +1148,8 @@ static const action_entry_t actions[] = {
     { "loose_list",       handle_loose_list },
     { "search",           handle_search },
     { "all_pack_entries", handle_all_pack_entries },
-    { "object_refs",      handle_object_refs },
+    { "object_refs",          handle_object_refs },
+    { "global_pack_index",    handle_global_pack_index },
     { NULL, NULL }
 };
 

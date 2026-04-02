@@ -34,7 +34,7 @@ static size_t data_size(uint32_t entry_count) {
 
 pack_index_t *pack_index_open(repo_t *repo) {
     char path[4096];
-    if (snprintf(path, sizeof(path), "%s/packs/pack-index",
+    if (snprintf(path, sizeof(path), "%s/packs/pack-index.pidx",
                  repo_path(repo)) >= (int)sizeof(path))
         return NULL;
 
@@ -350,7 +350,7 @@ status_t pack_index_rebuild(repo_t *repo) {
 
     /* Write to temp file */
     char tmp_path[4096];
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s/packs/pack-index.tmp",
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s/packs/pack-index.pidx.tmp",
                  repo_path(repo)) >= (int)sizeof(tmp_path)) {
         free(buf);
         return set_error(ERR_IO, "pack_index_rebuild: path too long");
@@ -427,7 +427,7 @@ status_t pack_index_rebuild(repo_t *repo) {
     close(fd);
 
     char final_path[4096];
-    snprintf(final_path, sizeof(final_path), "%s/packs/pack-index",
+    snprintf(final_path, sizeof(final_path), "%s/packs/pack-index.pidx",
              repo_path(repo));
     if (rename(tmp_path, final_path) == -1) {
         unlink(tmp_path);

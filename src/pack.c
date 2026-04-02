@@ -780,7 +780,7 @@ void pack_cache_invalidate(repo_t *repo) {
     /* Remove stale global pack index so next load falls through to
      * the per-pack .idx scan and rebuilds fresh state. */
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/packs/pack-index", repo_path(repo));
+    snprintf(path, sizeof(path), "%s/packs/pack-index.pidx", repo_path(repo));
     (void)unlink(path);
 }
 

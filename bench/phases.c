@@ -991,7 +991,7 @@ static void bench_pack_index_rebuild(void)
 
     /* Delete index, then time rebuild */
     char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index", BENCH_REPO);
+    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", BENCH_REPO);
     unlink(idx_path);
 
     int iters = 20;
