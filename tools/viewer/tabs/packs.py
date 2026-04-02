@@ -242,9 +242,11 @@ class PacksTab:
 
     def _build_global_index(self) -> None:
         # Header info
-        self._gidx_hdr_text = make_text_widget(
-            self._gidx_frame, height=6)
-        self._gidx_hdr_text.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+        hdr_frame = ttk.Frame(self._gidx_frame)
+        hdr_frame.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+        self._gidx_hdr_text = make_text_widget(hdr_frame)
+        self._gidx_hdr_text.config(height=5)
+        self._gidx_hdr_text.pack(fill=tk.X)
 
         # Fanout bar chart canvas
         fan_lbl = tk.Label(self._gidx_frame, text="Fanout distribution",
