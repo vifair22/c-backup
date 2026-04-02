@@ -33,6 +33,7 @@ import select
 import subprocess
 import tempfile
 import threading
+import time
 
 # Locate the backup binary: env override > build dir relative to repo > PATH
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -262,6 +263,7 @@ class Session:
                 req["params"] = {k: v for k, v in params.items()
                                  if v is not None}
 
+            t0 = time.monotonic()
             line_out = json.dumps(req, separators=(",", ":")) + "\n"
             try:
                 proc.stdin.write(line_out.encode())
@@ -273,6 +275,10 @@ class Session:
                 resp_line = self._readline(timeout=120)
             except RPCError:
                 raise
+
+            elapsed = time.monotonic() - t0
+            if elapsed >= 5.0:
+                _log_slow("session", action, params, elapsed)
 
             try:
                 resp = json.loads(resp_line)
@@ -394,6 +400,17 @@ def call(repo_spec: str, action: str, **params) -> dict:
     return _call_oneshot(repo_spec, action, **params)
 
 
+_SLOW_THRESHOLD = 5.0
+
+
+def _log_slow(mode: str, action: str, params: dict, elapsed: float) -> None:
+    p = ""
+    if params:
+        p = " " + " ".join(f"{k}={v}" for k, v in params.items()
+                            if v is not None)
+    print(f"[RPC SLOW] {elapsed:.1f}s  {mode}  {action}{p}")
+
+
 def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
     """One-shot RPC: spawn a subprocess, send one request, return response."""
     host, repo_path = parse_remote(repo_spec)
@@ -410,6 +427,7 @@ def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
         cmd = ["ssh"] + _ssh_base_opts(host) + [host,
                REMOTE_BIN, "--json", repo_path]
 
+    t0 = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
@@ -429,6 +447,10 @@ def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
         target = f"{host}:{repo_path}" if host else repo_path
         raise RPCError(
             f"backup --json timed out for action '{action}' on {target}")
+
+    elapsed = time.monotonic() - t0
+    if elapsed >= _SLOW_THRESHOLD:
+        _log_slow("oneshot", action, params, elapsed)
 
     if not proc.stdout:
         stderr = proc.stderr.decode(errors="replace").strip()
