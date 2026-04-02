@@ -349,6 +349,83 @@ static cJSON *handle_policy(repo_t *repo, const cJSON *params)
     return d;
 }
 
+/* --- save_policy -------------------------------------------------- */
+static cJSON *json_get_str_array(const cJSON *arr, char ***out, int *n)
+{
+    *out = NULL;
+    *n = 0;
+    if (!arr || !cJSON_IsArray(arr)) return NULL;
+    int cnt = cJSON_GetArraySize(arr);
+    if (cnt <= 0) return NULL;
+    char **list = calloc((size_t)cnt, sizeof(char *));
+    if (!list) return NULL;
+    for (int i = 0; i < cnt; i++) {
+        const cJSON *item = cJSON_GetArrayItem(arr, i);
+        if (cJSON_IsString(item))
+            list[i] = strdup(item->valuestring);
+        else
+            list[i] = strdup("");
+    }
+    *out = list;
+    *n = cnt;
+    return NULL;
+}
+
+static int json_get_bool(const cJSON *obj, const char *key, int def)
+{
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsBool(j)) return cJSON_IsTrue(j) ? 1 : 0;
+    return def;
+}
+
+static int json_get_int(const cJSON *obj, const char *key, int def)
+{
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(j)) return (int)j->valuedouble;
+    return def;
+}
+
+static cJSON *handle_save_policy(repo_t *repo, const cJSON *params)
+{
+    if (!params)
+        return set_error(ERR_INVALID, "save_policy: missing params"), NULL;
+
+    policy_t pol;
+    policy_init_defaults(&pol);
+
+    json_get_str_array(
+        cJSON_GetObjectItemCaseSensitive(params, "paths"),
+        &pol.paths, &pol.n_paths);
+    json_get_str_array(
+        cJSON_GetObjectItemCaseSensitive(params, "exclude"),
+        &pol.exclude, &pol.n_exclude);
+
+    pol.keep_snaps   = json_get_int(params, "keep_snaps",   pol.keep_snaps);
+    pol.keep_daily   = json_get_int(params, "keep_daily",   pol.keep_daily);
+    pol.keep_weekly  = json_get_int(params, "keep_weekly",  pol.keep_weekly);
+    pol.keep_monthly = json_get_int(params, "keep_monthly", pol.keep_monthly);
+    pol.keep_yearly  = json_get_int(params, "keep_yearly",  pol.keep_yearly);
+    pol.auto_pack    = json_get_bool(params, "auto_pack",   pol.auto_pack);
+    pol.auto_gc      = json_get_bool(params, "auto_gc",     pol.auto_gc);
+    pol.auto_prune   = json_get_bool(params, "auto_prune",  pol.auto_prune);
+    pol.verify_after = json_get_bool(params, "verify_after", pol.verify_after);
+    pol.strict_meta  = json_get_bool(params, "strict_meta", pol.strict_meta);
+
+    status_t st = policy_save(repo, &pol);
+
+    /* Free string arrays */
+    for (int i = 0; i < pol.n_paths; i++) free(pol.paths[i]);
+    free(pol.paths);
+    for (int i = 0; i < pol.n_exclude; i++) free(pol.exclude[i]);
+    free(pol.exclude);
+
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "saved", 1);
+    return d;
+}
+
 /* --- object_locate ------------------------------------------------ */
 static cJSON *handle_object_locate(repo_t *repo, const cJSON *params)
 {
@@ -1140,6 +1217,157 @@ static cJSON *handle_object_refs(repo_t *repo, const cJSON *params)
     return d;
 }
 
+/* --- object_layout ------------------------------------------------ */
+static cJSON *handle_object_layout(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jhash = cJSON_GetObjectItemCaseSensitive(params, "hash");
+    if (!cJSON_IsString(jhash))
+        return set_error(ERR_INVALID, "object_layout: missing 'hash' param"),
+               NULL;
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    if (hex_to_hash(jhash->valuestring, hash) != 0)
+        return set_error(ERR_INVALID, "object_layout: invalid hex hash"), NULL;
+
+    /* Build loose object path: objects/XX/YYYYYY... */
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_hex(hash, hex);
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/objects/%.2s/%s",
+                 repo_path(repo), hex, hex + 2) >= (int)sizeof(path))
+        return set_error(ERR_INVALID, "object_layout: path too long"), NULL;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return set_error(ERR_NOT_FOUND, "object_layout: object not found"),
+               NULL;
+
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) { close(fd); return NULL; }
+    off_t file_sz = sb.st_size;
+
+    /* Read object header (56 bytes) */
+    object_header_t hdr;
+    if (file_sz < (off_t)sizeof(hdr) ||
+        pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "object_layout: truncated header"), NULL;
+    }
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddNumberToObject(d, "file_size", (double)file_sz);
+    cJSON_AddNumberToObject(d, "header_size", (double)sizeof(hdr));
+    cJSON_AddNumberToObject(d, "version", hdr.version);
+    cJSON_AddNumberToObject(d, "type", hdr.type);
+    cJSON_AddNumberToObject(d, "compression", hdr.compression);
+    cJSON_AddNumberToObject(d, "uncompressed_size",
+                            (double)hdr.uncompressed_size);
+    cJSON_AddNumberToObject(d, "compressed_size",
+                            (double)hdr.compressed_size);
+
+    cJSON *segs = cJSON_AddArrayToObject(d, "segments");
+
+    /* Segment 1: object header */
+    {
+        cJSON *s = cJSON_CreateObject();
+        cJSON_AddStringToObject(s, "kind", "header");
+        cJSON_AddNumberToObject(s, "offset", 0);
+        cJSON_AddNumberToObject(s, "size", (double)sizeof(hdr));
+        cJSON_AddItemToArray(segs, s);
+    }
+
+    /* Segment 2: payload */
+    off_t payload_start = (off_t)sizeof(hdr);
+    off_t payload_end   = payload_start + (off_t)hdr.compressed_size;
+    if (payload_end > file_sz) payload_end = file_sz;
+    if (payload_end > payload_start) {
+        cJSON *s = cJSON_CreateObject();
+        cJSON_AddStringToObject(s, "kind", "payload");
+        cJSON_AddNumberToObject(s, "offset", (double)payload_start);
+        cJSON_AddNumberToObject(s, "size", (double)(payload_end - payload_start));
+        cJSON_AddItemToArray(segs, s);
+    }
+
+    /* Parity trailer — read footer from end of file */
+    off_t trailer_start = payload_end;
+    off_t trailer_sz    = file_sz - trailer_start;
+    if (trailer_sz > 0 && file_sz >= (off_t)sizeof(parity_footer_t)) {
+        parity_footer_t pftr;
+        ssize_t pr = pread(fd, &pftr, sizeof(pftr),
+                           file_sz - (off_t)sizeof(pftr));
+        if (pr == (ssize_t)sizeof(pftr) &&
+            pftr.magic == PARITY_FOOTER_MAGIC &&
+            (off_t)pftr.trailer_size == trailer_sz) {
+
+            size_t rs_sz = rs_parity_size((size_t)hdr.compressed_size);
+            size_t expected = sizeof(parity_record_t) + rs_sz + 4 + 4
+                              + sizeof(parity_footer_t);
+
+            if ((size_t)trailer_sz == expected) {
+                off_t off = trailer_start;
+
+                /* XOR header parity (260 bytes) */
+                {
+                    cJSON *s = cJSON_CreateObject();
+                    cJSON_AddStringToObject(s, "kind", "hdr_parity");
+                    cJSON_AddNumberToObject(s, "offset", (double)off);
+                    cJSON_AddNumberToObject(s, "size",
+                                            (double)sizeof(parity_record_t));
+                    cJSON_AddItemToArray(segs, s);
+                    off += (off_t)sizeof(parity_record_t);
+                }
+
+                /* RS parity */
+                if (rs_sz > 0) {
+                    cJSON *s = cJSON_CreateObject();
+                    cJSON_AddStringToObject(s, "kind", "rs_parity");
+                    cJSON_AddNumberToObject(s, "offset", (double)off);
+                    cJSON_AddNumberToObject(s, "size", (double)rs_sz);
+                    cJSON_AddItemToArray(segs, s);
+                    off += (off_t)rs_sz;
+                }
+
+                /* Payload CRC (4) + RS data length (4) */
+                {
+                    cJSON *s = cJSON_CreateObject();
+                    cJSON_AddStringToObject(s, "kind", "par_crc");
+                    cJSON_AddNumberToObject(s, "offset", (double)off);
+                    cJSON_AddNumberToObject(s, "size", 8);
+                    cJSON_AddItemToArray(segs, s);
+                    off += 8;
+                }
+
+                /* Parity footer (12 bytes) */
+                {
+                    cJSON *s = cJSON_CreateObject();
+                    cJSON_AddStringToObject(s, "kind", "par_footer");
+                    cJSON_AddNumberToObject(s, "offset", (double)off);
+                    cJSON_AddNumberToObject(s, "size",
+                                            (double)sizeof(parity_footer_t));
+                    cJSON_AddItemToArray(segs, s);
+                }
+            } else {
+                /* Unknown trailer layout */
+                cJSON *s = cJSON_CreateObject();
+                cJSON_AddStringToObject(s, "kind", "trailer_unknown");
+                cJSON_AddNumberToObject(s, "offset", (double)trailer_start);
+                cJSON_AddNumberToObject(s, "size", (double)trailer_sz);
+                cJSON_AddItemToArray(segs, s);
+            }
+        } else {
+            /* No valid parity footer */
+            cJSON *s = cJSON_CreateObject();
+            cJSON_AddStringToObject(s, "kind", "trailer_unknown");
+            cJSON_AddNumberToObject(s, "offset", (double)trailer_start);
+            cJSON_AddNumberToObject(s, "size", (double)trailer_sz);
+            cJSON_AddItemToArray(segs, s);
+        }
+    }
+
+    close(fd);
+    return d;
+}
+
 /* --- global_pack_index -------------------------------------------- */
 static cJSON *handle_global_pack_index(repo_t *repo, const cJSON *params)
 {
@@ -1217,6 +1445,7 @@ static const action_entry_t actions[] = {
     { "snap",             handle_snap },
     { "tags",             handle_tags },
     { "policy",           handle_policy },
+    { "save_policy",      handle_save_policy },
     { "object_locate",    handle_object_locate },
     { "object_content",   handle_object_content },
     { "diff",             handle_diff },
@@ -1228,6 +1457,7 @@ static const action_entry_t actions[] = {
     { "search",           handle_search },
     { "all_pack_entries", handle_all_pack_entries },
     { "object_refs",          handle_object_refs },
+    { "object_layout",        handle_object_layout },
     { "global_pack_index",    handle_global_pack_index },
     { NULL, NULL }
 };

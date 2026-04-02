@@ -1,8 +1,8 @@
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from .rpc import RPCError
+from .rpc import RPCError, is_remote, parse_remote, ssh_connect
 from .widgets import PAD
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
@@ -70,6 +70,32 @@ class ViewerApp(tk.Tk):
 
         search_tab.set_navigate_callback(nav)
 
+    # ---- SSH auth ----
+
+    def _ensure_ssh(self, host: str) -> bool:
+        """Establish SSH connection, prompting for password if needed."""
+        # Try key auth first
+        if ssh_connect(host):
+            return True
+
+        # Key auth failed — ask for password
+        password = simpledialog.askstring(
+            "SSH Authentication",
+            f"Password for {host}:",
+            show="*",
+            parent=self)
+        if not password:
+            return False
+
+        if ssh_connect(host, password):
+            return True
+
+        messagebox.showerror(
+            "SSH Error",
+            f"Authentication failed for {host}",
+            parent=self)
+        return False
+
     # ---- open repo ----
 
     def _open_repo(self) -> None:
@@ -78,9 +104,14 @@ class ViewerApp(tk.Tk):
             self.load_repo(path)
 
     def load_repo(self, path: str) -> None:
-        if not os.path.isdir(path):
+        if is_remote(path):
+            host, _ = parse_remote(path)
+            if not self._ensure_ssh(host):
+                return
+        elif not os.path.isdir(path):
             messagebox.showerror("Error", f"Not a directory: {path}")
             return
+
         self.repo_path = path
         self._repo_var.set(path)
         for tab in self._tabs.values():

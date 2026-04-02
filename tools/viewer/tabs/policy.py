@@ -1,4 +1,3 @@
-import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -32,7 +31,7 @@ class PolicyTab:
     def __init__(self, nb: ttk.Notebook):
         self._frame = ttk.Frame(nb)
         nb.add(self._frame, text="Policy")
-        self._policy_path: str | None = None
+        self._repo_path: str | None = None
         self._bool_vars: dict[str, tk.BooleanVar] = {}
         self._int_vars:  dict[str, tk.StringVar]  = {}
         self._build()
@@ -115,7 +114,7 @@ class PolicyTab:
         inner.columnconfigure(1, weight=1)
 
     def populate(self, repo_path: str) -> None:
-        self._policy_path = os.path.join(repo_path, "policy.toml")
+        self._repo_path = repo_path
 
         fmt_str = ""
         try:
@@ -133,13 +132,13 @@ class PolicyTab:
             data = None
 
         if data is None or data == {}:
-            # policy action returns null when file doesn't exist
             self._status_label.config(
                 text=f"{fmt_str}No policy.toml — defaults shown. Save to create.",
                 fg="gray")
             data = dict(_DEFAULTS)
         else:
-            self._status_label.config(text=f"{fmt_str}{self._policy_path}", fg="gray")
+            self._status_label.config(
+                text=f"{fmt_str}policy.toml loaded via RPC", fg="gray")
 
         self._paths_text.delete("1.0", tk.END)
         self._paths_text.insert("1.0", "\n".join(data.get("paths", [])))
@@ -156,7 +155,7 @@ class PolicyTab:
         self._save_status.config(text="")
 
     def _save(self) -> None:
-        if not self._policy_path:
+        if not self._repo_path:
             messagebox.showinfo("No repo", "Open a repository first.")
             return
 
@@ -165,35 +164,22 @@ class PolicyTab:
         exclude = [p.strip() for p in
                    self._exclude_text.get("1.0", tk.END).splitlines() if p.strip()]
 
-        def _arr(lst: list) -> str:
-            if not lst:
-                return "[]"
-            return "[" + ", ".join(f'"{s}"' for s in lst) + "]"
-
-        lines = [
-            f"paths = {_arr(paths)}",
-            f"exclude = {_arr(exclude)}",
-        ]
+        params: dict = {
+            "paths": paths,
+            "exclude": exclude,
+        }
         for key, _ in _INT_FIELDS:
             try:
-                v = int(self._int_vars[key].get())
+                params[key] = int(self._int_vars[key].get())
             except ValueError:
-                v = 0
-            lines.append(f"{key} = {v}")
+                params[key] = 0
         for key, _ in _BOOL_FIELDS:
-            v = "true" if self._bool_vars[key].get() else "false"
-            lines.append(f"{key} = {v}")
+            params[key] = bool(self._bool_vars[key].get())
 
-        tmp = self._policy_path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                f.write("\n".join(lines) + "\n")
-            os.replace(tmp, self._policy_path)
+            call(self._repo_path, "save_policy", **params)
             self._save_status.config(text="Saved.", fg="green")
-            self._status_label.config(text=self._policy_path, fg="gray")
-        except OSError as e:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            self._status_label.config(
+                text="policy.toml saved via RPC", fg="gray")
+        except RPCError as e:
             messagebox.showerror("Save error", str(e))
