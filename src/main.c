@@ -1622,10 +1622,13 @@ static int cmd_prune(repo_t *repo, int argc, char **argv) {
 static int cmd_gfs(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = {
         { "--repo", 1 }, { "--dry-run", 0 },
+        { "--full-scan", 0 }, { "--quiet", 0 },
     };
-    if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
+    if (validate_options(argc, argv, 2, specs, 4, NULL, 0)) return 1;
 
-    int dry_run = opt_has(argc, argv, 2, "--dry-run");
+    int dry_run   = opt_has(argc, argv, 2, "--dry-run");
+    int full_scan = opt_has(argc, argv, 2, "--full-scan");
+    int quiet     = opt_has(argc, argv, 2, "--quiet");
 
     policy_t *pol = NULL;
     policy_load(repo, &pol);
@@ -1645,7 +1648,7 @@ static int cmd_gfs(repo_t *repo, int argc, char **argv) {
     if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
 
     uint32_t pruned = 0;
-    status_t st2 = gfs_run(repo, pol, head_id, dry_run, 0, 1, &pruned);
+    status_t st2 = gfs_run(repo, pol, head_id, dry_run, quiet, full_scan, &pruned);
     if (st2 == OK && !dry_run && pruned > 0)
         repo_gc(repo, NULL, NULL);
     if (st2 != OK)
