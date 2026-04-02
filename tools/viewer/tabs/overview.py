@@ -21,7 +21,8 @@ class OverviewTab:
                 scan = call(repo_path, "scan")
                 snap_list = call(repo_path, "list")
             except RPCError as e:
-                self._frame.after(0, lambda: set_text(self._text, f"Error: {e}"))
+                msg = f"Error: {e}"
+                self._frame.after(0, lambda: set_text(self._text, msg))
                 return
 
             snaps = snap_list.get("snapshots", [])
