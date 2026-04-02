@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 from .rpc import RPCError, is_remote, parse_remote, ssh_connect
-from .widgets import PAD
+from .widgets import PAD, install_poll
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
     LooseTab, TagsTab, PolicyTab, LookupTab,
@@ -17,6 +17,7 @@ class ViewerApp(tk.Tk):
         self.title("c-backup Repository Viewer")
         self.geometry("1200x850")
         self.repo_path: str | None = None
+        install_poll(self)
         self._build_menu()
         self._build_layout()
 

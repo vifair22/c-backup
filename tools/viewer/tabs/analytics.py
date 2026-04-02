@@ -11,7 +11,7 @@ from ..constants import (
     OBJECT_TYPE_XATTR, OBJECT_TYPE_ACL,
     PROBER_VERSION,
 )
-from ..widgets import make_text_widget, set_text, PAD, FONT_MONO, FONT_BOLD
+from ..widgets import make_text_widget, set_text, ui_call, PAD, FONT_MONO, FONT_BOLD
 
 _TYPES = [OBJECT_TYPE_FILE, OBJECT_TYPE_SPARSE, OBJECT_TYPE_XATTR, OBJECT_TYPE_ACL]
 _COLORS = {
@@ -176,7 +176,7 @@ class AnalyticsTab:
                 "incomp_uncomp":  incomp_uncomp,
             }
 
-            self._frame.after(0, lambda: self._display(
+            ui_call(lambda: self._display(
                 lines, chart_data, loc_data, compress_data))
 
         threading.Thread(target=_worker, daemon=True).start()

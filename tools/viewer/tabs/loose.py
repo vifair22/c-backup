@@ -12,7 +12,7 @@ from ..constants import (
     OBJECT_TYPE_SPARSE, UI_SIZE_LIMIT, ZERO_HASH,
     COMPRESS_NONE, COMPRESS_LZ4, COMPRESS_LZ4_FRAME,
 )
-from ..widgets import (make_text_widget, set_text,
+from ..widgets import (make_text_widget, set_text, ui_call,
                        PAD, FONT_MONO, FONT_BOLD)
 
 _PREVIEW_LIMIT = UI_SIZE_LIMIT
@@ -306,10 +306,9 @@ class LooseTab:
             try:
                 d = call(repo_path, "object_layout", hash=hash_hex)
             except RPCError:
-                self._map_frame.after(0, self._clear_map)
+                ui_call(self._clear_map)
                 return
-            self._map_frame.after(
-                0, lambda: self._apply_layout(d, comp))
+            ui_call(lambda: self._apply_layout(d, comp))
 
         threading.Thread(target=_worker, daemon=True).start()
 

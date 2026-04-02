@@ -5,7 +5,7 @@ from tkinter import ttk
 from ..rpc import call, RPCError
 from ..formats import fmt_size
 from ..constants import OBJECT_HASH_SIZE, OBJECT_TYPE_NAMES
-from ..widgets import make_text_widget, set_text, FONT_MONO, PAD
+from ..widgets import make_text_widget, set_text, ui_call, FONT_MONO, PAD
 
 
 class LookupTab:
@@ -88,7 +88,7 @@ class LookupTab:
                     ))
             except RPCError:
                 pass
-            self._frame.after(0, lambda: self._finish_lookup(
+            ui_call(lambda: self._finish_lookup(
                 fast_lines, referencing, gen))
 
         threading.Thread(target=_worker, daemon=True).start()

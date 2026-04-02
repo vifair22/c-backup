@@ -11,7 +11,7 @@ from ..formats import fmt_size
 from ..constants import (OBJECT_TYPE_NAMES, COMPRESS_NAMES,
                          PACK_DAT_HDR_SIZE,
                          COMPRESS_NONE, COMPRESS_LZ4, COMPRESS_LZ4_FRAME)
-from ..widgets import make_text_widget, set_text, PAD, FONT_MONO, FONT_BOLD
+from ..widgets import make_text_widget, set_text, ui_call, PAD, FONT_MONO, FONT_BOLD
 
 _ENTRY_PAGE = 500
 
@@ -315,10 +315,10 @@ class PacksTab:
             try:
                 d = call(repo_path, "global_pack_index")
             except RPCError:
-                self._gidx_frame.after(0, lambda: self._gidx_loading.config(
+                ui_call(lambda: self._gidx_loading.config(
                     text="No global index available"))
                 return
-            self._gidx_frame.after(0, lambda: self._finish_gidx(d))
+            ui_call(lambda: self._finish_gidx(d))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -436,11 +436,9 @@ class PacksTab:
                 fsz = int(d.get("file_size", 0))
             except RPCError as e:
                 err = str(e)
-                self._entry_frame.after(0,
-                    lambda: self._on_dat_error(err, gen))
+                ui_call(lambda: self._on_dat_error(err, gen))
                 return
-            self._entry_frame.after(0,
-                lambda: self._finish_load_dat(dat_name, d, fsz, gen))
+            ui_call(lambda: self._finish_load_dat(dat_name, d, fsz, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 

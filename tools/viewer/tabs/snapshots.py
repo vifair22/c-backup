@@ -8,7 +8,7 @@ from ..formats import fmt_size, fmt_time, fmt_mode, gfs_flags_str
 from ..constants import (NODE_TYPE_NAMES, NODE_TYPE_REG, NODE_TYPE_DIR,
                          NODE_TYPE_SYMLINK, NODE_TYPE_CHR, NODE_TYPE_BLK,
                          ZERO_HASH)
-from ..widgets import make_text_widget, make_text_tab, set_text, PAD, FONT_MONO, FONT_BOLD
+from ..widgets import make_text_widget, make_text_tab, set_text, ui_call, PAD, FONT_MONO, FONT_BOLD
 
 # Cap visible rows; filter narrows the window before this limit matters
 NODE_PAGE_SIZE = 500
@@ -201,9 +201,9 @@ class SnapshotsTab:
                 s = call(repo_path, "snap", id=snap_id)
             except RPCError as e:
                 err = str(e)
-                self._frame.after(0, lambda: self._on_load_error(err, gen))
+                ui_call(lambda: self._on_load_error(err, gen))
                 return
-            self._frame.after(0, lambda: self._finish_load(s, gen))
+            ui_call(lambda: self._finish_load(s, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 

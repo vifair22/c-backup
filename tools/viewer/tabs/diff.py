@@ -6,7 +6,7 @@ from tkinter import ttk, messagebox
 
 from ..rpc import call, RPCError
 from ..formats import fmt_size, fmt_time
-from ..widgets import PAD, FONT_MONO, make_text_widget
+from ..widgets import PAD, FONT_MONO, make_text_widget, ui_call
 from ..constants import UI_SIZE_LIMIT, ZERO_HASH
 
 _DIFF_ROW_CAP = 5000
@@ -121,7 +121,7 @@ class DiffTab:
                 result = call(repo_path, "diff", id1=id_a, id2=id_b)
             except RPCError as e:
                 err = str(e)
-                self._frame.after(0, lambda: self._on_compare_error(err, gen))
+                ui_call(lambda: self._on_compare_error(err, gen))
                 return
 
             changes = result.get("changes", [])
@@ -161,7 +161,7 @@ class DiffTab:
                 if len(result_rows) < _DIFF_ROW_CAP:
                     result_rows.append(((status, path, old_sz, new_sz, old_h, new_h), tag))
 
-            self._frame.after(0, lambda: self._finish_compare(
+            ui_call(lambda: self._finish_compare(
                 changes, counts, result_rows, id_a, id_b, gen))
 
         threading.Thread(target=_worker, daemon=True).start()

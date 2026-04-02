@@ -4,7 +4,7 @@ from tkinter import ttk
 
 from ..rpc import call, RPCError
 from ..formats import fmt_size, fmt_time, gfs_flags_str
-from ..widgets import make_text_widget, set_text, PAD, FONT_BOLD
+from ..widgets import make_text_widget, set_text, ui_call, PAD, FONT_BOLD
 
 
 class OverviewTab:
@@ -22,7 +22,7 @@ class OverviewTab:
                 snap_list = call(repo_path, "list")
             except RPCError as e:
                 msg = f"Error: {e}"
-                self._frame.after(0, lambda: set_text(self._text, msg))
+                ui_call(lambda: set_text(self._text, msg))
                 return
 
             snaps = snap_list.get("snapshots", [])
@@ -62,6 +62,6 @@ class OverviewTab:
                         f"  {pk['name']:30}  {fmt_size(int(pk.get('size', 0))):>10}"
                     )
 
-            self._frame.after(0, lambda: set_text(self._text, "\n".join(lines)))
+            ui_call(lambda: set_text(self._text, "\n".join(lines)))
 
         threading.Thread(target=_worker, daemon=True).start()

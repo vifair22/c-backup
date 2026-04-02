@@ -3,6 +3,7 @@ Shared tkinter widget helpers used by every tab.
 """
 
 import base64
+import queue
 import struct
 import tkinter as tk
 from tkinter import ttk
@@ -10,6 +11,38 @@ from tkinter import ttk
 FONT_MONO = ("Courier", 10)
 FONT_BOLD = ("TkDefaultFont", 10, "bold")
 PAD = 4
+
+# ── Thread-safe callback scheduling ─────────────────────────────────
+# Python 3.13 forbids widget.after() from non-main threads.
+# Workers put callables here; the main loop drains it.
+
+_callback_queue: queue.Queue = queue.Queue()
+_poll_installed = False
+
+
+def ui_call(fn) -> None:
+    """Schedule *fn* to run on the main (Tk) thread. Thread-safe."""
+    _callback_queue.put(fn)
+
+
+def install_poll(root: tk.Tk, interval_ms: int = 30) -> None:
+    """Start polling the callback queue on the main thread.
+    Call once from the application after Tk() is created."""
+    global _poll_installed
+    if _poll_installed:
+        return
+    _poll_installed = True
+
+    def _drain():
+        try:
+            while True:
+                fn = _callback_queue.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
+        root.after(interval_ms, _drain)
+
+    root.after(interval_ms, _drain)
 
 
 def make_text_widget(parent) -> tk.Text:

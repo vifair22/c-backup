@@ -5,7 +5,7 @@ from tkinter import ttk
 from ..rpc import call, RPCError
 from ..formats import fmt_size, fmt_time
 from ..constants import NODE_TYPE_NAMES
-from ..widgets import PAD, FONT_MONO
+from ..widgets import PAD, FONT_MONO, ui_call
 
 _RESULT_CAP = 5000
 
@@ -118,7 +118,7 @@ class SearchTab:
                     fmt_size(int(node.get("size", 0))),
                     node.get("content_hash", "")[:20] + "\u2026",
                 ))
-            self._frame.after(0, lambda: self._finish_search(results, gen))
+            ui_call(lambda: self._finish_search(results, gen))
 
         threading.Thread(target=_worker, daemon=True).start()
 
