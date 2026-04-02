@@ -82,7 +82,15 @@ class DiffTab:
             self._snap_list = data.get("snapshots", [])
         except RPCError:
             self._snap_list = []
+        self._apply_list()
 
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        data = summary.get("list") or {}
+        self._snap_list = data.get("snapshots", [])
+        self._apply_list()
+
+    def _apply_list(self) -> None:
         labels = []
         for s in self._snap_list:
             labels.append(f"{int(s['id']):>6}  {fmt_time(int(s['created_sec']))}")

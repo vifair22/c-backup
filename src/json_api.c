@@ -1428,6 +1428,38 @@ static cJSON *handle_global_pack_index(repo_t *repo, const cJSON *params)
     return d;
 }
 
+/* --- repo_summary ------------------------------------------------- */
+static cJSON *handle_repo_summary(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    cJSON *d = cJSON_CreateObject();
+    if (!d) return NULL;
+
+    /* Each sub-call: on failure, store JSON null and continue. */
+    static const struct { const char *key; cJSON *(*fn)(repo_t *, const cJSON *); }
+    subs[] = {
+        { "scan",             handle_scan },
+        { "list",             handle_list },
+        { "tags",             handle_tags },
+        { "policy",           handle_policy },
+        { "loose_list",       handle_loose_list },
+        { "all_pack_entries", handle_all_pack_entries },
+        { "global_pack_index", handle_global_pack_index },
+    };
+
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+        err_clear();
+        cJSON *sub = subs[i].fn(repo, NULL);
+        if (sub)
+            cJSON_AddItemToObject(d, subs[i].key, sub);
+        else
+            cJSON_AddNullToObject(d, subs[i].key);
+        err_clear();
+    }
+
+    return d;
+}
+
 /* ------------------------------------------------------------------ */
 /* Dispatch table                                                      */
 /* ------------------------------------------------------------------ */
@@ -1459,6 +1491,7 @@ static const action_entry_t actions[] = {
     { "object_refs",          handle_object_refs },
     { "object_layout",        handle_object_layout },
     { "global_pack_index",    handle_global_pack_index },
+    { "repo_summary",         handle_repo_summary },
     { NULL, NULL }
 };
 
@@ -1520,5 +1553,83 @@ int json_api_dispatch(repo_t *repo)
     }
 
     cJSON_Delete(req);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Persistent session mode                                             */
+/* ------------------------------------------------------------------ */
+
+int json_api_session(repo_t *repo)
+{
+    /* Suppress stray log output that would corrupt the JSON stream */
+    FILE *f = freopen("/dev/null", "w", stderr);
+    (void)f;
+
+    /* Ready banner */
+    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":1}\n");
+    fflush(stdout);
+
+    /* Shared lock for the lifetime of the session */
+    repo_lock_shared(repo);
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t line_len;
+
+    while ((line_len = getline(&line, &line_cap, stdin)) > 0) {
+        /* Strip trailing newline */
+        if (line_len > 0 && line[line_len - 1] == '\n')
+            line[--line_len] = '\0';
+        if (line_len == 0) continue;
+
+        cJSON *req = cJSON_Parse(line);
+        if (!req) {
+            write_error("invalid JSON request");
+            continue;
+        }
+
+        const cJSON *jaction = cJSON_GetObjectItemCaseSensitive(req, "action");
+        if (!cJSON_IsString(jaction) || !jaction->valuestring[0]) {
+            write_error("missing or empty 'action' field");
+            cJSON_Delete(req);
+            continue;
+        }
+
+        if (strcmp(jaction->valuestring, "quit") == 0) {
+            cJSON_Delete(req);
+            break;
+        }
+
+        const cJSON *jparams = cJSON_GetObjectItemCaseSensitive(req, "params");
+
+        /* Find handler */
+        action_handler_t handler = NULL;
+        for (int i = 0; actions[i].name; i++) {
+            if (strcmp(actions[i].name, jaction->valuestring) == 0) {
+                handler = actions[i].handler;
+                break;
+            }
+        }
+
+        if (!handler) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "unknown action '%s'",
+                     jaction->valuestring);
+            write_error(msg);
+        } else {
+            err_clear();
+            cJSON *data = handler(repo, jparams);
+            if (data) {
+                write_ok(data);
+            } else {
+                write_error(err_msg()[0] ? err_msg() : "action failed");
+            }
+        }
+        err_clear();
+        cJSON_Delete(req);
+    }
+
+    free(line);
     return 0;
 }

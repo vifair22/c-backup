@@ -115,21 +115,27 @@ class PolicyTab:
 
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
-
-        fmt_str = ""
         try:
             scan = call(repo_path, "scan")
-            fmt_val = scan.get("format")
-            if fmt_val:
-                fmt_str = f"Format: {fmt_val}  |  "
         except RPCError:
-            pass
-
-        # Load policy via RPC
+            scan = {}
         try:
-            data = call(repo_path, "policy")
+            policy = call(repo_path, "policy")
         except RPCError:
-            data = None
+            policy = None
+        self._apply(scan, policy)
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        scan = summary.get("scan") or {}
+        policy = summary.get("policy")
+        self._apply(scan, policy)
+
+    def _apply(self, scan: dict, data: dict | None) -> None:
+        fmt_str = ""
+        fmt_val = scan.get("format")
+        if fmt_val:
+            fmt_str = f"Format: {fmt_val}  |  "
 
         if data is None or data == {}:
             self._status_label.config(

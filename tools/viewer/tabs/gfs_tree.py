@@ -105,14 +105,19 @@ class GFSTreeTab:
     # --------------------------------------------------------------- populate
 
     def populate(self, repo_path: str) -> None:
-        self._tree.delete(*self._tree.get_children())
-
         try:
             data = call(repo_path, "list")
         except RPCError:
             self._summary.config(text="Error loading snapshot list.")
             return
+        self._display(data)
 
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        data = summary.get("list") or {}
+        self._display(data)
+
+    def _display(self, data: dict) -> None:
+        self._tree.delete(*self._tree.get_children())
         snaps = data.get("snapshots", [])
         if not snaps:
             self._summary.config(text="No snapshots found.")

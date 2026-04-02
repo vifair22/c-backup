@@ -75,6 +75,15 @@ class SearchTab:
             self._snap_list = data.get("snapshots", [])
         except RPCError:
             self._snap_list = []
+        self._apply_list()
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        data = summary.get("list") or {}
+        self._snap_list = data.get("snapshots", [])
+        self._apply_list()
+
+    def _apply_list(self) -> None:
         self._snap_by_id = {int(s["id"]): s for s in self._snap_list}
         self._head_id = int(self._snap_list[-1]["id"]) if self._snap_list else None
 

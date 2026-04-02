@@ -1,14 +1,31 @@
 import os
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from .rpc import RPCError, is_remote, parse_remote, ssh_connect
-from .widgets import PAD, install_poll
+from .rpc import (RPCError, is_remote, parse_remote, ssh_connect,
+                  open_session, close_session, call)
+from .widgets import PAD, install_poll, ui_call
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
     LooseTab, TagsTab, PolicyTab, LookupTab,
     DiffTab, AnalyticsTab, SearchTab, GFSTreeTab,
 )
+
+# Map tab key → which repo_summary sub-keys it needs
+_SUMMARY_KEYS = {
+    "overview":  ("scan", "list"),
+    "analytics": ("all_pack_entries", "loose_list"),
+    "search":    ("list",),
+    "diff":      ("list",),
+    "snapshots": ("list",),
+    "loose":     ("loose_list",),
+    "packs":     ("scan", "global_pack_index"),
+    "tags":      ("tags",),
+    "policy":    ("scan", "policy"),
+    "lookup":    (),
+    "gfs_tree":  ("list",),
+}
 
 
 class ViewerApp(tk.Tk):
@@ -113,8 +130,49 @@ class ViewerApp(tk.Tk):
             messagebox.showerror("Error", f"Not a directory: {path}")
             return
 
+        # Close any previous session
+        if self.repo_path:
+            close_session(self.repo_path)
+
         self.repo_path = path
         self._repo_var.set(path)
+        self.title(f"c-backup Viewer — {path}")
+
+        # Show loading state on all tabs
+        for tab in self._tabs.values():
+            if hasattr(tab, "set_loading"):
+                tab.set_loading()
+
+        # Open session + fetch summary in background
+        def _load():
+            # Try to open a persistent session
+            open_session(path)
+
+            # Try consolidated summary
+            try:
+                summary = call(path, "repo_summary")
+            except RPCError:
+                summary = None
+
+            if summary:
+                ui_call(lambda: self._apply_summary(path, summary))
+            else:
+                # Fallback: per-tab populate
+                ui_call(lambda: self._populate_all(path))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _apply_summary(self, path: str, summary: dict) -> None:
+        """Distribute pre-fetched summary data to each tab."""
+        for key, tab in self._tabs.items():
+            needed = _SUMMARY_KEYS.get(key, ())
+            sub = {k: summary.get(k) for k in needed}
+            if hasattr(tab, "populate_from_summary"):
+                tab.populate_from_summary(path, sub)
+            else:
+                tab.populate(path)
+
+    def _populate_all(self, path: str) -> None:
+        """Legacy fallback: each tab fetches its own data."""
         for tab in self._tabs.values():
             tab.populate(path)
-        self.title(f"c-backup Viewer — {path}")

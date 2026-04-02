@@ -65,121 +65,126 @@ class AnalyticsTab:
         set_text(self._text, "Loading…")
 
         def _worker() -> None:
-            stats = {t: {"count": 0, "uncomp": 0, "comp": 0} for t in _TYPES}
-
-            pack    = {"count": 0, "uncomp": 0, "comp": 0}
-            loose   = {"count": 0, "uncomp": 0, "comp": 0}
-            skip    = {"count": 0, "uncomp": 0, "comp": 0}
-            hiratio = {"count": 0, "uncomp": 0, "comp": 0}
-
-            # All pack entries in a single RPC call
             try:
                 pack_data = call(repo_path, "all_pack_entries")
             except RPCError:
                 pack_data = {"entries": []}
-            for e in pack_data.get("entries", []):
-                t = int(e["type"])
-                uncomp = int(e["uncompressed_size"])
-                comp   = int(e["compressed_size"])
-                if t in stats:
-                    stats[t]["count"]  += 1
-                    stats[t]["uncomp"] += uncomp
-                    stats[t]["comp"]   += comp
-                pack["count"]  += 1
-                pack["uncomp"] += uncomp
-                pack["comp"]   += comp
-                if uncomp > 0 and comp / uncomp >= 0.90:
-                    hiratio["count"]  += 1
-                    hiratio["uncomp"] += uncomp
-                    hiratio["comp"]   += comp
-
-            # Loose objects
             try:
                 loose_data = call(repo_path, "loose_list")
             except RPCError:
                 loose_data = {"objects": []}
-            for obj in loose_data.get("objects", []):
-                t      = int(obj["type"])
-                uncomp = int(obj["uncompressed_size"])
-                comp   = int(obj["compressed_size"])
-                if t in stats:
-                    stats[t]["count"]  += 1
-                    stats[t]["uncomp"] += uncomp
-                    stats[t]["comp"]   += comp
-                loose["count"]  += 1
-                loose["uncomp"] += uncomp
-                loose["comp"]   += comp
-                if int(obj.get("pack_skip_ver", 0)) == PROBER_VERSION:
-                    skip["count"]  += 1
-                    skip["uncomp"] += uncomp
-                    skip["comp"]   += comp
-
-            total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
-            total_comp   = sum(s["comp"]   for s in stats.values()) or 1
-            total_count  = sum(s["count"]  for s in stats.values())
-            savings      = total_uncomp - total_comp
-
-            lines = [
-                f"{'Type':<8}  {'Count':>7}  {'Uncompressed':>14}  {'Compressed':>12}  {'Ratio':>6}",
-                "\u2500" * 58,
-            ]
-            for t in _TYPES:
-                s = stats[t]
-                ratio = f"{s['comp'] / s['uncomp']:.3f}" if s["uncomp"] else "\u2014"
-                lines.append(
-                    f"{OBJECT_TYPE_NAMES.get(t, t):<8}  {s['count']:>7}"
-                    f"  {fmt_size(s['uncomp']):>14}  {fmt_size(s['comp']):>12}  {ratio:>6}"
-                )
-            lines += [
-                "\u2500" * 58,
-                f"{'TOTAL':<8}  {total_count:>7}  {fmt_size(total_uncomp):>14}"
-                f"  {fmt_size(total_comp):>12}  {total_comp / total_uncomp:.3f}",
-                "",
-                f"Space saved : {fmt_size(savings)}"
-                f"  ({100 * (1 - total_comp / total_uncomp):.1f}% reduction)",
-            ]
-
-            total_all        = pack["count"]  + loose["count"]
-            total_all_uncomp = pack["uncomp"] + loose["uncomp"]
-            incomp_count     = skip["count"]  + hiratio["count"]
-            incomp_uncomp    = skip["uncomp"] + hiratio["uncomp"]
-            comp_count       = total_all        - incomp_count
-            comp_uncomp      = total_all_uncomp - incomp_uncomp
-
-            lines += [
-                "",
-                f"{'Category':<20}  {'Count':>7}  {'Uncompressed':>14}",
-                "\u2500" * 46,
-                f"{'Compressible':<20}  {comp_count:>7}  {fmt_size(comp_uncomp):>14}",
-                f"{'Incompressible':<20}  {incomp_count:>7}  {fmt_size(incomp_uncomp):>14}",
-                f"{'  skip-marked':<20}  {skip['count']:>7}  {fmt_size(skip['uncomp']):>14}",
-                f"{'  high-ratio pack':<20}  {hiratio['count']:>7}  {fmt_size(hiratio['uncomp']):>14}",
-            ]
-
-            chart_data = [(t, stats[t]["uncomp"], stats[t]["count"]) for t in _TYPES]
-            loose_only_count = loose["count"] - skip["count"]
-            loose_only_bytes = loose["uncomp"] - skip["uncomp"]
-            loc_data = [
-                ("Pack",         pack["uncomp"],       pack["count"],       _COLOR_PACK),
-                ("Loose",        loose_only_bytes,      loose_only_count,    _COLOR_LOOSE),
-                ("Loose (skip)", skip["uncomp"],        skip["count"],       _COLOR_LOOSE_SKIP),
-            ]
-            compress_data = {
-                "total":          total_all,
-                "comp_count":     comp_count,
-                "comp_uncomp":    comp_uncomp,
-                "skip_count":     skip["count"],
-                "skip_uncomp":    skip["uncomp"],
-                "hiratio_count":  hiratio["count"],
-                "hiratio_uncomp": hiratio["uncomp"],
-                "incomp_count":   incomp_count,
-                "incomp_uncomp":  incomp_uncomp,
-            }
-
-            ui_call(lambda: self._display(
-                lines, chart_data, loc_data, compress_data))
+            ui_call(lambda: self._compute_and_display(pack_data, loose_data))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        pack_data = summary.get("all_pack_entries") or {"entries": []}
+        loose_data = summary.get("loose_list") or {"objects": []}
+        self._compute_and_display(pack_data, loose_data)
+
+    def _compute_and_display(self, pack_data: dict, loose_data: dict) -> None:
+        stats = {t: {"count": 0, "uncomp": 0, "comp": 0} for t in _TYPES}
+
+        pack    = {"count": 0, "uncomp": 0, "comp": 0}
+        loose   = {"count": 0, "uncomp": 0, "comp": 0}
+        skip    = {"count": 0, "uncomp": 0, "comp": 0}
+        hiratio = {"count": 0, "uncomp": 0, "comp": 0}
+
+        for e in pack_data.get("entries", []):
+            t = int(e["type"])
+            uncomp = int(e["uncompressed_size"])
+            comp   = int(e["compressed_size"])
+            if t in stats:
+                stats[t]["count"]  += 1
+                stats[t]["uncomp"] += uncomp
+                stats[t]["comp"]   += comp
+            pack["count"]  += 1
+            pack["uncomp"] += uncomp
+            pack["comp"]   += comp
+            if uncomp > 0 and comp / uncomp >= 0.90:
+                hiratio["count"]  += 1
+                hiratio["uncomp"] += uncomp
+                hiratio["comp"]   += comp
+
+        for obj in loose_data.get("objects", []):
+            t      = int(obj["type"])
+            uncomp = int(obj["uncompressed_size"])
+            comp   = int(obj["compressed_size"])
+            if t in stats:
+                stats[t]["count"]  += 1
+                stats[t]["uncomp"] += uncomp
+                stats[t]["comp"]   += comp
+            loose["count"]  += 1
+            loose["uncomp"] += uncomp
+            loose["comp"]   += comp
+            if int(obj.get("pack_skip_ver", 0)) == PROBER_VERSION:
+                skip["count"]  += 1
+                skip["uncomp"] += uncomp
+                skip["comp"]   += comp
+
+        total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
+        total_comp   = sum(s["comp"]   for s in stats.values()) or 1
+        total_count  = sum(s["count"]  for s in stats.values())
+        savings      = total_uncomp - total_comp
+
+        lines = [
+            f"{'Type':<8}  {'Count':>7}  {'Uncompressed':>14}  {'Compressed':>12}  {'Ratio':>6}",
+            "\u2500" * 58,
+        ]
+        for t in _TYPES:
+            s = stats[t]
+            ratio = f"{s['comp'] / s['uncomp']:.3f}" if s["uncomp"] else "\u2014"
+            lines.append(
+                f"{OBJECT_TYPE_NAMES.get(t, t):<8}  {s['count']:>7}"
+                f"  {fmt_size(s['uncomp']):>14}  {fmt_size(s['comp']):>12}  {ratio:>6}"
+            )
+        lines += [
+            "\u2500" * 58,
+            f"{'TOTAL':<8}  {total_count:>7}  {fmt_size(total_uncomp):>14}"
+            f"  {fmt_size(total_comp):>12}  {total_comp / total_uncomp:.3f}",
+            "",
+            f"Space saved : {fmt_size(savings)}"
+            f"  ({100 * (1 - total_comp / total_uncomp):.1f}% reduction)",
+        ]
+
+        total_all        = pack["count"]  + loose["count"]
+        total_all_uncomp = pack["uncomp"] + loose["uncomp"]
+        incomp_count     = skip["count"]  + hiratio["count"]
+        incomp_uncomp    = skip["uncomp"] + hiratio["uncomp"]
+        comp_count       = total_all        - incomp_count
+        comp_uncomp      = total_all_uncomp - incomp_uncomp
+
+        lines += [
+            "",
+            f"{'Category':<20}  {'Count':>7}  {'Uncompressed':>14}",
+            "\u2500" * 46,
+            f"{'Compressible':<20}  {comp_count:>7}  {fmt_size(comp_uncomp):>14}",
+            f"{'Incompressible':<20}  {incomp_count:>7}  {fmt_size(incomp_uncomp):>14}",
+            f"{'  skip-marked':<20}  {skip['count']:>7}  {fmt_size(skip['uncomp']):>14}",
+            f"{'  high-ratio pack':<20}  {hiratio['count']:>7}  {fmt_size(hiratio['uncomp']):>14}",
+        ]
+
+        chart_data = [(t, stats[t]["uncomp"], stats[t]["count"]) for t in _TYPES]
+        loose_only_count = loose["count"] - skip["count"]
+        loose_only_bytes = loose["uncomp"] - skip["uncomp"]
+        loc_data = [
+            ("Pack",         pack["uncomp"],       pack["count"],       _COLOR_PACK),
+            ("Loose",        loose_only_bytes,      loose_only_count,    _COLOR_LOOSE),
+            ("Loose (skip)", skip["uncomp"],        skip["count"],       _COLOR_LOOSE_SKIP),
+        ]
+        compress_data = {
+            "total":          total_all,
+            "comp_count":     comp_count,
+            "comp_uncomp":    comp_uncomp,
+            "skip_count":     skip["count"],
+            "skip_uncomp":    skip["uncomp"],
+            "hiratio_count":  hiratio["count"],
+            "hiratio_uncomp": hiratio["uncomp"],
+            "incomp_count":   incomp_count,
+            "incomp_uncomp":  incomp_uncomp,
+        }
+
+        self._display(lines, chart_data, loc_data, compress_data)
 
     def _display(self, lines, chart_data, loc_data, compress_data) -> None:
         set_text(self._text, "\n".join(lines))

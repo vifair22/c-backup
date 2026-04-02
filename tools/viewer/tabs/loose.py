@@ -186,15 +186,23 @@ class LooseTab:
 
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
-        self._list.delete(0, tk.END)
         try:
             data = call(repo_path, "loose_list")
-            self._objects = data.get("objects", [])
         except RPCError as e:
             self._objects = []
             set_text(self._info_text,
                      f"Error loading loose objects: {e}")
             return
+        self._apply_list(data)
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        data = summary.get("loose_list") or {"objects": []}
+        self._apply_list(data)
+
+    def _apply_list(self, data: dict) -> None:
+        self._list.delete(0, tk.END)
+        self._objects = data.get("objects", [])
         for obj in self._objects:
             h = obj.get("hash", "")
             self._list.insert(tk.END, h[:2] + "/" + h[2:])

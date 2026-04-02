@@ -395,18 +395,29 @@ class PacksTab:
 
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
-        self._pack_names = []
-        self._list.delete(0, tk.END)
-
         try:
             scan = call(repo_path, "scan")
-            for pk in sorted(scan.get("packs", []), key=lambda p: p["name"]):
-                self._pack_names.append(pk["name"])
-                self._list.insert(tk.END, pk["name"])
         except RPCError:
-            pass
-
+            scan = {}
+        self._apply_scan(scan)
         self._load_global_index()
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        scan = summary.get("scan") or {}
+        self._apply_scan(scan)
+        gidx = summary.get("global_pack_index")
+        if gidx:
+            self._finish_gidx(gidx)
+        else:
+            self._gidx_loading.config(text="No global index available")
+
+    def _apply_scan(self, scan: dict) -> None:
+        self._pack_names = []
+        self._list.delete(0, tk.END)
+        for pk in sorted(scan.get("packs", []), key=lambda p: p["name"]):
+            self._pack_names.append(pk["name"])
+            self._list.insert(tk.END, pk["name"])
 
     # ---- events ----
 

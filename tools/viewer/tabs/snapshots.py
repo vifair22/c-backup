@@ -148,14 +148,20 @@ class SnapshotsTab:
 
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
-        self._snap_ids = []
-        self._snap_headers = []
-        self._list.delete(0, tk.END)
-
         try:
             data = call(repo_path, "list")
         except RPCError:
-            return
+            data = {}
+        self._apply_list(data)
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        self._apply_list(summary.get("list") or {})
+
+    def _apply_list(self, data: dict) -> None:
+        self._snap_ids = []
+        self._snap_headers = []
+        self._list.delete(0, tk.END)
 
         head_id = data.get("head")
         for s in data.get("snapshots", []):

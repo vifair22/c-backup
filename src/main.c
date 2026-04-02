@@ -1938,7 +1938,7 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) { usage(); return 1; }
 
-    /* --json mode: JSON RPC via stdin/stdout */
+    /* --json mode: one-shot JSON RPC via stdin/stdout */
     if (argc >= 3 && strcmp(argv[1], "--json") == 0) {
         repo_t *repo = NULL;
         if (repo_open(argv[2], &repo) != OK) {
@@ -1949,6 +1949,22 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         int ret = json_api_dispatch(repo);
+        repo_close(repo);
+        return ret;
+    }
+
+    /* --json-session mode: persistent JSON RPC session */
+    if (argc >= 3 && strcmp(argv[1], "--json-session") == 0) {
+        signal(SIGPIPE, SIG_IGN);
+        repo_t *repo = NULL;
+        if (repo_open(argv[2], &repo) != OK) {
+            fprintf(stdout,
+                    "{\"status\":\"error\",\"message\":\"cannot open repository: %s\"}\n",
+                    err_msg()[0] ? err_msg() : "unknown error");
+            fflush(stdout);
+            return 1;
+        }
+        int ret = json_api_session(repo);
         repo_close(repo);
         return ret;
     }

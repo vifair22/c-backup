@@ -31,6 +31,9 @@ class LookupTab:
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
 
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+
     def _lookup(self) -> None:
         if not self._repo_path:
             set_text(self._text, "No repository open.")

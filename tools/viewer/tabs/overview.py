@@ -25,43 +25,51 @@ class OverviewTab:
                 ui_call(lambda: set_text(self._text, msg))
                 return
 
-            snaps = snap_list.get("snapshots", [])
-            head  = snap_list.get("head")
-            packs = scan.get("packs", [])
-
-            lines = [
-                f"Repository : {repo_path}",
-                f"HEAD snap  : {head if head else '—'}",
-                f"Snapshots  : {scan.get('snapshot_files', 0)}",
-                f"Pack files : {len(packs)} .dat",
-                f"Loose objs : {scan.get('loose_objects', 0)}",
-                f"Tags       : {scan.get('tag_count', 0)}",
-                "",
-            ]
-
-            fmt_str = scan.get("format")
-            if fmt_str:
-                lines.insert(1, f"Format     : {fmt_str}")
-
-            if snaps:
-                lines.append("── Snapshots ──────────────────────────────────────────────────────────")
-                lines.append(f"  {'ID':>8}  {'Created':>19}  {'Nodes':>7}  {'GFS':>25}  New bytes")
-                for s in snaps:
-                    gfs = gfs_flags_str(int(s.get("gfs_flags", 0)))
-                    lines.append(
-                        f"  {s['id']:>8}  {fmt_time(int(s['created_sec'])):>19}"
-                        f"  {int(s.get('node_count', 0)):>7}  {gfs:>25}"
-                        f"  {fmt_size(int(s.get('phys_new_bytes', 0)))}"
-                    )
-
-            if packs:
-                lines += ["", "── Pack .dat files ────────────────────────────────────────────────────"]
-                lines.append(f"  {'File':30}  {'Size':>10}")
-                for pk in packs:
-                    lines.append(
-                        f"  {pk['name']:30}  {fmt_size(int(pk.get('size', 0))):>10}"
-                    )
-
-            ui_call(lambda: set_text(self._text, "\n".join(lines)))
+            ui_call(lambda: self._display(repo_path, scan, snap_list))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        scan = summary.get("scan") or {}
+        snap_list = summary.get("list") or {}
+        self._display(repo_path, scan, snap_list)
+
+    def _display(self, repo_path: str, scan: dict, snap_list: dict) -> None:
+        snaps = snap_list.get("snapshots", [])
+        head  = snap_list.get("head")
+        packs = scan.get("packs", [])
+
+        lines = [
+            f"Repository : {repo_path}",
+            f"HEAD snap  : {head if head else '—'}",
+            f"Snapshots  : {scan.get('snapshot_files', 0)}",
+            f"Pack files : {len(packs)} .dat",
+            f"Loose objs : {scan.get('loose_objects', 0)}",
+            f"Tags       : {scan.get('tag_count', 0)}",
+            "",
+        ]
+
+        fmt_str = scan.get("format")
+        if fmt_str:
+            lines.insert(1, f"Format     : {fmt_str}")
+
+        if snaps:
+            lines.append("── Snapshots ──────────────────────────────────────────────────────────")
+            lines.append(f"  {'ID':>8}  {'Created':>19}  {'Nodes':>7}  {'GFS':>25}  New bytes")
+            for s in snaps:
+                gfs = gfs_flags_str(int(s.get("gfs_flags", 0)))
+                lines.append(
+                    f"  {s['id']:>8}  {fmt_time(int(s['created_sec'])):>19}"
+                    f"  {int(s.get('node_count', 0)):>7}  {gfs:>25}"
+                    f"  {fmt_size(int(s.get('phys_new_bytes', 0)))}"
+                )
+
+        if packs:
+            lines += ["", "── Pack .dat files ────────────────────────────────────────────────────"]
+            lines.append(f"  {'File':30}  {'Size':>10}")
+            for pk in packs:
+                lines.append(
+                    f"  {pk['name']:30}  {fmt_size(int(pk.get('size', 0))):>10}"
+                )
+
+        set_text(self._text, "\n".join(lines))

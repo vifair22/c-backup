@@ -44,6 +44,14 @@ class TagsTab:
         for tag in self._tags:
             self._list.insert(tk.END, tag.get("name", "?"))
 
+    def populate_from_summary(self, repo_path: str, summary: dict) -> None:
+        self._repo_path = repo_path
+        self._list.delete(0, tk.END)
+        data = summary.get("tags") or {}
+        self._tags = data.get("tags", [])
+        for tag in self._tags:
+            self._list.insert(tk.END, tag.get("name", "?"))
+
     def _on_select(self, _event) -> None:
         sel = self._list.curselection()
         if not sel:
