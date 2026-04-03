@@ -269,6 +269,10 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
     }
     closedir(top);
 
+    /* Invalidate in-memory loose set — entries may have been deleted */
+    if (loose_deleted > 0)
+        repo_clear_loose_set(repo);
+
     if (show_progress) gc_line_clear();
 
     /* Also compact pack files, removing unreferenced entries */

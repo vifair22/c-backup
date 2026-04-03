@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,12 @@ struct repo {
     dat_cache_slot_t *dat_cache;
     uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
     uint32_t          dat_cache_count;  /* occupied slots */
+    /* In-memory hash set of loose object hashes (open-addressing, 32-byte keys) */
+    uint8_t         *loose_set;       /* NULL until built */
+    uint32_t         loose_set_mask;  /* capacity - 1 */
+    uint32_t         loose_set_cnt;
+    pthread_mutex_t  loose_set_mu;    /* protects inserts during parallel store */
+    int              loose_set_ready;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -189,6 +196,11 @@ status_t repo_open(const char *path, repo_t **out) {
         close(fd); free(r->path); free(r);
         return set_error(ERR_NOMEM, "repo_open: dat_cache alloc failed");
     }
+    r->loose_set       = NULL;
+    r->loose_set_mask  = 0;
+    r->loose_set_cnt   = 0;
+    r->loose_set_ready = 0;
+    pthread_mutex_init(&r->loose_set_mu, NULL);
     *out = r;
     return OK;
 }
@@ -203,6 +215,8 @@ void repo_close(repo_t *repo) {
     close(repo->dirfd);
     free(repo->path);
     free(repo->pack_cache);
+    pthread_mutex_destroy(&repo->loose_set_mu);
+    free(repo->loose_set);
     free(repo);
 }
 
@@ -218,6 +232,148 @@ int repo_objects_fd(repo_t *repo) {
     if (repo->obj_dirfd >= 0) return repo->obj_dirfd;
     repo->obj_dirfd = openat(repo->dirfd, "objects", O_RDONLY | O_DIRECTORY);
     return repo->obj_dirfd;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-memory loose object hash set                                     */
+/* ------------------------------------------------------------------ */
+
+#define LOOSE_SET_HASH_SIZE 32
+
+/* Slot layout: LOOSE_SET_HASH_SIZE bytes per slot.  All-zero = empty. */
+static uint32_t loose_set_slot(const uint8_t *hash, uint32_t mask) {
+    uint64_t k;
+    memcpy(&k, hash, sizeof(k));  /* first 8 bytes, native endian */
+    return (uint32_t)(k & (uint64_t)mask);
+}
+
+static const uint8_t loose_set_empty[LOOSE_SET_HASH_SIZE]; /* all zeros */
+
+static int loose_set_is_empty(const uint8_t *slot) {
+    return memcmp(slot, loose_set_empty, LOOSE_SET_HASH_SIZE) == 0;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_to_bin(const char *hex, uint8_t *out, size_t out_len) {
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+status_t repo_build_loose_set(repo_t *repo) {
+    if (repo->loose_set_ready) return OK;
+
+    int objfd = repo_objects_fd(repo);
+    if (objfd == -1) { repo->loose_set_ready = 1; return OK; }
+
+    /* First pass: count loose objects */
+    uint32_t count = 0;
+    char subdir[3];
+    for (unsigned i = 0; i < 256; i++) {
+        snprintf(subdir, sizeof(subdir), "%02x", i);
+        int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
+        if (subfd == -1) continue;
+        DIR *d = fdopendir(subfd);
+        if (!d) { close(subfd); continue; }
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            count++;
+        }
+        closedir(d);  /* also closes subfd */
+    }
+
+    /* Allocate at 50% load factor, minimum 256 slots */
+    uint32_t cap = 256;
+    while (cap < count * 2) cap *= 2;
+    repo->loose_set = calloc(cap, LOOSE_SET_HASH_SIZE);
+    if (!repo->loose_set) return set_error(ERR_NOMEM, "loose_set alloc");
+    repo->loose_set_mask = cap - 1;
+    repo->loose_set_cnt = 0;
+
+    /* Second pass: populate */
+    for (unsigned i = 0; i < 256; i++) {
+        snprintf(subdir, sizeof(subdir), "%02x", i);
+        int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
+        if (subfd == -1) continue;
+        DIR *d = fdopendir(subfd);
+        if (!d) { close(subfd); continue; }
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            /* Reconstruct full hash from bucket prefix + filename */
+            size_t nlen = strlen(de->d_name);
+            if (nlen != (LOOSE_SET_HASH_SIZE * 2 - 2)) continue;  /* 62 hex chars */
+            char hex[LOOSE_SET_HASH_SIZE * 2 + 1];
+            snprintf(hex, sizeof(hex), "%02x%s", i, de->d_name);
+            /* Parse hex to binary */
+            uint8_t hash[LOOSE_SET_HASH_SIZE];
+            if (hex_to_bin(hex, hash, LOOSE_SET_HASH_SIZE) != 0) continue;
+            /* Insert */
+            repo_loose_set_insert(repo, hash);
+        }
+        closedir(d);
+    }
+
+    repo->loose_set_ready = 1;
+    return OK;
+}
+
+int repo_loose_set_contains(repo_t *repo, const uint8_t *hash) {
+    if (!repo->loose_set_ready || !repo->loose_set) return 0;
+    uint32_t mask = repo->loose_set_mask;
+    uint32_t idx = loose_set_slot(hash, mask);
+    for (;;) {
+        const uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
+        if (loose_set_is_empty(slot)) return 0;
+        if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) return 1;
+        idx = (idx + 1) & mask;
+    }
+}
+
+void repo_loose_set_insert(repo_t *repo, const uint8_t *hash) {
+    if (!repo->loose_set) return;
+    /* All-zero hash is our empty sentinel — never insert it */
+    if (loose_set_is_empty(hash)) return;
+
+    pthread_mutex_lock(&repo->loose_set_mu);
+    uint32_t mask = repo->loose_set_mask;
+    uint32_t idx = loose_set_slot(hash, mask);
+    for (;;) {
+        uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
+        if (loose_set_is_empty(slot)) {
+            memcpy(slot, hash, LOOSE_SET_HASH_SIZE);
+            repo->loose_set_cnt++;
+            break;
+        }
+        if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) break;  /* already present */
+        idx = (idx + 1) & mask;
+    }
+    pthread_mutex_unlock(&repo->loose_set_mu);
+}
+
+void repo_clear_loose_set(repo_t *repo) {
+    pthread_mutex_lock(&repo->loose_set_mu);
+    free(repo->loose_set);
+    repo->loose_set      = NULL;
+    repo->loose_set_mask = 0;
+    repo->loose_set_cnt  = 0;
+    repo->loose_set_ready = 0;
+    pthread_mutex_unlock(&repo->loose_set_mu);
+}
+
+int repo_loose_set_ready(const repo_t *repo) {
+    return repo->loose_set_ready;
 }
 
 void repo_set_pack_cache(repo_t *repo, void *data, size_t cnt) {

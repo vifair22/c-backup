@@ -65,15 +65,21 @@ static int obj_name_exists_at(int subfd, const char *fname) {
 }
 
 int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
-    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
-    hash_to_path(hash, subdir, fname);
-    int objfd = repo_objects_fd(repo);
-    if (objfd != -1) {
-        int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-        if (subfd != -1) {
-            int exists = (faccessat(subfd, fname, F_OK, 0) == 0);
-            close(subfd);
-            if (exists) return 1;
+    /* Fast path: in-memory loose set (returns 0 if set not built) */
+    if (repo_loose_set_contains(repo, hash)) return 1;
+
+    /* On-disk check — only needed when loose set has not been built */
+    if (!repo_loose_set_ready(repo)) {
+        char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+        hash_to_path(hash, subdir, fname);
+        int objfd = repo_objects_fd(repo);
+        if (objfd != -1) {
+            int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
+            if (subfd != -1) {
+                int exists = (faccessat(subfd, fname, F_OK, 0) == 0);
+                close(subfd);
+                if (exists) return 1;
+            }
         }
     }
     return pack_object_exists(repo, hash);
@@ -223,6 +229,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
         goto fail;
     }
     close(subfd); free(compressed);
+    repo_loose_set_insert(repo, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = total_phys;
     return st;
@@ -610,6 +617,7 @@ abort_reader:
     }
 
     close(subfd);
+    repo_loose_set_insert(repo, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
     return OK;
@@ -1127,6 +1135,7 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
         unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: rename(%s, %s)", tmppath, dstpath);
     }
 
+    repo_loose_set_insert(repo, expected_hash);
     return OK;
 }
 

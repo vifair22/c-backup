@@ -2,6 +2,7 @@
 
 #include "error.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * repo_t is an opaque handle to an open repository.
@@ -24,6 +25,13 @@ size_t repo_pack_cache_count(const repo_t *repo);
 
 /* Cached objects/ directory fd — avoids repeated openat on every existence check. */
 int    repo_objects_fd(repo_t *repo);
+
+/* In-memory hash set of loose object hashes — avoids per-file faccessat. */
+status_t repo_build_loose_set(repo_t *repo);
+int      repo_loose_set_contains(repo_t *repo, const uint8_t *hash);
+void     repo_loose_set_insert(repo_t *repo, const uint8_t *hash);
+void     repo_clear_loose_set(repo_t *repo);
+int      repo_loose_set_ready(const repo_t *repo);
 
 /* Pack .dat file handle cache — avoids repeated open/close on bulk lookups. */
 #include <stdio.h>

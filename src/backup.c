@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "backup.h"
 #include "scan.h"
 #include "object.h"
@@ -19,6 +19,37 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+
+#ifdef __linux__
+/* Detect if a path resides on a rotational (HDD) device.
+ * Returns 1 for HDD, 0 for SSD/unknown. */
+static int path_is_rotational(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    unsigned int maj = major(st.st_dev);
+    unsigned int min = minor(st.st_dev);
+    char syspath[128];
+    FILE *f;
+    /* Try partition's own queue first */
+    snprintf(syspath, sizeof(syspath),
+             "/sys/dev/block/%u:%u/queue/rotational", maj, min);
+    f = fopen(syspath, "r");
+    if (!f) {
+        /* Try parent device (partition → whole disk) */
+        snprintf(syspath, sizeof(syspath),
+                 "/sys/dev/block/%u:%u/../queue/rotational", maj, min);
+        f = fopen(syspath, "r");
+    }
+    if (!f) return 0;
+    int val = 0;
+    if (fscanf(f, "%d", &val) != 1) val = 0;
+    fclose(f);
+    return val == 1;
+}
+#else
+static int path_is_rotational(const char *path) { (void)path; return 0; }
+#endif
 
 static void fmt_bytes(uint64_t n, char *buf, size_t sz) {
     if      (n >= (uint64_t)1024*1024*1024)
@@ -149,18 +180,30 @@ static void store_chunk_cb(uint64_t chunk_bytes, void *ctx) {
     c->accumulated += chunk_bytes;
 }
 
+/* Open a file with O_NOATIME to avoid atime writeback on HDD.
+ * Falls back to plain O_RDONLY if the caller lacks ownership. */
+static int open_noatime(const char *path) {
+#ifdef O_NOATIME
+    int fd = open(path, O_RDONLY | O_NOATIME);
+    if (fd >= 0 || errno != EPERM) return fd;
+#endif
+    return open(path, O_RDONLY);
+}
+
 /* Store a file's content using sparse-aware storage (with per-chunk callback). */
 static status_t store_file_content_cb(repo_t *repo, const char *path,
                                       uint64_t file_size,
                                       uint8_t out_hash[OBJECT_HASH_SIZE],
                                       uint64_t *out_phys_new,
                                       xfer_progress_fn cb, void *cb_ctx) {
-    int fd = open(path, O_RDONLY);
+    int fd = open_noatime(path);
     if (fd == -1) return set_error_errno(ERR_IO, "store: open(%s)", path);
+    posix_fadvise(fd, 0, (off_t)file_size, POSIX_FADV_SEQUENTIAL);
     int is_new = 0;
     uint64_t phys = 0;
     status_t st = object_store_file_cb(repo, fd, file_size, out_hash,
                                        &is_new, &phys, cb, cb_ctx);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     close(fd);
     if (out_phys_new) *out_phys_new = is_new ? phys : 0;
     return st;
@@ -371,6 +414,19 @@ static void *store_worker_fn(void *arg) {
     return (void *)0;
 }
 
+/* Sort context for inode-ordered store queue. Only accessed in the
+ * single-threaded Phase 3a section before workers are spawned. */
+static scan_entry_t *g_sort_entries;
+
+static int store_task_ino_cmp(const void *a, const void *b) {
+    const store_task_t *ta = a, *tb = b;
+    ino_t ia = g_sort_entries[ta->idx].st.st_ino;
+    ino_t ib = g_sort_entries[tb->idx].st.st_ino;
+    if (ia < ib) return -1;
+    if (ia > ib) return  1;
+    return 0;
+}
+
 static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
                                  store_task_t *tasks, uint32_t queue_len,
                                  int show_progress, uint32_t *out_skipped,
@@ -383,12 +439,27 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
 
     int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 1;
+    int env_override = 0;
     {
         const char *env = getenv("CBACKUP_STORE_THREADS");
         if (env && *env) {
             char *end = NULL;
             long v = strtol(env, &end, 10);
-            if (end != env && *end == '\0' && v > 0) nthreads = (int)v;
+            if (end != env && *end == '\0' && v > 0) {
+                nthreads = (int)v;
+                env_override = 1;
+            }
+        }
+    }
+    /* Auto-detect rotational media — cap threads to avoid seek thrashing */
+    if (!env_override && queue_len > 0) {
+        const char *src = entries[tasks[0].idx].path;
+        if (path_is_rotational(src)) {
+            nthreads = nthreads > 2 ? 2 : nthreads;
+            char rmsg[80];
+            snprintf(rmsg, sizeof(rmsg),
+                     "store: rotational source detected, using %d thread(s)", nthreads);
+            log_msg("INFO", rmsg);
         }
     }
     if (nthreads > 256) nthreads = 256;
@@ -860,6 +931,16 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         if (!opts || !opts->quiet)
             fprintf(stderr, "no changes since snapshot %u, skipping\n", prev_id);
         goto done;
+    }
+
+    /* Pre-populate loose object hash set for fast existence checks */
+    repo_build_loose_set(repo);
+
+    /* Sort store queue by source inode for near-sequential HDD reads */
+    if (store_qlen > 1) {
+        g_sort_entries = scan->entries;
+        qsort(store_queue, store_qlen, sizeof(*store_queue), store_task_ino_cmp);
+        g_sort_entries = NULL;
     }
 
     /* ----------------------------------------------------------------
