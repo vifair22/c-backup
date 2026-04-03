@@ -22,6 +22,9 @@ void   repo_set_pack_cache(repo_t *repo, void *data, size_t cnt);
 void  *repo_pack_cache_data(const repo_t *repo);
 size_t repo_pack_cache_count(const repo_t *repo);
 
+/* Cached objects/ directory fd — avoids repeated openat on every existence check. */
+int    repo_objects_fd(repo_t *repo);
+
 /* Pack .dat file handle cache — avoids repeated open/close on bulk lookups. */
 #include <stdio.h>
 #include <stdint.h>

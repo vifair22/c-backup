@@ -67,10 +67,9 @@ static int obj_name_exists_at(int subfd, const char *fname) {
 int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
-    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int objfd = repo_objects_fd(repo);
     if (objfd != -1) {
         int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-        close(objfd);
         if (subfd != -1) {
             int exists = (faccessat(subfd, fname, F_OK, 0) == 0);
             close(subfd);
@@ -90,17 +89,13 @@ status_t object_physical_size(repo_t *repo,
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
-    int fd = open(path, O_RDONLY);
-    if (fd != -1) {
-        struct stat st;
-        if (fstat(fd, &st) == 0) {
-            close(fd);
-            *out_bytes = (uint64_t)st.st_size;
-            return OK;
-        }
-        close(fd);
-        return set_error_errno(ERR_IO, "fstat(%s)", path);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        *out_bytes = (uint64_t)st.st_size;
+        return OK;
     }
+    if (errno != ENOENT)
+        return set_error_errno(ERR_IO, "stat(%s)", path);
 
     return pack_object_physical_size(repo, hash, out_bytes);
 }
@@ -134,16 +129,14 @@ static status_t write_object(repo_t *repo, uint8_t type,
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
 
-    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int objfd = repo_objects_fd(repo);
     if (objfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
-        close(objfd);
         free(compressed);
         return set_error_errno(ERR_IO, "mkdirat(%s)", subdir);
     }
     if (errno == EEXIST) errno = 0;
     int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-    close(objfd);
     if (subfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(%s)", subdir); }
 
     char tmppath[PATH_MAX];
@@ -393,11 +386,39 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     }
 
     /* ----------------------------------------------------------------
-     * Main loop: hash + (compress +) write each buffer slot
+     * RS parity accumulator — computed inline to avoid re-reading the
+     * payload from the temp file after writing.
+     * ---------------------------------------------------------------- */
+    const size_t rs_group_data = (size_t)RS_K * RS_INTERLEAVE;  /* 15296 */
+    size_t rs_total_sz = rs_parity_size((size_t)file_size);
+    uint8_t *rs_par_buf = NULL;
+    uint8_t *rs_group_buf = NULL;
+    size_t rs_group_fill = 0;   /* bytes accumulated in current group */
+    size_t rs_par_off = 0;      /* write offset into rs_par_buf */
+    if (rs_total_sz > 0) {
+        rs_par_buf = malloc(rs_total_sz);
+        rs_group_buf = malloc(rs_group_data);
+        if (!rs_par_buf || !rs_group_buf) {
+            free(rs_par_buf); free(rs_group_buf);
+            pthread_mutex_lock(&dbl.mu);
+            dbl.abort = 1;
+            pthread_cond_broadcast(&dbl.cond);
+            pthread_mutex_unlock(&dbl.mu);
+            pthread_join(reader_thr, NULL);
+            pthread_cond_destroy(&dbl.cond);
+            pthread_mutex_destroy(&dbl.mu);
+            free(dbl.bufs[0]); free(dbl.bufs[1]);
+            EVP_MD_CTX_free(mdctx);
+            close(tfd); unlink(tmppath);
+            return set_error(ERR_NOMEM, "stream: rs parity alloc");
+        }
+    }
+
+    /* ----------------------------------------------------------------
+     * Main loop: hash + write + accumulate CRC & RS parity
      * ---------------------------------------------------------------- */
     status_t st            = OK;
     int      slot      = 0;
-    off_t    write_off = (off_t)sizeof(hdr) + (off_t)total_written;
     uint32_t stream_crc = 0;   /* CRC accumulated inline, used by parity trailer */
 
     for (;;) {
@@ -423,7 +444,27 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
             st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto abort_reader;
         }
         stream_crc = crc32c_update(stream_crc, dbl.bufs[slot], len);
-        write_off     += (off_t)len;
+
+        /* Accumulate RS parity inline, one group at a time */
+        if (rs_par_buf) {
+            const uint8_t *rp = dbl.bufs[slot];
+            size_t rrem = len;
+            while (rrem > 0) {
+                size_t space = rs_group_data - rs_group_fill;
+                size_t take = rrem < space ? rrem : space;
+                memcpy(rs_group_buf + rs_group_fill, rp, take);
+                rs_group_fill += take;
+                rp += take;
+                rrem -= take;
+                if (rs_group_fill == rs_group_data) {
+                    rs_parity_encode(rs_group_buf, rs_group_data,
+                                     rs_par_buf + rs_par_off);
+                    rs_par_off += (size_t)RS_2T * RS_INTERLEAVE;
+                    rs_group_fill = 0;
+                }
+            }
+        }
+
         total_written += len;
         if (progress_cb) progress_cb((uint64_t)len, progress_ctx);
 
@@ -453,20 +494,32 @@ abort_reader:
 
     /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
 
+    /* Flush final partial RS group */
+    if (st == OK && rs_par_buf && rs_group_fill > 0) {
+        rs_parity_encode(rs_group_buf, rs_group_fill,
+                         rs_par_buf + rs_par_off);
+        rs_par_off += rs_parity_size(rs_group_fill);
+        rs_group_fill = 0;
+    }
+    free(rs_group_buf);
+    rs_group_buf = NULL;
+
     if (st != OK) {
+        free(rs_par_buf);
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return st;
     }
 
     unsigned int dlen = 0;
     if (EVP_DigestFinal_ex(mdctx, out_hash, &dlen) != 1 || dlen != OBJECT_HASH_SIZE) {
-        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_IO, "stream: SHA256 finalize failed");
+        EVP_MD_CTX_free(mdctx); free(rs_par_buf);
+        close(tfd); unlink(tmppath); return set_error(ERR_IO, "stream: SHA256 finalize failed");
     }
     EVP_MD_CTX_free(mdctx);
 
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) {
-        close(tfd); unlink(tmppath); return OK;
+        free(rs_par_buf); close(tfd); unlink(tmppath); return OK;
     }
 
     /* Patch header: fill in sizes and hash now that we know them */
@@ -475,67 +528,42 @@ abort_reader:
     memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
     if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
         if (errno == 0) errno = EIO;
-        close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: pwrite header");
+        free(rs_par_buf); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "stream: pwrite header");
     }
 
     /* ---- Parity trailer (version 2) ----
-     * Read payload back from temp file (in page cache) to compute RS parity.
+     * CRC and RS parity were computed inline during the write loop.
      */
     {
         parity_record_t shdr_par;
         parity_record_compute(&hdr, sizeof(hdr), &shdr_par);
         if (lseek(tfd, 0, SEEK_END) == (off_t)-1 ||
             write(tfd, &shdr_par, sizeof(shdr_par)) != (ssize_t)sizeof(shdr_par)) {
-            close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write parity header");
+            free(rs_par_buf); close(tfd); unlink(tmppath);
+            return set_error_errno(ERR_IO, "stream: write parity header");
         }
 
-        /* Compute CRC and RS parity by reading payload back in groups */
         size_t payload_len = (size_t)total_written;
         size_t rs_sz = rs_parity_size(payload_len);
-        uint8_t *rs_par_buf = NULL;
-        if (rs_sz > 0) {
-            rs_par_buf = malloc(rs_sz);
-            if (!rs_par_buf) { close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", rs_sz); }
-        }
-
-        /* CRC was accumulated inline during the write loop (stream_crc).
-         * RS parity still requires a re-read in group-aligned chunks. */
-        size_t remaining_p = payload_len;
-        off_t read_pos = (off_t)sizeof(hdr);
-        size_t rs_par_off = 0;
-        size_t group_data = RS_K * (size_t)RS_INTERLEAVE;  /* 15296 */
-
-        if (rs_par_buf) {
-            uint8_t *tmp_buf = malloc(group_data);
-            if (!tmp_buf) { free(rs_par_buf); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", group_data); }
-
-            while (remaining_p > 0) {
-                size_t chunk = remaining_p < group_data ? remaining_p : group_data;
-                if (pread(tfd, tmp_buf, chunk, read_pos) != (ssize_t)chunk) {
-                    free(tmp_buf); free(rs_par_buf); close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: pread parity chunk");
-                }
-                size_t grp_par = rs_parity_size(chunk);
-                rs_parity_encode(tmp_buf, chunk, rs_par_buf + rs_par_off);
-                rs_par_off += grp_par;
-                read_pos += (off_t)chunk;
-                remaining_p -= chunk;
-            }
-            free(tmp_buf);
-        }
 
         if (rs_par_buf && rs_sz > 0) {
             if (write(tfd, rs_par_buf, rs_sz) != (ssize_t)rs_sz) {
-                free(rs_par_buf); close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write RS parity");
+                free(rs_par_buf); close(tfd); unlink(tmppath);
+                return set_error_errno(ERR_IO, "stream: write RS parity");
             }
-            free(rs_par_buf);
         }
+        free(rs_par_buf);
+        rs_par_buf = NULL;
 
         if (write(tfd, &stream_crc, sizeof(stream_crc)) != (ssize_t)sizeof(stream_crc)) {
-            close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write CRC");
+            close(tfd); unlink(tmppath);
+            return set_error_errno(ERR_IO, "stream: write CRC");
         }
         uint32_t rs_data_len_s = (uint32_t)payload_len;
         if (write(tfd, &rs_data_len_s, sizeof(rs_data_len_s)) != (ssize_t)sizeof(rs_data_len_s)) {
-            close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write rs_data_len");
+            close(tfd); unlink(tmppath);
+            return set_error_errno(ERR_IO, "stream: write rs_data_len");
         }
 
         parity_footer_t spfooter = {
@@ -545,12 +573,13 @@ abort_reader:
                              + sizeof(rs_data_len_s) + sizeof(spfooter)),
         };
         if (write(tfd, &spfooter, sizeof(spfooter)) != (ssize_t)sizeof(spfooter)) {
-            close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write parity footer");
+            close(tfd); unlink(tmppath);
+            return set_error_errno(ERR_IO, "stream: write parity footer");
         }
     }
     /* ---- End parity trailer ---- */
 
-    /* Evict payload pages now that parity re-read is complete */
+    /* Evict payload pages — no parity re-read needed */
     posix_fadvise(tfd, (off_t)sizeof(hdr), (off_t)total_written, POSIX_FADV_DONTNEED);
 
     if (async_writeback(tfd) == -1) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: fdatasync"); }
@@ -559,14 +588,13 @@ abort_reader:
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
 
-    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int objfd = repo_objects_fd(repo);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "stream: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
-        close(objfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: mkdirat(%s)", subdir);
+        unlink(tmppath); return set_error_errno(ERR_IO, "stream: mkdirat(%s)", subdir);
     }
     if (errno == EEXIST) errno = 0;
     int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-    close(objfd);
     if (subfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "stream: openat(%s)", subdir); }
 
     char dstpath[PATH_MAX];
@@ -609,9 +637,24 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
     return object_store_file_ex(repo, fd, file_size, out_hash, NULL, NULL);
 }
 
+static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size,
+                                        uint8_t out_hash[OBJECT_HASH_SIZE],
+                                        int *out_is_new, uint64_t *out_phys_bytes,
+                                        xfer_progress_fn progress_cb,
+                                        void *progress_ctx);
+
 status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
+    return object_store_file_ex_cb(repo, fd, file_size, out_hash,
+                                   out_is_new, out_phys_bytes, NULL, NULL);
+}
+
+static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size,
+                                        uint8_t out_hash[OBJECT_HASH_SIZE],
+                                        int *out_is_new, uint64_t *out_phys_bytes,
+                                        xfer_progress_fn progress_cb,
+                                        void *progress_ctx) {
     if (file_size == 0) {
         /* empty file */
         uint8_t empty = 0;
@@ -663,7 +706,8 @@ status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
     if (!is_sparse || n_regions == 0) {
         free(regions);
         return write_object_file_stream(repo, fd, file_size, out_hash,
-                                        out_is_new, out_phys_bytes, NULL, NULL);
+                                        out_is_new, out_phys_bytes,
+                                        progress_cb, progress_ctx);
     }
 
     /* Build sparse payload: [sparse_hdr][regions][data bytes] */
@@ -714,23 +758,11 @@ status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
         return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
     }
-    /* Sparse-aware: detect holes and fall back to write_object for sparse files
-     * (sparse files are in-memory; callback fires only for the streaming path). */
-    off_t pos = lseek(fd, 0, SEEK_DATA);
-    int is_sparse = (pos != -1 && pos != 0) ||
-                    (pos == -1 && errno == ENXIO);
-    if (!is_sparse && pos != -1) {
-        /* Check whether any holes exist inside the file */
-        off_t hole = lseek(fd, pos == -1 ? 0 : pos, SEEK_HOLE);
-        if (hole != -1 && (uint64_t)hole < file_size) is_sparse = 1;
-    }
-    if (is_sparse) {
-        /* Delegate to the full sparse-aware path (no per-chunk callback). */
-        return object_store_file_ex(repo, fd, file_size, out_hash,
-                                    out_is_new, out_phys_bytes);
-    }
-    return write_object_file_stream(repo, fd, file_size, out_hash,
-                                    out_is_new, out_phys_bytes, cb, cb_ctx);
+    /* Sparse-aware path handles both sparse and non-sparse files.
+     * For non-sparse files it falls through to write_object_file_stream.
+     * The progress callback is only used on the streaming (non-sparse) path. */
+    return object_store_file_ex_cb(repo, fd, file_size, out_hash,
+                                   out_is_new, out_phys_bytes, cb, cb_ctx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1077,13 +1109,12 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(expected_hash, subdir, fname);
-    int objfd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int objfd = repo_objects_fd(repo);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
-        close(objfd); unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: mkdirat(%s)", subdir);
+        unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: mkdirat(%s)", subdir);
     }
     if (errno == EEXIST) errno = 0;
-    close(objfd);
 
     char dstpath[PATH_MAX];
     if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)

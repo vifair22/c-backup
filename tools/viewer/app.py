@@ -80,13 +80,19 @@ class ViewerApp(tk.Tk):
     def _wire_navigation(self) -> None:
         snaps_tab  = self._tabs["snapshots"]
         search_tab = self._tabs["search"]
+        gfs_tab    = self._tabs["gfs_tree"]
         snaps_idx  = list(self._tabs.keys()).index("snapshots")
 
         def nav(snap_id: int, full_path: str) -> None:
             self._nb.select(snaps_idx)
             snaps_tab.navigate_to_path(snap_id, full_path)
 
+        def nav_snap(snap_id: int) -> None:
+            self._nb.select(snaps_idx)
+            snaps_tab.navigate_to_path(snap_id, "")
+
         search_tab.set_navigate_callback(nav)
+        gfs_tab.set_navigate_callback(nav_snap)
 
     # ---- SSH auth ----
 

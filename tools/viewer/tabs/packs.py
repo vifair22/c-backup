@@ -276,6 +276,8 @@ class PacksTab:
         self._fan_canvas.pack(fill=tk.X, padx=PAD, pady=(0, PAD))
         self._fan_canvas.bind("<Configure>", lambda _: self._redraw_fanout())
         self._fan_canvas.bind("<Motion>", self._on_fan_motion)
+        self._fan_canvas.bind("<Leave>",
+                              lambda _: self._fan_canvas.delete("tip"))
         self._fan_data: list[int] = []
 
         # Entries tree (paginated)
@@ -386,10 +388,15 @@ class PacksTab:
         prev = self._fan_data[idx - 1] if idx > 0 else 0
         count = self._fan_data[idx] - prev
         self._fan_canvas.delete("tip")
+        # Flip label to left side when near the right edge
+        if event.x > W - 180:
+            x, anchor = event.x - 10, "e"
+        else:
+            x, anchor = event.x + 10, "w"
         self._fan_canvas.create_text(
-            event.x + 10, max(10, event.y - 10),
+            x, max(10, event.y - 10),
             text=f"0x{idx:02X}: {count:,} entries",
-            anchor="w", font=FONT_MONO, tag="tip")
+            anchor=anchor, font=FONT_MONO, tag="tip")
 
     # ---- populate ----
 

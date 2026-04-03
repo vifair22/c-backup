@@ -30,10 +30,102 @@
 
 /* Single-slot cache: keeps the last loaded snapshot alive so repeated
  * snap_dir_children calls for the same snap_id don't reload + decompress
- * the entire snapshot each time.  Only active during json_api_session(). */
-static snapshot_t *_cached_snap  = NULL;
-static uint32_t    _cached_snap_id = 0;
-static int         _cache_active = 0;
+ * the entire snapshot each time.  Only active during json_api_session().
+ *
+ * Also caches the parent-set (has_children) and node-map (node_id→node_t*)
+ * hash tables so they aren't rebuilt on every dir-tree expansion. */
+static snapshot_t *_cached_snap     = NULL;
+static uint32_t    _cached_snap_id  = 0;
+static int         _cache_active    = 0;
+
+/* Cached parent-set: which node_ids appear as a parent_node in dirents */
+static uint64_t   *_cached_pset     = NULL;
+static int        *_cached_pset_occ = NULL;
+static size_t      _cached_pset_cap = 0;
+
+/* Cached node-map: node_id → node_t* for O(1) metadata lookup */
+static uint64_t      *_cached_nm_keys = NULL;
+static const node_t **_cached_nm_vals = NULL;
+static int           *_cached_nm_occ  = NULL;
+static size_t         _cached_nm_cap  = 0;
+
+static void _free_cached_tables(void)
+{
+    free(_cached_pset);     _cached_pset     = NULL;
+    free(_cached_pset_occ); _cached_pset_occ = NULL;
+    _cached_pset_cap = 0;
+    free(_cached_nm_keys);  _cached_nm_keys  = NULL;
+    free(_cached_nm_vals);  _cached_nm_vals  = NULL;
+    free(_cached_nm_occ);   _cached_nm_occ   = NULL;
+    _cached_nm_cap = 0;
+}
+
+static int _build_cached_tables(const snapshot_t *snap)
+{
+    _free_cached_tables();
+
+    /* Parent set — power-of-two capacity */
+    size_t pset_cap = 32;
+    {
+        size_t need = snap->dirent_count < 16 ? 32 : snap->dirent_count * 2;
+        while (pset_cap < need) pset_cap <<= 1;
+    }
+    uint64_t *pset = calloc(pset_cap, sizeof(uint64_t));
+    int *pset_occ  = calloc(pset_cap, sizeof(int));
+    if (!pset || !pset_occ) { free(pset); free(pset_occ); return -1; }
+    size_t pmask = pset_cap - 1;
+
+    if (snap->dirent_data && snap->dirent_data_len > 0) {
+        const uint8_t *p   = snap->dirent_data;
+        const uint8_t *end = p + snap->dirent_data_len;
+        while (p + sizeof(dirent_rec_t) <= end) {
+            const dirent_rec_t *rec = (const dirent_rec_t *)p;
+            p += sizeof(dirent_rec_t);
+            if (p + rec->name_len > end) break;
+            uint64_t pn = rec->parent_node;
+            size_t slot = (size_t)(pn * 0x9E3779B97F4A7C15ULL >> 32) & pmask;
+            while (pset_occ[slot] && pset[slot] != pn)
+                slot = (slot + 1) & pmask;
+            pset[slot] = pn;
+            pset_occ[slot] = 1;
+            p += rec->name_len;
+        }
+    }
+    _cached_pset     = pset;
+    _cached_pset_occ = pset_occ;
+    _cached_pset_cap = pset_cap;
+
+    /* Node map — power-of-two capacity */
+    size_t nm_cap = 32;
+    {
+        size_t need = snap->node_count < 16 ? 32 : snap->node_count * 2;
+        while (nm_cap < need) nm_cap <<= 1;
+    }
+    uint64_t       *nm_keys = calloc(nm_cap, sizeof(uint64_t));
+    const node_t  **nm_vals = calloc(nm_cap, sizeof(const node_t *));
+    int            *nm_occ  = calloc(nm_cap, sizeof(int));
+    if (!nm_keys || !nm_vals || !nm_occ) {
+        free(nm_keys); free(nm_vals); free(nm_occ);
+        _free_cached_tables();
+        return -1;
+    }
+    size_t nm_mask = nm_cap - 1;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        uint64_t nid = snap->nodes[i].node_id;
+        size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & nm_mask;
+        while (nm_occ[slot] && nm_keys[slot] != nid)
+            slot = (slot + 1) & nm_mask;
+        nm_keys[slot] = nid;
+        nm_vals[slot] = &snap->nodes[i];
+        nm_occ[slot]  = 1;
+    }
+    _cached_nm_keys = nm_keys;
+    _cached_nm_vals = nm_vals;
+    _cached_nm_occ  = nm_occ;
+    _cached_nm_cap  = nm_cap;
+
+    return 0;
+}
 
 static snapshot_t *session_snap_get(repo_t *repo, uint32_t snap_id)
 {
@@ -44,6 +136,7 @@ static snapshot_t *session_snap_get(repo_t *repo, uint32_t snap_id)
     if (_cached_snap) {
         snapshot_free(_cached_snap);
         _cached_snap = NULL;
+        _free_cached_tables();
     }
 
     snapshot_t *snap = NULL;
@@ -53,6 +146,7 @@ static snapshot_t *session_snap_get(repo_t *repo, uint32_t snap_id)
     if (_cache_active) {
         _cached_snap = snap;
         _cached_snap_id = snap_id;
+        _build_cached_tables(snap);
     }
     return snap;
 }
@@ -63,6 +157,7 @@ static void session_snap_cache_clear(void)
         snapshot_free(_cached_snap);
         _cached_snap = NULL;
     }
+    _free_cached_tables();
     _cached_snap_id = 0;
 }
 
@@ -161,6 +256,8 @@ static char *read_stdin_all(void)
 /* Response helpers                                                    */
 /* ------------------------------------------------------------------ */
 
+static int _stdout_broken = 0;
+
 static void write_ok(cJSON *data)
 {
     cJSON *root = cJSON_CreateObject();
@@ -169,7 +266,7 @@ static void write_ok(cJSON *data)
     char *s = cJSON_PrintUnformatted(root);
     fputs(s, stdout);
     fputc('\n', stdout);
-    fflush(stdout);
+    if (fflush(stdout) != 0) _stdout_broken = 1;
     free(s);
     cJSON_Delete(root);
 }
@@ -182,7 +279,7 @@ static void write_error(const char *msg)
     char *s = cJSON_PrintUnformatted(root);
     fputs(s, stdout);
     fputc('\n', stdout);
-    fflush(stdout);
+    if (fflush(stdout) != 0) _stdout_broken = 1;
     free(s);
     cJSON_Delete(root);
 }
@@ -339,8 +436,10 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
     uint32_t snap_id     = (uint32_t)jid->valuedouble;
     uint64_t parent_node = (uint64_t)jpn->valuedouble;
 
-    /* Use session cache if active (avoids reloading 500K-entry snap per expansion) */
+    /* Use session cache if active (avoids reloading 500K-entry snap per
+     * expansion AND reuses pre-built hash tables across calls). */
     int from_cache = 0;
+    int tables_owned = 0;  /* 1 if we allocated local tables (non-session) */
     snapshot_t *snap = NULL;
     if (_cache_active) {
         snap = session_snap_get(repo, snap_id);
@@ -350,36 +449,78 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
         if (snapshot_load(repo, snap_id, &snap) != OK) return NULL;
     }
 
-    /* Pass 1: collect set of all parent_node values (to answer has_children).
-     * Use a simple open-addressing hash set of uint64_t. */
-    size_t set_cap = snap->dirent_count < 16 ? 32 : snap->dirent_count * 2;
-    uint64_t *pset = calloc(set_cap, sizeof(uint64_t));
-    int *pset_occ  = calloc(set_cap, sizeof(int));
-    if (!pset || !pset_occ) {
-        free(pset); free(pset_occ);
-        if (!from_cache) snapshot_free(snap);
-        return set_error(ERR_NOMEM, "snap_dir_children: alloc failed"), NULL;
-    }
+    /* Resolve table pointers — use session cache or build local copies */
+    uint64_t      *pset     = _cached_pset;
+    int           *pset_occ = _cached_pset_occ;
+    size_t         pset_cap = _cached_pset_cap;
+    uint64_t      *nm_keys  = _cached_nm_keys;
+    const node_t **nm_vals  = _cached_nm_vals;
+    int           *nm_occ   = _cached_nm_occ;
+    size_t         nm_cap   = _cached_nm_cap;
 
-    if (snap->dirent_data && snap->dirent_data_len > 0) {
-        const uint8_t *p   = snap->dirent_data;
-        const uint8_t *end = p + snap->dirent_data_len;
-        while (p + sizeof(dirent_rec_t) <= end) {
-            const dirent_rec_t *rec = (const dirent_rec_t *)p;
-            p += sizeof(dirent_rec_t);
-            if (p + rec->name_len > end) break;
-            /* Insert rec->parent_node into hash set */
-            uint64_t pn = rec->parent_node;
-            size_t slot = (size_t)(pn * 0x9E3779B97F4A7C15ULL >> 32) & (set_cap - 1);
-            while (pset_occ[slot] && pset[slot] != pn)
-                slot = (slot + 1) & (set_cap - 1);
-            pset[slot] = pn;
-            pset_occ[slot] = 1;
-            p += rec->name_len;
+    if (!pset || !nm_keys) {
+        /* No cached tables — build temporary local ones */
+        pset_cap = 32;
+        {
+            size_t need = snap->dirent_count < 16 ? 32 : snap->dirent_count * 2;
+            while (pset_cap < need) pset_cap <<= 1;
         }
+        pset     = calloc(pset_cap, sizeof(uint64_t));
+        pset_occ = calloc(pset_cap, sizeof(int));
+        if (!pset || !pset_occ) {
+            free(pset); free(pset_occ);
+            if (!from_cache) snapshot_free(snap);
+            return set_error(ERR_NOMEM, "snap_dir_children: alloc failed"), NULL;
+        }
+        size_t pmask = pset_cap - 1;
+        if (snap->dirent_data && snap->dirent_data_len > 0) {
+            const uint8_t *p   = snap->dirent_data;
+            const uint8_t *end = p + snap->dirent_data_len;
+            while (p + sizeof(dirent_rec_t) <= end) {
+                const dirent_rec_t *rec = (const dirent_rec_t *)p;
+                p += sizeof(dirent_rec_t);
+                if (p + rec->name_len > end) break;
+                uint64_t pn = rec->parent_node;
+                size_t slot = (size_t)(pn * 0x9E3779B97F4A7C15ULL >> 32) & pmask;
+                while (pset_occ[slot] && pset[slot] != pn)
+                    slot = (slot + 1) & pmask;
+                pset[slot] = pn;
+                pset_occ[slot] = 1;
+                p += rec->name_len;
+            }
+        }
+
+        nm_cap = 32;
+        {
+            size_t need = snap->node_count < 16 ? 32 : snap->node_count * 2;
+            while (nm_cap < need) nm_cap <<= 1;
+        }
+        nm_keys = calloc(nm_cap, sizeof(uint64_t));
+        nm_vals = calloc(nm_cap, sizeof(const node_t *));
+        nm_occ  = calloc(nm_cap, sizeof(int));
+        if (!nm_keys || !nm_vals || !nm_occ) {
+            free(nm_keys); free(nm_vals); free(nm_occ);
+            free(pset); free(pset_occ);
+            if (!from_cache) snapshot_free(snap);
+            return set_error(ERR_NOMEM, "snap_dir_children: node map alloc"), NULL;
+        }
+        size_t nm_mask = nm_cap - 1;
+        for (uint32_t i = 0; i < snap->node_count; i++) {
+            uint64_t nid = snap->nodes[i].node_id;
+            size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & nm_mask;
+            while (nm_occ[slot] && nm_keys[slot] != nid)
+                slot = (slot + 1) & nm_mask;
+            nm_keys[slot] = nid;
+            nm_vals[slot] = &snap->nodes[i];
+            nm_occ[slot]  = 1;
+        }
+        tables_owned = 1;
     }
 
-    /* Pass 2: find children of parent_node, emit with node metadata */
+    size_t pmask   = pset_cap - 1;
+    size_t nm_mask = nm_cap - 1;
+
+    /* Single pass: find children of parent_node, emit with node metadata */
     cJSON *d = cJSON_CreateObject();
     cJSON *children = cJSON_AddArrayToObject(d, "children");
 
@@ -403,22 +544,33 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
                     free(name);
                 }
 
-                const node_t *nd = snapshot_find_node(snap, rec->node_id);
-                if (nd) {
-                    cJSON_AddNumberToObject(child, "type", nd->type);
-                    cJSON_AddNumberToObject(child, "size", (double)nd->size);
-                    cJSON_AddNumberToObject(child, "mode", nd->mode);
+                uint64_t nid = rec->node_id;
+
+                /* O(1) node lookup via hash map */
+                {
+                    size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & nm_mask;
+                    const node_t *nd = NULL;
+                    while (nm_occ[slot]) {
+                        if (nm_keys[slot] == nid) { nd = nm_vals[slot]; break; }
+                        slot = (slot + 1) & nm_mask;
+                    }
+                    if (nd) {
+                        cJSON_AddNumberToObject(child, "type", nd->type);
+                        cJSON_AddNumberToObject(child, "size", (double)nd->size);
+                        cJSON_AddNumberToObject(child, "mode", nd->mode);
+                    }
                 }
 
                 /* has_children: check if this node_id exists as a parent */
-                uint64_t nid = rec->node_id;
-                size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & (set_cap - 1);
-                int hc = 0;
-                while (pset_occ[slot]) {
-                    if (pset[slot] == nid) { hc = 1; break; }
-                    slot = (slot + 1) & (set_cap - 1);
+                {
+                    size_t slot = (size_t)(nid * 0x9E3779B97F4A7C15ULL >> 32) & pmask;
+                    int hc = 0;
+                    while (pset_occ[slot]) {
+                        if (pset[slot] == nid) { hc = 1; break; }
+                        slot = (slot + 1) & pmask;
+                    }
+                    cJSON_AddBoolToObject(child, "has_children", hc);
                 }
-                cJSON_AddBoolToObject(child, "has_children", hc);
 
                 cJSON_AddItemToArray(children, child);
             }
@@ -426,8 +578,10 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
         }
     }
 
-    free(pset);
-    free(pset_occ);
+    if (tables_owned) {
+        free(nm_keys); free((void *)nm_vals); free(nm_occ);
+        free(pset); free(pset_occ);
+    }
     if (!from_cache) snapshot_free(snap);
     return d;
 }
@@ -1743,6 +1897,8 @@ int json_api_dispatch(repo_t *repo)
 
 int json_api_session(repo_t *repo)
 {
+    _stdout_broken = 0;
+
     /* Suppress stray log output that would corrupt the JSON stream */
     FILE *f = freopen("/dev/null", "w", stderr);
     (void)f;
@@ -1761,7 +1917,8 @@ int json_api_session(repo_t *repo)
     size_t line_cap = 0;
     ssize_t line_len;
 
-    while ((line_len = getline(&line, &line_cap, stdin)) > 0) {
+    while (!_stdout_broken &&
+           (line_len = getline(&line, &line_cap, stdin)) > 0) {
         /* Strip trailing newline */
         if (line_len > 0 && line[line_len - 1] == '\n')
             line[--line_len] = '\0';

@@ -90,6 +90,10 @@ class GFSTreeTab:
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._tree.pack(fill=tk.BOTH, expand=True)
 
+        self._tree.bind("<Double-1>", self._on_double_click)
+
+        self._navigate_cb = None
+
         # Colour tags for snap rows
         self._tree.tag_configure("yearly",   background="#FFF3CD", foreground="#7B4A00")
         self._tree.tag_configure("monthly",  background="#CCE5FF", foreground="#003087")
@@ -192,3 +196,24 @@ class GFSTreeTab:
                         ),
                         tags=(tag,),
                     )
+
+    # --------------------------------------------------------------- navigation
+
+    def set_navigate_callback(self, cb) -> None:
+        """Set callback: cb(snap_id: int) — called on double-click of a snap row."""
+        self._navigate_cb = cb
+
+    def _on_double_click(self, _event) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        snap_val = self._tree.set(item, "snap")
+        if not snap_val or not snap_val.startswith("#"):
+            return
+        try:
+            snap_id = int(snap_val[1:])
+        except ValueError:
+            return
+        if self._navigate_cb:
+            self._navigate_cb(snap_id)

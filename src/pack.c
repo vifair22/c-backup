@@ -384,7 +384,9 @@ typedef struct {
     uint32_t rs_data_len;   /* = (uint32_t)compressed_size */
 } pack_entry_parity_t;
 
-/* Cached metadata from the partition pass — avoids re-reading headers later. */
+/* Cached metadata from the partition pass — avoids re-reading headers later.
+ * The fd is kept open (positioned past the header) for the packing pass
+ * to consume, eliminating a redundant open/read/close cycle per object. */
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint8_t  type;
@@ -392,11 +394,12 @@ typedef struct {
     uint64_t compressed_size;
     uint64_t uncompressed_size;
     uint8_t  skip_ver;
+    int      fd;   /* open fd positioned past header, or -1 */
 } pack_obj_meta_t;
 
 typedef struct {
     repo_t *repo;
-    const pack_obj_meta_t *meta;
+    pack_obj_meta_t *meta;
     const uint32_t *indices;
     size_t loose_cnt;
 
@@ -480,25 +483,29 @@ static void *pack_worker_main(void *arg) {
         idx = ctx->next_index++;
         pthread_mutex_unlock(&ctx->mu);
 
-        const pack_obj_meta_t *m = &ctx->meta[ctx->indices[idx]];
+        pack_obj_meta_t *m = &ctx->meta[ctx->indices[idx]];
         const uint8_t *hash = m->hash;
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        object_hash_to_hex(hash, hex);
-        char loose_path[PATH_MAX];
-        if (path_fmt(loose_path, sizeof(loose_path),
-                     "%s/objects/%.2s/%s", repo_path(ctx->repo), hex, hex + 2) != 0) {
-            pack_worker_fail(ctx, ERR_IO);
-            break;
-        }
 
-        int fd = open(loose_path, O_RDONLY);
-        if (fd == -1) continue;
-
-        /* Skip past the on-disk header — metadata is already cached in m */
-        if (lseek(fd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
-            close(fd);
-            pack_worker_fail(ctx, ERR_CORRUPT);
-            break;
+        /* Consume the cached fd from the partition pass */
+        int fd = m->fd;
+        m->fd = -1;
+        if (fd < 0) {
+            /* Fallback: re-open if fd was closed (e.g. skip-marked path) */
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(hash, hex);
+            char loose_path[PATH_MAX];
+            if (path_fmt(loose_path, sizeof(loose_path),
+                         "%s/objects/%.2s/%s", repo_path(ctx->repo), hex, hex + 2) != 0) {
+                pack_worker_fail(ctx, ERR_IO);
+                break;
+            }
+            fd = open(loose_path, O_RDONLY);
+            if (fd == -1) continue;
+            if (lseek(fd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
+                close(fd);
+                pack_worker_fail(ctx, ERR_CORRUPT);
+                break;
+            }
         }
 
         uint8_t *payload = malloc((size_t)m->compressed_size);
@@ -540,7 +547,12 @@ static void *pack_worker_main(void *arg) {
                 if (sc > 0 && (double)sc / (double)sample_len >= PACK_RATIO_THRESHOLD) {
                     /* Incompressible: mark in the loose file and skip */
                     uint8_t sv = PROBER_VERSION;
-                    int wfd = open(loose_path, O_WRONLY);
+                    char skip_hex[OBJECT_HASH_SIZE * 2 + 1];
+                    object_hash_to_hex(hash, skip_hex);
+                    char skip_path[PATH_MAX];
+                    path_fmt(skip_path, sizeof(skip_path),
+                             "%s/objects/%.2s/%s", repo_path(ctx->repo), skip_hex, skip_hex + 2);
+                    int wfd = open(skip_path, O_WRONLY);
                     if (wfd >= 0) {
                         ssize_t pw = pwrite(wfd, &sv, 1,
                                             offsetof(object_header_t, pack_skip_ver));
@@ -2070,16 +2082,14 @@ fail:
     return st;
 }
 
-/* Batch-unlink loose objects by opening each objects/XX/ bucket directory once.
- * Reduces directory opens from O(n) to O(256) max. */
+/* Batch-unlink loose objects by grouping by first hash byte (bucket).
+ * Uses a 256-entry index to skip empty buckets and avoid O(256*N) scanning. */
 static void unlink_loose_batch(repo_t *repo,
                                const pack_idx_disk_entry_t *entries,
                                uint32_t count) {
     if (count == 0) return;
 
-    /* Sort a copy of hashes by first byte (bucket) for locality.
-     * We use the idx_entries directly — first byte of hash = bucket. */
-    int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int obj_fd = repo_objects_fd(repo);
     if (obj_fd < 0) {
         /* Fallback: individual unlinks */
         for (uint32_t i = 0; i < count; i++) {
@@ -2093,26 +2103,50 @@ static void unlink_loose_batch(repo_t *repo,
         return;
     }
 
-    /* Group by first byte of hash (the XX bucket).  Iterate all 256
-     * buckets, open each directory once, unlink matching entries. */
-    for (unsigned bucket = 0; bucket < 256; bucket++) {
-        int bfd = -1;
+    /* Build a bucket count to know which buckets are populated */
+    uint32_t bucket_start[257];
+    memset(bucket_start, 0, sizeof(bucket_start));
+    for (uint32_t i = 0; i < count; i++)
+        bucket_start[entries[i].hash[0] + 1]++;
+    /* Convert counts to start offsets via prefix sum */
+    for (unsigned b = 0; b < 256; b++)
+        bucket_start[b + 1] += bucket_start[b];
+
+    /* Build a sorted index array by bucket */
+    uint32_t *sorted = malloc(count * sizeof(*sorted));
+    if (!sorted) {
+        /* Fallback: direct unlinks */
         for (uint32_t i = 0; i < count; i++) {
-            if (entries[i].hash[0] != (uint8_t)bucket) continue;
-            if (bfd < 0) {
-                char bname[3];
-                snprintf(bname, sizeof(bname), "%02x", bucket);
-                bfd = openat(obj_fd, bname, O_RDONLY | O_DIRECTORY);
-                if (bfd < 0) break;  /* bucket doesn't exist */
-            }
             char hex[OBJECT_HASH_SIZE * 2 + 1];
             object_hash_to_hex(entries[i].hash, hex);
+            char path[PATH_MAX];
+            if (path_fmt(path, sizeof(path),
+                         "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) == 0)
+                unlink(path);
+        }
+        return;
+    }
+    uint32_t pos[256];
+    memcpy(pos, bucket_start, sizeof(pos));
+    for (uint32_t i = 0; i < count; i++)
+        sorted[pos[entries[i].hash[0]]++] = i;
+
+    /* Iterate only populated buckets */
+    for (unsigned bucket = 0; bucket < 256; bucket++) {
+        if (bucket_start[bucket] == bucket_start[bucket + 1]) continue;
+        char bname[3];
+        snprintf(bname, sizeof(bname), "%02x", bucket);
+        int bfd = openat(obj_fd, bname, O_RDONLY | O_DIRECTORY);
+        if (bfd < 0) continue;
+        for (uint32_t j = bucket_start[bucket]; j < bucket_start[bucket + 1]; j++) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(entries[sorted[j]].hash, hex);
             unlinkat(bfd, hex + 2, 0);
         }
-        if (bfd >= 0) close(bfd);
+        close(bfd);
     }
 
-    close(obj_fd);
+    free(sorted);
 }
 
 /* qsort_r comparator: sort index array by hash via meta array (context). */
@@ -2172,14 +2206,15 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     /* --- Partition pass: classify objects as large (streamed) or small (worker pool).
      *     Cache every header into pack_obj_meta_t so later passes skip re-reads. --- */
+    size_t meta_cnt = 0, small_cnt = 0, large_cnt = 0;
     pack_obj_meta_t *meta = malloc(loose_cnt * sizeof(*meta));
     uint32_t *small_indices = malloc(loose_cnt * sizeof(*small_indices));
     uint32_t *large_indices = malloc(loose_cnt * sizeof(*large_indices));
     if (!meta || !small_indices || !large_indices) {
-        free(meta); free(small_indices); free(large_indices);
+        free(meta); meta = NULL;
+        free(small_indices); free(large_indices);
         st = ERR_NOMEM; goto cleanup;
     }
-    size_t meta_cnt = 0, small_cnt = 0, large_cnt = 0;
     uint64_t total_bytes_for_pack = 0;
 
     struct timespec part_tick = {0};
@@ -2201,15 +2236,15 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         if (pfd == -1) continue;  /* deleted between collect and now */
         object_header_t ohdr;
         int rd = read_full_fd(pfd, &ohdr, sizeof(ohdr));
-        close(pfd);
         if (rd != 0) {
+            close(pfd);
             free(meta); meta = NULL;
             free(small_indices); small_indices = NULL;
             free(large_indices); large_indices = NULL;
             st = ERR_CORRUPT; goto cleanup;
         }
 
-        /* Populate cached metadata */
+        /* Populate cached metadata — keep fd open past header for later reuse */
         uint32_t mi = (uint32_t)meta_cnt;
         memcpy(meta[mi].hash, hash, OBJECT_HASH_SIZE);
         meta[mi].type              = ohdr.type;
@@ -2217,11 +2252,16 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         meta[mi].compressed_size   = ohdr.compressed_size;
         meta[mi].uncompressed_size = ohdr.uncompressed_size;
         meta[mi].skip_ver          = ohdr.pack_skip_ver;
+        meta[mi].fd                = pfd;  /* positioned past header */
         meta_cnt++;
 
         if (ohdr.compressed_size > PACK_STREAM_THRESHOLD) {
             /* Skip objects already marked as incompressible — they stay loose. */
-            if (ohdr.pack_skip_ver == PROBER_VERSION) continue;
+            if (ohdr.pack_skip_ver == PROBER_VERSION) {
+                close(meta[mi].fd);
+                meta[mi].fd = -1;
+                continue;
+            }
             large_indices[large_cnt++] = mi;
         } else {
             small_indices[small_cnt++] = mi;
@@ -2239,6 +2279,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     /* Nothing to pack — all loose objects are skip-marked incompressible files. */
     if (small_cnt == 0 && large_cnt == 0) {
+        for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
+            if (meta[mi2].fd >= 0) close(meta[mi2].fd);
+        }
         free(meta);
         free(small_indices);
         free(large_indices);
@@ -2271,16 +2314,21 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         for (size_t i = 0; i < large_cnt; i++) {
             pack_obj_meta_t *lm = &meta[large_indices[i]];
             if (lm->skip_ver == 0 && lm->compression == COMPRESS_NONE) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1];
-                object_hash_to_hex(lm->hash, hex);
-                char loose_path[PATH_MAX];
-                if (path_fmt(loose_path, sizeof(loose_path),
-                             "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0)
-                    continue;
-                int pfd = open(loose_path, O_RDONLY);
-                if (pfd < 0) continue;
-                if (lseek(pfd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
-                    close(pfd); continue;
+                /* Use cached fd from partition pass */
+                int pfd = lm->fd;
+                if (pfd < 0) {
+                    char hex[OBJECT_HASH_SIZE * 2 + 1];
+                    object_hash_to_hex(lm->hash, hex);
+                    char loose_path[PATH_MAX];
+                    if (path_fmt(loose_path, sizeof(loose_path),
+                                 "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0)
+                        continue;
+                    pfd = open(loose_path, O_RDONLY);
+                    if (pfd < 0) continue;
+                    if (lseek(pfd, (off_t)sizeof(object_header_t), SEEK_SET) == (off_t)-1) {
+                        close(pfd); continue;
+                    }
+                    lm->fd = pfd;
                 }
                 size_t probe_len = (size_t)(lm->compressed_size < PACK_PROBE_SIZE
                                            ? lm->compressed_size : PACK_PROBE_SIZE);
@@ -2295,21 +2343,33 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                         if (csz > 0 &&
                             (double)csz / (double)probe_len >= PACK_RATIO_THRESHOLD) {
                             skip = 1;
-                            uint8_t sv = PROBER_VERSION;
-                            int wfd = open(loose_path, O_WRONLY);
-                            if (wfd >= 0) {
-                                ssize_t pw = pwrite(wfd, &sv, 1,
-                                                    offsetof(object_header_t, pack_skip_ver));
-                                (void)pw;
-                                close(wfd);
+                            /* Mark as incompressible — need a writable fd */
+                            char phex[OBJECT_HASH_SIZE * 2 + 1];
+                            object_hash_to_hex(lm->hash, phex);
+                            char ppath[PATH_MAX];
+                            if (path_fmt(ppath, sizeof(ppath),
+                                         "%s/objects/%.2s/%s", repo_path(repo), phex, phex + 2) == 0) {
+                                uint8_t sv = PROBER_VERSION;
+                                int wfd = open(ppath, O_WRONLY);
+                                if (wfd >= 0) {
+                                    ssize_t pw = pwrite(wfd, &sv, 1,
+                                                        offsetof(object_header_t, pack_skip_ver));
+                                    (void)pw;
+                                    close(wfd);
+                                }
                             }
                         }
                         free(cbuf);
                     }
                 }
                 free(pbuf);
-                close(pfd);
-                if (skip) continue;
+                if (skip) {
+                    close(lm->fd);
+                    lm->fd = -1;
+                    continue;
+                }
+                /* Seek back to payload start for the streaming pass */
+                lseek(lm->fd, (off_t)sizeof(object_header_t), SEEK_SET);
             }
             large_indices[new_large_cnt++] = large_indices[i];
         }
@@ -2329,23 +2389,29 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     int pf_fds[PREFETCH_DEPTH];
     for (int k = 0; k < PREFETCH_DEPTH; k++) pf_fds[k] = -1;
 
-    /* Fill the prefetch window */
+    /* Fill the prefetch window — consume cached fds from partition pass */
     for (size_t p = 0; p < PREFETCH_DEPTH && p < large_cnt; p++) {
-        const pack_obj_meta_t *pm = &meta[large_indices[p]];
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        object_hash_to_hex(pm->hash, hex);
-        char lp[PATH_MAX];
-        if (path_fmt(lp, sizeof(lp), "%s/objects/%.2s/%s",
-                     repo_path(repo), hex, hex + 2) == 0) {
-            pf_fds[p] = open(lp, O_RDONLY);
-            if (pf_fds[p] >= 0) {
-                lseek(pf_fds[p], (off_t)sizeof(object_header_t), SEEK_SET);
-                posix_fadvise(pf_fds[p], (off_t)sizeof(object_header_t),
-                              (off_t)pm->compressed_size, POSIX_FADV_SEQUENTIAL);
-                posix_fadvise(pf_fds[p], (off_t)sizeof(object_header_t),
-                              (off_t)pm->compressed_size, POSIX_FADV_WILLNEED);
+        pack_obj_meta_t *pm = &meta[large_indices[p]];
+        int pfd = pm->fd;
+        pm->fd = -1;
+        if (pfd < 0) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(pm->hash, hex);
+            char lp[PATH_MAX];
+            if (path_fmt(lp, sizeof(lp), "%s/objects/%.2s/%s",
+                         repo_path(repo), hex, hex + 2) == 0) {
+                pfd = open(lp, O_RDONLY);
+                if (pfd >= 0)
+                    lseek(pfd, (off_t)sizeof(object_header_t), SEEK_SET);
             }
         }
+        if (pfd >= 0) {
+            posix_fadvise(pfd, (off_t)sizeof(object_header_t),
+                          (off_t)pm->compressed_size, POSIX_FADV_SEQUENTIAL);
+            posix_fadvise(pfd, (off_t)sizeof(object_header_t),
+                          (off_t)pm->compressed_size, POSIX_FADV_WILLNEED);
+        }
+        pf_fds[p] = pfd;
     }
     size_t pf_next_open = (large_cnt < PREFETCH_DEPTH) ? large_cnt : PREFETCH_DEPTH;
 
@@ -2358,23 +2424,29 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         int cur_fd = pf_fds[slot];
         pf_fds[slot] = -1;
 
-        /* Advance the prefetch window: open the next file in the vacated slot */
+        /* Advance the prefetch window: consume cached fd or re-open */
         if (pf_next_open < large_cnt) {
-            const pack_obj_meta_t *nm = &meta[large_indices[pf_next_open]];
-            char nhex[OBJECT_HASH_SIZE * 2 + 1];
-            object_hash_to_hex(nm->hash, nhex);
-            char np[PATH_MAX];
-            if (path_fmt(np, sizeof(np), "%s/objects/%.2s/%s",
-                         repo_path(repo), nhex, nhex + 2) == 0) {
-                pf_fds[slot] = open(np, O_RDONLY);
-                if (pf_fds[slot] >= 0) {
-                    lseek(pf_fds[slot], (off_t)sizeof(object_header_t), SEEK_SET);
-                    posix_fadvise(pf_fds[slot], (off_t)sizeof(object_header_t),
-                                  (off_t)nm->compressed_size, POSIX_FADV_SEQUENTIAL);
-                    posix_fadvise(pf_fds[slot], (off_t)sizeof(object_header_t),
-                                  (off_t)nm->compressed_size, POSIX_FADV_WILLNEED);
+            pack_obj_meta_t *nm = &meta[large_indices[pf_next_open]];
+            int nfd = nm->fd;
+            nm->fd = -1;
+            if (nfd < 0) {
+                char nhex[OBJECT_HASH_SIZE * 2 + 1];
+                object_hash_to_hex(nm->hash, nhex);
+                char np[PATH_MAX];
+                if (path_fmt(np, sizeof(np), "%s/objects/%.2s/%s",
+                             repo_path(repo), nhex, nhex + 2) == 0) {
+                    nfd = open(np, O_RDONLY);
+                    if (nfd >= 0)
+                        lseek(nfd, (off_t)sizeof(object_header_t), SEEK_SET);
                 }
             }
+            if (nfd >= 0) {
+                posix_fadvise(nfd, (off_t)sizeof(object_header_t),
+                              (off_t)nm->compressed_size, POSIX_FADV_SEQUENTIAL);
+                posix_fadvise(nfd, (off_t)sizeof(object_header_t),
+                              (off_t)nm->compressed_size, POSIX_FADV_WILLNEED);
+            }
+            pf_fds[slot] = nfd;
             pf_next_open++;
         }
 
@@ -2925,8 +2997,12 @@ cleanup:
     free(idx_entries);
     free(entry_parity);
     free(hashes);
-    /* meta/indices are freed inline before goto cleanup;
-     * these free(NULL) calls are harmless safety nets for the early-exit paths. */
+    /* Close any lingering meta fds (error paths, skipped objects). */
+    if (meta) {
+        for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
+            if (meta[mi2].fd >= 0) { close(meta[mi2].fd); meta[mi2].fd = -1; }
+        }
+    }
     free(meta);
     free(large_indices);
     free(small_indices);

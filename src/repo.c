@@ -29,6 +29,7 @@ struct repo {
     char   *path;
     int     dirfd;
     int     lock_fd;          /* -1 when unlocked */
+    int     obj_dirfd;        /* cached objects/ dir fd, -1 until first use */
     /* pack index cache, owned by pack.c, freed on close */
     void   *pack_cache;
     size_t  pack_cache_cnt;
@@ -178,6 +179,7 @@ status_t repo_open(const char *path, repo_t **out) {
     r->path           = strdup(path);
     r->dirfd          = fd;
     r->lock_fd        = -1;
+    r->obj_dirfd      = -1;
     r->pack_cache      = NULL;
     r->pack_cache_cnt  = 0;
     r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
@@ -197,6 +199,7 @@ void repo_close(repo_t *repo) {
     repo_dat_cache_flush(repo);
     free(repo->dat_cache);
     repo->dat_cache = NULL;
+    if (repo->obj_dirfd >= 0) close(repo->obj_dirfd);
     close(repo->dirfd);
     free(repo->path);
     free(repo->pack_cache);
@@ -209,6 +212,12 @@ int repo_fd(const repo_t *repo) {
 
 const char *repo_path(const repo_t *repo) {
     return repo->path;
+}
+
+int repo_objects_fd(repo_t *repo) {
+    if (repo->obj_dirfd >= 0) return repo->obj_dirfd;
+    repo->obj_dirfd = openat(repo->dirfd, "objects", O_RDONLY | O_DIRECTORY);
+    return repo->obj_dirfd;
 }
 
 void repo_set_pack_cache(repo_t *repo, void *data, size_t cnt) {

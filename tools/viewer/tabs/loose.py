@@ -85,6 +85,7 @@ class LooseTab:
         self._display_segments: list[tuple] = []
         self._display_starts: list[int] = []
         self._display_total: int = 0
+        self._layout_pending: tuple[str, int] | None = None
         self._build()
 
     def _build(self) -> None:
@@ -125,10 +126,11 @@ class LooseTab:
         self._nb.add(prev_frame, text="Content Preview")
         self._prev_text = make_text_widget(prev_frame)
 
-        # Tab 3: Object Map
+        # Tab 3: Object Map (built lazily on first select)
         self._map_frame = ttk.Frame(self._nb)
         self._nb.add(self._map_frame, text="Object Map")
-        self._build_object_map()
+        self._map_built = False
+        self._nb.bind("<<NotebookTabChanged>>", self._on_subtab_changed)
 
     def _build_object_map(self) -> None:
         legend_box = tk.Frame(self._map_frame)
@@ -181,6 +183,17 @@ class LooseTab:
         self._map_canvas.bind("<Button-5>",
                               lambda _: self._map_canvas.yview_scroll(
                                   3, "units"))
+
+    def _on_subtab_changed(self, _event) -> None:
+        cur = self._nb.select()
+        if str(cur) == str(self._map_frame):
+            if not self._map_built:
+                self._build_object_map()
+                self._map_built = True
+            if self._layout_pending:
+                hash_hex, comp = self._layout_pending
+                self._layout_pending = None
+                self._load_object_layout(hash_hex, comp)
 
     # ---- populate ----
 
@@ -238,7 +251,12 @@ class LooseTab:
         self._populate_info(hash_hex, otype, comp, uncomp_sz, comp_sz,
                             file_sz)
         self._populate_preview(uncomp_sz)
-        self._load_object_layout(hash_hex, comp)
+
+        # Defer layout RPC until Object Map tab is actually visible
+        if self._map_built and str(self._nb.select()) == str(self._map_frame):
+            self._load_object_layout(hash_hex, comp)
+        else:
+            self._layout_pending = (hash_hex, comp)
 
     def _populate_info(self, hash_hex, otype, comp, uncomp_sz, comp_sz,
                        file_sz) -> None:
@@ -324,8 +342,9 @@ class LooseTab:
         self._map_segments = []
         self._seg_starts = []
         self._map_total_bytes = 0
-        self._map_canvas.delete("all")
-        self._map_info_label.config(text="")
+        if self._map_built:
+            self._map_canvas.delete("all")
+            self._map_info_label.config(text="")
 
     def _apply_layout(self, d: dict, comp: int) -> None:
         file_sz = int(d.get("file_size", 0))
