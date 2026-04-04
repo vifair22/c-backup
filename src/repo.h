@@ -54,3 +54,9 @@ void     repo_unlock(repo_t *repo);
  * lock cannot be acquired the operation proceeds with a warning.
  */
 status_t repo_lock_shared(repo_t *repo);
+
+/*
+ * Non-blocking shared lock — returns OK if the lock was acquired,
+ * ERR_IO if contended (exclusive writer active).  Does not block.
+ */
+status_t repo_lock_shared_nb(repo_t *repo);

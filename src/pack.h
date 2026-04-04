@@ -9,7 +9,8 @@
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
 #define PACK_VERSION_V1  1u            /* compressed_size was uint32_t */
 #define PACK_VERSION_V2  2u            /* compressed_size is uint64_t  */
-#define PACK_VERSION     3u            /* parity trailers + idx entry_index */
+#define PACK_VERSION_V3  3u            /* parity trailers + idx entry_index */
+#define PACK_VERSION     4u            /* idx includes type + sizes for fast stats */
 
 /*
  * Pack all loose objects into a new pack file.
@@ -63,6 +64,13 @@ status_t pack_object_get_info(repo_t *repo,
 
 /* Drop the cached pack index so it is reloaded on next access. */
 void pack_cache_invalidate(repo_t *repo);
+
+/*
+ * Migrate all pre-v4 .idx files to v4 format (adds type+sizes from .dat).
+ * Returns OK on success.  *out_migrated receives the number of idx files
+ * rewritten (may be NULL).
+ */
+status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated);
 
 /*
  * Resolve a hash to its pack location.  Returns OK and fills out_pack_num +
@@ -132,11 +140,23 @@ typedef struct {
     uint64_t dat_offset;               /*  8 */
 } __attribute__((packed)) pack_idx_disk_entry_v2_t;
 
-/* On-disk index entry v3 (44 bytes, sorted by hash) — current write format */
+/* On-disk index entry v3 (44 bytes, sorted by hash) */
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
     uint64_t dat_offset;               /*  8 */
     uint32_t entry_index;              /*  4 */
+} __attribute__((packed)) pack_idx_disk_entry_v3_t;
+
+/* On-disk index entry v4 (62 bytes, sorted by hash) — current write format.
+ * Adds type + sizes so stats can be computed from idx alone (no .dat seeks). */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
+    uint64_t dat_offset;               /*  8 */
+    uint32_t entry_index;              /*  4 */
+    uint8_t  type;                     /*  1 */
+    uint8_t  compression;              /*  1 */
+    uint64_t uncompressed_size;        /*  8 */
+    uint64_t compressed_size;          /*  8 */
 } __attribute__((packed)) pack_idx_disk_entry_t;
 
 /* ------------------------------------------------------------------ */

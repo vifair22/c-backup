@@ -15,11 +15,11 @@ from .tabs import (
 # Map tab key → which repo_summary sub-keys it needs
 _SUMMARY_KEYS = {
     "overview":  ("scan", "list"),
-    "analytics": ("all_pack_entries", "loose_list"),
+    "analytics": ("repo_stats",),
     "search":    ("list",),
     "diff":      ("list",),
     "snapshots": ("list",),
-    "loose":     ("loose_list",),
+    "loose":     ("loose_stats",),
     "packs":     ("scan", "global_pack_index"),
     "tags":      ("tags",),
     "policy":    ("scan", "policy"),
@@ -149,36 +149,56 @@ class ViewerApp(tk.Tk):
             if hasattr(tab, "set_loading"):
                 tab.set_loading()
 
-        # Open session + fetch summary in background
+        # Lazy per-tab loading: fetch only what each tab needs on demand
+        self._rpc_cache: dict[str, object] = {}
+        self._populated_tabs: set[str] = set()
+
         def _load():
-            # Try to open a persistent session
             open_session(path)
-
-            # Try consolidated summary
-            try:
-                summary = call(path, "repo_summary")
-            except RPCError:
-                summary = None
-
-            if summary:
-                ui_call(lambda: self._apply_summary(path, summary))
-            else:
-                # Fallback: per-tab populate
-                ui_call(lambda: self._populate_all(path))
+            self._fetch_tab_data(path, self._active_tab_key())
 
         threading.Thread(target=_load, daemon=True).start()
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-    def _apply_summary(self, path: str, summary: dict) -> None:
-        """Distribute pre-fetched summary data to each tab."""
-        for key, tab in self._tabs.items():
-            needed = _SUMMARY_KEYS.get(key, ())
-            sub = {k: summary.get(k) for k in needed}
-            if hasattr(tab, "populate_from_summary"):
-                tab.populate_from_summary(path, sub)
-            else:
-                tab.populate(path)
+    def _active_tab_key(self) -> str:
+        """Return the key of the currently selected notebook tab."""
+        try:
+            idx = self._nb.index(self._nb.select())
+        except Exception:
+            idx = 0
+        keys = list(self._tabs.keys())
+        return keys[idx] if idx < len(keys) else keys[0]
 
-    def _populate_all(self, path: str) -> None:
-        """Legacy fallback: each tab fetches its own data."""
-        for tab in self._tabs.values():
-            tab.populate(path)
+    def _on_tab_changed(self, _event=None) -> None:
+        path = self.repo_path
+        if not path:
+            return
+        key = self._active_tab_key()
+        if key in self._populated_tabs:
+            return
+        threading.Thread(
+            target=self._fetch_tab_data, args=(path, key),
+            daemon=True).start()
+
+    def _fetch_tab_data(self, path: str, tab_key: str) -> None:
+        """Fetch only the RPC sub-keys a tab needs (skipping cached ones),
+        then deliver the full set from cache to the tab."""
+        needed = _SUMMARY_KEYS.get(tab_key, ())
+        to_fetch = [k for k in needed if k not in self._rpc_cache]
+
+        for sub_key in to_fetch:
+            try:
+                self._rpc_cache[sub_key] = call(path, sub_key)
+            except RPCError as e:
+                print(f"[RPC] error fetching {sub_key}: {e}", flush=True)
+                self._rpc_cache[sub_key] = None
+
+        # Build the full summary dict this tab expects from cache
+        sub = {k: self._rpc_cache.get(k) for k in needed}
+        self._populated_tabs.add(tab_key)
+
+        tab = self._tabs[tab_key]
+        if hasattr(tab, "populate_from_summary"):
+            ui_call(lambda t=tab, p=path, s=sub: t.populate_from_summary(p, s))
+        else:
+            ui_call(lambda t=tab, p=path: t.populate(p))

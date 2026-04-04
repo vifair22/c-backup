@@ -1755,6 +1755,22 @@ static int cmd_pack(repo_t *repo, int argc, char **argv) {
     return st == OK ? 0 : 1;
 }
 
+static int cmd_migrate_v4(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
+    (void)argc; (void)argv;
+    if (lock_or_die(repo)) return 1;
+    uint32_t migrated = 0;
+    status_t st = pack_migrate_idx_v4(repo, &migrated);
+    if (st != OK) {
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "migration failed");
+        return 1;
+    }
+    printf("migrated %u pack index file(s) to v4\n", migrated);
+    return 0;
+}
+
 static int cmd_verify(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 }, { "--repair", 0 } };
     if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
@@ -1975,7 +1991,8 @@ int main(int argc, char *argv[]) {
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
         "export", "import", "prune", "snapshot", "gfs", "gc", "pack", "verify",
-        "doctor", "stats", "tag", "bundle", "reindex", "migrate-packs", NULL
+        "doctor", "stats", "tag", "bundle", "reindex", "migrate-packs",
+        "migrate-v4", NULL
     };
     int known = 0;
     for (int k = 0; known_cmds[k]; k++)
@@ -2028,6 +2045,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);
     else if (strcmp(cmd, "reindex")    == 0) ret = cmd_reindex(repo, argc, argv);
     else if (strcmp(cmd, "migrate-packs") == 0) ret = cmd_migrate_packs(repo, argc, argv);
+    else if (strcmp(cmd, "migrate-v4")    == 0) ret = cmd_migrate_v4(repo, argc, argv);
     else {
         fprintf(stderr, "unknown command: %s\n", cmd);
         usage();

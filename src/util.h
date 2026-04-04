@@ -132,8 +132,15 @@ static inline double elapsed_sec(const struct timespec *start) {
     return (double)ds + (double)dn / 1000000000.0;
 }
 
+/* Warm-up: EMA needs ~5 samples to converge; show "--:--" until then.
+ * Cap: anything above 100 hours is meaningless — show "--h--m". */
+#define ETA_WARMUP_SAMPLES 5
+#define ETA_MAX_SECONDS    (100 * 3600)
+
 static inline void fmt_eta(double sec, char *buf, size_t sz) {
-    if (sec < 1.0) { snprintf(buf, sz, "<1s"); return; }
+    if (sec < 0.0)                   { snprintf(buf, sz, "--:--"); return; }
+    if (sec >= (double)ETA_MAX_SECONDS) { snprintf(buf, sz, "--h--m"); return; }
+    if (sec < 1.0)                   { snprintf(buf, sz, "<1s"); return; }
     unsigned long s = (unsigned long)sec;
     unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
     if (h > 0)      snprintf(buf, sz, "%luh%lum", h, m);

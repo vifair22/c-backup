@@ -44,6 +44,9 @@ static void cleanup(void) {
 static int setup_pipeline(void **state) {
     (void)state;
     cleanup();
+    /* Disable retry delays for fast test execution */
+    setenv("CBACKUP_RETRY_SETTLE_SEC", "0", 1);
+    setenv("CBACKUP_RETRY_FILE_DELAY_SEC", "0", 1);
     int rc = system("mkdir -p " TEST_SRC " " TEST_SRC2);
     (void)rc;
     if (repo_init(TEST_REPO) != OK) return -1;

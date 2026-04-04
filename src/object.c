@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <pthread.h>
@@ -245,7 +246,19 @@ fail:
 /* processor (main thread) hashes + writes the other.                 */
 /* ------------------------------------------------------------------ */
 
-#define STREAM_CHUNK ((size_t)(16 * 1024 * 1024))  /* 16 MiB per slot */
+#define STREAM_CHUNK      ((size_t)(16 * 1024 * 1024))  /* 16 MiB per slot */
+#define STREAM_CHUNK_FUSE ((size_t)( 1 * 1024 * 1024))  /*  1 MiB per slot */
+
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546
+#endif
+
+/* Detect whether fd lives on a FUSE filesystem. */
+static int fd_is_fuse(int fd) {
+    struct statfs sfs;
+    if (fstatfs(fd, &sfs) != 0) return 0;
+    return sfs.f_type == (__typeof__(sfs.f_type))FUSE_SUPER_MAGIC;
+}
 
 typedef struct {
     /* Synchronization — own cache line */
@@ -262,6 +275,7 @@ typedef struct {
     /* Shared / read-mostly */
     int             src_fd;
     uint64_t        file_size;
+    size_t          chunk_size;   /* STREAM_CHUNK or STREAM_CHUNK_FUSE */
     uint8_t        *bufs[2];
 } dbl_buf_t;
 
@@ -270,10 +284,15 @@ static void *dbl_reader_fn(void *arg) {
     uint64_t   offset = 0;
     int        slot   = 0;
 
-    posix_fadvise(d->src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    /* On FUSE, POSIX_FADV_SEQUENTIAL triggers aggressive kernel readahead
+     * that floods the userspace daemon with hundreds of background requests.
+     * Use normal (conservative) readahead instead to avoid overwhelming it. */
+    int is_fuse = (d->chunk_size <= STREAM_CHUNK_FUSE);
+    if (!is_fuse)
+        posix_fadvise(d->src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     while (offset < d->file_size) {
-        size_t want = STREAM_CHUNK;
+        size_t want = d->chunk_size;
         if ((uint64_t)want > d->file_size - offset)
             want = (size_t)(d->file_size - offset);
 
@@ -284,24 +303,48 @@ static void *dbl_reader_fn(void *arg) {
         if (d->abort) { pthread_mutex_unlock(&d->mu); return NULL; }
         pthread_mutex_unlock(&d->mu);
 
-        /* Read without the lock held */
+        /* Read without the lock held.
+         * FUSE filesystems can return transient errors (EIO, ENXIO) or
+         * be interrupted by signals (EINTR) — retry a few times before
+         * giving up so we don't abort a multi-GB file on a hiccup. */
         size_t got = 0;
+        int    retries = 0;
         while (got < want) {
             ssize_t r = read(d->src_fd, d->bufs[slot] + got, want - got);
-            if (r <= 0) {
-                if (r == 0) errno = ESTALE;
-                pthread_mutex_lock(&d->mu);
-                d->reader_st = set_error_errno(ERR_IO, "dbl_reader: read(src_fd)");
-                d->abort     = 1;
-                pthread_cond_broadcast(&d->cond);
-                pthread_mutex_unlock(&d->mu);
-                return NULL;
+            if (r > 0) {
+                got += (size_t)r;
+                retries = 0;          /* reset on any successful read */
+                continue;
             }
-            got += (size_t)r;
+            if (r == -1 && errno == EINTR)
+                continue;             /* interrupted — just retry */
+            if (r == -1 && retries < 3 &&
+                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
+                retries++;
+                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+                nanosleep(&ts, NULL);
+                continue;             /* transient — back off and retry */
+            }
+            if (r == 0) errno = ESTALE;
+            pthread_mutex_lock(&d->mu);
+            d->reader_st = set_error_errno(ERR_IO,
+                "dbl_reader: read(src_fd) at offset %llu/%llu (%.1f%%)",
+                (unsigned long long)(offset + got),
+                (unsigned long long)d->file_size,
+                d->file_size > 0
+                    ? 100.0 * (double)(offset + got) / (double)d->file_size
+                    : 0.0);
+            d->abort     = 1;
+            pthread_cond_broadcast(&d->cond);
+            pthread_mutex_unlock(&d->mu);
+            return NULL;
         }
 
-        /* Source pages are now in our buffer; no need to keep them in cache */
-        posix_fadvise(d->src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
+        /* Source pages are now in our buffer; no need to keep them in cache.
+         * Skip on FUSE — dropping cached pages there just forces re-reads
+         * through the userspace daemon if any readahead pages were evicted. */
+        if (!is_fuse)
+            posix_fadvise(d->src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
         offset += (uint64_t)got;
 
         pthread_mutex_lock(&d->mu);
@@ -365,20 +408,25 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
     }
 
+    /* Use smaller chunks on FUSE to avoid flooding the userspace daemon
+     * with hundreds of concurrent readahead requests (see dbl_reader_fn). */
+    size_t chunk = fd_is_fuse(src_fd) ? STREAM_CHUNK_FUSE : STREAM_CHUNK;
+
     dbl_buf_t dbl;
     dbl.src_fd     = src_fd;
     dbl.file_size  = file_size;
+    dbl.chunk_size = chunk;
     dbl.reader_st  = OK;
     dbl.abort      = 0;
     dbl.lens[0]    = 0;   dbl.lens[1]    = 0;
     dbl.is_last[0] = 0;   dbl.is_last[1] = 0;
     dbl.state[0]   = 0;   dbl.state[1]   = 0;
-    dbl.bufs[0]    = malloc(STREAM_CHUNK);
-    dbl.bufs[1]    = malloc(STREAM_CHUNK);
+    dbl.bufs[0]    = malloc(chunk);
+    dbl.bufs[1]    = malloc(chunk);
     if (!dbl.bufs[0] || !dbl.bufs[1]) {
         free(dbl.bufs[0]); free(dbl.bufs[1]);
         EVP_MD_CTX_free(mdctx);
-        close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
+        close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", chunk);
     }
     pthread_mutex_init(&dbl.mu, NULL);
     pthread_cond_init(&dbl.cond, NULL);
@@ -676,10 +724,27 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
     int is_sparse = 0;
 
     off_t pos = lseek(fd, 0, SEEK_DATA);
-    if (pos == -1 && errno == ENXIO) {
-        /* File is entirely a hole (all zeroes) */
-        is_sparse = 1;
-        /* no regions at all */
+    if (pos == -1 && errno == ENXIO && file_size == 0) {
+        /* Empty file, shouldn't reach here but be safe */
+        is_sparse = 0;
+    } else if (pos == -1 && errno == ENXIO) {
+        /* SEEK_DATA returns ENXIO for two reasons:
+         * 1. File is entirely a hole (all zeroes) — legitimate sparse
+         * 2. Filesystem (e.g. FUSE/shfs) doesn't support SEEK_DATA
+         *
+         * Distinguish by attempting a probe read.  A real all-zero sparse
+         * file will read zeroes; a FUSE that doesn't support SEEK_DATA
+         * will also read real data.  Either way we fall through to the
+         * non-sparse streaming path which handles both correctly. */
+        char probe;
+        if (pread(fd, &probe, 1, 0) == 1) {
+            /* File is readable — SEEK_DATA unsupported or has real data.
+             * Treat as non-sparse to avoid misclassifying. */
+            is_sparse = 0;
+        } else {
+            /* Can't even read the file — real I/O error */
+            return set_error_errno(ERR_IO, "store: read probe failed");
+        }
     } else if (pos != -1) {
         /* Check if first data region starts at 0 — if not, file is sparse */
         if (pos != 0) is_sparse = 1;

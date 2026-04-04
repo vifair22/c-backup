@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <openssl/evp.h>
+#include <lz4.h>
 
 /* ------------------------------------------------------------------ */
 /* Session snapshot cache                                              */
@@ -258,15 +259,71 @@ static char *read_stdin_all(void)
 
 static int _stdout_broken = 0;
 
+/* LZ4 compression threshold: responses smaller than this are sent as
+ * plain text for debuggability; larger ones get a binary LZ4 frame. */
+#define LZ4_COMPRESS_THRESHOLD 256
+
+/* Write a JSON string to stdout, compressing with LZ4 if large enough.
+ *
+ * Plain text: the JSON line followed by '\n' (as before).
+ * Compressed frame:
+ *   0x00              (1 byte)  — magic (no valid JSON starts with NUL)
+ *   uncomp_len        (4 bytes, LE) — uncompressed JSON length
+ *   comp_len          (4 bytes, LE) — compressed payload length
+ *   compressed data   (comp_len bytes)
+ *   '\n'              (1 byte)  — frame terminator
+ */
+static void write_json(const char *s, size_t len)
+{
+    if (len < LZ4_COMPRESS_THRESHOLD) {
+        fwrite(s, 1, len, stdout);
+        fputc('\n', stdout);
+        if (fflush(stdout) != 0) _stdout_broken = 1;
+        return;
+    }
+
+    int bound = LZ4_compressBound((int)len);
+    if (bound <= 0) goto plain;
+
+    char *comp = malloc((size_t)bound);
+    if (!comp) goto plain;
+
+    int comp_len = LZ4_compress_default(s, comp, (int)len, bound);
+    if (comp_len <= 0 || (size_t)comp_len >= len) {
+        /* Compression failed or didn't save space — send plain */
+        free(comp);
+        goto plain;
+    }
+
+    /* Write binary frame */
+    uint8_t header[9];
+    header[0] = 0x00;
+    uint32_t ulen = (uint32_t)len;
+    uint32_t clen = (uint32_t)comp_len;
+    memcpy(header + 1, &ulen, 4);
+    memcpy(header + 5, &clen, 4);
+
+    fwrite(header, 1, 9, stdout);
+    fwrite(comp, 1, (size_t)comp_len, stdout);
+    fputc('\n', stdout);
+    if (fflush(stdout) != 0) _stdout_broken = 1;
+    free(comp);
+    return;
+
+plain:
+    fwrite(s, 1, len, stdout);
+    fputc('\n', stdout);
+    if (fflush(stdout) != 0) _stdout_broken = 1;
+}
+
 static void write_ok(cJSON *data)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "status", "ok");
     cJSON_AddItemToObject(root, "data", data);
     char *s = cJSON_PrintUnformatted(root);
-    fputs(s, stdout);
-    fputc('\n', stdout);
-    if (fflush(stdout) != 0) _stdout_broken = 1;
+    size_t len = strlen(s);
+    write_json(s, len);
     free(s);
     cJSON_Delete(root);
 }
@@ -277,9 +334,8 @@ static void write_error(const char *msg)
     cJSON_AddStringToObject(root, "status", "error");
     cJSON_AddStringToObject(root, "message", msg ? msg : "unknown error");
     char *s = cJSON_PrintUnformatted(root);
-    fputs(s, stdout);
-    fputc('\n', stdout);
-    if (fflush(stdout) != 0) _stdout_broken = 1;
+    size_t len = strlen(s);
+    write_json(s, len);
     free(s);
     cJSON_Delete(root);
 }
@@ -1268,10 +1324,20 @@ static cJSON *handle_pack_index(repo_t *repo, const cJSON *params)
 /* --- loose_list --------------------------------------------------- */
 static cJSON *handle_loose_list(repo_t *repo, const cJSON *params)
 {
-    (void)params;
     const char *base = repo_path(repo);
     size_t base_len = strlen(base);
     if (base_len + sizeof("/objects/xx/") + 64 > PATH_MAX) return NULL;
+
+    uint32_t offset = 0, limit = 5000;
+    if (params) {
+        const cJSON *joff = cJSON_GetObjectItemCaseSensitive(params, "offset");
+        if (cJSON_IsNumber(joff) && joff->valuedouble >= 0)
+            offset = (uint32_t)joff->valuedouble;
+        const cJSON *jlim = cJSON_GetObjectItemCaseSensitive(params, "limit");
+        if (cJSON_IsNumber(jlim) && jlim->valuedouble > 0)
+            limit = (uint32_t)jlim->valuedouble;
+    }
+    if (limit > 5000) limit = 5000;
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/objects", base);
@@ -1279,7 +1345,8 @@ static cJSON *handle_loose_list(repo_t *repo, const cJSON *params)
 
     cJSON *d = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(d, "objects");
-    uint32_t n = 0;
+    uint32_t seen = 0, emitted = 0;
+    int has_more = 0;
 
     DIR *top = opendir(path);
     if (!top) return d;
@@ -1315,6 +1382,10 @@ static cJSON *handle_loose_list(repo_t *repo, const cJSON *params)
 
             if (hdr.magic != OBJECT_MAGIC) continue;
 
+            /* Pagination: skip until offset, stop after limit */
+            if (seen < offset) { seen++; continue; }
+            if (emitted >= limit) { has_more = 1; closedir(sub); goto done; }
+
             cJSON *item = cJSON_CreateObject();
             char hex[65];
             hash_hex(hdr.hash, hex);
@@ -1330,13 +1401,370 @@ static cJSON *handle_loose_list(repo_t *repo, const cJSON *params)
                 cJSON_AddNumberToObject(item, "file_size", (double)st.st_size);
 
             cJSON_AddItemToArray(arr, item);
-            n++;
+            seen++;
+            emitted++;
         }
         closedir(sub);
     }
+done:
     closedir(top);
 
-    cJSON_AddNumberToObject(d, "count", n);
+    cJSON_AddNumberToObject(d, "count",    emitted);
+    cJSON_AddNumberToObject(d, "offset",   offset);
+    cJSON_AddNumberToObject(d, "limit",    limit);
+    cJSON_AddBoolToObject(d,   "has_more", has_more);
+    return d;
+}
+
+/* --- repo_stats --------------------------------------------------- */
+
+/* Aggregated counters — no per-object JSON, just fixed-size totals. */
+struct repo_stats_ctx {
+    /* Per object type: count, uncompressed bytes, compressed bytes */
+    uint64_t type_count[5];   /* index 0 unused; 1=FILE,2=XATTR,3=ACL,4=SPARSE */
+    uint64_t type_uncomp[5];
+    uint64_t type_comp[5];
+
+    /* Pack totals */
+    uint64_t pack_count;
+    uint64_t pack_uncomp;
+    uint64_t pack_comp;
+
+    /* High-ratio entries (comp/uncomp >= 0.90) */
+    uint64_t hiratio_count;
+    uint64_t hiratio_uncomp;
+    uint64_t hiratio_comp;
+};
+
+static void repo_stats_accum(struct repo_stats_ctx *s,
+                             uint8_t type, uint64_t uncomp, uint64_t comp)
+{
+    if (type >= 1 && type <= 4) {
+        s->type_count[type]++;
+        s->type_uncomp[type] += uncomp;
+        s->type_comp[type]   += comp;
+    }
+    s->pack_count++;
+    s->pack_uncomp += uncomp;
+    s->pack_comp   += comp;
+
+    if (uncomp > 0 && comp * 100 / uncomp >= 90) {
+        s->hiratio_count++;
+        s->hiratio_uncomp += uncomp;
+        s->hiratio_comp   += comp;
+    }
+}
+
+/* Read a v4 .idx file — all stats are in the idx entries, no .dat seeking. */
+static void repo_stats_read_idx_v4(const char *path, uint32_t count,
+                                   struct repo_stats_ctx *s)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+
+    /* Skip idx header */
+    if (fseeko(f, (off_t)sizeof(pack_idx_hdr_t), SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+
+    /* Bulk-read all entries */
+    pack_idx_disk_entry_t *entries = malloc((size_t)count * sizeof(*entries));
+    if (!entries) { fclose(f); return; }
+    if (fread(entries, sizeof(*entries), count, f) != count) {
+        free(entries); fclose(f); return;
+    }
+    fclose(f);
+
+    for (uint32_t i = 0; i < count; i++) {
+        repo_stats_accum(s, entries[i].type, entries[i].uncompressed_size,
+                         entries[i].compressed_size);
+    }
+    free(entries);
+}
+
+/* Read entry headers from a .dat file — seeks over payloads.
+ * Fallback for pre-v4 packs that don't have type+sizes in the idx. */
+static void repo_stats_read_dat(const char *path, struct repo_stats_ctx *s)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+
+    pack_dat_hdr_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        hdr.magic != PACK_DAT_MAGIC) {
+        fclose(f);
+        return;
+    }
+
+    for (uint32_t i = 0; i < hdr.count; i++) {
+        if (hdr.version == PACK_VERSION_V1) {
+            pack_dat_entry_hdr_v1_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+            repo_stats_accum(s, eh.type, eh.uncompressed_size,
+                             (uint64_t)eh.compressed_size);
+            if (fseeko(f, (off_t)eh.compressed_size, SEEK_CUR) != 0) break;
+        } else {
+            pack_dat_entry_hdr_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+            repo_stats_accum(s, eh.type, eh.uncompressed_size,
+                             eh.compressed_size);
+            if (fseeko(f, (off_t)eh.compressed_size, SEEK_CUR) != 0) break;
+        }
+    }
+    fclose(f);
+}
+
+/* Scan a packs directory (flat or sharded) for stats.
+ * For v4 idx files, reads stats from idx directly (fast).
+ * For older versions, falls back to .dat scanning (slow). */
+static void repo_stats_scan_dir(const char *dirpath, struct repo_stats_ctx *s)
+{
+    DIR *dir = opendir(dirpath);
+    if (!dir) return;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        size_t len = strlen(de->d_name);
+
+        if (len > 4 && strcmp(de->d_name + len - 4, ".idx") == 0) {
+            /* Try to read idx — if v4, we get everything from idx */
+            char fpath[PATH_MAX];
+            int r = snprintf(fpath, sizeof(fpath), "%s/%s", dirpath,
+                             de->d_name);
+            if (r < 0 || (size_t)r >= sizeof(fpath)) continue;
+
+            FILE *f = fopen(fpath, "rb");
+            if (!f) continue;
+            pack_idx_hdr_t ihdr;
+            if (fread(&ihdr, sizeof(ihdr), 1, f) != 1 ||
+                ihdr.magic != PACK_IDX_MAGIC) {
+                fclose(f); continue;
+            }
+            fclose(f);
+
+            if (ihdr.version == PACK_VERSION) {
+                /* v4: read stats from idx — no .dat needed */
+                repo_stats_read_idx_v4(fpath, ihdr.count, s);
+            } else {
+                /* Pre-v4: must read .dat for type+sizes */
+                char dat_path[PATH_MAX];
+                memcpy(dat_path, fpath, (size_t)r + 1);
+                size_t ext = (size_t)r - 3;
+                memcpy(dat_path + ext, "dat", 4);
+                repo_stats_read_dat(dat_path, s);
+            }
+        } else if (len == 4) {
+            /* Shard subdirectory */
+            char subdir[PATH_MAX];
+            int r = snprintf(subdir, sizeof(subdir), "%s/%s", dirpath,
+                             de->d_name);
+            if (r < 0 || (size_t)r >= sizeof(subdir)) continue;
+            struct stat sb;
+            if (stat(subdir, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+            repo_stats_scan_dir(subdir, s);
+        }
+    }
+    closedir(dir);
+}
+
+/* Build the repo_stats JSON object from computed counters. */
+static cJSON *repo_stats_to_json(const struct repo_stats_ctx *s,
+                                 uint64_t loose_count, uint64_t loose_uncomp,
+                                 uint64_t loose_comp,
+                                 uint64_t skip_count, uint64_t skip_uncomp,
+                                 uint64_t skip_comp)
+{
+    cJSON *d = cJSON_CreateObject();
+
+    cJSON *per_type = cJSON_AddArrayToObject(d, "per_type");
+    for (int t = 1; t <= 4; t++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "type",   t);
+        cJSON_AddNumberToObject(item, "count",  (double)s->type_count[t]);
+        cJSON_AddNumberToObject(item, "uncomp", (double)s->type_uncomp[t]);
+        cJSON_AddNumberToObject(item, "comp",   (double)s->type_comp[t]);
+        cJSON_AddItemToArray(per_type, item);
+    }
+
+    cJSON *pack = cJSON_AddObjectToObject(d, "pack");
+    cJSON_AddNumberToObject(pack, "count",  (double)s->pack_count);
+    cJSON_AddNumberToObject(pack, "uncomp", (double)s->pack_uncomp);
+    cJSON_AddNumberToObject(pack, "comp",   (double)s->pack_comp);
+
+    cJSON *loose = cJSON_AddObjectToObject(d, "loose");
+    cJSON_AddNumberToObject(loose, "count",  (double)loose_count);
+    cJSON_AddNumberToObject(loose, "uncomp", (double)loose_uncomp);
+    cJSON_AddNumberToObject(loose, "comp",   (double)loose_comp);
+
+    cJSON *skip_obj = cJSON_AddObjectToObject(d, "skip");
+    cJSON_AddNumberToObject(skip_obj, "count",  (double)skip_count);
+    cJSON_AddNumberToObject(skip_obj, "uncomp", (double)skip_uncomp);
+    cJSON_AddNumberToObject(skip_obj, "comp",   (double)skip_comp);
+
+    cJSON *hi = cJSON_AddObjectToObject(d, "hiratio");
+    cJSON_AddNumberToObject(hi, "count",  (double)s->hiratio_count);
+    cJSON_AddNumberToObject(hi, "uncomp", (double)s->hiratio_uncomp);
+    cJSON_AddNumberToObject(hi, "comp",   (double)s->hiratio_comp);
+
+    return d;
+}
+
+static cJSON *handle_repo_stats(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    const char *base = repo_path(repo);
+
+    char packs_dir[PATH_MAX];
+    snprintf(packs_dir, sizeof(packs_dir), "%s/packs", base);
+
+    struct repo_stats_ctx s;
+    memset(&s, 0, sizeof(s));
+
+    repo_stats_scan_dir(packs_dir, &s);
+
+    /* Walk loose objects (typically very few after packing) */
+    uint64_t loose_count = 0, loose_uncomp = 0, loose_comp = 0;
+    uint64_t skip_count = 0, skip_uncomp = 0, skip_comp = 0;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects", base);
+    size_t obj_len = strlen(path);
+
+    DIR *top = opendir(path);
+    if (top) {
+        struct dirent *sde;
+        while ((sde = readdir(top)) != NULL) {
+            if (sde->d_name[0] == '.') continue;
+            if (strlen(sde->d_name) != 2) continue;
+
+            path[obj_len] = '/';
+            memcpy(path + obj_len + 1, sde->d_name, 3);
+            size_t sub_len = obj_len + 3;
+
+            DIR *sub = opendir(path);
+            if (!sub) continue;
+
+            struct dirent *lde;
+            while ((lde = readdir(sub)) != NULL) {
+                if (lde->d_name[0] == '.') continue;
+                size_t nlen = strlen(lde->d_name);
+                if (sub_len + 1 + nlen >= sizeof(path)) continue;
+                path[sub_len] = '/';
+                memcpy(path + sub_len + 1, lde->d_name, nlen + 1);
+
+                FILE *f = fopen(path, "rb");
+                if (!f) continue;
+                object_header_t hdr;
+                if (fread(&hdr, sizeof(hdr), 1, f) != 1) { fclose(f); continue; }
+                fclose(f);
+                if (hdr.magic != OBJECT_MAGIC) continue;
+
+                uint8_t t = hdr.type;
+                if (t >= 1 && t <= 4) {
+                    s.type_count[t]++;
+                    s.type_uncomp[t] += hdr.uncompressed_size;
+                    s.type_comp[t]   += hdr.compressed_size;
+                }
+                loose_count++;
+                loose_uncomp += hdr.uncompressed_size;
+                loose_comp   += hdr.compressed_size;
+
+                if (hdr.pack_skip_ver == PROBER_VERSION) {
+                    skip_count++;
+                    skip_uncomp += hdr.uncompressed_size;
+                    skip_comp   += hdr.compressed_size;
+                }
+            }
+            closedir(sub);
+        }
+        closedir(top);
+    }
+
+    return repo_stats_to_json(&s, loose_count, loose_uncomp, loose_comp,
+                              skip_count, skip_uncomp, skip_comp);
+}
+
+/* --- loose_stats -------------------------------------------------- */
+
+static cJSON *handle_loose_stats(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    const char *base = repo_path(repo);
+
+    uint64_t total_count = 0, total_bytes = 0;
+    uint64_t type_count[5] = {0};
+    uint64_t type_uncomp[5] = {0};
+    uint64_t skip_count = 0, skip_uncomp = 0;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects", base);
+    size_t obj_len = strlen(path);
+
+    DIR *top = opendir(path);
+    if (top) {
+        struct dirent *sde;
+        while ((sde = readdir(top)) != NULL) {
+            if (sde->d_name[0] == '.') continue;
+            if (strlen(sde->d_name) != 2) continue;
+
+            path[obj_len] = '/';
+            memcpy(path + obj_len + 1, sde->d_name, 3);
+            size_t sub_len = obj_len + 3;
+
+            DIR *sub = opendir(path);
+            if (!sub) continue;
+
+            struct dirent *lde;
+            while ((lde = readdir(sub)) != NULL) {
+                if (lde->d_name[0] == '.') continue;
+                size_t nlen = strlen(lde->d_name);
+                if (sub_len + 1 + nlen >= sizeof(path)) continue;
+                path[sub_len] = '/';
+                memcpy(path + sub_len + 1, lde->d_name, nlen + 1);
+
+                FILE *f = fopen(path, "rb");
+                if (!f) continue;
+                object_header_t hdr;
+                if (fread(&hdr, sizeof(hdr), 1, f) != 1) { fclose(f); continue; }
+                fclose(f);
+                if (hdr.magic != OBJECT_MAGIC) continue;
+
+                uint8_t t = hdr.type;
+                if (t >= 1 && t <= 4) {
+                    type_count[t]++;
+                    type_uncomp[t] += hdr.uncompressed_size;
+                }
+                total_count++;
+                total_bytes += hdr.uncompressed_size;
+
+                if (hdr.pack_skip_ver == PROBER_VERSION) {
+                    skip_count++;
+                    skip_uncomp += hdr.uncompressed_size;
+                }
+            }
+            closedir(sub);
+        }
+        closedir(top);
+    }
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddNumberToObject(d, "count", (double)total_count);
+    cJSON_AddNumberToObject(d, "total_uncomp", (double)total_bytes);
+
+    cJSON *per_type = cJSON_AddArrayToObject(d, "per_type");
+    for (int t = 1; t <= 4; t++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "type",   t);
+        cJSON_AddNumberToObject(item, "count",  (double)type_count[t]);
+        cJSON_AddNumberToObject(item, "uncomp", (double)type_uncomp[t]);
+        cJSON_AddItemToArray(per_type, item);
+    }
+
+    cJSON *skip_obj = cJSON_AddObjectToObject(d, "skip");
+    cJSON_AddNumberToObject(skip_obj, "count",  (double)skip_count);
+    cJSON_AddNumberToObject(skip_obj, "uncomp", (double)skip_uncomp);
+
     return d;
 }
 
@@ -1823,6 +2251,8 @@ static const action_entry_t actions[] = {
     { "loose_list",       handle_loose_list },
     { "search",           handle_search },
     { "all_pack_entries", handle_all_pack_entries },
+    { "repo_stats",           handle_repo_stats },
+    { "loose_stats",          handle_loose_stats },
     { "object_refs",          handle_object_refs },
     { "object_layout",        handle_object_layout },
     { "global_pack_index",    handle_global_pack_index },
@@ -1903,12 +2333,16 @@ int json_api_session(repo_t *repo)
     FILE *f = freopen("/dev/null", "w", stderr);
     (void)f;
 
-    /* Ready banner */
-    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":1}\n");
-    fflush(stdout);
+    /* Non-blocking shared lock — if a backup/gc/pack holds the exclusive
+     * lock we proceed without it rather than hanging.  The viewer is
+     * read-only and all on-disk writes are atomic (mkstemp→fsync→rename),
+     * so the worst case is a slightly stale view. */
+    int lock_held = (repo_lock_shared_nb(repo) == OK);
 
-    /* Shared lock for the lifetime of the session */
-    repo_lock_shared(repo);
+    /* Ready banner — includes lock status so the viewer can warn the user */
+    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":2,\"compression\":\"lz4\",\"lock\":%s}\n",
+            lock_held ? "true" : "false");
+    fflush(stdout);
 
     /* Enable snapshot cache for the session lifetime */
     _cache_active = 1;

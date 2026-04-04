@@ -9,7 +9,6 @@ from ..constants import (
     OBJECT_TYPE_NAMES,
     OBJECT_TYPE_FILE, OBJECT_TYPE_SPARSE,
     OBJECT_TYPE_XATTR, OBJECT_TYPE_ACL,
-    PROBER_VERSION,
 )
 from ..widgets import make_text_widget, set_text, ui_call, PAD, FONT_MONO, FONT_BOLD
 
@@ -66,61 +65,35 @@ class AnalyticsTab:
 
         def _worker() -> None:
             try:
-                pack_data = call(repo_path, "all_pack_entries")
+                data = call(repo_path, "repo_stats")
             except RPCError:
-                pack_data = {"entries": []}
-            try:
-                loose_data = call(repo_path, "loose_list")
-            except RPCError:
-                loose_data = {"objects": []}
-            ui_call(lambda: self._compute_and_display(pack_data, loose_data))
+                data = {}
+            ui_call(lambda: self._compute_and_display(data))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def populate_from_summary(self, repo_path: str, summary: dict) -> None:
-        pack_data = summary.get("all_pack_entries") or {"entries": []}
-        loose_data = summary.get("loose_list") or {"objects": []}
-        self._compute_and_display(pack_data, loose_data)
+        data = summary.get("repo_stats") or {}
+        self._compute_and_display(data)
 
-    def _compute_and_display(self, pack_data: dict, loose_data: dict) -> None:
+    def _compute_and_display(self, data: dict) -> None:
         stats = {t: {"count": 0, "uncomp": 0, "comp": 0} for t in _TYPES}
 
-        pack    = {"count": 0, "uncomp": 0, "comp": 0}
-        loose   = {"count": 0, "uncomp": 0, "comp": 0}
-        skip    = {"count": 0, "uncomp": 0, "comp": 0}
-        hiratio = {"count": 0, "uncomp": 0, "comp": 0}
-
-        for e in pack_data.get("entries", []):
-            t = int(e["type"])
-            uncomp = int(e["uncompressed_size"])
-            comp   = int(e["compressed_size"])
+        for entry in data.get("per_type", []):
+            t = int(entry["type"])
             if t in stats:
-                stats[t]["count"]  += 1
-                stats[t]["uncomp"] += uncomp
-                stats[t]["comp"]   += comp
-            pack["count"]  += 1
-            pack["uncomp"] += uncomp
-            pack["comp"]   += comp
-            if uncomp > 0 and comp / uncomp >= 0.90:
-                hiratio["count"]  += 1
-                hiratio["uncomp"] += uncomp
-                hiratio["comp"]   += comp
+                stats[t]["count"]  = int(entry["count"])
+                stats[t]["uncomp"] = int(entry["uncomp"])
+                stats[t]["comp"]   = int(entry["comp"])
 
-        for obj in loose_data.get("objects", []):
-            t      = int(obj["type"])
-            uncomp = int(obj["uncompressed_size"])
-            comp   = int(obj["compressed_size"])
-            if t in stats:
-                stats[t]["count"]  += 1
-                stats[t]["uncomp"] += uncomp
-                stats[t]["comp"]   += comp
-            loose["count"]  += 1
-            loose["uncomp"] += uncomp
-            loose["comp"]   += comp
-            if int(obj.get("pack_skip_ver", 0)) == PROBER_VERSION:
-                skip["count"]  += 1
-                skip["uncomp"] += uncomp
-                skip["comp"]   += comp
+        pack    = {k: int(data.get("pack", {}).get(k, 0))
+                   for k in ("count", "uncomp", "comp")}
+        loose   = {k: int(data.get("loose", {}).get(k, 0))
+                   for k in ("count", "uncomp", "comp")}
+        skip    = {k: int(data.get("skip", {}).get(k, 0))
+                   for k in ("count", "uncomp", "comp")}
+        hiratio = {k: int(data.get("hiratio", {}).get(k, 0))
+                   for k in ("count", "uncomp", "comp")}
 
         total_uncomp = sum(s["uncomp"] for s in stats.values()) or 1
         total_comp   = sum(s["comp"]   for s in stats.values()) or 1

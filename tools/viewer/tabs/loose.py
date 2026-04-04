@@ -95,8 +95,12 @@ class LooseTab:
         # Left: object list
         left = ttk.Frame(pane)
         pane.add(left, weight=1)
-        tk.Label(left, text="Loose objects", font=FONT_BOLD).pack(
-            anchor="w", padx=PAD)
+        hdr = tk.Frame(left)
+        hdr.pack(fill=tk.X, padx=PAD)
+        tk.Label(hdr, text="Loose objects", font=FONT_BOLD).pack(
+            side=tk.LEFT)
+        self._status_label = tk.Label(hdr, text="", font=FONT_MONO, fg="gray")
+        self._status_label.pack(side=tk.RIGHT)
         self._list = tk.Listbox(left, font=FONT_MONO, width=22)
         sb = ttk.Scrollbar(left, command=self._list.yview)
         self._list.config(yscrollcommand=sb.set)
@@ -200,25 +204,80 @@ class LooseTab:
     def populate(self, repo_path: str) -> None:
         self._repo_path = repo_path
         try:
-            data = call(repo_path, "loose_list")
+            data = call(repo_path, "loose_stats")
         except RPCError as e:
             self._objects = []
             set_text(self._info_text,
                      f"Error loading loose objects: {e}")
             return
-        self._apply_list(data)
+        self._apply_stats(data)
 
     def populate_from_summary(self, repo_path: str, summary: dict) -> None:
         self._repo_path = repo_path
-        data = summary.get("loose_list") or {"objects": []}
-        self._apply_list(data)
+        data = summary.get("loose_stats") or {}
+        self._apply_stats(data)
 
-    def _apply_list(self, data: dict) -> None:
+    def _apply_stats(self, data: dict) -> None:
+        """Show summary stats and start loading objects."""
+        count = int(data.get("count", 0))
+        total_uncomp = int(data.get("total_uncomp", 0))
+        skip = data.get("skip", {})
+        skip_count = int(skip.get("count", 0))
+
+        lines = [f"Loose objects: {count:,}  ({fmt_size(total_uncomp)})"]
+        if skip_count:
+            lines.append(f"  skip-marked: {skip_count:,}"
+                         f"  ({fmt_size(int(skip.get('uncomp', 0)))})")
+        per_type = data.get("per_type", [])
+        from ..constants import OBJECT_TYPE_NAMES
+        for entry in per_type:
+            t = int(entry["type"])
+            c = int(entry["count"])
+            u = int(entry["uncomp"])
+            if c > 0:
+                name = OBJECT_TYPE_NAMES.get(t, str(t))
+                lines.append(f"  {name:<8}: {c:>7,}  {fmt_size(u):>12}")
+        set_text(self._info_text, "\n".join(lines))
+
         self._list.delete(0, tk.END)
-        self._objects = data.get("objects", [])
-        for obj in self._objects:
+        self._objects = []
+        self._next_offset = 0
+        self._status_label.config(text="loading…")
+        self._fetch_page()
+
+    def _fetch_page(self) -> None:
+        """Fetch one page of loose objects from _next_offset."""
+        if not self._repo_path:
+            return
+        repo_path = self._repo_path
+        offset = self._next_offset
+
+        def _worker() -> None:
+            try:
+                data = call(repo_path, "loose_list",
+                            offset=offset, limit=1000)
+            except RPCError as e:
+                ui_call(lambda: set_text(self._info_text,
+                                         f"Error loading: {e}"))
+                return
+            ui_call(lambda: self._append_page(data))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _append_page(self, data: dict) -> None:
+        """Append a page of objects to the list."""
+        new_objects = data.get("objects", [])
+        for obj in new_objects:
             h = obj.get("hash", "")
             self._list.insert(tk.END, h[:2] + "/" + h[2:])
+        self._objects.extend(new_objects)
+        self._next_offset += len(new_objects)
+
+        if data.get("has_more"):
+            self._status_label.config(text=f"{len(self._objects)} loading…")
+            self._fetch_page()
+        else:
+            self._status_label.config(text=f"{len(self._objects):,}")
 
     # ---- selection ----
 

@@ -301,7 +301,9 @@ static double pack_elapsed_between(const struct timespec *a, const struct timesp
 }
 
 static void pack_fmt_eta(double sec, char *buf, size_t sz) {
-    if (sec < 1.0) { snprintf(buf, sz, "<1s"); return; }
+    if (sec < 0.0)                      { snprintf(buf, sz, "--:--"); return; }
+    if (sec >= (double)(100 * 3600))    { snprintf(buf, sz, "--h--m"); return; }
+    if (sec < 1.0)                      { snprintf(buf, sz, "<1s"); return; }
     unsigned long s = (unsigned long)sec;
     unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
     if (h) snprintf(buf, sz, "%luh%lum", h, m);
@@ -324,6 +326,7 @@ static void *pack_progress_fn(void *arg) {
     uint64_t last_bytes = 0;
     struct timespec last_t = prog->started_at;
     double ema_bps = 0.0;
+    int samples = 0;
 
     for (;;) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
@@ -339,14 +342,15 @@ static void *pack_progress_fn(void *arg) {
         if (dt > 0.0) {
             double inst = (double)(cur_bytes - last_bytes) / dt;
             if (ema_bps <= 0.0) ema_bps = inst;
-            else                 ema_bps = 0.12 * inst + 0.88 * ema_bps;
+            else                 ema_bps = 0.3 * inst + 0.7 * ema_bps;
+            samples++;
         }
         last_bytes = cur_bytes;
         last_t     = now;
 
-        double rem = (ema_bps > 0.0 && prog->total_bytes > cur_bytes)
+        double rem = (samples >= 5 && ema_bps > 0.0 && prog->total_bytes > cur_bytes)
                    ? (double)(prog->total_bytes - cur_bytes) / ema_bps
-                   : 0.0;
+                   : -1.0;
         char eta[32];
         pack_fmt_eta(rem, eta, sizeof(eta));
         char line[128];
@@ -717,12 +721,11 @@ static status_t pack_cache_load(repo_t *repo) {
             hdr.magic != PACK_IDX_MAGIC ||
             (hdr.version != PACK_VERSION_V1 &&
              hdr.version != PACK_VERSION_V2 &&
+             hdr.version != PACK_VERSION_V3 &&
              hdr.version != PACK_VERSION)) {
             fclose(f); continue;
         }
         if (hdr.count > 10000000u) { fclose(f); continue; }
-
-        int is_v3 = (hdr.version == PACK_VERSION);
 
         /* Ensure capacity for all entries in this pack at once */
         if (cnt + hdr.count > cap) {
@@ -734,11 +737,27 @@ static status_t pack_cache_load(repo_t *repo) {
         }
 
         /* Bulk-read all index entries in one fread call */
-        if (is_v3) {
+        if (hdr.version == PACK_VERSION) {
             size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_t);
             pack_idx_disk_entry_t *disk_buf = malloc(disk_sz);
             if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
             if (fread(disk_buf, sizeof(pack_idx_disk_entry_t), hdr.count, f) != hdr.count) {
+                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
+            }
+            for (uint32_t i = 0; i < hdr.count; i++) {
+                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
+                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
+                entries[cnt].pack_num     = pack_num;
+                entries[cnt].pack_version = hdr.version;
+                entries[cnt].entry_index  = disk_buf[i].entry_index;
+                cnt++;
+            }
+            free(disk_buf);
+        } else if (hdr.version == PACK_VERSION_V3) {
+            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v3_t);
+            pack_idx_disk_entry_v3_t *disk_buf = malloc(disk_sz);
+            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
+            if (fread(disk_buf, sizeof(pack_idx_disk_entry_v3_t), hdr.count, f) != hdr.count) {
                 free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
             }
             for (uint32_t i = 0; i < hdr.count; i++) {
@@ -1018,7 +1037,8 @@ status_t pack_object_load(repo_t *repo,
     if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
 
     /* --- Parity: attempt entry header repair for v3 packs --- */
-    if (found->pack_version == PACK_VERSION && found->entry_index != UINT32_MAX) {
+    if ((found->pack_version == PACK_VERSION_V3 || found->pack_version == PACK_VERSION) &&
+        found->entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         uint32_t pay_crc = 0;
         uint8_t *rs_par = NULL;
@@ -1214,7 +1234,8 @@ status_t pack_object_load_stream(repo_t *repo,
     uint32_t rs_data_len = 0;
     int have_parity = 0;
 
-    if (found->pack_version == PACK_VERSION && found->entry_index != UINT32_MAX) {
+    if ((found->pack_version == PACK_VERSION_V3 || found->pack_version == PACK_VERSION) &&
+        found->entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         if (load_entry_parity(f, found->entry_index, &hdr_par,
                               &pay_crc, &rs_par, &rs_par_sz, &rs_data_len) == 0) {
@@ -2681,7 +2702,11 @@ raw_copy:
         lg_body_offset        += sizeof(ehdr) + actual_compressed_size;
         processed_payload_bytes += actual_compressed_size;
 
-        idx_entries[lg_packed].entry_index = lg_packed;
+        idx_entries[lg_packed].entry_index        = lg_packed;
+        idx_entries[lg_packed].type               = ehdr.type;
+        idx_entries[lg_packed].compression        = ehdr.compression;
+        idx_entries[lg_packed].uncompressed_size  = ehdr.uncompressed_size;
+        idx_entries[lg_packed].compressed_size    = actual_compressed_size;
         lg_packed++;
         atomic_fetch_add(&prog.objects_packed, 1);
     }
@@ -2849,8 +2874,12 @@ raw_copy:
             }
 
             memcpy(idx_entries[sm_packed].hash, item.hash, OBJECT_HASH_SIZE);
-            idx_entries[sm_packed].dat_offset = sizeof(sm_dat_hdr) + dat_body_offset;
-            idx_entries[sm_packed].entry_index = sm_packed;
+            idx_entries[sm_packed].dat_offset         = sizeof(sm_dat_hdr) + dat_body_offset;
+            idx_entries[sm_packed].entry_index        = sm_packed;
+            idx_entries[sm_packed].type               = item.type;
+            idx_entries[sm_packed].compression        = item.compression;
+            idx_entries[sm_packed].uncompressed_size  = item.uncompressed_size;
+            idx_entries[sm_packed].compressed_size    = item.compressed_size;
             sm_packed++;
 
             pack_dat_entry_hdr_t ehdr;
@@ -3017,21 +3046,40 @@ static int ref_cmp(const void *key, const void *entry) {
     return memcmp(key, entry, OBJECT_HASH_SIZE);
 }
 
-/* Read idx entries from file, normalising v1/v2 (40-byte) to v3 (44-byte).
- * Caller provides an array of at least count v3 entries. */
+/* Read idx entries from file, normalising v1/v2/v3 to v4 (62-byte).
+ * Caller provides an array of at least count v4 entries. */
 static int read_idx_entries(FILE *f, uint32_t version, uint32_t count,
                             pack_idx_disk_entry_t *out) {
     if (version == PACK_VERSION) {
-        /* v3: 44-byte entries */
+        /* v4: 62-byte entries — native format */
         return (fread(out, sizeof(*out), count, f) == count) ? 0 : -1;
+    }
+    if (version == PACK_VERSION_V3) {
+        /* v3: 44-byte entries — no type/sizes */
+        for (uint32_t i = 0; i < count; i++) {
+            pack_idx_disk_entry_v3_t de3;
+            if (fread(&de3, sizeof(de3), 1, f) != 1) return -1;
+            memcpy(out[i].hash, de3.hash, OBJECT_HASH_SIZE);
+            out[i].dat_offset         = de3.dat_offset;
+            out[i].entry_index        = de3.entry_index;
+            out[i].type               = 0;
+            out[i].compression        = 0;
+            out[i].uncompressed_size  = 0;
+            out[i].compressed_size    = 0;
+        }
+        return 0;
     }
     /* v1/v2: 40-byte entries */
     for (uint32_t i = 0; i < count; i++) {
         pack_idx_disk_entry_v2_t de2;
         if (fread(&de2, sizeof(de2), 1, f) != 1) return -1;
         memcpy(out[i].hash, de2.hash, OBJECT_HASH_SIZE);
-        out[i].dat_offset  = de2.dat_offset;
-        out[i].entry_index = UINT32_MAX;
+        out[i].dat_offset         = de2.dat_offset;
+        out[i].entry_index        = UINT32_MAX;
+        out[i].type               = 0;
+        out[i].compression        = 0;
+        out[i].uncompressed_size  = 0;
+        out[i].compressed_size    = 0;
     }
     return 0;
 }
@@ -3088,7 +3136,8 @@ static status_t collect_pack_meta(repo_t *repo,
         pack_idx_hdr_t ihdr;
         if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
             ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 && ihdr.version != PACK_VERSION)) {
+            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
+             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
             fclose(idxf);
             continue;
         }
@@ -3332,7 +3381,8 @@ static status_t maybe_coalesce_packs(repo_t *repo,
         pack_idx_hdr_t ihdr;
         if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
             ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 && ihdr.version != PACK_VERSION)) {
+            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
+             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
             fclose(idxf);
             fclose(datf);
             rc = ERR_CORRUPT;
@@ -3423,8 +3473,12 @@ static status_t maybe_coalesce_packs(repo_t *repo,
             }
 
             memcpy(new_disk_idx[live_count].hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
-            new_disk_idx[live_count].dat_offset = sizeof(dhdr) + body_offset;
-            new_disk_idx[live_count].entry_index = live_count;
+            new_disk_idx[live_count].dat_offset         = sizeof(dhdr) + body_offset;
+            new_disk_idx[live_count].entry_index        = live_count;
+            new_disk_idx[live_count].type               = ehdr.type;
+            new_disk_idx[live_count].compression        = ehdr.compression;
+            new_disk_idx[live_count].uncompressed_size  = ehdr.uncompressed_size;
+            new_disk_idx[live_count].compressed_size    = ehdr.compressed_size;
             live_count++;
             body_offset += entry_total;
         }
@@ -3504,7 +3558,8 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t *found = NULL;
     if (pack_find_entry(repo, hash, &found) != OK) return -1;
-    if (found->pack_version != PACK_VERSION || found->entry_index == UINT32_MAX)
+    if ((found->pack_version != PACK_VERSION_V3 && found->pack_version != PACK_VERSION) ||
+        found->entry_index == UINT32_MAX)
         return -1;
 
     char dat_path[PATH_MAX];
@@ -3642,7 +3697,8 @@ status_t pack_gc(repo_t *repo,
         pack_idx_hdr_t ihdr;
         if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
             ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 && ihdr.version != PACK_VERSION)) {
+            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
+             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
             fclose(idxf); continue;
         }
         uint32_t dat_version = ihdr.version;
@@ -3762,8 +3818,12 @@ status_t pack_gc(repo_t *repo,
             }
 
             memcpy(new_disk_idx[live_count].hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
-            new_disk_idx[live_count].dat_offset = new_offset;
-            new_disk_idx[live_count].entry_index = live_count;
+            new_disk_idx[live_count].dat_offset         = new_offset;
+            new_disk_idx[live_count].entry_index        = live_count;
+            new_disk_idx[live_count].type               = ehdr.type;
+            new_disk_idx[live_count].compression        = ehdr.compression;
+            new_disk_idx[live_count].uncompressed_size  = ehdr.uncompressed_size;
+            new_disk_idx[live_count].compressed_size    = ehdr.compressed_size;
             live_count++;
             new_offset += sizeof(ehdr) + ehdr.compressed_size;
             total_kept++;
@@ -3875,6 +3935,166 @@ pack_fail:
 }
 
 /* ------------------------------------------------------------------ */
+/* Migrate pre-v4 .idx files to v4 (adds type+sizes from .dat)         */
+/* ------------------------------------------------------------------ */
+
+/* Migrate a single pack's .idx from pre-v4 to v4.
+ * Reads entry headers from the .dat to get type, compression, sizes. */
+static status_t migrate_one_idx(const char *idx_path, const char *dat_path,
+                                uint32_t pack_num)
+{
+    FILE *idxf = fopen(idx_path, "rb");
+    if (!idxf) return OK;  /* skip unreadable */
+
+    pack_idx_hdr_t ihdr;
+    if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
+        ihdr.magic != PACK_IDX_MAGIC) {
+        fclose(idxf);
+        return OK;
+    }
+    if (ihdr.version == PACK_VERSION) {
+        fclose(idxf);  /* already v4 */
+        return OK;
+    }
+    if (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
+        ihdr.version != PACK_VERSION_V3) {
+        fclose(idxf);
+        return OK;  /* unknown version, skip */
+    }
+
+    uint32_t count = ihdr.count;
+    if (count > 10000000u) { fclose(idxf); return OK; }
+
+    /* Read old idx entries */
+    pack_idx_disk_entry_t *entries = malloc((size_t)count * sizeof(*entries));
+    if (!entries) { fclose(idxf); return ERR_NOMEM; }
+    if (read_idx_entries(idxf, ihdr.version, count, entries) != 0) {
+        free(entries); fclose(idxf);
+        return OK;  /* skip corrupt */
+    }
+    fclose(idxf);
+
+    /* Read .dat to get type+sizes for each entry */
+    FILE *datf = fopen(dat_path, "rb");
+    if (!datf) { free(entries); return OK; }
+
+    pack_dat_hdr_t dhdr;
+    if (fread(&dhdr, sizeof(dhdr), 1, datf) != 1 ||
+        dhdr.magic != PACK_DAT_MAGIC) {
+        fclose(datf); free(entries);
+        return OK;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (fseeko(datf, (off_t)entries[i].dat_offset, SEEK_SET) != 0) {
+            fclose(datf); free(entries);
+            return set_error(ERR_IO, "migrate_one_idx: seek failed pack %u entry %u",
+                             pack_num, i);
+        }
+        pack_dat_entry_hdr_t ehdr;
+        if (read_entry_hdr(datf, &ehdr, dhdr.version) != 0) {
+            fclose(datf); free(entries);
+            return set_error(ERR_CORRUPT,
+                             "migrate_one_idx: bad entry header pack %u entry %u",
+                             pack_num, i);
+        }
+        entries[i].type              = ehdr.type;
+        entries[i].compression       = ehdr.compression;
+        entries[i].uncompressed_size = ehdr.uncompressed_size;
+        entries[i].compressed_size   = ehdr.compressed_size;
+    }
+    fclose(datf);
+
+    /* Write new v4 idx via temp file + atomic rename */
+    char tmp_path[PATH_MAX];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.v4tmp", idx_path)
+        >= (int)sizeof(tmp_path)) {
+        free(entries);
+        return set_error(ERR_IO, "migrate_one_idx: tmp path too long");
+    }
+
+    FILE *out = fopen(tmp_path, "wb");
+    if (!out) { free(entries); return set_error_errno(ERR_IO, "migrate_one_idx: fopen tmp"); }
+
+    pack_idx_hdr_t new_hdr = { PACK_IDX_MAGIC, PACK_VERSION, count };
+    if (fwrite(&new_hdr, sizeof(new_hdr), 1, out) != 1 ||
+        fwrite(entries, sizeof(*entries), count, out) != count) {
+        fclose(out); unlink(tmp_path); free(entries);
+        return set_error_errno(ERR_IO, "migrate_one_idx: write failed");
+    }
+
+    /* Write idx parity trailer */
+    status_t st = write_idx_parity(out, &new_hdr, entries,
+                                   (size_t)count * sizeof(*entries), count);
+    free(entries);
+    if (st != OK) { fclose(out); unlink(tmp_path); return st; }
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+        fclose(out); unlink(tmp_path);
+        return set_error_errno(ERR_IO, "migrate_one_idx: fsync failed");
+    }
+    fclose(out);
+
+    if (rename(tmp_path, idx_path) != 0) {
+        unlink(tmp_path);
+        return set_error_errno(ERR_IO, "migrate_one_idx: rename failed");
+    }
+
+    return OK;
+}
+
+status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated)
+{
+    if (out_migrated) *out_migrated = 0;
+
+    char packs_dir[PATH_MAX];
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+        return OK;
+
+    collect_pack_nums_ctx_t cpn = { NULL, 0, 0 };
+    cpn.nums = malloc(256 * sizeof(*cpn.nums));
+    if (!cpn.nums) return ERR_NOMEM;
+    cpn.cap = 256;
+    pack_for_each_num(packs_dir, collect_pack_num_cb, &cpn);
+
+    uint32_t migrated = 0;
+    status_t st = OK;
+
+    for (size_t i = 0; i < cpn.cnt && st == OK; i++) {
+        uint32_t pnum = cpn.nums[i];
+        char idx_path[PATH_MAX], dat_path[PATH_MAX];
+        if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
+                                  repo_path(repo), pnum) != 0 ||
+            pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                                  repo_path(repo), pnum) != 0)
+            continue;
+
+        /* Check if already v4 */
+        FILE *f = fopen(idx_path, "rb");
+        if (!f) continue;
+        pack_idx_hdr_t hdr;
+        int ok = (fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+                  hdr.magic == PACK_IDX_MAGIC);
+        fclose(f);
+        if (!ok || hdr.version == PACK_VERSION) continue;
+
+        st = migrate_one_idx(idx_path, dat_path, pnum);
+        if (st == OK) {
+            migrated++;
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "migrate-v4: pack %u migrated (%u entries)",
+                     pnum, hdr.count);
+            log_msg("INFO", msg);
+        }
+    }
+
+    free(cpn.nums);
+    if (out_migrated) *out_migrated = migrated;
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
 /* Read-only enumeration of pack .dat and .idx files                   */
 /* ------------------------------------------------------------------ */
 
@@ -3902,7 +4122,7 @@ status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
         return set_error(ERR_CORRUPT, "pack_enumerate_dat: bad header in %s", dat_name);
     }
     if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
-        hdr.version != PACK_VERSION) {
+        hdr.version != PACK_VERSION_V3 && hdr.version != PACK_VERSION) {
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_enumerate_dat: unknown version %u in %s",
                          hdr.version, dat_name);
@@ -3974,7 +4194,7 @@ status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
         return set_error(ERR_CORRUPT, "pack_enumerate_idx: bad header in %s", idx_name);
     }
     if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
-        hdr.version != PACK_VERSION) {
+        hdr.version != PACK_VERSION_V3 && hdr.version != PACK_VERSION) {
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_enumerate_idx: unknown version %u in %s",
                          hdr.version, idx_name);
@@ -3994,6 +4214,12 @@ status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
             memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
             info.dat_offset  = e.dat_offset;
             info.entry_index = 0;
+        } else if (hdr.version == PACK_VERSION_V3) {
+            pack_idx_disk_entry_v3_t e;
+            if (fread(&e, sizeof(e), 1, f) != 1) break;
+            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
+            info.dat_offset  = e.dat_offset;
+            info.entry_index = e.entry_index;
         } else {
             pack_idx_disk_entry_t e;
             if (fread(&e, sizeof(e), 1, f) != 1) break;

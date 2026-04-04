@@ -23,10 +23,10 @@
 
 #ifdef __linux__
 /* Detect if a path resides on a rotational (HDD) device.
- * Returns 1 for HDD, 0 for SSD/unknown. */
+ * Returns 1 for HDD, 0 for SSD, -1 for unknown (FUSE, NFS, etc). */
 static int path_is_rotational(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (stat(path, &st) != 0) return -1;
     unsigned int maj = major(st.st_dev);
     unsigned int min = minor(st.st_dev);
     char syspath[128];
@@ -41,14 +41,14 @@ static int path_is_rotational(const char *path) {
                  "/sys/dev/block/%u:%u/../queue/rotational", maj, min);
         f = fopen(syspath, "r");
     }
-    if (!f) return 0;
+    if (!f) return -1;  /* FUSE, NFS, or other virtual FS */
     int val = 0;
     if (fscanf(f, "%d", &val) != 1) val = 0;
     fclose(f);
     return val == 1;
 }
 #else
-static int path_is_rotational(const char *path) { (void)path; return 0; }
+static int path_is_rotational(const char *path) { (void)path; return -1; }
 #endif
 
 static void fmt_bytes(uint64_t n, char *buf, size_t sz) {
@@ -198,12 +198,13 @@ static status_t store_file_content_cb(repo_t *repo, const char *path,
                                       xfer_progress_fn cb, void *cb_ctx) {
     int fd = open_noatime(path);
     if (fd == -1) return set_error_errno(ERR_IO, "store: open(%s)", path);
-    posix_fadvise(fd, 0, (off_t)file_size, POSIX_FADV_SEQUENTIAL);
+    /* fadvise hints are handled by the object layer (dbl_reader_fn)
+     * which skips aggressive readahead on FUSE to avoid flooding
+     * the userspace daemon with concurrent requests. */
     int is_new = 0;
     uint64_t phys = 0;
     status_t st = object_store_file_cb(repo, fd, file_size, out_hash,
                                        &is_new, &phys, cb, cb_ctx);
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     close(fd);
     if (out_phys_new) *out_phys_new = is_new ? phys : 0;
     return st;
@@ -259,6 +260,14 @@ typedef struct {
     node_t   prev;
 } store_task_t;
 
+/* Transient-error errno values eligible for retry. */
+static int is_transient_errno(int err) {
+    return err == ENOENT || err == EACCES || err == EPERM ||
+           err == ESTALE || err == EIO || err == ENXIO ||
+           err == ENODEV || err == EHOSTDOWN || err == EHOSTUNREACH ||
+           err == ECONNRESET || err == ECONNREFUSED || err == ETIMEDOUT;
+}
+
 typedef struct {
     repo_t        *repo;
     scan_entry_t  *entries;    /* full scan array */
@@ -271,9 +280,10 @@ typedef struct {
     _Atomic uint64_t phys_new_bytes;
     int            show_progress;
     struct timespec started_at;
-    uint32_t       skipped_transient;
-    char           first_skipped_path[PATH_MAX];
-    int            first_skipped_errno;
+    /* Transient retry queue — collected under mu, drained after workers join */
+    uint32_t      *retry_qi;       /* queue indices of transient failures */
+    uint32_t       retry_count;
+    uint32_t       retry_cap;
     char           first_error_path[PATH_MAX];
     int            first_error_errno;
     pthread_mutex_t  mu;
@@ -295,6 +305,7 @@ static void *phase3_progress_fn(void *arg) {
     struct timespec last_t;
     clock_gettime(CLOCK_MONOTONIC, &last_t);
     double ema_bps = 0.0, ema_speed = 0.0;
+    int samples = 0;
 
     for (;;) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
@@ -314,17 +325,18 @@ static void *phase3_progress_fn(void *arg) {
             double inst_bps   = (double)(seen    - last_seen) / dt;
             double inst_speed = (double)(done_now - last_done) / dt;
             if (ema_bps <= 0.0)   ema_bps   = inst_bps;
-            else                   ema_bps   = 0.12 * inst_bps   + 0.88 * ema_bps;
+            else                   ema_bps   = 0.3 * inst_bps   + 0.7 * ema_bps;
             if (ema_speed <= 0.0) ema_speed = inst_speed;
-            else                   ema_speed = 0.12 * inst_speed + 0.88 * ema_speed;
+            else                   ema_speed = 0.3 * inst_speed + 0.7 * ema_speed;
+            samples++;
         }
         last_seen = seen;
         last_done = done_now;
         last_t    = now;
 
-        double rem = (ema_bps > 0.0 && pool->total_bytes > seen)
+        double rem = (samples >= ETA_WARMUP_SAMPLES && ema_bps > 0.0 && pool->total_bytes > seen)
                    ? (double)(pool->total_bytes - seen) / ema_bps
-                   : 0.0;
+                   : -1.0;
         char eta[32];
         fmt_eta(rem, eta, sizeof(eta));
         if (active > 0)
@@ -368,39 +380,47 @@ static void *store_worker_fn(void *arg) {
                                             store_chunk_cb, &cb_ctx);
         if (st != OK) {
             int err = errno;
-            if (err == ENOENT || err == EACCES || err == EPERM || err == ESTALE || err == EIO) {
+            if (is_transient_errno(err)) {
+                /* Enqueue for retry after all workers finish */
                 pthread_mutex_lock(&pool->mu);
-                pool->skipped_transient++;
-                if (pool->first_skipped_path[0] == '\0') {
-                    if (snprintf(pool->first_skipped_path, sizeof(pool->first_skipped_path),
-                                 "%s", e->path) >= (int)sizeof(pool->first_skipped_path)) {
-                        pool->first_skipped_path[0] = '\0';
-                    }
-                    pool->first_skipped_errno = err;
-                }
-                pthread_mutex_unlock(&pool->mu);
-
-                if (t->has_prev) {
-                    e->node = t->prev;
-                } else {
-                    e->node.type = 0;
-                }
-                st = OK;
-            }
-
-            if (st != OK) {
-                pthread_mutex_lock(&pool->mu);
-                if (pool->first_error == OK) {
-                    pool->first_error = st;
-                    pool->first_error_errno = err;
-                    if (snprintf(pool->first_error_path, sizeof(pool->first_error_path),
-                                 "%s", e->path) >= (int)sizeof(pool->first_error_path)) {
-                        pool->first_error_path[0] = '\0';
+                if (pool->retry_count == pool->retry_cap) {
+                    uint32_t nc = pool->retry_cap ? pool->retry_cap * 2 : 16;
+                    uint32_t *tmp = realloc(pool->retry_qi, nc * sizeof(*tmp));
+                    if (tmp) {
+                        pool->retry_qi  = tmp;
+                        pool->retry_cap = nc;
                     }
                 }
+                if (pool->retry_count < pool->retry_cap)
+                    pool->retry_qi[pool->retry_count++] = qi;
+                /* Log immediately so the user sees failures as they happen */
+                if (pool->show_progress) {
+                    progress_line_clear(&g_phase_line_len);
+                    char lmsg[PATH_MAX + 128];
+                    snprintf(lmsg, sizeof(lmsg),
+                             "store: transient error '%s' (%s), will retry",
+                             e->path, strerror(err));
+                    log_msg("WARN", lmsg);
+                }
                 pthread_mutex_unlock(&pool->mu);
-                return (void *)1;
+                /* Don't increment done — failed files shouldn't count as
+                 * progress.  Retire in-flight bytes and active count only. */
+                atomic_fetch_sub(&pool->bytes_in_flight, cb_ctx.accumulated);
+                atomic_fetch_sub(&pool->files_active, 1);
+                continue;
             }
+
+            pthread_mutex_lock(&pool->mu);
+            if (pool->first_error == OK) {
+                pool->first_error = st;
+                pool->first_error_errno = err;
+                if (snprintf(pool->first_error_path, sizeof(pool->first_error_path),
+                             "%s", e->path) >= (int)sizeof(pool->first_error_path)) {
+                    pool->first_error_path[0] = '\0';
+                }
+            }
+            pthread_mutex_unlock(&pool->mu);
+            return (void *)1;
         }
 
         /* Retire in-flight bytes and mark this file no longer active. */
@@ -429,10 +449,12 @@ static int store_task_ino_cmp(const void *a, const void *b) {
 
 static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
                                  store_task_t *tasks, uint32_t queue_len,
-                                 int show_progress, uint32_t *out_skipped,
+                                 int show_progress,
+                                 uint32_t **out_retry_qi, uint32_t *out_retry_count,
                                  uint64_t *out_phys_new_bytes) {
     if (queue_len == 0) {
-        if (out_skipped) *out_skipped = 0;
+        if (out_retry_qi) *out_retry_qi = NULL;
+        if (out_retry_count) *out_retry_count = 0;
         if (out_phys_new_bytes) *out_phys_new_bytes = 0;
         return OK;
     }
@@ -451,19 +473,37 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
             }
         }
     }
-    /* Auto-detect rotational media — cap threads to avoid seek thrashing */
+    /* Auto-detect rotational media — cap threads to avoid seek thrashing.
+     * FUSE/NFS (unknown) defaults to HDD-conservative since the backing
+     * storage is usually spinning rust (Unraid shfs, NAS, etc). */
+    int detected = -1;
     if (!env_override && queue_len > 0) {
         const char *src = entries[tasks[0].idx].path;
-        if (path_is_rotational(src)) {
+        detected = path_is_rotational(src);
+        if (detected == -1) {
+            /* FUSE/NFS — single thread to avoid overwhelming the
+             * userspace daemon with concurrent large-file reads */
+            nthreads = 1;
+        } else if (detected == 1) {
+            /* HDD — cap at 2 to limit seek thrashing */
             nthreads = nthreads > 2 ? 2 : nthreads;
-            char rmsg[80];
-            snprintf(rmsg, sizeof(rmsg),
-                     "store: rotational source detected, using %d thread(s)", nthreads);
-            log_msg("INFO", rmsg);
         }
     }
     if (nthreads > 256) nthreads = 256;
     if ((uint32_t)nthreads > queue_len) nthreads = (int)queue_len;
+
+    /* Always tell the user what we decided */
+    if (show_progress) {
+        progress_line_clear(&g_phase_line_len);
+        const char *dtype = detected == 1 ? "HDD" :
+                            detected == 0 ? "SSD" : "unknown (FUSE/network)";
+        if (env_override)
+            fprintf(stderr, "store:   %d thread(s) (CBACKUP_STORE_THREADS override)\n",
+                    nthreads);
+        else
+            fprintf(stderr, "store:   %d thread(s), source media: %s\n",
+                    nthreads, dtype);
+    }
 
     store_pool_t pool = {
         .repo          = repo,
@@ -540,13 +580,14 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         }
     }
 
-    /* Stop the progress thread before touching the display for error messages. */
+    /* Stop the progress thread and clear its line before any log messages. */
     if (progress_thr_started) {
         atomic_store(&pool.progress_stop, 1);
         pthread_join(pool.progress_thr, NULL);
     }
+    phase_line_clear();
 
-    if (pool.done < queue_len && pool.first_error == OK) {
+    if (pool.done + pool.retry_count < queue_len && pool.first_error == OK) {
         pool.first_error = ERR_IO;
         phase_line_clear();
         set_error(ERR_IO, "store worker exited early before queue completion");
@@ -571,18 +612,11 @@ static status_t store_parallel(repo_t *repo, scan_entry_t *entries,
         }
     }
 
-    if (out_skipped) *out_skipped = pool.skipped_transient;
+    /* Transfer retry queue ownership to caller */
+    if (out_retry_qi)    *out_retry_qi    = pool.retry_qi;
+    else                 free(pool.retry_qi);
+    if (out_retry_count) *out_retry_count = pool.retry_count;
     if (out_phys_new_bytes) *out_phys_new_bytes = pool.phys_new_bytes;
-
-    if (pool.skipped_transient > 0 && pool.first_skipped_path[0]) {
-        char msg[PATH_MAX + 192];
-        snprintf(msg, sizeof(msg),
-                 "skipped %u transiently unavailable file(s), first: '%s' (%s)",
-                 pool.skipped_transient,
-                 pool.first_skipped_path,
-                 strerror(pool.first_skipped_errno));
-        log_msg("WARN", msg);
-    }
 
     if (pool.show_progress) {
         double sec = elapsed_sec(&pool.started_at);
@@ -748,7 +782,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     store_task_t *store_queue = malloc(scan->count * sizeof(*store_queue));
     if (!store_queue) { st = ERR_NOMEM; goto done; }
     uint32_t store_qlen = 0;
-    uint32_t n_transient_skipped_store = 0;
+    /* (transient failures are handled by the retry queue after store_parallel) */
 
     uint32_t n_new = 0, n_modified = 0, n_unchanged = 0, n_meta = 0, n_deleted = 0;
     uint32_t n_unreadable = 0;
@@ -951,16 +985,175 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         else fprintf(stderr, "storing: %u new object(s)...\n", store_qlen);
     }
     fail_ctx = "store file contents";
+    uint32_t *retry_qi = NULL;
+    uint32_t  retry_count = 0;
     st = store_parallel(repo, scan->entries, store_queue, store_qlen,
-                        tui, &n_transient_skipped_store, &phys_new_bytes);
-    if (st != OK) goto done;
+                        tui, &retry_qi, &retry_count, &phys_new_bytes);
+    if (st != OK) { free(retry_qi); goto done; }
     if (tui) phase_line_clear();
 
-    if (n_transient_skipped_store > 0) {
-        fprintf(stderr,
-                "warning: skipped %u file(s) that changed/disappeared during store\n",
-                n_transient_skipped_store);
+    /* ----------------------------------------------------------------
+     * Phase 3c: Retry queue for transient failures
+     *
+     * Files that failed with transient errors (ENOENT, ESTALE, EIO,
+     * EACCES, EPERM, ENXIO, ENODEV, network errors) during Phase 3b
+     * get retried single-threaded with
+     * delays to let the filesystem/array settle.  Up to 5 rounds,
+     * 30 s settle between rounds, 5 s between files within a round.
+     * Non-transient errors on retry kick the file out immediately.
+     * ---------------------------------------------------------------- */
+    #define RETRY_MAX_ROUNDS      5
+    #define RETRY_SETTLE_SEC_DEFAULT  30
+    #define RETRY_FILE_DELAY_SEC_DEFAULT 5
+
+    if (retry_count > 0) {
+        /* Allow env overrides for testing (CBACKUP_RETRY_SETTLE_SEC,
+         * CBACKUP_RETRY_FILE_DELAY_SEC — set to 0 for instant retries). */
+        int settle_sec = RETRY_SETTLE_SEC_DEFAULT;
+        int file_delay_sec = RETRY_FILE_DELAY_SEC_DEFAULT;
+        {
+            const char *e1 = getenv("CBACKUP_RETRY_SETTLE_SEC");
+            if (e1 && *e1) { long v = strtol(e1, NULL, 10); if (v >= 0) settle_sec = (int)v; }
+            const char *e2 = getenv("CBACKUP_RETRY_FILE_DELAY_SEC");
+            if (e2 && *e2) { long v = strtol(e2, NULL, 10); if (v >= 0) file_delay_sec = (int)v; }
+        }
+
+        if (!opts || !opts->quiet)
+            fprintf(stderr, "retry:   %u file(s) queued for transient-error retry\n",
+                    retry_count);
+
+        for (int round = 1; round <= RETRY_MAX_ROUNDS && retry_count > 0; round++) {
+            /* Settle delay with countdown */
+            for (int s = settle_sec; s > 0; s--) {
+                if (tui)
+                    phase_line_setf("Phase 3 retry %d/%d: %u file(s), settling %ds...",
+                                    round, RETRY_MAX_ROUNDS, retry_count, s);
+                struct timespec one_sec = { .tv_sec = 1, .tv_nsec = 0 };
+                nanosleep(&one_sec, NULL);
+            }
+
+            uint32_t *next_qi = NULL;
+            uint32_t  next_count = 0;
+            uint32_t  next_cap = 0;
+            uint32_t  recovered = 0;
+            uint32_t  kicked = 0;
+
+            for (uint32_t ri = 0; ri < retry_count; ri++) {
+                uint32_t qi = retry_qi[ri];
+                store_task_t *t = &store_queue[qi];
+                scan_entry_t *e = &scan->entries[t->idx];
+
+                if (tui)
+                    phase_line_setf("Phase 3 retry %d/%d: %u/%u  recovered %u  failed %u",
+                                    round, RETRY_MAX_ROUNDS,
+                                    ri + 1, retry_count, recovered, kicked);
+
+                uint64_t phys_new = 0;
+                char lmsg[PATH_MAX + 128];
+                st = store_file_content_cb(repo, e->path, e->node.size,
+                                           e->node.content_hash, &phys_new,
+                                           NULL, NULL);
+                if (st == OK) {
+                    phys_new_bytes += phys_new;
+                    recovered++;
+                    if (tui) phase_line_clear();
+                    snprintf(lmsg, sizeof(lmsg), "retry %d: recovered '%s'", round, e->path);
+                    log_msg("INFO", lmsg);
+                } else {
+                    int err = errno;
+                    if (tui) phase_line_clear();
+                    if (is_transient_errno(err)) {
+                        /* Re-enqueue for next round */
+                        if (next_count == next_cap) {
+                            uint32_t nc = next_cap ? next_cap * 2 : 16;
+                            uint32_t *tmp = realloc(next_qi, nc * sizeof(*tmp));
+                            if (tmp) { next_qi = tmp; next_cap = nc; }
+                        }
+                        if (next_count < next_cap)
+                            next_qi[next_count++] = qi;
+                        snprintf(lmsg, sizeof(lmsg), "retry %d: still failing '%s' (%s)",
+                                 round, e->path, strerror(err));
+                        log_msg("WARN", lmsg);
+                    } else {
+                        /* Non-transient error — kick out permanently */
+                        kicked++;
+                        snprintf(lmsg, sizeof(lmsg), "retry %d: permanent failure '%s' (%s), giving up",
+                                 round, e->path, strerror(err));
+                        log_msg("WARN", lmsg);
+                        if (t->has_prev)
+                            e->node = t->prev;
+                        else
+                            e->node.type = 0;
+                    }
+                    st = OK;  /* non-fatal per file */
+                }
+
+                /* Re-display progress after log output */
+                if (tui)
+                    phase_line_setf("Phase 3 retry %d/%d: %u/%u  recovered %u  failed %u",
+                                    round, RETRY_MAX_ROUNDS,
+                                    ri + 1, retry_count, recovered, kicked);
+
+                /* Inter-file delay (skip after last file in round) */
+                if (ri + 1 < retry_count && file_delay_sec > 0) {
+                    struct timespec delay = { .tv_sec = file_delay_sec, .tv_nsec = 0 };
+                    nanosleep(&delay, NULL);
+                }
+            }
+
+            if (tui) phase_line_clear();
+
+            {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "retry %d/%d: %u recovered, %u permanent failure(s), %u remaining",
+                         round, RETRY_MAX_ROUNDS, recovered, kicked, next_count);
+                log_msg("INFO", msg);
+                if (!opts || !opts->quiet)
+                    fprintf(stderr, "retry:   %s\n", msg);
+            }
+
+            /* Early bail: if nothing recovered this round, the source is
+             * likely down — don't waste time on more rounds. */
+            if (recovered == 0 && next_count > 0) {
+                log_msg("WARN", "retry: no files recovered this round, "
+                        "skipping remaining rounds");
+                if (!opts || !opts->quiet)
+                    fprintf(stderr,
+                            "retry:   giving up — source appears unavailable "
+                            "(%u file(s) still failing)\n", next_count);
+                free(retry_qi);
+                retry_qi    = next_qi;
+                retry_count = next_count;
+                break;
+            }
+
+            free(retry_qi);
+            retry_qi    = next_qi;
+            retry_count = next_count;
+        }
+
+        /* Any files still in the retry queue after all rounds — give up */
+        if (retry_count > 0) {
+            for (uint32_t ri = 0; ri < retry_count; ri++) {
+                uint32_t qi = retry_qi[ri];
+                store_task_t *t = &store_queue[qi];
+                scan_entry_t *e = &scan->entries[t->idx];
+                char lmsg[PATH_MAX + 128];
+                snprintf(lmsg, sizeof(lmsg), "giving up on '%s' after %d retry rounds",
+                         e->path, RETRY_MAX_ROUNDS);
+                log_msg("WARN", lmsg);
+                if (t->has_prev)
+                    e->node = t->prev;
+                else
+                    e->node.type = 0;
+            }
+            fprintf(stderr,
+                    "warning: %u file(s) still unavailable after %d retry rounds\n",
+                    retry_count, RETRY_MAX_ROUNDS);
+        }
     }
+    free(retry_qi);
 
     /* Populate skipped set: new primary entries whose storage failed.
      * Their hardlink secondaries must be excluded from the dirent table. */
@@ -975,6 +1168,32 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
         }
     }
     qsort(skipped.ids, skipped.count, sizeof(*skipped.ids), skipped_cmp);
+
+    /* Recount effective changes: failed new files (type=0) don't count.
+     * If nothing actually changed, skip creating a useless snapshot. */
+    if (skipped.count > 0) {
+        uint32_t failed_new = 0, failed_mod = 0;
+        for (uint32_t i = 0; i < store_qlen; i++) {
+            scan_entry_t *e = &scan->entries[store_queue[i].idx];
+            if (e->node.type == 0) {
+                if (!store_queue[i].has_prev) failed_new++;
+                else                          failed_mod++;
+            }
+        }
+        if (failed_new > n_new) failed_new = n_new;     /* clamp */
+        if (failed_mod > n_modified) failed_mod = n_modified;
+        n_new      -= failed_new;
+        n_modified -= failed_mod;
+
+        if (prev_id > 0 && n_new == 0 && n_modified == 0 &&
+            n_meta == 0 && n_deleted == 0) {
+            if (!opts || !opts->quiet)
+                fprintf(stderr,
+                        "all changed files failed to store — "
+                        "no snapshot created (previous: %u)\n", prev_id);
+            goto done;
+        }
+    }
 
     /* ----------------------------------------------------------------
      * Phase 4 & 5: Build new snapshot
@@ -1055,7 +1274,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
     if (st == OK) {
         if (!opts || !opts->quiet)
             fprintf(stderr, "snapshot %u committed  (%u entries, %u change(s))\n",
-                    new_snap->snap_id, scan->count,
+                    new_snap->snap_id, new_snap->node_count,
                     n_new + n_modified + n_meta + n_deleted);
 
         /* ----------------------------------------------------------------

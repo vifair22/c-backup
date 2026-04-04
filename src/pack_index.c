@@ -196,6 +196,7 @@ static status_t read_idx_into(const char *idx_path, uint32_t pack_num,
         hdr.magic != PACK_IDX_MAGIC ||
         (hdr.version != PACK_VERSION_V1 &&
          hdr.version != PACK_VERSION_V2 &&
+         hdr.version != PACK_VERSION_V3 &&
          hdr.version != PACK_VERSION)) {
         fclose(f);
         return OK;  /* skip invalid */
@@ -207,8 +208,8 @@ static status_t read_idx_into(const char *idx_path, uint32_t pack_num,
         return set_error(ERR_NOMEM, "pack_index_rebuild: alloc for %u entries", hdr.count);
     }
 
-    int is_v3 = (hdr.version == PACK_VERSION);
-    if (is_v3) {
+    if (hdr.version == PACK_VERSION) {
+        /* v4: 62-byte entries — native format */
         size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_t);
         pack_idx_disk_entry_t *disk = malloc(disk_sz);
         if (!disk) { fclose(f); return ERR_NOMEM; }
@@ -224,7 +225,25 @@ static status_t read_idx_into(const char *idx_path, uint32_t pack_num,
             e->entry_index  = disk[i].entry_index;
         }
         free(disk);
+    } else if (hdr.version == PACK_VERSION_V3) {
+        /* v3: 44-byte entries */
+        size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v3_t);
+        pack_idx_disk_entry_v3_t *disk = malloc(disk_sz);
+        if (!disk) { fclose(f); return ERR_NOMEM; }
+        if (fread(disk, sizeof(pack_idx_disk_entry_v3_t), hdr.count, f) != hdr.count) {
+            free(disk); fclose(f); return OK;  /* skip truncated */
+        }
+        for (uint32_t i = 0; i < hdr.count; i++) {
+            pack_index_entry_t *e = &ctx->entries[ctx->count++];
+            memcpy(e->hash, disk[i].hash, OBJECT_HASH_SIZE);
+            e->pack_num     = pack_num;
+            e->dat_offset   = disk[i].dat_offset;
+            e->pack_version = hdr.version;
+            e->entry_index  = disk[i].entry_index;
+        }
+        free(disk);
     } else {
+        /* v1/v2: 40-byte entries */
         size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v2_t);
         pack_idx_disk_entry_v2_t *disk = malloc(disk_sz);
         if (!disk) { fclose(f); return ERR_NOMEM; }

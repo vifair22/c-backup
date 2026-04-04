@@ -30,10 +30,13 @@ import json
 import os
 import pty
 import select
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+
+import lz4.block
 
 # Locate the backup binary: env override > build dir relative to repo > PATH
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -234,7 +237,7 @@ class Session:
 
         # Read ready banner (with timeout)
         try:
-            line = self._readline(timeout=15)
+            line = self._read_response(timeout=15)
         except RPCError:
             self._kill()
             return False
@@ -248,6 +251,11 @@ class Session:
         if banner.get("status") == "error":
             self._kill()
             raise RPCError(banner.get("message", "session start failed"))
+
+        if banner.get("lock") is False:
+            print("[RPC] warning: repo is locked by another process "
+                  "(backup/gc/pack running?), data may be stale",
+                  flush=True)
 
         return banner.get("status") == "ready"
 
@@ -273,13 +281,12 @@ class Session:
                 raise RPCError(f"session write failed: {e}")
 
             try:
-                resp_line = self._readline(timeout=120)
+                resp_line = self._read_response(timeout=120)
             except RPCError:
                 raise
 
             elapsed = time.monotonic() - t0
-            if elapsed >= 5.0:
-                _log_slow("session", action, params, elapsed)
+            _log_rpc_done("session", action, params, elapsed)
 
             try:
                 resp = json.loads(resp_line)
@@ -310,8 +317,17 @@ class Session:
         p = self._proc
         return p is not None and p.poll() is None
 
-    def _readline(self, timeout: float = 120) -> str:
-        """Read one line from stdout with timeout."""
+    def _read_response(self, timeout: float = 120) -> str:
+        """Read one response from stdout with timeout.
+
+        Handles both plain JSON lines and LZ4 compressed binary frames.
+        Binary frame format:
+          0x00 (1 byte magic)
+          uncomp_len (4 bytes LE)
+          comp_len (4 bytes LE)
+          compressed payload (comp_len bytes)
+          '\\n' (1 byte terminator)
+        """
         proc = self._proc
         if not proc or not proc.stdout:
             raise RPCError("session not started")
@@ -319,10 +335,31 @@ class Session:
         ready, _, _ = select.select([fd], [], [], timeout)
         if not ready:
             raise RPCError("session read timed out")
-        line = proc.stdout.readline()
-        if not line:
+
+        # Peek at first byte to determine frame type
+        first = proc.stdout.read(1)
+        if not first:
             raise RPCError("session process EOF")
-        return line.decode()
+
+        if first[0] == 0x00:
+            # Binary LZ4 frame
+            hdr = proc.stdout.read(8)
+            if len(hdr) < 8:
+                raise RPCError("truncated LZ4 frame header")
+            uncomp_len, comp_len = struct.unpack("<II", hdr)
+            comp_data = proc.stdout.read(comp_len)
+            if len(comp_data) < comp_len:
+                raise RPCError("truncated LZ4 frame payload")
+            # Read trailing newline
+            proc.stdout.read(1)
+            return lz4.block.decompress(comp_data,
+                                        uncompressed_size=uncomp_len).decode()
+        else:
+            # Plain text — read rest of line
+            rest = proc.stdout.readline()
+            if not rest:
+                raise RPCError("session process EOF")
+            return (first + rest).decode()
 
     def _kill(self) -> None:
         proc = self._proc
@@ -404,20 +441,43 @@ def call(repo_spec: str, action: str, **params) -> dict:
 _SLOW_THRESHOLD = 5.0
 
 
+def _fmt_params(params: dict) -> str:
+    if not params:
+        return ""
+    return " " + " ".join(f"{k}={v}" for k, v in params.items()
+                          if v is not None)
+
+
 def _log_rpc(mode: str, action: str, params: dict) -> None:
-    p = ""
-    if params:
-        p = " " + " ".join(f"{k}={v}" for k, v in params.items()
-                            if v is not None)
-    print(f"[RPC] {mode}  {action}{p}")
+    ts = time.strftime("%H:%M:%S")
+    print(f"[RPC {ts}] {mode}  {action}{_fmt_params(params)}",
+          flush=True)
 
 
-def _log_slow(mode: str, action: str, params: dict, elapsed: float) -> None:
-    p = ""
-    if params:
-        p = " " + " ".join(f"{k}={v}" for k, v in params.items()
-                            if v is not None)
-    print(f"[RPC SLOW] {elapsed:.1f}s  {mode}  {action}{p}")
+def _log_rpc_done(mode: str, action: str, params: dict,
+                  elapsed: float) -> None:
+    ts = time.strftime("%H:%M:%S")
+    tag = "SLOW " if elapsed >= _SLOW_THRESHOLD else ""
+    print(f"[RPC {ts}] {tag}{mode}  {action}{_fmt_params(params)}"
+          f"  ({elapsed:.1f}s)", flush=True)
+
+
+def _decode_response(data: bytes) -> dict:
+    """Decode a response that may be plain JSON or an LZ4 binary frame."""
+    if not data:
+        raise RPCError("empty response")
+    if data[0] == 0x00:
+        # LZ4 frame
+        if len(data) < 9:
+            raise RPCError("truncated LZ4 frame header")
+        uncomp_len, comp_len = struct.unpack("<II", data[1:9])
+        comp_data = data[9:9 + comp_len]
+        if len(comp_data) < comp_len:
+            raise RPCError("truncated LZ4 frame payload")
+        text = lz4.block.decompress(comp_data,
+                                    uncompressed_size=uncomp_len).decode()
+        return json.loads(text)
+    return json.loads(data)
 
 
 def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
@@ -459,17 +519,16 @@ def _call_oneshot(repo_spec: str, action: str, **params) -> dict:
             f"backup --json timed out for action '{action}' on {target}")
 
     elapsed = time.monotonic() - t0
-    if elapsed >= _SLOW_THRESHOLD:
-        _log_slow("oneshot", action, params, elapsed)
+    _log_rpc_done("oneshot", action, params, elapsed)
 
     if not proc.stdout:
         stderr = proc.stderr.decode(errors="replace").strip()
         raise RPCError(f"backup --json produced no output: {stderr}")
 
     try:
-        resp = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise RPCError(f"invalid JSON from backup: {e}")
+        resp = _decode_response(proc.stdout)
+    except (json.JSONDecodeError, Exception) as e:
+        raise RPCError(f"invalid response from backup: {e}")
 
     if resp.get("status") == "error":
         raise RPCError(resp.get("message", "unknown error"))

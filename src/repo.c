@@ -539,3 +539,21 @@ status_t repo_lock_shared(repo_t *repo) {
     repo->lock_fd = fd;
     return OK;
 }
+
+status_t repo_lock_shared_nb(repo_t *repo) {
+    if (repo->lock_fd != -1) return OK;
+
+    char lock_path[PATH_MAX];
+    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
+
+    int fd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    if (fd == -1) return OK;
+
+    if (flock(fd, LOCK_SH | LOCK_NB) == -1) {
+        close(fd);
+        return ERR_IO;
+    }
+
+    repo->lock_fd = fd;
+    return OK;
+}
