@@ -11,21 +11,11 @@
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
-/* Calendar helpers (UTC)                                              */
+/* Calendar helpers (local timezone for day boundaries)                */
 /* ------------------------------------------------------------------ */
 
-static int64_t cal_day(uint64_t ts) {
-    return (int64_t)(ts / 86400);
-}
-
-static void ts_to_tm(uint64_t ts, struct tm *out) {
-    time_t t = (time_t)ts;
-    gmtime_r(&t, out);
-}
-
 /*
- * Portable timegm — converts a UTC struct tm to a Unix timestamp.
- * Does not modify the struct tm or consult the local timezone.
+ * Portable timegm — converts a struct tm (interpreted as UTC) to epoch.
  */
 static int is_leap_year(int y) {
     return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -36,12 +26,10 @@ static time_t tm_to_utc(const struct tm *tm) {
     int y  = tm->tm_year + 1900;
     int m  = tm->tm_mon; /* 0-11 */
     int y0 = y - 1;
-    /* Days from epoch to Jan 1 of year y */
     long ydays = (long)(y - 1970) * 365
                + (y0 / 4   - 1969 / 4)
                - (y0 / 100 - 1969 / 100)
                + (y0 / 400 - 1969 / 400);
-    /* Days within the year up to start of month m */
     long yday = mdays[m] + (m > 1 && is_leap_year(y) ? 1 : 0);
     long days = ydays + yday + tm->tm_mday - 1;
     return (time_t)(days * 86400L
@@ -50,11 +38,40 @@ static time_t tm_to_utc(const struct tm *tm) {
                   + tm->tm_sec);
 }
 
+/*
+ * Return a day number for the local calendar date containing ts.
+ * Uses localtime to determine which date the timestamp falls on,
+ * then maps that date to a stable day number (UTC noon of that date
+ * divided by 86400).  This ensures "Mar 31 22:00 PDT" and
+ * "Apr 1 10:00 PDT" are on different days.
+ */
+static int64_t cal_day(uint64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    /* Map the local date to a unique day number by computing
+     * the UTC epoch of noon on that date (noon avoids DST edge cases). */
+    tm.tm_hour = 12; tm.tm_min = 0; tm.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tm) / 86400);
+}
+
+/* Convert a day number to struct tm (UTC, for date field extraction). */
+static void day_to_tm(int64_t day, struct tm *out) {
+    time_t t = (time_t)(day * 86400);
+    gmtime_r(&t, out);
+}
+
+/* Convert a UTC struct tm to a day number. */
+static int64_t tm_to_day(const struct tm *tm) {
+    struct tm tmp = *tm;
+    tmp.tm_hour = 12; tmp.tm_min = 0; tmp.tm_sec = 0;
+    return (int64_t)(tm_to_utc(&tmp) / 86400);
+}
+
 /* Return the cal_day of the Sunday that ends the Mon-Sun week containing day. */
 static int64_t week_sunday_of(int64_t day) {
-    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
-    ts_to_tm(ts, &tm);
+    day_to_tm(day, &tm);
     /* tm_wday: 0=Sun, 1=Mon, ..., 6=Sat */
     if (tm.tm_wday == 0) return day;
     return day + (7 - tm.tm_wday);
@@ -62,45 +79,37 @@ static int64_t week_sunday_of(int64_t day) {
 
 /* Return the cal_day of the first day of the month containing day. */
 static int64_t month_start_of(int64_t day) {
-    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
-    ts_to_tm(ts, &tm);
+    day_to_tm(day, &tm);
     tm.tm_mday = 1;
-    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
-    return (int64_t)(tm_to_utc(&tm) / 86400);
+    return tm_to_day(&tm);
 }
 
 /* Return the cal_day of the last day of the month containing day. */
 static int64_t month_end_of(int64_t day) {
-    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
-    ts_to_tm(ts, &tm);
+    day_to_tm(day, &tm);
     tm.tm_mon++;
     if (tm.tm_mon >= 12) { tm.tm_mon = 0; tm.tm_year++; }
     tm.tm_mday = 1;
-    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
-    return (int64_t)(tm_to_utc(&tm) / 86400) - 1;
+    return tm_to_day(&tm) - 1;
 }
 
 /* Return the cal_day of Jan 1 of the year containing day. */
 static int64_t year_start_of(int64_t day) {
-    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
-    ts_to_tm(ts, &tm);
+    day_to_tm(day, &tm);
     tm.tm_mon = 0; tm.tm_mday = 1;
-    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
-    return (int64_t)(tm_to_utc(&tm) / 86400);
+    return tm_to_day(&tm);
 }
 
 /* Return the cal_day of Dec 31 of the year containing day. */
 static int64_t year_end_of(int64_t day) {
-    uint64_t ts = (uint64_t)(day < 0 ? 0 : day) * 86400;
     struct tm tm;
-    ts_to_tm(ts, &tm);
+    day_to_tm(day, &tm);
     tm.tm_year++;
     tm.tm_mon = 0; tm.tm_mday = 1;
-    tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0;
-    return (int64_t)(tm_to_utc(&tm) / 86400) - 1;
+    return tm_to_day(&tm) - 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -256,6 +265,20 @@ status_t gfs_run(repo_t *repo, const policy_t *policy,
 
     int64_t scan_end_day   = cal_day(new_ts);
     int64_t scan_start_day = full_scan ? 0 : cal_day(prev_ts);
+
+    /* Incremental recovery: if any surviving snap on a *closed* day
+     * (i.e., day < scan_end_day) has gfs_flags == 0, an earlier
+     * gfs_run was likely missed (crash, error, interruption).  Extend
+     * scan_start_day backward to cover that snap's day so it gets
+     * flagged on this run.  This makes incremental GFS self-healing. */
+    if (!full_scan) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (snaps[i].gfs_flags != 0) continue;
+            int64_t d = cal_day(snaps[i].ts);
+            if (d < scan_end_day && d < scan_start_day)
+                scan_start_day = d;
+        }
+    }
 
     /* ---- Pass 1: Daily election ----
      * For each closed day in the scan interval, elect the latest snap

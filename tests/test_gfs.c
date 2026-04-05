@@ -280,6 +280,44 @@ static void test_full_scan_retroactive(void **state) {
 }
 
 /*
+ * Incremental recovery: if gfs_run was missed for a snap (e.g. crash
+ * between snapshot commit and gfs_run), the next incremental run must
+ * detect the unflagged snap on a closed day and extend backward to
+ * cover it.  Without this, a missed day stays unflagged forever.
+ *
+ * Simulate: 3 snaps on Mon/Tue/Wed, but only run incremental gfs for
+ * snap 3 (skipping snap 2).  Snap 1 should still get daily because
+ * the incremental scan extends backward to cover the unflagged day.
+ */
+static void test_incremental_recovery(void **state) {
+    (void)state;
+    uint32_t s1 = make_snap("a"); /* Mon Mar 16 */
+    uint32_t s2 = make_snap("b"); /* Tue Mar 17 */
+    uint32_t s3 = make_snap("c"); /* Wed Mar 18 */
+    assert_int_equal(set_snap_ts(s1, TS_MAR16_NOON), OK);
+    assert_int_equal(set_snap_ts(s2, TS_MAR17_NOON), OK);
+    assert_int_equal(set_snap_ts(s3, TS_MAR18_NOON), OK);
+
+    policy_t pol = make_policy(10, 7, 4, 3, 1);
+
+    /* Only run gfs for snap 1 (no previous → scan covers epoch..day1,
+     * but day1 is excluded → nothing flagged). */
+    run_gfs(s1, &pol);
+    assert_int_equal(flags_of(s1), 0);
+
+    /* Skip gfs_run for snap 2 entirely (simulates crash). */
+
+    /* Run gfs for snap 3.  Normal incremental would scan [day2, day3)
+     * which only covers Tue → snap 2 gets daily but snap 1 does NOT.
+     * With recovery, scan extends back to day1 → snap 1 also gets daily. */
+    run_gfs(s3, &pol);
+
+    assert_true((flags_of(s1) & GFS_DAILY) != 0);  /* recovered */
+    assert_true((flags_of(s2) & GFS_DAILY) != 0);
+    assert_int_equal(flags_of(s3) & GFS_DAILY, 0);  /* today, not closed */
+}
+
+/*
  * Dry run must not write any flags or delete any snaps.
  */
 static void test_dry_run_does_not_modify(void **state) {
@@ -340,6 +378,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_weekly_multi_gap,               setup, teardown),
         cmocka_unit_test_setup_teardown(test_weekly_empty_week_skipped,      setup, teardown),
         cmocka_unit_test_setup_teardown(test_full_scan_retroactive,          setup, teardown),
+        cmocka_unit_test_setup_teardown(test_incremental_recovery,           setup, teardown),
         cmocka_unit_test_setup_teardown(test_dry_run_does_not_modify,        setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_expired_daily,            setup, teardown),
     };

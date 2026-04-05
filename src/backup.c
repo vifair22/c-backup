@@ -198,14 +198,12 @@ static status_t store_file_content_cb(repo_t *repo, const char *path,
                                       xfer_progress_fn cb, void *cb_ctx) {
     int fd = open_noatime(path);
     if (fd == -1) return set_error_errno(ERR_IO, "store: open(%s)", path);
-    /* fadvise hints are handled by the object layer (dbl_reader_fn)
-     * which skips aggressive readahead on FUSE to avoid flooding
-     * the userspace daemon with concurrent requests. */
+    /* object_store_file_cb takes ownership of fd when src_path is provided
+     * (closes it on return, may reopen on transient read errors). */
     int is_new = 0;
     uint64_t phys = 0;
-    status_t st = object_store_file_cb(repo, fd, file_size, out_hash,
+    status_t st = object_store_file_cb(repo, fd, path, file_size, out_hash,
                                        &is_new, &phys, cb, cb_ctx);
-    close(fd);
     if (out_phys_new) *out_phys_new = is_new ? phys : 0;
     return st;
 }
@@ -396,10 +394,16 @@ static void *store_worker_fn(void *arg) {
                 /* Log immediately so the user sees failures as they happen */
                 if (pool->show_progress) {
                     progress_line_clear(&g_phase_line_len);
-                    char lmsg[PATH_MAX + 128];
-                    snprintf(lmsg, sizeof(lmsg),
-                             "store: transient error '%s' (%s), will retry",
-                             e->path, strerror(err));
+                    const char *detail = err_msg();
+                    char lmsg[PATH_MAX + ERR_MSG_MAX + 128];
+                    if (detail[0])
+                        snprintf(lmsg, sizeof(lmsg),
+                                 "store: transient error '%s': %s — will retry",
+                                 e->path, detail);
+                    else
+                        snprintf(lmsg, sizeof(lmsg),
+                                 "store: transient error '%s' (%s) — will retry",
+                                 e->path, strerror(err));
                     log_msg("WARN", lmsg);
                 }
                 pthread_mutex_unlock(&pool->mu);

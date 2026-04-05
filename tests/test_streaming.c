@@ -191,7 +191,7 @@ static void test_stream_progress_callback(void **state) {
     uint8_t hash[OBJECT_HASH_SIZE];
     int is_new = 0;
     uint64_t phys = 0;
-    assert_int_equal(object_store_file_cb(repo, fd, (uint64_t)file_size,
+    assert_int_equal(object_store_file_cb(repo, fd, NULL, (uint64_t)file_size,
                                            hash, &is_new, &phys,
                                            progress_cb, NULL), OK);
     close(fd);

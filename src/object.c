@@ -3,6 +3,7 @@
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
+#include "parity_stream.h"
 #include "util.h"
 #include "../vendor/log.h"
 
@@ -242,12 +243,13 @@ fail:
 }
 
 /* ------------------------------------------------------------------ */
-/* Double-buffered streaming: reader thread fills one slot while the   */
-/* processor (main thread) hashes + writes the other.                 */
+/* Streaming file → object store.  Single-threaded read → hash → write */
+/* loop.  Uses smaller chunks on FUSE to avoid overwhelming userspace. */
 /* ------------------------------------------------------------------ */
 
-#define STREAM_CHUNK      ((size_t)(16 * 1024 * 1024))  /* 16 MiB per slot */
-#define STREAM_CHUNK_FUSE ((size_t)( 1 * 1024 * 1024))  /*  1 MiB per slot */
+#define STREAM_CHUNK      ((size_t)(128 * 1024 * 1024)) /* 128 MiB write buffer */
+#define STREAM_CHUNK_FUSE ((size_t)(  1 * 1024 * 1024)) /*   1 MiB on FUSE */
+#define STREAM_LOAD_MAX   ((size_t)( 16 * 1024 * 1024)) /*  16 MiB load threshold */
 
 #ifndef FUSE_SUPER_MAGIC
 #define FUSE_SUPER_MAGIC 0x65735546
@@ -260,117 +262,24 @@ static int fd_is_fuse(int fd) {
     return sfs.f_type == (__typeof__(sfs.f_type))FUSE_SUPER_MAGIC;
 }
 
-typedef struct {
-    /* Synchronization — own cache line */
-    pthread_mutex_t mu  __attribute__((aligned(64)));
-    pthread_cond_t  cond;
-
-    /* Reader-written fields — own cache line to avoid false sharing */
-    size_t          lens[2]     __attribute__((aligned(64)));
-    int             is_last[2];
-    int             state[2];   /* 0 = empty (reader fills), 1 = full (processor reads) */
-    status_t        reader_st;
-    int             abort;
-
-    /* Shared / read-mostly */
-    int             src_fd;
-    uint64_t        file_size;
-    size_t          chunk_size;   /* STREAM_CHUNK or STREAM_CHUNK_FUSE */
-    uint8_t        *bufs[2];
-} dbl_buf_t;
-
-static void *dbl_reader_fn(void *arg) {
-    dbl_buf_t *d      = arg;
-    uint64_t   offset = 0;
-    int        slot   = 0;
-
-    /* On FUSE, POSIX_FADV_SEQUENTIAL triggers aggressive kernel readahead
-     * that floods the userspace daemon with hundreds of background requests.
-     * Use normal (conservative) readahead instead to avoid overwhelming it. */
-    int is_fuse = (d->chunk_size <= STREAM_CHUNK_FUSE);
-    if (!is_fuse)
-        posix_fadvise(d->src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-
-    while (offset < d->file_size) {
-        size_t want = d->chunk_size;
-        if ((uint64_t)want > d->file_size - offset)
-            want = (size_t)(d->file_size - offset);
-
-        /* Wait for slot to become empty */
-        pthread_mutex_lock(&d->mu);
-        while (d->state[slot] != 0 && !d->abort)
-            pthread_cond_wait(&d->cond, &d->mu);
-        if (d->abort) { pthread_mutex_unlock(&d->mu); return NULL; }
-        pthread_mutex_unlock(&d->mu);
-
-        /* Read without the lock held.
-         * FUSE filesystems can return transient errors (EIO, ENXIO) or
-         * be interrupted by signals (EINTR) — retry a few times before
-         * giving up so we don't abort a multi-GB file on a hiccup. */
-        size_t got = 0;
-        int    retries = 0;
-        while (got < want) {
-            ssize_t r = read(d->src_fd, d->bufs[slot] + got, want - got);
-            if (r > 0) {
-                got += (size_t)r;
-                retries = 0;          /* reset on any successful read */
-                continue;
-            }
-            if (r == -1 && errno == EINTR)
-                continue;             /* interrupted — just retry */
-            if (r == -1 && retries < 3 &&
-                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
-                retries++;
-                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-                nanosleep(&ts, NULL);
-                continue;             /* transient — back off and retry */
-            }
-            if (r == 0) errno = ESTALE;
-            pthread_mutex_lock(&d->mu);
-            d->reader_st = set_error_errno(ERR_IO,
-                "dbl_reader: read(src_fd) at offset %llu/%llu (%.1f%%)",
-                (unsigned long long)(offset + got),
-                (unsigned long long)d->file_size,
-                d->file_size > 0
-                    ? 100.0 * (double)(offset + got) / (double)d->file_size
-                    : 0.0);
-            d->abort     = 1;
-            pthread_cond_broadcast(&d->cond);
-            pthread_mutex_unlock(&d->mu);
-            return NULL;
-        }
-
-        /* Source pages are now in our buffer; no need to keep them in cache.
-         * Skip on FUSE — dropping cached pages there just forces re-reads
-         * through the userspace daemon if any readahead pages were evicted. */
-        if (!is_fuse)
-            posix_fadvise(d->src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
-        offset += (uint64_t)got;
-
-        pthread_mutex_lock(&d->mu);
-        d->lens[slot]    = got;
-        d->is_last[slot] = (offset >= d->file_size);
-        d->state[slot]   = 1;
-        pthread_cond_broadcast(&d->cond);
-        pthread_mutex_unlock(&d->mu);
-
-        slot ^= 1;
-    }
-    return NULL;
-}
-
 /* Probe size and compression threshold for LZ4 frame decision */
 #define PROBE_SIZE        (64  * 1024)          /* 64 KiB sample          */
 #define PROBE_RATIO_MAX   0.98                  /* skip LZ4 if > 98% size */
 
+#define STREAM_REOPEN_MAX 5   /* max seek/reopen recovery attempts per file */
+
 static status_t write_object_file_stream(repo_t *repo, int src_fd,
+                                         const char *src_path,
                                          uint64_t file_size,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
                                          void *progress_ctx) {
     /* Always store uncompressed; the pack sweeper handles compression. */
-    if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) return set_error_errno(ERR_IO, "lseek(src_fd)");
+    if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
+        if (src_path) close(src_fd);
+        return set_error_errno(ERR_IO, "lseek(src_fd)");
+    }
 
     /* ----------------------------------------------------------------
      * Create temp file and write placeholder header.
@@ -378,10 +287,16 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
      * ---------------------------------------------------------------- */
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
-        >= (int)sizeof(tmppath)) return set_error(ERR_IO, "stream: tmppath too long");
+        >= (int)sizeof(tmppath)) {
+        if (src_path) close(src_fd);
+        return set_error(ERR_IO, "stream: tmppath too long");
+    }
 
     int tfd = mkstemp(tmppath);
-    if (tfd == -1) return set_error_errno(ERR_IO, "mkstemp(%s)", tmppath);
+    if (tfd == -1) {
+        if (src_path) close(src_fd);
+        return set_error_errno(ERR_IO, "mkstemp(%s)", tmppath);
+    }
 
     object_header_t hdr = {
         .magic             = OBJECT_MAGIC,
@@ -394,179 +309,259 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     };
     if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
         if (errno == 0) errno = EIO;
-        close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: write header");
+        if (src_path) close(src_fd);
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "stream: write header");
     }
 
     uint64_t total_written = 0;
 
     /* ----------------------------------------------------------------
-     * Hash context + double-buffered reader thread
+     * Hash context + read buffer
      * ---------------------------------------------------------------- */
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
     if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
         EVP_MD_CTX_free(mdctx);
-        close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
+        if (src_path) close(src_fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
     }
 
-    /* Use smaller chunks on FUSE to avoid flooding the userspace daemon
-     * with hundreds of concurrent readahead requests (see dbl_reader_fn). */
-    size_t chunk = fd_is_fuse(src_fd) ? STREAM_CHUNK_FUSE : STREAM_CHUNK;
+    int is_fuse = fd_is_fuse(src_fd);
+    size_t chunk = is_fuse ? STREAM_CHUNK_FUSE : STREAM_CHUNK;
 
-    dbl_buf_t dbl;
-    dbl.src_fd     = src_fd;
-    dbl.file_size  = file_size;
-    dbl.chunk_size = chunk;
-    dbl.reader_st  = OK;
-    dbl.abort      = 0;
-    dbl.lens[0]    = 0;   dbl.lens[1]    = 0;
-    dbl.is_last[0] = 0;   dbl.is_last[1] = 0;
-    dbl.state[0]   = 0;   dbl.state[1]   = 0;
-    dbl.bufs[0]    = malloc(chunk);
-    dbl.bufs[1]    = malloc(chunk);
-    if (!dbl.bufs[0] || !dbl.bufs[1]) {
-        free(dbl.bufs[0]); free(dbl.bufs[1]);
+    uint8_t *buf = malloc(chunk);
+    if (!buf) {
         EVP_MD_CTX_free(mdctx);
-        close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", chunk);
+        if (src_path) close(src_fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "malloc(%zu)", chunk);
     }
-    pthread_mutex_init(&dbl.mu, NULL);
-    pthread_cond_init(&dbl.cond, NULL);
 
-    pthread_t reader_thr;
-    if (pthread_create(&reader_thr, NULL, dbl_reader_fn, &dbl) != 0) {
-        free(dbl.bufs[0]); free(dbl.bufs[1]);
-        pthread_mutex_destroy(&dbl.mu);
-        pthread_cond_destroy(&dbl.cond);
+    /* On FUSE, POSIX_FADV_SEQUENTIAL triggers aggressive kernel readahead
+     * that floods the userspace daemon — use conservative readahead instead. */
+    if (!is_fuse)
+        posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    /* ----------------------------------------------------------------
+     * RS parity accumulator — bounded-RAM streaming, spills to temp file.
+     * ---------------------------------------------------------------- */
+    char ps_tmp_dir[PATH_MAX];
+    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", repo_path(repo));
+    rs_parity_stream_t ps;
+    int ps_ok = rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir);
+    if (ps_ok != 0) {
+        free(buf);
         EVP_MD_CTX_free(mdctx);
-        close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "pthread_create(reader)");
+        if (src_path) close(src_fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "stream: rs parity stream init");
     }
 
     /* ----------------------------------------------------------------
-     * RS parity accumulator — computed inline to avoid re-reading the
-     * payload from the temp file after writing.
+     * Main loop: read → hash → write → accumulate CRC & RS parity
      * ---------------------------------------------------------------- */
-    const size_t rs_group_data = (size_t)RS_K * RS_INTERLEAVE;  /* 15296 */
-    size_t rs_total_sz = rs_parity_size((size_t)file_size);
-    uint8_t *rs_par_buf = NULL;
-    uint8_t *rs_group_buf = NULL;
-    size_t rs_group_fill = 0;   /* bytes accumulated in current group */
-    size_t rs_par_off = 0;      /* write offset into rs_par_buf */
-    if (rs_total_sz > 0) {
-        rs_par_buf = malloc(rs_total_sz);
-        rs_group_buf = malloc(rs_group_data);
-        if (!rs_par_buf || !rs_group_buf) {
-            free(rs_par_buf); free(rs_group_buf);
-            pthread_mutex_lock(&dbl.mu);
-            dbl.abort = 1;
-            pthread_cond_broadcast(&dbl.cond);
-            pthread_mutex_unlock(&dbl.mu);
-            pthread_join(reader_thr, NULL);
-            pthread_cond_destroy(&dbl.cond);
-            pthread_mutex_destroy(&dbl.mu);
-            free(dbl.bufs[0]); free(dbl.bufs[1]);
-            EVP_MD_CTX_free(mdctx);
-            close(tfd); unlink(tmppath);
-            return set_error(ERR_NOMEM, "stream: rs parity alloc");
+    status_t st     = OK;
+    uint32_t stream_crc = 0;
+    uint64_t offset = 0;
+    int      recoveries = 0;       /* total seek/reopen attempts consumed */
+    int      last_was_seek = 0;    /* if true, skip Tier 1 next time */
+
+    /* Helper: push the progress line down before logging so our messages
+     * aren't overwritten by the \r-based progress display. */
+    #define STREAM_LOG(level, msg) do { \
+        fprintf(stderr, "\n"); fflush(stderr); \
+        log_msg((level), (msg)); \
+    } while (0)
+
+    while (offset < file_size) {
+        size_t want = chunk;
+        if ((uint64_t)want > file_size - offset)
+            want = (size_t)(file_size - offset);
+
+        /* Read with EINTR + transient-error retry */
+        size_t got = 0;
+        int    retries = 0;
+        while (got < want) {
+            ssize_t r = read(src_fd, buf + got, want - got);
+            if (r > 0) { got += (size_t)r; retries = 0; last_was_seek = 0; continue; }
+            if (r == -1 && errno == EINTR) continue;
+            if (r == -1 && retries < 3 &&
+                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
+                retries++;
+                char rmsg[256];
+                snprintf(rmsg, sizeof(rmsg),
+                         "stream: transient read error (%s) at offset %llu/%llu (%.1f%%), retry %d/3",
+                         strerror(errno),
+                         (unsigned long long)(offset + got),
+                         (unsigned long long)file_size,
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                         retries);
+                STREAM_LOG("WARN", rmsg);
+                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            if (r == 0) errno = ESTALE;
+
+            /* --- Recovery: seek on same fd, or reopen + seek --- */
+            int saved_errno = errno;
+            char rmsg[256];
+
+            if (recoveries >= STREAM_REOPEN_MAX) {
+                snprintf(rmsg, sizeof(rmsg),
+                         "stream: read failed (%s) at offset %llu/%llu (%.1f%%), all %d recovery attempts exhausted",
+                         strerror(saved_errno),
+                         (unsigned long long)(offset + got),
+                         (unsigned long long)file_size,
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                         STREAM_REOPEN_MAX);
+                STREAM_LOG("ERROR", rmsg);
+                errno = saved_errno;
+                st = set_error_errno(ERR_IO, "%s", rmsg);
+                goto done;
+            }
+
+            /* Tier 1: lseek on existing fd (skip if last attempt was also a seek,
+             * since that means the fd is dead and lseek just lies about success) */
+            if (!last_was_seek) {
+                off_t seek_target = (off_t)(offset + got);
+                if (lseek(src_fd, seek_target, SEEK_SET) == seek_target) {
+                    recoveries++;
+                    last_was_seek = 1;
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: read error (%s) at offset %llu/%llu (%.1f%%), trying seek recovery (%d/%d)",
+                             strerror(saved_errno),
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                             recoveries, STREAM_REOPEN_MAX);
+                    STREAM_LOG("WARN", rmsg);
+                    errno = saved_errno;
+                    continue;
+                }
+                snprintf(rmsg, sizeof(rmsg),
+                         "stream: seek recovery failed (%s) at offset %llu/%llu (%.1f%%), escalating to reopen",
+                         strerror(errno),
+                         (unsigned long long)(offset + got),
+                         (unsigned long long)file_size,
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                STREAM_LOG("WARN", rmsg);
+            }
+
+            /* Tier 2: close + reopen by path + seek */
+            if (src_path) {
+                off_t seek_target = (off_t)(offset + got);
+                snprintf(rmsg, sizeof(rmsg),
+                         "stream: attempting reopen recovery at offset %llu/%llu (%.1f%%), attempt %d/%d",
+                         (unsigned long long)(offset + got),
+                         (unsigned long long)file_size,
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                         recoveries + 1, STREAM_REOPEN_MAX);
+                STREAM_LOG("WARN", rmsg);
+
+                int new_fd = open(src_path, O_RDONLY);
+                if (new_fd < 0) {
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: reopen failed (%s), giving up",
+                             strerror(errno));
+                    STREAM_LOG("ERROR", rmsg);
+                    errno = saved_errno;
+                    st = set_error_errno(ERR_IO,
+                        "stream: read failed at offset %llu/%llu (%.1f%%), reopen failed",
+                        (unsigned long long)(offset + got),
+                        (unsigned long long)file_size,
+                        file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                    goto done;
+                }
+                if (lseek(new_fd, seek_target, SEEK_SET) != seek_target) {
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: reopen seek failed (%s), giving up",
+                             strerror(errno));
+                    STREAM_LOG("ERROR", rmsg);
+                    close(new_fd);
+                    errno = saved_errno;
+                    st = set_error_errno(ERR_IO,
+                        "stream: read failed at offset %llu/%llu (%.1f%%), reopen seek failed",
+                        (unsigned long long)(offset + got),
+                        (unsigned long long)file_size,
+                        file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                    goto done;
+                }
+                close(src_fd);
+                src_fd = new_fd;
+                recoveries++;
+                last_was_seek = 0;
+                snprintf(rmsg, sizeof(rmsg),
+                         "stream: reopened fd at offset %llu/%llu (%.1f%%), recovery %d/%d",
+                         (unsigned long long)(offset + got),
+                         (unsigned long long)file_size,
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                         recoveries, STREAM_REOPEN_MAX);
+                STREAM_LOG("WARN", rmsg);
+                if (!is_fuse)
+                    posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                errno = saved_errno;
+                continue;
+            }
+
+            /* No src_path — can't reopen, give up */
+            snprintf(rmsg, sizeof(rmsg),
+                     "stream: read failed (%s) at offset %llu/%llu (%.1f%%), no path for reopen",
+                     strerror(saved_errno),
+                     (unsigned long long)(offset + got),
+                     (unsigned long long)file_size,
+                     file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+            STREAM_LOG("ERROR", rmsg);
+            errno = saved_errno;
+            st = set_error_errno(ERR_IO, "%s", rmsg);
+            goto done;
         }
-    }
 
-    /* ----------------------------------------------------------------
-     * Main loop: hash + write + accumulate CRC & RS parity
-     * ---------------------------------------------------------------- */
-    status_t st            = OK;
-    int      slot      = 0;
-    uint32_t stream_crc = 0;   /* CRC accumulated inline, used by parity trailer */
+        /* Drop source pages from cache (not on FUSE) */
+        if (!is_fuse)
+            posix_fadvise(src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
 
-    for (;;) {
-        pthread_mutex_lock(&dbl.mu);
-        while (dbl.state[slot] != 1 && !dbl.abort)
-            pthread_cond_wait(&dbl.cond, &dbl.mu);
-        int      do_abort = dbl.abort;
-        status_t rdr_st   = dbl.reader_st;
-        size_t   len      = dbl.lens[slot];
-        int      is_last  = dbl.is_last[slot];
-        pthread_mutex_unlock(&dbl.mu);
-
-        if (do_abort) { st = (rdr_st != OK) ? rdr_st : set_error(ERR_IO, "stream: reader thread aborted"); break; }
-
-        /* Hash the uncompressed bytes */
-        if (EVP_DigestUpdate(mdctx, dbl.bufs[slot], len) != 1) {
-            st = set_error(ERR_IO, "stream: SHA256 update failed"); goto abort_reader;
+        /* Hash */
+        if (EVP_DigestUpdate(mdctx, buf, got) != 1) {
+            st = set_error(ERR_IO, "stream: SHA256 update failed"); goto done;
         }
 
         /* Write raw bytes (always uncompressed) */
-        if (write(tfd, dbl.bufs[slot], len) != (ssize_t)len) {
+        if (write(tfd, buf, got) != (ssize_t)got) {
             if (errno == 0) errno = EIO;
-            st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto abort_reader;
+            st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto done;
         }
-        stream_crc = crc32c_update(stream_crc, dbl.bufs[slot], len);
+        stream_crc = crc32c_update(stream_crc, buf, got);
 
-        /* Accumulate RS parity inline, one group at a time */
-        if (rs_par_buf) {
-            const uint8_t *rp = dbl.bufs[slot];
-            size_t rrem = len;
-            while (rrem > 0) {
-                size_t space = rs_group_data - rs_group_fill;
-                size_t take = rrem < space ? rrem : space;
-                memcpy(rs_group_buf + rs_group_fill, rp, take);
-                rs_group_fill += take;
-                rp += take;
-                rrem -= take;
-                if (rs_group_fill == rs_group_data) {
-                    rs_parity_encode(rs_group_buf, rs_group_data,
-                                     rs_par_buf + rs_par_off);
-                    rs_par_off += (size_t)RS_2T * RS_INTERLEAVE;
-                    rs_group_fill = 0;
-                }
-            }
-        }
+        /* Accumulate RS parity inline via bounded-RAM stream */
+        rs_parity_stream_feed(&ps, buf, got);
 
-        total_written += len;
-        if (progress_cb) progress_cb((uint64_t)len, progress_ctx);
-
-        pthread_mutex_lock(&dbl.mu);
-        dbl.state[slot] = 0;
-        pthread_cond_broadcast(&dbl.cond);
-        pthread_mutex_unlock(&dbl.mu);
-
-        if (is_last) break;
-        slot ^= 1;
-        continue;
-
-abort_reader:
-        pthread_mutex_lock(&dbl.mu);
-        dbl.abort = 1;
-        pthread_cond_broadcast(&dbl.cond);
-        pthread_mutex_unlock(&dbl.mu);
-        break;
+        total_written += got;
+        offset += (uint64_t)got;
+        if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
     }
 
-    pthread_join(reader_thr, NULL);
-    if (st == OK && dbl.reader_st != OK) st = dbl.reader_st;
-    pthread_cond_destroy(&dbl.cond);
-    pthread_mutex_destroy(&dbl.mu);
-    free(dbl.bufs[1]);
-    free(dbl.bufs[0]);
+    #undef STREAM_LOG
+
+done:
+    free(buf);
+    if (src_path) close(src_fd);  /* only close if we own the fd */
 
     /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
 
     /* Flush final partial RS group */
-    if (st == OK && rs_par_buf && rs_group_fill > 0) {
-        rs_parity_encode(rs_group_buf, rs_group_fill,
-                         rs_par_buf + rs_par_off);
-        rs_par_off += rs_parity_size(rs_group_fill);
-        rs_group_fill = 0;
-    }
-    free(rs_group_buf);
-    rs_group_buf = NULL;
+    if (st == OK)
+        rs_parity_stream_finish(&ps);
 
     if (st != OK) {
-        free(rs_par_buf);
+        rs_parity_stream_destroy(&ps);
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return st;
     }
 
     unsigned int dlen = 0;
     if (EVP_DigestFinal_ex(mdctx, out_hash, &dlen) != 1 || dlen != OBJECT_HASH_SIZE) {
-        EVP_MD_CTX_free(mdctx); free(rs_par_buf);
+        EVP_MD_CTX_free(mdctx); rs_parity_stream_destroy(&ps);
         close(tfd); unlink(tmppath); return set_error(ERR_IO, "stream: SHA256 finalize failed");
     }
     EVP_MD_CTX_free(mdctx);
@@ -574,7 +569,7 @@ abort_reader:
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(repo, out_hash)) {
-        free(rs_par_buf); close(tfd); unlink(tmppath); return OK;
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath); return OK;
     }
 
     /* Patch header: fill in sizes and hash now that we know them */
@@ -583,7 +578,7 @@ abort_reader:
     memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
     if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
         if (errno == 0) errno = EIO;
-        free(rs_par_buf); close(tfd); unlink(tmppath);
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "stream: pwrite header");
     }
 
@@ -595,21 +590,22 @@ abort_reader:
         parity_record_compute(&hdr, sizeof(hdr), &shdr_par);
         if (lseek(tfd, 0, SEEK_END) == (off_t)-1 ||
             write(tfd, &shdr_par, sizeof(shdr_par)) != (ssize_t)sizeof(shdr_par)) {
-            free(rs_par_buf); close(tfd); unlink(tmppath);
+            rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
             return set_error_errno(ERR_IO, "stream: write parity header");
         }
 
         size_t payload_len = (size_t)total_written;
-        size_t rs_sz = rs_parity_size(payload_len);
+        size_t rs_sz = rs_parity_stream_total(&ps);
 
-        if (rs_par_buf && rs_sz > 0) {
-            if (write(tfd, rs_par_buf, rs_sz) != (ssize_t)rs_sz) {
-                free(rs_par_buf); close(tfd); unlink(tmppath);
-                return set_error_errno(ERR_IO, "stream: write RS parity");
+        if (rs_sz > 0) {
+            if (rs_parity_stream_replay_fd(&ps, tfd) != 0) {
+                if (errno == 0) errno = EIO;
+                rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+                return set_error_errno(ERR_IO,
+                    "stream: write RS parity (%zu bytes)", rs_sz);
             }
         }
-        free(rs_par_buf);
-        rs_par_buf = NULL;
+        rs_parity_stream_destroy(&ps);
 
         if (write(tfd, &stream_crc, sizeof(stream_crc)) != (ssize_t)sizeof(stream_crc)) {
             close(tfd); unlink(tmppath);
@@ -693,7 +689,9 @@ status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
     return object_store_file_ex(repo, fd, file_size, out_hash, NULL, NULL);
 }
 
-static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size,
+static status_t object_store_file_ex_cb(repo_t *repo, int fd,
+                                        const char *src_path,
+                                        uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         xfer_progress_fn progress_cb,
@@ -702,17 +700,19 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
 status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
-    return object_store_file_ex_cb(repo, fd, file_size, out_hash,
+    return object_store_file_ex_cb(repo, fd, NULL, file_size, out_hash,
                                    out_is_new, out_phys_bytes, NULL, NULL);
 }
 
-static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size,
+static status_t object_store_file_ex_cb(repo_t *repo, int fd,
+                                        const char *src_path,
+                                        uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx) {
     if (file_size == 0) {
-        /* empty file */
+        if (src_path) close(fd);
         uint8_t empty = 0;
         return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
@@ -743,6 +743,7 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
             is_sparse = 0;
         } else {
             /* Can't even read the file — real I/O error */
+            if (src_path) close(fd);
             return set_error_errno(ERR_IO, "store: read probe failed");
         }
     } else if (pos != -1) {
@@ -759,7 +760,7 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
                 if (n_regions == regions_cap) {
                     uint32_t nc = regions_cap ? regions_cap * 2 : 8;
                     sparse_region_t *tmp = realloc(regions, nc * sizeof(*tmp));
-                    if (!tmp) { free(regions); return set_error(ERR_NOMEM, "realloc sparse regions"); }
+                    if (!tmp) { free(regions); if (src_path) close(fd); return set_error(ERR_NOMEM, "realloc sparse regions"); }
                     regions = tmp; regions_cap = nc;
                 }
                 regions[n_regions].offset = (uint64_t)data_start;
@@ -775,10 +776,11 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
         }
     }
 
-    /* If the file isn't sparse (or the FS doesn't report holes), read it whole */
+    /* If the file isn't sparse (or the FS doesn't report holes), read it whole.
+     * write_object_file_stream takes ownership of fd (closes it on return). */
     if (!is_sparse || n_regions == 0) {
         free(regions);
-        return write_object_file_stream(repo, fd, file_size, out_hash,
+        return write_object_file_stream(repo, fd, src_path, file_size, out_hash,
                                         out_is_new, out_phys_bytes,
                                         progress_cb, progress_ctx);
     }
@@ -791,7 +793,11 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
                       + n_regions * sizeof(sparse_region_t)
                       + data_bytes;
     uint8_t *payload = malloc(payload_sz);
-    if (!payload) { free(regions); return set_error(ERR_NOMEM, "malloc(%zu)", payload_sz); }
+    if (!payload) {
+        free(regions);
+        if (src_path) close(fd);
+        return set_error(ERR_NOMEM, "malloc(%zu)", payload_sz);
+    }
 
     uint8_t *p = payload;
     sparse_hdr_t shdr = { .magic = SPARSE_MAGIC, .region_count = n_regions };
@@ -808,6 +814,7 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
             if (r <= 0) {
                 free(regions);
                 free(payload);
+                if (src_path) close(fd);
                 errno = (r == 0) ? ESTALE : errno;
                 return set_error_errno(ERR_IO, "sparse: read region %u", i);
             }
@@ -816,17 +823,20 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd, uint64_t file_size
     }
 
     free(regions);
+    if (src_path) close(fd);  /* done reading; fd no longer needed */
     status_t st = write_object(repo, OBJECT_TYPE_SPARSE, payload, payload_sz, out_hash,
                                out_is_new, out_phys_bytes);
     free(payload);
     return st;
 }
 
-status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
+status_t object_store_file_cb(repo_t *repo, int fd, const char *src_path,
+                              uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes,
                               xfer_progress_fn cb, void *cb_ctx) {
     if (file_size == 0) {
+        if (src_path) close(fd);  /* we own fd when src_path is set */
         uint8_t empty = 0;
         return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
@@ -834,7 +844,7 @@ status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
     /* Sparse-aware path handles both sparse and non-sparse files.
      * For non-sparse files it falls through to write_object_file_stream.
      * The progress callback is only used on the streaming (non-sparse) path. */
-    return object_store_file_ex_cb(repo, fd, file_size, out_hash,
+    return object_store_file_ex_cb(repo, fd, src_path, file_size, out_hash,
                                    out_is_new, out_phys_bytes, cb, cb_ctx);
 }
 
@@ -872,7 +882,7 @@ status_t object_load(repo_t *repo,
     }
 
     /* Large uncompressed objects must be loaded via object_load_stream. */
-    if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_CHUNK) {
+    if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_LOAD_MAX) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
         close(fd);
         return set_error(ERR_TOO_LARGE, "object %s: %lu bytes, use streaming load", hex, (unsigned long)hdr.compressed_size);
@@ -1043,13 +1053,13 @@ status_t object_load_stream(repo_t *repo,
             EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_IO, "load_stream: SHA256 init failed");
         }
 
-        uint8_t *buf = malloc(STREAM_CHUNK);
-        if (!buf) { EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK); }
+        uint8_t *buf = malloc(STREAM_LOAD_MAX);
+        if (!buf) { EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_LOAD_MAX); }
 
         uint64_t remaining = hdr.compressed_size;
         status_t st = OK;
         while (remaining > 0 && st == OK) {
-            size_t want = (remaining > STREAM_CHUNK) ? STREAM_CHUNK : (size_t)remaining;
+            size_t want = (remaining > STREAM_LOAD_MAX) ? STREAM_LOAD_MAX : (size_t)remaining;
             if (io_read_full(fd, buf, want) != 0)           { st = set_error(ERR_CORRUPT, "load_stream: truncated payload"); break; }
             if (EVP_DigestUpdate(mdctx, buf, want) != 1) { st = set_error(ERR_IO, "load_stream: SHA256 update failed"); break; }
             if (io_write_full(out_fd, buf, want) != 0)      { st = set_error_errno(ERR_IO, "load_stream: write to out_fd"); break; }
@@ -1147,15 +1157,15 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_IO, "store_fd: SHA256 init failed");
     }
 
-    uint8_t *buf = malloc(STREAM_CHUNK);
+    uint8_t *buf = malloc(STREAM_LOAD_MAX);
     if (!buf) {
-        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_LOAD_MAX);
     }
 
     uint64_t remaining = size;
     status_t st = OK;
     while (remaining > 0) {
-        size_t want = (remaining < STREAM_CHUNK) ? (size_t)remaining : STREAM_CHUNK;
+        size_t want = (remaining < STREAM_LOAD_MAX) ? (size_t)remaining : STREAM_LOAD_MAX;
         ssize_t r = read(src_fd, buf, want);
         if (r <= 0) { st = set_error_errno(ERR_IO, "store_fd: read src_fd"); break; }
         if (EVP_DigestUpdate(mdctx, buf, (size_t)r) != 1) { st = set_error(ERR_IO, "store_fd: SHA256 update failed"); break; }

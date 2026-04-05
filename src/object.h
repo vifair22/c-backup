@@ -38,8 +38,11 @@ status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
 typedef void (*xfer_progress_fn)(uint64_t chunk_bytes, void *ctx);
 
 /* Like object_store_file_ex but fires cb(chunk_bytes, cb_ctx) per chunk.
- * Useful for sub-second progress updates during large-file transfers. */
-status_t object_store_file_cb(repo_t *repo, int fd, uint64_t file_size,
+ * Useful for sub-second progress updates during large-file transfers.
+ * If src_path is non-NULL the function takes ownership of fd (closes it)
+ * and may reopen the file on transient read errors to recover mid-stream. */
+status_t object_store_file_cb(repo_t *repo, int fd, const char *src_path,
+                              uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes,
                               xfer_progress_fn cb, void *cb_ctx);
