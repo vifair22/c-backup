@@ -1226,6 +1226,25 @@ static void tar_compute_checksum(tar_hdr_t *h) {
 
 static int tar_write_padding(int fd, uint64_t size);
 
+/* Non-directory tar entries must not end with '/'.
+ * Some readers treat that as a directory regardless of typeflag. */
+static const char *tar_normalize_path(const char *path, char typeflag,
+                                      char **owned_path) {
+    *owned_path = NULL;
+    if (!path || typeflag == '5') return path;
+
+    size_t plen = strlen(path);
+    while (plen > 1 && path[plen - 1] == '/') plen--;
+    if (plen == strlen(path)) return path;
+
+    char *clean = malloc(plen + 1);
+    if (!clean) return NULL;
+    memcpy(clean, path, plen);
+    clean[plen] = '\0';
+    *owned_path = clean;
+    return clean;
+}
+
 /* Write a GNU ././@LongLink header for paths that exceed ustar limits. */
 static int tar_write_longname(int fd, const char *path) {
     size_t plen = strlen(path) + 1;  /* include NUL */
@@ -1250,14 +1269,22 @@ static int tar_set_path(tar_hdr_t *h, const char *path) {
         return 1;
     }
     if (plen < 256) {
-        /* Find a '/' split point where name < 100 and prefix < 155 */
+        /* Find the rightmost '/' that keeps name <= 100 and prefix <= 155. */
         const char *split = NULL;
-        for (const char *s = path + plen - 99; s > path; s--) {
-            if (*s == '/') { split = s; break; }
+        for (const char *s = path + plen - 1; s > path; s--) {
+            if (*s != '/') continue;
+            size_t prefix_len = (size_t)(s - path);
+            size_t name_len = plen - prefix_len - 1;
+            if (prefix_len <= 155 && name_len <= 100) {
+                split = s;
+                break;
+            }
         }
-        if (split && (size_t)(split - path) <= 155) {
-            memcpy(h->prefix, path, (size_t)(split - path));
-            memcpy(h->name, split + 1, plen - (size_t)(split - path) - 1);
+        if (split) {
+            size_t prefix_len = (size_t)(split - path);
+            size_t name_len = plen - prefix_len - 1;
+            memcpy(h->prefix, path, prefix_len);
+            memcpy(h->name, split + 1, name_len);
             return 1;
         }
     }
@@ -1272,11 +1299,18 @@ static int tar_write_header(int fd, const char *path, char typeflag,
                             uint64_t size, uint64_t mtime_sec,
                             const char *linkname,
                             uint32_t devmajor, uint32_t devminor) {
+    char *owned_path = NULL;
+    path = tar_normalize_path(path, typeflag, &owned_path);
+    if (!path) return -1;
+
     /* Emit GNU LongLink header if path won't fit in ustar fields */
     tar_hdr_t probe;
     memset(&probe, 0, sizeof(probe));
     if (!tar_set_path(&probe, path)) {
-        if (tar_write_longname(fd, path) != 0) return -1;
+        if (tar_write_longname(fd, path) != 0) {
+            free(owned_path);
+            return -1;
+        }
     }
 
     /* Similarly for long symlink targets */
@@ -1291,9 +1325,18 @@ static int tar_write_header(int fd, const char *path, char typeflag,
         memcpy(kh.magic, "ustar ", 6);
         kh.version[0] = ' '; kh.version[1] = '\0';
         tar_compute_checksum(&kh);
-        if (write_all(fd, &kh, 512) != 0) return -1;
-        if (write_all(fd, linkname, llen) != 0) return -1;
-        if (tar_write_padding(fd, (uint64_t)llen) != 0) return -1;
+        if (write_all(fd, &kh, 512) != 0) {
+            free(owned_path);
+            return -1;
+        }
+        if (write_all(fd, linkname, llen) != 0) {
+            free(owned_path);
+            return -1;
+        }
+        if (tar_write_padding(fd, (uint64_t)llen) != 0) {
+            free(owned_path);
+            return -1;
+        }
     }
 
     tar_hdr_t h;
@@ -1318,7 +1361,9 @@ static int tar_write_header(int fd, const char *path, char typeflag,
     if (devminor) tar_set_octal(h.devminor, sizeof(h.devminor), devminor);
 
     tar_compute_checksum(&h);
-    return write_all(fd, &h, 512);
+    int rc = write_all(fd, &h, 512);
+    free(owned_path);
+    return rc;
 }
 
 /* Write zero-padding to round up to 512-byte block boundary */
@@ -1474,31 +1519,10 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
         const char *path = pm->slots[si].key;
         const node_t *nd = &pm->slots[si].value;
 
-        /* Sanitize path: ensure directories end with '/', others don't */
-        size_t pathlen = strlen(path);
-        char pathbuf[PATH_MAX];
-        const char *tpath = path;
-        if (nd->type == NODE_TYPE_DIR) {
-            if (pathlen > 0 && path[pathlen - 1] != '/' &&
-                pathlen + 1 < sizeof(pathbuf)) {
-                memcpy(pathbuf, path, pathlen);
-                pathbuf[pathlen] = '/';
-                pathbuf[pathlen + 1] = '\0';
-                tpath = pathbuf;
-            }
-        } else {
-            if (pathlen > 0 && path[pathlen - 1] == '/' &&
-                pathlen < sizeof(pathbuf)) {
-                memcpy(pathbuf, path, pathlen - 1);
-                pathbuf[pathlen - 1] = '\0';
-                tpath = pathbuf;
-            }
-        }
-
         switch (nd->type) {
         case NODE_TYPE_DIR:
             /* Directory: typeflag '5', size 0 */
-            if (tar_write_header(tar_fd, tpath, '5',
+            if (tar_write_header(tar_fd, path, '5',
                                  nd->mode, nd->uid, nd->gid,
                                  0, nd->mtime_sec, NULL, 0, 0) != 0)
                 write_err = 1;
@@ -1506,7 +1530,7 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
 
         case NODE_TYPE_REG: {
             /* Regular file: typeflag '0' */
-            if (tar_write_header(tar_fd, tpath, '0',
+            if (tar_write_header(tar_fd, path, '0',
                                  nd->mode, nd->uid, nd->gid,
                                  nd->size, nd->mtime_sec, NULL, 0, 0) != 0) {
                 write_err = 1;
@@ -1525,7 +1549,7 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
                 if (object_load(repo, nd->content_hash, &td, &tl, NULL) == OK)
                     target = (char *)td;
             }
-            if (tar_write_header(tar_fd, tpath, '2',
+            if (tar_write_header(tar_fd, path, '2',
                                  nd->mode, nd->uid, nd->gid,
                                  0, nd->mtime_sec,
                                  target ? target : "", 0, 0) != 0)
@@ -1535,14 +1559,14 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
         }
 
         case NODE_TYPE_FIFO:
-            if (tar_write_header(tar_fd, tpath, '6',
+            if (tar_write_header(tar_fd, path, '6',
                                  nd->mode, nd->uid, nd->gid,
                                  0, nd->mtime_sec, NULL, 0, 0) != 0)
                 write_err = 1;
             break;
 
         case NODE_TYPE_CHR:
-            if (tar_write_header(tar_fd, tpath, '3',
+            if (tar_write_header(tar_fd, path, '3',
                                  nd->mode, nd->uid, nd->gid,
                                  0, nd->mtime_sec, NULL,
                                  nd->device.major, nd->device.minor) != 0)
@@ -1550,7 +1574,7 @@ status_t export_snapshot_targz(repo_t *repo, uint32_t snap_id, const char *outpu
             break;
 
         case NODE_TYPE_BLK:
-            if (tar_write_header(tar_fd, tpath, '4',
+            if (tar_write_header(tar_fd, path, '4',
                                  nd->mode, nd->uid, nd->gid,
                                  0, nd->mtime_sec, NULL,
                                  nd->device.major, nd->device.minor) != 0)

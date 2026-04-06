@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <lz4.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -158,6 +159,120 @@ static void flip_first_byte(const char *path) {
     b ^= 0xFF;
     assert_int_equal(write(fd, &b, 1), 1);
     close(fd);
+}
+
+static void snapshot_append_slash_to_name(repo_t *repo, uint32_t snap_id,
+                                          const char *name_suffix) {
+    snapshot_t *snap = NULL;
+    assert_int_equal(snapshot_load(repo, snap_id, &snap), OK);
+    assert_non_null(snap);
+
+    size_t new_len = snap->dirent_data_len + 1;
+    uint8_t *new_dirent = malloc(new_len);
+    assert_non_null(new_dirent);
+
+    uint32_t nodes_sz = snap->node_count * (uint32_t)sizeof(node_t);
+    node_t *nodes = malloc(nodes_sz);
+    assert_non_null(nodes);
+    memcpy(nodes, snap->nodes, nodes_sz);
+
+    const uint8_t *src = snap->dirent_data;
+    const uint8_t *end = src + snap->dirent_data_len;
+    uint8_t *dst = new_dirent;
+    int updated = 0;
+
+    while (src < end) {
+        assert_true(src + sizeof(dirent_rec_t) <= end);
+        dirent_rec_t dr;
+        memcpy(&dr, src, sizeof(dr));
+        src += sizeof(dr);
+        assert_true(src + dr.name_len <= end);
+
+        const char *name = (const char *)src;
+        if (!updated &&
+            dr.name_len == strlen(name_suffix) &&
+            memcmp(name, name_suffix, dr.name_len) == 0) {
+            dirent_rec_t changed = dr;
+            changed.name_len = (uint16_t)(dr.name_len + 1);
+            memcpy(dst, &changed, sizeof(changed));
+            dst += sizeof(changed);
+            memcpy(dst, name, dr.name_len);
+            dst += dr.name_len;
+            *dst++ = '/';
+            updated = 1;
+        } else {
+            memcpy(dst, &dr, sizeof(dr));
+            dst += sizeof(dr);
+            memcpy(dst, name, dr.name_len);
+            dst += dr.name_len;
+        }
+        src += dr.name_len;
+    }
+
+    assert_true(updated);
+    assert_true((size_t)(dst - new_dirent) == new_len);
+
+    snapshot_t mutated = *snap;
+    mutated.nodes = nodes;
+    mutated.dirent_data = new_dirent;
+    mutated.dirent_data_len = new_len;
+    mutated._backing = NULL;
+
+    assert_int_equal(snapshot_write(repo, &mutated), OK);
+
+    free(nodes);
+    free(new_dirent);
+    snapshot_free(snap);
+}
+
+static void read_first_regular_tar_name(const char *path, char *out, size_t out_sz) {
+    char cmd[PATH_MAX + 32];
+    assert_true(snprintf(cmd, sizeof(cmd), "gzip -dc %s", path) < (int)sizeof(cmd));
+
+    FILE *fp = popen(cmd, "r");
+    assert_non_null(fp);
+
+    for (;;) {
+        unsigned char hdr[512];
+        assert_int_equal(fread(hdr, 1, sizeof(hdr), fp), sizeof(hdr));
+
+        int all_zero = 1;
+        for (size_t i = 0; i < sizeof(hdr); i++) {
+            if (hdr[i] != 0) {
+                all_zero = 0;
+                break;
+            }
+        }
+        if (all_zero) break;
+
+        char name[101];
+        memcpy(name, hdr, 100);
+        name[100] = '\0';
+        char prefix[156];
+        memcpy(prefix, hdr + 345, 155);
+        prefix[155] = '\0';
+
+        char full[256];
+        if (prefix[0] != '\0')
+            assert_true(snprintf(full, sizeof(full), "%s/%s", prefix, name) < (int)sizeof(full));
+        else
+            assert_true(snprintf(full, sizeof(full), "%s", name) < (int)sizeof(full));
+
+        uint64_t size = strtoull((const char *)(hdr + 124), NULL, 8);
+        char typeflag = (char)hdr[156];
+        if (typeflag == '\0') typeflag = '0';
+
+        if (typeflag == '0') {
+            assert_true(snprintf(out, out_sz, "%s", full) < (int)out_sz);
+            break;
+        }
+
+        uint64_t skip = ((size + 511u) / 512u) * 512u;
+        if (skip > 0)
+            assert_int_equal(fseek(fp, (long)skip, SEEK_CUR), 0);
+    }
+
+    assert_int_equal(pclose(fp), 0);
 }
 
 /* Corrupt the compressed payload of the first object record.
@@ -340,6 +455,23 @@ static void test_export_snapshot_targz_creates_archive(void **state) {
     repo_close(src);
 }
 
+static void test_export_snapshot_targz_strips_trailing_slash_from_regular_entry(void **state) {
+    (void)state;
+    repo_t *src = NULL;
+    assert_int_equal(repo_open(SRC_REPO, &src), OK);
+
+    snapshot_append_slash_to_name(src, 1, "hello.txt");
+    assert_int_equal(export_snapshot_targz(src, 1, TARGZ_SNAP), OK);
+
+    char first_reg[256];
+    memset(first_reg, 0, sizeof(first_reg));
+    read_first_regular_tar_name(TARGZ_SNAP, first_reg, sizeof(first_reg));
+
+    assert_string_equal(first_reg, "tmp/c_backup_xfer_src_data/hello.txt");
+
+    repo_close(src);
+}
+
 static void test_verify_bundle_detects_bad_magic(void **state) {
     (void)state;
     repo_t *src = NULL;
@@ -481,6 +613,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_import_bundle_dry_run_no_mutation, setup, teardown),
         cmocka_unit_test_setup_teardown(test_import_bundle_no_head_update, setup, teardown),
         cmocka_unit_test_setup_teardown(test_export_snapshot_targz_creates_archive, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_export_snapshot_targz_strips_trailing_slash_from_regular_entry, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_bundle_detects_bad_magic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_import_bundle_detects_truncation, setup, teardown),
         cmocka_unit_test_setup_teardown(test_import_bundle_detects_object_hash_corruption, setup, teardown),
