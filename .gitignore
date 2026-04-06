@@ -12,3 +12,5 @@ tools/.venv
 .claude
 AGENTS.md
 CLAUDE.md
+.idea
+.claude/

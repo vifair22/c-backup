@@ -7,6 +7,7 @@
 #include "object.h"
 #include "repo.h"
 #include "snapshot.h"
+#include "progress.h"
 #include "util.h"
 #include "../vendor/log.h"
 
@@ -114,6 +115,21 @@ static void pack_resume_deleting(repo_t *repo);
 
 static int idx_disk_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
+}
+
+/* After pwriting pack_skip_ver into a loose object header, the header
+ * parity record in the trailer is stale.  Re-read the full header,
+ * recompute XOR parity, and pwrite the updated parity record back.
+ * fd must be open O_WRONLY or O_RDWR.  compressed_size locates the trailer. */
+static void update_loose_header_parity(int fd, uint64_t compressed_size) {
+    object_header_t hdr;
+    if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return;
+    if (hdr.version != 2) return;
+    off_t par_off = (off_t)sizeof(hdr) + (off_t)compressed_size;
+    parity_record_t hdr_par;
+    parity_record_compute(&hdr, sizeof(hdr), &hdr_par);
+    ssize_t wr = pwrite(fd, &hdr_par, sizeof(hdr_par), par_off);
+    (void)wr;
 }
 
 static int path_fmt(char *buf, size_t sz, const char *fmt, ...) {
@@ -318,82 +334,7 @@ static size_t g_pack_line_len = 0;
 #define pack_line_clear()       progress_line_clear(&g_pack_line_len)
 
 #define pack_tick_due(t)     tick_due(t)
-#define pack_elapsed_sec(s)  elapsed_sec(s)
-
-static double pack_bps_to_mib(double bps) {
-    return bps / (1024.0 * 1024.0);
-}
-
-static double pack_elapsed_between(const struct timespec *a, const struct timespec *b) {
-    time_t ds = b->tv_sec - a->tv_sec;
-    long   dn = b->tv_nsec - a->tv_nsec;
-    return (double)ds + (double)dn / 1000000000.0;
-}
-
-static void pack_fmt_eta(double sec, char *buf, size_t sz) {
-    if (sec < 0.0)                      { snprintf(buf, sz, "--:--"); return; }
-    if (sec >= (double)(100 * 3600))    { snprintf(buf, sz, "--h--m"); return; }
-    if (sec < 1.0)                      { snprintf(buf, sz, "<1s"); return; }
-    unsigned long s = (unsigned long)sec;
-    unsigned long h = s / 3600, m = (s % 3600) / 60, r = s % 60;
-    if (h) snprintf(buf, sz, "%luh%lum", h, m);
-    else if (m) snprintf(buf, sz, "%lum%lus", m, r);
-    else snprintf(buf, sz, "%lus", r);
-}
-
-/* Decoupled progress tracking for the pack write phase. */
-typedef struct {
-    _Atomic uint64_t bytes_processed;   /* updated per chunk by streaming + writer */
-    _Atomic uint32_t objects_packed;    /* updated per object by main writer loop */
-    _Atomic int      stop;
-    struct timespec  started_at;
-    size_t           total_count;       /* total objects to pack */
-    uint64_t         total_bytes;       /* sum of all object sizes (for ETA) */
-} pack_prog_t;
-
-static void *pack_progress_fn(void *arg) {
-    pack_prog_t *prog = arg;
-    uint64_t last_bytes = 0;
-    struct timespec last_t = prog->started_at;
-    double ema_bps = 0.0;
-    int samples = 0;
-
-    for (;;) {
-        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&req, NULL);
-        if (atomic_load(&prog->stop)) break;
-
-        uint64_t cur_bytes = atomic_load(&prog->bytes_processed);
-        uint32_t cur_objs  = atomic_load(&prog->objects_packed);
-
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double dt = pack_elapsed_between(&last_t, &now);
-        if (dt > 0.0) {
-            double inst = (double)(cur_bytes - last_bytes) / dt;
-            if (ema_bps <= 0.0) ema_bps = inst;
-            else                 ema_bps = 0.3 * inst + 0.7 * ema_bps;
-            samples++;
-        }
-        last_bytes = cur_bytes;
-        last_t     = now;
-
-        double rem = (samples >= 5 && ema_bps > 0.0 && prog->total_bytes > cur_bytes)
-                   ? (double)(prog->total_bytes - cur_bytes) / ema_bps
-                   : -1.0;
-        char eta[32];
-        pack_fmt_eta(rem, eta, sizeof(eta));
-        char line[128];
-        snprintf(line, sizeof(line),
-                 "pack: %u/%zu objects  %.1f/%.1f GiB  %.1f MiB/s  ETA %s",
-                 cur_objs, prog->total_count,
-                 (double)cur_bytes        / (1024.0 * 1024.0 * 1024.0),
-                 (double)prog->total_bytes / (1024.0 * 1024.0 * 1024.0),
-                 pack_bps_to_mib(ema_bps), eta);
-        pack_line_set(line);
-    }
-    return NULL;
-}
+/* pack progress uses progress_t from progress.h */
 
 /* Accumulated parity data for one entry in the current pack. */
 typedef struct {
@@ -418,7 +359,7 @@ typedef struct {
     int      fd;   /* open fd positioned past header, or -1 */
 } pack_obj_meta_t;
 
-static uint32_t pack_worker_threads(void) {
+static uint32_t pack_worker_threads(const repo_t *repo) {
     const char *env = getenv("CBACKUP_PACK_THREADS");
     if (env && *env) {
         char *end = NULL;
@@ -433,6 +374,18 @@ static uint32_t pack_worker_threads(void) {
     if (n <= 0) n = 4;
     if (n > PACK_WORKER_THREADS_MAX) n = PACK_WORKER_THREADS_MAX;
     if (n < 1) n = 1;
+
+    /* Cap threads for slow / contention-prone media, same as store workers.
+     * Pack writes go to the repo, so detect media type from the repo path. */
+    int rot = path_is_rotational(repo_path(repo));
+    if (rot == -1) {
+        /* FUSE/NFS — single thread to avoid overwhelming userspace daemon */
+        n = 1;
+    } else if (rot == 1) {
+        /* HDD — cap at 2 to limit seek thrashing */
+        if (n > 2) n = 2;
+    }
+
     return (uint32_t)n;
 }
 
@@ -1002,6 +955,125 @@ status_t pack_object_load(repo_t *repo,
     *out_size = data_sz;
     if (out_type) *out_type = ehdr.type;
     return OK;
+}
+
+status_t pack_object_load_prefix(repo_t *repo,
+                                  const uint8_t hash[OBJECT_HASH_SIZE],
+                                  size_t max_bytes,
+                                  void **out_data, size_t *out_size,
+                                  uint64_t *out_full_size,
+                                  uint8_t *out_type) {
+    pack_cache_entry_t *found = NULL;
+    status_t st = pack_find_entry(repo, hash, &found);
+    if (st != OK) return st;
+
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
+    uint32_t pnum = found->pack_num;
+    char dat_path[PATH_MAX];
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              repo_path(repo), pnum) != 0)
+        return set_error(ERR_IO, "pack_object_load_prefix: path too long");
+    FILE *f = dat_open_or_checkout(repo, pnum);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_load_prefix: fopen(%s)", dat_path);
+
+    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+        fclose(f); return set_error_errno(ERR_IO, "pack_object_load_prefix: fseeko");
+    }
+
+    pack_dat_entry_hdr_t ehdr;
+    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
+        fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_prefix: bad entry header");
+    }
+
+    if (out_full_size) *out_full_size = ehdr.uncompressed_size;
+    if (out_type) *out_type = ehdr.type;
+
+    size_t want = max_bytes;
+    if (want > ehdr.uncompressed_size) want = (size_t)ehdr.uncompressed_size;
+
+    if (ehdr.compression == COMPRESS_NONE) {
+        /* Uncompressed — just read the prefix */
+        char *buf = malloc(want);
+        if (!buf) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: alloc"); }
+        if (fread_full(buf, want, f) != 0) {
+            free(buf); fclose(f);
+            return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
+        }
+        dat_return_or_close(repo, pnum, f);
+        *out_data = buf;
+        *out_size = want;
+        return OK;
+    }
+
+    if (ehdr.compression == COMPRESS_LZ4) {
+        if (ehdr.compressed_size > (uint64_t)INT_MAX) {
+            fclose(f); return set_error(ERR_TOO_LARGE, "pack_object_load_prefix: LZ4 exceeds INT_MAX");
+        }
+        /* Must read the full compressed payload — LZ4 block is atomic */
+        char *cpayload = malloc((size_t)ehdr.compressed_size);
+        if (!cpayload) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: compressed alloc"); }
+        if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
+            free(cpayload); fclose(f);
+            return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
+        }
+        dat_return_or_close(repo, pnum, f);
+
+        char *out = malloc(want);
+        if (!out) { free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_prefix: output alloc"); }
+        int r = LZ4_decompress_safe_partial(cpayload, out,
+                                            (int)ehdr.compressed_size,
+                                            (int)want, (int)want);
+        free(cpayload);
+        if (r < 0) { free(out); return set_error(ERR_CORRUPT, "pack_object_load_prefix: LZ4 decompress failed"); }
+        *out_data = out;
+        *out_size = (size_t)r;
+        return OK;
+    }
+
+    if (ehdr.compression == COMPRESS_LZ4_FRAME) {
+        /* Read compressed payload, decompress only up to want bytes */
+        char *cpayload = malloc((size_t)ehdr.compressed_size);
+        if (!cpayload) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: frame alloc"); }
+        if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
+            free(cpayload); fclose(f);
+            return set_error(ERR_CORRUPT, "pack_object_load_prefix: frame short read");
+        }
+        dat_return_or_close(repo, pnum, f);
+
+        LZ4F_dctx *dctx = NULL;
+        LZ4F_errorCode_t ec = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
+        if (LZ4F_isError(ec)) {
+            free(cpayload);
+            return set_error(ERR_NOMEM, "pack_object_load_prefix: LZ4F context alloc");
+        }
+
+        char *out = malloc(want);
+        if (!out) { LZ4F_freeDecompressionContext(dctx); free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_prefix: output alloc"); }
+
+        size_t src_pos = 0, dst_pos = 0;
+        while (src_pos < (size_t)ehdr.compressed_size && dst_pos < want) {
+            size_t src_remaining = (size_t)ehdr.compressed_size - src_pos;
+            size_t dst_remaining = want - dst_pos;
+            size_t consumed = LZ4F_decompress(dctx,
+                                               out + dst_pos, &dst_remaining,
+                                               cpayload + src_pos, &src_remaining,
+                                               NULL);
+            if (LZ4F_isError(consumed)) {
+                free(out); free(cpayload); LZ4F_freeDecompressionContext(dctx);
+                return set_error(ERR_CORRUPT, "pack_object_load_prefix: LZ4F decompress failed");
+            }
+            src_pos += src_remaining;
+            dst_pos += dst_remaining;
+        }
+        LZ4F_freeDecompressionContext(dctx);
+        free(cpayload);
+        *out_data = out;
+        *out_size = dst_pos;
+        return OK;
+    }
+
+    fclose(f);
+    return set_error(ERR_CORRUPT, "pack_object_load_prefix: unknown compression %u", ehdr.compression);
 }
 
 status_t pack_object_load_stream(repo_t *repo,
@@ -1951,7 +2023,7 @@ typedef struct {
     _Atomic uint32_t  next_pack_num;
     _Atomic int       stop;
     _Atomic int       error;         /* first non-OK status from any worker */
-    pack_prog_t      *prog;
+    progress_t       *prog;
 } pack_unified_ctx_t;
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
@@ -2059,11 +2131,12 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                 char path[PATH_MAX];
                 path_fmt(path, sizeof(path), "%s/objects/%.2s/%s",
                          repo_path(ctx->repo), hex, hex + 2);
-                int wfd = open(path, O_WRONLY);
+                int wfd = open(path, O_RDWR);
                 if (wfd >= 0) {
                     ssize_t pw2 = pwrite(wfd, &sv, 1,
                                          offsetof(object_header_t, pack_skip_ver));
                     (void)pw2;
+                    update_loose_header_parity(wfd, m->compressed_size);
                     close(wfd);
                 }
                 return OK; /* skip */
@@ -2155,8 +2228,8 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     pw->body_offset += sizeof(ehdr) + compressed_size;
     pw->packed++;
 
-    atomic_fetch_add(&ctx->prog->bytes_processed, compressed_size);
-    atomic_fetch_add(&ctx->prog->objects_packed, 1);
+    atomic_fetch_add(&ctx->prog->bytes, compressed_size);
+    atomic_fetch_add(&ctx->prog->items, 1);
 
     free(owned_payload);
     return OK;
@@ -2255,7 +2328,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                 rs_parity_stream_feed(ps, comp_out, out_sz);
                 compressed_written += out_sz;
             }
-            atomic_fetch_add(&ctx->prog->bytes_processed, (uint64_t)got);
+            atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
             remaining -= (uint64_t)got;
         }
 
@@ -2305,7 +2378,7 @@ raw_copy:
             }
             running_crc = crc32c_update(running_crc, stream_buf, (size_t)got);
             rs_parity_stream_feed(ps, stream_buf, (size_t)got);
-            atomic_fetch_add(&ctx->prog->bytes_processed, (uint64_t)got);
+            atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
             remaining -= (uint64_t)got;
         }
     }
@@ -2370,7 +2443,7 @@ done:
     pw->body_offset += sizeof(ehdr) + actual_compressed_size;
     pw->packed++;
 
-    atomic_fetch_add(&ctx->prog->objects_packed, 1);
+    atomic_fetch_add(&ctx->prog->items, 1);
     return OK;
 }
 
@@ -2494,8 +2567,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     log_msg("INFO", "pack: phase 2/2 writing pack files");
 
-    int prog_thr_started = 0;
-    pthread_t prog_thr;
+
 
     /* --- Partition pass: read all headers, cache metadata --- */
     size_t meta_cnt = 0, packable_cnt = 0;
@@ -2605,11 +2677,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                                 if (path_fmt(ppath, sizeof(ppath),
                                              "%s/objects/%.2s/%s", repo_path(repo), phex, phex + 2) == 0) {
                                     uint8_t sv = PROBER_VERSION;
-                                    int wfd = open(ppath, O_WRONLY);
+                                    int wfd = open(ppath, O_RDWR);
                                     if (wfd >= 0) {
                                         ssize_t pw = pwrite(wfd, &sv, 1,
                                                             offsetof(object_header_t, pack_skip_ver));
                                         (void)pw;
+                                        update_loose_header_parity(wfd, lm->compressed_size);
                                         close(wfd);
                                     }
                                 }
@@ -2646,7 +2719,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
                 pack_idx_hash_cmp, meta);
 
     /* --- Spawn unified workers --- */
-    uint32_t n_workers = pack_worker_threads();
+    uint32_t n_workers = pack_worker_threads(repo);
     /* Cap workers: each worker creates its own pack, so don't use more
      * workers than needed.  Use 1 worker per ~PACK_MAX_MULTI_BYTES of data
      * to avoid creating lots of tiny packs. */
@@ -2656,17 +2729,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     }
     if (n_workers < 1) n_workers = 1;
 
-    pack_prog_t prog;
-    atomic_init(&prog.bytes_processed, 0);
-    atomic_init(&prog.objects_packed,  0);
-    atomic_init(&prog.stop,            0);
-    clock_gettime(CLOCK_MONOTONIC, &prog.started_at);
-    prog.total_count = packable_cnt;
-    prog.total_bytes = total_bytes_for_pack;
-    if (show_progress) {
-        if (pthread_create(&prog_thr, NULL, pack_progress_fn, &prog) == 0)
-            prog_thr_started = 1;
-    }
+    progress_t prog = {
+        .label = "pack:", .unit = "objects",
+        .total_items = (uint64_t)packable_cnt,
+        .total_bytes = total_bytes_for_pack,
+    };
+    if (show_progress) progress_start(&prog);
 
     pack_unified_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -2705,14 +2773,9 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     for (uint32_t i = 0; i < launched; i++)
         pthread_join(tids[i], NULL);
 
-    /* Stop progress thread */
-    if (prog_thr_started) {
-        atomic_store(&prog.stop, 1);
-        pthread_join(prog_thr, NULL);
-        prog_thr_started = 0;
-    }
+    progress_end(&prog);
 
-    packed = atomic_load(&prog.objects_packed);
+    packed = (uint32_t)atomic_load(&prog.items);
 
     /* Check for worker errors */
     {
@@ -2723,15 +2786,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         }
     }
 
-    if (show_progress) {
-        double sec = pack_elapsed_sec(&prog.started_at);
-        double bps = (sec > 0.0) ? ((double)atomic_load(&prog.bytes_processed) / sec) : 0.0;
-        char line[128];
-        snprintf(line, sizeof(line), "pack: writing %zu/%zu (%.1f MiB/s)",
-                 packable_cnt, packable_cnt, pack_bps_to_mib(bps));
-        pack_line_set(line);
-        pack_line_clear();
-    }
+    /* progress already cleared by progress_end() */
 
     /* Single packs/ dir fsync after all packs are written */
     {
@@ -2760,11 +2815,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     return OK;
 
 cleanup:
-    if (show_progress) pack_line_clear();
-    if (prog_thr_started) {
-        atomic_store(&prog.stop, 1);
-        pthread_join(prog_thr, NULL);
-    }
+    progress_end(&prog);
     if (meta) {
         for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
             if (meta[mi2].fd >= 0) { close(meta[mi2].fd); meta[mi2].fd = -1; }

@@ -859,66 +859,56 @@ static cJSON *handle_object_content(repo_t *repo, const cJSON *params)
 
     void *data = NULL;
     size_t data_sz = 0;
+    uint64_t full_sz = 0;
     uint8_t type = 0;
-    status_t st = object_load(repo, hash, &data, &data_sz, &type);
-
-    if (st == ERR_TOO_LARGE) {
-        /* Large uncompressed object — stream to a tmpfile, read prefix */
-        err_clear();
-        char tmp[] = "/tmp/cbackup-content-XXXXXX";
-        int tfd = mkstemp(tmp);
-        if (tfd < 0) return set_error(ERR_IO, "object_content: mkstemp failed"), NULL;
-        unlink(tmp);
-
-        uint64_t full_sz = 0;
-        st = object_load_stream(repo, hash, tfd, &full_sz, &type);
-        if (st != OK) { close(tfd); return NULL; }
-
-        size_t want = max_bytes > 0 ? max_bytes : (size_t)full_sz;
-        if (want > full_sz) want = (size_t)full_sz;
-        data = malloc(want);
-        if (!data) { close(tfd); return set_error(ERR_NOMEM, "object_content: alloc"), NULL; }
-
-        lseek(tfd, 0, SEEK_SET);
-        size_t got = 0;
-        while (got < want) {
-            ssize_t r = read(tfd, (char *)data + got, want - got);
-            if (r <= 0) break;
-            got += (size_t)r;
-        }
-        close(tfd);
-
-        data_sz = (size_t)full_sz;
-        int truncated = (want < (size_t)full_sz) ? 1 : 0;
-        char *b64 = base64_encode(data, got);
-        free(data);
-        if (!b64) return set_error(ERR_NOMEM, "object_content: base64 alloc"), NULL;
-
-        cJSON *d = cJSON_CreateObject();
-        cJSON_AddNumberToObject(d, "type", type);
-        cJSON_AddNumberToObject(d, "size", (double)data_sz);
-        cJSON_AddBoolToObject(d, "truncated", truncated);
-        cJSON_AddStringToObject(d, "content_base64", b64);
-        free(b64);
-        return d;
-    }
-
-    if (st != OK) return NULL;
-
     int truncated = 0;
-    size_t encode_sz = data_sz;
-    if (max_bytes > 0 && data_sz > max_bytes) {
-        encode_sz = max_bytes;
-        truncated = 1;
+    status_t st;
+
+    if (max_bytes > 0) {
+        /* Prefix load — decompress only what the client needs */
+        st = object_load_prefix(repo, hash, max_bytes,
+                                &data, &data_sz, &full_sz, &type);
+        if (st != OK) return NULL;
+        truncated = (data_sz < full_sz) ? 1 : 0;
+    } else {
+        /* Full load */
+        st = object_load(repo, hash, &data, &data_sz, &type);
+        if (st == ERR_TOO_LARGE) {
+            /* Large uncompressed object — stream to a tmpfile */
+            err_clear();
+            char tmp[] = "/tmp/cbackup-content-XXXXXX";
+            int tfd = mkstemp(tmp);
+            if (tfd < 0) return set_error(ERR_IO, "object_content: mkstemp failed"), NULL;
+            unlink(tmp);
+
+            st = object_load_stream(repo, hash, tfd, &full_sz, &type);
+            if (st != OK) { close(tfd); return NULL; }
+
+            data = malloc((size_t)full_sz);
+            if (!data) { close(tfd); return set_error(ERR_NOMEM, "object_content: alloc"), NULL; }
+
+            lseek(tfd, 0, SEEK_SET);
+            size_t got = 0;
+            while (got < (size_t)full_sz) {
+                ssize_t r = read(tfd, (char *)data + got, (size_t)full_sz - got);
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            close(tfd);
+            data_sz = got;
+        } else if (st != OK) {
+            return NULL;
+        }
+        full_sz = data_sz;
     }
 
-    char *b64 = base64_encode(data, encode_sz);
+    char *b64 = base64_encode(data, data_sz);
     free(data);
     if (!b64) return set_error(ERR_NOMEM, "object_content: base64 alloc failed"), NULL;
 
     cJSON *d = cJSON_CreateObject();
     cJSON_AddNumberToObject(d, "type", type);
-    cJSON_AddNumberToObject(d, "size", (double)data_sz);
+    cJSON_AddNumberToObject(d, "size", (double)full_sz);
     cJSON_AddBoolToObject(d, "truncated", truncated);
     cJSON_AddStringToObject(d, "content_base64", b64);
     free(b64);

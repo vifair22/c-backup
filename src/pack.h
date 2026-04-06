@@ -48,6 +48,20 @@ status_t pack_object_load_stream(repo_t *repo,
                                  uint64_t *out_size,
                                  uint8_t *out_type);
 
+/*
+ * Load at most max_bytes of uncompressed data from a packed object.
+ * Uses LZ4_decompress_safe_partial for LZ4 objects — avoids decompressing
+ * the entire payload.  Skips hash verification (partial data can't be hashed).
+ * *out_full_size receives the full uncompressed size from the entry header.
+ * *out_size receives the number of bytes actually returned (≤ max_bytes).
+ */
+status_t pack_object_load_prefix(repo_t *repo,
+                                  const uint8_t hash[OBJECT_HASH_SIZE],
+                                  size_t max_bytes,
+                                  void **out_data, size_t *out_size,
+                                  uint64_t *out_full_size,
+                                  uint8_t *out_type);
+
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
 int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
 

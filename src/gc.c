@@ -6,6 +6,7 @@
 #include "snapshot.h"
 #include "object.h"
 #include "parity.h"
+#include "progress.h"
 #include "util.h"
 #include "../vendor/log.h"
 
@@ -475,15 +476,15 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
 
     /* --- Verify each unique object in pack-sorted order --- */
     int errors = 0;
-    uint64_t done_objs = 0, total_objs = (uint64_t)ve_cnt;
-    uint64_t bytes_done = 0;
-
-    struct timespec t_start, next_tick;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
-    next_tick = t_start;
 
     int null_fd = show_progress ? open("/dev/null", O_WRONLY) : -1;
     static const char *hash_type_names[] = { "", "xattr ", "acl " };
+
+    progress_t prog = {
+        .label = "verify:", .unit = "objects",
+        .total_items = (uint64_t)ve_cnt,
+    };
+    if (show_progress) progress_start(&prog);
 
     for (size_t vi = 0; vi < ve_cnt; vi++) {
         const verify_entry_t *entry = &ve[vi];
@@ -493,7 +494,7 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
 
         if (obj_st == OK) {
             maybe_repair_object(repo, entry->hash, obj_before, do_repair);
-            bytes_done += sz;
+            atomic_fetch_add(&prog.bytes, sz);
             free(data);
         } else if (obj_st == ERR_TOO_LARGE) {
             int vfd = (null_fd >= 0) ? null_fd : open("/dev/null", O_WRONLY);
@@ -505,14 +506,16 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
                                             vfd, &stream_sz, NULL);
                 if (null_fd < 0) close(vfd);
             }
-            if (obj_st == OK) bytes_done += stream_sz;
+            if (obj_st == OK) {
+                maybe_repair_object(repo, entry->hash, obj_before, do_repair);
+                atomic_fetch_add(&prog.bytes, stream_sz);
+            }
         } else {
             free(data);
         }
 
         if (obj_st != OK) {
             char hex[OBJECT_HASH_SIZE * 2 + 1];
-            if (show_progress) gc_line_clear();
             object_hash_to_hex(entry->hash, hex);
             set_error(obj_st, "verify: snap %u node %llu %s%s: %s",
                       entry->snap_id, (unsigned long long)entry->node_id,
@@ -521,37 +524,17 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
             log_msg("ERROR", err_msg());
             errors++;
         }
-        done_objs++;
-
-        if (show_progress && gc_tick_due(&next_tick) && done_objs > 0) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            double elapsed = (double)(now.tv_sec  - t_start.tv_sec) +
-                             (double)(now.tv_nsec - t_start.tv_nsec) * 1e-9;
-            double rate    = (elapsed > 0.0) ? (double)done_objs / elapsed : 0.0;
-            double eta_sec = (rate > 0.0 && total_objs > done_objs)
-                             ? (double)(total_objs - done_objs) / rate : 0.0;
-            char eta[32];
-            fmt_eta(eta_sec, eta, sizeof(eta));
-            char line[128];
-            snprintf(line, sizeof(line),
-                     "verify: %llu/%llu objects  %.1f GiB  %.0f obj/s  ETA %s",
-                     (unsigned long long)done_objs,
-                     (unsigned long long)total_objs,
-                     (double)bytes_done / (1024.0 * 1024.0 * 1024.0),
-                     rate, eta);
-            gc_line_set(line);
-        }
+        atomic_fetch_add(&prog.items, 1);
     }
 
     if (null_fd >= 0) close(null_fd);
-    if (show_progress) gc_line_clear();
+    progress_end(&prog);
     free(ve);
 
     if (opts) {
         parity_stats_t ps_after = parity_stats_get();
-        opts->objects_checked  = done_objs;
-        opts->bytes_checked    = bytes_done;
+        opts->objects_checked  = atomic_load(&prog.items);
+        opts->bytes_checked    = atomic_load(&prog.bytes);
         opts->parity_repaired  = ps_after.repaired - ps_before.repaired;
         opts->parity_corrupt   = ps_after.uncorrectable - ps_before.uncorrectable;
     }

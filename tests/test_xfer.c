@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "../src/backup.h"
+#include "../src/parity.h"
 #include "../src/repo.h"
 #include "../src/object.h"
 #include "../src/snapshot.h"
@@ -43,19 +44,48 @@ typedef struct __attribute__((packed)) {
     uint8_t hash[32];
 } cbb_rec_t;
 
+/* Write parity trailer for a record to FILE* */
+static void write_record_parity(FILE *f, const void *hdr_data, size_t hdr_len,
+                                 const void *payload, size_t payload_len) {
+    parity_record_t hdr_par;
+    parity_record_compute(hdr_data, hdr_len, &hdr_par);
+    assert_int_equal(fwrite(&hdr_par, 1, sizeof(hdr_par), f), sizeof(hdr_par));
+
+    size_t rs_sz = rs_parity_size(payload_len);
+    if (rs_sz > 0) {
+        uint8_t *rs_buf = calloc(1, rs_sz);
+        assert_non_null(rs_buf);
+        rs_parity_encode(payload, payload_len, rs_buf);
+        assert_int_equal(fwrite(rs_buf, 1, rs_sz, f), rs_sz);
+        free(rs_buf);
+    }
+    uint32_t payload_crc = crc32c(payload, payload_len);
+    uint32_t rs_data_len = (uint32_t)rs_sz;
+    uint32_t entry_par_sz = (uint32_t)(sizeof(hdr_par) + rs_sz + 12);
+    assert_int_equal(fwrite(&payload_crc, 1, 4, f), 4u);
+    assert_int_equal(fwrite(&rs_data_len, 1, 4, f), 4u);
+    assert_int_equal(fwrite(&entry_par_sz, 1, 4, f), 4u);
+}
+
 static void write_malicious_bundle(const char *path, uint8_t kind,
                                    const char *path_field, int raw_nonempty) {
+    rs_init();
     FILE *f = fopen(path, "wb");
     assert_non_null(f);
 
     cbb_hdr_t hdr = {
-        .magic = {'C','B','B','1'},
-        .version = 1,
+        .magic = {'C','B','B','2'},
+        .version = 2,
         .scope = 2,
         .compression = 1,
         .reserved = 0,
     };
     assert_int_equal(fwrite(&hdr, 1, sizeof(hdr), f), sizeof(hdr));
+
+    /* Header parity */
+    parity_record_t hdr_par;
+    parity_record_compute(&hdr, sizeof(hdr), &hdr_par);
+    assert_int_equal(fwrite(&hdr_par, 1, sizeof(hdr_par), f), sizeof(hdr_par));
 
     const char raw1[] = "x";
     int bound = LZ4_compressBound((int)sizeof(raw1));
@@ -74,10 +104,18 @@ static void write_malicious_bundle(const char *path, uint8_t kind,
     if (rec.path_len > 0) assert_int_equal(fwrite(path_field, 1, rec.path_len, f), rec.path_len);
     if (raw_nonempty) assert_int_equal(fwrite(cbuf, 1, (size_t)clen, f), (size_t)clen);
 
+    /* Record parity */
+    write_record_parity(f, &rec, sizeof(rec), raw_nonempty ? cbuf : NULL,
+                        raw_nonempty ? (size_t)clen : 0);
+
     cbb_rec_t end;
     memset(&end, 0, sizeof(end));
     end.kind = 0;
     assert_int_equal(fwrite(&end, 1, sizeof(end), f), sizeof(end));
+
+    /* End record parity */
+    write_record_parity(f, &end, sizeof(end), NULL, 0);
+
     fclose(f);
 }
 
@@ -122,31 +160,45 @@ static void flip_first_byte(const char *path) {
     close(fd);
 }
 
-static void corrupt_first_object_hash(const char *path) {
+/* Corrupt the compressed payload of the first object record.
+ * This will be caught by the CRC-32C check in the parity trailer. */
+static void corrupt_first_object_payload(const char *path) {
+    rs_init();
     FILE *f = fopen(path, "r+b");
     assert_non_null(f);
 
     cbb_hdr_t hdr;
     assert_int_equal(fread(&hdr, 1, sizeof(hdr), f), sizeof(hdr));
 
+    /* Skip header parity */
+    assert_int_equal(fseek(f, (long)sizeof(parity_record_t), SEEK_CUR), 0);
+
     while (1) {
-        long rec_pos = ftell(f);
-        assert_true(rec_pos >= 0);
         cbb_rec_t rec;
         assert_int_equal(fread(&rec, 1, sizeof(rec), f), sizeof(rec));
         if (rec.kind == 0) break;
-        if (rec.kind == 2) {
-            long hash_pos = rec_pos + offsetof(cbb_rec_t, hash);
-            assert_int_equal(fseek(f, hash_pos, SEEK_SET), 0);
+
+        /* Skip path */
+        if (rec.path_len > 0)
+            assert_int_equal(fseek(f, rec.path_len, SEEK_CUR), 0);
+
+        if (rec.kind == 2 && rec.comp_len > 0) {
+            /* We're at the start of the compressed payload — flip a byte */
+            long payload_pos = ftell(f);
+            assert_true(payload_pos >= 0);
             uint8_t b = 0;
             assert_int_equal(fread(&b, 1, 1, f), 1);
-            assert_int_equal(fseek(f, hash_pos, SEEK_SET), 0);
-            b ^= 0x01;
+            assert_int_equal(fseek(f, payload_pos, SEEK_SET), 0);
+            b ^= 0xFF;
             assert_int_equal(fwrite(&b, 1, 1, f), 1);
             fclose(f);
             return;
         }
-        assert_int_equal(fseek(f, rec.path_len + (long)rec.comp_len, SEEK_CUR), 0);
+
+        /* Skip: compressed payload + parity trailer */
+        size_t parity_sz = sizeof(parity_record_t) + rs_parity_size((size_t)rec.comp_len) + 12;
+        long skip = (long)rec.comp_len + (long)parity_sz;
+        assert_int_equal(fseek(f, skip, SEEK_CUR), 0);
     }
 
     fclose(f);
@@ -329,7 +381,7 @@ static void test_import_bundle_detects_object_hash_corruption(void **state) {
     repo_close(src);
 
     copy_file(BUNDLE_REPO, "/tmp/c_backup_xfer_badhash.cbb");
-    corrupt_first_object_hash("/tmp/c_backup_xfer_badhash.cbb");
+    corrupt_first_object_payload("/tmp/c_backup_xfer_badhash.cbb");
     assert_int_equal(import_bundle(dst, "/tmp/c_backup_xfer_badhash.cbb", 0, 0, 1), ERR_CORRUPT);
 
     uint32_t head = 0;

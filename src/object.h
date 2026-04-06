@@ -71,6 +71,20 @@ status_t object_load_stream(repo_t *repo,
                              uint64_t *out_size,
                              uint8_t *out_type);
 
+/*
+ * Load at most max_bytes of an object's uncompressed content.
+ * Avoids decompressing the entire payload for large objects.
+ * *out_full_size receives the total uncompressed size.
+ * *out_size receives the bytes actually returned (≤ max_bytes).
+ * Hash verification is skipped (partial data can't be hashed).
+ */
+status_t object_load_prefix(repo_t *repo,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             size_t max_bytes,
+                             void **out_data, size_t *out_size,
+                             uint64_t *out_full_size,
+                             uint8_t *out_type);
+
 /* Hex-encode a hash.  buf must be at least OBJECT_HASH_SIZE*2+1 bytes. */
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf);
 

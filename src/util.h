@@ -78,6 +78,42 @@ static inline int hex_decode(const char *hex, size_t hexlen, uint8_t *out) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Media detection                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Detect if a path resides on a rotational (HDD) device.
+ * Returns 1 for HDD, 0 for SSD, -1 for unknown (FUSE, NFS, etc). */
+#ifdef __linux__
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+static inline int path_is_rotational(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    unsigned int maj = major(st.st_dev);
+    unsigned int min = minor(st.st_dev);
+    char syspath[128];
+    FILE *f;
+    /* Try partition's own queue first */
+    snprintf(syspath, sizeof(syspath),
+             "/sys/dev/block/%u:%u/queue/rotational", maj, min);
+    f = fopen(syspath, "r");
+    if (!f) {
+        /* Try parent device (partition → whole disk) */
+        snprintf(syspath, sizeof(syspath),
+                 "/sys/dev/block/%u:%u/../queue/rotational", maj, min);
+        f = fopen(syspath, "r");
+    }
+    if (!f) return -1;  /* FUSE, NFS, or other virtual FS */
+    int val = 0;
+    if (fscanf(f, "%d", &val) != 1) val = 0;
+    fclose(f);
+    return val == 1;
+}
+#else
+static inline int path_is_rotational(const char *path) { (void)path; return -1; }
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Progress line: overwrite-in-place on stderr                        */
 /* ------------------------------------------------------------------ */
 

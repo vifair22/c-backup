@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,12 +23,9 @@
 #include <acl/libacl.h>
 #include <sys/xattr.h>
 #include <openssl/evp.h>
+#include "progress.h"
 
-static size_t g_restore_line_len = 0;
-#define restore_progress_enabled() progress_enabled()
-#define restore_line_set(msg) progress_line_set(&g_restore_line_len, (msg))
-#define restore_line_clear()  progress_line_clear(&g_restore_line_len)
-#define restore_tick_due(t)   tick_due(t)
+#define RESTORE_THREADS_MAX 32
 
 static void restore_fmt_bytes(uint64_t n, char *buf, size_t sz) {
     if      (n >= (uint64_t)1024*1024*1024)
@@ -497,6 +496,16 @@ static int nl_htab_set(nl_htab_t *h, uint64_t key, const char *path) {
     return 0;
 }
 
+/* Thread-safe wrapper for nl_htab_set when running with parallel workers. */
+static pthread_mutex_t g_nl_map_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int nl_htab_set_locked(nl_htab_t *h, uint64_t key, const char *path) {
+    pthread_mutex_lock(&g_nl_map_mu);
+    int rc = nl_htab_set(h, key, path);
+    pthread_mutex_unlock(&g_nl_map_mu);
+    return rc;
+}
+
 /* Materialize a single non-directory entry.  Returns OK on success. */
 static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
                                   const char *full, nl_htab_t *nl_map,
@@ -574,7 +583,7 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
         close(fd);
         stats->files++;
         stats->bytes += nd->size;
-        nl_htab_set(nl_map, e->node_id, full);
+        nl_htab_set_locked(nl_map, e->node_id, full);
         break;
     }
     case NODE_TYPE_SYMLINK: {
@@ -668,6 +677,77 @@ static int nid_set_test_and_add(nid_set_t *s, uint64_t id) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Parallel restore worker pool                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    repo_t                  *repo;
+    const restore_entry_t   *entries;
+    const restore_sort_key_t *sort_keys;
+    uint32_t                 start;        /* first index in sort_keys */
+    uint32_t                 end;          /* one past last */
+    nl_htab_t               *nl_map;
+    const char              *dest_path;
+    progress_t              *prog;         /* shared progress */
+    _Atomic int             *stop;         /* shared stop flag */
+    restore_stats_t          local_stats;  /* per-worker stats */
+    status_t                 error;        /* per-worker error */
+} restore_worker_ctx_t;
+
+static void *restore_worker_fn(void *arg) {
+    restore_worker_ctx_t *ctx = arg;
+    memset(&ctx->local_stats, 0, sizeof(ctx->local_stats));
+    ctx->error = OK;
+
+    for (uint32_t si = ctx->start; si < ctx->end; si++) {
+        if (atomic_load(ctx->stop)) break;
+
+        uint32_t i = ctx->sort_keys[si].orig_index;
+        const restore_entry_t *e = &ctx->entries[i];
+
+        char full[PATH_MAX];
+        if (join_dest_path(full, sizeof(full), ctx->dest_path, e->path) != 0) {
+            ctx->error = set_error(ERR_IO, "restore: path too long: %s", e->path);
+            atomic_store(ctx->stop, 1);
+            return NULL;
+        }
+        ctx->error = restore_one_entry(ctx->repo, e, full, ctx->nl_map,
+                                        &ctx->local_stats);
+        if (ctx->error != OK) {
+            atomic_store(ctx->stop, 1);
+            return NULL;
+        }
+
+        atomic_fetch_add(&ctx->prog->items, 1);
+        atomic_fetch_add(&ctx->prog->bytes, e->node->size);
+    }
+    return NULL;
+}
+
+
+static int restore_thread_count(const char *dest_path) {
+    int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads < 1) nthreads = 1;
+
+    const char *env = getenv("CBACKUP_RESTORE_THREADS");
+    if (env && *env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) {
+            if (v > RESTORE_THREADS_MAX) v = RESTORE_THREADS_MAX;
+            return (int)v;
+        }
+    }
+
+    /* Cap based on destination media type (writes go to dest, not repo) */
+    int rot = path_is_rotational(dest_path);
+    if (rot == -1) nthreads = 1;        /* FUSE/NFS */
+    else if (rot == 1 && nthreads > 2) nthreads = 2;  /* HDD */
+    if (nthreads > RESTORE_THREADS_MAX) nthreads = RESTORE_THREADS_MAX;
+    return nthreads;
+}
+
 static status_t restore_materialize_nodes(repo_t *repo,
                                           const restore_entry_t *entries,
                                           uint32_t count,
@@ -716,36 +796,94 @@ static status_t restore_materialize_nodes(repo_t *repo,
     if (primary_cnt > 1)
         qsort(sort_keys, primary_cnt, sizeof(*sort_keys), restore_sort_cmp);
 
-    int show_progress = restore_progress_enabled();
-    struct timespec next_tick = {0};
-    clock_gettime(CLOCK_MONOTONIC, &next_tick);
-    uint32_t done = 0;
     uint32_t total = primary_cnt + hl_cnt;
     status_t st = OK;
 
-    /* --- Pass 1: restore primaries in pack-sorted order --- */
-    for (uint32_t si = 0; si < primary_cnt; si++) {
-        uint32_t i = sort_keys[si].orig_index;
-        const restore_entry_t *e = &entries[i];
+    progress_t rprog = {
+        .label       = "restore:",
+        .unit        = "files",
+        .total_items = (uint64_t)total,
+    };
+    progress_start(&rprog);
 
-        char full[PATH_MAX];
-        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
-            st = set_error(ERR_IO, "restore: path too long: %s", e->path);
-            goto cleanup;
+    /* --- Pass 1: restore primaries with parallel workers --- */
+    {
+        int nthreads = restore_thread_count(dest_path);
+        if ((uint32_t)nthreads > primary_cnt) nthreads = (int)primary_cnt;
+        if (nthreads < 1) nthreads = 1;
+
+        if (nthreads == 1) {
+            /* Single-threaded fast path (avoids thread overhead) */
+            for (uint32_t si = 0; si < primary_cnt; si++) {
+                uint32_t i = sort_keys[si].orig_index;
+                const restore_entry_t *e = &entries[i];
+                char full[PATH_MAX];
+                if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
+                    st = set_error(ERR_IO, "restore: path too long: %s", e->path);
+                    break;
+                }
+                st = restore_one_entry(repo, e, full, nl_map, stats);
+                if (st != OK) break;
+                atomic_fetch_add(&rprog.items, 1);
+                atomic_fetch_add(&rprog.bytes, e->node->size);
+            }
+        } else {
+            /* Partition primaries into contiguous chunks per worker.
+             * Contiguous chunks preserve sequential I/O order within
+             * each worker's slice of the pack-sorted array. */
+            _Atomic int worker_stop;
+            atomic_init(&worker_stop, 0);
+
+            restore_worker_ctx_t *wctxs = calloc((size_t)nthreads,
+                                                  sizeof(*wctxs));
+            pthread_t *tids = malloc((size_t)nthreads * sizeof(pthread_t));
+            if (!wctxs || !tids) {
+                free(wctxs); free(tids);
+                st = set_error(ERR_NOMEM, "restore: worker alloc");
+            } else {
+                uint32_t chunk = primary_cnt / (uint32_t)nthreads;
+                uint32_t rem   = primary_cnt % (uint32_t)nthreads;
+                uint32_t off   = 0;
+                int launched = 0;
+
+                for (int t = 0; t < nthreads; t++) {
+                    uint32_t n = chunk + (t < (int)rem ? 1 : 0);
+                    wctxs[t].repo       = repo;
+                    wctxs[t].entries     = entries;
+                    wctxs[t].sort_keys   = sort_keys;
+                    wctxs[t].start       = off;
+                    wctxs[t].end         = off + n;
+                    wctxs[t].nl_map      = nl_map;
+                    wctxs[t].dest_path   = dest_path;
+                    wctxs[t].prog        = &rprog;
+                    wctxs[t].stop        = &worker_stop;
+                    off += n;
+
+                    if (pthread_create(&tids[t], NULL, restore_worker_fn,
+                                       &wctxs[t]) != 0) break;
+                    launched++;
+                }
+
+                for (int t = 0; t < launched; t++)
+                    pthread_join(tids[t], NULL);
+
+                /* Aggregate per-worker stats */
+                for (int t = 0; t < launched; t++) {
+                    stats->files += wctxs[t].local_stats.files;
+                    stats->bytes += wctxs[t].local_stats.bytes;
+                    stats->warns += wctxs[t].local_stats.warns;
+                    if (st == OK && wctxs[t].error != OK)
+                        st = wctxs[t].error;
+                }
+                free(tids);
+                free(wctxs);
+            }
         }
-        st = restore_one_entry(repo, e, full, nl_map, stats);
+
         if (st != OK) goto cleanup;
-
-        done++;
-        if (show_progress && restore_tick_due(&next_tick)) {
-            char line[128];
-            snprintf(line, sizeof(line), "restore: %u/%u files  %.1f GiB",
-                     done, total, (double)stats->bytes / (1024.0*1024.0*1024.0));
-            restore_line_set(line);
-        }
     }
 
-    /* --- Pass 2: hardlinks (link to already-restored primaries) --- */
+    /* --- Pass 2: hardlinks (single-threaded, just link() syscalls) --- */
     for (uint32_t hi = 0; hi < hl_cnt; hi++) {
         uint32_t i = hl_indices[hi];
         const restore_entry_t *e = &entries[i];
@@ -762,29 +900,21 @@ static status_t restore_materialize_nodes(repo_t *repo,
                 char emsg[128];
                 snprintf(emsg, sizeof(emsg), "hard link failed: %s; falling through to copy", strerror(errno));
                 log_msg("WARN", emsg);
-                /* Fall through to full restore */
                 st = restore_one_entry(repo, e, full, nl_map, stats);
                 if (st != OK) goto cleanup;
             } else {
-                nl_htab_set(nl_map, e->node_id, full);
+                nl_htab_set_locked(nl_map, e->node_id, full);
             }
         } else {
-            /* Primary not found (shouldn't happen), restore normally */
             st = restore_one_entry(repo, e, full, nl_map, stats);
             if (st != OK) goto cleanup;
         }
 
-        done++;
-        if (show_progress && restore_tick_due(&next_tick)) {
-            char line[128];
-            snprintf(line, sizeof(line), "restore: %u/%u files  %.1f GiB",
-                     done, total, (double)stats->bytes / (1024.0*1024.0*1024.0));
-            restore_line_set(line);
-        }
+        atomic_fetch_add(&rprog.items, 1);
     }
 
 cleanup:
-    if (show_progress) restore_line_clear();
+    progress_end(&rprog);
     free(sort_keys);
     free(hl_indices);
     nl_htab_free(nl_map);
@@ -797,43 +927,38 @@ static status_t restore_apply_metadata_pass(repo_t *repo,
                                             const char *dest_path,
                                             const node_t *root_dir_meta,
                                             restore_stats_t *stats) {
-    int show_progress = restore_progress_enabled();
-    struct timespec next_tick = {0};
-    clock_gettime(CLOCK_MONOTONIC, &next_tick);
-    uint32_t meta_done = 0;
+    progress_t meta_prog = {
+        .label       = "restore: metadata",
+        .total_items = (uint64_t)count,
+    };
+    progress_start(&meta_prog);
 
     for (uint32_t i = 0; i < count; i++) {
         const restore_entry_t *e = &entries[i];
         if (!e->node || e->node->type == NODE_TYPE_DIR) continue;
         if (!path_is_safe(e->path)) continue;
         char full[PATH_MAX];
-        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
+            progress_end(&meta_prog);
             return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
+        }
         stats->warns += (uint32_t)apply_metadata(full, e->node, repo,
                                                  e->node->type == NODE_TYPE_SYMLINK);
-        meta_done++;
-        if (show_progress && restore_tick_due(&next_tick)) {
-            char line[128];
-            snprintf(line, sizeof(line), "restore: metadata %u/%u", meta_done, count);
-            restore_line_set(line);
-        }
+        atomic_fetch_add(&meta_prog.items, 1);
     }
     for (uint32_t i = count; i-- > 0;) {
         const restore_entry_t *e = &entries[i];
         if (!e->node || e->node->type != NODE_TYPE_DIR) continue;
         if (!path_is_safe(e->path)) continue;
         char full[PATH_MAX];
-        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0)
+        if (join_dest_path(full, sizeof(full), dest_path, e->path) != 0) {
+            progress_end(&meta_prog);
             return set_error(ERR_IO, "restore_apply_metadata: path too long: %s", e->path);
-        stats->warns += (uint32_t)apply_metadata(full, e->node, repo, 0);
-        meta_done++;
-        if (show_progress && restore_tick_due(&next_tick)) {
-            char line[128];
-            snprintf(line, sizeof(line), "restore: metadata %u/%u", meta_done, count);
-            restore_line_set(line);
         }
+        stats->warns += (uint32_t)apply_metadata(full, e->node, repo, 0);
+        atomic_fetch_add(&meta_prog.items, 1);
     }
-    if (show_progress) restore_line_clear();
+    progress_end(&meta_prog);
     if (root_dir_meta)
         stats->warns += (uint32_t)apply_metadata(dest_path, root_dir_meta, repo, 0);
     return OK;

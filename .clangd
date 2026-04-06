@@ -1,0 +1,7 @@
+Diagnostics:
+  Suppress:
+    # C11 _Atomic is valid but clangd's C++ frontend misparses it,
+    # emitting "must be a pointer to a trivially-copyable type".
+    - err_atomic_op_needs_trivial_copy
+    - err_atomic_builtin_must_be_pointer_intfltptr
+    - err_atomic_builtin_must_be_pointer_intptr

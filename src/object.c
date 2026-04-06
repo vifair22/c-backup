@@ -1393,6 +1393,52 @@ status_t object_load_stream(repo_t *repo,
     }
 }
 
+status_t object_load_prefix(repo_t *repo,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             size_t max_bytes,
+                             void **out_data, size_t *out_size,
+                             uint64_t *out_full_size,
+                             uint8_t *out_type) {
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        /* Not loose — try pack files */
+        return pack_object_load_prefix(repo, hash, max_bytes,
+                                        out_data, out_size, out_full_size, out_type);
+    }
+
+    object_header_t hdr;
+    if (io_read_full(fd, &hdr, sizeof(hdr)) != 0) {
+        close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: truncated header");
+    }
+    if (hdr.magic != OBJECT_MAGIC || (hdr.version != 1 && hdr.version != 2)) {
+        close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: bad header");
+    }
+
+    /* Loose objects are always uncompressed — read just the prefix */
+    if (out_full_size) *out_full_size = hdr.uncompressed_size;
+    if (out_type) *out_type = hdr.type;
+
+    size_t want = max_bytes;
+    if (want > hdr.uncompressed_size) want = (size_t)hdr.uncompressed_size;
+
+    char *buf = malloc(want);
+    if (!buf) { close(fd); return set_error(ERR_NOMEM, "object_load_prefix: alloc"); }
+    if (io_read_full(fd, buf, want) != 0) {
+        free(buf); close(fd);
+        return set_error(ERR_CORRUPT, "object_load_prefix: short read");
+    }
+    close(fd);
+
+    *out_data = buf;
+    *out_size = want;
+    return OK;
+}
+
 status_t object_get_info(repo_t *repo,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint64_t *out_size, uint8_t *out_type) {
