@@ -4,7 +4,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 from .rpc import (RPCError, is_remote, parse_remote, ssh_connect,
-                  open_session, close_session, call)
+                  open_session, close_session, call,
+                  VIEWER_VERSION, BACKUP_BIN, get_binary_version)
 from .widgets import PAD, install_poll, ui_call
 from .tabs import (
     OverviewTab, SnapshotsTab, PacksTab,
@@ -47,7 +48,59 @@ class ViewerApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=file_menu)
+
+        help_menu = tk.Menu(mb, tearoff=0)
+        help_menu.add_command(label="About", command=self._show_about)
+        mb.add_cascade(label="Help", menu=help_menu)
+
         self.config(menu=mb)
+
+    def _show_about(self) -> None:
+        bin_ver = get_binary_version(self.repo_path)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("About c-backup Viewer")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        ttk.Label(frame, text="c-backup Repository Viewer",
+                  font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 8))
+
+        # Viewer section
+        ttk.Label(frame, text="Viewer",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        detail = ttk.Frame(frame)
+        detail.pack(anchor="w", padx=(12, 0), pady=(2, 8))
+        ttk.Label(detail, text=f"Version:  {VIEWER_VERSION}",
+                  font=("TkDefaultFont", 9)).pack(anchor="w")
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
+
+        # Binary section
+        ttk.Label(frame, text="Backup Binary",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        detail2 = ttk.Frame(frame)
+        detail2.pack(anchor="w", padx=(12, 0), pady=(2, 8))
+        ttk.Label(detail2, text=f"Version:  {bin_ver}",
+                  font=("TkDefaultFont", 9)).pack(anchor="w")
+        ttk.Label(detail2, text=f"Path:     {BACKUP_BIN}",
+                  font=("TkDefaultFont", 9)).pack(anchor="w")
+
+        # Close button
+        ttk.Button(frame, text="Close", command=dlg.destroy).pack(pady=(8, 0))
+
+        # Center on parent
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
     # ---- layout ----
 
@@ -149,13 +202,42 @@ class ViewerApp(tk.Tk):
             if hasattr(tab, "set_loading"):
                 tab.set_loading()
 
-        # Lazy per-tab loading: fetch only what each tab needs on demand
         self._rpc_cache: dict[str, object] = {}
         self._populated_tabs: set[str] = set()
 
         def _load():
             open_session(path)
-            self._fetch_tab_data(path, self._active_tab_key())
+
+            # Priority 1: overview (user sees this immediately)
+            self._fetch_and_populate(path, "overview")
+
+            # Priority 2: snapshots (common first click, uses cached "list")
+            self._fetch_and_populate(path, "snapshots")
+
+            # Priority 3: cheap deterministic data (tags, policy)
+            for key in ("tags", "policy"):
+                if key not in self._rpc_cache:
+                    try:
+                        self._rpc_cache[key] = call(path, key)
+                    except RPCError:
+                        self._rpc_cache[key] = None
+
+            # Priority 4: heavier stats (repo_stats, loose_stats,
+            # global_pack_index) — these scan idx files and object dirs,
+            # so they go last to avoid blocking the UI on large repos
+            for key in ("repo_stats", "loose_stats", "global_pack_index"):
+                if key not in self._rpc_cache:
+                    try:
+                        self._rpc_cache[key] = call(path, key)
+                    except RPCError:
+                        self._rpc_cache[key] = None
+
+            # Deliver all tabs whose data is now fully cached
+            for tab_key in self._tabs:
+                if tab_key not in self._populated_tabs:
+                    needed = _SUMMARY_KEYS.get(tab_key, ())
+                    if all(k in self._rpc_cache for k in needed):
+                        self._deliver_tab(path, tab_key)
 
         threading.Thread(target=_load, daemon=True).start()
         self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -176,24 +258,26 @@ class ViewerApp(tk.Tk):
         key = self._active_tab_key()
         if key in self._populated_tabs:
             return
+        # Data may not be cached yet if background load is still running
         threading.Thread(
-            target=self._fetch_tab_data, args=(path, key),
+            target=self._fetch_and_populate, args=(path, key),
             daemon=True).start()
 
-    def _fetch_tab_data(self, path: str, tab_key: str) -> None:
-        """Fetch only the RPC sub-keys a tab needs (skipping cached ones),
-        then deliver the full set from cache to the tab."""
+    def _fetch_and_populate(self, path: str, tab_key: str) -> None:
+        """Fetch any missing RPC keys for a tab, then deliver to the UI."""
         needed = _SUMMARY_KEYS.get(tab_key, ())
-        to_fetch = [k for k in needed if k not in self._rpc_cache]
+        for sub_key in needed:
+            if sub_key not in self._rpc_cache:
+                try:
+                    self._rpc_cache[sub_key] = call(path, sub_key)
+                except RPCError as e:
+                    print(f"[RPC] error fetching {sub_key}: {e}", flush=True)
+                    self._rpc_cache[sub_key] = None
+        self._deliver_tab(path, tab_key)
 
-        for sub_key in to_fetch:
-            try:
-                self._rpc_cache[sub_key] = call(path, sub_key)
-            except RPCError as e:
-                print(f"[RPC] error fetching {sub_key}: {e}", flush=True)
-                self._rpc_cache[sub_key] = None
-
-        # Build the full summary dict this tab expects from cache
+    def _deliver_tab(self, path: str, tab_key: str) -> None:
+        """Push cached data to a tab's UI. Must be called from any thread."""
+        needed = _SUMMARY_KEYS.get(tab_key, ())
         sub = {k: self._rpc_cache.get(k) for k in needed}
         self._populated_tabs.add(tab_key)
 

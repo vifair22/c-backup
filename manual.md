@@ -2423,7 +2423,7 @@ The combination of `pathmap_build` + `pathmap_lookup` reduces change detection f
 
 ## 23. JSON RPC API
 
-The JSON RPC API (`src/json_api.c`) provides programmatic access to repository data. It is the communication channel used by the Viewer GUI.
+The JSON RPC API (`src/json_api.c`) provides programmatic access to repository data. It is the communication channel used by the Viewer GUI and is available to any third-party application. For the complete action-by-action reference with request/response examples, see [rpc.md](rpc.md).
 
 ### 23.1 Modes of Operation
 
@@ -2432,7 +2432,7 @@ The JSON RPC API (`src/json_api.c`) provides programmatic access to repository d
 **Session mode (`--json-session`).** Reads and responds to multiple newline-delimited JSON requests in a loop on stdin/stdout. Emits a ready banner on startup:
 
 ```json
-{"status":"ready","protocol":2,"compression":"lz4","lock":true}
+{"status":"ready","protocol":2,"compression":"lz4","lock":true,"version":"0.1.0_20260406.1944.release"}
 ```
 
 The `lock` field indicates whether a shared lock was acquired (false if an exclusive lock is held by a concurrent backup/gc/pack). Session mode enables a single-slot snapshot cache to avoid repeated decompression of the same snapshot across requests. The session ends when the client sends `{"action":"quit"}` or closes stdin. Stderr is redirected to `/dev/null` to prevent log output from corrupting the JSON stream.

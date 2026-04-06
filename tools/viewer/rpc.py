@@ -41,13 +41,24 @@ import lz4.block
 # Locate the backup binary: env override > build dir relative to repo > PATH
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BUILD_BIN = os.path.normpath(
-    os.path.join(_HERE, "..", "..", "build", "backup"))
+    os.path.join(_HERE, "..", "..", "build", "bins", "backup"))
 
 BACKUP_BIN = os.environ.get("CBACKUP_BIN") or (
     _BUILD_BIN if os.path.isfile(_BUILD_BIN) else "backup"
 )
 
 REMOTE_BIN = os.environ.get("CBACKUP_REMOTE_BIN", "backup")
+
+# Viewer version: read from release_version file (shared with C binary)
+_RELEASE_VERSION_FILE = os.path.normpath(
+    os.path.join(_HERE, "..", "..", "release_version"))
+try:
+    with open(_RELEASE_VERSION_FILE) as _f:
+        VIEWER_VERSION = _f.read().strip()
+except OSError:
+    VIEWER_VERSION = "unknown"
+
+
 
 # SSH ControlMaster sockets keyed by host string
 _control_sockets: dict[str, str] = {}
@@ -214,6 +225,7 @@ class Session:
         self._repo_spec = repo_spec
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self.binary_version: str = "unknown"
 
     def start(self) -> bool:
         """Launch the persistent process.  Returns True on success."""
@@ -251,6 +263,8 @@ class Session:
         if banner.get("status") == "error":
             self._kill()
             raise RPCError(banner.get("message", "session start failed"))
+
+        self.binary_version = banner.get("version", "unknown")
 
         if banner.get("lock") is False:
             print("[RPC] warning: repo is locked by another process "
@@ -407,6 +421,30 @@ def close_all_sessions() -> None:
     """Close all persistent sessions."""
     for spec in list(_sessions):
         close_session(spec)
+
+
+def get_binary_version(repo_spec: str | None = None) -> str:
+    """Return the binary version string.
+
+    If *repo_spec* has an active session, the version comes from the
+    RPC ready banner (no subprocess spawn).  Otherwise falls back to
+    running ``backup --version``."""
+    if repo_spec:
+        sess = _sessions.get(repo_spec)
+        if sess and sess.binary_version != "unknown":
+            return sess.binary_version
+
+    try:
+        result = subprocess.run(
+            [BACKUP_BIN, "--version"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return f"(binary returned exit {result.returncode})"
+    except FileNotFoundError:
+        return f"(binary not found: {BACKUP_BIN})"
+    except subprocess.TimeoutExpired:
+        return "(binary timed out)"
 
 
 atexit.register(close_all_sessions)

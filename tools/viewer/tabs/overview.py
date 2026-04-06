@@ -53,6 +53,11 @@ class OverviewTab:
         if fmt_str:
             lines.insert(1, f"Format     : {fmt_str}")
 
+        lw_ver = scan.get("last_written_version")
+        if lw_ver:
+            idx = 2 if fmt_str else 1
+            lines.insert(idx, f"Last write : {lw_ver}")
+
         if snaps:
             lines.append("── Snapshots ──────────────────────────────────────────────────────────")
             lines.append(f"  {'ID':>8}  {'Created':>19}  {'Nodes':>7}  {'GFS':>25}  New bytes")

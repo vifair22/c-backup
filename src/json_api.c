@@ -1134,6 +1134,24 @@ static cJSON *handle_scan(repo_t *repo, const cJSON *params)
         }
     }
 
+    /* last_written version file */
+    {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/last_written", base);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char buf[128];
+            if (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'
+                                   || buf[len - 1] == ' '))
+                    buf[--len] = '\0';
+                cJSON_AddStringToObject(d, "last_written_version", buf);
+            }
+            fclose(f);
+        }
+    }
+
     return d;
 }
 
@@ -2331,8 +2349,13 @@ int json_api_session(repo_t *repo)
     int lock_held = (repo_lock_shared_nb(repo) == OK);
 
     /* Ready banner — includes lock status so the viewer can warn the user */
-    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":2,\"compression\":\"lz4\",\"lock\":%s}\n",
+#ifdef VERSION_STRING
+    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":2,\"compression\":\"lz4\",\"lock\":%s,\"version\":\"%s\"}\n",
+            lock_held ? "true" : "false", VERSION_STRING);
+#else
+    fprintf(stdout, "{\"status\":\"ready\",\"protocol\":2,\"compression\":\"lz4\",\"lock\":%s,\"version\":\"unknown\"}\n",
             lock_held ? "true" : "false");
+#endif
     fflush(stdout);
 
     /* Enable snapshot cache for the session lifetime */
