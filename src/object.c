@@ -268,6 +268,229 @@ static int fd_is_fuse(int fd) {
 
 #define STREAM_REOPEN_MAX 5   /* max seek/reopen recovery attempts per file */
 
+/* ------------------------------------------------------------------ */
+/* FUSE readahead ring — overlaps FUSE reads with disk writes.        */
+/*                                                                    */
+/* A single reader thread fills a small bounded ring of 1 MiB buffers */
+/* while the main thread processes (hash + write + CRC + RS).  The    */
+/* ring is small (4 slots) so the FUSE daemon never has more than one */
+/* outstanding read, avoiding the flooding that caused ENXIO before.  */
+/* ------------------------------------------------------------------ */
+
+#define FUSE_RING_SLOTS  4
+#define FUSE_RING_CHUNK  ((size_t)(4 * 1024 * 1024))   /* 4 MiB per slot */
+
+typedef struct {
+    /* Ring state */
+    uint8_t *bufs[FUSE_RING_SLOTS];   /* per-slot buffers, each FUSE_RING_CHUNK */
+    size_t   lens[FUSE_RING_SLOTS];   /* bytes valid in each slot */
+    int      head;                     /* next slot to fill (reader) */
+    int      tail;                     /* next slot to consume (main) */
+    int      count;                    /* slots currently filled */
+
+    /* Synchronization */
+    pthread_mutex_t mu;
+    pthread_cond_t  not_full;          /* reader waits when ring is full */
+    pthread_cond_t  not_empty;         /* main waits when ring is empty */
+
+    /* Reader thread state */
+    int      src_fd;
+    char    *src_path;                 /* for reopen recovery (NULL if no path) */
+    uint64_t file_size;
+    uint64_t read_offset;              /* how far the reader has gotten */
+
+    /* Completion / error signaling */
+    int      done;                     /* reader finished (EOF or error) */
+    int      error;                    /* errno from reader, 0 if none */
+    int      stop;                     /* main thread requests early stop */
+    int      recoveries;              /* shared recovery count */
+} fuse_ring_t;
+
+static int fuse_ring_init(fuse_ring_t *r, int src_fd, const char *src_path,
+                          uint64_t file_size)
+{
+    memset(r, 0, sizeof(*r));
+    r->src_fd    = src_fd;
+    r->src_path  = src_path ? strdup(src_path) : NULL;
+    r->file_size = file_size;
+
+    pthread_mutex_init(&r->mu, NULL);
+    pthread_cond_init(&r->not_full, NULL);
+    pthread_cond_init(&r->not_empty, NULL);
+
+    for (int i = 0; i < FUSE_RING_SLOTS; i++) {
+        r->bufs[i] = malloc(FUSE_RING_CHUNK);
+        if (!r->bufs[i]) {
+            for (int j = 0; j < i; j++) free(r->bufs[j]);
+            free(r->src_path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void fuse_ring_destroy(fuse_ring_t *r)
+{
+    for (int i = 0; i < FUSE_RING_SLOTS; i++)
+        free(r->bufs[i]);
+    free(r->src_path);
+    pthread_mutex_destroy(&r->mu);
+    pthread_cond_destroy(&r->not_full);
+    pthread_cond_destroy(&r->not_empty);
+}
+
+/* Reader thread: fills ring slots with FUSE reads, one at a time. */
+static void *fuse_reader_thread(void *arg)
+{
+    fuse_ring_t *r = (fuse_ring_t *)arg;
+
+    while (r->read_offset < r->file_size) {
+        size_t want = FUSE_RING_CHUNK;
+        if ((uint64_t)want > r->file_size - r->read_offset)
+            want = (size_t)(r->file_size - r->read_offset);
+
+        /* Wait for a free slot */
+        pthread_mutex_lock(&r->mu);
+        while (r->count == FUSE_RING_SLOTS && !r->stop)
+            pthread_cond_wait(&r->not_full, &r->mu);
+        if (r->stop) {
+            r->done = 1;
+            pthread_cond_signal(&r->not_empty);
+            pthread_mutex_unlock(&r->mu);
+            return NULL;
+        }
+        int slot = r->head;
+        pthread_mutex_unlock(&r->mu);
+
+        /* Read into this slot (outside the lock) */
+        size_t got = 0;
+        int retries = 0;
+        int last_was_seek = 0;
+
+        while (got < want) {
+            ssize_t rd = read(r->src_fd, r->bufs[slot] + got, want - got);
+            if (rd > 0) { got += (size_t)rd; retries = 0; last_was_seek = 0; continue; }
+            if (rd == -1 && errno == EINTR) continue;
+            if (rd == -1 && retries < 3 &&
+                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
+                retries++;
+                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            if (rd == 0) errno = ESTALE;
+
+            /* Recovery: seek or reopen */
+            int saved_errno = errno;
+
+            if (r->recoveries >= STREAM_REOPEN_MAX) {
+                pthread_mutex_lock(&r->mu);
+                r->error = saved_errno ? saved_errno : EIO;
+                r->done = 1;
+                pthread_cond_signal(&r->not_empty);
+                pthread_mutex_unlock(&r->mu);
+                return NULL;
+            }
+
+            /* Tier 1: seek on existing fd */
+            if (!last_was_seek) {
+                off_t target = (off_t)(r->read_offset + got);
+                if (lseek(r->src_fd, target, SEEK_SET) == target) {
+                    r->recoveries++;
+                    last_was_seek = 1;
+                    continue;
+                }
+            }
+
+            /* Tier 2: reopen by path */
+            if (r->src_path) {
+                off_t target = (off_t)(r->read_offset + got);
+                int new_fd = open(r->src_path, O_RDONLY);
+                if (new_fd >= 0 && lseek(new_fd, target, SEEK_SET) == target) {
+                    close(r->src_fd);
+                    r->src_fd = new_fd;
+                    r->recoveries++;
+                    last_was_seek = 0;
+                    continue;
+                }
+                if (new_fd >= 0) close(new_fd);
+            }
+
+            /* Unrecoverable */
+            pthread_mutex_lock(&r->mu);
+            r->error = saved_errno ? saved_errno : EIO;
+            r->done = 1;
+            pthread_cond_signal(&r->not_empty);
+            pthread_mutex_unlock(&r->mu);
+            return NULL;
+        }
+
+        /* Slot filled — publish it */
+        pthread_mutex_lock(&r->mu);
+        r->lens[slot] = got;
+        r->head = (r->head + 1) % FUSE_RING_SLOTS;
+        r->count++;
+        r->read_offset += got;
+        pthread_cond_signal(&r->not_empty);
+        pthread_mutex_unlock(&r->mu);
+    }
+
+    /* EOF — signal done */
+    pthread_mutex_lock(&r->mu);
+    r->done = 1;
+    pthread_cond_signal(&r->not_empty);
+    pthread_mutex_unlock(&r->mu);
+    return NULL;
+}
+
+/* Pull the next filled buffer from the ring.
+ * Returns pointer to buffer and sets *out_len.
+ * Returns NULL on error (sets *out_errno) or when done (*out_len = 0).
+ *
+ * IMPORTANT: The returned buffer remains owned by the ring.  The caller
+ * must call fuse_ring_release() after it is done processing the buffer.
+ * Until release, the reader thread cannot reuse this slot. */
+static uint8_t *fuse_ring_pull(fuse_ring_t *r, size_t *out_len, int *out_errno)
+{
+    pthread_mutex_lock(&r->mu);
+    while (r->count == 0 && !r->done)
+        pthread_cond_wait(&r->not_empty, &r->mu);
+
+    if (r->count == 0) {
+        /* Ring empty and done */
+        if (r->error) {
+            *out_errno = r->error;
+            pthread_mutex_unlock(&r->mu);
+            return NULL;
+        }
+        *out_len = 0;
+        pthread_mutex_unlock(&r->mu);
+        return NULL;
+    }
+
+    int slot = r->tail;
+    *out_len = r->lens[slot];
+    uint8_t *buf = r->bufs[slot];
+    /* Advance tail but do NOT decrement count yet — the buffer is still
+     * in use by the caller.  count is decremented in fuse_ring_release(). */
+    r->tail = (r->tail + 1) % FUSE_RING_SLOTS;
+    pthread_mutex_unlock(&r->mu);
+
+    *out_errno = 0;
+    return buf;
+}
+
+/* Release a previously pulled buffer back to the ring.
+ * Must be called after the caller is done processing the buffer
+ * returned by fuse_ring_pull(). */
+static void fuse_ring_release(fuse_ring_t *r)
+{
+    pthread_mutex_lock(&r->mu);
+    r->count--;
+    pthread_cond_signal(&r->not_full);
+    pthread_mutex_unlock(&r->mu);
+}
+
 static status_t write_object_file_stream(repo_t *repo, int src_fd,
                                          const char *src_path,
                                          uint64_t file_size,
@@ -328,14 +551,17 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     }
 
     int is_fuse = fd_is_fuse(src_fd);
-    size_t chunk = is_fuse ? STREAM_CHUNK_FUSE : STREAM_CHUNK;
 
-    uint8_t *buf = malloc(chunk);
-    if (!buf) {
-        EVP_MD_CTX_free(mdctx);
-        if (src_path) close(src_fd);
-        close(tfd); unlink(tmppath);
-        return set_error(ERR_NOMEM, "malloc(%zu)", chunk);
+    /* Non-FUSE path uses a single large buffer; FUSE path uses ring buffers */
+    uint8_t *buf = NULL;
+    if (!is_fuse) {
+        buf = malloc(STREAM_CHUNK);
+        if (!buf) {
+            EVP_MD_CTX_free(mdctx);
+            if (src_path) close(src_fd);
+            close(tfd); unlink(tmppath);
+            return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
+        }
     }
 
     /* On FUSE, POSIX_FADV_SEQUENTIAL triggers aggressive kernel readahead
@@ -364,8 +590,6 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
     status_t st     = OK;
     uint32_t stream_crc = 0;
     uint64_t offset = 0;
-    int      recoveries = 0;       /* total seek/reopen attempts consumed */
-    int      last_was_seek = 0;    /* if true, skip Tier 1 next time */
 
     /* Helper: push the progress line down before logging so our messages
      * aren't overwritten by the \r-based progress display. */
@@ -374,174 +598,253 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
         log_msg((level), (msg)); \
     } while (0)
 
-    while (offset < file_size) {
-        size_t want = chunk;
-        if ((uint64_t)want > file_size - offset)
-            want = (size_t)(file_size - offset);
+    if (is_fuse) {
+        /* ---- FUSE path: reader thread fills ring, main thread processes ---- */
+        fuse_ring_t ring;
+        if (fuse_ring_init(&ring, src_fd, src_path, file_size) != 0) {
+            free(buf);
+            rs_parity_stream_destroy(&ps);
+            EVP_MD_CTX_free(mdctx);
+            close(tfd); unlink(tmppath);
+            return set_error(ERR_NOMEM, "stream: fuse ring init");
+        }
 
-        /* Read with EINTR + transient-error retry */
-        size_t got = 0;
-        int    retries = 0;
-        while (got < want) {
-            ssize_t r = read(src_fd, buf + got, want - got);
-            if (r > 0) { got += (size_t)r; retries = 0; last_was_seek = 0; continue; }
-            if (r == -1 && errno == EINTR) continue;
-            if (r == -1 && retries < 3 &&
-                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
-                retries++;
-                char rmsg[256];
-                snprintf(rmsg, sizeof(rmsg),
-                         "stream: transient read error (%s) at offset %llu/%llu (%.1f%%), retry %d/3",
-                         strerror(errno),
-                         (unsigned long long)(offset + got),
-                         (unsigned long long)file_size,
-                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
-                         retries);
-                STREAM_LOG("WARN", rmsg);
-                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-                nanosleep(&ts, NULL);
-                continue;
+        pthread_t reader_thr;
+        if (pthread_create(&reader_thr, NULL, fuse_reader_thread, &ring) != 0) {
+            fuse_ring_destroy(&ring);
+            free(buf);
+            rs_parity_stream_destroy(&ps);
+            EVP_MD_CTX_free(mdctx);
+            close(tfd); unlink(tmppath);
+            return set_error(ERR_IO, "stream: pthread_create reader");
+        }
+
+        while (st == OK) {
+            size_t got = 0;
+            int pull_errno = 0;
+            uint8_t *chunk_buf = fuse_ring_pull(&ring, &got, &pull_errno);
+
+            if (!chunk_buf && got == 0 && pull_errno == 0)
+                break;  /* EOF */
+
+            if (!chunk_buf || pull_errno) {
+                errno = pull_errno ? pull_errno : EIO;
+                st = set_error_errno(ERR_IO,
+                    "stream: FUSE read error at offset %llu/%llu (%.1f%%)",
+                    (unsigned long long)offset,
+                    (unsigned long long)file_size,
+                    file_size > 0 ? 100.0 * (double)offset / (double)file_size : 0.0);
+                break;
             }
-            if (r == 0) errno = ESTALE;
 
-            /* --- Recovery: seek on same fd, or reopen + seek --- */
-            int saved_errno = errno;
-            char rmsg[256];
+            if (EVP_DigestUpdate(mdctx, chunk_buf, got) != 1) {
+                st = set_error(ERR_IO, "stream: SHA256 update failed");
+                fuse_ring_release(&ring); break;
+            }
+            if (write(tfd, chunk_buf, got) != (ssize_t)got) {
+                if (errno == 0) errno = EIO;
+                st = set_error_errno(ERR_IO, "stream: write payload chunk");
+                fuse_ring_release(&ring); break;
+            }
+            stream_crc = crc32c_update(stream_crc, chunk_buf, got);
+            rs_parity_stream_feed(&ps, chunk_buf, got);
 
-            if (recoveries >= STREAM_REOPEN_MAX) {
+            /* Done with buffer — release slot back to reader */
+            fuse_ring_release(&ring);
+
+            total_written += got;
+            offset += (uint64_t)got;
+            if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
+        }
+
+        /* Signal reader to stop (in case it's blocked on not_full) */
+        pthread_mutex_lock(&ring.mu);
+        ring.stop = 1;
+        pthread_cond_signal(&ring.not_full);
+        pthread_mutex_unlock(&ring.mu);
+
+        pthread_join(reader_thr, NULL);
+
+        /* Reader thread may have reopened src_fd — update for cleanup. */
+        if (ring.src_fd != src_fd)
+            src_fd = ring.src_fd;
+        fuse_ring_destroy(&ring);
+
+        goto post_loop;
+
+    } else {
+        /* ---- Non-FUSE path: direct read with recovery ---- */
+        int recoveries = 0;
+        int last_was_seek = 0;
+
+        while (offset < file_size) {
+            size_t want = STREAM_CHUNK;
+            if ((uint64_t)want > file_size - offset)
+                want = (size_t)(file_size - offset);
+
+            /* Read with EINTR + transient-error retry */
+            size_t got = 0;
+            int    retries = 0;
+            while (got < want) {
+                ssize_t r = read(src_fd, buf + got, want - got);
+                if (r > 0) { got += (size_t)r; retries = 0; last_was_seek = 0; continue; }
+                if (r == -1 && errno == EINTR) continue;
+                if (r == -1 && retries < 3 &&
+                    (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
+                    retries++;
+                    char rmsg[256];
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: transient read error (%s) at offset %llu/%llu (%.1f%%), retry %d/3",
+                             strerror(errno),
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                             retries);
+                    STREAM_LOG("WARN", rmsg);
+                    struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+                    nanosleep(&ts, NULL);
+                    continue;
+                }
+                if (r == 0) errno = ESTALE;
+
+                /* --- Recovery: seek on same fd, or reopen + seek --- */
+                int saved_errno = errno;
+                char rmsg[256];
+
+                if (recoveries >= STREAM_REOPEN_MAX) {
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: read failed (%s) at offset %llu/%llu (%.1f%%), all %d recovery attempts exhausted",
+                             strerror(saved_errno),
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                             STREAM_REOPEN_MAX);
+                    STREAM_LOG("ERROR", rmsg);
+                    errno = saved_errno;
+                    st = set_error_errno(ERR_IO, "%s", rmsg);
+                    goto done;
+                }
+
+                /* Tier 1: lseek on existing fd (skip if last attempt was also a seek,
+                 * since that means the fd is dead and lseek just lies about success) */
+                if (!last_was_seek) {
+                    off_t seek_target = (off_t)(offset + got);
+                    if (lseek(src_fd, seek_target, SEEK_SET) == seek_target) {
+                        recoveries++;
+                        last_was_seek = 1;
+                        snprintf(rmsg, sizeof(rmsg),
+                                 "stream: read error (%s) at offset %llu/%llu (%.1f%%), trying seek recovery (%d/%d)",
+                                 strerror(saved_errno),
+                                 (unsigned long long)(offset + got),
+                                 (unsigned long long)file_size,
+                                 file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                                 recoveries, STREAM_REOPEN_MAX);
+                        STREAM_LOG("WARN", rmsg);
+                        errno = saved_errno;
+                        continue;
+                    }
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: seek recovery failed (%s) at offset %llu/%llu (%.1f%%), escalating to reopen",
+                             strerror(errno),
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                    STREAM_LOG("WARN", rmsg);
+                }
+
+                /* Tier 2: close + reopen by path + seek */
+                if (src_path) {
+                    off_t seek_target = (off_t)(offset + got);
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: attempting reopen recovery at offset %llu/%llu (%.1f%%), attempt %d/%d",
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                             recoveries + 1, STREAM_REOPEN_MAX);
+                    STREAM_LOG("WARN", rmsg);
+
+                    int new_fd = open(src_path, O_RDONLY);
+                    if (new_fd < 0) {
+                        snprintf(rmsg, sizeof(rmsg),
+                                 "stream: reopen failed (%s), giving up",
+                                 strerror(errno));
+                        STREAM_LOG("ERROR", rmsg);
+                        errno = saved_errno;
+                        st = set_error_errno(ERR_IO,
+                            "stream: read failed at offset %llu/%llu (%.1f%%), reopen failed",
+                            (unsigned long long)(offset + got),
+                            (unsigned long long)file_size,
+                            file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                        goto done;
+                    }
+                    if (lseek(new_fd, seek_target, SEEK_SET) != seek_target) {
+                        snprintf(rmsg, sizeof(rmsg),
+                                 "stream: reopen seek failed (%s), giving up",
+                                 strerror(errno));
+                        STREAM_LOG("ERROR", rmsg);
+                        close(new_fd);
+                        errno = saved_errno;
+                        st = set_error_errno(ERR_IO,
+                            "stream: read failed at offset %llu/%llu (%.1f%%), reopen seek failed",
+                            (unsigned long long)(offset + got),
+                            (unsigned long long)file_size,
+                            file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
+                        goto done;
+                    }
+                    close(src_fd);
+                    src_fd = new_fd;
+                    recoveries++;
+                    last_was_seek = 0;
+                    snprintf(rmsg, sizeof(rmsg),
+                             "stream: reopened fd at offset %llu/%llu (%.1f%%), recovery %d/%d",
+                             (unsigned long long)(offset + got),
+                             (unsigned long long)file_size,
+                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
+                             recoveries, STREAM_REOPEN_MAX);
+                    STREAM_LOG("WARN", rmsg);
+                    posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                    errno = saved_errno;
+                    continue;
+                }
+
+                /* No src_path — can't reopen, give up */
                 snprintf(rmsg, sizeof(rmsg),
-                         "stream: read failed (%s) at offset %llu/%llu (%.1f%%), all %d recovery attempts exhausted",
+                         "stream: read failed (%s) at offset %llu/%llu (%.1f%%), no path for reopen",
                          strerror(saved_errno),
                          (unsigned long long)(offset + got),
                          (unsigned long long)file_size,
-                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
-                         STREAM_REOPEN_MAX);
+                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
                 STREAM_LOG("ERROR", rmsg);
                 errno = saved_errno;
                 st = set_error_errno(ERR_IO, "%s", rmsg);
                 goto done;
             }
 
-            /* Tier 1: lseek on existing fd (skip if last attempt was also a seek,
-             * since that means the fd is dead and lseek just lies about success) */
-            if (!last_was_seek) {
-                off_t seek_target = (off_t)(offset + got);
-                if (lseek(src_fd, seek_target, SEEK_SET) == seek_target) {
-                    recoveries++;
-                    last_was_seek = 1;
-                    snprintf(rmsg, sizeof(rmsg),
-                             "stream: read error (%s) at offset %llu/%llu (%.1f%%), trying seek recovery (%d/%d)",
-                             strerror(saved_errno),
-                             (unsigned long long)(offset + got),
-                             (unsigned long long)file_size,
-                             file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
-                             recoveries, STREAM_REOPEN_MAX);
-                    STREAM_LOG("WARN", rmsg);
-                    errno = saved_errno;
-                    continue;
-                }
-                snprintf(rmsg, sizeof(rmsg),
-                         "stream: seek recovery failed (%s) at offset %llu/%llu (%.1f%%), escalating to reopen",
-                         strerror(errno),
-                         (unsigned long long)(offset + got),
-                         (unsigned long long)file_size,
-                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-                STREAM_LOG("WARN", rmsg);
-            }
-
-            /* Tier 2: close + reopen by path + seek */
-            if (src_path) {
-                off_t seek_target = (off_t)(offset + got);
-                snprintf(rmsg, sizeof(rmsg),
-                         "stream: attempting reopen recovery at offset %llu/%llu (%.1f%%), attempt %d/%d",
-                         (unsigned long long)(offset + got),
-                         (unsigned long long)file_size,
-                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
-                         recoveries + 1, STREAM_REOPEN_MAX);
-                STREAM_LOG("WARN", rmsg);
-
-                int new_fd = open(src_path, O_RDONLY);
-                if (new_fd < 0) {
-                    snprintf(rmsg, sizeof(rmsg),
-                             "stream: reopen failed (%s), giving up",
-                             strerror(errno));
-                    STREAM_LOG("ERROR", rmsg);
-                    errno = saved_errno;
-                    st = set_error_errno(ERR_IO,
-                        "stream: read failed at offset %llu/%llu (%.1f%%), reopen failed",
-                        (unsigned long long)(offset + got),
-                        (unsigned long long)file_size,
-                        file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-                    goto done;
-                }
-                if (lseek(new_fd, seek_target, SEEK_SET) != seek_target) {
-                    snprintf(rmsg, sizeof(rmsg),
-                             "stream: reopen seek failed (%s), giving up",
-                             strerror(errno));
-                    STREAM_LOG("ERROR", rmsg);
-                    close(new_fd);
-                    errno = saved_errno;
-                    st = set_error_errno(ERR_IO,
-                        "stream: read failed at offset %llu/%llu (%.1f%%), reopen seek failed",
-                        (unsigned long long)(offset + got),
-                        (unsigned long long)file_size,
-                        file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-                    goto done;
-                }
-                close(src_fd);
-                src_fd = new_fd;
-                recoveries++;
-                last_was_seek = 0;
-                snprintf(rmsg, sizeof(rmsg),
-                         "stream: reopened fd at offset %llu/%llu (%.1f%%), recovery %d/%d",
-                         (unsigned long long)(offset + got),
-                         (unsigned long long)file_size,
-                         file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
-                         recoveries, STREAM_REOPEN_MAX);
-                STREAM_LOG("WARN", rmsg);
-                if (!is_fuse)
-                    posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-                errno = saved_errno;
-                continue;
-            }
-
-            /* No src_path — can't reopen, give up */
-            snprintf(rmsg, sizeof(rmsg),
-                     "stream: read failed (%s) at offset %llu/%llu (%.1f%%), no path for reopen",
-                     strerror(saved_errno),
-                     (unsigned long long)(offset + got),
-                     (unsigned long long)file_size,
-                     file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-            STREAM_LOG("ERROR", rmsg);
-            errno = saved_errno;
-            st = set_error_errno(ERR_IO, "%s", rmsg);
-            goto done;
-        }
-
-        /* Drop source pages from cache (not on FUSE) */
-        if (!is_fuse)
+            /* Drop source pages from cache */
             posix_fadvise(src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
 
-        /* Hash */
-        if (EVP_DigestUpdate(mdctx, buf, got) != 1) {
-            st = set_error(ERR_IO, "stream: SHA256 update failed"); goto done;
+            /* Hash */
+            if (EVP_DigestUpdate(mdctx, buf, got) != 1) {
+                st = set_error(ERR_IO, "stream: SHA256 update failed"); goto done;
+            }
+
+            /* Write raw bytes (always uncompressed) */
+            if (write(tfd, buf, got) != (ssize_t)got) {
+                if (errno == 0) errno = EIO;
+                st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto done;
+            }
+            stream_crc = crc32c_update(stream_crc, buf, got);
+
+            /* Accumulate RS parity inline via bounded-RAM stream */
+            rs_parity_stream_feed(&ps, buf, got);
+
+            total_written += got;
+            offset += (uint64_t)got;
+            if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
         }
-
-        /* Write raw bytes (always uncompressed) */
-        if (write(tfd, buf, got) != (ssize_t)got) {
-            if (errno == 0) errno = EIO;
-            st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto done;
-        }
-        stream_crc = crc32c_update(stream_crc, buf, got);
-
-        /* Accumulate RS parity inline via bounded-RAM stream */
-        rs_parity_stream_feed(&ps, buf, got);
-
-        total_written += got;
-        offset += (uint64_t)got;
-        if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
     }
 
+post_loop:
     #undef STREAM_LOG
 
 done:

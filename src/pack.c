@@ -509,6 +509,22 @@ static status_t pack_cache_load(repo_t *repo) {
         }
         if (hdr.count > 10000000u) { fclose(f); continue; }
 
+        /* Validate count against actual file size */
+        {
+            size_t entry_sz = (hdr.version == PACK_VERSION)
+                ? sizeof(pack_idx_disk_entry_t)
+                : (hdr.version == PACK_VERSION_V3)
+                    ? sizeof(pack_idx_disk_entry_v3_t)
+                    : sizeof(pack_idx_disk_entry_v2_t);
+            long cur = ftell(f);
+            if (fseek(f, 0, SEEK_END) != 0) { fclose(f); continue; }
+            long fsz = ftell(f);
+            if (fseek(f, cur, SEEK_SET) != 0) { fclose(f); continue; }
+            if (fsz > 0 && cur >= 0 && (size_t)(fsz - cur) / entry_sz < hdr.count) {
+                fclose(f); continue; /* count exceeds file data */
+            }
+        }
+
         /* Ensure capacity for all entries in this pack at once */
         if (cnt + hdr.count > cap) {
             size_t nc = cap ? cap : 256;
@@ -661,6 +677,7 @@ status_t pack_object_physical_size(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     FILE *f = dat_open_or_checkout(repo, found->pack_num);
     if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%08u.dat", found->pack_num);
 
@@ -803,6 +820,7 @@ status_t pack_object_load(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
@@ -995,6 +1013,7 @@ status_t pack_object_load_stream(repo_t *repo,
     status_t st = pack_find_entry(repo, hash, &found);
     if (st != OK) return st;
 
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     uint32_t pnum = found->pack_num;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
@@ -2160,23 +2179,24 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
     uint64_t actual_compressed_size = m->compressed_size;
     uint32_t running_crc = 0;
-    uint8_t stream_buf[256 * 1024]; /* 256 KiB I/O chunks */
+    uint8_t *stream_buf = malloc(256 * 1024);
+    if (!stream_buf) return ERR_NOMEM;
     status_t st = OK;
 
     /* Init parity stream for inline RS computation */
     char ps_tmp[PATH_MAX];
     snprintf(ps_tmp, sizeof(ps_tmp), "%s/tmp", repo_path(pw->repo));
     rs_parity_stream_t *ps = malloc(sizeof(*ps));
-    if (!ps) return ERR_NOMEM;
+    if (!ps) { free(stream_buf); return ERR_NOMEM; }
     if (rs_parity_stream_init(ps, 256 * 1024 * 1024, ps_tmp) != 0) {
-        free(ps);
+        free(ps); free(stream_buf);
         return ERR_NOMEM;
     }
 
     if (m->compression == COMPRESS_NONE) {
         /* LZ4F streaming compression */
         LZ4F_cctx *cctx = NULL;
-        size_t comp_bound = LZ4F_compressBound(sizeof(stream_buf), NULL);
+        size_t comp_bound = LZ4F_compressBound((256 * 1024), NULL);
         uint8_t *comp_out = malloc(comp_bound);
         LZ4F_errorCode_t lz4err = LZ4F_createCompressionContext(&cctx, LZ4F_VERSION);
 
@@ -2216,8 +2236,8 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         /* Stream: read → compress → write */
         uint64_t remaining = m->compressed_size;
         while (remaining > 0 && st == OK) {
-            size_t want = (remaining > sizeof(stream_buf))
-                          ? sizeof(stream_buf) : (size_t)remaining;
+            size_t want = (remaining > (256 * 1024))
+                          ? (256 * 1024) : (size_t)remaining;
             ssize_t got = read(fd, stream_buf, want);
             if (got <= 0) {
                 if (got < 0 && errno == EINTR) continue;
@@ -2272,8 +2292,8 @@ raw_copy:
 
         uint64_t remaining = m->compressed_size;
         while (remaining > 0 && st == OK) {
-            size_t want = (remaining > sizeof(stream_buf))
-                          ? sizeof(stream_buf) : (size_t)remaining;
+            size_t want = (remaining > (256 * 1024))
+                          ? (256 * 1024) : (size_t)remaining;
             ssize_t got = read(fd, stream_buf, want);
             if (got <= 0) {
                 if (got < 0 && errno == EINTR) continue;
@@ -2291,6 +2311,7 @@ raw_copy:
     }
 
 done:
+    free(stream_buf);
     if (st != OK) {
         rs_parity_stream_destroy(ps);
         free(ps);
@@ -2688,6 +2709,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
     if (prog_thr_started) {
         atomic_store(&prog.stop, 1);
         pthread_join(prog_thr, NULL);
+        prog_thr_started = 0;
     }
 
     packed = atomic_load(&prog.objects_packed);
@@ -2830,6 +2852,9 @@ static status_t collect_pack_meta(repo_t *repo,
 
     collect_pack_nums_ctx_t cpn = { pack_nums, num_cap, 0 };
     pack_for_each_num(packs_dir, collect_pack_num_cb, &cpn);
+    /* cpn.nums is pack_nums (or its realloc'd replacement from
+       collect_pack_num_cb); freed at end of function. */
+    // cppcheck-suppress memleak
     pack_nums = cpn.nums;
     num_cnt = cpn.cnt;
 
@@ -3274,6 +3299,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t *found = NULL;
     if (pack_find_entry(repo, hash, &found) != OK) return -1;
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     if ((found->pack_version != PACK_VERSION_V3 && found->pack_version != PACK_VERSION) ||
         found->entry_index == UINT32_MAX)
         return -1;

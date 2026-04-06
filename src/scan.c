@@ -195,12 +195,19 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     ssize_t *sizes = malloc(attr_count * sizeof(ssize_t));
     if (!sizes) { free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc sizes failed"); }
 
+    const size_t XATTR_MAX_TOTAL = 64u * 1024u * 1024u; /* 64 MiB cap */
     size_t total = 0, idx = 0;
     for (char *n = names; n < names + list_sz; n += strlen(n) + 1, idx++) {
         ssize_t vsz = lgetxattr(path, n, NULL, 0);
         sizes[idx] = vsz;
-        if (vsz >= 0)
-            total += sizeof(uint16_t) + strlen(n) + 1 + sizeof(uint32_t) + (size_t)vsz;
+        if (vsz >= 0) {
+            size_t inc = sizeof(uint16_t) + strlen(n) + 1 + sizeof(uint32_t) + (size_t)vsz;
+            if (inc > XATTR_MAX_TOTAL - total) {
+                free(sizes); free(names);
+                return set_error(ERR_CORRUPT, "collect_xattrs: total xattr size exceeds limit for '%s'", path);
+            }
+            total += inc;
+        }
     }
     if (total == 0) { free(sizes); free(names); *out = NULL; *out_len = 0; return OK; }
 
@@ -279,6 +286,16 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         return OK;
     }
 
+    /* Skip entries on different filesystems (mount point crossing) */
+    if (opts && opts->one_filesystem && opts->root_dev != 0 &&
+        st.st_dev != opts->root_dev) {
+        char msg[PATH_MAX + 96];
+        snprintf(msg, sizeof(msg), "skipping mount point: %s (different device)", path);
+        scan_warn(res, msg);
+        log_msg("WARN", msg);
+        return OK;
+    }
+
     scan_entry_t e = {0};
     e.path             = strdup(path);
     if (!e.path) return set_error(ERR_NOMEM, "scan: strdup failed for '%s'", path);
@@ -313,7 +330,12 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         nd->device.minor = (uint32_t)minor(st.st_rdev);
     } else if (nd->type == NODE_TYPE_SYMLINK) {
         char target[4096];
-        ssize_t tlen = readlink(path, target, sizeof(target) - 1);
+        /* Use O_PATH|O_NOFOLLOW fd to avoid TOCTOU between lstat and readlink */
+        int sym_fd = open(path, O_PATH | O_NOFOLLOW);
+        ssize_t tlen = (sym_fd >= 0)
+            ? readlinkat(sym_fd, "", target, sizeof(target) - 1)
+            : readlink(path, target, sizeof(target) - 1);
+        if (sym_fd >= 0) close(sym_fd);
         if (tlen > 0) {
             target[tlen] = '\0';
             nd->symlink.target_len = (uint32_t)tlen + 1;
@@ -474,6 +496,14 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         log_msg("WARN", msg);
         *out = res;
         return OK;
+    }
+
+    /* Record root device for mount-crossing detection.
+     * Caller should set opts->root_dev = 0; scan_tree sets it from root stat. */
+    if (opts && opts->one_filesystem && opts->root_dev == 0) {
+        /* root_dev is set once per scan_tree call; safe to cast away const
+         * since the field is output-only (set by scan_tree, read by children). */
+        ((scan_opts_t *)(void *)opts)->root_dev = root_st.st_dev;
     }
 
     uint64_t root_parent_id = 0;

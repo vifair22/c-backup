@@ -98,6 +98,17 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
         if (read(fd, &compressed_payload_len, 8) != 8) { close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated compressed_payload_len", snap_id); }
     }
 
+    /* Sanity-check counts from untrusted file header */
+    if (node_count > 100000000u) {
+        close(fd); return set_error(ERR_CORRUPT, "snapshot %u: node_count %u exceeds limit", snap_id, node_count);
+    }
+    if (dirent_count > 100000000u) {
+        close(fd); return set_error(ERR_CORRUPT, "snapshot %u: dirent_count %u exceeds limit", snap_id, dirent_count);
+    }
+    if (dirent_data_len > (uint64_t)sb.st_size) {
+        close(fd); return set_error(ERR_CORRUPT, "snapshot %u: dirent_data_len exceeds file size", snap_id);
+    }
+
     uint64_t uncompressed_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
     uint64_t hdr_sz          = (version == SNAP_VERSION_V3) ? 52u : 60u;
     uint64_t stored_sz       = (compressed_payload_len > 0)

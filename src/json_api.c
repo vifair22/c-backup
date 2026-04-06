@@ -245,7 +245,7 @@ static char *read_stdin_all(void)
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
         }
-        size_t n = fread(buf + len, 1, cap - len, stdin);
+        size_t n = fread(buf + len, 1, cap - len - 1, stdin);
         len += n;
         if (n == 0) break;
     }
@@ -1497,6 +1497,7 @@ static void repo_stats_read_dat(const char *path, struct repo_stats_ctx *s)
         return;
     }
 
+    if (hdr.count > 10000000u) { fclose(f); return; }
     for (uint32_t i = 0; i < hdr.count; i++) {
         if (hdr.version == PACK_VERSION_V1) {
             pack_dat_entry_hdr_v1_t eh;

@@ -521,6 +521,7 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
                 memcpy(&shdr, sp_p, sizeof(shdr));
                 sp_p += sizeof(shdr);
                 if (shdr.magic != SPARSE_MAGIC ||
+                    shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
                     len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
                     free(data); close(fd); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
                 }
@@ -580,9 +581,22 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
         if (hash_is_zero(nd->content_hash)) break;
         void *tdata = NULL; size_t tlen = 0;
         if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
-        unlink(full);
-        if (symlink((char *)tdata, full) == -1 && errno != EEXIST) {
+        /* Warn on suspicious symlink targets */
+        if (((char *)tdata)[0] == '/' || strstr((char *)tdata, "..")) {
+            fprintf(stderr, "warn: symlink target may escape restore tree: %s -> %s\n",
+                    full, (char *)tdata);
+            stats->warns++;
+        }
+        /* Create symlink atomically: temp name → rename, avoids TOCTOU race */
+        char sym_tmp[PATH_MAX];
+        snprintf(sym_tmp, sizeof(sym_tmp), "%s.cbkp.tmp.%d", full, (int)getpid());
+        unlink(sym_tmp);
+        if (symlink((char *)tdata, sym_tmp) == -1) {
             fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
+            stats->warns++;
+        } else if (rename(sym_tmp, full) == -1) {
+            fprintf(stderr, "warn: rename symlink failed: %s: %s\n", full, strerror(errno));
+            unlink(sym_tmp);
             stats->warns++;
         } else {
             stats->files++;
@@ -954,6 +968,13 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
     uint8_t read_hash[OBJECT_HASH_SIZE];
     uint8_t expected_hash[OBJECT_HASH_SIZE];
     static const uint8_t zero_buf[65536];   /* BSS zeroes, no stack cost */
+    uint8_t *vbuf = malloc(65536);
+    if (!vbuf) {
+        fprintf(stderr, "verify: out of memory\n");
+        for (uint32_t j = 0; j < cnt; j++) free(ws[j].path);
+        free(ws);
+        return set_error(ERR_NOMEM, "verify: malloc read buffer");
+    }
 
     for (uint32_t i = 0; i < cnt; i++) {
         if (!ws[i].path) continue;
@@ -978,10 +999,9 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
             fprintf(stderr, "verify: cannot init digest for %s\n", ws[i].path);
             errors++; close(fd); continue;
         }
-        uint8_t buf[65536];
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
-            EVP_DigestUpdate(ctx, buf, (size_t)nr);
+        while ((nr = read(fd, vbuf, 65536)) > 0)
+            EVP_DigestUpdate(ctx, vbuf, (size_t)nr);
         close(fd);
         if (nr < 0 || EVP_DigestFinal_ex(ctx, read_hash, NULL) != 1) {
             fprintf(stderr, "verify: cannot hash %s\n", ws[i].path);
@@ -1019,6 +1039,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
             sparse_hdr_t shdr;
             memcpy(&shdr, obj_data, sizeof(shdr));
             if (shdr.magic != SPARSE_MAGIC ||
+                shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
                 obj_len < sizeof(sparse_hdr_t) +
                           shdr.region_count * sizeof(sparse_region_t)) {
                 memcpy(expected_hash, ws[i].node.content_hash, OBJECT_HASH_SIZE);
@@ -1077,6 +1098,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
         }
     }
 
+    free(vbuf);
     for (uint32_t i = 0; i < cnt; i++) free(ws[i].path);
     free(ws);
 
@@ -1327,6 +1349,7 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
         sparse_hdr_t shdr;
         memcpy(&shdr, obj, sizeof(shdr));
         if (shdr.magic != SPARSE_MAGIC ||
+            shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
             obj_len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
             free(obj);
             snap_paths_free(&sp);

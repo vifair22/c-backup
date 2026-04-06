@@ -153,21 +153,26 @@ int rs_parity_stream_replay_fd(rs_parity_stream_t *ps, int fd)
         if (lseek(ps->spill_fd, 0, SEEK_SET) == (off_t)-1)
             return -1;
 
-        uint8_t replay_buf[RS_PS_REPLAY_CHUNK];
+        uint8_t *replay_buf = malloc(RS_PS_REPLAY_CHUNK);
+        if (!replay_buf) { errno = ENOMEM; return -1; }
         size_t remaining = ps->spill_size;
 
         while (remaining > 0) {
-            size_t want = remaining < sizeof(replay_buf) ? remaining : sizeof(replay_buf);
+            size_t want = remaining < RS_PS_REPLAY_CHUNK ? remaining : RS_PS_REPLAY_CHUNK;
             ssize_t got = read(ps->spill_fd, replay_buf, want);
             if (got <= 0) {
                 if (got == -1 && errno == EINTR) continue;
                 if (errno == 0) errno = EIO;
+                free(replay_buf);
                 return -1;
             }
-            if (write_full(fd, replay_buf, (size_t)got) != 0)
+            if (write_full(fd, replay_buf, (size_t)got) != 0) {
+                free(replay_buf);
                 return -1;
+            }
             remaining -= (size_t)got;
         }
+        free(replay_buf);
     }
 
     /* Phase 2: write in-memory remainder */
@@ -186,21 +191,26 @@ int rs_parity_stream_replay_file(rs_parity_stream_t *ps, FILE *f)
         if (lseek(ps->spill_fd, 0, SEEK_SET) == (off_t)-1)
             return -1;
 
-        uint8_t replay_buf[RS_PS_REPLAY_CHUNK];
+        uint8_t *replay_buf = malloc(RS_PS_REPLAY_CHUNK);
+        if (!replay_buf) { errno = ENOMEM; return -1; }
         size_t remaining = ps->spill_size;
 
         while (remaining > 0) {
-            size_t want = remaining < sizeof(replay_buf) ? remaining : sizeof(replay_buf);
+            size_t want = remaining < RS_PS_REPLAY_CHUNK ? remaining : RS_PS_REPLAY_CHUNK;
             ssize_t got = read(ps->spill_fd, replay_buf, want);
             if (got <= 0) {
                 if (got == -1 && errno == EINTR) continue;
                 if (errno == 0) errno = EIO;
+                free(replay_buf);
                 return -1;
             }
-            if (fwrite_full(replay_buf, (size_t)got, f) != 0)
+            if (fwrite_full(replay_buf, (size_t)got, f) != 0) {
+                free(replay_buf);
                 return -1;
+            }
             remaining -= (size_t)got;
         }
+        free(replay_buf);
     }
 
     /* Phase 2: write in-memory remainder */

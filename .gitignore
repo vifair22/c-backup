@@ -1,6 +1,10 @@
 build/
 *.o
 *.a
+*.su
+*.gcno
+*.gcda
+*.gcov
 backup
 .cache
 **/__pycache__/**

@@ -42,7 +42,7 @@ TEST_SRCS   := $(filter-out $(FAULT_SRCS), $(filter-out $(TESTS)/fault_inject.c,
 TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(TEST_SRCS))
 FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BUILD)/%, $(FAULT_SRCS))
 
-.PHONY: all static asan clean test bench bench-micro bench-phases
+.PHONY: all static asan clean test bench bench-micro bench-phases analyze lint
 
 all: $(TARGET)
 
@@ -59,6 +59,7 @@ $(BUILD)/cJSON.o: vendor/cJSON.c | $(BUILD)
 	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 
 -include $(OBJS:.o=.d)
+-include $(ASAN_OBJS:.o=.d)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -99,7 +100,48 @@ FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
 $(BUILD)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(LDFLAGS) -lcmocka
 
-test: $(TARGET) $(TEST_BINS) $(FAULT_BINS)
+# Static analysis (runs as part of test)
+ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 -I src -I vendor
+STACK_LIMIT    := 65536
+
+analyze: | $(BUILD)
+	@echo "=== stack-usage ==="
+	@for f in $(SRCS); do \
+	    base=$$(basename $$f .c); \
+	    $(CC) $(ANALYZE_CFLAGS) -fstack-usage -c $$f -o $(BUILD)/$$base-su.o 2>/dev/null; \
+	done
+	@fail=0; for su in $(BUILD)/*-su.su; do \
+	    [ -f "$$su" ] || continue; \
+	    awk -v limit=$(STACK_LIMIT) -v file="$$su" \
+	        '$$2+0 > limit { printf "STACK OVERFLOW RISK: %s %s (%s bytes, limit %d)\n", file, $$1, $$2, limit; found=1 } \
+	         END { exit (found ? 1 : 0) }' "$$su" || fail=1; \
+	done; \
+	rm -f $(BUILD)/*-su.o $(BUILD)/*-su.su; \
+	if [ $$fail -ne 0 ]; then echo "stack-usage: FAIL"; exit 1; fi
+	@echo "stack-usage: OK"
+	@echo "=== gcc-fanalyzer ==="
+	@for f in $(SRCS); do \
+	    $(CC) $(ANALYZE_CFLAGS) -fanalyzer -fsyntax-only $$f 2>&1; \
+	done
+	@echo "gcc-fanalyzer: OK"
+	@echo "=== cppcheck ==="
+	@cppcheck --enable=warning,performance,portability --error-exitcode=1 \
+	    --suppress=missingIncludeSystem \
+	    --suppress=normalCheckLevelMaxBranches \
+	    --suppress=toomanyconfigs \
+	    --suppress=*:vendor/* \
+	    --suppress=oppositeInnerCondition:src/object.c \
+	    --suppress=intToPointerCast:src/backup.c \
+	    --inline-suppr \
+	    --quiet -I src -I vendor $(SRCS)
+	@echo "cppcheck: OK"
+
+lint:
+	@echo "=== clang-tidy ==="
+	@clang-tidy $(SRCS) -- -std=c11 -I src -I vendor 2>&1 | \
+	    grep -E "warning:|error:" || echo "clang-tidy: OK"
+
+test: $(TARGET) $(TEST_BINS) $(FAULT_BINS) analyze
 	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
 
 # Benchmark binaries (no cmocka)
@@ -110,6 +152,9 @@ $(BUILD)/bench_micro: $(BENCH)/micro.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BUILD)/bench_phases: $(BENCH)/phases.c $(LIB_OBJS) | $(BUILD)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/bench_fuse_xfer: $(BENCH)/fuse_xfer.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ $(LDFLAGS)
 
 bench: $(BUILD)/bench_micro $(BUILD)/bench_phases
@@ -136,6 +181,40 @@ test-asan: $(TARGET) $(TARGET_ASAN) $(ASAN_TEST_BINS)
 	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
 
 .PHONY: test-asan
+
+# Coverage build: compile with gcov instrumentation, run tests, generate report
+COV_DIR     := $(BUILD)/coverage
+COV_CFLAGS  := -std=c11 -Wall -Wextra -O0 -g --coverage -march=znver3 \
+               -Wno-unused-result -Wno-format-truncation -I src -I vendor
+COV_LDFLAGS := --coverage -llz4 -lssl -lcrypto -lacl -lpthread
+COV_OBJS    := $(patsubst $(SRC)/%.c, $(COV_DIR)/%.o, $(SRCS))
+COV_VENDOR  := $(COV_DIR)/toml.o $(COV_DIR)/cJSON.o
+COV_OBJS    += $(COV_VENDOR)
+COV_MAIN    := $(COV_DIR)/main.o
+COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
+COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
+
+$(COV_DIR):
+	mkdir -p $(COV_DIR)
+
+$(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) -c $< -o $@
+
+$(COV_DIR)/toml.o: vendor/toml.c | $(COV_DIR)
+	$(CC) -std=c11 -O0 -g --coverage -I src -I vendor -c $< -o $@
+$(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
+	$(CC) -std=c11 -O0 -g --coverage -I src -I vendor -c $< -o $@
+
+$(COV_DIR)/%: $(TESTS)/%.c $(COV_LIB) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
+
+coverage: $(COV_TESTS)
+	@for t in $(COV_TESTS); do $$t >/dev/null 2>&1 || true; done
+	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
+	    --exclude '.*vendor.*' -s
+	@echo "Coverage report: $(COV_DIR)/coverage.html"
+
+.PHONY: coverage
 
 clean:
 	rm -rf $(BUILD)

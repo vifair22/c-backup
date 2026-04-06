@@ -4,6 +4,7 @@
 
 | Date | Notes |
 |------|-------|
+| 2026-04-05 | Streaming RS parity (bounded-RAM `rs_parity_stream_t`), FUSE readahead ring (4×4 MiB), unified pack workers (per-thread packs), bounded-RAM GC copy, transient-error retry queue with multi-round retry, O_NOATIME, rotational disk detection, `migrate-v4` command, JSON RPC session mode |
 | 2026-04-02 | HDD I/O optimizations: global pack index, pack sharding, dynamic DAT cache, async writeback, inode-sorted scan, pack-worker hash sort, pack-ordered restore/verify, parity read consolidation, `reindex` and `migrate-packs` commands |
 | 2026-03-26 | Build/bench section, verify --deep removal, GFS Tree viewer tab, post-backup runbook accuracy |
 | 2026-03-24 | Initial |
@@ -88,6 +89,7 @@
     - 13.19 `gfs`
     - 13.20 `reindex`
     - 13.21 `migrate-packs`
+    - 13.22 `migrate-v4`
 14. [policy.toml Reference](#14-policytoml-reference)
 15. [Viewer GUI](#15-viewer-gui)
     - 15.1 Architecture
@@ -276,15 +278,15 @@ Each scanned entry is compared against the previous snapshot pathmap. Changes ar
 | `CHANGE_MODIFIED` | Content hash changed |
 | `CHANGE_METADATA_ONLY` | Same content hash, different metadata (mode/uid/gid/mtime/xattr/ACL) |
 
-Regular files classified as `CREATED` or `MODIFIED` are submitted to the parallel store pool. The pool dispatches file store tasks across `CBACKUP_STORE_THREADS` worker threads (default: CPU count).
+Regular files classified as `CREATED` or `MODIFIED` are submitted to the parallel store pool. Before dispatch, the store task array is sorted by source inode number (`st_ino`), converting random disk access into sequential I/O on rotational media. The pool dispatches file store tasks across `CBACKUP_STORE_THREADS` worker threads (default: CPU count, reduced to 1 for FUSE/NFS sources).
 
 Each worker calls `object_store_file_cb`, which:
-1. Opens the file read-only
+1. Opens the file read-only with `O_NOATIME` (falls back to plain `O_RDONLY` if not permitted), avoiding atime writeback on HDD
 2. Detects sparse regions via `lseek(SEEK_HOLE)` / `lseek(SEEK_DATA)`
 3. If sparse: builds a `sparse_hdr_t` + `sparse_region_t[]` table prepended to the data regions; stores as `OBJECT_TYPE_SPARSE`
-4. If dense: streams the file through the object write path
+4. If dense: streams the file through the object write path (with ownership of the fd for reopen recovery on transient errors)
 
-A per-chunk progress callback (`store_chunk_cb`) fires after each ~16 MiB chunk is written to disk. This callback atomically adds the chunk byte count to the pool's `bytes_in_flight` counter without waiting for file completion. A dedicated progress thread (`phase3_progress_fn`) wakes every 1 second and reads `bytes_done + bytes_in_flight` as the monotonically increasing "seen" byte count, computing an EMA-based throughput rate and ETA.
+A per-chunk progress callback (`store_chunk_cb`) fires after each ~16 MiB chunk is written to disk. This callback atomically adds the chunk byte count to the pool's `bytes_in_flight` counter without waiting for file completion. A dedicated progress thread (`phase3_progress_fn`) wakes every 1 second and reads `bytes_done + bytes_in_flight` as the monotonically increasing "seen" byte count, computing an EMA-based throughput rate and ETA. ETA display is suppressed during a warmup period to avoid misleading early estimates.
 
 Display format:
 ```
@@ -295,7 +297,14 @@ Where `K writing` shows the number of in-flight files (incremented at task start
 
 On file completion, the worker subtracts its accumulated `bytes_in_flight` contribution from the pool's counter and adds the full `file_size` to `bytes_done`. The net change to `bytes_done + bytes_in_flight` is zero, avoiding double-counting.
 
-Files that change on disk between scan and store (detected by a second `stat` or a short read) are added to a `skipped` set and excluded from the snapshot. This is logged as a warning.
+**Transient error handling**: Files that fail with transient errors (ENOENT, EACCES, ESTALE, EIO, ENXIO, ECONNRESET, ETIMEDOUT, etc.) during parallel storage are not immediately discarded. Instead, they are enqueued in a dynamic retry queue. After all parallel workers complete, the retry queue is drained single-threaded with delays to let the filesystem/array settle:
+
+- Up to 5 retry rounds, with a 30-second settle delay between rounds and 5-second delays between files within a round (configurable via `CBACKUP_RETRY_SETTLE_SEC` and `CBACKUP_RETRY_FILE_DELAY_SEC` environment variables).
+- Successfully recovered files are stored normally. Files that fail with non-transient errors are permanently excluded.
+- If no files are recovered in a round, remaining rounds are skipped (source is assumed unavailable).
+- Progress is displayed during retry rounds: `Phase 3 retry R/5: N/M  recovered K  failed F`.
+
+Files that remain unrecoverable after all retry rounds, or that change on disk between scan and store, are added to a `skipped` set and excluded from the snapshot. If all new files failed and no changes were detected, the snapshot is not created.
 
 **Phase 4 / 5 — Build Snapshot Structures**
 
@@ -317,16 +326,21 @@ If `auto_pack = true`, `repo_pack` is called. Pack errors are non-fatal to the b
 
 The core object write function (`write_object` / `write_object_file_stream`) follows this sequence:
 
-1. **Hash** — SHA-256 is computed over the raw content bytes.
-2. **Existence check** — `object_exists` checks loose storage and the pack cache. If found, return immediately.
-3. **Deduplication is complete** — no write occurs.
-4. **Stage 1 compression is disabled** — loose objects are always written as `COMPRESS_NONE`. The object header records `compression = COMPRESS_NONE` and `compressed_size = uncompressed_size`. Compression is handled entirely by the pack sweeper (see §7.2).
-5. **Write to temp file** — `mkstemp` under `tmp/`, write the 56-byte `object_header_t`, then the raw payload.
+1. **Write placeholder header** — `mkstemp` under `tmp/`, write a 56-byte `object_header_t` with `compressed_size = 0` (patched after streaming).
+2. **Stream payload** — read source in chunks, computing SHA-256, CRC-32C, and RS parity inline. Write each chunk as raw uncompressed bytes. Stage 1 compression is disabled; compression is handled entirely by the pack sweeper (see §7.2).
+3. **Existence check** — after the full hash is known, `object_exists` checks loose storage and the pack cache. If found, discard the temp file and return immediately (deduplication complete, no rename).
+4. **Patch header** — `pwrite` the final `compressed_size` and `hash` into the header at offset 0.
+5. **Parity trailer** — append the XOR interleaved parity record for the header, the RS parity data (from the streaming accumulator), the CRC-32C checksum, and the parity footer.
 6. **Async writeback** — on Linux, `sync_file_range(SYNC_FILE_RANGE_WRITE)` initiates non-blocking writeback of the temp file. On non-Linux systems, `fdatasync()` is used as a fallback. Because the object is not visible until the subsequent `rename`, a crash before writeback completes simply loses the temp file — no corruption is possible.
 7. **Rename** — `rename(tmp_path, final_path)`. The final path is `objects/XX/<rest>` where `XX` is the first two hex characters of the hash.
-8. **Directory fsync** — the containing `objects/XX/` directory is fsynced to persist the directory entry.
 
-For large streaming files (`write_object_file_stream`), the payload is written in `STREAM_CHUNK` (16 MiB) pieces. After each chunk write, `progress_cb(chunk_bytes, ctx)` is invoked if a callback was supplied. The SHA-256 hash is computed rolling across all chunks.
+For large streaming files (`write_object_file_stream`), the payload is written in 128 MiB chunks on local filesystems, or via a FUSE readahead ring on FUSE sources. After each chunk, `progress_cb(chunk_bytes, ctx)` is invoked if a callback was supplied.
+
+**FUSE readahead ring**: When the source fd is on a FUSE filesystem (detected via `fstatfs` / `FUSE_SUPER_MAGIC`), a dedicated reader thread fills a bounded 4-slot ring of 4 MiB buffers. The main thread pulls filled buffers for processing (SHA-256 + write + CRC + RS parity). The ring is bounded so the FUSE daemon never has more than one outstanding read, avoiding the readahead flooding that `POSIX_FADV_SEQUENTIAL` causes on userspace filesystems. This overlaps FUSE read latency with disk write I/O.
+
+**Streaming RS parity**: RS parity is computed inline during the write loop via `rs_parity_stream_t`, a bounded-RAM streaming accumulator that spills completed parity groups to a temp file when the in-RAM buffer exceeds 256 MiB. This avoids allocating a parity buffer proportional to object size.
+
+**Transient read recovery**: The streaming loop handles transient read errors (ENXIO, EIO, EAGAIN) with two-tier recovery: (1) lseek on the existing fd, (2) close + reopen by path + seek. Up to 5 recovery attempts are allowed per file. This is critical for FUSE/NFS sources where the underlying filesystem daemon may temporarily lose connections.
 
 ### 5.3 Compression Strategy
 
@@ -675,17 +689,18 @@ These objects are stored as-is in the pack — whatever compression format was a
 
 Single-object packs for large files are always > 64 MiB (since the objects are > 16 MiB and compressible), so they are excluded by the `PACK_COALESCE_SMALL_BYTES` threshold during coalescing.
 
-### 7.4 Worker Pool (Small Objects)
+### 7.4 Unified Worker Model (Small Objects)
 
-Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads (default: CPU count, max 32). Before dispatch, the work indices are sorted by object hash so that workers read `objects/XX/` directories in sequential order, converting random seeks into near-sequential I/O on spinning disks. Architecture:
+Small objects are dispatched to a pool of `CBACKUP_PACK_THREADS` worker threads (default: CPU count, max 32). The worker count is capped to `total_bytes_for_pack / PACK_MAX_MULTI_BYTES + 1` to avoid creating many tiny packs when the workload is small. Before dispatch, the work indices are sorted by object hash so that workers read `objects/XX/` directories in sequential order, converting random seeks into near-sequential I/O on spinning disks. Architecture:
 
-- A bounded queue of `pack_work_item_t` structures (capacity: `n_workers × 4`, minimum 16) is shared between workers (producers) and the main thread (consumer/writer).
-- Each worker has a pre-allocated compression buffer of `LZ4_compressBound(16 MiB)` bytes.
-- Workers read a loose object, probe its compressibility, compress with LZ4 if beneficial, and push a `pack_work_item_t` (containing the compressed payload and metadata) onto the bounded queue.
-- The main thread pops items from the queue and writes them sequentially to the `.dat` file, maintaining the ordered `idx_entries` array. Before writing each item, it checks whether adding it would exceed the **256 MiB** multi-object pack cap (`PACK_MAX_MULTI_BYTES`). If so, the current pack is finalized, loose objects for that segment are deleted, and a new pack is opened with the next sequential pack number.
-- Workers signal `cv_have_work` when an item is available; the main thread signals `cv_have_space` when a slot is freed.
+- Each worker thread owns its own independent `pack_writer_t` with separate `.dat` and `.idx` temp files. There is no shared queue or main-thread serializer.
+- Pack numbers are assigned via `atomic_fetch_add` on a shared counter, ensuring uniqueness without locks.
+- Each worker reads a loose object, probes its compressibility, compresses with LZ4 if beneficial, and writes the entry directly to its own `.dat` file. When the pack reaches the **256 MiB** multi-object cap (`PACK_MAX_MULTI_BYTES`), the worker finalizes the current pack (patch count, sort/write index, fsync, atomic rename) and opens a new one.
+- Work items are distributed across workers via a shared atomic index — each worker claims the next item with `atomic_fetch_add`, ensuring even distribution without contention.
+- RS parity for each entry is computed via bounded-RAM `rs_parity_stream_t` (streaming accumulator with temp file spill), avoiding allocation proportional to object size.
+- On error, the first worker to fail stores its error via `atomic_compare_exchange_strong` and sets a shared stop flag so other workers drain promptly.
 
-This producer-consumer design means CPU-bound compression (workers) and I/O-bound writing (main thread) overlap, saturating both CPU and I/O when the system has multi-core capacity.
+This unified model eliminates the serialization bottleneck of a single writer thread. Each worker independently reads, compresses, and writes, achieving full parallelism across CPU and I/O.
 
 ### 7.5 Pack Index Cache
 
@@ -791,11 +806,12 @@ For each pack:
 
 **Case C — Mixed (some live, some dead)**: Rewrite the pack:
 1. Create new temp `.dat` and `.idx` files in `tmp/`.
-2. Copy only the live entries (header + payload) from the old pack to the new pack, with sequential offsets.
-3. Build a new sorted index.
-4. fsync both new files.
-5. Rename new `.dat` over the old `.dat` filename.
-6. Rename new `.idx` over the old `.idx` filename.
+2. Copy only the live entries (header + payload) from the old pack to the new pack, with sequential offsets. Payloads are copied in fixed 128 KiB chunks rather than allocating a buffer proportional to compressed size, ensuring bounded RAM usage regardless of object size.
+3. Recompute RS parity for each copied entry via bounded-RAM `rs_parity_stream_t`.
+4. Build a new sorted index.
+5. fsync both new files.
+6. Rename new `.dat` over the old `.dat` filename.
+7. Rename new `.idx` over the old `.idx` filename.
 
 After processing all packs, `maybe_coalesce_packs` is called (§9).
 
@@ -1366,6 +1382,14 @@ backup migrate-packs --repo <path>
 
 Moves flat-layout pack files (`packs/pack-NNNNNNNN.{dat,idx}`) into sharded subdirectories (`packs/NNNN/pack-NNNNNNNN.{dat,idx}`). Acquires an exclusive lock. After moving all files, rebuilds the global pack index. New packs are always created in sharded directories; this command is only needed for repositories created before pack sharding was introduced. Running it on an already-sharded repository is harmless (no files to move).
 
+### 13.22 `migrate-v4`
+
+```
+backup migrate-v4 --repo <path>
+```
+
+Migrates pack index files (`.idx`) to the v4 format with 64-bit compressed size fields. Acquires an exclusive lock. Reports the number of index files migrated. Repositories created with recent versions already use v4; this command is only needed for repositories created before the v4 index format was introduced. Running it on an already-migrated repository is harmless (no files to migrate).
+
 ---
 
 ## 14. `policy.toml` Reference
@@ -1525,10 +1549,13 @@ Both benchmarks link against the full library (everything except `main.o`) and r
 - Decrease to reduce I/O pressure on slow disks or when backing up over a network filesystem.
 
 **`CBACKUP_PACK_THREADS=N`** — Worker threads for `backup pack` / post-run packing.
-- Default: CPU count.
-- Each worker reads one loose object, probes compressibility, compresses if beneficial, and pushes the result to the main writer thread.
+- Default: CPU count (capped to avoid creating more packs than needed).
+- Each worker independently reads loose objects, probes compressibility, compresses if beneficial, and writes entries directly to its own pack file. There is no shared queue or serializer thread.
 - Compression is CPU-bound; using all available cores maximizes throughput.
-- The writer thread is a single serializer; all pack workers feed it via the bounded queue.
+
+**`CBACKUP_RETRY_SETTLE_SEC=N`** — Settle delay (seconds) between transient-error retry rounds during `backup run`. Default: 30.
+
+**`CBACKUP_RETRY_FILE_DELAY_SEC=N`** — Delay (seconds) between individual file retries within a round. Default: 5. Set both to 0 for instant retries (useful in testing).
 
 ### Policy Settings
 
@@ -1746,6 +1773,8 @@ Large files that are already compressed (video, audio, archive files, database f
 The primary RAM-scaling concern for very large repositories is GC reference collection (§8.1). Peak memory is proportional to `number_of_snapshots × nodes_per_snapshot × 3 × 32 bytes`. For a 100-snapshot repository with 1 million nodes per snapshot and good deduplication, this is typically 1–4 GB before deduplication. Post-deduplication the working set is much smaller, but the peak during `qsort` of the full array must be accommodated.
 
 The pack index cache is the secondary RAM consumer: it holds 44 bytes per packed object across all packs. For 10 million packed objects this is approximately 440 MB.
+
+Object storage and pack operations use bounded-RAM streaming: loose object writes use `rs_parity_stream_t` (spills to disk at 256 MiB), pack GC copies entries in fixed 128 KiB chunks, and pack workers use per-entry streaming parity with 256 KiB spill threshold. None of these operations allocate buffers proportional to object size.
 
 ---
 
@@ -1993,9 +2022,22 @@ On every object load (loose, packed, or snapshot), the following sequence runs:
 
 All repair functions `fsync()` after writing corrections. The parity data itself is not modified — it remains valid for detecting future corruption.
 
-### 22.10 Source Module
+### 22.10 Streaming Parity Accumulator (`rs_parity_stream_t`)
 
-All parity algorithms are implemented in `src/parity.c` / `src/parity.h` (~800 lines of C). The module is self-contained with no external dependencies beyond the C standard library. Global parity statistics (`parity_stats_t`) use atomic counters for thread safety.
+For large objects and pack entries, computing RS parity requires accumulating group data across the entire payload. The naive approach — allocating a parity buffer proportional to the payload size — would violate the bounded-RAM design constraint.
+
+`rs_parity_stream_t` (implemented in `src/parity_stream.c` / `src/parity_stream.h`) solves this with a streaming accumulator:
+
+1. Callers feed arbitrary-length byte sequences via `rs_parity_stream_feed()`. The accumulator handles RS group boundary tracking internally.
+2. Completed parity groups are appended to an in-RAM buffer. When the buffer exceeds a configurable threshold (256 MiB for object writes, 256 KiB for pack entries), groups spill to a lazily-created temp file.
+3. `rs_parity_stream_finish()` flushes the final partial group.
+4. `rs_parity_stream_replay_fd()` / `rs_parity_stream_replay_file()` replays the accumulated parity data to a destination fd or FILE*, reading from the in-RAM buffer first, then streaming from the spill file.
+
+This ensures parity computation uses bounded RAM regardless of payload size, with the temp file providing overflow capacity for very large objects.
+
+### 22.11 Source Module
+
+All parity algorithms are implemented in `src/parity.c` / `src/parity.h` (~800 lines of C). The streaming parity accumulator is in `src/parity_stream.c` / `src/parity_stream.h`. Both modules are self-contained with no external dependencies beyond the C standard library. Global parity statistics (`parity_stats_t`) use atomic counters for thread safety.
 
 ---
 

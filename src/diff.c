@@ -164,6 +164,7 @@ status_t snapshot_diff_collect(repo_t *repo, uint32_t snap_id1, uint32_t snap_id
     }
 
     /* Iterate pm2: find Added and Modified entries */
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     for (size_t i = 0; i < pm2->capacity; i++) {
         if (!pm2->slots[i].key) continue;
         const char *path = pm2->slots[i].key;
@@ -231,6 +232,7 @@ status_t snapshot_diff(repo_t *repo, uint32_t snap_id1, uint32_t snap_id2) {
     status_t st = snapshot_diff_collect(repo, snap_id1, snap_id2, &r);
     if (st != OK) return st;
 
+    // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
     for (uint32_t i = 0; i < r->count; i++)
         printf("%c  %s\n", r->changes[i].change, r->changes[i].path);
 

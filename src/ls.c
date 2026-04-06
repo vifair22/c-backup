@@ -603,6 +603,7 @@ status_t snapshot_search_multi(repo_t *repo, const uint32_t *snap_ids,
                 }
                 free(flat);
                 free(drmap);
+                drmap = NULL;
             }
             free(prev_dirent_data);
             prev_dirent_data = NULL;
