@@ -10,7 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define BIN "./build/backup"
+#define BIN "./build/bins/backup"
 #define TEST_REPO "/tmp/c_backup_cli_repo"
 #define TEST_REPO2 "/tmp/c_backup_cli_repo_import"
 #define TEST_SRC "/tmp/c_backup_cli_src"
@@ -97,7 +97,7 @@ static void test_cli_happy_and_error_paths(void **state) {
     assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO), 0);
     assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO " --repair"), 0);
     assert_int_equal(run_cmd(BIN " verify --repo " TEST_REPO " --deep"), 1);  /* --deep not supported */
-    assert_int_equal(run_cmd(BIN " doctor --repo " TEST_REPO), 0);
+
 
     assert_int_equal(run_cmd(BIN " prune --repo " TEST_REPO " --dry-run --keep-snaps 1 --keep-daily 0 --keep-weekly 0 --keep-monthly 0 --keep-yearly 0"), 0);
     assert_int_equal(run_cmd(BIN " snapshot --repo " TEST_REPO " delete --snapshot 1 --dry-run"), 0);

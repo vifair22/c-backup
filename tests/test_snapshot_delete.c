@@ -45,11 +45,11 @@ static int setup(void **state) {
     assert_int_equal(mkdir(TEST_SRC, 0755), 0);
     write_file(TEST_SRC "/a.txt", "one");
 
-    assert_int_equal(run_cmd("./build/backup init --repo %s --keep-snaps 10 >/dev/null 2>&1", TEST_REPO), 0);
-    assert_int_equal(run_cmd("./build/backup run --repo %s --path %s >/dev/null 2>&1", TEST_REPO, TEST_SRC), 0);
+    assert_int_equal(run_cmd("./build/bins/backup init --repo %s --keep-snaps 10 >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup run --repo %s --path %s >/dev/null 2>&1", TEST_REPO, TEST_SRC), 0);
     write_file(TEST_SRC "/a.txt", "two");
-    assert_int_equal(run_cmd("./build/backup run --repo %s --path %s >/dev/null 2>&1", TEST_REPO, TEST_SRC), 0);
-    assert_int_equal(run_cmd("./build/backup tag --repo %s set --snapshot 1 --name keepme >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup run --repo %s --path %s >/dev/null 2>&1", TEST_REPO, TEST_SRC), 0);
+    assert_int_equal(run_cmd("./build/bins/backup tag --repo %s set --snapshot 1 --name keepme >/dev/null 2>&1", TEST_REPO), 0);
     return 0;
 }
 
@@ -62,7 +62,7 @@ static int teardown(void **state) {
 
 static void test_snapshot_delete_refuses_tagged_without_force(void **state) {
     (void)state;
-    int rc = run_cmd("./build/backup snapshot --repo %s delete --snapshot 1 >/dev/null 2>&1", TEST_REPO);
+    int rc = run_cmd("./build/bins/backup snapshot --repo %s delete --snapshot 1 >/dev/null 2>&1", TEST_REPO);
     assert_int_not_equal(rc, 0);
 
     repo_t *repo = NULL;
@@ -75,7 +75,7 @@ static void test_snapshot_delete_refuses_tagged_without_force(void **state) {
 
 static void test_snapshot_delete_dry_run_no_changes(void **state) {
     (void)state;
-    assert_int_equal(run_cmd("./build/backup snapshot --repo %s delete --snapshot 1 --force --dry-run >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup snapshot --repo %s delete --snapshot 1 --force --dry-run >/dev/null 2>&1", TEST_REPO), 0);
 
     repo_t *repo = NULL;
     assert_int_equal(repo_open(TEST_REPO, &repo), OK);
@@ -87,7 +87,7 @@ static void test_snapshot_delete_dry_run_no_changes(void **state) {
 
 static void test_snapshot_delete_force_removes_snapshot_and_tag(void **state) {
     (void)state;
-    assert_int_equal(run_cmd("./build/backup snapshot --repo %s delete --snapshot 1 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup snapshot --repo %s delete --snapshot 1 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
 
     repo_t *repo = NULL;
     assert_int_equal(repo_open(TEST_REPO, &repo), OK);
@@ -101,8 +101,8 @@ static void test_snapshot_delete_force_removes_snapshot_and_tag(void **state) {
 
 static void test_snapshot_delete_force_head_updates_head(void **state) {
     (void)state;
-    assert_int_equal(run_cmd("./build/backup snapshot --repo %s delete --snapshot 1 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
-    assert_int_equal(run_cmd("./build/backup snapshot --repo %s delete --snapshot 2 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup snapshot --repo %s delete --snapshot 1 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
+    assert_int_equal(run_cmd("./build/bins/backup snapshot --repo %s delete --snapshot 2 --force --no-gc >/dev/null 2>&1", TEST_REPO), 0);
 
     repo_t *repo = NULL;
     assert_int_equal(repo_open(TEST_REPO, &repo), OK);

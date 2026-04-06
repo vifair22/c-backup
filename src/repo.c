@@ -16,6 +16,25 @@
 
 #define FORMAT_VERSION "c-backup-1\n"
 
+#ifndef VERSION_STRING
+#define VERSION_STRING "unknown"
+#endif
+
+/* Write the build version string to a file in the repo directory.
+ * Uses atomic tmp+rename for safety. Errors are silently ignored
+ * since this is best-effort housekeeping. */
+static void write_version_file(const char *repo_path, const char *filename) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(final, sizeof(final), "%s/%s", repo_path, filename);
+    snprintf(tmp, sizeof(tmp), "%s/tmp/.%s.tmp", repo_path, filename);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) return;
+    const char *ver = VERSION_STRING "\n";
+    if (write(fd, ver, strlen(ver)) < 0) { close(fd); unlink(tmp); return; }
+    close(fd);
+    rename(tmp, final);
+}
+
 /* Dynamic open-addressing hash table for .dat FILE* handles.
  * No eviction — all handles stay open until repo_close() or flush.
  * Grows at 75% load factor.  Minimum 128 slots. */
@@ -201,6 +220,9 @@ status_t repo_open(const char *path, repo_t **out) {
     r->loose_set_cnt   = 0;
     r->loose_set_ready = 0;
     pthread_mutex_init(&r->loose_set_mu, NULL);
+
+    write_version_file(path, "last_accessed");
+
     *out = r;
     return OK;
 }
@@ -503,6 +525,8 @@ status_t repo_lock(repo_t *repo) {
         }
         closedir(td);
     }
+
+    write_version_file(repo->path, "last_written");
 
     return OK;
 }

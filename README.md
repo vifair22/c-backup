@@ -12,186 +12,224 @@ A deduplicating filesystem backup tool for Linux, written in C.
 
 - Individual files and total repository size may be arbitrarily large — no limit short of available disk space.
 - Any single file may exceed available RAM. All large-object paths stream rather than buffer.
-- Repositories with millions of inodes are expected. Change detection is O(n), not O(n²).
+- Repositories with millions of inodes are expected. Change detection is O(n), not O(n2).
 - Pre-compressed content (video, audio, database files) is detected at intake and stored verbatim — no CPU wasted re-compressing incompressible data.
 
----
-
-## Features
-
-| Feature | Detail |
-|---------|--------|
-| Content deduplication | SHA-256 content addressing; identical data stored once regardless of filename or snapshot |
-| Incremental backups | Only changed objects are stored; unchanged files cost one hash comparison |
-| LZ4 compression | Per-object compression with 64 KiB probing; skip markers prevent re-probing incompressible content |
-| Sparse file support | Holes are preserved using a region table; no sparse-to-dense bloat |
-| Metadata fidelity | Stores mode, uid, gid, mtime, xattrs, POSIX ACLs, symlink targets, hardlink relationships, device numbers |
-| Pack files | Loose objects are coalesced into pack files with binary-searchable indexes; multi-object packs are capped at 256 MiB, large compressible files get dedicated single-object packs |
-| Parity error correction | Reed-Solomon RS(255,239) corrects up to 512-byte burst errors per object; XOR parity repairs single-byte header corruption; CRC-32C provides fast detection; `verify --repair` rewrites corrected files to disk |
-| GFS retention | Grandfather-Father-Son calendar tiers: daily / weekly / monthly / yearly |
-| Crash safety | All writes go to `tmp/` via `mkstemp`, fsynced, then atomically renamed |
-| Export / Import | Native `.cbb` bundles for offline transfer; tar.gz export for interoperability |
-| GUI viewer | Python/Tkinter read-only repository browser with analytics, diff, and content preview |
+For usage documentation, CLI reference, and technical internals see [manual.md](manual.md).
 
 ---
 
 ## Dependencies
+
+### Build toolchain
+
+| Package | Notes |
+|---------|-------|
+| GCC (C11) | Primary compiler; Clang may work but is not tested |
+| GNU Make | Parallel builds via `-j$(nproc)` |
+| `liblz4-dev` | LZ4 compression headers and library |
+| `libssl-dev` | OpenSSL headers (SHA-256) |
+| `libacl1-dev` | POSIX ACL headers |
+| `libcmocka-dev` | Unit test framework (test builds only) |
+| `libasan` | AddressSanitizer runtime (`make asan` only) |
+| `gcovr` | Coverage report generation (`make coverage` only) |
+
+### Runtime libraries
 
 | Library | Purpose |
 |---------|---------|
 | `liblz4` | Object compression |
 | `libssl` / `libcrypto` (OpenSSL) | SHA-256 hashing |
 | `libacl` | POSIX ACL backup and restore |
-| `libpthread` | Parallel Phase 3 worker pool |
+| `libpthread` | Parallel worker pools |
 
-For the Python viewer: `pip install lz4` (optional — structural info is readable without it).
+### Viewer GUI (optional)
+
+Python 3 with Tkinter. `pip install lz4` for compressed content preview.
 
 ---
 
-## Build
+## Building
+
+Requires GCC with C11 support and GNU Make. Builds use all available CPU cores automatically.
+
+### Build targets
+
+| Target | Output | Optimisation | Description |
+|--------|--------|-------------|-------------|
+| `make` | `build/bins/backup` | `-O3` | Release build |
+| `make static` | `build/bins/backup-static` | `-O3` | Statically linked release |
+| `make debug` | `build/bins/backup-debug` | `-Og -g` | Debug build with full symbols |
+| `make asan` | `build/bins/backup-asan` | `-O1 -g -fsanitize=address` | AddressSanitizer build |
+| `make clean` | — | — | Remove `build/` |
+
+Each build type compiles into its own subdirectory (`build/release/`, `build/static/`, `build/debug/`, `build/asan/`) so you can switch between them without stale object conflicts. All final binaries are placed in `build/bins/`.
+
+Compiler warnings include `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wnull-dereference -Wmissing-prototypes` and more. Vendor code (`vendor/`) is compiled with relaxed flags.
+
+### Versioning
+
+The binary embeds a version string in the format `SEMVER_YYYYMMDD.HHMM.TYPE`:
+
+```
+$ build/bins/backup --version
+c-backup 0.1.0_20260406.1944.release
+```
+
+- **SEMVER** is read from `release_version` (controlled, bumped for releases).
+- **YYYYMMDD.HHMM** is the UTC build timestamp.
+- **TYPE** is one of `release`, `static`, `debug`, or `asan`.
+
+---
+
+## Testing
+
+Tests use the [cmocka](https://cmocka.org/) framework.
 
 ```sh
-make          # builds build/backup
-make static   # builds build/backup-static (statically linked)
-make asan     # builds build/backup-asan (AddressSanitizer, -O1 -g)
-make test     # builds and runs all tests (requires cmocka)
-make clean    # removes build/
+make test           # build release + all tests + static analysis, then run
+make test-asan      # build asan + all tests under AddressSanitizer, then run
 ```
 
-Requires GCC and C11.
-
-### Benchmarks
+Individual test binaries can be run directly:
 
 ```sh
-make bench            # run all benchmarks (micro + phases)
-make bench-micro      # micro-level: SHA-256, CRC32C, LZ4, RS encode/decode
-make bench-phases     # phase-level: scan, backup, pack, verify, gc, restore
+build/bins/test_parity
+build/bins/test_restore
+build/bins/test_pack_gc
 ```
 
-Both benchmark binaries support name filtering and listing:
+Test binary names mirror source filenames under `tests/`. There are 33 test suites covering snapshots, objects, packing, GC, coalescing, parity, restore, export/import, CLI options, and fault injection.
+
+The `make test` target also runs static analysis:
+
+| Analyser | What it checks |
+|----------|---------------|
+| Stack usage | Flags any function exceeding 64 KiB stack frame |
+| `gcc -fanalyzer` | GCC's built-in static analyser |
+| `cppcheck` | Supplemental static analysis (if installed) |
+
+### Coverage
 
 ```sh
-build/bench_micro sha256       # run only benchmarks matching "sha256"
-build/bench_micro -l           # list available micro benchmarks
-build/bench_phases pack        # run only benchmarks matching "pack"
-build/bench_phases -l          # list available phase benchmarks
+make coverage
 ```
+
+Builds with `--coverage`, runs all tests, and generates an HTML report at `build/coverage/coverage.html` via `gcovr`.
 
 ---
 
-## Quick start
+## Benchmarks
+
+Two benchmark suites live under `bench/`:
+
+| Suite | Binary | What it measures |
+|-------|--------|-----------------|
+| Micro | `build/bins/bench_micro` | SHA-256, CRC-32C, LZ4 compress/decompress, RS encode/decode, XOR parity, object store/load round-trips |
+| Phases | `build/bins/bench_phases` | End-to-end per-phase timing: scan, backup, pack, verify, GC, restore with synthetic test data |
 
 ```sh
-# Create a repository
-backup init --repo /mnt/backup/myrepo --path /home/alice
-
-# Run a backup
-backup run --repo /mnt/backup/myrepo
-
-# List snapshots
-backup list --repo /mnt/backup/myrepo
-
-# Restore a snapshot
-backup restore --repo /mnt/backup/myrepo --snapshot HEAD --dest /tmp/restore
-
-# Restore a single file
-backup restore --repo /mnt/backup/myrepo --snapshot HEAD \
-    --path /home/alice/documents/report.pdf --dest /tmp/restore
+make bench            # build and run all benchmarks
+make bench-micro      # micro only
+make bench-phases     # phases only
 ```
 
----
-
-## Common operations
+Both binaries support name filtering and listing:
 
 ```sh
-# Manually pack loose objects
-backup pack --repo /mnt/backup/myrepo
+build/bins/bench_micro sha256       # run only benchmarks matching "sha256"
+build/bins/bench_micro -l           # list available benchmarks
+```
 
-# Run garbage collection
-backup gc --repo /mnt/backup/myrepo
+Benchmarks link against the full library (everything except `main.o`) and do not require cmocka.
 
-# Prune old snapshots per retention policy
-backup prune --repo /mnt/backup/myrepo
+---
 
-# Verify all object hashes
-backup verify --repo /mnt/backup/myrepo
+## Source layout
 
-# Verify and repair bit-rot via parity
-backup verify --repo /mnt/backup/myrepo --repair
-
-# Tag a snapshot
-backup tag --repo /mnt/backup/myrepo --snapshot 42 --name release-2025
-backup tag --repo /mnt/backup/myrepo --snapshot 42 --name legal-hold --preserve
-
-# Inspect a snapshot's file tree
-backup ls --repo /mnt/backup/myrepo --snapshot HEAD
-
-# Export to a portable bundle
-backup export --repo /mnt/backup/myrepo --snapshot HEAD --out archive.cbb
-
-# Import a bundle into a new repository
-backup import --repo /mnt/backup/newrepo archive.cbb
+```
+c-backup/
+├── src/                    # Core C source (21 .c, 23 .h)
+│   ├── main.c              #   CLI entry point and command dispatch
+│   ├── backup.c            #   Backup pipeline (scan, compare, parallel store)
+│   ├── restore.c           #   Restore engine (pack-sorted, parallel)
+│   ├── snapshot.c          #   Snapshot manifest read/write
+│   ├── object.c            #   Object store (loose read/write, FUSE ring, streaming)
+│   ├── pack.c              #   Pack system (creation, GC, coalesce, workers)
+│   ├── pack_index.c        #   Global pack index (mmap'd, fanout + binary search)
+│   ├── parity.c            #   CRC-32C, XOR parity, Reed-Solomon RS(255,239)
+│   ├── parity_stream.c     #   Bounded-RAM streaming RS parity accumulator
+│   ├── scan.c              #   Filesystem scanner (inode-sorted, exclusions, hardlinks)
+│   ├── gc.c                #   Garbage collection (reference collection, loose + pack GC)
+│   ├── gfs.c               #   GFS retention engine (tier assignment, prune logic)
+│   ├── diff.c              #   Snapshot-to-snapshot diff
+│   ├── ls.c                #   In-snapshot directory listing and search
+│   ├── xfer.c              #   Bundle export/import, TAR export
+│   ├── json_api.c          #   JSON RPC API (single-shot and session modes)
+│   ├── repo.c              #   Repository open/close, locking, DAT cache, loose set
+│   ├── policy.c            #   policy.toml parser and writer
+│   ├── tag.c               #   Tag management
+│   ├── stats.c             #   Repository statistics
+│   ├── error.c             #   Thread-local error context
+│   └── types.h             #   Core type definitions (node_t, object_header_t, etc.)
+│
+├── tests/                  # cmocka test suites (34 files)
+│   ├── test_backup.c       #   End-to-end backup pipeline
+│   ├── test_restore.c      #   Restore correctness
+│   ├── test_pack_gc.c      #   Pack GC and rewrite
+│   ├── test_parity.c       #   Parity encode/decode/repair
+│   ├── test_*_fault.c      #   Fault injection tests (malloc/IO failure paths)
+│   └── fault_inject.c      #   Shared fault injection harness (--wrap)
+│
+├── bench/                  # Benchmark suites
+│   ├── micro.c             #   Primitive-level throughput benchmarks
+│   ├── phases.c            #   End-to-end pipeline phase timing
+│   └── fuse_xfer.c         #   FUSE transfer benchmarks
+│
+├── vendor/                 # Third-party (vendored, relaxed warnings)
+│   ├── cJSON.{c,h}         #   JSON parser (MIT)
+│   ├── toml.{c,h}          #   TOML parser (MIT)
+│   └── log.h               #   Logging macros
+│
+├── tools/
+│   └── viewer/             # Python/Tkinter GUI (read-only repo browser)
+│       ├── app.py          #   Main application
+│       ├── rpc.py          #   JSON RPC client
+│       ├── tabs/           #   Per-tab UI modules
+│       └── widgets.py      #   Shared display widgets
+│
+├── Makefile                # GNU Makefile (parallel, multi-target)
+├── release_version         # SemVer string (e.g. "0.1.0")
+├── manual.md               # Full technical manual
+└── README.md               # This file
 ```
 
 ---
 
-## Repository layout
+## Releases
 
-```
-<repo>/
-├── format                    # Version marker: "c-backup-1"
-├── lock                      # Lock file for flock(2)
-├── policy.toml               # Retention and backup policy
-├── refs/HEAD                 # ID of the most recent snapshot
-├── tags/<name>               # One file per named tag
-├── snapshots/NNNNNNNN.snap   # Snapshot manifests
-├── objects/XX/<62-hex>       # Loose content objects
-├── packs/pack-NNNNNNNN.dat   # Pack data files
-├── packs/pack-NNNNNNNN.idx   # Pack indexes (sorted, binary-searchable)
-├── logs/                     # Structured log output, coalesce state
-└── tmp/                      # Crash-safe staging area
-```
+Version numbers follow [Semantic Versioning](https://semver.org/). The release version is stored in `release_version` and baked into every binary at build time.
+
+To cut a release:
+
+1. Update `release_version` with the new version (e.g. `0.2.0`).
+2. Build all targets (`make`, `make static`, `make debug`).
+3. Tag the commit: `git tag v0.2.0`.
+4. The resulting binaries embed the full version string (e.g. `0.2.0_20260407.1200.release`).
 
 ---
 
-## Retention policy (`policy.toml`)
+## Documentation
 
-```toml
-path      = ["/home/alice", "/etc"]
-exclude   = ["/home/alice/.cache"]
+See [manual.md](manual.md) for:
 
-keep_snaps   = 7      # rolling window: keep last N snapshots
-keep_daily   = 30     # GFS: daily anchors
-keep_weekly  = 12     # GFS: weekly anchors (Sunday)
-keep_monthly = 12     # GFS: monthly anchors (1st of month)
-keep_yearly  = 5      # GFS: yearly anchors (Jan 1)
-
-auto_pack    = true
-auto_gc      = true
-auto_prune   = true
-verify_after = false
-strict_meta  = false  # true = fail on unreadable xattrs/ACLs
-```
-
-All policy values can be overridden at runtime with `--` flags on any command that accepts them.
-
----
-
-## Viewer GUI
-
-A read-only repository browser built with Python and Tkinter.
-
-```sh
-cd tools/viewer
-python -m viewer /mnt/backup/myrepo
-```
-
-**Tabs:** Overview · Snapshots · Objects · Packs · Analytics · Diff · Content · Search · Integrity · Export
-
-The viewer reads repository files directly using pure-Python binary parsers — it does not invoke the `backup` binary and makes no writes to the repository.
-
----
-
-## Full documentation
-
-See [manual.md](manual.md) for complete technical documentation covering on-disk formats, algorithms, all CLI subcommands, policy reference, performance tuning, and troubleshooting.
+- Complete CLI reference with all flags and examples
+- `policy.toml` field reference
+- Common configuration recipes
+- Troubleshooting guide
+- Environment variables
+- Storage model, data flow, and algorithm internals
+- On-disk file format specifications
+- JSON RPC API reference
+- Parity error correction details
+- On-disk format version history

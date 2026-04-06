@@ -354,7 +354,6 @@ static void usage(void) {
         "  backup gc       --repo <path>\n"
         "  backup pack     --repo <path>\n"
         "  backup verify   --repo <path> [--repair]\n"
-        "  backup doctor   --repo <path>\n"
         "  backup stats    --repo <path> [--json]\n"
         "  backup tag      --repo <path> set --snapshot <id|tag> --name <name>"
                                             " [--preserve]\n"
@@ -1799,45 +1798,6 @@ static int cmd_verify(repo_t *repo, int argc, char **argv) {
     return st == OK ? 0 : 1;
 }
 
-static int cmd_doctor(repo_t *repo, int argc, char **argv) {
-    static const flag_spec_t specs[] = { { "--repo", 1 } };
-    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
-    lock_shared(repo);
-
-    int problems = 0;
-    uint32_t head = 0;
-    if (snapshot_read_head(repo, &head) == OK) {
-        printf("check head: ok (%u)\n", head);
-    } else {
-        printf("check head: fail\n");
-        problems++;
-    }
-
-    repo_stat_t s = {0};
-    if (repo_stats(repo, &s) == OK) {
-        printf("check stats: ok (snapshots=%u, loose=%u, packs=%u)\n",
-               s.snap_count, s.loose_objects, s.pack_files);
-    } else {
-        printf("check stats: fail\n");
-        problems++;
-    }
-
-    if (repo_verify(repo, NULL) == OK) {
-        printf("check verify: ok\n");
-    } else {
-        printf("check verify: fail%s%s\n",
-               err_msg()[0] ? ": " : "", err_msg());
-        problems++;
-    }
-
-    if (problems == 0) {
-        printf("doctor: repository looks healthy\n");
-        return 0;
-    }
-    printf("doctor: %d problem(s) found\n", problems);
-    return 1;
-}
-
 static int cmd_stats(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 }, { "--json", 0 } };
     if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
@@ -1954,6 +1914,20 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) { usage(); return 1; }
 
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        usage();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0) {
+#ifdef VERSION_STRING
+        printf("c-backup %s\n", VERSION_STRING);
+#else
+        printf("c-backup (unknown version)\n");
+#endif
+        return 0;
+    }
+
     /* --json mode: one-shot JSON RPC via stdin/stdout */
     if (argc >= 3 && strcmp(argv[1], "--json") == 0) {
         repo_t *repo = NULL;
@@ -1994,7 +1968,7 @@ int main(int argc, char *argv[]) {
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
         "export", "import", "prune", "snapshot", "gfs", "gc", "pack", "verify",
-        "doctor", "stats", "tag", "bundle", "reindex", "migrate-packs",
+        "stats", "tag", "bundle", "reindex", "migrate-packs",
         "migrate-v4", NULL
     };
     int known = 0;
@@ -2043,7 +2017,6 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "gc")         == 0) ret = cmd_gc(repo, argc, argv);
     else if (strcmp(cmd, "pack")       == 0) ret = cmd_pack(repo, argc, argv);
     else if (strcmp(cmd, "verify")     == 0) ret = cmd_verify(repo, argc, argv);
-    else if (strcmp(cmd, "doctor")     == 0) ret = cmd_doctor(repo, argc, argv);
     else if (strcmp(cmd, "stats")      == 0) ret = cmd_stats(repo, argc, argv);
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);
     else if (strcmp(cmd, "reindex")    == 0) ret = cmd_reindex(repo, argc, argv);
