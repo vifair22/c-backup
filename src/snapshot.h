@@ -18,13 +18,14 @@
  */
 typedef struct {
     uint32_t    snap_id;
-    uint32_t    version;       /* on-disk format version (V3/V4/V5) */
+    uint32_t    version;       /* on-disk format version (3/4/5/6) */
     uint64_t    created_sec;   /* wall-clock time when snapshot was written */
     uint64_t    phys_new_bytes; /* deduped physical bytes first introduced by this snapshot */
     uint32_t    node_count;
     uint32_t    dirent_count;
     uint32_t    gfs_flags;     /* bitmask of GFS_* tier membership */
     uint32_t    snap_flags;    /* bitmask of SNAP_FLAG_* */
+    uint64_t    logical_bytes; /* precomputed sum of node.size for regular files (V6+; 0 for older) */
     node_t     *nodes;
     /* dirents are variable-size; stored as raw bytes */
     uint8_t    *dirent_data;
@@ -131,3 +132,30 @@ typedef struct {
 
 status_t snapshot_list_all(repo_t *repo, snap_list_t **out);
 void     snap_list_free(snap_list_t *l);
+
+/* ---------- snapshot path index (.pidx) ----------
+ *
+ * Companion file alongside each .snap that maps FNV-1a path hashes
+ * to node indices for O(log N) path lookup without building a full pathmap.
+ */
+
+/*
+ * Write a .pidx file for the given snapshot. The snapshot must be
+ * fully loaded (nodes + dirent_data). Called during snapshot_write.
+ */
+status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap);
+
+/*
+ * Look up a repo-relative path in the .pidx file.
+ * On success, copies the matching node into *out_node and returns OK.
+ * Returns ERR_NOT_FOUND if the path is not in the index.
+ * Falls back gracefully if .pidx is missing or corrupt.
+ */
+status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
+                          const char *path, node_t *out_node);
+
+/*
+ * Rebuild .pidx files for all snapshots that don't have one.
+ * Returns the number of files rebuilt in *out_rebuilt (may be NULL).
+ */
+status_t snap_pidx_rebuild_all(repo_t *repo, uint32_t *out_rebuilt);

@@ -15,10 +15,11 @@
 #include <lz4.h>
 
 #define SNAP_MAGIC          0x43424B50u  /* "CBKP" */
-#define SNAP_VERSION_V3     3u
-#define SNAP_VERSION_V4     4u
-#define SNAP_VERSION_V5     5u
-#define SNAP_VERSION        SNAP_VERSION_V5  /* current write version */
+#define SNAP_VERSION_3      3u
+#define SNAP_VERSION_4      4u
+#define SNAP_VERSION_5      5u
+#define SNAP_VERSION_6      6u
+#define SNAP_VERSION        SNAP_VERSION_6  /* current write version */
 
 /* Compress payload when LZ4 ratio is below this threshold (saves >10%) */
 #define SNAP_COMPRESS_RATIO 0.90
@@ -66,8 +67,8 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
         return set_error(ERR_CORRUPT, "snapshot %u: truncated header", snap_id);
     }
     if (magic != SNAP_MAGIC ||
-        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
-         version != SNAP_VERSION_V5)) {
+        (version != SNAP_VERSION_3 && version != SNAP_VERSION_4 &&
+         version != SNAP_VERSION_5 && version != SNAP_VERSION_6)) {
         close(fd);
         return set_error(ERR_CORRUPT, "snapshot %u: invalid magic/version", snap_id);
     }
@@ -91,11 +92,16 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
 #undef RD32
 #undef RD64
 
-    /* v4 appends compressed_payload_len (8 bytes) to the base 52-byte header.
-     * 0 = payload stored uncompressed; >0 = LZ4-compressed payload size. */
+    /* v4+ appends compressed_payload_len (8 bytes) to the base 52-byte header.
+     * 0 = payload stored uncompressed; >0 = LZ4-compressed payload size.
+     * v6+ appends logical_bytes (8 bytes) after compressed_payload_len. */
     uint64_t compressed_payload_len = 0;
-    if (version >= SNAP_VERSION_V4) {
+    uint64_t logical_bytes = 0;
+    if (version >= SNAP_VERSION_4) {
         if (read(fd, &compressed_payload_len, 8) != 8) { close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated compressed_payload_len", snap_id); }
+    }
+    if (version >= SNAP_VERSION_6) {
+        if (read(fd, &logical_bytes, 8) != 8) { close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated logical_bytes", snap_id); }
     }
 
     /* Sanity-check counts from untrusted file header */
@@ -110,13 +116,14 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
     }
 
     uint64_t uncompressed_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
-    uint64_t hdr_sz          = (version == SNAP_VERSION_V3) ? 52u : 60u;
+    uint64_t hdr_sz          = (version == SNAP_VERSION_3) ? 52u
+                               : (version >= SNAP_VERSION_6) ? 68u : 60u;
     uint64_t stored_sz       = (compressed_payload_len > 0)
                                ? compressed_payload_len : uncompressed_sz;
 
     /* V5: file = header + payload + parity trailer. Read trailer_size from footer. */
     uint64_t trailer_sz = 0;
-    if (version == SNAP_VERSION_V5) {
+    if (version >= SNAP_VERSION_5) {
         parity_footer_t pftr;
         off_t fend = (off_t)sb.st_size;
         if (fend >= (off_t)sizeof(pftr) &&
@@ -131,12 +138,10 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
         close(fd); return set_error(ERR_CORRUPT, "snapshot %u: file size mismatch", snap_id);
     }
 
-    /* V5 header parity repair: reconstruct the full 60-byte header struct
-     * and check/repair via the stored parity record. */
-    if (version == SNAP_VERSION_V5 && trailer_sz > 0) {
+    /* Header parity repair (V5+): reconstruct the header and check/repair
+     * via the stored parity record. V5 = 60 bytes, V6+ = 68 bytes. */
+    if (version >= SNAP_VERSION_5 && trailer_sz > 0) {
         off_t tstart = (off_t)sb.st_size - (off_t)trailer_sz;
-        /* Build the full header in memory for parity check.
-         * The header was read field-by-field; reassemble it. */
         snap_file_header_t fhdr_check = {
             .magic           = magic,
             .version         = version,
@@ -149,20 +154,23 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
             .gfs_flags       = gfs_flags,
             .snap_flags      = snap_flags,
         };
-        /* Parity covers the 60-byte header (52-byte struct + 8-byte compressed_payload_len). */
-        uint8_t hdr_buf[60];
+        size_t hdr_parity_sz = (version >= SNAP_VERSION_6) ? 68u : 60u;
+        uint8_t hdr_buf[68];
         memcpy(hdr_buf, &fhdr_check, sizeof(fhdr_check));
         memcpy(hdr_buf + sizeof(fhdr_check), &compressed_payload_len, 8);
+        if (version >= SNAP_VERSION_6)
+            memcpy(hdr_buf + sizeof(fhdr_check) + 8, &logical_bytes, 8);
 
         parity_record_t hdr_par;
         if (pread(fd, &hdr_par, sizeof(hdr_par), tstart) == (ssize_t)sizeof(hdr_par)) {
-            int hrc = parity_record_check(hdr_buf, 60, &hdr_par);
+            int hrc = parity_record_check(hdr_buf, hdr_parity_sz, &hdr_par);
             if (hrc == 1) {
                 log_msg("WARN", "snapshot: repaired corrupt header via parity");
                 parity_stats_add_repaired(1);
-                /* Re-extract fields from repaired header. */
                 memcpy(&fhdr_check, hdr_buf, sizeof(fhdr_check));
                 memcpy(&compressed_payload_len, hdr_buf + sizeof(fhdr_check), 8);
+                if (version >= SNAP_VERSION_6)
+                    memcpy(&logical_bytes, hdr_buf + sizeof(fhdr_check) + 8, 8);
                 magic        = fhdr_check.magic;
                 version      = fhdr_check.version;
                 snap_id_f    = fhdr_check.snap_id;
@@ -173,7 +181,6 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
                 dirent_data_len = fhdr_check.dirent_data_len;
                 gfs_flags    = fhdr_check.gfs_flags;
                 snap_flags   = fhdr_check.snap_flags;
-                /* Recompute derived values. */
                 uncompressed_sz = (uint64_t)node_count * sizeof(node_t) + dirent_data_len;
                 stored_sz = (compressed_payload_len > 0)
                             ? compressed_payload_len : uncompressed_sz;
@@ -195,6 +202,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
     snap->dirent_data_len = (size_t)dirent_data_len;
     snap->gfs_flags       = gfs_flags;
     snap->snap_flags      = snap_flags;
+    snap->logical_bytes   = logical_bytes;
 
     if (compressed_payload_len > 0) {
         /* v4/v5 compressed: read compressed blob, decompress into nodes+dirent_data */
@@ -210,7 +218,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
         }
 
         /* V5: check/repair compressed payload via CRC + RS parity. */
-        if (version == SNAP_VERSION_V5 && trailer_sz > 0) {
+        if (version >= SNAP_VERSION_5 && trailer_sz > 0) {
             off_t tstart = (off_t)sb.st_size - (off_t)trailer_sz;
             off_t crc_off = (off_t)sb.st_size - (off_t)sizeof(parity_footer_t)
                             - (off_t)sizeof(uint32_t) - (off_t)sizeof(uint32_t);
@@ -324,8 +332,8 @@ status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **
         return set_error(ERR_CORRUPT, "snapshot %u: truncated header", snap_id);
     }
     if (magic != SNAP_MAGIC ||
-        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
-         version != SNAP_VERSION_V5)) {
+        (version != SNAP_VERSION_3 && version != SNAP_VERSION_4 &&
+         version != SNAP_VERSION_5 && version != SNAP_VERSION_6)) {
         close(fd);
         return set_error(ERR_CORRUPT, "snapshot %u: invalid magic/version", snap_id);
     }
@@ -343,6 +351,15 @@ status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **
         close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated header counts", snap_id);
     }
     if (RD32(snap_flags)) { close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated snap_flags", snap_id); }
+
+    /* V6+: skip compressed_payload_len (8 bytes), read logical_bytes (8 bytes) */
+    uint64_t logical_bytes = 0;
+    if (version >= SNAP_VERSION_6) {
+        uint64_t skip_cpl;
+        if (RD64(skip_cpl) || RD64(logical_bytes)) {
+            close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated v6 header", snap_id);
+        }
+    }
 #undef RD32
 #undef RD64
 
@@ -357,6 +374,7 @@ status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **
     snap->node_count      = node_count;
     snap->dirent_count    = dirent_count;
     snap->dirent_data_len = (size_t)dirent_data_len;
+    snap->logical_bytes   = logical_bytes;
     snap->gfs_flags       = gfs_flags;
     snap->snap_flags      = snap_flags;
 
@@ -400,9 +418,16 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         }
     }
 
+    /* Precompute logical_bytes: sum of node.size for regular files */
+    uint64_t logical_bytes = 0;
+    for (uint32_t i = 0; i < snap->node_count; i++) {
+        if (snap->nodes[i].type == NODE_TYPE_REG)
+            logical_bytes += snap->nodes[i].size;
+    }
+
     snap_file_header_t fhdr = {
         .magic           = SNAP_MAGIC,
-        .version         = SNAP_VERSION_V5,
+        .version         = SNAP_VERSION,
         .snap_id         = snap->snap_id,
         .created_sec     = snap->created_sec,
         .phys_new_bytes  = snap->phys_new_bytes,
@@ -414,9 +439,10 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     };
 
     status_t st = OK;
-    /* Write 52-byte base header + 8-byte compressed_payload_len = 60-byte v5 header */
+    /* Write 52-byte base header + 8-byte compressed_payload_len + 8-byte logical_bytes = 68-byte v6 header */
     if (write(fd, &fhdr, sizeof(fhdr)) != sizeof(fhdr)) { st = ERR_IO; goto fail; }
     if (write(fd, &compressed_payload_len, 8) != 8) { st = ERR_IO; goto fail; }
+    if (write(fd, &logical_bytes, 8) != 8) { st = ERR_IO; goto fail; }
 
     /* Determine the stored payload pointer and size for parity computation. */
     const void *stored_payload;
@@ -437,15 +463,16 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         stored_payload_sz = 0;
     }
 
-    /* ---- Parity trailer (V5) ---- */
+    /* ---- Parity trailer ---- */
     {
-        /* Header parity: covers the full 60-byte header. */
-        uint8_t hdr_buf[60];
+        /* Header parity: covers the full 68-byte V6 header. */
+        uint8_t hdr_buf[68];
         memcpy(hdr_buf, &fhdr, sizeof(fhdr));
         memcpy(hdr_buf + sizeof(fhdr), &compressed_payload_len, 8);
+        memcpy(hdr_buf + sizeof(fhdr) + 8, &logical_bytes, 8);
 
         parity_record_t snap_hdr_par;
-        parity_record_compute(hdr_buf, 60, &snap_hdr_par);
+        parity_record_compute(hdr_buf, 68, &snap_hdr_par);
         if (write(fd, &snap_hdr_par, sizeof(snap_hdr_par)) != (ssize_t)sizeof(snap_hdr_par)) {
             st = ERR_IO; goto fail;
         }
@@ -503,6 +530,10 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
+
+    /* Build path index (best-effort — failure doesn't affect the snapshot) */
+    snap_pidx_write(repo, snap);
+
     return OK;
 fail:
     if (fd >= 0) { close(fd); unlink(tmppath); }
@@ -544,8 +575,8 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
         close(fd); return set_error(ERR_CORRUPT, "snapshot %u: truncated header in gfs read", snap_id);
     }
     if (magic != SNAP_MAGIC ||
-        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
-         version != SNAP_VERSION_V5)) {
+        (version != SNAP_VERSION_3 && version != SNAP_VERSION_4 &&
+         version != SNAP_VERSION_5 && version != SNAP_VERSION_6)) {
         close(fd);
         return set_error(ERR_CORRUPT, "snapshot %u: invalid magic/version in gfs read", snap_id);
     }
@@ -579,8 +610,8 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
     uint32_t magic = 0, version = 0;
     if (pread(fd, &magic, 4, 0) != 4 || pread(fd, &version, 4, 4) != 4 ||
         magic != SNAP_MAGIC ||
-        (version != SNAP_VERSION_V3 && version != SNAP_VERSION_V4 &&
-         version != SNAP_VERSION_V5)) {
+        (version != SNAP_VERSION_3 && version != SNAP_VERSION_4 &&
+         version != SNAP_VERSION_5 && version != SNAP_VERSION_6)) {
         close(fd);
         return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: bad magic/version snap %u", snap_id);
     }
@@ -600,10 +631,8 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
         return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite gfs_flags snap %u", snap_id);
     }
 
-    /* V5: recompute header parity record (covers the 60-byte header).
-     * The header parity lives at the START of the parity trailer, not at
-     * offset 60 (that's the payload).  Locate the trailer via the footer. */
-    if (version == SNAP_VERSION_V5) {
+    /* V5+: recompute header parity record. V5 = 60 bytes, V6+ = 68 bytes. */
+    if (version >= SNAP_VERSION_5) {
         struct stat sb;
         if (fstat(fd, &sb) != 0) {
             close(fd);
@@ -615,20 +644,20 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
             pread(fd, &pftr, sizeof(pftr), fend - (off_t)sizeof(pftr))
                 != (ssize_t)sizeof(pftr) ||
             pftr.magic != PARITY_FOOTER_MAGIC) {
-            /* No valid parity footer — nothing to update. */
             fdatasync(fd);
             close(fd);
             return OK;
         }
         off_t tstart = fend - (off_t)pftr.trailer_size;
 
-        uint8_t hdr_buf[60];
-        if (pread(fd, hdr_buf, 60, 0) != 60) {
+        size_t hdr_sz = (version >= SNAP_VERSION_6) ? 68u : 60u;
+        uint8_t hdr_buf[68];
+        if (pread(fd, hdr_buf, hdr_sz, 0) != (ssize_t)hdr_sz) {
             close(fd);
             return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: cannot re-read header snap %u", snap_id);
         }
         parity_record_t hdr_par;
-        parity_record_compute(hdr_buf, 60, &hdr_par);
+        parity_record_compute(hdr_buf, hdr_sz, &hdr_par);
         if (pwrite(fd, &hdr_par, sizeof(hdr_par), tstart) != (ssize_t)sizeof(hdr_par)) {
             close(fd);
             return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite parity snap %u", snap_id);
@@ -1004,7 +1033,7 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
     /* Read and validate header fields */
     uint32_t magic = 0, version = 0;
     if (read(fd, &magic, 4) != 4 || read(fd, &version, 4) != 4) { close(fd); return -1; }
-    if (magic != SNAP_MAGIC || version != SNAP_VERSION_V5) { close(fd); return 0; }
+    if (magic != SNAP_MAGIC || (version != SNAP_VERSION_5 && version != SNAP_VERSION_6)) { close(fd); return 0; }
 
     uint32_t snap_id_f, node_count, dirent_count, gfs_flags, snap_flags;
     uint64_t created_sec, phys_new_bytes, dirent_data_len;
@@ -1020,6 +1049,10 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
     }
     uint64_t compressed_payload_len = 0;
     if (read(fd, &compressed_payload_len, 8) != 8) { close(fd); return -1; }
+    uint64_t logical_bytes = 0;
+    if (version >= SNAP_VERSION_6) {
+        if (read(fd, &logical_bytes, 8) != 8) { close(fd); return -1; }
+    }
 
     /* Read parity footer */
     parity_footer_t pftr;
@@ -1032,7 +1065,7 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
     off_t tstart = fend - (off_t)pftr.trailer_size;
     int total_fixed = 0;
 
-    /* Header: reconstruct the 60-byte blob and repair */
+    /* Header: reconstruct and repair. V5 = 60 bytes, V6+ = 68 bytes. */
     snap_file_header_t fhdr = {
         .magic = magic, .version = version, .snap_id = snap_id_f,
         .created_sec = created_sec, .phys_new_bytes = phys_new_bytes,
@@ -1040,17 +1073,20 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
         .dirent_data_len = dirent_data_len, .gfs_flags = gfs_flags,
         .snap_flags = snap_flags,
     };
-    uint8_t hdr_buf[60];
+    size_t hdr_parity_sz = (version >= SNAP_VERSION_6) ? 68u : 60u;
+    uint8_t hdr_buf[68];
     memcpy(hdr_buf, &fhdr, sizeof(fhdr));
     memcpy(hdr_buf + sizeof(fhdr), &compressed_payload_len, 8);
+    if (version >= SNAP_VERSION_6)
+        memcpy(hdr_buf + sizeof(fhdr) + 8, &logical_bytes, 8);
 
     parity_record_t hdr_par;
     if (pread(fd, &hdr_par, sizeof(hdr_par), tstart) == (ssize_t)sizeof(hdr_par)) {
-        uint8_t hdr_copy[60];
-        memcpy(hdr_copy, hdr_buf, 60);
-        int hrc = parity_record_check(hdr_copy, 60, &hdr_par);
+        uint8_t hdr_copy[68];
+        memcpy(hdr_copy, hdr_buf, hdr_parity_sz);
+        int hrc = parity_record_check(hdr_copy, hdr_parity_sz, &hdr_par);
         if (hrc == 1) {
-            if (pwrite(fd, hdr_copy, 60, 0) == 60)
+            if (pwrite(fd, hdr_copy, (size_t)hdr_parity_sz, 0) == (ssize_t)hdr_parity_sz)
                 total_fixed++;
         }
     }
@@ -1065,7 +1101,7 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
         if (pread(fd, &stored_crc, 4, crc_off) == 4) {
             char *payload = malloc((size_t)stored_sz);
             if (payload) {
-                if (pread(fd, payload, (size_t)stored_sz, 60) == (ssize_t)stored_sz) {
+                if (pread(fd, payload, (size_t)stored_sz, (off_t)hdr_parity_sz) == (ssize_t)stored_sz) {
                     uint32_t cur = crc32c(payload, (size_t)stored_sz);
                     if (cur != stored_crc) {
                         size_t rs_sz = rs_parity_size((size_t)stored_sz);
@@ -1077,7 +1113,7 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
                                     rs_init();
                                     int rrc = rs_parity_decode(payload, (size_t)stored_sz, rs_par);
                                     if (rrc > 0) {
-                                        if (pwrite(fd, payload, (size_t)stored_sz, 60)
+                                        if (pwrite(fd, payload, (size_t)stored_sz, (off_t)hdr_parity_sz)
                                             == (ssize_t)stored_sz)
                                             total_fixed += rrc;
                                     }
@@ -1115,9 +1151,22 @@ status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
     uint32_t count = 0;
     for (uint32_t id = 1; id <= head; id++) {
         snapshot_t *snap = NULL;
-        if (snapshot_load_nodes_only(repo, id, &snap) != OK) {
+
+        /* V6+: logical_bytes is in the header — no decompression needed.
+         * Older versions: fall back to loading nodes and computing it. */
+        if (snapshot_load_header_only(repo, id, &snap) != OK) {
             err_clear();
             continue;
+        }
+
+        int need_nodes = (snap->version < SNAP_VERSION_6);
+        if (need_nodes) {
+            snapshot_free(snap);
+            snap = NULL;
+            if (snapshot_load_nodes_only(repo, id, &snap) != OK) {
+                err_clear();
+                continue;
+            }
         }
 
         if (count >= cap) {
@@ -1137,12 +1186,16 @@ status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
         si->gfs_flags     = snap->gfs_flags;
         si->snap_flags    = snap->snap_flags;
 
-        uint64_t logical = 0;
-        for (uint32_t i = 0; i < snap->node_count; i++) {
-            if (snap->nodes[i].type == NODE_TYPE_REG)
-                logical += snap->nodes[i].size;
+        if (need_nodes) {
+            uint64_t logical = 0;
+            for (uint32_t i = 0; i < snap->node_count; i++) {
+                if (snap->nodes[i].type == NODE_TYPE_REG)
+                    logical += snap->nodes[i].size;
+            }
+            si->logical_bytes = logical;
+        } else {
+            si->logical_bytes = snap->logical_bytes;
         }
-        si->logical_bytes = logical;
 
         snapshot_free(snap);
     }
@@ -1161,4 +1214,267 @@ void snap_list_free(snap_list_t *l)
     if (!l) return;
     free(l->snaps);
     free(l);
+}
+
+/* ------------------------------------------------------------------ */
+/* Snapshot path index (.pidx)                                        */
+/* ------------------------------------------------------------------ */
+
+#define PIDX_MAGIC   0x53504458u  /* "SPDX" */
+#define PIDX_VERSION 1u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t entry_count;
+    uint32_t reserved;
+} pidx_hdr_t;  /* 16 bytes */
+
+typedef struct __attribute__((packed)) {
+    uint64_t path_hash;      /* FNV-1a of full repo-relative path */
+    uint32_t node_index;     /* index into snapshot's node_t array */
+    uint32_t reserved;
+} pidx_entry_t;  /* 16 bytes */
+
+static int pidx_path(repo_t *repo, uint32_t snap_id, char *buf, size_t bufsz) {
+    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.pidx", repo_path(repo), snap_id);
+    return (n >= 0 && (size_t)n < bufsz) ? 0 : -1;
+}
+
+static int pidx_entry_cmp(const void *a, const void *b) {
+    const pidx_entry_t *ea = a, *eb = b;
+    if (ea->path_hash < eb->path_hash) return -1;
+    if (ea->path_hash > eb->path_hash) return  1;
+    return 0;
+}
+
+status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap) {
+    if (!snap->dirent_data || snap->dirent_count == 0) return OK;
+
+    /* Parse dirents and reconstruct full paths — same logic as pathmap_build
+     * but we only need (hash, node_index) pairs, not the full pathmap. */
+    dr_flat_t *flat = calloc(snap->dirent_count, sizeof(dr_flat_t));
+    if (!flat && snap->dirent_count > 0)
+        return set_error(ERR_NOMEM, "snap_pidx_write: flat alloc failed");
+
+    id_map_t flat_idx = {0}, node_idx = {0};
+    if (id_map_init(&flat_idx, snap->dirent_count * 2u + 16u) != 0 ||
+        id_map_init(&node_idx, snap->node_count * 2u + 16u) != 0) {
+        id_map_free(&flat_idx); id_map_free(&node_idx); free(flat);
+        return set_error(ERR_NOMEM, "snap_pidx_write: id_map alloc failed");
+    }
+
+    /* Build node_id → index map (index into snap->nodes[]) */
+    for (uint32_t i = 0; i < snap->node_count; i++)
+        id_map_put_if_absent(&node_idx, snap->nodes[i].node_id, (uintptr_t)i);
+
+    /* Parse dirent blob */
+    size_t n_flat = 0;
+    const uint8_t *p = snap->dirent_data;
+    const uint8_t *end = p + snap->dirent_data_len;
+    while (p < end && n_flat < snap->dirent_count) {
+        if (p + sizeof(dirent_rec_t) > end) break;
+        dirent_rec_t dr;
+        memcpy(&dr, p, sizeof(dr));
+        p += sizeof(dr);
+        if (p + dr.name_len > end) break;
+
+        char *name = malloc(dr.name_len + 1);
+        if (!name) goto oom;
+        memcpy(name, p, dr.name_len);
+        name[dr.name_len] = '\0';
+        p += dr.name_len;
+
+        flat[n_flat].parent_node_id = dr.parent_node;
+        flat[n_flat].node_id        = dr.node_id;
+        flat[n_flat].name           = name;
+        flat[n_flat].full_path      = NULL;
+        id_map_put_if_absent(&flat_idx, dr.node_id, (uintptr_t)&flat[n_flat]);
+        n_flat++;
+    }
+
+    /* Reconstruct paths and build pidx entries */
+    pidx_entry_t *entries = malloc(n_flat * sizeof(pidx_entry_t));
+    if (!entries && n_flat > 0) goto oom;
+    uint32_t n_entries = 0;
+
+    for (size_t i = 0; i < n_flat; i++) {
+        char *fp = build_full_path(&flat_idx, &flat[i]);
+        if (!fp) goto oom;
+
+        uintptr_t ni = id_map_get(&node_idx, flat[i].node_id);
+        /* node_idx stores index as value (0 is valid); check node exists */
+        int found = 0;
+        if (flat[i].node_id != 0) {
+            for (uint32_t j = 0; j < snap->node_count; j++) {
+                if (snap->nodes[j].node_id == flat[i].node_id) { ni = j; found = 1; break; }
+            }
+        }
+        /* Use id_map for O(1) — the map stores index directly */
+        {
+            size_t mask = node_idx.capacity - 1;
+            size_t h = (size_t)(id_hash_u64(flat[i].node_id) & (uint64_t)mask);
+            found = 0;
+            while (node_idx.slots[h].key != 0) {
+                if (node_idx.slots[h].key == flat[i].node_id) {
+                    ni = node_idx.slots[h].val;
+                    found = 1;
+                    break;
+                }
+                h = (h + 1) & mask;
+            }
+        }
+        if (!found) continue;
+
+        entries[n_entries].path_hash  = pm_fnv1a(fp);
+        entries[n_entries].node_index = (uint32_t)ni;
+        entries[n_entries].reserved   = 0;
+        n_entries++;
+    }
+
+    /* Sort by path_hash for binary search */
+    if (n_entries > 1)
+        qsort(entries, n_entries, sizeof(pidx_entry_t), pidx_entry_cmp);
+
+    /* Write to file atomically */
+    char tmppath[PATH_MAX];
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/pidx.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) goto oom;
+    int fd = mkstemp(tmppath);
+    status_t st = OK;
+    if (fd == -1) { free(entries); goto cleanup; }
+
+    pidx_hdr_t hdr = {
+        .magic       = PIDX_MAGIC,
+        .version     = PIDX_VERSION,
+        .entry_count = n_entries,
+        .reserved    = 0,
+    };
+    if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) { st = ERR_IO; goto wfail; }
+    if (n_entries > 0 &&
+        write(fd, entries, n_entries * sizeof(pidx_entry_t))
+            != (ssize_t)(n_entries * sizeof(pidx_entry_t))) { st = ERR_IO; goto wfail; }
+
+    /* CRC over header + entries */
+    {
+        uint32_t crc = crc32c(&hdr, sizeof(hdr));
+        if (n_entries > 0)
+            crc = crc32c_update(crc, entries, n_entries * sizeof(pidx_entry_t));
+        if (write(fd, &crc, sizeof(crc)) != sizeof(crc)) { st = ERR_IO; goto wfail; }
+    }
+
+    /* Parity footer */
+    {
+        parity_footer_t pftr = {
+            .magic = PARITY_FOOTER_MAGIC,
+            .version = PARITY_VERSION,
+            .trailer_size = (uint32_t)(sizeof(uint32_t) + sizeof(parity_footer_t)),
+        };
+        if (write(fd, &pftr, sizeof(pftr)) != sizeof(pftr)) { st = ERR_IO; goto wfail; }
+    }
+
+    if (fdatasync(fd) == -1) { st = ERR_IO; goto wfail; }
+    close(fd); fd = -1;
+    free(entries); entries = NULL;
+
+    char dstpath[PATH_MAX];
+    if (pidx_path(repo, snap->snap_id, dstpath, sizeof(dstpath)) != 0) { st = ERR_IO; goto cleanup; }
+    if (rename(tmppath, dstpath) == -1) { unlink(tmppath); st = ERR_IO; goto cleanup; }
+
+    goto cleanup;
+
+wfail:
+    if (fd >= 0) { close(fd); unlink(tmppath); }
+    free(entries);
+cleanup:
+    for (size_t i = 0; i < n_flat; i++) {
+        free(flat[i].name);
+        free(flat[i].full_path);
+    }
+    id_map_free(&flat_idx);
+    id_map_free(&node_idx);
+    free(flat);
+    return st;
+
+oom:
+    st = ERR_NOMEM;
+    goto cleanup;
+}
+
+status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
+                          const char *path, node_t *out_node) {
+    char idx_path[PATH_MAX];
+    if (pidx_path(repo, snap_id, idx_path, sizeof(idx_path)) != 0)
+        return ERR_NOT_FOUND;
+
+    int fd = open(idx_path, O_RDONLY);
+    if (fd == -1) return ERR_NOT_FOUND;
+
+    pidx_hdr_t hdr;
+    if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr) ||
+        hdr.magic != PIDX_MAGIC || hdr.version != PIDX_VERSION ||
+        hdr.entry_count == 0) {
+        close(fd);
+        return ERR_NOT_FOUND;
+    }
+
+    size_t data_sz = (size_t)hdr.entry_count * sizeof(pidx_entry_t);
+    pidx_entry_t *entries = malloc(data_sz);
+    if (!entries) { close(fd); return ERR_NOMEM; }
+    if (read(fd, entries, data_sz) != (ssize_t)data_sz) {
+        free(entries); close(fd); return ERR_NOT_FOUND;
+    }
+    close(fd);
+
+    /* Binary search for the path hash */
+    uint64_t target_hash = pm_fnv1a(path);
+    pidx_entry_t key = { .path_hash = target_hash };
+    pidx_entry_t *found = bsearch(&key, entries, hdr.entry_count,
+                                   sizeof(pidx_entry_t), pidx_entry_cmp);
+    if (!found) { free(entries); return ERR_NOT_FOUND; }
+
+    uint32_t node_index = found->node_index;
+    free(entries);
+
+    /* Load snapshot nodes-only to extract the target node */
+    snapshot_t *snap = NULL;
+    status_t st = snapshot_load_nodes_only(repo, snap_id, &snap);
+    if (st != OK) return st;
+
+    if (node_index >= snap->node_count) {
+        snapshot_free(snap);
+        return ERR_CORRUPT;
+    }
+
+    *out_node = snap->nodes[node_index];
+    snapshot_free(snap);
+    return OK;
+}
+
+status_t snap_pidx_rebuild_all(repo_t *repo, uint32_t *out_rebuilt) {
+    uint32_t head = 0;
+    snapshot_read_head(repo, &head);
+    uint32_t rebuilt = 0;
+
+    for (uint32_t id = 1; id <= head; id++) {
+        char path[PATH_MAX];
+        if (pidx_path(repo, id, path, sizeof(path)) != 0) continue;
+
+        /* Skip if .pidx already exists */
+        if (access(path, F_OK) == 0) continue;
+
+        /* Skip if .snap doesn't exist */
+        snapshot_t *snap = NULL;
+        if (snapshot_load(repo, id, &snap) != OK) {
+            err_clear();
+            continue;
+        }
+
+        if (snap_pidx_write(repo, snap) == OK)
+            rebuilt++;
+        snapshot_free(snap);
+    }
+
+    if (out_rebuilt) *out_rebuilt = rebuilt;
+    return OK;
 }

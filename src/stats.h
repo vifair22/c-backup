@@ -19,3 +19,7 @@ typedef struct {
 
 status_t repo_stats(repo_t *repo, repo_stat_t *out);
 void     repo_stats_print(const repo_stat_t *s);
+
+/* Rebuild the stats cache file (<repo>/stats.cache).
+ * Call after any operation that changes the object or pack set. */
+status_t stats_cache_rebuild(repo_t *repo);

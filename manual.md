@@ -4,6 +4,7 @@
 
 | Date | Notes |
 |------|-------|
+| 2026-04-06 | Snapshot V6 (`logical_bytes` in header), stats cache, snapshot path index (`.pidx`), `reindex-snaps` command, version system (`release_version`, `--version`, `last_accessed`/`last_written`), `--help`/`-h`, debug build target, parallel make, removed `doctor` command, viewer Help > About dialog, diagrams, manual reorder and RFC-style format diagrams, RPC reference (`rpc.md`) |
 | 2026-04-05 | Streaming RS parity (bounded-RAM `rs_parity_stream_t`), FUSE readahead ring (4×4 MiB), unified pack workers (per-thread packs), bounded-RAM GC copy, transient-error retry queue with multi-round retry, O_NOATIME, rotational disk detection, `migrate-v4` command, JSON RPC session mode |
 | 2026-04-02 | HDD I/O optimizations: global pack index, pack sharding, dynamic DAT cache, async writeback, inode-sorted scan, pack-worker hash sort, pack-ordered restore/verify, parity read consolidation, `reindex` and `migrate-packs` commands |
 | 2026-03-26 | Build/bench section, verify --deep removal, GFS Tree viewer tab, post-backup runbook accuracy |
@@ -36,8 +37,9 @@
    - 4.17 `policy`
    - 4.18 `gfs`
    - 4.19 `reindex`
-   - 4.20 `migrate-packs`
-   - 4.21 `migrate-v4`
+   - 4.20 `reindex-snaps`
+   - 4.21 `migrate-packs`
+   - 4.22 `migrate-v4`
 5. [policy.toml Reference](#5-policytoml-reference)
 6. [Common Configurations](#6-common-configurations)
    - 6.1 Laptop / Workstation
@@ -112,6 +114,7 @@
     - 21.6 Tag files
     - 21.7 Policy file (`policy.toml`)
     - 21.8 Administrative files
+    - 21.9 Snapshot path index (`.pidx`)
 22. [Object Lookup Algorithms](#22-object-lookup-algorithms)
 23. [JSON RPC API](#23-json-rpc-api)
     - 23.1 Modes of operation
@@ -181,6 +184,7 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 ├── prune-pending             # (transient) Crash-safety file for interrupted prunes
 ├── last_accessed             # Build version string; mtime = last repo open
 ├── last_written              # Build version string; mtime = last write operation
+├── stats.cache               # Cached aggregate stats (rebuilt after gc/pack/coalesce)
 │
 ├── refs/
 │   └── HEAD                  # ASCII decimal snapshot ID of the latest snapshot
@@ -189,7 +193,8 @@ History is stored as **snapshot manifests** (`.snap` files) that reference immut
 │   └── <name>                # One file per tag; contains "snapshot = N\npreserve = true|false"
 │
 ├── snapshots/
-│   ├── 00000001.snap
+│   ├── 00000001.snap         # Snapshot manifest
+│   ├── 00000001.pidx         # Path index (FNV-1a hash → node index)
 │   ├── 00000002.snap
 │   └── ...
 │
@@ -475,7 +480,7 @@ Verifies repository integrity. Without `--repair`, acquires a shared lock. With 
 
 Calls `repo_verify`, which loads every surviving snapshot and collects all unique content, xattr, and ACL hashes across all nodes, deduplicating so each object is verified exactly once regardless of how many snapshots reference it. The unique hashes are resolved to pack locations and sorted by `(pack_num, dat_offset)` so that verification sweeps each pack file sequentially. Each object is loaded, decompressed, and its SHA-256 hash is compared to the stored hash.
 
-If parity data is present (format version 2 objects, version 3 packs, version 5 snapshots), corruption is automatically detected via CRC-32C and corrected in memory via XOR or Reed-Solomon parity. The object is then verified against its SHA-256 hash as usual.
+If parity data is present (format version 2 objects, version 3+ packs, version 5+ snapshots), corruption is automatically detected via CRC-32C and corrected in memory via XOR or Reed-Solomon parity. The object is then verified against its SHA-256 hash as usual.
 
 With `--repair`, any object that was corrected via parity during the verify pass is rewritten to disk using `pwrite()`, making the repair permanent. This covers loose objects, packed objects, and snapshots.
 
@@ -580,7 +585,15 @@ backup reindex --repo <path>
 
 Rebuilds the global pack index (`packs/pack-index.pidx`) from all per-pack `.idx` files. Acquires an exclusive lock. Use after manual pack manipulation, repository migration, or if the global index is suspected corrupt. The runtime already rebuilds the index automatically after `pack`, `gc`, and `coalesce`, so this command is primarily for repair and migration scenarios.
 
-### 4.20 `migrate-packs`
+### 4.20 `reindex-snaps`
+
+```
+backup reindex-snaps --repo <path>
+```
+
+Rebuilds snapshot path index (`.pidx`) files for all snapshots that don't already have one. Acquires a shared lock. Path indices are built automatically during `backup run`, so this command is only needed for snapshots created before path indexing was introduced. Reports the number of index files rebuilt. Running it on a repository where all snapshots already have indices is harmless (no files rebuilt).
+
+### 4.21 `migrate-packs`
 
 ```
 backup migrate-packs --repo <path>
@@ -588,7 +601,7 @@ backup migrate-packs --repo <path>
 
 Moves flat-layout pack files (`packs/pack-NNNNNNNN.{dat,idx}`) into sharded subdirectories (`packs/NNNN/pack-NNNNNNNN.{dat,idx}`). Acquires an exclusive lock. After moving all files, rebuilds the global pack index. New packs are always created in sharded directories; this command is only needed for repositories created before pack sharding was introduced. Running it on an already-sharded repository is harmless (no files to move).
 
-### 4.21 `migrate-v4`
+### 4.22 `migrate-v4`
 
 ```
 backup migrate-v4 --repo <path>
@@ -1816,15 +1829,15 @@ Object storage and pack operations use bounded-RAM streaming: loose object write
 
 Stored at `snapshots/XXXXXXXX.snap` where `XXXXXXXX` is the zero-padded decimal snapshot ID.
 
-Three header versions exist. Version 3 (legacy, read-only) has a 52-byte header with an uncompressed payload. Version 4 has a 60-byte header and an optionally LZ4-compressed payload. Version 5 (current) is identical to V4 but includes a parity trailer appended after the payload.
+Four header versions exist. Version 3 (legacy, read-only) has a 52-byte header with an uncompressed payload. Version 4 has a 60-byte header and an optionally LZ4-compressed payload. Version 5 is identical to V4 but includes a parity trailer. Version 6 (current) adds a precomputed `logical_bytes` field to the header (68 bytes).
 
-**v4/v5 file header** (60 bytes, little-endian):
+**v6 file header** (68 bytes, little-endian):
 
 ```
  Byte
  offset
   0   +---------------+---------------+---------------+
-      |  magic (CBKP) | version (4|5) |    snap_id    |
+      |  magic (CBKP) |  version (6)  |    snap_id    |
   12  +---------------+-------+-------+---------------+
       |          created_sec          |  phys_new_bytes
   20  +               +---------------+               +
@@ -1836,14 +1849,16 @@ Three header versions exist. Version 3 (legacy, read-only) has a 52-byte header 
   44  +---------------+---------------+---------------+
       |       compressed_payload_len                  |
   52  +               +-------------------------------+
+      |               |        logical_bytes
+  60  +---------------+                               +
       |               |
-  60  +---------------+
+  68  +---------------+
 ```
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `0x43424B50` ("CBKP") |
-| 4 | 4 | `version` | 4 or 5 (5 = with parity trailer) |
+| 4 | 4 | `version` | 3, 4, 5, or 6 (6 = current) |
 | 8 | 4 | `snap_id` | Decimal snapshot number |
 | 12 | 8 | `created_sec` | UTC Unix timestamp of backup completion |
 | 20 | 8 | `phys_new_bytes` | Deduped physical bytes first introduced by this snapshot |
@@ -1853,6 +1868,7 @@ Three header versions exist. Version 3 (legacy, read-only) has a 52-byte header 
 | 44 | 4 | `gfs_flags` | Bitmask: bit 0=daily, 1=weekly, 2=monthly, 3=yearly |
 | 48 | 4 | `snap_flags` | Reserved; currently 0 |
 | 52 | 8 | `compressed_payload_len` | 0 = uncompressed; >0 = LZ4 block size |
+| 60 | 8 | `logical_bytes` | Precomputed sum of `node.size` for regular files (V6+) |
 
 The payload immediately follows the header. When `compressed_payload_len > 0` the payload
 is a single LZ4 block; decompress it with the known uncompressed size of
@@ -2214,6 +2230,59 @@ Stored at `<repo>/policy.toml`. TOML format. All fields are optional; defaults a
 | `packs/.deleting-NNNNNNNN` | Deletion recovery marker written by `maybe_coalesce_packs` before removing old pack files. Contains pack numbers of packs to delete. Rescanned and completed by `pack_resume_deleting` on next call. |
 | `last_accessed` | Updated on every `repo_open`. Contains the build version string (e.g. `0.1.0_20260406.1944.release`). File mtime indicates when the repository was last opened by any command. |
 | `last_written` | Updated on every exclusive lock acquisition. Same format as `last_accessed`. File mtime indicates when the repository was last modified by a write operation. |
+| `stats.cache` | Cached aggregate statistics (snap/loose/pack counts and byte totals). 40-byte binary file with magic `BSTC`. Rebuilt after GC, pack, and coalesce operations. If missing or corrupt, `repo_stats` falls back to a full filesystem scan. |
+| `snapshots/XXXXXXXX.pidx` | Path index for a snapshot. Maps FNV-1a path hashes to node indices for O(log N) path lookup. Built automatically during `snapshot_write`. If missing or corrupt, commands fall back to building a full pathmap from dirent records. Rebuild with `backup reindex-snaps`. |
+
+### 21.9 Snapshot Path Index (`.pidx`)
+
+Companion file stored at `snapshots/XXXXXXXX.pidx` alongside each `.snap`. Provides O(log N) path lookup by FNV-1a hash, avoiding the need to build a full pathmap from dirent records.
+
+**Header** (16 bytes):
+
+```
+  0   +---------------+---------------+
+      |  magic (SPDX) |  version (1)  |
+  8   +---------------+---------------+
+      | entry_count   |   reserved    |
+  16  +---------------+---------------+
+```
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 | `magic` | `0x53504458` ("SPDX") |
+| 4 | 4 | `version` | 1 |
+| 8 | 4 | `entry_count` | Number of path entries |
+| 12 | 4 | `reserved` | 0 |
+
+**Entries** (`entry_count × 16 bytes`, sorted by `path_hash`):
+
+```
+  0   +-------------------------------+
+      |         path_hash             |
+  8   +---------------+---------------+
+      |  node_index   |   reserved    |
+  16  +---------------+---------------+
+```
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 8 | `path_hash` | FNV-1a hash of the full repo-relative path |
+| 8 | 4 | `node_index` | Index into the snapshot's `node_t` array |
+| 12 | 4 | `reserved` | 0 |
+
+**Trailer:**
+
+```
+      +-----------------------------------------------+
+      |  CRC-32C over header + entries (4 B)          |
+      +-----------------------------------------------+
+      |  parity_footer_t (12 B): PARI + ver + size    |
+      +-----------------------------------------------+
+```
+
+Lookup: compute `pm_fnv1a(path)`, binary search sorted entries, load the node at the matching `node_index`. On hash collision (multiple paths with same FNV-1a hash), the caller loads the snapshot to verify the exact path.
+
+If the `.pidx` file is missing, corrupt, or has a wrong magic/version, commands fall back to the existing `pathmap_build()` code path transparently.
 
 ---
 
@@ -2766,7 +2835,8 @@ This section summarises every on-disk file format, its version lineage, and what
 | 2 | 44 B | Added `created_sec` (8 B), `gfs_flags` (4 B), and `snap_flags` (4 B). Code support removed. |
 | 3 | 52 B | Added `phys_new_bytes` (8 B) for tracking per-snapshot deduped physical bytes. Earliest version still readable by current code. Read-only (never written). |
 | 4 | 60 B | Added `compressed_payload_len` (8 B at offset 52). Payload may be LZ4-compressed when ratio < 0.90. |
-| 5 | 60 B | Same header as V4. Appends a parity trailer (XOR + RS + CRC + parity footer) after the payload for error correction. Current write version. |
+| 5 | 60 B | Same header as V4. Appends a parity trailer (XOR + RS + CRC + parity footer) after the payload for error correction. |
+| 6 | 68 B | Added `logical_bytes` (8 B) — precomputed sum of regular file sizes. Enables `list` without decompressing snapshots. Parity covers the full 68-byte header. Current write version. |
 
 ### 26.3 Loose Object
 
@@ -2796,28 +2866,34 @@ The `.dat` and `.idx` files for a given pack always share the same version numbe
 | V3 | 44 B | Added `entry_index` (4 B) for O(1) parity trailer lookup in the .dat file. Added parity trailer (header CRC + XOR parity over entries + per-entry CRCs + parity footer). |
 | V4 | 62 B | Added `type` (1 B), `compression` (1 B), `uncompressed_size` (8 B), `compressed_size` (8 B) from the .dat entry header. Enables stats computation from the idx alone without seeking into the .dat. Migrated with `migrate-v4` command. Current write version. |
 
-### 26.6 Global Pack Index (`pack-index.bin`)
+### 26.5 Global Pack Index (`pack-index.bin`)
 
 | Version | Entry size | Notes |
 |---------|------------|-------|
 | 1 | 52 B | Only version. Merges all per-pack .idx files into a single mmap'd file with a 256-entry fanout table. Includes CRC-32C + RS parity trailer + parity footer. |
 
-### 26.7 Bundle File (`.cbb`)
+### 26.6 Bundle File (`.cbb`)
 
 | Version | Magic | Changes |
 |---------|-------|---------|
 | 1 | `CBB1` | Original format. Header (20 B) + records (57 B record header + path + payload). No per-record integrity. |
 | 2 | `CBB2` | Adds per-record parity trailers (XOR header parity + RS payload parity + CRC + lengths). V1 bundles are not readable by current code. Current write version. |
 
-### 26.8 Parity Footer
+### 26.7 Parity Footer
 
 | Version | Size | Notes |
 |---------|------|-------|
 | 1 | 12 B | Only version. Magic `PARI` (0x50415249) + version (4 B) + trailer_size (4 B). Present at the tail of all parity-protected files. |
 
+### 26.8 Snapshot Path Index (`.pidx`)
+
+| Version | Entry size | Notes |
+|---------|------------|-------|
+| 1 | 16 B | Only version. Magic `SPDX` (0x53504458). FNV-1a path hash (8 B) + node index (4 B) + reserved (4 B). Sorted by hash for binary search. CRC + parity footer appended. |
+
 ### 26.9 Compatibility
 
-All format readers accept every historical version listed above. Writers always produce the current (latest) version. The `migrate-v4` command upgrades pre-V4 pack .idx files in place. V1 loose objects and V3/V4 snapshots are read transparently with no migration required.
+All format readers accept every historical version listed above. Writers always produce the current (latest) version. The `migrate-v4` command upgrades pre-V4 pack .idx files in place. V1 loose objects and V3/V4/V5 snapshots are read transparently with no migration required. For `list`, V6 snapshots return `logical_bytes` from the header; older snapshots fall back to loading and summing the node array.
 
 ---
 

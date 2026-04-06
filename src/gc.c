@@ -4,6 +4,7 @@
 #include "tag.h"
 #include "pack.h"
 #include "snapshot.h"
+#include "stats.h"
 #include "object.h"
 #include "parity.h"
 #include "progress.h"
@@ -296,6 +297,10 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
              pack_kept, pack_deleted,
              kept, deleted);
     log_msg("INFO", msg);
+
+    /* Rebuild stats cache since loose/pack counts changed. */
+    stats_cache_rebuild(repo);
+
     return OK;
 }
 

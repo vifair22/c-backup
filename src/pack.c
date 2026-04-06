@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "pack.h"
 #include "pack_index.h"
+#include "stats.h"
 #include "parity.h"
 #include "parity_stream.h"
 #include "object.h"
@@ -2796,6 +2797,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
 
     pack_cache_invalidate(repo);
     pack_index_rebuild(repo);
+    stats_cache_rebuild(repo);
 
     /* Close any remaining meta fds from skipped objects */
     for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
@@ -3026,6 +3028,7 @@ remove_stage:
     if (pfd >= 0) { fsync(pfd); close(pfd); }
 
     pack_index_rebuild(repo);
+    stats_cache_rebuild(repo);
 }
 
 /* Resume any interrupted coalesce deletions by scanning for .deleting-NNNNNNNN
@@ -3069,6 +3072,7 @@ static void pack_resume_deleting(repo_t *repo) {
     closedir(dir);
 
     pack_index_rebuild(repo);
+    stats_cache_rebuild(repo);
 }
 
 static status_t maybe_coalesce_packs(repo_t *repo,
@@ -3328,6 +3332,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
         if (pfd >= 0) { fsync(pfd); close(pfd); }
         pack_cache_invalidate(repo);
         pack_index_rebuild(repo);
+    stats_cache_rebuild(repo);
         coalesce_state_write(repo, head);
 
         char msg[160];
@@ -3724,6 +3729,7 @@ pack_fail:
     if (total_deleted > 0) {
         pack_cache_invalidate(repo);
         pack_index_rebuild(repo);
+    stats_cache_rebuild(repo);
     }
 
     if (out_kept)    *out_kept    = total_kept;

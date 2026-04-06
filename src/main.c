@@ -360,6 +360,7 @@ static void usage(void) {
         "  backup tag      --repo <path> list\n"
         "  backup tag      --repo <path> delete --name <name>\n"
         "  backup reindex  --repo <path>\n"
+        "  backup reindex-snaps --repo <path>\n"
         "  backup migrate-packs --repo <path>\n"
         "  backup migrate-v4   --repo <path>\n"
         "\n"
@@ -1683,6 +1684,21 @@ static int cmd_reindex(repo_t *repo, int argc, char **argv) {
     return st == OK ? 0 : 1;
 }
 
+static int cmd_reindex_snaps(repo_t *repo, int argc, char **argv) {
+    static const flag_spec_t specs[] = { { "--repo", 1 } };
+    if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
+    (void)argc; (void)argv;
+    lock_shared(repo);
+    uint32_t rebuilt = 0;
+    status_t st = snap_pidx_rebuild_all(repo, &rebuilt);
+    if (st != OK)
+        fprintf(stderr, "error: %s\n",
+                err_msg()[0] ? err_msg() : "reindex-snaps failed");
+    else
+        printf("reindex-snaps: rebuilt %u path index file(s)\n", rebuilt);
+    return st == OK ? 0 : 1;
+}
+
 static int cmd_migrate_packs(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 } };
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
@@ -1968,7 +1984,7 @@ int main(int argc, char *argv[]) {
     static const char *const known_cmds[] = {
         "policy", "run", "list", "ls", "cat", "restore", "diff", "grep",
         "export", "import", "prune", "snapshot", "gfs", "gc", "pack", "verify",
-        "stats", "tag", "bundle", "reindex", "migrate-packs",
+        "stats", "tag", "bundle", "reindex", "reindex-snaps", "migrate-packs",
         "migrate-v4", NULL
     };
     int known = 0;
@@ -2020,6 +2036,7 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "stats")      == 0) ret = cmd_stats(repo, argc, argv);
     else if (strcmp(cmd, "tag")        == 0) ret = cmd_tag(repo, argc, argv);
     else if (strcmp(cmd, "reindex")    == 0) ret = cmd_reindex(repo, argc, argv);
+    else if (strcmp(cmd, "reindex-snaps") == 0) ret = cmd_reindex_snaps(repo, argc, argv);
     else if (strcmp(cmd, "migrate-packs") == 0) ret = cmd_migrate_packs(repo, argc, argv);
     else if (strcmp(cmd, "migrate-v4")    == 0) ret = cmd_migrate_v4(repo, argc, argv);
     else {

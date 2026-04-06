@@ -1419,22 +1419,33 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
         return set_error(ERR_INVALID, "restore_cat: invalid path: %s", file_path);
     if (!path_is_safe(norm)) return set_error(ERR_INVALID, "restore_cat: unsafe path: %s", norm);
 
+    /* Fast path: try the path index first (avoids full snapshot load + pathmap build) */
+    node_t pidx_node;
+    const node_t *target = NULL;
     snapshot_t *snap = NULL;
-    status_t st = snapshot_load(repo, snap_id, &snap);
-    if (st != OK) return st;
-
     snap_paths_t sp = {0};
-    st = snap_paths_build(snap, &sp);
-    if (st != OK) {
-        snapshot_free(snap);
-        return st;
+    status_t st;
+
+    if (snap_pidx_lookup(repo, snap_id, norm, &pidx_node) == OK) {
+        target = &pidx_node;
     }
 
-    const node_t *target = NULL;
-    for (uint32_t i = 0; i < sp.count; i++) {
-        if (strcmp(sp.entries[i].path, norm) != 0) continue;
-        target = sp.entries[i].node;
-        break;
+    /* Slow path: fall back to full snapshot load + pathmap */
+    if (!target) {
+        st = snapshot_load(repo, snap_id, &snap);
+        if (st != OK) return st;
+
+        st = snap_paths_build(snap, &sp);
+        if (st != OK) {
+            snapshot_free(snap);
+            return st;
+        }
+
+        for (uint32_t i = 0; i < sp.count; i++) {
+            if (strcmp(sp.entries[i].path, norm) != 0) continue;
+            target = sp.entries[i].node;
+            break;
+        }
     }
 
     if (!target) {
