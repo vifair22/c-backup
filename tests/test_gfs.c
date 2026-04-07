@@ -10,11 +10,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/backup.h"
-#include "../src/gfs.h"
-#include "../src/policy.h"
-#include "../src/repo.h"
-#include "../src/snapshot.h"
+#include "backup.h"
+#include "gfs.h"
+#include "policy.h"
+#include "repo.h"
+#include "snapshot.h"
 
 #define TEST_REPO "/tmp/c_backup_gfs_repo"
 #define TEST_SRC  "/tmp/c_backup_gfs_src"

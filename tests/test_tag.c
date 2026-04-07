@@ -11,9 +11,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../src/repo.h"
-#include "../src/tag.h"
-#include "../src/snapshot.h"
+#include "repo.h"
+#include "tag.h"
+#include "snapshot.h"
 
 #define TEST_REPO "/tmp/c_backup_tag_repo"
 

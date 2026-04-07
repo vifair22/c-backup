@@ -11,9 +11,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/backup.h"
-#include "../src/ls.h"
-#include "../src/repo.h"
+#include "backup.h"
+#include "ls.h"
+#include "repo.h"
 
 #define TEST_REPO "/tmp/c_backup_ls_repo"
 #define TEST_SRC  "/tmp/c_backup_ls_src"

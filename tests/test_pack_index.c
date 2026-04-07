@@ -18,14 +18,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/backup.h"
-#include "../src/gc.h"
-#include "../src/object.h"
-#include "../src/pack.h"
-#include "../src/pack_index.h"
-#include "../src/repo.h"
-#include "../src/snapshot.h"
-#include "../src/types.h"
+#include "backup.h"
+#include "gc.h"
+#include "object.h"
+#include "pack.h"
+#include "pack_index.h"
+#include "repo.h"
+#include "snapshot.h"
+#include "types.h"
 
 #define TEST_REPO "/tmp/c_backup_packidx_repo"
 #define TEST_SRC  "/tmp/c_backup_packidx_src"

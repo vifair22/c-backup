@@ -20,6 +20,65 @@
 #define VERSION_STRING "unknown"
 #endif
 
+/* Parse a version string of the form "MAJ.MIN.PAT_YYYYMMDD.HHMM.variant".
+ * Returns 0 on success, -1 if any required field is missing/unparseable.
+ * The variant suffix is ignored. Trailing whitespace/newlines are tolerated. */
+static int parse_version_string(const char *s,
+                                int *maj, int *min_, int *pat,
+                                long *date, long *tim) {
+    if (!s) return -1;
+    int a=0, b=0, c=0; long d=0, t=0;
+    if (sscanf(s, "%d.%d.%d_%ld.%ld", &a, &b, &c, &d, &t) != 5) return -1;
+    if (a < 0 || b < 0 || c < 0 || d <= 0 || t < 0) return -1;
+    *maj = a; *min_ = b; *pat = c; *date = d; *tim = t;
+    return 0;
+}
+
+/* Compare two parsed versions. Returns -1 if A<B, 0 if equal, +1 if A>B. */
+static int compare_parsed_versions(int a_maj, int a_min, int a_pat, long a_date, long a_time,
+                                   int b_maj, int b_min, int b_pat, long b_date, long b_time) {
+    if (a_maj != b_maj) return a_maj < b_maj ? -1 : 1;
+    if (a_min != b_min) return a_min < b_min ? -1 : 1;
+    if (a_pat != b_pat) return a_pat < b_pat ? -1 : 1;
+    if (a_date != b_date) return a_date < b_date ? -1 : 1;
+    if (a_time != b_time) return a_time < b_time ? -1 : 1;
+    return 0;
+}
+
+/* Read the repo's last_written version file and refuse to open if it was
+ * written by a binary newer than the current one. Missing/unparseable files
+ * are tolerated (older repos predate this check). */
+static status_t check_repo_version_compat(const char *repo_path) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/last_written", repo_path);
+    FILE *f = fopen(p, "r");
+    if (!f) return OK;  /* no record — tolerate */
+    char stored[64] = {0};
+    size_t n = fread(stored, 1, sizeof(stored) - 1, f);
+    fclose(f);
+    if (n == 0) return OK;
+    stored[n] = '\0';
+
+    int s_maj, s_min, s_pat; long s_date, s_time;
+    if (parse_version_string(stored, &s_maj, &s_min, &s_pat, &s_date, &s_time) != 0)
+        return OK;  /* unparseable — tolerate */
+
+    int c_maj, c_min, c_pat; long c_date, c_time;
+    if (parse_version_string(VERSION_STRING, &c_maj, &c_min, &c_pat, &c_date, &c_time) != 0)
+        return OK;  /* current binary has no parseable version — tolerate */
+
+    if (compare_parsed_versions(c_maj, c_min, c_pat, c_date, c_time,
+                                s_maj, s_min, s_pat, s_date, s_time) < 0) {
+        /* Strip trailing newline for a cleaner error message. */
+        char *nl = strchr(stored, '\n'); if (nl) *nl = '\0';
+        return set_error(ERR_CORRUPT,
+                         "repository was last written by a newer binary (%s); "
+                         "current binary is %s — refusing to open",
+                         stored, VERSION_STRING);
+    }
+    return OK;
+}
+
 /* Write the build version string to a file in the repo directory.
  * Uses atomic tmp+rename for safety. Errors are silently ignored
  * since this is best-effort housekeeping. */
@@ -49,6 +108,7 @@ struct repo {
     char   *path;
     int     dirfd;
     int     lock_fd;          /* -1 when unlocked */
+    int     lock_mode;        /* 0=none, 1=shared, 2=exclusive */
     int     obj_dirfd;        /* cached objects/ dir fd, -1 until first use */
     /* pack index cache, owned by pack.c, freed on close */
     void   *pack_cache;
@@ -200,11 +260,16 @@ status_t repo_open(const char *path, repo_t **out) {
         return set_error(ERR_CORRUPT, "unsupported repository format in '%s'", path);
     }
 
+    status_t vst = check_repo_version_compat(path);
+    if (vst != OK) { close(fd); return vst; }
+
     repo_t *r = malloc(sizeof(*r));
     if (!r) { close(fd); return set_error(ERR_NOMEM, "repo_open: alloc failed"); }
     r->path           = strdup(path);
+    if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "repo_open: strdup failed"); }
     r->dirfd          = fd;
     r->lock_fd        = -1;
+    r->lock_mode      = 0;
     r->obj_dirfd      = -1;
     r->pack_cache      = NULL;
     r->pack_cache_cnt  = 0;
@@ -354,13 +419,38 @@ status_t repo_build_loose_set(repo_t *repo) {
 int repo_loose_set_contains(repo_t *repo, const uint8_t *hash) {
     if (!repo->loose_set_ready || !repo->loose_set) return 0;
     uint32_t mask = repo->loose_set_mask;
+    uint32_t cap = mask + 1;
     uint32_t idx = loose_set_slot(hash, mask);
-    for (;;) {
+    /* Bounded probe: if every slot is non-empty and none match, the table
+     * is full — treat as miss rather than spinning forever. */
+    for (uint32_t i = 0; i < cap; i++) {
         const uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
         if (loose_set_is_empty(slot)) return 0;
         if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) return 1;
         idx = (idx + 1) & mask;
     }
+    return 0;
+}
+
+/* Grow the loose-set table to 2x capacity and rehash. Caller must hold
+ * loose_set_mu. Best-effort — on alloc failure the old table is kept. */
+static void loose_set_grow_locked(repo_t *repo) {
+    uint32_t old_cap = repo->loose_set_mask + 1;
+    uint32_t new_cap = old_cap * 2;
+    uint8_t *new_tbl = calloc(new_cap, LOOSE_SET_HASH_SIZE);
+    if (!new_tbl) return;
+    uint32_t new_mask = new_cap - 1;
+    for (uint32_t i = 0; i < old_cap; i++) {
+        uint8_t *src = repo->loose_set + (size_t)i * LOOSE_SET_HASH_SIZE;
+        if (loose_set_is_empty(src)) continue;
+        uint32_t idx = loose_set_slot(src, new_mask);
+        while (!loose_set_is_empty(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE))
+            idx = (idx + 1) & new_mask;
+        memcpy(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE, src, LOOSE_SET_HASH_SIZE);
+    }
+    free(repo->loose_set);
+    repo->loose_set = new_tbl;
+    repo->loose_set_mask = new_mask;
 }
 
 void repo_loose_set_insert(repo_t *repo, const uint8_t *hash) {
@@ -369,9 +459,16 @@ void repo_loose_set_insert(repo_t *repo, const uint8_t *hash) {
     if (loose_set_is_empty(hash)) return;
 
     pthread_mutex_lock(&repo->loose_set_mu);
+    /* Grow at 75% load to keep open addressing efficient and to guarantee a
+     * free slot exists. */
+    uint32_t cap = repo->loose_set_mask + 1;
+    if (repo->loose_set_cnt * 4 >= cap * 3)
+        loose_set_grow_locked(repo);
+
     uint32_t mask = repo->loose_set_mask;
+    cap = mask + 1;
     uint32_t idx = loose_set_slot(hash, mask);
-    for (;;) {
+    for (uint32_t i = 0; i < cap; i++) {
         uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
         if (loose_set_is_empty(slot)) {
             memcpy(slot, hash, LOOSE_SET_HASH_SIZE);
@@ -491,7 +588,17 @@ void repo_dat_cache_flush(repo_t *repo) {
 /* ------------------------------------------------------------------ */
 
 status_t repo_lock(repo_t *repo) {
-    if (repo->lock_fd != -1) return OK;   /* already locked by us */
+    if (repo->lock_fd != -1) {
+        if (repo->lock_mode == 2) return OK;  /* already exclusive */
+        /* Upgrade shared → exclusive. flock(2) atomically replaces the lock. */
+        if (flock(repo->lock_fd, LOCK_EX | LOCK_NB) == -1) {
+            if (errno == EWOULDBLOCK)
+                return set_error(ERR_IO, "repository is locked by another process (upgrade)");
+            return set_error_errno(ERR_IO, "flock upgrade");
+        }
+        repo->lock_mode = 2;
+        return OK;
+    }
 
     char lock_path[PATH_MAX];
     snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
@@ -510,6 +617,7 @@ status_t repo_lock(repo_t *repo) {
     }
 
     repo->lock_fd = fd;
+    repo->lock_mode = 2;
 
     /* Clean up any temp files left by a previous crashed run. */
     char tmp_dir[PATH_MAX];
@@ -536,6 +644,16 @@ void repo_unlock(repo_t *repo) {
     flock(repo->lock_fd, LOCK_UN);
     close(repo->lock_fd);
     repo->lock_fd = -1;
+    repo->lock_mode = 0;
+}
+
+status_t repo_lock_downgrade(repo_t *repo) {
+    if (!repo || repo->lock_fd == -1) return OK;
+    if (repo->lock_mode != 2) return OK;
+    if (flock(repo->lock_fd, LOCK_SH) == -1)
+        return set_error_errno(ERR_IO, "flock downgrade");
+    repo->lock_mode = 1;
+    return OK;
 }
 
 /*
@@ -546,7 +664,7 @@ void repo_unlock(repo_t *repo) {
  * visible.
  */
 status_t repo_lock_shared(repo_t *repo) {
-    if (repo->lock_fd != -1) return OK;   /* already holds a lock */
+    if (repo->lock_fd != -1) return OK;   /* already holds a lock (shared or stronger) */
 
     char lock_path[PATH_MAX];
     snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
@@ -561,6 +679,7 @@ status_t repo_lock_shared(repo_t *repo) {
     }
 
     repo->lock_fd = fd;
+    repo->lock_mode = 1;
     return OK;
 }
 
@@ -579,5 +698,10 @@ status_t repo_lock_shared_nb(repo_t *repo) {
     }
 
     repo->lock_fd = fd;
+    repo->lock_mode = 1;
     return OK;
+}
+
+int repo_lock_is_exclusive(const repo_t *repo) {
+    return repo && repo->lock_mode == 2;
 }

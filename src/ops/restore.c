@@ -358,10 +358,22 @@ static int apply_metadata(const char *full, const node_t *nd,
     if (!hash_is_zero(nd->acl_hash)) {
         void *ad = NULL; size_t al = 0;
         if (object_load(repo, nd->acl_hash, &ad, &al, NULL) == OK) {
-            acl_t acl = acl_from_text((char *)ad);
-            if (acl) {
-                if (acl_set_file(full, ACL_TYPE_ACCESS, acl) == -1) warn++;
-                acl_free(acl);
+            /* Ensure NUL termination before handing to acl_from_text: older
+             * repositories stored the blob without a trailing NUL. */
+            char *acl_txt = NULL;
+            if (al > 0 && memchr(ad, '\0', al) != NULL) {
+                acl_txt = (char *)ad;
+            } else {
+                acl_txt = malloc(al + 1);
+                if (acl_txt) { memcpy(acl_txt, ad, al); acl_txt[al] = '\0'; }
+            }
+            if (acl_txt) {
+                acl_t acl = acl_from_text(acl_txt);
+                if (acl) {
+                    if (acl_set_file(full, ACL_TYPE_ACCESS, acl) == -1) warn++;
+                    acl_free(acl);
+                }
+                if (acl_txt != (char *)ad) free(acl_txt);
             }
             free(ad);
         }
@@ -506,6 +518,113 @@ static int nl_htab_set_locked(nl_htab_t *h, uint64_t key, const char *path) {
     return rc;
 }
 
+/* Streaming sparse restore: decompress a sparse object through a pipe,
+ * parse the header + region table, and scatter data to the correct offsets
+ * in out_fd.  Bounded-RAM — safe for sparse objects that exceed STREAM_LOAD_MAX. */
+struct sparse_stream_arg {
+    repo_t *repo;
+    const uint8_t *hash;
+    int pipe_wfd;
+    status_t rc;
+};
+
+static void *sparse_stream_worker(void *a) {
+    struct sparse_stream_arg *arg = a;
+    uint64_t sz = 0; uint8_t type = 0;
+    arg->rc = object_load_stream(arg->repo, arg->hash, arg->pipe_wfd, &sz, &type);
+    close(arg->pipe_wfd);
+    return NULL;
+}
+
+static status_t read_pipe_full(int fd, void *buf, size_t n) {
+    uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t r = read(fd, p, n);
+        if (r == 0) return ERR_CORRUPT;
+        if (r < 0) { if (errno == EINTR) continue; return ERR_IO; }
+        p += r; n -= (size_t)r;
+    }
+    return OK;
+}
+
+static status_t restore_sparse_streaming(repo_t *repo,
+                                         const uint8_t hash[OBJECT_HASH_SIZE],
+                                         int out_fd, uint64_t file_size,
+                                         const char *full) {
+    int pfd[2];
+    if (pipe(pfd) == -1) return set_error_errno(ERR_IO, "restore sparse: pipe");
+
+    struct sparse_stream_arg arg = { .repo = repo, .hash = hash,
+                                     .pipe_wfd = pfd[1], .rc = OK };
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, sparse_stream_worker, &arg) != 0) {
+        close(pfd[0]); close(pfd[1]);
+        return set_error_errno(ERR_IO, "restore sparse: pthread_create");
+    }
+
+    status_t st = OK;
+    sparse_region_t *rgns = NULL;
+    uint8_t *buf = NULL;
+    sparse_hdr_t shdr;
+    if (read_pipe_full(pfd[0], &shdr, sizeof(shdr)) != OK) {
+        st = set_error(ERR_CORRUPT, "restore sparse: short header for %s", full);
+        goto done;
+    }
+    if (shdr.magic != SPARSE_MAGIC || shdr.region_count == 0) {
+        st = set_error(ERR_CORRUPT, "restore sparse: bad header for %s", full);
+        goto done;
+    }
+    size_t rt_sz = (size_t)shdr.region_count * sizeof(sparse_region_t);
+    rgns = malloc(rt_sz);
+    if (!rgns) { st = set_error(ERR_NOMEM, "restore sparse: regions"); goto done; }
+    if (read_pipe_full(pfd[0], rgns, rt_sz) != OK) {
+        st = set_error(ERR_CORRUPT, "restore sparse: short regions for %s", full);
+        goto done;
+    }
+    if (ftruncate(out_fd, (off_t)file_size) == -1 && file_size > 0) {
+        st = set_error_errno(ERR_IO, "restore sparse: ftruncate(%s)", full);
+        goto done;
+    }
+    enum { SP_BUF = 1u << 20 };
+    buf = malloc(SP_BUF);
+    if (!buf) { st = set_error(ERR_NOMEM, "restore sparse: buf"); goto done; }
+
+    uint64_t prev_end = 0;
+    for (uint32_t r = 0; r < shdr.region_count && st == OK; r++) {
+        if (rgns[r].offset < prev_end || rgns[r].offset > file_size ||
+            rgns[r].length > file_size - rgns[r].offset) {
+            st = set_error(ERR_CORRUPT, "restore sparse: region %u OOB for %s", r, full);
+            break;
+        }
+        if (lseek(out_fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
+            st = set_error_errno(ERR_IO, "restore sparse: lseek(%s)", full); break;
+        }
+        uint64_t rem = rgns[r].length;
+        while (rem > 0) {
+            size_t want = (rem > SP_BUF) ? SP_BUF : (size_t)rem;
+            ssize_t got = read(pfd[0], buf, want);
+            if (got == 0) { st = set_error(ERR_CORRUPT, "restore sparse: short data for %s", full); break; }
+            if (got < 0) { if (errno == EINTR) continue; st = set_error_errno(ERR_IO, "restore sparse: read pipe"); break; }
+            if (io_write_full(out_fd, buf, (size_t)got) != 0) {
+                st = set_error_errno(ERR_IO, "restore sparse: write(%s)", full); break;
+            }
+            rem -= (uint64_t)got;
+        }
+        prev_end = rgns[r].offset + rgns[r].length;
+    }
+
+done:
+    free(buf);
+    free(rgns);
+    /* Drain pipe so the writer thread can finish cleanly. */
+    uint8_t drain[4096];
+    while (read(pfd[0], drain, sizeof(drain)) > 0) {}
+    close(pfd[0]);
+    pthread_join(tid, NULL);
+    if (st == OK && arg.rc != OK) st = arg.rc;
+    return st;
+}
+
 /* Materialize a single non-directory entry.  Returns OK on success. */
 static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
                                   const char *full, nl_htab_t *nl_map,
@@ -517,21 +636,32 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
         if (fd == -1) return set_error_errno(ERR_IO, "restore: open(%s)", full);
         if (!hash_is_zero(nd->content_hash)) {
             void *data = NULL; size_t len = 0; uint8_t obj_type = 0;
+            int streamed_sparse = 0;
             status_t load_st = object_load(repo, nd->content_hash, &data, &len, &obj_type);
             if (load_st == ERR_TOO_LARGE) {
-                uint64_t stream_sz = 0;
-                load_st = object_load_stream(repo, nd->content_hash, fd,
-                                             &stream_sz, &obj_type);
+                uint64_t info_sz = 0; uint8_t info_type = 0;
+                status_t info_st = object_get_info(repo, nd->content_hash,
+                                                   &info_sz, &info_type);
+                if (info_st == OK && info_type == OBJECT_TYPE_SPARSE) {
+                    load_st = restore_sparse_streaming(repo, nd->content_hash,
+                                                       fd, nd->size, full);
+                    streamed_sparse = 1;
+                } else {
+                    uint64_t stream_sz = 0;
+                    load_st = object_load_stream(repo, nd->content_hash, fd,
+                                                 &stream_sz, &obj_type);
+                }
             }
             if (load_st != OK) { close(fd); return load_st; }
-            if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
+            if (streamed_sparse) {
+                /* restore_sparse_streaming already wrote data at correct offsets */
+            } else if (obj_type == OBJECT_TYPE_SPARSE && len >= sizeof(sparse_hdr_t)) {
                 const uint8_t *sp_p = (const uint8_t *)data;
                 sparse_hdr_t shdr;
                 memcpy(&shdr, sp_p, sizeof(shdr));
                 sp_p += sizeof(shdr);
                 if (shdr.magic != SPARSE_MAGIC ||
-                    shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
-                    len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
+                                        len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
                     free(data); close(fd); return set_error(ERR_CORRUPT, "restore: invalid sparse header for %s", full);
                 }
                 if (ftruncate(fd, (off_t)nd->size) == -1 && nd->size > 0) {
@@ -590,17 +720,28 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
         if (hash_is_zero(nd->content_hash)) break;
         void *tdata = NULL; size_t tlen = 0;
         if (object_load(repo, nd->content_hash, &tdata, &tlen, NULL) != OK) break;
+        if (tlen == 0) { free(tdata); break; }
+        /* Copy to a NUL-terminated scratch buffer — object_load does not
+         * guarantee termination, so callers that treat the blob as a C string
+         * would otherwise over-read. */
+        char *tgt = malloc(tlen + 1);
+        if (!tgt) { free(tdata); stats->warns++; break; }
+        memcpy(tgt, tdata, tlen);
+        /* Trim any existing trailing NULs from stored blob to get pure length */
+        size_t tn = tlen;
+        while (tn > 0 && tgt[tn - 1] == '\0') tn--;
+        tgt[tn] = '\0';
         /* Warn on suspicious symlink targets */
-        if (((char *)tdata)[0] == '/' || strstr((char *)tdata, "..")) {
+        if (tgt[0] == '/' || strstr(tgt, "..")) {
             fprintf(stderr, "warn: symlink target may escape restore tree: %s -> %s\n",
-                    full, (char *)tdata);
+                    full, tgt);
             stats->warns++;
         }
         /* Create symlink atomically: temp name → rename, avoids TOCTOU race */
         char sym_tmp[PATH_MAX];
         snprintf(sym_tmp, sizeof(sym_tmp), "%s.cbkp.tmp.%d", full, (int)getpid());
         unlink(sym_tmp);
-        if (symlink((char *)tdata, sym_tmp) == -1) {
+        if (symlink(tgt, sym_tmp) == -1) {
             fprintf(stderr, "warn: symlink failed: %s: %s\n", full, strerror(errno));
             stats->warns++;
         } else if (rename(sym_tmp, full) == -1) {
@@ -610,6 +751,7 @@ static status_t restore_one_entry(repo_t *repo, const restore_entry_t *e,
         } else {
             stats->files++;
         }
+        free(tgt);
         free(tdata);
         break;
     }
@@ -1164,8 +1306,7 @@ status_t restore_verify_dest(repo_t *repo, uint32_t snap_id,
             sparse_hdr_t shdr;
             memcpy(&shdr, obj_data, sizeof(shdr));
             if (shdr.magic != SPARSE_MAGIC ||
-                shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
-                obj_len < sizeof(sparse_hdr_t) +
+                                obj_len < sizeof(sparse_hdr_t) +
                           shdr.region_count * sizeof(sparse_region_t)) {
                 memcpy(expected_hash, ws[i].node.content_hash, OBJECT_HASH_SIZE);
             } else {
@@ -1485,8 +1626,7 @@ status_t restore_cat_file_ex(repo_t *repo, uint32_t snap_id,
         sparse_hdr_t shdr;
         memcpy(&shdr, obj, sizeof(shdr));
         if (shdr.magic != SPARSE_MAGIC ||
-            shdr.region_count > (SIZE_MAX - sizeof(sparse_hdr_t)) / sizeof(sparse_region_t) ||
-            obj_len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
+                        obj_len < sizeof(sparse_hdr_t) + shdr.region_count * sizeof(sparse_region_t)) {
             free(obj);
             snap_paths_free(&sp);
             snapshot_free(snap);

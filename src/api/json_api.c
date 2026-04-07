@@ -231,6 +231,8 @@ static char *base64_encode(const void *data, size_t len)
 /* Read stdin                                                          */
 /* ------------------------------------------------------------------ */
 
+#define JSON_MAX_REQUEST_BYTES (16u * 1024u * 1024u)
+
 static char *read_stdin_all(void)
 {
     size_t cap = 4096, len = 0;
@@ -240,10 +242,18 @@ static char *read_stdin_all(void)
     for (;;) {
         size_t avail = cap - len;
         if (avail < 1024) {
-            cap *= 2;
-            char *tmp = realloc(buf, cap);
+            if (cap >= JSON_MAX_REQUEST_BYTES) {
+                free(buf);
+                set_error(ERR_TOO_LARGE, "read_stdin_all: request exceeds %u bytes",
+                          JSON_MAX_REQUEST_BYTES);
+                return NULL;
+            }
+            size_t ncap = cap * 2;
+            if (ncap > JSON_MAX_REQUEST_BYTES) ncap = JSON_MAX_REQUEST_BYTES;
+            char *tmp = realloc(buf, ncap);
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
+            cap = ncap;
         }
         size_t n = fread(buf + len, 1, cap - len - 1, stdin);
         len += n;
@@ -800,7 +810,20 @@ static cJSON *handle_save_policy(repo_t *repo, const cJSON *params)
     pol.verify_after = json_get_bool(params, "verify_after", pol.verify_after);
     pol.strict_meta  = json_get_bool(params, "strict_meta", pol.strict_meta);
 
+    /* Writing policy.toml requires exclusive lock. Upgrade shared→exclusive. */
+    int was_shared = !repo_lock_is_exclusive(repo);
+    status_t lst = repo_lock(repo);
+    if (lst != OK) {
+        for (int i = 0; i < pol.n_paths; i++) free(pol.paths[i]);
+        free(pol.paths);
+        for (int i = 0; i < pol.n_exclude; i++) free(pol.exclude[i]);
+        free(pol.exclude);
+        return NULL;
+    }
+
     status_t st = policy_save(repo, &pol);
+
+    if (was_shared) repo_lock_downgrade(repo);
 
     /* Free string arrays */
     for (int i = 0; i < pol.n_paths; i++) free(pol.paths[i]);
@@ -1175,11 +1198,33 @@ static void pe_cb(const pack_entry_info_t *info, void *ctx)
     cJSON_AddItemToArray(c->arr, item);
 }
 
+/* Validate that a JSON-supplied pack filename matches pack-NNNNNNNN.(dat|idx)
+ * and contains no path separators or traversal sequences. */
+static int validate_pack_name(const char *name, const char *ext)
+{
+    if (!name) return 0;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\') return 0;
+    if (strstr(name, "..")) return 0;
+    /* Expect exactly "pack-NNNNNNNN.<ext>" */
+    size_t elen = strlen(ext);
+    size_t nlen = strlen(name);
+    if (nlen != 5 + 8 + 1 + elen) return 0;
+    if (memcmp(name, "pack-", 5) != 0) return 0;
+    for (int i = 0; i < 8; i++)
+        if (name[5 + i] < '0' || name[5 + i] > '9') return 0;
+    if (name[13] != '.') return 0;
+    if (memcmp(name + 14, ext, elen) != 0) return 0;
+    return 1;
+}
+
 static cJSON *handle_pack_entries(repo_t *repo, const cJSON *params)
 {
     const cJSON *jname = cJSON_GetObjectItemCaseSensitive(params, "name");
     if (!cJSON_IsString(jname))
         return set_error(ERR_INVALID, "pack_entries: missing 'name' param"), NULL;
+    if (!validate_pack_name(jname->valuestring, "dat"))
+        return set_error(ERR_INVALID, "pack_entries: invalid pack name"), NULL;
 
     cJSON *d = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(d, "entries");
@@ -1314,6 +1359,8 @@ static cJSON *handle_pack_index(repo_t *repo, const cJSON *params)
     const cJSON *jname = cJSON_GetObjectItemCaseSensitive(params, "name");
     if (!cJSON_IsString(jname))
         return set_error(ERR_INVALID, "pack_index: missing 'name' param"), NULL;
+    if (!validate_pack_name(jname->valuestring, "idx"))
+        return set_error(ERR_INVALID, "pack_index: invalid pack name"), NULL;
 
     cJSON *d = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(d, "entries");

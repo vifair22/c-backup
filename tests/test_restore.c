@@ -16,14 +16,14 @@
 #include <errno.h>
 #include <limits.h>
 
-#include "../src/repo.h"
-#include "../src/backup.h"
-#include "../src/restore.h"
-#include "../src/snapshot.h"
-#include "../src/object.h"
-#include "../src/pack.h"
-#include "../src/parity.h"
-#include "../src/gc.h"
+#include "repo.h"
+#include "backup.h"
+#include "restore.h"
+#include "snapshot.h"
+#include "object.h"
+#include "pack.h"
+#include "parity.h"
+#include "gc.h"
 
 #define TEST_REPO  "/tmp/c_backup_rst_repo"
 #define TEST_SRC   "/tmp/c_backup_rst_src"
@@ -881,6 +881,65 @@ static void test_restore_sparse_trailing_hole(void **state) {
     assert_int_equal((uint64_t)st.st_size, 256u * 1024u);
 }
 
+/* Fix 1 regression: sparse file whose total data exceeds STREAM_LOAD_MAX
+ * must survive roundtrip via the streaming sparse writer + streaming sparse
+ * restore path. */
+static void test_restore_sparse_large_streaming(void **state) {
+    (void)state;
+    const char *src = TEST_SRC "/sparse_big.bin";
+    int fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(fd >= 0);
+
+    /* Total file: 64 MiB. Three 8 MiB data regions separated by holes.
+     * Total data bytes = 24 MiB, which exceeds STREAM_LOAD_MAX (16 MiB)
+     * so load() returns ERR_TOO_LARGE and restore takes the streaming path. */
+    const uint64_t FILE_SZ = 64ull * 1024 * 1024;
+    const uint64_t REG_SZ  =  8ull * 1024 * 1024;
+    const uint64_t regions[3] = { 0, 16ull<<20, 48ull<<20 };
+
+    assert_int_equal(ftruncate(fd, (off_t)FILE_SZ), 0);
+    uint8_t *chunk = malloc((size_t)REG_SZ);
+    assert_non_null(chunk);
+    for (int r = 0; r < 3; r++) {
+        /* Distinct content per region so we catch offset mixups */
+        memset(chunk, 'A' + r, (size_t)REG_SZ);
+        assert_int_equal(lseek(fd, (off_t)regions[r], SEEK_SET), (off_t)regions[r]);
+        assert_int_equal(write(fd, chunk, (size_t)REG_SZ), (ssize_t)REG_SZ);
+    }
+    free(chunk);
+    close(fd);
+
+    const char *paths[] = { TEST_SRC };
+    assert_int_equal(backup_run(repo, paths, 1), OK);
+
+    mkdir(TEST_DEST, 0755);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+
+    char rpath[PATH_MAX];
+    snprintf(rpath, sizeof(rpath), "%s%s/sparse_big.bin", TEST_DEST, TEST_SRC);
+    struct stat st;
+    assert_int_equal(stat(rpath, &st), 0);
+    assert_int_equal((uint64_t)st.st_size, FILE_SZ);
+
+    int rfd = open(rpath, O_RDONLY);
+    assert_true(rfd >= 0);
+    uint8_t *vbuf = malloc((size_t)REG_SZ);
+    assert_non_null(vbuf);
+    for (int r = 0; r < 3; r++) {
+        assert_int_equal(lseek(rfd, (off_t)regions[r], SEEK_SET), (off_t)regions[r]);
+        assert_int_equal(read(rfd, vbuf, (size_t)REG_SZ), (ssize_t)REG_SZ);
+        for (size_t i = 0; i < REG_SZ; i++)
+            assert_int_equal(vbuf[i], 'A' + r);
+    }
+    /* Spot-check a hole byte */
+    uint8_t zb = 0xFF;
+    assert_int_equal(lseek(rfd, (off_t)(REG_SZ + 4), SEEK_SET), (off_t)(REG_SZ + 4));
+    assert_int_equal(read(rfd, &zb, 1), 1);
+    assert_int_equal(zb, 0);
+    free(vbuf);
+    close(rfd);
+}
+
 int main(void) {
     rs_init();
     const struct CMUnitTest tests[] = {
@@ -910,6 +969,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_restore_verify_after_pack, setup, teardown),
         cmocka_unit_test_setup_teardown(test_many_hardlinks_resize, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_sparse_trailing_hole, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_sparse_large_streaming, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

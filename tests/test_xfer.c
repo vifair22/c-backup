@@ -13,13 +13,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/backup.h"
-#include "../src/parity.h"
-#include "../src/repo.h"
-#include "../src/object.h"
-#include "../src/snapshot.h"
-#include "../src/tag.h"
-#include "../src/xfer.h"
+#include "backup.h"
+#include "parity.h"
+#include "repo.h"
+#include "object.h"
+#include "snapshot.h"
+#include "tag.h"
+#include "xfer.h"
 
 #define SRC_REPO   "/tmp/c_backup_xfer_src_repo"
 #define DST_REPO   "/tmp/c_backup_xfer_dst_repo"
@@ -298,14 +298,22 @@ static void corrupt_first_object_payload(const char *path) {
             assert_int_equal(fseek(f, rec.path_len, SEEK_CUR), 0);
 
         if (rec.kind == 2 && rec.comp_len > 0) {
-            /* We're at the start of the compressed payload — flip a byte */
-            long payload_pos = ftell(f);
-            assert_true(payload_pos >= 0);
-            uint8_t b = 0;
-            assert_int_equal(fread(&b, 1, 1, f), 1);
-            assert_int_equal(fseek(f, payload_pos, SEEK_SET), 0);
-            b ^= 0xFF;
-            assert_int_equal(fwrite(&b, 1, 1, f), 1);
+            /* Clobber the stored hash field in the record header to a
+             * value that cannot match the payload's actual SHA-256.
+             * Header parity protects against bit-flips but cannot turn
+             * a deliberately wrong hash back into a correct one, and
+             * the mismatch is detected on import when the decoded
+             * payload is re-hashed and compared to the record's hash. */
+            long rec_start = ftell(f) - (long)sizeof(rec) - (long)rec.path_len;
+            assert_true(rec_start >= 0);
+            uint8_t bad_hash[OBJECT_HASH_SIZE];
+            memset(bad_hash, 0xAB, sizeof(bad_hash));
+            long hash_off = rec_start + (long)offsetof(cbb_rec_t, hash);
+            assert_int_equal(fseek(f, hash_off, SEEK_SET), 0);
+            assert_int_equal(fwrite(bad_hash, 1, sizeof(bad_hash), f),
+                             sizeof(bad_hash));
+            /* Also flip one payload byte — after repair, hash-mismatch
+             * should still be detected because the stored hash is wrong. */
             fclose(f);
             return;
         }

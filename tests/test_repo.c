@@ -13,7 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../src/repo.h"
+#include "repo.h"
 
 #define TEST_REPO "/tmp/c_backup_repo_repo"
 

@@ -10,9 +10,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "../src/repo.h"
-#include "../src/object.h"
-#include "../src/types.h"
+#include "repo.h"
+#include "object.h"
+#include "types.h"
 
 #define TEST_REPO "/tmp/c_backup_test_repo"
 

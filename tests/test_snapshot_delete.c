@@ -10,9 +10,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../src/repo.h"
-#include "../src/snapshot.h"
-#include "../src/tag.h"
+#include "repo.h"
+#include "snapshot.h"
+#include "tag.h"
 
 #define TEST_REPO "/tmp/c_backup_snapshot_delete_repo"
 #define TEST_SRC  "/tmp/c_backup_snapshot_delete_src"

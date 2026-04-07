@@ -16,13 +16,13 @@
 #include <sys/stat.h>
 
 #include "fault_inject.h"
-#include "../src/repo.h"
-#include "../src/object.h"
-#include "../src/pack.h"
-#include "../src/parity.h"
-#include "../src/backup.h"
-#include "../src/restore.h"
-#include "../src/gc.h"
+#include "repo.h"
+#include "object.h"
+#include "pack.h"
+#include "parity.h"
+#include "backup.h"
+#include "restore.h"
+#include "gc.h"
 
 #define TEST_REPO "/tmp/c_backup_objfault_repo"
 #define TEST_SRC  "/tmp/c_backup_objfault_src"

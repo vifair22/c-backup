@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/scan.h"
+#include "scan.h"
 
 #define TEST_ROOT1 "/tmp/c_backup_scan_root1"
 #define TEST_ROOT2 "/tmp/c_backup_scan_root2"

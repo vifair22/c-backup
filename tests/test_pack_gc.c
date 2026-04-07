@@ -23,15 +23,15 @@
 #include <openssl/sha.h>
 #include <unistd.h>
 
-#include "../src/backup.h"
-#include "../src/gc.h"
-#include "../src/object.h"
-#include "../src/repo.h"
-#include "../src/snapshot.h"
-#include "../src/pack.h"
-#include "../src/restore.h"
-#include "../src/parity.h"
-#include "../src/types.h"
+#include "backup.h"
+#include "gc.h"
+#include "object.h"
+#include "repo.h"
+#include "snapshot.h"
+#include "pack.h"
+#include "restore.h"
+#include "parity.h"
+#include "types.h"
 
 #define TEST_REPO "/tmp/c_backup_packgc_repo"
 #define TEST_SRC  "/tmp/c_backup_packgc_src"

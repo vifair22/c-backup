@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "snapshot.h"
 #include "parity.h"
+#include "util.h"
 #include "../vendor/log.h"
 
 #include <errno.h>
@@ -212,8 +213,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
         }
         char *cbuf = malloc((size_t)compressed_payload_len);
         if (!cbuf) { free(snap); close(fd); return set_error(ERR_NOMEM, "snapshot %u: compressed buffer alloc failed", snap_id); }
-        if (read(fd, cbuf, (size_t)compressed_payload_len) !=
-                (ssize_t)compressed_payload_len) {
+        if (io_read_full(fd, cbuf, (size_t)compressed_payload_len) != 0) {
             free(cbuf); free(snap); close(fd); return set_error(ERR_CORRUPT, "snapshot %u: short read on compressed payload", snap_id);
         }
 
@@ -278,8 +278,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
                              ? node_count * sizeof(node_t) : 1);
         if (!snap->nodes && node_count > 0) { free(snap); close(fd); return set_error(ERR_NOMEM, "snapshot %u: nodes alloc failed", snap_id); }
         if (node_count > 0 &&
-            read(fd, snap->nodes, node_count * sizeof(node_t)) !=
-                (ssize_t)(node_count * sizeof(node_t))) {
+            io_read_full(fd, snap->nodes, node_count * sizeof(node_t)) != 0) {
             free(snap->nodes); free(snap); close(fd); return set_error(ERR_CORRUPT, "snapshot %u: short read on nodes", snap_id);
         }
 
@@ -292,8 +291,7 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
                 free(snap->nodes); free(snap); close(fd); return set_error(ERR_NOMEM, "snapshot %u: dirent_data alloc failed", snap_id);
             }
             if (snap->dirent_data_len > 0 &&
-                read(fd, snap->dirent_data, snap->dirent_data_len) !=
-                    (ssize_t)snap->dirent_data_len) {
+                io_read_full(fd, snap->dirent_data, snap->dirent_data_len) != 0) {
                 free(snap->dirent_data); free(snap->nodes); free(snap); close(fd);
                 return set_error(ERR_CORRUPT, "snapshot %u: short read on dirent_data", snap_id);
             }
@@ -495,7 +493,8 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
         if (write(fd, &snap_pcrc, sizeof(snap_pcrc)) != (ssize_t)sizeof(snap_pcrc)) {
             st = ERR_IO; goto fail;
         }
-        uint32_t snap_rs_data_len = (uint32_t)stored_payload_sz;
+        /* Deprecated rs_data_len field — always 0, see parity.h. */
+        uint32_t snap_rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
         if (write(fd, &snap_rs_data_len, sizeof(snap_rs_data_len))
             != (ssize_t)sizeof(snap_rs_data_len)) {
             st = ERR_IO; goto fail;
@@ -626,12 +625,13 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
     uint32_t new_flags = use_or ? (cur_flags | flags) : flags;
     if (new_flags == cur_flags) { close(fd); return OK; }  /* no change needed */
 
-    if (pwrite(fd, &new_flags, 4, 44) != 4) {
-        close(fd);
-        return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite gfs_flags snap %u", snap_id);
-    }
-
-    /* V5+: recompute header parity record. V5 = 60 bytes, V6+ = 68 bytes. */
+    /* Crash-atomic ordering: write parity record FIRST (computed against the
+     * new flags value in a scratch header buffer), fdatasync, THEN write the
+     * flags, fdatasync. On a crash between the two writes the parity record
+     * reflects the new flags while the file still has old flags — this is
+     * detected by snapshot_load_impl's parity check, and re-applying the
+     * patch is idempotent. The reverse ordering (flags first) would leave
+     * stale parity which the loader would treat as corruption. */
     if (version >= SNAP_VERSION_5) {
         struct stat sb;
         if (fstat(fd, &sb) != 0) {
@@ -640,28 +640,36 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
         }
         parity_footer_t pftr;
         off_t fend = (off_t)sb.st_size;
-        if (fend < (off_t)sizeof(pftr) ||
+        if (fend >= (off_t)sizeof(pftr) &&
             pread(fd, &pftr, sizeof(pftr), fend - (off_t)sizeof(pftr))
-                != (ssize_t)sizeof(pftr) ||
-            pftr.magic != PARITY_FOOTER_MAGIC) {
-            fdatasync(fd);
-            close(fd);
-            return OK;
-        }
-        off_t tstart = fend - (off_t)pftr.trailer_size;
+                == (ssize_t)sizeof(pftr) &&
+            pftr.magic == PARITY_FOOTER_MAGIC) {
+            off_t tstart = fend - (off_t)pftr.trailer_size;
 
-        size_t hdr_sz = (version >= SNAP_VERSION_6) ? 68u : 60u;
-        uint8_t hdr_buf[68];
-        if (pread(fd, hdr_buf, hdr_sz, 0) != (ssize_t)hdr_sz) {
-            close(fd);
-            return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: cannot re-read header snap %u", snap_id);
+            size_t hdr_sz = (version >= SNAP_VERSION_6) ? 68u : 60u;
+            uint8_t hdr_buf[68];
+            if (pread(fd, hdr_buf, hdr_sz, 0) != (ssize_t)hdr_sz) {
+                close(fd);
+                return set_error(ERR_CORRUPT, "snap_patch_gfs_flags: cannot re-read header snap %u", snap_id);
+            }
+            /* Patch new flags into scratch copy before computing parity */
+            memcpy(hdr_buf + 44, &new_flags, sizeof(new_flags));
+            parity_record_t hdr_par;
+            parity_record_compute(hdr_buf, hdr_sz, &hdr_par);
+            if (pwrite(fd, &hdr_par, sizeof(hdr_par), tstart) != (ssize_t)sizeof(hdr_par)) {
+                close(fd);
+                return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite parity snap %u", snap_id);
+            }
+            if (fdatasync(fd) != 0) {
+                close(fd);
+                return set_error_errno(ERR_IO, "snap_patch_gfs_flags: fdatasync parity snap %u", snap_id);
+            }
         }
-        parity_record_t hdr_par;
-        parity_record_compute(hdr_buf, hdr_sz, &hdr_par);
-        if (pwrite(fd, &hdr_par, sizeof(hdr_par), tstart) != (ssize_t)sizeof(hdr_par)) {
-            close(fd);
-            return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite parity snap %u", snap_id);
-        }
+    }
+
+    if (pwrite(fd, &new_flags, 4, 44) != 4) {
+        close(fd);
+        return set_error_errno(ERR_IO, "snap_patch_gfs_flags: pwrite gfs_flags snap %u", snap_id);
     }
 
     fdatasync(fd);
@@ -846,23 +854,28 @@ static void id_map_free(id_map_t *m) {
 }
 
 static int id_map_put_if_absent(id_map_t *m, uint64_t key, uintptr_t val) {
-    if (key == 0) return 0;
+    if (key == 0 || !m->slots || m->capacity == 0) return 0;
     size_t mask = m->capacity - 1;
     size_t h = (size_t)(id_hash_u64(key) & (uint64_t)mask);
-    while (m->slots[h].key != 0) {
+    for (size_t probes = 0; probes < m->capacity; probes++) {
+        if (m->slots[h].key == 0) {
+            m->slots[h].key = key;
+            m->slots[h].val = val;
+            return 0;
+        }
         if (m->slots[h].key == key) return 0;
         h = (h + 1) & mask;
     }
-    m->slots[h].key = key;
-    m->slots[h].val = val;
+    /* Table full — caller sized it wrong. Refuse silently rather than loop. */
     return 0;
 }
 
 static uintptr_t id_map_get(const id_map_t *m, uint64_t key) {
-    if (key == 0 || !m->slots) return 0;
+    if (key == 0 || !m->slots || m->capacity == 0) return 0;
     size_t mask = m->capacity - 1;
     size_t h = (size_t)(id_hash_u64(key) & (uint64_t)mask);
-    while (m->slots[h].key != 0) {
+    for (size_t probes = 0; probes < m->capacity; probes++) {
+        if (m->slots[h].key == 0) return 0;
         if (m->slots[h].key == key) return m->slots[h].val;
         h = (h + 1) & mask;
     }

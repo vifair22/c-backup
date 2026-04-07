@@ -8,9 +8,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/repo.h"
-#include "../src/snapshot.h"
-#include "../src/gfs.h"
+#include "repo.h"
+#include "snapshot.h"
+#include "gfs.h"
 
 #define TEST_REPO "/tmp/c_backup_snap_test"
 

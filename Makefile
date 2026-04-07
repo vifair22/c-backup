@@ -22,9 +22,10 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wformat=2 -Wformat-truncation -Wmissing-prototypes \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
+SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common
 COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
-                 -I src -I vendor $(VERSION_DEF)
+                 $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
 
 RELEASE_CFLAGS := $(COMMON_CFLAGS) -O3 -flto=auto -march=znver3 -mtune=znver3
 STATIC_CFLAGS  := $(COMMON_CFLAGS) -O3 -flto=auto -march=znver3 -mtune=znver3
@@ -55,8 +56,13 @@ endif
 TARGET := $(BINS)/$(BIN_NAME)
 
 # ---- Sources and objects ----------------------------------------------
-SRCS        := $(wildcard $(SRC)/*.c)
-OBJS        := $(patsubst $(SRC)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
+# Sources live under src/{cli,ops,store,api,common}.  Object files are
+# flattened into $(OBJ_DIR) by basename; VPATH lets the pattern rule find
+# the .c under any subdirectory.
+SRCS        := $(shell find $(SRC) -name '*.c')
+SRC_DIRS    := $(sort $(dir $(SRCS)))
+VPATH       := $(SRC_DIRS)
+OBJS        := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS)))
 VENDOR_OBJS := $(OBJ_DIR)/toml.o $(OBJ_DIR)/cJSON.o
 OBJS        += $(VENDOR_OBJS)
 MAIN_OBJ    := $(OBJ_DIR)/main.o
@@ -64,11 +70,11 @@ LIB_OBJS    := $(filter-out $(MAIN_OBJ), $(OBJS))
 
 # Vendor flags: match optimisation level but drop strict warnings
 ifeq ($(BUILD_TYPE),debug)
-  VENDOR_CFLAGS := -std=c11 -Og -g -I src -I vendor $(VERSION_DEF)
+  VENDOR_CFLAGS := -std=c11 -Og -g $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
 else ifeq ($(BUILD_TYPE),asan)
-  VENDOR_CFLAGS := -std=c11 -O1 -g -I src -I vendor $(VERSION_DEF)
+  VENDOR_CFLAGS := -std=c11 -O1 -g $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
 else
-  VENDOR_CFLAGS := -std=c11 -O3 -flto=auto -march=znver3 -I src -I vendor $(VERSION_DEF)
+  VENDOR_CFLAGS := -std=c11 -O3 -flto=auto -march=znver3 $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
 endif
 
 # ---- Phony targets ----------------------------------------------------
@@ -96,7 +102,7 @@ $(OBJ_DIR):
 $(BINS):
 	mkdir -p $(BINS)
 
-$(OBJ_DIR)/%.o: $(SRC)/%.c | $(OBJ_DIR)
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
 
 $(OBJ_DIR)/toml.o: vendor/toml.c | $(OBJ_DIR)
@@ -112,10 +118,10 @@ $(TARGET): $(OBJS) | $(BINS)
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(filter-out $(REL_OBJ_DIR)/main.o, \
-                 $(patsubst $(SRC)/%.c, $(REL_OBJ_DIR)/%.o, $(SRCS)) \
+                 $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                  $(REL_OBJ_DIR)/toml.o $(REL_OBJ_DIR)/cJSON.o)
 
-TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result -I src -I vendor
+TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result $(SRC_INCLUDES) -I vendor
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
 
 FAULT_SRCS  := $(wildcard $(TESTS)/test_*_fault.c)
@@ -140,10 +146,10 @@ test: all $(TEST_BINS) $(FAULT_BINS) analyze
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
 ASAN_LIB_OBJS = $(filter-out $(ASAN_OBJ_DIR)/main.o, \
-                  $(patsubst $(SRC)/%.c, $(ASAN_OBJ_DIR)/%.o, $(SRCS)) \
+                  $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                   $(ASAN_OBJ_DIR)/toml.o $(ASAN_OBJ_DIR)/cJSON.o)
 
-ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result -I src -I vendor
+ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(ASAN_LIB_OBJS) | $(BINS)
@@ -156,7 +162,7 @@ test-asan: asan $(ASAN_TEST_BINS)
 .PHONY: test-asan
 
 # ---- Static analysis --------------------------------------------------
-ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 -I src -I vendor
+ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 $(SRC_INCLUDES) -I vendor
 STACK_LIMIT    := 65536
 
 analyze: | $(BUILD)
@@ -186,15 +192,16 @@ analyze: | $(BUILD)
 	    --suppress=normalCheckLevelMaxBranches \
 	    --suppress=toomanyconfigs \
 	    --suppress=*:vendor/* \
-	    --suppress=oppositeInnerCondition:src/object.c \
-	    --suppress=intToPointerCast:src/backup.c \
+	    --suppress=oppositeInnerCondition:src/store/object.c \
+	    --suppress=intToPointerCast:src/ops/backup.c \
+	    -DVERSION_STRING=\"0.0.0\" \
 	    --inline-suppr \
-	    --quiet -I src -I vendor $(SRCS)
+	    --quiet $(SRC_INCLUDES) -I vendor $(SRCS)
 	@echo "cppcheck: OK"
 
 lint:
 	@echo "=== clang-tidy ==="
-	@clang-tidy $(SRCS) -- -std=c11 -I src -I vendor 2>&1 | \
+	@clang-tidy $(SRCS) -- -std=c11 $(SRC_INCLUDES) -I vendor 2>&1 | \
 	    grep -E "warning:|error:" || echo "clang-tidy: OK"
 
 # ---- Benchmarks -------------------------------------------------------

@@ -17,14 +17,14 @@
 #include <fcntl.h>
 #include <dirent.h>
 
-#include "../src/repo.h"
-#include "../src/object.h"
-#include "../src/pack.h"
-#include "../src/snapshot.h"
-#include "../src/backup.h"
-#include "../src/gc.h"
-#include "../src/parity.h"
-#include "../src/types.h"
+#include "repo.h"
+#include "object.h"
+#include "pack.h"
+#include "snapshot.h"
+#include "backup.h"
+#include "gc.h"
+#include "parity.h"
+#include "types.h"
 
 #define TEST_REPO  "/tmp/c_backup_packpar_repo"
 #define TEST_SRC   "/tmp/c_backup_packpar_src"

@@ -211,7 +211,11 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     }
     if (total == 0) { free(sizes); free(names); *out = NULL; *out_len = 0; return OK; }
 
-    /* Second pass: read values directly into the output buffer using cached sizes */
+    /* Second pass: read values directly into the output buffer using cached sizes.
+     * The value may have shrunk between the probe and this read (TOCTOU), so we
+     * capture the actual returned length and patch the vlen field afterward.
+     * On error or disappearance, emit the attribute with vlen=0 rather than
+     * hashing uninitialized buffer contents. */
     uint8_t *buf = malloc(total);
     if (!buf) { free(sizes); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
     uint8_t *p = buf;
@@ -221,11 +225,22 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
         uint16_t nlen = (uint16_t)strlen(n) + 1;
         memcpy(p, &nlen, sizeof(nlen)); p += sizeof(nlen);
         memcpy(p, n, nlen); p += nlen;
-        uint32_t v32 = (uint32_t)sizes[idx];
-        memcpy(p, &v32, sizeof(v32)); p += sizeof(v32);
-        if (sizes[idx] > 0)
-            lgetxattr(path, n, p, (size_t)sizes[idx]);
-        p += (size_t)sizes[idx];
+        uint8_t *vlen_pos = p;
+        p += sizeof(uint32_t);
+        uint32_t actual_vlen = 0;
+        if (sizes[idx] > 0) {
+            ssize_t got = lgetxattr(path, n, p, (size_t)sizes[idx]);
+            if (got < 0) {
+                actual_vlen = 0;
+            } else if ((size_t)got > (size_t)sizes[idx]) {
+                /* Shouldn't happen — kernel would truncate — clamp defensively */
+                actual_vlen = (uint32_t)sizes[idx];
+            } else {
+                actual_vlen = (uint32_t)got;
+            }
+        }
+        memcpy(vlen_pos, &actual_vlen, sizeof(actual_vlen));
+        p += actual_vlen;
     }
     free(sizes);
     free(names);
@@ -242,12 +257,15 @@ static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
     acl_free(acl);
     if (!txt) { *out = NULL; *out_len = 0; return OK; }
     size_t sz = (size_t)sz_s;
-    uint8_t *buf = malloc(sz);
+    /* Include the trailing NUL so restore can pass the blob directly to
+     * acl_from_text() without an extra copy. */
+    uint8_t *buf = malloc(sz + 1);
     if (!buf) { acl_free(txt); return set_error(ERR_NOMEM, "collect_acl: alloc failed"); }
     memcpy(buf, txt, sz);
+    buf[sz] = '\0';
     acl_free(txt);
     *out     = buf;
-    *out_len = (size_t)sz;
+    *out_len = sz + 1;
     return OK;
 }
 
@@ -347,17 +365,17 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     int collect_meta = (!opts || opts->collect_meta);
     if (collect_meta) {
         if ((st2 = collect_xattrs(path, &e.xattr_data, &e.xattr_len)) != OK) {
-            free(e.path); return st2;
+            free(e.path); free(e.symlink_target); return st2;
         }
         if ((st2 = collect_acl(path, &e.acl_data, &e.acl_len)) != OK) {
-            free(e.path); free(e.xattr_data); return st2;
+            free(e.path); free(e.xattr_data); free(e.symlink_target); return st2;
         }
     }
 
     uint64_t this_node_id = nd->node_id;
 
     if ((st2 = result_append(res, &e, opts)) != OK) {
-        free(e.path); free(e.xattr_data); free(e.acl_data); return st2;
+        free(e.path); free(e.xattr_data); free(e.acl_data); free(e.symlink_target); return st2;
     }
 
     if (nd->type == NODE_TYPE_DIR && e.path && e.path[0] == '/' &&

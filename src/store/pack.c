@@ -344,7 +344,8 @@ typedef struct {
     uint8_t *rs_parity;              /* malloc'd RS parity buffer (small entries) */
     rs_parity_stream_t *rs_ps;       /* streaming RS parity (large entries, NULL if unused) */
     size_t   rs_par_sz;
-    uint32_t rs_data_len;   /* = (uint32_t)compressed_size */
+    /* (formerly) uint32_t rs_data_len — deprecated trailer field, see parity.h.
+     * Always serialized as 0 by write_dat_parity_precomputed. */
 } pack_entry_parity_t;
 
 /* Cached metadata from the partition pass — avoids re-reading headers later.
@@ -686,8 +687,7 @@ status_t pack_object_get_info(repo_t *repo,
 static int load_entry_parity(FILE *f, uint32_t entry_index,
                              parity_record_t *out_hdr_par,
                              uint32_t *out_payload_crc,
-                             uint8_t **out_rs_par, size_t *out_rs_par_sz,
-                             uint32_t *out_rs_data_len) {
+                             uint8_t **out_rs_par, size_t *out_rs_par_sz) {
     if (entry_index == UINT32_MAX) return -1;
 
     /* Read parity footer (last 12 bytes of file) */
@@ -754,14 +754,18 @@ static int load_entry_parity(FILE *f, uint32_t entry_index,
         }
     }
 
-    /* Read payload_crc and rs_data_len (at block_size - 12 from block start) */
+    /* Read payload_crc, then skip the deprecated rs_data_len field (4 bytes).
+     * Layout at block_size - 12: payload_crc(4) + rs_data_len_dep(4, ignored)
+     * + entry_parity_size(4, computed from offsets). */
     if (fseeko(f, par_pos + (off_t)(block_size - 12), SEEK_SET) != 0) {
         free(*out_rs_par); *out_rs_par = NULL; return -1;
     }
+    uint32_t rs_data_len_skip;  /* deprecated — value ignored, see parity.h */
     if (fread(out_payload_crc, sizeof(*out_payload_crc), 1, f) != 1 ||
-        fread(out_rs_data_len, sizeof(*out_rs_data_len), 1, f) != 1) {
+        fread(&rs_data_len_skip, sizeof(rs_data_len_skip), 1, f) != 1) {
         free(*out_rs_par); *out_rs_par = NULL; return -1;
     }
+    (void)rs_data_len_skip;
 
     return 0;
 }
@@ -797,10 +801,9 @@ status_t pack_object_load(repo_t *repo,
         uint32_t pay_crc = 0;
         uint8_t *rs_par = NULL;
         size_t rs_par_sz = 0;
-        uint32_t rs_data_len = 0;
 
         if (load_entry_parity(f, found->entry_index, &hdr_par,
-                              &pay_crc, &rs_par, &rs_par_sz, &rs_data_len) == 0) {
+                              &pay_crc, &rs_par, &rs_par_sz) == 0) {
             /* Verify/repair entry header */
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
             if (hrc == 1) {
@@ -1032,42 +1035,61 @@ status_t pack_object_load_prefix(repo_t *repo,
     }
 
     if (ehdr.compression == COMPRESS_LZ4_FRAME) {
-        /* Read compressed payload, decompress only up to want bytes */
-        char *cpayload = malloc((size_t)ehdr.compressed_size);
-        if (!cpayload) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: frame alloc"); }
-        if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
-            free(cpayload); fclose(f);
-            return set_error(ERR_CORRUPT, "pack_object_load_prefix: frame short read");
-        }
-        dat_return_or_close(repo, pnum, f);
-
+        /* Stream compressed input in fixed chunks — never allocate the full
+         * compressed payload (it may be many GiB for huge streamed objects). */
         LZ4F_dctx *dctx = NULL;
         LZ4F_errorCode_t ec = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
         if (LZ4F_isError(ec)) {
-            free(cpayload);
+            fclose(f);
             return set_error(ERR_NOMEM, "pack_object_load_prefix: LZ4F context alloc");
         }
 
+        enum { CHUNK = 64u * 1024u };
+        char *cbuf = malloc(CHUNK);
         char *out = malloc(want);
-        if (!out) { LZ4F_freeDecompressionContext(dctx); free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_prefix: output alloc"); }
+        if (!cbuf || !out) {
+            free(cbuf); free(out);
+            LZ4F_freeDecompressionContext(dctx); fclose(f);
+            return set_error(ERR_NOMEM, "pack_object_load_prefix: buffer alloc");
+        }
 
-        size_t src_pos = 0, dst_pos = 0;
-        while (src_pos < (size_t)ehdr.compressed_size && dst_pos < want) {
-            size_t src_remaining = (size_t)ehdr.compressed_size - src_pos;
+        uint64_t remaining = ehdr.compressed_size;
+        size_t dst_pos = 0;
+        size_t cbuf_have = 0;
+        size_t cbuf_pos = 0;
+        int corrupt = 0;
+
+        while (dst_pos < want) {
+            if (cbuf_pos >= cbuf_have) {
+                if (remaining == 0) break;
+                size_t n = (remaining > CHUNK) ? (size_t)CHUNK : (size_t)remaining;
+                if (fread_full(cbuf, n, f) != 0) { corrupt = 1; break; }
+                cbuf_have = n;
+                cbuf_pos = 0;
+                remaining -= n;
+            }
+            size_t src_remaining = cbuf_have - cbuf_pos;
             size_t dst_remaining = want - dst_pos;
             size_t consumed = LZ4F_decompress(dctx,
                                                out + dst_pos, &dst_remaining,
-                                               cpayload + src_pos, &src_remaining,
+                                               cbuf + cbuf_pos, &src_remaining,
                                                NULL);
-            if (LZ4F_isError(consumed)) {
-                free(out); free(cpayload); LZ4F_freeDecompressionContext(dctx);
-                return set_error(ERR_CORRUPT, "pack_object_load_prefix: LZ4F decompress failed");
-            }
-            src_pos += src_remaining;
+            if (LZ4F_isError(consumed)) { corrupt = 1; break; }
+            cbuf_pos += src_remaining;
             dst_pos += dst_remaining;
+            if (dst_remaining == 0 && src_remaining == 0) break;  /* EOF from decoder */
         }
+
         LZ4F_freeDecompressionContext(dctx);
-        free(cpayload);
+        free(cbuf);
+        /* Pack file position is mid-entry now; always close rather than
+         * returning to the cache (next caller would seek anyway, but be safe). */
+        fclose(f);
+
+        if (corrupt) {
+            free(out);
+            return set_error(ERR_CORRUPT, "pack_object_load_prefix: LZ4F decompress failed");
+        }
         *out_data = out;
         *out_size = dst_pos;
         return OK;
@@ -1104,14 +1126,13 @@ status_t pack_object_load_stream(repo_t *repo,
     uint32_t pay_crc = 0;
     uint8_t *rs_par = NULL;
     size_t rs_par_sz = 0;
-    uint32_t rs_data_len = 0;
     int have_parity = 0;
 
     if ((found->pack_version == PACK_VERSION_V3 || found->pack_version == PACK_VERSION) &&
         found->entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         if (load_entry_parity(f, found->entry_index, &hdr_par,
-                              &pay_crc, &rs_par, &rs_par_sz, &rs_data_len) == 0) {
+                              &pay_crc, &rs_par, &rs_par_sz) == 0) {
             have_parity = 1;
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
             if (hrc == 1) {
@@ -1601,11 +1622,19 @@ static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
                     return set_error_errno(ERR_IO, "write_dat_parity: fread payload for entry %u failed", i);
                 }
                 crc_acc = crc32c_update(crc_acc, chunk_buf, want);
-                if (ps_inited) rs_parity_stream_feed(&ps, chunk_buf, want);
+                if (ps_inited && rs_parity_stream_feed(&ps, chunk_buf, want) != 0) {
+                    rs_parity_stream_destroy(&ps);
+                    free(entry_offsets); free(chunk_buf);
+                    return set_error_errno(ERR_IO, "write_dat_parity: parity stream feed failed");
+                }
                 remaining -= want;
             }
             payload_crc = crc_acc;
-            if (ps_inited) rs_parity_stream_finish(&ps);
+            if (ps_inited && rs_parity_stream_finish(&ps) != 0) {
+                rs_parity_stream_destroy(&ps);
+                free(entry_offsets); free(chunk_buf);
+                return set_error_errno(ERR_IO, "write_dat_parity: parity stream finish failed");
+            }
         }
 
         /* Seek to trailer write position */
@@ -1615,8 +1644,9 @@ static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
             return set_error_errno(ERR_IO, "write_dat_parity: fseeko to parity block %u failed", i);
         }
 
-        /* Write: hdr_parity(260) + rs_parity(var) + payload_crc(4) + rs_data_len(4) + entry_parity_size(4) */
-        uint32_t rs_data_len = (uint32_t)csize;
+        /* Write: hdr_parity(260) + rs_parity(var) + payload_crc(4)
+         *      + rs_data_len_dep(4, deprecated) + entry_parity_size(4) */
+        uint32_t rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
         uint32_t entry_par_sz = (uint32_t)(sizeof(hdr_par) + rs_par_sz + 4 + 4 + 4);
 
         int write_ok = 1;
@@ -1702,8 +1732,10 @@ static status_t write_dat_parity_precomputed(FILE *dat_f,
                 }
             }
         }
+        /* Deprecated rs_data_len field — always 0, see parity.h. */
+        uint32_t rs_data_len_dep = PARITY_RS_DATA_LEN_DEPRECATED;
         if (fwrite(&ep->payload_crc, sizeof(ep->payload_crc), 1, dat_f) != 1 ||
-            fwrite(&ep->rs_data_len, sizeof(ep->rs_data_len), 1, dat_f) != 1 ||
+            fwrite(&rs_data_len_dep, sizeof(rs_data_len_dep), 1, dat_f) != 1 ||
             fwrite(&entry_par_sz, sizeof(entry_par_sz), 1, dat_f) != 1) {
             free(entry_offsets);
             return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite block %u tail failed", i);
@@ -1857,6 +1889,17 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
 
         /* Ensure the shard subdirectory exists */
         pack_ensure_shard_dir(repo_path(repo), pack_num);
+
+        /* Defensive: refuse to overwrite an existing pack with this number.
+         * next_pack_num() returns max+1 so this should never trigger, but if
+         * it does we'd silently destroy data — better to fail loudly. */
+        struct stat _st_chk;
+        if (stat(dat_final, &_st_chk) == 0 || stat(idx_final, &_st_chk) == 0) {
+            st = set_error(ERR_IO,
+                           "finalize_pack: pack %08u already exists — refusing to overwrite",
+                           pack_num);
+            goto fail;
+        }
 
         if (mkdir(stage_dir, 0755) != 0) {
             st = set_error_errno(ERR_IO, "finalize_pack: mkdir(%s)", stage_dir);
@@ -2224,7 +2267,6 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     pw->entry_parity[pw->packed].rs_parity   = rs_buf;
     pw->entry_parity[pw->packed].rs_ps       = NULL;
     pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
-    pw->entry_parity[pw->packed].rs_data_len = (uint32_t)csize;
 
     pw->body_offset += sizeof(ehdr) + compressed_size;
     pw->packed++;
@@ -2304,7 +2346,10 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
             st = ERR_IO; goto done;
         }
         running_crc = crc32c_update(running_crc, comp_out, hdr_sz);
-        rs_parity_stream_feed(ps, comp_out, hdr_sz);
+        if (rs_parity_stream_feed(ps, comp_out, hdr_sz) != 0) {
+            free(comp_out); LZ4F_freeCompressionContext(cctx);
+            st = ERR_IO; goto done;
+        }
         compressed_written += hdr_sz;
 
         /* Stream: read → compress → write */
@@ -2326,7 +2371,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                     st = ERR_IO; break;
                 }
                 running_crc = crc32c_update(running_crc, comp_out, out_sz);
-                rs_parity_stream_feed(ps, comp_out, out_sz);
+                if (rs_parity_stream_feed(ps, comp_out, out_sz) != 0) { st = ERR_IO; break; }
                 compressed_written += out_sz;
             }
             atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
@@ -2342,8 +2387,8 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                 st = ERR_IO;
             } else {
                 running_crc = crc32c_update(running_crc, comp_out, end_sz);
-                rs_parity_stream_feed(ps, comp_out, end_sz);
-                compressed_written += end_sz;
+                if (rs_parity_stream_feed(ps, comp_out, end_sz) != 0) { st = ERR_IO; }
+                else compressed_written += end_sz;
             }
         }
 
@@ -2378,7 +2423,7 @@ raw_copy:
                 st = ERR_IO; break;
             }
             running_crc = crc32c_update(running_crc, stream_buf, (size_t)got);
-            rs_parity_stream_feed(ps, stream_buf, (size_t)got);
+            if (rs_parity_stream_feed(ps, stream_buf, (size_t)got) != 0) { st = ERR_IO; break; }
             atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
             remaining -= (uint64_t)got;
         }
@@ -2392,7 +2437,11 @@ done:
         return st;
     }
 
-    rs_parity_stream_finish(ps);
+    if (rs_parity_stream_finish(ps) != 0) {
+        rs_parity_stream_destroy(ps);
+        free(ps);
+        return ERR_IO;
+    }
 
     /* Recompute header parity with final header (patched compressed_size) */
     parity_record_t hdr_par;
@@ -2439,7 +2488,6 @@ done:
     pw->entry_parity[pw->packed].rs_parity   = rs_buf;
     pw->entry_parity[pw->packed].rs_ps       = kept_ps;
     pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
-    pw->entry_parity[pw->packed].rs_data_len = (uint32_t)actual_compressed_size;
 
     pw->body_offset += sizeof(ehdr) + actual_compressed_size;
     pw->packed++;
@@ -3374,9 +3422,8 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     uint32_t pay_crc = 0;
     uint8_t *rs_par = NULL;
     size_t rs_par_sz = 0;
-    uint32_t rs_data_len = 0;
     if (load_entry_parity(f, found->entry_index, &hdr_par,
-                          &pay_crc, &rs_par, &rs_par_sz, &rs_data_len) != 0) {
+                          &pay_crc, &rs_par, &rs_par_sz) != 0) {
         fclose(f);
         return -1;
     }

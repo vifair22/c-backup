@@ -194,9 +194,10 @@ static status_t write_object(repo_t *repo, uint8_t type,
         st = set_error_errno(ERR_IO, "write_object: write CRC");
         goto fail;
     }
-    uint32_t rs_data_len = (uint32_t)payload_size;
-    if (write(fd, &rs_data_len, sizeof(rs_data_len)) != (ssize_t)sizeof(rs_data_len)) {
-        st = set_error_errno(ERR_IO, "write_object: write rs_data_len");
+    /* Deprecated rs_data_len field — always 0, see parity.h. */
+    uint32_t rs_data_len_dep = PARITY_RS_DATA_LEN_DEPRECATED;
+    if (write(fd, &rs_data_len_dep, sizeof(rs_data_len_dep)) != (ssize_t)sizeof(rs_data_len_dep)) {
+        st = set_error_errno(ERR_IO, "write_object: write rs_data_len (deprecated)");
         goto fail;
     }
 
@@ -204,7 +205,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
         .magic        = PARITY_FOOTER_MAGIC,
         .version      = PARITY_VERSION,
         .trailer_size = (uint32_t)(sizeof(hdr_par) + rs_sz + sizeof(pcrc)
-                         + sizeof(rs_data_len) + sizeof(pfooter)),
+                         + sizeof(rs_data_len_dep) + sizeof(pfooter)),
     };
     if (write(fd, &pfooter, sizeof(pfooter)) != (ssize_t)sizeof(pfooter)) {
         st = set_error_errno(ERR_IO, "write_object: write parity footer");
@@ -647,7 +648,10 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
                 fuse_ring_release(&ring); break;
             }
             stream_crc = crc32c_update(stream_crc, chunk_buf, got);
-            rs_parity_stream_feed(&ps, chunk_buf, got);
+            if (rs_parity_stream_feed(&ps, chunk_buf, got) != 0) {
+                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (spill)");
+                fuse_ring_release(&ring); break;
+            }
 
             /* Done with buffer — release slot back to reader */
             fuse_ring_release(&ring);
@@ -836,7 +840,10 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
             stream_crc = crc32c_update(stream_crc, buf, got);
 
             /* Accumulate RS parity inline via bounded-RAM stream */
-            rs_parity_stream_feed(&ps, buf, got);
+            if (rs_parity_stream_feed(&ps, buf, got) != 0) {
+                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (spill)");
+                goto done;
+            }
 
             total_written += got;
             offset += (uint64_t)got;
@@ -854,8 +861,10 @@ done:
     /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
 
     /* Flush final partial RS group */
-    if (st == OK)
-        rs_parity_stream_finish(&ps);
+    if (st == OK) {
+        if (rs_parity_stream_finish(&ps) != 0)
+            st = set_error_errno(ERR_IO, "stream: RS parity finish failed");
+    }
 
     if (st != OK) {
         rs_parity_stream_destroy(&ps);
@@ -897,7 +906,6 @@ done:
             return set_error_errno(ERR_IO, "stream: write parity header");
         }
 
-        size_t payload_len = (size_t)total_written;
         size_t rs_sz = rs_parity_stream_total(&ps);
 
         if (rs_sz > 0) {
@@ -914,10 +922,11 @@ done:
             close(tfd); unlink(tmppath);
             return set_error_errno(ERR_IO, "stream: write CRC");
         }
-        uint32_t rs_data_len_s = (uint32_t)payload_len;
+        /* Deprecated rs_data_len field — always 0, see parity.h. */
+        uint32_t rs_data_len_s = PARITY_RS_DATA_LEN_DEPRECATED;
         if (write(tfd, &rs_data_len_s, sizeof(rs_data_len_s)) != (ssize_t)sizeof(rs_data_len_s)) {
             close(tfd); unlink(tmppath);
-            return set_error_errno(ERR_IO, "stream: write rs_data_len");
+            return set_error_errno(ERR_IO, "stream: write rs_data_len (deprecated)");
         }
 
         parity_footer_t spfooter = {
@@ -999,6 +1008,243 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd,
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx);
+
+/* Streaming writer for sparse objects. Writes [sparse_hdr_t][regions[]][data]
+ * to a new object without ever materializing the full payload in RAM.
+ * Takes ownership of fd (closes on return). */
+static status_t write_sparse_object_stream(repo_t *repo, int fd,
+                                           const char *src_path,
+                                           uint64_t file_size,
+                                           const sparse_region_t *regions,
+                                           uint32_t n_regions,
+                                           uint8_t out_hash[OBJECT_HASH_SIZE],
+                                           int *out_is_new,
+                                           uint64_t *out_phys_bytes) {
+    (void)file_size;  /* uncompressed_size is the sparse payload size, not file size */
+
+    /* Compute total payload size (header + regions table + region data) */
+    uint64_t data_bytes = 0;
+    for (uint32_t i = 0; i < n_regions; i++) {
+        if (regions[i].length > UINT64_MAX - data_bytes) {
+            if (src_path) close(fd);
+            return set_error(ERR_TOO_LARGE, "sparse: region data_bytes overflow");
+        }
+        data_bytes += regions[i].length;
+    }
+    uint64_t payload_sz = (uint64_t)sizeof(sparse_hdr_t)
+                        + (uint64_t)n_regions * sizeof(sparse_region_t)
+                        + data_bytes;
+
+    char tmppath[PATH_MAX];
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+        >= (int)sizeof(tmppath)) {
+        if (src_path) close(fd);
+        return set_error(ERR_IO, "sparse_stream: tmppath too long");
+    }
+    int tfd = mkstemp(tmppath);
+    if (tfd == -1) {
+        if (src_path) close(fd);
+        return set_error_errno(ERR_IO, "mkstemp(%s)", tmppath);
+    }
+
+    object_header_t hdr = {
+        .magic             = OBJECT_MAGIC,
+        .version           = OBJECT_HDR_VERSION,
+        .type              = OBJECT_TYPE_SPARSE,
+        .compression       = COMPRESS_NONE,
+        .pack_skip_ver     = 0,
+        .uncompressed_size = payload_sz,
+        .compressed_size   = 0,   /* patched below */
+    };
+    if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+        if (src_path) close(fd);
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write header");
+    }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        if (src_path) close(fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "sparse_stream: EVP init");
+    }
+
+    char ps_tmp_dir[PATH_MAX];
+    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", repo_path(repo));
+    rs_parity_stream_t ps;
+    if (rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir) != 0) {
+        EVP_MD_CTX_free(mdctx);
+        if (src_path) close(fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "sparse_stream: rs init");
+    }
+
+    uint32_t crc = 0;
+    uint64_t total_written = 0;
+    status_t st = OK;
+
+    /* Helper macro: hash + crc + rs + write to tfd */
+    #define SP_EMIT(buf, n) do {                                               \
+        if (EVP_DigestUpdate(mdctx, (buf), (n)) != 1) {                        \
+            st = set_error(ERR_IO, "sparse_stream: SHA256 update"); goto sp_done; \
+        }                                                                      \
+        if (io_write_full(tfd, (buf), (n)) != 0) {                             \
+            st = set_error_errno(ERR_IO, "sparse_stream: write tfd"); goto sp_done; \
+        }                                                                      \
+        crc = crc32c_update(crc, (buf), (n));                                  \
+        if (rs_parity_stream_feed(&ps, (buf), (n)) != 0) {                     \
+            st = set_error_errno(ERR_IO, "sparse_stream: rs feed"); goto sp_done; \
+        }                                                                      \
+        total_written += (uint64_t)(n);                                        \
+    } while (0)
+
+    /* Write sparse header */
+    sparse_hdr_t shdr = { .magic = SPARSE_MAGIC, .region_count = n_regions };
+    SP_EMIT(&shdr, sizeof(shdr));
+
+    /* Write regions table */
+    SP_EMIT(regions, (size_t)n_regions * sizeof(sparse_region_t));
+
+    /* Stream each region's data */
+    uint8_t *buf = malloc(STREAM_CHUNK);
+    if (!buf) { st = set_error(ERR_NOMEM, "sparse_stream: buf alloc"); goto sp_done; }
+
+    for (uint32_t r = 0; r < n_regions && st == OK; r++) {
+        if (lseek(fd, (off_t)regions[r].offset, SEEK_SET) == (off_t)-1) {
+            st = set_error_errno(ERR_IO, "sparse_stream: lseek region %u", r); break;
+        }
+        uint64_t remaining = regions[r].length;
+        while (remaining > 0) {
+            size_t want = (remaining > STREAM_CHUNK) ? STREAM_CHUNK : (size_t)remaining;
+            ssize_t got = read(fd, buf, want);
+            if (got <= 0) {
+                if (got == -1 && errno == EINTR) continue;
+                st = set_error_errno(ERR_IO, "sparse_stream: read region %u", r);
+                break;
+            }
+            SP_EMIT(buf, (size_t)got);
+            remaining -= (uint64_t)got;
+        }
+    }
+    free(buf);
+
+    #undef SP_EMIT
+
+sp_done:
+    if (src_path) close(fd);
+
+    if (st != OK) {
+        rs_parity_stream_destroy(&ps);
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
+        return st;
+    }
+
+    if (total_written != payload_sz) {
+        rs_parity_stream_destroy(&ps);
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
+        return set_error(ERR_IO, "sparse_stream: payload size mismatch %llu != %llu",
+                         (unsigned long long)total_written, (unsigned long long)payload_sz);
+    }
+
+    if (rs_parity_stream_finish(&ps) != 0) {
+        rs_parity_stream_destroy(&ps);
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: rs finish");
+    }
+
+    unsigned int dlen = 0;
+    if (EVP_DigestFinal_ex(mdctx, out_hash, &dlen) != 1 || dlen != OBJECT_HASH_SIZE) {
+        rs_parity_stream_destroy(&ps);
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
+        return set_error(ERR_IO, "sparse_stream: SHA256 finalize");
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    if (out_is_new) *out_is_new = 0;
+    if (out_phys_bytes) *out_phys_bytes = 0;
+    if (object_exists(repo, out_hash)) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return OK;
+    }
+
+    hdr.compressed_size = total_written;
+    memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
+    if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: pwrite header");
+    }
+
+    /* Parity trailer (V2 object, parity V1 footer format) */
+    parity_record_t hpar;
+    parity_record_compute(&hdr, sizeof(hdr), &hpar);
+    if (lseek(tfd, 0, SEEK_END) == (off_t)-1 ||
+        write(tfd, &hpar, sizeof(hpar)) != (ssize_t)sizeof(hpar)) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write hpar");
+    }
+    size_t rs_sz = rs_parity_stream_total(&ps);
+    if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write rs parity");
+    }
+    rs_parity_stream_destroy(&ps);
+
+    if (write(tfd, &crc, sizeof(crc)) != (ssize_t)sizeof(crc)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write crc");
+    }
+    /* Deprecated rs_data_len field — always 0, see parity.h. */
+    uint32_t rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
+    if (write(tfd, &rs_data_len, sizeof(rs_data_len)) != (ssize_t)sizeof(rs_data_len)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write rs_data_len (deprecated)");
+    }
+    parity_footer_t pftr = {
+        .magic = PARITY_FOOTER_MAGIC,
+        .version = PARITY_VERSION,
+        .trailer_size = (uint32_t)(sizeof(hpar) + rs_sz + sizeof(crc)
+                                   + sizeof(rs_data_len) + sizeof(pftr)),
+    };
+    if (write(tfd, &pftr, sizeof(pftr)) != (ssize_t)sizeof(pftr)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: write footer");
+    }
+
+    if (async_writeback(tfd) != 0) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: fdatasync");
+    }
+    close(tfd);
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(out_hash, subdir, fname);
+    int objfd = repo_objects_fd(repo);
+    if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: openat(objects)"); }
+    if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
+        unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: mkdirat(%s)", subdir);
+    }
+    if (errno == EEXIST) errno = 0;
+    int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
+    if (subfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: openat(%s)", subdir); }
+    char dstpath[PATH_MAX];
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s",
+                 repo_path(repo), subdir, fname) >= (int)sizeof(dstpath)) {
+        close(subfd); unlink(tmppath); return set_error(ERR_IO, "sparse_stream: dstpath too long");
+    }
+    if (rename(tmppath, dstpath) == -1) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
+            close(subfd); unlink(tmppath); return OK;
+        }
+        close(subfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "sparse_stream: rename(%s, %s)", tmppath, dstpath);
+    }
+    close(subfd);
+    repo_loose_set_insert(repo, out_hash);
+    if (out_is_new) *out_is_new = 1;
+    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
+    return OK;
+}
 
 status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -1088,48 +1334,11 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd,
                                         progress_cb, progress_ctx);
     }
 
-    /* Build sparse payload: [sparse_hdr][regions][data bytes] */
-    size_t data_bytes = 0;
-    for (uint32_t i = 0; i < n_regions; i++) data_bytes += (size_t)regions[i].length;
-
-    size_t payload_sz = sizeof(sparse_hdr_t)
-                      + n_regions * sizeof(sparse_region_t)
-                      + data_bytes;
-    uint8_t *payload = malloc(payload_sz);
-    if (!payload) {
-        free(regions);
-        if (src_path) close(fd);
-        return set_error(ERR_NOMEM, "malloc(%zu)", payload_sz);
-    }
-
-    uint8_t *p = payload;
-    sparse_hdr_t shdr = { .magic = SPARSE_MAGIC, .region_count = n_regions };
-    memcpy(p, &shdr, sizeof(shdr)); p += sizeof(shdr);
-    memcpy(p, regions, n_regions * sizeof(sparse_region_t));
-    p += n_regions * sizeof(sparse_region_t);
-
-    /* Read each data region */
-    for (uint32_t i = 0; i < n_regions; i++) {
-        lseek(fd, (off_t)regions[i].offset, SEEK_SET);
-        size_t remaining = (size_t)regions[i].length;
-        while (remaining > 0) {
-            ssize_t r = read(fd, p, remaining);
-            if (r <= 0) {
-                free(regions);
-                free(payload);
-                if (src_path) close(fd);
-                errno = (r == 0) ? ESTALE : errno;
-                return set_error_errno(ERR_IO, "sparse: read region %u", i);
-            }
-            p += r; remaining -= (size_t)r;
-        }
-    }
-
+    /* Stream sparse object — bounded RAM regardless of file size. */
+    status_t st = write_sparse_object_stream(repo, fd, src_path, file_size,
+                                             regions, n_regions,
+                                             out_hash, out_is_new, out_phys_bytes);
     free(regions);
-    if (src_path) close(fd);  /* done reading; fd no longer needed */
-    status_t st = write_object(repo, OBJECT_TYPE_SPARSE, payload, payload_sz, out_hash,
-                               out_is_new, out_phys_bytes);
-    free(payload);
     return st;
 }
 

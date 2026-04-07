@@ -61,7 +61,9 @@ typedef struct __attribute__((packed)) {
 #define write_all io_write_full
 
 /* Write a parity trailer for a record: hdr_parity(260) + rs_parity(var) +
- * payload_crc(4) + rs_data_len(4) + entry_parity_size(4).
+ * payload_crc(4) + rs_data_len_dep(4) + entry_parity_size(4).
+ * The rs_data_len_dep slot is a deprecated field, always written as 0
+ * (see parity.h).
  * hdr_data/hdr_len = the record header bytes to protect with XOR parity.
  * payload/payload_len = compressed payload bytes for RS + CRC. */
 static int bundle_write_parity(int fd,
@@ -82,15 +84,15 @@ static int bundle_write_parity(int fd,
 
     /* CRC-32C over payload */
     uint32_t payload_crc = crc32c(payload, payload_len);
-    uint32_t rs_data_len = (uint32_t)rs_sz;
+    uint32_t rs_data_len_dep = PARITY_RS_DATA_LEN_DEPRECATED;
     uint32_t entry_par_sz = (uint32_t)(sizeof(hdr_par) + rs_sz + 4 + 4 + 4);
 
-    /* Write: hdr_parity + rs_parity + payload_crc + rs_data_len + entry_parity_size */
+    /* Write: hdr_parity + rs_parity + payload_crc + rs_data_len_dep + entry_parity_size */
     int rc = 0;
     if (write_all(fd, &hdr_par, sizeof(hdr_par)) != 0) rc = -1;
     if (rc == 0 && rs_sz > 0 && write_all(fd, rs_buf, rs_sz) != 0) rc = -1;
     if (rc == 0 && write_all(fd, &payload_crc, 4) != 0) rc = -1;
-    if (rc == 0 && write_all(fd, &rs_data_len, 4) != 0) rc = -1;
+    if (rc == 0 && write_all(fd, &rs_data_len_dep, 4) != 0) rc = -1;
     if (rc == 0 && write_all(fd, &entry_par_sz, 4) != 0) rc = -1;
 
     free(rs_buf);
@@ -114,12 +116,9 @@ static int bundle_read_parity(int fd, void *hdr_data, size_t hdr_len,
         }
     }
 
-    /* Read rs_data_len + payload_crc + entry_parity_size from trailer tail.
-     * Layout: rs_parity(var) + payload_crc(4) + rs_data_len(4) + entry_parity_size(4)
-     * We need to read rs_data_len first to know how much RS data to skip/read.
-     * But rs_data_len comes AFTER rs_parity... we know its position from entry_parity_size.
-     *
-     * Alternative: since we know payload_len, we can compute rs_sz ourselves. */
+    /* Trailer tail layout (after hdr_par): rs_parity(var) + payload_crc(4)
+     * + rs_data_len_dep(4, deprecated/ignored) + entry_parity_size(4).
+     * Caller already knows payload_len so we compute rs_sz directly. */
     size_t rs_sz = rs_parity_size(payload_len);
 
     /* Read RS parity block */
@@ -130,25 +129,45 @@ static int bundle_read_parity(int fd, void *hdr_data, size_t hdr_len,
         if (read_all(fd, rs_buf, rs_sz) != 0) { free(rs_buf); return -1; }
     }
 
-    /* Read CRC + rs_data_len + entry_parity_size */
-    uint32_t payload_crc, rs_data_len_stored, entry_par_sz;
+    /* Read CRC, skip deprecated rs_data_len field, read entry_parity_size. */
+    uint32_t payload_crc, entry_par_sz;
+    uint32_t rs_data_len_skip;  /* deprecated — value ignored, see parity.h */
     if (read_all(fd, &payload_crc, 4) != 0 ||
-        read_all(fd, &rs_data_len_stored, 4) != 0 ||
+        read_all(fd, &rs_data_len_skip, 4) != 0 ||
         read_all(fd, &entry_par_sz, 4) != 0) {
         free(rs_buf);
         return -1;
     }
+    (void)rs_data_len_skip;
 
-    /* Verify CRC */
+    /* Verify CRC + Reed-Solomon repair. If CRC mismatches, try RS decode to
+     * recover before giving up. */
     if (payload && payload_len > 0) {
         uint32_t got_crc = crc32c(payload, payload_len);
-        if (got_crc != payload_crc) {
+        int need_repair = (got_crc != payload_crc);
+        if (rs_buf && rs_sz > 0) {
+            /* rs_parity_decode mutates payload if repair needed. Caller owns
+             * the buffer (payload is not const-qualified by intent). */
+            int rrc = rs_parity_decode((void *)(uintptr_t)payload, payload_len, rs_buf);
+            if (rrc < 0 && need_repair) {
+                set_error(ERR_CORRUPT, "bundle: payload RS uncorrectable");
+                free(rs_buf);
+                return -1;
+            }
+            if (rrc > 0) {
+                /* Repaired — re-verify CRC against the repaired buffer. */
+                got_crc = crc32c(payload, payload_len);
+                need_repair = (got_crc != payload_crc);
+            }
+        }
+        if (need_repair) {
             set_error(ERR_CORRUPT, "bundle: payload CRC mismatch");
             free(rs_buf);
             return -1;
         }
     }
 
+    (void)entry_par_sz;
     free(rs_buf);
     return 0;
 }

@@ -16,8 +16,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "../src/parity.h"
-#include "../src/parity_stream.h"
+#include "parity.h"
+#include "parity_stream.h"
 
 #define TMP_DIR  "/tmp/c_backup_ps_test"
 

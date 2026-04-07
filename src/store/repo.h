@@ -60,3 +60,9 @@ status_t repo_lock_shared(repo_t *repo);
  * ERR_IO if contended (exclusive writer active).  Does not block.
  */
 status_t repo_lock_shared_nb(repo_t *repo);
+
+/* Downgrade an exclusive lock to shared. No-op if not exclusive. */
+status_t repo_lock_downgrade(repo_t *repo);
+
+/* Returns non-zero if the repo currently holds an exclusive lock. */
+int repo_lock_is_exclusive(const repo_t *repo);

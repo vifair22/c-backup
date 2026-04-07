@@ -33,8 +33,12 @@ typedef struct {
     size_t   spill_size;                        /* total bytes written to spill */
     size_t   total_parity;                      /* total parity bytes produced */
     int      finished;                          /* set after _finish() */
+    int      sticky_err;                        /* set to errno on first failure; subsequent feeds are no-ops */
     char     tmp_dir_buf[4096];                 /* stored tmp dir for lazy spill */
 } rs_parity_stream_t;
+
+/* Returns non-zero if the stream has entered the sticky-error state. */
+int rs_parity_stream_error(const rs_parity_stream_t *ps);
 
 /*
  * Initialize the parity stream.  mem_cap is the maximum parity bytes to hold
@@ -47,15 +51,17 @@ int rs_parity_stream_init(rs_parity_stream_t *ps, size_t mem_cap,
 /*
  * Feed data into the parity stream.  Can be called with any length — the
  * stream handles group boundary accumulation internally.
+ * Returns 0 on success, -1 on error (spill flush failed). After an error
+ * the stream enters a sticky-error state and all further feeds are no-ops.
  */
-void rs_parity_stream_feed(rs_parity_stream_t *ps,
-                           const void *data, size_t len);
+int rs_parity_stream_feed(rs_parity_stream_t *ps,
+                          const void *data, size_t len);
 
 /*
  * Flush the final partial group.  Must be called exactly once after all
- * data has been fed.
+ * data has been fed. Returns 0 on success, -1 on error.
  */
-void rs_parity_stream_finish(rs_parity_stream_t *ps);
+int rs_parity_stream_finish(rs_parity_stream_t *ps);
 
 /*
  * Write all accumulated parity to a raw fd using write().

@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#include "../src/parity.h"
+#include "parity.h"
 
 /* ---- CRC-32C tests ---- */
 

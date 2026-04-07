@@ -114,9 +114,11 @@ int rs_parity_stream_init(rs_parity_stream_t *ps, size_t mem_cap,
     return 0;
 }
 
-void rs_parity_stream_feed(rs_parity_stream_t *ps,
-                           const void *data, size_t len)
+int rs_parity_stream_feed(rs_parity_stream_t *ps,
+                          const void *data, size_t len)
 {
+    if (ps->sticky_err) return -1;
+
     const uint8_t *src = (const uint8_t *)data;
 
     while (len > 0) {
@@ -129,21 +131,36 @@ void rs_parity_stream_feed(rs_parity_stream_t *ps,
         len -= take;
 
         if (ps->group_fill == RS_PS_GROUP_DATA) {
-            encode_group(ps, RS_PS_GROUP_DATA);
+            if (encode_group(ps, RS_PS_GROUP_DATA) != 0) {
+                ps->sticky_err = errno ? errno : EIO;
+                return -1;
+            }
             ps->group_fill = 0;
         }
     }
+    return 0;
 }
 
-void rs_parity_stream_finish(rs_parity_stream_t *ps)
+int rs_parity_stream_finish(rs_parity_stream_t *ps)
 {
-    if (ps->finished) return;
+    if (ps->finished) return ps->sticky_err ? -1 : 0;
     ps->finished = 1;
 
+    if (ps->sticky_err) return -1;
+
     if (ps->group_fill > 0) {
-        encode_group(ps, ps->group_fill);
+        if (encode_group(ps, ps->group_fill) != 0) {
+            ps->sticky_err = errno ? errno : EIO;
+            return -1;
+        }
         ps->group_fill = 0;
     }
+    return 0;
+}
+
+int rs_parity_stream_error(const rs_parity_stream_t *ps)
+{
+    return ps->sticky_err;
 }
 
 int rs_parity_stream_replay_fd(rs_parity_stream_t *ps, int fd)

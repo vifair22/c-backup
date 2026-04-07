@@ -84,6 +84,8 @@ status_t policy_write_template(repo_t *repo) {
         "# strict_meta = false\n"
     );
 
+    if (fflush(f) != 0) { fclose(f); unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: fflush"); }
+    if (fsync(fileno(f)) != 0) { fclose(f); unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: fsync"); }
     if (fclose(f) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: fclose"); }
     if (rename(tmp, path) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_write_template: rename(%s)", path); }
     return OK;
@@ -220,6 +222,8 @@ status_t policy_save(repo_t *repo, const policy_t *p) {
     fprintf(f, "verify_after = %s\n",     p->verify_after     ? "true" : "false");
     fprintf(f, "strict_meta = %s\n",      p->strict_meta      ? "true" : "false");
 
+    if (fflush(f) != 0) { fclose(f); unlink(tmp); return set_error_errno(ERR_IO, "policy_save: fflush"); }
+    if (fsync(fileno(f)) != 0) { fclose(f); unlink(tmp); return set_error_errno(ERR_IO, "policy_save: fsync"); }
     if (fclose(f) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_save: fclose"); }
     if (rename(tmp, path) != 0) { unlink(tmp); return set_error_errno(ERR_IO, "policy_save: rename(%s)", path); }
     return OK;

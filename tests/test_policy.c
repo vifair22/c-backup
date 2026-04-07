@@ -10,8 +10,8 @@
 #include <stdint.h>
 #include <limits.h>
 
-#include "../src/repo.h"
-#include "../src/policy.h"
+#include "repo.h"
+#include "policy.h"
 
 #define TEST_REPO "/tmp/c_backup_policy_repo"
 

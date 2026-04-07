@@ -12,9 +12,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../src/repo.h"
-#include "../src/backup.h"
-#include "../src/restore.h"
+#include "repo.h"
+#include "backup.h"
+#include "restore.h"
 
 #define TEST_REPO "/tmp/c_backup_cat_repo"
 #define TEST_SRC  "/tmp/c_backup_cat_src"

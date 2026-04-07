@@ -417,11 +417,11 @@ status_t pack_index_rebuild(repo_t *repo) {
         return set_error_errno(ERR_IO, "pack_index_rebuild: write crc");
     }
 
-    /* rs_data_len */
-    uint32_t rs_data_len = (uint32_t)data_sz;
+    /* Deprecated rs_data_len field — always 0, see parity.h. */
+    uint32_t rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
     if (write(fd, &rs_data_len, sizeof(rs_data_len)) != (ssize_t)sizeof(rs_data_len)) {
         free(buf); close(fd); unlink(tmp_path);
-        return set_error_errno(ERR_IO, "pack_index_rebuild: write rs_data_len");
+        return set_error_errno(ERR_IO, "pack_index_rebuild: write rs_data_len (deprecated)");
     }
 
     /* Parity footer */
