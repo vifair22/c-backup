@@ -13,7 +13,7 @@ flowchart TD
         SORT_REFS["qsort by hash<br/>for bsearch"]
     end
 
-    START --> ENUM --> EXTRACT --> DEDUP --> SORT_REFS
+    START -->|open snapshots dir| ENUM -->|per-node hashes| EXTRACT -->|unique hashes| DEDUP -->|sorted ref set| SORT_REFS
 
     subgraph "Phase 2: Loose Sweep"
         WALK["Walk objects/XX/<br/>256 subdirectories"]
@@ -22,9 +22,9 @@ flowchart TD
         DELETE_L["unlinkat()<br/>loose_deleted++"]
     end
 
-    SORT_REFS --> WALK --> BSEARCH_L
-    BSEARCH_L -- "Found" --> KEEP_L
-    BSEARCH_L -- "Not found" --> DELETE_L
+    SORT_REFS -->|begin sweep| WALK -->|per loose object| BSEARCH_L
+    BSEARCH_L -- "reachable" --> KEEP_L
+    BSEARCH_L -- "unreferenced" --> DELETE_L
 
     subgraph "Phase 3: Pack GC"
         RESUME_DEL["pack_resume_deleting()<br/>Consume .deleting-* markers"]
@@ -35,9 +35,9 @@ flowchart TD
         MIXED["Mixed: rewrite<br/>mkstemp → copy live<br/>entries (128 KB chunks)<br/>→ fsync → rename"]
     end
 
-    KEEP_L --> RESUME_DEL
-    DELETE_L --> RESUME_DEL
-    RESUME_DEL --> EACH_PACK --> CLASSIFY
+    KEEP_L -->|loose phase done| RESUME_DEL
+    DELETE_L -->|loose phase done| RESUME_DEL
+    RESUME_DEL -->|crash recovery first| EACH_PACK -->|entries vs refs| CLASSIFY
     CLASSIFY -- "0 dead" --> ALL_LIVE
     CLASSIFY -- "all dead" --> ALL_DEAD
     CLASSIFY -- "some dead" --> MIXED
@@ -54,17 +54,17 @@ flowchart TD
         CLEANUP["Delete marker<br/>Update coalesce.state"]
     end
 
-    ALL_LIVE --> RESUME_INST
-    ALL_DEAD --> RESUME_INST
-    MIXED --> RESUME_INST
+    ALL_LIVE -->|pack untouched| RESUME_INST
+    ALL_DEAD -->|pack removed| RESUME_INST
+    MIXED -->|rewritten in place| RESUME_INST
 
-    RESUME_INST --> SNAP_GAP
-    SNAP_GAP -- "No" --> SKIP(["Skip coalesce"])
-    SNAP_GAP -- "Yes" --> TRIGGER
-    TRIGGER -- "No" --> SKIP
-    TRIGGER -- "Yes" --> SELECT --> ENOUGH
-    ENOUGH -- "No" --> SKIP
-    ENOUGH -- "Yes" --> WRITE_NEW --> MARKER --> UNLINK --> CLEANUP
+    RESUME_INST -->|finish staged installs| SNAP_GAP
+    SNAP_GAP -- "too soon" --> SKIP(["Skip coalesce"])
+    SNAP_GAP -- "gap satisfied" --> TRIGGER
+    TRIGGER -- "below threshold" --> SKIP
+    TRIGGER -- "fragmentation threshold hit" --> SELECT -->|candidate set| ENOUGH
+    ENOUGH -- "not enough candidates" --> SKIP
+    ENOUGH -- "viable batch" --> WRITE_NEW -->|staged new packs| MARKER -->|safe to remove originals| UNLINK -->|reclaim marker| CLEANUP
 
     style ALL_DEAD fill:#f8d7da,stroke:#dc3545
     style MIXED fill:#fff3cd,stroke:#ffc107

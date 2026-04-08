@@ -18,19 +18,19 @@ flowchart TD
     AUTO_PRUNE -- "Yes" --> GFS_RUN["gfs_run()<br/>Assign tiers + prune expired"]
     AUTO_PRUNE -- "No" --> AUTO_PACK
 
-    GFS_RUN --> PRUNED{"pruned > 0?"}
+    GFS_RUN -->|prune result| PRUNED{"pruned > 0?"}
     PRUNED -- "Yes" --> GC1["repo_gc()<br/>Reclaim freed objects"]
-    GC1 --> SET_GC["did_gc = 1"]
-    SET_GC --> AUTO_PACK
+    GC1 -->|mark done| SET_GC["did_gc = 1"]
+    SET_GC -->|continue chain| AUTO_PACK
     PRUNED -- "No" --> AUTO_PACK
 
     AUTO_PACK{"auto_pack<br/>= true?"}
     AUTO_PACK -- "Yes" --> RESUME["pack_resume_installing()<br/>Complete interrupted packs"]
-    RESUME --> GC_GUARD{"did_gc?"}
+    RESUME -->|check gc flag| GC_GUARD{"did_gc?"}
     GC_GUARD -- "No" --> GC2["repo_gc()<br/>Clean before packing"]
     GC_GUARD -- "Yes" --> PACK
-    GC2 --> PACK
-    PACK["repo_pack()<br/>Pack loose objects"] --> DONE
+    GC2 -->|refs pruned| PACK
+    PACK["repo_pack()<br/>Pack loose objects"] -->|maintenance complete| DONE
 
     AUTO_PACK -- "No" --> AUTO_GC{"auto_gc = true<br/>AND !did_gc?"}
     AUTO_GC -- "Yes" --> GC3["repo_gc()<br/>Standalone GC"]

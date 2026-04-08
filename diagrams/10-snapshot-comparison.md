@@ -33,10 +33,10 @@ flowchart TD
         QUEUED["Queued (parallel store):<br/>regular file content<br/>(MODIFIED, size > 0)"]
     end
 
-    CREATED --> INLINE
-    CREATED --> QUEUED
-    MODIFIED --> QUEUED
-    META_ONLY --> INLINE
+    CREATED -->|xattr/acl/symlink| INLINE
+    CREATED -->|file bytes| QUEUED
+    MODIFIED -->|file bytes| QUEUED
+    META_ONLY -->|xattr/acl only| INLINE
 
     style UNCHANGED fill:#d4edda,stroke:#28a745
     style CREATED fill:#f8d7da,stroke:#dc3545

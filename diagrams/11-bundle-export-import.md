@@ -24,11 +24,11 @@ flowchart TD
         END_REC["Write CBB_REC_END"]
     end
 
-    LOAD_SNAP --> FILES
-    LOAD_ALL --> FILES
-    COLLECT_TAGS --> FILES
-    COLLECT_ALL_TAGS --> FILES
-    FILES --> DEDUP --> SORT_OBJ --> OBJECTS --> END_REC
+    LOAD_SNAP -->|single snap manifest| FILES
+    LOAD_ALL -->|full repo manifest| FILES
+    COLLECT_TAGS -->|tag list| FILES
+    COLLECT_ALL_TAGS -->|tag list| FILES
+    FILES -->|referenced hashes| DEDUP -->|unique hashes| SORT_OBJ -->|pack-ordered ids| OBJECTS -->|stream complete| END_REC
 
     style FILES fill:#d1ecf1,stroke:#0c5460
     style DEDUP fill:#fff3cd,stroke:#ffc107
@@ -46,7 +46,7 @@ flowchart TD
         FAIL1{"Any hash<br/>mismatch?"}
     end
 
-    READ1 --> VERIFY_HDR --> VERIFY_REC --> FAIL1
+    READ1 -->|framing intact| VERIFY_HDR -->|header ok| VERIFY_REC -->|hash results| FAIL1
     FAIL1 -- "Yes" --> ABORT(["ABORT<br/>ERR_CORRUPT<br/>No writes made"])
 
     subgraph "Pass 2: Apply"
@@ -57,8 +57,8 @@ flowchart TD
     end
 
     FAIL1 -- "No: all clean" --> READ2
-    READ2 --> WRITE_FILE --> WRITE_OBJ --> UPDATE_HEAD
-    UPDATE_HEAD --> DONE(("Import complete"))
+    READ2 -->|file records| WRITE_FILE -->|object records| WRITE_OBJ -->|all bytes landed| UPDATE_HEAD
+    UPDATE_HEAD -->|HEAD committed| DONE(("Import complete"))
 
     style ABORT fill:#f8d7da,stroke:#dc3545
     style DONE fill:#d4edda,stroke:#28a745

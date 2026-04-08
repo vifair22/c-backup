@@ -853,3 +853,290 @@ In session mode, the server maintains a single-slot snapshot cache:
 - Cleared on session end
 
 This makes repeated `snap_dir_children` calls for the same snapshot nearly free.
+
+---
+
+## Architecture: From Binary Entry to File Access
+
+This section traces how an RPC call traverses the binary, layer by layer, down to the `pread()`/`mmap()` calls that touch the on-disk repository.
+
+### High-Level Diagram
+
+```mermaid
+flowchart TD
+    CLIENT(["Client<br/>(Viewer GUI, script)"])
+    REQ["JSON request<br/>{action, params}"]
+    ROUTER{{"Router<br/>(action → intent)"}}
+
+    subgraph INTENTS["Read intents"]
+      direction TB
+      I1["Snapshot tree<br/>snap, snap_header,<br/>snap_dir_children, list, diff"]
+      I2["Path lookup in snapshot<br/>ls, (restore)"]
+      I3["Object bytes<br/>object_content, object_locate,<br/>object_layout, object_refs"]
+      I4["Filename search<br/>search"]
+      I5["Repo introspection<br/>stats, scan, repo_stats,<br/>loose_*, pack_*, tags,<br/>global_pack_index"]
+    end
+
+    CACHE[["Session snapshot cache<br/>(short-circuits I1/I2/I4<br/>on repeat hits)"]]
+
+    subgraph DISK["On-disk repository"]
+      direction TB
+      F1[("snapshots/NNNNNNNN.snap")]
+      F1b[("snapshots/NNNNNNNN.pidx")]
+      F2[("objects/XX/YYYY…<br/>(loose)")]
+      F3[("packs/pack-NNNNNNNN.dat<br/>+ .idx")]
+      F5[("packs/pack-index.pidx<br/>(global)")]
+      FT[("tags/, refs/HEAD")]
+    end
+
+    RESP["JSON response<br/>(LZ4-framed if ≥256B)"]
+
+    SIDE["save_policy<br/>(only writer — sidecar)"]:::sidecar
+    POL[("policy.toml")]
+
+    CLIENT -->|stdin write| REQ
+    REQ -->|parse + dispatch| ROUTER
+    ROUTER -->|tree request| I1
+    ROUTER -->|path resolve| I2
+    ROUTER -->|object fetch| I3
+    ROUTER -->|name search| I4
+    ROUTER -->|metadata query| I5
+
+    I1 -.->|reuse decoded snap| CACHE
+    I2 -.->|reuse decoded snap| CACHE
+    I4 -.->|reuse decoded snap| CACHE
+    CACHE -.->|cold / different id| F1
+
+    I1 -->|cold load| F1
+    I2 -->|hash → node_id| F1b
+    I2 -.->|pidx miss → walk tree| F1
+    I4 -->|scan dirents| F1
+
+    I3 -->|hot path: try loose first| F2
+    I3 -->|loose miss: consult global index| F5
+    F5 -->|index hit → seek pack| F3
+
+    I5 -->|count snapshots| F1
+    I5 -->|enumerate loose| F2
+    I5 -->|read pack trailers| F3
+    I5 -->|dump global index| F5
+    I5 -->|list tags / head| FT
+
+    F1 -->|nodes + dirents| RESP
+    F1b -->|node_id| RESP
+    F2 -->|decompressed bytes| RESP
+    F3 -->|decompressed bytes| RESP
+    F5 -->|index entries| RESP
+    FT -->|names + ids| RESP
+    RESP -->|stdout write| CLIENT
+
+    ROUTER -.->|save_policy only| SIDE
+    SIDE -.->|atomic rewrite| POL
+
+    classDef sidecar stroke-dasharray: 4 3,fill:#fff8dc,color:#664;
+```
+
+### Layer 1 — Process Entry (`src/cli/main.c`)
+
+The binary's `main()` parses two RPC-only flags:
+
+- `--json` → `main.c:107–119`. Calls `repo_open()` (`:109`), then hands the open repo straight to `json_api_dispatch()` (`:116`), then `repo_close()`.
+- `--json-session` → `main.c:122–135`. Same `repo_open()` (`:125`), then `json_api_session()` (`:132`).
+
+`repo_open()` (in `src/store/repo.c`) is what actually populates the in-memory `repo_t` — it resolves the repo path, opens the on-disk format header, and prepares lazy structures (pack cache, etc.). No object data is read yet; it is all on-demand from this point on.
+
+### Layer 2 — RPC Loop & Locking (`src/api/json_api.c`)
+
+#### One-shot dispatch — `json_api_dispatch()` (`:2323`)
+
+1. `read_stdin_all()` (`:2325`) slurps the entire stdin payload.
+2. `cJSON_Parse()` (`:2331`) parses it; missing `action` → error.
+3. Linear scan over `actions[]` (`:2349–2362`) finds the handler.
+4. `repo_lock_shared(repo)` (`:2365`) — **blocking** shared lock.
+5. Handler is invoked; result wrapped via `write_ok()` / `write_error()`.
+
+#### Session dispatch — `json_api_session()` (`:2384`)
+
+1. `stderr → /dev/null` (`:2388`) — protocol cleanliness.
+2. `repo_lock_shared_nb(repo)` (`:2396`) — **non-blocking** shared lock. The boolean result is what becomes the `lock` field of the ready banner. If a backup/GC/pack process holds the exclusive lock, the session still starts but `lock:false` warns the client of stale-read potential.
+3. Ready banner emitted (`:2400`) with protocol/compression/version.
+4. `_cache_active = 1` (`:2409`) enables the snapshot cache (see Layer 3).
+5. Main loop (`:2416–2470`): `getline()` for newline-delimited requests; per-request dispatch is identical to the one-shot path but without re-locking.
+6. On exit, `session_snap_cache_clear()` (`:2470`) frees the cached snapshot and hash tables.
+
+#### Lock file
+
+`repo_lock_shared()` lives in `src/store/repo.c:666`. It opens `{repo}/lock` (`O_RDWR|O_CREAT`), runs `flock(fd, LOCK_SH)`, and stores the fd on `repo->lock_fd` with `lock_mode=1`. The `_nb` variant at `:686` uses `LOCK_SH | LOCK_NB` and is what lets the session detect exclusive contention without blocking the GUI startup.
+
+#### Response framing & LZ4 — `write_json()` (`:290–327`)
+
+Every successful response funnels through `write_json()`:
+
+- Computes `LZ4_compressBound()` (`:295`).
+- `LZ4_compress_default()` (`:301`) compresses the JSON.
+- Writes the 9-byte binary frame: `0x00` magic, 4-byte uncompressed length (LE), 4-byte compressed length (LE), then compressed bytes and `'\n'` (`:309–318`).
+- On compression failure or for sub-256B payloads, falls back to plain JSON + newline (`:323–326`).
+
+The leading `0x00` is the discriminator: JSON itself can never start with a null byte, so a client can sniff one byte to decide whether to LZ4-decompress.
+
+### Layer 3 — Session Snapshot Cache
+
+The cache is **single-slot** (LRU of size one) and lives entirely in `static` storage in `json_api.c:38–51`:
+
+| Symbol | Purpose |
+|--------|---------|
+| `_cached_snap` | The `snapshot_t*` itself (nodes + packed dirent_data) |
+| `_cached_snap_id` | Snapshot ID currently cached |
+| `_cache_active` | Set to `1` only during `--json-session` |
+| `_cached_pset` / `_cached_pset_occ` / `_cached_pset_cap` | Open-addressed hash set of node_ids that appear as `parent_node` in any dirent. Used by `snap_dir_children` to answer "does this node have children?" in O(1). |
+| `_cached_nm_keys` / `_cached_nm_vals` / `_cached_nm_occ` / `_cached_nm_cap` | Open-addressed hash map `node_id → const node_t*` so lookups during directory expansion are O(1) instead of O(N) over `snap->nodes[]`. |
+
+`session_snap_get()` (`:131`) is the cache's only entry point:
+
+1. If `snap_id == _cached_snap_id`, return the cached pointer.
+2. Otherwise evict: `snapshot_free(_cached_snap)` and `_free_cached_tables()` (`:137–140`).
+3. `snapshot_load(repo, snap_id, &snap)` (`:144`) loads the new snapshot from disk.
+4. If `_cache_active`, install the new snapshot and call `_build_cached_tables()` (`:64–125`), which power-of-2-sizes both hash tables (start 32, double until ≥ load) and hashes node_ids with the FNV-1a-style `0x9E3779B97F4A7C15` mixer.
+
+The net effect: a viewer that opens a snapshot and then expands many directories pays the snapshot decompression cost **once**, and every subsequent `snap_dir_children` is constant-time work over already-resident memory.
+
+### Layer 4 — Action Handlers and Their Disk Paths
+
+The dispatch table at `json_api.c:2291–2317` is the canonical list. Below are the call chains for the most representative handlers, followed by which on-disk artifacts each one touches.
+
+#### `snap` — full snapshot load (`handle_snap`, `:419–473`)
+
+```
+handle_snap
+  └── session_snap_get()                       json_api.c:131
+        └── snapshot_load()                    src/store/snapshot.c:306
+              └── open()/read() snaps/snap-NNN.bin   (decompresses nodes + dirent blob)
+  ├── snap_add_header_fields()                 :438
+  ├── walk snap->nodes[] → JSON                :442
+  └── walk dirent_data dirent_rec_t records   :447–468
+```
+
+If the cache is warm, the first three lines collapse to a pointer return — the handler then just walks already-decoded memory.
+
+#### `snap_dir_children` — lazy directory expansion (`:493–651`)
+
+```
+handle_snap_dir_children
+  ├── session_snap_get()                       :511   (loads snap if cold)
+  ├── use _cached_pset / _cached_nm_*          :519–525
+  │     (or _build_cached_tables() inline at :527–572 for one-shot mode)
+  ├── linear scan of dirent_data for parent    :573–616
+  └── per-child: node-map lookup → JSON        :617–648
+```
+
+This is the hottest path for the GUI's tree view. It is intentionally tuned so that **no disk I/O** happens for repeated expansions of the same snapshot.
+
+#### `object_content` / `object_locate` — payload retrieval (`:869–939`)
+
+```
+handle_object_content
+  ├── hex_to_hash()                            :876
+  ├── object_load() / object_load_prefix()     src/store/object.c:1367
+  │     ├── hash_to_path() → objects/XX/YYY…   :1372
+  │     ├── open(O_RDONLY) loose object        :1376
+  │     │     ├── pread() 56-byte header       :1383
+  │     │     ├── read compressed payload      :1403
+  │     │     └── (v2) read RS parity trailer, verify/repair
+  │     └── on ENOENT → pack_object_load()     pack.c:773
+  │           ├── pack_find_entry()            pack.c:583  (bsearch over cache)
+  │           │     └── pack_cache_load()      pack.c:391
+  │           │           └── pack_index_open() pack_index.c:35
+  │           │                 └── mmap() packs/pack-index.pidx
+  │           ├── dat_open_or_checkout()       fopen("packs/pack-NNNNNNNN.dat")
+  │           ├── fseeko(dat_offset) + read_entry_hdr()
+  │           ├── (v3/v4) load_entry_parity() + RS verify/repair
+  │           └── LZ4_decompress_safe / ZSTD_decompress / memcpy
+  └── base64_encode() into JSON                :928
+```
+
+So a single `object_content` call may walk: **lock file → mmapped global pack index → pack `.dat` header → parity records → decompressor**, all under one shared `flock`.
+
+#### `ls` — filtered directory listing (`:975–1017`)
+
+```
+handle_ls
+  └── snapshot_ls_collect()                    src/ops/ls.c
+        └── snapshot_load()                    (or cache hit)
+              → walks dirent tree, applies path/recursive/type/glob filters
+```
+
+#### `search` — cross-snapshot filename search (`:1939–1983`)
+
+```
+handle_search
+  ├── if id given:  search_one_snapshot()      src/ops/search.c
+  └── otherwise:    snapshot_list_all() then snapshot_search_multi()
+        → loads each snapshot in turn (no cache benefit for full sweep)
+```
+
+#### `pack_entries` — enumerate one pack file (`:1221–1329`)
+
+```
+handle_pack_entries
+  ├── pack_enumerate_dat()                     pack.c:3952
+  │     └── opens packs/pack-NNNNNNNN.dat, walks entry headers
+  └── trailer parsing via pread():
+        ├── parity_footer_t at fend - sizeof(pftr)         :1265
+        ├── offset table at fend - 16 - 8*count            :1279–1290
+        └── per-entry parity records                       :1298–1300
+```
+
+This handler deliberately uses positional reads on the trailer rather than full-file mmap so that very large packs do not pollute the page cache.
+
+#### `object_layout` — physical loose-object map (`:2038–2140`)
+
+```
+handle_object_layout
+  ├── construct objects/XX/YYY… path           :2053–2055
+  ├── open(O_RDONLY)                           :2057
+  ├── pread() object_header_t                  :2069
+  ├── compute segments[] (header / payload)    :2085–2106
+  └── pread() parity_footer_t at end           :2112–2117
+```
+
+Pure introspection — never invokes the decompressor.
+
+#### `global_pack_index` — paginated dump (`:2189–2246`)
+
+```
+handle_global_pack_index
+  ├── pack_index_open()                        pack_index.c:35
+  │     └── mmap(packs/pack-index.pidx, MAP_PRIVATE)
+  │           ├── validate magic / version
+  │           ├── verify parity_footer_t
+  │           └── CRC32C + RS-repair if corrupt
+  ├── serialize header (magic/version/counts)
+  ├── serialize fanout[256]
+  ├── slice [offset, offset+limit) of entries
+  └── pack_index_close()                       (munmap)
+```
+
+### Layer 5 — Disk Artifacts Touched by RPC
+
+| Artifact | Path | Touched by | Access pattern |
+|----------|------|------------|----------------|
+| Repo lock | `{repo}/lock` | every action (via `repo_lock_shared`) | `flock(LOCK_SH[\|LOCK_NB])` |
+| Snapshot files | `{repo}/snaps/snap-NNN.bin` | `snap`, `snap_header`, `snap_dir_children`, `ls`, `search`, `diff`, `list`, `repo_summary` | `read()`, decompress |
+| Loose objects | `{repo}/objects/XX/YYY…` | `object_content`, `object_locate`, `object_layout`, `loose_list`, `loose_stats` | `pread()` header + payload + parity |
+| Pack data | `{repo}/packs/pack-NNNNNNNN.dat` | `object_content` (fallback), `pack_entries`, `all_pack_entries`, `repo_stats`, `scan` | `fseeko()`+`read()`, trailer `pread()` |
+| Pack legacy idx | `{repo}/packs/pack-NNNNNNNN.idx` | `pack_index`, fallback `pack_cache_load()` | sequential read |
+| Global pack index | `{repo}/packs/pack-index.pidx` | `global_pack_index`, all packed-object lookups | `mmap(MAP_PRIVATE)` |
+| Tags / policy | `{repo}/tags/*`, `{repo}/policy.toml` | `tags`, `policy`, `save_policy` | direct file I/O |
+
+### Recap: a Single `object_content` Round-Trip
+
+1. **Client** writes `{"action":"object_content","params":{"hash":"…"}}\n` to the session's stdin.
+2. **Session loop** (`json_api.c:2416`) `getline()`s the request.
+3. **cJSON** parses; **dispatch table** routes to `handle_object_content` (`:869`).
+4. **Hash decode** → 32 bytes.
+5. **`object_load`** tries `objects/XX/YYY…` first. On hit: `pread()` header, `pread()` payload, RS-verify, decompress.
+6. On miss: **`pack_object_load`** → `pack_find_entry` → `pack_cache_load` → first time only, `pack_index_open` `mmap`s `pack-index.pidx`. Subsequent lookups are just `bsearch` over the resident cache.
+7. **`fopen` + `fseeko`** the resolved `pack-NNNNNNNN.dat` to `dat_offset`, read the entry header, parity-verify (v3/v4), decompress into a fresh buffer.
+8. **`base64_encode`** the result, build the JSON object, hand to **`write_ok`**.
+9. **`write_json`** LZ4-compresses (since payload > 256 B), writes the 9-byte binary frame and the compressed body.
+10. The shared `flock` is held for the entire round-trip — released only when the session exits.

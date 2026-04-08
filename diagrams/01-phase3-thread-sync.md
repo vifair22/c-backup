@@ -33,23 +33,23 @@ flowchart TD
         DISPLAY["Render: items/total  K writing<br/>X.X/Y.Y GiB  Z.Z MiB/s  ETA"]
     end
 
-    SORT --> SPAWN
-    SPAWN --> CLAIM
-    SPAWN --> SAMPLE
+    SORT -->|inode-order locality| SPAWN
+    SPAWN -->|launch workers| CLAIM
+    SPAWN -->|launch sampler| SAMPLE
 
-    CLAIM --> CHECK
-    CHECK -- "No" --> ACTIVE --> STORE
-    STORE --> CHUNK
-    CHUNK --> SUCCESS
-    CHUNK --> TRANSIENT
-    CHUNK --> FATAL
-    SUCCESS --> CLAIM
-    TRANSIENT --> CLAIM
-    CHECK -- "Yes: queue exhausted" --> JOIN
+    CLAIM -->|claimed index| CHECK
+    CHECK -- "work available" --> ACTIVE -->|mark file in-flight| STORE
+    STORE -->|stream chunks| CHUNK
+    CHUNK -->|whole file written| SUCCESS
+    CHUNK -->|recoverable failure| TRANSIENT
+    CHUNK -->|unrecoverable failure| FATAL
+    SUCCESS -->|grab next task| CLAIM
+    TRANSIENT -->|grab next task| CLAIM
+    CHECK -- "queue exhausted" --> JOIN
 
-    SAMPLE --> READ --> EMA --> DISPLAY --> SAMPLE
+    SAMPLE -->|tick elapsed| READ -->|raw counters| EMA -->|smoothed rate| DISPLAY -->|loop| SAMPLE
 
-    JOIN --> STOP_PROG --> DRAIN
+    JOIN -->|workers done| STOP_PROG -->|progress thread joined| DRAIN
 
     style CLAIM fill:#d1ecf1,stroke:#0c5460
     style CHUNK fill:#d1ecf1,stroke:#0c5460

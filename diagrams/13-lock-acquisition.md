@@ -11,9 +11,9 @@ flowchart TD
         ACCESSED["write_version_file('last_accessed')<br/>Atomic: tmp → rename"]
     end
 
-    OPEN_DIR --> CHECK_FMT --> ALLOC --> ACCESSED
+    OPEN_DIR -->|dir fd| CHECK_FMT -->|format valid| ALLOC -->|state ready| ACCESSED
 
-    ACCESSED --> LOCK_TYPE{"Lock type<br/>needed?"}
+    ACCESSED -->|repo usable| LOCK_TYPE{"Lock type<br/>needed?"}
 
     subgraph "Shared Lock (reads: list, restore, verify, stats, ls)"
         SH_OPEN["open(lock, O_RDWR | O_CREAT)"]
@@ -21,10 +21,10 @@ flowchart TD
         SH_FAIL["Lock failed:<br/>Proceed with warning<br/>(non-fatal)"]
     end
 
-    LOCK_TYPE -- "Shared" --> SH_OPEN --> SH_FLOCK
-    SH_FLOCK -. "error" .-> SH_FAIL
-    SH_FLOCK --> READY(["Ready for operation"])
-    SH_FAIL --> READY
+    LOCK_TYPE -- "Shared" --> SH_OPEN -->|lock fd| SH_FLOCK
+    SH_FLOCK -. "flock errno" .-> SH_FAIL
+    SH_FLOCK -->|lock held| READY(["Ready for operation"])
+    SH_FAIL -->|degraded read| READY
 
     subgraph "Exclusive Lock (writes: run, prune, gc, pack, tag set)"
         EX_OPEN["open(lock, O_WRONLY | O_CREAT)"]
@@ -35,9 +35,9 @@ flowchart TD
         PRUNE_RESUME["repo_prune_resume_pending()<br/>Complete interrupted prune:<br/>read prune-pending,<br/>delete listed .snap files,<br/>run repo_gc(),<br/>delete marker"]
     end
 
-    LOCK_TYPE -- "Exclusive" --> EX_OPEN --> EX_FLOCK
-    EX_FLOCK -- "EWOULDBLOCK" --> EX_FAIL
-    EX_FLOCK -- "OK" --> CLEAN_TMP --> WRITTEN --> PRUNE_RESUME --> READY
+    LOCK_TYPE -- "Exclusive" --> EX_OPEN -->|lock fd| EX_FLOCK
+    EX_FLOCK -- "contended" --> EX_FAIL
+    EX_FLOCK -- "acquired" --> CLEAN_TMP -->|orphans gone| WRITTEN -->|version stamped| PRUNE_RESUME -->|replay complete| READY
 
     style ACCESSED fill:#d1ecf1,stroke:#0c5460
     style WRITTEN fill:#d1ecf1,stroke:#0c5460

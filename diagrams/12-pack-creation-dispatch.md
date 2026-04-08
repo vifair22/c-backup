@@ -9,7 +9,7 @@ flowchart TD
     GC["repo_gc()<br/>Delete unreferenced objects<br/>before packing"]
     COLLECT["collect_loose()<br/>Walk objects/XX/<br/>Collect all loose hashes"]
 
-    START --> GC --> COLLECT
+    START -->|clean first| GC -->|live set| COLLECT
 
     subgraph "Partition Pass"
         READ_HDR["Read 56-byte header<br/>of each loose object"]
@@ -21,14 +21,14 @@ flowchart TD
         MARK_SKIP["Write skip marker<br/>to loose object header<br/>(pwrite, in-place)"]
     end
 
-    COLLECT --> READ_HDR --> SKIP
-    SKIP -- "Yes" --> SKIP_MARK
-    SKIP -- "No" --> SIZE
-    SIZE -- "Yes" --> PROBE
-    SIZE -- "No" --> SMALL["Add to small<br/>object queue"]
-    PROBE --> RATIO
-    RATIO -- "No" --> MARK_SKIP
-    RATIO -- "Yes" --> LARGE["Add to large<br/>object queue"]
+    COLLECT -->|per hash| READ_HDR -->|inspect flags| SKIP
+    SKIP -- "already marked" --> SKIP_MARK
+    SKIP -- "not marked" --> SIZE
+    SIZE -- "huge object" --> PROBE
+    SIZE -- "fits small pool" --> SMALL["Add to small<br/>object queue"]
+    PROBE -->|ratio sample| RATIO
+    RATIO -- "poor compression" --> MARK_SKIP
+    RATIO -- "compressible" --> LARGE["Add to large<br/>object queue"]
 
     subgraph "Large Objects (streamed)"
         LARGE_LOOP["For each large object:"]
@@ -37,9 +37,9 @@ flowchart TD
         FINALIZE_L["Finalize current pack<br/>→ open new pack"]
     end
 
-    LARGE --> LARGE_LOOP --> STREAM --> CAP_CHECK
-    CAP_CHECK -- "No" --> LARGE_LOOP
-    CAP_CHECK -- "Yes" --> FINALIZE_L --> LARGE_LOOP
+    LARGE -->|serial loop| LARGE_LOOP -->|compress + write| STREAM -->|check size| CAP_CHECK
+    CAP_CHECK -- "room remains" --> LARGE_LOOP
+    CAP_CHECK -- "cap reached" --> FINALIZE_L -->|new pack opened| LARGE_LOOP
 
     subgraph "Small Objects (parallel worker pool)"
         SORT_HASH["Sort indices by hash<br/>(sequential objects/XX/ access)"]
@@ -51,13 +51,13 @@ flowchart TD
         FINALIZE_W["Finalize pack<br/>→ open new pack<br/>atomic_fetch_add(&next_pack_num)"]
     end
 
-    SMALL --> SORT_HASH --> SPAWN --> WORKER --> LZ4 --> WRITE_ENTRY --> W_CAP
-    W_CAP -- "No" --> WORKER
-    W_CAP -- "Yes" --> FINALIZE_W --> WORKER
+    SMALL -->|locality order| SORT_HASH -->|dispatch pool| SPAWN -->|grab task| WORKER -->|compressed blob| LZ4 -->|append| WRITE_ENTRY -->|check size| W_CAP
+    W_CAP -- "room remains" --> WORKER
+    W_CAP -- "cap reached" --> FINALIZE_W -->|new pack opened| WORKER
 
-    FINALIZE_L --> REBUILD
-    FINALIZE_W --> REBUILD["Rebuild global<br/>pack index"]
-    REBUILD --> DONE(("Done"))
+    FINALIZE_L -->|large phase done| REBUILD
+    FINALIZE_W -->|small phase done| REBUILD["Rebuild global<br/>pack index"]
+    REBUILD -->|index published| DONE(("Done"))
 
     style SKIP_MARK fill:#e2e3e5,stroke:#6c757d
     style MARK_SKIP fill:#e2e3e5,stroke:#6c757d

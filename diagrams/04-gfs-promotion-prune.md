@@ -27,12 +27,12 @@ flowchart TD
         FLUSH["Flush changed flags<br/>snapshot_replace_gfs_flags()"]
     end
 
-    SNAP --> P1 --> P2 --> P3 --> P4 --> FLUSH
+    SNAP -->|start cascade| P1 -->|dailies fixed| P2 -->|weeklies fixed| P3 -->|monthlies fixed| P4 -->|persist| FLUSH
 
-    DAY -.-> P1
-    WEEK -.-> P2
-    MONTH -.-> P3
-    YEAR -.-> P4
+    DAY -.->|defines day window| P1
+    WEEK -.->|defines week window| P2
+    MONTH -.->|defines month window| P3
+    YEAR -.->|defines year window| P4
 
     style P1 fill:#e0f7fa,stroke:#00838f
     style P2 fill:#c8e6c9,stroke:#2e7d32

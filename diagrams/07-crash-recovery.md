@@ -27,18 +27,18 @@ flowchart TD
         R4["pack_resume_installing()<br/>Find .installing-* dirs,<br/>rename staged files to final,<br/>rmdir staging dir,<br/>rebuild index"]
     end
 
-    C1 -.-> M1
-    C2 -.-> M2
-    C3 -.-> M3
-    C4 -.-> R1
+    C1 -.->|guarded by| M1
+    C2 -.->|guarded by| M2
+    C3 -.->|guarded by| M3
+    C4 -.->|leaves tmp orphans| R1
 
-    R0 --> R1 --> R2
-    R2 --> R3
-    R3 --> R4
+    R0 -->|hold exclusive| R1 -->|orphans cleared| R2
+    R2 -->|prune replay done| R3
+    R3 -->|pack deletes done| R4
 
-    M1 -.-> R2
-    M2 -.-> R3
-    M3 -.-> R4
+    M1 -.->|replay list| R2
+    M2 -.->|replay list| R3
+    M3 -.->|staged files| R4
 
     style M1 fill:#fff3cd,stroke:#ffc107
     style M2 fill:#fff3cd,stroke:#ffc107
@@ -61,7 +61,7 @@ flowchart LR
         E["rename()<br/>Atomic swap<br/>to final path"]
     end
 
-    A --> B --> C --> D --> E
+    A -->|fd open| B -->|bytes buffered| C -->|data durable| D -->|dirent durable| E
 
     subgraph "Crash at any point"
         X1["Before rename:<br/>Orphan in tmp/<br/>Cleaned by repo_lock()"]

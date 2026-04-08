@@ -922,12 +922,12 @@ flowchart TD
     HEAD["refs/HEAD\nsnapshot ID"]
     TAG["tags/name\nsnapshot ID + preserve flag"]
 
-    HEAD --> SNAP
-    TAG --> SNAP
+    HEAD -->|latest committed| SNAP
+    TAG -->|named pin| SNAP
 
     SNAP["Snapshot .snap file\nheader + node_t array + dirent blob"]
 
-    SNAP --> NODE["node_t (161 bytes)\ntype, mode, uid, gid,\nsize, mtime, inode_identity"]
+    SNAP -->|flat array of nodes| NODE["node_t (161 bytes)\ntype, mode, uid, gid,\nsize, mtime, inode_identity"]
 
     NODE -- "content_hash" --> OBJ
     NODE -- "xattr_hash" --> OBJ
@@ -936,11 +936,11 @@ flowchart TD
 
     OBJ["Object\nSHA-256 addressed"]
 
-    OBJ --> LOOSE["Loose\nobjects/XX/rest\n56 B header + payload\n+ parity trailer"]
-    OBJ --> PACKED["Packed\n.dat entry\n50 B header + payload"]
+    OBJ -->|freshly written| LOOSE["Loose\nobjects/XX/rest\n56 B header + payload\n+ parity trailer"]
+    OBJ -->|compacted by sweeper| PACKED["Packed\n.dat entry\n50 B header + payload"]
 
-    PACKED -.-> PIDX["pack-index.pidx\nfanout 256 +\nsorted entries 52 B each"]
-    PACKED -.-> IDX[".idx file\nhash to dat_offset\nper-pack, sorted"]
+    PACKED -.->|global lookup| PIDX["pack-index.pidx\nfanout 256 +\nsorted entries 52 B each"]
+    PACKED -.->|per-pack lookup| IDX[".idx file\nhash to dat_offset\nper-pack, sorted"]
 
     style HEAD fill:#cce5ff,stroke:#004085
     style TAG fill:#cce5ff,stroke:#004085
@@ -1106,7 +1106,7 @@ flowchart TD
     OPEN["open_noatime<br/>O_RDONLY | O_NOATIME"]
     SPARSE{"Detect sparse<br/>SEEK_DATA / SEEK_HOLE"}
 
-    OPEN --> SPARSE
+    OPEN -->|fd ready| SPARSE
 
     SPARSE -- "Has holes" --> SPARSE_STORE["Build sparse_hdr_t +<br/>region table<br/>OBJECT_TYPE_SPARSE"]
     SPARSE -- "Dense file" --> FUSE_CHECK{"FUSE source?<br/>fstatfs FUSE_SUPER_MAGIC"}
@@ -1116,18 +1116,18 @@ flowchart TD
 
     STREAM["Read chunks →<br/>SHA-256 + CRC-32C +<br/>RS parity inline<br/>Write to tmp/ file"]
 
-    RING --> STREAM
-    DIRECT --> STREAM
-    SPARSE_STORE --> DEDUP
+    RING -->|filled buffers| STREAM
+    DIRECT -->|filled buffers| STREAM
+    SPARSE_STORE -->|hash computed| DEDUP
 
-    STREAM --> DEDUP{"object_exists?<br/>Dedup check after<br/>full hash known"}
+    STREAM -->|full hash known| DEDUP{"object_exists?<br/>Dedup check after<br/>full hash known"}
 
     DEDUP -- "Exists" --> DISCARD["Discard temp file<br/>Return existing hash"]
     DEDUP -- "New" --> PATCH["pwrite header<br/>Set compressed_size + hash"]
-    PATCH --> PARITY["Append parity trailer<br/>XOR + RS + CRC-32C +<br/>parity_footer_t"]
-    PARITY --> ASYNC["async_writeback<br/>sync_file_range"]
-    ASYNC --> RENAME["rename to objects/XX/rest<br/>Atomic visibility"]
-    RENAME --> LOOSE["Insert into<br/>loose hash set"]
+    PATCH -->|header finalized| PARITY["Append parity trailer<br/>XOR + RS + CRC-32C +<br/>parity_footer_t"]
+    PARITY -->|payload + trailer on disk| ASYNC["async_writeback<br/>sync_file_range"]
+    ASYNC -->|writeback kicked| RENAME["rename to objects/XX/rest<br/>Atomic visibility"]
+    RENAME -->|now visible| LOOSE["Insert into<br/>loose hash set"]
 
     style DISCARD fill:#f8d7da,stroke:#dc3545
     style RENAME fill:#d4edda,stroke:#28a745
@@ -1205,9 +1205,15 @@ flowchart TD
     P8["<b>Phase 8: Maintenance</b><br/>auto_prune → GC → auto_pack"]
     DONE(("Done"))
 
-    P1 --> P2 --> P3a --> P3b
-    P3b --> P3c --> P45 --> P6
-    P6 --> P7 --> P8 --> DONE
+    P1 -->|scan_entry_t array| P2
+    P2 -->|pathmap ready| P3a
+    P3a -->|changed files queued| P3b
+    P3b -->|transient failures| P3c
+    P3c -->|recovered + failed set| P45
+    P45 -->|node + dirent tables| P6
+    P6 -->|committed snapshot| P7
+    P7 -->|all hashes present| P8
+    P8 --> DONE
 
     P3a -. "no changes →<br/>skip 3b" .-> P45
     P3b -. "no failures →<br/>skip 3c" .-> P45
@@ -2308,10 +2314,11 @@ flowchart TD
         LOOSE_OPEN{"open() →<br/>found?"}
     end
 
-    START --> LOOSE_PATH --> LOOSE_OPEN
+    START -->|hash bytes| LOOSE_PATH
+    LOOSE_PATH -->|openat| LOOSE_OPEN
 
     LOOSE_OPEN -- "Yes" --> LOOSE_READ["Read header + payload<br/>Verify SHA-256"]
-    LOOSE_READ --> FOUND(["Return object"])
+    LOOSE_READ -->|bytes verified| FOUND(["Return object"])
 
     LOOSE_OPEN -- "ENOENT" --> GLOBAL_CHECK{"Global index<br/>pack-index.pidx<br/>available?"}
 
@@ -2322,7 +2329,10 @@ flowchart TD
         PACK_HIT{"Found?"}
     end
 
-    GLOBAL_CHECK -- "Yes" --> MMAP --> FANOUT --> BSEARCH --> PACK_HIT
+    GLOBAL_CHECK -- "Yes" --> MMAP
+    MMAP -->|hash[0] byte| FANOUT
+    FANOUT -->|narrowed range| BSEARCH
+    BSEARCH -->|entry or miss| PACK_HIT
 
     PACK_HIT -- "Yes" --> DAT_READ
 
@@ -2333,7 +2343,10 @@ flowchart TD
         DAT_RETURN["DAT cache return"]
     end
 
-    DAT_READ --> DECOMPRESS --> VERIFY --> DAT_RETURN --> FOUND
+    DAT_READ -->|compressed bytes| DECOMPRESS
+    DECOMPRESS -->|plaintext payload| VERIFY
+    VERIFY -->|hash match| DAT_RETURN
+    DAT_RETURN -->|release dat fd| FOUND
 
     subgraph "Tier 2b: Fallback .idx Scan"
         LOAD_IDX["Load all per-pack .idx<br/>into sorted array"]
@@ -2341,7 +2354,9 @@ flowchart TD
         FB_HIT{"Found?"}
     end
 
-    GLOBAL_CHECK -- "No / stale" --> LOAD_IDX --> FALLBACK_SEARCH --> FB_HIT
+    GLOBAL_CHECK -- "No / stale" --> LOAD_IDX
+    LOAD_IDX -->|unified sorted array| FALLBACK_SEARCH
+    FALLBACK_SEARCH -->|entry or miss| FB_HIT
     PACK_HIT -- "No" --> LOAD_IDX
 
     FB_HIT -- "Yes" --> DAT_READ

@@ -13,10 +13,10 @@ flowchart TD
         SORT["qsort primaries by<br/>(pack_num, dat_offset)<br/>→ sequential pack reads"]
     end
 
-    LOAD --> RESOLVE --> CLASSIFY
-    CLASSIFY --> PRIMARY
-    CLASSIFY --> HARDLINK
-    PRIMARY --> SORT
+    LOAD -->|nodes + hashes| RESOLVE -->|located entries| CLASSIFY
+    CLASSIFY -->|first sighting| PRIMARY
+    CLASSIFY -->|already seen node_id| HARDLINK
+    PRIMARY -->|minimise seeks| SORT
 
     subgraph "Pass 1: Primaries (parallel, pack-sorted)"
         PARTITION["Partition sorted array<br/>into N contiguous chunks"]
@@ -29,21 +29,21 @@ flowchart TD
         META["Apply metadata:<br/>1. lchown(uid, gid)<br/>2. chmod(mode)<br/>3. lsetxattr (each xattr)<br/>4. acl_set_file<br/>5. utimensat(mtime)"]
     end
 
-    SORT --> PARTITION --> WORKERS --> ENTRY
-    ENTRY -- "dir" --> DIR_E --> META
-    ENTRY -- "reg/sparse" --> REG_E --> META
-    ENTRY -- "symlink" --> SYM_E --> META
-    ENTRY -- "chr/blk/fifo" --> DEV_E --> META
+    SORT -->|equal slices| PARTITION -->|dispatch| WORKERS -->|per node| ENTRY
+    ENTRY -- "dir" --> DIR_E -->|inode created| META
+    ENTRY -- "reg/sparse" --> REG_E -->|bytes written| META
+    ENTRY -- "symlink" --> SYM_E -->|link created| META
+    ENTRY -- "chr/blk/fifo" --> DEV_E -->|special node created| META
 
     subgraph "Pass 2: Hardlinks (single-threaded)"
         LOOKUP["For each secondary:<br/>nl_htab_get(node_id)<br/>→ primary path"]
         LINK["link(primary_path,<br/>secondary_path)"]
     end
 
-    HARDLINK --> LOOKUP --> LINK
+    HARDLINK -->|after pass 1| LOOKUP -->|target path known| LINK
 
-    META --> DONE(("Done"))
-    LINK --> DONE
+    META -->|primary finalized| DONE(("Done"))
+    LINK -->|secondary attached| DONE
 
     style SORT fill:#d1ecf1,stroke:#0c5460
     style WORKERS fill:#d4edda,stroke:#28a745
