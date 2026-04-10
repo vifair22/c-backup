@@ -19,6 +19,12 @@ status_t tag_delete(repo_t *repo, const char *name);
 status_t tag_list(repo_t *repo);   /* prints name -> snap_id [preserved] to stdout */
 
 /*
+ * Rename a tag atomically: read old, write new, delete old.
+ * Fails if old_name doesn't exist or new_name already exists.
+ */
+status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name);
+
+/*
  * Returns 1 if snap_id is protected by at least one preserved tag, and writes
  * the first matching tag name into name_out (if non-NULL).  Returns 0 otherwise.
  */

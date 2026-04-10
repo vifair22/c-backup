@@ -3,6 +3,7 @@
 #include "cmd_common.h"
 #include "cli.h"
 #include "backup.h"
+#include "journal.h"
 #include "policy.h"
 #include "snapshot.h"
 #include "gfs.h"
@@ -104,20 +105,25 @@ int cmd_run(repo_t *repo, int argc, char **argv) {
         .strict_meta  = (pol && pol->strict_meta),
     };
 
+    journal_op_t *jop = journal_start(repo, "run", JOURNAL_SOURCE_CLI);
+
     if (lock_or_die(repo)) {
         free_abs_list(source_owned, source_abs, n_source);
         free_abs_list(exclude_owned, exclude_abs, n_excl);
         policy_free(pol);
+        journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL);
         return 1;
     }
 
     status_t st = backup_run_opts(repo, source_abs, n_source, &bopts);
     if (st != OK) {
+        const char *emsg = err_msg()[0] ? err_msg() : "backup failed";
         if (err_msg()[0])
             log_msg("ERROR", err_msg());
         free_abs_list(source_owned, source_abs, n_source);
         free_abs_list(exclude_owned, exclude_abs, n_excl);
         policy_free(pol);
+        journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, emsg, NULL);
         return 1;
     }
 
@@ -151,6 +157,7 @@ int cmd_run(repo_t *repo, int argc, char **argv) {
     free_abs_list(source_owned, source_abs, n_source);
     free_abs_list(exclude_owned, exclude_abs, n_excl);
     policy_free(pol);
+    journal_complete(jop, JOURNAL_RESULT_SUCCESS, NULL, NULL, NULL);
     return 0;
 }
 
@@ -215,7 +222,9 @@ int cmd_prune(repo_t *repo, int argc, char **argv) {
         return 1;
     }
 
-    if (!dry_run && lock_or_die(repo)) { policy_free(pol); return 1; }
+    journal_op_t *jop = journal_start(repo, "prune", JOURNAL_SOURCE_CLI);
+
+    if (!dry_run && lock_or_die(repo)) { policy_free(pol); journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
 
     uint32_t head_id = 0;
     snapshot_read_head(repo, &head_id);
@@ -226,6 +235,10 @@ int cmd_prune(repo_t *repo, int argc, char **argv) {
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "prune failed");
+    char psummary[64];
+    snprintf(psummary, sizeof(psummary), "{\"pruned\":%u}", pruned);
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     psummary, st != OK ? err_msg() : NULL, NULL);
     policy_free(pol);
     return st == OK ? 0 : 1;
 }
@@ -273,12 +286,15 @@ int cmd_gc(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 } };
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
-    if (lock_or_die(repo)) return 1;
+    journal_op_t *jop = journal_start(repo, "gc", JOURNAL_SOURCE_CLI);
+    if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
     log_msg("INFO", "running GC");
     status_t st = repo_gc(repo, NULL, NULL);
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "gc failed");
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, st != OK ? err_msg() : NULL, NULL);
     return st == OK ? 0 : 1;
 }
 
@@ -370,7 +386,8 @@ int cmd_pack(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 } };
     if (validate_options(argc, argv, 2, specs, 1, NULL, 0)) return 1;
     (void)argc; (void)argv;
-    if (lock_or_die(repo)) return 1;
+    journal_op_t *jop = journal_start(repo, "pack", JOURNAL_SOURCE_CLI);
+    if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
     pack_resume_installing(repo);
     log_msg("INFO", "running GC");
     repo_gc(repo, NULL, NULL);
@@ -379,6 +396,8 @@ int cmd_pack(repo_t *repo, int argc, char **argv) {
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "pack failed");
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, st != OK ? err_msg() : NULL, NULL);
     return st == OK ? 0 : 1;
 }
 
@@ -402,8 +421,9 @@ int cmd_verify(repo_t *repo, int argc, char **argv) {
     static const flag_spec_t specs[] = { { "--repo", 1 }, { "--repair", 0 } };
     if (validate_options(argc, argv, 2, specs, 2, NULL, 0)) return 1;
     int repair = opt_has(argc, argv, 2, "--repair");
+    journal_op_t *jop = journal_start(repo, "verify", JOURNAL_SOURCE_CLI);
     if (repair) {
-        if (lock_or_die(repo)) return 1;
+        if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
     } else {
         lock_shared(repo);
     }
@@ -420,6 +440,15 @@ int cmd_verify(repo_t *repo, int argc, char **argv) {
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "verification failed");
+    /* Build verify summary JSON. */
+    char vsummary[256];
+    snprintf(vsummary, sizeof(vsummary),
+             "{\"objects_checked\":%llu,\"parity_repaired\":%llu,\"parity_corrupt\":%llu}",
+             (unsigned long long)vopts.objects_checked,
+             (unsigned long long)vopts.parity_repaired,
+             (unsigned long long)vopts.parity_corrupt);
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     vsummary, st != OK ? err_msg() : NULL, NULL);
     return st == OK ? 0 : 1;
 }
 

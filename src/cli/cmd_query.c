@@ -3,6 +3,7 @@
 #include "cmd_common.h"
 #include "cli.h"
 #include "help.h"
+#include "journal.h"
 #include "repo.h"
 #include "snapshot.h"
 #include "restore.h"
@@ -273,6 +274,8 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
         return 1;
     }
 
+    journal_op_t *jop = journal_start(repo, "restore", JOURNAL_SOURCE_CLI);
+
     int verify  = opt_has(argc, argv, 2, "--verify");
     int quiet   = opt_has(argc, argv, 2, "--quiet");
     const char *file_arg = opt_get(argc, argv, 2, "--file");
@@ -282,6 +285,7 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
     if (snap_arg) {
         if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
             fprintf(stderr, "error: unknown snapshot or tag '%s'\n", snap_arg);
+            journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "unknown snapshot or tag", NULL);
             return 1;
         }
     }
@@ -291,6 +295,7 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
     if (file_arg) {
         if (!snap_arg) {
             fprintf(stderr, "error: --snapshot required with --file\n");
+            journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "--snapshot required with --file", NULL);
             return 1;
         }
         st = restore_file(repo, snap_id, file_arg, dest);
@@ -314,6 +319,8 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
     if (st != OK) {
         if (!quiet) fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "restore failed");
+        journal_complete(jop, JOURNAL_RESULT_FAILED, NULL,
+                         err_msg()[0] ? err_msg() : "restore failed", NULL);
         return 1;
     }
 
@@ -322,11 +329,14 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
         if (st != OK) {
             fprintf(stderr, "error: %s\n",
                     err_msg()[0] ? err_msg() : "post-restore verification failed");
+            journal_complete(jop, JOURNAL_RESULT_FAILED, NULL,
+                             err_msg()[0] ? err_msg() : "post-restore verification failed", NULL);
             return 1;
         }
         if (!quiet) fprintf(stderr, "verify: OK\n");
     }
 
+    journal_complete(jop, JOURNAL_RESULT_SUCCESS, NULL, NULL, NULL);
     return 0;
 }
 
