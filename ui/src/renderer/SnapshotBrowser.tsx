@@ -58,16 +58,18 @@ interface Props {
   connName: string
   repoPath: string
   snapId: number
+  initialPath?: string
   onBack: () => void
 }
 
-export function SnapshotBrowser({ connName, repoPath, snapId, onBack }: Props): React.ReactElement {
+export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack }: Props): React.ReactElement {
   const [header, setHeader] = useState<SnapHeader | null>(null)
   const [tree, setTree] = useState<Map<number, TreeNode[]>>(new Map())
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState<Set<number>>(new Set())
   const [breadcrumb, setBreadcrumb] = useState<Breadcrumb[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [highlightNodeId, setHighlightNodeId] = useState<number | null>(null)
   const [initLoading, setInitLoading] = useState(true)
 
   const fetchChildren = useCallback(async (parentNodeId: number) => {
@@ -102,10 +104,62 @@ export function SnapshotBrowser({ connName, repoPath, snapId, onBack }: Props): 
     Promise.all([
       api.rpcCall<SnapHeader>(connName, repoPath, 'snap_header', { id: snapId }),
       api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', { id: snapId, parent_node: 0 }),
-    ]).then(([h, root]) => {
+    ]).then(async ([h, root]) => {
       if (cancelled) return
       setHeader(h)
-      setTree(new Map([[0, sortChildren(root.children)]]))
+      const rootChildren = sortChildren(root.children)
+      const treeMap = new Map([[0, rootChildren]])
+      const expandedSet = new Set<number>()
+
+      // Auto-expand to initialPath if provided
+      if (initialPath) {
+        const segments = initialPath.replace(/^\/+/, '').split('/').filter(Boolean)
+        let parentId = 0
+        const crumbs: Breadcrumb[] = []
+
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i]
+          const children = treeMap.get(parentId)
+          if (!children) break
+
+          const match = children.find(c => c.name === seg)
+          if (!match) break
+
+          const isLast = i === segments.length - 1
+          if (isLast) {
+            // Highlight the target file/dir
+            setHighlightNodeId(match.node_id)
+            if (match.type === NODE_DIR) {
+              // Expand it too
+              expandedSet.add(match.node_id)
+              crumbs.push({ nodeId: match.node_id, name: match.name })
+              try {
+                const resp = await api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', {
+                  id: snapId, parent_node: match.node_id,
+                })
+                treeMap.set(match.node_id, sortChildren(resp.children))
+              } catch { /* ignore */ }
+            }
+          } else if (match.type === NODE_DIR && match.has_children) {
+            // Expand intermediate directory
+            expandedSet.add(match.node_id)
+            crumbs.push({ nodeId: match.node_id, name: match.name })
+            try {
+              const resp = await api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', {
+                id: snapId, parent_node: match.node_id,
+              })
+              treeMap.set(match.node_id, sortChildren(resp.children))
+            } catch { break }
+            parentId = match.node_id
+          } else {
+            break
+          }
+        }
+        setBreadcrumb(crumbs)
+      }
+
+      setTree(treeMap)
+      setExpanded(expandedSet)
     }).catch(err => {
       if (!cancelled) setError(String(err))
     }).finally(() => {
@@ -154,7 +208,9 @@ export function SnapshotBrowser({ connName, repoPath, snapId, onBack }: Props): 
       rows.push(
         <tr key={`${parentId}-${node.node_id}`}
           onClick={isDir ? () => toggleDir(node, depth, parentChain) : undefined}
-          className={`border-t border-border-default hover:bg-surface-hover text-text-primary ${isDir ? 'cursor-pointer' : ''}`}>
+          className={`border-t border-border-default hover:bg-surface-hover text-text-primary ${isDir ? 'cursor-pointer' : ''} ${
+            highlightNodeId === node.node_id ? 'bg-accent/10 ring-1 ring-accent/30' : ''
+          }`}>
           <td className="py-1 pr-2" style={{ paddingLeft: `${depth * 20 + 8}px` }}>
             <span className="inline-flex items-center gap-1">
               {isDir ? (

@@ -85,9 +85,10 @@ interface Props {
   repoPath: string
   onSelectSnapshot?: (snapId: number) => void
   onViewAllSnapshots?: () => void
+  onCompareSnapshots?: (a?: number, b?: number) => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
@@ -290,12 +291,20 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
         <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
           <div className="flex items-center justify-between mb-2">
             <div className="text-[11px] text-text-muted uppercase tracking-wide">Recent Snapshots</div>
-            {onViewAllSnapshots && snaps.length > 10 && (
-              <button onClick={onViewAllSnapshots}
-                className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-                View all {fmtNum(snaps.length)} snapshots
-              </button>
-            )}
+            <div className="flex gap-3">
+              {onCompareSnapshots && snaps.length >= 2 && (
+                <button onClick={() => onCompareSnapshots()}
+                  className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
+                  Compare snapshots
+                </button>
+              )}
+              {onViewAllSnapshots && snaps.length > 10 && (
+                <button onClick={onViewAllSnapshots}
+                  className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
+                  View all {fmtNum(snaps.length)} snapshots
+                </button>
+              )}
+            </div>
           </div>
           <table className="w-full text-xs">
             <thead>

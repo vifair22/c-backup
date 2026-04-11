@@ -6,6 +6,7 @@ import { ConfirmDialog } from './ConfirmDialog'
 import { RepoView } from './RepoView'
 import { SnapshotList } from './SnapshotList'
 import { SnapshotBrowser } from './SnapshotBrowser'
+import { SnapshotDiff } from './SnapshotDiff'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -34,7 +35,7 @@ export function App(): React.ReactElement {
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -456,18 +457,29 @@ export function App(): React.ReactElement {
               <RepoView connName={activeRepo.conn} repoPath={activeRepo.path}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onViewAllSnapshots={() => navigateTo({ view: 'snapshots' })}
+                onCompareSnapshots={(a, b) => navigateTo({ view: 'diff', snapA: a, snapB: b })}
               />
             )}
             {currentView.view === 'snapshots' && (
               <SnapshotList connName={activeRepo.conn} repoPath={activeRepo.path}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
+                onCompareSnapshots={() => navigateTo({ view: 'diff' })}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'snapshot-browser' && (
               <SnapshotBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
                 snapId={currentView.snapId}
+                initialPath={currentView.path}
                 onBack={navBack}
+              />
+            )}
+            {currentView.view === 'diff' && (
+              <SnapshotDiff connName={activeRepo.conn} repoPath={activeRepo.path}
+                initialSnapA={currentView.snapA}
+                initialSnapB={currentView.snapB}
+                onBack={navBack}
+                onNavigateToFile={(snapId, path) => navigateTo({ view: 'snapshot-browser', snapId, path })}
               />
             )}
           </>

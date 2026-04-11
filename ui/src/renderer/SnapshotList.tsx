@@ -34,10 +34,11 @@ interface Props {
   connName: string
   repoPath: string
   onSelectSnapshot: (snapId: number) => void
+  onCompareSnapshots?: () => void
   onBack: () => void
 }
 
-export function SnapshotList({ connName, repoPath, onSelectSnapshot, onBack }: Props): React.ReactElement {
+export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSnapshots, onBack }: Props): React.ReactElement {
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -101,8 +102,8 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onBack }: P
 
       {snapList && (
         <>
-          {/* Tier filter */}
-          <div className="flex gap-2 mb-3">
+          {/* Tier filter + compare */}
+          <div className="flex gap-2 mb-3 items-center">
             <button onClick={() => setTierFilter(null)}
               className={`text-[11px] px-2 py-0.5 rounded cursor-pointer border-none ${
                 tierFilter === null ? 'bg-accent text-accent-text' : 'bg-surface-tertiary text-text-secondary hover:bg-surface-hover'
@@ -121,6 +122,12 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onBack }: P
                 </button>
               )
             })}
+            {onCompareSnapshots && snaps.length >= 2 && (
+              <button onClick={onCompareSnapshots}
+                className="text-[11px] px-2 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover text-text-secondary cursor-pointer border-none ml-auto">
+                Compare
+              </button>
+            )}
           </div>
 
           {/* Table */}
