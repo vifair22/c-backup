@@ -628,6 +628,9 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
                         cJSON_AddNumberToObject(child, "type", nd->type);
                         cJSON_AddNumberToObject(child, "size", (double)nd->size);
                         cJSON_AddNumberToObject(child, "mode", nd->mode);
+                        char hex[65];
+                        hash_hex(nd->content_hash, hex);
+                        cJSON_AddStringToObject(child, "content_hash", hex);
                     }
                 }
 

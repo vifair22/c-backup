@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime, gfsBadges, NODE_TYPE_NAMES } from './format'
+import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
 
@@ -34,6 +35,7 @@ interface TreeNode {
   size: number
   mode: number
   has_children: boolean
+  content_hash?: string
 }
 
 interface DirChildrenResponse {
@@ -71,6 +73,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [error, setError] = useState<string | null>(null)
   const [highlightNodeId, setHighlightNodeId] = useState<number | null>(null)
   const [initLoading, setInitLoading] = useState(true)
+  const [selectedFile, setSelectedFile] = useState<{ node: TreeNode; path: string } | null>(null)
+  const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
 
   const fetchChildren = useCallback(async (parentNodeId: number) => {
     setLoading(prev => new Set(prev).add(parentNodeId))
@@ -205,11 +209,18 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       const isLoading = loading.has(node.node_id)
       const chain = isDir ? [...parentChain, { nodeId: node.node_id, name: node.name }] : parentChain
 
+      const filePath = '/' + [...parentChain.map(b => b.name), node.name].join('/')
+      const isSelected = selectedFile?.node.node_id === node.node_id
+
       rows.push(
         <tr key={`${parentId}-${node.node_id}`}
-          onClick={isDir ? () => toggleDir(node, depth, parentChain) : undefined}
-          className={`border-t border-border-default hover:bg-surface-hover text-text-primary ${isDir ? 'cursor-pointer' : ''} ${
-            highlightNodeId === node.node_id ? 'bg-accent/10 ring-1 ring-accent/30' : ''
+          onClick={isDir
+            ? () => toggleDir(node, depth, parentChain)
+            : () => setSelectedFile({ node, path: filePath })
+          }
+          className={`border-t border-border-default hover:bg-surface-hover text-text-primary cursor-pointer ${
+            highlightNodeId === node.node_id ? 'bg-accent/10 ring-1 ring-accent/30' :
+            isSelected ? 'bg-accent/10' : ''
           }`}>
           <td className="py-1 pr-2" style={{ paddingLeft: `${depth * 20 + 8}px` }}>
             <span className="inline-flex items-center gap-1">
@@ -314,6 +325,67 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
             </tbody>
           </table>
         </div>
+      )}
+
+      {/* File detail modal */}
+      {selectedFile && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <div className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+            <div className="flex items-start justify-between mb-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold truncate">{selectedFile.node.name}</div>
+                <div className="text-[11px] text-text-muted font-mono truncate mt-0.5">{selectedFile.path}</div>
+              </div>
+              <button onClick={() => setSelectedFile(null)}
+                className="text-text-muted hover:text-text-primary bg-transparent border-none cursor-pointer text-lg px-1 shrink-0">
+                &times;
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3 mb-3">
+              <div>
+                <div className="text-[10px] text-text-muted uppercase tracking-wide">Type</div>
+                <div className="text-xs text-text-primary">{NODE_TYPE_NAMES[selectedFile.node.type] ?? `${selectedFile.node.type}`}</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-text-muted uppercase tracking-wide">Size</div>
+                <div className="text-xs text-text-primary">{fmtSize(selectedFile.node.size)}</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-text-muted uppercase tracking-wide">Mode</div>
+                <div className="text-xs text-text-primary font-mono">{fmtMode(selectedFile.node.mode)}</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-text-muted uppercase tracking-wide">Hash</div>
+                <div className="text-xs text-text-muted font-mono truncate" title={selectedFile.node.content_hash}>
+                  {selectedFile.node.content_hash?.slice(0, 16)}...
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setSelectedFile(null)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
+                Close
+              </button>
+              {selectedFile.node.content_hash && selectedFile.node.content_hash !== '0'.repeat(64) && (
+                <button onClick={() => { setViewerHash({ hash: selectedFile.node.content_hash!, filename: selectedFile.node.name }); setSelectedFile(null) }}
+                  className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
+                  View Content
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Content viewer modal */}
+      {viewerHash && (
+        <ContentViewer
+          connName={connName}
+          repoPath={repoPath}
+          hash={viewerHash.hash}
+          filename={viewerHash.filename}
+          onClose={() => setViewerHash(null)}
+        />
       )}
     </div>
   )
