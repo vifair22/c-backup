@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 
@@ -87,97 +87,11 @@ function metaDiffLines(old_node: DiffNode, new_node: DiffNode): string[] {
   return lines.length > 0 ? lines : ['(no visible metadata differences)']
 }
 
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-function getDiffTheme() {
-  const isDark = document.documentElement.classList.contains('dark') ||
-    window.matchMedia('(prefers-color-scheme: dark)').matches
-  return {
-    isDark,
-    bg: isDark ? '#1e1e2e' : '#ffffff',
-    fg: isDark ? '#cdd6f4' : '#1e1e1e',
-    mutedFg: isDark ? '#6c7086' : '#888888',
-    addBg: isDark ? 'rgba(166,227,161,0.1)' : 'rgba(40,167,69,0.08)',
-    addFg: isDark ? '#a6e3a1' : '#22863a',
-    delBg: isDark ? 'rgba(243,139,168,0.1)' : 'rgba(220,53,69,0.08)',
-    delFg: isDark ? '#f38ba8' : '#cb2431',
-    headerBg: isDark ? '#313244' : '#f0f0f0',
-    border: isDark ? '#45475a' : '#ddd',
-  }
-}
-
-function diffStyles(t: ReturnType<typeof getDiffTheme>): string {
-  return `
-    body { margin:0; background:${t.bg}; color:${t.fg}; font-family:-apple-system,BlinkMacSystemFont,sans-serif; font-size:12px; }
-    .header { display:flex; justify-content:space-between; padding:8px 12px; background:${t.headerBg}; border-bottom:1px solid ${t.border}; font-weight:600; }
-    .loading { display:flex; align-items:center; justify-content:center; height:100vh; color:${t.mutedFg}; }
-    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
-    .loading { animation: pulse 1.5s ease-in-out infinite; }
-    table { width:100%; border-collapse:collapse; }
-    td { padding:0 8px; vertical-align:top; }
-    td pre { margin:0; white-space:pre-wrap; word-break:break-all; font-family:'SF Mono',Menlo,Consolas,monospace; font-size:11px; line-height:1.5; }
-    td.ln { width:40px; text-align:right; color:${t.mutedFg}; user-select:none; padding:0 4px; border-right:1px solid ${t.border}; }
-    tr:hover td { background:${t.isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.02)'}; }
-  `
-}
-
-function openDiffWindowLoading(title: string): Window | null {
-  const t = getDiffTheme()
-  const html = `<!DOCTYPE html><html><head><title>${escapeHtml(title)}</title><style>${diffStyles(t)}</style></head><body><div class="loading">Loading diff...</div></body></html>`
-  const blob = new Blob([html], { type: 'text/html' })
-  const url = URL.createObjectURL(blob)
-  const w = window.open(url, '_blank', 'width=900,height=600')
-  URL.revokeObjectURL(url)
-  return w
-}
-
-function fillDiffWindow(w: Window, title: string, oldText: string | null, newText: string | null, change: ChangeType) {
-  const oldLines = oldText?.split('\n') ?? []
-  const newLines = newText?.split('\n') ?? []
-
-  const t = getDiffTheme()
-
-  let body = ''
-
-  if (change === 'M' && oldText !== null && newText !== null) {
-    const maxLines = Math.max(oldLines.length, newLines.length)
-    let rows = ''
-    for (let i = 0; i < Math.min(maxLines, 5000); i++) {
-      const ol = i < oldLines.length ? escapeHtml(oldLines[i]) : ''
-      const nl = i < newLines.length ? escapeHtml(newLines[i]) : ''
-      const olStyle = i < oldLines.length && (i >= newLines.length || oldLines[i] !== newLines[i]) ? `background:${t.delBg};color:${t.delFg}` : ''
-      const nlStyle = i < newLines.length && (i >= oldLines.length || oldLines[i] !== newLines[i]) ? `background:${t.addBg};color:${t.addFg}` : ''
-      rows += `<tr><td class="ln">${i + 1}</td><td style="${olStyle}"><pre>${ol}</pre></td><td class="ln">${i + 1}</td><td style="${nlStyle}"><pre>${nl}</pre></td></tr>`
-    }
-    if (maxLines > 5000) rows += `<tr><td colspan="4" style="color:${t.mutedFg};text-align:center;padding:8px">... ${maxLines - 5000} more lines</td></tr>`
-    body = `
-      <div class="header">
-        <span style="color:${t.delFg}">Old (${oldLines.length} lines)</span>
-        <span style="color:${t.addFg}">New (${newLines.length} lines)</span>
-      </div>
-      <table>${rows}</table>`
-  } else {
-    const lines = change === 'D' ? oldLines : newLines
-    const text = change === 'D' ? oldText : newText
-    const lineBg = change === 'D' ? t.delBg : t.addBg
-    const lineFg = change === 'D' ? t.delFg : t.addFg
-    const prefix = change === 'D' ? '-' : '+'
-    let rows = ''
-    if (text !== null) {
-      for (let i = 0; i < Math.min(lines.length, 5000); i++) {
-        rows += `<tr><td class="ln">${i + 1}</td><td style="background:${lineBg};color:${lineFg}"><pre>${prefix} ${escapeHtml(lines[i])}</pre></td></tr>`
-      }
-      if (lines.length > 5000) rows += `<tr><td colspan="2" style="color:${t.mutedFg};text-align:center;padding:8px">... ${lines.length - 5000} more lines</td></tr>`
-    }
-    body = `<table>${rows}</table>`
-  }
-
-  const html = `<!DOCTYPE html><html><head><title>${escapeHtml(title)}</title><style>${diffStyles(t)}</style></head><body>${body}</body></html>`
-  w.document.open()
-  w.document.write(html)
-  w.document.close()
+interface FileDiffData {
+  path: string
+  change: ChangeType
+  oldText: string | null
+  newText: string | null
 }
 
 interface Props {
@@ -207,6 +121,26 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
 
   // Metadata modal
   const [metaModal, setMetaModal] = useState<{ path: string; lines: string[] } | null>(null)
+
+  // File diff modal
+  const [fileDiff, setFileDiff] = useState<FileDiffData | null>(null)
+  const [diffLoading, setDiffLoading] = useState(false)
+
+  // Synced scroll refs for side-by-side diff
+  const leftRef = useRef<HTMLDivElement>(null)
+  const rightRef = useRef<HTMLDivElement>(null)
+  const syncing = useRef(false)
+  const syncScroll = (source: 'left' | 'right') => {
+    if (syncing.current) return
+    syncing.current = true
+    const src = source === 'left' ? leftRef.current : rightRef.current
+    const dst = source === 'left' ? rightRef.current : leftRef.current
+    if (src && dst) {
+      dst.scrollTop = src.scrollTop
+      dst.scrollLeft = src.scrollLeft
+    }
+    syncing.current = false
+  }
 
   // Loading indicator for content fetch
   const [fetchingPath, setFetchingPath] = useState<string | null>(null)
@@ -276,7 +210,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       return
     }
 
-    // Content change: pop-out window
+    // Content change: in-app diff modal
     const oldSize = change.old_node?.size ?? 0
     const newSize = change.new_node?.size ?? 0
     if (oldSize > CONTENT_MAX_BYTES || newSize > CONTENT_MAX_BYTES) {
@@ -284,14 +218,10 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       return
     }
 
-    const filename = change.path.split('/').pop() || change.path
-    const windowTitle = `${filename} \u2014 ${CHANGE_LABELS[change.change].label}`
-
-    // Open window immediately with loading skeleton
-    const diffWin = openDiffWindowLoading(windowTitle)
-    if (!diffWin) return
-
     setFetchingPath(change.path)
+    setDiffLoading(true)
+    setFileDiff({ path: change.path, change: change.change, oldText: null, newText: null })
+
     try {
       const zeroHash = '0'.repeat(64)
       const [oldContent, newContent] = await Promise.all([
@@ -312,17 +242,17 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       const newText = decode(newContent)
 
       const isBinary = (s: string | null) => s !== null && /[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 4096))
-      if (diffWin.closed) { /* user closed it */ }
-      else if (isBinary(oldText) || isBinary(newText)) {
-        diffWin.close()
+      if (isBinary(oldText) || isBinary(newText)) {
+        setFileDiff(null)
         setMetaModal({ path: change.path, lines: ['Binary file \u2014 cannot display diff'] })
       } else {
-        fillDiffWindow(diffWin, windowTitle, oldText, newText, change.change)
+        setFileDiff({ path: change.path, change: change.change, oldText, newText })
       }
     } catch (err) {
-      if (!diffWin.closed) diffWin.close()
+      setFileDiff(null)
       setMetaModal({ path: change.path, lines: [`Error loading content: ${err}`] })
     }
+    setDiffLoading(false)
     setFetchingPath(null)
   }
 
@@ -535,6 +465,89 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
                 Close
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* File diff modal */}
+      {fileDiff && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-surface-primary rounded-lg shadow-xl border border-border-default flex flex-col"
+            style={{ width: 'min(95vw, 1000px)', height: 'min(85vh, 700px)' }}>
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border-default shrink-0">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold truncate">
+                  {fileDiff.path.split('/').pop()}
+                  <span className={`ml-2 inline-block px-1.5 py-0 rounded text-[10px] font-semibold ${CHANGE_LABELS[fileDiff.change].color}`}>
+                    {CHANGE_LABELS[fileDiff.change].label}
+                  </span>
+                </div>
+                <div className="text-[10px] text-text-muted font-mono truncate">{fileDiff.path}</div>
+              </div>
+              <button onClick={() => setFileDiff(null)}
+                className="text-text-muted hover:text-text-primary bg-transparent border-none cursor-pointer text-lg px-2 shrink-0">
+                &times;
+              </button>
+            </div>
+
+            {/* Diff content */}
+            <div className="flex-1 overflow-auto min-h-0">
+              {diffLoading ? (
+                <div className="flex items-center justify-center h-full text-text-muted text-sm">Loading diff...</div>
+              ) : fileDiff.change === 'M' && fileDiff.oldText !== null && fileDiff.newText !== null ? (
+                /* Side by side */
+                <div className="grid grid-cols-2 h-full">
+                  <div ref={leftRef} onScroll={() => syncScroll('left')} className="border-r border-border-default overflow-auto">
+                    <div className="px-3 py-1.5 bg-surface-secondary border-b border-border-default text-[10px] text-red-400 font-semibold sticky top-0">
+                      Old ({fileDiff.oldText.split('\n').length} lines)
+                    </div>
+                    {fileDiff.oldText.split('\n').slice(0, 5000).map((line, i) => {
+                      const newLines = fileDiff.newText!.split('\n')
+                      const changed = i >= newLines.length || line !== newLines[i]
+                      return (
+                        <div key={i} className={`flex text-[11px] font-mono leading-relaxed ${changed ? 'bg-red-500/10 text-red-400' : 'text-text-primary'}`}>
+                          <span className="w-10 shrink-0 text-right pr-2 text-text-muted select-none border-r border-border-default">{i + 1}</span>
+                          <pre className="m-0 px-2 whitespace-pre-wrap break-all">{line}</pre>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div ref={rightRef} onScroll={() => syncScroll('right')} className="overflow-auto">
+                    <div className="px-3 py-1.5 bg-surface-secondary border-b border-border-default text-[10px] text-green-400 font-semibold sticky top-0">
+                      New ({fileDiff.newText.split('\n').length} lines)
+                    </div>
+                    {fileDiff.newText.split('\n').slice(0, 5000).map((line, i) => {
+                      const oldLines = fileDiff.oldText!.split('\n')
+                      const changed = i >= oldLines.length || line !== oldLines[i]
+                      return (
+                        <div key={i} className={`flex text-[11px] font-mono leading-relaxed ${changed ? 'bg-green-500/10 text-green-400' : 'text-text-primary'}`}>
+                          <span className="w-10 shrink-0 text-right pr-2 text-text-muted select-none border-r border-border-default">{i + 1}</span>
+                          <pre className="m-0 px-2 whitespace-pre-wrap break-all">{line}</pre>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                /* Single side (added or deleted) */
+                <div className="overflow-auto h-full">
+                  {(() => {
+                    const text = fileDiff.change === 'D' ? fileDiff.oldText : fileDiff.newText
+                    const isDelete = fileDiff.change === 'D'
+                    const lines = text?.split('\n') ?? []
+                    const prefix = isDelete ? '-' : '+'
+                    const lineClass = isDelete ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'
+                    return lines.slice(0, 5000).map((line, i) => (
+                      <div key={i} className={`flex text-[11px] font-mono leading-relaxed ${lineClass}`}>
+                        <span className="w-10 shrink-0 text-right pr-2 text-text-muted select-none border-r border-border-default">{i + 1}</span>
+                        <pre className="m-0 px-2 whitespace-pre-wrap break-all">{prefix} {line}</pre>
+                      </div>
+                    ))
+                  })()}
+                </div>
+              )}
             </div>
           </div>
         </div>
