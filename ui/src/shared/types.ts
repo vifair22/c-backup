@@ -85,9 +85,13 @@ export const IPC = {
   CONNECTION_DISCONNECT: 'connection:disconnect',
   CONNECTION_STATUS: 'connection:status',
 
+  CONNECTION_EDIT: 'connection:edit',
+  CONNECTION_RESTART: 'connection:restart',
+
   // Repo management
   REPO_ADD: 'repo:add',
   REPO_REMOVE: 'repo:remove',
+  REPO_EDIT: 'repo:edit',
   REPO_OPEN: 'repo:open',
   REPO_CLOSE: 'repo:close',
 

@@ -21,16 +21,21 @@ import { ChildProcess, spawn } from 'child_process'
 import { EventEmitter } from 'events'
 import type { RpcReadyBanner } from '../shared/types'
 
-// LZ4 decompression — loaded lazily
-let lz4Uncompress: ((input: Buffer) => Buffer) | null = null
+// LZ4 raw block decompression via lz4js
+let lz4Decompress: ((src: Uint8Array, destSize: number) => Uint8Array) | null = null
 async function ensureLz4(): Promise<void> {
-  if (lz4Uncompress) return
+  if (lz4Decompress) return
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const lz4 = require('lz4-napi') as typeof import('lz4-napi')
-    lz4Uncompress = (input: Buffer) => lz4.uncompressSync(input)
+    const lz4 = require('lz4js') as { decompressBlock: (src: Uint8Array, dst: Uint8Array, sOff: number, sLen: number, dOff: number) => number }
+    lz4Decompress = (src: Uint8Array, destSize: number): Uint8Array => {
+      const dst = new Uint8Array(destSize)
+      const written = lz4.decompressBlock(src, dst, 0, src.length, 0)
+      if (written < 0) throw new Error('LZ4 decompressBlock failed')
+      return dst.subarray(0, written)
+    }
   } catch {
-    console.warn('lz4-napi not available — compressed responses will fail')
+    console.warn('lz4js not available — compressed responses will fail')
   }
 }
 
@@ -266,10 +271,10 @@ export class RpcSession extends EventEmitter {
         const compData = this.buffer.subarray(9, 9 + compLen)
         let json: string
 
-        if (lz4Uncompress) {
+        if (lz4Decompress) {
           try {
-            const raw = lz4Uncompress(compData)
-            json = raw.toString('utf-8')
+            const raw = lz4Decompress(new Uint8Array(compData), uncompLen)
+            json = Buffer.from(raw).toString('utf-8')
           } catch (err) {
             this.deliverError(new Error(`LZ4 decompression failed: ${err}`))
             this.buffer = this.buffer.subarray(totalLen)

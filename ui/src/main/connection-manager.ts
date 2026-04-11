@@ -8,7 +8,7 @@
 import { RpcSession } from './rpc-session'
 import type { SessionOptions } from './rpc-session'
 import {
-  addConnectionConfig, removeConnectionConfig,
+  addConnectionConfig, removeConnectionConfig, updateConnectionConfig,
   addRepoToConnection, removeRepoFromConnection,
   setCredential, getCredential, deleteCredentials,
   hasStoredCredentials,
@@ -25,6 +25,8 @@ import type {
 interface ManagedRepo {
   path: string
   session: RpcSession | null
+  opening?: Promise<{ ok: boolean; error?: string; version?: string; needsCredentials?: boolean }>
+  callQueue: Promise<unknown>
 }
 
 interface ManagedConnection {
@@ -49,7 +51,7 @@ export class ConnectionManager {
     for (const connConfig of config.connections) {
       const repos = new Map<string, ManagedRepo>()
       for (const repoPath of connConfig.repos ?? []) {
-        repos.set(repoPath, { path: repoPath, session: null })
+        repos.set(repoPath, { path: repoPath, session: null, callQueue: Promise.resolve() })
       }
       this.connections.set(connConfig.name, {
         config: connConfig,
@@ -90,6 +92,62 @@ export class ConnectionManager {
     removeConnectionConfig(name)
     deleteCredentials(name)
     return { ok: true }
+  }
+
+  async editConnection(name: string, newConfig: ConnectionConfig): Promise<{ ok: boolean; error?: string }> {
+    const conn = this.connections.get(name)
+    if (!conn) return { ok: false, error: `connection '${name}' not found` }
+
+    // Disconnect if currently connected
+    if (conn.status === 'connected' || conn.status === 'connecting') {
+      await this.disconnect(name)
+    }
+
+    // If name changed, re-key the map
+    if (newConfig.name !== name) {
+      if (this.connections.has(newConfig.name)) {
+        return { ok: false, error: `connection '${newConfig.name}' already exists` }
+      }
+      this.connections.delete(name)
+    }
+
+    // Preserve repos from old config
+    if (!Array.isArray(newConfig.repos) || newConfig.repos.length === 0) {
+      newConfig.repos = conn.config.repos
+    }
+
+    conn.config = newConfig
+    this.connections.set(newConfig.name, conn)
+    updateConnectionConfig(name, newConfig)
+    return { ok: true }
+  }
+
+  editRepo(connectionName: string, oldPath: string, newPath: string): { ok: boolean; error?: string } {
+    const conn = this.connections.get(connectionName)
+    if (!conn) return { ok: false, error: `connection '${connectionName}' not found` }
+
+    const repo = conn.repos.get(oldPath)
+    if (!repo) return { ok: false, error: `repo '${oldPath}' not found` }
+
+    if (conn.repos.has(newPath)) {
+      return { ok: false, error: `repo '${newPath}' already exists` }
+    }
+
+    repo.session?.close()
+    repo.session = null
+    conn.repos.delete(oldPath)
+    conn.repos.set(newPath, { path: newPath, session: null, callQueue: Promise.resolve() })
+    removeRepoFromConnection(connectionName, oldPath)
+    addRepoToConnection(connectionName, newPath)
+    return { ok: true }
+  }
+
+  async restartConnection(name: string): Promise<{ ok: boolean; error?: string }> {
+    const conn = this.connections.get(name)
+    if (!conn) return { ok: false, error: `connection '${name}' not found` }
+
+    await this.disconnect(name)
+    return this.connect(name)
   }
 
   listConnections(): ConnectionState[] {
@@ -208,7 +266,7 @@ export class ConnectionManager {
       return { ok: false, error: `repo '${repoPath}' already added` }
     }
 
-    conn.repos.set(repoPath, { path: repoPath, session: null })
+    conn.repos.set(repoPath, { path: repoPath, session: null, callQueue: Promise.resolve() })
     addRepoToConnection(connectionName, repoPath)
     return { ok: true }
   }
@@ -233,15 +291,24 @@ export class ConnectionManager {
   async openRepo(
     connectionName: string,
     repoPath: string
-  ): Promise<{ ok: boolean; error?: string; version?: string }> {
+  ): Promise<{ ok: boolean; error?: string; version?: string; needsCredentials?: boolean }> {
     const conn = this.connections.get(connectionName)
     if (!conn) return { ok: false, error: `connection '${connectionName}' not found` }
-    if (conn.status !== 'connected') return { ok: false, error: `connection not connected (status: ${conn.status})` }
+
+    // Auto-connect if not connected
+    if (conn.status !== 'connected') {
+      const needsCreds = conn.config.sudo || (conn.config.type === 'ssh' && conn.config.authMethod === 'password')
+      if (needsCreds && !hasStoredCredentials(connectionName) && !conn.credentials) {
+        return { ok: false, error: 'credentials_required', needsCredentials: true }
+      }
+      const connectResult = await this.connect(connectionName)
+      if (!connectResult.ok) return { ok: false, error: connectResult.error, needsCredentials: needsCreds }
+    }
     console.log(`[openRepo] ${connectionName}:${repoPath}`)
 
     let repo = conn.repos.get(repoPath)
     if (!repo) {
-      conn.repos.set(repoPath, { path: repoPath, session: null })
+      conn.repos.set(repoPath, { path: repoPath, session: null, callQueue: Promise.resolve() })
       addRepoToConnection(connectionName, repoPath)
       repo = conn.repos.get(repoPath)!
     }
@@ -250,6 +317,23 @@ export class ConnectionManager {
       return { ok: true, version: repo.session.banner?.version }
     }
 
+    // Deduplicate concurrent open attempts
+    if (repo.opening) {
+      return repo.opening
+    }
+
+    const openPromise = this.doOpenRepo(conn, repo, connectionName, repoPath)
+    repo.opening = openPromise
+    openPromise.finally(() => { repo!.opening = undefined })
+    return openPromise
+  }
+
+  private async doOpenRepo(
+    conn: ManagedConnection,
+    repo: ManagedRepo,
+    connectionName: string,
+    repoPath: string
+  ): Promise<{ ok: boolean; error?: string; version?: string; needsCredentials?: boolean }> {
     const sessionOpts = this.buildSessionOpts(conn, repoPath)
     console.log(`[openRepo] spawning:`, sessionOpts.command.join(' '))
     const session = new RpcSession()
@@ -293,6 +377,13 @@ export class ConnectionManager {
       await repo.session.close()
       repo.session = null
     }
+
+    // Auto-disconnect if no repo sessions remain active
+    const hasActiveSessions = Array.from(conn.repos.values()).some(r => r.session?.alive)
+    if (!hasActiveSessions && conn.status === 'connected') {
+      await this.disconnect(connectionName)
+    }
+
     return { ok: true }
   }
 
@@ -309,16 +400,26 @@ export class ConnectionManager {
     const conn = this.connections.get(connectionName)
     if (!conn) throw new Error(`connection '${connectionName}' not found`)
 
-    const repo = conn.repos.get(repoPath)
-    if (!repo?.session?.alive) {
-      const result = await this.openRepo(connectionName, repoPath)
-      if (!result.ok) throw new Error(result.error ?? 'failed to open repo')
-      const reopened = conn.repos.get(repoPath)
-      if (!reopened?.session?.alive) throw new Error('session not alive after open')
-      return reopened.session.call(action, params)
+    let repo = conn.repos.get(repoPath)
+    if (!repo) {
+      // Ensure repo entry exists
+      const openResult = await this.openRepo(connectionName, repoPath)
+      if (!openResult.ok) throw new Error(openResult.error ?? 'failed to open repo')
+      repo = conn.repos.get(repoPath)!
     }
 
-    return repo.session.call(action, params)
+    if (!repo.session?.alive) {
+      const result = await this.openRepo(connectionName, repoPath)
+      if (!result.ok) throw new Error(result.error ?? 'failed to open repo')
+    }
+
+    // Serialize calls through the queue to avoid "another call in progress"
+    const callPromise = repo.callQueue.then(() => {
+      if (!repo!.session?.alive) throw new Error('session not alive')
+      return repo!.session.call(action, params)
+    })
+    repo.callQueue = callPromise.catch(() => {}) // prevent unhandled rejection on queue
+    return callPromise
   }
 
   /* ---------------------------------------------------------------- */

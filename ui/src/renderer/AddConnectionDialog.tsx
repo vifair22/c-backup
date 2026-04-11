@@ -4,21 +4,26 @@ import type { ConnectionConfig } from '../shared/types'
 interface Props {
   onAdd: (config: ConnectionConfig) => void
   onCancel: () => void
+  initialConfig?: ConnectionConfig
 }
 
-export function AddConnectionDialog({ onAdd, onCancel }: Props): React.ReactElement {
-  const [type, setType] = useState<'local' | 'ssh'>('local')
-  const [name, setName] = useState('')
-  const [binaryPath, setBinaryPath] = useState('backup')
-  const [sudo, setSudo] = useState(false)
+export function AddConnectionDialog({ onAdd, onCancel, initialConfig }: Props): React.ReactElement {
+  const editing = !!initialConfig
+  const [type, setType] = useState<'local' | 'ssh'>(initialConfig?.type ?? 'local')
+  const [name, setName] = useState(initialConfig?.name ?? '')
+  const [binaryPath, setBinaryPath] = useState(
+    initialConfig?.type === 'local' ? initialConfig.binaryPath : 'backup'
+  )
+  const [sudo, setSudo] = useState(initialConfig?.sudo ?? false)
 
   // SSH fields
-  const [host, setHost] = useState('')
-  const [port, setPort] = useState('22')
-  const [username, setUsername] = useState('')
-  const [authMethod, setAuthMethod] = useState<'key' | 'password' | 'agent'>('key')
-  const [keyFilePath, setKeyFilePath] = useState('')
-  const [remoteBinaryPath, setRemoteBinaryPath] = useState('backup')
+  const sshInit = initialConfig?.type === 'ssh' ? initialConfig : undefined
+  const [host, setHost] = useState(sshInit?.host ?? '')
+  const [port, setPort] = useState(String(sshInit?.port ?? 22))
+  const [username, setUsername] = useState(sshInit?.username ?? '')
+  const [authMethod, setAuthMethod] = useState<'key' | 'password' | 'agent'>(sshInit?.authMethod ?? 'key')
+  const [keyFilePath, setKeyFilePath] = useState(sshInit?.keyFilePath ?? '')
+  const [remoteBinaryPath, setRemoteBinaryPath] = useState(sshInit?.remoteBinaryPath ?? 'backup')
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -43,7 +48,7 @@ export function AddConnectionDialog({ onAdd, onCancel }: Props): React.ReactElem
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
       <form onSubmit={handleSubmit}
         className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
-        <h3 className="text-sm font-semibold m-0 mb-4">Add Connection</h3>
+        <h3 className="text-sm font-semibold m-0 mb-4">{editing ? 'Edit Connection' : 'Add Connection'}</h3>
 
         {/* Type selector */}
         <div className="mb-3">
@@ -140,7 +145,7 @@ export function AddConnectionDialog({ onAdd, onCancel }: Props): React.ReactElem
           </button>
           <button type="submit"
             className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
-            Add
+            {editing ? 'Save' : 'Add'}
           </button>
         </div>
       </form>

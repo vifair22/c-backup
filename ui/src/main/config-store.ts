@@ -76,6 +76,17 @@ export function removeConnectionConfig(name: string): void {
   saveConfig()
 }
 
+export function updateConnectionConfig(name: string, newConfig: ConnectionConfig): void {
+  const idx = _config.connections.findIndex(c => c.name === name)
+  if (idx === -1) return
+  // Preserve existing repos list unless the new config carries one
+  if (!Array.isArray(newConfig.repos) || newConfig.repos.length === 0) {
+    newConfig.repos = _config.connections[idx].repos
+  }
+  _config.connections[idx] = newConfig
+  saveConfig()
+}
+
 export function addRepoToConnection(connectionName: string, repoPath: string): void {
   const conn = _config.connections.find(c => c.name === connectionName)
   if (!conn) return

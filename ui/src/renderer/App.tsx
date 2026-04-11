@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import type { ConnectionState } from '../shared/types'
-import type { ConnectionConfig } from '../shared/types'
+import type { ConnectionState, ConnectionConfig } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
+import { ContextMenu, type ContextMenuItem } from './ContextMenu'
+import { ConfirmDialog } from './ConfirmDialog'
+import { RepoView } from './RepoView'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -29,17 +31,41 @@ export function App(): React.ReactElement {
 
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
-  const [repoData, setRepoData] = useState<Record<string, unknown> | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
 
   // Dialogs
   const [showAddConnection, setShowAddConnection] = useState(false)
+  const [editingConnection, setEditingConnection] = useState<ConnectionConfig | null>(null)
   const [connectingName, setConnectingName] = useState<string | null>(null)
+  const [pendingRepoOpen, setPendingRepoOpen] = useState<{ conn: string; path: string } | null>(null)
   const [sudoPasswordInput, setSudoPasswordInput] = useState('')
   const [savePassword, setSavePassword] = useState(true)
   const [addRepoConn, setAddRepoConn] = useState<string | null>(null)
   const [repoPathInput, setRepoPathInput] = useState('')
+  const [postCreateConn, setPostCreateConn] = useState<string | null>(null)
+  const [editingRepo, setEditingRepo] = useState<{ connName: string; oldPath: string } | null>(null)
+
+  // Collapsed connections
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const toggleCollapsed = (name: string) => {
+    setCollapsed(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+
+  // Context menu
+  const [contextMenu, setContextMenu] = useState<{
+    x: number; y: number; items: ContextMenuItem[]
+  } | null>(null)
+
+  // Confirm dialog
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string; message: string; confirmLabel?: string; cancelLabel?: string
+    danger?: boolean; onConfirm: () => void; onCancel?: () => void
+  } | null>(null)
 
   const refreshConnections = useCallback(async () => {
     try {
@@ -66,42 +92,19 @@ export function App(): React.ReactElement {
     const result = await api.connectionAdd(config)
     if (!result.ok) { setError(result.error ?? 'Failed to add connection'); return }
     await refreshConnections()
+    setPostCreateConn(config.name)
   }
 
-  const handleConnect = async (name: string) => {
-    const conn = connections.find(c => c.config.name === name)
-    if (!conn) return
-
-    const needsCreds = conn.config.sudo || (conn.config.type === 'ssh' && conn.config.authMethod === 'password')
-
-    if (needsCreds) {
-      // Check for stored credentials — auto-connect if available
-      const hasCreds = await api.credentialHas(name)
-      if (hasCreds) {
-        setError(null)
-        const result = await api.connectionConnect(name)
-        if (!result.ok) {
-          // Stored creds may be wrong — show password dialog
-          setConnectingName(name)
-          setSudoPasswordInput('')
-          setSavePassword(true)
-        }
-        await refreshConnections()
-        return
-      }
-
-      // No stored credentials — prompt
-      setConnectingName(name)
-      setSudoPasswordInput('')
-      setSavePassword(true)
-      return
-    }
-
-    // No credentials needed at all
+  const handleEditConnection = async (config: ConnectionConfig) => {
+    if (!editingConnection) return
+    const originalName = editingConnection.name
+    // No-op if nothing changed
+    if (JSON.stringify(config) === JSON.stringify(editingConnection)) { setEditingConnection(null); return }
     setError(null)
-    const result = await api.connectionConnect(name)
-    if (!result.ok) setError(result.error ?? 'Connection failed')
+    const result = await api.connectionEdit(originalName, config)
+    if (!result.ok) setError(result.error ?? 'Failed to edit connection')
     await refreshConnections()
+    setEditingConnection(null)
   }
 
   const handleConnectWithCredentials = async () => {
@@ -114,46 +117,158 @@ export function App(): React.ReactElement {
 
     setConnectingName(null)
     const result = await api.connectionConnect(connectingName, creds)
-    if (!result.ok) setError(result.error ?? 'Connection failed')
+    if (!result.ok) { setError(result.error ?? 'Connection failed'); return }
     await refreshConnections()
-  }
 
-  const handleDisconnect = async (name: string) => {
-    await api.connectionDisconnect(name)
-    if (activeRepo?.conn === name) { setActiveRepo(null); setRepoData(null) }
-    await refreshConnections()
+    // If we were trying to open a repo, retry now
+    if (pendingRepoOpen && pendingRepoOpen.conn === connectingName) {
+      const pending = pendingRepoOpen
+      setPendingRepoOpen(null)
+      await handleOpenRepo(pending.conn, pending.path)
+    }
   }
 
   const handleRemoveConnection = async (name: string) => {
-    await api.connectionRemove(name)
-    if (activeRepo?.conn === name) { setActiveRepo(null); setRepoData(null) }
+    setConfirmDialog({
+      title: 'Delete Connection',
+      message: `Delete "${name}"? All repo sessions will be closed and saved credentials will be removed.`,
+      onConfirm: async () => {
+        setConfirmDialog(null)
+        await api.connectionRemove(name)
+        if (activeRepo?.conn === name) { setActiveRepo(null);  }
+        await refreshConnections()
+      }
+    })
+  }
+
+  const handleRestartConnection = async (name: string) => {
+    setError(null)
+    const result = await api.connectionRestart(name)
+    if (!result.ok) setError(result.error ?? 'Restart failed')
     await refreshConnections()
   }
 
   const handleAddRepo = async () => {
     if (!addRepoConn || !repoPathInput.trim()) return
+    const connName = addRepoConn
+    const path = repoPathInput.trim()
     setError(null)
-    const result = await api.repoAdd(addRepoConn, repoPathInput.trim())
-    if (!result.ok) setError(result.error ?? 'Failed to add repo')
+    const result = await api.repoAdd(connName, path)
+    if (!result.ok) { setError(result.error ?? 'Failed to add repo'); return }
     setAddRepoConn(null)
     setRepoPathInput('')
     await refreshConnections()
+
+    // Probe the repo to verify it's reachable
+    const probe = await api.repoOpen(connName, path)
+    if (!probe.ok && !probe.needsCredentials) {
+      setConfirmDialog({
+        title: 'Repository Not Reachable',
+        message: `Could not open "${path.split('/').pop() || path}": ${probe.error ?? 'unknown error'}. Keep it anyway?`,
+        confirmLabel: 'Keep',
+        cancelLabel: 'Remove',
+        danger: false,
+        onConfirm: () => setConfirmDialog(null),
+        onCancel: async () => {
+          setConfirmDialog(null)
+          await api.repoRemove(connName, path)
+          await refreshConnections()
+        },
+      })
+    } else {
+      await refreshConnections()
+    }
+  }
+
+  const handleEditRepo = async () => {
+    if (!editingRepo || !repoPathInput.trim()) return
+    if (repoPathInput.trim() === editingRepo.oldPath) { setEditingRepo(null); return }
+    setError(null)
+    const result = await api.repoEdit(editingRepo.connName, editingRepo.oldPath, repoPathInput.trim())
+    if (!result.ok) setError(result.error ?? 'Failed to edit repo')
+    if (activeRepo?.conn === editingRepo.connName && activeRepo?.path === editingRepo.oldPath) {
+      setActiveRepo({ conn: editingRepo.connName, path: repoPathInput.trim() })
+    }
+    await refreshConnections()
+    setEditingRepo(null)
+    setRepoPathInput('')
+  }
+
+  const handleRemoveRepo = (connName: string, repoPath: string) => {
+    setConfirmDialog({
+      title: 'Remove Repository',
+      message: `Remove "${repoPath.split('/').pop() || repoPath}" from this connection? This does not delete the actual data.`,
+      confirmLabel: 'Remove',
+      onConfirm: async () => {
+        setConfirmDialog(null)
+        await api.repoRemove(connName, repoPath)
+        if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
+          setActiveRepo(null)
+        }
+        await refreshConnections()
+      }
+    })
   }
 
   const handleOpenRepo = async (connName: string, repoPath: string) => {
     setError(null)
-    setRepoData(null)
-    setLoading(true)
     setActiveRepo({ conn: connName, path: repoPath })
     try {
       const result = await api.repoOpen(connName, repoPath)
-      if (!result.ok) { setError(result.error ?? 'Failed to open repo'); setLoading(false); return }
-      const stats = await api.rpcCall(connName, repoPath, 'stats')
-      setRepoData(stats as Record<string, unknown>)
+      if (!result.ok) {
+        if (result.needsCredentials) {
+          setPendingRepoOpen({ conn: connName, path: repoPath })
+          setConnectingName(connName)
+          setSudoPasswordInput('')
+          setSavePassword(true)
+          return
+        }
+        setError(result.error ?? 'Failed to open repo')
+        return
+      }
+      await refreshConnections()
     } catch (err) {
       setError(`RPC error: ${err}`)
     }
-    setLoading(false)
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Context menus                                                     */
+  /* ---------------------------------------------------------------- */
+
+  const showConnectionMenu = (e: React.MouseEvent, conn: ConnectionState) => {
+    e.preventDefault()
+    setContextMenu({
+      x: e.clientX, y: e.clientY,
+      items: [
+        { label: 'Edit', onClick: () => setEditingConnection(conn.config) },
+        { label: 'Add Repo', onClick: () => { setAddRepoConn(conn.config.name); setRepoPathInput('') } },
+        ...(conn.status === 'connected' ? [
+          { label: 'Restart', onClick: () => handleRestartConnection(conn.config.name) },
+        ] : []),
+        { label: 'Delete', danger: true, onClick: () => handleRemoveConnection(conn.config.name) },
+      ]
+    })
+  }
+
+  const showRepoMenu = (e: React.MouseEvent, connName: string, repoPath: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const repo = connections.find(c => c.config.name === connName)?.repos.find(r => r.path === repoPath)
+    setContextMenu({
+      x: e.clientX, y: e.clientY,
+      items: [
+        ...(repo?.sessionActive ? [{
+          label: 'Disconnect', onClick: async () => {
+            await api.repoClose(connName, repoPath)
+            if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {  }
+            await refreshConnections()
+          }
+        }] : []),
+        { label: 'Edit Path', onClick: () => { setEditingRepo({ connName, oldPath: repoPath }); setRepoPathInput(repoPath) } },
+        { label: 'Remove', danger: true, onClick: () => handleRemoveRepo(connName, repoPath) },
+      ]
+    })
   }
 
   /* ---------------------------------------------------------------- */
@@ -202,32 +317,15 @@ export function App(): React.ReactElement {
         <div className="flex-1 overflow-auto p-2">
           {connections.map(conn => (
             <div key={conn.config.name} className="mb-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between cursor-pointer rounded px-1 py-0.5 hover:bg-surface-hover"
+                onClick={() => toggleCollapsed(conn.config.name)}
+                onContextMenu={e => showConnectionMenu(e, conn)}>
                 <span className="flex items-center gap-1.5">
+                  <span className={`text-text-muted text-[10px] inline-flex items-center justify-center w-3 h-3 ${collapsed.has(conn.config.name) ? '' : 'rotate-90'} transition-transform origin-center`}>&#9654;</span>
                   <span className={`inline-block w-2 h-2 rounded-full ${statusColor(conn.status)}`} />
                   <strong className="text-sm">{conn.config.name}</strong>
                   <span className="text-text-muted text-[11px]">({connLabel(conn)})</span>
                 </span>
-                <div className="flex gap-1">
-                  {conn.status === 'disconnected' && (
-                    <button onClick={() => handleConnect(conn.config.name)}
-                      className="text-[10px] px-1.5 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover cursor-pointer text-text-secondary">
-                      Connect
-                    </button>
-                  )}
-                  {conn.status === 'connected' && (
-                    <button onClick={() => handleDisconnect(conn.config.name)}
-                      className="text-[10px] px-1.5 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover cursor-pointer text-text-secondary">
-                      Disconnect
-                    </button>
-                  )}
-                  {conn.status !== 'connecting' && (
-                    <button onClick={() => handleRemoveConnection(conn.config.name)}
-                      className="text-[10px] px-1 cursor-pointer text-text-muted hover:text-status-error">
-                      x
-                    </button>
-                  )}
-                </div>
               </div>
 
               {conn.error && (
@@ -235,28 +333,27 @@ export function App(): React.ReactElement {
               )}
 
               {/* Repos */}
-              <div className="ml-4 mt-1">
+              {!collapsed.has(conn.config.name) && <div className="ml-4 mt-1">
                 {conn.repos.map(repo => (
                   <div
                     key={repo.path}
-                    onClick={() => conn.status === 'connected' ? handleOpenRepo(conn.config.name, repo.path) : undefined}
-                    className={`text-xs py-1 px-1.5 rounded mb-0.5 ${
-                      conn.status === 'connected' ? 'cursor-pointer hover:bg-surface-hover' : 'opacity-50'
-                    } ${activeRepo?.conn === conn.config.name && activeRepo?.path === repo.path ? 'bg-surface-active' : ''}`}
+                    onClick={() => handleOpenRepo(conn.config.name, repo.path)}
+                    onContextMenu={e => showRepoMenu(e, conn.config.name, repo.path)}
+                    className={`text-xs py-1 px-1.5 rounded mb-0.5 cursor-pointer hover:bg-surface-hover ${
+                      activeRepo?.conn === conn.config.name && activeRepo?.path === repo.path ? 'bg-surface-active' : ''
+                    }`}
                   >
                     <span className="text-text-primary">{repo.path.split('/').pop() || repo.path}</span>
                     {repo.sessionActive && (
-                      <span className="text-status-connected text-[10px] ml-1.5">live</span>
+                      <span className="text-status-connected text-[10px] ml-1.5">connected</span>
                     )}
                   </div>
                 ))}
-                {conn.status === 'connected' && (
-                  <button onClick={() => { setAddRepoConn(conn.config.name); setRepoPathInput('') }}
-                    className="text-[10px] mt-0.5 cursor-pointer text-accent hover:text-accent-hover bg-transparent border-none px-1.5">
-                    + Add repo
-                  </button>
-                )}
-              </div>
+                <button onClick={() => { setAddRepoConn(conn.config.name); setRepoPathInput('') }}
+                  className="text-[10px] mt-0.5 cursor-pointer text-accent hover:text-accent-hover bg-transparent border-none px-1.5">
+                  + Add repo
+                </button>
+              </div>}
             </div>
           ))}
 
@@ -293,17 +390,7 @@ export function App(): React.ReactElement {
         )}
 
         {activeRepo ? (
-          <div>
-            <h3 className="text-lg font-medium m-0 mb-1">{activeRepo.path}</h3>
-            <div className="text-text-muted text-xs mb-3">via {activeRepo.conn}</div>
-            {loading ? (
-              <div className="text-text-muted">Connecting...</div>
-            ) : repoData ? (
-              <pre className="bg-surface-secondary text-text-primary text-xs p-3 rounded overflow-auto m-0 border border-border-default">
-                {JSON.stringify(repoData, null, 2)}
-              </pre>
-            ) : null}
-          </div>
+          <RepoView connName={activeRepo.conn} repoPath={activeRepo.path} />
         ) : (
           <div className="text-text-muted text-center mt-16">
             <div className="text-xl mb-2 text-text-secondary">c-backup</div>
@@ -312,7 +399,26 @@ export function App(): React.ReactElement {
         )}
       </div>
 
-      {/* Dialogs */}
+      {/* Context menu */}
+      {contextMenu && (
+        <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextMenu.items}
+          onClose={() => setContextMenu(null)} />
+      )}
+
+      {/* Confirm dialog */}
+      {confirmDialog && (
+        <ConfirmDialog
+          title={confirmDialog.title}
+          message={confirmDialog.message}
+          confirmLabel={confirmDialog.confirmLabel}
+          cancelLabel={confirmDialog.cancelLabel}
+          danger={confirmDialog.danger}
+          onConfirm={confirmDialog.onConfirm}
+          onCancel={confirmDialog.onCancel ?? (() => setConfirmDialog(null))}
+        />
+      )}
+
+      {/* Add connection dialog */}
       {showAddConnection && (
         <AddConnectionDialog
           onAdd={handleAddConnection}
@@ -320,6 +426,38 @@ export function App(): React.ReactElement {
         />
       )}
 
+      {/* Edit connection dialog */}
+      {editingConnection && (
+        <AddConnectionDialog
+          initialConfig={editingConnection}
+          onAdd={handleEditConnection}
+          onCancel={() => setEditingConnection(null)}
+        />
+      )}
+
+      {/* Post-create: offer to add a repo */}
+      {postCreateConn && (
+        <Overlay>
+          <div className="bg-surface-primary rounded-lg p-5 w-80 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-2">Connection Created</h3>
+            <p className="text-xs text-text-secondary m-0 mb-4">
+              "{postCreateConn}" was added successfully. Would you like to add a repository now?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setPostCreateConn(null)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
+                Not Now
+              </button>
+              <button onClick={() => { setAddRepoConn(postCreateConn); setRepoPathInput(''); setPostCreateConn(null) }}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
+                Add Repo
+              </button>
+            </div>
+          </div>
+        </Overlay>
+      )}
+
+      {/* Credential prompt */}
       {connectingName && (
         <Overlay>
           <form onSubmit={e => { e.preventDefault(); handleConnectWithCredentials() }} className="bg-surface-primary rounded-lg p-5 w-80 shadow-xl border border-border-default">
@@ -339,7 +477,7 @@ export function App(): React.ReactElement {
               </label>
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setConnectingName(null)}
+              <button type="button" onClick={() => { setConnectingName(null); setPendingRepoOpen(null) }}
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
               <button type="submit"
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Connect</button>
@@ -348,6 +486,7 @@ export function App(): React.ReactElement {
         </Overlay>
       )}
 
+      {/* Add repo dialog */}
       {addRepoConn && (
         <Overlay>
           <form onSubmit={e => { e.preventDefault(); handleAddRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
@@ -365,6 +504,29 @@ export function App(): React.ReactElement {
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
               <button type="submit"
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Add</button>
+            </div>
+          </form>
+        </Overlay>
+      )}
+
+      {/* Edit repo dialog */}
+      {editingRepo && (
+        <Overlay>
+          <form onSubmit={e => { e.preventDefault(); handleEditRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-2">Edit Repository</h3>
+            <div className="text-text-muted text-xs mb-3">Connection: {editingRepo.connName}</div>
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-text-secondary mb-1">Repository Path (absolute)</label>
+              <input value={repoPathInput} onChange={e => setRepoPathInput(e.target.value)}
+                placeholder="/path/to/backup/repo"
+                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
+                autoFocus required />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setEditingRepo(null)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
+              <button type="submit"
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Save</button>
             </div>
           </form>
         </Overlay>
