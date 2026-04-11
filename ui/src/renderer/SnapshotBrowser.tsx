@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime, gfsBadges, NODE_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
 
@@ -212,14 +212,17 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       const filePath = '/' + [...parentChain.map(b => b.name), node.name].join('/')
       const isSelected = selectedFile?.node.node_id === node.node_id
 
+      const isHighlighted = highlightNodeId === node.node_id
+
       rows.push(
         <tr key={`${parentId}-${node.node_id}`}
+          ref={isHighlighted ? (el) => { el?.scrollIntoView({ block: 'center', behavior: 'smooth' }) } : undefined}
           onClick={isDir
             ? () => toggleDir(node, depth, parentChain)
             : () => setSelectedFile({ node, path: filePath })
           }
           className={`border-t border-border-default hover:bg-surface-hover text-text-primary cursor-pointer ${
-            highlightNodeId === node.node_id ? 'bg-accent/10 ring-1 ring-accent/30' :
+            isHighlighted ? 'bg-accent/10 ring-1 ring-accent/30' :
             isSelected ? 'bg-accent/10' : ''
           }`}>
           <td className="py-1 pr-2" style={{ paddingLeft: `${depth * 20 + 8}px` }}>

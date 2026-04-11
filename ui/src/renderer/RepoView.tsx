@@ -86,9 +86,10 @@ interface Props {
   onSelectSnapshot?: (snapId: number) => void
   onViewAllSnapshots?: () => void
   onCompareSnapshots?: (a?: number, b?: number) => void
+  onSearch?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
@@ -209,6 +210,28 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
           value={fmtNum(stats?.head_entries ?? 0)}
           detail={stats?.head_logical_bytes ? `${fmtSize(stats.head_logical_bytes)} logical` : undefined}
         />
+      </div>
+
+      {/* Quick actions */}
+      <div className="flex gap-2 mb-4">
+        {onSearch && (
+          <button onClick={onSearch}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Search files
+          </button>
+        )}
+        {onCompareSnapshots && snaps.length >= 2 && (
+          <button onClick={() => onCompareSnapshots()}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Compare snapshots
+          </button>
+        )}
+        {onViewAllSnapshots && (
+          <button onClick={onViewAllSnapshots}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            All snapshots
+          </button>
+        )}
       </div>
 
       {/* Row 2: GFS Retention */}
