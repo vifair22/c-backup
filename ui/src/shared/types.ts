@@ -91,6 +91,7 @@ export const IPC = {
   // Repo management
   REPO_ADD: 'repo:add',
   REPO_REMOVE: 'repo:remove',
+  REPO_INIT: 'repo:init',
   REPO_EDIT: 'repo:edit',
   REPO_OPEN: 'repo:open',
   REPO_CLOSE: 'repo:close',

@@ -1,5 +1,9 @@
 import React, { useEffect, useState } from 'react'
 import { StatCard } from './StatCard'
+import {
+  fmtSize, fmtNum, relativeTime, absoluteTime, gfsBadges,
+  GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY,
+} from './format'
 
 const api = window.cbackup
 
@@ -61,37 +65,6 @@ interface RepoStats {
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-const GFS_DAILY = 1
-const GFS_WEEKLY = 2
-const GFS_MONTHLY = 4
-const GFS_YEARLY = 8
-
-function fmtSize(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const val = bytes / Math.pow(1024, i)
-  return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`
-}
-
-function fmtNum(n: number): string {
-  return n.toLocaleString()
-}
-
-function relativeTime(epochSec: number): string {
-  const now = Date.now() / 1000
-  const diff = now - epochSec
-  if (diff < 60) return 'just now'
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`
-  return `${Math.floor(diff / 604800)}w ago`
-}
-
-function absoluteTime(epochSec: number): string {
-  return new Date(epochSec * 1000).toLocaleString()
-}
-
 function lastBackupStatus(epochSec: number): 'ok' | 'warn' | 'error' {
   const ageSec = Date.now() / 1000 - epochSec
   if (ageSec < 86400) return 'ok'
@@ -103,15 +76,6 @@ const OBJECT_TYPE_NAMES: Record<number, string> = {
   1: 'File', 2: 'Xattr', 3: 'ACL', 4: 'Sparse',
 }
 
-function gfsBadges(flags: number): { label: string; color: string }[] {
-  const badges: { label: string; color: string }[] = []
-  if (flags & GFS_YEARLY) badges.push({ label: 'Y', color: 'bg-amber-600 text-white' })
-  if (flags & GFS_MONTHLY) badges.push({ label: 'M', color: 'bg-blue-600 text-white' })
-  if (flags & GFS_WEEKLY) badges.push({ label: 'W', color: 'bg-green-600 text-white' })
-  if (flags & GFS_DAILY) badges.push({ label: 'D', color: 'bg-teal-600 text-white' })
-  return badges
-}
-
 /* ------------------------------------------------------------------ */
 /* Component                                                           */
 /* ------------------------------------------------------------------ */
@@ -119,9 +83,11 @@ function gfsBadges(flags: number): { label: string; color: string }[] {
 interface Props {
   connName: string
   repoPath: string
+  onSelectSnapshot?: (snapId: number) => void
+  onViewAllSnapshots?: () => void
 }
 
-export function RepoView({ connName, repoPath }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
@@ -217,11 +183,13 @@ export function RepoView({ connName, repoPath }: Props): React.ReactElement {
           detail={latest ? absoluteTime(latest.created_sec) : undefined}
           status={latest ? lastBackupStatus(latest.created_sec) : 'error'}
         />
-        <StatCard
-          label="Snapshots"
-          value={fmtNum(stats?.snap_count ?? 0)}
-          detail={snapList?.head ? `HEAD: #${snapList.head}` : undefined}
-        />
+        <div onClick={() => onViewAllSnapshots?.()} className={`${onViewAllSnapshots ? 'cursor-pointer' : ''} h-full`}>
+          <StatCard
+            label="Snapshots"
+            value={fmtNum(stats?.snap_count ?? 0)}
+            detail={snapList?.head ? `HEAD: #${snapList.head}` : undefined}
+          />
+        </div>
         <StatCard
           label="Storage"
           value={fmtSize(stats?.total_bytes ?? 0)}
@@ -320,7 +288,15 @@ export function RepoView({ connName, repoPath }: Props): React.ReactElement {
       {/* Row 4: Recent snapshots */}
       {recentSnaps.length > 0 && (
         <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-          <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Recent Snapshots</div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11px] text-text-muted uppercase tracking-wide">Recent Snapshots</div>
+            {onViewAllSnapshots && snaps.length > 10 && (
+              <button onClick={onViewAllSnapshots}
+                className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
+                View all {fmtNum(snaps.length)} snapshots
+              </button>
+            )}
+          </div>
           <table className="w-full text-xs">
             <thead>
               <tr className="text-text-muted text-left">
@@ -335,7 +311,8 @@ export function RepoView({ connName, repoPath }: Props): React.ReactElement {
               {recentSnaps.map(s => {
                 const badges = gfsBadges(s.gfs_flags)
                 return (
-                  <tr key={s.id} className="text-text-primary border-t border-border-default">
+                  <tr key={s.id} onClick={() => onSelectSnapshot?.(s.id)}
+                    className={`text-text-primary border-t border-border-default ${onSelectSnapshot ? 'cursor-pointer hover:bg-surface-hover' : ''}`}>
                     <td className="py-1.5 font-mono">#{s.id}</td>
                     <td className="py-1.5">{absoluteTime(s.created_sec)}</td>
                     <td className="py-1.5 text-right">{fmtNum(s.node_count)}</td>

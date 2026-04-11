@@ -14,6 +14,7 @@ export interface CBackupApi {
   connectionStatus(name: string): Promise<ConnectionState | null>
 
   // Repo management
+  repoInit(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string; needsCredentials?: boolean }>
   repoAdd(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string }>
   repoRemove(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string }>
   repoEdit(connectionName: string, oldPath: string, newPath: string): Promise<{ ok: boolean; error?: string }>
@@ -38,6 +39,7 @@ const api: CBackupApi = {
   connectionList: () => ipcRenderer.invoke(IPC.CONNECTION_LIST),
   connectionStatus: (name) => ipcRenderer.invoke(IPC.CONNECTION_STATUS, name),
 
+  repoInit: (conn, path) => ipcRenderer.invoke(IPC.REPO_INIT, conn, path),
   repoAdd: (conn, path) => ipcRenderer.invoke(IPC.REPO_ADD, conn, path),
   repoRemove: (conn, path) => ipcRenderer.invoke(IPC.REPO_REMOVE, conn, path),
   repoEdit: (conn, oldPath, newPath) => ipcRenderer.invoke(IPC.REPO_EDIT, conn, oldPath, newPath),

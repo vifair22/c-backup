@@ -116,6 +116,10 @@ function registerIpcHandlers(): void {
     return connectionManager.restartConnection(name)
   })
 
+  ipcMain.handle(IPC.REPO_INIT, async (_e, connectionName: string, repoPath: string) => {
+    return connectionManager.initRepo(connectionName, repoPath)
+  })
+
   ipcMain.handle(IPC.REPO_EDIT, async (_e, connectionName: string, oldPath: string, newPath: string) => {
     return connectionManager.editRepo(connectionName, oldPath, newPath)
   })

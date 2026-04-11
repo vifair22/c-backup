@@ -16,7 +16,7 @@ const borderColor = {
 
 export function StatCard({ label, value, detail, status, children }: Props): React.ReactElement {
   return (
-    <div className={`bg-surface-secondary border border-border-default rounded-lg p-4 border-l-4 ${
+    <div className={`bg-surface-secondary border border-border-default rounded-lg p-4 border-l-4 h-full ${
       status ? borderColor[status] : 'border-l-border-default'
     }`}>
       <div className="text-[11px] text-text-muted uppercase tracking-wide mb-1">{label}</div>

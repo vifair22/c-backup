@@ -388,6 +388,96 @@ export class ConnectionManager {
   }
 
   /* ---------------------------------------------------------------- */
+  /* Repo init (one-shot command)                                      */
+  /* ---------------------------------------------------------------- */
+
+  async initRepo(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string; needsCredentials?: boolean }> {
+    const conn = this.connections.get(connectionName)
+    if (!conn) return { ok: false, error: `connection '${connectionName}' not found` }
+
+    // Ensure connection is up (auto-connect)
+    if (conn.status !== 'connected') {
+      const needsCreds = conn.config.sudo || (conn.config.type === 'ssh' && conn.config.authMethod === 'password')
+      if (needsCreds && !hasStoredCredentials(connectionName) && !conn.credentials) {
+        return { ok: false, error: 'credentials_required', needsCredentials: true }
+      }
+      const connectResult = await this.connect(connectionName)
+      if (!connectResult.ok) return { ok: false, error: connectResult.error, needsCredentials: needsCreds }
+    }
+
+    const config = conn.config
+    const cmd = this.buildInitCommand(config, conn.credentials, repoPath)
+
+    const { spawn } = await import('child_process')
+    return new Promise((resolve) => {
+      const proc = spawn(cmd[0], cmd.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
+      let stderr = ''
+
+      // Feed sudo password if needed
+      if (config.sudo && conn.credentials?.sudoPassword) {
+        proc.stdin!.write(conn.credentials.sudoPassword + '\n')
+      }
+
+      proc.stderr!.on('data', (chunk: Buffer) => { stderr += chunk.toString() })
+
+      const timer = setTimeout(() => {
+        proc.kill()
+        resolve({ ok: false, error: 'init timed out' })
+      }, 30_000)
+
+      proc.on('exit', (code) => {
+        clearTimeout(timer)
+        if (code === 0) {
+          // Auto-add the repo to the connection
+          this.addRepo(connectionName, repoPath)
+          resolve({ ok: true })
+        } else {
+          const msg = stderr.trim().split('\n').pop() || `exit code ${code}`
+          resolve({ ok: false, error: msg })
+        }
+      })
+
+      proc.on('error', (err) => {
+        clearTimeout(timer)
+        resolve({ ok: false, error: err.message })
+      })
+    })
+  }
+
+  private buildInitCommand(config: ConnectionConfig, credentials: ManagedConnection['credentials'], repoPath: string): string[] {
+    if (config.type === 'local') {
+      const bin = (config as LocalConnectionConfig).binaryPath || 'backup'
+      return config.sudo
+        ? ['sudo', '-S', bin, 'init', '--repo', repoPath]
+        : [bin, 'init', '--repo', repoPath]
+    }
+
+    const sshConfig = config as SshConnectionConfig
+    const remoteBin = sshConfig.remoteBinaryPath || 'backup'
+
+    const args: string[] = ['ssh']
+    if (sshConfig.port !== 22) args.push('-p', String(sshConfig.port))
+    if (sshConfig.username) args.push('-l', sshConfig.username)
+    if (sshConfig.authMethod === 'key' && sshConfig.keyFilePath) {
+      args.push('-i', sshConfig.keyFilePath)
+    }
+    args.push(
+      '-o', 'StrictHostKeyChecking=accept-new',
+      '-o', 'BatchMode=yes',
+      '-o', 'ConnectTimeout=10',
+      sshConfig.host,
+    )
+
+    if (config.sudo) {
+      args.push('sudo', '-S', remoteBin, 'init', '--repo', repoPath)
+    } else {
+      args.push(remoteBin, 'init', '--repo', repoPath)
+    }
+
+    return args
+  }
+
+  /* ---------------------------------------------------------------- */
   /* RPC call passthrough                                              */
   /* ---------------------------------------------------------------- */
 

@@ -4,6 +4,8 @@ import { AddConnectionDialog } from './AddConnectionDialog'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
 import { RepoView } from './RepoView'
+import { SnapshotList } from './SnapshotList'
+import { SnapshotBrowser } from './SnapshotBrowser'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -31,6 +33,19 @@ export function App(): React.ReactElement {
 
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
+  // Navigation history
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number }
+  const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
+  const [navIndex, setNavIndex] = useState(0)
+  const currentView = navHistory[navIndex]
+
+  const navigateTo = (state: ViewState) => {
+    setNavHistory(prev => [...prev.slice(0, navIndex + 1), state])
+    setNavIndex(prev => prev + 1)
+  }
+  const navBack = () => { if (navIndex > 0) setNavIndex(prev => prev - 1) }
+  const navForward = () => { if (navIndex < navHistory.length - 1) setNavIndex(prev => prev + 1) }
+
   const [error, setError] = useState<string | null>(null)
 
   // Dialogs
@@ -44,6 +59,9 @@ export function App(): React.ReactElement {
   const [repoPathInput, setRepoPathInput] = useState('')
   const [postCreateConn, setPostCreateConn] = useState<string | null>(null)
   const [editingRepo, setEditingRepo] = useState<{ connName: string; oldPath: string } | null>(null)
+  const [initRepoConn, setInitRepoConn] = useState<string | null>(null)
+  const [initRepoPath, setInitRepoPath] = useState('')
+  const [initRepoLoading, setInitRepoLoading] = useState(false)
 
   // Collapsed connections
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -81,6 +99,16 @@ export function App(): React.ReactElement {
     const interval = setInterval(refreshConnections, 3000)
     return () => clearInterval(interval)
   }, [refreshConnections])
+
+  // Mouse back/forward buttons
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (e.button === 3) { e.preventDefault(); navBack() }
+      if (e.button === 4) { e.preventDefault(); navForward() }
+    }
+    window.addEventListener('mouseup', handler)
+    return () => window.removeEventListener('mouseup', handler)
+  }, [navIndex, navHistory.length])
 
   /* ---------------------------------------------------------------- */
   /* Handlers                                                          */
@@ -120,11 +148,16 @@ export function App(): React.ReactElement {
     if (!result.ok) { setError(result.error ?? 'Connection failed'); return }
     await refreshConnections()
 
-    // If we were trying to open a repo, retry now
+    // If we were trying to do something, retry now
     if (pendingRepoOpen && pendingRepoOpen.conn === connectingName) {
       const pending = pendingRepoOpen
       setPendingRepoOpen(null)
-      await handleOpenRepo(pending.conn, pending.path)
+      if (pending.path === '' && initRepoConn) {
+        // Was trying to init a repo
+        await handleInitRepo()
+      } else {
+        await handleOpenRepo(pending.conn, pending.path)
+      }
     }
   }
 
@@ -180,6 +213,31 @@ export function App(): React.ReactElement {
     }
   }
 
+  const handleInitRepo = async () => {
+    if (!initRepoConn || !initRepoPath.trim()) return
+    const connName = initRepoConn
+    const path = initRepoPath.trim()
+    setError(null)
+    setInitRepoLoading(true)
+    const result = await api.repoInit(connName, path)
+    setInitRepoLoading(false)
+    if (!result.ok) {
+      if (result.needsCredentials) {
+        // Stash the init intent, show credential dialog
+        setPendingRepoOpen({ conn: connName, path: '' }) // empty path signals init, not open
+        setConnectingName(connName)
+        setSudoPasswordInput('')
+        setSavePassword(true)
+        return
+      }
+      setError(result.error ?? 'Failed to create repo')
+      return
+    }
+    setInitRepoConn(null)
+    setInitRepoPath('')
+    await refreshConnections()
+  }
+
   const handleEditRepo = async () => {
     if (!editingRepo || !repoPathInput.trim()) return
     if (repoPathInput.trim() === editingRepo.oldPath) { setEditingRepo(null); return }
@@ -213,6 +271,8 @@ export function App(): React.ReactElement {
   const handleOpenRepo = async (connName: string, repoPath: string) => {
     setError(null)
     setActiveRepo({ conn: connName, path: repoPath })
+    setNavHistory([{ view: 'dashboard' }])
+    setNavIndex(0)
     try {
       const result = await api.repoOpen(connName, repoPath)
       if (!result.ok) {
@@ -243,6 +303,7 @@ export function App(): React.ReactElement {
       items: [
         { label: 'Edit', onClick: () => setEditingConnection(conn.config) },
         { label: 'Add Repo', onClick: () => { setAddRepoConn(conn.config.name); setRepoPathInput('') } },
+        { label: 'Create New Repo', onClick: () => { setInitRepoConn(conn.config.name); setInitRepoPath('') } },
         ...(conn.status === 'connected' ? [
           { label: 'Restart', onClick: () => handleRestartConnection(conn.config.name) },
         ] : []),
@@ -390,7 +451,26 @@ export function App(): React.ReactElement {
         )}
 
         {activeRepo ? (
-          <RepoView connName={activeRepo.conn} repoPath={activeRepo.path} />
+          <>
+            {currentView.view === 'dashboard' && (
+              <RepoView connName={activeRepo.conn} repoPath={activeRepo.path}
+                onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
+                onViewAllSnapshots={() => navigateTo({ view: 'snapshots' })}
+              />
+            )}
+            {currentView.view === 'snapshots' && (
+              <SnapshotList connName={activeRepo.conn} repoPath={activeRepo.path}
+                onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
+                onBack={navBack}
+              />
+            )}
+            {currentView.view === 'snapshot-browser' && (
+              <SnapshotBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
+                snapId={currentView.snapId}
+                onBack={navBack}
+              />
+            )}
+          </>
         ) : (
           <div className="text-text-muted text-center mt-16">
             <div className="text-xl mb-2 text-text-secondary">c-backup</div>
@@ -510,6 +590,32 @@ export function App(): React.ReactElement {
       )}
 
       {/* Edit repo dialog */}
+      {/* Create new repo dialog */}
+      {initRepoConn && (
+        <Overlay>
+          <form onSubmit={e => { e.preventDefault(); handleInitRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-2">Create New Repository</h3>
+            <div className="text-text-muted text-xs mb-3">Connection: {initRepoConn}</div>
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-text-secondary mb-1">Repository Path (absolute)</label>
+              <input value={initRepoPath} onChange={e => setInitRepoPath(e.target.value)}
+                placeholder="/path/to/new/repo"
+                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
+                autoFocus required />
+              <div className="text-[10px] text-text-muted mt-1">The directory will be created and initialized as a c-backup repository.</div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setInitRepoConn(null)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
+                disabled={initRepoLoading}>Cancel</button>
+              <button type="submit"
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
+                disabled={initRepoLoading}>{initRepoLoading ? 'Creating...' : 'Create'}</button>
+            </div>
+          </form>
+        </Overlay>
+      )}
+
       {editingRepo && (
         <Overlay>
           <form onSubmit={e => { e.preventDefault(); handleEditRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
