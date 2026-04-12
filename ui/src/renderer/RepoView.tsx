@@ -89,9 +89,10 @@ interface Props {
   onSearch?: () => void
   onEditPolicy?: () => void
   onViewJournal?: () => void
+  onViewTags?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
@@ -238,6 +239,12 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
           <button onClick={onEditPolicy}
             className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
             Policy
+          </button>
+        )}
+        {onViewTags && (
+          <button onClick={onViewTags}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Tags
           </button>
         )}
         {onViewJournal && (
