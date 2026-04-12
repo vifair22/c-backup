@@ -93,9 +93,10 @@ interface Props {
   onViewTags?: () => void
   onRunBackup?: () => void
   onRunOperation?: (command: string) => void
+  onViewTasks?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation, onViewTasks }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -255,6 +256,12 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
           <button onClick={onViewJournal}
             className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
             Journal
+          </button>
+        )}
+        {onViewTasks && (
+          <button onClick={onViewTasks}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Tasks
           </button>
         )}
         <div className="border-l border-border-default h-5 mx-1" />

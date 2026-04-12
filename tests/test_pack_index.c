@@ -61,7 +61,7 @@ static int setup_packed(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run_opts(repo, paths, 1, NULL), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
     return 0;
 }
 
@@ -288,7 +288,7 @@ static void test_dat_cache_hit(void **state) {
 static void test_verify_pack_ordered(void **state) {
     (void)state;
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
     assert_true(vopts.bytes_checked > 0);
 }
@@ -495,7 +495,7 @@ static void test_verify_deduplicates(void **state) {
 
     /* Verify should succeed and process fewer objects than 2× */
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     /* With 10 files and 100% dedup across 2 snapshots, objects_checked
      * should be equal to unique object count, not 2× */
     assert_true(vopts.objects_checked > 0);

@@ -2591,7 +2591,8 @@ out:
     return NULL;
 }
 
-status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
+status_t repo_pack(repo_t *repo, uint32_t *out_packed,
+                   task_progress_fn progress, void *progress_ctx) {
     int show_progress = pack_progress_enabled();
 
     if (!loose_objects_exist(repo)) {
@@ -2862,6 +2863,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed) {
         log_msg("INFO", msg);
     }
     if (out_packed) *out_packed = packed;
+    if (progress) progress((uint64_t)packed, (uint64_t)packed, "packing", progress_ctx);
     return OK;
 
 cleanup:

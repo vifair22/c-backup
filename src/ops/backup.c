@@ -604,11 +604,14 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
 
     int tui = phase_ui_enabled(opts);
     const char *fail_ctx = "startup";
+    task_progress_fn prog_cb = opts ? opts->progress : NULL;
+    void *prog_ctx = opts ? opts->progress_ctx : NULL;
 
     /* ----------------------------------------------------------------
      * Phase 1: Scan source trees (shared imap across all roots)
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 1: scanning");
+    if (prog_cb) prog_cb(0, 0, "scanning", prog_ctx);
 
     scan_imap_t *imap = scan_imap_new();
     if (!imap) return set_error(ERR_NOMEM, "backup: alloc inode map failed");
@@ -703,6 +706,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
      * Phase 2: Load previous snapshot + build path map
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 2: loading previous snapshot");
+    if (prog_cb) prog_cb(0, 0, "comparing", prog_ctx);
 
     uint32_t   prev_id   = 0;
     snapshot_t *prev_snap = NULL;
@@ -732,6 +736,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
      *           queue regular files for parallel content storage.
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 3: compare and store");
+    if (prog_cb) prog_cb(0, 0, "storing", prog_ctx);
 
     status_t st = OK;
 
@@ -1156,6 +1161,7 @@ status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count
      * Phase 4 & 5: Build new snapshot
      * ---------------------------------------------------------------- */
     log_msg("INFO", "Phase 4/5: building snapshot");
+    if (prog_cb) prog_cb(0, 0, "committing", prog_ctx);
 
     snapshot_t *new_snap = calloc(1, sizeof(*new_snap));
     if (!new_snap) { st = ERR_NOMEM; goto done; }

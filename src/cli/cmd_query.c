@@ -298,17 +298,17 @@ int cmd_restore(repo_t *repo, int argc, char **argv) {
             journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "--snapshot required with --file", NULL);
             return 1;
         }
-        st = restore_file(repo, snap_id, file_arg, dest);
+        st = restore_file(repo, snap_id, file_arg, dest, NULL, NULL);
         if (st == ERR_INVALID || st == ERR_NOT_FOUND) {
-            st = restore_subtree(repo, snap_id, file_arg, dest);
+            st = restore_subtree(repo, snap_id, file_arg, dest, NULL, NULL);
             if (st == ERR_NOT_FOUND)
                 fprintf(stderr, "error: path '%s' not found in snapshot %u\n",
                         file_arg, snap_id);
         }
     } else if (snap_id > 0) {
-        st = restore_snapshot(repo, snap_id, dest);
+        st = restore_snapshot(repo, snap_id, dest, NULL, NULL);
     } else {
-        st = restore_latest(repo, dest);
+        st = restore_latest(repo, dest, NULL, NULL);
         if (verify) {
             uint32_t head = 0;
             snapshot_read_head(repo, &head);

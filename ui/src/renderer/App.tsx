@@ -10,7 +10,7 @@ import { SnapshotDiff } from './SnapshotDiff'
 import { FileSearch } from './FileSearch'
 import { PolicyEditor } from './PolicyEditor'
 import { JournalView } from './JournalView'
-import { TaskBar } from './TaskBar'
+import { TaskBar, type TaskInfo } from './TaskBar'
 import { TaskListView } from './TaskListView'
 import { TagsView } from './TagsView'
 import { useTheme, type ThemeMode } from './useTheme'
@@ -54,6 +54,23 @@ export function App(): React.ReactElement {
   const navForward = () => { if (navIndex < navHistory.length - 1) setNavIndex(prev => prev + 1) }
 
   const [error, setError] = useState<string | null>(null)
+
+  // Shared task state — single poll shared by TaskBar + TaskListView
+  const [taskList, setTaskList] = useState<TaskInfo[]>([])
+
+  useEffect(() => {
+    if (!activeRepo) { setTaskList([]); return }
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const resp = await api.rpcCall<{ tasks: TaskInfo[] }>(activeRepo.conn, activeRepo.path, 'task_list')
+        if (!cancelled) setTaskList(resp.tasks)
+      } catch { /* ignore */ }
+    }
+    poll()
+    const interval = setInterval(poll, 2000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [activeRepo?.conn, activeRepo?.path])
 
   // Restore modal
   const [restoreModal, setRestoreModal] = useState<{ snapId: number; filePath?: string } | null>(null)
@@ -324,6 +341,7 @@ export function App(): React.ReactElement {
       if (backupVerify) params.verify_after = true
       await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
       setShowBackupModal(false)
+      navigateTo({ view: 'tasks' })
     } catch (err) {
       setError(String(err))
     }
@@ -344,6 +362,7 @@ export function App(): React.ReactElement {
       if (restoreVerify) params.verify = true
       await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
       setRestoreModal(null)
+      navigateTo({ view: 'tasks' })
     } catch (err) {
       setError(String(err))
     }
@@ -363,6 +382,7 @@ export function App(): React.ReactElement {
         setError(null)
         try {
           await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', { command })
+          navigateTo({ view: 'tasks' })
         } catch (err) {
           setError(String(err))
         }
@@ -540,6 +560,7 @@ export function App(): React.ReactElement {
                 onEditPolicy={() => navigateTo({ view: 'policy' })}
                 onViewJournal={() => navigateTo({ view: 'journal' })}
                 onViewTags={() => navigateTo({ view: 'tags' })}
+                onViewTasks={() => navigateTo({ view: 'tasks' })}
                 onRunBackup={() => { setShowBackupModal(true); setBackupUsePolicy(true); setBackupVerify(false) }}
                 onRunOperation={handleStartOperation}
               />
@@ -560,7 +581,7 @@ export function App(): React.ReactElement {
               />
             )}
             {currentView.view === 'tasks' && (
-              <TaskListView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <TaskListView tasks={taskList} connName={activeRepo.conn} repoPath={activeRepo.path}
                 onBack={navBack}
               />
             )}
@@ -604,7 +625,7 @@ export function App(): React.ReactElement {
       </div>
       {/* Task status bar */}
       {activeRepo && (
-        <TaskBar connName={activeRepo.conn} repoPath={activeRepo.path}
+        <TaskBar tasks={taskList} connName={activeRepo.conn} repoPath={activeRepo.path}
           onViewTasks={() => navigateTo({ view: 'tasks' })}
         />
       )}

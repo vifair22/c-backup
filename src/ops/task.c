@@ -351,6 +351,8 @@ status_t task_cancel(repo_t *repo, const char *task_id)
 static repo_t    *_child_repo = NULL;
 static task_info_t _child_info;
 
+static struct timespec _last_progress_write;
+
 static void child_progress_cb(uint64_t current, uint64_t total,
                                const char *phase, void *ctx)
 {
@@ -360,6 +362,15 @@ static void child_progress_cb(uint64_t current, uint64_t total,
     if (phase)
         snprintf(_child_info.progress_phase, sizeof(_child_info.progress_phase),
                  "%s", phase);
+
+    /* Throttle writes to at most every 200ms to avoid I/O overhead. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - _last_progress_write.tv_sec) * 1000
+                    + (now.tv_nsec - _last_progress_write.tv_nsec) / 1000000;
+    if (elapsed_ms < 200 && current < total) return;
+    _last_progress_write = now;
+
     /* Best-effort write — don't fail the operation if status update fails. */
     task_status_write(_child_repo, &_child_info);
 }
@@ -429,6 +440,8 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
             .quiet       = 1,
             .verify_after = pol->verify_after,
             .strict_meta  = pol->strict_meta,
+            .progress     = child_progress_cb,
+            .progress_ctx = NULL,
         };
         /* Cast through void* to avoid -Wcast-qual warning; policy_load
          * allocates these as mutable but backup_run_opts only reads them. */
@@ -438,23 +451,23 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
         /* Post-backup automations. */
         if (result == OK && pol->auto_pack) {
             child_progress_cb(0, 0, "packing", NULL);
-            repo_pack(repo, NULL);
+            repo_pack(repo, NULL, child_progress_cb, NULL);
         }
         if (result == OK && pol->auto_gc) {
             child_progress_cb(0, 0, "gc", NULL);
-            repo_gc(repo, NULL, NULL);
+            repo_gc(repo, NULL, NULL, child_progress_cb, NULL);
         }
         policy_free(pol);
         break;
     }
     case TASK_CMD_GC: {
         uint32_t kept = 0, deleted = 0;
-        result = repo_gc(repo, &kept, &deleted);
+        result = repo_gc(repo, &kept, &deleted, child_progress_cb, NULL);
         break;
     }
     case TASK_CMD_PACK: {
         uint32_t packed = 0;
-        result = repo_pack(repo, &packed);
+        result = repo_pack(repo, &packed, child_progress_cb, NULL);
         break;
     }
     case TASK_CMD_VERIFY: {
@@ -464,7 +477,7 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
             const cJSON *jrepair = cJSON_GetObjectItemCaseSensitive(cmd_params, "repair");
             if (cJSON_IsTrue(jrepair)) vopts.repair = 1;
         }
-        result = repo_verify(repo, &vopts);
+        result = repo_verify(repo, &vopts, child_progress_cb, NULL);
         break;
     }
     case TASK_CMD_PRUNE:
@@ -509,15 +522,15 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
                 result = set_error(ERR_INVALID, "restore: snapshot required with file");
                 break;
             }
-            result = restore_file(repo, snap_id, file_arg, dest_arg);
+            result = restore_file(repo, snap_id, file_arg, dest_arg, child_progress_cb, NULL);
             if (result == ERR_INVALID || result == ERR_NOT_FOUND) {
                 err_clear();
-                result = restore_subtree(repo, snap_id, file_arg, dest_arg);
+                result = restore_subtree(repo, snap_id, file_arg, dest_arg, child_progress_cb, NULL);
             }
         } else if (snap_id > 0) {
-            result = restore_snapshot(repo, snap_id, dest_arg);
+            result = restore_snapshot(repo, snap_id, dest_arg, child_progress_cb, NULL);
         } else {
-            result = restore_latest(repo, dest_arg);
+            result = restore_latest(repo, dest_arg, child_progress_cb, NULL);
             if (result == OK && verify) {
                 snapshot_read_head(repo, &snap_id);
             }

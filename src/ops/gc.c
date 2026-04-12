@@ -216,7 +216,8 @@ static status_t collect_refs(repo_t *repo,
 
 /* ------------------------------------------------------------------ */
 
-status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
+status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted,
+                 task_progress_fn progress, void *progress_ctx) {
     uint8_t *refs  = NULL;
     size_t   ref_cnt = 0;
     status_t st = collect_refs(repo, &refs, &ref_cnt);
@@ -259,6 +260,7 @@ status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted) {
                 loose_deleted++;
             }
             scanned++;
+            if (progress) progress((uint64_t)scanned, 0, "gc", progress_ctx);
             if (show_progress && gc_tick_due(&next_tick)) {
                 char line[128];
                 snprintf(line, sizeof(line),
@@ -403,7 +405,8 @@ static int gc_hs_insert_check(gc_hashset_t *hs, const uint8_t hash[OBJECT_HASH_S
     return 0;
 }
 
-status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
+status_t repo_verify(repo_t *repo, verify_opts_t *opts,
+                     task_progress_fn progress, void *progress_ctx) {
     parity_stats_t ps_before = parity_stats_get();
     int do_repair = (opts && opts->repair);
 
@@ -530,6 +533,7 @@ status_t repo_verify(repo_t *repo, verify_opts_t *opts) {
             errors++;
         }
         atomic_fetch_add(&prog.items, 1);
+        if (progress) progress((uint64_t)(vi + 1), (uint64_t)ve_cnt, "verifying", progress_ctx);
     }
 
     if (null_fd >= 0) close(null_fd);

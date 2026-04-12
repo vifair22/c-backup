@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React from 'react'
 
 const api = window.cbackup
 
@@ -20,34 +20,14 @@ interface TaskInfo {
   progress?: TaskProgress
 }
 
-interface TaskListResponse {
-  tasks: TaskInfo[]
-}
-
 interface Props {
+  tasks: TaskInfo[]
   connName: string
   repoPath: string
   onViewTasks: () => void
 }
 
-export function TaskBar({ connName, repoPath, onViewTasks }: Props): React.ReactElement | null {
-  const [tasks, setTasks] = useState<TaskInfo[]>([])
-
-  useEffect(() => {
-    let cancelled = false
-    const poll = async () => {
-      try {
-        const resp = await api.rpcCall<TaskListResponse>(connName, repoPath, 'task_list')
-        if (!cancelled) setTasks(resp.tasks)
-      } catch {
-        // Ignore polling errors
-      }
-    }
-    poll()
-    const interval = setInterval(poll, 2000)
-    return () => { cancelled = true; clearInterval(interval) }
-  }, [connName, repoPath])
-
+export function TaskBar({ tasks, connName, repoPath, onViewTasks }: Props): React.ReactElement | null {
   const running = tasks.filter(t => t.state === 'running' && t.alive)
   const recentFailed = tasks.filter(t => t.state === 'failed' && (Date.now() / 1000 - t.started) < 3600)
 
@@ -102,3 +82,5 @@ export function TaskBar({ connName, repoPath, onViewTasks }: Props): React.React
     </div>
   )
 }
+
+export type { TaskInfo }

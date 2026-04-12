@@ -1,30 +1,9 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useState } from 'react'
 import { fmtNum, absoluteTime } from './format'
 import { ConfirmDialog } from './ConfirmDialog'
+import type { TaskInfo } from './TaskBar'
 
 const api = window.cbackup
-
-interface TaskProgress {
-  current: number
-  total: number
-  phase: string
-}
-
-interface TaskInfo {
-  task_id: string
-  command: string
-  pid: number
-  started: number
-  state: 'running' | 'completed' | 'failed'
-  exit_code: number
-  error?: string
-  alive: boolean
-  progress?: TaskProgress
-}
-
-interface TaskListResponse {
-  tasks: TaskInfo[]
-}
 
 function fmtElapsed(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`
@@ -39,38 +18,20 @@ const STATE_CONFIG: Record<string, { color: string; bg: string; label: string }>
 }
 
 interface Props {
+  tasks: TaskInfo[]
   connName: string
   repoPath: string
   onBack: () => void
 }
 
-export function TaskListView({ connName, repoPath, onBack }: Props): React.ReactElement {
-  const [tasks, setTasks] = useState<TaskInfo[]>([])
-  const [loading, setLoading] = useState(true)
+export function TaskListView({ tasks, connName, repoPath, onBack }: Props): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null)
-
-  const refresh = useCallback(async () => {
-    try {
-      const resp = await api.rpcCall<TaskListResponse>(connName, repoPath, 'task_list')
-      setTasks(resp.tasks)
-    } catch (err) {
-      setError(String(err))
-    }
-    setLoading(false)
-  }, [connName, repoPath])
-
-  useEffect(() => {
-    refresh()
-    const interval = setInterval(refresh, 2000)
-    return () => clearInterval(interval)
-  }, [refresh])
 
   const handleCancel = async (taskId: string) => {
     setConfirmCancel(null)
     try {
       await api.rpcCall(connName, repoPath, 'task_cancel', { task_id: taskId })
-      await refresh()
     } catch (err) {
       setError(String(err))
     }
@@ -98,9 +59,8 @@ export function TaskListView({ connName, repoPath, onBack }: Props): React.React
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
-      {loading && <div className="text-text-muted text-sm">Loading tasks...</div>}
 
-      {!loading && sorted.length > 0 && (
+      {sorted.length > 0 && (
         <div className="space-y-2">
           {sorted.map(t => {
             const cfg = STATE_CONFIG[t.state] ?? STATE_CONFIG.running
@@ -170,7 +130,7 @@ export function TaskListView({ connName, repoPath, onBack }: Props): React.React
         </div>
       )}
 
-      {!loading && tasks.length === 0 && (
+      {tasks.length === 0 && (
         <div className="text-text-muted text-xs text-center py-8">No background tasks.</div>
       )}
 

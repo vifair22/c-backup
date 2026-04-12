@@ -2,25 +2,29 @@
 
 #include "error.h"
 #include "repo.h"
-//#include "types.h"
+#include "task.h"
 #include <stdint.h>
 
 /* Restore latest snapshot to dest_path. */
-status_t restore_latest(repo_t *repo, const char *dest_path);
+status_t restore_latest(repo_t *repo, const char *dest_path,
+                        task_progress_fn progress, void *progress_ctx);
 
 /* Restore a specific snapshot (by ID) to dest_path. */
-status_t restore_snapshot(repo_t *repo, uint32_t snap_id, const char *dest_path);
+status_t restore_snapshot(repo_t *repo, uint32_t snap_id, const char *dest_path,
+                          task_progress_fn progress, void *progress_ctx);
 
 /* Restore a single file (by repo-relative path) from a snapshot. */
 status_t restore_file(repo_t *repo, uint32_t snap_id,
-                      const char *file_path, const char *dest_path);
+                      const char *file_path, const char *dest_path,
+                      task_progress_fn progress, void *progress_ctx);
 
 /*
  * Restore a directory subtree (all entries whose path equals subtree_path or
  * starts with subtree_path + "/") from a snapshot.
  */
 status_t restore_subtree(repo_t *repo, uint32_t snap_id,
-                         const char *subtree_path, const char *dest_path);
+                         const char *subtree_path, const char *dest_path,
+                         task_progress_fn progress, void *progress_ctx);
 
 /* Print a regular file from a snapshot to stdout (like cat). */
 status_t restore_cat_file(repo_t *repo, uint32_t snap_id,

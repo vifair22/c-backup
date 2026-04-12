@@ -139,18 +139,18 @@ int cmd_run(repo_t *repo, int argc, char **argv) {
             if (!quiet) log_msg("INFO", "post-backup: running retention");
             gfs_run(repo, pol, head_id, 0, quiet, 0, &pruned);
             if (pruned > 0) {
-                repo_gc(repo, NULL, NULL);
+                repo_gc(repo, NULL, NULL, NULL, NULL);
                 did_gc = 1;
             }
         }
         if (pol->auto_pack) {
             if (!quiet) log_msg("INFO", "post-backup: packing loose objects");
             pack_resume_installing(repo);
-            if (!did_gc) repo_gc(repo, NULL, NULL);
-            repo_pack(repo, NULL);
+            if (!did_gc) repo_gc(repo, NULL, NULL, NULL, NULL);
+            repo_pack(repo, NULL, NULL, NULL);
         } else if (pol->auto_gc && !did_gc) {
             if (!quiet) log_msg("INFO", "post-backup: running GC");
-            repo_gc(repo, NULL, NULL);
+            repo_gc(repo, NULL, NULL, NULL, NULL);
         }
     }
 
@@ -231,7 +231,7 @@ int cmd_prune(repo_t *repo, int argc, char **argv) {
     uint32_t pruned = 0;
     status_t st = gfs_run(repo, pol, head_id, dry_run, 0, 1, &pruned);
     if (st == OK && !dry_run && pruned > 0)
-        repo_gc(repo, NULL, NULL);
+        repo_gc(repo, NULL, NULL, NULL, NULL);
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "prune failed");
@@ -274,7 +274,7 @@ int cmd_gfs(repo_t *repo, int argc, char **argv) {
     uint32_t pruned = 0;
     status_t st2 = gfs_run(repo, pol, head_id, dry_run, quiet, full_scan, &pruned);
     if (st2 == OK && !dry_run && pruned > 0)
-        repo_gc(repo, NULL, NULL);
+        repo_gc(repo, NULL, NULL, NULL, NULL);
     if (st2 != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "gfs failed");
@@ -289,7 +289,7 @@ int cmd_gc(repo_t *repo, int argc, char **argv) {
     journal_op_t *jop = journal_start(repo, "gc", JOURNAL_SOURCE_CLI);
     if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
     log_msg("INFO", "running GC");
-    status_t st = repo_gc(repo, NULL, NULL);
+    status_t st = repo_gc(repo, NULL, NULL, NULL, NULL);
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "gc failed");
@@ -390,9 +390,9 @@ int cmd_pack(repo_t *repo, int argc, char **argv) {
     if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
     pack_resume_installing(repo);
     log_msg("INFO", "running GC");
-    repo_gc(repo, NULL, NULL);
+    repo_gc(repo, NULL, NULL, NULL, NULL);
     log_msg("INFO", "running pack");
-    status_t st = repo_pack(repo, NULL);
+    status_t st = repo_pack(repo, NULL, NULL, NULL);
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "pack failed");
@@ -429,7 +429,7 @@ int cmd_verify(repo_t *repo, int argc, char **argv) {
     }
     verify_opts_t vopts = {0};
     vopts.repair = repair;
-    status_t st = repo_verify(repo, &vopts);
+    status_t st = repo_verify(repo, &vopts, NULL, NULL);
     char smsg[160];
     snprintf(smsg, sizeof(smsg),
              "verify: checked %llu objects, %llu parity repairs, %llu uncorrectable",

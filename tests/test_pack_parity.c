@@ -141,10 +141,10 @@ static void test_verify_parity_stats_clean(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
     assert_true(vopts.bytes_checked > 0);
     assert_int_equal((int)vopts.parity_repaired, 0);
@@ -165,7 +165,7 @@ static void test_verify_parity_stats_with_repair(void **state) {
         /* No packs — test inconclusive but not a failure */
         parity_stats_reset();
         verify_opts_t vopts = {0};
-        assert_int_equal(repo_verify(repo, &vopts), OK);
+        assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
         assert_true(vopts.objects_checked > 0);
         return;
     }
@@ -186,7 +186,7 @@ static void test_verify_parity_stats_with_repair(void **state) {
     parity_stats_reset();
 
     verify_opts_t vopts = {0};
-    status_t st = repo_verify(repo, &vopts);
+    status_t st = repo_verify(repo, &vopts, NULL, NULL);
     assert_true(vopts.objects_checked > 0);
     (void)st;
 }
@@ -203,7 +203,7 @@ static void test_pack_load_parity_clean(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Load from pack — should use parity fast path */
     uint8_t hash[OBJECT_HASH_SIZE];
@@ -228,7 +228,7 @@ static void test_pack_load_parity_repairs_header(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Find the .dat file and corrupt the type field of the first entry header
      * (offset = pack header (12 bytes) + hash (32 bytes) + type byte) */
@@ -269,7 +269,7 @@ static void test_pack_load_parity_repairs_payload(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     char dat_path[512];
     assert_int_equal(find_pack_dat(dat_path, sizeof(dat_path)), 0);
@@ -307,7 +307,7 @@ static void test_pack_stream_clean(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(find_content_hash(1, hash), 0);
@@ -330,7 +330,7 @@ static void test_pack_stream_rs_repair(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     char dat_path[512];
     assert_int_equal(find_pack_dat(dat_path, sizeof(dat_path)), 0);
@@ -366,7 +366,7 @@ static void test_pack_repair_header_and_payload(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(find_content_hash(1, hash), 0);
@@ -396,7 +396,7 @@ static void test_pack_repair_clean(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(find_content_hash(1, hash), 0);
@@ -413,7 +413,7 @@ static void test_pack_repair_not_v3(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Get hash before modifying pack files */
     uint8_t hash[OBJECT_HASH_SIZE];
@@ -484,7 +484,7 @@ static void test_pack_stream_compress_none(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Loose objects deleted by repo_pack → load_stream falls to pack path */
     uint8_t hash[OBJECT_HASH_SIZE];
@@ -511,7 +511,7 @@ static void test_pack_stream_lz4_from_pack(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(find_content_hash(1, hash), 0);
@@ -544,7 +544,7 @@ static void test_pack_stream_compress_none_corrupt_rs_repair(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Corrupt a payload byte in the dat file */
     char dat_path[512];
@@ -586,7 +586,7 @@ static void test_pack_stream_lz4_corrupt_crc(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Corrupt a byte in the compressed payload area */
     char dat_path[512];
@@ -633,11 +633,11 @@ static void test_pack_mixed_codecs_stream(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Verify + stream all objects from the snapshot */
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
 
     /* Load each content hash via streaming */
