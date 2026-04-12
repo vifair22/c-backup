@@ -95,9 +95,11 @@ interface Props {
   onRunOperation?: (command: string) => void
   onViewTasks?: () => void
   onHashLookup?: () => void
+  onLooseObjects?: () => void
+  onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation, onViewTasks, onHashLookup }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -244,6 +246,8 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
         <div className="border-l border-border-default h-4 mx-0.5" />
 
         {/* Debug */}
+        {onLooseObjects && <QBtn onClick={onLooseObjects}>Loose</QBtn>}
+        {onPackBrowser && <QBtn onClick={onPackBrowser}>Packs</QBtn>}
         {onHashLookup && <QBtn onClick={onHashLookup}>Lookup</QBtn>}
         {onViewJournal && <QBtn onClick={onViewJournal}>Journal</QBtn>}
         {onViewTasks && <QBtn onClick={onViewTasks}>Tasks</QBtn>}
