@@ -205,7 +205,12 @@ export function App(): React.ReactElement {
       onConfirm: async () => {
         setConfirmDialog(null)
         await api.connectionRemove(name)
-        if (activeRepo?.conn === name) { setActiveRepo(null);  }
+        if (activeRepo?.conn === name) {
+          setActiveRepo(null)
+          setNavHistory([{ view: 'dashboard' }])
+          setNavIndex(0)
+          setTaskList([])
+        }
         await refreshConnections()
       }
     })
@@ -299,6 +304,9 @@ export function App(): React.ReactElement {
         await api.repoRemove(connName, repoPath)
         if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
           setActiveRepo(null)
+          setNavHistory([{ view: 'dashboard' }])
+          setNavIndex(0)
+          setTaskList([])
         }
         await refreshConnections()
       }
@@ -404,6 +412,16 @@ export function App(): React.ReactElement {
         { label: 'Add Repo', onClick: () => { setAddRepoConn(conn.config.name); setRepoPathInput('') } },
         { label: 'Create New Repo', onClick: () => { setInitRepoConn(conn.config.name); setInitRepoPath('') } },
         ...(conn.status === 'connected' ? [
+          { label: 'Disconnect', onClick: async () => {
+            await api.connectionDisconnect(conn.config.name)
+            if (activeRepo?.conn === conn.config.name) {
+              setActiveRepo(null)
+              setNavHistory([{ view: 'dashboard' }])
+              setNavIndex(0)
+              setTaskList([])
+            }
+            await refreshConnections()
+          }},
           { label: 'Restart', onClick: () => handleRestartConnection(conn.config.name) },
         ] : []),
         { label: 'Delete', danger: true, onClick: () => handleRemoveConnection(conn.config.name) },
@@ -421,7 +439,12 @@ export function App(): React.ReactElement {
         ...(repo?.sessionActive ? [{
           label: 'Disconnect', onClick: async () => {
             await api.repoClose(connName, repoPath)
-            if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {  }
+            if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
+              setActiveRepo(null)
+              setNavHistory([{ view: 'dashboard' }])
+              setNavIndex(0)
+              setTaskList([])
+            }
             await refreshConnections()
           }
         }] : []),
