@@ -9,6 +9,7 @@ import { SnapshotBrowser } from './SnapshotBrowser'
 import { SnapshotDiff } from './SnapshotDiff'
 import { FileSearch } from './FileSearch'
 import { PolicyEditor } from './PolicyEditor'
+import { JournalView } from './JournalView'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -37,7 +38,7 @@ export function App(): React.ReactElement {
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -462,6 +463,7 @@ export function App(): React.ReactElement {
                 onCompareSnapshots={(a, b) => navigateTo({ view: 'diff', snapA: a, snapB: b })}
                 onSearch={() => navigateTo({ view: 'search' })}
                 onEditPolicy={() => navigateTo({ view: 'policy' })}
+                onViewJournal={() => navigateTo({ view: 'journal' })}
               />
             )}
             {currentView.view === 'snapshots' && (
@@ -475,6 +477,11 @@ export function App(): React.ReactElement {
               <SnapshotBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
                 snapId={currentView.snapId}
                 initialPath={currentView.path}
+                onBack={navBack}
+              />
+            )}
+            {currentView.view === 'journal' && (
+              <JournalView connName={activeRepo.conn} repoPath={activeRepo.path}
                 onBack={navBack}
               />
             )}
