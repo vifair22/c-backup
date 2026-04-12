@@ -9,6 +9,7 @@ import { SnapshotBrowser } from './SnapshotBrowser'
 import { SnapshotDiff } from './SnapshotDiff'
 import { FileSearch } from './FileSearch'
 import { PolicyEditor } from './PolicyEditor'
+import { HashLookup } from './HashLookup'
 import { JournalView } from './JournalView'
 import { TaskBar, type TaskInfo } from './TaskBar'
 import { TaskListView } from './TaskListView'
@@ -41,7 +42,7 @@ export function App(): React.ReactElement {
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -561,6 +562,7 @@ export function App(): React.ReactElement {
                 onViewJournal={() => navigateTo({ view: 'journal' })}
                 onViewTags={() => navigateTo({ view: 'tags' })}
                 onViewTasks={() => navigateTo({ view: 'tasks' })}
+                onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
                 onRunBackup={() => { setShowBackupModal(true); setBackupUsePolicy(true); setBackupVerify(false) }}
                 onRunOperation={handleStartOperation}
               />
@@ -593,6 +595,12 @@ export function App(): React.ReactElement {
             )}
             {currentView.view === 'journal' && (
               <JournalView connName={activeRepo.conn} repoPath={activeRepo.path}
+                onBack={navBack}
+              />
+            )}
+            {currentView.view === 'hash-lookup' && (
+              <HashLookup connName={activeRepo.conn} repoPath={activeRepo.path}
+                onNavigateToSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onBack={navBack}
               />
             )}

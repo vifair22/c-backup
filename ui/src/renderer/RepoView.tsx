@@ -94,9 +94,10 @@ interface Props {
   onRunBackup?: () => void
   onRunOperation?: (command: string) => void
   onViewTasks?: () => void
+  onHashLookup?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation, onViewTasks }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation, onViewTasks, onHashLookup }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -258,6 +259,12 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
             Journal
           </button>
         )}
+        {onHashLookup && (
+          <button onClick={onHashLookup}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Lookup
+          </button>
+        )}
         {onViewTasks && (
           <button onClick={onViewTasks}
             className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
@@ -307,55 +314,115 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
       )}
 
       {/* Row 3: Storage breakdown */}
-      {repoStats && (
-        <div className="grid grid-cols-2 gap-3 mb-4">
-          {/* Compression */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Compression</div>
-            <div className="flex justify-between text-sm mb-2">
-              <span className="text-text-secondary">{fmtSize(totalUncomp)} uncompressed</span>
-              <span className="text-text-primary font-semibold">{fmtSize(totalComp)} on disk</span>
-            </div>
-            <div className="flex h-2 rounded-full overflow-hidden bg-surface-tertiary mb-2">
-              <div className="bg-accent" style={{ width: `${Math.round(compressionRatio * 100)}%` }} />
-            </div>
-            <div className="flex justify-between text-[10px] text-text-muted">
-              <span>{(compressionRatio * 100).toFixed(1)}% ratio</span>
-              <span>{fmtSize(spaceSaved)} saved</span>
-            </div>
-            {repoStats.skip.count > 0 && (
-              <div className="text-[10px] text-text-muted mt-1">
-                {fmtNum(repoStats.skip.count)} incompressible objects ({fmtSize(repoStats.skip.uncomp)})
+      {repoStats && (() => {
+        const compressibleCount = repoStats.pack.count + repoStats.loose.count - repoStats.skip.count
+        const totalObjCount = repoStats.pack.count + repoStats.loose.count
+        const skipCount = repoStats.skip.count
+        const hiratioCount = repoStats.hiratio.count
+        const compressibleBytes = totalUncomp - repoStats.skip.uncomp
+        const totalTypeBytes = repoStats.per_type.reduce((a, t) => a + t.uncomp, 0)
+        const typeColors: Record<number, string> = { 1: 'bg-blue-500', 2: 'bg-orange-500', 3: 'bg-green-500', 4: 'bg-red-500' }
+        const pct = (n: number, total: number) => total > 0 ? Math.round((n / total) * 100) : 0
+
+        return (
+        <div className="space-y-3 mb-4">
+          <div className="grid grid-cols-2 gap-3">
+            {/* Compression */}
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
+              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Compression</div>
+              <div className="flex justify-between text-sm mb-2">
+                <span className="text-text-secondary">{fmtSize(totalUncomp)} uncompressed</span>
+                <span className="text-text-primary font-semibold">{fmtSize(totalComp)} on disk</span>
               </div>
-            )}
+              <div className="flex h-2 rounded-full overflow-hidden bg-surface-tertiary mb-2">
+                <div className="bg-accent" style={{ width: `${Math.round(compressionRatio * 100)}%` }} />
+              </div>
+              <div className="flex justify-between text-[10px] text-text-muted">
+                <span>{(compressionRatio * 100).toFixed(1)}% ratio</span>
+                <span>{fmtSize(spaceSaved)} saved</span>
+              </div>
+            </div>
+
+            {/* Object types table */}
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
+              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Object Types</div>
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-text-muted text-left">
+                    <th className="font-medium pb-1">Type</th>
+                    <th className="font-medium pb-1 text-right">Count</th>
+                    <th className="font-medium pb-1 text-right">Size</th>
+                    <th className="font-medium pb-1 text-right">Compressed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {repoStats.per_type.filter(t => t.count > 0).map(t => (
+                    <tr key={t.type} className="text-text-primary">
+                      <td className="py-0.5 flex items-center gap-1">
+                        <span className={`inline-block w-2 h-2 rounded-full ${typeColors[t.type] ?? 'bg-gray-500'}`} />
+                        {OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`}
+                      </td>
+                      <td className="py-0.5 text-right">{fmtNum(t.count)}</td>
+                      <td className="py-0.5 text-right">{fmtSize(t.uncomp)}</td>
+                      <td className="py-0.5 text-right">{fmtSize(t.comp)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
 
-          {/* Object types */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Object Types</div>
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-text-muted text-left">
-                  <th className="font-medium pb-1">Type</th>
-                  <th className="font-medium pb-1 text-right">Count</th>
-                  <th className="font-medium pb-1 text-right">Size</th>
-                  <th className="font-medium pb-1 text-right">Compressed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {repoStats.per_type.filter(t => t.count > 0).map(t => (
-                  <tr key={t.type} className="text-text-primary">
-                    <td className="py-0.5">{OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`}</td>
-                    <td className="py-0.5 text-right">{fmtNum(t.count)}</td>
-                    <td className="py-0.5 text-right">{fmtSize(t.uncomp)}</td>
-                    <td className="py-0.5 text-right">{fmtSize(t.comp)}</td>
-                  </tr>
+          {/* Distribution bars */}
+          <div className="grid grid-cols-3 gap-3">
+            {/* Compressibility */}
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
+              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Compressibility</div>
+              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
+                {compressibleCount > 0 && <div className="bg-accent" style={{ width: `${pct(compressibleCount, totalObjCount)}%` }} title={`Compressible: ${fmtNum(compressibleCount)}`} />}
+                {hiratioCount > 0 && <div className="bg-amber-500" style={{ width: `${pct(hiratioCount, totalObjCount)}%` }} title={`High-ratio: ${fmtNum(hiratioCount)}`} />}
+                {skipCount > 0 && <div className="bg-status-error" style={{ width: `${pct(skipCount, totalObjCount)}%` }} title={`Skip-marked: ${fmtNum(skipCount)}`} />}
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
+                <span><span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />Compressible {fmtNum(compressibleCount)}</span>
+                {hiratioCount > 0 && <span><span className="inline-block w-2 h-2 rounded-full bg-amber-500 mr-1" />High-ratio {fmtNum(hiratioCount)}</span>}
+                {skipCount > 0 && <span><span className="inline-block w-2 h-2 rounded-full bg-status-error mr-1" />Skip {fmtNum(skipCount)}</span>}
+              </div>
+            </div>
+
+            {/* Pack vs Loose */}
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
+              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Pack vs Loose</div>
+              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
+                {repoStats.pack.count > 0 && <div className="bg-accent" style={{ width: `${pct(repoStats.pack.count, totalObjCount)}%` }} />}
+                {repoStats.loose.count > 0 && <div className="bg-status-warning" style={{ width: `${pct(repoStats.loose.count, totalObjCount)}%` }} />}
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
+                <span><span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />Packed {fmtNum(repoStats.pack.count)} ({fmtSize(repoStats.pack.comp)})</span>
+                <span><span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />Loose {fmtNum(repoStats.loose.count)} ({fmtSize(repoStats.loose.comp)})</span>
+              </div>
+            </div>
+
+            {/* Type distribution by size */}
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
+              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Size by Type</div>
+              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
+                {repoStats.per_type.filter(t => t.uncomp > 0).map(t => (
+                  <div key={t.type} className={typeColors[t.type] ?? 'bg-gray-500'} style={{ width: `${pct(t.uncomp, totalTypeBytes)}%` }} />
                 ))}
-              </tbody>
-            </table>
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
+                {repoStats.per_type.filter(t => t.uncomp > 0).map(t => (
+                  <span key={t.type}>
+                    <span className={`inline-block w-2 h-2 rounded-full ${typeColors[t.type] ?? 'bg-gray-500'} mr-1`} />
+                    {OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`} {fmtSize(t.uncomp)}
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* Row 4: Recent snapshots */}
       {recentSnaps.length > 0 && (
