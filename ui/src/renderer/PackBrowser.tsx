@@ -116,7 +116,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
     try {
       const [entries, idx] = await Promise.all([
         api.rpcCall<PackEntriesResponse>(connName, repoPath, 'pack_entries', { name }),
-        api.rpcCall<PackIndexResponse>(connName, repoPath, 'pack_index', { name }),
+        api.rpcCall<PackIndexResponse>(connName, repoPath, 'pack_index', { name: name.replace(/\.dat$/, '.idx') }),
       ])
       setPackEntries(entries)
       setPackIndex(idx)
@@ -140,13 +140,16 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
     setGlobalLoading(false)
   }, [connName, repoPath])
 
-  // Fanout distribution for the bar
-  const fanoutMax = globalIndex ? Math.max(...globalIndex.fanout.map((v, i) => i === 0 ? v : v - globalIndex.fanout[i - 1])) : 0
+  // Fanout distribution
+  const [fanoutHover, setFanoutHover] = useState<number | null>(null)
+  const fanoutCounts = globalIndex ? globalIndex.fanout.map((v, i) => i === 0 ? v : v - globalIndex.fanout[i - 1]) : []
+  const fanoutMax = fanoutCounts.length > 0 ? Math.max(...fanoutCounts) : 0
+  const fanoutAvg = fanoutCounts.length > 0 ? fanoutCounts.reduce((a, b) => a + b, 0) / fanoutCounts.length : 0
 
   return (
-    <div>
+    <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center gap-3 mb-4">
+      <div className="flex items-center gap-3 mb-4 shrink-0">
         <button onClick={onBack}
           className="text-xs text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
           &larr; Dashboard
@@ -158,12 +161,12 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
       {loading && <div className="text-text-muted text-sm">Loading...</div>}
 
-      <div className="flex gap-4">
+      <div className="flex gap-4 flex-1 min-h-0">
         {/* Pack list sidebar */}
-        <div className="w-56 shrink-0">
-          <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
-            <div className="px-3 py-2 border-b border-border-default text-[11px] text-text-muted uppercase tracking-wide">Packs</div>
-            <div className="max-h-80 overflow-auto">
+        <div className="w-56 shrink-0 flex flex-col">
+          <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden flex flex-col flex-1">
+            <div className="px-3 py-2 border-b border-border-default text-[11px] text-text-muted uppercase tracking-wide shrink-0">Packs</div>
+            <div className="flex-1 overflow-auto">
               {packs.map(p => (
                 <div key={p.name}
                   onClick={() => { loadPack(p.name); setPackTab('entries') }}
@@ -188,11 +191,11 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
         </div>
 
         {/* Main content */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 flex flex-col min-h-0">
           {selectedPack && (
             <>
               {/* Tabs */}
-              <div className="flex gap-0 border-b border-border-default mb-3">
+              <div className="flex gap-0 border-b border-border-default mb-3 shrink-0">
                 {(['entries', 'index'] as const).map(tab => (
                   <button key={tab} onClick={() => setPackTab(tab)}
                     className={`px-4 py-2 text-xs cursor-pointer border-none bg-transparent ${
@@ -208,12 +211,12 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
               {/* Pack header info */}
               {packEntries && packTab === 'entries' && (
                 <>
-                  <div className="flex gap-4 mb-3 text-xs text-text-muted">
+                  <div className="flex gap-4 mb-3 text-xs text-text-muted shrink-0">
                     <span>Version {packEntries.version}</span>
                     <span>{fmtNum(packEntries.count)} objects</span>
                     {packEntries.file_size && <span>{fmtSize(packEntries.file_size)} on disk</span>}
                   </div>
-                  <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
+                  <div className="bg-surface-secondary border border-border-default rounded-lg overflow-auto flex-1 min-h-0">
                     <table className="w-full text-xs table-fixed">
                       <thead>
                         <tr className="text-text-muted text-left">
@@ -251,7 +254,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
 
               {/* Pack index */}
               {packIndex && packTab === 'index' && (
-                <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
+                <div className="bg-surface-secondary border border-border-default rounded-lg overflow-auto flex-1 min-h-0">
                   <table className="w-full text-xs table-fixed">
                     <thead>
                       <tr className="text-text-muted text-left">
@@ -294,17 +297,48 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
 
                   {/* Fanout distribution */}
                   <div className="bg-surface-secondary border border-border-default rounded-lg p-4 mb-3">
-                    <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Hash Distribution (fanout)</div>
-                    <div className="flex items-end h-16 gap-px">
-                      {globalIndex.fanout.map((cumulative, i) => {
-                        const count = i === 0 ? cumulative : cumulative - globalIndex.fanout[i - 1]
-                        const height = fanoutMax > 0 ? Math.max(1, (count / fanoutMax) * 100) : 0
-                        return (
-                          <div key={i} className="flex-1 bg-accent/60 hover:bg-accent rounded-t-sm transition-colors"
-                            style={{ height: `${height}%` }}
-                            title={`0x${i.toString(16).padStart(2, '0')}: ${fmtNum(count)} entries`} />
-                        )
-                      })}
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[11px] text-text-muted uppercase tracking-wide">Hash Distribution (fanout)</div>
+                      <div className="text-[11px] text-text-primary font-mono">
+                        {fanoutHover !== null
+                          ? `0x${fanoutHover.toString(16).padStart(2, '0')}: ${fmtNum(fanoutCounts[fanoutHover])} objects`
+                          : `${fmtNum(globalIndex.header.entry_count)} total objects`
+                        }
+                      </div>
+                    </div>
+                    {/* Y-axis label */}
+                    <div className="flex gap-1">
+                      <div className="flex flex-col justify-between text-[9px] text-text-muted w-8 shrink-0 text-right pr-1">
+                        <span>{fmtNum(fanoutMax)}</span>
+                        <span>{fmtNum(Math.round(fanoutMax / 2))}</span>
+                        <span>0</span>
+                      </div>
+                      {/* Bars + average line */}
+                      <div className="flex items-end h-20 gap-px flex-1 relative" onMouseLeave={() => setFanoutHover(null)}>
+                        {fanoutMax > 0 && (
+                          <div className="absolute left-0 right-0 border-t border-dashed border-status-warning/60 pointer-events-none"
+                            style={{ bottom: `${(fanoutAvg / fanoutMax) * 100}%` }}>
+                            <span className="absolute right-0 -top-3 text-[8px] text-status-warning">avg {Math.round(fanoutAvg)}</span>
+                          </div>
+                        )}
+                        {fanoutCounts.map((count, i) => {
+                          const height = fanoutMax > 0 ? Math.max(1, (count / fanoutMax) * 100) : 0
+                          const isHovered = fanoutHover === i
+                          return (
+                            <div key={i}
+                              onMouseEnter={() => setFanoutHover(i)}
+                              className={`flex-1 rounded-t-sm cursor-crosshair ${isHovered ? 'bg-accent' : 'bg-accent/50'}`}
+                              style={{ height: `${height}%` }} />
+                          )
+                        })}
+                      </div>
+                    </div>
+                    {/* X-axis labels */}
+                    <div className="flex ml-9 text-[9px] text-text-muted mt-1">
+                      <span className="flex-1">0x00</span>
+                      <span className="flex-1 text-center">0x40</span>
+                      <span className="flex-1 text-center">0x80</span>
+                      <span className="flex-1 text-right">0xFF</span>
                     </div>
                   </div>
 
