@@ -75,6 +75,10 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [highlightNodeId, setHighlightNodeId] = useState<number | null>(null)
   const [initLoading, setInitLoading] = useState(true)
   const [selectedFile, setSelectedFile] = useState<{ node: TreeNode; path: string } | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [noteEditing, setNoteEditing] = useState(false)
+  const [noteText, setNoteText] = useState('')
+  const [noteSaving, setNoteSaving] = useState(false)
   const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
 
   const fetchChildren = useCallback(async (parentNodeId: number) => {
@@ -105,6 +109,13 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     setTree(new Map())
     setExpanded(new Set())
     setBreadcrumb([])
+    setNote(null)
+    setNoteEditing(false)
+
+    // Load note (fire and forget)
+    api.rpcCall<{ text: string }>(connName, repoPath, 'note_get', { id: snapId })
+      .then(r => { if (!cancelled) setNote(r.text) })
+      .catch(() => { if (!cancelled) setNote(null) })
 
     Promise.all([
       api.rpcCall<SnapHeader>(connName, repoPath, 'snap_header', { id: snapId }),
@@ -310,6 +321,60 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
             <button onClick={() => onRestore(snapId)}
               className="text-xs px-3 py-1 rounded bg-accent text-accent-text hover:bg-accent-hover border-none cursor-pointer ml-auto">
               Restore
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Note */}
+      {header && (
+        <div className="mb-4">
+          {noteEditing ? (
+            <div className="bg-surface-secondary border border-border-default rounded-lg p-3">
+              <textarea value={noteText} onChange={e => setNoteText(e.target.value)}
+                placeholder="Add a note for this snapshot..."
+                className="w-full px-2 py-1.5 border border-border-default rounded text-xs bg-surface-primary text-text-primary focus:outline-none focus:border-accent resize-y min-h-[60px]"
+                rows={3} autoFocus />
+              <div className="flex justify-end gap-2 mt-2">
+                <button onClick={() => setNoteEditing(false)}
+                  className="text-[11px] px-2 py-0.5 rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none cursor-pointer">
+                  Cancel
+                </button>
+                {note !== null && (
+                  <button onClick={async () => {
+                    setNoteSaving(true)
+                    try { await api.rpcCall(connName, repoPath, 'note_delete', { id: snapId }); setNote(null); setNoteEditing(false) }
+                    catch { /* ignore */ }
+                    setNoteSaving(false)
+                  }}
+                    className="text-[11px] px-2 py-0.5 rounded bg-surface-tertiary text-status-error hover:bg-surface-hover border-none cursor-pointer"
+                    disabled={noteSaving}>
+                    Delete
+                  </button>
+                )}
+                <button onClick={async () => {
+                  if (!noteText.trim()) return
+                  setNoteSaving(true)
+                  try { await api.rpcCall(connName, repoPath, 'note_set', { id: snapId, text: noteText.trim() }); setNote(noteText.trim()); setNoteEditing(false) }
+                  catch { /* ignore */ }
+                  setNoteSaving(false)
+                }}
+                  className="text-[11px] px-2 py-0.5 rounded bg-accent text-accent-text hover:bg-accent-hover border-none cursor-pointer"
+                  disabled={noteSaving || !noteText.trim()}>
+                  Save
+                </button>
+              </div>
+            </div>
+          ) : note ? (
+            <div onClick={() => { setNoteText(note); setNoteEditing(true) }}
+              className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs text-text-secondary cursor-pointer hover:bg-surface-hover">
+              <span className="text-[10px] text-text-muted uppercase tracking-wide mr-2">Note:</span>
+              {note}
+            </div>
+          ) : (
+            <button onClick={() => { setNoteText(''); setNoteEditing(true) }}
+              className="text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
+              + Add note
             </button>
           )}
         </div>

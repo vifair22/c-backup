@@ -181,6 +181,13 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
   const loosePct = Math.round((looseBytes / totalBytes) * 100)
   const packPct = 100 - loosePct
 
+  const QBtn = ({ onClick, children }: { onClick: () => void; children: React.ReactNode }) => (
+    <button onClick={onClick}
+      className="px-2.5 py-1 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+      {children}
+    </button>
+  )
+
   return (
     <div>
       <h3 className="text-lg font-medium m-0 mb-1">{repoPath}</h3>
@@ -222,59 +229,31 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
       </div>
 
       {/* Quick actions */}
-      <div className="flex gap-2 mb-4">
-        {onSearch && (
-          <button onClick={onSearch}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Search files
-          </button>
-        )}
-        {onCompareSnapshots && snaps.length >= 2 && (
-          <button onClick={() => onCompareSnapshots()}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Compare snapshots
-          </button>
-        )}
-        {onViewAllSnapshots && (
-          <button onClick={onViewAllSnapshots}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            All snapshots
-          </button>
-        )}
-        {onEditPolicy && (
-          <button onClick={onEditPolicy}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Policy
-          </button>
-        )}
-        {onViewTags && (
-          <button onClick={onViewTags}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Tags
-          </button>
-        )}
-        {onViewJournal && (
-          <button onClick={onViewJournal}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Journal
-          </button>
-        )}
-        {onHashLookup && (
-          <button onClick={onHashLookup}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Lookup
-          </button>
-        )}
-        {onViewTasks && (
-          <button onClick={onViewTasks}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Tasks
-          </button>
-        )}
-        <div className="border-l border-border-default h-5 mx-1" />
+      <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
+        {/* Browse */}
+        {onSearch && <QBtn onClick={onSearch}>Search</QBtn>}
+        {onViewAllSnapshots && <QBtn onClick={onViewAllSnapshots}>Snapshots</QBtn>}
+        {onCompareSnapshots && snaps.length >= 2 && <QBtn onClick={() => onCompareSnapshots()}>Compare</QBtn>}
+
+        <div className="border-l border-border-default h-4 mx-0.5" />
+
+        {/* Config */}
+        {onEditPolicy && <QBtn onClick={onEditPolicy}>Policy</QBtn>}
+        {onViewTags && <QBtn onClick={onViewTags}>Tags</QBtn>}
+
+        <div className="border-l border-border-default h-4 mx-0.5" />
+
+        {/* Debug */}
+        {onHashLookup && <QBtn onClick={onHashLookup}>Lookup</QBtn>}
+        {onViewJournal && <QBtn onClick={onViewJournal}>Journal</QBtn>}
+        {onViewTasks && <QBtn onClick={onViewTasks}>Tasks</QBtn>}
+
+        <div className="border-l border-border-default h-4 mx-0.5" />
+
+        {/* Operations */}
         {onRunBackup && (
           <button onClick={onRunBackup}
-            className="text-xs px-3 py-1.5 rounded bg-accent text-accent-text hover:bg-accent-hover cursor-pointer border-none">
+            className="px-3 py-1 rounded bg-accent text-accent-text hover:bg-accent-hover cursor-pointer border-none">
             Run Backup
           </button>
         )}
@@ -283,8 +262,8 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
             const rect = e.currentTarget.getBoundingClientRect()
             setOpsMenu({ x: rect.left, y: rect.bottom + 4 })
           }}
-            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
-            Operations
+            className="px-3 py-1 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Maintenance
           </button>
         )}
       </div>
