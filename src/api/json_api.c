@@ -2686,11 +2686,15 @@ int json_api_dispatch(repo_t *repo)
         return 0;  /* protocol ok, action not found */
     }
 
-    /* Acquire shared lock for read-only access */
+    /* Acquire shared lock for read-only access — released after each call
+     * so background tasks can acquire exclusive locks between calls. */
     repo_lock_shared(repo);
 
     err_clear();
     cJSON *data = handler(repo, params);
+
+    /* Release shared lock before writing response (I/O may block). */
+    repo_unlock(repo);
 
     if (data) {
         write_ok(data);

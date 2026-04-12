@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { StatCard } from './StatCard'
+import { ContextMenu } from './ContextMenu'
 import {
   fmtSize, fmtNum, relativeTime, absoluteTime, gfsBadges,
   GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY,
@@ -90,10 +91,13 @@ interface Props {
   onEditPolicy?: () => void
   onViewJournal?: () => void
   onViewTags?: () => void
+  onRunBackup?: () => void
+  onRunOperation?: (command: string) => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onRunBackup, onRunOperation }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
+  const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
   const [loading, setLoading] = useState(true)
@@ -253,6 +257,22 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
             Journal
           </button>
         )}
+        <div className="border-l border-border-default h-5 mx-1" />
+        {onRunBackup && (
+          <button onClick={onRunBackup}
+            className="text-xs px-3 py-1.5 rounded bg-accent text-accent-text hover:bg-accent-hover cursor-pointer border-none">
+            Run Backup
+          </button>
+        )}
+        {onRunOperation && (
+          <button onClick={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect()
+            setOpsMenu({ x: rect.left, y: rect.bottom + 4 })
+          }}
+            className="text-xs px-3 py-1.5 rounded bg-surface-secondary border border-border-default text-text-secondary hover:bg-surface-hover cursor-pointer">
+            Operations
+          </button>
+        )}
       </div>
 
       {/* Row 2: GFS Retention */}
@@ -389,6 +409,16 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
             </tbody>
           </table>
         </div>
+      )}
+      {/* Operations menu */}
+      {opsMenu && onRunOperation && (
+        <ContextMenu x={opsMenu.x} y={opsMenu.y} onClose={() => setOpsMenu(null)}
+          items={[
+            { label: 'Verify', onClick: () => onRunOperation('verify') },
+            { label: 'Pack', onClick: () => onRunOperation('pack') },
+            { label: 'Garbage Collect', onClick: () => onRunOperation('gc') },
+          ]}
+        />
       )}
     </div>
   )

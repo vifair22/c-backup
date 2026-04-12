@@ -62,9 +62,10 @@ interface Props {
   snapId: number
   initialPath?: string
   onBack: () => void
+  onRestore?: (snapId: number, filePath?: string) => void
 }
 
-export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack }: Props): React.ReactElement {
+export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack, onRestore }: Props): React.ReactElement {
   const [header, setHeader] = useState<SnapHeader | null>(null)
   const [tree, setTree] = useState<Map<number, TreeNode[]>>(new Map())
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -305,6 +306,12 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
               ))}
             </div>
           )}
+          {onRestore && (
+            <button onClick={() => onRestore(snapId)}
+              className="text-xs px-3 py-1 rounded bg-accent text-accent-text hover:bg-accent-hover border-none cursor-pointer ml-auto">
+              Restore
+            </button>
+          )}
         </div>
       )}
 
@@ -371,8 +378,14 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
               </button>
               {selectedFile.node.content_hash && selectedFile.node.content_hash !== '0'.repeat(64) && (
                 <button onClick={() => { setViewerHash({ hash: selectedFile.node.content_hash!, filename: selectedFile.node.name }); setSelectedFile(null) }}
-                  className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
+                  className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
                   View Content
+                </button>
+              )}
+              {onRestore && (
+                <button onClick={() => { onRestore(snapId, selectedFile.path); setSelectedFile(null) }}
+                  className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
+                  Restore File
                 </button>
               )}
             </div>

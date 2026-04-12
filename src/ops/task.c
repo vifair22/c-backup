@@ -4,12 +4,15 @@
 #include "gc.h"
 #include "pack.h"
 #include "policy.h"
+#include "restore.h"
 #include "snapshot.h"
+#include "tag.h"
 #include "../vendor/cJSON.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -379,18 +382,24 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
 
     _child_repo = repo;
 
-    /* Acquire exclusive lock (non-blocking — fail fast if contended).
-     * We use repo_lock() which blocks.  The parent already checked
-     * liveness before forking, so contention should be rare.  If the
-     * lock is truly stuck, the child will wait — which is the safe
-     * behavior for a detached task. */
-    if (repo_lock(repo) != OK) {
-        _child_info.state = TASK_STATE_FAILED;
-        snprintf(_child_info.error, sizeof(_child_info.error),
-                 "cannot acquire lock: %.200s", err_msg());
-        task_status_write(repo, &_child_info);
-        repo_close(repo);
-        _exit(1);
+    /* Acquire exclusive lock — blocking.  The parent session may reacquire
+     * a shared lock between RPC calls, so we use blocking LOCK_EX here.
+     * The child is detached, so waiting is the safe behavior. */
+    {
+        char lock_path[PATH_MAX];
+        snprintf(lock_path, sizeof(lock_path), "%s/lock", repo_path_str);
+        int lfd = open(lock_path, O_RDWR | O_CREAT, 0600);
+        if (lfd < 0 || flock(lfd, LOCK_EX) == -1) {
+            _child_info.state = TASK_STATE_FAILED;
+            snprintf(_child_info.error, sizeof(_child_info.error),
+                     "cannot acquire lock");
+            task_status_write(repo, &_child_info);
+            if (lfd >= 0) close(lfd);
+            repo_close(repo);
+            _exit(1);
+        }
+        /* Hand the lock FD to the repo so repo_unlock() works normally. */
+        repo_set_lock_fd(repo, lfd);
     }
 
     /* Write initial "running" status. */
@@ -462,10 +471,64 @@ static _Noreturn void child_run_task(const char *repo_path_str, task_cmd_t cmd,
         /* TODO: implement prune task. */
         result = set_error(ERR_INVALID, "prune task not yet implemented");
         break;
-    case TASK_CMD_RESTORE:
-        /* TODO: implement restore task. */
-        result = set_error(ERR_INVALID, "restore task not yet implemented");
+    case TASK_CMD_RESTORE: {
+        const char *snap_arg = NULL;
+        const char *dest_arg = NULL;
+        const char *file_arg = NULL;
+        int verify = 0;
+
+        if (cmd_params) {
+            const cJSON *j;
+            j = cJSON_GetObjectItemCaseSensitive(cmd_params, "snapshot");
+            if (cJSON_IsString(j)) snap_arg = j->valuestring;
+            j = cJSON_GetObjectItemCaseSensitive(cmd_params, "dest");
+            if (cJSON_IsString(j)) dest_arg = j->valuestring;
+            j = cJSON_GetObjectItemCaseSensitive(cmd_params, "file");
+            if (cJSON_IsString(j)) file_arg = j->valuestring;
+            j = cJSON_GetObjectItemCaseSensitive(cmd_params, "verify");
+            if (cJSON_IsTrue(j)) verify = 1;
+        }
+
+        if (!dest_arg || !dest_arg[0]) {
+            result = set_error(ERR_INVALID, "restore: missing 'dest' param");
+            break;
+        }
+
+        uint32_t snap_id = 0;
+        if (snap_arg && snap_arg[0]) {
+            if (tag_resolve(repo, snap_arg, &snap_id) != OK) {
+                result = set_error(ERR_INVALID, "restore: unknown snapshot or tag");
+                break;
+            }
+        }
+
+        child_progress_cb(0, 0, "restoring", NULL);
+
+        if (file_arg && file_arg[0]) {
+            if (snap_id == 0) {
+                result = set_error(ERR_INVALID, "restore: snapshot required with file");
+                break;
+            }
+            result = restore_file(repo, snap_id, file_arg, dest_arg);
+            if (result == ERR_INVALID || result == ERR_NOT_FOUND) {
+                err_clear();
+                result = restore_subtree(repo, snap_id, file_arg, dest_arg);
+            }
+        } else if (snap_id > 0) {
+            result = restore_snapshot(repo, snap_id, dest_arg);
+        } else {
+            result = restore_latest(repo, dest_arg);
+            if (result == OK && verify) {
+                snapshot_read_head(repo, &snap_id);
+            }
+        }
+
+        if (result == OK && verify && snap_id > 0) {
+            child_progress_cb(0, 0, "verifying", NULL);
+            result = restore_verify_dest(repo, snap_id, dest_arg);
+        }
         break;
+    }
     }
 
     /* Write final status. */
@@ -513,6 +576,11 @@ status_t task_start(repo_t *repo, task_cmd_t cmd, const cJSON *cmd_params,
     /* Make a deep copy of cmd_params for the child (cJSON is not fork-safe
      * if the parent frees it). */
     cJSON *params_copy = cmd_params ? cJSON_Duplicate(cmd_params, 1) : NULL;
+
+    /* Release the parent's shared lock so the child can acquire exclusive.
+     * The session dispatch releases the lock after each call anyway, but
+     * we release it here so the child doesn't inherit the lock FD. */
+    repo_unlock(repo);
 
     pid_t pid = fork();
     if (pid == -1) {

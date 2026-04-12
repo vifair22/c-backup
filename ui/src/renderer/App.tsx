@@ -10,6 +10,8 @@ import { SnapshotDiff } from './SnapshotDiff'
 import { FileSearch } from './FileSearch'
 import { PolicyEditor } from './PolicyEditor'
 import { JournalView } from './JournalView'
+import { TaskBar } from './TaskBar'
+import { TaskListView } from './TaskListView'
 import { TagsView } from './TagsView'
 import { useTheme, type ThemeMode } from './useTheme'
 
@@ -39,7 +41,7 @@ export function App(): React.ReactElement {
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -52,6 +54,18 @@ export function App(): React.ReactElement {
   const navForward = () => { if (navIndex < navHistory.length - 1) setNavIndex(prev => prev + 1) }
 
   const [error, setError] = useState<string | null>(null)
+
+  // Restore modal
+  const [restoreModal, setRestoreModal] = useState<{ snapId: number; filePath?: string } | null>(null)
+  const [restoreDest, setRestoreDest] = useState('')
+  const [restoreVerify, setRestoreVerify] = useState(false)
+  const [restoreStarting, setRestoreStarting] = useState(false)
+
+  // Backup modal
+  const [showBackupModal, setShowBackupModal] = useState(false)
+  const [backupUsePolicy, setBackupUsePolicy] = useState(true)
+  const [backupVerify, setBackupVerify] = useState(false)
+  const [backupStarting, setBackupStarting] = useState(false)
 
   // Dialogs
   const [showAddConnection, setShowAddConnection] = useState(false)
@@ -298,6 +312,65 @@ export function App(): React.ReactElement {
   }
 
   /* ---------------------------------------------------------------- */
+  /* Task operations                                                   */
+  /* ---------------------------------------------------------------- */
+
+  const handleStartBackup = async () => {
+    if (!activeRepo) return
+    setBackupStarting(true)
+    setError(null)
+    try {
+      const params: Record<string, unknown> = { command: 'run' }
+      if (backupVerify) params.verify_after = true
+      await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
+      setShowBackupModal(false)
+    } catch (err) {
+      setError(String(err))
+    }
+    setBackupStarting(false)
+  }
+
+  const handleStartRestore = async () => {
+    if (!activeRepo || !restoreModal || !restoreDest.trim()) return
+    setRestoreStarting(true)
+    setError(null)
+    try {
+      const params: Record<string, unknown> = {
+        command: 'restore',
+        snapshot: String(restoreModal.snapId),
+        dest: restoreDest.trim(),
+      }
+      if (restoreModal.filePath) params.file = restoreModal.filePath
+      if (restoreVerify) params.verify = true
+      await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
+      setRestoreModal(null)
+    } catch (err) {
+      setError(String(err))
+    }
+    setRestoreStarting(false)
+  }
+
+  const handleStartOperation = (command: string) => {
+    if (!activeRepo) return
+    const labels: Record<string, string> = { verify: 'Verify', pack: 'Pack', gc: 'Garbage Collect' }
+    setConfirmDialog({
+      title: `Run ${labels[command] ?? command}`,
+      message: `Start a background ${labels[command] ?? command} operation on this repository?`,
+      confirmLabel: 'Start',
+      danger: false,
+      onConfirm: async () => {
+        setConfirmDialog(null)
+        setError(null)
+        try {
+          await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', { command })
+        } catch (err) {
+          setError(String(err))
+        }
+      },
+    })
+  }
+
+  /* ---------------------------------------------------------------- */
   /* Context menus                                                     */
   /* ---------------------------------------------------------------- */
 
@@ -447,7 +520,8 @@ export function App(): React.ReactElement {
       </div>
 
       {/* Main content */}
-      <div className="flex-1 p-4 overflow-auto bg-surface-primary">
+      <div className="flex-1 flex flex-col bg-surface-primary">
+      <div className="flex-1 p-4 overflow-auto">
         {error && (
           <div className="bg-error-bg border border-error-border text-error-text text-xs px-3 py-2 rounded mb-3 flex justify-between items-center">
             <span>{error}</span>
@@ -466,6 +540,8 @@ export function App(): React.ReactElement {
                 onEditPolicy={() => navigateTo({ view: 'policy' })}
                 onViewJournal={() => navigateTo({ view: 'journal' })}
                 onViewTags={() => navigateTo({ view: 'tags' })}
+                onRunBackup={() => { setShowBackupModal(true); setBackupUsePolicy(true); setBackupVerify(false) }}
+                onRunOperation={handleStartOperation}
               />
             )}
             {currentView.view === 'snapshots' && (
@@ -479,6 +555,12 @@ export function App(): React.ReactElement {
               <SnapshotBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
                 snapId={currentView.snapId}
                 initialPath={currentView.path}
+                onBack={navBack}
+                onRestore={(sid, fp) => { setRestoreModal({ snapId: sid, filePath: fp }); setRestoreDest(''); setRestoreVerify(false) }}
+              />
+            )}
+            {currentView.view === 'tasks' && (
+              <TaskListView connName={activeRepo.conn} repoPath={activeRepo.path}
                 onBack={navBack}
               />
             )}
@@ -519,6 +601,13 @@ export function App(): React.ReactElement {
             <div className="text-sm">Add a connection and open a repository to get started.</div>
           </div>
         )}
+      </div>
+      {/* Task status bar */}
+      {activeRepo && (
+        <TaskBar connName={activeRepo.conn} repoPath={activeRepo.path}
+          onViewTasks={() => navigateTo({ view: 'tasks' })}
+        />
+      )}
       </div>
 
       {/* Context menu */}
@@ -677,6 +766,65 @@ export function App(): React.ReactElement {
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Save</button>
             </div>
           </form>
+        </Overlay>
+      )}
+      {/* Restore modal */}
+      {restoreModal && (
+        <Overlay>
+          <form onSubmit={e => { e.preventDefault(); handleStartRestore() }}
+            className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-3">
+              {restoreModal.filePath ? 'Restore File' : 'Restore Snapshot'}
+            </h3>
+            <div className="text-xs text-text-muted mb-3">
+              Snapshot #{restoreModal.snapId}
+              {restoreModal.filePath && <span className="font-mono ml-1">— {restoreModal.filePath}</span>}
+            </div>
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-text-secondary mb-1">Destination Path</label>
+              <input value={restoreDest} onChange={e => setRestoreDest(e.target.value)}
+                placeholder="/path/to/restore/destination"
+                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent font-mono"
+                autoFocus required />
+            </div>
+            <div className="mb-4">
+              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
+                <input type="checkbox" checked={restoreVerify} onChange={e => setRestoreVerify(e.target.checked)} />
+                Verify after restore
+              </label>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setRestoreModal(null)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
+                disabled={restoreStarting}>Cancel</button>
+              <button type="submit"
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
+                disabled={restoreStarting}>{restoreStarting ? 'Starting...' : 'Start Restore'}</button>
+            </div>
+          </form>
+        </Overlay>
+      )}
+
+      {/* Backup modal */}
+      {showBackupModal && (
+        <Overlay>
+          <div className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-3">Run Backup</h3>
+            <div className="mb-3">
+              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
+                <input type="checkbox" checked={backupVerify} onChange={e => setBackupVerify(e.target.checked)} />
+                Verify after backup
+              </label>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowBackupModal(false)}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
+                disabled={backupStarting}>Cancel</button>
+              <button onClick={handleStartBackup}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
+                disabled={backupStarting}>{backupStarting ? 'Starting...' : 'Start Backup'}</button>
+            </div>
+          </div>
         </Overlay>
       )}
     </div>
