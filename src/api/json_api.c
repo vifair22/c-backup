@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "json_api.h"
 #include "error.h"
+#include "journal.h"
 #include "diff.h"
 #include "ls.h"
 #include "object.h"
@@ -2491,7 +2492,7 @@ static cJSON *handle_journal(repo_t *repo, const cJSON *params)
             cJSON_AddStringToObject(item, "user", e->user);
         if (e->result[0])
             cJSON_AddStringToObject(item, "result", e->result);
-        if (e->duration_ms > 0)
+        if (e->state[0] == 'c')  /* completed entries always have duration */
             cJSON_AddNumberToObject(item, "duration_ms", (double)e->duration_ms);
         if (e->error[0])
             cJSON_AddStringToObject(item, "error", e->error);
@@ -2686,6 +2687,9 @@ int json_api_dispatch(repo_t *repo)
         return 0;  /* protocol ok, action not found */
     }
 
+    const char *action_name = jaction->valuestring;
+    journal_op_t *jop = journal_start(repo, action_name, JOURNAL_SOURCE_UI);
+
     /* Acquire shared lock for read-only access — released after each call
      * so background tasks can acquire exclusive locks between calls. */
     repo_lock_shared(repo);
@@ -2695,6 +2699,10 @@ int json_api_dispatch(repo_t *repo)
 
     /* Release shared lock before writing response (I/O may block). */
     repo_unlock(repo);
+
+    journal_complete(jop,
+                     data ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, data ? NULL : err_msg(), NULL);
 
     if (data) {
         write_ok(data);
@@ -2783,8 +2791,15 @@ int json_api_session(repo_t *repo)
                      jaction->valuestring);
             write_error(msg);
         } else {
+            journal_op_t *jop = journal_start(repo, jaction->valuestring, JOURNAL_SOURCE_UI);
+
             err_clear();
             cJSON *data = handler(repo, jparams);
+
+            journal_complete(jop,
+                             data ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                             NULL, data ? NULL : err_msg(), NULL);
+
             if (data) {
                 write_ok(data);
             } else {
