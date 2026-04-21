@@ -493,7 +493,22 @@ Stream A (C-side, ~3-4 weeks):         Stream C (Electron, starts day 1):
 
 ## Tasks (Dependency-Ordered)
 
-Legend: `[BLOCKS: X.Y]` = must complete before task X.Y can start.
+Legend: `[BLOCKS: X.Y]` = must complete before task X.Y can start. `[x]` = done, `[~]` = partial (see inline note), `[ ]` = not started.
+
+### Status snapshot (2026-04-21)
+
+**Done**: Phase 0.1 (journal), 0.2 (tasks, minus export command), 0.3 (tags), 0.4 (notes); Phase 1 foundation (minus SFTP); Phase 2 sidebar/connections/multi-repo; Phase 3 core + inspection tabs + search; Phase 4 task UI, backup trigger, journal viewer, tag CRUD, snapshot notes inline editor.
+
+**Biggest outstanding gaps**:
+- **GFS Tree view** (3.11) — no component; also blocks 4.9.1.
+- **Data export** (4.13) — UI missing; C-side needs `TASK_CMD_EXPORT` added to `task_cmd_t` (0.2.3).
+- **Local export over SSH** (4.14.x) — no SFTP module (1.3.5).
+- **Health dashboard completeness** (4.6) — journal is available but last-verify, failures list, and warnings panel are not wired.
+- **Notifications** (4.8.1, 4.8.2) — not started.
+- **Verify results** (0.5.2 → 4.11 → 4.12) — `verify_opts_t` only tracks aggregates; no per-object result collection, no results view, no dashboard/sidebar integration.
+- **Filesystem path picker** (2.6) — needed by 2.7 (init wizard), 4.4 (restore dest), 4.13 (export dest).
+- **Pack map / object map visualizations** (3.5, 3.6) — tables present, canvas layouts not built.
+- **Repo init wizard** (2.7–2.9) — init fires but no wizard/templates.
 
 ---
 
@@ -501,36 +516,36 @@ Legend: `[BLOCKS: X.Y]` = must complete before task X.Y can start.
 _No UI dependencies. Can be developed in parallel with Phase 1._
 
 **0.1 Operation Journal** _(no C-side dependencies, foundational for everything)_
-- [ ] 0.1.1 Implement journal append-only storage (`<repo>/logs/journal.jsonl`)
-- [ ] 0.1.2 Add journal start/complete entry writes to all CLI command paths [BLOCKS: 0.1.4]
-- [ ] 0.1.3 Add journal start/complete entry writes to all JSON API action paths [BLOCKS: 0.1.4]
-- [ ] 0.1.4 Implement crash signal handler (SIGSEGV, SIGABRT, SIGBUS) with pre-allocated buffer journal write (depends on 0.1.1)
-- [ ] 0.1.5 Implement `journal` RPC action (filtered/paginated reads) [BLOCKS: 4.6, 4.7, 4.8]
+- [x] 0.1.1 Implement journal append-only storage (`<repo>/logs/journal.jsonl`)
+- [x] 0.1.2 Add journal start/complete entry writes to all CLI command paths [BLOCKS: 0.1.4]
+- [x] 0.1.3 Add journal start/complete entry writes to all JSON API action paths [BLOCKS: 0.1.4]
+- [x] 0.1.4 Implement crash signal handler (SIGSEGV, SIGABRT, SIGBUS) with pre-allocated buffer journal write (depends on 0.1.1) — _lives in `src/ops/journal.c`, not a separate `crash_journal.c`_
+- [x] 0.1.5 Implement `journal` RPC action (filtered/paginated reads) [BLOCKS: 4.6, 4.7, 4.8]
 
 **0.2 Background Tasks** _(depends on 0.1 -- tasks write journal entries)_
-- [ ] 0.2.1 Implement task status file format and read/write helpers
-- [ ] 0.2.2 Implement fork-and-detach mechanism in session handler (depends on 0.2.1)
-- [ ] 0.2.3 Wire up heavy operations (run, gc, prune, pack, verify, restore, export) as taskable commands (depends on 0.2.2)
-- [ ] 0.2.4 Implement `task_start` RPC action (depends on 0.2.3) [BLOCKS: 4.1, 4.4, 4.5, 4.10, 4.13]
-- [ ] 0.2.5 Implement `task_list` RPC action (depends on 0.2.1) [BLOCKS: 4.1]
-- [ ] 0.2.6 Implement `task_status` RPC action (depends on 0.2.1) [BLOCKS: 4.2]
-- [ ] 0.2.7 Implement `task_cancel` RPC action (depends on 0.2.2) [BLOCKS: 4.1]
-- [ ] 0.2.8 Task progress reporting from child process (periodic status file updates) (depends on 0.2.3) [BLOCKS: 4.2]
-- [ ] 0.2.9 Add journal writes to task child processes (depends on 0.1.1, 0.2.3)
-- [ ] 0.2.10 Task cleanup (purge old completed/failed task files) (depends on 0.2.1)
+- [x] 0.2.1 Implement task status file format and read/write helpers
+- [x] 0.2.2 Implement fork-and-detach mechanism in session handler (depends on 0.2.1)
+- [~] 0.2.3 Wire up heavy operations (run, gc, prune, pack, verify, restore, export) as taskable commands (depends on 0.2.2) — _run/gc/prune/pack/verify/restore wired; **export still missing** from `task_cmd_t` (blocks 4.13)_
+- [x] 0.2.4 Implement `task_start` RPC action (depends on 0.2.3) [BLOCKS: 4.1, 4.4, 4.5, 4.10, 4.13]
+- [x] 0.2.5 Implement `task_list` RPC action (depends on 0.2.1) [BLOCKS: 4.1]
+- [x] 0.2.6 Implement `task_status` RPC action (depends on 0.2.1) [BLOCKS: 4.2]
+- [x] 0.2.7 Implement `task_cancel` RPC action (depends on 0.2.2) [BLOCKS: 4.1]
+- [x] 0.2.8 Task progress reporting from child process (periodic status file updates) (depends on 0.2.3) [BLOCKS: 4.2]
+- [x] 0.2.9 Add journal writes to task child processes (depends on 0.1.1, 0.2.3)
+- [x] 0.2.10 Task cleanup (purge old completed/failed task files) (depends on 0.2.1)
 
 **0.3 Tag Management** _(no C-side dependencies)_
-- [ ] 0.3.1 Implement `tag_set` RPC action [BLOCKS: 4.9]
-- [ ] 0.3.2 Implement `tag_delete` RPC action [BLOCKS: 4.9]
-- [ ] 0.3.3 Implement `tag_rename` RPC action (atomic rename) [BLOCKS: 4.9]
+- [x] 0.3.1 Implement `tag_set` RPC action [BLOCKS: 4.9]
+- [x] 0.3.2 Implement `tag_delete` RPC action [BLOCKS: 4.9]
+- [x] 0.3.3 Implement `tag_rename` RPC action (atomic rename) [BLOCKS: 4.9]
 
 **0.4 Snapshot Notes** _(no C-side dependencies)_
-- [ ] 0.4.1 Implement snapshot notes storage (`<repo>/notes/`) [BLOCKS: 0.4.2]
-- [ ] 0.4.2 Implement `note_get`, `note_set`, `note_delete`, `note_list` RPC actions [BLOCKS: 4.7]
+- [x] 0.4.1 Implement snapshot notes storage (`<repo>/notes/`) [BLOCKS: 0.4.2]
+- [x] 0.4.2 Implement `note_get`, `note_set`, `note_delete`, `note_list` RPC actions [BLOCKS: 4.7]
 
 **0.5 Verify Enhancements** _(depends on 0.2 -- verify runs as background task)_
-- [ ] 0.5.1 Implement verify as a taskable command with optional repair flag (depends on 0.2.3) [BLOCKS: 4.10]
-- [ ] 0.5.2 Structured verify result output (per-object pass/fail with corruption classification) (depends on 0.5.1) [BLOCKS: 4.11]
+- [x] 0.5.1 Implement verify as a taskable command with optional repair flag (depends on 0.2.3) [BLOCKS: 4.10]
+- [ ] 0.5.2 Structured verify result output (per-object pass/fail with corruption classification) (depends on 0.5.1) [BLOCKS: 4.11] — _`verify_opts_t` only has aggregate counters (objects_checked, parity_repaired, parity_corrupt); no per-object result list or RPC action yet_
 
 ---
 
@@ -538,34 +553,34 @@ _No UI dependencies. Can be developed in parallel with Phase 1._
 _Can start in parallel with Phase 0. No dependency on C-side changes._
 
 **1.1 Project Setup** _(no dependencies)_
-- [ ] 1.1.1 Initialize Electron project scaffolding [BLOCKS: everything in 1.2+]
-- [ ] 1.1.2 Set up build pipeline (dev + production) (depends on 1.1.1)
-- [ ] 1.1.3 Dark/light theme system (follow OS default, manual override) (depends on 1.1.1) [BLOCKS: all UI work]
-- [ ] 1.1.4 Professional corporate color palette (muted blues, grays, subtle accents) (depends on 1.1.3)
+- [x] 1.1.1 Initialize Electron project scaffolding [BLOCKS: everything in 1.2+]
+- [x] 1.1.2 Set up build pipeline (dev + production) (depends on 1.1.1)
+- [x] 1.1.3 Dark/light theme system (follow OS default, manual override) (depends on 1.1.1) [BLOCKS: all UI work]
+- [x] 1.1.4 Professional corporate color palette (muted blues, grays, subtle accents) (depends on 1.1.3)
 
 **1.2 Config & Credentials** _(depends on 1.1)_
-- [ ] 1.2.1 Implement config storage layer (JSON config + safeStorage for secrets) [BLOCKS: 1.2.2, 1.3, 2.1]
-- [ ] 1.2.2 Implement config export/import (depends on 1.2.1)
+- [x] 1.2.1 Implement config storage layer (JSON config + safeStorage for secrets) [BLOCKS: 1.2.2, 1.3, 2.1]
+- [x] 1.2.2 Implement config export/import (depends on 1.2.1)
 
 **1.3 RPC Client** _(depends on 1.1)_
-- [ ] 1.3.1 Implement RPC client module (session + one-shot, LZ4 decompression) [BLOCKS: 2.4, 3.x]
-- [ ] 1.3.2 Implement SSH connection manager (key auth, password auth, ControlMaster) [BLOCKS: 1.3.3, 2.1]
-- [ ] 1.3.3 Implement sudo promotion for remote connections (depends on 1.3.2) [BLOCKS: 2.6]
-- [ ] 1.3.4 Implement connection lifecycle management (persistent, status tracking, reconnect) (depends on 1.3.2) [BLOCKS: 2.2]
-- [ ] 1.3.5 Implement SFTP transfer module (depends on 1.3.2) [BLOCKS: 4.14]
+- [x] 1.3.1 Implement RPC client module (session + one-shot, LZ4 decompression) [BLOCKS: 2.4, 3.x]
+- [x] 1.3.2 Implement SSH connection manager (key auth, password auth, ControlMaster) [BLOCKS: 1.3.3, 2.1]
+- [x] 1.3.3 Implement sudo promotion for remote connections (depends on 1.3.2) [BLOCKS: 2.6]
+- [x] 1.3.4 Implement connection lifecycle management (persistent, status tracking, reconnect) (depends on 1.3.2) [BLOCKS: 2.2]
+- [ ] 1.3.5 Implement SFTP transfer module (depends on 1.3.2) [BLOCKS: 4.14] — _ssh2 dep is present but no SFTP code in main/_
 
 ---
 
 ### Phase 2: Connection & Repo UI
 _Depends on Phase 1. Requires config storage and RPC client._
 
-- [ ] 2.1 Build sidebar with connection/repo tree (depends on 1.2.1, 1.3.2) [BLOCKS: 2.2-2.5, 3.x]
-- [ ] 2.2 Connection status indicators (connected/disconnected/error) (depends on 1.3.4, 2.1)
-- [ ] 2.3 Add/edit/remove connection dialog (depends on 2.1)
-- [ ] 2.4 Add/remove repo under connection (depends on 1.3.1, 2.1) [BLOCKS: 3.x]
-- [ ] 2.5 Multi-repo tab switching in main content area (depends on 2.1) [BLOCKS: 3.x]
-- [ ] 2.6 Filesystem browser component (local + remote, sudo context) (depends on 1.3.3) [BLOCKS: 2.7, 4.4, 4.13]
-- [ ] 2.7 Repo init wizard (path selection, policy templates, init + save_policy) (depends on 2.6, 2.4)
+- [x] 2.1 Build sidebar with connection/repo tree (depends on 1.2.1, 1.3.2) [BLOCKS: 2.2-2.5, 3.x]
+- [x] 2.2 Connection status indicators (connected/disconnected/error) (depends on 1.3.4, 2.1)
+- [x] 2.3 Add/edit/remove connection dialog (depends on 2.1)
+- [x] 2.4 Add/remove repo under connection (depends on 1.3.1, 2.1) [BLOCKS: 3.x]
+- [x] 2.5 Multi-repo tab switching in main content area (depends on 2.1) [BLOCKS: 3.x]
+- [ ] 2.6 Filesystem browser component (local + remote, sudo context) (depends on 1.3.3) [BLOCKS: 2.7, 4.4, 4.13] — _SnapshotBrowser navigates snapshot trees, but no reusable OS path picker for init/restore-dest/export-dest_
+- [~] 2.7 Repo init wizard (path selection, policy templates, init + save_policy) (depends on 2.6, 2.4) — _`handleInitRepo` fires init, but no wizard/path-picker/template step_
 - [ ] 2.8 Built-in policy templates from manual (depends on 2.7)
 - [ ] 2.9 User-created custom policy template support (depends on 2.7, 1.2.1)
 
@@ -576,22 +591,22 @@ _Depends on Phase 2 (sidebar + repo switching) and Phase 1 (RPC client). Each vi
 _Note: "feature parity" means all existing capabilities are accessible, NOT that the layout mirrors the old 11-tab tkinter UI. Views should be redesigned for better UX -- consolidate, restructure, and improve as appropriate._
 
 **3A: Core views** _(build first -- most used, needed by other views)_
-- [ ] 3.1 Repo overview / dashboard (depends on 2.5) [BLOCKS: 4.6]
-- [ ] 3.2 Snapshot exploration -- header, nodes, directory tree (depends on 2.5) [BLOCKS: 3.12, 4.4, 4.7, 4.9]
-- [ ] 3.3 Policy tab with save_policy write support (depends on 2.5)
-- [ ] 3.4 Tags tab (depends on 2.5) [BLOCKS: 4.9]
+- [x] 3.1 Repo overview / dashboard (depends on 2.5) [BLOCKS: 4.6] — _storage/GFS counts/last-backup present; journal-driven sections land with 4.6_
+- [x] 3.2 Snapshot exploration -- header, nodes, directory tree (depends on 2.5) [BLOCKS: 3.12, 4.4, 4.7, 4.9]
+- [x] 3.3 Policy tab with save_policy write support (depends on 2.5)
+- [x] 3.4 Tags tab (depends on 2.5) [BLOCKS: 4.9]
 
 **3B: Data inspection tabs** _(independent of each other)_
-- [ ] 3.5 Pack Files tab -- header, entries, index, pack map, global index (depends on 2.5)
-- [ ] 3.6 Loose Objects tab -- info, content preview, object map (depends on 2.5)
-- [ ] 3.7 Hash Lookup tab (depends on 2.5) [BLOCKS: 4.11]
-- [ ] 3.8 Diff tab (depends on 2.5)
-- [ ] 3.9 Analytics tab with charts (depends on 2.5) [BLOCKS: 4.6]
+- [~] 3.5 Pack Files tab -- header, entries, index, pack map, global index (depends on 2.5) — _header/entries/index/global index done; **pack map visualization missing**_
+- [~] 3.6 Loose Objects tab -- info, content preview, object map (depends on 2.5) — _info + content preview done; **object map visualization missing**_
+- [x] 3.7 Hash Lookup tab (depends on 2.5) [BLOCKS: 4.11]
+- [x] 3.8 Diff tab (depends on 2.5)
+- [~] 3.9 Analytics tab with charts (depends on 2.5) [BLOCKS: 4.6] — _stat cards + per-type breakdowns in RepoView; **no canvas charts**_
 
 **3C: Navigation & discovery tabs** _(depend on Snapshots tab for cross-nav)_
-- [ ] 3.10 Search tab (depends on 3.2 for jump-to-snapshots)
-- [ ] 3.11 GFS Tree tab (depends on 3.2 for jump-to-snapshots) [BLOCKS: 4.9]
-- [ ] 3.12 Cross-tab navigation wiring (depends on 3.2, 3.8, 3.10, 3.11)
+- [x] 3.10 Search tab (depends on 3.2 for jump-to-snapshots)
+- [ ] 3.11 GFS Tree tab (depends on 3.2 for jump-to-snapshots) [BLOCKS: 4.9] — _no `GfsTree.tsx`; blocks 4.9.1_
+- [~] 3.12 Cross-tab navigation wiring (depends on 3.2, 3.8, 3.10, 3.11) — _Search→Snapshots, Diff→ContentViewer, Pack/Loose→ContentViewer wired; GFS→Snapshots blocked by 3.11_
 
 ---
 
@@ -599,29 +614,29 @@ _Note: "feature parity" means all existing capabilities are accessible, NOT that
 _Depends on Phase 3 + Phase 0 C-side changes._
 
 **4A: Task System UI** _(depends on Phase 0.2 C-side task system)_
-- [ ] 4.1 Task management UI -- start/monitor/cancel (depends on 0.2.4, 0.2.5, 0.2.7)
-- [ ] 4.2 Task progress indicators -- progress bars, live polling (depends on 4.1, 0.2.6, 0.2.8)
-- [ ] 4.3 Task history view -- completed/failed with details (depends on 4.1)
+- [x] 4.1 Task management UI -- start/monitor/cancel (depends on 0.2.4, 0.2.5, 0.2.7)
+- [x] 4.2 Task progress indicators -- progress bars, live polling (depends on 4.1, 0.2.6, 0.2.8)
+- [x] 4.3 Task history view -- completed/failed with details (depends on 4.1) — _completed/failed tasks listed in TaskListView (no separate "history" filter, but content is there)_
 
 **4B: Active Operations** _(depend on task system UI + specific C-side support)_
-- [ ] 4.4 Restore workflow UI -- browse tree, select files, destination, conflict policy (depends on 4.1, 3.2, 2.6, 0.2.4)
-- [ ] 4.5 Backup run trigger -- toolbar/context menu per repo (depends on 4.1, 0.2.4)
-- [ ] 4.10 Verify trigger from UI -- repair option + warning dialog (depends on 4.1, 0.5.1)
-- [ ] 4.11 Verify results view -- object-level pass/fail, warn/error, click-through to Hash Lookup (depends on 4.10, 3.7, 0.5.2)
+- [~] 4.4 Restore workflow UI -- browse tree, select files, destination, conflict policy (depends on 4.1, 3.2, 2.6, 0.2.4) — _restore modal + tree select + destination + verify flag done; **no conflict policy (overwrite/skip/rename)**_
+- [x] 4.5 Backup run trigger -- toolbar/context menu per repo (depends on 4.1, 0.2.4)
+- [~] 4.10 Verify trigger from UI -- repair option + warning dialog (depends on 4.1, 0.5.1) — _verify fires via `task_start`; **no repair flag UI, no warning dialog**_
+- [ ] 4.11 Verify results view -- object-level pass/fail, warn/error, click-through to Hash Lookup (depends on 4.10, 3.7, 0.5.2) — _blocked by 0.5.2_
 - [ ] 4.12 Verify status in health dashboard + sidebar indicator (depends on 4.11, 4.6)
-- [ ] 4.13 Data export dialog -- bundle/tar, full/subset, destination prompt (depends on 4.1, 2.6, 0.2.4)
+- [ ] 4.13 Data export dialog -- bundle/tar, full/subset, destination prompt (depends on 4.1, 2.6, 0.2.4) — _needs `TASK_CMD_EXPORT` added to `task_cmd_t` first (see 0.2.3)_
 
 **4C: Journal, Health & Notifications** _(depend on Phase 0.1 journal)_
-- [ ] 4.6 Repo health dashboard -- last backup, verify, failures, storage, GFS coverage, warnings (depends on 0.1.5, 3.1, 3.9)
-- [ ] 4.7 Snapshot notes UI -- inline edit, list column, searchable (depends on 0.4.2, 3.2)
-- [ ] 4.8 Journal viewer -- filterable/searchable operation history per repo (depends on 0.1.5)
+- [~] 4.6 Repo health dashboard -- last backup, verify, failures, storage, GFS coverage, warnings (depends on 0.1.5, 3.1, 3.9) — _last-backup + storage + GFS coverage done; **last-verify, recent-failures list, warnings panel all missing**_
+- [~] 4.7 Snapshot notes UI -- inline edit, list column, searchable (depends on 0.4.2, 3.2) — _inline edit in SnapshotBrowser done; **no note column in SnapshotList, notes not indexed by search**_
+- [x] 4.8 Journal viewer -- filterable/searchable operation history per repo (depends on 0.1.5)
 - [ ] 4.14.6 Orphaned journal entry detection -- flag crashed/killed operations (depends on 4.8)
 - [ ] 4.8.1 Notifications panel -- bell icon, badge, toasts, history (depends on 0.1.5, 4.6)
 - [ ] 4.8.2 OS-level notifications via Electron native API (depends on 4.8.1)
 
 **4D: Tag Management UI** _(depends on Phase 0.3 C-side tag RPC + Tags tab)_
-- [ ] 4.9 Tag management UI -- create, rename, delete from Tags tab + context menus (depends on 0.3.1, 0.3.2, 0.3.3, 3.4, 3.2, 3.11)
-- [ ] 4.9.1 Preserve tag quick-action in GFS Tree (depends on 4.9, 3.11)
+- [~] 4.9 Tag management UI -- create, rename, delete from Tags tab + context menus (depends on 0.3.1, 0.3.2, 0.3.3, 3.4, 3.2, 3.11) — _full CRUD from Tags tab done; **no tag quick-action in snapshot row context menus**_
+- [ ] 4.9.1 Preserve tag quick-action in GFS Tree (depends on 4.9, 3.11) — _blocked by 3.11_
 
 **4E: Local Export over SSH** _(depends on SFTP module + export dialog)_
 - [ ] 4.14 Local export over SSH -- SFTP side channel, download queue with progress (depends on 1.3.5, 4.13)

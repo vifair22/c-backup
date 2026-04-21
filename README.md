@@ -43,9 +43,9 @@ For usage documentation, CLI reference, and technical internals see [manual.md](
 | `libacl` | POSIX ACL backup and restore |
 | `libpthread` | Parallel worker pools |
 
-### Viewer GUI (optional)
+### Electron UI (optional)
 
-Python 3 with Tkinter. `pip install lz4` for compressed content preview.
+The desktop application lives in `ui/` and targets Node.js 24 LTS and Electron 41. It is self-contained: `cd ui && npm install && npm run dev` for a development build, or `npm run build` for a packaged distribution. No system-wide runtime dependencies are required beyond a working Linux desktop stack (GTK/Wayland). See [manual.md §9](manual.md#9-electron-ui) for the full architecture and usage reference.
 
 ---
 
@@ -191,12 +191,15 @@ c-backup/
 │   ├── toml.{c,h}          #   TOML parser (MIT)
 │   └── log.h               #   Logging macros
 │
-├── tools/
-│   └── viewer/             # Python/Tkinter GUI (read-only repo browser)
-│       ├── app.py          #   Main application
-│       ├── rpc.py          #   JSON RPC client
-│       ├── tabs/           #   Per-tab UI modules
-│       └── widgets.py      #   Shared display widgets
+├── ui/                     # Electron desktop application
+│   ├── src/
+│   │   ├── main/           #   Main process: connection manager, RPC client,
+│   │   │                   #   SSH transport, safeStorage-backed credential store
+│   │   ├── preload/        #   Context-bridge preload scripts
+│   │   ├── renderer/       #   React 19 + TypeScript + Tailwind UI
+│   │   └── shared/         #   Types shared across processes
+│   ├── package.json        #   Dependencies and build scripts
+│   └── electron-vite.config.ts
 │
 ├── Makefile                # GNU Makefile (parallel, multi-target)
 ├── release_version         # SemVer string (e.g. "0.1.0")
