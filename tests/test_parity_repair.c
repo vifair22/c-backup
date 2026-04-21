@@ -69,7 +69,7 @@ static int setup_with_backup(void **state) {
     if (backup_run(repo, paths, 1) != OK) return -1;
 
     /* Pack all loose objects */
-    if (repo_pack(repo, NULL) != OK) return -1;
+    if (repo_pack(repo, NULL, NULL, NULL) != OK) return -1;
 
     return 0;
 }

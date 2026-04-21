@@ -647,6 +647,11 @@ void repo_unlock(repo_t *repo) {
     repo->lock_mode = 0;
 }
 
+void repo_set_lock_fd(repo_t *repo, int fd) {
+    repo->lock_fd = fd;
+    repo->lock_mode = 2;  /* exclusive */
+}
+
 status_t repo_lock_downgrade(repo_t *repo) {
     if (!repo || repo->lock_fd == -1) return OK;
     if (repo->lock_mode != 2) return OK;

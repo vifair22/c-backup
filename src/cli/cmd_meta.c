@@ -321,7 +321,7 @@ int cmd_snapshot(repo_t *repo, int argc, char **argv) {
 
     if (!no_gc) {
         log_msg("INFO", "snapshot delete: running GC");
-        if (repo_gc(repo, NULL, NULL) != OK) {
+        if (repo_gc(repo, NULL, NULL, NULL, NULL) != OK) {
             fprintf(stderr, "warning: snapshot deleted, but gc failed: %s\n",
                     err_msg()[0] ? err_msg() : "unknown error");
         }

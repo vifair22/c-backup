@@ -894,7 +894,9 @@ static status_t restore_materialize_nodes(repo_t *repo,
                                           const restore_entry_t *entries,
                                           uint32_t count,
                                           const char *dest_path,
-                                          restore_stats_t *stats) {
+                                          restore_stats_t *stats,
+                                          task_progress_fn progress,
+                                          void *progress_ctx) {
     nl_htab_t *nl_map = nl_htab_new(count / 4 > 64 ? count / 4 : 64);
     if (!nl_map) return set_error(ERR_NOMEM, "restore_materialize_nodes: alloc failed for hardlink map");
 
@@ -968,6 +970,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
                 if (st != OK) break;
                 atomic_fetch_add(&rprog.items, 1);
                 atomic_fetch_add(&rprog.bytes, e->node->size);
+                if (progress) progress((uint64_t)rprog.items, (uint64_t)total, "restoring", progress_ctx);
             }
         } else {
             /* Partition primaries into contiguous chunks per worker.
@@ -1053,6 +1056,7 @@ static status_t restore_materialize_nodes(repo_t *repo,
         }
 
         atomic_fetch_add(&rprog.items, 1);
+        if (progress) progress((uint64_t)rprog.items, (uint64_t)total, "restoring", progress_ctx);
     }
 
 cleanup:
@@ -1110,7 +1114,9 @@ static status_t restore_entries(repo_t *repo,
                                 const restore_entry_t *entries,
                                 uint32_t count,
                                 const char *dest_path,
-                                const node_t *root_dir_meta) {
+                                const node_t *root_dir_meta,
+                                task_progress_fn progress,
+                                void *progress_ctx) {
     if (mkdir(dest_path, 0755) == -1 && errno != EEXIST)
         return set_error_errno(ERR_IO, "restore: mkdir(%s)", dest_path);
 
@@ -1118,7 +1124,7 @@ static status_t restore_entries(repo_t *repo,
     status_t st = restore_make_dirs(entries, count, dest_path);
     if (st != OK) return st;
 
-    st = restore_materialize_nodes(repo, entries, count, dest_path, &stats);
+    st = restore_materialize_nodes(repo, entries, count, dest_path, &stats, progress, progress_ctx);
     if (st != OK) return st;
 
     {
@@ -1138,7 +1144,8 @@ static status_t restore_entries(repo_t *repo,
 }
 
 static status_t do_restore(repo_t *repo, const snapshot_t *snap,
-                           const char *dest_path) {
+                           const char *dest_path,
+                           task_progress_fn progress, void *progress_ctx) {
     snap_paths_t sp = {0};
     status_t st = snap_paths_build(snap, &sp);
     if (st != OK) return st;
@@ -1161,7 +1168,7 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
         }
     }
 
-    st = restore_entries(repo, entries, sp.count, dest_path, root_dir_meta);
+    st = restore_entries(repo, entries, sp.count, dest_path, root_dir_meta, progress, progress_ctx);
     free(entries);
     snap_paths_free(&sp);
     return st;
@@ -1171,21 +1178,23 @@ static status_t do_restore(repo_t *repo, const snapshot_t *snap,
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
-status_t restore_latest(repo_t *repo, const char *dest_path) {
+status_t restore_latest(repo_t *repo, const char *dest_path,
+                        task_progress_fn progress, void *progress_ctx) {
     uint32_t head_id = 0;
     if (snapshot_read_head(repo, &head_id) != OK || head_id == 0) {
         return set_error(ERR_NOT_FOUND, "no snapshots in repository");
     }
-    return restore_snapshot(repo, head_id, dest_path);
+    return restore_snapshot(repo, head_id, dest_path, progress, progress_ctx);
 }
 
-status_t restore_snapshot(repo_t *repo, uint32_t snap_id, const char *dest_path) {
+status_t restore_snapshot(repo_t *repo, uint32_t snap_id, const char *dest_path,
+                          task_progress_fn progress, void *progress_ctx) {
     snapshot_t *snap = NULL;
     status_t st = snapshot_load(repo, snap_id, &snap);
     if (st != OK) return st;
 
     fprintf(stderr, "restoring snapshot %u -> %s\n", snap_id, dest_path);
-    st = do_restore(repo, snap, dest_path);
+    st = do_restore(repo, snap, dest_path, progress, progress_ctx);
     snapshot_free(snap);
     return st;
 }
@@ -1394,7 +1403,8 @@ static void makedirs_for(const char *dest_path, const char *rel_path) {
 }
 
 status_t restore_file(repo_t *repo, uint32_t snap_id,
-                      const char *file_path, const char *dest_path) {
+                      const char *file_path, const char *dest_path,
+                      task_progress_fn progress, void *progress_ctx) {
     char norm[PATH_MAX];
     if (normalize_snapshot_path(file_path, norm, sizeof(norm)) != 0)
         return set_error(ERR_INVALID, "restore_file: invalid path: %s", file_path);
@@ -1442,7 +1452,7 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
             single.dirent_count = 1;
             /* Pre-create intermediate parent directories */
             makedirs_for(dest_path, norm);
-            st = do_restore(repo, &single, dest_path);
+            st = do_restore(repo, &single, dest_path, progress, progress_ctx);
             free(single.dirent_data);
         } else {
             st = set_error(ERR_NOMEM, "restore_file: alloc failed for single-file dirent blob");
@@ -1458,7 +1468,8 @@ status_t restore_file(repo_t *repo, uint32_t snap_id,
 /* ------------------------------------------------------------------ */
 
 status_t restore_subtree(repo_t *repo, uint32_t snap_id,
-                         const char *subtree_path, const char *dest_path) {
+                         const char *subtree_path, const char *dest_path,
+                         task_progress_fn progress, void *progress_ctx) {
     char norm[PATH_MAX];
     if (normalize_snapshot_path(subtree_path, norm, sizeof(norm)) != 0)
         return set_error(ERR_INVALID, "restore_subtree: invalid path: %s", subtree_path);
@@ -1543,7 +1554,7 @@ status_t restore_subtree(repo_t *repo, uint32_t snap_id,
         .dirent_data_len = dirent_sz,
     };
 
-    st = do_restore(repo, &subset, dest_path);
+    st = do_restore(repo, &subset, dest_path, progress, progress_ctx);
 
     free(dirent_data);
     free(node_ids);

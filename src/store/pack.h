@@ -3,6 +3,7 @@
 #include "error.h"
 #include "repo.h"
 #include "object.h"
+#include "task.h"
 #include <stdint.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
@@ -16,7 +17,8 @@
  * Pack all loose objects into a new pack file.
  * *out_packed (may be NULL) receives the number of objects packed.
  */
-status_t repo_pack(repo_t *repo, uint32_t *out_packed);
+status_t repo_pack(repo_t *repo, uint32_t *out_packed,
+                   task_progress_fn progress, void *progress_ctx);
 
 /*
  * Complete any interrupted pack installs from a previous crash.

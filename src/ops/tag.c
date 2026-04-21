@@ -154,6 +154,45 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
     return found;
 }
 
+status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name) {
+    if (!tag_name_valid(old_name))
+        return set_error(ERR_INVALID, "tag_rename: invalid old tag name '%s'",
+                         old_name ? old_name : "(null)");
+    if (!tag_name_valid(new_name))
+        return set_error(ERR_INVALID, "tag_rename: invalid new tag name '%s'",
+                         new_name ? new_name : "(null)");
+    if (strcmp(old_name, new_name) == 0)
+        return set_error(ERR_INVALID, "tag_rename: old and new names are the same");
+
+    /* Read old tag. */
+    char old_path[PATH_MAX];
+    if (tag_path(repo, old_name, old_path, sizeof(old_path)) != 0)
+        return set_error(ERR_IO, "tag_rename: path too long");
+    uint32_t snap_id = 0;
+    int preserve = 0;
+    status_t st = tag_parse(old_path, &snap_id, &preserve);
+    if (st != OK) return st;
+
+    /* Check new tag doesn't already exist. */
+    char new_path[PATH_MAX];
+    if (tag_path(repo, new_name, new_path, sizeof(new_path)) != 0)
+        return set_error(ERR_IO, "tag_rename: path too long");
+    struct stat stbuf;
+    if (lstat(new_path, &stbuf) == 0)
+        return set_error(ERR_INVALID, "tag_rename: tag '%s' already exists", new_name);
+
+    /* Write new tag, then delete old. */
+    st = tag_set(repo, new_name, snap_id, preserve);
+    if (st != OK) return st;
+
+    if (unlink(old_path) == -1) {
+        /* New tag was written but old wasn't deleted — try to clean up.
+         * This is a best-effort cleanup; the rename partially succeeded. */
+        return set_error_errno(ERR_IO, "tag_rename: unlink(%s)", old_path);
+    }
+    return OK;
+}
+
 status_t tag_resolve(repo_t *repo, const char *arg, uint32_t *out_id) {
     if (arg && (strcmp(arg, "HEAD") == 0 || strcmp(arg, "head") == 0)) {
         return snapshot_read_head(repo, out_id);

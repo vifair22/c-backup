@@ -2,6 +2,7 @@
 
 #include "error.h"
 #include "repo.h"
+#include "task.h"
 #include <stdint.h>
 
 /*
@@ -9,7 +10,8 @@
  * *out_deleted (may be NULL) receives the count of deleted objects.
  * *out_kept   (may be NULL) receives the count of retained objects.
  */
-status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted);
+status_t repo_gc(repo_t *repo, uint32_t *out_kept, uint32_t *out_deleted,
+                 task_progress_fn progress, void *progress_ctx);
 
 typedef struct {
     uint64_t objects_checked;
@@ -26,7 +28,8 @@ typedef struct {
  * Returns OK if all objects are present and uncorrupted, ERR_CORRUPT
  * if any are missing or have hash mismatches.
  */
-status_t repo_verify(repo_t *repo, verify_opts_t *opts);
+status_t repo_verify(repo_t *repo, verify_opts_t *opts,
+                     task_progress_fn progress, void *progress_ctx);
 
 /*
  * Complete any prune that was interrupted.

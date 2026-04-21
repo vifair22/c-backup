@@ -68,7 +68,7 @@ static status_t create_packed_repo(void) {
     backup_opts_t opts = { .quiet = 1 };
     status_t st = backup_run_opts(repo, paths, 1, &opts);
     if (st != OK) return st;
-    return repo_pack(repo, NULL);
+    return repo_pack(repo, NULL, NULL, NULL);
 }
 
 /* Get first content hash from snap 1 */
@@ -297,7 +297,7 @@ static void test_pack_write_fwrite_fail(void **state) {
 
         fault_reset_all();
         fault_fwrite_at = n;
-        status_t st = repo_pack(repo, NULL);
+        status_t st = repo_pack(repo, NULL, NULL, NULL);
         fault_reset_all();
         if (st != OK) {
             found_failure = 1;
@@ -348,7 +348,7 @@ static void test_pack_finalize_fsync_fail(void **state) {
 
         fault_reset_all();
         fault_fsync_at = n;
-        status_t st = repo_pack(repo, NULL);
+        status_t st = repo_pack(repo, NULL, NULL, NULL);
         fault_reset_all();
         if (st != OK) {
             found_failure = 1;
@@ -371,7 +371,7 @@ static void test_pack_finalize_fsync_fail(void **state) {
     assert_int_equal(repo_init(TEST_REPO), OK);
     assert_int_equal(repo_open(TEST_REPO, &repo), OK);
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 }
 
 /*
@@ -386,7 +386,7 @@ static void test_pack_gc_malloc_fail(void **state) {
     for (int n = 0; n < 40; n++) {
         fault_reset_all();
         fault_malloc_at = n;
-        status_t st = repo_gc(repo, NULL, NULL);
+        status_t st = repo_gc(repo, NULL, NULL, NULL, NULL);
         fault_reset_all();
         if (st == ERR_NOMEM) {
             found_failure = 1;
@@ -398,7 +398,7 @@ static void test_pack_gc_malloc_fail(void **state) {
 
     /* Verify repo is still valid */
     fault_reset_all();
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 int main(void) {

@@ -147,12 +147,12 @@ static void test_pipeline_mixed_files(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/tiny.txt", "hi\n", 3);
@@ -182,17 +182,17 @@ static void test_pipeline_incremental_snapshots(void **state) {
     write_file(TEST_SRC "/file3.txt", "new file\n", 9);
 
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     int rc = system("mkdir -p " TEST_DEST "/snap1");
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST "/snap1"), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST "/snap1", NULL, NULL), OK);
     verify_file_matches(TEST_DEST "/snap1" TEST_SRC "/file1.txt", "version 1\n", 10);
 
     rc = system("mkdir -p " TEST_DEST "/snap2");
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST "/snap2"), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST "/snap2", NULL, NULL), OK);
     verify_file_matches(TEST_DEST "/snap2" TEST_SRC "/file1.txt", "version 2 with more data\n", 25);
     verify_file_matches(TEST_DEST "/snap2" TEST_SRC "/file3.txt", "new file\n", 9);
 }
@@ -212,15 +212,15 @@ static void test_pipeline_gc_cycle(void **state) {
     assert_int_equal(snapshot_delete(repo, 1), OK);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
     assert_true(kept > 0);
 
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
     verify_file_matches(TEST_DEST TEST_SRC "/keep.txt", "keep this\n", 10);
 }
 

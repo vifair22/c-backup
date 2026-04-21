@@ -183,7 +183,7 @@ static void test_exists_loose_and_pack_fallback(void **state) {
     assert_true(object_exists(repo, hash));
 
     /* Pack the loose object. */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Now delete the loose file. */
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -211,7 +211,7 @@ static void test_get_info_loose_and_packed(void **state) {
     assert_int_equal(typ, OBJECT_TYPE_FILE);
 
     /* Pack, delete loose */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(hash, hex);
     char path[512];
@@ -358,7 +358,7 @@ static void test_load_stream_pack_fallback(void **state) {
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
 
     /* Pack the object (also deletes loose) */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Verify loose file is gone */
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -386,7 +386,7 @@ static void test_load_stream_pack_fallback_null_params(void **state) {
     size_t len = strlen(data);
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     int null_fd = open("/dev/null", O_WRONLY);
     assert_true(null_fd >= 0);
@@ -427,7 +427,7 @@ static void test_load_from_pack_various_sizes(void **state) {
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, medium, sizeof(medium), h_medium), OK);
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, large, sizeof(large), h_large), OK);
 
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Load all three from pack */
     void *data = NULL;

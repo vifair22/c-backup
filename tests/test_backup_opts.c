@@ -103,7 +103,7 @@ static void test_verify_after_succeeds(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Snapshot should exist and verify clean */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Delete an object after backup → verify_after catches it */
@@ -166,12 +166,12 @@ static void test_modified_file_content(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Both snapshots should be valid */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     /* Restore snap 2 and verify */
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
     verify_file_matches(TEST_DEST TEST_SRC "/mod.txt", "modified\n", 9);
 }
 
@@ -188,7 +188,7 @@ static void test_symlink_content(void **state) {
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char lnk[256];
     ssize_t ll = readlink(TEST_DEST TEST_SRC "/link.txt", lnk, sizeof(lnk) - 1);
@@ -216,7 +216,7 @@ static void test_transient_file_disappearance(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Verify snap 2 */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Exclude list filters paths */
@@ -236,7 +236,7 @@ static void test_exclude_paths(void **state) {
     /* Restore and verify excluded dir is absent */
     rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/keep.txt", "keep me\n", 8);
 
@@ -257,7 +257,7 @@ static void test_multiple_source_paths(void **state) {
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/from_src1.txt", "source 1\n", 9);
     verify_file_matches(TEST_DEST TEST_SRC2 "/from_src2.txt", "source 2\n", 9);
@@ -277,7 +277,7 @@ static void test_no_changes_quiet(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Both snapshots should verify */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Hardlink: backup two hardlinked files, only one object stored */
@@ -294,7 +294,7 @@ static void test_hardlink_primary_fail(void **state) {
     /* Restore and verify both files have same content */
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/primary.txt", "hardlink test\n", 14);
     verify_file_matches(TEST_DEST TEST_SRC "/secondary.txt", "hardlink test\n", 14);
@@ -311,7 +311,7 @@ static void test_non_quiet_backup(void **state) {
     /* quiet=0, verbose=0 — exercises the default progress output path */
     backup_opts_t opts = {0};
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Verbose mode: exercises verbose warning paths */
@@ -324,7 +324,7 @@ static void test_verbose_backup(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .verbose = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Many unique files: forces parallel worker pool with multiple items */
@@ -344,11 +344,11 @@ static void test_many_files_parallel_store(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Verify all objects exist */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     /* Pack and re-verify */
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Delete + add files between snapshots — exercises all change types */
@@ -371,12 +371,12 @@ static void test_all_change_types(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     /* Verify both snapshots */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     /* Restore snap 2 and verify */
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/unchanged.txt", "stays the same\n", 15);
     verify_file_matches(TEST_DEST TEST_SRC "/modified.txt", "version 2 new content\n", 22);
@@ -403,7 +403,7 @@ static void test_deep_directory_structure(void **state) {
 
     rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     verify_file_matches(TEST_DEST TEST_SRC "/a/b/c/d/deepest.txt", "deepest level\n", 14);
 }
@@ -445,7 +445,7 @@ static void test_progress_env_override(void **state) {
     unsetenv("CBACKUP_STORE_THREADS");
 
     assert_int_equal(st, OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* File becomes unreadable between scan and store phases.
@@ -475,7 +475,7 @@ static void test_transient_eacces_during_store(void **state) {
     chmod(TEST_SRC "/unreadable.txt", 0644);
 
     /* Verify repo integrity */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Multiple files disappear between scan and store — tests skipped_add
@@ -514,7 +514,7 @@ static void test_transient_multiple_vanished(void **state) {
         snprintf(path, sizeof(path), "%s/vanish_%02d.txt", TEST_SRC, i);
         chmod(path, 0644);
     }
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /*

@@ -188,7 +188,7 @@ static void test_restore_latest_roundtrip(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_latest(repo, TEST_DEST), OK);
+    assert_int_equal(restore_latest(repo, TEST_DEST, NULL, NULL), OK);
 
     /* Restored tree uses tar-like relative-absolute layout under DEST/tmp/... */
     char path[256];
@@ -221,7 +221,7 @@ static void test_restore_symlink(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_latest(repo, TEST_DEST), OK);
+    assert_int_equal(restore_latest(repo, TEST_DEST, NULL, NULL), OK);
 
     char lpath[256];
     snprintf(lpath, sizeof(lpath), "%s/tmp/c_backup_rst_src/link.txt", TEST_DEST);
@@ -250,7 +250,7 @@ static void test_restore_by_id(void **state) {
 
     /* restore snapshot 1 (original) */
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/hello.txt", TEST_DEST);
@@ -263,7 +263,7 @@ static void test_restore_by_id(void **state) {
 static void test_restore_latest_no_snapshots(void **state) {
     (void)state;
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_latest(repo, TEST_DEST), ERR_NOT_FOUND);
+    assert_int_equal(restore_latest(repo, TEST_DEST, NULL, NULL), ERR_NOT_FOUND);
 }
 
 static void test_restore_verify_dest_detects_mismatch(void **state) {
@@ -272,7 +272,7 @@ static void test_restore_verify_dest_detects_mismatch(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
 
     write_file(TEST_DEST "/tmp/c_backup_rst_src/hello.txt", "tampered");
@@ -285,7 +285,7 @@ static void test_restore_verify_dest_detects_missing_file(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(unlink(TEST_DEST "/tmp/c_backup_rst_src/hello.txt"), 0);
 
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), ERR_CORRUPT);
@@ -302,14 +302,14 @@ static void test_restore_snapshot_corrupt_manifest_fails(void **state) {
     fclose(f);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), ERR_CORRUPT);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), ERR_CORRUPT);
 }
 
 static void test_restore_snapshot_corrupt_object_fails_corrupt(void **state) {
     (void)state;
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(first_content_hash_from_snapshot(hash), 0);
@@ -317,7 +317,7 @@ static void test_restore_snapshot_corrupt_object_fails_corrupt(void **state) {
     corrupt_packed_payload_byte(hash);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), ERR_CORRUPT);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), ERR_CORRUPT);
 }
 
 static void test_restore_file_and_subtree(void **state) {
@@ -327,22 +327,22 @@ static void test_restore_file_and_subtree(void **state) {
 
     mkdir(TEST_DEST, 0755);
 
-    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/hello.txt", TEST_DEST), OK);
+    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/hello.txt", TEST_DEST, NULL, NULL), OK);
     char *content = read_file_str(TEST_DEST "/tmp/c_backup_rst_src/hello.txt");
     assert_non_null(content);
     assert_string_equal(content, "hello world");
     free(content);
 
-    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/subdir", TEST_DEST), ERR_NOT_FOUND);
-    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/missing.txt", TEST_DEST), ERR_NOT_FOUND);
+    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/subdir", TEST_DEST, NULL, NULL), ERR_NOT_FOUND);
+    assert_int_equal(restore_file(repo, 1, "tmp/c_backup_rst_src/missing.txt", TEST_DEST, NULL, NULL), ERR_NOT_FOUND);
 
-    assert_int_equal(restore_file(repo, 1, "/tmp/c_backup_rst_src/hello.txt", TEST_DEST), OK);
+    assert_int_equal(restore_file(repo, 1, "/tmp/c_backup_rst_src/hello.txt", TEST_DEST, NULL, NULL), OK);
 
     int rc = system("rm -rf " TEST_DEST);
     (void)rc;
     mkdir(TEST_DEST, 0755);
 
-    assert_int_equal(restore_subtree(repo, 1, "tmp/c_backup_rst_src/subdir", TEST_DEST), OK);
+    assert_int_equal(restore_subtree(repo, 1, "tmp/c_backup_rst_src/subdir", TEST_DEST, NULL, NULL), OK);
     content = read_file_str(TEST_DEST "/tmp/c_backup_rst_src/subdir/nested.txt");
     assert_non_null(content);
     assert_string_equal(content, "nested content");
@@ -352,13 +352,13 @@ static void test_restore_file_and_subtree(void **state) {
     rc = system("rm -rf " TEST_DEST);
     (void)rc;
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_subtree(repo, 1, "/tmp/c_backup_rst_src/subdir", TEST_DEST), OK);
+    assert_int_equal(restore_subtree(repo, 1, "/tmp/c_backup_rst_src/subdir", TEST_DEST, NULL, NULL), OK);
     content = read_file_str(TEST_DEST "/tmp/c_backup_rst_src/subdir/nested.txt");
     assert_non_null(content);
     assert_string_equal(content, "nested content");
     free(content);
 
-    assert_int_equal(restore_subtree(repo, 1, "tmp/c_backup_rst_src/does-not-exist", TEST_DEST), ERR_NOT_FOUND);
+    assert_int_equal(restore_subtree(repo, 1, "tmp/c_backup_rst_src/does-not-exist", TEST_DEST, NULL, NULL), ERR_NOT_FOUND);
 }
 
 static void test_restore_snapshot_missing_manifest_fails(void **state) {
@@ -373,7 +373,7 @@ static void test_restore_snapshot_missing_manifest_fails(void **state) {
     assert_int_equal(unlink(TEST_REPO "/snapshots/00000001.snap"), 0);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), ERR_NOT_FOUND);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), ERR_NOT_FOUND);
 }
 
 static void test_restore_rejects_unsafe_paths(void **state) {
@@ -383,10 +383,10 @@ static void test_restore_rejects_unsafe_paths(void **state) {
 
     mkdir(TEST_DEST, 0755);
 
-    assert_int_equal(restore_file(repo, 1, "../etc/passwd", TEST_DEST), ERR_INVALID);
-    assert_int_equal(restore_file(repo, 1, "/../../tmp/c_backup_rst_src/hello.txt", TEST_DEST), ERR_INVALID);
-    assert_int_equal(restore_subtree(repo, 1, "../tmp", TEST_DEST), ERR_INVALID);
-    assert_int_equal(restore_subtree(repo, 1, "/../../tmp", TEST_DEST), ERR_INVALID);
+    assert_int_equal(restore_file(repo, 1, "../etc/passwd", TEST_DEST, NULL, NULL), ERR_INVALID);
+    assert_int_equal(restore_file(repo, 1, "/../../tmp/c_backup_rst_src/hello.txt", TEST_DEST, NULL, NULL), ERR_INVALID);
+    assert_int_equal(restore_subtree(repo, 1, "../tmp", TEST_DEST, NULL, NULL), ERR_INVALID);
+    assert_int_equal(restore_subtree(repo, 1, "/../../tmp", TEST_DEST, NULL, NULL), ERR_INVALID);
 
     assert_int_equal(restore_cat_file(repo, 1, "../tmp/c_backup_rst_src/hello.txt"), ERR_INVALID);
     assert_int_equal(restore_cat_file(repo, 1, "/../../tmp/c_backup_rst_src/hello.txt"), ERR_INVALID);
@@ -456,7 +456,7 @@ static void test_restore_sparse_file_cat_and_verify(void **state) {
     assert_int_equal(obj_type, OBJECT_TYPE_SPARSE);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
 
     int outfd = open(TEST_DEST "/cat_sparse.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -542,7 +542,7 @@ static void test_restore_empty_file_roundtrip(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/empty.txt", TEST_DEST);
@@ -560,7 +560,7 @@ static void test_restore_fifo_roundtrip(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/testfifo", TEST_DEST);
@@ -579,7 +579,7 @@ static void test_restore_hardlink_inode_identity(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char p1[256], p2[256];
     snprintf(p1, sizeof(p1), "%s/tmp/c_backup_rst_src/hlprimary.txt", TEST_DEST);
@@ -616,7 +616,7 @@ static void test_restore_permissions_roundtrip(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     struct stat st;
@@ -650,7 +650,7 @@ static void test_restore_xattr_roundtrip(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/xattr.txt", TEST_DEST);
@@ -688,7 +688,7 @@ static void test_restore_acl_roundtrip(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/aclfile.txt", TEST_DEST);
@@ -725,7 +725,7 @@ static void test_restore_incremental_snapshots(void **state) {
 
     /* Restore snap 1: should NOT have extra.txt */
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char path[256];
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/extra.txt", TEST_DEST);
@@ -742,7 +742,7 @@ static void test_restore_incremental_snapshots(void **state) {
     int rc = system("rm -rf " TEST_DEST);
     (void)rc;
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
 
     snprintf(path, sizeof(path), "%s/tmp/c_backup_rst_src/extra.txt", TEST_DEST);
     c = read_file_str(path);
@@ -758,11 +758,11 @@ static void test_restore_verify_after_pack(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     /* Pack all loose objects */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Restore from packed objects */
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     /* Verify restore integrity */
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
@@ -801,7 +801,7 @@ static void test_many_hardlinks_resize(void **state) {
 
     /* Restore — exercises nl_htab_grow for hardlink reconstruction */
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     /* Verify a few hardlinks were restored correctly */
     for (int i = 0; i < 200; i += 50) {
@@ -849,7 +849,7 @@ static void test_restore_sparse_trailing_hole(void **state) {
 
     /* Restore and verify */
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
 
     /* Cat the sparse file to a real file (pipe would block on 256 KiB) */
@@ -913,7 +913,7 @@ static void test_restore_sparse_large_streaming(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     mkdir(TEST_DEST, 0755);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char rpath[PATH_MAX];
     snprintf(rpath, sizeof(rpath), "%s%s/sparse_big.bin", TEST_DEST, TEST_SRC);

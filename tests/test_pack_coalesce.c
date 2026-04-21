@@ -151,9 +151,9 @@ static void test_pack_coalesce_many_small_packs(void **state) {
         assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
     }
 
-    repo_pack(repo, NULL);
+    repo_pack(repo, NULL, NULL, NULL);
     int packs_before = count_packs();
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
     assert_true(packs_before >= 1);
 }
 
@@ -168,9 +168,9 @@ static void test_pack_mixed_small_and_large(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(count_packs() >= 1);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 static void test_gc_with_large_packed_objects(void **state) {
@@ -182,7 +182,7 @@ static void test_gc_with_large_packed_objects(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     unlink(TEST_SRC "/gc_big.bin");
     write_file_str(TEST_SRC "/gc_new.txt", "new content\n");
@@ -191,9 +191,9 @@ static void test_gc_with_large_packed_objects(void **state) {
     assert_int_equal(snapshot_delete(repo, 1), OK);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* ================================================================== */
@@ -209,7 +209,7 @@ static void test_coalesce_count_trigger(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Clone the pack to create 34 total */
     char src_dat[256], src_idx[256];
@@ -227,10 +227,10 @@ static void test_coalesce_count_trigger(void **state) {
 
     /* GC should trigger coalescing */
     pack_cache_invalidate(repo);
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     assert_true(count_packs() < 34);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* 10 small packs → fires on ratio */
@@ -241,7 +241,7 @@ static void test_coalesce_ratio_trigger(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Clone to 10 packs */
     char src_dat[256], src_idx[256];
@@ -257,10 +257,10 @@ static void test_coalesce_ratio_trigger(void **state) {
 
     assert_int_equal(count_packs(), 10);
     pack_cache_invalidate(repo);
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     /* May or may not coalesce depending on ratio threshold, but should succeed */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Newest pack excluded from coalesce candidates */
@@ -272,17 +272,17 @@ static void test_coalesce_skips_newest(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     write_file_str(TEST_SRC "/b.txt", "second snap\n");
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     int initial = count_packs();
     assert_true(initial >= 1);
 
     /* Verify all data still accessible */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* .installing-NNNNNNNN/ with dat+idx → resume renames correctly */
@@ -294,7 +294,7 @@ static void test_resume_installing_both(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Simulate a crash during install: create .installing-00000099/ with copies.
      * The staging dir format is .installing-%08u and files inside are
@@ -333,7 +333,7 @@ static void test_resume_installing_partial(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Simulate incomplete install: only .dat, no .idx.
      * The staging dir format must match .installing-%08u and files
@@ -371,7 +371,7 @@ static void test_resume_deleting_replays(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Clone pack 0 to pack 50 */
     char src_dat[256], src_idx[256];
@@ -397,7 +397,7 @@ static void test_resume_deleting_replays(void **state) {
 
     /* GC replays the deleting marker via pack_resume_deleting */
     pack_cache_invalidate(repo);
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     /* Pack 50 should be gone */
     struct stat st;
