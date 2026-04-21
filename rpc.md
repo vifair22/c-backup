@@ -1,6 +1,6 @@
 # c-backup JSON RPC API Reference
 
-Complete reference for the JSON RPC interface provided by the `backup` binary. This API is used by the Viewer GUI and is available to any third-party application.
+Complete reference for the JSON RPC interface provided by the `backup` binary. This API is used by the Electron UI (see [manual.md §9](manual.md#9-electron-ui)) and is available to any third-party application.
 
 ---
 
@@ -823,6 +823,327 @@ Any sub-action that fails returns `null` for that key; others continue.
 
 ---
 
+### tag_set
+
+Create or replace a tag pointing at a snapshot.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | Tag name |
+| `snap_id` | number | yes | Target snapshot ID |
+| `preserve` | boolean | no | If `true`, snapshot is pinned against pruning |
+
+**Response:**
+
+```json
+{ "saved": true }
+```
+
+Existing tags with the same name are overwritten atomically.
+
+---
+
+### tag_delete
+
+Remove a tag. The pointed-at snapshot is unaffected.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | Tag name |
+
+**Response:**
+
+```json
+{ "deleted": true }
+```
+
+Returns an error if the tag does not exist.
+
+---
+
+### tag_rename
+
+Atomically rename a tag.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `old_name` | string | yes | Current tag name |
+| `new_name` | string | yes | New tag name |
+
+**Response:**
+
+```json
+{ "renamed": true }
+```
+
+Fails if `old_name` does not exist or `new_name` is already taken.
+
+---
+
+### note_get
+
+Load a snapshot's note.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `id` | number | yes | Snapshot ID |
+
+**Response:**
+
+```json
+{ "text": "before v2.3 migration" }
+```
+
+Empty string if the snapshot has no note. Notes are stored under `<repo>/notes/` as one plain-text file per annotated snapshot.
+
+---
+
+### note_set
+
+Create or replace a snapshot's note.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `id` | number | yes | Snapshot ID |
+| `text` | string | yes | Note body (max 4096 bytes) |
+
+**Response:**
+
+```json
+{ "saved": true }
+```
+
+---
+
+### note_delete
+
+Remove a snapshot's note.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `id` | number | yes | Snapshot ID |
+
+**Response:**
+
+```json
+{ "deleted": true }
+```
+
+Idempotent: succeeds even if no note exists.
+
+---
+
+### note_list
+
+Enumerate all annotated snapshots.
+
+**Parameters:** none
+
+**Response:**
+
+```json
+{
+  "notes": [
+    { "snap_id": 10, "text": "release-candidate" },
+    { "snap_id": 42, "text": "known good state" }
+  ]
+}
+```
+
+---
+
+### task_start
+
+Fork a detached child that runs a long operation. Returns immediately with a task ID; progress is tracked via `task_status` / `task_list`.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `command` | string | yes | One of `run`, `gc`, `prune`, `pack`, `verify`, `restore` |
+| `repair` | boolean | no | (`verify` only) Rewrite corrupted objects via parity |
+| `snapshot` | string | no | (`restore` only) Snapshot ID or tag name |
+| `dest` | string | yes (`restore`) | Destination path on the binary's host |
+| `file` | string | no | (`restore` only) Specific file or subtree path within the snapshot |
+| `verify` | boolean | no | (`restore` only) Verify restored object hashes |
+
+**Response:**
+
+```json
+{ "task_id": "6824e3f4028-a1b2c3d4" }
+```
+
+The child acquires the repo's exclusive lock non-blocking. Returns `{"status":"error"}` immediately if the lock is contended. Status, progress, and exit state are written to `<repo>/.backup/tasks/<task_id>.json` via atomic tmp+rename; readers see consistent snapshots at all times.
+
+The `run` command reads source paths and automation flags from `policy.toml`; it does not accept override parameters in this release. `prune` is reserved but not yet implemented and will return an error.
+
+---
+
+### task_list
+
+Enumerate all tasks (active + recent) for the repo.
+
+**Parameters:** none
+
+**Response:**
+
+```json
+{
+  "tasks": [
+    {
+      "task_id": "6824e3f4028-a1b2c3d4",
+      "command": "run",
+      "pid": 12345,
+      "started": 1745263092,
+      "state": "running",
+      "exit_code": 0,
+      "alive": true,
+      "progress": {
+        "current": 84120,
+        "total": 150000,
+        "phase": "scanning"
+      }
+    },
+    {
+      "task_id": "6824e2a1ff3-91c0aab8",
+      "command": "verify",
+      "pid": 12100,
+      "started": 1745262500,
+      "state": "completed",
+      "exit_code": 0,
+      "alive": false,
+      "progress": { "current": 5000, "total": 5000, "phase": "done" }
+    }
+  ]
+}
+```
+
+`alive` is derived at call time by checking whether the stored PID is still the task child process (guards against PID reuse).
+
+---
+
+### task_status
+
+Per-task status snapshot.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task_id` | string | yes | Task ID returned from `task_start` |
+
+**Response:**
+
+```json
+{
+  "task_id": "6824e3f4028-a1b2c3d4",
+  "command": "run",
+  "pid": 12345,
+  "started": 1745263092,
+  "state": "running",
+  "exit_code": 0,
+  "alive": true,
+  "progress": {
+    "current": 84120,
+    "total": 150000,
+    "phase": "scanning"
+  }
+}
+```
+
+On task failure, an `error` string field is present describing the failure. Reads are lock-free and scan the single `<task_id>.json` file.
+
+---
+
+### task_cancel
+
+Request graceful cancellation of a running task. Sends SIGTERM to the child PID.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task_id` | string | yes | Task ID |
+
+**Response:**
+
+```json
+{ "cancelled": true }
+```
+
+The acknowledgement is immediate; the task writes its terminal `failed` status entry when the child finishes winding down. If the task has already completed, returns an error. A task that does not honour SIGTERM within a reasonable window can be escalated to SIGKILL externally; the next exclusive lock acquisition runs the standard crash-recovery path (prune-resume, tmp/ cleanup, pack-resume).
+
+---
+
+### journal
+
+Filtered, paginated read of the operation journal at `<repo>/logs/journal.jsonl`.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `offset` | number | no | Pagination start (default: 0) |
+| `limit` | number | no | Max entries (default: 100) |
+| `operation` | string | no | Filter by operation name (`run`, `gc`, `pack`, `verify`, etc.) |
+| `result` | string | no | Filter by result (`success`, `failed`, `cancelled`, `crash`) |
+| `state` | string | no | Filter by entry state (`started` or `completed`) |
+| `since` | string | no | ISO 8601 timestamp; exclude entries older than this |
+
+**Response:**
+
+```json
+{
+  "entries": [
+    {
+      "op_id": "6824e3f4028-a1b2c3d4",
+      "state": "completed",
+      "timestamp": "2026-04-21T18:51:40Z",
+      "operation": "run",
+      "source": "ui",
+      "user": "vifair",
+      "result": "success",
+      "duration_ms": 12340,
+      "task_id": "6824e3f4028-a1b2c3d4",
+      "summary": { "snap_id": 42, "files_backed_up": 150000, "bytes_new": 500000000 }
+    },
+    {
+      "op_id": "6824e2a1ff3-91c0aab8",
+      "state": "completed",
+      "timestamp": "2026-04-21T18:41:20Z",
+      "operation": "verify",
+      "source": "cli",
+      "user": "vifair",
+      "result": "crash",
+      "duration_ms": 3500,
+      "signal": 11
+    }
+  ],
+  "count": 2,
+  "orphan_count": 0
+}
+```
+
+Every operation writes two journal entries linked by `op_id`: a `started` entry at operation begin and a `completed` entry at end. Catastrophic failures (SIGSEGV, SIGABRT, SIGBUS) are caught by a pre-installed signal handler that writes a minimal completion entry with `result: "crash"` and the signal number, using a pre-allocated buffer and direct `write()` syscall (no malloc, no stdio).
+
+`orphan_count` reports the number of `started` entries with no matching `completed` — these indicate SIGKILL, power loss, or kernel panic. The UI surfaces these in the health dashboard.
+
+The `summary` field is operation-specific; see the implementation in `src/ops/journal.c` for the schema per operation.
+
+---
+
 ### quit
 
 Session mode only. Ends the session cleanly. No response is sent.
@@ -864,7 +1185,7 @@ This section traces how an RPC call traverses the binary, layer by layer, down t
 
 ```mermaid
 flowchart TD
-    CLIENT(["Client<br/>(Viewer GUI, script)"])
+    CLIENT(["Client<br/>(Electron UI, script)"])
     REQ["JSON request<br/>{action, params}"]
     ROUTER{{"Router<br/>(action → intent)"}}
 
@@ -891,8 +1212,8 @@ flowchart TD
 
     RESP["JSON response<br/>(LZ4-framed if ≥256B)"]
 
-    SIDE["save_policy<br/>(only writer — sidecar)"]:::sidecar
-    POL[("policy.toml")]
+    SIDE["Write actions<br/>save_policy, tag_set/delete/rename,<br/>note_set/delete, task_start"]:::sidecar
+    POL[("policy.toml, tags/,<br/>notes/, .backup/tasks/")]
 
     CLIENT -->|stdin write| REQ
     REQ -->|parse + dispatch| ROUTER
@@ -930,8 +1251,8 @@ flowchart TD
     FT -->|names + ids| RESP
     RESP -->|stdout write| CLIENT
 
-    ROUTER -.->|save_policy only| SIDE
-    SIDE -.->|atomic rewrite| POL
+    ROUTER -.->|write actions| SIDE
+    SIDE -.->|atomic writes| POL
 
     classDef sidecar stroke-dasharray: 4 3,fill:#fff8dc,color:#664;
 ```
@@ -998,7 +1319,7 @@ The cache is **single-slot** (LRU of size one) and lives entirely in `static` st
 3. `snapshot_load(repo, snap_id, &snap)` (`:144`) loads the new snapshot from disk.
 4. If `_cache_active`, install the new snapshot and call `_build_cached_tables()` (`:64–125`), which power-of-2-sizes both hash tables (start 32, double until ≥ load) and hashes node_ids with the FNV-1a-style `0x9E3779B97F4A7C15` mixer.
 
-The net effect: a viewer that opens a snapshot and then expands many directories pays the snapshot decompression cost **once**, and every subsequent `snap_dir_children` is constant-time work over already-resident memory.
+The net effect: a client that opens a snapshot and then expands many directories pays the snapshot decompression cost **once**, and every subsequent `snap_dir_children` is constant-time work over already-resident memory.
 
 ### Layer 4 — Action Handlers and Their Disk Paths
 
@@ -1120,13 +1441,17 @@ handle_global_pack_index
 
 | Artifact | Path | Touched by | Access pattern |
 |----------|------|------------|----------------|
-| Repo lock | `{repo}/lock` | every action (via `repo_lock_shared`) | `flock(LOCK_SH[\|LOCK_NB])` |
+| Repo lock | `{repo}/lock` | every action (via `repo_lock_shared`); task children take `LOCK_EX \| LOCK_NB` | `flock(LOCK_SH[\|LOCK_NB])` for sessions |
 | Snapshot files | `{repo}/snaps/snap-NNN.bin` | `snap`, `snap_header`, `snap_dir_children`, `ls`, `search`, `diff`, `list`, `repo_summary` | `read()`, decompress |
 | Loose objects | `{repo}/objects/XX/YYY…` | `object_content`, `object_locate`, `object_layout`, `loose_list`, `loose_stats` | `pread()` header + payload + parity |
 | Pack data | `{repo}/packs/pack-NNNNNNNN.dat` | `object_content` (fallback), `pack_entries`, `all_pack_entries`, `repo_stats`, `scan` | `fseeko()`+`read()`, trailer `pread()` |
 | Pack legacy idx | `{repo}/packs/pack-NNNNNNNN.idx` | `pack_index`, fallback `pack_cache_load()` | sequential read |
 | Global pack index | `{repo}/packs/pack-index.pidx` | `global_pack_index`, all packed-object lookups | `mmap(MAP_PRIVATE)` |
-| Tags / policy | `{repo}/tags/*`, `{repo}/policy.toml` | `tags`, `policy`, `save_policy` | direct file I/O |
+| Tags | `{repo}/tags/*` | `tags`, `tag_set`, `tag_delete`, `tag_rename` | direct file I/O; atomic rename for writes |
+| Policy | `{repo}/policy.toml` | `policy`, `save_policy` | direct read; atomic tmp+rename for writes |
+| Snapshot notes | `{repo}/notes/<snap-id>` | `note_get`, `note_set`, `note_delete`, `note_list` | direct file I/O |
+| Journal | `{repo}/logs/journal.jsonl` | every action (via wrapping start/complete writes); `journal` action reads | append-only; tail-read for `journal` queries |
+| Task status | `{repo}/.backup/tasks/<task-id>.json` | `task_start` (write), `task_list`/`task_status` (read), `task_cancel` (PID signal) | atomic tmp+rename for child writes; lock-free reads |
 
 ### Recap: a Single `object_content` Round-Trip
 

@@ -4,6 +4,7 @@
 
 | Date | Notes |
 |------|-------|
+| 2026-04-21 | Replace Python/Tkinter viewer with Electron desktop application (React 19 + TypeScript + Tailwind, Node.js 24 LTS / Electron 41). New features: connection management (local + SSH with sudo promotion, safeStorage credentials), multi-repo sessions, background task system (fork-and-detach run/gc/prune/pack/verify/restore), operation journal, snapshot notes, full tag CRUD from UI, crash signal handler. New RPC actions: `task_start`, `task_list`, `task_status`, `task_cancel`, `journal`, `tag_set`, `tag_delete`, `tag_rename`, `note_get`, `note_set`, `note_delete`, `note_list` |
 | 2026-04-06 | Snapshot V6 (`logical_bytes` in header), stats cache, snapshot path index (`.pidx`), `reindex-snaps` command, version system (`release_version`, `--version`, `last_accessed`/`last_written`), `--help`/`-h`, debug build target, parallel make, removed `doctor` command, viewer Help > About dialog, diagrams, manual reorder and RFC-style format diagrams, RPC reference (`rpc.md`) |
 | 2026-04-05 | Streaming RS parity (bounded-RAM `rs_parity_stream_t`), FUSE readahead ring (4×4 MiB), unified pack workers (per-thread packs), bounded-RAM GC copy, transient-error retry queue with multi-round retry, O_NOATIME, rotational disk detection, `migrate-v4` command, JSON RPC session mode |
 | 2026-04-02 | HDD I/O optimizations: global pack index, pack sharding, dynamic DAT cache, async writeback, inode-sorted scan, pack-worker hash sort, pack-ordered restore/verify, parity read consolidation, `reindex` and `migrate-packs` commands |
@@ -50,10 +51,16 @@
    - 6.6 Multi-Source Backup
 7. [Troubleshooting](#7-troubleshooting)
 8. [Environment Variables](#8-environment-variables)
-9. [Viewer GUI](#9-viewer-gui)
+9. [Electron UI](#9-electron-ui)
    - 9.1 Architecture
    - 9.2 Launching
-   - 9.3 Tab reference
+   - 9.3 Configuration and credential storage
+   - 9.4 Connection model
+   - 9.5 Repository model
+   - 9.6 Background task system
+   - 9.7 View reference
+   - 9.8 Write operations
+   - 9.9 Theming
 10. [Storage Model](#10-storage-model)
     - 10.1 Snapshot model
     - 10.2 Content-addressed object store
@@ -822,86 +829,228 @@ Thread count variables bypass the automatic media-type detection (HDD/SSD/FUSE) 
 
 ---
 
-## 9. Viewer GUI
+## 9. Electron UI
+
+The Electron application at `ui/` is the primary graphical interface to one or more c-backup repositories, local or remote. Unlike the retired Python viewer, it is read-write: it drives policy edits, tag/note CRUD, and long-running operations (backup run, gc, prune, pack, verify, restore) via the RPC action set documented in §23.
 
 ### 9.1 Architecture
 
-The viewer is a Python/Tkinter application at `tools/viewer/`. It communicates with the repository through the JSON RPC API (§23), which provides read-only access to all repository data. The RPC API is a general-purpose interface available to any third-party application; the viewer is the only built-in consumer. See §23 for the full protocol specification and action reference.
+The application uses Electron 41 on Node.js 24 LTS with a standard three-process layout:
 
-GUI components are completely separated from data access logic. The viewer is read-only; it makes no writes to the repository.
+| Process | Responsibilities | Source |
+|---------|------------------|--------|
+| **Main** | Connection manager (local spawn + SSH), RPC session/one-shot clients, LZ4 response decompression, safeStorage-backed credential store, IPC routing | `ui/src/main/` |
+| **Preload** | Context-bridge surface exposing a narrow `api` object to the renderer; no direct Node integration in the renderer | `ui/src/preload/` |
+| **Renderer** | React 19 + TypeScript UI styled with Tailwind CSS 4. Stateless with respect to repo data — everything flows through IPC to the main process. | `ui/src/renderer/` |
+| **Shared** | Connection, repo, task, journal, and note type definitions used by both ends of the IPC boundary | `ui/src/shared/` |
+
+The main process owns all I/O: spawning the local `backup` binary under `--json-session`, opening SSH channels via the `ssh2` npm package, and maintaining one RPC session per opened repo. The renderer is sandboxed and communicates exclusively through a thin `window.api.*` surface defined in the preload script.
+
+Response framing matches the RPC specification in §23.3: responses ≥ 256 bytes are LZ4-compressed with a 9-byte frame (0x00 magic, 4-byte uncompressed length, 4-byte compressed length, payload, trailing newline). The main-process client decodes these inline using `lz4js` before parsing the JSON.
+
+The session is a persistent subprocess per repo. It holds a non-blocking shared `flock` on `<repo>/lock`; if an exclusive writer (backup, gc, pack, prune) holds the lock when the session starts, the ready banner reports `"lock": false` and the UI shows a "stale view" indicator. Write operations do not use the session's lock: they are dispatched through `task_start`, which forks a detached child that acquires its own exclusive lock per the model in §10.4.
 
 ### 9.2 Launching
 
-```
-cd tools/viewer
-python -m viewer <optional-repo-path>
-```
-
-Or, from the project root:
+**Development build.** Requires Node.js 24 LTS and npm.
 
 ```
-python -m tools.viewer <optional-repo-path>
+cd ui
+npm install
+npm run dev
 ```
 
-The window opens at 1200×850 pixels. Use **File → Open Repository** to select a repository directory, or **File → Open Single File** to inspect an individual `.snap`, `.idx`, or `.dat` file without opening a full repository.
+`npm run dev` starts Vite in watch mode for the renderer, rebuilds the main/preload bundles on change, and launches Electron. The `ELECTRON_DISABLE_SANDBOX=1` environment variable is set in the `dev` script because the Vite dev server communicates with the main process over a local socket that the Electron sandbox can block on some distributions.
 
-### 9.3 Tab Reference
+**Production build.**
 
-**Overview**
+```
+cd ui
+npm run build
+```
 
-Displays a summary table of all snapshots: ID, creation time, node count, logical bytes, physical new bytes, GFS tier flags, tags, and whether the `.snap` file is present. Clicking a row navigates the Snapshots tab to that snapshot. Also shows high-level repository statistics (loose objects, pack files, total storage).
+This produces a distributable under `ui/out/`. Packaging into platform binaries (AppImage, deb, rpm) is handled separately via electron-builder; see `ui/package.json` scripts when added.
 
-**Analytics**
+**Type checking.** `npm run typecheck` runs `tsc --noEmit` over the full TypeScript source. The build will refuse to produce a bundle if typechecking fails.
 
-Three chart sections, each with a horizontal bar chart:
+### 9.3 Configuration and Credential Storage
 
-*Compressibility* — Two bars as percentages of total object count:
-- **Compressible** (solid bar, green): Objects stored with LZ4 compression or uncompressed objects without a skip marker (i.e., potentially compressible).
-- **Incompressible / skip-marked** (stacked bar, orange sections): Objects with `pack_skip_ver` set (skip-marked as incompressible) and packed objects whose `compressed_size / uncompressed_size ≥ 0.90` (high-ratio; nearly no compression benefit).
+Configuration is split across two files in the Electron userData directory (`~/.config/c-backup-ui/` on Linux by default):
 
-*Uncompressed size by type* — One bar per object type (file, sparse, xattr, ACL), height proportional to aggregate uncompressed bytes. Provides insight into what type of content dominates storage.
+| File | Contents | Encryption |
+|------|----------|------------|
+| `config.json` | Connection definitions (name, type, host, port, user, binary path, sudo flags), repo lists per connection, UI preferences (active repo, theme override) | Plain text |
+| `credentials.enc` | SSH passwords, sudo passwords, key-file passphrases | Encrypted via Electron `safeStorage` |
 
-*Pack vs. loose* — Three stacked bars showing the proportion of objects stored in packs, as loose objects, and as loose skip-marked objects. Useful for assessing whether a `backup pack` run is needed.
+`safeStorage` delegates to the OS keychain where available: `libsecret` on Linux, Keychain on macOS, DPAPI on Windows. On headless Linux hosts without a keyring service it falls back to a per-install machine-tied key, which is weaker but still prevents casual file-copy exfiltration.
 
-A text summary above the charts shows absolute counts and byte totals for each category.
+Secrets are never placed in `config.json`. Connection entries reference secrets by the connection ID; the credential store is consulted at connect time by the main process and the plaintext never crosses the IPC boundary into the renderer.
 
-**Search**
+Config export and import round-trip `config.json`. Users can choose whether to include secrets in the export; if included, the export file itself is encrypted against a user-supplied passphrase rather than against `safeStorage` (so it can be moved to another machine).
 
-Full-text search across all snapshot path names. Enter a substring or glob pattern to find which snapshots contain a given path. Clicking a result navigates directly to that path within the Snapshots tab.
+### 9.4 Connection Model
 
-**Diff**
+Connections are a first-class concept. A connection defines *how to reach a backup binary* — it is independent of any particular repository. Repositories live underneath connections in the sidebar tree.
 
-Select two snapshots and display a side-by-side diff of their path manifests. Change markers (`A`, `D`, `M`, `m`) match the CLI `backup diff` output.
+**Local connection.** Spawns the `backup` binary directly.
 
-**Snapshots**
+| Field | Purpose |
+|-------|---------|
+| `name` | User-defined label |
+| `binary_path` | Path to `backup` executable. Defaults to `backup` resolved through `PATH`. |
+| `sudo` | If enabled, wraps the binary invocation in `sudo -S` and feeds the sudo password from the credential store. Required when the repo is root-owned. |
 
-The main file browser. Select a snapshot from the left panel; the right panel shows the directory tree. Drill into directories, view file metadata (size, mode, uid, gid, mtime, hash). If LZ4 is installed, text file content can be previewed in a sub-pane.
+**SSH connection.** Opens an SSH channel via `ssh2` and runs the remote binary over that channel.
 
-Supports navigation from Search and Overview tabs.
+| Field | Purpose |
+|-------|---------|
+| `name` | User-defined label |
+| `host`, `port`, `user` | SSH endpoint |
+| `auth` | One of `key` (private key file), `password`, or `agent` (SSH agent socket) |
+| `remote_binary` | Path to `backup` on the remote host. Defaults to `backup` in the remote user's PATH. |
+| `sudo` | If enabled, wraps the remote binary in `sudo -S` using the sudo password from the credential store |
 
-**Loose**
+**Lifecycle.** Connections stay open for the lifetime of the application. Status is reported per-connection in the sidebar as a coloured dot:
 
-Lists all loose object files in the `objects/` directory. Shows hash, type, compression, skip-marker status, and sizes. Useful for monitoring how much data is awaiting packing.
+| Colour | Meaning |
+|--------|---------|
+| Green | Connected and healthy |
+| Grey | Disconnected (either not yet opened, or manually closed) |
+| Amber | Reconnecting after transient failure |
+| Red | Permanent error (auth failure, unreachable host, remote binary not found) |
 
-**Packs**
+Transient SSH failures trigger automatic reconnect with exponential backoff. Manual disconnect and reconnect are available via the connection's right-click menu.
 
-Lists all pack files. For each pack, shows the pack number, object count, `.dat` file size, and `.idx` file size. Selecting a pack expands its object list: hash, type, compression, uncompressed size, and compressed size for each entry.
+### 9.5 Repository Model
 
-**Tags**
+Repositories are added manually under a connection. The user provides a path; the main process validates that the path is a c-backup repo by issuing a one-shot `scan` RPC before persisting the entry.
 
-Lists all tags with their snapshot ID and preserve flag.
+Each opened repo holds its own `--json-session` subprocess. This means:
 
-**Lookup**
+- Opening *N* repos on one connection spawns *N* session processes (one `backup` binary each) under the same SSH channel or local shell.
+- Session caches (§23.4) are per-repo; switching repos in the sidebar does not invalidate any cache.
+- Closing a repo (right-click → Close) terminates only its session. Its tab state (active sub-view, scroll position, selections) is discarded.
+- Opening a repo is idempotent: if already open, clicking it in the sidebar switches the main content area to its existing session.
 
-Enter any SHA-256 hash (hex) to locate the object: reports whether it is loose or packed, which pack file (if packed), the object type, compression, and sizes. If LZ4 is installed and the object is small enough, the content is displayed.
+Repos persist across application restarts as part of `config.json`. The sidebar restores the tree on launch but does not auto-open sessions — the user clicks a repo to bring its session up, which avoids an N-way SSH fan-out on startup.
 
-**GFS Tree**
+### 9.6 Background Task System
 
-Displays all snapshots organized in a calendar hierarchy: year → month → individual snapshots. Each snapshot row is colour-coded by its highest GFS tier (yearly = amber, monthly = blue, weekly = green, daily = teal, untagged = grey). Columns show snap ID, date/time, GFS tier flags, node count, and physical new bytes. A summary line at the top reports tier counts across the entire repository.
+Long-running operations (backup run, gc, prune, pack, verify, restore) would die if run synchronously inside the RPC session: a dropped SSH channel, an app restart, or even a sidebar click that switched repos could interrupt them. Instead the UI dispatches these through `task_start` (§23.5), which fork-and-detaches a child process from the session handler.
 
-**Policy**
+**Execution model.**
 
-Displays the parsed `policy.toml` in a human-readable table.
+1. UI sends `task_start` with `{"command": "...", ...command-specific params}`.
+2. Session handler acquires the repo's exclusive lock non-blocking. If contended, the call fails immediately with a clear error.
+3. Session handler `fork()`s. The parent returns a `task_id`; the child calls `setsid()`, closes inherited FDs, and runs the operation.
+4. The child writes periodic status updates to `<repo>/.backup/tasks/<task-id>.json` via tmp+rename (atomic; readers see consistent snapshots).
+5. If the session dies, the child keeps running. On reconnect the UI re-reads the task directory and resumes monitoring.
+6. On completion the child writes a terminal status entry (success/failure/error), releases its lock, and exits. The journal (§9.7, Journal sub-view) records both start and completion.
+
+**Task status schema.** Each task's JSON file contains:
+
+| Field | Meaning |
+|-------|---------|
+| `task_id` | Opaque ID (timestamp-prefixed for ordering) |
+| `command` | `run`, `gc`, `prune`, `pack`, `verify`, or `restore` |
+| `pid` | Child process ID |
+| `started` | Unix timestamp |
+| `state` | `running`, `completed`, or `failed` |
+| `exit_code` | 0 on success, non-zero on failure |
+| `error` | Human-readable error message (set on failure) |
+| `progress.current`, `progress.total`, `progress.phase` | Progress reporting; populated by the child via the `child_progress_cb` callback |
+
+**Cancellation.** `task_cancel` sends SIGTERM to the child's PID. The child's signal handler releases the lock, writes a `failed` status entry, and exits. If the child dies uncleanly (SIGKILL, power loss), the next exclusive lock acquisition runs the existing crash-recovery path (prune-resume, tmp/ cleanup, pack-resume) and the orphaned task entry is flagged by the journal as crashed on the next `journal` query.
+
+**UI surfaces.** Two renderer components consume the task system:
+
+- **TaskBar** (bottom of the main content area) shows the currently-running task per repo with a live progress bar and phase string. Polls `task_list` every 2 seconds while at least one task is active.
+- **TaskListView** (sidebar quick-action) shows a full list of tasks (running first, then completed/failed by started-time descending) with per-task cancel buttons and error details.
+
+### 9.7 View Reference
+
+All views except the sidebar tree are scoped to a single active repo. The sidebar drives repo selection; clicking a repo switches the main content area.
+
+**Dashboard** (`RepoView.tsx`)
+
+Storage, snapshot count, compression, and GFS-tier coverage. Stat cards show last-backup timestamp (with age-based colouring: green < 24 h, amber 24 h–7 d, red > 7 d), HEAD snapshot ID, snapshot count, total logical/physical size, packed-vs-loose split, per-type (file/xattr/acl/sparse) size breakdown, and compressibility ratios. Toolbar hosts the quick-action buttons (Run Backup, Verify, GC, Pack). Data sources: `scan`, `list`, `repo_stats`, `loose_stats`, `global_pack_index`.
+
+**Snapshot Browser** (`SnapshotBrowser.tsx`)
+
+Primary snapshot exploration surface. Composed of:
+- *Header panel*: snapshot metadata (ID, version, creation time, node and dirent counts, GFS tier flags)
+- *Directory tree*: lazy-expand hierarchy via `snap_dir_children`. Double-click a file to open `ContentViewer`.
+- *Breadcrumb*: path resolution within the snapshot
+- *Notes panel*: inline editor tied to `note_get`/`note_set`/`note_delete`
+- *Context menu*: restore this file/directory, copy hash, show references (jumps to Hash Lookup), tag this snapshot
+
+**Snapshot List** (`SnapshotList.tsx`)
+
+Tabular snapshot view with sortable columns (ID, created, nodes, logical/physical size, GFS flags). Double-click a row to open it in the browser. Serves as the "pick a snapshot" entry point for the Diff view.
+
+**Snapshot Diff** (`SnapshotDiff.tsx`)
+
+Two-snapshot comparison using the `diff` RPC. Change codes from §23.5 (`A`/`D`/`M`/`C`) are colour-coded. Double-click a row to open a side-by-side content diff modal that pulls both sides via `object_content` with synchronised scroll.
+
+**File Search** (`FileSearch.tsx`)
+
+Cross-snapshot filename search via the `search` RPC. Toggleable between "HEAD only" and "all snapshots". Result rows show snap ID, path, type, size, and content hash; double-click jumps to that path in the Snapshot Browser.
+
+**Hash Lookup** (`HashLookup.tsx`)
+
+SHA-256 input box. On submit, runs `object_locate` to show type and size, then `object_refs` to enumerate every snapshot/node reference across the repo. Deep-link target for verify-result and Pack Browser click-throughs.
+
+**Pack Browser** (`PackBrowser.tsx`)
+
+Per-pack inspection: header metadata, entries table (`pack_entries`), index table (`pack_index`), and a paginated view of the global pack index (`global_pack_index`) with fanout distribution as a bar chart. No on-disk byte-map visualization (planned; see `ui-refresh.md` task 3.5).
+
+**Loose Objects** (`LooseObjects.tsx`)
+
+Paginated loose object list (`loose_list`) with per-object info (hash, type, compression, sizes, skip-marker status). Content preview sub-panel (first 2 MiB as hex dump or decompressed text) when a row is selected.
+
+**Tags** (`TagsView.tsx`)
+
+Tag CRUD. Creates, renames, and deletes via `tag_set` / `tag_rename` / `tag_delete`. The preserve flag is editable per tag. Empty state drives a create-tag prompt.
+
+**Policy Editor** (`PolicyEditor.tsx`)
+
+Full read-write editor for `policy.toml`. Edits buffer locally until Save is pressed; Save dispatches a single `save_policy` RPC with the changed fields. Fields: source paths, exclusions, retention (keep_snaps/keep_daily/keep_weekly/keep_monthly/keep_yearly), automation flags (auto_pack, auto_gc, auto_prune, verify_after, strict_meta).
+
+**Journal** (`JournalView.tsx`)
+
+Filterable, paginated operation history. Wraps the `journal` RPC with UI controls for `operation`, `result`, `since`, and `state` filters. Each row shows timestamp, operation, source (`cli` or `ui`), user, duration, and a per-operation summary payload. Crash entries (result = `crash`) are flagged red with signal number. Orphaned start-entries (started but no matching completion) are marked as inferred crashes.
+
+**Task List** (`TaskListView.tsx`)
+
+See §9.6. Covers both active and completed tasks, with cancel and error-surfacing.
+
+**Content Viewer** (`ContentViewer.tsx`)
+
+Shared modal used by the Snapshot Browser, Diff view, and Pack/Loose browsers to render object bytes. Auto-detects text vs binary; binary is rendered as a hex dump. LZ4 and LZ4-frame compressed content is decompressed client-side in the main process before being handed to the renderer.
+
+### 9.8 Write Operations
+
+Every write path in the UI is explicit about its risk profile:
+
+| Operation | RPC action(s) | Lock requirement | Reversibility |
+|-----------|---------------|------------------|---------------|
+| Edit policy | `save_policy` | None (atomic sidecar rewrite) | Previous policy is not preserved; export before editing for backup |
+| Create/rename/delete tag | `tag_set`, `tag_rename`, `tag_delete` | None | Deletions are immediate; not undoable |
+| Set/delete snapshot note | `note_set`, `note_delete` | None | Deletions are immediate; not undoable |
+| Run backup | `task_start` command=`run` | Exclusive (in fork-and-detach child) | Produces a new snapshot; no rollback |
+| Verify repo | `task_start` command=`verify` (+ `repair` flag planned) | Exclusive | Read-only unless `repair` is set |
+| Garbage collect | `task_start` command=`gc` | Exclusive | Deletes unreferenced objects; not undoable |
+| Pack | `task_start` command=`pack` | Exclusive | Moves loose objects into packs; reversible by unpack (not exposed in UI) |
+| Prune | `task_start` command=`prune` | Exclusive | Deletes snapshots per GFS policy; not undoable |
+| Restore | `task_start` command=`restore` | Exclusive | Writes to a destination path; does not modify the repo itself |
+
+Destructive actions (`tag_delete`, `note_delete`, `prune`, `gc`) prompt for explicit confirmation in the renderer before the RPC is dispatched.
+
+### 9.9 Theming
+
+The UI follows the OS theme preference by default (`prefers-color-scheme`). A manual override is available in the application settings; the chosen theme is persisted in `config.json` and applied at launch before the first paint to avoid flash.
+
+Colour palette is a muted professional scheme: slate greys for structural surfaces, desaturated blue for primary accents, amber for warnings, and a muted red for errors and destructive actions. Tailwind CSS 4 drives the theme via a custom palette in `ui/src/renderer/index.css`; theme classes are toggled via a `data-theme` attribute on the document root.
 
 ---
 
@@ -2507,7 +2656,7 @@ The combination of `pathmap_build` + `pathmap_lookup` reduces change detection f
 
 ## 23. JSON RPC API
 
-The JSON RPC API (`src/json_api.c`) provides programmatic access to repository data. It is the communication channel used by the Viewer GUI and is available to any third-party application. For the complete action-by-action reference with request/response examples, see [rpc.md](rpc.md).
+The JSON RPC API (`src/api/json_api.c`) provides programmatic access to repository data and is the communication channel used by the Electron UI (§9). It is available to any third-party application. For the complete action-by-action reference with request/response examples, see [rpc.md](rpc.md).
 
 ### 23.1 Modes of Operation
 
