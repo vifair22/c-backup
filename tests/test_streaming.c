@@ -212,14 +212,14 @@ static void test_pipeline_large_file_roundtrip(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
 
     assert_int_equal(mkdir(TEST_DEST, 0755), 0);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char restored[512];
     snprintf(restored, sizeof(restored), "%s%s/big.bin", TEST_DEST, TEST_SRC);
@@ -273,11 +273,11 @@ static void test_stream_incremental_mixed_sizes(void **state) {
     create_prng_file(TEST_SRC "/big.bin", 17u * 1024u * 1024u);
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     assert_int_equal(mkdir(TEST_DEST, 0755), 0);
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
 
     char restored[512];
     snprintf(restored, sizeof(restored), "%s%s/big.bin", TEST_DEST, TEST_SRC);
@@ -324,10 +324,10 @@ static void test_pack_cache_reload_after_operations(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     pack_cache_invalidate(repo);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* Pack a large compressible file (>16 MiB) — exercises repo_pack's large
@@ -346,12 +346,12 @@ static void test_pack_large_compressible_file(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
 
     /* Verify the packed data is intact */
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
 
     /* Stream-load from pack — exercises pack_object_load_stream LZ4_FRAME path */
@@ -394,10 +394,10 @@ static void test_pack_large_compressible_restore(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     assert_int_equal(mkdir(TEST_DEST, 0755), 0);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char restored[512];
     snprintf(restored, sizeof(restored), "%s%s/large_restore.txt", TEST_DEST, TEST_SRC);
@@ -440,7 +440,7 @@ static void test_pack_small_lz4_stream_load(void **state) {
 
     /* Pack — compresses small objects with LZ4 block API */
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
 
     /* Loose object is now deleted; stream-load goes through pack LZ4 path */
@@ -505,7 +505,7 @@ static void test_pack_large_lz4frame_content_verify(void **state) {
     assert_true(found);
 
     /* Pack — large compressible objects get LZ4_FRAME */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Stream-load from pack to temp file */
     char outpath[] = "/tmp/c_backup_stream_lz4f_XXXXXX";
@@ -549,15 +549,15 @@ static void test_pack_mixed_lz4_lz4frame(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
 
     /* Restore and verify both files */
     assert_int_equal(mkdir(TEST_DEST, 0755), 0);
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     char small_path[512], large_path[512];
     snprintf(small_path, sizeof(small_path), "%s%s/mix_small.txt", TEST_DEST, TEST_SRC);
@@ -621,7 +621,7 @@ static void test_pack_incompressible_skip_marker(void **state) {
     assert_int_equal(ohdr.pack_skip_ver, 0);
 
     /* Pack — the probe should detect incompressibility and write skip marker */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Object should still be loose (not packed) with skip marker set */
     assert_int_equal(stat(obj_path, &st), 0);  /* still exists */
@@ -633,7 +633,7 @@ static void test_pack_incompressible_skip_marker(void **state) {
     assert_int_equal(ohdr.pack_skip_ver, PROBER_VERSION);
 
     /* Second pack should skip this object entirely (line 2082) */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
     assert_int_equal(stat(obj_path, &st), 0);  /* still loose */
 }
 
@@ -678,7 +678,7 @@ static void test_pack_incompressible_skip_marker_worker(void **state) {
              repo_path(repo), hex, hex + 2);
 
     /* Pack — worker probe should detect incompressibility */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Object should still be loose with skip marker set */
     struct stat st;

@@ -2,6 +2,7 @@
 
 #include "error.h"
 #include "repo.h"
+#include "task.h"
 
 /*
  * Run a full backup of source_paths[] into repo.
@@ -17,6 +18,8 @@ typedef struct {
     int          verbose;      /* verbose warnings (e.g., list skipped unreadable paths) */
     int          verify_after; /* verify all objects exist after committing snapshot */
     int          strict_meta;  /* force full xattr/ACL metadata detection each run */
+    task_progress_fn progress; /* optional progress callback (may be NULL) */
+    void        *progress_ctx;
 } backup_opts_t;
 
 status_t backup_run_opts(repo_t *repo, const char **source_paths, int path_count,

@@ -105,7 +105,7 @@ static int setup(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
     return 0;
 }
 
@@ -289,7 +289,7 @@ static void test_repo_verify_detects_corrupt_packed_object(void **state) {
     void *data = NULL;
     size_t sz = 0;
     assert_int_equal(object_load(repo, hash, &data, &sz, NULL), ERR_CORRUPT);
-    assert_int_equal(repo_verify(repo, NULL), ERR_CORRUPT);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), ERR_CORRUPT);
 }
 
 static void test_repo_verify_detects_missing_pack_data_file(void **state) {
@@ -304,7 +304,7 @@ static void test_repo_verify_detects_missing_pack_data_file(void **state) {
     void *data = NULL;
     size_t sz = 0;
     assert_int_equal(object_load(repo, hash, &data, &sz, NULL), ERR_IO);
-    assert_int_equal(repo_verify(repo, NULL), ERR_CORRUPT);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), ERR_CORRUPT);
 }
 
 static void test_pack_object_physical_size_success_and_invalid(void **state) {
@@ -431,7 +431,7 @@ static void test_repo_gc_coalesces_small_packs_and_records_head(void **state) {
     assert_int_equal(before, 10);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
 
     int after = count_pack_dat_files();
     assert_true(after < before);
@@ -440,11 +440,11 @@ static void test_repo_gc_coalesces_small_packs_and_records_head(void **state) {
 static void test_repo_gc_skips_second_coalesce_when_snapshot_gap_is_small(void **state) {
     (void)state;
     clone_base_pack(9);
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     int before_second_gc = count_pack_dat_files();
 
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     int after_second_gc = count_pack_dat_files();
     assert_int_equal(after_second_gc, before_second_gc);
@@ -459,7 +459,7 @@ static void test_repo_gc_deletes_unreferenced_loose_object(void **state) {
     assert_true(object_exists(repo, hash));
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
 
     assert_true(deleted >= 1);
     assert_false(object_exists(repo, hash));
@@ -481,12 +481,12 @@ static void test_pack_many_small_objects(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
     assert_int_equal(restore_verify_dest(repo, 1, TEST_DEST), OK);
 }
 
@@ -498,11 +498,11 @@ static void test_pack_empty_file_roundtrip(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 1, TEST_DEST, NULL, NULL), OK);
 
     struct stat st;
     assert_int_equal(stat(TEST_DEST TEST_SRC "/empty_packed.bin", &st), 0);
@@ -516,10 +516,10 @@ static void test_pack_cache_invalidate_reload(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     pack_cache_invalidate(repo);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     pack_cache_invalidate(repo);
 
@@ -552,19 +552,19 @@ static void test_pack_gc_removes_dead_entries(void **state) {
 
     unlink(TEST_SRC "/doomed.txt");
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     assert_int_equal(snapshot_delete(repo, 1), OK);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
 
-    assert_int_equal(repo_pack(repo, NULL), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 
     int rc = system("mkdir -p " TEST_DEST);
     (void)rc;
-    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST), OK);
+    assert_int_equal(restore_snapshot(repo, 2, TEST_DEST, NULL, NULL), OK);
     verify_file_matches(TEST_DEST TEST_SRC "/alive.txt", "alive\n", 6);
 }
 
@@ -587,18 +587,18 @@ static void test_gc_partial_rewrite(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     /* Pack all */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Delete snap 1 → dead.txt's object becomes unreferenced */
     assert_int_equal(snapshot_delete(repo, 1), OK);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
     assert_true(deleted > 0);
     assert_true(kept > 0);
 
     /* Verify surviving objects */
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* GC all dead → entire pack deleted (nothing survives) */
@@ -616,18 +616,18 @@ static void test_gc_all_dead_deletes(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     /* Pack snap 1's objects separately */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Delete snap 1 */
     assert_int_equal(snapshot_delete(repo, 1), OK);
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
 
     /* All of snap 1's unique objects should be gone */
     assert_true(deleted > 0);
 
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* GC all live → pack untouched */
@@ -639,18 +639,18 @@ static void test_gc_all_live_no_rewrite(void **state) {
     write_file(TEST_SRC "/f2.txt", "file two\n", 9);
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     int packs_before = count_pack_dat_files();
 
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
     assert_int_equal((int)deleted, 0);
 
     int packs_after = count_pack_dat_files();
     assert_int_equal(packs_before, packs_after);
 
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* repo_pack with no loose objects → early return */
@@ -659,7 +659,7 @@ static void test_pack_no_loose_early_exit(void **state) {
 
     /* Already packed in setup — no loose objects */
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_int_equal((int)packed, 0);
 }
 
@@ -687,7 +687,7 @@ static void test_pack_object_load_after_gc(void **state) {
     const char *extra = "unreferenced-data-for-gc";
     uint8_t extra_h[OBJECT_HASH_SIZE];
     assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, extra, strlen(extra), extra_h), OK);
-    assert_int_equal(repo_gc(repo, NULL, NULL), OK);
+    assert_int_equal(repo_gc(repo, NULL, NULL, NULL, NULL), OK);
 
     /* Original packed object must still load */
     void *data = NULL;
@@ -706,7 +706,7 @@ static void test_lz4_compressed_roundtrip(void **state) {
 
     const char *paths[] = { TEST_SRC };
     assert_int_equal(backup_run(repo, paths, 1), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Find the hash of the compressible file */
     snapshot_t *snap = NULL;
@@ -761,12 +761,12 @@ static void test_pack_with_custom_thread_count(void **state) {
     /* Set env var to trigger the parsing path */
     setenv("CBACKUP_PACK_THREADS", "2", 1);
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
     unsetenv("CBACKUP_PACK_THREADS");
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
 }
 
 
@@ -801,12 +801,12 @@ static void test_pack_incompressible_skip_markers(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
 
     /* Verify everything is loadable */
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
     assert_true(vopts.objects_checked > 0);
 }
 
@@ -847,16 +847,16 @@ static void test_pack_mixed_compress_skip(void **state) {
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
 
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
 
     /* Pack again — should be no-op (no loose objects left) */
     uint32_t packed2 = 0;
-    assert_int_equal(repo_pack(repo, &packed2), OK);
+    assert_int_equal(repo_pack(repo, &packed2, NULL, NULL), OK);
     assert_int_equal(packed2, 0);
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
 }
 
 /* Pack + GC cycle with partial rewrite then verify all remaining
@@ -872,7 +872,7 @@ static void test_gc_partial_then_stream_load(void **state) {
     const char *paths[] = { TEST_SRC };
     backup_opts_t opts = { .quiet = 1 };
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 
     /* Create snapshot 2 without b.txt */
     unlink(TEST_SRC "/b.txt");
@@ -881,7 +881,7 @@ static void test_gc_partial_then_stream_load(void **state) {
     /* Delete snapshot 1, GC → b's object becomes dead → partial rewrite */
     assert_int_equal(snapshot_delete(repo, 1), OK);
     uint32_t kept = 0, deleted = 0;
-    assert_int_equal(repo_gc(repo, &kept, &deleted), OK);
+    assert_int_equal(repo_gc(repo, &kept, &deleted, NULL, NULL), OK);
 
     /* Stream-load all remaining objects from snapshot 2 */
     snapshot_t *snap = NULL;
@@ -915,7 +915,7 @@ static void test_pack_with_invalid_thread_env(void **state) {
     /* Non-numeric value → strtol parse fails, fallback to sysconf */
     setenv("CBACKUP_PACK_THREADS", "abc", 1);
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
 
     /* Zero → v <= 0, also falls through */
@@ -924,12 +924,12 @@ static void test_pack_with_invalid_thread_env(void **state) {
     write_compressible_file(TEST_SRC "/inv_thread2.txt", 4096);
     assert_int_equal(backup_run_opts(repo, paths, 1, &opts), OK);
     packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
 
     unsetenv("CBACKUP_PACK_THREADS");
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
 }
 
 /* Exercises the PACK_WORKER_THREADS_MAX cap branch (line 375 of pack.c). */
@@ -944,12 +944,12 @@ static void test_pack_with_thread_count_capped(void **state) {
     /* 999 > PACK_WORKER_THREADS_MAX (32) → capped */
     setenv("CBACKUP_PACK_THREADS", "999", 1);
     uint32_t packed = 0;
-    assert_int_equal(repo_pack(repo, &packed), OK);
+    assert_int_equal(repo_pack(repo, &packed, NULL, NULL), OK);
     assert_true(packed > 0);
     unsetenv("CBACKUP_PACK_THREADS");
 
     verify_opts_t vopts = {0};
-    assert_int_equal(repo_verify(repo, &vopts), OK);
+    assert_int_equal(repo_verify(repo, &vopts, NULL, NULL), OK);
 }
 
 /* Create a v1 pack file manually and verify objects can be loaded from it.
@@ -1149,7 +1149,7 @@ static void test_pack_worker_corrupt_truncated_object(void **state) {
     assert_int_equal(truncate(loose, (off_t)sizeof(object_header_t)), 0);
 
     /* Pack should fail because worker can't read the full payload */
-    status_t pack_st = repo_pack(repo, NULL);
+    status_t pack_st = repo_pack(repo, NULL, NULL, NULL);
     /* The worker sets ERR_CORRUPT; repo_pack may return ERR_CORRUPT or ERR_IO */
     assert_true(pack_st != OK);
 }
@@ -1177,7 +1177,7 @@ static void test_pack_worker_missing_object_skipped(void **state) {
     assert_int_equal(unlink(loose), 0);
 
     /* Pack should succeed, just with fewer objects packed */
-    assert_int_equal(repo_pack(repo, NULL), OK);
+    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
 }
 
 /* ================================================================== */

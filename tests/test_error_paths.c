@@ -195,7 +195,7 @@ static void test_snapshot_delete_verify(void **state) {
     assert_int_equal(backup_run(repo, paths, 1), OK);
 
     assert_int_equal(snapshot_delete(repo, 1), OK);
-    assert_int_equal(repo_verify(repo, NULL), OK);
+    assert_int_equal(repo_verify(repo, NULL, NULL, NULL), OK);
 }
 
 /* ================================================================== */

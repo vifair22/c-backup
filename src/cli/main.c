@@ -4,6 +4,7 @@
 #include "cmd.h"
 #include "help.h"
 #include "json_api.h"
+#include "journal.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -145,8 +146,10 @@ int main(int argc, char *argv[]) {
     set_topic(cmd);
 
     /* No-repo commands handle their own --help and --repo parsing. */
-    if (entry->no_repo)
+    if (entry->no_repo) {
+        /* No repo available — journal to a temp handle if we can, otherwise skip. */
         return entry->no_repo(argc, argv);
+    }
 
     /* Top-level --help for simple (non-dispatcher) commands. */
     if (has_help_flag(argc, argv, 2) && !is_dispatcher(cmd)) {
@@ -168,7 +171,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    journal_op_t *jop = journal_start(repo, cmd, JOURNAL_SOURCE_CLI);
+
     int ret = entry->with_repo(repo, argc, argv);
+
+    journal_complete(jop,
+                     ret == 0 ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, ret != 0 ? err_msg() : NULL, NULL);
+
     repo_close(repo);
     return ret;
 }

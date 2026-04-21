@@ -3,6 +3,7 @@
 #include "cmd_common.h"
 #include "cli.h"
 #include "help.h"
+#include "journal.h"
 #include "repo.h"
 #include "tag.h"
 #include "xfer.h"
@@ -79,11 +80,15 @@ int cmd_export(repo_t *repo, int argc, char **argv) {
         }
     }
 
+    journal_op_t *jop = journal_start(repo, "export", JOURNAL_SOURCE_CLI);
+
     if (fmt_tar) {
         status_t st = export_snapshot_targz(repo, snap_id, output);
         if (st != OK)
             fprintf(stderr, "error: %s\n",
                     err_msg()[0] ? err_msg() : "export failed");
+        journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                         NULL, st != OK ? err_msg() : NULL, NULL);
         return st == OK ? 0 : 1;
     }
 
@@ -92,6 +97,8 @@ int cmd_export(repo_t *repo, int argc, char **argv) {
     if (st != OK)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "export failed");
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, st != OK ? err_msg() : NULL, NULL);
     return st == OK ? 0 : 1;
 }
 
@@ -111,13 +118,17 @@ int cmd_import(repo_t *repo, int argc, char **argv) {
         return 1;
     }
 
+    journal_op_t *jop = journal_start(repo, "import", JOURNAL_SOURCE_CLI);
+
     if (dry_run) lock_shared(repo);
-    else if (lock_or_die(repo)) return 1;
+    else if (lock_or_die(repo)) { journal_complete(jop, JOURNAL_RESULT_FAILED, NULL, "lock contention", NULL); return 1; }
 
     status_t st = import_bundle(repo, input, dry_run, no_head_update, quiet);
     if (st != OK && !quiet)
         fprintf(stderr, "error: %s\n",
                 err_msg()[0] ? err_msg() : "import failed");
+    journal_complete(jop, st == OK ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, st != OK ? err_msg() : NULL, NULL);
     return st == OK ? 0 : 1;
 }
 

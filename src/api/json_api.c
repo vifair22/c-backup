@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "json_api.h"
 #include "error.h"
+#include "journal.h"
 #include "diff.h"
 #include "ls.h"
 #include "object.h"
@@ -11,6 +12,10 @@
 #include "repo.h"
 #include "snapshot.h"
 #include "stats.h"
+#include "notes.h"
+#include "tag.h"
+#include "task.h"
+#include "journal.h"
 #include "types.h"
 #include "../vendor/cJSON.h"
 
@@ -624,6 +629,9 @@ static cJSON *handle_snap_dir_children(repo_t *repo, const cJSON *params)
                         cJSON_AddNumberToObject(child, "type", nd->type);
                         cJSON_AddNumberToObject(child, "size", (double)nd->size);
                         cJSON_AddNumberToObject(child, "mode", nd->mode);
+                        char hex[65];
+                        hash_hex(nd->content_hash, hex);
+                        cJSON_AddStringToObject(child, "content_hash", hex);
                     }
                 }
 
@@ -708,6 +716,60 @@ static cJSON *handle_tags(repo_t *repo, const cJSON *params)
         cJSON_AddItemToArray(arr, tag);
     }
     closedir(dir);
+    return d;
+}
+
+/* --- tag_set ------------------------------------------------------ */
+static cJSON *handle_tag_set(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jname = cJSON_GetObjectItemCaseSensitive(params, "name");
+    const cJSON *jsnap = cJSON_GetObjectItemCaseSensitive(params, "snap_id");
+    if (!cJSON_IsString(jname) || !cJSON_IsNumber(jsnap)) {
+        set_error(ERR_INVALID, "tag_set: missing 'name' or 'snap_id'");
+        return NULL;
+    }
+    int preserve = 0;
+    const cJSON *jpres = cJSON_GetObjectItemCaseSensitive(params, "preserve");
+    if (cJSON_IsBool(jpres)) preserve = cJSON_IsTrue(jpres);
+
+    status_t st = tag_set(repo, jname->valuestring, (uint32_t)jsnap->valuedouble, preserve);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "saved", 1);
+    return d;
+}
+
+/* --- tag_delete --------------------------------------------------- */
+static cJSON *handle_tag_delete(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jname = cJSON_GetObjectItemCaseSensitive(params, "name");
+    if (!cJSON_IsString(jname)) {
+        set_error(ERR_INVALID, "tag_delete: missing 'name'");
+        return NULL;
+    }
+    status_t st = tag_delete(repo, jname->valuestring);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "deleted", 1);
+    return d;
+}
+
+/* --- tag_rename --------------------------------------------------- */
+static cJSON *handle_tag_rename(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jold = cJSON_GetObjectItemCaseSensitive(params, "old_name");
+    const cJSON *jnew = cJSON_GetObjectItemCaseSensitive(params, "new_name");
+    if (!cJSON_IsString(jold) || !cJSON_IsString(jnew)) {
+        set_error(ERR_INVALID, "tag_rename: missing 'old_name' or 'new_name'");
+        return NULL;
+    }
+    status_t st = tag_rename(repo, jold->valuestring, jnew->valuestring);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "renamed", 1);
     return d;
 }
 
@@ -2277,6 +2339,258 @@ static cJSON *handle_repo_summary(repo_t *repo, const cJSON *params)
     return d;
 }
 
+/* --- task_start --------------------------------------------------- */
+static cJSON *handle_task_start(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(params, "command");
+    if (!cJSON_IsString(jcmd) || !jcmd->valuestring[0]) {
+        set_error(ERR_INVALID, "task_start: missing 'command' param");
+        return NULL;
+    }
+
+    task_cmd_t cmd = task_cmd_from_str(jcmd->valuestring);
+
+    char task_id[64];
+    status_t st = task_start(repo, cmd, params, task_id, sizeof(task_id));
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "task_id", task_id);
+    return d;
+}
+
+/* --- task_list ---------------------------------------------------- */
+static cJSON *handle_task_list(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    task_info_t *tasks = NULL;
+    int count = 0;
+    status_t st = task_list_all(repo, &tasks, &count);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(d, "tasks");
+
+    for (int i = 0; i < count; i++) {
+        const task_info_t *t = &tasks[i];
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "task_id", t->task_id);
+        cJSON_AddStringToObject(item, "command", task_cmd_str(t->command));
+        cJSON_AddNumberToObject(item, "pid", (double)t->pid);
+        cJSON_AddNumberToObject(item, "started", (double)t->started);
+        cJSON_AddStringToObject(item, "state", task_state_str(t->state));
+        cJSON_AddNumberToObject(item, "exit_code", t->exit_code);
+        if (t->error[0])
+            cJSON_AddStringToObject(item, "error", t->error);
+        cJSON_AddBoolToObject(item, "alive", task_is_alive(t));
+
+        cJSON *prog = cJSON_AddObjectToObject(item, "progress");
+        cJSON_AddNumberToObject(prog, "current", (double)t->progress_current);
+        cJSON_AddNumberToObject(prog, "total", (double)t->progress_total);
+        if (t->progress_phase[0])
+            cJSON_AddStringToObject(prog, "phase", t->progress_phase);
+
+        cJSON_AddItemToArray(arr, item);
+    }
+    free(tasks);
+    return d;
+}
+
+/* --- task_status -------------------------------------------------- */
+static cJSON *handle_task_status(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "task_id");
+    if (!cJSON_IsString(jid) || !jid->valuestring[0]) {
+        set_error(ERR_INVALID, "task_status: missing 'task_id' param");
+        return NULL;
+    }
+
+    task_info_t info;
+    status_t st = task_status_read(repo, jid->valuestring, &info);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "task_id", info.task_id);
+    cJSON_AddStringToObject(d, "command", task_cmd_str(info.command));
+    cJSON_AddNumberToObject(d, "pid", (double)info.pid);
+    cJSON_AddNumberToObject(d, "started", (double)info.started);
+    cJSON_AddStringToObject(d, "state", task_state_str(info.state));
+    cJSON_AddNumberToObject(d, "exit_code", info.exit_code);
+    if (info.error[0])
+        cJSON_AddStringToObject(d, "error", info.error);
+    cJSON_AddBoolToObject(d, "alive", task_is_alive(&info));
+
+    cJSON *prog = cJSON_AddObjectToObject(d, "progress");
+    cJSON_AddNumberToObject(prog, "current", (double)info.progress_current);
+    cJSON_AddNumberToObject(prog, "total", (double)info.progress_total);
+    if (info.progress_phase[0])
+        cJSON_AddStringToObject(prog, "phase", info.progress_phase);
+
+    return d;
+}
+
+/* --- task_cancel -------------------------------------------------- */
+static cJSON *handle_task_cancel(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "task_id");
+    if (!cJSON_IsString(jid) || !jid->valuestring[0]) {
+        set_error(ERR_INVALID, "task_cancel: missing 'task_id' param");
+        return NULL;
+    }
+
+    status_t st = task_cancel(repo, jid->valuestring);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "cancelled", 1);
+    return d;
+}
+
+/* --- journal ------------------------------------------------------ */
+static cJSON *handle_journal(repo_t *repo, const cJSON *params)
+{
+    journal_query_t q = {0};
+
+    if (params) {
+        const cJSON *j;
+        j = cJSON_GetObjectItemCaseSensitive(params, "offset");
+        if (cJSON_IsNumber(j)) q.offset = (int)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(params, "limit");
+        if (cJSON_IsNumber(j)) q.limit = (int)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(params, "operation");
+        if (cJSON_IsString(j)) q.operation = j->valuestring;
+        j = cJSON_GetObjectItemCaseSensitive(params, "result");
+        if (cJSON_IsString(j)) q.result = j->valuestring;
+        j = cJSON_GetObjectItemCaseSensitive(params, "since");
+        if (cJSON_IsString(j)) q.since = j->valuestring;
+        j = cJSON_GetObjectItemCaseSensitive(params, "state");
+        if (cJSON_IsString(j)) q.state = j->valuestring;
+    }
+
+    /* Default limit to prevent unbounded reads. */
+    if (q.limit <= 0) q.limit = 100;
+
+    journal_entry_t *entries = NULL;
+    int count = 0;
+    status_t st = journal_query(repo, &q, &entries, &count);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(d, "entries");
+    cJSON_AddNumberToObject(d, "count", count);
+
+    for (int i = 0; i < count; i++) {
+        const journal_entry_t *e = &entries[i];
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "op_id", e->op_id);
+        cJSON_AddStringToObject(item, "state", e->state);
+        cJSON_AddStringToObject(item, "timestamp", e->timestamp);
+        cJSON_AddStringToObject(item, "operation", e->operation);
+        if (e->source[0])
+            cJSON_AddStringToObject(item, "source", e->source);
+        if (e->user[0])
+            cJSON_AddStringToObject(item, "user", e->user);
+        if (e->result[0])
+            cJSON_AddStringToObject(item, "result", e->result);
+        if (e->state[0] == 'c')  /* completed entries always have duration */
+            cJSON_AddNumberToObject(item, "duration_ms", (double)e->duration_ms);
+        if (e->error[0])
+            cJSON_AddStringToObject(item, "error", e->error);
+        if (e->task_id[0])
+            cJSON_AddStringToObject(item, "task_id", e->task_id);
+        if (e->signal_num > 0)
+            cJSON_AddNumberToObject(item, "signal", e->signal_num);
+        if (e->summary_json[0]) {
+            cJSON *summary = cJSON_Parse(e->summary_json);
+            if (summary)
+                cJSON_AddItemToObject(item, "summary", summary);
+        }
+        cJSON_AddItemToArray(arr, item);
+    }
+    free(entries);
+
+    /* Also include orphan count for health dashboard. */
+    journal_entry_t *orphans = NULL;
+    int orphan_count = 0;
+    if (journal_orphans(repo, &orphans, &orphan_count) == OK) {
+        cJSON_AddNumberToObject(d, "orphan_count", orphan_count);
+        free(orphans);
+    }
+
+    return d;
+}
+
+/* --- note_get ----------------------------------------------------- */
+static cJSON *handle_note_get(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
+    if (!cJSON_IsNumber(jid)) {
+        set_error(ERR_INVALID, "note_get: missing 'id' (snap_id)");
+        return NULL;
+    }
+    char buf[4096];
+    status_t st = note_get(repo, (uint32_t)jid->valuedouble, buf, sizeof(buf));
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "text", buf);
+    return d;
+}
+
+/* --- note_set ----------------------------------------------------- */
+static cJSON *handle_note_set(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
+    const cJSON *jtext = cJSON_GetObjectItemCaseSensitive(params, "text");
+    if (!cJSON_IsNumber(jid) || !cJSON_IsString(jtext)) {
+        set_error(ERR_INVALID, "note_set: missing 'id' or 'text'");
+        return NULL;
+    }
+    status_t st = note_set(repo, (uint32_t)jid->valuedouble, jtext->valuestring);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "saved", 1);
+    return d;
+}
+
+/* --- note_delete -------------------------------------------------- */
+static cJSON *handle_note_delete(repo_t *repo, const cJSON *params)
+{
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(params, "id");
+    if (!cJSON_IsNumber(jid)) {
+        set_error(ERR_INVALID, "note_delete: missing 'id'");
+        return NULL;
+    }
+    status_t st = note_delete(repo, (uint32_t)jid->valuedouble);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddBoolToObject(d, "deleted", 1);
+    return d;
+}
+
+/* --- note_list ---------------------------------------------------- */
+static cJSON *handle_note_list(repo_t *repo, const cJSON *params)
+{
+    (void)params;
+    note_entry_t *entries = NULL;
+    int count = 0;
+    status_t st = note_list(repo, &entries, &count);
+    if (st != OK) return NULL;
+
+    cJSON *d = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(d, "notes");
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "snap_id", entries[i].snap_id);
+        cJSON_AddStringToObject(item, "text", entries[i].text);
+        cJSON_AddItemToArray(arr, item);
+    }
+    free(entries);
+    return d;
+}
+
 /* ------------------------------------------------------------------ */
 /* Dispatch table                                                      */
 /* ------------------------------------------------------------------ */
@@ -2313,6 +2627,18 @@ static const action_entry_t actions[] = {
     { "object_layout",        handle_object_layout },
     { "global_pack_index",    handle_global_pack_index },
     { "repo_summary",         handle_repo_summary },
+    { "task_start",           handle_task_start },
+    { "task_list",            handle_task_list },
+    { "task_status",          handle_task_status },
+    { "task_cancel",          handle_task_cancel },
+    { "journal",              handle_journal },
+    { "tag_set",              handle_tag_set },
+    { "tag_delete",           handle_tag_delete },
+    { "tag_rename",           handle_tag_rename },
+    { "note_get",             handle_note_get },
+    { "note_set",             handle_note_set },
+    { "note_delete",          handle_note_delete },
+    { "note_list",            handle_note_list },
     { NULL, NULL }
 };
 
@@ -2361,11 +2687,22 @@ int json_api_dispatch(repo_t *repo)
         return 0;  /* protocol ok, action not found */
     }
 
-    /* Acquire shared lock for read-only access */
+    const char *action_name = jaction->valuestring;
+    journal_op_t *jop = journal_start(repo, action_name, JOURNAL_SOURCE_UI);
+
+    /* Acquire shared lock for read-only access — released after each call
+     * so background tasks can acquire exclusive locks between calls. */
     repo_lock_shared(repo);
 
     err_clear();
     cJSON *data = handler(repo, params);
+
+    /* Release shared lock before writing response (I/O may block). */
+    repo_unlock(repo);
+
+    journal_complete(jop,
+                     data ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                     NULL, data ? NULL : err_msg(), NULL);
 
     if (data) {
         write_ok(data);
@@ -2454,8 +2791,15 @@ int json_api_session(repo_t *repo)
                      jaction->valuestring);
             write_error(msg);
         } else {
+            journal_op_t *jop = journal_start(repo, jaction->valuestring, JOURNAL_SOURCE_UI);
+
             err_clear();
             cJSON *data = handler(repo, jparams);
+
+            journal_complete(jop,
+                             data ? JOURNAL_RESULT_SUCCESS : JOURNAL_RESULT_FAILED,
+                             NULL, data ? NULL : err_msg(), NULL);
+
             if (data) {
                 write_ok(data);
             } else {

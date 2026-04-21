@@ -47,6 +47,7 @@ void   repo_dat_cache_flush(repo_t *repo);
  */
 status_t repo_lock(repo_t *repo);
 void     repo_unlock(repo_t *repo);
+void     repo_set_lock_fd(repo_t *repo, int fd);
 
 /*
  * Shared lock — held during read-only operations (restore, list, diff, verify,

@@ -127,11 +127,76 @@ static void test_tag_list_outputs(void **state) {
     free(out);
 }
 
+static void test_tag_rename_basic(void **state) {
+    (void)state;
+    assert_int_equal(tag_set(repo, "old-name", 42, 1), OK);
+
+    assert_int_equal(tag_rename(repo, "old-name", "new-name"), OK);
+
+    /* Old tag should be gone. */
+    uint32_t id = 0;
+    assert_int_equal(tag_get(repo, "old-name", &id), ERR_NOT_FOUND);
+
+    /* New tag should have same snap_id and preserve flag. */
+    assert_int_equal(tag_get(repo, "new-name", &id), OK);
+    assert_int_equal(id, 42u);
+
+    char name[64] = {0};
+    assert_true(tag_snap_is_preserved(repo, 42, name, sizeof(name)));
+    assert_string_equal(name, "new-name");
+
+    tag_delete(repo, "new-name");
+}
+
+static void test_tag_rename_target_exists(void **state) {
+    (void)state;
+    assert_int_equal(tag_set(repo, "src", 10, 0), OK);
+    assert_int_equal(tag_set(repo, "dst", 20, 0), OK);
+
+    /* Rename should fail if target already exists. */
+    assert_int_equal(tag_rename(repo, "src", "dst"), ERR_INVALID);
+
+    /* Both tags should still be intact. */
+    uint32_t id = 0;
+    assert_int_equal(tag_get(repo, "src", &id), OK);
+    assert_int_equal(id, 10u);
+    assert_int_equal(tag_get(repo, "dst", &id), OK);
+    assert_int_equal(id, 20u);
+
+    tag_delete(repo, "src");
+    tag_delete(repo, "dst");
+}
+
+static void test_tag_rename_source_missing(void **state) {
+    (void)state;
+    assert_int_not_equal(tag_rename(repo, "nonexistent", "whatever"), OK);
+}
+
+static void test_tag_rename_same_name(void **state) {
+    (void)state;
+    assert_int_equal(tag_set(repo, "same", 5, 0), OK);
+    assert_int_equal(tag_rename(repo, "same", "same"), ERR_INVALID);
+    tag_delete(repo, "same");
+}
+
+static void test_tag_rename_invalid_names(void **state) {
+    (void)state;
+    assert_int_equal(tag_set(repo, "valid", 5, 0), OK);
+    assert_int_equal(tag_rename(repo, "valid", "bad/name"), ERR_INVALID);
+    assert_int_equal(tag_rename(repo, "bad/name", "valid"), ERR_INVALID);
+    tag_delete(repo, "valid");
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_tag_set_get_resolve_delete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tag_invalid_and_corrupt, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tag_list_outputs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_rename_basic, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_rename_target_exists, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_rename_source_missing, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_rename_same_name, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tag_rename_invalid_names, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
