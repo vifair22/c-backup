@@ -78,7 +78,7 @@ else
 endif
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-browse-sqlite analyze lint
+.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-browse-sqlite bench-manifest analyze lint
 
 all:
 	$(MAKE) BUILD_TYPE=release _build
@@ -223,6 +223,9 @@ $(BINS)/bench_browse: $(BENCH)/browse.c $(REL_LIB_OBJS) | $(BINS)
 $(BINS)/bench_browse_sqlite: $(BENCH)/browse_sqlite.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS) -lsqlite3
 
+$(BINS)/bench_manifest: $(BENCH)/manifest.c $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS) -lsqlite3
+
 bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse
 	@echo "=== micro ===" && $(BINS)/bench_micro
 	@echo "=== phases ===" && $(BINS)/bench_phases
@@ -239,6 +242,9 @@ bench-browse: $(BINS)/bench_browse
 
 bench-browse-sqlite: $(BINS)/bench_browse_sqlite
 	$(BINS)/bench_browse_sqlite
+
+bench-manifest: $(BINS)/bench_manifest
+	$(BINS)/bench_manifest
 
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage

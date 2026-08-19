@@ -6,6 +6,85 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-08-19 - Manifest trees and derived-index sizing
+
+Harness: `bench/manifest.c` (`make bench-manifest`). Answers the two questions
+the daemonization plan had been settling by reasoning rather than measurement:
+does a per-directory content-addressed manifest actually dedup, and how large
+does the derived node table get.
+
+### Manifest tree dedup
+
+Two runs, deliberately different scales, to check the shape holds.
+
+| Run | dirs | new trees/snapshot | reused | new bytes/snapshot |
+|-----|-----:|-------------------:|-------:|-------------------:|
+| 50k files, 6 snaps, 50 changed | 2,582 | 82 (3.2%) | 2,500 | 0.29 MiB |
+| 200k files, 10 snaps, 200 changed | 10,316 | 344 (3.3%) | 9,972 | 1.29 MiB |
+
+The first snapshot writes every tree (8.24 MiB / 32.96 MiB); every snapshot
+after it writes only the directories on a path from a changed file to the root.
+With 50 files changed the tree count changed by 82: roughly 50 leaves, their
+~31 parents, and the root. That is O(changed dirs + depth), as designed.
+
+**Determinism passed in both runs.** Rebuilding a snapshot's trees produced a
+byte-identical root hash. This is the property the whole scheme rests on; if it
+ever regresses, dedup degrades to a full rewrite per snapshot and nothing fails
+loudly. `tests/test_manifest_tree.c` must assert it.
+
+Total manifest volume:
+
+| Run | tree objects (unique) | `.snap` today | ratio |
+|-----|----------------------:|--------------:|------:|
+| 50k x 6 | 9.34 MiB | 27.55 MiB | 2.95x |
+| 200k x 10 | 43.10 MiB | 183.80 MiB | 4.26x |
+
+The ratio improves with retention depth because the first snapshot dominates
+the tree cost while `.snap` pays full price every time. At 30 snapshots of the
+200k tree the projection is ~12x. Note the comparison is conservative: tree
+bytes here are uncompressed, `.snap` bytes are already LZ4'd, and real tree
+objects go through `store_put_object` and compress too.
+
+Tree assembly cost is 26 ms for 10,316 directories over 210k dirents, which is
+noise next to the backup itself.
+
+### Derived node table sizing
+
+| Run | rows | table only | + indexes | + FTS5 | bytes/row |
+|-----|-----:|-----------:|----------:|-------:|----------:|
+| 50k x 6 | 315,486 | 31.56 MiB | 52.25 MiB | 74.22 MiB | 246.7 |
+| 200k x 10 | 2,103,150 | 211.46 MiB | 349.86 MiB | 486.02 MiB | 242.3 |
+
+Bytes/row is stable across a 6.6x change in dataset size, so the extrapolation
+is trustworthy:
+
+| Repo shape | rows | fully-indexed DB |
+|------------|-----:|-----------------:|
+| 1M files x 30 snapshots | 30M | ~6.8 GiB |
+| 1M files x 50 snapshots | 50M | ~11.3 GiB |
+| 5M files x 30 snapshots | 150M | ~34 GiB |
+
+Insert throughput is 764k-843k rows/s, so indexing a 1M-file snapshot costs
+about 1.3 s. Index build over 2.1M rows: 2.21 s. FTS5 build: 4.44 s.
+
+**The DB is roughly 11x the size of the manifest it is derived from** (486 MiB
+vs 43 MiB at 200k x 10). That is the price of keeping the node table flat and
+denormalised so browsing is an index seek. It is the right trade at small and
+medium scale and it needs a mitigation at large scale.
+
+### Consequence: the DB can be a cache, not a full materialisation
+
+Manifest trees make per-snapshot reindex cheap, which creates an option that
+did not exist under the old design: **node rows for cold snapshots can be
+evicted and rematerialised on demand.** At 764k rows/s, faulting a 1M-file
+snapshot back in costs about 1.3 s plus the tree walk, which is acceptable for
+"user clicked a two-year-old snapshot."
+
+That caps DB size at (hot snapshots x files) instead of (all snapshots x
+files), and it turns the 34 GiB case into something bounded by retention
+policy rather than by history. Worth designing the schema so eviction is
+possible even if the daemon always materialises everything in v1.
+
 ## 2026-08-19 - Browse-path baseline and SQLite evaluation
 
 Commit: `b87c546` (master). Purpose: establish the interactive-browse numbers
