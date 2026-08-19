@@ -78,7 +78,7 @@ else
 endif
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases analyze lint
+.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse bench-browse-sqlite analyze lint
 
 all:
 	$(MAKE) BUILD_TYPE=release _build
@@ -206,7 +206,7 @@ lint:
 
 # ---- Benchmarks -------------------------------------------------------
 BENCH        := bench
-BENCH_CFLAGS := -std=c11 -Wall -Wextra -O3 -flto=auto -march=znver3 -mtune=znver3 -Wno-unused-result -I src -I vendor
+BENCH_CFLAGS := -std=c11 -Wall -Wextra -O3 -flto=auto -march=znver3 -mtune=znver3 -Wno-unused-result -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common -I vendor
 
 $(BINS)/bench_micro: $(BENCH)/micro.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
@@ -217,15 +217,28 @@ $(BINS)/bench_phases: $(BENCH)/phases.c $(REL_LIB_OBJS) | $(BINS)
 $(BINS)/bench_fuse_xfer: $(BENCH)/fuse_xfer.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
 
-bench: $(BINS)/bench_micro $(BINS)/bench_phases
+$(BINS)/bench_browse: $(BENCH)/browse.c $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
+
+$(BINS)/bench_browse_sqlite: $(BENCH)/browse_sqlite.c $(REL_LIB_OBJS) | $(BINS)
+	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS) -lsqlite3
+
+bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse
 	@echo "=== micro ===" && $(BINS)/bench_micro
 	@echo "=== phases ===" && $(BINS)/bench_phases
+	@echo "=== browse ===" && $(BINS)/bench_browse
 
 bench-micro: $(BINS)/bench_micro
 	$(BINS)/bench_micro
 
 bench-phases: $(BINS)/bench_phases
 	$(BINS)/bench_phases
+
+bench-browse: $(BINS)/bench_browse
+	$(BINS)/bench_browse
+
+bench-browse-sqlite: $(BINS)/bench_browse_sqlite
+	$(BINS)/bench_browse_sqlite
 
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
