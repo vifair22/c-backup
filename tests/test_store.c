@@ -339,7 +339,7 @@ static void test_pack_commit_cb_registration(void **state)
     commit_probe_t probe = { 0 };
     store_set_pack_commit_cb(st, probe_commit, &probe);
 
-    pack_commit_entry_t e = { { 0 }, 128, 10, 20 };
+    pack_commit_entry_t e = { { 0 }, 128, 10, 20, 0 };
     pack_commit_info_t info = {
         .pack_id = 3, .filename = "pack-00000003.dat",
         .size = 999, .entry_count = 1, .entries = &e,
@@ -361,6 +361,40 @@ static void test_pack_commit_without_cb(void **state)
     store_t *st = fresh_store();
     pack_commit_info_t info = { 1, "pack-00000001.dat", 0, 0, NULL };
     store_emit_pack_commit(st, &info);
+    done(st);
+}
+
+/* ---------- pack removed callback ---------- */
+
+typedef struct { int calls; uint64_t pack_id; } removed_probe_t;
+
+static void probe_removed(void *user, uint64_t pack_id)
+{
+    removed_probe_t *p = user;
+    p->calls++;
+    p->pack_id = pack_id;
+}
+
+static void test_pack_removed_cb_registration(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    removed_probe_t probe = { 0, 0 };
+    store_set_pack_removed_cb(st, probe_removed, &probe);
+    store_emit_pack_removed(st, 7);
+
+    assert_int_equal(probe.calls, 1);
+    assert_int_equal(probe.pack_id, 7);
+
+    done(st);
+}
+
+static void test_pack_removed_without_cb(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    store_emit_pack_removed(st, 1);
     done(st);
 }
 
@@ -398,6 +432,8 @@ int main(void)
         cmocka_unit_test(test_loose_read_ignores_resolver),
         cmocka_unit_test(test_pack_commit_cb_registration),
         cmocka_unit_test(test_pack_commit_without_cb),
+        cmocka_unit_test(test_pack_removed_cb_registration),
+        cmocka_unit_test(test_pack_removed_without_cb),
         cmocka_unit_test(test_fuse_readahead_defaults_off),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

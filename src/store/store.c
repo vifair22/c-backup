@@ -66,6 +66,8 @@ struct store {
     void                 *locate_user;
     store_pack_commit_fn  commit_cb;
     void                 *commit_user;
+    store_pack_removed_fn removed_cb;
+    void                 *removed_user;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -145,7 +147,10 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
      * second identity file in the engine would mean two sources of truth
      * that can disagree. */
 
-    store_t *r = malloc(sizeof(*r));
+    /* calloc, not malloc: the fields below are set individually, and a field
+     * added later without a line here would otherwise start as garbage. That
+     * has already cost one segfault. */
+    store_t *r = calloc(1, sizeof(*r));
     if (!r) { close(fd); return set_error(ERR_NOMEM, "store_open: alloc failed"); }
     r->path           = strdup(path);
     if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
@@ -167,6 +172,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->locate_user     = NULL;
     r->commit_cb       = NULL;
     r->commit_user     = NULL;
+    r->removed_cb      = NULL;
+    r->removed_user    = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     *out = r;
@@ -487,4 +494,15 @@ void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user) 
 void store_emit_pack_commit(store_t *st, const pack_commit_info_t *info) {
     if (!st || !st->commit_cb || !info) return;
     st->commit_cb(st->commit_user, info);
+}
+
+void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user) {
+    if (!st) return;
+    st->removed_cb = cb;
+    st->removed_user = user;
+}
+
+void store_emit_pack_removed(store_t *st, uint64_t pack_id) {
+    if (!st || !st->removed_cb) return;
+    st->removed_cb(st->removed_user, pack_id);
 }

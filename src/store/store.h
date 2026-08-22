@@ -78,6 +78,12 @@ typedef struct {
     uint64_t offset;
     uint64_t comp_size;
     uint64_t orig_size;
+    /* Position in the pack's on-disk entry order, which is what indexes the
+     * parity trailer's offsets table. It is NOT the position of this entry in
+     * the entries array: that array is sorted by hash before it is handed
+     * over. Recording the array position instead makes every parity lookup
+     * read the wrong offsets and silently disables repair. */
+    uint32_t entry_index;
 } pack_commit_entry_t;
 
 typedef struct {
@@ -96,6 +102,21 @@ typedef struct {
 typedef void (*store_pack_commit_fn)(void *user, const pack_commit_info_t *info);
 void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user);
 void store_emit_pack_commit(store_t *st, const pack_commit_info_t *info);
+
+/*
+ * Called when a pack file is removed or about to be replaced wholesale, so
+ * the daemon can drop its packs and pack_objects rows.
+ *
+ * The counterpart to the commit callback, and just as necessary: GC and
+ * coalescing both delete packs, and an index that still lists objects in a
+ * file that is gone hands out locations pointing at nothing. Emitted after
+ * the file is unlinked, or between the rename and the re-commit when a pack
+ * is rewritten in place. The window that leaves is one where a live object
+ * has no row, which reads as not-found rather than as a bad location.
+ */
+typedef void (*store_pack_removed_fn)(void *user, uint64_t pack_id);
+void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user);
+void store_emit_pack_removed(store_t *st, uint64_t pack_id);
 
 /* ---------- internals used by object.c and pack.c ---------- */
 

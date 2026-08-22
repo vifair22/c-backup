@@ -1042,11 +1042,14 @@ status_t pack_object_load_stream(store_t *store,
         free(src); free(dst);
         LZ4F_freeDecompressionContext(dctx);
 
-        /* Report CRC mismatch for LZ4_FRAME (detection only — RS repair would
-         * require buffering the entire compressed payload, defeating streaming). */
+        /* Detection only for LZ4_FRAME: RS repair would require buffering the
+         * entire compressed payload, which defeats the point of streaming a
+         * payload too large to hold. Counted as uncorrectable, not repaired,
+         * because nothing was fixed - calling it a repair would inflate the
+         * repaired figure and hide damage that needs operator attention. */
         if (have_parity && fst == OK && running_crc != pay_crc) {
-            log_msg("WARN", "pack: LZ4_FRAME payload CRC mismatch (stream)");
-            parity_stats_add_repaired(1);
+            log_msg("WARN", "pack: LZ4_FRAME payload CRC mismatch (stream, not repairable)");
+            parity_stats_add_uncorrectable(1);
         }
         free(rs_par);
 
@@ -1660,9 +1663,10 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
         if (!ce) return set_error(ERR_NOMEM, "finalize_pack: commit entries");
         for (uint32_t i = 0; i < packed; i++) {
             memcpy(ce[i].hash, idx_entries[i].hash, OBJECT_HASH_SIZE);
-            ce[i].offset    = idx_entries[i].dat_offset;
-            ce[i].comp_size = 0;   /* filled by the reader from the entry header */
-            ce[i].orig_size = 0;
+            ce[i].offset      = idx_entries[i].dat_offset;
+            ce[i].comp_size   = 0; /* filled by the reader from the entry header */
+            ce[i].orig_size   = 0;
+            ce[i].entry_index = idx_entries[i].entry_index;
         }
         char fname[64];
         snprintf(fname, sizeof(fname), "pack-%08u.dat", pack_num);
@@ -2725,6 +2729,7 @@ static void pack_resume_deleting(store_t *store) {
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                                       store_root(store), pnum) == 0)
                 unlink(dat_path);
+            store_emit_pack_removed(store, pnum);
         }
         fclose(mf);
         unlink(marker_path);
@@ -2994,6 +2999,7 @@ static status_t maybe_coalesce_packs(store_t *store,
             char dat_path[PATH_MAX];
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) == 0)
                 unlink(dat_path);
+            store_emit_pack_removed(store, cand[ci].num);
         }
 
         if (del_marker[0] != '\0') unlink(del_marker);
@@ -3196,6 +3202,7 @@ status_t pack_gc(store_t *store,
         if (n_dead == count) {
             /* Every entry is dead — delete the whole pack */
             unlink(dat_path);
+            store_emit_pack_removed(store, pnum);
             total_deleted += count;
             free(disk_idx);
             continue;
@@ -3347,14 +3354,16 @@ status_t pack_gc(store_t *store,
          * callback replaces them. Emitted after the rename for the same
          * reason as in finalize_pack: rows must never describe a pack that
          * is not on disk yet. */
+        store_emit_pack_removed(store, pnum);
         if (live_count > 0) {
             pack_commit_entry_t *ce = malloc((size_t)live_count * sizeof(*ce));
             if (ce) {
                 for (uint32_t ei = 0; ei < live_count; ei++) {
                     memcpy(ce[ei].hash, new_disk_idx[ei].hash, OBJECT_HASH_SIZE);
-                    ce[ei].offset    = new_disk_idx[ei].dat_offset;
-                    ce[ei].comp_size = 0;
-                    ce[ei].orig_size = 0;
+                    ce[ei].offset      = new_disk_idx[ei].dat_offset;
+                    ce[ei].comp_size   = 0;
+                    ce[ei].orig_size   = 0;
+                    ce[ei].entry_index = new_disk_idx[ei].entry_index;
                 }
                 struct stat gc_sz;
                 char fname[64];

@@ -25,6 +25,7 @@
 
 #include "backup.h"
 #include "gc.h"
+#include "pack.h"
 #include "prune.h"
 #include "repo.h"
 #include "restore.h"
@@ -235,6 +236,41 @@ static void test_prune_of_unknown_snapshot_is_harmless(void **state)
 
 /* GC must refuse to sweep when it cannot complete the mark, since an
  * incomplete mark set makes live objects look unreachable. */
+/*
+ * Packed objects are the case the sweep can get subtly wrong. Their bytes
+ * stay until pack compaction, so it is tempting to leave the index alone
+ * too, but a pack_objects row that outlives its object still resolves: a
+ * restore would happily read bytes the sweep declared dead, and once
+ * compaction rewrites the pack those bytes belong to something else.
+ */
+static void test_gc_clears_pack_locations_for_swept_objects(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t first;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &first), OK);
+
+    /* Move everything into a pack, which populates pack_objects. */
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    int packed_rows = count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?");
+    assert_true(packed_rows > 0);
+
+    write_file(TEST_SRC "/keep.txt", "content that displaces the first\n");
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_int_equal(prune_snapshot(store, db, repo_id, first.snapshot_id), OK);
+
+    gc_result_t g;
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_true(g.swept > 0);
+
+    /* No pack_objects row may survive its objects row. */
+    assert_int_equal(count(
+        "SELECT COUNT(*) FROM pack_objects po WHERE po.repo_id = ?"
+        " AND NOT EXISTS (SELECT 1 FROM objects o"
+        "                 WHERE o.repo_id = po.repo_id AND o.hash = po.hash)"), 0);
+    assert_true(count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?") < packed_rows);
+}
+
 static void test_gc_refuses_to_sweep_on_unreadable_tree(void **state)
 {
     (void)state;
@@ -263,6 +299,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_prune_removes_snapshot_and_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_clears_its_marker, setup, teardown),
         cmocka_unit_test_setup_teardown(test_prune_of_unknown_snapshot_is_harmless, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_clears_pack_locations_for_swept_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_refuses_to_sweep_on_unreadable_tree, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

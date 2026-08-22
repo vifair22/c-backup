@@ -185,6 +185,19 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     db_result_free(dead);
 
+    /* Packed objects keep their bytes until compaction, but they must stop
+     * being locatable now. Leaving the pack_objects row behind would let a
+     * later restore resolve an object this sweep declared dead, and once
+     * compaction rewrites the pack the row points into bytes that belong to
+     * something else. */
+    if (db_execute_non_query(db,
+            "DELETE FROM pack_objects WHERE repo_id = ? AND hash IN"
+            " (SELECT hash FROM objects WHERE repo_id = ? AND refcount = 0)",
+            (const char *[]){ repo, repo, NULL }, NULL) != 0) {
+        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        return set_error(ERR_IO, "gc: cannot clear pack locations");
+    }
+
     if (db_execute_non_query(db,
             "DELETE FROM objects WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, NULL) != 0) {

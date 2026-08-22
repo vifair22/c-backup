@@ -110,7 +110,7 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         snprintf(off,  sizeof(off),  "%llu", (unsigned long long)info->entries[i].offset);
         snprintf(comp, sizeof(comp), "%llu", (unsigned long long)info->entries[i].comp_size);
         snprintf(orig, sizeof(orig), "%llu", (unsigned long long)info->entries[i].orig_size);
-        snprintf(eidx, sizeof(eidx), "%u", i);
+        snprintf(eidx, sizeof(eidx), "%u", info->entries[i].entry_index);
 
         if (db_execute_non_query(idx->db,
                 "INSERT OR REPLACE INTO pack_objects"
@@ -137,6 +137,32 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         log_error("pack commit: commit failed for pack %s", pack);
 }
 
+/*
+ * A pack was deleted or is about to be replaced. Its rows go with it.
+ *
+ * Ordering mirrors the commit side: pack_objects first, then the packs row,
+ * so nothing ever references a pack row that is already gone.
+ */
+static void pack_removed(void *user, uint64_t pack_id)
+{
+    store_index_t *idx = user;
+    if (!idx) return;
+
+    char repo[32], pack[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
+    snprintf(pack, sizeof(pack), "%llu", (unsigned long long)pack_id);
+
+    if (db_execute_non_query(idx->db,
+            "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+            (const char *[]){ repo, pack, NULL }, NULL) != 0)
+        log_error("pack removed: cannot clear pack_objects for pack %s", pack);
+
+    if (db_execute_non_query(idx->db,
+            "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, pack, NULL }, NULL) != 0)
+        log_error("pack removed: cannot delete packs row %s", pack);
+}
+
 /* ------------------------------------------------------------------ */
 
 status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -152,6 +178,7 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     store_set_locate_cb(store, db_locate, idx);
     store_set_pack_commit_cb(store, db_pack_commit, idx);
+    store_set_pack_removed_cb(store, pack_removed, idx);
     *out = idx;
     return OK;
 }
