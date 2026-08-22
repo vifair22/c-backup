@@ -137,31 +137,39 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
         char ntype[8];
         snprintf(ntype, sizeof(ntype), "%u", e->type);
 
-        /* Same reason as the backup path: a NULL in the params array is a
-         * terminator, not a value. */
-        int rc;
-        if (!have_target) {
-            rc = db_execute_non_query(ctx->db,
-                "INSERT OR REPLACE INTO nodes"
-                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-                "  gid, mtime_ns, size)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
-                                  uid, gid, mtime, size, NULL }, NULL);
-        } else {
-            rc = db_execute_non_query(ctx->db,
-                is_dir
-                  ? "INSERT OR REPLACE INTO nodes"
-                    " (repo_id, id, snap_id, parent_node_id, name, type, mode,"
-                    "  uid, gid, mtime_ns, size, subtree_hash)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                  : "INSERT OR REPLACE INTO nodes"
-                    " (repo_id, id, snap_id, parent_node_id, name, type, mode,"
-                    "  uid, gid, mtime_ns, size, content_hash)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
-                                  uid, gid, mtime, size, thex, NULL }, NULL);
-        }
+        /*
+         * One statement with every column bound, "" for absent, matching the
+         * backup path. A NULL in the params array is a terminator rather than
+         * a value, so a conditional NULL silently unbinds every column after
+         * it.
+         *
+         * NULLIF keeps absent columns genuinely NULL while the parameter
+         * list stays a fixed length, since a NULL parameter would terminate
+         * the array rather than bind a value.
+         *
+         * link_target and hardlink_group_id are the reason a repository can
+         * outlive its index: the trees have always carried them, so a rebuild
+         * restores symlinks and hardlink identity that the index never had.
+         */
+        /* Signed for the same reason as the backup path: an unsigned
+         * 64-bit hash does not fit SQLite's INTEGER and degrades to REAL. */
+        char hgroup[32];
+        snprintf(hgroup, sizeof(hgroup), "%lld",
+                 (long long)e->inode_identity);
+        const char *ltarget = e->link_target ? e->link_target : "";
+
+        int rc = db_execute_non_query(ctx->db,
+            "INSERT OR REPLACE INTO nodes"
+            " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
+            "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
+            "  hardlink_group_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?)",
+            (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
+                              uid, gid, mtime, size,
+                              (have_target && !is_dir) ? thex : "",
+                              (have_target && is_dir) ? thex : "",
+                              ltarget, hgroup, NULL }, NULL);
         if (rc != 0) {
             st = set_error(ERR_IO, "reindex: cannot insert node");
             break;

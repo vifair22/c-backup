@@ -488,6 +488,12 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 /* Phase 3: snapshot record + index                                    */
 /* ------------------------------------------------------------------ */
 
+static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
+{
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) if (h[i]) return 0;
+    return 1;
+}
+
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
@@ -573,27 +579,48 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(ntype, sizeof(ntype), "%u", e->node.type);
 
         /*
-         * Two statements rather than one with a conditional NULL. The params
-         * array is NULL-terminated, so passing NULL as a value silently
-         * truncates the list and leaves later columns unbound: that is how
-         * subtree_hash ended up NULL for every directory and made
-         * directories indistinguishable from files in the index.
+         * One statement with every column bound, "" standing for absent and
+         * NULLIF turning it back into a real NULL in the row.
+         *
+         * The arity has to be fixed because the params array is
+         * NULL-terminated: a conditional NULL value silently truncates the
+         * list and unbinds every column after it. But the stored value has to
+         * be NULL rather than "", because queries elsewhere ask
+         * "content_hash IS NOT NULL" to mean "this node has content", and an
+         * empty string satisfies that while matching no object.
          */
-        int rc = is_dir
-            ? db_execute_non_query(p->db,
+        const char *ltarget = e->symlink_target ? e->symlink_target : "";
+        /*
+         * Signed, deliberately. inode_identity is a 64-bit hash, so about
+         * half of all values exceed INT64_MAX; written as unsigned decimal
+         * SQLite cannot fit them in an INTEGER column and falls back to REAL,
+         * which loses precision and collapses distinct inodes onto the same
+         * value. Restoring then hardlinked unrelated files together. The bit
+         * pattern round-trips through int64 exactly, so signed is lossless.
+         */
+        char hgroup[32];
+        snprintf(hgroup, sizeof(hgroup), "%lld",
+                 (long long)e->node.inode_identity);
+
+        int rc = db_execute_non_query(p->db,
                 "INSERT OR REPLACE INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-                "  gid, mtime_ns, size, subtree_hash)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
+                "  hardlink_group_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?)",
                 (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
-                                  gid, mtime, size, shex, NULL }, NULL)
-            : db_execute_non_query(p->db,
-                "INSERT OR REPLACE INTO nodes"
-                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-                "  gid, mtime_ns, size, content_hash)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
-                                  gid, mtime, size, chex, NULL }, NULL);
+                                  gid, mtime, size,
+                                  /* A symlink or device node has no content
+                                   * object, so its hash is zero. Storing that
+                                   * rather than NULL leaves a row claiming
+                                   * content that matches no object, which is
+                                   * exactly what an index consistency check
+                                   * is looking for. */
+                                  (is_dir || hash_is_zero(e->node.content_hash))
+                                      ? "" : chex,
+                                  is_dir ? shex : "",
+                                  ltarget, hgroup, NULL }, NULL);
         if (rc != 0) {
             if (db_exec_raw(p->db, "ROLLBACK") != 0)
                 log_error("index_nodes: rollback failed");

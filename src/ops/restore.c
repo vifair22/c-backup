@@ -50,6 +50,82 @@ static int path_within(const char *rel, const char *subpath)
     return rel[n] == '\0' || rel[n] == '/';
 }
 
+/*
+ * First path restored for each inode identity, so later members of the group
+ * can be linked to it rather than copied. Open addressing, sized from the
+ * node count: a tree with no hardlinks pays one allocation and nothing else.
+ */
+typedef struct {
+    uint64_t *keys;    /* inode identity, 0 means empty */
+    char    **paths;
+    uint32_t  mask;
+} hardlink_map_t;
+
+static void hardlink_map_free(hardlink_map_t *m)
+{
+    if (m->paths)
+        for (uint32_t i = 0; i <= m->mask; i++) free(m->paths[i]);
+    free(m->keys);
+    free(m->paths);
+    m->keys = NULL;
+    m->paths = NULL;
+}
+
+static int hardlink_map_init(hardlink_map_t *m, uint32_t n)
+{
+    uint32_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    m->keys  = calloc(cap, sizeof(*m->keys));
+    m->paths = calloc(cap, sizeof(*m->paths));
+    if (!m->keys || !m->paths) { hardlink_map_free(m); return -1; }
+    m->mask = cap - 1;
+    return 0;
+}
+
+static uint32_t hardlink_slot(const hardlink_map_t *m, uint64_t key)
+{
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
+    while (m->keys[h] != 0 && m->keys[h] != key) h = (h + 1) & m->mask;
+    return h;
+}
+
+static const char *hardlink_lookup(const hardlink_map_t *m, uint64_t key)
+{
+    if (!m->keys) return NULL;
+    uint32_t h = hardlink_slot(m, key);
+    return m->keys[h] == key ? m->paths[h] : NULL;
+}
+
+static void hardlink_remember(hardlink_map_t *m, uint64_t key, const char *path)
+{
+    if (!m->keys) return;
+    uint32_t h = hardlink_slot(m, key);
+    if (m->keys[h] == key) return;
+    char *dup = strdup(path);
+    if (!dup) return;
+    m->keys[h]  = key;
+    m->paths[h] = dup;
+}
+
+static int hash_is_zero_hex(const char *hex)
+{
+    for (const char *c = hex; *c; c++) if (*c != '0') return 0;
+    return 1;
+}
+
+/* Metadata for something the kernel must not follow: a symlink's own
+ * ownership and timestamps, never its target's. */
+static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid,
+                                    uint64_t mtime_ns)
+{
+    if (lchown(path, (uid_t)uid, (gid_t)gid) != 0) { /* best effort */ }
+    struct timespec times[2];
+    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
+    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[1] = times[0];
+    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0) { /* best effort */ }
+}
+
 static int cancelled(const restore_opts_t *o)
 {
     return o && o->cancel && *o->cancel;
@@ -172,7 +248,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      */
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type"
+            "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type,"
+            "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0)"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -190,6 +267,12 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&res, 0, sizeof(res));
     status_t st = OK;
 
+    hardlink_map_t hlinks = { NULL, NULL, 0 };
+    if (hardlink_map_init(&hlinks, (uint32_t)r->nrows) != 0) {
+        db_result_free(r);
+        return set_error(ERR_NOMEM, "restore: hardlink map");
+    }
+
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
         report(opts, "restore", (uint64_t)i, (uint64_t)r->nrows);
@@ -201,6 +284,9 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         uint64_t    mtime   = strtoull(r->rows[i][5], NULL, 10);
         const char *chash   = r->rows[i][7];
         uint32_t    ntype   = (uint32_t)strtoul(r->rows[i][8], NULL, 10);
+        const char *ltarget = r->rows[i][9];
+        /* Written signed; the bit pattern is what identifies the inode. */
+        uint64_t    hgroup  = (uint64_t)strtoll(r->rows[i][10], NULL, 10);
 
         char rel[PATH_MAX];
         if (node_rel_path(db, repo, snap, id, rel, sizeof(rel)) != OK) {
@@ -229,7 +315,59 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
 
-        if (!chash || !chash[0]) { res.skipped++; continue; }
+        /*
+         * Symlinks carry no content object; their target is the payload.
+         * Without this they fell through to the content path, matched a
+         * zero hash, and were recreated as empty regular files: a restored
+         * tree that looked complete and had lost every link in it.
+         */
+        if (ntype == NODE_TYPE_SYMLINK) {
+            if (!ltarget || !ltarget[0]) {
+                log_warn("restore: symlink %s has no recorded target, skipping", rel);
+                res.skipped++;
+                continue;
+            }
+            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (opts->overwrite) unlink(full);
+            if (symlink(ltarget, full) != 0 && errno != EEXIST) {
+                log_warn("restore: cannot create symlink %s: %s", full, strerror(errno));
+                res.skipped++;
+                continue;
+            }
+            /* Mode is not applied: a symlink's own permissions are ignored by
+             * the kernel, and chmod would follow the link and alter its
+             * target instead. */
+            apply_metadata_nofollow(full, uid, gid, mtime);
+            res.symlinks++;
+            continue;
+        }
+
+        /*
+         * Anything sharing an inode with something already restored is
+         * relinked rather than copied. Without this, 30,000 hardlinked files
+         * in a source tree came back as 30,000 independent copies: the
+         * content was right and the tree was several gigabytes larger than
+         * what was backed up.
+         */
+        if (hgroup != 0) {
+            const char *first = hardlink_lookup(&hlinks, hgroup);
+            if (first) {
+                if (make_parents(full) != OK) { st = ERR_IO; break; }
+                if (opts->overwrite) unlink(full);
+                if (link(first, full) == 0) { res.hardlinks++; continue; }
+                /* Cross-device or unsupported: fall through and copy. */
+                log_warn("restore: cannot hardlink %s to %s, copying: %s",
+                         full, first, strerror(errno));
+            }
+        }
+
+        if (!chash || !chash[0] || hash_is_zero_hex(chash)) {
+            if (ntype != NODE_TYPE_REG)
+                log_warn("restore: %s is an unsupported node type %u, skipping",
+                         rel, ntype);
+            res.skipped++;
+            continue;
+        }
 
         if (make_parents(full) != OK) { st = ERR_IO; break; }
 
@@ -272,16 +410,21 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
 
         apply_metadata(full, mode, uid, gid, mtime);
+        /* First member of its inode group: everything later links here. */
+        if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
         res.files++;
         res.bytes += sz;
     }
 
+    hardlink_map_free(&hlinks);
     db_result_free(r);
     if (st != OK) return st;
 
-    log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, %llu skipped",
+    log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
+             "%llu symlinks, %llu hardlinks, %llu skipped",
              (long long)snap_id, dest, (unsigned long long)res.files,
-             (unsigned long long)res.dirs, (unsigned long long)res.skipped);
+             (unsigned long long)res.dirs, (unsigned long long)res.symlinks,
+             (unsigned long long)res.hardlinks, (unsigned long long)res.skipped);
     if (out) *out = res;
     return OK;
 }

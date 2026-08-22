@@ -230,10 +230,11 @@ test-api: all
 test-cli: all
 	@./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
-# The two shell suites each start a daemon and poll jobs on a wall-clock
-# budget, so running them concurrently under -j makes them race each other for
-# CPU and disk and fail on timing rather than on behaviour. Ordering test-cli
-# behind test-api is enough to keep them apart.
+# The shell suites each start a daemon and poll jobs on a wall-clock budget,
+# so anything running beside them under -j competes for CPU and disk and makes
+# them fail on timing rather than on behaviour. analyze is the worst offender
+# because cppcheck and -fanalyzer saturate every core. Chain all three.
+test-api: analyze
 test-cli: test-api
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli

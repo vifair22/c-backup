@@ -27,6 +27,7 @@ typedef struct {
     uint64_t files;
     uint64_t dirs;
     uint64_t symlinks;
+    uint64_t hardlinks;
     uint64_t bytes;
     uint64_t skipped;
 } restore_result_t;

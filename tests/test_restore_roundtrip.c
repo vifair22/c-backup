@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -199,6 +200,113 @@ static void test_restore_of_unknown_snapshot_fails(void **state)
 {
     (void)state;
     assert_int_not_equal(restore_run(store, db, repo_id, 999, TEST_DST, NULL, NULL), OK);
+}
+
+/*
+ * Symlinks and hardlinks survive a round trip.
+ *
+ * Nothing in this suite had a link in it until a 223,000-file tree was backed
+ * up and restored: all 190 of its symlinks came back as empty regular files
+ * and all 29,920 of its hardlinked files came back as independent copies,
+ * several gigabytes larger than the source. File content was never wrong,
+ * which is exactly why every earlier round trip passed.
+ *
+ * The repository was never at fault. Manifest trees have always carried both
+ * the link target and the inode identity; the derived index had nowhere to
+ * put them and restore reads the index.
+ */
+static void test_symlinks_and_hardlinks_round_trip(void **state)
+{
+    (void)state;
+
+    assert_int_equal(symlink("top.txt", TEST_SRC "/link_rel"), 0);
+    assert_int_equal(symlink("/etc/hostname", TEST_SRC "/link_abs"), 0);
+    assert_int_equal(symlink("nowhere-at-all", TEST_SRC "/link_broken"), 0);
+    assert_int_equal(link(TEST_SRC "/top.txt", TEST_SRC "/hard_a"), 0);
+    assert_int_equal(link(TEST_SRC "/top.txt", TEST_SRC "/hard_b"), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    struct stat sb;
+    char target[PATH_MAX];
+
+    /* Each symlink is a symlink again, pointing where it did. A broken one
+     * is still a link: restore must not resolve or drop it. */
+    struct { const char *name; const char *want; } links[] = {
+        { "link_rel",    "top.txt" },
+        { "link_abs",    "/etc/hostname" },
+        { "link_broken", "nowhere-at-all" },
+    };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", restored_root(), links[i].name);
+        assert_int_equal(lstat(path, &sb), 0);
+        assert_true(S_ISLNK(sb.st_mode));
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        assert_true(n > 0);
+        target[n] = '\0';
+        assert_string_equal(target, links[i].want);
+    }
+    assert_int_equal(rr.symlinks, 3);
+
+    /* The three hardlinked paths share one inode again rather than being
+     * three copies of the same bytes. */
+    struct stat a, b, c;
+    snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+    assert_int_equal(stat(path, &a), 0);
+    snprintf(path, sizeof(path), "%s/hard_a", restored_root());
+    assert_int_equal(stat(path, &b), 0);
+    snprintf(path, sizeof(path), "%s/hard_b", restored_root());
+    assert_int_equal(stat(path, &c), 0);
+    assert_int_equal(a.st_ino, b.st_ino);
+    assert_int_equal(a.st_ino, c.st_ino);
+    assert_true(a.st_nlink >= 3);
+}
+
+/*
+ * And a rebuilt index restores them too, which is the claim that the
+ * repository is the source of truth rather than the database.
+ */
+static void test_links_survive_a_reindex(void **state)
+{
+    (void)state;
+    assert_int_equal(symlink("top.txt", TEST_SRC "/link_rel"), 0);
+    assert_int_equal(link(TEST_SRC "/top.txt", TEST_SRC "/hard_a"), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    struct stat sb;
+    snprintf(path, sizeof(path), "%s/link_rel", restored_root());
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_true(S_ISLNK(sb.st_mode));
+
+    struct stat a, b;
+    snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+    assert_int_equal(stat(path, &a), 0);
+    snprintf(path, sizeof(path), "%s/hard_a", restored_root());
+    assert_int_equal(stat(path, &b), 0);
+    assert_int_equal(a.st_ino, b.st_ino);
 }
 
 /* ---------- reindex ---------- */
@@ -468,6 +576,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_preserves_the_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_object_registry, setup, teardown),

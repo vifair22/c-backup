@@ -1,0 +1,13 @@
+-- Symlink targets and hardlink identity were never carried into the index.
+--
+-- The manifest trees have always recorded both, so the repository itself is
+-- complete and a reindex can recover them. The derived index simply had
+-- nowhere to put them, and restore reads the index. The result was silent:
+-- a symlink came back as an empty regular file, and hardlinked files came
+-- back as independent copies. Content was never wrong, which is why every
+-- earlier round trip passed - the fixtures had no links in them.
+--
+-- hardlink_group_id already existed and was never written. It holds the
+-- inode identity: every path sharing one inode shares one group, which is
+-- exactly what the restore needs to relink them.
+ALTER TABLE nodes ADD COLUMN link_target TEXT;
