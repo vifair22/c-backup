@@ -151,6 +151,35 @@ else
     bad "restored tree is identical" "no differences" "diff reported changes"
 fi
 
+echo "schedules"
+check "create schedule" 201 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+     -d '{"action":"gc","trigger":{"type":"interval","seconds":3600}}' \
+     http://localhost/repos/1/schedules)"
+# The trigger is validated at creation rather than at fire time, so a typo is
+# reported to whoever made it instead of quietly disabling the schedule later.
+check "reject bad trigger" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+     -d '{"action":"gc","trigger":{"type":"cron","spec":"* * * * *"}}' \
+     http://localhost/repos/1/schedules)"
+contains "schedule listed" '"action":"gc"' "$(sock_body /repos/1/schedules)"
+check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+     -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
+contains "schedule disabled" '"enabled":"0"' "$(sock_body /repos/1/schedules)"
+
+# A schedule already due must fire on the next tick and produce a real job.
+curl -s -X POST --unix-socket "$SOCK" \
+     -d '{"action":"gc","trigger":{"type":"interval","seconds":1}}' \
+     http://localhost/repos/1/schedules > /dev/null
+JOBS_BEFORE=$(sock_body /jobs | grep -o '"id"' | wc -l)
+sleep 3
+JOBS_AFTER=$(sock_body /jobs | grep -o '"id"' | wc -l)
+if [ "$JOBS_AFTER" -gt "$JOBS_BEFORE" ]; then
+    ok "due schedule submitted a job"
+else
+    bad "due schedule submitted a job" "more than $JOBS_BEFORE jobs" "$JOBS_AFTER"
+fi
+check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
+     http://localhost/repos/1/schedules/1)"
+
 echo "maintenance"
 check "gc" 202 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      http://localhost/repos/1/gc)"

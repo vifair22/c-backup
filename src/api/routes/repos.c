@@ -190,7 +190,8 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (*rest == '\0') return get_repo(req, ud);
 
-    if (strcmp(rest, "/tags") == 0)    return metadata_tags_get(req, repo_id);
+    if (strcmp(rest, "/tags") == 0)      return metadata_tags_get(req, repo_id);
+    if (strcmp(rest, "/schedules") == 0) return schedules_get(req, repo_id);
     if (strcmp(rest, "/policy") == 0)  return metadata_policy_get(req, repo_id);
     if (strcmp(rest, "/journal") == 0) return metadata_journal_get(req, repo_id);
 
@@ -209,6 +210,13 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
 
     if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
 
+    if (strncmp(rest, "/schedules/", 11) == 0) {
+        char *end = NULL;
+        long long id = strtoll(rest + 11, &end, 10);
+        if (id > 0 && end && *end == '\0')
+            return schedules_patch(req, repo_id, id);
+    }
+
     int64_t sid = snap_suffix(rest, "/note");
     if (sid > 0) return metadata_note_put(req, repo_id, sid);
 
@@ -225,6 +233,8 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
         return backup_route_post(req, repo_id, rest);
     if (strcmp(rest, "/tags") == 0)
         return metadata_tags_post(req, repo_id);
+    if (strcmp(rest, "/schedules") == 0)
+        return schedules_post(req, repo_id);
     return snapshots_route_post(req, repo_id, rest);
 }
 
@@ -250,6 +260,13 @@ static api_response_t repo_scoped_delete(const api_request_t *req, void *ud)
 
     if (strncmp(rest, "/tags/", 6) == 0)
         return metadata_tags_delete(req, repo_id, rest + 6);
+
+    if (strncmp(rest, "/schedules/", 11) == 0) {
+        char *end = NULL;
+        long long id = strtoll(rest + 11, &end, 10);
+        if (id > 0 && end && *end == '\0')
+            return schedules_delete(req, repo_id, id);
+    }
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;

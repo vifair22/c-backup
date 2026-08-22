@@ -27,6 +27,7 @@
 #include "job_manager.h"
 #include "lock.h"
 #include "routes.h"
+#include "scheduler.h"
 #include "server.h"
 
 #ifndef VERSION_STRING
@@ -48,6 +49,27 @@ static void sig_handler(int sig)
  * under the process umask instead. Setting it here means the daemon never
  * has a permissive umask to fall back to.
  */
+/*
+ * A due schedule becomes a queued job. The scheduler knows when; the job
+ * manager knows how and enforces the parallelism cap, so the two stay
+ * separable and a long backup cannot delay the next tick.
+ */
+static status_t schedule_dispatch(void *user, int64_t schedule_id, int64_t repo_id,
+                                  const char *action, const char *params)
+{
+    (void)schedule_id;
+    (void)params;
+    job_manager_t *jm = user;
+
+    int64_t job_id = 0;
+    status_t st = routes_submit_scheduled(jm, repo_id, action, &job_id);
+    if (st != OK) return st;
+
+    log_info("scheduler: submitted %s for repo %lld as job %lld",
+             action, (long long)repo_id, (long long)job_id);
+    return OK;
+}
+
 static void tighten_umask(void)
 {
     umask(0077);
@@ -117,6 +139,23 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /*
+     * The scheduler submits work through the job manager rather than running
+     * it: firing a schedule and executing it are different concerns, and
+     * keeping them apart means a slow job cannot delay the next tick.
+     */
+    scheduler_t *sched = NULL;
+    if (config_get_int(cfg, "scheduler.enabled", 1)) {
+        if (scheduler_open(db, schedule_dispatch, jm, &sched) != OK) {
+            log_error("cannot create scheduler");
+            job_manager_stop(jm);
+            appguard_shutdown(guard);
+            return 1;
+        }
+    } else {
+        log_info("scheduler disabled by config");
+    }
+
     const char *socket_path = config_get_str(cfg, "http.socket");
     int tcp_port = config_get_int(cfg, "http.port", 8765);
 
@@ -133,6 +172,7 @@ int main(int argc, char *argv[])
     routes_auth_set_config(cfg);
     routes_snapshots_init(db, jm);
     routes_metadata_init(db);
+    routes_schedules_init(db, sched);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||
@@ -155,7 +195,14 @@ int main(int argc, char *argv[])
     }
 
     log_info("listening on %s and port %d", socket_path ? socket_path : "(no socket)", tcp_port);
-    log_info("scheduler: not yet (Phase 7)");
+    if (sched && scheduler_run(sched) != OK) {
+        log_error("cannot start scheduler loop");
+        api_server_stop(srv);
+        scheduler_stop(sched);
+        job_manager_stop(jm);
+        appguard_shutdown(guard);
+        return 1;
+    }
     log_info("c-backupd ready");
 
     while (running) {
@@ -165,6 +212,7 @@ int main(int argc, char *argv[])
 
     log_info("shutting down");
     api_server_stop(srv);
+    if (sched) scheduler_stop(sched);
     job_manager_stop(jm);
     repo_locks_shutdown();
     appguard_shutdown(guard);

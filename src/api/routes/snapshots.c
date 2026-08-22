@@ -425,6 +425,37 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     return api_no_content();
 }
 
+/*
+ * Submit a job by action name.
+ *
+ * The scheduler needs to start exactly the work the routes start, so the job
+ * bodies live in one place and both callers go through here. Restore is
+ * absent on purpose: it needs a destination, which a schedule has no way to
+ * supply.
+ */
+status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
+                                 const char *action, int64_t *out_job_id)
+{
+    snap_job_kind_t kind;
+    if      (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
+    else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
+    else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;
+    else return set_error(ERR_INVALID, "no scheduled job for action '%s'", action);
+
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+
+    snap_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "scheduled job: alloc"); }
+    j->db = g_ctx.db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+    j->kind = kind;
+
+    return job_submit(jm ? jm : g_ctx.jm, repo_id, action, NULL,
+                      snap_job_run, j, snap_job_free, out_job_id);
+}
+
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
 {
     g_ctx.db = db;

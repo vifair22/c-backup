@@ -5,6 +5,7 @@
 #include "routes.h"
 
 #include <cutils/log.h>
+#include <cutils/push.h>
 
 #include <pthread.h>
 #include <time.h>
@@ -141,6 +142,22 @@ static void *worker_main(void *arg)
             journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
                            (int64_t)(time(NULL) - began) * 1000, detail);
             pthread_mutex_unlock(&jm->db_mu);
+        }
+
+        /*
+         * A failed backup that nobody hears about is the whole reason
+         * unattended backups go wrong: the job stops working and the first
+         * anyone knows is when a restore is needed. push_send is a no-op when
+         * Pushover is unconfigured, so this needs no feature flag.
+         */
+        if (st != OK && !jm->queue[slot_index].cancel) {
+            char title[128], body[512];
+            snprintf(title, sizeof(title), "c-backup: %s failed", slot.action);
+            snprintf(body, sizeof(body), "repo %lld: %s",
+                     (long long)slot.repo_id, detail ? detail : "no detail");
+            if (push_send(title, body) != 0)
+                log_warn("cannot queue failure notification for job %lld",
+                         (long long)slot.job_id);
         }
         if (st != OK && outcome[0] == 'f') err_clear();
 

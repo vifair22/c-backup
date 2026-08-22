@@ -4,6 +4,7 @@
 #include <cutils/db.h>
 #include <cutils/config.h>
 #include <stdint.h>
+#include "error.h"
 
 /*
  * Route registration.
@@ -42,6 +43,11 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
                                  const char *rest);
 
+/* Submit a maintenance job by action name, so the scheduler starts exactly
+ * the work the routes do. */
+status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
+                                 const char *action, int64_t *out_job_id);
+
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */
 void routes_metadata_init(cutils_db_t *db);
@@ -61,3 +67,13 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id);
 void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                     const char *operation, const char *result,
                     int64_t duration_ms, const char *message);
+
+/* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
+struct scheduler;
+void routes_schedules_init(cutils_db_t *db, struct scheduler *sched);
+api_response_t schedules_get(const api_request_t *req, int64_t repo_id);
+api_response_t schedules_post(const api_request_t *req, int64_t repo_id);
+api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
+                               int64_t schedule_id);
+api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
+                                int64_t schedule_id);
