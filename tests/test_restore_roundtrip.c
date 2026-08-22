@@ -27,6 +27,7 @@
 
 #include "backup.h"
 #include "gc.h"
+#include "pack.h"
 #include "prune.h"
 #include "reindex.h"
 #include "repo.h"
@@ -309,6 +310,113 @@ static void test_links_survive_a_reindex(void **state)
     snprintf(path, sizeof(path), "%s/hard_a", restored_root());
     assert_int_equal(stat(path, &b), 0);
     assert_int_equal(a.st_ino, b.st_ino);
+}
+
+/* ---------- pack compaction via gc ---------- */
+
+/* Total bytes across every pack .dat in the repo. */
+static uint64_t pack_bytes_on_disk(void)
+{
+    FILE *p = popen("find '" TEST_REPO "/packs' -name '*.dat' -printf '%s\\n' 2>/dev/null", "r");
+    assert_non_null(p);
+    uint64_t total = 0;
+    char line[64];
+    while (fgets(line, sizeof(line), p))
+        total += strtoull(line, NULL, 10);
+    pclose(p);
+    return total;
+}
+
+/*
+ * GC reclaims bytes inside packs, not just index rows.
+ *
+ * Before compaction was wired in, a pruned snapshot's packed objects lost
+ * their rows and kept their bytes forever: nothing in the daemon ever
+ * called pack_gc. The sweep reported bytes freed that the disk never gave
+ * back.
+ */
+static void test_gc_compacts_packs(void **state)
+{
+    (void)state;
+
+    /* Snapshot 1: the survivor. Incompressible content so the pack size
+     * tracks payload size and the byte assertion below is meaningful. */
+    char blob[64 * 1024];
+    srand(1234);
+    for (size_t i = 0; i < sizeof(blob); i++) blob[i] = (char)(rand() & 0xFF);
+    FILE *f = fopen(TEST_SRC "/keep.bin", "wb");
+    assert_non_null(f);
+    assert_int_equal(fwrite(blob, 1, sizeof(blob), f), sizeof(blob));
+    fclose(f);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t keep_br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &keep_br), OK);
+
+    /* Snapshot 2: several unique objects that will die with it. */
+    for (int i = 0; i < 8; i++) {
+        char path[PATH_MAX], content[64 * 1024];
+        for (size_t b = 0; b < sizeof(content); b++) content[b] = (char)(rand() & 0xFF);
+        snprintf(path, sizeof(path), "%s/dead%02d.bin", TEST_SRC, i);
+        f = fopen(path, "wb");
+        assert_non_null(f);
+        assert_int_equal(fwrite(content, 1, sizeof(content), f), sizeof(content));
+        fclose(f);
+    }
+    backup_result_t dead_br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &dead_br), OK);
+
+    uint32_t packed = 0;
+    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
+    assert_true(packed > 0);
+    uint64_t bytes_before = pack_bytes_on_disk();
+    assert_true(bytes_before > 0);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, dead_br.snapshot_id), OK);
+
+    gc_result_t gr;
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_true(gr.swept > 0);
+    assert_true(gr.pack_entries_dropped > 0);
+
+    /* The dead entries' bytes are actually gone from disk. */
+    uint64_t bytes_after = pack_bytes_on_disk();
+    assert_true(bytes_after < bytes_before);
+
+    /* No index row points into a pack that was rewritten out from under
+     * it: every pack_objects row resolves to a pack that exists. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM pack_objects po"
+        " LEFT JOIN packs p ON p.repo_id = po.repo_id AND p.id = po.pack_id"
+        " WHERE p.id IS NULL", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
+
+    /* The surviving snapshot restores from the rewritten packs. */
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, keep_br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.skipped, 0);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/keep.bin", restored_root());
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal(sb.st_size, (off_t)sizeof(blob));
+
+    /* And a reindex on top of the rewritten packs agrees with them, which
+     * is the callback contract: every rewrite emitted its removal and its
+     * commit, so the derived index never drifted. */
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    rmrf(TEST_DST);
+    assert_int_equal(restore_run(store, db, repo_id, keep_br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.skipped, 0);
 }
 
 /* ---------- xattrs and ACLs ---------- */
@@ -730,6 +838,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_survive_a_reindex, setup, teardown),

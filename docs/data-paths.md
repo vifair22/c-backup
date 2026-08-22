@@ -530,15 +530,17 @@ never outlive their pack.
   (they must stop being locatable) but their bytes wait for pack
   compaction.
 - **Pack compaction and coalescing** (`pack_gc`,
-  `maybe_coalesce_packs`): rewrites packs keeping only referenced entries,
+  `maybe_coalesce_packs`): the second half of the sweep, run by `gc_run`
+  itself after the DB transaction commits (dry runs stop before it).
+  The reference list is every surviving `objects` row - the sweep just
+  deleted everything unreachable, so surviving is the definition of
+  referenced. `pack_gc` rewrites only packs that contain dead entries,
   then merges small packs (under a quarter of the seal size) when there
   are enough of them, under a rewrite budget, and only when the merge
   provably removes at least two pack files - merging n candidates of B
   bytes yields ceil(B/256 MiB) packs, so the reduction is known before a
-  byte is copied. **Gap:** `pack_gc` currently has no daemon caller; it is
-  exercised by the test suites but the GC job stops at the DB sweep, so
-  packed dead bytes are not yet reclaimed in production. Wiring it into
-  the GC job is the missing step.
+  byte is copied. Every rewrite emits its removal and commit callbacks,
+  so the derived index never drifts.
 - **Prune / GFS** (`src/ops/prune.c`, `gfs.c`): retention deletes snapshot
   records and node rows; the objects they referenced become GC's problem,
   which is the correct division - prune decides *what* is dead, GC decides

@@ -24,6 +24,11 @@ typedef struct {
     uint64_t reachable;
     uint64_t swept;
     uint64_t bytes_freed;
+    /* Pack compaction, the second half of the sweep: entries surviving a
+     * pack rewrite and entries dropped by one. Both zero when no pack
+     * contained anything dead. */
+    uint64_t pack_entries_kept;
+    uint64_t pack_entries_dropped;
 } gc_result_t;
 
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,

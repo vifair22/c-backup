@@ -6,6 +6,7 @@
 
 #include "manifest.h"
 #include "object.h"
+#include "pack.h"
 
 #include <cutils/log.h>
 
@@ -212,9 +213,50 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * gone; dropping it forces a rebuild on next use. */
     store_clear_loose_set(store);
 
-    log_info("gc: %llu reachable references, %llu objects swept, %llu bytes",
+    /*
+     * Second half of the sweep: the bytes. A dead packed object lost its
+     * rows above, but its bytes sit inside a pack that live objects share,
+     * so reclaiming them means rewriting those packs without the dead
+     * entries. pack_gc self-limits - a pack with nothing dead is left
+     * alone - and runs the coalescing pass afterwards, so small trailing
+     * packs merge under the same operation that orphaned them.
+     *
+     * The reference list is every surviving object row: the sweep just
+     * deleted everything unreachable, so surviving is the definition of
+     * referenced. Hashes travel as lowercase hex, which sorts in the same
+     * order as the raw bytes, so ORDER BY hash hands pack_gc the sorted
+     * array its bsearch needs without a second sort here.
+     */
+    if (cancel && *cancel)
+        return set_error(ERR_BUSY, "gc cancelled");
+
+    db_result_t *live = NULL;
+    if (db_execute(db, "SELECT hash FROM objects WHERE repo_id = ? ORDER BY hash",
+                   (const char *[]){ repo, NULL }, &live) != 0)
+        return set_error(ERR_IO, "gc: cannot list live objects for compaction");
+
+    size_t refs_cnt = live ? (size_t)live->nrows : 0;
+    uint8_t *refs = refs_cnt ? malloc(refs_cnt * OBJECT_HASH_SIZE) : NULL;
+    if (refs_cnt && !refs) {
+        db_result_free(live);
+        return set_error(ERR_NOMEM, "gc: refs alloc");
+    }
+    for (size_t i = 0; i < refs_cnt; i++)
+        hex_to_hash(live->rows[i][0], refs + i * OBJECT_HASH_SIZE);
+    db_result_free(live);
+
+    uint32_t kept = 0, dropped = 0;
+    status_t pst = pack_gc(store, refs, refs_cnt, &kept, &dropped);
+    free(refs);
+    if (pst != OK) return pst;
+    res.pack_entries_kept    = kept;
+    res.pack_entries_dropped = dropped;
+
+    log_info("gc: %llu reachable references, %llu objects swept, %llu bytes, "
+             "%u pack entr%s dropped",
              (unsigned long long)res.reachable, (unsigned long long)res.swept,
-             (unsigned long long)res.bytes_freed);
+             (unsigned long long)res.bytes_freed,
+             dropped, dropped == 1 ? "y" : "ies");
     if (out) *out = res;
     return OK;
 }
