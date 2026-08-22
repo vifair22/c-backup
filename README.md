@@ -96,7 +96,7 @@ Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
 | `src/meta/` | Repository identity and per-repo locks |
 | `src/daemon/`, `src/cli/` | The two entry points |
 | `ui/` | Electron app |
-| `docs/` | `api.md`, `repo-format.md` |
+| `docs/` | `api.md`, `repo-format.md`, `data-paths.md` |
 | `bench/` | Benchmarks; results journalled in `PERF.md` |
 
 ## Documentation
@@ -105,6 +105,9 @@ Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
   matters more than it looks.
 - `docs/api.md`: every endpoint, with the reasoning behind pagination, auth
   and the trigger model.
+- `docs/data-paths.md`: how bytes move end to end. The storage and restore
+  pipelines, every per-file-type branch, packing and compression decisions,
+  and the maintenance paths that rewrite data.
 - `PERF.md`: benchmark journal. New numbers are added, not substituted.
 - `manual.md`: **stale.** Written for the pre-rewrite CLI and not yet updated.
 
