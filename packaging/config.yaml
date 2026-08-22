@@ -1,0 +1,34 @@
+# c-backupd configuration.
+#
+# Values here are read before the database opens, so anything needed to open
+# the database or bind a socket lives in this file. Everything else is stored
+# in the database and changed through the API at runtime.
+#
+# Install to /etc/c-backupd/config.yaml and point the unit at it with
+# C_BACKUP_CONFIG_PATH. Keep it 0600: it holds Pushover credentials.
+
+db:
+  # systemd's StateDirectory=c-backupd creates the parent directory before
+  # ExecStart, so this path is ready by the time the daemon opens it.
+  path: /var/lib/c-backupd/state.db
+
+http:
+  # The unix socket bypasses authentication entirely; filesystem permissions
+  # on it are the access control. RuntimeDirectory=c-backupd creates the
+  # parent and removes it on stop, so a stale socket never survives a crash.
+  socket: /run/c-backupd/c-backupd.sock
+  # TCP requires a bearer token or session cookie. Set bind to 127.0.0.1 to
+  # force remote access through a reverse proxy.
+  port: 8765
+  bind: 0.0.0.0
+
+log:
+  level: info
+
+auth:
+  # Requires HTTPS in front of the daemon; it does not terminate TLS itself.
+  cookie_secure: 0
+
+pushover:
+  token: ""
+  user: ""

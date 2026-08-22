@@ -1,0 +1,30 @@
+[Unit]
+Description=c-backup daemon
+Documentation=https://git.airies.net/vifair22/c-backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/c-backupd
+Environment=C_BACKUP_CONFIG_PATH=/etc/c-backupd/config.yaml
+
+# Runs as root for now: reading arbitrary source paths and restoring metadata
+# both need it. Capability-based hardening is a later revisit.
+User=root
+
+# The socket directory has to exist before the daemon binds; systemd creates
+# and cleans it up so a stale socket never survives a crash.
+RuntimeDirectory=c-backupd
+RuntimeDirectoryMode=0755
+StateDirectory=c-backupd
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -16,3 +16,7 @@ CLAUDE.md
 .claude/
 .codex
 daemonization-spec.md
+/config.yaml
+*.db
+*.db-wal
+*.db-shm

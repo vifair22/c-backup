@@ -2,12 +2,29 @@ MAKEFLAGS += -j$(shell nproc)
 
 CC      := gcc
 
+# ---- c-utils ----------------------------------------------------------
+# Sibling checkout by default. cutils_version pins the tag CI builds against;
+# a local checkout that has drifted from the pin gets a warning rather than a
+# hard failure, so day-to-day work against an unreleased c-utils still builds.
+CUTILS_DIR ?= ../c-utils
+
 # ---- Version ----------------------------------------------------------
 SEMVER     := $(shell cat release_version 2>/dev/null | tr -d '[:space:]')
 BUILD_TS   := $(shell date -u '+%Y%m%d.%H%M')
 BUILD_TYPE ?= release
 VERSION    := $(SEMVER)_$(BUILD_TS).$(BUILD_TYPE)
 VERSION_DEF := -DVERSION_STRING='"$(VERSION)"'
+
+CUTILS_SEMVER      := $(shell cat $(CUTILS_DIR)/release_version 2>/dev/null | tr -d '[:space:]')
+CUTILS_VERSION_DEF := -DCUTILS_VERSION_STRING='"$(CUTILS_SEMVER)_$(BUILD_TS).release"'
+CUTILS_REF         := $(shell cat cutils_version 2>/dev/null | tr -d '[:space:]')
+ifneq ($(CUTILS_SEMVER),)
+ifneq ($(CUTILS_REF),)
+ifneq (v$(CUTILS_SEMVER),$(CUTILS_REF))
+$(warning sibling c-utils $(CUTILS_SEMVER) differs from pinned $(CUTILS_REF))
+endif
+endif
+endif
 
 # ---- Directory layout -------------------------------------------------
 BUILD      := build
@@ -22,17 +39,19 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wformat=2 -Wformat-truncation -Wmissing-prototypes \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
-SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common
+SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common \
+                -I src/config -I src/daemon -I $(CUTILS_DIR)/include
 COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
-                 $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
+                 $(SRC_INCLUDES) -I vendor $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 
 RELEASE_CFLAGS := $(COMMON_CFLAGS) -O3 -flto=auto -march=znver3 -mtune=znver3
 STATIC_CFLAGS  := $(COMMON_CFLAGS) -O3 -flto=auto -march=znver3 -mtune=znver3
 DEBUG_CFLAGS   := $(COMMON_CFLAGS) -Og -g -march=znver3 -mtune=znver3
 ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g -fsanitize=address -fno-omit-frame-pointer -march=znver3 -mtune=znver3
 
-LDFLAGS        := -llz4 -lssl -lcrypto -lacl -lpthread
+CUTILS_LIB     := -L$(CUTILS_DIR)/build -lc-utils
+LDFLAGS        := $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
 
 # Per-type CFLAGS/LDFLAGS selection
 ifeq ($(BUILD_TYPE),release)
@@ -49,7 +68,7 @@ else ifeq ($(BUILD_TYPE),debug)
   BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
-  TYPE_LDFLAGS := -static-libasan -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread
+  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
   BIN_SUFFIX   := -asan
 endif
 
@@ -71,7 +90,8 @@ SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
 VENDOR_OBJS := $(OBJ_DIR)/cJSON.o
-LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) $(VENDOR_OBJS)
+LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) $(VENDOR_OBJS) \
+               $(OBJ_DIR)/app_migrations.o
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
 OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
@@ -102,7 +122,10 @@ asan:
 
 # ---- Internal build target (called via recursive make) ----------------
 .PHONY: _build
-_build: $(TARGETS)
+_build: $(MIGRATE_SRC) $(TARGETS)
+
+$(BUILD):
+	mkdir -p $(BUILD)
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
@@ -115,6 +138,20 @@ $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 
 $(OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(OBJ_DIR)
 	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
+
+# ---- Embedded SQL migrations ------------------------------------------
+# Compiled into the binary so a deployed daemon carries its own schema and
+# cannot half-migrate against a stale migrations/ directory on disk.
+MIGRATE_SRC := $(BUILD)/app_migrations.c
+
+$(MIGRATE_SRC): $(wildcard migrations/*.sql) | $(BUILD)
+	$(CUTILS_DIR)/tools/embed_sql.sh migrations/ app_migrations > $@
+
+$(OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(OBJ_DIR)
+	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
+
+.PHONY: embed-migrations
+embed-migrations: $(MIGRATE_SRC)
 
 $(DAEMON_OBJ): $(DAEMON_MAIN) | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
@@ -132,7 +169,7 @@ $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) | $(BINS)
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-               $(REL_OBJ_DIR)/cJSON.o
+               $(REL_OBJ_DIR)/cJSON.o $(REL_OBJ_DIR)/app_migrations.o
 
 TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result $(SRC_INCLUDES) -I vendor
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
@@ -168,14 +205,14 @@ test: all $(TEST_BINS) $(FAULT_BINS) analyze
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
 ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                $(ASAN_OBJ_DIR)/cJSON.o
+                $(ASAN_OBJ_DIR)/cJSON.o $(ASAN_OBJ_DIR)/app_migrations.o
 
-ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor
+ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(ASAN_LIB_OBJS) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
-	    -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread -lcmocka
+	    $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lcmocka
 
 test-asan: asan $(ASAN_TEST_BINS)
 	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
@@ -183,7 +220,7 @@ test-asan: asan $(ASAN_TEST_BINS)
 .PHONY: test-asan
 
 # ---- Static analysis --------------------------------------------------
-ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 $(SRC_INCLUDES) -I vendor
+ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=znver3 $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
 analyze: | $(BUILD)
