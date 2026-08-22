@@ -212,7 +212,14 @@ $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(REL_LIB_
 test-api: all
 	@./$(TESTS)/test_api_e2e.sh $(BINS)/c-backupd
 
-test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api
+# The CLI holds no repository logic, so what is worth testing is that each
+# command reaches the right endpoint and that a missing daemon produces a
+# clear message rather than a crash or a hang.
+.PHONY: test-cli
+test-cli: all
+	@./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli
 	@if [ -z "$(strip $(TEST_BINS)$(FAULT_BINS))" ]; then \
 	    echo "no active tests: suites are in tests/attic/ pending their phase"; \
 	else \
