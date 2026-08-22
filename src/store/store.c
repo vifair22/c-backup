@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
-#include "../vendor/log.h"
+#include <cutils/log.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -128,7 +128,7 @@ status_t store_init_dirs(const char *path) {
     if ((st = mkdir_at(repofd, "snapshots")) != OK) goto done;
     if ((st = mkdir_at(repofd, "tmp"))       != OK) goto done;
 
-    log_msg("INFO", "repository initialised");
+    log_info("repository initialised");
 
 done:
     close(repofd);

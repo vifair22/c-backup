@@ -15,6 +15,11 @@ stages:
 variables:
   CUTILS_DIR: /tmp/c-utils
   DEBIAN_FRONTEND: noninteractive
+  # The Makefile defaults to the dev machine's znver3. Runners are not
+  # guaranteed to be Zen 3, and a binary built for one CPU and run on another
+  # dies on an illegal instruction, so CI builds to the portable floor.
+  MARCH: x86-64-v2
+  MTUNE: generic
 
 .debian_deps: &debian_deps
   - apt-get update -qq
@@ -101,7 +106,10 @@ build:image:
     - master
 
 # Deploy fans out to one child job per target so a host can be added or
-# removed by editing a CI variable rather than this file.
+# removed by editing a CI variable rather than this file. With no targets set
+# the generator would emit a child pipeline containing no jobs, which GitLab
+# rejects, so the whole stage sits out until someone configures a target. A
+# red pipeline because nobody has picked a deploy host yet is noise.
 generate_deploy_child_pipeline:
   stage: deploy
   image: debian:trixie
@@ -138,8 +146,8 @@ generate_deploy_child_pipeline:
   artifacts:
     paths:
       - deploy-child.yml
-  only:
-    - master
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS != ""'
 
 trigger_deploy:
   stage: deploy
@@ -151,5 +159,5 @@ trigger_deploy:
     # depend so the parent pipeline reflects the children's status rather
     # than going green the moment the trigger is accepted.
     strategy: depend
-  only:
-    - master
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS != ""'

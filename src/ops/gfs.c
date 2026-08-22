@@ -3,7 +3,7 @@
 #include "prune.h"
 
 #include <cutils/log.h>
-#include "../vendor/log.h"
+#include <cutils/log.h>
 
 #include <limits.h>
 #include <stdio.h>

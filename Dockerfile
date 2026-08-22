@@ -13,15 +13,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# c-utils is a sibling checkout in development. In CI it is cloned to a known
-# path and CUTILS_DIR points at it, so the same Makefile serves both.
-ARG CUTILS_REF=master
-RUN git clone --depth 1 --branch "${CUTILS_REF}" \
-        https://git.airies.net/vifair22/c-utils.git /c-utils \
+# c-utils is a sibling checkout in development. Here it is cloned to a known
+# path and CUTILS_DIR points at it, so the same Makefile serves both. The ref
+# comes from cutils_version rather than master: an image that silently picks
+# up a different library than CI tested against is not the artefact CI
+# approved.
+COPY cutils_version /build/cutils_version
+RUN git clone -q https://git.airies.net/vifair22/c-utils.git /c-utils \
+    && git -C /c-utils checkout -q "$(tr -d '[:space:]' < /build/cutils_version)" \
     && make -C /c-utils
 
 COPY . /build
-RUN make CUTILS_DIR=/c-utils
+# The image runs on whatever the deployment host is, which is not this
+# builder, so it is built to the portable floor rather than the Makefile's
+# znver3 default. See the MARCH comment in the Makefile.
+RUN make CUTILS_DIR=/c-utils MARCH=x86-64-v2 MTUNE=generic
 
 FROM debian:trixie-slim
 

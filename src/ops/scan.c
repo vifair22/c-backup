@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "scan.h"
-#include "../vendor/log.h"
+#include <cutils/log.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -300,7 +300,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", path, strerror(errno));
         scan_warn(res, msg);
-        log_msg("WARN", msg);
+        log_warn("%s", msg);
         return OK;
     }
 
@@ -310,7 +310,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "skipping mount point: %s (different device)", path);
         scan_warn(res, msg);
-        log_msg("WARN", msg);
+        log_warn("%s", msg);
         return OK;
     }
 
@@ -432,7 +432,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)", path, strerror(errno));
         scan_warn(res, msg);
-        log_msg("WARN", msg);
+        log_warn("%s", msg);
         return OK;
     }
 
@@ -477,7 +477,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
             if (opts && opts->progress_clear_cb)
                 opts->progress_clear_cb(opts->progress_ctx);
             scan_warn(res, "path too long, skipping entry");
-            log_msg("WARN", "path too long, skipping entry");
+            log_warn("path too long, skipping entry");
             continue;
         }
         memcpy(child, path, plen);
@@ -511,7 +511,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", root, strerror(errno));
         scan_warn(res, msg);
-        log_msg("WARN", msg);
+        log_warn("%s", msg);
         *out = res;
         return OK;
     }
@@ -597,7 +597,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
             opts->progress_clear_cb(opts->progress_ctx);
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "lstat failed, skipping: %s (%s)", root, strerror(errno));
-        log_msg("WARN", msg);
+        log_warn("%s", msg);
         scan_result_free(res);
         res = calloc(1, sizeof(*res));
         if (!res) return set_error(ERR_NOMEM, "scan_tree: realloc result failed");

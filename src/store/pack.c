@@ -7,7 +7,7 @@
 #include "store.h"
 #include "progress.h"
 #include "util.h"
-#include "../vendor/log.h"
+#include <cutils/log.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -598,10 +598,10 @@ status_t pack_object_load(store_t *store,
             /* Verify/repair entry header */
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
             if (hrc == 1) {
-                log_msg("WARN", "pack: repaired entry header via parity");
+                log_warn("pack: repaired entry header via parity");
                 parity_stats_add_repaired(1);
             } else if (hrc < 0) {
-                log_msg("WARN", "pack: entry header parity uncorrectable");
+                log_warn("pack: entry header parity uncorrectable");
                 parity_stats_add_uncorrectable(1);
             }
 
@@ -635,10 +635,10 @@ status_t pack_object_load(store_t *store,
                     int rrc = rs_parity_decode(cpayload, (size_t)ehdr.compressed_size,
                                                rs_par);
                     if (rrc > 0) {
-                        log_msg("WARN", "pack: repaired payload via RS parity");
+                        log_warn("pack: repaired payload via RS parity");
                         parity_stats_add_repaired(1);
                     } else if (rrc < 0) {
-                        log_msg("WARN", "pack: payload RS parity uncorrectable");
+                        log_warn("pack: payload RS parity uncorrectable");
                         parity_stats_add_uncorrectable(1);
                     }
                 }
@@ -927,10 +927,10 @@ status_t pack_object_load_stream(store_t *store,
             have_parity = 1;
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
             if (hrc == 1) {
-                log_msg("WARN", "pack: repaired entry header via parity (stream)");
+                log_warn("pack: repaired entry header via parity (stream)");
                 parity_stats_add_repaired(1);
             } else if (hrc < 0) {
-                log_msg("WARN", "pack: entry header parity uncorrectable (stream)");
+                log_warn("pack: entry header parity uncorrectable (stream)");
                 parity_stats_add_uncorrectable(1);
             }
         }
@@ -968,10 +968,10 @@ status_t pack_object_load_stream(store_t *store,
                 rs_init();
                 int rrc = rs_parity_decode(cpayload, (size_t)ehdr.compressed_size, rs_par);
                 if (rrc > 0) {
-                    log_msg("WARN", "pack: repaired payload via RS parity (stream/lz4)");
+                    log_warn("pack: repaired payload via RS parity (stream/lz4)");
                     parity_stats_add_repaired(1);
                 } else if (rrc < 0) {
-                    log_msg("WARN", "pack: payload RS parity uncorrectable (stream/lz4)");
+                    log_warn("pack: payload RS parity uncorrectable (stream/lz4)");
                     parity_stats_add_uncorrectable(1);
                 }
             }
@@ -1048,7 +1048,7 @@ status_t pack_object_load_stream(store_t *store,
          * because nothing was fixed - calling it a repair would inflate the
          * repaired figure and hide damage that needs operator attention. */
         if (have_parity && fst == OK && running_crc != pay_crc) {
-            log_msg("WARN", "pack: LZ4_FRAME payload CRC mismatch (stream, not repairable)");
+            log_warn("pack: LZ4_FRAME payload CRC mismatch (stream, not repairable)");
             parity_stats_add_uncorrectable(1);
         }
         free(rs_par);
@@ -1131,7 +1131,7 @@ status_t pack_object_load_stream(store_t *store,
             if (rrc > 0) {
                 total_corrected += rrc;
             } else if (rrc < 0) {
-                log_msg("WARN", "pack: payload RS group uncorrectable (stream)");
+                log_warn("pack: payload RS group uncorrectable (stream)");
                 parity_stats_add_uncorrectable(1);
                 /* Continue — write what we have, SHA-256 will catch it */
             }
@@ -1144,7 +1144,7 @@ status_t pack_object_load_stream(store_t *store,
         free(gbuf);
 
         if (total_corrected > 0) {
-            log_msg("WARN", "pack: repaired payload via RS parity (stream)");
+            log_warn("pack: repaired payload via RS parity (stream)");
             parity_stats_add_repaired(1);
         }
 
@@ -2328,13 +2328,13 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     int show_progress = pack_progress_enabled();
 
     if (!loose_objects_exist(store)) {
-        log_msg("INFO", "pack: no loose objects to pack");
+        log_info("pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;
         return OK;
     }
 
     /* Collect loose object hashes */
-    log_msg("INFO", "pack: phase 1/2 collecting loose objects");
+    log_info("pack: phase 1/2 collecting loose objects");
     uint8_t *hashes       = NULL;
     size_t   loose_cnt = 0;
     status_t st = collect_loose(store, &hashes, &loose_cnt);
@@ -2342,12 +2342,12 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
 
     if (loose_cnt == 0) {
         free(hashes);
-        log_msg("INFO", "pack: no loose objects to pack");
+        log_info("pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;
         return OK;
     }
 
-    log_msg("INFO", "pack: phase 2/2 writing pack files");
+    log_info("pack: phase 2/2 writing pack files");
 
 
 
@@ -2414,7 +2414,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         for (size_t mi2 = 0; mi2 < meta_cnt; mi2++)
             if (meta[mi2].fd >= 0) close(meta[mi2].fd);
         free(meta); free(indices); free(hashes);
-        log_msg("INFO", "pack: no packable objects (all loose objects are skip-marked)");
+        log_info("pack: no packable objects (all loose objects are skip-marked)");
         if (out_packed) *out_packed = 0;
         return OK;
     }
@@ -2490,7 +2490,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         for (size_t mi2 = 0; mi2 < meta_cnt; mi2++)
             if (meta[mi2].fd >= 0) close(meta[mi2].fd);
         free(meta); free(indices); free(hashes);
-        log_msg("INFO", "pack: no packable objects after probe pass");
+        log_info("pack: no packable objects after probe pass");
         if (out_packed) *out_packed = 0;
         return OK;
     }
@@ -2590,7 +2590,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         char msg[128];
         snprintf(msg, sizeof(msg), "pack: packed %u object(s) into pack file(s)",
                  packed);
-        log_msg("INFO", msg);
+        log_info("%s", msg);
     }
     if (out_packed) *out_packed = packed;
     if (progress) progress((uint64_t)packed, (uint64_t)packed, "packing", progress_ctx);
@@ -3012,7 +3012,7 @@ static status_t maybe_coalesce_packs(store_t *store,
         snprintf(msg, sizeof(msg),
                  "pack-coalesce: merged %zu pack(s) into %u pack(s) (%u objects)",
                  n_cand, packs_written, total_live);
-        log_msg("INFO", msg);
+        log_info("%s", msg);
     } else if (rc != OK) {
         if (new_dat) { fclose(new_dat); new_dat = NULL; }
         if (new_idx) { fclose(new_idx); new_idx = NULL; }
@@ -3405,7 +3405,7 @@ pack_fail:
 
     status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
     if (coalesce_st != OK)
-        log_msg("WARN", "pack-coalesce: skipped due to error");
+        log_warn("pack-coalesce: skipped due to error");
 
     /* All packs processed — invalidate cache so next lookup is fresh */
     if (total_deleted > 0) {

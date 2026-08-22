@@ -5,7 +5,7 @@
 #include "parity.h"
 #include "parity_stream.h"
 #include "util.h"
-#include "../vendor/log.h"
+#include <cutils/log.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -600,9 +600,9 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
 
     /* Helper: push the progress line down before logging so our messages
      * aren't overwritten by the \r-based progress display. */
-    #define STREAM_LOG(level, msg) do { \
+    #define STREAM_LOG(logfn, msg) do { \
         fprintf(stderr, "\n"); fflush(stderr); \
-        log_msg((level), (msg)); \
+        logfn("%s", (msg)); \
     } while (0)
 
     if (is_fuse) {
@@ -710,7 +710,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                              (unsigned long long)file_size,
                              file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
                              retries);
-                    STREAM_LOG("WARN", rmsg);
+                    STREAM_LOG(log_warn, rmsg);
                     struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
                     nanosleep(&ts, NULL);
                     continue;
@@ -729,7 +729,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                              (unsigned long long)file_size,
                              file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
                              STREAM_REOPEN_MAX);
-                    STREAM_LOG("ERROR", rmsg);
+                    STREAM_LOG(log_error, rmsg);
                     errno = saved_errno;
                     st = set_error_errno(ERR_IO, "%s", rmsg);
                     goto done;
@@ -749,7 +749,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                                  (unsigned long long)file_size,
                                  file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
                                  recoveries, STREAM_REOPEN_MAX);
-                        STREAM_LOG("WARN", rmsg);
+                        STREAM_LOG(log_warn, rmsg);
                         errno = saved_errno;
                         continue;
                     }
@@ -759,7 +759,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                              (unsigned long long)(offset + got),
                              (unsigned long long)file_size,
                              file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-                    STREAM_LOG("WARN", rmsg);
+                    STREAM_LOG(log_warn, rmsg);
                 }
 
                 /* Tier 2: close + reopen by path + seek */
@@ -771,14 +771,14 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                              (unsigned long long)file_size,
                              file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
                              recoveries + 1, STREAM_REOPEN_MAX);
-                    STREAM_LOG("WARN", rmsg);
+                    STREAM_LOG(log_warn, rmsg);
 
                     int new_fd = open(src_path, O_RDONLY);
                     if (new_fd < 0) {
                         snprintf(rmsg, sizeof(rmsg),
                                  "stream: reopen failed (%s), giving up",
                                  strerror(errno));
-                        STREAM_LOG("ERROR", rmsg);
+                        STREAM_LOG(log_error, rmsg);
                         errno = saved_errno;
                         st = set_error_errno(ERR_IO,
                             "stream: read failed at offset %llu/%llu (%.1f%%), reopen failed",
@@ -791,7 +791,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                         snprintf(rmsg, sizeof(rmsg),
                                  "stream: reopen seek failed (%s), giving up",
                                  strerror(errno));
-                        STREAM_LOG("ERROR", rmsg);
+                        STREAM_LOG(log_error, rmsg);
                         close(new_fd);
                         errno = saved_errno;
                         st = set_error_errno(ERR_IO,
@@ -811,7 +811,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                              (unsigned long long)file_size,
                              file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0,
                              recoveries, STREAM_REOPEN_MAX);
-                    STREAM_LOG("WARN", rmsg);
+                    STREAM_LOG(log_warn, rmsg);
                     posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
                     errno = saved_errno;
                     continue;
@@ -824,7 +824,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                          (unsigned long long)(offset + got),
                          (unsigned long long)file_size,
                          file_size > 0 ? 100.0 * (double)(offset + got) / (double)file_size : 0.0);
-                STREAM_LOG("ERROR", rmsg);
+                STREAM_LOG(log_error, rmsg);
                 errno = saved_errno;
                 st = set_error_errno(ERR_IO, "%s", rmsg);
                 goto done;
@@ -1434,10 +1434,10 @@ status_t object_load(store_t *store,
                 memcpy(&hdr_par, trailer, sizeof(hdr_par));
                 int hrc = parity_record_check(&hdr, sizeof(hdr), &hdr_par);
                 if (hrc == 1) {
-                    log_msg("WARN", "object: repaired corrupt header via parity");
+                    log_warn("object: repaired corrupt header via parity");
                     parity_stats_add_repaired(1);
                 } else if (hrc < 0) {
-                    log_msg("WARN", "object: header parity check failed (uncorrectable)");
+                    log_warn("object: header parity check failed (uncorrectable)");
                     parity_stats_add_uncorrectable(1);
                 }
 
@@ -1451,10 +1451,10 @@ status_t object_load(store_t *store,
                     int rrc = rs_parity_decode(cpayload, (size_t)hdr.compressed_size,
                                                trailer + sizeof(hdr_par));
                     if (rrc > 0) {
-                        log_msg("WARN", "object: RS repaired corrupt payload bytes");
+                        log_warn("object: RS repaired corrupt payload bytes");
                         parity_stats_add_repaired(1);
                     } else if (rrc < 0) {
-                        log_msg("WARN", "object: RS repair failed (uncorrectable)");
+                        log_warn("object: RS repair failed (uncorrectable)");
                         parity_stats_add_uncorrectable(1);
                     }
                 }
@@ -1549,10 +1549,10 @@ status_t object_load_stream(store_t *store,
                 pftr.magic == PARITY_FOOTER_MAGIC && pftr.version == PARITY_VERSION) {
                 int hrc = parity_record_check(&hdr, sizeof(hdr), &hpar);
                 if (hrc == 1) {
-                    log_msg("WARN", "object: repaired corrupt header via parity (stream)");
+                    log_warn("object: repaired corrupt header via parity (stream)");
                     parity_stats_add_repaired(1);
                 } else if (hrc < 0) {
-                    log_msg("WARN", "object: header parity uncorrectable (stream)");
+                    log_warn("object: header parity uncorrectable (stream)");
                     parity_stats_add_uncorrectable(1);
                 }
             }

@@ -1,0 +1,25 @@
+# The image build only needs the sources, the Makefile and packaging/. Without
+# this the context carries the host's build/ directory, whose LTO objects were
+# produced by a different gcc than the one in the image; the link then fails
+# with a bytecode-version mismatch. CI clones fresh so it never saw this, but
+# a local `docker build` did, and shipping host artefacts into an image is
+# wrong regardless.
+
+build/
+.git/
+.cache/
+.idea/
+.vscode/
+.claude/
+.codex/
+node_modules/
+ui/node_modules/
+ui/dist/
+ui/out/
+compile_commands.json
+daemonization-spec.md
+CLAUDE.md
+*.o
+*.d
+*.gcda
+*.gcno
