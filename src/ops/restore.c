@@ -109,6 +109,62 @@ static void hardlink_remember(hardlink_map_t *m, uint64_t key, const char *path)
     m->paths[h] = dup;
 }
 
+/*
+ * How many snapshot members each inode group has. Every regular file
+ * carries an inode identity, so size-one groups are the overwhelming
+ * majority and the map exists to find the few that are not.
+ */
+typedef struct {
+    uint64_t *keys;
+    uint32_t *counts;
+    uint32_t  mask;
+} groupcount_t;
+
+static int groupcount_init(groupcount_t *m, uint32_t n)
+{
+    uint32_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    m->keys   = calloc(cap, sizeof(*m->keys));
+    m->counts = calloc(cap, sizeof(*m->counts));
+    if (!m->keys || !m->counts) {
+        free(m->keys); free(m->counts);
+        m->keys = NULL; m->counts = NULL;
+        return -1;
+    }
+    m->mask = cap - 1;
+    return 0;
+}
+
+static void groupcount_free(groupcount_t *m)
+{
+    free(m->keys);
+    free(m->counts);
+    m->keys = NULL;
+    m->counts = NULL;
+}
+
+static uint32_t groupcount_slot(const groupcount_t *m, uint64_t key)
+{
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
+    while (m->keys[h] != 0 && m->keys[h] != key) h = (h + 1) & m->mask;
+    return h;
+}
+
+static void groupcount_add(groupcount_t *m, uint64_t key)
+{
+    if (!m->keys || key == 0) return;
+    uint32_t h = groupcount_slot(m, key);
+    m->keys[h] = key;
+    m->counts[h]++;
+}
+
+static uint32_t groupcount_get(const groupcount_t *m, uint64_t key)
+{
+    if (!m->keys || key == 0) return 0;
+    uint32_t h = groupcount_slot(m, key);
+    return m->keys[h] == key ? m->counts[h] : 0;
+}
+
 static int hash_is_zero_hex(const char *hex)
 {
     for (const char *c = hex; *c; c++) if (*c != '0') return 0;
@@ -390,6 +446,54 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_NOMEM, "restore: hardlink map");
     }
 
+    /*
+     * Resume pre-pass. A restore into a partially-populated destination
+     * skips what already exists, and skipped files never reach the code
+     * that remembers a group's first restored member. Whichever member of
+     * a group happens to be missing then gets a copy, because its
+     * surviving siblings were invisible to the map. Order does not save
+     * this: the missing member can sort before every survivor.
+     *
+     * So before restoring anything, members of every multi-member group
+     * that already exist on disk are remembered. Fresh restores pay a
+     * stat per member of a real hardlink group, all ENOENT; single-link
+     * files, the overwhelming majority, never reach the stat.
+     */
+    if (!opts->overwrite) {
+        groupcount_t gcount;
+        if (groupcount_init(&gcount, (uint32_t)r->nrows) != 0) {
+            hardlink_map_free(&hlinks);
+            db_result_free(r);
+            return set_error(ERR_NOMEM, "restore: group counts");
+        }
+        for (int i = 0; i < r->nrows; i++) {
+            uint32_t ntype = (uint32_t)strtoul(r->rows[i][8], NULL, 10);
+            if (ntype != NODE_TYPE_REG) continue;
+            groupcount_add(&gcount, (uint64_t)strtoll(r->rows[i][10], NULL, 10));
+        }
+        for (int i = 0; i < r->nrows; i++) {
+            uint32_t ntype = (uint32_t)strtoul(r->rows[i][8], NULL, 10);
+            if (ntype != NODE_TYPE_REG) continue;
+            uint64_t hgroup = (uint64_t)strtoll(r->rows[i][10], NULL, 10);
+            if (hgroup == 0 || groupcount_get(&gcount, hgroup) < 2) continue;
+            if (hardlink_lookup(&hlinks, hgroup)) continue;
+
+            char rel[PATH_MAX];
+            if (node_rel_path(db, repo, snap, r->rows[i][0], rel, sizeof(rel)) != OK) {
+                err_clear();
+                continue;
+            }
+            if (opts->subpath && !path_within(rel, opts->subpath)) continue;
+            char full[PATH_MAX];
+            if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
+                continue;
+            struct stat sb;
+            if (stat(full, &sb) == 0 && S_ISREG(sb.st_mode))
+                hardlink_remember(&hlinks, hgroup, full);
+        }
+        groupcount_free(&gcount);
+    }
+
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
         report(opts, "restore", (uint64_t)i, (uint64_t)r->nrows);
@@ -466,6 +570,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
 
+
         /*
          * Anything sharing an inode with something already restored is
          * relinked rather than copied. Without this, 30,000 hardlinked files
@@ -497,7 +602,17 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (!opts->overwrite) {
             struct stat sb;
-            if (stat(full, &sb) == 0) { res.skipped++; continue; }
+            if (stat(full, &sb) == 0) {
+                /* Skipped, but still this inode group's anchor. A resumed
+                 * restore skips everything an earlier attempt wrote, and
+                 * without remembering those paths every group whose first
+                 * member landed in the earlier run came back as copies:
+                 * 2,262 links flattened on the first interrupted 45G run,
+                 * silently, because the content was never wrong. */
+                if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
+                res.skipped++;
+                continue;
+            }
         }
 
         uint8_t hash[OBJECT_HASH_SIZE];

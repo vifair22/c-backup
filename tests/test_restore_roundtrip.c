@@ -312,6 +312,43 @@ static void test_links_survive_a_reindex(void **state)
     assert_int_equal(a.st_ino, b.st_ino);
 }
 
+/*
+ * A resumed restore must keep relinking into groups an earlier attempt
+ * already wrote. Files that exist are skipped, and the skip used to skip
+ * the hardlink map too, so any group whose first member landed in the
+ * earlier run came back as copies. On the first interrupted 45G restore
+ * that flattened 2,262 links, silently: content was never wrong.
+ */
+static void test_resumed_restore_relinks_hardlinks(void **state)
+{
+    (void)state;
+    assert_int_equal(link(TEST_SRC "/top.txt", TEST_SRC "/hard_a"), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, NULL), OK);
+
+    /* Simulate an interrupted first attempt: the group's first member is
+     * on disk, the second is not. */
+    char kept[PATH_MAX], removed[PATH_MAX];
+    snprintf(kept,    sizeof(kept),    "%s/top.txt", restored_root());
+    snprintf(removed, sizeof(removed), "%s/hard_a",  restored_root());
+    assert_int_equal(unlink(removed), 0);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    struct stat a, b;
+    assert_int_equal(stat(kept, &a), 0);
+    assert_int_equal(stat(removed, &b), 0);
+    assert_int_equal(a.st_ino, b.st_ino);
+    assert_int_equal(rr.hardlinks, 1);
+}
+
 /* ---------- pack compaction via gc ---------- */
 
 /* Total bytes across every pack .dat in the repo. */
@@ -838,6 +875,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_resumed_restore_relinks_hardlinks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
