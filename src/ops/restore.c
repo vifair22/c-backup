@@ -26,6 +26,30 @@
  */
 #define MAX_PATH_DEPTH 256
 
+/*
+ * Is this node inside the requested subpath?
+ *
+ * Node paths are stored with the leading slash stripped, because scan_tree
+ * records absolute paths and the restore rebuilds them under dest. A caller
+ * naturally passes the absolute path they see in the browser, so both forms
+ * are accepted rather than silently matching nothing.
+ *
+ * Matching stops at a path boundary: a plain prefix test would let a subpath
+ * of "src/doc" pull in "src/documents" too.
+ */
+static int path_within(const char *rel, const char *subpath)
+{
+    while (*subpath == '/') subpath++;
+    while (*rel == '/') rel++;
+
+    size_t n = strlen(subpath);
+    while (n > 0 && subpath[n - 1] == '/') n--;
+    if (n == 0) return 1;   /* the whole snapshot */
+
+    if (strncmp(rel, subpath, n) != 0) return 0;
+    return rel[n] == '\0' || rel[n] == '/';
+}
+
 static int cancelled(const restore_opts_t *o)
 {
     return o && o->cancel && *o->cancel;
@@ -185,7 +209,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
 
-        if (opts->subpath && strncmp(rel, opts->subpath, strlen(opts->subpath)) != 0)
+        if (opts->subpath && !path_within(rel, opts->subpath))
             continue;
 
         char full[PATH_MAX];

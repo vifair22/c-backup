@@ -69,10 +69,20 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/repos/<id>/backup` | `{paths:[...], label}` |
-| POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite}` |
+| POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository |
+| POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
+
+`subpath` restores one path out of the snapshot instead of all of it, so
+pulling a single file back does not cost a full restore. It accepts the path
+either as it appears in the browser or without its leading slash, and matches
+on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
+
+Packing is what keeps a long-lived repository from holding one file per
+object. It is also available as a schedule action, which is how it is meant to
+run: alongside `gc`, `gfs` and `reindex`.
 
 ## Jobs
 

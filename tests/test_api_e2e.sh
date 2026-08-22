@@ -235,6 +235,51 @@ well_formed() {  # well_formed <name> <body>
     esac
 }
 
+echo "packing"
+PACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/pack)")
+check "pack submitted" "1" "$([ -n "$PACK_JOB" ] && echo 1 || echo 0)"
+wait_job "$PACK_JOB"
+contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
+contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
+contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
+# Objects are in packs now, so every read path has to resolve through the
+# index rather than the objects directory.
+PACKED=$(sock_body '/repos/1/objects?location=pack&limit=1' \
+         | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
+contains "packed object locates" '"found":true'  "$(sock_body "/repos/1/objects/$PACKED")"
+contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$PACKED/layout")"
+contains "packed object content" '"base64"'      "$(sock_body "/repos/1/objects/$PACKED/content")"
+contains "diff over packs"       '"modified"'    "$(sock_body '/repos/1/diff?from=1&to=2')"
+
+# The sharpest check on packing: every object still readable afterwards. A
+# lost pack_objects row leaves bytes on disk that nothing can resolve, and a
+# full restore is the only thing that notices. Snapshot 2, because the diff
+# section above changed a.txt and snapshot 1 no longer matches the source.
+REPACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+             -d "{\"dest\":\"$WORK/packed_out\"}" \
+             http://localhost/repos/1/snapshots/2/restore)")
+wait_job "$REPACK_JOB"
+contains "restore after packing completed" '"state":"completed"' \
+         "$(sock_body "/jobs/$REPACK_JOB")"
+if diff -r "$WORK/src" "$WORK/packed_out$WORK/src" > /dev/null 2>&1; then
+    ok "restore from packs is identical"
+else
+    bad "restore from packs is identical" "no differences" "diff reported changes"
+fi
+
+echo "partial restore"
+SUB_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"dest\":\"$WORK/sub\",\"subpath\":\"$WORK/src/docs\"}" \
+          http://localhost/repos/1/snapshots/1/restore)")
+wait_job "$SUB_JOB"
+contains "subpath restore completed" '"state":"completed"' "$(sock_body "/jobs/$SUB_JOB")"
+# Only the requested subtree, so the siblings must not be there.
+if [ -f "$WORK/sub$WORK/src/docs/c.txt" ]; then ok "subpath restored its file"
+else bad "subpath restored its file" "$WORK/sub$WORK/src/docs/c.txt exists" "missing"; fi
+if [ -f "$WORK/sub$WORK/src/a.txt" ]; then
+    bad "subpath excluded the rest" "no a.txt outside the subpath" "a.txt restored"
+else ok "subpath excluded the rest"; fi
+
 echo "maintenance"
 GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")
 check "gc submitted" "1" "$([ -n "$GC_JOB" ] && echo 1 || echo 0)"

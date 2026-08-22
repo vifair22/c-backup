@@ -74,6 +74,16 @@ static status_t db_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
 /* pack commit: replaces the .idx sidecar                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Pack writing is multi-threaded, so several workers can finish a pack at the
+ * same moment and each try to open a transaction on the one shared database
+ * handle. SQLite has no nested transactions, so the second BEGIN fails, the
+ * callback bails, and that pack's rows are never written: its objects are on
+ * disk and unreachable. Serialising the commits is enough, and they are rare
+ * and short compared to the packing itself.
+ */
+static pthread_mutex_t g_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void db_pack_commit(void *user, const pack_commit_info_t *info)
 {
     store_index_t *idx = user;
@@ -91,8 +101,10 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
      * The pack file is already installed by the time this runs; that ordering
      * is deliberate and explained in daemonization-spec.md section 12.
      */
+    pthread_mutex_lock(&g_commit_lock);
     if (db_exec_raw(idx->db, "BEGIN") != 0) {
         log_error("pack commit: cannot begin transaction for pack %s", pack);
+        pthread_mutex_unlock(&g_commit_lock);
         return;
     }
 
@@ -140,10 +152,12 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         if (db_exec_raw(idx->db, "ROLLBACK") != 0)
             log_error("pack commit: rollback failed for pack %s", pack);
         log_error("pack commit: rolled back pack %s (%u objects)", pack, info->entry_count);
+        pthread_mutex_unlock(&g_commit_lock);
         return;
     }
     if (db_exec_raw(idx->db, "COMMIT") != 0)
         log_error("pack commit: commit failed for pack %s", pack);
+    pthread_mutex_unlock(&g_commit_lock);
 }
 
 /*
@@ -156,6 +170,10 @@ static void pack_removed(void *user, uint64_t pack_id)
 {
     store_index_t *idx = user;
     if (!idx) return;
+
+    /* Same shared handle as the commit callback, and GC emits removals from
+     * the same worker threads that emit commits. */
+    pthread_mutex_lock(&g_commit_lock);
 
     char repo[32], pack[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
@@ -170,6 +188,7 @@ static void pack_removed(void *user, uint64_t pack_id)
             "DELETE FROM packs WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, pack, NULL }, NULL) != 0)
         log_error("pack removed: cannot delete packs row %s", pack);
+    pthread_mutex_unlock(&g_commit_lock);
 }
 
 /* ------------------------------------------------------------------ */

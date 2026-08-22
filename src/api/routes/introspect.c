@@ -6,6 +6,7 @@
 #include "manifest.h"
 #include "object.h"
 #include "store.h"
+#include "store_index.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -67,6 +68,45 @@ static char *repo_path_of(int64_t repo_id)
     db_result_free(r);
     return p;
 }
+
+/*
+ * Open a repository with its index attached.
+ *
+ * A bare store_open leaves the locate callback unset, so the store can only
+ * find loose objects. That was invisible while nothing packed anything: every
+ * object was loose and every handler worked. The moment packing became
+ * reachable, layout, content and diff would all have started reporting
+ * packed objects as missing, and diff worst of all, because the manifest
+ * trees it walks get packed like any other object.
+ */
+static status_t open_bound_store(int64_t repo_id, store_t **out_store,
+                                 store_index_t **out_idx)
+{
+    *out_store = NULL;
+    *out_idx   = NULL;
+
+    char *path = repo_path_of(repo_id);
+    if (!path) return set_error(ERR_NOT_FOUND, "no such repo");
+
+    status_t st = store_open(path, NULL, out_store);
+    free(path);
+    if (st != OK) return st;
+
+    st = store_index_bind(*out_store, g_db, repo_id, out_idx);
+    if (st != OK) {
+        store_close(*out_store);
+        *out_store = NULL;
+        return st;
+    }
+    return OK;
+}
+
+static void close_bound_store(store_t *store, store_index_t *idx)
+{
+    store_index_free(idx);
+    store_close(store);
+}
+
 
 static int hex_ok(const char *hex)
 {
@@ -321,13 +361,10 @@ api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_i
     (void)req;
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
-    char *path = repo_path_of(repo_id);
-    if (!path) return api_error(404, "no such repo");
-
     store_t *store = NULL;
-    status_t st = store_open(path, NULL, &store);
-    free(path);
-    if (st != OK) return api_error(500, err_msg());
+    store_index_t *idx = NULL;
+    status_t st = open_bound_store(repo_id, &store, &idx);
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(hex, hash);
@@ -340,7 +377,7 @@ api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_i
          * is unreadable; report the logical size rather than nothing. */
         if (object_physical_size(store, hash, &phys) != OK) { phys = 0; err_clear(); }
     }
-    store_close(store);
+    close_bound_store(store, idx);
 
     if (st != OK) return api_error(404, "no such object");
 
@@ -390,13 +427,10 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
     (void)req;
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
-    char *path = repo_path_of(repo_id);
-    if (!path) return api_error(404, "no such repo");
-
     store_t *store = NULL;
-    status_t st = store_open(path, NULL, &store);
-    free(path);
-    if (st != OK) return api_error(500, err_msg());
+    store_index_t *idx = NULL;
+    status_t st = open_bound_store(repo_id, &store, &idx);
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
 
     uint8_t hash[OBJECT_HASH_SIZE];
     hex_to_hash(hex, hash);
@@ -404,11 +438,11 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
     uint64_t size = 0;
     uint8_t type = 0;
     if (object_get_info(store, hash, &size, &type) != OK) {
-        store_close(store);
+        close_bound_store(store, idx);
         return api_error(404, "no such object");
     }
     if (size > CONTENT_MAX) {
-        store_close(store);
+        close_bound_store(store, idx);
         char *body = NULL;
         if (asprintf(&body,
                 "{\"too_large\":true,\"size\":%llu,\"limit\":%u}",
@@ -420,7 +454,7 @@ api_response_t introspect_object_content(const api_request_t *req, int64_t repo_
     void *data = NULL;
     size_t len = 0;
     st = object_load(store, hash, &data, &len, &type);
-    store_close(store);
+    close_bound_store(store, idx);
     if (st != OK) return api_error(500, err_msg());
 
     char *b64 = b64_encode(data, len);
@@ -709,16 +743,14 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     if (root_hash_of(repo_id, to, hto) != 0)
         return api_error(404, "no such snapshot in 'to'");
 
-    char *path = repo_path_of(repo_id);
-    if (!path) return api_error(404, "no such repo");
     store_t *store = NULL;
-    status_t st = store_open(path, NULL, &store);
-    free(path);
-    if (st != OK) return api_error(500, err_msg());
+    store_index_t *idx = NULL;
+    status_t st = open_bound_store(repo_id, &store, &idx);
+    if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
 
     cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) {
-        store_close(store);
+        close_bound_store(store, idx);
         return api_error(500, "out of memory");
     }
 
@@ -728,7 +760,7 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     ctx.store = store;
 
     diff_walk(&ctx, hfrom, hto, "", 0);
-    store_close(store);
+    close_bound_store(store, idx);
 
     char n[32];
     snprintf(n, sizeof(n), "%u", ctx.added);

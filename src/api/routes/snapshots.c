@@ -8,6 +8,7 @@
 #include "gc.h"
 #include "gfs.h"
 #include "prune.h"
+#include "pack.h"
 #include "reindex.h"
 #include "restore.h"
 #include "store.h"
@@ -208,6 +209,7 @@ typedef enum {
     SNAP_JOB_REINDEX,
     SNAP_JOB_GC,
     SNAP_JOB_GFS,
+    SNAP_JOB_PACK,
 } snap_job_kind_t;
 
 typedef struct {
@@ -216,6 +218,7 @@ typedef struct {
     int64_t         snap_id;
     char           *repo_path;
     char           *dest;
+    char           *subpath;
     int             overwrite;
     int             dry_run;
     snap_job_kind_t kind;
@@ -227,7 +230,25 @@ static void snap_job_free(void *p)
     if (!j) return;
     free(j->repo_path);
     free(j->dest);
+    free(j->subpath);
     free(j);
+}
+
+/*
+ * pack.c predates the job manager and takes its progress callback with the
+ * counters first. Adapting here keeps that older signature out of the job
+ * plumbing rather than churning every caller of it.
+ */
+typedef struct {
+    void (*progress)(const char *, uint64_t, uint64_t, void *);
+    void  *ctx;
+} pack_progress_bridge_t;
+
+static void pack_progress_adapter(uint64_t current, uint64_t total,
+                                  const char *phase, void *ctx)
+{
+    pack_progress_bridge_t *b = ctx;
+    if (b && b->progress) b->progress(phase ? phase : "pack", current, total, b->ctx);
 }
 
 static status_t snap_job_run(void *arg, volatile int *cancel,
@@ -251,6 +272,17 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
     if (j->kind == SNAP_JOB_REINDEX) {
         st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
+    } else if (j->kind == SNAP_JOB_PACK) {
+        /* Loose objects are one file each. A repository of any size needs
+         * them coalesced into packs or it accumulates inodes without bound,
+         * and the index rows that make packed objects findable arrive through
+         * the commit callback store_index_bind installed above. */
+        pack_progress_bridge_t bridge = { progress, progress_ctx };
+        uint32_t packed = 0;
+        st = repo_pack(store, &packed, pack_progress_adapter, &bridge);
+        if (st == OK)
+            log_info("pack: %u object(s) packed in repo %lld",
+                     packed, (long long)j->repo_id);
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
@@ -292,6 +324,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     } else {
         restore_opts_t o;
         memset(&o, 0, sizeof(o));
+        o.subpath      = j->subpath;
         o.overwrite    = j->overwrite;
         o.cancel       = cancel;
         o.progress_cb  = progress;
@@ -341,12 +374,17 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         }
         uint32_t ow = 0;
         if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
+        /* Optional: restore one path out of the snapshot rather than all of
+         * it. Pulling a single file out of a large backup should not cost a
+         * full restore. */
+        if (json_req_get_str(body, "subpath", &j->subpath) != 0) j->subpath = NULL;
     }
 
     int64_t job_id = 0;
     const char *action = kind == SNAP_JOB_REINDEX ? "reindex"
                        : kind == SNAP_JOB_GC      ? "gc"
                        : kind == SNAP_JOB_GFS     ? "gfs"
+                       : kind == SNAP_JOB_PACK    ? "pack"
                                                   : "restore";
     status_t st = job_submit(g_ctx.jm, repo_id, action,
                              NULL, snap_job_run, j, snap_job_free, &job_id);
@@ -383,6 +421,7 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
     if (strcmp(rest, "/reindex") == 0) return submit_snap_job(repo_id, 0, req, SNAP_JOB_REINDEX);
     if (strcmp(rest, "/gc") == 0)      return submit_snap_job(repo_id, 0, req, SNAP_JOB_GC);
     if (strcmp(rest, "/gfs") == 0)     return submit_snap_job(repo_id, 0, req, SNAP_JOB_GFS);
+    if (strcmp(rest, "/pack") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_PACK);
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;
@@ -440,6 +479,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     if      (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
     else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
     else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;
+    else if (strcmp(action, "pack") == 0)    kind = SNAP_JOB_PACK;
     else return set_error(ERR_INVALID, "no scheduled job for action '%s'", action);
 
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
