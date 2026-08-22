@@ -80,7 +80,7 @@ else ifeq ($(BUILD_TYPE),debug)
   BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
-  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
   BIN_SUFFIX   := -asan
 endif
 
@@ -250,7 +250,7 @@ ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
-	    $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lcmocka
+	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lcmocka
 
 test-asan: asan $(ASAN_TEST_BINS)
 	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
