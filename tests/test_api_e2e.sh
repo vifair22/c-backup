@@ -43,6 +43,26 @@ sock_code() { curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" "http
 sock_body() { curl -s --unix-socket "$SOCK" "http://localhost$1"; }
 tcp_code()  { curl -s -o /dev/null -w '%{http_code}' "$@" "http://127.0.0.1:$PORT$1" 2>/dev/null; }
 
+# Job ids come from the submit response, never from counting submissions.
+# Anything that fires a schedule consumes an id too, so a hardcoded id ends up
+# polling somebody else's already-finished job and the wait returns instantly.
+job_id() {  # job_id <submit-response-body>
+    printf '%s' "$1" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p'
+}
+
+wait_job() {  # wait_job <id>
+    # An empty id means the submit itself failed; polling /jobs/ for 20s to
+    # discover that buries the real error under a timeout.
+    [ -n "$1" ] || return 1
+    for _ in $(seq 1 100); do
+        case "$(sock_body "/jobs/$1")" in
+            *'"state":"completed"'*|*'"state":"failed"'*) return 0 ;;
+        esac
+        sleep 0.2
+    done
+    return 1
+}
+
 mkdir -p "$WORK/src/docs"
 echo "alpha content"  > "$WORK/src/a.txt"
 echo "beta content"   > "$WORK/src/b.txt"
@@ -108,16 +128,12 @@ check "refuses foreign dir" 400 \
 check "foreign dir untouched" "data.txt" "$(ls "$WORK/foreign")"
 
 echo "backup"
-contains "submit" '"job_id"' \
-    "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
-       http://localhost/repos/1/backup)"
-for _ in $(seq 1 60); do
-    case "$(sock_body /jobs/1)" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
-contains "job completed" '"state":"completed"' "$(sock_body /jobs/1)"
+BACKUP_RESP=$(curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
+              http://localhost/repos/1/backup)
+contains "submit" '"job_id"' "$BACKUP_RESP"
+BACKUP_JOB=$(job_id "$BACKUP_RESP")
+wait_job "$BACKUP_JOB"
+contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")"
 contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
@@ -136,15 +152,10 @@ check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --uni
      http://localhost/repos/1/tags/milestone)"
 
 echo "restore"
-curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$WORK/out\"}" \
-     http://localhost/repos/1/snapshots/1/restore > /dev/null
-for _ in $(seq 1 60); do
-    case "$(sock_body /jobs/2)" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
-contains "restore completed" '"state":"completed"' "$(sock_body /jobs/2)"
+RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$WORK/out\"}" \
+                        http://localhost/repos/1/snapshots/1/restore)")
+wait_job "$RESTORE_JOB"
+contains "restore completed" '"state":"completed"' "$(sock_body "/jobs/$RESTORE_JOB")"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
@@ -203,12 +214,10 @@ check    "rejects bad hash" 400 "$(sock_code /repos/1/objects/nothexatall)"
 # Diff walks manifest trees: an unchanged subtree hash prunes the whole
 # subtree, so a second snapshot with one change reports exactly one change.
 echo "changed" > "$WORK/src/a.txt"
-curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
-     http://localhost/repos/1/backup > /dev/null
-for _ in $(seq 1 60); do
-    case "$(sock_body /jobs/2)" in *'"state":"completed"'*|*'"state":"failed"'*) break ;; esac
-    sleep 0.2
-done
+DIFF_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
+                      http://localhost/repos/1/backup)")
+wait_job "$DIFF_JOB"
+contains "second backup completed" '"state":"completed"' "$(sock_body "/jobs/$DIFF_JOB")"
 DIFF=$(sock_body '/repos/1/diff?from=1&to=2')
 contains "diff reports the modification" '"change":"modified"' "$DIFF"
 contains "diff counts one change"        '"modified":"1"'      "$DIFF"
