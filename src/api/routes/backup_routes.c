@@ -233,26 +233,43 @@ static api_response_t get_job(const api_request_t *req, void *ud)
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", id);
     db_result_t *r = NULL;
+    /*
+     * COALESCE rather than a NULL check in C: this db layer hands back an
+     * empty string for a NULL column, not NULL, so the guard never fired and
+     * a job that had not reported progress serialised as "current":, which is
+     * not JSON at all. Every gc, gfs and reindex job hit it, because those
+     * report no progress.
+     */
     if (db_execute(ctx->db,
-            "SELECT id, repo_id, action, state, started, ended,"
-            "       progress_phase, progress_current, progress_total, error"
+            "SELECT id, action, state,"
+            "       COALESCE(NULLIF(progress_phase,''),''),"
+            "       CAST(COALESCE(NULLIF(progress_current,''),0) AS INTEGER),"
+            "       CAST(COALESCE(NULLIF(progress_total,''),0) AS INTEGER),"
+            "       COALESCE(NULLIF(error,''),'')"
             "  FROM jobs WHERE id = ?",
             (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(404, "no such job");
     }
 
-    char *body = NULL;
-    int n = asprintf(&body,
-        "{\"id\":%s,\"action\":\"%s\",\"state\":\"%s\","
-        "\"phase\":\"%s\",\"current\":%s,\"total\":%s,\"error\":\"%s\"}",
-        r->rows[0][0], r->rows[0][2], r->rows[0][3],
-        r->rows[0][6] ? r->rows[0][6] : "",
-        r->rows[0][7] ? r->rows[0][7] : "0",
-        r->rows[0][8] ? r->rows[0][8] : "0",
-        r->rows[0][9] ? r->rows[0][9] : "");
+    /* Built rather than printed: phase and error carry paths and strerror
+     * text, and one quote or backslash in either would produce a body no
+     * client can parse. */
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    int bad = json_resp_add_str(resp, "id",      r->rows[0][0]) != 0
+           || json_resp_add_str(resp, "action",  r->rows[0][1]) != 0
+           || json_resp_add_str(resp, "state",   r->rows[0][2]) != 0
+           || json_resp_add_str(resp, "phase",   r->rows[0][3]) != 0
+           || json_resp_add_u64(resp, "current", strtoull(r->rows[0][4], NULL, 10)) != 0
+           || json_resp_add_u64(resp, "total",   strtoull(r->rows[0][5], NULL, 10)) != 0
+           || json_resp_add_str(resp, "error",   r->rows[0][6]) != 0;
     db_result_free(r);
-    if (n < 0) return api_error(500, "out of memory");
+    if (bad) return api_error(500, "cannot serialise response");
+
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
     return api_ok(body);
 }
 

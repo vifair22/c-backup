@@ -223,13 +223,30 @@ contains "diff reports the modification" '"change":"modified"' "$DIFF"
 contains "diff counts one change"        '"modified":"1"'      "$DIFF"
 contains "diff adds nothing"             '"added":"0"'         "$DIFF"
 
+# A job that never reported progress used to serialise as "current":, which
+# is not JSON. gc, gfs and reindex all hit it, so every client broke on
+# exactly the maintenance jobs. No parser here, so the check is for an empty
+# value after any key, which is what the bug produced.
+well_formed() {  # well_formed <name> <body>
+    case "$2" in
+        *'":,'*|*'":}'*|*'":]'*) bad "$1" "no empty JSON values" "$2" ;;
+        '') bad "$1" "a response body" "(empty)" ;;
+        *) ok "$1" ;;
+    esac
+}
+
 echo "maintenance"
-check "gc" 202 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
-     http://localhost/repos/1/gc)"
+GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")
+check "gc submitted" "1" "$([ -n "$GC_JOB" ] && echo 1 || echo 0)"
 check "reindex" 202 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      http://localhost/repos/1/reindex)"
 check "gfs" 202 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      http://localhost/repos/1/gfs)"
+wait_job "$GC_JOB"
+# The maintenance jobs are the ones that report no progress, so they are the
+# ones the empty-value bug hit.
+well_formed "gc job body is well formed" "$(sock_body "/jobs/$GC_JOB")"
+well_formed "job list is well formed"    "$(sock_body /jobs)"
 sleep 1
 contains "journal readable" 'entries' "$(sock_body /repos/1/journal)"
 

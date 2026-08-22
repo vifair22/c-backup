@@ -101,12 +101,19 @@ contains "journal" 'entries'  "$(cb journal 1)"
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
 contains "restore submits a job" '"job_id"' "$RESTORE_OUT"
 RESTORE_JOB=$(printf '%s' "$RESTORE_OUT" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-for _ in $(seq 1 100); do
+# Three maintenance jobs were queued just above and there are two workers, so
+# the restore can sit behind them. The old twenty-second budget ran out on a
+# loaded machine and the loop fell through silently, leaving the tree
+# comparison below to report a difference that was really "not finished yet".
+RESTORE_DONE=0
+for _ in $(seq 1 600); do
     case "$(cb jobs "$RESTORE_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*|*'"state":"cancelled"'*) break ;;
+        *'"state":"completed"'*|*'"state":"failed"'*|*'"state":"cancelled"'*)
+            RESTORE_DONE=1; break ;;
     esac
     sleep 0.2
 done
+check "restore job reached a terminal state" 1 "$RESTORE_DONE"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
