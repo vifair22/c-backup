@@ -23,6 +23,22 @@
  * to recognise these to know what to parse and recurse into. See section 5.4. */
 #define OBJECT_TYPE_TREE    5
 
+/*
+ * Metadata blob wire formats. Both blobs are stored as content-addressed
+ * objects whose hashes land in manifest trees, so their bytes are part of the
+ * determinism contract: explicit little-endian lengths, deterministic entry
+ * order, nothing host- or environment-dependent. Written by scan.c, parsed by
+ * restore.c.
+ *
+ * OBJECT_TYPE_XATTR payload, one record per attribute, sorted by name:
+ *   name_len u16 LE (includes NUL) | name bytes | value_len u32 LE | value
+ *
+ * OBJECT_TYPE_ACL payload, one record per ACL, access before default:
+ *   kind u8 | text_len u32 LE (includes NUL) | acl_to_text() bytes
+ */
+#define ACL_BLOB_ACCESS  1
+#define ACL_BLOB_DEFAULT 2
+
 #define COMPRESS_NONE      0
 #define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
 #define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */

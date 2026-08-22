@@ -14,8 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/acl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 /*
@@ -126,6 +128,129 @@ static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0) { /* best effort */ }
 }
 
+static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
+{
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) { out[i] = 0; continue; }
+        out[i] = (uint8_t)v;
+    }
+}
+
+/*
+ * Reapply a node's stored xattr set. Best effort, like ownership: a restore
+ * running unprivileged cannot set security.* or trusted.* attributes, and
+ * that must not fail the file whose content just restored correctly.
+ *
+ * lsetxattr, never setxattr: the path may be a symlink, and the recorded
+ * attributes belong to the link itself, not to whatever it points at.
+ *
+ * Blob format is defined in types.h and written by scan.c. A malformed blob
+ * stops the walk rather than reading past the end; a truncated record can
+ * only come from corruption the object layer failed to catch, and quietly
+ * applying half of it would be worse than applying none.
+ */
+static void apply_xattrs(store_t *store, const char *path, const char *xhex)
+{
+    if (!xhex || !xhex[0] || hash_is_zero_hex(xhex)) return;
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    hex_to_hash(xhex, hash);
+    void  *data = NULL;
+    size_t len  = 0;
+    if (object_load(store, hash, &data, &len, NULL) != OK) {
+        log_warn("restore: cannot load xattrs for %s: %s", path, err_msg());
+        err_clear();
+        return;
+    }
+
+    const uint8_t *p   = data;
+    size_t         rem = len;
+    while (rem >= sizeof(uint16_t)) {
+        uint16_t nlen = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+        p += sizeof(uint16_t); rem -= sizeof(uint16_t);
+        if (nlen == 0 || nlen > rem || p[nlen - 1] != '\0') {
+            log_warn("restore: malformed xattr blob for %s", path);
+            break;
+        }
+        const char *name = (const char *)p;
+        p += nlen; rem -= nlen;
+
+        if (rem < sizeof(uint32_t)) {
+            log_warn("restore: malformed xattr blob for %s", path);
+            break;
+        }
+        uint32_t vlen = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                      | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p += sizeof(uint32_t); rem -= sizeof(uint32_t);
+        if (vlen > rem) {
+            log_warn("restore: malformed xattr blob for %s", path);
+            break;
+        }
+
+        if (lsetxattr(path, name, p, vlen, 0) != 0)
+            log_warn("restore: cannot set xattr %s on %s: %s",
+                     name, path, strerror(errno));
+        p += vlen; rem -= vlen;
+    }
+    free(data);
+}
+
+/*
+ * Reapply a node's stored ACLs. Runs after chmod on purpose: the access
+ * ACL's base entries carry the definitive permissions, and applying it last
+ * means the ACL wins over whatever chmod left. Default ACLs only make sense
+ * on directories; applying one here, before the directory's children are
+ * restored, is harmless because every child's own recorded state is applied
+ * over anything it inherits.
+ */
+static void apply_acls(store_t *store, const char *path, const char *ahex,
+                       int is_dir)
+{
+    if (!ahex || !ahex[0] || hash_is_zero_hex(ahex)) return;
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    hex_to_hash(ahex, hash);
+    void  *data = NULL;
+    size_t len  = 0;
+    if (object_load(store, hash, &data, &len, NULL) != OK) {
+        log_warn("restore: cannot load ACL for %s: %s", path, err_msg());
+        err_clear();
+        return;
+    }
+
+    const uint8_t *p   = data;
+    size_t         rem = len;
+    while (rem >= 1 + sizeof(uint32_t)) {
+        uint8_t kind = *p++;
+        rem--;
+        uint32_t tlen = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                      | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p += sizeof(uint32_t); rem -= sizeof(uint32_t);
+        if (tlen == 0 || tlen > rem || p[tlen - 1] != '\0') {
+            log_warn("restore: malformed ACL blob for %s", path);
+            break;
+        }
+
+        if (kind == ACL_BLOB_ACCESS || (kind == ACL_BLOB_DEFAULT && is_dir)) {
+            acl_t acl = acl_from_text((const char *)p);
+            if (!acl) {
+                log_warn("restore: unparseable ACL text for %s", path);
+            } else {
+                acl_type_t t = (kind == ACL_BLOB_DEFAULT)
+                               ? ACL_TYPE_DEFAULT : ACL_TYPE_ACCESS;
+                if (acl_set_file(path, t, acl) != 0)
+                    log_warn("restore: cannot set %s ACL on %s: %s",
+                             kind == ACL_BLOB_DEFAULT ? "default" : "access",
+                             path, strerror(errno));
+                acl_free(acl);
+            }
+        }
+        p += tlen; rem -= tlen;
+    }
+    free(data);
+}
+
 static int cancelled(const restore_opts_t *o)
 {
     return o && o->cancel && *o->cancel;
@@ -135,15 +260,6 @@ static void report(const restore_opts_t *o, const char *phase,
                    uint64_t done, uint64_t total)
 {
     if (o && o->progress_cb) o->progress_cb(phase, done, total, o->progress_ctx);
-}
-
-static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
-{
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        unsigned v = 0;
-        if (sscanf(hex + i * 2, "%2x", &v) != 1) { out[i] = 0; continue; }
-        out[i] = (uint8_t)v;
-    }
 }
 
 /* Build a node's path relative to the snapshot root by walking parents. */
@@ -249,7 +365,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_t *r = NULL;
     if (db_execute(db,
             "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type,"
-            "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0)"
+            "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
+            "       COALESCE(xattr_hash,''), COALESCE(acl_hash,'')"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -287,6 +404,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         const char *ltarget = r->rows[i][9];
         /* Written signed; the bit pattern is what identifies the inode. */
         uint64_t    hgroup  = (uint64_t)strtoll(r->rows[i][10], NULL, 10);
+        const char *xhash   = r->rows[i][11];
+        const char *ahash   = r->rows[i][12];
 
         char rel[PATH_MAX];
         if (node_rel_path(db, repo, snap, id, rel, sizeof(rel)) != OK) {
@@ -311,6 +430,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 break;
             }
             apply_metadata(full, mode, uid, gid, mtime);
+            apply_xattrs(store, full, xhash);
+            apply_acls(store, full, ahash, 1);
             res.dirs++;
             continue;
         }
@@ -338,6 +459,9 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              * the kernel, and chmod would follow the link and alter its
              * target instead. */
             apply_metadata_nofollow(full, uid, gid, mtime);
+            /* No ACL branch: symlinks have none (scan does not collect them,
+             * and acl_set_file would follow the link anyway). */
+            apply_xattrs(store, full, xhash);
             res.symlinks++;
             continue;
         }
@@ -410,6 +534,10 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
 
         apply_metadata(full, mode, uid, gid, mtime);
+        /* Later hardlink members share this inode, so the attributes set
+         * here are already theirs; link() sites above need no reapply. */
+        apply_xattrs(store, full, xhash);
+        apply_acls(store, full, ahash, 0);
         /* First member of its inode group: everything later links here. */
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
         res.files++;

@@ -11,6 +11,8 @@
 
 #include <cutils/log.h>
 
+#include <openssl/sha.h>
+
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -40,6 +42,17 @@ typedef struct {
     int      hash_ready;
 } node_link_t;
 
+/*
+ * Hashes already ensured present this run. Open addressing over full 32-byte
+ * keys; the all-zero hash doubles as the empty marker, which is safe because
+ * SHA-256 of real data is never zero and a zero hash means "no blob".
+ */
+typedef struct {
+    uint8_t *keys;      /* capacity * OBJECT_HASH_SIZE */
+    uint32_t mask;
+    uint32_t cnt;
+} hashset_t;
+
 typedef struct {
     store_t       *store;
     cutils_db_t   *db;
@@ -53,7 +66,66 @@ typedef struct {
      * not see can be swept afterwards. */
     int64_t        cache_stamp;
     struct timespec last_report;
+    /* Metadata blobs (xattr sets, ACL texts) already stored this run. */
+    hashset_t      meta_seen;
 } pipeline_t;
+
+static void hashset_free(hashset_t *s)
+{
+    free(s->keys);
+    s->keys = NULL;
+    s->mask = 0;
+    s->cnt = 0;
+}
+
+static uint32_t hashset_slot(const hashset_t *s, const uint8_t key[OBJECT_HASH_SIZE])
+{
+    uint32_t h;
+    memcpy(&h, key, sizeof(h));   /* SHA-256 output: any 4 bytes are uniform */
+    h &= s->mask;
+    while (memcmp(s->keys + (size_t)h * OBJECT_HASH_SIZE,
+                  (uint8_t[OBJECT_HASH_SIZE]){ 0 }, OBJECT_HASH_SIZE) != 0 &&
+           memcmp(s->keys + (size_t)h * OBJECT_HASH_SIZE, key, OBJECT_HASH_SIZE) != 0)
+        h = (h + 1) & s->mask;
+    return h;
+}
+
+static int hashset_contains(const hashset_t *s, const uint8_t key[OBJECT_HASH_SIZE])
+{
+    if (!s->keys) return 0;
+    uint32_t h = hashset_slot(s, key);
+    return memcmp(s->keys + (size_t)h * OBJECT_HASH_SIZE, key, OBJECT_HASH_SIZE) == 0;
+}
+
+static void hashset_add(hashset_t *s, const uint8_t key[OBJECT_HASH_SIZE])
+{
+    if (!s->keys) {
+        s->keys = calloc(64, OBJECT_HASH_SIZE);
+        if (!s->keys) return;   /* memo only; a miss costs a lookup, not data */
+        s->mask = 63;
+    }
+    if ((s->cnt + 1) * 10 >= (s->mask + 1) * 7) {
+        uint32_t ncap = (s->mask + 1) * 2;
+        uint8_t *nk = calloc(ncap, OBJECT_HASH_SIZE);
+        if (!nk) return;
+        hashset_t ns = { nk, ncap - 1, 0 };
+        for (uint32_t i = 0; i <= s->mask; i++) {
+            const uint8_t *k = s->keys + (size_t)i * OBJECT_HASH_SIZE;
+            if (memcmp(k, (uint8_t[OBJECT_HASH_SIZE]){ 0 }, OBJECT_HASH_SIZE) == 0)
+                continue;
+            memcpy(ns.keys + (size_t)hashset_slot(&ns, k) * OBJECT_HASH_SIZE,
+                   k, OBJECT_HASH_SIZE);
+            ns.cnt++;
+        }
+        free(s->keys);
+        *s = ns;
+    }
+    uint32_t h = hashset_slot(s, key);
+    if (memcmp(s->keys + (size_t)h * OBJECT_HASH_SIZE, key, OBJECT_HASH_SIZE) == 0)
+        return;
+    memcpy(s->keys + (size_t)h * OBJECT_HASH_SIZE, key, OBJECT_HASH_SIZE);
+    s->cnt++;
+}
 
 static int cancelled(const pipeline_t *p)
 {
@@ -158,6 +230,45 @@ static int scan_path_cmp(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+/*
+ * Store one metadata blob (an xattr set or ACL text) as its own object and
+ * return its hash for the manifest entry. No blob means a zero hash, which is
+ * how "none" is spelled everywhere else.
+ *
+ * The memo matters more than it looks. The same blob recurs across most of a
+ * tree - one SELinux label set can cover every file on a machine - and once
+ * packing has run, each object_store_ex existence check on it is a resolver
+ * query. A quarter-million of those per incremental is the tight-loop-on-the-
+ * shared-DB-handle pattern that has starved the daemon before; hashing the
+ * few bytes locally and remembering the answer makes repeats free.
+ */
+static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
+                                const uint8_t *data, size_t len,
+                                uint8_t out_hash[OBJECT_HASH_SIZE])
+{
+    if (!data || len == 0) {
+        memset(out_hash, 0, OBJECT_HASH_SIZE);
+        return OK;
+    }
+
+    SHA256(data, len, out_hash);
+    if (hashset_contains(&p->meta_seen, out_hash)) return OK;
+
+    int is_new = 0;
+    uint64_t phys = 0;
+    status_t st = object_store_ex(p->store, obj_type, data, len, out_hash,
+                                  &is_new, &phys);
+    if (st != OK) return st;
+    if (is_new) {
+        p->res->objects_new++;
+        st = store_index_put_loose(p->db, p->repo_id, out_hash, obj_type,
+                                   phys, len);
+        if (st != OK) return st;
+    }
+    hashset_add(&p->meta_seen, out_hash);
+    return OK;
+}
+
 static status_t store_content(pipeline_t *p)
 {
     /*
@@ -178,6 +289,22 @@ static status_t store_content(pipeline_t *p)
 
         scan_entry_t *e = &p->scan->entries[i];
         report(p, "store", i, p->count);
+
+        /* Every node type can carry xattrs and ACLs, so their blobs are
+         * stored before the type branches below skip non-regular entries.
+         * The hashes land in the node and travel into the manifest. */
+        status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR,
+                                       e->xattr_data, e->xattr_len,
+                                       e->node.xattr_hash);
+        if (mst == OK)
+            mst = store_meta_blob(p, OBJECT_TYPE_ACL,
+                                  e->acl_data, e->acl_len,
+                                  e->node.acl_hash);
+        if (mst != OK) {
+            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+                log_warn("backup: cache commit failed");
+            return mst;
+        }
 
         if (e->node.type == NODE_TYPE_DIR) { p->res->dirs++; continue; }
         if (e->node.type != NODE_TYPE_REG) continue;
@@ -573,6 +700,10 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         hash_hex(e->node.content_hash, chex);
         char shex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(p->links[i].tree_hash, shex);
+        char xhex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(e->node.xattr_hash, xhex);
+        char ahex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(e->node.acl_hash, ahex);
         int is_dir = (e->node.type == NODE_TYPE_DIR);
 
         char ntype[8];
@@ -606,9 +737,10 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                 "INSERT OR REPLACE INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id)"
+                "  hardlink_group_id, xattr_hash, acl_hash)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?)",
+                "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
+                "         NULLIF(?,''), NULLIF(?,''))",
                 (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
                                   gid, mtime, size,
                                   /* A symlink or device node has no content
@@ -620,7 +752,10 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   (is_dir || hash_is_zero(e->node.content_hash))
                                       ? "" : chex,
                                   is_dir ? shex : "",
-                                  ltarget, hgroup, NULL }, NULL);
+                                  ltarget, hgroup,
+                                  hash_is_zero(e->node.xattr_hash) ? "" : xhex,
+                                  hash_is_zero(e->node.acl_hash)   ? "" : ahex,
+                                  NULL }, NULL);
         if (rc != 0) {
             if (db_exec_raw(p->db, "ROLLBACK") != 0)
                 log_error("index_nodes: rollback failed");
@@ -705,7 +840,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 } };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 } };
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
@@ -716,6 +851,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     if (st != OK) {
+        hashset_free(&p.meta_seen);
         free(links);
         scan_result_free(scan);
         return st;
@@ -769,6 +905,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     res.snapshot_id = snap_id;
+    hashset_free(&p.meta_seen);
     free(links);
     scan_result_free(scan);
 

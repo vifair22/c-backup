@@ -17,7 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <limits.h>
 
 #include <cmocka.h>
@@ -309,6 +311,156 @@ static void test_links_survive_a_reindex(void **state)
     assert_int_equal(a.st_ino, b.st_ino);
 }
 
+/* ---------- xattrs and ACLs ---------- */
+
+/*
+ * Fixture: a user xattr on a file, a user xattr on a directory, and a
+ * non-trivial access ACL (a named-user entry plus the mask it forces) on
+ * another file. Directories additionally get a default ACL, the case ACLs
+ * actually exist for.
+ *
+ * Skips rather than fails when the filesystem under TEST_DIR supports
+ * neither, because that is a property of the machine, not of the code.
+ */
+static int fixture_xattrs_and_acls(void)
+{
+    if (lsetxattr(TEST_SRC "/top.txt", "user.cb_test", "v-file", 6, 0) != 0)
+        return -1;   /* no user xattr support here */
+    assert_int_equal(lsetxattr(TEST_SRC "/top.txt", "user.cb_aaa", "first", 5, 0), 0);
+    assert_int_equal(lsetxattr(TEST_SRC "/nested", "user.cb_dir", "v-dir", 5, 0), 0);
+
+    /* uid 0 exists everywhere, so the named-user entry always parses. */
+    acl_t acl = acl_from_text("u::rw-,g::r--,o::r--,u:0:rw-,m::rw-");
+    assert_non_null(acl);
+    int rc = acl_set_file(TEST_SRC "/nested/mid.txt", ACL_TYPE_ACCESS, acl);
+    if (rc == 0)
+        rc = acl_set_file(TEST_SRC "/nested", ACL_TYPE_DEFAULT, acl);
+    acl_free(acl);
+    if (rc != 0) return -1;   /* no ACL support here */
+    return 0;
+}
+
+static void assert_xattr_equals(const char *path, const char *name,
+                                const char *want)
+{
+    char buf[64];
+    ssize_t n = lgetxattr(path, name, buf, sizeof(buf) - 1);
+    assert_true(n >= 0);
+    buf[n] = '\0';
+    assert_string_equal(buf, want);
+}
+
+/* Compare an ACL by its canonical text form, which is what was stored. */
+static void assert_acl_equals(const char *path, acl_type_t type,
+                              const char *want_text)
+{
+    acl_t acl = acl_get_file(path, type);
+    assert_non_null(acl);
+    char *txt = acl_to_text(acl, NULL);
+    acl_free(acl);
+    assert_non_null(txt);
+    assert_string_equal(txt, want_text);
+    acl_free(txt);
+}
+
+static void test_xattrs_and_acls_round_trip(void **state)
+{
+    (void)state;
+    if (fixture_xattrs_and_acls() != 0)
+        skip();
+
+    /* The reference is what the filesystem canonicalised, not the literal
+     * that was set. */
+    acl_t src_acl = acl_get_file(TEST_SRC "/nested/mid.txt", ACL_TYPE_ACCESS);
+    assert_non_null(src_acl);
+    char *want_access = acl_to_text(src_acl, NULL);
+    acl_free(src_acl);
+    src_acl = acl_get_file(TEST_SRC "/nested", ACL_TYPE_DEFAULT);
+    assert_non_null(src_acl);
+    char *want_default = acl_to_text(src_acl, NULL);
+    acl_free(src_acl);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+    assert_xattr_equals(path, "user.cb_test", "v-file");
+    assert_xattr_equals(path, "user.cb_aaa", "first");
+    snprintf(path, sizeof(path), "%s/nested", restored_root());
+    assert_xattr_equals(path, "user.cb_dir", "v-dir");
+    assert_acl_equals(path, ACL_TYPE_DEFAULT, want_default);
+    snprintf(path, sizeof(path), "%s/nested/mid.txt", restored_root());
+    assert_acl_equals(path, ACL_TYPE_ACCESS, want_access);
+
+    acl_free(want_access);
+    acl_free(want_default);
+
+    /* A trivial ACL must not have grown an object: a file without ACLs
+     * restores through chmod alone, and its node carries a NULL acl_hash. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM nodes WHERE name = 'top.txt'"
+        " AND acl_hash IS NOT NULL", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
+}
+
+/*
+ * The blob's bytes feed the manifest hash, so an unstable serialisation
+ * (listxattr order, host endianness) would give every tree a fresh hash on
+ * every run and dedup would silently die. An unchanged tree backed up twice
+ * must store nothing new.
+ */
+static void test_xattr_backup_is_deterministic(void **state)
+{
+    (void)state;
+    if (fixture_xattrs_and_acls() != 0)
+        skip();
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br1, br2;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br1), OK);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br2), OK);
+    assert_int_equal(br2.objects_new, 0);
+    assert_int_equal(br2.trees_new, 0);
+}
+
+/* And the index is still derived: a rebuilt one restores them too. */
+static void test_xattrs_and_acls_survive_a_reindex(void **state)
+{
+    (void)state;
+    if (fixture_xattrs_and_acls() != 0)
+        skip();
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+    assert_xattr_equals(path, "user.cb_test", "v-file");
+    snprintf(path, sizeof(path), "%s/nested", restored_root());
+    assert_xattr_equals(path, "user.cb_dir", "v-dir");
+}
+
 /* ---------- reindex ---------- */
 
 /*
@@ -578,6 +730,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_xattrs_and_acls_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_preserves_the_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_object_registry, setup, teardown),

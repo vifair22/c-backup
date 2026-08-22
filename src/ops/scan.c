@@ -178,38 +178,79 @@ static uint8_t stat_to_node_type(const struct stat *st) {
     return 0;
 }
 
+/*
+ * The blob these produce is stored as an object and its hash lands in
+ * manifest trees, so its bytes are covered by the determinism contract:
+ * attributes sorted by name (llistxattr order is filesystem-dependent) and
+ * lengths written explicitly little-endian, never by struct copy.
+ */
+
+static int xattr_name_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/*
+ * POSIX ACLs surface in listxattr as system.posix_acl_* on most filesystems.
+ * They are excluded here because ACLs travel on their own channel
+ * (collect_acl, as acl_to_text), and carrying them twice would apply them
+ * twice on restore, in an undefined order.
+ */
+static int xattr_name_excluded(const char *n) {
+    return strcmp(n, "system.posix_acl_access") == 0 ||
+           strcmp(n, "system.posix_acl_default") == 0;
+}
+
+static void put_le16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)((v >> (8 * i)) & 0xFF);
+}
+
 static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
     ssize_t list_sz_s = llistxattr(path, NULL, 0);
-    if (list_sz_s <= 0) { *out = NULL; *out_len = 0; return OK; }
+    if (list_sz_s <= 0) return OK;
     size_t list_sz = (size_t)list_sz_s;
 
     char *names = malloc(list_sz);
     if (!names) return set_error(ERR_NOMEM, "collect_xattrs: alloc failed");
     if (llistxattr(path, names, list_sz) < 0) { free(names); return set_error_errno(ERR_IO, "llistxattr(%s)", path); }
 
-    /* Count attributes and probe sizes in a single pass */
+    /* Collect name pointers, dropping the excluded ones, then sort. */
     size_t attr_count = 0;
     for (char *n = names; n < names + list_sz; n += strlen(n) + 1)
-        attr_count++;
+        if (!xattr_name_excluded(n)) attr_count++;
+    if (attr_count == 0) { free(names); return OK; }
 
-    ssize_t *sizes = malloc(attr_count * sizeof(ssize_t));
-    if (!sizes) { free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc sizes failed"); }
+    const char **attrs = malloc(attr_count * sizeof(*attrs));
+    ssize_t *sizes = malloc(attr_count * sizeof(*sizes));
+    if (!attrs || !sizes) {
+        free(attrs); free(sizes); free(names);
+        return set_error(ERR_NOMEM, "collect_xattrs: alloc names failed");
+    }
+    size_t idx = 0;
+    for (char *n = names; n < names + list_sz; n += strlen(n) + 1)
+        if (!xattr_name_excluded(n)) attrs[idx++] = n;
+    qsort(attrs, attr_count, sizeof(*attrs), xattr_name_cmp);
 
     const size_t XATTR_MAX_TOTAL = 64u * 1024u * 1024u; /* 64 MiB cap */
-    size_t total = 0, idx = 0;
-    for (char *n = names; n < names + list_sz; n += strlen(n) + 1, idx++) {
-        ssize_t vsz = lgetxattr(path, n, NULL, 0);
+    size_t total = 0;
+    for (idx = 0; idx < attr_count; idx++) {
+        ssize_t vsz = lgetxattr(path, attrs[idx], NULL, 0);
         sizes[idx] = vsz;
         if (vsz >= 0) {
-            size_t inc = sizeof(uint16_t) + strlen(n) + 1 + sizeof(uint32_t) + (size_t)vsz;
+            size_t inc = sizeof(uint16_t) + strlen(attrs[idx]) + 1 + sizeof(uint32_t) + (size_t)vsz;
             if (inc > XATTR_MAX_TOTAL - total) {
-                free(sizes); free(names);
+                free(attrs); free(sizes); free(names);
                 return set_error(ERR_CORRUPT, "collect_xattrs: total xattr size exceeds limit for '%s'", path);
             }
             total += inc;
         }
     }
-    if (total == 0) { free(sizes); free(names); *out = NULL; *out_len = 0; return OK; }
+    if (total == 0) { free(attrs); free(sizes); free(names); return OK; }
 
     /* Second pass: read values directly into the output buffer using cached sizes.
      * The value may have shrunk between the probe and this read (TOCTOU), so we
@@ -217,13 +258,13 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
      * On error or disappearance, emit the attribute with vlen=0 rather than
      * hashing uninitialized buffer contents. */
     uint8_t *buf = malloc(total);
-    if (!buf) { free(sizes); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
+    if (!buf) { free(attrs); free(sizes); free(names); return set_error(ERR_NOMEM, "collect_xattrs: alloc xattr buf failed"); }
     uint8_t *p = buf;
-    idx = 0;
-    for (char *n = names; n < names + list_sz; n += strlen(n) + 1, idx++) {
+    for (idx = 0; idx < attr_count; idx++) {
         if (sizes[idx] < 0) continue;
+        const char *n = attrs[idx];
         uint16_t nlen = (uint16_t)strlen(n) + 1;
-        memcpy(p, &nlen, sizeof(nlen)); p += sizeof(nlen);
+        put_le16(p, nlen); p += sizeof(uint16_t);
         memcpy(p, n, nlen); p += nlen;
         uint8_t *vlen_pos = p;
         p += sizeof(uint32_t);
@@ -233,15 +274,16 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
             if (got < 0) {
                 actual_vlen = 0;
             } else if ((size_t)got > (size_t)sizes[idx]) {
-                /* Shouldn't happen — kernel would truncate — clamp defensively */
+                /* Shouldn't happen (kernel would truncate); clamp defensively */
                 actual_vlen = (uint32_t)sizes[idx];
             } else {
                 actual_vlen = (uint32_t)got;
             }
         }
-        memcpy(vlen_pos, &actual_vlen, sizeof(actual_vlen));
+        put_le32(vlen_pos, actual_vlen);
         p += actual_vlen;
     }
+    free(attrs);
     free(sizes);
     free(names);
     *out     = buf;
@@ -249,23 +291,77 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     return OK;
 }
 
-static status_t collect_acl(const char *path, uint8_t **out, size_t *out_len) {
-    acl_t acl = acl_get_file(path, ACL_TYPE_ACCESS);
-    if (!acl) { *out = NULL; *out_len = 0; return OK; }
-    ssize_t sz_s;
-    char *txt = acl_to_text(acl, &sz_s);
+/*
+ * One ACL as text, or NULL when there is nothing worth storing.
+ *
+ * A trivial access ACL (owner/group/other only) restates the mode bits the
+ * manifest already carries, and acl_get_file synthesises one for every file
+ * on the system. Storing those would give every node an ACL object whose
+ * restore is a slower chmod; acl_equiv_mode is the standard test for "this
+ * ACL is only a mode".
+ */
+static char *acl_fetch_text(const char *path, acl_type_t type) {
+    acl_t acl = acl_get_file(path, type);
+    if (!acl) return NULL;
+    if (type == ACL_TYPE_ACCESS && acl_equiv_mode(acl, NULL) == 0) {
+        acl_free(acl);
+        return NULL;
+    }
+    /* A default ACL with no entries is how "none" reads back on some
+     * filesystems; it says nothing, so store nothing. */
+    if (type == ACL_TYPE_DEFAULT) {
+        acl_entry_t e;
+        if (acl_get_entry(acl, ACL_FIRST_ENTRY, &e) != 1) {
+            acl_free(acl);
+            return NULL;
+        }
+    }
+    char *txt = acl_to_text(acl, NULL);
     acl_free(acl);
-    if (!txt) { *out = NULL; *out_len = 0; return OK; }
-    size_t sz = (size_t)sz_s;
-    /* Include the trailing NUL so restore can pass the blob directly to
-     * acl_from_text() without an extra copy. */
-    uint8_t *buf = malloc(sz + 1);
-    if (!buf) { acl_free(txt); return set_error(ERR_NOMEM, "collect_acl: alloc failed"); }
-    memcpy(buf, txt, sz);
-    buf[sz] = '\0';
-    acl_free(txt);
+    return txt;  /* caller acl_free()s */
+}
+
+/*
+ * Blob format: see types.h. Access before default, so the bytes are
+ * deterministic. Directories are the only place a default ACL exists;
+ * everything else stores at most the access record.
+ */
+static status_t collect_acl(const char *path, int is_dir,
+                            uint8_t **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
+
+    char *access_txt = acl_fetch_text(path, ACL_TYPE_ACCESS);
+    char *dflt_txt   = is_dir ? acl_fetch_text(path, ACL_TYPE_DEFAULT) : NULL;
+    if (!access_txt && !dflt_txt) return OK;
+
+    /* Text lengths include the trailing NUL so restore can hand each record
+     * straight to acl_from_text() without a copy. */
+    size_t alen = access_txt ? strlen(access_txt) + 1 : 0;
+    size_t dlen = dflt_txt   ? strlen(dflt_txt)   + 1 : 0;
+    size_t rec  = 1 + sizeof(uint32_t);
+    size_t total = (access_txt ? rec + alen : 0) + (dflt_txt ? rec + dlen : 0);
+
+    uint8_t *buf = malloc(total);
+    if (!buf) {
+        if (access_txt) acl_free(access_txt);
+        if (dflt_txt)   acl_free(dflt_txt);
+        return set_error(ERR_NOMEM, "collect_acl: alloc failed");
+    }
+    uint8_t *p = buf;
+    if (access_txt) {
+        *p++ = ACL_BLOB_ACCESS;
+        put_le32(p, (uint32_t)alen); p += sizeof(uint32_t);
+        memcpy(p, access_txt, alen); p += alen;
+        acl_free(access_txt);
+    }
+    if (dflt_txt) {
+        *p++ = ACL_BLOB_DEFAULT;
+        put_le32(p, (uint32_t)dlen); p += sizeof(uint32_t);
+        memcpy(p, dflt_txt, dlen); p += dlen;
+        acl_free(dflt_txt);
+    }
     *out     = buf;
-    *out_len = sz + 1;
+    *out_len = total;
     return OK;
 }
 
@@ -275,12 +371,17 @@ status_t scan_entry_collect_metadata(scan_entry_t *e) {
 
     status_t st = collect_xattrs(e->path, &e->xattr_data, &e->xattr_len);
     if (st != OK) return st;
-    st = collect_acl(e->path, &e->acl_data, &e->acl_len);
-    if (st != OK) {
-        free(e->xattr_data);
-        e->xattr_data = NULL;
-        e->xattr_len = 0;
-        return st;
+    /* No ACL for symlinks: acl_get_file follows the link, so what it returns
+     * is the target's ACL wearing the symlink's name. */
+    if (e->node.type != NODE_TYPE_SYMLINK) {
+        st = collect_acl(e->path, e->node.type == NODE_TYPE_DIR,
+                         &e->acl_data, &e->acl_len);
+        if (st != OK) {
+            free(e->xattr_data);
+            e->xattr_data = NULL;
+            e->xattr_len = 0;
+            return st;
+        }
     }
     return OK;
 }
@@ -377,7 +478,11 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         if ((st2 = collect_xattrs(path, &e.xattr_data, &e.xattr_len)) != OK) {
             free(e.path); free(e.symlink_target); return st2;
         }
-        if ((st2 = collect_acl(path, &e.acl_data, &e.acl_len)) != OK) {
+        /* No ACL for symlinks: acl_get_file follows the link and would
+         * record the target's ACL under the symlink's name. */
+        if (nd->type != NODE_TYPE_SYMLINK &&
+            (st2 = collect_acl(path, nd->type == NODE_TYPE_DIR,
+                               &e.acl_data, &e.acl_len)) != OK) {
             free(e.path); free(e.xattr_data); free(e.symlink_target); return st2;
         }
     }

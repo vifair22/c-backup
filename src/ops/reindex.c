@@ -158,18 +158,27 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
                  (long long)e->inode_identity);
         const char *ltarget = e->link_target ? e->link_target : "";
 
+        char xhex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(e->xattr_hash, xhex);
+        char ahex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(e->acl_hash, ahex);
+
         int rc = db_execute_non_query(ctx->db,
             "INSERT OR REPLACE INTO nodes"
             " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
             "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-            "  hardlink_group_id)"
+            "  hardlink_group_id, xattr_hash, acl_hash)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?)",
+            "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
+            "         NULLIF(?,''), NULLIF(?,''))",
             (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
                               uid, gid, mtime, size,
                               (have_target && !is_dir) ? thex : "",
                               (have_target && is_dir) ? thex : "",
-                              ltarget, hgroup, NULL }, NULL);
+                              ltarget, hgroup,
+                              hash_is_zero(e->xattr_hash) ? "" : xhex,
+                              hash_is_zero(e->acl_hash)   ? "" : ahex,
+                              NULL }, NULL);
         if (rc != 0) {
             st = set_error(ERR_IO, "reindex: cannot insert node");
             break;
@@ -193,9 +202,9 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
             if (st != OK) break;
         }
         if (!hash_is_zero(e->xattr_hash))
-            st = note_object(ctx, e->xattr_hash, OBJECT_TYPE_FILE);
+            st = note_object(ctx, e->xattr_hash, OBJECT_TYPE_XATTR);
         if (st == OK && !hash_is_zero(e->acl_hash))
-            st = note_object(ctx, e->acl_hash, OBJECT_TYPE_FILE);
+            st = note_object(ctx, e->acl_hash, OBJECT_TYPE_ACL);
         if (st != OK) break;
 
         if (is_dir && have_target)

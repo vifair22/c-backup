@@ -6,6 +6,53 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-08-22 - xattr/ACL persistence cost
+
+The metadata was always collected at scan time and discarded; this measures
+what actually storing it costs. A/B against the pre-change HEAD (7586800)
+with a one-shot driver calling backup_run/restore_run directly (no daemon,
+no HTTP): one cold backup, then unchanged incrementals, median of 3+ runs.
+Loose objects only; auto-pack not exercised (identical on both sides).
+
+Trees:
+
+- **real**: ~/git/home/easyraid, 39,240 files / 314 dirs / 1.9G, XFS,
+  page cache primed. Zero xattrs, zero non-trivial ACLs: the common case.
+- **plain**: synthetic 50,000 files / 507 dirs, tmpfs, no xattrs.
+- **shared**: same shape, every file one identical xattr (the SELinux
+  pattern). Dedups to a single blob object.
+- **unique**: same shape, every file a distinct xattr value plus access +
+  default ACLs on every dir. 50,000 distinct blobs: the adversarial case,
+  memo never hits.
+
+| Tree | Cold before | Cold after | Incr before | Incr after |
+|------|------------:|-----------:|------------:|-----------:|
+| real (no xattrs) | 8.36s | 8.37s (+0.2%) | 1.00s | 1.06s (+5%) |
+| plain (no xattrs) | 4.82s | 4.77s (0%) | 1.36s | 1.39s (+2%) |
+| shared (1 blob) | 4.83s | 4.95s (+2.6%) | 1.42s | 1.51s (+7%) |
+| unique (50k blobs) | 4.93s | 7.05s (+43%) | 1.46s | 1.67s (+14%) |
+
+Restore of the unique tree (applying 50k xattr sets + 507 ACL pairs):
+3.38s -> 3.86s (+14%); that is the feature doing work, not overhead.
+
+Reading of the numbers:
+
+- The no-xattr overhead (~1.3 us/entry, all of it in the index phase: the
+  nodes INSERT grew two NULLIF columns and c-utils re-parses the statement
+  per row) is the price everyone pays. On the 223k-file reference tree that
+  is ~0.3s on a 14s incremental.
+- The shared case adds a SHA-256 of a ~70-byte blob per entry (~2 us); the
+  in-run memo keeps it off the resolver, so it stays CPU-bound.
+- The unique case is the bound: +43% cold is 50,000 extra loose-object
+  writes, one per file. No real filesystem hands every file a distinct
+  xattr set; anything shared collapses to the shared row.
+- Trivial-ACL filtering is what keeps "real" out of the shared row: without
+  acl_equiv_mode every file on the system would carry an ACL blob.
+
+If the flat per-row index cost ever matters, the fix is a prepared-statement
+cache in c-utils, not surgery here: it would pay across every insert in the
+daemon, not just these two columns.
+
 ## 2026-08-19 - Manifest trees and derived-index sizing
 
 Harness: `bench/manifest.c` (`make bench-manifest`). Answers the two questions
