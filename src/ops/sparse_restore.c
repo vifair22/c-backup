@@ -27,7 +27,7 @@
  * parse the header + region table, and scatter data to the correct offsets
  * in out_fd.  Bounded-RAM — safe for sparse objects that exceed STREAM_LOAD_MAX. */
 struct sparse_stream_arg {
-    repo_t *repo;
+    store_t *store;
     const uint8_t *hash;
     int pipe_wfd;
     status_t rc;
@@ -36,7 +36,7 @@ struct sparse_stream_arg {
 static void *sparse_stream_worker(void *a) {
     struct sparse_stream_arg *arg = a;
     uint64_t sz = 0; uint8_t type = 0;
-    arg->rc = object_load_stream(arg->repo, arg->hash, arg->pipe_wfd, &sz, &type);
+    arg->rc = object_load_stream(arg->store, arg->hash, arg->pipe_wfd, &sz, &type);
     close(arg->pipe_wfd);
     return NULL;
 }
@@ -52,14 +52,14 @@ static status_t read_pipe_full(int fd, void *buf, size_t n) {
     return OK;
 }
 
-status_t restore_sparse_streaming(repo_t *repo,
+status_t restore_sparse_streaming(store_t *store,
                                          const uint8_t hash[OBJECT_HASH_SIZE],
                                          int out_fd, uint64_t file_size,
                                          const char *full) {
     int pfd[2];
     if (pipe(pfd) == -1) return set_error_errno(ERR_IO, "restore sparse: pipe");
 
-    struct sparse_stream_arg arg = { .repo = repo, .hash = hash,
+    struct sparse_stream_arg arg = { .store = store, .hash = hash,
                                      .pipe_wfd = pfd[1], .rc = OK };
     pthread_t tid;
     if (pthread_create(&tid, NULL, sparse_stream_worker, &arg) != 0) {

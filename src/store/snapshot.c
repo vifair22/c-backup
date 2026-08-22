@@ -39,8 +39,8 @@ typedef struct __attribute__((packed)) {
 } snap_file_header_t;
 
 
-static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
-    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.snap", repo_path(repo), id);
+static int snap_path(store_t *store, uint32_t id, char *buf, size_t bufsz) {
+    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.snap", store_root(store), id);
     return (n >= 0 && (size_t)n < bufsz) ? 0 : -1;
 }
 
@@ -48,10 +48,10 @@ static int snap_path(repo_t *repo, uint32_t id, char *buf, size_t bufsz) {
 /* Snapshot I/O                                                        */
 /* ------------------------------------------------------------------ */
 
-static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
+static status_t snapshot_load_impl(store_t *store, uint32_t snap_id,
                                     snapshot_t **out, int skip_dirent) {
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0)
         return set_error(ERR_IO, "snapshot_load: path overflow for snap %u", snap_id);
 
     int fd = open(path, O_RDONLY);
@@ -303,17 +303,17 @@ static status_t snapshot_load_impl(repo_t *repo, uint32_t snap_id,
     return OK;
 }
 
-status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
-    return snapshot_load_impl(repo, snap_id, out, 0);
+status_t snapshot_load(store_t *store, uint32_t snap_id, snapshot_t **out) {
+    return snapshot_load_impl(store, snap_id, out, 0);
 }
 
-status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
-    return snapshot_load_impl(repo, snap_id, out, 1);
+status_t snapshot_load_nodes_only(store_t *store, uint32_t snap_id, snapshot_t **out) {
+    return snapshot_load_impl(store, snap_id, out, 1);
 }
 
-status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **out) {
+status_t snapshot_load_header_only(store_t *store, uint32_t snap_id, snapshot_t **out) {
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0)
         return set_error(ERR_IO, "snapshot_load_header_only: path overflow for snap %u", snap_id);
 
     int fd = open(path, O_RDONLY);
@@ -380,9 +380,9 @@ status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **
     return OK;
 }
 
-status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
+status_t snapshot_write(store_t *store, snapshot_t *snap) {
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/snap.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/snap.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) return set_error(ERR_IO, "snapshot_write: tmppath overflow for snap %u", snap->snap_id);
     int fd = mkstemp(tmppath);
     if (fd == -1) return set_error_errno(ERR_IO, "snapshot_write: mkstemp failed for snap %u", snap->snap_id);
@@ -518,20 +518,20 @@ status_t snapshot_write(repo_t *repo, snapshot_t *snap) {
     free(payload);    payload    = NULL;
 
     char dstpath[PATH_MAX];
-    if (snap_path(repo, snap->snap_id, dstpath, sizeof(dstpath)) != 0) {
+    if (snap_path(store, snap->snap_id, dstpath, sizeof(dstpath)) != 0) {
         return set_error(ERR_IO, "snapshot_write: dstpath overflow for snap %u", snap->snap_id);
     }
     if (rename(tmppath, dstpath) == -1) { return set_error_errno(ERR_IO, "snapshot_write: rename failed for snap %u", snap->snap_id); }
     {
         char dirpath[PATH_MAX];
-        if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo))
+        if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", store_root(store))
             >= (int)sizeof(dirpath)) return set_error(ERR_IO, "snapshot_write: dirpath overflow for fsync");
         int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { fsync(dfd); close(dfd); }
     }
 
     /* Build path index (best-effort — failure doesn't affect the snapshot) */
-    snap_pidx_write(repo, snap);
+    snap_pidx_write(store, snap);
 
     return OK;
 fail:
@@ -541,11 +541,11 @@ fail:
     return st;
 }
 
-status_t snapshot_delete(repo_t *repo, uint32_t snap_id) {
+status_t snapshot_delete(store_t *store, uint32_t snap_id) {
     if (snap_id == 0) return set_error(ERR_INVALID, "snapshot_delete: snap_id is 0");
 
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return set_error(ERR_IO, "snapshot_delete: path overflow for snap %u", snap_id);
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0) return set_error(ERR_IO, "snapshot_delete: path overflow for snap %u", snap_id);
 
     if (unlink(path) == -1) {
         if (errno == ENOENT) return set_error(ERR_NOT_FOUND, "snapshot %u not found", snap_id);
@@ -553,7 +553,7 @@ status_t snapshot_delete(repo_t *repo, uint32_t snap_id) {
     }
 
     char dirpath[PATH_MAX];
-    if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", repo_path(repo))
+    if (snprintf(dirpath, sizeof(dirpath), "%s/snapshots", store_root(store))
         >= (int)sizeof(dirpath)) return set_error(ERR_IO, "snapshot_delete: dirpath overflow for fsync");
     int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
     if (dfd >= 0) { fsync(dfd); close(dfd); }
@@ -561,9 +561,9 @@ status_t snapshot_delete(repo_t *repo, uint32_t snap_id) {
     return OK;
 }
 
-status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags) {
+status_t snapshot_read_gfs_flags(store_t *store, uint32_t snap_id, uint32_t *out_flags) {
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return set_error(ERR_IO, "snapshot_read_gfs_flags: path overflow for snap %u", snap_id);
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0) return set_error(ERR_IO, "snapshot_read_gfs_flags: path overflow for snap %u", snap_id);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) return set_error_errno(ERR_IO, "snapshot_read_gfs_flags: cannot open snap %u", snap_id);
@@ -595,10 +595,10 @@ status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_f
  * gfs_flags is at byte offset 44 in all snapshot versions.
  * For V5 files, also recomputes the header parity record at byte 60.
  */
-static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
+static status_t snap_patch_gfs_flags(store_t *store, uint32_t snap_id,
                                       uint32_t flags, int use_or) {
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0)
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0)
         return set_error(ERR_IO, "snap_patch_gfs_flags: path overflow");
 
     int fd = open(path, O_RDWR);
@@ -677,12 +677,12 @@ static status_t snap_patch_gfs_flags(repo_t *repo, uint32_t snap_id,
     return OK;
 }
 
-status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags) {
-    return snap_patch_gfs_flags(repo, snap_id, new_flags, 1);
+status_t snapshot_set_gfs_flags(store_t *store, uint32_t snap_id, uint32_t new_flags) {
+    return snap_patch_gfs_flags(store, snap_id, new_flags, 1);
 }
 
-status_t snapshot_replace_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t flags) {
-    return snap_patch_gfs_flags(repo, snap_id, flags, 0);
+status_t snapshot_replace_gfs_flags(store_t *store, uint32_t snap_id, uint32_t flags) {
+    return snap_patch_gfs_flags(store, snap_id, flags, 0);
 }
 
 void snapshot_free(snapshot_t *snap) {
@@ -697,9 +697,9 @@ void snapshot_free(snapshot_t *snap) {
     free(snap);
 }
 
-status_t snapshot_read_head(repo_t *repo, uint32_t *out_id) {
+status_t snapshot_read_head(store_t *store, uint32_t *out_id) {
     char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/refs/HEAD", repo_path(repo)) >= (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/refs/HEAD", store_root(store)) >= (int)sizeof(path))
         return set_error(ERR_IO, "snapshot_read_head: path overflow");
     FILE *f = fopen(path, "r");
     if (!f) return set_error_errno(ERR_IO, "snapshot_read_head: cannot open HEAD");
@@ -710,9 +710,9 @@ status_t snapshot_read_head(repo_t *repo, uint32_t *out_id) {
     return OK;
 }
 
-status_t snapshot_write_head(repo_t *repo, uint32_t snap_id) {
+status_t snapshot_write_head(store_t *store, uint32_t snap_id) {
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/HEAD.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/HEAD.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) return set_error(ERR_IO, "snapshot_write_head: tmppath overflow");
     int fd = mkstemp(tmppath);
     if (fd == -1) return set_error_errno(ERR_IO, "snapshot_write_head: mkstemp failed");
@@ -722,11 +722,11 @@ status_t snapshot_write_head(repo_t *repo, uint32_t snap_id) {
     if (fsync(fd) == -1) { close(fd); unlink(tmppath); return set_error_errno(ERR_IO, "snapshot_write_head: fsync failed"); }
     close(fd);
     char dstpath[PATH_MAX];
-    if (snprintf(dstpath, sizeof(dstpath), "%s/refs/HEAD", repo_path(repo))
+    if (snprintf(dstpath, sizeof(dstpath), "%s/refs/HEAD", store_root(store))
         >= (int)sizeof(dstpath)) { unlink(tmppath); return set_error(ERR_IO, "snapshot_write_head: dstpath overflow"); }
     if (rename(tmppath, dstpath) == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "snapshot_write_head: rename failed"); }
     char dirpath[PATH_MAX];
-    if (snprintf(dirpath, sizeof(dirpath), "%s/refs", repo_path(repo))
+    if (snprintf(dirpath, sizeof(dirpath), "%s/refs", store_root(store))
         >= (int)sizeof(dirpath)) return set_error(ERR_IO, "snapshot_write_head: dirpath overflow");
     int dfd = open(dirpath, O_RDONLY | O_DIRECTORY);
     if (dfd >= 0) { fsync(dfd); close(dfd); }
@@ -1033,9 +1033,9 @@ status_t pathmap_build(const snapshot_t *snap, pathmap_t **out) {
     return pathmap_build_progress(snap, out, NULL, NULL);
 }
 
-int snapshot_repair(repo_t *repo, uint32_t snap_id) {
+int snapshot_repair(store_t *store, uint32_t snap_id) {
     char path[PATH_MAX];
-    if (snap_path(repo, snap_id, path, sizeof(path)) != 0) return -1;
+    if (snap_path(store, snap_id, path, sizeof(path)) != 0) return -1;
 
     int fd = open(path, O_RDWR);
     if (fd == -1) return -1;
@@ -1151,10 +1151,10 @@ int snapshot_repair(repo_t *repo, uint32_t snap_id) {
 /* snapshot_list_all — enumerate all snapshots with header metadata     */
 /* ------------------------------------------------------------------ */
 
-status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
+status_t snapshot_list_all(store_t *store, snap_list_t **out)
 {
     uint32_t head = 0;
-    snapshot_read_head(repo, &head);
+    snapshot_read_head(store, &head);
 
     /* Count existing snapshots first */
     uint32_t cap = head < 64 ? 64 : head;
@@ -1167,7 +1167,7 @@ status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
 
         /* V6+: logical_bytes is in the header — no decompression needed.
          * Older versions: fall back to loading nodes and computing it. */
-        if (snapshot_load_header_only(repo, id, &snap) != OK) {
+        if (snapshot_load_header_only(store, id, &snap) != OK) {
             err_clear();
             continue;
         }
@@ -1176,7 +1176,7 @@ status_t snapshot_list_all(repo_t *repo, snap_list_t **out)
         if (need_nodes) {
             snapshot_free(snap);
             snap = NULL;
-            if (snapshot_load_nodes_only(repo, id, &snap) != OK) {
+            if (snapshot_load_nodes_only(store, id, &snap) != OK) {
                 err_clear();
                 continue;
             }
@@ -1244,13 +1244,13 @@ typedef struct __attribute__((packed)) {
 } pidx_hdr_t;  /* 16 bytes */
 
 typedef struct __attribute__((packed)) {
-    uint64_t path_hash;      /* FNV-1a of full repo-relative path */
+    uint64_t path_hash;      /* FNV-1a of full store-relative path */
     uint32_t node_index;     /* index into snapshot's node_t array */
     uint32_t reserved;
 } pidx_entry_t;  /* 16 bytes */
 
-static int pidx_path(repo_t *repo, uint32_t snap_id, char *buf, size_t bufsz) {
-    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.pidx", repo_path(repo), snap_id);
+static int pidx_path(store_t *store, uint32_t snap_id, char *buf, size_t bufsz) {
+    int n = snprintf(buf, bufsz, "%s/snapshots/%08u.pidx", store_root(store), snap_id);
     return (n >= 0 && (size_t)n < bufsz) ? 0 : -1;
 }
 
@@ -1261,7 +1261,7 @@ static int pidx_entry_cmp(const void *a, const void *b) {
     return 0;
 }
 
-status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap) {
+status_t snap_pidx_write(store_t *store, const snapshot_t *snap) {
     if (!snap->dirent_data || snap->dirent_count == 0) return OK;
 
     /* Parse dirents and reconstruct full paths — same logic as pathmap_build
@@ -1351,7 +1351,7 @@ status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap) {
 
     /* Write to file atomically */
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/pidx.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/pidx.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) goto oom;
     int fd = mkstemp(tmppath);
     status_t st = OK;
@@ -1391,7 +1391,7 @@ status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap) {
     free(entries); entries = NULL;
 
     char dstpath[PATH_MAX];
-    if (pidx_path(repo, snap->snap_id, dstpath, sizeof(dstpath)) != 0) { st = ERR_IO; goto cleanup; }
+    if (pidx_path(store, snap->snap_id, dstpath, sizeof(dstpath)) != 0) { st = ERR_IO; goto cleanup; }
     if (rename(tmppath, dstpath) == -1) { unlink(tmppath); st = ERR_IO; goto cleanup; }
 
     goto cleanup;
@@ -1414,10 +1414,10 @@ oom:
     goto cleanup;
 }
 
-status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
+status_t snap_pidx_lookup(store_t *store, uint32_t snap_id,
                           const char *path, node_t *out_node) {
     char idx_path[PATH_MAX];
-    if (pidx_path(repo, snap_id, idx_path, sizeof(idx_path)) != 0)
+    if (pidx_path(store, snap_id, idx_path, sizeof(idx_path)) != 0)
         return ERR_NOT_FOUND;
 
     int fd = open(idx_path, O_RDONLY);
@@ -1451,7 +1451,7 @@ status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
 
     /* Load snapshot nodes-only to extract the target node */
     snapshot_t *snap = NULL;
-    status_t st = snapshot_load_nodes_only(repo, snap_id, &snap);
+    status_t st = snapshot_load_nodes_only(store, snap_id, &snap);
     if (st != OK) return st;
 
     if (node_index >= snap->node_count) {
@@ -1464,26 +1464,26 @@ status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
     return OK;
 }
 
-status_t snap_pidx_rebuild_all(repo_t *repo, uint32_t *out_rebuilt) {
+status_t snap_pidx_rebuild_all(store_t *store, uint32_t *out_rebuilt) {
     uint32_t head = 0;
-    snapshot_read_head(repo, &head);
+    snapshot_read_head(store, &head);
     uint32_t rebuilt = 0;
 
     for (uint32_t id = 1; id <= head; id++) {
         char path[PATH_MAX];
-        if (pidx_path(repo, id, path, sizeof(path)) != 0) continue;
+        if (pidx_path(store, id, path, sizeof(path)) != 0) continue;
 
         /* Skip if .pidx already exists */
         if (access(path, F_OK) == 0) continue;
 
         /* Skip if .snap doesn't exist */
         snapshot_t *snap = NULL;
-        if (snapshot_load(repo, id, &snap) != OK) {
+        if (snapshot_load(store, id, &snap) != OK) {
             err_clear();
             continue;
         }
 
-        if (snap_pidx_write(repo, snap) == OK)
+        if (snap_pidx_write(store, snap) == OK)
             rebuilt++;
         snapshot_free(snap);
     }

@@ -52,9 +52,9 @@ static void fmt_bytes(uint64_t n, char *buf, size_t sz) {
 /* Try loading cached stats. Returns OK on success, ERR_NOT_FOUND if
  * the cache is missing or invalid. Does NOT fill HEAD-dependent fields
  * (snap_total, head_entries, head_logical_bytes). */
-static status_t stats_cache_load(repo_t *repo, repo_stat_t *out) {
+static status_t stats_cache_load(store_t *store, repo_stat_t *out) {
     char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/stats.cache", repo_path(repo))
+    if (snprintf(path, sizeof(path), "%s/stats.cache", store_root(store))
         >= (int)sizeof(path)) return ERR_NOT_FOUND;
 
     int fd = open(path, O_RDONLY);
@@ -80,8 +80,8 @@ static status_t stats_cache_load(repo_t *repo, repo_stat_t *out) {
 }
 
 /* Full filesystem scan — the slow path. Populates snap/loose/pack fields. */
-static status_t stats_full_scan(repo_t *repo, repo_stat_t *out) {
-    const char *root = repo_path(repo);
+static status_t stats_full_scan(store_t *store, repo_stat_t *out) {
+    const char *root = store_root(store);
 
     /* Snapshots */
     {
@@ -176,15 +176,15 @@ static status_t stats_full_scan(repo_t *repo, repo_stat_t *out) {
     return OK;
 }
 
-status_t repo_stats(repo_t *repo, repo_stat_t *out) {
+status_t repo_stats(store_t *store, repo_stat_t *out) {
     memset(out, 0, sizeof(*out));
 
     /* HEAD-dependent fields: always read fresh (cheap with V6 headers). */
-    snapshot_read_head(repo, &out->snap_total);
+    snapshot_read_head(store, &out->snap_total);
     if (out->snap_total > 0) {
         snapshot_t *head = NULL;
         /* Try header-only first (V6: has logical_bytes precomputed). */
-        if (snapshot_load_header_only(repo, out->snap_total, &head) == OK) {
+        if (snapshot_load_header_only(store, out->snap_total, &head) == OK) {
             out->head_entries = head->node_count;
             if (head->logical_bytes > 0) {
                 out->head_logical_bytes = head->logical_bytes;
@@ -193,7 +193,7 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
                 /* Pre-V6: fall back to loading nodes. */
                 snapshot_free(head);
                 head = NULL;
-                if (snapshot_load_nodes_only(repo, out->snap_total, &head) == OK) {
+                if (snapshot_load_nodes_only(store, out->snap_total, &head) == OK) {
                     out->head_entries = head->node_count;
                     for (uint32_t i = 0; i < head->node_count; i++) {
                         if (head->nodes[i].type == NODE_TYPE_REG)
@@ -206,17 +206,17 @@ status_t repo_stats(repo_t *repo, repo_stat_t *out) {
     }
 
     /* Try cache for the expensive fields. */
-    if (stats_cache_load(repo, out) == OK)
+    if (stats_cache_load(store, out) == OK)
         return OK;
 
     /* Cache miss — full scan. */
-    return stats_full_scan(repo, out);
+    return stats_full_scan(store, out);
 }
 
-status_t stats_cache_rebuild(repo_t *repo) {
+status_t stats_cache_rebuild(store_t *store) {
     repo_stat_t s;
     memset(&s, 0, sizeof(s));
-    status_t st = stats_full_scan(repo, &s);
+    status_t st = stats_full_scan(store, &s);
     if (st != OK) return st;
 
     stats_cache_hdr_t hdr = {
@@ -231,9 +231,9 @@ status_t stats_cache_rebuild(repo_t *repo) {
     };
 
     char tmp[PATH_MAX], final[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/tmp/.stats.cache.tmp", repo_path(repo))
+    if (snprintf(tmp, sizeof(tmp), "%s/tmp/.stats.cache.tmp", store_root(store))
         >= (int)sizeof(tmp)) return ERR_IO;
-    if (snprintf(final, sizeof(final), "%s/stats.cache", repo_path(repo))
+    if (snprintf(final, sizeof(final), "%s/stats.cache", store_root(store))
         >= (int)sizeof(final)) return ERR_IO;
 
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -264,5 +264,5 @@ void repo_stats_print(const repo_stat_t *s) {
     printf("pack files physical:   %u  (%s)\n", s->pack_files, buf);
 
     fmt_bytes(s->total_bytes, buf, sizeof(buf));
-    printf("repo physical total:   %s\n", buf);
+    printf("store physical total:   %s\n", buf);
 }

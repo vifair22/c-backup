@@ -23,13 +23,13 @@ static int parse_u32_str(const char *s, uint32_t *out) {
     return 1;
 }
 
-static int tag_dir(repo_t *repo, char *buf, size_t sz) {
-    int n = snprintf(buf, sz, "%s/tags", repo_path(repo));
+static int tag_dir(store_t *store, char *buf, size_t sz) {
+    int n = snprintf(buf, sz, "%s/tags", store_root(store));
     return (n >= 0 && (size_t)n < sz) ? 0 : -1;
 }
 
-static int tag_path(repo_t *repo, const char *name, char *buf, size_t sz) {
-    int n = snprintf(buf, sz, "%s/tags/%s", repo_path(repo), name);
+static int tag_path(store_t *store, const char *name, char *buf, size_t sz) {
+    int n = snprintf(buf, sz, "%s/tags/%s", store_root(store), name);
     return (n >= 0 && (size_t)n < sz) ? 0 : -1;
 }
 
@@ -41,15 +41,15 @@ static int tag_name_valid(const char *name) {
     return 1;
 }
 
-status_t tag_set(repo_t *repo, const char *name, uint32_t snap_id, int preserve) {
+status_t tag_set(store_t *store, const char *name, uint32_t snap_id, int preserve) {
     if (!tag_name_valid(name)) return set_error(ERR_INVALID, "tag_set: invalid tag name '%s'", name ? name : "(null)");
 
     char dir[PATH_MAX];
-    if (tag_dir(repo, dir, sizeof(dir)) != 0) return set_error(ERR_IO, "tag_set: path too long");
+    if (tag_dir(store, dir, sizeof(dir)) != 0) return set_error(ERR_IO, "tag_set: path too long");
     if (mkdir(dir, 0755) == -1 && errno != EEXIST) return set_error_errno(ERR_IO, "tag_set: mkdir(%s)", dir);
 
     char path[PATH_MAX];
-    if (tag_path(repo, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_set: path too long for '%s'", name);
+    if (tag_path(store, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_set: path too long for '%s'", name);
     FILE *f = fopen(path, "w");
     if (!f) return set_error_errno(ERR_IO, "tag_set: fopen(%s)", path);
     fprintf(f, "id = %u\n", snap_id);
@@ -86,24 +86,24 @@ static status_t tag_parse(const char *path, uint32_t *out_id, int *out_preserve)
     return (got_id && *out_id > 0) ? OK : set_error(ERR_CORRUPT, "tag_parse: missing or invalid id in '%s'", path);
 }
 
-status_t tag_get(repo_t *repo, const char *name, uint32_t *out_id) {
+status_t tag_get(store_t *store, const char *name, uint32_t *out_id) {
     if (!tag_name_valid(name)) return set_error(ERR_INVALID, "tag_get: invalid tag name '%s'", name ? name : "(null)");
     char path[PATH_MAX];
-    if (tag_path(repo, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_get: path too long for '%s'", name);
+    if (tag_path(store, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_get: path too long for '%s'", name);
     return tag_parse(path, out_id, NULL);
 }
 
-status_t tag_delete(repo_t *repo, const char *name) {
+status_t tag_delete(store_t *store, const char *name) {
     if (!tag_name_valid(name)) return set_error(ERR_INVALID, "tag_delete: invalid tag name '%s'", name ? name : "(null)");
     char path[PATH_MAX];
-    if (tag_path(repo, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_delete: path too long for '%s'", name);
+    if (tag_path(store, name, path, sizeof(path)) != 0) return set_error(ERR_IO, "tag_delete: path too long for '%s'", name);
     if (unlink(path) == -1) return set_error_errno(ERR_IO, "tag_delete: unlink(%s)", path);
     return OK;
 }
 
-status_t tag_list(repo_t *repo) {
+status_t tag_list(store_t *store) {
     char dir[PATH_MAX];
-    if (tag_dir(repo, dir, sizeof(dir)) != 0) return set_error(ERR_IO, "tag_list: path too long");
+    if (tag_dir(store, dir, sizeof(dir)) != 0) return set_error(ERR_IO, "tag_list: path too long");
     DIR *d = opendir(dir);
     if (!d) {
         printf("(no tags)\n");
@@ -115,7 +115,7 @@ status_t tag_list(repo_t *repo) {
         if (de->d_name[0] == '.') continue;
         if (!tag_name_valid(de->d_name)) continue;
         char path[PATH_MAX];
-        if (tag_path(repo, de->d_name, path, sizeof(path)) != 0) continue;
+        if (tag_path(store, de->d_name, path, sizeof(path)) != 0) continue;
         uint32_t id = 0;
         int preserve = 0;
         if (tag_parse(path, &id, &preserve) == OK) {
@@ -129,10 +129,10 @@ status_t tag_list(repo_t *repo) {
     return OK;
 }
 
-int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
+int tag_snap_is_preserved(store_t *store, uint32_t snap_id,
                           char *name_out, size_t name_sz) {
     char dir[PATH_MAX];
-    if (tag_dir(repo, dir, sizeof(dir)) != 0) return 0;
+    if (tag_dir(store, dir, sizeof(dir)) != 0) return 0;
     DIR *d = opendir(dir);
     if (!d) return 0;
 
@@ -142,7 +142,7 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
         if (de->d_name[0] == '.') continue;
         if (!tag_name_valid(de->d_name)) continue;
         char path[PATH_MAX];
-        if (tag_path(repo, de->d_name, path, sizeof(path)) != 0) continue;
+        if (tag_path(store, de->d_name, path, sizeof(path)) != 0) continue;
         uint32_t id = 0;
         int preserve = 0;
         if (tag_parse(path, &id, &preserve) == OK && id == snap_id && preserve) {
@@ -154,7 +154,7 @@ int tag_snap_is_preserved(repo_t *repo, uint32_t snap_id,
     return found;
 }
 
-status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name) {
+status_t tag_rename(store_t *store, const char *old_name, const char *new_name) {
     if (!tag_name_valid(old_name))
         return set_error(ERR_INVALID, "tag_rename: invalid old tag name '%s'",
                          old_name ? old_name : "(null)");
@@ -166,7 +166,7 @@ status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name) {
 
     /* Read old tag. */
     char old_path[PATH_MAX];
-    if (tag_path(repo, old_name, old_path, sizeof(old_path)) != 0)
+    if (tag_path(store, old_name, old_path, sizeof(old_path)) != 0)
         return set_error(ERR_IO, "tag_rename: path too long");
     uint32_t snap_id = 0;
     int preserve = 0;
@@ -175,14 +175,14 @@ status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name) {
 
     /* Check new tag doesn't already exist. */
     char new_path[PATH_MAX];
-    if (tag_path(repo, new_name, new_path, sizeof(new_path)) != 0)
+    if (tag_path(store, new_name, new_path, sizeof(new_path)) != 0)
         return set_error(ERR_IO, "tag_rename: path too long");
     struct stat stbuf;
     if (lstat(new_path, &stbuf) == 0)
         return set_error(ERR_INVALID, "tag_rename: tag '%s' already exists", new_name);
 
     /* Write new tag, then delete old. */
-    st = tag_set(repo, new_name, snap_id, preserve);
+    st = tag_set(store, new_name, snap_id, preserve);
     if (st != OK) return st;
 
     if (unlink(old_path) == -1) {
@@ -193,10 +193,10 @@ status_t tag_rename(repo_t *repo, const char *old_name, const char *new_name) {
     return OK;
 }
 
-status_t tag_resolve(repo_t *repo, const char *arg, uint32_t *out_id) {
+status_t tag_resolve(store_t *store, const char *arg, uint32_t *out_id) {
     if (arg && (strcmp(arg, "HEAD") == 0 || strcmp(arg, "head") == 0)) {
-        return snapshot_read_head(repo, out_id);
+        return snapshot_read_head(store, out_id);
     }
     if (parse_u32_str(arg, out_id)) return OK;
-    return tag_get(repo, arg, out_id);
+    return tag_get(store, arg, out_id);
 }

@@ -66,15 +66,15 @@ static int obj_name_exists_at(int subfd, const char *fname) {
     return faccessat(subfd, fname, F_OK, 0) == 0;
 }
 
-int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
+int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     /* Fast path: in-memory loose set (returns 0 if set not built) */
-    if (repo_loose_set_contains(repo, hash)) return 1;
+    if (store_loose_set_contains(store, hash)) return 1;
 
     /* On-disk check — only needed when loose set has not been built */
-    if (!repo_loose_set_ready(repo)) {
+    if (!store_loose_set_ready(store)) {
         char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
         hash_to_path(hash, subdir, fname);
-        int objfd = repo_objects_fd(repo);
+        int objfd = store_objects_fd(store);
         if (objfd != -1) {
             int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
             if (subfd != -1) {
@@ -84,10 +84,10 @@ int object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
             }
         }
     }
-    return pack_object_exists(repo, hash);
+    return pack_object_exists(store, hash);
 }
 
-status_t object_physical_size(repo_t *repo,
+status_t object_physical_size(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_bytes) {
     if (!out_bytes) return set_error(ERR_INVALID, "object_physical_size: out_bytes is NULL");
@@ -96,7 +96,7 @@ status_t object_physical_size(repo_t *repo,
     hash_to_path(hash, subdir, fname);
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
     struct stat st;
     if (stat(path, &st) == 0) {
         *out_bytes = (uint64_t)st.st_size;
@@ -105,18 +105,18 @@ status_t object_physical_size(repo_t *repo,
     if (errno != ENOENT)
         return set_error_errno(ERR_IO, "stat(%s)", path);
 
-    return pack_object_physical_size(repo, hash, out_bytes);
+    return pack_object_physical_size(store, hash, out_bytes);
 }
 
 /* Write a blob (already in memory) as an object. */
-static status_t write_object(repo_t *repo, uint8_t type,
+static status_t write_object(store_t *store, uint8_t type,
                              const void *data, size_t len,
                              uint8_t out_hash[OBJECT_HASH_SIZE],
                              int *out_is_new, uint64_t *out_phys_bytes) {
     sha256(data, len, out_hash);
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
-    if (object_exists(repo, out_hash)) return OK;
+    if (object_exists(store, out_hash)) return OK;
 
     /* Always store uncompressed; the pack sweeper handles compression. */
     const void *payload = data;
@@ -137,7 +137,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
 
-    int objfd = repo_objects_fd(repo);
+    int objfd = store_objects_fd(store);
     if (objfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
         free(compressed);
@@ -148,7 +148,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
     if (subfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(%s)", subdir); }
 
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) {
         close(subfd); free(compressed); return set_error(ERR_IO, "write_object: tmppath too long");
     }
@@ -220,7 +220,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
                         + (uint64_t)pfooter.trailer_size;
 
     char dstpath[PATH_MAX];
-    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", store_root(store), subdir, fname)
         >= (int)sizeof(dstpath)) { st = set_error(ERR_IO, "write_object: dstpath too long"); goto fail; }
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
@@ -232,7 +232,7 @@ static status_t write_object(repo_t *repo, uint8_t type,
         goto fail;
     }
     close(subfd); free(compressed);
-    repo_loose_set_insert(repo, out_hash);
+    store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = total_phys;
     return st;
@@ -492,7 +492,7 @@ static void fuse_ring_release(fuse_ring_t *r)
     pthread_mutex_unlock(&r->mu);
 }
 
-static status_t write_object_file_stream(repo_t *repo, int src_fd,
+static status_t write_object_file_stream(store_t *store, int src_fd,
                                          const char *src_path,
                                          uint64_t file_size,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -510,7 +510,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
      * compressed_size will be patched after writing.
      * ---------------------------------------------------------------- */
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) {
         if (src_path) close(src_fd);
         return set_error(ERR_IO, "stream: tmppath too long");
@@ -574,7 +574,7 @@ static status_t write_object_file_stream(repo_t *repo, int src_fd,
      * RS parity accumulator — bounded-RAM streaming, spills to temp file.
      * ---------------------------------------------------------------- */
     char ps_tmp_dir[PATH_MAX];
-    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", repo_path(repo));
+    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", store_root(store));
     rs_parity_stream_t ps;
     int ps_ok = rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir);
     if (ps_ok != 0) {
@@ -880,7 +880,7 @@ done:
 
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
-    if (object_exists(repo, out_hash)) {
+    if (object_exists(store, out_hash)) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath); return OK;
     }
 
@@ -951,7 +951,7 @@ done:
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
 
-    int objfd = repo_objects_fd(repo);
+    int objfd = store_objects_fd(store);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "stream: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
         unlink(tmppath); return set_error_errno(ERR_IO, "stream: mkdirat(%s)", subdir);
@@ -962,7 +962,7 @@ done:
 
     char dstpath[PATH_MAX];
     if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s",
-                 repo_path(repo), subdir, fname) >= (int)sizeof(dstpath)) {
+                 store_root(store), subdir, fname) >= (int)sizeof(dstpath)) {
         close(subfd); unlink(tmppath); return set_error(ERR_IO, "stream: dstpath too long");
     }
     if (rename(tmppath, dstpath) == -1) {
@@ -973,35 +973,35 @@ done:
     }
 
     close(subfd);
-    repo_loose_set_insert(repo, out_hash);
+    store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
     return OK;
 }
 
-status_t object_store(repo_t *repo, uint8_t type,
+status_t object_store(store_t *store, uint8_t type,
                       const void *data, size_t len,
                       uint8_t out_hash[OBJECT_HASH_SIZE]) {
-    return object_store_ex(repo, type, data, len, out_hash, NULL, NULL);
+    return object_store_ex(store, type, data, len, out_hash, NULL, NULL);
 }
 
-status_t object_store_ex(repo_t *repo, uint8_t type,
+status_t object_store_ex(store_t *store, uint8_t type,
                          const void *data, size_t len,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
                          int *out_is_new, uint64_t *out_phys_bytes) {
-    return write_object(repo, type, data, len, out_hash, out_is_new, out_phys_bytes);
+    return write_object(store, type, data, len, out_hash, out_is_new, out_phys_bytes);
 }
 
 /* ------------------------------------------------------------------ */
 /* Sparse-aware file storage                                           */
 /* ------------------------------------------------------------------ */
 
-status_t object_store_file(repo_t *repo, int fd, uint64_t file_size,
+status_t object_store_file(store_t *store, int fd, uint64_t file_size,
                            uint8_t out_hash[OBJECT_HASH_SIZE]) {
-    return object_store_file_ex(repo, fd, file_size, out_hash, NULL, NULL);
+    return object_store_file_ex(store, fd, file_size, out_hash, NULL, NULL);
 }
 
-static status_t object_store_file_ex_cb(repo_t *repo, int fd,
+static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         const char *src_path,
                                         uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -1012,7 +1012,7 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd,
 /* Streaming writer for sparse objects. Writes [sparse_hdr_t][regions[]][data]
  * to a new object without ever materializing the full payload in RAM.
  * Takes ownership of fd (closes on return). */
-static status_t write_sparse_object_stream(repo_t *repo, int fd,
+static status_t write_sparse_object_stream(store_t *store, int fd,
                                            const char *src_path,
                                            uint64_t file_size,
                                            const sparse_region_t *regions,
@@ -1036,7 +1036,7 @@ static status_t write_sparse_object_stream(repo_t *repo, int fd,
                         + data_bytes;
 
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) {
         if (src_path) close(fd);
         return set_error(ERR_IO, "sparse_stream: tmppath too long");
@@ -1071,7 +1071,7 @@ static status_t write_sparse_object_stream(repo_t *repo, int fd,
     }
 
     char ps_tmp_dir[PATH_MAX];
-    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", repo_path(repo));
+    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", store_root(store));
     rs_parity_stream_t ps;
     if (rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir) != 0) {
         EVP_MD_CTX_free(mdctx);
@@ -1163,7 +1163,7 @@ sp_done:
 
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
-    if (object_exists(repo, out_hash)) {
+    if (object_exists(store, out_hash)) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return OK;
     }
@@ -1219,7 +1219,7 @@ sp_done:
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
-    int objfd = repo_objects_fd(repo);
+    int objfd = store_objects_fd(store);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
         unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: mkdirat(%s)", subdir);
@@ -1229,7 +1229,7 @@ sp_done:
     if (subfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "sparse_stream: openat(%s)", subdir); }
     char dstpath[PATH_MAX];
     if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s",
-                 repo_path(repo), subdir, fname) >= (int)sizeof(dstpath)) {
+                 store_root(store), subdir, fname) >= (int)sizeof(dstpath)) {
         close(subfd); unlink(tmppath); return set_error(ERR_IO, "sparse_stream: dstpath too long");
     }
     if (rename(tmppath, dstpath) == -1) {
@@ -1240,20 +1240,20 @@ sp_done:
         return set_error_errno(ERR_IO, "sparse_stream: rename(%s, %s)", tmppath, dstpath);
     }
     close(subfd);
-    repo_loose_set_insert(repo, out_hash);
+    store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
     return OK;
 }
 
-status_t object_store_file_ex(repo_t *repo, int fd, uint64_t file_size,
+status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
-    return object_store_file_ex_cb(repo, fd, NULL, file_size, out_hash,
+    return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
                                    out_is_new, out_phys_bytes, NULL, NULL);
 }
 
-static status_t object_store_file_ex_cb(repo_t *repo, int fd,
+static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         const char *src_path,
                                         uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -1263,7 +1263,7 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd,
     if (file_size == 0) {
         if (src_path) close(fd);
         uint8_t empty = 0;
-        return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
+        return write_object(store, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
     }
 
@@ -1329,20 +1329,20 @@ static status_t object_store_file_ex_cb(repo_t *repo, int fd,
      * write_object_file_stream takes ownership of fd (closes it on return). */
     if (!is_sparse || n_regions == 0) {
         free(regions);
-        return write_object_file_stream(repo, fd, src_path, file_size, out_hash,
+        return write_object_file_stream(store, fd, src_path, file_size, out_hash,
                                         out_is_new, out_phys_bytes,
                                         progress_cb, progress_ctx);
     }
 
     /* Stream sparse object — bounded RAM regardless of file size. */
-    status_t st = write_sparse_object_stream(repo, fd, src_path, file_size,
+    status_t st = write_sparse_object_stream(store, fd, src_path, file_size,
                                              regions, n_regions,
                                              out_hash, out_is_new, out_phys_bytes);
     free(regions);
     return st;
 }
 
-status_t object_store_file_cb(repo_t *repo, int fd, const char *src_path,
+status_t object_store_file_cb(store_t *store, int fd, const char *src_path,
                               uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes,
@@ -1350,13 +1350,13 @@ status_t object_store_file_cb(repo_t *repo, int fd, const char *src_path,
     if (file_size == 0) {
         if (src_path) close(fd);  /* we own fd when src_path is set */
         uint8_t empty = 0;
-        return write_object(repo, OBJECT_TYPE_FILE, &empty, 0, out_hash,
+        return write_object(store, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
     }
     /* Sparse-aware path handles both sparse and non-sparse files.
      * For non-sparse files it falls through to write_object_file_stream.
      * The progress callback is only used on the streaming (non-sparse) path. */
-    return object_store_file_ex_cb(repo, fd, src_path, file_size, out_hash,
+    return object_store_file_ex_cb(store, fd, src_path, file_size, out_hash,
                                    out_is_new, out_phys_bytes, cb, cb_ctx);
 }
 
@@ -1364,7 +1364,7 @@ status_t object_store_file_cb(repo_t *repo, int fd, const char *src_path,
 /* Load                                                                */
 /* ------------------------------------------------------------------ */
 
-status_t object_load(repo_t *repo,
+status_t object_load(store_t *store,
                      const uint8_t hash[OBJECT_HASH_SIZE],
                      void **out_data, size_t *out_size,
                      uint8_t *out_type) {
@@ -1372,11 +1372,11 @@ status_t object_load(repo_t *repo,
     hash_to_path(hash, subdir, fname);
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
         /* Not a loose object — try pack files */
-        return pack_object_load(repo, hash, out_data, out_size, out_type);
+        return pack_object_load(store, hash, out_data, out_size, out_type);
     }
 
     object_header_t hdr;
@@ -1492,7 +1492,7 @@ status_t object_load(repo_t *repo,
     return OK;
 }
 
-status_t object_load_stream(repo_t *repo,
+status_t object_load_stream(store_t *store,
                              const uint8_t hash[OBJECT_HASH_SIZE],
                              int out_fd,
                              uint64_t *out_size,
@@ -1501,13 +1501,13 @@ status_t object_load_stream(repo_t *repo,
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
         /* Not a loose object — try pack files (streaming to handle large objects). */
         uint64_t psz = 0; uint8_t ptype = 0;
-        status_t st = pack_object_load_stream(repo, hash, out_fd, &psz, &ptype);
+        status_t st = pack_object_load_stream(store, hash, out_fd, &psz, &ptype);
         if (st != OK) return st;
         if (out_size) *out_size = psz;
         if (out_type) *out_type = ptype;
@@ -1602,7 +1602,7 @@ status_t object_load_stream(repo_t *repo,
     }
 }
 
-status_t object_load_prefix(repo_t *repo,
+status_t object_load_prefix(store_t *store,
                              const uint8_t hash[OBJECT_HASH_SIZE],
                              size_t max_bytes,
                              void **out_data, size_t *out_size,
@@ -1611,12 +1611,12 @@ status_t object_load_prefix(repo_t *repo,
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) {
         /* Not loose — try pack files */
-        return pack_object_load_prefix(repo, hash, max_bytes,
+        return pack_object_load_prefix(store, hash, max_bytes,
                                         out_data, out_size, out_full_size, out_type);
     }
 
@@ -1648,17 +1648,17 @@ status_t object_load_prefix(repo_t *repo,
     return OK;
 }
 
-status_t object_get_info(repo_t *repo,
+status_t object_get_info(store_t *store,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint64_t *out_size, uint8_t *out_type) {
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1)
-        return pack_object_get_info(repo, hash, out_size, out_type);
+        return pack_object_get_info(store, hash, out_size, out_type);
 
     object_header_t hdr;
     int rc = io_read_full(fd, &hdr, sizeof(hdr));
@@ -1683,13 +1683,13 @@ status_t object_get_info(repo_t *repo,
  * bytes is computed while streaming and verified against expected_hash.
  * Returns OK, ERR_NOMEM, ERR_IO, or ERR_CORRUPT (hash mismatch).
  */
-status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
+status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size,
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
     /* Check existence first to avoid redundant work. */
-    if (object_exists(repo, expected_hash)) return OK;
+    if (object_exists(store, expected_hash)) return OK;
 
     char tmppath[PATH_MAX];
-    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", repo_path(repo))
+    if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) return set_error(ERR_IO, "store_fd: tmppath too long");
 
     int tfd = mkstemp(tmppath);
@@ -1750,7 +1750,7 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(expected_hash, subdir, fname);
-    int objfd = repo_objects_fd(repo);
+    int objfd = store_objects_fd(store);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
         unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: mkdirat(%s)", subdir);
@@ -1758,26 +1758,26 @@ status_t object_store_fd(repo_t *repo, uint8_t type, int src_fd, uint64_t size,
     if (errno == EEXIST) errno = 0;
 
     char dstpath[PATH_MAX];
-    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", repo_path(repo), subdir, fname)
+    if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s", store_root(store), subdir, fname)
         >= (int)sizeof(dstpath)) { unlink(tmppath); return set_error(ERR_IO, "store_fd: dstpath too long"); }
     if (rename(tmppath, dstpath) == -1) {
-        if ((errno == EEXIST || errno == ENOTEMPTY) && object_exists(repo, expected_hash)) {
+        if ((errno == EEXIST || errno == ENOTEMPTY) && object_exists(store, expected_hash)) {
             unlink(tmppath);
             return OK;
         }
         unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: rename(%s, %s)", tmppath, dstpath);
     }
 
-    repo_loose_set_insert(repo, expected_hash);
+    store_loose_set_insert(store, expected_hash);
     return OK;
 }
 
-int object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
+int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/objects/%s/%s", repo_path(repo), subdir, fname);
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
     int fd = open(path, O_RDWR);
     if (fd == -1) return -1;  /* not a loose object or not writable */
 

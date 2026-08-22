@@ -164,7 +164,7 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 /* load_snap_infos                                                     */
 /* ------------------------------------------------------------------ */
 
-static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
+static status_t load_snap_infos(store_t *store, uint32_t head_id,
                                 gfs_snap_info_t **out, uint32_t *out_n) {
     gfs_snap_info_t *arr = malloc(head_id * sizeof(gfs_snap_info_t));
     if (!arr) return set_error(ERR_NOMEM, "load_snap_infos: alloc failed for %u entries", head_id);
@@ -172,7 +172,7 @@ static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
 
     for (uint32_t id = 1; id <= head_id; id++) {
         snapshot_t *s = NULL;
-        if (snapshot_load_header_only(repo, id, &s) != OK) continue;
+        if (snapshot_load_header_only(store, id, &s) != OK) continue;
         arr[n].id        = id;
         arr[n].ts        = s->created_sec;
         arr[n].gfs_flags = s->gfs_flags;
@@ -180,7 +180,7 @@ static status_t load_snap_infos(repo_t *repo, uint32_t head_id,
         snapshot_free(s);
 
         char tname[256] = {0};
-        if (tag_snap_is_preserved(repo, id, tname, sizeof(tname)))
+        if (tag_snap_is_preserved(store, id, tname, sizeof(tname)))
             arr[n].preserved = 1;
         n++;
     }
@@ -225,14 +225,14 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 /* gfs_run                                                             */
 /* ------------------------------------------------------------------ */
 
-status_t gfs_run(repo_t *repo, const gfs_retention_t *policy,
+status_t gfs_run(store_t *store, const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  int full_scan, uint32_t *out_pruned) {
     if (new_snap_id == 0) return OK;
 
     gfs_snap_info_t *snaps = NULL;
     uint32_t n = 0;
-    status_t st = load_snap_infos(repo, new_snap_id, &snaps, &n);
+    status_t st = load_snap_infos(store, new_snap_id, &snaps, &n);
     if (st != OK) return st;
 
     /* Save original flags so we can detect what changed at flush time. */
@@ -330,7 +330,7 @@ status_t gfs_run(repo_t *repo, const gfs_retention_t *policy,
     if (!dry_run) {
         for (uint32_t i = 0; i < n; i++) {
             if (snaps[i].gfs_flags == orig_flags[i]) continue;
-            st = snapshot_replace_gfs_flags(repo, snaps[i].id, snaps[i].gfs_flags);
+            st = snapshot_replace_gfs_flags(store, snaps[i].id, snaps[i].gfs_flags);
             if (st != OK) {
                 log_msg("WARN", "gfs: could not update GFS flags on snap");
                 st = OK;
@@ -383,7 +383,7 @@ status_t gfs_run(repo_t *repo, const gfs_retention_t *policy,
         } else {
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/snapshots/%08u.snap",
-                     repo_path(repo), id);
+                     store_root(store), id);
             if (unlink(path) == 0) pruned_snaps++;
         }
         if (dry_run) pruned_snaps++;

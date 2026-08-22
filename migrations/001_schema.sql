@@ -233,6 +233,9 @@ CREATE TABLE packs (
     filename  TEXT NOT NULL,
     size      INTEGER,
     sealed_at INTEGER,
+    -- Entry header layout changed between pack format versions, so a reader
+    -- has to know which one it is looking at before it can parse anything.
+    version   INTEGER NOT NULL,
     PRIMARY KEY (repo_id, id),
     FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
 );
@@ -247,6 +250,8 @@ CREATE TABLE pack_objects (
     offset    INTEGER NOT NULL,
     comp_size INTEGER NOT NULL,
     orig_size INTEGER NOT NULL,
+    -- Position in .dat entry order; parity records are addressed by it.
+    entry_index INTEGER NOT NULL,
     PRIMARY KEY (repo_id, hash),
     FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
 );

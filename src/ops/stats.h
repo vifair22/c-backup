@@ -1,7 +1,7 @@
 #pragma once
 
 #include "error.h"
-#include "repo.h"
+#include "store.h"
 #include <stdint.h>
 
 typedef struct {
@@ -17,9 +17,9 @@ typedef struct {
     uint64_t total_bytes;
 } repo_stat_t;
 
-status_t repo_stats(repo_t *repo, repo_stat_t *out);
+status_t repo_stats(store_t *store, repo_stat_t *out);
 void     repo_stats_print(const repo_stat_t *s);
 
-/* Rebuild the stats cache file (<repo>/stats.cache).
+/* Rebuild the stats cache file (<store>/stats.cache).
  * Call after any operation that changes the object or pack set. */
-status_t stats_cache_rebuild(repo_t *repo);
+status_t stats_cache_rebuild(store_t *store);

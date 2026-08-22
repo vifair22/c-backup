@@ -1,7 +1,7 @@
 #pragma once
 
 #include "error.h"
-#include "repo.h"
+#include "store.h"
 #include "object.h"
 #include "progress.h"
 #include <stdint.h>
@@ -17,14 +17,14 @@
  * Pack all loose objects into a new pack file.
  * *out_packed (may be NULL) receives the number of objects packed.
  */
-status_t repo_pack(repo_t *repo, uint32_t *out_packed,
+status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx);
 
 /*
  * Complete any interrupted pack installs from a previous crash.
  * Call before repo_pack() to recover staging directories.
  */
-void pack_resume_installing(repo_t *repo);
+void pack_resume_installing(store_t *store);
 
 /* --- used by object.c -------------------------------------------- */
 
@@ -35,7 +35,7 @@ void pack_resume_installing(repo_t *repo);
  * exceeds STREAM_CHUNK — use pack_object_load_stream instead),
  * or ERR_IO / ERR_CORRUPT.
  */
-status_t pack_object_load(repo_t *repo,
+status_t pack_object_load(store_t *store,
                           const uint8_t hash[OBJECT_HASH_SIZE],
                           void **out_data, size_t *out_size,
                           uint8_t *out_type);
@@ -44,7 +44,7 @@ status_t pack_object_load(repo_t *repo,
  * Stream a packed object to out_fd without buffering the full payload.
  * Safe for large COMPRESS_NONE objects that would OOM pack_object_load.
  */
-status_t pack_object_load_stream(repo_t *repo,
+status_t pack_object_load_stream(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  int out_fd,
                                  uint64_t *out_size,
@@ -57,7 +57,7 @@ status_t pack_object_load_stream(repo_t *repo,
  * *out_full_size receives the full uncompressed size from the entry header.
  * *out_size receives the number of bytes actually returned (≤ max_bytes).
  */
-status_t pack_object_load_prefix(repo_t *repo,
+status_t pack_object_load_prefix(store_t *store,
                                   const uint8_t hash[OBJECT_HASH_SIZE],
                                   size_t max_bytes,
                                   void **out_data, size_t *out_size,
@@ -65,35 +65,35 @@ status_t pack_object_load_prefix(repo_t *repo,
                                   uint8_t *out_type);
 
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
-int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
+int pack_object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /* Return packed physical bytes (entry header + compressed payload). */
-status_t pack_object_physical_size(repo_t *repo,
+status_t pack_object_physical_size(store_t *store,
                                    const uint8_t hash[OBJECT_HASH_SIZE],
                                    uint64_t *out_bytes);
 
 /* Return uncompressed size and type for a packed object without loading payload. */
-status_t pack_object_get_info(repo_t *repo,
+status_t pack_object_get_info(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_uncompressed_size,
                               uint8_t *out_type);
 
 /* Drop the cached pack index so it is reloaded on next access. */
-void pack_cache_invalidate(repo_t *repo);
+void pack_cache_invalidate(store_t *store);
 
 /*
  * Migrate all pre-v4 .idx files to v4 format (adds type+sizes from .dat).
  * Returns OK on success.  *out_migrated receives the number of idx files
  * rewritten (may be NULL).
  */
-status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated);
+status_t pack_migrate_idx_v4(store_t *store, uint32_t *out_migrated);
 
 /*
  * Resolve a hash to its pack location.  Returns OK and fills out_pack_num +
  * out_dat_offset on success.  Returns ERR_NOT_FOUND if the hash is not in
  * any pack (i.e. the object is loose or missing).
  */
-status_t pack_resolve_location(repo_t *repo,
+status_t pack_resolve_location(store_t *store,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                uint32_t *out_pack_num,
                                uint64_t *out_dat_offset);
@@ -102,7 +102,7 @@ status_t pack_resolve_location(repo_t *repo,
  * Attempt to repair a packed object's entry in-place via pwrite().
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
  */
-int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
+int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
@@ -110,7 +110,7 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]);
  * OBJECT_HASH_SIZE bytes each).  Called by repo_gc after collecting refs.
  * *out_kept / *out_deleted (may be NULL) receive aggregate counts.
  */
-status_t pack_gc(repo_t *repo,
+status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted);
 
@@ -190,7 +190,7 @@ typedef struct {
 
 typedef void (*pack_dat_entry_cb)(const pack_entry_info_t *info, void *ctx);
 
-status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
+status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx);
 
@@ -202,14 +202,14 @@ typedef struct {
 
 typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
 
-status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
+status_t pack_enumerate_idx(store_t *store, const char *idx_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_idx_entry_cb cb, void *ctx);
 
 /* --- path helpers (shared with json_api.c) ------------------------- */
 
 /* Resolve a pack_num to its .dat path (sharded first, flat fallback). */
-int pack_dat_path_resolve(char *buf, size_t sz, const char *repo,
+int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
                           uint32_t pack_num);
 
 /* Parse "pack-NNNNNNNN.dat" → pack_num.  Returns 1 on success, 0 on fail. */

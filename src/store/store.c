@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "repo.h"
+#include "store.h"
 #include "../vendor/log.h"
 
 #include <errno.h>
@@ -48,9 +48,9 @@ static int compare_parsed_versions(int a_maj, int a_min, int a_pat, long a_date,
 /* Read the repo's last_written version file and refuse to open if it was
  * written by a binary newer than the current one. Missing/unparseable files
  * are tolerated (older repos predate this check). */
-static status_t check_repo_version_compat(const char *repo_path) {
+static status_t check_repo_version_compat(const char *store_root) {
     char p[PATH_MAX];
-    snprintf(p, sizeof(p), "%s/last_written", repo_path);
+    snprintf(p, sizeof(p), "%s/last_written", store_root);
     FILE *f = fopen(p, "r");
     if (!f) return OK;  /* no record — tolerate */
     char stored[64] = {0};
@@ -82,10 +82,10 @@ static status_t check_repo_version_compat(const char *repo_path) {
 /* Write the build version string to a file in the repo directory.
  * Uses atomic tmp+rename for safety. Errors are silently ignored
  * since this is best-effort housekeeping. */
-static void write_version_file(const char *repo_path, const char *filename) {
+static void write_version_file(const char *store_root, const char *filename) {
     char tmp[PATH_MAX], final[PATH_MAX];
-    snprintf(final, sizeof(final), "%s/%s", repo_path, filename);
-    snprintf(tmp, sizeof(tmp), "%s/tmp/.%s.tmp", repo_path, filename);
+    snprintf(final, sizeof(final), "%s/%s", store_root, filename);
+    snprintf(tmp, sizeof(tmp), "%s/tmp/.%s.tmp", store_root, filename);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1) return;
     const char *ver = VERSION_STRING "\n";
@@ -95,7 +95,7 @@ static void write_version_file(const char *repo_path, const char *filename) {
 }
 
 /* Dynamic open-addressing hash table for .dat FILE* handles.
- * No eviction — all handles stay open until repo_close() or flush.
+ * No eviction — all handles stay open until store_close() or flush.
  * Grows at 75% load factor.  Minimum 128 slots. */
 #define DAT_CACHE_MIN_SLOTS 128
 
@@ -104,15 +104,10 @@ typedef struct {
     FILE    *fp;         /* NULL = empty slot */
 } dat_cache_slot_t;
 
-struct repo {
+struct store {
     char   *path;
     int     dirfd;
-    int     lock_fd;          /* -1 when unlocked */
-    int     lock_mode;        /* 0=none, 1=shared, 2=exclusive */
     int     obj_dirfd;        /* cached objects/ dir fd, -1 until first use */
-    /* pack index cache, owned by pack.c, freed on close */
-    void   *pack_cache;
-    size_t  pack_cache_cnt;
     /* Dynamic .dat file handle cache (open-addressing hash table) */
     dat_cache_slot_t *dat_cache;
     uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
@@ -123,6 +118,14 @@ struct repo {
     uint32_t         loose_set_cnt;
     pthread_mutex_t  loose_set_mu;    /* protects inserts during parallel store */
     int              loose_set_ready;
+
+    store_config_t        cfg;
+    /* Set by the daemon. NULL in tests and benchmarks, where only loose
+     * objects exist and no resolution is needed. */
+    store_locate_fn       locate_cb;
+    void                 *locate_user;
+    store_pack_commit_fn  commit_cb;
+    void                 *commit_user;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -197,7 +200,7 @@ static int dir_is_empty(const char *path) {
     return 1;
 }
 
-status_t repo_init(const char *path) {
+status_t store_init_dirs(const char *path) {
     struct stat stbuf;
     if (lstat(path, &stbuf) == 0) {
         if (!S_ISDIR(stbuf.st_mode))
@@ -236,7 +239,7 @@ done:
     return st;
 }
 
-status_t repo_open(const char *path, repo_t **out) {
+status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd == -1)
         return set_error_errno(ERR_IO, "cannot open repository '%s'", path);
@@ -260,30 +263,28 @@ status_t repo_open(const char *path, repo_t **out) {
         return set_error(ERR_CORRUPT, "unsupported repository format in '%s'", path);
     }
 
-    status_t vst = check_repo_version_compat(path);
-    if (vst != OK) { close(fd); return vst; }
-
-    repo_t *r = malloc(sizeof(*r));
-    if (!r) { close(fd); return set_error(ERR_NOMEM, "repo_open: alloc failed"); }
+    store_t *r = malloc(sizeof(*r));
+    if (!r) { close(fd); return set_error(ERR_NOMEM, "store_open: alloc failed"); }
     r->path           = strdup(path);
-    if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "repo_open: strdup failed"); }
+    if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
     r->dirfd          = fd;
-    r->lock_fd        = -1;
-    r->lock_mode      = 0;
     r->obj_dirfd      = -1;
-    r->pack_cache      = NULL;
-    r->pack_cache_cnt  = 0;
     r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
     r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
     r->dat_cache_count = 0;
     if (!r->dat_cache) {
         close(fd); free(r->path); free(r);
-        return set_error(ERR_NOMEM, "repo_open: dat_cache alloc failed");
+        return set_error(ERR_NOMEM, "store_open: dat_cache alloc failed");
     }
     r->loose_set       = NULL;
     r->loose_set_mask  = 0;
     r->loose_set_cnt   = 0;
     r->loose_set_ready = 0;
+    r->cfg             = cfg ? *cfg : (store_config_t){ 0 };
+    r->locate_cb       = NULL;
+    r->locate_user     = NULL;
+    r->commit_cb       = NULL;
+    r->commit_user     = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     write_version_file(path, "last_accessed");
@@ -292,33 +293,31 @@ status_t repo_open(const char *path, repo_t **out) {
     return OK;
 }
 
-void repo_close(repo_t *repo) {
-    if (!repo) return;
-    repo_unlock(repo);
-    repo_dat_cache_flush(repo);
-    free(repo->dat_cache);
-    repo->dat_cache = NULL;
-    if (repo->obj_dirfd >= 0) close(repo->obj_dirfd);
-    close(repo->dirfd);
-    free(repo->path);
-    free(repo->pack_cache);
-    pthread_mutex_destroy(&repo->loose_set_mu);
-    free(repo->loose_set);
-    free(repo);
+void store_close(store_t *st) {
+    if (!st) return;
+    store_dat_cache_flush(st);
+    free(st->dat_cache);
+    st->dat_cache = NULL;
+    if (st->obj_dirfd >= 0) close(st->obj_dirfd);
+    close(st->dirfd);
+    free(st->path);
+    pthread_mutex_destroy(&st->loose_set_mu);
+    free(st->loose_set);
+    free(st);
 }
 
-int repo_fd(const repo_t *repo) {
-    return repo->dirfd;
+int store_fd(const store_t *st) {
+    return st->dirfd;
 }
 
-const char *repo_path(const repo_t *repo) {
-    return repo->path;
+const char *store_root(const store_t *st) {
+    return st->path;
 }
 
-int repo_objects_fd(repo_t *repo) {
-    if (repo->obj_dirfd >= 0) return repo->obj_dirfd;
-    repo->obj_dirfd = openat(repo->dirfd, "objects", O_RDONLY | O_DIRECTORY);
-    return repo->obj_dirfd;
+int store_objects_fd(store_t *st) {
+    if (st->obj_dirfd >= 0) return st->obj_dirfd;
+    st->obj_dirfd = openat(st->dirfd, "objects", O_RDONLY | O_DIRECTORY);
+    return st->obj_dirfd;
 }
 
 /* ------------------------------------------------------------------ */
@@ -357,11 +356,11 @@ static int hex_to_bin(const char *hex, uint8_t *out, size_t out_len) {
     return 0;
 }
 
-status_t repo_build_loose_set(repo_t *repo) {
-    if (repo->loose_set_ready) return OK;
+status_t store_build_loose_set(store_t *st) {
+    if (st->loose_set_ready) return OK;
 
-    int objfd = repo_objects_fd(repo);
-    if (objfd == -1) { repo->loose_set_ready = 1; return OK; }
+    int objfd = store_objects_fd(st);
+    if (objfd == -1) { st->loose_set_ready = 1; return OK; }
 
     /* First pass: count loose objects */
     uint32_t count = 0;
@@ -383,10 +382,10 @@ status_t repo_build_loose_set(repo_t *repo) {
     /* Allocate at 50% load factor, minimum 256 slots */
     uint32_t cap = 256;
     while (cap < count * 2) cap *= 2;
-    repo->loose_set = calloc(cap, LOOSE_SET_HASH_SIZE);
-    if (!repo->loose_set) return set_error(ERR_NOMEM, "loose_set alloc");
-    repo->loose_set_mask = cap - 1;
-    repo->loose_set_cnt = 0;
+    st->loose_set = calloc(cap, LOOSE_SET_HASH_SIZE);
+    if (!st->loose_set) return set_error(ERR_NOMEM, "loose_set alloc");
+    st->loose_set_mask = cap - 1;
+    st->loose_set_cnt = 0;
 
     /* Second pass: populate */
     for (unsigned i = 0; i < 256; i++) {
@@ -407,24 +406,24 @@ status_t repo_build_loose_set(repo_t *repo) {
             uint8_t hash[LOOSE_SET_HASH_SIZE];
             if (hex_to_bin(hex, hash, LOOSE_SET_HASH_SIZE) != 0) continue;
             /* Insert */
-            repo_loose_set_insert(repo, hash);
+            store_loose_set_insert(st, hash);
         }
         closedir(d);
     }
 
-    repo->loose_set_ready = 1;
+    st->loose_set_ready = 1;
     return OK;
 }
 
-int repo_loose_set_contains(repo_t *repo, const uint8_t *hash) {
-    if (!repo->loose_set_ready || !repo->loose_set) return 0;
-    uint32_t mask = repo->loose_set_mask;
+int store_loose_set_contains(store_t *st, const uint8_t *hash) {
+    if (!st->loose_set_ready || !st->loose_set) return 0;
+    uint32_t mask = st->loose_set_mask;
     uint32_t cap = mask + 1;
     uint32_t idx = loose_set_slot(hash, mask);
     /* Bounded probe: if every slot is non-empty and none match, the table
      * is full — treat as miss rather than spinning forever. */
     for (uint32_t i = 0; i < cap; i++) {
-        const uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
+        const uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
         if (loose_set_is_empty(slot)) return 0;
         if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) return 1;
         idx = (idx + 1) & mask;
@@ -434,279 +433,178 @@ int repo_loose_set_contains(repo_t *repo, const uint8_t *hash) {
 
 /* Grow the loose-set table to 2x capacity and rehash. Caller must hold
  * loose_set_mu. Best-effort — on alloc failure the old table is kept. */
-static void loose_set_grow_locked(repo_t *repo) {
-    uint32_t old_cap = repo->loose_set_mask + 1;
+static void loose_set_grow_locked(store_t *st) {
+    uint32_t old_cap = st->loose_set_mask + 1;
     uint32_t new_cap = old_cap * 2;
     uint8_t *new_tbl = calloc(new_cap, LOOSE_SET_HASH_SIZE);
     if (!new_tbl) return;
     uint32_t new_mask = new_cap - 1;
     for (uint32_t i = 0; i < old_cap; i++) {
-        uint8_t *src = repo->loose_set + (size_t)i * LOOSE_SET_HASH_SIZE;
+        uint8_t *src = st->loose_set + (size_t)i * LOOSE_SET_HASH_SIZE;
         if (loose_set_is_empty(src)) continue;
         uint32_t idx = loose_set_slot(src, new_mask);
         while (!loose_set_is_empty(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE))
             idx = (idx + 1) & new_mask;
         memcpy(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE, src, LOOSE_SET_HASH_SIZE);
     }
-    free(repo->loose_set);
-    repo->loose_set = new_tbl;
-    repo->loose_set_mask = new_mask;
+    free(st->loose_set);
+    st->loose_set = new_tbl;
+    st->loose_set_mask = new_mask;
 }
 
-void repo_loose_set_insert(repo_t *repo, const uint8_t *hash) {
-    if (!repo->loose_set) return;
+void store_loose_set_insert(store_t *st, const uint8_t *hash) {
+    if (!st->loose_set) return;
     /* All-zero hash is our empty sentinel — never insert it */
     if (loose_set_is_empty(hash)) return;
 
-    pthread_mutex_lock(&repo->loose_set_mu);
+    pthread_mutex_lock(&st->loose_set_mu);
     /* Grow at 75% load to keep open addressing efficient and to guarantee a
      * free slot exists. */
-    uint32_t cap = repo->loose_set_mask + 1;
-    if (repo->loose_set_cnt * 4 >= cap * 3)
-        loose_set_grow_locked(repo);
+    uint32_t cap = st->loose_set_mask + 1;
+    if (st->loose_set_cnt * 4 >= cap * 3)
+        loose_set_grow_locked(st);
 
-    uint32_t mask = repo->loose_set_mask;
+    uint32_t mask = st->loose_set_mask;
     cap = mask + 1;
     uint32_t idx = loose_set_slot(hash, mask);
     for (uint32_t i = 0; i < cap; i++) {
-        uint8_t *slot = repo->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
+        uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
         if (loose_set_is_empty(slot)) {
             memcpy(slot, hash, LOOSE_SET_HASH_SIZE);
-            repo->loose_set_cnt++;
+            st->loose_set_cnt++;
             break;
         }
         if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) break;  /* already present */
         idx = (idx + 1) & mask;
     }
-    pthread_mutex_unlock(&repo->loose_set_mu);
+    pthread_mutex_unlock(&st->loose_set_mu);
 }
 
-void repo_clear_loose_set(repo_t *repo) {
-    pthread_mutex_lock(&repo->loose_set_mu);
-    free(repo->loose_set);
-    repo->loose_set      = NULL;
-    repo->loose_set_mask = 0;
-    repo->loose_set_cnt  = 0;
-    repo->loose_set_ready = 0;
-    pthread_mutex_unlock(&repo->loose_set_mu);
+void store_clear_loose_set(store_t *st) {
+    pthread_mutex_lock(&st->loose_set_mu);
+    free(st->loose_set);
+    st->loose_set      = NULL;
+    st->loose_set_mask = 0;
+    st->loose_set_cnt  = 0;
+    st->loose_set_ready = 0;
+    pthread_mutex_unlock(&st->loose_set_mu);
 }
 
-int repo_loose_set_ready(const repo_t *repo) {
-    return repo->loose_set_ready;
+int store_loose_set_ready(const store_t *st) {
+    return st->loose_set_ready;
 }
 
-void repo_set_pack_cache(repo_t *repo, void *data, size_t cnt) {
-    free(repo->pack_cache);
-    repo->pack_cache     = data;
-    repo->pack_cache_cnt = cnt;
-}
-
-void *repo_pack_cache_data(const repo_t *repo) {
-    return repo->pack_cache;
-}
-
-size_t repo_pack_cache_count(const repo_t *repo) {
-    return repo->pack_cache_cnt;
-}
-
-/* Hash function for pack_num → slot index */
 static inline uint32_t dat_cache_hash(uint32_t pack_num) {
     /* Knuth multiplicative hash */
     return pack_num * 2654435761u;
 }
 
-static void dat_cache_grow(repo_t *repo) {
-    uint32_t old_cap = repo->dat_cache_mask + 1;
+static void dat_cache_grow(store_t *st) {
+    uint32_t old_cap = st->dat_cache_mask + 1;
     uint32_t new_cap = old_cap * 2;
     dat_cache_slot_t *new_tbl = calloc(new_cap, sizeof(dat_cache_slot_t));
     if (!new_tbl) return;  /* best effort — keep old table */
 
     uint32_t new_mask = new_cap - 1;
     for (uint32_t i = 0; i < old_cap; i++) {
-        if (!repo->dat_cache[i].fp) continue;
-        uint32_t idx = dat_cache_hash(repo->dat_cache[i].pack_num) & new_mask;
+        if (!st->dat_cache[i].fp) continue;
+        uint32_t idx = dat_cache_hash(st->dat_cache[i].pack_num) & new_mask;
         while (new_tbl[idx].fp)
             idx = (idx + 1) & new_mask;
-        new_tbl[idx] = repo->dat_cache[i];
+        new_tbl[idx] = st->dat_cache[i];
     }
 
-    free(repo->dat_cache);
-    repo->dat_cache      = new_tbl;
-    repo->dat_cache_mask = new_mask;
+    free(st->dat_cache);
+    st->dat_cache      = new_tbl;
+    st->dat_cache_mask = new_mask;
 }
 
-FILE *repo_dat_cache_checkout(repo_t *repo, uint32_t pack_num) {
-    if (!repo->dat_cache) return NULL;
-    uint32_t mask = repo->dat_cache_mask;
+FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num) {
+    if (!st->dat_cache) return NULL;
+    uint32_t mask = st->dat_cache_mask;
     uint32_t idx = dat_cache_hash(pack_num) & mask;
     for (;;) {
-        dat_cache_slot_t *s = &repo->dat_cache[idx];
+        dat_cache_slot_t *s = &st->dat_cache[idx];
         if (!s->fp) return NULL;  /* empty slot → miss */
         if (s->pack_num == pack_num) {
             FILE *fp = s->fp;
             s->fp = NULL;
-            repo->dat_cache_count--;
+            st->dat_cache_count--;
             return fp;
         }
         idx = (idx + 1) & mask;
     }
 }
 
-void repo_dat_cache_return(repo_t *repo, uint32_t pack_num, FILE *fp) {
+void store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp) {
     if (!fp) return;
-    if (!repo->dat_cache) { fclose(fp); return; }
+    if (!st->dat_cache) { fclose(fp); return; }
 
     /* Grow at 75% load factor */
-    uint32_t cap = repo->dat_cache_mask + 1;
-    if (repo->dat_cache_count * 4 >= cap * 3)
-        dat_cache_grow(repo);
+    uint32_t cap = st->dat_cache_mask + 1;
+    if (st->dat_cache_count * 4 >= cap * 3)
+        dat_cache_grow(st);
 
-    uint32_t mask = repo->dat_cache_mask;
+    uint32_t mask = st->dat_cache_mask;
     uint32_t idx = dat_cache_hash(pack_num) & mask;
-    while (repo->dat_cache[idx].fp)
+    while (st->dat_cache[idx].fp)
         idx = (idx + 1) & mask;
 
-    repo->dat_cache[idx].fp       = fp;
-    repo->dat_cache[idx].pack_num = pack_num;
-    repo->dat_cache_count++;
+    st->dat_cache[idx].fp       = fp;
+    st->dat_cache[idx].pack_num = pack_num;
+    st->dat_cache_count++;
 }
 
-void repo_dat_cache_flush(repo_t *repo) {
-    if (!repo || !repo->dat_cache) return;
-    uint32_t cap = repo->dat_cache_mask + 1;
+void store_dat_cache_flush(store_t *st) {
+    if (!st || !st->dat_cache) return;
+    uint32_t cap = st->dat_cache_mask + 1;
     for (uint32_t i = 0; i < cap; i++) {
-        if (repo->dat_cache[i].fp) {
-            fclose(repo->dat_cache[i].fp);
-            repo->dat_cache[i].fp = NULL;
+        if (st->dat_cache[i].fp) {
+            fclose(st->dat_cache[i].fp);
+            st->dat_cache[i].fp = NULL;
         }
     }
-    repo->dat_cache_count = 0;
+    st->dat_cache_count = 0;
 }
 
 /* ------------------------------------------------------------------ */
 /* Advisory lock                                                       */
 /* ------------------------------------------------------------------ */
 
-status_t repo_lock(repo_t *repo) {
-    if (repo->lock_fd != -1) {
-        if (repo->lock_mode == 2) return OK;  /* already exclusive */
-        /* Upgrade shared → exclusive. flock(2) atomically replaces the lock. */
-        if (flock(repo->lock_fd, LOCK_EX | LOCK_NB) == -1) {
-            if (errno == EWOULDBLOCK)
-                return set_error(ERR_IO, "repository is locked by another process (upgrade)");
-            return set_error_errno(ERR_IO, "flock upgrade");
-        }
-        repo->lock_mode = 2;
-        return OK;
-    }
+/* ------------------------------------------------------------------ */
+/* Config and daemon callbacks                                         */
+/* ------------------------------------------------------------------ */
 
-    char lock_path[PATH_MAX];
-    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
-
-    int fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
-    if (fd == -1)
-        return set_error_errno(ERR_IO, "cannot open lock file '%s'", lock_path);
-
-    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
-        int e = errno;
-        close(fd);
-        if (e == EWOULDBLOCK)
-            return set_error(ERR_IO, "repository is locked by another process");
-        errno = e;
-        return set_error_errno(ERR_IO, "flock '%s'", lock_path);
-    }
-
-    repo->lock_fd = fd;
-    repo->lock_mode = 2;
-
-    /* Clean up any temp files left by a previous crashed run. */
-    char tmp_dir[PATH_MAX];
-    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", repo->path);
-    DIR *td = opendir(tmp_dir);
-    if (td) {
-        struct dirent *de;
-        while ((de = readdir(td)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            char entry[PATH_MAX];
-            snprintf(entry, sizeof(entry), "%s/tmp/%s", repo->path, de->d_name);
-            unlink(entry);
-        }
-        closedir(td);
-    }
-
-    write_version_file(repo->path, "last_written");
-
-    return OK;
+const store_config_t *store_config(const store_t *st) {
+    return st ? &st->cfg : NULL;
 }
 
-void repo_unlock(repo_t *repo) {
-    if (!repo || repo->lock_fd == -1) return;
-    flock(repo->lock_fd, LOCK_UN);
-    close(repo->lock_fd);
-    repo->lock_fd = -1;
-    repo->lock_mode = 0;
-}
-
-void repo_set_lock_fd(repo_t *repo, int fd) {
-    repo->lock_fd = fd;
-    repo->lock_mode = 2;  /* exclusive */
-}
-
-status_t repo_lock_downgrade(repo_t *repo) {
-    if (!repo || repo->lock_fd == -1) return OK;
-    if (repo->lock_mode != 2) return OK;
-    if (flock(repo->lock_fd, LOCK_SH) == -1)
-        return set_error_errno(ERR_IO, "flock downgrade");
-    repo->lock_mode = 1;
-    return OK;
+void store_set_locate_cb(store_t *st, store_locate_fn cb, void *user) {
+    if (!st) return;
+    st->locate_cb = cb;
+    st->locate_user = user;
 }
 
 /*
- * Acquire a shared (read) lock.  Blocks until any exclusive writer finishes.
- * Non-fatal: if the lock file does not exist yet (no writer has ever run)
- * or if flock fails for any reason, we proceed without the lock — reads are
- * safe as long as no writer is active, and the warning makes the situation
- * visible.
+ * With no resolver the engine can only see loose objects. That is the right
+ * answer for tests and benchmarks, and it is a hard error in the daemon,
+ * which always registers one.
  */
-status_t repo_lock_shared(repo_t *repo) {
-    if (repo->lock_fd != -1) return OK;   /* already holds a lock (shared or stronger) */
-
-    char lock_path[PATH_MAX];
-    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
-
-    int fd = open(lock_path, O_RDWR | O_CREAT, 0644);
-    if (fd == -1) return OK;   /* no lock file — no writer has run, safe to proceed */
-
-    if (flock(fd, LOCK_SH) == -1) {
-        close(fd);
-        log_msg("WARN", "could not acquire shared lock; proceeding without lock");
-        return OK;
-    }
-
-    repo->lock_fd = fd;
-    repo->lock_mode = 1;
-    return OK;
+status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
+                      store_location_t *out) {
+    if (!st || !out) return set_error(ERR_INVALID, "store_locate: null argument");
+    if (!st->locate_cb)
+        return set_error(ERR_NOT_FOUND, "store_locate: no resolver registered");
+    return st->locate_cb(st->locate_user, hash, out);
 }
 
-status_t repo_lock_shared_nb(repo_t *repo) {
-    if (repo->lock_fd != -1) return OK;
-
-    char lock_path[PATH_MAX];
-    snprintf(lock_path, sizeof(lock_path), "%s/lock", repo->path);
-
-    int fd = open(lock_path, O_RDWR | O_CREAT, 0644);
-    if (fd == -1) return OK;
-
-    if (flock(fd, LOCK_SH | LOCK_NB) == -1) {
-        close(fd);
-        return ERR_IO;
-    }
-
-    repo->lock_fd = fd;
-    repo->lock_mode = 1;
-    return OK;
+void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user) {
+    if (!st) return;
+    st->commit_cb = cb;
+    st->commit_user = user;
 }
 
-int repo_lock_is_exclusive(const repo_t *repo) {
-    return repo && repo->lock_mode == 2;
+void store_emit_pack_commit(store_t *st, const pack_commit_info_t *info) {
+    if (!st || !st->commit_cb || !info) return;
+    st->commit_cb(st->commit_user, info);
 }

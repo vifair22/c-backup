@@ -1,7 +1,7 @@
 #pragma once
 
 #include "error.h"
-#include "repo.h"
+#include "store.h"
 #include "types.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -35,11 +35,11 @@ typedef struct {
     void       *_backing;
 } snapshot_t;
 
-status_t snapshot_load(repo_t *repo, uint32_t snap_id, snapshot_t **out);
-status_t snapshot_load_nodes_only(repo_t *repo, uint32_t snap_id, snapshot_t **out);
-status_t snapshot_load_header_only(repo_t *repo, uint32_t snap_id, snapshot_t **out);
-status_t snapshot_write(repo_t *repo, snapshot_t *snap);
-status_t snapshot_delete(repo_t *repo, uint32_t snap_id);
+status_t snapshot_load(store_t *store, uint32_t snap_id, snapshot_t **out);
+status_t snapshot_load_nodes_only(store_t *store, uint32_t snap_id, snapshot_t **out);
+status_t snapshot_load_header_only(store_t *store, uint32_t snap_id, snapshot_t **out);
+status_t snapshot_write(store_t *store, snapshot_t *snap);
+status_t snapshot_delete(store_t *store, uint32_t snap_id);
 void     snapshot_free(snapshot_t *snap);
 
 /*
@@ -48,20 +48,20 @@ void     snapshot_free(snapshot_t *snap);
  * via tmp + rename).  snapshot_read_gfs_flags reads without loading the
  * full snapshot; returns ERR_IO if the file does not exist.
  */
-status_t snapshot_set_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t new_flags);
-status_t snapshot_replace_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t flags);
-status_t snapshot_read_gfs_flags(repo_t *repo, uint32_t snap_id, uint32_t *out_flags);
+status_t snapshot_set_gfs_flags(store_t *store, uint32_t snap_id, uint32_t new_flags);
+status_t snapshot_replace_gfs_flags(store_t *store, uint32_t snap_id, uint32_t flags);
+status_t snapshot_read_gfs_flags(store_t *store, uint32_t snap_id, uint32_t *out_flags);
 
 /* HEAD helpers */
-status_t snapshot_read_head(repo_t *repo, uint32_t *out_id);
-status_t snapshot_write_head(repo_t *repo, uint32_t snap_id);
+status_t snapshot_read_head(store_t *store, uint32_t *out_id);
+status_t snapshot_write_head(store_t *store, uint32_t snap_id);
 
 /* Lookup helpers */
 const node_t *snapshot_find_node(const snapshot_t *snap, uint64_t node_id);
 
 /* ---------- path map ----------
  *
- * Maps repo-relative path strings to node_t values from a snapshot.
+ * Maps store-relative path strings to node_t values from a snapshot.
  * Used by the compare phase to check what existed in the previous snapshot.
  */
 typedef struct pm_slot {
@@ -105,7 +105,7 @@ void pathmap_free(pathmap_t *map);
  * Attempt to repair a snapshot file in-place using its parity data.
  * Returns: >0 = bytes corrected, 0 = no corruption found, <0 = error.
  */
-int snapshot_repair(repo_t *repo, uint32_t snap_id);
+int snapshot_repair(store_t *store, uint32_t snap_id);
 
 /* ---------- snapshot list ----------
  *
@@ -130,7 +130,7 @@ typedef struct {
     uint32_t     count;
 } snap_list_t;
 
-status_t snapshot_list_all(repo_t *repo, snap_list_t **out);
+status_t snapshot_list_all(store_t *store, snap_list_t **out);
 void     snap_list_free(snap_list_t *l);
 
 /* ---------- snapshot path index (.pidx) ----------
@@ -143,19 +143,19 @@ void     snap_list_free(snap_list_t *l);
  * Write a .pidx file for the given snapshot. The snapshot must be
  * fully loaded (nodes + dirent_data). Called during snapshot_write.
  */
-status_t snap_pidx_write(repo_t *repo, const snapshot_t *snap);
+status_t snap_pidx_write(store_t *store, const snapshot_t *snap);
 
 /*
- * Look up a repo-relative path in the .pidx file.
+ * Look up a store-relative path in the .pidx file.
  * On success, copies the matching node into *out_node and returns OK.
  * Returns ERR_NOT_FOUND if the path is not in the index.
  * Falls back gracefully if .pidx is missing or corrupt.
  */
-status_t snap_pidx_lookup(repo_t *repo, uint32_t snap_id,
+status_t snap_pidx_lookup(store_t *store, uint32_t snap_id,
                           const char *path, node_t *out_node);
 
 /*
  * Rebuild .pidx files for all snapshots that don't have one.
  * Returns the number of files rebuilt in *out_rebuilt (may be NULL).
  */
-status_t snap_pidx_rebuild_all(repo_t *repo, uint32_t *out_rebuilt);
+status_t snap_pidx_rebuild_all(store_t *store, uint32_t *out_rebuilt);

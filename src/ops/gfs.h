@@ -1,7 +1,7 @@
 #pragma once
 
 #include "error.h"
-#include "repo.h"
+#include "store.h"
 /* Retention counters, formerly the relevant slice of policy_t from the
  * deleted policy.h. Phase 6 sources these from policy_values rows in the
  * daemon DB; the field names are kept so the algorithm below is untouched. */
@@ -48,7 +48,7 @@ typedef struct {
  * full_scan=1: clear all existing GFS flags and recompute from scratch
  *              across the full history.  Use for manual `backup gfs` runs.
  */
-status_t gfs_run(repo_t *repo, const gfs_retention_t *policy,
+status_t gfs_run(store_t *store, const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  int full_scan, uint32_t *out_pruned);
 

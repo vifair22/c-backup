@@ -1,13 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "pack.h"
-#include "pack_index.h"
-#include "stats.h"
 #include "parity.h"
 #include "parity_stream.h"
 #include "object.h"
-#include "repo.h"
-#include "snapshot.h"
+#include "store.h"
 #include "progress.h"
 #include "util.h"
 #include "../vendor/log.h"
@@ -112,7 +109,7 @@ typedef struct {
 #define cache_cmp hash_cmp
 
 /* Forward declarations for startup recovery */
-static void pack_resume_deleting(repo_t *repo);
+static void pack_resume_deleting(store_t *store);
 
 static int idx_disk_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
@@ -150,38 +147,38 @@ static int path_fmt(char *buf, size_t sz, const char *fmt, ...) {
  * pack_dat_path_resolve / pack_idx_path_resolve try sharded first,
  * fall back to flat (for reads). */
 
-static int pack_dat_path(char *buf, size_t sz, const char *repo,
+static int pack_dat_path(char *buf, size_t sz, const char *store,
                          uint32_t pack_num) {
     return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.dat",
-                    repo, pack_num / 256, pack_num);
+                    store, pack_num / 256, pack_num);
 }
 
-static int pack_idx_path(char *buf, size_t sz, const char *repo,
+static int pack_idx_path(char *buf, size_t sz, const char *store,
                          uint32_t pack_num) {
     return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.idx",
-                    repo, pack_num / 256, pack_num);
+                    store, pack_num / 256, pack_num);
 }
 
 /* Build sharded path; if file doesn't exist, try flat layout. */
-int pack_dat_path_resolve(char *buf, size_t sz, const char *repo,
+int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
                           uint32_t pack_num) {
-    if (pack_dat_path(buf, sz, repo, pack_num) != 0) return -1;
+    if (pack_dat_path(buf, sz, store, pack_num) != 0) return -1;
     if (access(buf, F_OK) == 0) return 0;
-    return path_fmt(buf, sz, "%s/packs/pack-%08u.dat", repo, pack_num);
+    return path_fmt(buf, sz, "%s/packs/pack-%08u.dat", store, pack_num);
 }
 
-static int pack_idx_path_resolve(char *buf, size_t sz, const char *repo,
+static int pack_idx_path_resolve(char *buf, size_t sz, const char *store,
                                  uint32_t pack_num) {
-    if (pack_idx_path(buf, sz, repo, pack_num) != 0) return -1;
+    if (pack_idx_path(buf, sz, store, pack_num) != 0) return -1;
     if (access(buf, F_OK) == 0) return 0;
-    return path_fmt(buf, sz, "%s/packs/pack-%08u.idx", repo, pack_num);
+    return path_fmt(buf, sz, "%s/packs/pack-%08u.idx", store, pack_num);
 }
 
 /* Ensure the shard directory exists for a pack_num. */
-static void pack_ensure_shard_dir(const char *repo, uint32_t pack_num) {
+static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
     char shard[PATH_MAX];
     if (path_fmt(shard, sizeof(shard), "%s/packs/%04x",
-                 repo, pack_num / 256) == 0)
+                 store, pack_num / 256) == 0)
         (void)mkdir(shard, 0755);  /* EEXIST is fine */
 }
 
@@ -262,48 +259,15 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
     if (pack_num >= *max) *max = pack_num + 1;
 }
 
-static uint32_t next_pack_num(repo_t *repo) {
+static uint32_t next_pack_num(store_t *store) {
     uint32_t pack_num = 0;
     char packs_dir[PATH_MAX];
-    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
         return 0;
     pack_for_each_num(packs_dir, max_pack_num_cb, &pack_num);
     return pack_num;
 }
 
-static status_t coalesce_state_read(repo_t *repo, uint32_t *out_head) {
-    char p[PATH_MAX];
-    if (path_fmt(p, sizeof(p), "%s/logs/pack-coalesce.state", repo_path(repo)) != 0)
-        return set_error(ERR_IO, "coalesce_state_read: path too long");
-    FILE *f = fopen(p, "r");
-    if (!f) { *out_head = 0; return OK; }
-    unsigned head = 0;
-    int ok = fscanf(f, "%u", &head);
-    fclose(f);
-    *out_head = (ok == 1) ? (uint32_t)head : 0;
-    return OK;
-}
-
-static void coalesce_state_write(repo_t *repo, uint32_t head) {
-    char p[PATH_MAX], tmp[PATH_MAX];
-    if (path_fmt(p, sizeof(p), "%s/logs/pack-coalesce.state", repo_path(repo)) != 0 ||
-        path_fmt(tmp, sizeof(tmp), "%s/tmp/pack-coalesce.XXXXXX", repo_path(repo)) != 0)
-        return;
-    int fd = mkstemp(tmp);
-    if (fd < 0) return;
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp); return; }
-    fprintf(f, "%u\n", head);
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    if (rename(tmp, p) == 0) {
-        int lfd = openat(repo_fd(repo), "logs", O_RDONLY | O_DIRECTORY);
-        if (lfd >= 0) { fsync(lfd); close(lfd); }
-    } else {
-        unlink(tmp);
-    }
-}
 
 /* read_full_fd: uses io_read_full from util.h */
 #define read_full_fd io_read_full
@@ -361,7 +325,7 @@ typedef struct {
     int      fd;   /* open fd positioned past header, or -1 */
 } pack_obj_meta_t;
 
-static uint32_t pack_worker_threads(const repo_t *repo) {
+static uint32_t pack_worker_threads(const store_t *store) {
     const char *env = getenv("CBACKUP_PACK_THREADS");
     if (env && *env) {
         char *end = NULL;
@@ -378,8 +342,8 @@ static uint32_t pack_worker_threads(const repo_t *repo) {
     if (n < 1) n = 1;
 
     /* Cap threads for slow / contention-prone media, same as store workers.
-     * Pack writes go to the repo, so detect media type from the repo path. */
-    int rot = path_is_rotational(repo_path(repo));
+     * Pack writes go to the store, so detect media type from the store path. */
+    int rot = path_is_rotational(store_root(store));
     if (rot == -1) {
         /* FUSE/NFS — single thread to avoid overwhelming userspace daemon */
         n = 1;
@@ -392,290 +356,128 @@ static uint32_t pack_worker_threads(const repo_t *repo) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Pack index cache — loaded lazily, invalidated after repo_pack      */
+/* Object location                                                     */
+/*                                                                     */
+/* The .idx sidecar and its in-memory sorted cache are gone. Pack       */
+/* contents live in the pack_objects table, and the daemon answers      */
+/* lookups through the resolver registered on the store. The engine     */
+/* never sees a query; it asks where a hash lives and gets an answer.   */
+/*                                                                     */
+/* With no resolver registered (tests, benchmarks) nothing is packed    */
+/* as far as the engine is concerned, and callers fall back to loose    */
+/* objects.                                                            */
 /* ------------------------------------------------------------------ */
 
-static status_t pack_cache_load(repo_t *repo) {
-    if (repo_pack_cache_data(repo) != NULL) return OK;  /* already loaded */
-
-    /* Fast path: try the global pack index first. */
-    pack_index_t *gidx = pack_index_open(repo);
-    if (gidx) {
-        uint32_t n = gidx->hdr->entry_count;
-        pack_cache_entry_t *entries = malloc((n ? n : 1) * sizeof(*entries));
-        if (entries) {
-            for (uint32_t i = 0; i < n; i++) {
-                const pack_index_entry_t *ge = &gidx->entries[i];
-                memcpy(entries[i].hash, ge->hash, OBJECT_HASH_SIZE);
-                entries[i].dat_offset   = ge->dat_offset;
-                entries[i].pack_num     = ge->pack_num;
-                entries[i].pack_version = ge->pack_version;
-                entries[i].entry_index  = ge->entry_index;
-            }
-            /* Already sorted by hash in the global index. */
-            repo_set_pack_cache(repo, entries, n);
-            pack_index_close(gidx);
-            return OK;
-        }
-        pack_index_close(gidx);
-        /* malloc failed — fall through to legacy path */
-    }
-
-    /* Legacy path: scan all per-pack .idx files (flat + sharded). */
-    char legacy_packs_dir[PATH_MAX];
-    if (path_fmt(legacy_packs_dir, sizeof(legacy_packs_dir), "%s/packs",
-                 repo_path(repo)) != 0) {
-        repo_set_pack_cache(repo, malloc(1), 0);
-        return OK;
-    }
-
-    /* Collect all pack numbers via two-level walk */
-    collect_pack_nums_ctx_t legacy_cpn = { NULL, 0, 0 };
-    legacy_cpn.nums = malloc(256 * sizeof(*legacy_cpn.nums));
-    if (!legacy_cpn.nums) {
-        repo_set_pack_cache(repo, malloc(1), 0);
-        return OK;
-    }
-    legacy_cpn.cap = 256;
-    pack_for_each_num(legacy_packs_dir, collect_pack_num_cb, &legacy_cpn);
-
-    pack_cache_entry_t *entries = NULL;
-    size_t cap = 0, cnt = 0;
-    status_t st = OK;
-
-    for (size_t pi = 0; pi < legacy_cpn.cnt && st == OK; pi++) {
-        uint32_t pack_num = legacy_cpn.nums[pi];
-        char idx_path[PATH_MAX];
-        if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
-                                  repo_path(repo), pack_num) != 0)
-            continue;
-
-        FILE *f = fopen(idx_path, "rb");
-        if (!f) continue;
-
-        pack_idx_hdr_t hdr;
-        if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
-            hdr.magic != PACK_IDX_MAGIC ||
-            (hdr.version != PACK_VERSION_V1 &&
-             hdr.version != PACK_VERSION_V2 &&
-             hdr.version != PACK_VERSION_V3 &&
-             hdr.version != PACK_VERSION)) {
-            fclose(f); continue;
-        }
-        if (hdr.count > 10000000u) { fclose(f); continue; }
-
-        /* Validate count against actual file size */
-        {
-            size_t entry_sz = (hdr.version == PACK_VERSION)
-                ? sizeof(pack_idx_disk_entry_t)
-                : (hdr.version == PACK_VERSION_V3)
-                    ? sizeof(pack_idx_disk_entry_v3_t)
-                    : sizeof(pack_idx_disk_entry_v2_t);
-            long cur = ftell(f);
-            if (fseek(f, 0, SEEK_END) != 0) { fclose(f); continue; }
-            long fsz = ftell(f);
-            if (fseek(f, cur, SEEK_SET) != 0) { fclose(f); continue; }
-            if (fsz > 0 && cur >= 0 && (size_t)(fsz - cur) / entry_sz < hdr.count) {
-                fclose(f); continue; /* count exceeds file data */
-            }
-        }
-
-        /* Ensure capacity for all entries in this pack at once */
-        if (cnt + hdr.count > cap) {
-            size_t nc = cap ? cap : 256;
-            while (nc < cnt + hdr.count) nc *= 2;
-            pack_cache_entry_t *tmp = realloc(entries, nc * sizeof(*tmp));
-            if (!tmp) { st = ERR_NOMEM; fclose(f); break; }
-            entries = tmp; cap = nc;
-        }
-
-        /* Bulk-read all index entries in one fread call */
-        if (hdr.version == PACK_VERSION) {
-            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_t);
-            pack_idx_disk_entry_t *disk_buf = malloc(disk_sz);
-            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
-            if (fread(disk_buf, sizeof(pack_idx_disk_entry_t), hdr.count, f) != hdr.count) {
-                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
-            }
-            for (uint32_t i = 0; i < hdr.count; i++) {
-                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
-                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
-                entries[cnt].pack_num     = pack_num;
-                entries[cnt].pack_version = hdr.version;
-                entries[cnt].entry_index  = disk_buf[i].entry_index;
-                cnt++;
-            }
-            free(disk_buf);
-        } else if (hdr.version == PACK_VERSION_V3) {
-            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v3_t);
-            pack_idx_disk_entry_v3_t *disk_buf = malloc(disk_sz);
-            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
-            if (fread(disk_buf, sizeof(pack_idx_disk_entry_v3_t), hdr.count, f) != hdr.count) {
-                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
-            }
-            for (uint32_t i = 0; i < hdr.count; i++) {
-                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
-                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
-                entries[cnt].pack_num     = pack_num;
-                entries[cnt].pack_version = hdr.version;
-                entries[cnt].entry_index  = disk_buf[i].entry_index;
-                cnt++;
-            }
-            free(disk_buf);
-        } else {
-            size_t disk_sz = (size_t)hdr.count * sizeof(pack_idx_disk_entry_v2_t);
-            pack_idx_disk_entry_v2_t *disk_buf = malloc(disk_sz);
-            if (!disk_buf) { st = ERR_NOMEM; fclose(f); break; }
-            if (fread(disk_buf, sizeof(pack_idx_disk_entry_v2_t), hdr.count, f) != hdr.count) {
-                free(disk_buf); st = ERR_CORRUPT; fclose(f); break;
-            }
-            for (uint32_t i = 0; i < hdr.count; i++) {
-                memcpy(entries[cnt].hash, disk_buf[i].hash, OBJECT_HASH_SIZE);
-                entries[cnt].dat_offset   = disk_buf[i].dat_offset;
-                entries[cnt].pack_num     = pack_num;
-                entries[cnt].pack_version = hdr.version;
-                entries[cnt].entry_index  = UINT32_MAX;
-                cnt++;
-            }
-            free(disk_buf);
-        }
-        fclose(f);
-    }
-    free(legacy_cpn.nums);
-
-    if (st != OK) { free(entries); return st; }
-
-    if (cnt > 0)
-        qsort(entries, cnt, sizeof(*entries), cache_cmp);
-
-    /* Sentinel: even with cnt==0 set a non-NULL pointer so we skip re-scanning */
-    if (!entries) {
-        entries = malloc(sizeof(pack_cache_entry_t));
-        if (!entries) return set_error(ERR_NOMEM, "pack_cache_load: alloc failed");
-    }
-    repo_set_pack_cache(repo, entries, cnt);
-    return OK;
+void pack_cache_invalidate(store_t *store) {
+    /* Retained so callers need not care whether an index exists. The
+     * resolver is authoritative and stateless from the engine's side, so
+     * there is nothing left to invalidate except open .dat handles. */
+    store_dat_cache_flush(store);
 }
 
-void pack_cache_invalidate(repo_t *repo) {
-    repo_dat_cache_flush(repo);
-    repo_set_pack_cache(repo, NULL, 0);
-
-    /* Remove stale global pack index so next load falls through to
-     * the per-pack .idx scan and rebuilds fresh state. */
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/packs/pack-index.pidx", repo_path(repo));
-    (void)unlink(path);
+int pack_object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
+    store_location_t loc;
+    return store_locate(store, hash, &loc) == OK && loc.in_pack;
 }
 
-/* ------------------------------------------------------------------ */
-/* Lookup helpers called by object.c                                  */
-/* ------------------------------------------------------------------ */
-
-int pack_object_exists(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
-    if (pack_cache_load(repo) != OK) return 0;
-    size_t cnt = repo_pack_cache_count(repo);
-    if (cnt == 0) return 0;
-    pack_cache_entry_t *arr = repo_pack_cache_data(repo);
-    return bsearch(hash, arr, cnt, sizeof(*arr), cache_cmp) != NULL;
-}
-
-static status_t pack_find_entry(repo_t *repo,
+static status_t pack_find_entry(store_t *store,
                                 const uint8_t hash[OBJECT_HASH_SIZE],
-                                pack_cache_entry_t **out_found) {
-    status_t st = pack_cache_load(repo);
+                                pack_cache_entry_t *out_found) {
+    store_location_t loc;
+    memset(&loc, 0, sizeof(loc));
+    status_t st = store_locate(store, hash, &loc);
     if (st != OK) return st;
+    if (!loc.in_pack)
+        return set_error(ERR_NOT_FOUND, "pack_find_entry: object is loose, not packed");
 
-    size_t cnt = repo_pack_cache_count(repo);
-    if (cnt == 0) return set_error(ERR_NOT_FOUND, "pack_find_entry: no packed objects");
-
-    pack_cache_entry_t *arr = repo_pack_cache_data(repo);
-    pack_cache_entry_t *found = bsearch(hash, arr, cnt, sizeof(*arr), cache_cmp);
-    if (!found) return set_error(ERR_NOT_FOUND, "pack_find_entry: hash not in pack index");
-    *out_found = found;
+    memcpy(out_found->hash, hash, OBJECT_HASH_SIZE);
+    out_found->dat_offset   = loc.offset;
+    out_found->pack_num     = (uint32_t)loc.pack_id;
+    out_found->pack_version = loc.pack_version;
+    out_found->entry_index  = loc.entry_index;
     return OK;
 }
 
-status_t pack_resolve_location(repo_t *repo,
+status_t pack_resolve_location(store_t *store,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                uint32_t *out_pack_num,
                                uint64_t *out_dat_offset) {
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
-    if (st != OK || !found) return st != OK ? st : ERR_NOT_FOUND;
-    *out_pack_num  = found->pack_num;
-    *out_dat_offset = found->dat_offset;
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
+    if (st != OK) return st;
+    *out_pack_num  = found.pack_num;
+    *out_dat_offset = found.dat_offset;
     return OK;
 }
 
 /* ---- .dat file handle cache helpers ---- */
 
-static FILE *dat_open_or_checkout(repo_t *repo, uint32_t pack_num) {
-    FILE *f = repo_dat_cache_checkout(repo, pack_num);
+static FILE *dat_open_or_checkout(store_t *store, uint32_t pack_num) {
+    FILE *f = store_dat_cache_checkout(store, pack_num);
     if (f) return f;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                              repo_path(repo), pack_num) != 0)
+                              store_root(store), pack_num) != 0)
         return NULL;
     return fopen(dat_path, "rb");
 }
 
-static void dat_return_or_close(repo_t *repo, uint32_t pack_num, FILE *f) {
-    repo_dat_cache_return(repo, pack_num, f);
+static void dat_return_or_close(store_t *store, uint32_t pack_num, FILE *f) {
+    store_dat_cache_return(store, pack_num, f);
 }
 
-status_t pack_object_physical_size(repo_t *repo,
+status_t pack_object_physical_size(store_t *store,
                                    const uint8_t hash[OBJECT_HASH_SIZE],
                                    uint64_t *out_bytes) {
     if (!out_bytes) return set_error(ERR_INVALID, "pack_object_physical_size: out_bytes is NULL");
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    FILE *f = dat_open_or_checkout(repo, found->pack_num);
-    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%08u.dat", found->pack_num);
+    FILE *f = dat_open_or_checkout(store, found.pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%08u.dat", found.pack_num);
 
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
         fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%08u.dat", found->pack_num);
+        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%08u.dat", found.pack_num);
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
+    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found->pack_num);
+        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
     }
-    dat_return_or_close(repo, found->pack_num, f);
+    dat_return_or_close(store, found.pack_num, f);
     /* Physical size accounts for the on-disk header size of the actual version */
-    size_t hdr_sz = (found->pack_version == PACK_VERSION_V1)
+    size_t hdr_sz = (found.pack_version == PACK_VERSION_V1)
                     ? sizeof(pack_dat_entry_hdr_v1_t)
                     : sizeof(pack_dat_entry_hdr_t);
     *out_bytes = (uint64_t)hdr_sz + ehdr.compressed_size;
     return OK;
 }
 
-status_t pack_object_get_info(repo_t *repo,
+status_t pack_object_get_info(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_uncompressed_size,
                               uint8_t *out_type) {
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
-    if (st != OK || !found) return st != OK ? st : ERR_NOT_FOUND;
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
+    if (st != OK) return st;
 
-    FILE *f = dat_open_or_checkout(repo, found->pack_num);
-    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%08u.dat", found->pack_num);
+    FILE *f = dat_open_or_checkout(store, found.pack_num);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%08u.dat", found.pack_num);
 
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
-        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found->pack_num);
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found.pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found->pack_num);
+    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
+        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
     }
-    dat_return_or_close(repo, found->pack_num, f);
+    dat_return_or_close(store, found.pack_num, f);
 
-    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in pack-%08u.dat", found->pack_num);
+    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) return set_error(ERR_CORRUPT, "pack_object_get_info: hash mismatch in pack-%08u.dat", found.pack_num);
     if (out_uncompressed_size) *out_uncompressed_size = ehdr.uncompressed_size;
     if (out_type) *out_type = ehdr.type;
     return OK;
@@ -770,39 +572,39 @@ static int load_entry_parity(FILE *f, uint32_t entry_index,
     return 0;
 }
 
-status_t pack_object_load(repo_t *repo,
+status_t pack_object_load(store_t *store,
                           const uint8_t hash[OBJECT_HASH_SIZE],
                           void **out_data, size_t *out_size,
                           uint8_t *out_type) {
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    uint32_t pnum = found->pack_num;
+    uint32_t pnum = found.pack_num;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                              repo_path(repo), pnum) != 0)
+                              store_root(store), pnum) != 0)
         return set_error(ERR_IO, "pack_object_load: path too long for pack-%08u.dat", pnum);
-    FILE *f = dat_open_or_checkout(repo, pnum);
+    FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load: fopen(%s)", dat_path);
 
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
         fclose(f); return set_error_errno(ERR_IO, "pack_object_load: fseeko(%s)", dat_path);
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
+    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
 
     /* --- Parity: attempt entry header repair for v3 packs --- */
-    if ((found->pack_version == PACK_VERSION_V3 || found->pack_version == PACK_VERSION) &&
-        found->entry_index != UINT32_MAX) {
+    if ((found.pack_version == PACK_VERSION_V3 || found.pack_version == PACK_VERSION) &&
+        found.entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         uint32_t pay_crc = 0;
         uint8_t *rs_par = NULL;
         size_t rs_par_sz = 0;
 
-        if (load_entry_parity(f, found->entry_index, &hdr_par,
+        if (load_entry_parity(f, found.entry_index, &hdr_par,
                               &pay_crc, &rs_par, &rs_par_sz) == 0) {
             /* Verify/repair entry header */
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
@@ -815,10 +617,10 @@ status_t pack_object_load(repo_t *repo,
             }
 
             /* Re-seek to payload position after header repair */
-            size_t hdr_disk_sz = (found->pack_version == PACK_VERSION_V1)
+            size_t hdr_disk_sz = (found.pack_version == PACK_VERSION_V1)
                                  ? sizeof(pack_dat_entry_hdr_v1_t)
                                  : sizeof(pack_dat_entry_hdr_t);
-            if (fseeko(f, (off_t)(found->dat_offset + (uint64_t)hdr_disk_sz),
+            if (fseeko(f, (off_t)(found.dat_offset + (uint64_t)hdr_disk_sz),
                        SEEK_SET) != 0) {
                 free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load: fseeko after parity repair in %s", dat_path);
             }
@@ -835,7 +637,7 @@ status_t pack_object_load(repo_t *repo,
                 if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
                     free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
                 }
-                dat_return_or_close(repo, pnum, f); f = NULL;
+                dat_return_or_close(store, pnum, f); f = NULL;
 
                 /* CRC fast-check on compressed payload */
                 uint32_t got_crc = crc32c(cpayload, (size_t)ehdr.compressed_size);
@@ -894,10 +696,10 @@ status_t pack_object_load(repo_t *repo,
         }
         /* If parity load failed or object is too large, fall through to
          * non-parity path (re-seek needed). */
-        if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+        if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
             fclose(f); return set_error_errno(ERR_IO, "pack_object_load: re-seek failed in %s", dat_path);
         }
-        if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
+        if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
             fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header on re-read in %s", dat_path);
         }
     }
@@ -921,7 +723,7 @@ status_t pack_object_load(repo_t *repo,
     if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
         free(cpayload); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
     }
-    dat_return_or_close(repo, pnum, f);
+    dat_return_or_close(store, pnum, f);
 
     void *data;
     size_t data_sz;
@@ -961,31 +763,31 @@ status_t pack_object_load(repo_t *repo,
     return OK;
 }
 
-status_t pack_object_load_prefix(repo_t *repo,
+status_t pack_object_load_prefix(store_t *store,
                                   const uint8_t hash[OBJECT_HASH_SIZE],
                                   size_t max_bytes,
                                   void **out_data, size_t *out_size,
                                   uint64_t *out_full_size,
                                   uint8_t *out_type) {
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    uint32_t pnum = found->pack_num;
+    uint32_t pnum = found.pack_num;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                              repo_path(repo), pnum) != 0)
+                              store_root(store), pnum) != 0)
         return set_error(ERR_IO, "pack_object_load_prefix: path too long");
-    FILE *f = dat_open_or_checkout(repo, pnum);
+    FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load_prefix: fopen(%s)", dat_path);
 
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
         fclose(f); return set_error_errno(ERR_IO, "pack_object_load_prefix: fseeko");
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) {
+    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
         fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_prefix: bad entry header");
     }
 
@@ -1003,7 +805,7 @@ status_t pack_object_load_prefix(repo_t *repo,
             free(buf); fclose(f);
             return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
         }
-        dat_return_or_close(repo, pnum, f);
+        dat_return_or_close(store, pnum, f);
         *out_data = buf;
         *out_size = want;
         return OK;
@@ -1020,7 +822,7 @@ status_t pack_object_load_prefix(repo_t *repo,
             free(cpayload); fclose(f);
             return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
         }
-        dat_return_or_close(repo, pnum, f);
+        dat_return_or_close(store, pnum, f);
 
         char *out = malloc(want);
         if (!out) { free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_prefix: output alloc"); }
@@ -1099,28 +901,28 @@ status_t pack_object_load_prefix(repo_t *repo,
     return set_error(ERR_CORRUPT, "pack_object_load_prefix: unknown compression %u", ehdr.compression);
 }
 
-status_t pack_object_load_stream(repo_t *repo,
+status_t pack_object_load_stream(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  int out_fd,
                                  uint64_t *out_size,
                                  uint8_t *out_type) {
-    pack_cache_entry_t *found = NULL;
-    status_t st = pack_find_entry(repo, hash, &found);
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    uint32_t pnum = found->pack_num;
+    uint32_t pnum = found.pack_num;
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                              repo_path(repo), pnum) != 0)
+                              store_root(store), pnum) != 0)
         return set_error(ERR_IO, "pack_object_load_stream: path too long for pack-%08u.dat", pnum);
-    FILE *f = dat_open_or_checkout(repo, pnum);
+    FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "pack_object_load_stream: fopen(%s)", dat_path);
 
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found->pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
+    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
 
     /* Parity: load entry parity for v3 packs (persists across codec paths) */
     uint32_t pay_crc = 0;
@@ -1128,10 +930,10 @@ status_t pack_object_load_stream(repo_t *repo,
     size_t rs_par_sz = 0;
     int have_parity = 0;
 
-    if ((found->pack_version == PACK_VERSION_V3 || found->pack_version == PACK_VERSION) &&
-        found->entry_index != UINT32_MAX) {
+    if ((found.pack_version == PACK_VERSION_V3 || found.pack_version == PACK_VERSION) &&
+        found.entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
-        if (load_entry_parity(f, found->entry_index, &hdr_par,
+        if (load_entry_parity(f, found.entry_index, &hdr_par,
                               &pay_crc, &rs_par, &rs_par_sz) == 0) {
             have_parity = 1;
             int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
@@ -1144,10 +946,10 @@ status_t pack_object_load_stream(repo_t *repo,
             }
         }
         /* Re-seek to payload position */
-        size_t hdr_disk_sz = (found->pack_version == PACK_VERSION_V1)
+        size_t hdr_disk_sz = (found.pack_version == PACK_VERSION_V1)
                              ? sizeof(pack_dat_entry_hdr_v1_t)
                              : sizeof(pack_dat_entry_hdr_t);
-        if (fseeko(f, (off_t)(found->dat_offset + (uint64_t)hdr_disk_sz),
+        if (fseeko(f, (off_t)(found.dat_offset + (uint64_t)hdr_disk_sz),
                    SEEK_SET) != 0) {
             free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko after parity in %s", dat_path);
         }
@@ -1168,7 +970,7 @@ status_t pack_object_load_stream(repo_t *repo,
         if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
             free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 payload in %s", dat_path);
         }
-        dat_return_or_close(repo, pnum, f);
+        dat_return_or_close(store, pnum, f);
 
         /* CRC fast-check + RS repair on compressed payload */
         if (have_parity) {
@@ -1247,7 +1049,7 @@ status_t pack_object_load_stream(repo_t *repo,
             }
             remaining -= want;
         }
-        dat_return_or_close(repo, pnum, f);
+        dat_return_or_close(store, pnum, f);
         free(src); free(dst);
         LZ4F_freeDecompressionContext(dctx);
 
@@ -1255,7 +1057,7 @@ status_t pack_object_load_stream(repo_t *repo,
          * require buffering the entire compressed payload, defeating streaming). */
         if (have_parity && fst == OK && running_crc != pay_crc) {
             log_msg("WARN", "pack: LZ4_FRAME payload CRC mismatch (stream)");
-            parity_stats_add_uncorrectable(1);
+            parity_stats_add_repaired(1);
         }
         free(rs_par);
 
@@ -1355,7 +1157,7 @@ status_t pack_object_load_stream(repo_t *repo,
         }
 
         free(rs_par); rs_par = NULL;
-        dat_return_or_close(repo, pnum, f);
+        dat_return_or_close(store, pnum, f);
 
         if (stream_st == OK) {
             uint8_t got[OBJECT_HASH_SIZE];
@@ -1386,7 +1188,7 @@ status_t pack_object_load_stream(repo_t *repo,
         remaining -= want;
     }
     free(buf);
-    dat_return_or_close(repo, pnum, f);
+    dat_return_or_close(store, pnum, f);
 
     if (stream_st == OK) {
         uint8_t got[OBJECT_HASH_SIZE];
@@ -1405,13 +1207,13 @@ status_t pack_object_load_stream(repo_t *repo,
 /* ------------------------------------------------------------------ */
 
 /* Collect all loose object hashes by walking objects/XX/ */
-static status_t collect_loose(repo_t *repo,
+static status_t collect_loose(store_t *store,
                                uint8_t **out_hashes, size_t *out_cnt) {
     size_t cap = 256, cnt = 0;
     uint8_t *hashes = malloc(cap * OBJECT_HASH_SIZE);
     if (!hashes) return set_error(ERR_NOMEM, "collect_loose: alloc failed");
 
-    int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+    int obj_fd = openat(store_fd(store), "objects", O_RDONLY | O_DIRECTORY);
     if (obj_fd == -1) { *out_hashes = hashes; *out_cnt = 0; return OK; }
 
     DIR *top = fdopendir(obj_fd);
@@ -1467,8 +1269,8 @@ done:
     return OK;
 }
 
-static int loose_objects_exist(repo_t *repo) {
-    int obj_fd = openat(repo_fd(repo), "objects", O_RDONLY | O_DIRECTORY);
+static int loose_objects_exist(store_t *store) {
+    int obj_fd = openat(store_fd(store), "objects", O_RDONLY | O_DIRECTORY);
     if (obj_fd == -1) return 0;
 
     DIR *top = fdopendir(obj_fd);
@@ -1499,13 +1301,13 @@ static int loose_objects_exist(repo_t *repo) {
 /* Pack file open / finalize helpers                                   */
 /* ------------------------------------------------------------------ */
 
-static status_t open_new_pack(repo_t *repo, uint32_t pack_num,
+static status_t open_new_pack(store_t *store, uint32_t pack_num,
                               FILE **dat_f, FILE **idx_f,
                               char *dat_tmp, char *idx_tmp,
                               pack_dat_hdr_t *dat_hdr)
 {
-    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", repo_path(repo)) != 0 ||
-        path_fmt(idx_tmp, PATH_MAX, "%s/tmp/pack-idx.XXXXXX", repo_path(repo)) != 0)
+    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0 ||
+        path_fmt(idx_tmp, PATH_MAX, "%s/tmp/pack-idx.XXXXXX", store_root(store)) != 0)
         return set_error(ERR_IO, "open_new_pack: tmp path too long");
 
     int dat_fd = mkstemp(dat_tmp);
@@ -1812,7 +1614,7 @@ static int idx_offset_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
+static status_t finalize_pack(store_t *store, FILE **dat_f, FILE **idx_f,
                               char *dat_tmp, char *idx_tmp,
                               pack_dat_hdr_t *dat_hdr,
                               pack_idx_disk_entry_t *idx_entries,
@@ -1875,20 +1677,20 @@ static status_t finalize_pack(repo_t *repo, FILE **dat_f, FILE **idx_f,
         char stage_dir[PATH_MAX];
         char stage_dat[PATH_MAX], stage_idx[PATH_MAX];
         if (pack_dat_path(dat_final, sizeof(dat_final),
-                          repo_path(repo), pack_num) != 0 ||
+                          store_root(store), pack_num) != 0 ||
             pack_idx_path(idx_final, sizeof(idx_final),
-                          repo_path(repo), pack_num) != 0 ||
+                          store_root(store), pack_num) != 0 ||
             path_fmt(stage_dir, sizeof(stage_dir), "%s/packs/.installing-%08u",
-                     repo_path(repo), pack_num) != 0 ||
+                     store_root(store), pack_num) != 0 ||
             path_fmt(stage_dat, sizeof(stage_dat), "%s/packs/.installing-%08u/pack-%08u.dat",
-                     repo_path(repo), pack_num, pack_num) != 0 ||
+                     store_root(store), pack_num, pack_num) != 0 ||
             path_fmt(stage_idx, sizeof(stage_idx), "%s/packs/.installing-%08u/pack-%08u.idx",
-                     repo_path(repo), pack_num, pack_num) != 0) {
+                     store_root(store), pack_num, pack_num) != 0) {
             st = set_error(ERR_IO, "finalize_pack: path too long"); goto fail;
         }
 
         /* Ensure the shard subdirectory exists */
-        pack_ensure_shard_dir(repo_path(repo), pack_num);
+        pack_ensure_shard_dir(store_root(store), pack_num);
 
         /* Defensive: refuse to overwrite an existing pack with this number.
          * next_pack_num() returns max+1 so this should never trigger, but if
@@ -1959,12 +1761,12 @@ fail:
 
 /* Batch-unlink loose objects by grouping by first hash byte (bucket).
  * Uses a 256-entry index to skip empty buckets and avoid O(256*N) scanning. */
-static void unlink_loose_batch(repo_t *repo,
+static void unlink_loose_batch(store_t *store,
                                const pack_idx_disk_entry_t *entries,
                                uint32_t count) {
     if (count == 0) return;
 
-    int obj_fd = repo_objects_fd(repo);
+    int obj_fd = store_objects_fd(store);
     if (obj_fd < 0) {
         /* Fallback: individual unlinks */
         for (uint32_t i = 0; i < count; i++) {
@@ -1972,7 +1774,7 @@ static void unlink_loose_batch(repo_t *repo,
             object_hash_to_hex(entries[i].hash, hex);
             char path[PATH_MAX];
             if (path_fmt(path, sizeof(path),
-                         "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) == 0)
+                         "%s/objects/%.2s/%s", store_root(store), hex, hex + 2) == 0)
                 unlink(path);
         }
         return;
@@ -1996,7 +1798,7 @@ static void unlink_loose_batch(repo_t *repo,
             object_hash_to_hex(entries[i].hash, hex);
             char path[PATH_MAX];
             if (path_fmt(path, sizeof(path),
-                         "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) == 0)
+                         "%s/objects/%.2s/%s", store_root(store), hex, hex + 2) == 0)
                 unlink(path);
         }
         return;
@@ -2037,7 +1839,7 @@ static int pack_idx_hash_cmp(const void *a, const void *b, void *arg) {
 
 /* Per-worker state: owns its pack files, buffers, and parity arrays. */
 typedef struct {
-    repo_t              *repo;
+    store_t              *store;
     FILE                *dat_f;
     FILE                *idx_f;
     char                 dat_tmp[PATH_MAX];
@@ -2059,7 +1861,7 @@ typedef struct {
 
 /* Shared context for all unified workers. */
 typedef struct {
-    repo_t           *repo;
+    store_t           *store;
     pack_obj_meta_t  *meta;
     uint32_t         *indices;
     size_t            total_cnt;
@@ -2101,12 +1903,12 @@ static void pw_free_parity(pack_writer_t *pw) {
 static status_t pw_finalize(pack_writer_t *pw) {
     if (!pw->dat_f || pw->packed == 0) return OK;
 
-    status_t st = finalize_pack(pw->repo, &pw->dat_f, &pw->idx_f,
+    status_t st = finalize_pack(pw->store, &pw->dat_f, &pw->idx_f,
                                 pw->dat_tmp, pw->idx_tmp, &pw->dat_hdr,
                                 pw->idx_entries, pw->packed, pw->pack_num,
                                 pw->entry_parity);
     if (st == OK) {
-        unlink_loose_batch(pw->repo, pw->idx_entries, pw->packed);
+        unlink_loose_batch(pw->store, pw->idx_entries, pw->packed);
         pw->total_packed += pw->packed;
         pw->packs_created++;
     }
@@ -2120,7 +1922,7 @@ static status_t pw_open(pack_writer_t *pw, pack_unified_ctx_t *ctx) {
     pw->pack_num = atomic_fetch_add(&ctx->next_pack_num, 1);
     pw->packed = 0;
     pw->body_offset = 0;
-    return open_new_pack(pw->repo, pw->pack_num, &pw->dat_f, &pw->idx_f,
+    return open_new_pack(pw->store, pw->pack_num, &pw->dat_f, &pw->idx_f,
                          pw->dat_tmp, pw->idx_tmp, &pw->dat_hdr);
 }
 
@@ -2174,7 +1976,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                 object_hash_to_hex(m->hash, hex);
                 char path[PATH_MAX];
                 path_fmt(path, sizeof(path), "%s/objects/%.2s/%s",
-                         repo_path(ctx->repo), hex, hex + 2);
+                         store_root(ctx->store), hex, hex + 2);
                 int wfd = open(path, O_RDWR);
                 if (wfd >= 0) {
                     ssize_t pw2 = pwrite(wfd, &sv, 1,
@@ -2301,7 +2103,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
 
     /* Init parity stream for inline RS computation */
     char ps_tmp[PATH_MAX];
-    snprintf(ps_tmp, sizeof(ps_tmp), "%s/tmp", repo_path(pw->repo));
+    snprintf(ps_tmp, sizeof(ps_tmp), "%s/tmp", store_root(pw->store));
     rs_parity_stream_t *ps = malloc(sizeof(*ps));
     if (!ps) { free(stream_buf); return ERR_NOMEM; }
     if (rs_parity_stream_init(ps, 256 * 1024 * 1024, ps_tmp) != 0) {
@@ -2503,7 +2305,7 @@ static void *pack_unified_worker(void *arg) {
 
     pack_writer_t pw;
     memset(&pw, 0, sizeof(pw));
-    pw.repo = ctx->repo;
+    pw.store = ctx->store;
 
     /* Pre-allocate io_buf for small objects */
     pw.io_buf = malloc((size_t)PACK_STREAM_THRESHOLD);
@@ -2530,7 +2332,7 @@ static void *pack_unified_worker(void *arg) {
             object_hash_to_hex(m->hash, hex);
             char loose_path[PATH_MAX];
             if (path_fmt(loose_path, sizeof(loose_path),
-                         "%s/objects/%.2s/%s", repo_path(ctx->repo), hex, hex + 2) != 0) {
+                         "%s/objects/%.2s/%s", store_root(ctx->store), hex, hex + 2) != 0) {
                 pw.error = ERR_IO; break;
             }
             fd = open(loose_path, O_RDONLY);
@@ -2591,11 +2393,11 @@ out:
     return NULL;
 }
 
-status_t repo_pack(repo_t *repo, uint32_t *out_packed,
+status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
     int show_progress = pack_progress_enabled();
 
-    if (!loose_objects_exist(repo)) {
+    if (!loose_objects_exist(store)) {
         log_msg("INFO", "pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;
         return OK;
@@ -2605,7 +2407,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
     log_msg("INFO", "pack: phase 1/2 collecting loose objects");
     uint8_t *hashes       = NULL;
     size_t   loose_cnt = 0;
-    status_t st = collect_loose(repo, &hashes, &loose_cnt);
+    status_t st = collect_loose(store, &hashes, &loose_cnt);
     if (st != OK) return st;
 
     if (loose_cnt == 0) {
@@ -2638,7 +2440,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
         object_hash_to_hex(hash, hex);
         char loose_path[PATH_MAX];
         if (path_fmt(loose_path, sizeof(loose_path),
-                     "%s/objects/%.2s/%s", repo_path(repo), hex, hex + 2) != 0) {
+                     "%s/objects/%.2s/%s", store_root(store), hex, hex + 2) != 0) {
             st = ERR_IO; goto cleanup;
         }
         int pfd = open(loose_path, O_RDONLY);
@@ -2700,7 +2502,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
                     object_hash_to_hex(lm->hash, hex);
                     char lp[PATH_MAX];
                     if (path_fmt(lp, sizeof(lp), "%s/objects/%.2s/%s",
-                                 repo_path(repo), hex, hex + 2) == 0) {
+                                 store_root(store), hex, hex + 2) == 0) {
                         pfd = open(lp, O_RDONLY);
                         if (pfd >= 0)
                             lseek(pfd, (off_t)sizeof(object_header_t), SEEK_SET);
@@ -2725,7 +2527,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
                                 object_hash_to_hex(lm->hash, phex);
                                 char ppath[PATH_MAX];
                                 if (path_fmt(ppath, sizeof(ppath),
-                                             "%s/objects/%.2s/%s", repo_path(repo), phex, phex + 2) == 0) {
+                                             "%s/objects/%.2s/%s", store_root(store), phex, phex + 2) == 0) {
                                     uint8_t sv = PROBER_VERSION;
                                     int wfd = open(ppath, O_RDWR);
                                     if (wfd >= 0) {
@@ -2769,7 +2571,7 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
                 pack_idx_hash_cmp, meta);
 
     /* --- Spawn unified workers --- */
-    uint32_t n_workers = pack_worker_threads(repo);
+    uint32_t n_workers = pack_worker_threads(store);
     /* Cap workers: each worker creates its own pack, so don't use more
      * workers than needed.  Use 1 worker per ~PACK_MAX_MULTI_BYTES of data
      * to avoid creating lots of tiny packs. */
@@ -2788,12 +2590,12 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
 
     pack_unified_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.repo       = repo;
+    ctx.store       = store;
     ctx.meta       = meta;
     ctx.indices    = indices;
     ctx.total_cnt  = packable_cnt;
     atomic_init(&ctx.next_index, 0);
-    atomic_init(&ctx.next_pack_num, next_pack_num(repo));
+    atomic_init(&ctx.next_pack_num, next_pack_num(store));
     atomic_init(&ctx.stop, 0);
     atomic_init(&ctx.error, OK);
     ctx.prog       = &prog;
@@ -2840,13 +2642,11 @@ status_t repo_pack(repo_t *repo, uint32_t *out_packed,
 
     /* Single packs/ dir fsync after all packs are written */
     {
-        int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
+        int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
         if (pfd >= 0) { fsync(pfd); close(pfd); }
     }
 
-    pack_cache_invalidate(repo);
-    pack_index_rebuild(repo);
-    stats_cache_rebuild(repo);
+    pack_cache_invalidate(store);
 
     /* Close any remaining meta fds from skipped objects */
     for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
@@ -2935,7 +2735,7 @@ static int pack_meta_small_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static status_t collect_pack_meta(repo_t *repo,
+static status_t collect_pack_meta(store_t *store,
                                   pack_meta_t **out_meta, size_t *out_cnt,
                                   uint64_t *out_total_dat,
                                   uint32_t *out_small_cnt) {
@@ -2945,7 +2745,7 @@ static status_t collect_pack_meta(repo_t *repo,
     *out_small_cnt = 0;
 
     char packs_dir[PATH_MAX];
-    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
         return OK;
 
     /* Collect pack numbers via two-level walk */
@@ -2968,8 +2768,8 @@ static status_t collect_pack_meta(repo_t *repo,
     for (size_t i = 0; i < num_cnt; i++) {
         uint32_t n = pack_nums[i];
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), n) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), n) != 0)
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), n) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), n) != 0)
             continue;
 
         struct stat st;
@@ -3007,9 +2807,9 @@ static status_t collect_pack_meta(repo_t *repo,
  *   - If files remain in staging dir: move them to packs/
  *   - If staging dir is incomplete (only one file): remove it entirely
  *     since the temp source files are gone and we can't finish the install */
-void pack_resume_installing(repo_t *repo) {
+void pack_resume_installing(store_t *store) {
     char packs_dir[PATH_MAX];
-    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo))
+    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store))
         >= (int)sizeof(packs_dir))
         return;
 
@@ -3030,12 +2830,12 @@ void pack_resume_installing(repo_t *repo) {
         char dat_final[PATH_MAX], idx_final[PATH_MAX];
         if (path_fmt(stage_dat, sizeof(stage_dat), "%s/pack-%08u.dat", stage_dir, pack_num) != 0 ||
             path_fmt(stage_idx, sizeof(stage_idx), "%s/pack-%08u.idx", stage_dir, pack_num) != 0 ||
-            pack_dat_path(dat_final, sizeof(dat_final), repo_path(repo), pack_num) != 0 ||
-            pack_idx_path(idx_final, sizeof(idx_final), repo_path(repo), pack_num) != 0)
+            pack_dat_path(dat_final, sizeof(dat_final), store_root(store), pack_num) != 0 ||
+            pack_idx_path(idx_final, sizeof(idx_final), store_root(store), pack_num) != 0)
             continue;
 
         /* Ensure the shard subdirectory exists for final paths */
-        pack_ensure_shard_dir(repo_path(repo), pack_num);
+        pack_ensure_shard_dir(store_root(store), pack_num);
 
         /* Check what's already in packs/ vs staging */
         int dat_staged = (access(stage_dat, F_OK) == 0);
@@ -3074,18 +2874,16 @@ remove_stage:
     closedir(dir);
 
     /* fsync packs/ to persist any completed installs */
-    int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
+    int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
     if (pfd >= 0) { fsync(pfd); close(pfd); }
 
-    pack_index_rebuild(repo);
-    stats_cache_rebuild(repo);
 }
 
 /* Resume any interrupted coalesce deletions by scanning for .deleting-NNNNNNNN
  * marker files in the packs/ directory and re-attempting the listed deletions. */
-static void pack_resume_deleting(repo_t *repo) {
+static void pack_resume_deleting(store_t *store) {
     char packs_dir[PATH_MAX];
-    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo))
+    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store))
         >= (int)sizeof(packs_dir))
         return;
 
@@ -3110,10 +2908,10 @@ static void pack_resume_deleting(repo_t *repo) {
             char dat_path[PATH_MAX], idx_path[PATH_MAX];
             /* Try sharded path first, then flat fallback */
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                                      repo_path(repo), pnum) == 0)
+                                      store_root(store), pnum) == 0)
                 unlink(dat_path);
             if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
-                                      repo_path(repo), pnum) == 0)
+                                      store_root(store), pnum) == 0)
                 unlink(idx_path);
         }
         fclose(mf);
@@ -3121,29 +2919,19 @@ static void pack_resume_deleting(repo_t *repo) {
     }
     closedir(dir);
 
-    pack_index_rebuild(repo);
-    stats_cache_rebuild(repo);
 }
 
-static status_t maybe_coalesce_packs(repo_t *repo,
+static status_t maybe_coalesce_packs(store_t *store,
                                      const uint8_t *refs, size_t refs_cnt) {
-    pack_resume_installing(repo);
-    pack_resume_deleting(repo);
+    pack_resume_installing(store);
+    pack_resume_deleting(store);
     pack_meta_t *meta = NULL;
     size_t pack_cnt = 0;
     uint64_t total_dat = 0;
     uint32_t small_cnt = 0;
-    status_t st = collect_pack_meta(repo, &meta, &pack_cnt, &total_dat, &small_cnt);
+    status_t st = collect_pack_meta(store, &meta, &pack_cnt, &total_dat, &small_cnt);
     if (st != OK) return st;
     if (pack_cnt < 2) { free(meta); return OK; }
-
-    uint32_t head = 0, last_head = 0;
-    snapshot_read_head(repo, &head);
-    coalesce_state_read(repo, &last_head);
-    if (head > 0 && last_head > 0 && head - last_head < PACK_COALESCE_MIN_SNAP_GAP) {
-        free(meta);
-        return OK;
-    }
 
     int count_trigger = pack_cnt > PACK_COALESCE_TARGET_COUNT;
     int ratio_trigger = (small_cnt >= PACK_COALESCE_MIN_SMALL) &&
@@ -3181,7 +2969,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     for (size_t i = 0; i < n_cand; i++) total_entries += cand[i].count;
     if (total_entries == 0) { free(cand); return OK; }
 
-    uint32_t new_pack_num = next_pack_num(repo);
+    uint32_t new_pack_num = next_pack_num(store);
     uint32_t first_pack_num = new_pack_num;
 
     pack_idx_disk_entry_t *new_disk_idx = malloc((size_t)total_entries * sizeof(*new_disk_idx));
@@ -3193,7 +2981,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     dat_tmp[0] = '\0'; idx_tmp[0] = '\0';
     pack_dat_hdr_t dhdr;
 
-    rc = open_new_pack(repo, new_pack_num, &new_dat, &new_idx,
+    rc = open_new_pack(store, new_pack_num, &new_dat, &new_idx,
                        dat_tmp, idx_tmp, &dhdr);
     if (rc != OK) {
         free(new_disk_idx); free(cand);
@@ -3209,8 +2997,8 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
     for (size_t ci = 0; rc == OK && ci < n_cand; ci++) {
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), cand[ci].num) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), cand[ci].num) != 0) {
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), cand[ci].num) != 0) {
             rc = ERR_IO;
             break;
         }
@@ -3262,7 +3050,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
             /* Split: finalize current pack if adding this entry would exceed cap */
             if (live_count > 0 && body_offset + entry_total > PACK_MAX_MULTI_BYTES) {
-                rc = finalize_pack(repo, &new_dat, &new_idx, dat_tmp, idx_tmp,
+                rc = finalize_pack(store, &new_dat, &new_idx, dat_tmp, idx_tmp,
                                    &dhdr, new_disk_idx, live_count, new_pack_num,
                                    NULL);
                 if (rc != OK) break;
@@ -3272,7 +3060,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
                 live_count = 0;
                 body_offset = 0;
 
-                rc = open_new_pack(repo, new_pack_num, &new_dat, &new_idx,
+                rc = open_new_pack(store, new_pack_num, &new_dat, &new_idx,
                                    dat_tmp, idx_tmp, &dhdr);
                 if (rc != OK) break;
             }
@@ -3337,7 +3125,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
     /* Finalize the last output pack */
     if (rc == OK && live_count > 0) {
-        rc = finalize_pack(repo, &new_dat, &new_idx, dat_tmp, idx_tmp,
+        rc = finalize_pack(store, &new_dat, &new_idx, dat_tmp, idx_tmp,
                            &dhdr, new_disk_idx, live_count, new_pack_num,
                            NULL);
         if (rc == OK) {
@@ -3355,7 +3143,7 @@ static status_t maybe_coalesce_packs(repo_t *repo,
          * Use first_pack_num as the marker key. */
         char del_marker[PATH_MAX];
         if (path_fmt(del_marker, sizeof(del_marker), "%s/packs/.deleting-%08u",
-                     repo_path(repo), first_pack_num) == 0) {
+                     store_root(store), first_pack_num) == 0) {
             FILE *dm = fopen(del_marker, "w");
             if (dm) {
                 for (size_t ci = 0; ci < n_cand; ci++)
@@ -3370,20 +3158,17 @@ static status_t maybe_coalesce_packs(repo_t *repo,
 
         for (size_t ci = 0; ci < n_cand; ci++) {
             char dat_path[PATH_MAX], idx_path[PATH_MAX];
-            if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), cand[ci].num) == 0)
+            if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) == 0)
                 unlink(dat_path);
-            if (pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), cand[ci].num) == 0)
+            if (pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), cand[ci].num) == 0)
                 unlink(idx_path);
         }
 
         if (del_marker[0] != '\0') unlink(del_marker);
 
-        int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
+        int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
         if (pfd >= 0) { fsync(pfd); close(pfd); }
-        pack_cache_invalidate(repo);
-        pack_index_rebuild(repo);
-    stats_cache_rebuild(repo);
-        coalesce_state_write(repo, head);
+        pack_cache_invalidate(store);
 
         char msg[160];
         snprintf(msg, sizeof(msg),
@@ -3402,17 +3187,17 @@ static status_t maybe_coalesce_packs(repo_t *repo,
     return rc;
 }
 
-int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
-    pack_cache_entry_t *found = NULL;
-    if (pack_find_entry(repo, hash, &found) != OK) return -1;
+int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
+    pack_cache_entry_t found;
+    if (pack_find_entry(store, hash, &found) != OK) return -1;
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    if ((found->pack_version != PACK_VERSION_V3 && found->pack_version != PACK_VERSION) ||
-        found->entry_index == UINT32_MAX)
+    if ((found.pack_version != PACK_VERSION_V3 && found.pack_version != PACK_VERSION) ||
+        found.entry_index == UINT32_MAX)
         return -1;
 
     char dat_path[PATH_MAX];
     if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                              repo_path(repo), found->pack_num) != 0)
+                              store_root(store), found.pack_num) != 0)
         return -1;
 
     /* Open read-only FILE* for load_entry_parity and reading current data */
@@ -3424,14 +3209,14 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     uint32_t pay_crc = 0;
     uint8_t *rs_par = NULL;
     size_t rs_par_sz = 0;
-    if (load_entry_parity(f, found->entry_index, &hdr_par,
+    if (load_entry_parity(f, found.entry_index, &hdr_par,
                           &pay_crc, &rs_par, &rs_par_sz) != 0) {
         fclose(f);
         return -1;
     }
 
     /* Read entry header */
-    if (fseeko(f, (off_t)found->dat_offset, SEEK_SET) != 0) {
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
         free(rs_par); fclose(f); return -1;
     }
     pack_dat_entry_hdr_t ehdr;
@@ -3447,7 +3232,7 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     if (hrc == 1) {
         fd = open(dat_path, O_WRONLY);
         if (fd < 0) { free(rs_par); fclose(f); return -1; }
-        if (pwrite(fd, &ehdr, sizeof(ehdr), (off_t)found->dat_offset) != sizeof(ehdr)) {
+        if (pwrite(fd, &ehdr, sizeof(ehdr), (off_t)found.dat_offset) != sizeof(ehdr)) {
             close(fd); free(rs_par); fclose(f); return -1;
         }
         fixed++;
@@ -3457,7 +3242,7 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     if (ehdr.compressed_size > 0 && ehdr.compressed_size <= PACK_STREAM_THRESHOLD) {
         uint8_t *payload = malloc((size_t)ehdr.compressed_size);
         if (payload) {
-            off_t pay_off = (off_t)(found->dat_offset + sizeof(ehdr));
+            off_t pay_off = (off_t)(found.dat_offset + sizeof(ehdr));
             if (fseeko(f, pay_off, SEEK_SET) == 0 &&
                 fread_full(payload, (size_t)ehdr.compressed_size, f) == 0) {
 
@@ -3491,17 +3276,17 @@ int pack_object_repair(repo_t *repo, const uint8_t hash[OBJECT_HASH_SIZE]) {
     return fixed;
 }
 
-status_t pack_gc(repo_t *repo,
+status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
-    pack_resume_deleting(repo);
+    pack_resume_deleting(store);
     uint32_t total_kept = 0, total_deleted = 0;
     int show_progress = pack_progress_enabled();
     struct timespec next_tick = {0};
     if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
 
     char gc_packs_dir[PATH_MAX];
-    if (path_fmt(gc_packs_dir, sizeof(gc_packs_dir), "%s/packs", repo_path(repo)) != 0) {
+    if (path_fmt(gc_packs_dir, sizeof(gc_packs_dir), "%s/packs", store_root(store)) != 0) {
         if (out_kept)    *out_kept    = 0;
         if (out_deleted) *out_deleted = 0;
         return OK;
@@ -3536,8 +3321,8 @@ status_t pack_gc(repo_t *repo,
         uint32_t pnum = pack_nums[pi];
 
         char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), repo_path(repo), pnum) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), repo_path(repo), pnum) != 0) {
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), pnum) != 0 ||
+            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), pnum) != 0) {
             continue;
         }
 
@@ -3590,9 +3375,9 @@ status_t pack_gc(repo_t *repo,
         /* Partial rewrite: copy live entries into new tmp dat+idx */
         char dat_tmp[PATH_MAX], idx_tmp[PATH_MAX];
         if (path_fmt(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX",
-                     repo_path(repo)) != 0 ||
+                     store_root(store)) != 0 ||
             path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
-                     repo_path(repo)) != 0) {
+                     store_root(store)) != 0) {
             free(disk_idx);
             return set_error(ERR_IO, "pack_gc: tmp path too long for pack %u", pnum);
         }
@@ -3744,7 +3529,7 @@ status_t pack_gc(repo_t *repo,
             }
         }
         {
-            int pfd = openat(repo_fd(repo), "packs", O_RDONLY | O_DIRECTORY);
+            int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
             if (pfd >= 0) { fsync(pfd); close(pfd); }
         }
         free(disk_idx);
@@ -3770,15 +3555,13 @@ pack_fail:
         pack_line_clear();
     }
 
-    status_t coalesce_st = maybe_coalesce_packs(repo, refs, refs_cnt);
+    status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
     if (coalesce_st != OK)
         log_msg("WARN", "pack-coalesce: skipped due to error");
 
     /* All packs processed — invalidate cache so next lookup is fresh */
     if (total_deleted > 0) {
-        pack_cache_invalidate(repo);
-        pack_index_rebuild(repo);
-    stats_cache_rebuild(repo);
+        pack_cache_invalidate(store);
     }
 
     if (out_kept)    *out_kept    = total_kept;
@@ -3896,12 +3679,12 @@ static status_t migrate_one_idx(const char *idx_path, const char *dat_path,
     return OK;
 }
 
-status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated)
+status_t pack_migrate_idx_v4(store_t *store, uint32_t *out_migrated)
 {
     if (out_migrated) *out_migrated = 0;
 
     char packs_dir[PATH_MAX];
-    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", repo_path(repo)) != 0)
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
         return OK;
 
     collect_pack_nums_ctx_t cpn = { NULL, 0, 0 };
@@ -3917,9 +3700,9 @@ status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated)
         uint32_t pnum = cpn.nums[i];
         char idx_path[PATH_MAX], dat_path[PATH_MAX];
         if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
-                                  repo_path(repo), pnum) != 0 ||
+                                  store_root(store), pnum) != 0 ||
             pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                                  repo_path(repo), pnum) != 0)
+                                  store_root(store), pnum) != 0)
             continue;
 
         /* Check if already v4 */
@@ -3951,19 +3734,19 @@ status_t pack_migrate_idx_v4(repo_t *repo, uint32_t *out_migrated)
 /* Read-only enumeration of pack .dat and .idx files                   */
 /* ------------------------------------------------------------------ */
 
-status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
+status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx)
 {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), dat_name);
+    snprintf(path, sizeof(path), "%s/packs/%s", store_root(store), dat_name);
 
     FILE *f = fopen(path, "rb");
     if (!f) {
         /* Try sharded path: parse pack_num from name */
         uint32_t pnum;
         if (parse_pack_dat_name(dat_name, &pnum) &&
-            pack_dat_path_resolve(path, sizeof(path), repo_path(repo), pnum) == 0)
+            pack_dat_path_resolve(path, sizeof(path), store_root(store), pnum) == 0)
             f = fopen(path, "rb");
         if (!f)
             return set_error_errno(ERR_IO, "pack_enumerate_dat: open %s", dat_name);
@@ -4021,12 +3804,12 @@ status_t pack_enumerate_dat(repo_t *repo, const char *dat_name,
     return OK;
 }
 
-status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
+status_t pack_enumerate_idx(store_t *store, const char *idx_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_idx_entry_cb cb, void *ctx)
 {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/packs/%s", repo_path(repo), idx_name);
+    snprintf(path, sizeof(path), "%s/packs/%s", store_root(store), idx_name);
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -4035,7 +3818,7 @@ status_t pack_enumerate_idx(repo_t *repo, const char *idx_name,
         int end = 0;
         if (sscanf(idx_name, "pack-%08u.idx%n", &pnum, &end) == 1 &&
             idx_name[end] == '\0' &&
-            pack_idx_path_resolve(path, sizeof(path), repo_path(repo), pnum) == 0)
+            pack_idx_path_resolve(path, sizeof(path), store_root(store), pnum) == 0)
             f = fopen(path, "rb");
         if (!f)
             return set_error_errno(ERR_IO, "pack_enumerate_idx: open %s", idx_name);
