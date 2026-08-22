@@ -78,7 +78,21 @@ typedef struct {
 } pack_meta_t;
 
 #define PACK_COALESCE_TARGET_COUNT   32u
-#define PACK_COALESCE_SMALL_BYTES    PACK_MAX_MULTI_BYTES
+/*
+ * What counts as small enough to be worth merging.
+ *
+ * This was PACK_MAX_MULTI_BYTES, which is the size a pack is sealed at, so
+ * every normally-written pack came in just under it and was classified as
+ * small. Coalescing then merged full packs into full packs: a rewrite of up
+ * to the whole budget, on every GC, for no reduction at all.
+ *
+ * A quarter of the cap means two candidates can merge into one pack with room
+ * to spare. The packs this is actually for are the trailing partial one each
+ * backup leaves behind, which is nowhere near the cap.
+ */
+#define PACK_COALESCE_SMALL_BYTES    (PACK_MAX_MULTI_BYTES / 4)
+/* Do not rewrite unless the merge removes at least this many pack files. */
+#define PACK_COALESCE_MIN_REDUCTION  2u
 #define PACK_COALESCE_MIN_SMALL      8u
 #define PACK_COALESCE_MIN_RATIO_PCT  30u
 #define PACK_COALESCE_MAX_BUDGET     (10ull * 1024ull * 1024ull * 1024ull)
@@ -96,6 +110,16 @@ typedef struct {
  * started.  Both large (streamed) and small (worker-compressed) objects
  * are batched into shared packs up to this cap. */
 #define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
+
+/*
+ * The relationship, not the numbers, is what matters. A pack is sealed when
+ * the next object would take it past the cap, so it lands just under; if
+ * "small" is defined at the cap then every full pack is small and coalescing
+ * merges full packs into full packs forever. Cheap to get wrong again by
+ * tuning one constant, so state it where the compiler checks it.
+ */
+_Static_assert(PACK_COALESCE_SMALL_BYTES < PACK_MAX_MULTI_BYTES,
+               "coalesce smallness must be below the pack seal size");
 
 /* Maximum plausible object size: 128 GiB */
 #define OBJECT_SIZE_MAX ((uint64_t)(128ull * 1024ull * 1024ull * 1024ull))
@@ -2813,6 +2837,28 @@ static status_t maybe_coalesce_packs(store_t *store,
     free(meta);
 
     if (n_cand < 2) { free(cand); return OK; }
+
+    /*
+     * Would this actually remove pack files?
+     *
+     * Merging n candidates holding B bytes produces ceil(B / cap) packs, so
+     * the reduction is known before a single byte is copied. Checking it here
+     * makes the whole thing self-correcting: however the smallness threshold
+     * is tuned, a merge that would not pay for itself does not happen, and a
+     * repository already packed as tightly as it can be stops being rewritten
+     * on every GC.
+     */
+    {
+        uint64_t out_packs = (cand_bytes + PACK_MAX_MULTI_BYTES - 1)
+                             / PACK_MAX_MULTI_BYTES;
+        if (out_packs >= n_cand ||
+            (uint64_t)n_cand - out_packs < PACK_COALESCE_MIN_REDUCTION) {
+            log_info("pack-coalesce: %zu candidate(s) would produce %llu pack(s),"
+                     " skipping", n_cand, (unsigned long long)out_packs);
+            free(cand);
+            return OK;
+        }
+    }
 
     uint64_t total_entries = 0;
     for (size_t i = 0; i < n_cand; i++) total_entries += cand[i].count;
