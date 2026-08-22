@@ -183,13 +183,12 @@ REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
 TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result $(SRC_INCLUDES) -I vendor
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
 
-# tests/attic/ holds the suites that cover the surviving storage engine but do
-# not build until the code they exercise is reachable again. Each phase revives
-# its own: object/pack/parity/streaming in Phase 2, scan in Phase 4, gfs in
-# Phase 6. See daemonization-spec.md Phase 0. Anything directly in tests/ is
-# live, which right now is nothing.
+# Every suite in tests/ is live. Helpers are linked into suites rather than
+# built as suites of their own; a test_*_fault.c suite additionally links the
+# fault injector and its --wrap flags.
+TEST_HELPERS := $(TESTS)/fault_inject.c $(TESTS)/fake_index.c
 FAULT_SRCS  := $(wildcard $(TESTS)/test_*_fault.c)
-TEST_SRCS   := $(filter-out $(FAULT_SRCS), $(filter-out $(TESTS)/fault_inject.c, $(wildcard $(TESTS)/*.c)))
+TEST_SRCS   := $(filter-out $(FAULT_SRCS) $(TEST_HELPERS), $(wildcard $(TESTS)/*.c))
 TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
 FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(FAULT_SRCS))
 
@@ -198,10 +197,10 @@ FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
               -Wl,--wrap=sync_file_range
 
 # Ensure release objects exist before linking tests
-$(BINS)/%: $(TESTS)/%.c $(REL_LIB_OBJS) | $(BINS)
+$(BINS)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $^ -o $@ $(TEST_LDFLAGS)
 
-$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(REL_LIB_OBJS) | $(BINS)
+$(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(TEST_LDFLAGS)
 
 # The shell suite drives a real daemon over HTTP. The unit tests cover the
@@ -220,11 +219,7 @@ test-cli: all
 	@./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli
-	@if [ -z "$(strip $(TEST_BINS)$(FAULT_BINS))" ]; then \
-	    echo "no active tests: suites are in tests/attic/ pending their phase"; \
-	else \
-	    for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done; \
-	fi
+	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
 
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
@@ -234,7 +229,7 @@ ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
 ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
-$(BINS)/%-asan: $(TESTS)/%.c $(ASAN_LIB_OBJS) | $(BINS)
+$(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
 	    $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lcmocka
 
@@ -352,15 +347,15 @@ $(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
 $(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
 	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -I vendor -c $< -o $@
 
-$(COV_DIR)/%: $(TESTS)/%.c $(COV_LIB) | $(COV_DIR)
+$(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
 
 # Ratchet, not aspiration: the floor is what the current phase actually
 # achieves, raised as each phase lands. src/store/ is gated separately because
-# it is the code that survives; the shim modules are excluded because they are
-# scheduled for deletion and testing them would be wasted work.
-# See daemonization-spec.md section 14.
-COV_STORE_MIN := 47
+# it is the code that survives. The gap to the 80% standard is in pack.c's
+# error branches, which need failure injection past what the fault suites
+# reach. See daemonization-spec.md section 14.
+COV_STORE_MIN := 67
 
 coverage: $(COV_TESTS)
 	@for t in $(COV_TESTS); do $$t >/dev/null 2>&1 || true; done
@@ -368,7 +363,6 @@ coverage: $(COV_TESTS)
 	    --exclude '.*vendor.*' -s
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
-	    --exclude 'src/store/snapshot.c' \
 	    --fail-under-line $(COV_STORE_MIN) -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 

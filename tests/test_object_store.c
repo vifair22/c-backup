@@ -17,6 +17,7 @@
 #include <fcntl.h>
 
 #include "store.h"
+#include "fake_index.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -32,72 +33,13 @@ static void cleanup(void) {
     (void)rc;
 }
 
-/*
- * Stand-in for the daemon's pack bookkeeping.
- *
- * The engine has no index of its own since the .idx sidecar was removed: it
- * learns what went into a pack from the commit callback and asks the locate
- * callback where things live. In production both sides are the pack_objects
- * table. Here they are an array, which is enough to exercise the same
- * contract, and it means these tests fail if that contract regresses rather
- * than silently reading through some fallback path.
- */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint64_t pack_id;
-    uint64_t offset;
-    uint32_t pack_version;
-    uint32_t entry_index;
-} fake_row_t;
-
-static fake_row_t fake_rows[4096];
-static size_t     fake_row_cnt;
-
-static void fake_commit(void *user, const pack_commit_info_t *info) {
-    (void)user;
-    for (uint32_t i = 0; i < info->entry_count; i++) {
-        if (fake_row_cnt >= sizeof(fake_rows) / sizeof(fake_rows[0])) return;
-        /* A rewritten pack replaces any earlier row for the same hash. */
-        size_t slot = fake_row_cnt;
-        for (size_t j = 0; j < fake_row_cnt; j++) {
-            if (memcmp(fake_rows[j].hash, info->entries[i].hash, OBJECT_HASH_SIZE) == 0) {
-                slot = j;
-                break;
-            }
-        }
-        memcpy(fake_rows[slot].hash, info->entries[i].hash, OBJECT_HASH_SIZE);
-        fake_rows[slot].pack_id      = info->pack_id;
-        fake_rows[slot].offset       = info->entries[i].offset;
-        fake_rows[slot].pack_version = PACK_VERSION;
-        fake_rows[slot].entry_index  = i;
-        if (slot == fake_row_cnt) fake_row_cnt++;
-    }
-}
-
-static status_t fake_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
-                            store_location_t *out) {
-    (void)user;
-    for (size_t i = 0; i < fake_row_cnt; i++) {
-        if (memcmp(fake_rows[i].hash, hash, OBJECT_HASH_SIZE) != 0) continue;
-        memset(out, 0, sizeof(*out));
-        out->in_pack      = 1;
-        out->pack_id      = fake_rows[i].pack_id;
-        out->offset       = fake_rows[i].offset;
-        out->pack_version = fake_rows[i].pack_version;
-        out->entry_index  = fake_rows[i].entry_index;
-        return OK;
-    }
-    return ERR_NOT_FOUND;
-}
-
 static int setup_basic(void **state) {
     (void)state;
     cleanup();
-    fake_row_cnt = 0;
+    fake_index_reset();
     if (store_init_dirs(TEST_REPO) != OK) return -1;
     if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
-    store_set_pack_commit_cb(store, fake_commit, NULL);
-    store_set_locate_cb(store, fake_locate, NULL);
+    fake_index_attach(store);
     return 0;
 }
 
