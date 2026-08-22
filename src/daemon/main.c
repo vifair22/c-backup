@@ -24,6 +24,7 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "job_manager.h"
 #include "lock.h"
 #include "routes.h"
 #include "server.h"
@@ -108,6 +109,14 @@ int main(int argc, char *argv[])
         log_warn("no admin password set: TCP requests are unauthenticated "
                  "until POST /api/auth/setup");
 
+    job_manager_t *jm = NULL;
+    int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
+    if (job_manager_start(db, max_parallel, &jm) != OK) {
+        log_error("cannot start job manager");
+        appguard_shutdown(guard);
+        return 1;
+    }
+
     const char *socket_path = config_get_str(cfg, "http.socket");
     int tcp_port = config_get_int(cfg, "http.port", 8765);
 
@@ -124,7 +133,8 @@ int main(int argc, char *argv[])
     routes_auth_set_config(cfg);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
-        routes_register_repos(srv, db) != 0) {
+        routes_register_repos(srv, db) != 0 ||
+        routes_register_jobs(srv, db, jm) != 0) {
         log_error("cannot register routes");
         api_server_stop(srv);
         appguard_shutdown(guard);
@@ -153,6 +163,7 @@ int main(int argc, char *argv[])
 
     log_info("shutting down");
     api_server_stop(srv);
+    job_manager_stop(jm);
     repo_locks_shutdown();
     appguard_shutdown(guard);
     return 0;

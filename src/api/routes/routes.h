@@ -21,3 +21,8 @@ int routes_register_auth(api_server_t *srv, cutils_db_t *db);
 /* Repo lifecycle endpoints. */
 int routes_register_repos(api_server_t *srv, cutils_db_t *db);
 void routes_auth_set_config(cutils_config_t *cfg);
+
+/* Backup submission and job inspection. Needs the job manager because a
+ * backup is queued rather than run inside the request. */
+struct job_manager;
+int routes_register_jobs(api_server_t *srv, cutils_db_t *db, struct job_manager *jm);

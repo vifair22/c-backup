@@ -39,7 +39,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wformat=2 -Wformat-truncation -Wmissing-prototypes \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
-SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/common \
+SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include
 COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
@@ -92,6 +92,15 @@ VPATH       := $(SRC_DIRS)
 VENDOR_OBJS := $(OBJ_DIR)/cJSON.o
 LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) $(VENDOR_OBJS) \
                $(OBJ_DIR)/app_migrations.o
+# Objects are flattened into one directory by basename, so two sources with
+# the same filename in different subdirectories silently clobber each other
+# and the link fails with an undefined reference to a function that is
+# plainly right there. Caught twice; now it fails loudly at configure time.
+DUP_BASENAMES := $(strip $(shell printf '%s\n' $(notdir $(SRCS)) | sort | uniq -d))
+ifneq ($(DUP_BASENAMES),)
+$(error duplicate source basenames would collide in $(OBJ_DIR): $(DUP_BASENAMES))
+endif
+
 DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
 OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)

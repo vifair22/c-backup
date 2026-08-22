@@ -18,6 +18,10 @@
 #define OBJECT_TYPE_XATTR   2
 #define OBJECT_TYPE_ACL     3
 #define OBJECT_TYPE_SPARSE  4   /* sparse file: region table prepended to data */
+/* Manifest tree: one directory's entries, content-addressed like any other
+ * object so it inherits compression, parity and dedup. GC's mark phase needs
+ * to recognise these to know what to parse and recurse into. See section 5.4. */
+#define OBJECT_TYPE_TREE    5
 
 #define COMPRESS_NONE      0
 #define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
