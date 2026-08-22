@@ -120,10 +120,19 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
                 NULL) != 0)
             failed = 1;
 
-        /* The object moved from loose to packed; its registry row follows. */
+        /*
+         * The object moved from loose to packed, so both its location and its
+         * footprint change. phys_size becomes the bytes it occupies inside the
+         * pack; the pack's own headers and parity trailer are charged to
+         * packs.size rather than split across its entries, so total bytes on
+         * disk is sum(packs.size) plus phys_size of everything still loose.
+         * Updating location alone left every packed object still claiming the
+         * loose footprint it no longer has.
+         */
         if (!failed && db_execute_non_query(idx->db,
-                "UPDATE objects SET location = ? WHERE repo_id = ? AND hash = ?",
-                (const char *[]){ pack, repo, hex, NULL }, NULL) != 0)
+                "UPDATE objects SET location = ?, phys_size = ?, orig_size = ?"
+                " WHERE repo_id = ? AND hash = ?",
+                (const char *[]){ pack, comp, orig, repo, hex, NULL }, NULL) != 0)
             failed = 1;
     }
 

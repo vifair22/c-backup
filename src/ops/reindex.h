@@ -27,6 +27,12 @@ typedef struct {
      * would make a rebuilt snapshot claim more files than it has. */
     uint64_t files;
     uint64_t trees_read;
+    /* Registry rebuilt alongside the nodes. Without these the recovered
+     * database can browse and restore but cannot account for its own disk
+     * usage, and GC has nothing to sweep. */
+    uint64_t objects;
+    uint64_t packs;
+    uint64_t pack_entries;
 } reindex_result_t;
 
 /* Rebuild every snapshot found under the repo's snapshots/ directory. */

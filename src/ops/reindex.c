@@ -4,6 +4,8 @@
 #include "reindex.h"
 
 #include "manifest.h"
+#include "object.h"
+#include "pack.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -60,6 +62,41 @@ static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
  * had they been written into the trees, a rebuild would have to preserve
  * them and the trees would stop being content-addressable.
  */
+/*
+ * Record an object in the registry.
+ *
+ * Sizes are deliberately left NULL here and filled in one pass afterwards.
+ * A hash referenced by a thousand nodes would otherwise be stat'd a thousand
+ * times, and on a repository with real dedup that dominates the rebuild.
+ *
+ * refcount starts at zero because that is what the backup path records too:
+ * GC owns refcounts, zeroing and recomputing them from every live snapshot on
+ * each run, so anything written here would be discarded at the next sweep.
+ */
+static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_id);
+
+static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
+                            uint8_t type)
+{
+    if (hash_is_zero(hash)) return OK;
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_hex(hash, hex);
+    char repo[32], t[8];
+    snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
+    snprintf(t, sizeof(t), "%u", type);
+
+    if (db_execute_non_query(ctx->db,
+            "INSERT INTO objects (repo_id, hash, refcount, location, type)"
+            " VALUES (?, ?, 0, 'loose', ?)"
+            " ON CONFLICT(repo_id, hash) DO NOTHING",
+            (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "reindex: cannot record object");
+
+    ctx->res->objects++;
+    return OK;
+}
+
 static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
                           int64_t parent_node_id)
 {
@@ -68,6 +105,11 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
     status_t st = manifest_read_tree(ctx->store, tree_hash, &entries, &count);
     if (st != OK) return st;
     ctx->res->trees_read++;
+
+    /* The tree is an object too, and nothing else will record it: no entry
+     * points at its own directory. Miss it and GC sweeps the manifest. */
+    st = note_object(ctx, tree_hash, OBJECT_TYPE_TREE);
+    if (st != OK) { manifest_free_entries(entries, count); return st; }
 
     char repo[32], snap[32], parent[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
@@ -135,6 +177,18 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
 
         ctx->res->nodes++;
         if (e->type == NODE_TYPE_REG) ctx->res->files++;
+
+        /* Subtree hashes are recorded by the recursion below, so only content
+         * needs noting here. */
+        if (have_target && !is_dir) {
+            st = note_object(ctx, e->target_hash, e->type);
+            if (st != OK) break;
+        }
+        if (!hash_is_zero(e->xattr_hash))
+            st = note_object(ctx, e->xattr_hash, OBJECT_TYPE_FILE);
+        if (st == OK && !hash_is_zero(e->acl_hash))
+            st = note_object(ctx, e->acl_hash, OBJECT_TYPE_FILE);
+        if (st != OK) break;
 
         if (is_dir && have_target)
             st = walk_tree(ctx, e->target_hash, node_id);
@@ -257,9 +311,205 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_exec_raw(db, "COMMIT") != 0)
         return set_error(ERR_IO, "reindex: commit");
 
+    /* Standalone callers fault a single cold snapshot back in and get a
+     * complete registry for it. Called from reindex_repo this is nearly a
+     * no-op, because it only touches rows still missing their sizes. */
+    status_t fst = fill_object_sizes(store, db, repo_id);
+    if (fst != OK) return fst;
+
     res.snapshots = 1;
     if (out) *out = res;
     return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pack index rebuild                                                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    cutils_db_t *db;
+    const char  *repo;
+    char         pack[32];
+    int          failed;
+    uint64_t     entries;
+} pack_entry_ctx_t;
+
+static void pack_entry_seen(const pack_entry_info_t *info, void *vctx)
+{
+    pack_entry_ctx_t *c = vctx;
+    if (c->failed) return;
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_hex(info->hash, hex);
+    char off[32], comp[32], orig[32], eidx[16];
+    snprintf(off,  sizeof(off),  "%llu", (unsigned long long)info->entry_offset);
+    snprintf(comp, sizeof(comp), "%llu", (unsigned long long)info->compressed_size);
+    snprintf(orig, sizeof(orig), "%llu", (unsigned long long)info->uncompressed_size);
+    snprintf(eidx, sizeof(eidx), "%u",   info->entry_index);
+
+    if (db_execute_non_query(c->db,
+            "INSERT OR REPLACE INTO pack_objects"
+            " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (const char *[]){ c->repo, hex, c->pack, off, comp, orig, eidx, NULL },
+            NULL) != 0) {
+        c->failed = 1;
+        return;
+    }
+    c->entries++;
+}
+
+typedef struct {
+    store_t     *store;
+    cutils_db_t *db;
+    const char  *repo;
+    int          failed;
+    uint64_t     packs;
+    uint64_t     entries;
+} pack_scan_ctx_t;
+
+static void pack_num_seen(uint32_t pack_num, void *vctx)
+{
+    pack_scan_ctx_t *c = vctx;
+    if (c->failed) return;
+
+    char name[64];
+    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+
+    uint32_t version = 0, count = 0;
+    pack_entry_ctx_t ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.db = c->db;
+    ec.repo = c->repo;
+    snprintf(ec.pack, sizeof(ec.pack), "%u", pack_num);
+
+    if (pack_enumerate_dat(c->store, name, &version, &count,
+                           pack_entry_seen, &ec) != OK) {
+        /* One unreadable pack must not abandon the rest, for the same reason
+         * one unreadable snapshot does not. */
+        log_warn("reindex: cannot read %s: %s", name, err_msg());
+        err_clear();
+        return;
+    }
+    if (ec.failed) { c->failed = 1; return; }
+
+    char path[PATH_MAX];
+    uint64_t size = 0;
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(c->store), pack_num) == 0) {
+        struct stat sb;
+        if (stat(path, &sb) == 0) size = (uint64_t)sb.st_size;
+    }
+
+    char pid[32], szbuf[32], ver[16];
+    snprintf(pid,   sizeof(pid),   "%u", pack_num);
+    snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)size);
+    snprintf(ver,   sizeof(ver),   "%u", version);
+    if (db_execute_non_query(c->db,
+            "INSERT OR REPLACE INTO packs (repo_id, id, filename, size,"
+            " sealed_at, version) VALUES (?, ?, ?, ?, strftime('%s','now'), ?)",
+            (const char *[]){ c->repo, pid, name, szbuf, ver, NULL }, NULL) != 0) {
+        c->failed = 1;
+        return;
+    }
+    c->packs++;
+    c->entries += ec.entries;
+}
+
+/*
+ * Rebuild packs and pack_objects by reading the pack files themselves.
+ *
+ * This has to run before the trees are walked. Every packed object resolves
+ * through pack_objects, so until these rows exist the store cannot locate,
+ * size or read anything that lives in a pack, and the object registry built
+ * from the walk would describe packed objects as missing.
+ */
+static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                   reindex_result_t *res)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    if (db_execute_non_query(db, "DELETE FROM pack_objects WHERE repo_id = ?",
+                             (const char *[]){ repo, NULL }, NULL) != 0 ||
+        db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ?",
+                             (const char *[]){ repo, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "reindex: cannot clear pack index");
+
+    pack_scan_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.store = store;
+    c.db    = db;
+    c.repo  = repo;
+
+    status_t st = pack_list(store, pack_num_seen, &c);
+    if (st != OK) return st;
+    if (c.failed) return set_error(ERR_IO, "reindex: cannot rebuild pack index");
+
+    res->packs         = c.packs;
+    res->pack_entries  = c.entries;
+    return OK;
+}
+
+/*
+ * Fill in the sizes and locations the tree walk deliberately left blank.
+ *
+ * One pass over the distinct objects rather than one lookup per reference:
+ * on a repository where dedup is doing its job the same hash appears under
+ * many names, and sizing it once is the difference between a rebuild that
+ * takes seconds and one that takes minutes.
+ */
+static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT hash FROM objects WHERE repo_id = ? AND phys_size IS NULL",
+            (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot list unsized objects");
+    }
+
+    status_t st = OK;
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        const char *hex = r->rows[i][0];
+        uint8_t hash[OBJECT_HASH_SIZE];
+        hex_to_hash(hex, hash);
+
+        uint64_t phys = 0, orig = 0;
+        uint8_t  type = 0;
+        if (object_physical_size(store, hash, &phys) != OK ||
+            object_get_info(store, hash, &orig, &type) != OK) {
+            /* Referenced but absent. Leaving the row unsized rather than
+             * inventing a number keeps the gap visible to a verify pass. */
+            log_warn("reindex: object %.16s referenced but unreadable: %s",
+                     hex, err_msg());
+            err_clear();
+            continue;
+        }
+
+        store_location_t loc;
+        memset(&loc, 0, sizeof(loc));
+        char location[32] = "loose";
+        if (store_locate(store, hash, &loc) == OK && loc.in_pack)
+            snprintf(location, sizeof(location), "%llu", (unsigned long long)loc.pack_id);
+
+        char pbuf[32], obuf[32], tbuf[8];
+        snprintf(pbuf, sizeof(pbuf), "%llu", (unsigned long long)phys);
+        snprintf(obuf, sizeof(obuf), "%llu", (unsigned long long)orig);
+        snprintf(tbuf, sizeof(tbuf), "%u", type);
+        if (db_execute_non_query(db,
+                "UPDATE objects SET phys_size = ?, orig_size = ?, type = ?,"
+                " location = ? WHERE repo_id = ? AND hash = ?",
+                (const char *[]){ pbuf, obuf, tbuf, location, repo, hex, NULL },
+                NULL) != 0) {
+            st = set_error(ERR_IO, "reindex: cannot size object");
+            break;
+        }
+    }
+    db_result_free(r);
+    return st;
 }
 
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -275,6 +525,14 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     reindex_result_t total;
     memset(&total, 0, sizeof(total));
     status_t st = OK;
+
+    /* Packs first: the tree walk resolves packed objects through these rows,
+     * so rebuilding them afterwards would be too late. */
+    status_t pst = rebuild_pack_index(store, db, repo_id, &total);
+    if (pst != OK) {
+        closedir(d);
+        return pst;
+    }
 
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
@@ -295,14 +553,23 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
         total.snapshots += one.snapshots;
         total.nodes     += one.nodes;
+        total.files     += one.files;
+        total.objects   += one.objects;
         total.trees_read += one.trees_read;
     }
     closedir(d);
     if (st != OK) return st;
 
-    log_info("reindex: %llu snapshot(s), %llu nodes, %llu trees read",
+    /* Every snapshot has contributed its hashes by now, so each distinct
+     * object is sized exactly once. */
+    st = fill_object_sizes(store, db, repo_id);
+    if (st != OK) return st;
+
+    log_info("reindex: %llu snapshot(s), %llu nodes, %llu trees read, "
+             "%llu object(s), %llu pack(s) with %llu entries",
              (unsigned long long)total.snapshots, (unsigned long long)total.nodes,
-             (unsigned long long)total.trees_read);
+             (unsigned long long)total.trees_read, (unsigned long long)total.objects,
+             (unsigned long long)total.packs, (unsigned long long)total.pack_entries);
     if (out) *out = total;
     return OK;
 }

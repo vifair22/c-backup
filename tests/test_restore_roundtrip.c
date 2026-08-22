@@ -23,6 +23,8 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "gc.h"
+#include "prune.h"
 #include "reindex.h"
 #include "repo.h"
 #include "restore.h"
@@ -279,6 +281,113 @@ static void test_reindex_preserves_the_file_count(void **state)
     assert_true(rx.nodes > rx.files);
 }
 
+static int scalar(const char *sql, const char *p1)
+{
+    db_result_t *r = NULL;
+    const char *params[] = { p1, NULL };
+    if (db_execute(db, sql, params, &r) != 0) return -1;
+    int v = (r && r->nrows == 1) ? atoi(r->rows[0][0]) : -1;
+    db_result_free(r);
+    return v;
+}
+
+/*
+ * The registry has to come back too, not just the nodes.
+ *
+ * reindex used to rebuild nodes and stop, so a recovered repository could
+ * browse and restore but reported zero objects and zero bytes, and GC had no
+ * rows to sweep: garbage accumulated with no way to reclaim it. Nothing
+ * failed, which is what made it easy to miss. The existing reindex tests did
+ * not catch it because they wiped nodes and snapshots but left objects alone.
+ */
+static void test_reindex_rebuilds_the_object_registry(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
+        " FROM objects WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    int      before_count = atoi(r->rows[0][0]);
+    uint64_t before_phys  = strtoull(r->rows[0][1], NULL, 10);
+    uint64_t before_orig  = strtoull(r->rows[0][2], NULL, 10);
+    db_result_free(r);
+    assert_true(before_count > 0);
+    assert_true(before_phys > 0);
+
+    /* Everything derived goes, including the registry this time. */
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM pack_objects", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM packs", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_true(rx.objects > 0);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
+        " FROM objects WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(atoi(r->rows[0][0]), before_count);
+    assert_int_equal(strtoull(r->rows[0][1], NULL, 10), before_phys);
+    assert_int_equal(strtoull(r->rows[0][2], NULL, 10), before_orig);
+    db_result_free(r);
+
+    /* Nothing may be left unsized: a NULL here is an object the rebuild saw
+     * referenced but could not account for. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects"
+                            " WHERE repo_id = ? AND phys_size IS NULL", repo), 0);
+}
+
+/*
+ * And the recovered registry has to be good enough for GC to act on, which is
+ * the part that was silently broken: reclaiming space is the whole reason the
+ * registry exists.
+ */
+static void test_gc_reclaims_after_reindex(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t first;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &first), OK);
+
+    /* Second snapshot without one of the files, so its object becomes
+     * garbage once the first snapshot is pruned. */
+    assert_int_equal(unlink(TEST_SRC "/nested/mid.txt"), 0);
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int before = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?", repo);
+    assert_true(before > 0);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, first.snapshot_id), OK);
+    gc_result_t g;
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+
+    /* Before the fix there were no rows to mark, so this sat at zero. */
+    assert_true(g.reachable > 0);
+    assert_true(g.swept > 0);
+    assert_true(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?", repo) < before);
+}
+
 /* And the rebuilt index must be good enough to restore from. */
 static void test_restore_after_reindex_is_identical(void **state)
 {
@@ -361,6 +470,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_preserves_the_file_count, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_object_registry, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_reclaims_after_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_after_reindex_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_handles_multiple_snapshots, setup, teardown),

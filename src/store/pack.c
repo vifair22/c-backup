@@ -182,9 +182,8 @@ int parse_pack_dat_name(const char *name, uint32_t *out_num) {
 }
 
 /* Walk packs/ directory (both flat and sharded) collecting pack numbers
- * from .dat files.  Calls cb(pack_num, ctx) for each found pack. */
-typedef void (*pack_num_cb)(uint32_t pack_num, void *ctx);
-
+ * from .dat files.  Calls cb(pack_num, ctx) for each found pack.
+ * pack_num_cb is declared in pack.h, which pack_list exposes. */
 static void pack_for_each_num(const char *packs_dir, pack_num_cb cb,
                                void *ctx) {
     DIR *dir = opendir(packs_dir);
@@ -1664,8 +1663,8 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
         for (uint32_t i = 0; i < packed; i++) {
             memcpy(ce[i].hash, idx_entries[i].hash, OBJECT_HASH_SIZE);
             ce[i].offset      = idx_entries[i].dat_offset;
-            ce[i].comp_size   = 0; /* filled by the reader from the entry header */
-            ce[i].orig_size   = 0;
+            ce[i].comp_size   = idx_entries[i].compressed_size;
+            ce[i].orig_size   = idx_entries[i].uncompressed_size;
             ce[i].entry_index = idx_entries[i].entry_index;
         }
         char fname[64];
@@ -3361,8 +3360,8 @@ status_t pack_gc(store_t *store,
                 for (uint32_t ei = 0; ei < live_count; ei++) {
                     memcpy(ce[ei].hash, new_disk_idx[ei].hash, OBJECT_HASH_SIZE);
                     ce[ei].offset      = new_disk_idx[ei].dat_offset;
-                    ce[ei].comp_size   = 0;
-                    ce[ei].orig_size   = 0;
+                    ce[ei].comp_size   = new_disk_idx[ei].compressed_size;
+                    ce[ei].orig_size   = new_disk_idx[ei].uncompressed_size;
                     ce[ei].entry_index = new_disk_idx[ei].entry_index;
                 }
                 struct stat gc_sz;
@@ -3428,6 +3427,16 @@ pack_fail:
 /* Read-only enumeration of pack .dat files                            */
 /* ------------------------------------------------------------------ */
 
+status_t pack_list(store_t *store, pack_num_cb cb, void *ctx)
+{
+    if (!store || !cb) return set_error(ERR_INVALID, "pack_list: null argument");
+    char packs_dir[PATH_MAX];
+    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
+        return set_error(ERR_IO, "pack_list: path too long");
+    pack_for_each_num(packs_dir, cb, ctx);
+    return OK;
+}
+
 status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx)
@@ -3476,6 +3485,8 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
             info.uncompressed_size = eh.uncompressed_size;
             info.compressed_size   = (uint64_t)eh.compressed_size;
             info.payload_offset    = offset + sizeof(eh);
+            info.entry_offset      = offset;
+            info.entry_index       = i;
             offset += sizeof(eh) + (uint64_t)eh.compressed_size;
             if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
         } else {
@@ -3487,6 +3498,8 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
             info.uncompressed_size = eh.uncompressed_size;
             info.compressed_size   = eh.compressed_size;
             info.payload_offset    = offset + sizeof(eh);
+            info.entry_offset      = offset;
+            info.entry_index       = i;
             offset += sizeof(eh) + eh.compressed_size;
             if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
         }

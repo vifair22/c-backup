@@ -184,6 +184,14 @@ typedef struct {
     uint64_t uncompressed_size;
     uint64_t compressed_size;
     uint64_t payload_offset;
+    /* Start of the entry, header included. This is what a reader seeks to and
+     * what pack_objects.offset holds; payload_offset is past the header and
+     * cannot be turned back into it without knowing the pack version. */
+    uint64_t entry_offset;
+    /* Position in on-disk entry order, which is what indexes the parity
+     * trailer. Enumeration is in that order, so it is simply the iteration
+     * count, but a caller rebuilding pack_objects must not have to assume so. */
+    uint32_t entry_index;
 } pack_entry_info_t;
 
 typedef void (*pack_dat_entry_cb)(const pack_entry_info_t *info, void *ctx);
@@ -191,6 +199,14 @@ typedef void (*pack_dat_entry_cb)(const pack_entry_info_t *info, void *ctx);
 status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx);
+
+/*
+ * Iterate the pack numbers present in the repository, whatever directory
+ * layout they are in. Exposed so a rebuild does not have to reimplement the
+ * sharded and flat path rules and drift from them.
+ */
+typedef void (*pack_num_cb)(uint32_t pack_num, void *ctx);
+status_t pack_list(store_t *store, pack_num_cb cb, void *ctx);
 
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
