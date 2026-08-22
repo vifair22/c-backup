@@ -110,6 +110,11 @@ build:image:
 # the generator would emit a child pipeline containing no jobs, which GitLab
 # rejects, so the whole stage sits out until someone configures a target. A
 # red pipeline because nobody has picked a deploy host yet is noise.
+#
+# The rule is a bare variable, not a `!= ""` comparison: an undefined variable
+# compares as null, and null != "" is true, so the comparison form runs the
+# job in exactly the case it was written to prevent. A bare variable matches
+# only when it is both defined and non-empty.
 generate_deploy_child_pipeline:
   stage: deploy
   image: debian:trixie
@@ -119,6 +124,13 @@ generate_deploy_child_pipeline:
       : > deploy-child.yml
       echo "stages: [deploy]" >> deploy-child.yml
       i=0
+      # Belt and braces behind the rule above. A child pipeline with no jobs
+      # fails downstream as "unknown_failure", which says nothing about the
+      # cause; failing here names it.
+      if [ -z "$(printf '%s' "$CBACKUP_DEPLOY_TARGETS" | tr -d '[:space:]')" ]; then
+        echo "CBACKUP_DEPLOY_TARGETS is empty: nothing to deploy to" >&2
+        exit 1
+      fi
       printf '%s\n' "$CBACKUP_DEPLOY_TARGETS" | while IFS='|' read -r host network ip; do
         [ -z "$host" ] && continue
         i=$((i+1))
@@ -147,7 +159,7 @@ generate_deploy_child_pipeline:
     paths:
       - deploy-child.yml
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS != ""'
+    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS'
 
 trigger_deploy:
   stage: deploy
@@ -160,4 +172,4 @@ trigger_deploy:
     # than going green the moment the trigger is accepted.
     strategy: depend
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS != ""'
+    - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS'
