@@ -94,10 +94,58 @@ static const char *basename_of(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static uint32_t find_index(const pipeline_t *p, uint64_t node_id)
+/*
+ * node_id to scan index.
+ *
+ * This was a linear scan of every entry. It is called once per step of every
+ * parent chain, so on a tree with a quarter of a million entries and
+ * twenty-five thousand directories the cost compounded into something that
+ * would not have finished this decade. Open addressing, built once per run,
+ * keeps it O(1) and the whole ordering pass linear, which is what design
+ * constraint 3 asks for.
+ */
+typedef struct {
+    uint64_t *keys;     /* node_id, 0 means empty */
+    uint32_t *vals;     /* scan index */
+    uint32_t  mask;
+} idmap_t;
+
+static void idmap_free(idmap_t *m)
 {
-    for (uint32_t i = 0; i < p->count; i++)
-        if (p->links[i].node_id == node_id) return i;
+    free(m->keys);
+    free(m->vals);
+    m->keys = NULL;
+    m->vals = NULL;
+}
+
+static int idmap_build(idmap_t *m, const node_link_t *links, uint32_t count)
+{
+    uint32_t cap = 16;
+    while (cap < count * 2) cap <<= 1;
+    m->keys = calloc(cap, sizeof(*m->keys));
+    m->vals = calloc(cap, sizeof(*m->vals));
+    if (!m->keys || !m->vals) { idmap_free(m); return -1; }
+    m->mask = cap - 1;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t k = links[i].node_id;
+        if (k == 0) continue;   /* 0 is the empty marker and never a node id */
+        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
+        while (m->keys[h] != 0 && m->keys[h] != k) h = (h + 1) & m->mask;
+        m->keys[h] = k;
+        m->vals[h] = i;
+    }
+    return 0;
+}
+
+static uint32_t idmap_get(const idmap_t *m, uint64_t node_id)
+{
+    if (node_id == 0) return UINT32_MAX;
+    uint32_t h = (uint32_t)((node_id * 0x9E3779B97F4A7C15ULL) >> 32) & m->mask;
+    while (m->keys[h] != 0) {
+        if (m->keys[h] == node_id) return m->vals[h];
+        h = (h + 1) & m->mask;
+    }
     return UINT32_MAX;
 }
 
@@ -296,18 +344,70 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
     return OK;
 }
 
-static uint32_t depth_of(const pipeline_t *p, uint32_t i)
+/*
+ * Depth of every entry, in one pass.
+ *
+ * Each chain walk memoises what it learns, so an entry is resolved once and
+ * every descendant that passes through it afterwards stops there. Total work
+ * is proportional to the number of entries rather than to entries times
+ * depth, and nothing recomputes a depth it has already established.
+ *
+ * The visiting marker guards against a parent cycle. That should not be
+ * possible from a filesystem scan, but a cycle here would be an unkillable
+ * loop rather than a wrong answer, and this is the pass that just proved how
+ * badly that ends.
+ */
+#define DEPTH_UNKNOWN  UINT32_MAX
+#define DEPTH_VISITING (UINT32_MAX - 1)
+
+static status_t compute_depths(const pipeline_t *p, const idmap_t *map,
+                               uint32_t **out_depth)
 {
-    uint32_t d = 0;
-    uint64_t parent = p->links[i].parent_id;
-    while (parent != 0 && d < p->count) {
-        uint32_t pi = find_index(p, parent);
-        if (pi == UINT32_MAX) break;
-        parent = p->links[pi].parent_id;
-        d++;
+    uint32_t *depth = malloc(p->count * sizeof(*depth));
+    if (!depth) return set_error(ERR_NOMEM, "build_trees: depth alloc");
+    for (uint32_t i = 0; i < p->count; i++) depth[i] = DEPTH_UNKNOWN;
+
+    uint32_t *stack = malloc(p->count * sizeof(*stack));
+    if (!stack) { free(depth); return set_error(ERR_NOMEM, "build_trees: depth stack"); }
+
+    for (uint32_t i = 0; i < p->count; i++) {
+        if (depth[i] != DEPTH_UNKNOWN) continue;
+
+        uint32_t n_stack = 0;
+        uint32_t cur = i;
+        uint32_t base = 0;   /* depth to give the topmost entry on the stack */
+
+        /*
+         * Walk up until an ancestor whose depth is already known, or a root.
+         * An anchored chain hangs one level below that ancestor; an unanchored
+         * one is rooted here, at depth zero.
+         */
+        for (;;) {
+            if (depth[cur] == DEPTH_VISITING) { base = 0; break; }  /* cycle */
+            if (depth[cur] != DEPTH_UNKNOWN) { base = depth[cur] + 1; break; }
+
+            depth[cur] = DEPTH_VISITING;
+            stack[n_stack++] = cur;
+
+            uint64_t parent = p->links[cur].parent_id;
+            if (parent == 0) { base = 0; break; }
+            uint32_t pi = idmap_get(map, parent);
+            if (pi == UINT32_MAX) { base = 0; break; }
+            cur = pi;
+        }
+
+        /* Top of the stack is shallowest, so unwind assigning increasing
+         * depth. Everything touched is now resolved for later chains. */
+        uint32_t d = base;
+        while (n_stack > 0) depth[stack[--n_stack]] = d++;
     }
-    return d;
+
+    free(stack);
+    *out_depth = depth;
+    return OK;
 }
+
+
 
 static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 {
@@ -325,18 +425,50 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
         for (uint32_t i = 0; i < p->count; i++)
             if (p->scan->entries[i].node.type == NODE_TYPE_DIR) dirs[k++] = i;
 
-        /* Insertion sort by descending depth: directory counts are small
-         * relative to file counts and this keeps the ordering obvious. */
-        for (uint32_t a = 1; a < ndirs; a++) {
-            uint32_t v = dirs[a];
-            uint32_t dv = depth_of(p, v);
-            uint32_t b = a;
-            while (b > 0 && depth_of(p, dirs[b - 1]) < dv) {
-                dirs[b] = dirs[b - 1];
-                b--;
-            }
-            dirs[b] = v;
+        /*
+         * Counting sort by descending depth.
+         *
+         * This was an insertion sort calling a parent-chain walk on every
+         * comparison, which is fine at a few hundred directories and fatal at
+         * twenty-five thousand: quadratic in directories, each comparison
+         * linear in entries. Depths are already computed, and they are small
+         * integers, so ordering by them is a pair of linear passes.
+         */
+        idmap_t map = { NULL, NULL, 0 };
+        if (idmap_build(&map, p->links, p->count) != 0) {
+            free(dirs);
+            return set_error(ERR_NOMEM, "build_trees: id map");
         }
+        uint32_t *depth = NULL;
+        status_t dst = compute_depths(p, &map, &depth);
+        idmap_free(&map);
+        if (dst != OK) { free(dirs); return dst; }
+
+        uint32_t maxd = 0;
+        for (uint32_t a = 0; a < ndirs; a++)
+            if (depth[dirs[a]] > maxd) maxd = depth[dirs[a]];
+
+        uint32_t *counts = calloc((size_t)maxd + 2, sizeof(*counts));
+        uint32_t *sorted = malloc(ndirs * sizeof(*sorted));
+        if (!counts || !sorted) {
+            free(counts); free(sorted); free(depth); free(dirs);
+            return set_error(ERR_NOMEM, "build_trees: ordering");
+        }
+        for (uint32_t a = 0; a < ndirs; a++) counts[depth[dirs[a]]]++;
+        /* Deepest first: offsets accumulate from the high end. */
+        uint32_t running = 0;
+        for (uint32_t d = maxd + 1; d-- > 0; ) {
+            uint32_t c = counts[d];
+            counts[d] = running;
+            running += c;
+        }
+        for (uint32_t a = 0; a < ndirs; a++)
+            sorted[counts[depth[dirs[a]]]++] = dirs[a];
+
+        memcpy(dirs, sorted, ndirs * sizeof(*dirs));
+        free(sorted);
+        free(counts);
+        free(depth);
 
         for (uint32_t a = 0; a < ndirs; a++) {
             if (cancelled(p)) { free(dirs); return set_error(ERR_BUSY, "backup cancelled"); }

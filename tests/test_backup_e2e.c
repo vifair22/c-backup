@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <time.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -292,6 +293,71 @@ static void test_phys_size_may_exceed_logical_size(void **state)
                             " WHERE repo_id = ? AND phys_size < orig_size", "1"), 0);
 }
 
+/*
+ * Deep and wide trees order correctly and cheaply.
+ *
+ * build_trees used to sort directories with an insertion sort whose
+ * comparator walked each entry's parent chain, and each step of that walk was
+ * a linear scan of every entry in the scan. On a real 223,000-file tree with
+ * 25,000 directories that never finished; it is a hash lookup and a counting
+ * sort now.
+ *
+ * Be clear about what this test does and does not do. It covers the deep
+ * chain and the ordering invariant, and it would catch an implementation that
+ * got slow in the depth dimension. It does NOT reproduce the original
+ * pathology, because the dominant term there was scanning a quarter-million
+ * entry array and a fixture that large does not belong in a unit suite. The
+ * regression itself is verified against a real 45 GB tree; this guards the
+ * behaviour the fix has to preserve.
+ */
+static void test_deep_wide_tree_is_not_quadratic(void **state)
+{
+    (void)state;
+
+    /* A 200-deep chain, plus 1500 siblings near the root. */
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/deep", TEST_SRC);
+    assert_int_equal(mkdir(path, 0700), 0);
+    for (int d = 0; d < 200; d++) {
+        n += snprintf(path + n, sizeof(path) - (size_t)n, "/d");
+        assert_true(n < (int)sizeof(path) - 32);
+        assert_int_equal(mkdir(path, 0700), 0);
+    }
+    char leaf[PATH_MAX];
+    snprintf(leaf, sizeof(leaf), "%s/f.txt", path);
+    write_file(leaf, "deep");
+
+    for (int i = 0; i < 1500; i++) {
+        char sib[PATH_MAX];
+        snprintf(sib, sizeof(sib), "%s/w%04d", TEST_SRC, i);
+        assert_int_equal(mkdir(sib, 0700), 0);
+        char f[PATH_MAX];
+        snprintf(f, sizeof(f), "%s/f.txt", sib);
+        write_file(f, "wide");
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    backup_opts_t o = basic_opts();
+    backup_result_t r;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double secs = (double)(t1.tv_sec - t0.tv_sec)
+                + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    assert_true(secs < 20.0);
+
+    /* The ordering invariant: a parent is never serialised before its
+     * children, so every directory has a tree and the snapshot is walkable
+     * from its root. A depth ordering that regressed would leave a parent
+     * referencing a subtree hash that was never computed. */
+    assert_true(r.trees_new > 1500);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", "1"), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes"
+                            " WHERE repo_id = ? AND type = 2"
+                            "   AND subtree_hash IS NULL", "1"), 0);
+}
+
 static void test_cancellation_stops_the_run(void **state)
 {
     (void)state;
@@ -325,6 +391,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_identical_files_share_one_object, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phys_size_matches_bytes_on_disk, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phys_size_may_exceed_logical_size, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_deep_wide_tree_is_not_quadratic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
     };
