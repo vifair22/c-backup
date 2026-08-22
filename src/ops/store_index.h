@@ -28,7 +28,7 @@ void     store_index_free(store_index_t *idx);
  * write, so the object is findable before any snapshot references it. */
 status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
                                const uint8_t hash[OBJECT_HASH_SIZE],
-                               uint8_t type, uint64_t comp_size, uint64_t orig_size);
+                               uint8_t type, uint64_t phys_size, uint64_t orig_size);
 
 /* Bump or drop an object's refcount. GC collects rows that reach zero. */
 status_t store_index_addref(cutils_db_t *db, int64_t repo_id,

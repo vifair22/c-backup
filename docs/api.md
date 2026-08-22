@@ -99,6 +99,15 @@ What is actually inside a repository, as opposed to what it can do.
 |---|---|---|
 | GET | `/repos/<id>/summary` | Dashboard aggregate in one request |
 | GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=loose` narrows |
+
+Size fields on the object endpoints are `orig_size`, the logical bytes that
+went in, and `phys_size`, the bytes the repository spends on them: payload
+after compression, plus the 56-byte object header, plus the Reed-Solomon
+parity trailer. `phys_size` exceeding `orig_size` is normal and expected for
+incompressible input, where the payload is stored raw and the parity trailer
+is pure overhead. `pack_objects` reports `comp_size` instead, which there is
+genuinely the compressed entry payload.
+
 | GET | `/repos/<id>/objects` | Paginated; `?location=loose` or `?location=pack` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
 | GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |

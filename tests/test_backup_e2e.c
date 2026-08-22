@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -235,6 +236,62 @@ static void test_identical_files_share_one_object(void **state)
     assert_int_equal(res.objects_new, 4);
 }
 
+/*
+ * phys_size must be the object's real footprint on disk.
+ *
+ * It was three different things at once: the small-object write path counted
+ * the parity trailer, the streaming and sparse paths did not, and tree
+ * objects recorded their serialised length with no header or trailer at all.
+ * The column was called comp_size then, so it also read as a compression
+ * figure, which it never was. Nothing failed; the repository simply
+ * under-reported its own disk usage, worst for the large files that dominate
+ * it. Comparing against stat() is the only check that cannot drift.
+ */
+static void test_phys_size_matches_bytes_on_disk(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, phys_size FROM objects WHERE repo_id = ?",
+        (const char *[]){ "1", NULL }, &r), 0);
+    assert_non_null(r);
+    assert_true(r->nrows > 0);
+
+    int checked = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        const char *hex = r->rows[i][0];
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+
+        struct stat sb;
+        assert_int_equal(stat(path, &sb), 0);
+        assert_int_equal((unsigned long long)sb.st_size,
+                         strtoull(r->rows[i][1], NULL, 10));
+        checked++;
+    }
+    db_result_free(r);
+    assert_true(checked > 0);
+}
+
+/* Incompressible content is stored raw, so phys_size exceeds orig_size by the
+ * header and parity trailer. That is the designed cost, but it means no
+ * caller may treat these two fields as a compression ratio. */
+static void test_phys_size_may_exceed_logical_size(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    assert_true(scalar("SELECT COUNT(*) FROM objects"
+                       " WHERE repo_id = ? AND phys_size > orig_size", "1") > 0);
+    /* And never smaller than the payload it describes. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects"
+                            " WHERE repo_id = ? AND phys_size < orig_size", "1"), 0);
+}
+
 static void test_cancellation_stops_the_run(void **state)
 {
     (void)state;
@@ -266,6 +323,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_root_tree_is_walkable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_search_finds_backed_up_files, setup, teardown),
         cmocka_unit_test_setup_teardown(test_identical_files_share_one_object, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_phys_size_matches_bytes_on_disk, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_phys_size_may_exceed_logical_size, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
     };

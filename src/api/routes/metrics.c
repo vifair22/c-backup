@@ -87,8 +87,10 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "gauge", "SELECT COUNT(*) FROM snapshots");
     emit_scalar(&m, "cbackup_objects_total", "Stored objects across all repositories.",
                 "gauge", "SELECT COUNT(*) FROM objects");
-    emit_scalar(&m, "cbackup_objects_bytes", "Compressed bytes of stored objects.",
-                "gauge", "SELECT COALESCE(SUM(comp_size), 0) FROM objects");
+    /* On-disk bytes, not logical: header and parity trailer included, which
+     * is what actually fills the volume the repository lives on. */
+    emit_scalar(&m, "cbackup_objects_bytes", "Bytes stored on disk by objects.",
+                "gauge", "SELECT COALESCE(SUM(phys_size), 0) FROM objects");
     emit_scalar(&m, "cbackup_nodes_total", "Indexed file and directory nodes.",
                 "gauge", "SELECT COUNT(*) FROM nodes");
 

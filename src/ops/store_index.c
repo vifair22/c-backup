@@ -190,24 +190,24 @@ void store_index_free(store_index_t *idx)
 
 status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
                                const uint8_t hash[OBJECT_HASH_SIZE],
-                               uint8_t type, uint64_t comp_size, uint64_t orig_size)
+                               uint8_t type, uint64_t phys_size, uint64_t orig_size)
 {
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_to_hex(hash, hex);
-    char repo[32], comp[32], orig[32], t[8];
+    char repo[32], phys[32], orig[32], t[8];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(comp, sizeof(comp), "%llu", (unsigned long long)comp_size);
+    snprintf(phys, sizeof(phys), "%llu", (unsigned long long)phys_size);
     snprintf(orig, sizeof(orig), "%llu", (unsigned long long)orig_size);
     snprintf(t,    sizeof(t),    "%u",   type);
 
     /* Content-addressed: seeing the same hash twice is dedup working, not an
      * error, so an existing row is left alone rather than overwritten. */
     if (db_execute_non_query(db,
-            "INSERT INTO objects (repo_id, hash, refcount, comp_size, orig_size,"
+            "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " VALUES (?, ?, 0, ?, ?, 'loose', ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
-            (const char *[]){ repo, hex, comp, orig, t, NULL }, NULL) != 0)
+            (const char *[]){ repo, hex, phys, orig, t, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record object");
     return OK;
 }

@@ -1,0 +1,16 @@
+-- objects.comp_size never held a compressed size.
+--
+-- The backup pipeline recorded the object's on-disk footprint there: header
+-- plus payload plus parity trailer. Reading it as a compression figure made
+-- every ratio come out above 100%, because the header alone is 56 bytes more
+-- than the payload it describes and incompressible payloads are stored raw.
+--
+-- Worse, it was not even a consistent footprint. The small-object write path
+-- counted the parity trailer and the streaming and sparse paths did not, so
+-- the number disagreed with itself between objects in one repository and
+-- understated disk usage worst for the large files that dominate it. That is
+-- fixed in object.c; this renames the column to match what it holds.
+--
+-- pack_objects.comp_size is left alone: there it genuinely is the compressed
+-- entry payload, which is what the pack reader needs to size its buffers.
+ALTER TABLE objects RENAME COLUMN comp_size TO phys_size;

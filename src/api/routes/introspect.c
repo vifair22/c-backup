@@ -102,12 +102,12 @@ api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     int rc = loose_only
         ? db_execute(g_db,
-            "SELECT type, COUNT(*), COALESCE(SUM(comp_size),0), COALESCE(SUM(orig_size),0)"
+            "SELECT type, COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
             "  FROM objects WHERE repo_id = ? AND location = 'loose'"
             " GROUP BY type ORDER BY type",
             (const char *[]){ repo, NULL }, &r)
         : db_execute(g_db,
-            "SELECT type, COUNT(*), COALESCE(SUM(comp_size),0), COALESCE(SUM(orig_size),0)"
+            "SELECT type, COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
             "  FROM objects WHERE repo_id = ? GROUP BY type ORDER BY type",
             (const char *[]){ repo, NULL }, &r);
     if (rc != 0) {
@@ -123,7 +123,7 @@ api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
         if (json_resp_array_append_begin(resp, "per_type", &e) != 0) break;
         int bad = json_elem_add_str(&e, "type",      r->rows[i][0]) != 0
                || json_elem_add_str(&e, "count",     r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "comp_size", r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "phys_size", r->rows[i][2]) != 0
                || json_elem_add_str(&e, "orig_size", r->rows[i][3]) != 0;
         if (bad) break;
         json_elem_commit(&e);
@@ -148,7 +148,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
             "SELECT"
             " (SELECT COUNT(*) FROM snapshots WHERE repo_id = ?),"
             " (SELECT COUNT(*) FROM objects   WHERE repo_id = ?),"
-            " (SELECT COALESCE(SUM(comp_size),0) FROM objects WHERE repo_id = ?),"
+            " (SELECT COALESCE(SUM(phys_size),0) FROM objects WHERE repo_id = ?),"
             " (SELECT COALESCE(SUM(orig_size),0) FROM objects WHERE repo_id = ?),"
             " (SELECT COUNT(*) FROM packs      WHERE repo_id = ?),"
             " (SELECT COUNT(*) FROM objects    WHERE repo_id = ? AND location = 'loose'),"
@@ -162,7 +162,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
 
     char *body = NULL;
     int n = asprintf(&body,
-        "{\"snapshots\":%s,\"objects\":%s,\"comp_size\":%s,\"orig_size\":%s,"
+        "{\"snapshots\":%s,\"objects\":%s,\"phys_size\":%s,\"orig_size\":%s,"
         "\"packs\":%s,\"loose\":%s,\"tags\":%s,\"last_snapshot_ts\":%s}",
         r->rows[0][0], r->rows[0][1], r->rows[0][2], r->rows[0][3],
         r->rows[0][4], r->rows[0][5], r->rows[0][6], r->rows[0][7]);
@@ -192,21 +192,21 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     int rc;
     if (loc && strcmp(loc, "loose") == 0) {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(comp_size,0), COALESCE(orig_size,0),"
+            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       location FROM objects"
             " WHERE repo_id = ? AND location = 'loose'"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else if (loc && strcmp(loc, "pack") == 0) {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(comp_size,0), COALESCE(orig_size,0),"
+            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       location FROM objects"
             " WHERE repo_id = ? AND location <> 'loose'"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(comp_size,0), COALESCE(orig_size,0),"
+            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       location FROM objects WHERE repo_id = ?"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
@@ -224,7 +224,7 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
         int bad = json_elem_add_str(&e, "hash",      r->rows[i][0]) != 0
                || json_elem_add_str(&e, "type",      r->rows[i][1]) != 0
                || json_elem_add_str(&e, "refcount",  r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "comp_size", r->rows[i][3]) != 0
+               || json_elem_add_str(&e, "phys_size", r->rows[i][3]) != 0
                || json_elem_add_str(&e, "orig_size", r->rows[i][4]) != 0
                || json_elem_add_str(&e, "location",  r->rows[i][5]) != 0;
         if (bad) break;
@@ -246,7 +246,7 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT o.type, o.refcount, COALESCE(o.comp_size,0), COALESCE(o.orig_size,0),"
+            "SELECT o.type, o.refcount, COALESCE(o.phys_size,0), COALESCE(o.orig_size,0),"
             "       o.location, COALESCE(po.pack_id,-1), COALESCE(po.offset,-1),"
             "       COALESCE(po.entry_index,-1)"
             "  FROM objects o"
@@ -260,7 +260,7 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
 
     char *body = NULL;
     int n = asprintf(&body,
-        "{\"found\":true,\"type\":%s,\"refcount\":%s,\"comp_size\":%s,"
+        "{\"found\":true,\"type\":%s,\"refcount\":%s,\"phys_size\":%s,"
         "\"orig_size\":%s,\"location\":\"%s\",\"pack_id\":%s,\"offset\":%s,"
         "\"entry_index\":%s}",
         r->rows[0][0], r->rows[0][1], r->rows[0][2], r->rows[0][3],

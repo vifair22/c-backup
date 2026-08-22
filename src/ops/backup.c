@@ -172,11 +172,12 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
     }
 
     int is_new = 0;
+    uint64_t tree_phys = 0;
     uint8_t *buf = NULL; size_t len = 0;
     status_t st = manifest_serialise(entries, k, &buf, &len);
     if (st == OK) {
         st = object_store_ex(p->store, OBJECT_TYPE_TREE, buf, len, out_hash,
-                             &is_new, NULL);
+                             &is_new, &tree_phys);
         free(buf);
     }
     free(entries);
@@ -187,8 +188,12 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
      * written. A run where this is always 1 means determinism has broken. */
     if (is_new) {
         p->res->trees_new++;
+        /* The serialised length is the logical size. The physical size is
+         * what the store actually wrote, header and parity trailer included,
+         * and only the store knows it. Recording len for both understated
+         * every tree by the trailer. */
         st = store_index_put_loose(p->db, p->repo_id, out_hash,
-                                   OBJECT_TYPE_TREE, len, len);
+                                   OBJECT_TYPE_TREE, tree_phys, len);
         if (st != OK) return st;
     } else {
         p->res->trees_reused++;

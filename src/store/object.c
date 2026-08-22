@@ -903,6 +903,7 @@ done:
     /* ---- Parity trailer (version 2) ----
      * CRC and RS parity were computed inline during the write loop.
      */
+    uint64_t stream_trailer_sz = 0;
     {
         parity_record_t shdr_par;
         parity_record_compute(&hdr, sizeof(hdr), &shdr_par);
@@ -945,6 +946,7 @@ done:
             close(tfd); unlink(tmppath);
             return set_error_errno(ERR_IO, "stream: write parity footer");
         }
+        stream_trailer_sz = spfooter.trailer_size;
     }
     /* ---- End parity trailer ---- */
 
@@ -981,7 +983,14 @@ done:
     close(subfd);
     store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
-    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
+    /* The parity trailer is on disk whether or not the caller asked about it,
+     * so it belongs in the physical size. Leaving it out here while the
+     * small-object path counted it made the figure disagree with itself
+     * between objects in one repo, and understated it worst for the large
+     * files that dominate a repository. */
+    if (out_phys_bytes)
+        *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written
+                        + stream_trailer_sz;
     return OK;
 }
 
@@ -1248,7 +1257,10 @@ sp_done:
     close(subfd);
     store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
-    if (out_phys_bytes) *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written;
+    /* Trailer included, same reasoning as the streaming path above. */
+    if (out_phys_bytes)
+        *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written
+                        + pftr.trailer_size;
     return OK;
 }
 

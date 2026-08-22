@@ -150,7 +150,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Count and size what would go, before deciding whether to act. */
     db_result_t *dead = NULL;
     if (db_execute(db,
-            "SELECT hash, COALESCE(comp_size, 0), location FROM objects"
+            "SELECT hash, COALESCE(phys_size, 0), location FROM objects"
             " WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, &dead) != 0) {
         if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
