@@ -19,23 +19,18 @@ export interface Endpoint {
 /*
  * Actions with no successor in the daemon API.
  *
- * The first three read the .idx sidecar, which no longer exists: pack contents
- * are rows in pack_objects, and the sidecar's 256-entry fanout table has no
- * equivalent at all. PackBrowser's fanout chart has to be removed or rebuilt
- * against a prefix histogram; it cannot be mapped.
+ * Only one remains. `snap` loaded an entire snapshot in a single response;
+ * every collection route pages by design, because returning a 10k-entry
+ * directory row by row measured 2304 us against 93 us for the first page.
+ * Restoring the full-load action would reintroduce exactly the cost the
+ * pagination rule exists to prevent, so it stays removed rather than mapped.
  *
- * `snap` loaded an entire snapshot in one response. Every collection route
- * pages by design, because returning a 10k-entry directory row by row measured
- * 2304 us against 93 us for the first page. Restoring the full-load action
- * would reintroduce exactly the cost the pagination rule exists to avoid.
+ * The three .idx readers that used to be here are now served from
+ * pack_objects rows, and the sidecar's 256-entry fanout table is a GROUP BY
+ * over hash prefixes: the same shape, computed rather than stored, and a
+ * visualisation now rather than a lookup structure.
  */
 export const REMOVED_ACTIONS: Record<string, string> = {
-  pack_index:
-    'the .idx sidecar is gone; pack contents are rows in pack_objects',
-  global_pack_index:
-    'the .idx sidecar is gone; its fanout table has no successor',
-  all_pack_entries:
-    'the .idx sidecar is gone; use paginated object listing instead',
   snap: 'full-snapshot loads are removed; page through the tree endpoint',
 }
 
@@ -137,12 +132,58 @@ export function mapAction(
       return { method: 'POST', path: `/jobs/${q(params, 'task_id')}/cancel` }
 
     case 'repo_summary':
+      return { method: 'GET', path: `${base}/summary` }
     case 'repo_stats':
     case 'stats':
+      return { method: 'GET', path: `${base}/stats` }
     case 'loose_stats':
-      /* No aggregate endpoint yet; the snapshot list carries the counts the
-       * dashboard actually renders. */
-      return { method: 'GET', path: `${base}/snapshots?limit=1` }
+      return { method: 'GET', path: `${base}/stats?scope=loose` }
+
+    case 'diff':
+      return {
+        method: 'GET',
+        path: `${base}/diff?from=${q(params, 'from')}&to=${q(params, 'to')}`,
+      }
+
+    /* Object introspection. */
+    case 'loose_list':
+      return {
+        method: 'GET',
+        path: `${base}/objects?location=loose` +
+              `&offset=${q(params, 'offset', '0')}&limit=${q(params, 'limit', '500')}`,
+      }
+    case 'all_pack_entries':
+    case 'global_pack_index':
+      return {
+        method: 'GET',
+        path: `${base}/objects?location=pack` +
+              `&offset=${q(params, 'offset', '0')}&limit=${q(params, 'limit', '500')}`,
+      }
+    case 'object_locate':
+      return { method: 'GET', path: `${base}/objects/${q(params, 'hash')}` }
+    case 'object_refs':
+      return { method: 'GET', path: `${base}/objects/${q(params, 'hash')}/refs` }
+    case 'object_layout':
+      return { method: 'GET', path: `${base}/objects/${q(params, 'hash')}/layout` }
+    case 'object_content':
+      return { method: 'GET', path: `${base}/objects/${q(params, 'hash')}/content` }
+
+    /* Packs. `pack_index` used to name a sidecar file; it names a pack now,
+     * and its entries come from pack_objects. */
+    case 'packs':
+      return { method: 'GET', path: `${base}/packs` }
+    case 'pack_index':
+    case 'pack_entries':
+      return {
+        method: 'GET',
+        path: `${base}/packs/${q(params, 'name', q(params, 'pack_id', '0'))}/entries` +
+              `&offset=${q(params, 'offset', '0')}`.replace('&', '?'),
+      }
+
+    /* The fanout chart's replacement: a prefix histogram over object hashes,
+     * which is the same shape the .idx header used to store. */
+    case 'fanout':
+      return { method: 'GET', path: `${base}/fanout` }
 
     default:
       throw new UnsupportedActionError(action, 'no endpoint is mapped for it')

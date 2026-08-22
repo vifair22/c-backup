@@ -195,6 +195,41 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     if (strcmp(rest, "/policy") == 0)  return metadata_policy_get(req, repo_id);
     if (strcmp(rest, "/journal") == 0) return metadata_journal_get(req, repo_id);
 
+    /* Introspection: what is actually inside the repository. */
+    if (strcmp(rest, "/summary") == 0) return introspect_summary(req, repo_id);
+    if (strcmp(rest, "/stats") == 0)   return introspect_stats(req, repo_id);
+    if (strcmp(rest, "/diff") == 0)    return introspect_diff(req, repo_id);
+    if (strcmp(rest, "/fanout") == 0)  return introspect_fanout(req, repo_id);
+    if (strcmp(rest, "/objects") == 0) return introspect_objects(req, repo_id);
+    if (strcmp(rest, "/packs") == 0)   return introspect_packs(req, repo_id);
+
+    /* /objects/<hash>[/refs|/layout|/content] */
+    if (strncmp(rest, "/objects/", 9) == 0) {
+        const char *hex = rest + 9;
+        const char *slash = strchr(hex, '/');
+        if (!slash) return introspect_object_locate(req, repo_id, hex);
+
+        char hexbuf[80];
+        size_t hlen = (size_t)(slash - hex);
+        if (hlen >= sizeof(hexbuf)) return api_error(400, "malformed hash");
+        memcpy(hexbuf, hex, hlen);
+        hexbuf[hlen] = '\0';
+
+        if (strcmp(slash, "/refs") == 0)    return introspect_object_refs(req, repo_id, hexbuf);
+        if (strcmp(slash, "/layout") == 0)  return introspect_object_layout(req, repo_id, hexbuf);
+        if (strcmp(slash, "/content") == 0) return introspect_object_content(req, repo_id, hexbuf);
+        return api_error(404, "not found");
+    }
+
+    /* /packs/<id>/entries */
+    if (strncmp(rest, "/packs/", 7) == 0) {
+        char *end = NULL;
+        long long pid = strtoll(rest + 7, &end, 10);
+        if (pid >= 0 && end && strcmp(end, "/entries") == 0)
+            return introspect_pack_entries(req, repo_id, pid);
+        return api_error(404, "not found");
+    }
+
     int64_t sid = snap_suffix(rest, "/note");
     if (sid > 0) return metadata_note_get(req, repo_id, sid);
 

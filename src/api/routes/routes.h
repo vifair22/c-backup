@@ -85,3 +85,23 @@ int routes_register_metrics(api_server_t *srv, cutils_db_t *db);
 
 /* SSE progress stream for one job. */
 int routes_register_stream(api_server_t *srv, cutils_db_t *db);
+
+/* Introspection: objects, packs, statistics, diff. Repo-scoped sub-handlers
+ * dispatched from repos.c, like the snapshot and metadata ones. */
+void routes_introspect_init(cutils_db_t *db);
+api_response_t introspect_stats(const api_request_t *req, int64_t repo_id);
+api_response_t introspect_summary(const api_request_t *req, int64_t repo_id);
+api_response_t introspect_objects(const api_request_t *req, int64_t repo_id);
+api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_id,
+                                        const char *hex);
+api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
+                                      const char *hex);
+api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_id,
+                                        const char *hex);
+api_response_t introspect_object_content(const api_request_t *req, int64_t repo_id,
+                                         const char *hex);
+api_response_t introspect_packs(const api_request_t *req, int64_t repo_id);
+api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id,
+                                       int64_t pack_id);
+api_response_t introspect_fanout(const api_request_t *req, int64_t repo_id);
+api_response_t introspect_diff(const api_request_t *req, int64_t repo_id);

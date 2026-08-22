@@ -180,6 +180,40 @@ fi
 check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
 
+echo "introspection"
+contains "summary"      '"snapshots"'  "$(sock_body /repos/1/summary)"
+contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
+contains "loose stats"  '"per_type"'   "$(sock_body '/repos/1/stats?scope=loose')"
+contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
+contains "packs"        '{'            "$(sock_body /repos/1/packs)"
+contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
+
+# type 1 is a file. Tree objects are referenced by subtree_hash rather than
+# content_hash, so they have no refs and would be a misleading probe.
+OBJ=$(sock_body '/repos/1/objects?location=loose&limit=200' \
+      | tr '}' '\n' | grep '"type":"1"' | head -1 \
+      | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
+contains "object locate"  '"found":true' "$(sock_body "/repos/1/objects/$OBJ")"
+contains "object refs"    '"refs"'       "$(sock_body "/repos/1/objects/$OBJ/refs")"
+contains "object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$OBJ/layout")"
+contains "object content" '"base64"'     "$(sock_body "/repos/1/objects/$OBJ/content")"
+# A malformed hash must be rejected rather than reaching the store.
+check    "rejects bad hash" 400 "$(sock_code /repos/1/objects/nothexatall)"
+
+# Diff walks manifest trees: an unchanged subtree hash prunes the whole
+# subtree, so a second snapshot with one change reports exactly one change.
+echo "changed" > "$WORK/src/a.txt"
+curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \
+     http://localhost/repos/1/backup > /dev/null
+for _ in $(seq 1 60); do
+    case "$(sock_body /jobs/2)" in *'"state":"completed"'*|*'"state":"failed"'*) break ;; esac
+    sleep 0.2
+done
+DIFF=$(sock_body '/repos/1/diff?from=1&to=2')
+contains "diff reports the modification" '"change":"modified"' "$DIFF"
+contains "diff counts one change"        '"modified":"1"'      "$DIFF"
+contains "diff adds nothing"             '"added":"0"'         "$DIFF"
+
 echo "maintenance"
 check "gc" 202 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      http://localhost/repos/1/gc)"

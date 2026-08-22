@@ -91,6 +91,42 @@ The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered
 job endpoint.
 
+## Introspection
+
+What is actually inside a repository, as opposed to what it can do.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/repos/<id>/summary` | Dashboard aggregate in one request |
+| GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=loose` narrows |
+| GET | `/repos/<id>/objects` | Paginated; `?location=loose` or `?location=pack` |
+| GET | `/repos/<id>/objects/<hash>` | Where one object lives |
+| GET | `/repos/<id>/objects/<hash>/refs` | Which snapshots and nodes reference it |
+| GET | `/repos/<id>/objects/<hash>/layout` | Header fields and on-disk footprint |
+| GET | `/repos/<id>/objects/<hash>/content` | Base64, capped at 2 MiB |
+| GET | `/repos/<id>/packs` | Pack listing with entry counts |
+| GET | `/repos/<id>/packs/<pid>/entries` | Contents of one pack, paginated |
+| GET | `/repos/<id>/fanout` | Hash-prefix histogram |
+| GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
+
+`/objects` replaces three separate actions that each read a different part of
+the old `.idx` sidecar. Pack membership is a column now, so one query serves
+all of them.
+
+`/fanout` replaces the sidecar's 256-entry fanout table. That table existed
+because a sorted on-disk index needs somewhere to start a binary search; the
+same shape is a `GROUP BY` over hash prefixes, and it is a visualisation now
+rather than a lookup structure.
+
+`/content` is capped deliberately. It feeds a preview pane, and a viewer that
+tries to render a multi-gigabyte object helps nobody; restore is how you get a
+whole file.
+
+`/diff` walks manifest trees rather than comparing node lists. Two directories
+with the same hash have identical contents by construction, so an unchanged
+subtree is pruned in a single comparison instead of being read. That is the
+same property that makes incremental backups cheap, applied to reading.
+
 ## Metadata
 
 | Method | Path | Purpose |

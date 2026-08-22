@@ -95,12 +95,18 @@ contains "reindex" '"job_id"' "$(cb reindex 1)"
 contains "gfs"     '"job_id"' "$(cb gfs 1)"
 contains "journal" 'entries'  "$(cb journal 1)"
 
-contains "restore submits a job" '"job_id"' "$(cb restore 1 1 "$WORK/out")"
-for _ in $(seq 1 60); do
-    case "$(cb jobs)" in *'"state":"running"'*) sleep 0.2; continue ;; esac
-    break
+# Poll the restore's own job, not "is anything running". The maintenance jobs
+# above may still be queued ahead of it, and a global check breaks out while
+# the restore has not started.
+RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
+contains "restore submits a job" '"job_id"' "$RESTORE_OUT"
+RESTORE_JOB=$(printf '%s' "$RESTORE_OUT" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    case "$(cb jobs "$RESTORE_JOB")" in
+        *'"state":"completed"'*|*'"state":"failed"'*|*'"state":"cancelled"'*) break ;;
+    esac
+    sleep 0.2
 done
-sleep 1
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
