@@ -38,6 +38,10 @@ typedef struct {
     uint64_t dirs;
     uint64_t bytes_logical;
     uint64_t objects_new;
+    /* Files the cache vouched for, so never opened. On a healthy incremental
+     * this is nearly everything, and it is the number to watch if backups
+     * start taking as long as the first one did. */
+    uint64_t files_unchanged;
     uint64_t trees_new;
     uint64_t trees_reused;
 } backup_result_t;

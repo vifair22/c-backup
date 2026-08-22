@@ -3,6 +3,7 @@
 
 #include "backup.h"
 
+#include "file_cache.h"
 #include "manifest.h"
 #include "object.h"
 #include "scan.h"
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -47,6 +49,10 @@ typedef struct {
     uint32_t       count;
     backup_result_t *res;
     const backup_opts_t *opts;
+    /* Stamped into every cache row this run touches, so entries the scan did
+     * not see can be swept afterwards. */
+    int64_t        cache_stamp;
+    struct timespec last_report;
 } pipeline_t;
 
 static int cancelled(const pipeline_t *p)
@@ -54,10 +60,31 @@ static int cancelled(const pipeline_t *p)
     return p->opts->cancel && *p->opts->cancel;
 }
 
-static void report(const pipeline_t *p, const char *phase, uint64_t done, uint64_t total)
+/*
+ * Progress is throttled, not reported per entry.
+ *
+ * Every tick is a database write, and a write here costs tens of
+ * milliseconds; on a tree of a few thousand files that was more time than the
+ * work being reported on. Nobody can read updates faster than a few a second
+ * anyway. The first and last of a phase always go through so a phase never
+ * appears stuck at its starting count or stops short of its total.
+ */
+#define PROGRESS_MIN_INTERVAL_MS 250
+
+static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t total)
 {
-    if (p->opts->progress_cb)
-        p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
+    if (!p->opts->progress_cb) return;
+
+    if (done > 0 && done + 1 < total) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t ms = (int64_t)(now.tv_sec - p->last_report.tv_sec) * 1000
+                   + (int64_t)(now.tv_nsec - p->last_report.tv_nsec) / 1000000;
+        if (ms < PROGRESS_MIN_INTERVAL_MS) return;
+        p->last_report = now;
+    }
+
+    p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
 }
 
 /* The last path component; what the entry is called inside its parent. */
@@ -78,16 +105,73 @@ static uint32_t find_index(const pipeline_t *p, uint64_t node_id)
 /* Phase 1: content                                                    */
 /* ------------------------------------------------------------------ */
 
+static int scan_path_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 static status_t store_content(pipeline_t *p)
 {
+    /*
+     * Cache writes are batched. One transaction per file would put an fsync
+     * between every entry, and on a tree of any size that costs more than the
+     * hashing it exists to avoid.
+     */
+    int in_txn = 0;
+    uint32_t since_commit = 0;
+    #define CACHE_BATCH 2000
+
     for (uint32_t i = 0; i < p->count; i++) {
-        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        if (cancelled(p)) {
+            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+                log_warn("backup: cache commit failed on cancel");
+            return set_error(ERR_BUSY, "backup cancelled");
+        }
 
         scan_entry_t *e = &p->scan->entries[i];
         report(p, "store", i, p->count);
 
         if (e->node.type == NODE_TYPE_DIR) { p->res->dirs++; continue; }
         if (e->node.type != NODE_TYPE_REG) continue;
+
+        /*
+         * A transaction spans a batch of entries whether or not they write.
+         *
+         * Reads are far cheaper inside one: a standalone SELECT in WAL mode
+         * re-establishes a snapshot every time, measured at 30ms a lookup
+         * against 0.7ms batched. But it has to be committed periodically
+         * rather than held for the whole scan, because an open transaction
+         * blocks WAL checkpointing and the lookups then slow down as the WAL
+         * grows - 17ms a lookup by the end. Both extremes were measured; this
+         * is the middle.
+         */
+        if (!in_txn) {
+            if (db_exec_raw(p->db, "BEGIN") == 0) in_txn = 1;
+            else err_clear();
+            since_commit = 0;
+        }
+        if (++since_commit >= CACHE_BATCH) {
+            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+                log_warn("backup: cache commit failed");
+            in_txn = 0;
+        }
+
+        /*
+         * The file is only opened when the cache cannot vouch for it. This is
+         * the difference between an incremental costing a full read of the
+         * tree and costing a directory walk: content addressing has no way to
+         * know a file is unchanged without hashing it, so the metadata has to
+         * answer instead.
+         */
+        if (file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                              e->node.content_hash)) {
+            /* Nothing is written here on purpose. A hit has to be free, or
+             * the cache costs more than the reading it avoids. */
+            p->res->files++;
+            p->res->bytes_logical += e->node.size;
+            p->res->files_unchanged++;
+            continue;
+        }
 
         int fd = open(e->path, O_RDONLY);
         if (fd == -1) {
@@ -114,9 +198,20 @@ static status_t store_content(pipeline_t *p)
 
         st = store_index_put_loose(p->db, p->repo_id, e->node.content_hash,
                                    OBJECT_TYPE_FILE, phys, e->node.size);
-        if (st != OK) return st;
+        if (st != OK) {
+            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+                log_warn("backup: cache commit failed");
+            return st;
+        }
+
+        file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                       e->node.content_hash, p->cache_stamp);
     }
+
+    if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+        log_warn("backup: cache commit failed");
     return OK;
+    #undef CACHE_BATCH
 }
 
 /* ------------------------------------------------------------------ */
@@ -450,11 +545,16 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         links[i].scan_index = i;
     }
 
-    pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts };
+    pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
+                     (int64_t)time(NULL), { 0, 0 } };
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
+    struct timespec t0, t1, t2, t3;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     st = store_content(&p);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     if (st == OK) st = build_trees(&p, root_hash);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
 
     if (st != OK) {
         free(links);
@@ -475,6 +575,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     time_t now = time(NULL);
     st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
     if (st == OK) st = index_nodes(&p, snap_id);
+    clock_gettime(CLOCK_MONOTONIC, &t3);
 
     if (st == OK) {
         char snap[32], ts[32], files[32], bytes[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
@@ -493,17 +594,38 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             st = set_error(ERR_IO, "backup_run: cannot record snapshot");
     }
 
+    /* Paths the scan no longer sees keep their cache rows otherwise, and the
+     * cache would grow for every file that ever existed under this repo. */
+    if (st == OK) {
+        const char **seen = malloc(scan->count * sizeof(*seen));
+        if (seen) {
+            size_t n_seen = 0;
+            for (uint32_t i = 0; i < scan->count; i++)
+                if (scan->entries[i].node.type == NODE_TYPE_REG)
+                    seen[n_seen++] = scan->entries[i].path;
+            qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
+            file_cache_sweep(db, repo_id, seen, n_seen);
+            free(seen);
+        }
+    }
+
     res.snapshot_id = snap_id;
     free(links);
     scan_result_free(scan);
 
     if (st == OK && out) *out = res;
-    if (st == OK)
-        log_info("backup: snapshot %lld, %llu files, %llu new objects, "
-                 "%llu new trees, %llu reused",
+    if (st == OK) {
+        log_info("backup phases: scan+store %.1fs, trees %.1fs, index %.1fs",
+                 (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
+                 (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) / 1e9,
+                 (double)(t3.tv_sec - t2.tv_sec) + (double)(t3.tv_nsec - t2.tv_nsec) / 1e9);
+        log_info("backup: snapshot %lld, %llu files (%llu unchanged, not read), "
+                 "%llu new objects, %llu new trees, %llu reused",
                  (long long)snap_id, (unsigned long long)res.files,
+                 (unsigned long long)res.files_unchanged,
                  (unsigned long long)res.objects_new,
                  (unsigned long long)res.trees_new,
                  (unsigned long long)res.trees_reused);
+    }
     return st;
 }
