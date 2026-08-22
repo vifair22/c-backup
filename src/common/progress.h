@@ -23,6 +23,13 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+/* Operation progress callback. Lived in the deleted task.h; kept here in
+ * Phase 0 because pack.c takes one. Phase 4 replaces it with the job
+ * manager's progress plumbing, at which point the stderr renderer below
+ * goes too: it is a CLI concern and the daemon has no terminal. */
+typedef void (*task_progress_fn)(uint64_t current, uint64_t total,
+                                 const char *phase, void *ctx);
+
 typedef struct progress progress_t;
 
 /* Custom format callback.  If non-NULL, called instead of the default

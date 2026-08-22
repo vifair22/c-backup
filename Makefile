@@ -38,35 +38,43 @@ LDFLAGS        := -llz4 -lssl -lcrypto -lacl -lpthread
 ifeq ($(BUILD_TYPE),release)
   TYPE_CFLAGS  := $(RELEASE_CFLAGS)
   TYPE_LDFLAGS := -flto=auto $(LDFLAGS)
-  BIN_NAME     := backup
+  BIN_SUFFIX   :=
 else ifeq ($(BUILD_TYPE),static)
   TYPE_CFLAGS  := $(STATIC_CFLAGS)
   TYPE_LDFLAGS := -flto=auto -Wl,-Bstatic $(LDFLAGS) -Wl,-Bdynamic
-  BIN_NAME     := backup-static
+  BIN_SUFFIX   := -static
 else ifeq ($(BUILD_TYPE),debug)
   TYPE_CFLAGS  := $(DEBUG_CFLAGS)
   TYPE_LDFLAGS := $(LDFLAGS)
-  BIN_NAME     := backup-debug
+  BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
   TYPE_LDFLAGS := -static-libasan -Wl,-Bstatic -llz4 -lssl -lcrypto -lacl -Wl,-Bdynamic -lpthread
-  BIN_NAME     := backup-asan
+  BIN_SUFFIX   := -asan
 endif
 
-TARGET := $(BINS)/$(BIN_NAME)
+DAEMON_TARGET := $(BINS)/c-backupd$(BIN_SUFFIX)
+CLI_TARGET    := $(BINS)/c-backup$(BIN_SUFFIX)
+TARGETS       := $(DAEMON_TARGET) $(CLI_TARGET)
 
 # ---- Sources and objects ----------------------------------------------
 # Sources live under src/{cli,ops,store,api,common}.  Object files are
 # flattened into $(OBJ_DIR) by basename; VPATH lets the pattern rule find
 # the .c under any subdirectory.
-SRCS        := $(shell find $(SRC) -name '*.c')
-SRC_DIRS    := $(sort $(dir $(SRCS)))
+# Two entry points now: the daemon and the thin CLI client. Both are called
+# main.c, and objects are flattened by basename, so they get explicit rules
+# with distinct object names rather than going through the pattern rule.
+DAEMON_MAIN := $(SRC)/daemon/main.c
+CLI_MAIN    := $(SRC)/cli/main.c
+ALL_SRCS    := $(shell find $(SRC) -name '*.c')
+SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN), $(ALL_SRCS))
+SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
-OBJS        := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS)))
-VENDOR_OBJS := $(OBJ_DIR)/toml.o $(OBJ_DIR)/cJSON.o
-OBJS        += $(VENDOR_OBJS)
-MAIN_OBJ    := $(OBJ_DIR)/main.o
-LIB_OBJS    := $(filter-out $(MAIN_OBJ), $(OBJS))
+VENDOR_OBJS := $(OBJ_DIR)/cJSON.o
+LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) $(VENDOR_OBJS)
+DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
+CLI_OBJ     := $(OBJ_DIR)/cli_main.o
+OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
 
 # Vendor flags: match optimisation level but drop strict warnings
 ifeq ($(BUILD_TYPE),debug)
@@ -94,7 +102,7 @@ asan:
 
 # ---- Internal build target (called via recursive make) ----------------
 .PHONY: _build
-_build: $(TARGET)
+_build: $(TARGETS)
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
@@ -105,25 +113,35 @@ $(BINS):
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
 
-$(OBJ_DIR)/toml.o: vendor/toml.c | $(OBJ_DIR)
-	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 $(OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(OBJ_DIR)
 	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
 
+$(DAEMON_OBJ): $(DAEMON_MAIN) | $(OBJ_DIR)
+	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
+$(CLI_OBJ): $(CLI_MAIN) | $(OBJ_DIR)
+	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
+
 -include $(wildcard $(OBJ_DIR)/*.d)
 
-$(TARGET): $(OBJS) | $(BINS)
+$(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) | $(BINS)
+	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
+
+$(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
-REL_LIB_OBJS = $(filter-out $(REL_OBJ_DIR)/main.o, \
-                 $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                 $(REL_OBJ_DIR)/toml.o $(REL_OBJ_DIR)/cJSON.o)
+REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
+               $(REL_OBJ_DIR)/cJSON.o
 
 TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=znver3 -Wno-unused-result $(SRC_INCLUDES) -I vendor
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
 
+# tests/attic/ holds the suites that cover the surviving storage engine but do
+# not build until the code they exercise is reachable again. Each phase revives
+# its own: object/pack/parity/streaming in Phase 2, scan in Phase 4, gfs in
+# Phase 6. See daemonization-spec.md Phase 0. Anything directly in tests/ is
+# live, which right now is nothing.
 FAULT_SRCS  := $(wildcard $(TESTS)/test_*_fault.c)
 TEST_SRCS   := $(filter-out $(FAULT_SRCS), $(filter-out $(TESTS)/fault_inject.c, $(wildcard $(TESTS)/*.c)))
 TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(TEST_SRCS))
@@ -141,13 +159,16 @@ $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(REL_LIB_
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(TEST_LDFLAGS)
 
 test: all $(TEST_BINS) $(FAULT_BINS) analyze
-	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
+	@if [ -z "$(strip $(TEST_BINS)$(FAULT_BINS))" ]; then \
+	    echo "no active tests: suites are in tests/attic/ pending their phase"; \
+	else \
+	    for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done; \
+	fi
 
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
-ASAN_LIB_OBJS = $(filter-out $(ASAN_OBJ_DIR)/main.o, \
-                  $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                  $(ASAN_OBJ_DIR)/toml.o $(ASAN_OBJ_DIR)/cJSON.o)
+ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
+                $(ASAN_OBJ_DIR)/cJSON.o
 
 ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
@@ -193,7 +214,6 @@ analyze: | $(BUILD)
 	    --suppress=toomanyconfigs \
 	    --suppress=*:vendor/* \
 	    --suppress=oppositeInnerCondition:src/store/object.c \
-	    --suppress=intToPointerCast:src/ops/backup.c \
 	    -DVERSION_STRING=\"0.0.0\" \
 	    --inline-suppr \
 	    --quiet $(SRC_INCLUDES) -I vendor $(SRCS)

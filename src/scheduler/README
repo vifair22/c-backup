@@ -1,0 +1,2 @@
+Phase 7 fills this in: trigger.c, scheduler.c, overlap.c, error_loop.c.
+See daemonization-spec.md section 7.3.

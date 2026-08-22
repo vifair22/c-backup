@@ -225,7 +225,7 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 /* gfs_run                                                             */
 /* ------------------------------------------------------------------ */
 
-status_t gfs_run(repo_t *repo, const policy_t *policy,
+status_t gfs_run(repo_t *repo, const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  int full_scan, uint32_t *out_pruned) {
     if (new_snap_id == 0) return OK;

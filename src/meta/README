@@ -1,0 +1,2 @@
+Phase 3 fills this in: repo.c (.cbackup marker, UUIDs), lock.c (per-repo rwlocks).
+See daemonization-spec.md sections 5.1 and 7.1.

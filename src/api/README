@@ -1,0 +1,2 @@
+Phase 3 fills this in: server.c, auth.c, middleware.c, routes/.
+See daemonization-spec.md section 8.

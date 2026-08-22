@@ -3,7 +3,7 @@
 #include "error.h"
 #include "repo.h"
 #include "object.h"
-#include "task.h"
+#include "progress.h"
 #include <stdint.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
