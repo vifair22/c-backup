@@ -213,9 +213,23 @@ static int seconds_until_next(scheduler_t *sched, time_t now)
 {
     db_result_t *r = NULL;
     int wait = IDLE_SLEEP_SEC;
+    /*
+     * MIN() over no rows is SQL NULL, and this db layer returns an empty
+     * string for NULL rather than a NULL pointer. Testing the pointer
+     * therefore succeeded on an empty schedules table, strtoll("") gave 0,
+     * and the wait clamped to zero: with nothing scheduled at all the
+     * scheduler stopped sleeping and spun.
+     *
+     * That is not a idle-CPU problem so much as a correctness one. Every
+     * thread shares one database handle behind one mutex, so a thread
+     * querying in a tight loop starves the rest of the daemon: a backup on
+     * this machine spent 89 of its 104 seconds waiting to acquire that mutex
+     * rather than doing any work.
+     */
     if (db_execute(sched->db,
             "SELECT MIN(next_due_at) FROM schedules WHERE enabled = 1",
-            NULL, &r) == 0 && r && r->nrows == 1 && r->rows[0][0]) {
+            NULL, &r) == 0 && r && r->nrows == 1 &&
+        r->rows[0][0] && r->rows[0][0][0] != '\0') {
         time_t due = (time_t)strtoll(r->rows[0][0], NULL, 10);
         long delta = (long)(due - now);
         if (delta < 0) delta = 0;
@@ -234,12 +248,25 @@ static void *scheduler_main(void *arg)
         if (!s->running) { pthread_mutex_unlock(&s->mu); break; }
 
         int wait = seconds_until_next(s, time(NULL));
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
         if (wait > 0) {
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
             deadline.tv_sec += wait;
-            pthread_cond_timedwait(&s->cv, &s->mu, &deadline);
+        } else {
+            /*
+             * A due schedule normally advances its own next_due_at when it
+             * fires, so the next pass computes a positive wait. If it cannot
+             * - a schedule that fails to dispatch, a clock that moved - the
+             * loop would spin. A short floor costs a fraction of a second of
+             * firing latency and makes that impossible.
+             */
+            deadline.tv_nsec += 100 * 1000 * 1000;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_nsec -= 1000000000L;
+                deadline.tv_sec += 1;
+            }
         }
+        pthread_cond_timedwait(&s->cv, &s->mu, &deadline);
         int still_running = s->running;
         pthread_mutex_unlock(&s->mu);
         if (!still_running) break;

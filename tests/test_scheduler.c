@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 /*
@@ -325,6 +326,47 @@ static void test_one_bad_schedule_does_not_block_others(void **state)
     assert_string_equal(g_last_action, "gc");
 }
 
+/*
+ * With nothing scheduled the loop must actually sleep.
+ *
+ * MIN() over no rows is SQL NULL, and this db layer returns an empty string
+ * for NULL rather than a NULL pointer, so the guard meaning "nothing is
+ * scheduled" never fired: strtoll("") gave 0, the wait clamped to zero and
+ * the thread spun. Because every thread in the daemon shares one database
+ * handle behind one mutex, that did not merely waste a core, it starved
+ * everything else - a backup measured 89 of its 104 seconds waiting on that
+ * mutex rather than working.
+ *
+ * Asserting that something sleeps is awkward, so this asserts on the
+ * consequence: a spinning loop burns wall-clock worth of CPU, a sleeping one
+ * burns almost none.
+ */
+static double process_cpu_seconds(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static void test_idle_scheduler_does_not_spin(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM schedules", NULL, NULL), 0);
+
+    scheduler_t *s = NULL;
+    assert_int_equal(scheduler_open(db, record_dispatch, NULL, &s), OK);
+    assert_int_equal(scheduler_run(s), OK);
+
+    double cpu0 = process_cpu_seconds();
+    usleep(500000);
+    double cpu1 = process_cpu_seconds();
+    scheduler_stop(s);
+
+    /* A spin consumed essentially the whole half second. A tenth of it is
+     * generous for a thread that should be asleep throughout. */
+    assert_true(cpu1 - cpu0 < 0.05);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -341,6 +383,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_catchup_run_once_fires_now, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bad_trigger_disables_schedule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_bad_schedule_does_not_block_others, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_idle_scheduler_does_not_spin, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
