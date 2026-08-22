@@ -132,6 +132,7 @@ int main(int argc, char *argv[])
 
     routes_auth_set_config(cfg);
     routes_snapshots_init(db, jm);
+    routes_metadata_init(db);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||

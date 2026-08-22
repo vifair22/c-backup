@@ -2,9 +2,12 @@
 
 #include "job_manager.h"
 
+#include "routes.h"
+
 #include <cutils/log.h>
 
 #include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +18,7 @@ typedef struct {
     int64_t  job_id;
     int64_t  repo_id;
     char    *action;
+    time_t   started_at;
     job_fn   fn;
     void    *arg;
     void   (*arg_free)(void *);
@@ -105,21 +109,40 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
+        time_t began = time(NULL);
 
         progress_ctx_t pc = { jm, slot.job_id };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
 
+        /*
+         * Journalling happens here rather than in each route because this is
+         * the one place that knows how every job actually ended. A route only
+         * knows the job was accepted.
+         */
+        const char *outcome;
+        const char *detail = NULL;
         if (st == OK) {
+            outcome = "success";
             set_job_state(jm, slot.job_id, "completed", NULL);
         } else if (jm->queue[slot_index].cancel) {
+            outcome = "cancelled";
             set_job_state(jm, slot.job_id, "cancelled", NULL);
         } else {
-            set_job_state(jm, slot.job_id, "failed", err_msg());
+            outcome = "failed";
+            detail = err_msg();
+            set_job_state(jm, slot.job_id, "failed", detail);
             log_warn("job %lld (%s) failed: %s",
-                     (long long)slot.job_id, slot.action, err_msg());
-            err_clear();
+                     (long long)slot.job_id, slot.action, detail);
         }
+
+        if (slot.repo_id > 0) {
+            pthread_mutex_lock(&jm->db_mu);
+            journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
+                           (int64_t)(time(NULL) - began) * 1000, detail);
+            pthread_mutex_unlock(&jm->db_mu);
+        }
+        if (st != OK && outcome[0] == 'f') err_clear();
 
         if (slot.arg_free) slot.arg_free(slot.arg);
         free(slot.action);

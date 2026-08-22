@@ -133,6 +133,8 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
     return api_ok(body);
 }
 
+static api_response_t repo_scoped_delete(const api_request_t *req, void *ud);
+
 static api_response_t delete_repo(const api_request_t *req, void *userdata)
 {
     cutils_db_t *db = userdata;
@@ -170,13 +172,47 @@ static int64_t split_repo_url(const char *url, const char **rest)
     return id;
 }
 
+/* /repos/<id>/snapshots/<sid>/<suffix>: returns sid, or -1. */
+static int64_t snap_suffix(const char *rest, const char *suffix)
+{
+    if (strncmp(rest, "/snapshots/", 11) != 0) return -1;
+    const char *p = rest + 11;
+    char *end = NULL;
+    long long sid = strtoll(p, &end, 10);
+    if (sid <= 0 || !end || strcmp(end, suffix) != 0) return -1;
+    return sid;
+}
+
 static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
 {
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (*rest == '\0') return get_repo(req, ud);
+
+    if (strcmp(rest, "/tags") == 0)    return metadata_tags_get(req, repo_id);
+    if (strcmp(rest, "/policy") == 0)  return metadata_policy_get(req, repo_id);
+    if (strcmp(rest, "/journal") == 0) return metadata_journal_get(req, repo_id);
+
+    int64_t sid = snap_suffix(rest, "/note");
+    if (sid > 0) return metadata_note_get(req, repo_id, sid);
+
     return snapshots_route_get(req, repo_id, rest);
+}
+
+static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
+{
+    (void)ud;
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(req->url, &rest);
+    if (repo_id < 0) return api_error(400, "invalid repo id");
+
+    if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
+
+    int64_t sid = snap_suffix(rest, "/note");
+    if (sid > 0) return metadata_note_put(req, repo_id, sid);
+
+    return api_error(404, "not found");
 }
 
 static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
@@ -187,6 +223,8 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (strcmp(rest, "/backup") == 0)
         return backup_route_post(req, repo_id, rest);
+    if (strcmp(rest, "/tags") == 0)
+        return metadata_tags_post(req, repo_id);
     return snapshots_route_post(req, repo_id, rest);
 }
 
@@ -196,6 +234,30 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db)
     if (api_server_route(srv, "/repos",   API_POST,   create_repo,      db) != 0) return -1;
     if (api_server_route(srv, "/repos/*", API_GET,    repo_scoped_get,  db) != 0) return -1;
     if (api_server_route(srv, "/repos/*", API_POST,   repo_scoped_post, db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_DELETE, delete_repo,      db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_PUT,    repo_scoped_put,  db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_DELETE, repo_scoped_delete, db) != 0) return -1;
     return 0;
+}
+
+/* Deleting a repo and deleting a tag inside one share a prefix, so the
+ * suffix decides which is meant. */
+static api_response_t repo_scoped_delete(const api_request_t *req, void *ud)
+{
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(req->url, &rest);
+    if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (*rest == '\0') return delete_repo(req, ud);
+
+    if (strncmp(rest, "/tags/", 6) == 0)
+        return metadata_tags_delete(req, repo_id, rest + 6);
+
+    if (strncmp(rest, "/snapshots/", 11) == 0) {
+        const char *p = rest + 11;
+        char *end = NULL;
+        long long sid = strtoll(p, &end, 10);
+        if (sid > 0 && end && *end == '\0')
+            return snapshots_route_delete(req, repo_id, sid);
+    }
+
+    return api_error(404, "not found");
 }

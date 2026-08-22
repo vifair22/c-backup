@@ -12,8 +12,24 @@ typedef struct {
     int keep_monthly;
     int keep_yearly;
 } gfs_retention_t;
-#include "snapshot.h"
+#include <cutils/db.h>
 #include <stdint.h>
+
+/*
+ * Tier membership, stored as a bitfield in snapshots.gfs_flags.
+ *
+ * A bitfield rather than a single tier because a snapshot can hold several
+ * at once: the last Sunday of December is simultaneously that day's daily,
+ * that week's weekly, that month's monthly and that year's yearly. Collapsing
+ * it to one tier would lose the information that keeps it alive when the
+ * daily window rolls past.
+ *
+ * Lived in snapshot.h when tiers were written into .snap headers.
+ */
+#define GFS_DAILY    (1u << 0)
+#define GFS_WEEKLY   (1u << 1)
+#define GFS_MONTHLY  (1u << 2)
+#define GFS_YEARLY   (1u << 3)
 
 /*
  * GFS (Grandfather-Father-Son) retention engine.
@@ -48,7 +64,15 @@ typedef struct {
  * full_scan=1: clear all existing GFS flags and recompute from scratch
  *              across the full history.  Use for manual `backup gfs` runs.
  */
-status_t gfs_run(store_t *store, const gfs_retention_t *policy,
+/*
+ * Ported to the database in Phase 6. The calendar boundaries and the tier
+ * promotion algorithm are unchanged; only where the data comes from and
+ * where the results go have moved. Retention counters come from
+ * policy_values, tier flags are a column, and pruning is a transactional
+ * row delete rather than an unlink.
+ */
+status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
+                 const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  int full_scan, uint32_t *out_pruned);
 

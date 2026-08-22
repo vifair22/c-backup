@@ -204,7 +204,15 @@ $(BINS)/%: $(TESTS)/%.c $(REL_LIB_OBJS) | $(BINS)
 $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(TEST_CFLAGS) $(FAULT_WRAP) $^ -o $@ $(TEST_LDFLAGS)
 
-test: all $(TEST_BINS) $(FAULT_BINS) analyze
+# The shell suite drives a real daemon over HTTP. The unit tests cover the
+# code behind the routes; nothing else covers the routes themselves, the auth
+# middleware, or the job manager running work on a worker thread, because
+# those only exist once a process is listening.
+.PHONY: test-api
+test-api: all
+	@./$(TESTS)/test_api_e2e.sh $(BINS)/c-backupd
+
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api
 	@if [ -z "$(strip $(TEST_BINS)$(FAULT_BINS))" ]; then \
 	    echo "no active tests: suites are in tests/attic/ pending their phase"; \
 	else \
@@ -345,7 +353,7 @@ $(COV_DIR)/%: $(TESTS)/%.c $(COV_LIB) | $(COV_DIR)
 # it is the code that survives; the shim modules are excluded because they are
 # scheduled for deletion and testing them would be wasted work.
 # See daemonization-spec.md section 14.
-COV_STORE_MIN := 45
+COV_STORE_MIN := 47
 
 coverage: $(COV_TESTS)
 	@for t in $(COV_TESTS); do $$t >/dev/null 2>&1 || true; done

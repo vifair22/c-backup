@@ -5,6 +5,9 @@
 
 #include "job_manager.h"
 #include "lock.h"
+#include "gc.h"
+#include "gfs.h"
+#include "prune.h"
 #include "reindex.h"
 #include "restore.h"
 #include "store.h"
@@ -199,14 +202,23 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
 
 /* ---------- restore + reindex jobs ---------- */
 
+/* What kind of long-running work a submitted job represents. */
+typedef enum {
+    SNAP_JOB_RESTORE,
+    SNAP_JOB_REINDEX,
+    SNAP_JOB_GC,
+    SNAP_JOB_GFS,
+} snap_job_kind_t;
+
 typedef struct {
-    cutils_db_t *db;
-    int64_t      repo_id;
-    int64_t      snap_id;
-    char        *repo_path;
-    char        *dest;
-    int          overwrite;
-    int          is_reindex;
+    cutils_db_t    *db;
+    int64_t         repo_id;
+    int64_t         snap_id;
+    char           *repo_path;
+    char           *dest;
+    int             overwrite;
+    int             dry_run;
+    snap_job_kind_t kind;
 } snap_job_t;
 
 static void snap_job_free(void *p)
@@ -237,8 +249,46 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
 
-    if (j->is_reindex) {
+    if (j->kind == SNAP_JOB_REINDEX) {
         st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
+    } else if (j->kind == SNAP_JOB_GC) {
+        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
+    } else if (j->kind == SNAP_JOB_GFS) {
+        /* Retention comes from policy_values, falling back to the daemon
+         * defaults when a repo has not set its own. */
+        gfs_retention_t ret = { 0, 7, 4, 12, 3 };
+        char repo[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)j->repo_id);
+        db_result_t *r = NULL;
+        if (db_execute(j->db,
+                "SELECT key, value FROM policy_values WHERE repo_id = ?"
+                " AND key LIKE 'retention.%'",
+                (const char *[]){ repo, NULL }, &r) == 0 && r) {
+            for (int i = 0; i < r->nrows; i++) {
+                const char *k = r->rows[i][0];
+                int v = atoi(r->rows[i][1]);
+                if      (strcmp(k, "retention.keep_daily") == 0)   ret.keep_daily = v;
+                else if (strcmp(k, "retention.keep_weekly") == 0)  ret.keep_weekly = v;
+                else if (strcmp(k, "retention.keep_monthly") == 0) ret.keep_monthly = v;
+                else if (strcmp(k, "retention.keep_yearly") == 0)  ret.keep_yearly = v;
+                else if (strcmp(k, "retention.keep_snaps") == 0)   ret.keep_snaps = v;
+            }
+        }
+        db_result_free(r);
+
+        uint32_t head = 0;
+        r = NULL;
+        if (db_execute(j->db, "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
+                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+            head = (uint32_t)strtoul(r->rows[0][0], NULL, 10);
+        db_result_free(r);
+
+        /* Manual runs are full scans: an operator asking for GFS explicitly
+         * wants the whole history reconsidered, not the incremental pass the
+         * backup pipeline does. */
+        st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
+                            j->dry_run, 1, 1, NULL)
+                  : OK;
     } else {
         restore_opts_t o;
         memset(&o, 0, sizeof(o));
@@ -257,7 +307,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
 static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                                       const api_request_t *req,
-                                      int is_reindex)
+                                      snap_job_kind_t kind)
 {
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
@@ -268,9 +318,14 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     j->repo_id = repo_id;
     j->snap_id = snap_id;
     j->repo_path = repo_path;
-    j->is_reindex = is_reindex;
+    j->kind = kind;
 
-    if (!is_reindex) {
+    {
+        const char *dry = api_query_param(req, "dry_run");
+        j->dry_run = dry && (strcmp(dry, "1") == 0 || strcmp(dry, "true") == 0);
+    }
+
+    if (kind == SNAP_JOB_RESTORE) {
         if (!req->body || req->body_len == 0) {
             snap_job_free(j);
             return api_error(400, "dest is required");
@@ -289,7 +344,11 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     }
 
     int64_t job_id = 0;
-    status_t st = job_submit(g_ctx.jm, repo_id, is_reindex ? "reindex" : "restore",
+    const char *action = kind == SNAP_JOB_REINDEX ? "reindex"
+                       : kind == SNAP_JOB_GC      ? "gc"
+                       : kind == SNAP_JOB_GFS     ? "gfs"
+                                                  : "restore";
+    status_t st = job_submit(g_ctx.jm, repo_id, action,
                              NULL, snap_job_run, j, snap_job_free, &job_id);
     if (st != OK) return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
 
@@ -321,15 +380,16 @@ api_response_t snapshots_route_get(const api_request_t *req, int64_t repo_id,
 api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
                                     const char *rest)
 {
-    if (strcmp(rest, "/reindex") == 0)
-        return submit_snap_job(repo_id, 0, req, 1);
+    if (strcmp(rest, "/reindex") == 0) return submit_snap_job(repo_id, 0, req, SNAP_JOB_REINDEX);
+    if (strcmp(rest, "/gc") == 0)      return submit_snap_job(repo_id, 0, req, SNAP_JOB_GC);
+    if (strcmp(rest, "/gfs") == 0)     return submit_snap_job(repo_id, 0, req, SNAP_JOB_GFS);
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;
         char *end = NULL;
         long long sid = strtoll(p, &end, 10);
         if (sid > 0 && end && strcmp(end, "/restore") == 0)
-            return submit_snap_job(repo_id, sid, req, 0);
+            return submit_snap_job(repo_id, sid, req, SNAP_JOB_RESTORE);
     }
     return api_error(404, "not found");
 }
@@ -337,6 +397,34 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
 /* No routes of its own: repos.c owns the repo-scoped pattern for every method and calls in
  * here. The router matches the first registered pattern, so three modules
  * each claiming it would silently leave two of them unreachable. */
+/*
+ * Pruning runs inline rather than as a job: it is a handful of row deletes
+ * and one unlink, so queueing it would cost more than doing it. The bytes
+ * are reclaimed later by GC, which is the part that takes time.
+ */
+api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
+                                      int64_t snap_id)
+{
+    (void)req;
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return api_error(404, "no such repo");
+
+    status_t st = repo_trylock_write(repo_id);
+    if (st != OK) { free(repo_path); return api_error(503, "repo is busy"); }
+
+    store_t *store = NULL;
+    st = store_open(repo_path, NULL, &store);
+    free(repo_path);
+    if (st != OK) { repo_unlock(repo_id); return api_error(500, err_msg()); }
+
+    st = prune_snapshot(store, g_ctx.db, repo_id, snap_id);
+    store_close(store);
+    repo_unlock(repo_id);
+
+    if (st != OK) return api_error(500, err_msg());
+    return api_no_content();
+}
+
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
 {
     g_ctx.db = db;

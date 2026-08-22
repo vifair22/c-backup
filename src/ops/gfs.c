@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gfs.h"
-#include "tag.h"
+#include "prune.h"
+
+#include <cutils/log.h>
 #include "../vendor/log.h"
 
 #include <limits.h>
@@ -164,26 +166,42 @@ void gfs_flags_str(uint32_t flags, char *buf, size_t sz) {
 /* load_snap_infos                                                     */
 /* ------------------------------------------------------------------ */
 
-static status_t load_snap_infos(store_t *store, uint32_t head_id,
+/*
+ * One query where there used to be a .snap header read per snapshot plus a
+ * per-snapshot tag lookup. The preserved flag comes from a join rather than
+ * a directory scan.
+ */
+static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, uint32_t head_id,
                                 gfs_snap_info_t **out, uint32_t *out_n) {
-    gfs_snap_info_t *arr = malloc(head_id * sizeof(gfs_snap_info_t));
-    if (!arr) return set_error(ERR_NOMEM, "load_snap_infos: alloc failed for %u entries", head_id);
+    (void)head_id;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT s.id, s.ts, s.gfs_flags,"
+            "       EXISTS(SELECT 1 FROM tags t"
+            "               WHERE t.repo_id = s.repo_id AND t.snap_id = s.id)"
+            "  FROM snapshots s WHERE s.repo_id = ? ORDER BY s.id ASC",
+            (const char *[]){ repo, NULL }, &r) != 0 || !r)
+        return set_error(ERR_IO, "load_snap_infos: cannot read snapshots");
+
+    gfs_snap_info_t *arr = calloc((size_t)(r->nrows ? r->nrows : 1), sizeof(*arr));
+    if (!arr) { db_result_free(r); return set_error(ERR_NOMEM, "load_snap_infos: alloc"); }
+
     uint32_t n = 0;
-
-    for (uint32_t id = 1; id <= head_id; id++) {
-        snapshot_t *s = NULL;
-        if (snapshot_load_header_only(store, id, &s) != OK) continue;
-        arr[n].id        = id;
-        arr[n].ts        = s->created_sec;
-        arr[n].gfs_flags = s->gfs_flags;
-        arr[n].preserved = 0;
-        snapshot_free(s);
-
-        char tname[256] = {0};
-        if (tag_snap_is_preserved(store, id, tname, sizeof(tname)))
-            arr[n].preserved = 1;
+    for (int i = 0; i < r->nrows; i++) {
+        arr[n].id        = (uint32_t)strtoul(r->rows[i][0], NULL, 10);
+        arr[n].ts        = strtoull(r->rows[i][1], NULL, 10);
+        arr[n].gfs_flags = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
+        /* Any tag protects a snapshot from pruning. Tags are how a user says
+         * "keep this one", and silently deleting a tagged snapshot because a
+         * retention window rolled past it would be the worst kind of
+         * surprise. */
+        arr[n].preserved = atoi(r->rows[i][3]) ? 1 : 0;
         n++;
     }
+    db_result_free(r);
     *out   = arr;
     *out_n = n;
     return OK;
@@ -225,14 +243,15 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 /* gfs_run                                                             */
 /* ------------------------------------------------------------------ */
 
-status_t gfs_run(store_t *store, const gfs_retention_t *policy,
+status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
+                 const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
                  int full_scan, uint32_t *out_pruned) {
     if (new_snap_id == 0) return OK;
 
     gfs_snap_info_t *snaps = NULL;
     uint32_t n = 0;
-    status_t st = load_snap_infos(store, new_snap_id, &snaps, &n);
+    status_t st = load_snap_infos(db, repo_id, new_snap_id, &snaps, &n);
     if (st != OK) return st;
 
     /* Save original flags so we can detect what changed at flush time. */
@@ -330,15 +349,19 @@ status_t gfs_run(store_t *store, const gfs_retention_t *policy,
     if (!dry_run) {
         for (uint32_t i = 0; i < n; i++) {
             if (snaps[i].gfs_flags == orig_flags[i]) continue;
-            st = snapshot_replace_gfs_flags(store, snaps[i].id, snaps[i].gfs_flags);
-            if (st != OK) {
-                log_msg("WARN", "gfs: could not update GFS flags on snap");
-                st = OK;
+            char repo[32], sid[32], flags[16];
+            snprintf(repo,  sizeof(repo),  "%lld", (long long)repo_id);
+            snprintf(sid,   sizeof(sid),   "%u", snaps[i].id);
+            snprintf(flags, sizeof(flags), "%u", snaps[i].gfs_flags);
+            if (db_execute_non_query(db,
+                    "UPDATE snapshots SET gfs_flags = ?"
+                    " WHERE repo_id = ? AND id = ?",
+                    (const char *[]){ flags, repo, sid, NULL }, NULL) != 0) {
+                log_warn("gfs: cannot update tier flags on snapshot %u", snaps[i].id);
             } else if (!quiet) {
                 char tbuf[64];
                 gfs_flags_str(snaps[i].gfs_flags, tbuf, sizeof(tbuf));
-                fprintf(stderr, "gfs: snap %08u flagged [%s]\n",
-                        snaps[i].id, tbuf);
+                log_info("gfs: snapshot %u flagged [%s]", snaps[i].id, tbuf);
             }
         }
     }
@@ -379,23 +402,22 @@ status_t gfs_run(store_t *store, const gfs_retention_t *policy,
         if (snaps[i].preserved)                           continue;
 
         if (dry_run) {
-            fprintf(stderr, "  would remove snap %08u\n", id);
+            log_info("gfs: would remove snapshot %u", id);
+            pruned_snaps++;
+        } else if (prune_snapshot(store, db, repo_id, (int64_t)id) == OK) {
+            pruned_snaps++;
         } else {
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/snapshots/%08u.snap",
-                     store_root(store), id);
-            if (unlink(path) == 0) pruned_snaps++;
+            log_warn("gfs: cannot prune snapshot %u: %s", id, err_msg());
+            err_clear();
         }
-        if (dry_run) pruned_snaps++;
     }
 
     if (!quiet || dry_run) {
         if (dry_run)
-            fprintf(stderr,
-                    "gfs (dry-run): would remove %u snap(s); snap window=%u\n",
-                    pruned_snaps, snap_window);
+            log_info("gfs (dry run): would remove %u snapshot(s); window=%u",
+                     pruned_snaps, snap_window);
         else
-            fprintf(stderr, "gfs: removed %u snap(s)\n", pruned_snaps);
+            log_info("gfs: removed %u snapshot(s)", pruned_snaps);
     }
 
     free(tier_expired);
