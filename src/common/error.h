@@ -12,7 +12,10 @@ typedef enum {
     ERR_NOMEM,
     ERR_INVALID,
     ERR_NOT_FOUND,
-    ERR_TOO_LARGE
+    ERR_TOO_LARGE,
+    /* Contended: another job holds the repo write lock. Distinct from ERR_IO
+     * so callers can retry or report "busy" rather than treat it as failure. */
+    ERR_BUSY
 } status_t;
 
 /* ------------------------------------------------------------------ */

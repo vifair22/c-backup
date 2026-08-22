@@ -39,7 +39,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wformat=2 -Wformat-truncation -Wmissing-prototypes \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
-SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common \
+SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/common \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include
 COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
@@ -51,7 +51,7 @@ DEBUG_CFLAGS   := $(COMMON_CFLAGS) -Og -g -march=znver3 -mtune=znver3
 ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g -fsanitize=address -fno-omit-frame-pointer -march=znver3 -mtune=znver3
 
 CUTILS_LIB     := -L$(CUTILS_DIR)/build -lc-utils
-LDFLAGS        := $(CUTILS_LIB) -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
 
 # Per-type CFLAGS/LDFLAGS selection
 ifeq ($(BUILD_TYPE),release)

@@ -74,57 +74,7 @@ static status_t mkdir_at(int base, const char *name) {
     return OK;
 }
 
-static status_t write_format(int repofd) {
-    int fd = openat(repofd, "format", O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd == -1) {
-        if (errno == EEXIST) return OK;   /* already initialised */
-        return set_error_errno(ERR_IO, "cannot create format file");
-    }
-    if (write(fd, FORMAT_VERSION, strlen(FORMAT_VERSION)) < 0) {
-        int e = errno;
-        close(fd);
-        errno = e;
-        return set_error_errno(ERR_IO, "cannot write format file");
-    }
-    if (fsync(fd) == -1) {
-        int e = errno;
-        close(fd);
-        errno = e;
-        return set_error_errno(ERR_IO, "fsync format file");
-    }
-    close(fd);
-    return OK;
-}
 
-static status_t write_head(int repofd) {
-    /* refs/ subdir */
-    if (mkdirat(repofd, "refs", 0755) == -1 && errno != EEXIST)
-        return set_error_errno(ERR_IO, "mkdirat 'refs'");
-
-    /* open refs/HEAD – create only if missing */
-    int refsfd = openat(repofd, "refs", O_RDONLY | O_DIRECTORY);
-    if (refsfd == -1)
-        return set_error_errno(ERR_IO, "openat 'refs'");
-    int fd = openat(refsfd, "HEAD", O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd == -1) {
-        if (errno == EEXIST) { close(refsfd); return OK; }
-        int e = errno;
-        close(refsfd);
-        errno = e;
-        return set_error_errno(ERR_IO, "openat 'refs/HEAD'");
-    }
-    const char *empty = "0\n";
-    if (write(fd, empty, strlen(empty)) < 0) {
-        int e = errno;
-        close(fd); close(refsfd);
-        errno = e;
-        return set_error_errno(ERR_IO, "write 'refs/HEAD'");
-    }
-    fsync(fd);
-    close(fd);
-    close(refsfd);
-    return OK;
-}
 
 static int dir_is_empty(const char *path) {
     DIR *d = opendir(path);
@@ -164,13 +114,17 @@ status_t store_init_dirs(const char *path) {
         return set_error_errno(ERR_IO, "cannot open '%s'", path);
 
     status_t st = OK;
-    if ((st = write_format(repofd))         != OK) goto done;
+    /* Section 5's contract, plus tmp/. Everything the engine writes goes
+     * through mkstemp there and is renamed into place, so the staging
+     * directory has to be on the same filesystem as its destination.
+     *
+     * Gone with the one-shot CLI: format and HEAD (identity now lives in
+     * .cbackup, written by the daemon), refs/ (the snapshot pointer is a
+     * repos row), and logs/ (the journal is a table). */
     if ((st = mkdir_at(repofd, "objects"))   != OK) goto done;
     if ((st = mkdir_at(repofd, "packs"))     != OK) goto done;
     if ((st = mkdir_at(repofd, "snapshots")) != OK) goto done;
-    if ((st = mkdir_at(repofd, "logs"))      != OK) goto done;
     if ((st = mkdir_at(repofd, "tmp"))       != OK) goto done;
-    if ((st = write_head(repofd))            != OK) goto done;
 
     log_msg("INFO", "repository initialised");
 
@@ -184,24 +138,12 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     if (fd == -1)
         return set_error_errno(ERR_IO, "cannot open repository '%s'", path);
 
-    /* validate format file */
-    int fmt = openat(fd, "format", O_RDONLY);
-    if (fmt == -1) {
-        close(fd);
-        return set_error(ERR_CORRUPT, "not a valid repository (missing format file): %s", path);
-    }
-    char buf[32] = {0};
-    if (read(fmt, buf, sizeof(buf) - 1) < 0) {
-        int e = errno;
-        close(fmt); close(fd);
-        errno = e;
-        return set_error_errno(ERR_IO, "cannot read format file in '%s'", path);
-    }
-    close(fmt);
-    if (strncmp(buf, FORMAT_VERSION, strlen(FORMAT_VERSION) - 1) != 0) {
-        close(fd);
-        return set_error(ERR_CORRUPT, "unsupported repository format in '%s'", path);
-    }
+    /* No format-file check here any more. Deciding whether a directory is a
+     * c-backup repository is the daemon's job via the .cbackup marker
+     * (src/meta/repo.c); the engine is handed a path it has already been
+     * told is a data directory and does not second-guess it. Keeping a
+     * second identity file in the engine would mean two sources of truth
+     * that can disagree. */
 
     store_t *r = malloc(sizeof(*r));
     if (!r) { close(fd); return set_error(ERR_NOMEM, "store_open: alloc failed"); }

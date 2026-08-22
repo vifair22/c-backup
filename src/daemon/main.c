@@ -23,6 +23,10 @@
 #include <cutils/version.h>
 
 #include "app_config.h"
+#include "auth.h"
+#include "lock.h"
+#include "routes.h"
+#include "server.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -89,7 +93,57 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    log_info("listening: not yet (Phase 3); scheduler: not yet (Phase 7)");
+    if (repo_locks_init() != OK) {
+        log_error("cannot initialise repo locks");
+        appguard_shutdown(guard);
+        return 1;
+    }
+
+    if (auth_init(db) != 0) {
+        log_error("cannot initialise auth");
+        appguard_shutdown(guard);
+        return 1;
+    }
+    if (!auth_is_setup(db))
+        log_warn("no admin password set: TCP requests are unauthenticated "
+                 "until POST /api/auth/setup");
+
+    const char *socket_path = config_get_str(cfg, "http.socket");
+    int tcp_port = config_get_int(cfg, "http.port", 8765);
+
+    /* static_dir is NULL: the daemon serves an API, not a web UI. The
+     * lifted server retains its static-file path so it stays diffable
+     * against airies-ups, but nothing reaches it here. */
+    api_server_t *srv = api_server_create(tcp_port, socket_path, NULL);
+    if (!srv) {
+        log_error("cannot create API server");
+        appguard_shutdown(guard);
+        return 1;
+    }
+
+    routes_auth_set_config(cfg);
+    if (routes_register_health(srv, db) != 0 ||
+        routes_register_auth(srv, db) != 0 ||
+        routes_register_repos(srv, db) != 0) {
+        log_error("cannot register routes");
+        api_server_stop(srv);
+        appguard_shutdown(guard);
+        return 1;
+    }
+
+    /* The unix socket bypasses this entirely; see auth_check. Filesystem
+     * permissions on the socket are the access control there. */
+    api_server_set_auth(srv, auth_check, db);
+
+    if (api_server_start(srv) != 0) {
+        log_error("cannot start API server");
+        api_server_stop(srv);
+        appguard_shutdown(guard);
+        return 1;
+    }
+
+    log_info("listening on %s and port %d", socket_path ? socket_path : "(no socket)", tcp_port);
+    log_info("scheduler: not yet (Phase 7)");
     log_info("c-backupd ready");
 
     while (running) {
@@ -98,6 +152,8 @@ int main(int argc, char *argv[])
     }
 
     log_info("shutting down");
+    api_server_stop(srv);
+    repo_locks_shutdown();
     appguard_shutdown(guard);
     return 0;
 }
