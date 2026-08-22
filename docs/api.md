@@ -80,9 +80,11 @@ pulling a single file back does not cost a full restore. It accepts the path
 either as it appears in the browser or without its leading slash, and matches
 on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
 
-Packing is what keeps a long-lived repository from holding one file per
-object. It is also available as a schedule action, which is how it is meant to
-run: alongside `gc`, `gfs` and `reindex`.
+Packing runs automatically at the end of every backup, because compression
+only happens at pack time: a backup that stopped at the snapshot would have
+written more bytes than it read and left one file per object behind. Set the
+policy key `maintenance.auto_pack` to `false` to turn it off, and use this
+endpoint or a schedule to pack on your own terms instead.
 
 ## Jobs
 

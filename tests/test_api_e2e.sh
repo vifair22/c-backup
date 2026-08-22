@@ -39,6 +39,18 @@ contains() {  # contains <name> <needle> <haystack>
     esac
 }
 
+# A job that never reported progress used to serialise as "current":, which
+# is not JSON. gc, gfs and reindex all hit it, so every client broke on
+# exactly the maintenance jobs. No parser here, so the check is for an empty
+# value after any key, which is what the bug produced.
+well_formed() {  # well_formed <name> <body>
+    case "$2" in
+        *'":,'*|*'":}'*|*'":]'*) bad "$1" "no empty JSON values" "$2" ;;
+        '') bad "$1" "a response body" "(empty)" ;;
+        *) ok "$1" ;;
+    esac
+}
+
 sock_code() { curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" "http://localhost$1"; }
 sock_body() { curl -s --unix-socket "$SOCK" "http://localhost$1"; }
 tcp_code()  { curl -s -o /dev/null -w '%{http_code}' "$@" "http://127.0.0.1:$PORT$1" 2>/dev/null; }
@@ -194,14 +206,18 @@ check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE 
 echo "introspection"
 contains "summary"      '"snapshots"'  "$(sock_body /repos/1/summary)"
 contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
-contains "loose stats"  '"per_type"'   "$(sock_body '/repos/1/stats?scope=loose')"
+# Backups pack on completion, so the loose scope is legitimately empty here.
+# What matters is that the scoped query answers rather than errors.
+well_formed "loose stats scope answers" "$(sock_body '/repos/1/stats?scope=loose')"
 contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
 contains "packs"        '{'            "$(sock_body /repos/1/packs)"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than
-# content_hash, so they have no refs and would be a misleading probe.
-OBJ=$(sock_body '/repos/1/objects?location=loose&limit=200' \
+# content_hash, so they have no refs and would be a misleading probe. No
+# location filter: a backup packs on completion, so which side of the loose
+# and packed split an object lands on is not this test's business.
+OBJ=$(sock_body '/repos/1/objects?limit=200' \
       | tr '}' '\n' | grep '"type":"1"' | head -1 \
       | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "object locate"  '"found":true' "$(sock_body "/repos/1/objects/$OBJ")"
@@ -223,17 +239,6 @@ contains "diff reports the modification" '"change":"modified"' "$DIFF"
 contains "diff counts one change"        '"modified":"1"'      "$DIFF"
 contains "diff adds nothing"             '"added":"0"'         "$DIFF"
 
-# A job that never reported progress used to serialise as "current":, which
-# is not JSON. gc, gfs and reindex all hit it, so every client broke on
-# exactly the maintenance jobs. No parser here, so the check is for an empty
-# value after any key, which is what the bug produced.
-well_formed() {  # well_formed <name> <body>
-    case "$2" in
-        *'":,'*|*'":}'*|*'":]'*) bad "$1" "no empty JSON values" "$2" ;;
-        '') bad "$1" "a response body" "(empty)" ;;
-        *) ok "$1" ;;
-    esac
-}
 
 echo "packing"
 PACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/pack)")

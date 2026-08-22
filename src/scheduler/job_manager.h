@@ -31,9 +31,15 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
 void     job_manager_stop(job_manager_t *jm);
 
 /*
- * Queue a job. repo_id may be 0 for daemon-wide work. `arg` is owned by the
- * job manager from this point and released with `arg_free` once the job ends,
- * however it ends.
+ * Queue a job.
+ *
+ * repo_id must reference a registered repository: jobs.repo_id carries a
+ * foreign key, so a daemon-wide value of 0 is rejected at insert. Jobs for
+ * one repository are dispatched one at a time, because each takes the repo
+ * write lock and that lock rejects rather than queues.
+ *
+ * `arg` is owned by the job manager from this point and released with
+ * `arg_free` once the job ends, however it ends.
  */
 status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     const char *params_json, job_fn fn, void *arg,

@@ -3,6 +3,8 @@
 
 #include "routes.h"
 
+#include <strings.h>
+
 #include <cutils/json.h>
 #include <cutils/log.h>
 
@@ -166,6 +168,36 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
 }
 
 /* ---------- policy ---------- */
+
+int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def)
+{
+    if (!db || !key) return def;
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT value FROM policy_values WHERE repo_id = ? AND key = ?",
+                   (const char *[]){ repo, key, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return def;
+    }
+
+    const char *v = r->rows[0][0];
+    /* Accept what a human would plausibly type rather than one blessed
+     * spelling; anything unrecognised falls back to the default rather than
+     * silently reading as false. */
+    int out = def;
+    if (v) {
+        if (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+            strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0)
+            out = 1;
+        else if (strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
+                 strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0)
+            out = 0;
+    }
+    db_result_free(r);
+    return out;
+}
 
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
 {

@@ -114,6 +114,9 @@ for _ in $(seq 1 600); do
     sleep 0.2
 done
 check "restore job reached a terminal state" 1 "$RESTORE_DONE"
+# Completed, not merely terminal. Accepting "failed" here is what let a
+# restore rejected with "repo is busy" masquerade as a tree difference.
+contains "restore job completed" '"state":"completed"' "$(cb jobs "$RESTORE_JOB")"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else

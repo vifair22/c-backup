@@ -230,6 +230,12 @@ test-api: all
 test-cli: all
 	@./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
+# The two shell suites each start a daemon and poll jobs on a wall-clock
+# budget, so running them concurrently under -j makes them race each other for
+# CPU and disk and fail on timing rather than on behaviour. Ordering test-cli
+# behind test-api is enough to keep them apart.
+test-cli: test-api
+
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli
 	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
 

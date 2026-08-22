@@ -45,6 +45,25 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
 
 /* Submit a maintenance job by action name, so the scheduler starts exactly
  * the work the routes do. */
+/*
+ * Run the pack phase against an already-open store.
+ *
+ * Shared so the backup job can finish by packing without duplicating the
+ * progress adaptation: pack.c predates the job manager and takes its progress
+ * callback with the counters first.
+ */
+struct store;
+status_t routes_run_pack(struct store *store, int64_t repo_id,
+                         volatile int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx);
+
+/*
+ * Read a boolean policy flag, falling back to def when the repo has not set
+ * one. Policy lives in policy_values as text.
+ */
+int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def);
+
 status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
                                  const char *action, int64_t *out_job_id);
 

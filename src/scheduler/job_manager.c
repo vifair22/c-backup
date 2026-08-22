@@ -36,6 +36,16 @@ struct job_manager {
     job_slot_t      queue[JOB_QUEUE_MAX];
     int             head, tail, count;
     int             stopping;
+    /*
+     * Repositories with a job on a worker right now.
+     *
+     * Every repo-scoped job takes the repo write lock, and that lock rejects
+     * rather than queues, so dispatching two jobs for one repo made the
+     * second fail instantly with "repo is busy". The queue was generating the
+     * contention the lock exists to catch. One entry per worker is enough:
+     * a repo can only be busy because some worker is holding it.
+     */
+    int64_t        *running_repo;
     /* Guards DB writes from worker threads. c-utils serialises internally,
      * but progress updates are frequent enough that batching them behind one
      * lock keeps them from interleaving mid-transaction with a job's own
@@ -90,23 +100,73 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
     pthread_mutex_unlock(&pc->jm->db_mu);
 }
 
+/* Caller holds jm->mu. repo_id 0 means "not repo scoped", never busy. */
+static int repo_is_running(const job_manager_t *jm, int64_t repo_id)
+{
+    if (repo_id <= 0) return 0;
+    for (int i = 0; i < jm->nworkers; i++)
+        if (jm->running_repo[i] == repo_id) return 1;
+    return 0;
+}
+
+/*
+ * Take the oldest queued job whose repository is not already busy.
+ *
+ * Scanning past a blocked job rather than waiting on it keeps one slow
+ * repository from stalling every other one, which a strict head-of-queue
+ * policy would do. Returns the ring index, or -1 if nothing is runnable
+ * right now. Caller holds jm->mu.
+ */
+static int take_runnable(job_manager_t *jm, job_slot_t *out)
+{
+    for (int k = 0; k < jm->count; k++) {
+        int i = (jm->head + k) % JOB_QUEUE_MAX;
+        if (repo_is_running(jm, jm->queue[i].repo_id)) continue;
+
+        *out = jm->queue[i];
+        /* Close the gap so the ring stays contiguous from head. */
+        for (int m = k; m > 0; m--) {
+            int dst = (jm->head + m) % JOB_QUEUE_MAX;
+            int src = (jm->head + m - 1) % JOB_QUEUE_MAX;
+            jm->queue[dst] = jm->queue[src];
+        }
+        int slot_index = jm->head;
+        jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
+        jm->count--;
+        jm->queue[slot_index] = *out;
+        jm->queue[slot_index].active = 1;
+        return slot_index;
+    }
+    return -1;
+}
+
 static void *worker_main(void *arg)
 {
     job_manager_t *jm = arg;
 
+    int me = 0;
+    pthread_mutex_lock(&jm->mu);
+    for (int i = 0; i < jm->nworkers; i++) {
+        if (jm->running_repo[i] == -1) { me = i; jm->running_repo[i] = 0; break; }
+    }
+    pthread_mutex_unlock(&jm->mu);
+
     for (;;) {
         pthread_mutex_lock(&jm->mu);
-        while (jm->count == 0 && !jm->stopping)
+        job_slot_t slot;
+        int slot_index = -1;
+        for (;;) {
+            if (jm->stopping && jm->count == 0) {
+                pthread_mutex_unlock(&jm->mu);
+                return NULL;
+            }
+            slot_index = take_runnable(jm, &slot);
+            if (slot_index >= 0) break;
+            /* Either nothing queued, or everything queued belongs to a repo
+             * another worker is busy with. Both resolve on the next signal. */
             pthread_cond_wait(&jm->cv, &jm->mu);
-        if (jm->stopping && jm->count == 0) {
-            pthread_mutex_unlock(&jm->mu);
-            return NULL;
         }
-        job_slot_t slot = jm->queue[jm->head];
-        jm->queue[jm->head].active = 1;
-        int slot_index = jm->head;
-        jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
-        jm->count--;
+        jm->running_repo[me] = slot.repo_id;
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
@@ -167,6 +227,9 @@ static void *worker_main(void *arg)
         pthread_mutex_lock(&jm->mu);
         jm->queue[slot_index].active = 0;
         jm->queue[slot_index].job_id = 0;
+        jm->running_repo[me] = 0;
+        /* This repo just became free, so a worker parked on it can proceed. */
+        pthread_cond_broadcast(&jm->cv);
         pthread_mutex_unlock(&jm->mu);
     }
 }
@@ -196,6 +259,14 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
 
     jm->workers = calloc((size_t)max_parallel, sizeof(pthread_t));
     if (!jm->workers) { free(jm); return set_error(ERR_NOMEM, "job_manager_start: workers"); }
+    jm->running_repo = calloc((size_t)max_parallel, sizeof(*jm->running_repo));
+    if (!jm->running_repo) {
+        free(jm->workers); free(jm);
+        return set_error(ERR_NOMEM, "job_manager_start: running set");
+    }
+    /* -1 marks a slot no worker has claimed yet; each worker takes the first
+     * on entry so it has a stable index for the life of the thread. */
+    for (int i = 0; i < max_parallel; i++) jm->running_repo[i] = -1;
     jm->nworkers = max_parallel;
     for (int i = 0; i < max_parallel; i++) {
         if (pthread_create(&jm->workers[i], NULL, worker_main, jm) != 0) {
@@ -225,6 +296,7 @@ void job_manager_stop(job_manager_t *jm)
         pthread_join(jm->workers[i], NULL);
 
     free(jm->workers);
+    free(jm->running_repo);
     pthread_mutex_destroy(&jm->mu);
     pthread_mutex_destroy(&jm->db_mu);
     pthread_cond_destroy(&jm->cv);

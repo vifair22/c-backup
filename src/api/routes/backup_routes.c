@@ -99,7 +99,32 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     o.progress_ctx = progress_ctx;
 
     backup_result_t res;
+    memset(&res, 0, sizeof(res));
     st = backup_run(store, j->db, j->repo_id, &o, &res);
+
+    /*
+     * Packing finishes the backup rather than waiting for someone to ask.
+     *
+     * Compression only happens at pack time, so a backup that stops here has
+     * written more bytes than it read and left one file per object behind.
+     * Treating packing as a separate operation meant the common case - back
+     * up and walk away - produced a repository that never compressed anything
+     * at all. It runs inside this job, under the same write lock, so nothing
+     * can interleave between the snapshot landing and its objects being
+     * consolidated.
+     *
+     * A pack failure does not fail the backup: the snapshot is committed and
+     * its objects are readable loose. It is logged and left for the next run
+     * or an explicit pack.
+     */
+    if (st == OK && routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1)) {
+        status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+        if (pst != OK) {
+            log_warn("backup: snapshot %lld committed but packing failed: %s",
+                     (long long)res.snapshot_id, err_msg());
+            err_clear();
+        }
+    }
 
     free(cpaths);
     store_index_free(idx);

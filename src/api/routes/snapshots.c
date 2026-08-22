@@ -251,6 +251,21 @@ static void pack_progress_adapter(uint64_t current, uint64_t total,
     if (b && b->progress) b->progress(phase ? phase : "pack", current, total, b->ctx);
 }
 
+status_t routes_run_pack(struct store *store, int64_t repo_id,
+                         volatile int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)cancel;   /* repo_pack has no cancellation hook of its own yet */
+    pack_progress_bridge_t bridge = { progress, progress_ctx };
+    uint32_t packed = 0;
+    status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
+    if (st == OK && packed > 0)
+        log_info("pack: %u object(s) packed in repo %lld",
+                 packed, (long long)repo_id);
+    return st;
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -273,16 +288,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     if (j->kind == SNAP_JOB_REINDEX) {
         st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
     } else if (j->kind == SNAP_JOB_PACK) {
-        /* Loose objects are one file each. A repository of any size needs
-         * them coalesced into packs or it accumulates inodes without bound,
-         * and the index rows that make packed objects findable arrive through
-         * the commit callback store_index_bind installed above. */
-        pack_progress_bridge_t bridge = { progress, progress_ctx };
-        uint32_t packed = 0;
-        st = repo_pack(store, &packed, pack_progress_adapter, &bridge);
-        if (st == OK)
-            log_info("pack: %u object(s) packed in repo %lld",
-                     packed, (long long)j->repo_id);
+        /* Loose objects are one file each, and compression only happens at
+         * pack time, so an unpacked repository stores more than its source
+         * and keeps one inode per object. */
+        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
