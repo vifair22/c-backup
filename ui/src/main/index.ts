@@ -54,7 +54,7 @@ app.whenReady().then(() => {
   loadCredentials()
 
   // Restore connections and repos from config
-  connectionManager.restoreFromConfig(config)
+  connectionManager.restoreFromConfig(config.connections)
 
   registerIpcHandlers()
   createWindow()
@@ -121,7 +121,7 @@ function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IPC.REPO_EDIT, async (_e, connectionName: string, oldPath: string, newPath: string) => {
-    return connectionManager.editRepo(connectionName, oldPath, newPath)
+    return connectionManager.editRepo()
   })
 
   ipcMain.handle(IPC.REPO_ADD, async (_e, connectionName: string, repoPath: string) => {
@@ -129,18 +129,18 @@ function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IPC.REPO_REMOVE, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.removeRepo(connectionName, repoPath)
+    return connectionManager.removeRepo(connectionName, Number(repoPath))
   })
 
   ipcMain.handle(IPC.REPO_OPEN, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.openRepo(connectionName, repoPath)
+    return connectionManager.openRepo(connectionName, Number(repoPath))
   })
 
   ipcMain.handle(IPC.REPO_CLOSE, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.closeRepo(connectionName, repoPath)
+    return connectionManager.closeRepo(connectionName, Number(repoPath))
   })
 
   ipcMain.handle(IPC.RPC_CALL, async (_e, connectionName: string, repoPath: string, action: string, params?: Record<string, unknown>) => {
-    return connectionManager.rpcCall(connectionName, repoPath, action, params)
+    return connectionManager.rpcCall(connectionName, Number(repoPath), action, params)
   })
 }

@@ -1,357 +1,138 @@
-/**
- * RPC session client for the c-backup binary.
+/*
+ * HTTP client for c-backupd.
  *
- * Session mode only (--json-session): persistent subprocess reads
- * newline-delimited JSON on stdin, writes responses on stdout.
+ * Replaces the subprocess transport entirely. The old session spawned a binary
+ * per (host, repo), fed sudo a password on stdin, managed an SSH child, and
+ * parsed a ready banner before it could send anything. All of that existed
+ * because the CLI was the only way in; the daemon has an HTTP API, so none of
+ * it is needed.
  *
- * Handles:
- * - LZ4 compressed binary frames (0x00 magic + lengths + payload)
- * - Plain JSON lines (small responses)
- * - sudo -S password feeding (detects password prompt before banner)
- * - Ready banner parsing
- *
- * All four connection permutations:
- *   local          -> spawn: backup --json-session <repo>
- *   local + sudo   -> spawn: sudo -S backup --json-session <repo>
- *   remote         -> spawn: ssh host backup --json-session <repo>
- *   remote + sudo  -> spawn: ssh host sudo -S backup --json-session <repo>
+ * Local connections use node:http with socketPath, which speaks HTTP over a
+ * unix socket with no extra dependency. Remote connections are ordinary TCP
+ * with a bearer token.
  */
 
-import { ChildProcess, spawn } from 'child_process'
-import { EventEmitter } from 'events'
-import type { RpcReadyBanner } from '../shared/types'
+import http from 'node:http'
+import type { ConnectionConfig, DaemonInfo } from '../shared/types'
 
-// LZ4 raw block decompression via lz4js
-let lz4Decompress: ((src: Uint8Array, destSize: number) => Uint8Array) | null = null
-async function ensureLz4(): Promise<void> {
-  if (lz4Decompress) return
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const lz4 = require('lz4js') as { decompressBlock: (src: Uint8Array, dst: Uint8Array, sOff: number, sLen: number, dOff: number) => number }
-    lz4Decompress = (src: Uint8Array, destSize: number): Uint8Array => {
-      const dst = new Uint8Array(destSize)
-      const written = lz4.decompressBlock(src, dst, 0, src.length, 0)
-      if (written < 0) throw new Error('LZ4 decompressBlock failed')
-      return dst.subarray(0, written)
-    }
-  } catch {
-    console.warn('lz4js not available — compressed responses will fail')
+export interface HttpResult<T = unknown> {
+  status: number
+  body: T
+}
+
+export class DaemonUnreachableError extends Error {
+  constructor(target: string, cause: string) {
+    super(`no daemon at ${target}: ${cause}`)
+    this.name = 'DaemonUnreachableError'
   }
 }
 
-export interface SessionOptions {
-  /** Command + args to spawn (e.g. ['backup', '--json-session', '/path/to/repo']) */
-  command: string[]
-  /** Sudo password — if set, we expect a password prompt before the ready banner */
-  sudoPassword?: string
-  /** Timeout for initial connection (ms) */
-  connectTimeout?: number
-  /** Timeout for individual RPC calls (ms) */
-  callTimeout?: number
-}
+export class DaemonClient {
+  private config: ConnectionConfig
+  private token?: string
 
-interface PendingCall {
-  resolve: (data: unknown) => void
-  reject: (err: Error) => void
-  timer: ReturnType<typeof setTimeout>
-}
-
-export class RpcSession extends EventEmitter {
-  private proc: ChildProcess | null = null
-  private buffer: Buffer = Buffer.alloc(0)
-  private pending: PendingCall | null = null
-  private bannerResolve: ((banner: RpcReadyBanner) => void) | null = null
-  private bannerReject: ((err: Error) => void) | null = null
-  private sudoPassword: string | undefined
-  private sudoFed = false
-  private _alive = false
-  private callTimeout: number
-
-  banner: RpcReadyBanner | null = null
-
-  constructor() {
-    super()
-    this.callTimeout = 120_000
+  constructor(config: ConnectionConfig, token?: string) {
+    this.config = config
+    this.token = token
   }
 
-  get alive(): boolean {
-    return this._alive && this.proc !== null && this.proc.exitCode === null
+  setToken(token: string | undefined): void {
+    this.token = token
   }
 
-  /**
-   * Start the session subprocess and wait for the ready banner.
-   */
-  async start(opts: SessionOptions): Promise<RpcReadyBanner> {
-    await ensureLz4()
-
-    this.sudoPassword = opts.sudoPassword
-    this.sudoFed = false
-    this.callTimeout = opts.callTimeout ?? 120_000
-    const connectTimeout = opts.connectTimeout ?? 15_000
-
-    const [cmd, ...args] = opts.command
-    this.proc = spawn(cmd, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-
-    this.proc.stdout!.on('data', (chunk: Buffer) => this.onData(chunk))
-    this.proc.stderr!.on('data', (chunk: Buffer) => this.onStderr(chunk))
-    this.proc.on('exit', (code) => {
-      this._alive = false
-      this.emit('exit', code)
-      // Reject any pending call
-      if (this.pending) {
-        this.pending.reject(new Error(`session process exited with code ${code}`))
-        clearTimeout(this.pending.timer)
-        this.pending = null
-      }
-      if (this.bannerReject) {
-        this.bannerReject(new Error(`session process exited before ready banner (code ${code})`))
-        this.bannerResolve = null
-        this.bannerReject = null
-      }
-    })
-
-    return new Promise<RpcReadyBanner>((resolve, reject) => {
-      this.bannerResolve = resolve
-      this.bannerReject = reject
-
-      const timer = setTimeout(() => {
-        reject(new Error('session start timed out'))
-        this.kill()
-      }, connectTimeout)
-
-      // Store timer ref so we can clear it when banner arrives
-      const origResolve = this.bannerResolve
-      this.bannerResolve = (banner: RpcReadyBanner) => {
-        clearTimeout(timer)
-        this.banner = banner
-        this._alive = true
-        origResolve(banner)
-      }
-      const origReject = this.bannerReject
-      this.bannerReject = (err: Error) => {
-        clearTimeout(timer)
-        origReject(err)
-      }
-    })
+  private target(): string {
+    return this.config.type === 'local'
+      ? this.config.socketPath
+      : `${this.config.host}:${this.config.port}`
   }
 
-  /**
-   * Send an RPC request and wait for the response.
-   */
-  async call<T = unknown>(action: string, params?: Record<string, unknown>): Promise<T> {
-    if (!this.alive) {
-      throw new Error('session not alive')
-    }
-    if (this.pending) {
-      throw new Error('another call is already in progress')
+  async request<T = unknown>(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<HttpResult<T>> {
+    const payload = body === undefined ? undefined : JSON.stringify(body)
+
+    const options: http.RequestOptions = {
+      method,
+      path,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+        // The unix socket bypasses auth entirely, so a token is only ever
+        // sent to a remote daemon.
+        ...(this.token && this.config.type === 'remote'
+          ? { Authorization: `Bearer ${this.token}` }
+          : {}),
+      },
     }
 
-    const req: Record<string, unknown> = { action }
-    if (params && Object.keys(params).length > 0) {
-      req.params = params
+    if (this.config.type === 'local') {
+      options.socketPath = this.config.socketPath
+    } else {
+      options.host = this.config.host
+      options.port = this.config.port
     }
 
-    const line = JSON.stringify(req) + '\n'
-
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending = null
-        reject(new Error(`RPC call '${action}' timed out after ${this.callTimeout}ms`))
-      }, this.callTimeout)
-
-      this.pending = {
-        resolve: resolve as (data: unknown) => void,
-        reject,
-        timer,
-      }
-
-      try {
-        this.proc!.stdin!.write(line)
-      } catch (err) {
-        clearTimeout(timer)
-        this.pending = null
-        reject(new Error(`failed to write to session: ${err}`))
-      }
-    })
-  }
-
-  /**
-   * Gracefully close the session.
-   */
-  async close(): Promise<void> {
-    if (!this.proc) return
-
-    if (this.alive) {
-      try {
-        this.proc.stdin!.write('{"action":"quit"}\n')
-      } catch { /* ignore */ }
-
-      // Wait up to 5s for graceful exit
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          this.kill()
-          resolve()
-        }, 5000)
-        this.proc!.once('exit', () => {
-          clearTimeout(timer)
-          resolve()
+    return new Promise((resolve, reject) => {
+      const req = http.request(options, (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8')
+          let parsed: unknown = undefined
+          if (text.length > 0) {
+            try {
+              parsed = JSON.parse(text)
+            } catch {
+              // Non-JSON from an API that always returns JSON means something
+              // is wrong upstream; surface the text rather than hide it.
+              parsed = { error: text }
+            }
+          }
+          resolve({ status: res.statusCode ?? 0, body: parsed as T })
         })
       })
-    }
 
-    this._alive = false
-    this.proc = null
-  }
-
-  kill(): void {
-    if (this.proc) {
-      try { this.proc.kill() } catch { /* ignore */ }
-      this._alive = false
-      this.proc = null
-    }
-  }
-
-  /* ---------------------------------------------------------------- */
-  /* Internal: data processing                                         */
-  /* ---------------------------------------------------------------- */
-
-  private onStderr(chunk: Buffer): void {
-    const text = chunk.toString()
-    // Detect sudo password prompt on stderr
-    if (this.sudoPassword && !this.sudoFed) {
-      const lower = text.toLowerCase()
-      if (lower.includes('password') || lower.includes('passphrase')) {
-        this.proc!.stdin!.write(this.sudoPassword + '\n')
-        this.sudoFed = true
-        return
-      }
-    }
-    this.emit('stderr', text)
-  }
-
-  private onData(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk])
-
-    // Also check stdout for sudo password prompt (some sudo configs use stdout)
-    if (this.sudoPassword && !this.sudoFed && !this.banner) {
-      const text = this.buffer.toString('utf-8', 0, Math.min(this.buffer.length, 256))
-      const lower = text.toLowerCase()
-      if (lower.includes('[sudo] password') || lower.includes('password:')) {
-        this.proc!.stdin!.write(this.sudoPassword + '\n')
-        this.sudoFed = true
-        // Clear the prompt from our buffer
-        const nlIdx = this.buffer.indexOf(0x0a)
-        if (nlIdx >= 0) {
-          this.buffer = this.buffer.subarray(nlIdx + 1)
+      req.on('error', (err: NodeJS.ErrnoException) => {
+        // ENOENT and ECONNREFUSED both mean nothing is listening, which is a
+        // different problem from a request that failed, and the UI should say
+        // so rather than showing a transport error.
+        if (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') {
+          reject(new DaemonUnreachableError(this.target(), err.code))
         } else {
-          this.buffer = Buffer.alloc(0)
+          reject(err)
         }
-        return
-      }
-    }
+      })
 
-    // Try to extract complete messages
-    this.processBuffer()
+      if (payload) req.write(payload)
+      req.end()
+    })
   }
 
-  private processBuffer(): void {
-    while (this.buffer.length > 0) {
-      if (this.buffer[0] === 0x00) {
-        // LZ4 binary frame: 0x00 + uint32le(uncomp) + uint32le(comp) + data + \n
-        if (this.buffer.length < 9) return  // need at least header
-
-        const uncompLen = this.buffer.readUInt32LE(1)
-        const compLen = this.buffer.readUInt32LE(5)
-        const totalLen = 9 + compLen + 1  // header + payload + newline
-
-        if (this.buffer.length < totalLen) return  // incomplete frame
-
-        const compData = this.buffer.subarray(9, 9 + compLen)
-        let json: string
-
-        if (lz4Decompress) {
-          try {
-            const raw = lz4Decompress(new Uint8Array(compData), uncompLen)
-            json = Buffer.from(raw).toString('utf-8')
-          } catch (err) {
-            this.deliverError(new Error(`LZ4 decompression failed: ${err}`))
-            this.buffer = this.buffer.subarray(totalLen)
-            continue
-          }
-        } else {
-          this.deliverError(new Error('LZ4 not available for compressed response'))
-          this.buffer = this.buffer.subarray(totalLen)
-          continue
-        }
-
-        this.buffer = this.buffer.subarray(totalLen)
-        this.deliverMessage(json)
-      } else {
-        // Plain text line — find newline
-        const nlIdx = this.buffer.indexOf(0x0a)
-        if (nlIdx < 0) return  // incomplete line
-
-        const line = this.buffer.subarray(0, nlIdx).toString('utf-8')
-        this.buffer = this.buffer.subarray(nlIdx + 1)
-
-        if (line.length > 0) {
-          this.deliverMessage(line)
-        }
-      }
-    }
+  /* Readiness doubles as the connection check: it proves the daemon is up and
+   * its database is open, which is what "connected" should mean. */
+  async ready(): Promise<DaemonInfo> {
+    const res = await this.request<DaemonInfo>('GET', '/readyz')
+    if (res.status !== 200) throw new Error(`daemon not ready (HTTP ${res.status})`)
+    return res.body
   }
 
-  private deliverMessage(json: string): void {
-    let parsed: Record<string, unknown>
-    try {
-      parsed = JSON.parse(json)
-    } catch (err) {
-      this.deliverError(new Error(`invalid JSON from session: ${json.substring(0, 200)}`))
-      return
+  /* Exchange a password for a bearer token. Remote connections only: the
+   * socket needs no credential. */
+  async login(password: string): Promise<string> {
+    const res = await this.request<{ token?: string }>('POST', '/api/auth/login', {
+      password,
+    })
+    if (res.status !== 200 || !res.body?.token) {
+      throw new Error('login failed: check the admin password')
     }
-
-    // Is this the ready banner?
-    if (this.bannerResolve && parsed.status === 'ready') {
-      this.bannerResolve(parsed as unknown as RpcReadyBanner)
-      this.bannerResolve = null
-      this.bannerReject = null
-      return
-    }
-
-    // Is this a response to a pending call?
-    if (this.pending) {
-      const { resolve, reject, timer } = this.pending
-      this.pending = null
-      clearTimeout(timer)
-
-      if (parsed.status === 'error') {
-        reject(new Error((parsed.message as string) || 'unknown RPC error'))
-      } else {
-        resolve(parsed.data ?? parsed)
-      }
-      return
-    }
-
-    // Unsolicited message
-    this.emit('message', parsed)
+    this.token = res.body.token
+    return res.body.token
   }
 
-  private deliverError(err: Error): void {
-    if (this.bannerReject) {
-      this.bannerReject(err)
-      this.bannerResolve = null
-      this.bannerReject = null
-      return
-    }
-    if (this.pending) {
-      const { reject, timer } = this.pending
-      this.pending = null
-      clearTimeout(timer)
-      reject(err)
-      return
-    }
-    this.emit('error', err)
+  async isSetup(): Promise<boolean> {
+    const res = await this.request<{ configured?: boolean }>('GET', '/api/auth/setup')
+    return res.status === 200 && res.body?.configured === true
   }
 }

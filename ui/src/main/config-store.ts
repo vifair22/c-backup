@@ -42,7 +42,6 @@ export function loadConfig(): AppConfig {
     _config = { ...defaultConfig, ...parsed }
     // Ensure every connection has a repos array
     for (const conn of _config.connections) {
-      if (!Array.isArray(conn.repos)) conn.repos = []
     }
   } catch {
     _config = { ...defaultConfig }
@@ -66,7 +65,6 @@ export function getConfig(): AppConfig {
 
 export function addConnectionConfig(config: ConnectionConfig): void {
   _config.connections = _config.connections.filter(c => c.name !== config.name)
-  if (!Array.isArray(config.repos)) config.repos = []
   _config.connections.push(config)
   saveConfig()
 }
@@ -79,29 +77,11 @@ export function removeConnectionConfig(name: string): void {
 export function updateConnectionConfig(name: string, newConfig: ConnectionConfig): void {
   const idx = _config.connections.findIndex(c => c.name === name)
   if (idx === -1) return
-  // Preserve existing repos list unless the new config carries one
-  if (!Array.isArray(newConfig.repos) || newConfig.repos.length === 0) {
-    newConfig.repos = _config.connections[idx].repos
-  }
   _config.connections[idx] = newConfig
   saveConfig()
 }
 
-export function addRepoToConnection(connectionName: string, repoPath: string): void {
-  const conn = _config.connections.find(c => c.name === connectionName)
-  if (!conn) return
-  if (!conn.repos.includes(repoPath)) {
-    conn.repos.push(repoPath)
-    saveConfig()
-  }
-}
 
-export function removeRepoFromConnection(connectionName: string, repoPath: string): void {
-  const conn = _config.connections.find(c => c.name === connectionName)
-  if (!conn) return
-  conn.repos = conn.repos.filter(r => r !== repoPath)
-  saveConfig()
-}
 
 export function updateWindowBounds(bounds: { x: number; y: number; width: number; height: number }): void {
   _config.windowBounds = bounds

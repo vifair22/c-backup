@@ -4,28 +4,34 @@
 
 export type ConnectionType = 'local' | 'ssh'
 
+/*
+ * A connection is a c-backupd instance, not a machine to run a binary on.
+ *
+ * The daemon owns every repo on its host and is the only writer, so the app no
+ * longer spawns processes, escalates with sudo, or manages SSH children. Local
+ * means the daemon's unix socket; remote means its TCP port with a bearer
+ * token. Everything that made the old transport complicated lived on the
+ * client side and is simply gone.
+ */
 export interface LocalConnectionConfig {
   type: 'local'
   name: string
-  binaryPath: string       // defaults to 'backup' in PATH
-  sudo: boolean            // run via sudo -S
-  repos: string[]          // absolute repo paths on this connection
+  /** Unix socket path. Access is gated by filesystem permissions, so there is
+   *  no token: if you can open the socket, you are authorised. */
+  socketPath: string
 }
 
-export interface SshConnectionConfig {
-  type: 'ssh'
+export interface RemoteConnectionConfig {
+  type: 'remote'
   name: string
   host: string
-  port: number             // defaults to 22
-  username: string
-  authMethod: 'key' | 'password' | 'agent'
-  keyFilePath?: string     // for key auth
-  remoteBinaryPath: string // defaults to 'backup'
-  sudo: boolean            // run via sudo -S on remote host
-  repos: string[]          // absolute repo paths on this connection
+  port: number
+  /** Identifier for the bearer token in Electron safeStorage. The token
+   *  itself is never written to the config file. */
+  tokenId?: string
 }
 
-export type ConnectionConfig = LocalConnectionConfig | SshConnectionConfig
+export type ConnectionConfig = LocalConnectionConfig | RemoteConnectionConfig
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
@@ -40,20 +46,27 @@ export interface ConnectionState {
 /* Repository types                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Repos are registered with the daemon and addressed by id. The path still
+ * matters to a human choosing one, but it is no longer the handle: a repo can
+ * be moved on disk and re-registered while keeping its identity, which is what
+ * the .cbackup marker's uuid is for.
+ */
 export interface RepoState {
+  id: number
   path: string
-  sessionActive: boolean
+  label?: string
+  uuid?: string
 }
 
 /* ------------------------------------------------------------------ */
 /* RPC types                                                           */
 /* ------------------------------------------------------------------ */
 
-export interface RpcReadyBanner {
-  status: 'ready'
-  protocol: number
-  compression: string
-  lock: boolean
+/* What /readyz reports. Replaces the session banner the old subprocess
+ * transport printed on stdout before accepting commands. */
+export interface DaemonInfo {
+  status: string
   version: string
 }
 

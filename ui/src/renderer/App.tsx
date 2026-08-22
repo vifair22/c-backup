@@ -179,8 +179,9 @@ export function App(): React.ReactElement {
     setError(null)
     const conn = connections.find(c => c.config.name === connectingName)
     const creds: { password?: string; sudoPassword?: string; save?: boolean } = { save: savePassword }
-    if (conn?.config.type === 'ssh' && conn.config.authMethod === 'password') creds.password = sudoPasswordInput
-    if (conn?.config.sudo) creds.sudoPassword = sudoPasswordInput
+    /* Only a remote daemon needs a credential: the unix socket is gated by
+     * file permissions, and there is no sudo escalation any more. */
+    if (conn?.config.type === 'remote') creds.password = sudoPasswordInput
 
     setConnectingName(null)
     const result = await api.connectionConnect(connectingName, creds)
@@ -438,7 +439,7 @@ export function App(): React.ReactElement {
     setContextMenu({
       x: e.clientX, y: e.clientY,
       items: [
-        ...(repo?.sessionActive ? [{
+        ...(repo ? [{
           label: 'Disconnect', onClick: async () => {
             await api.repoClose(connName, repoPath)
             if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
@@ -470,8 +471,7 @@ export function App(): React.ReactElement {
   }
 
   const connLabel = (conn: ConnectionState) => {
-    const parts = [conn.config.type === 'ssh' ? 'SSH' : 'local']
-    if (conn.config.sudo) parts.push('sudo')
+    const parts = [conn.config.type === 'remote' ? 'remote' : 'local']
     return parts.join(', ')
   }
 
@@ -529,7 +529,7 @@ export function App(): React.ReactElement {
                     }`}
                   >
                     <span className="text-text-primary">{repo.path.split('/').pop() || repo.path}</span>
-                    {repo.sessionActive && (
+                    {(
                       <span className="text-status-connected text-[10px] ml-1.5">connected</span>
                     )}
                   </div>
@@ -741,7 +741,7 @@ export function App(): React.ReactElement {
             <h3 className="text-sm font-semibold m-0 mb-3">Connect: {connectingName}</h3>
             <div className="mb-3">
               <label className="block text-xs font-medium text-text-secondary mb-1">
-                {connections.find(c => c.config.name === connectingName)?.config.sudo ? 'Sudo Password' : 'Password'}
+                Admin password
               </label>
               <input type="password" value={sudoPasswordInput} onChange={e => setSudoPasswordInput(e.target.value)}
                 className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
