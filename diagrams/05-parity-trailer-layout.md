@@ -77,37 +77,6 @@ flowchart LR
     style PF fill:#f8d7da,stroke:#721c24
 ```
 
-## Pack .idx (V3/V4)
-
-```mermaid
-flowchart LR
-    subgraph ".idx File"
-        IH["pack_idx_hdr_t<br/>12 B"]
-        IE["Sorted entries<br/>N x 62 B (V4)"]
-        subgraph "Parity Trailer (276 + N*4 bytes)"
-            IC["Header CRC<br/>4 B"]
-            IX["XOR parity<br/>over all entries<br/>260 B"]
-            CRCS["Per-entry CRCs<br/>N x 4 B"]
-            IPF["parity_footer_t<br/>12 B"]
-        end
-    end
-
-    IH --> IE --> IC --> IX --> CRCS --> IPF
-
-    style IH fill:#cce5ff,stroke:#004085
-    style IE fill:#d4edda,stroke:#155724
-    style IC fill:#fff3cd,stroke:#856404
-    style IPF fill:#f8d7da,stroke:#721c24
-```
-
-## Snapshot .snap (V5)
-
-Same structure as loose object: `[60 B header] + [compressed payload] + [260 B XOR + M B RS + 4 B CRC + 4 B len + 12 B footer]`
-
-## Bundle .cbb (V2)
-
-Per-record trailer after each record's path + payload: `[260 B XOR over 52 B rec header] + [M B RS over payload] + [4 B CRC + 4 B len + 4 B block size]`
-
-## Global pack index (pack-index.pidx)
-
-Same structure as loose object: `[16 B header + 1024 B fanout + N*52 B entries] + [260 B XOR over header + M B RS over data section + 4 B CRC + 4 B len + 12 B footer]`
+> The `.idx` sidecar and the `.snap` container both had layouts here. Neither
+> exists any more: a pack is a single `.dat` installed by one rename, and a
+> snapshot is a record plus manifest trees. See `docs/repo-format.md`.

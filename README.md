@@ -109,7 +109,8 @@ Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
   pipelines, every per-file-type branch, packing and compression decisions,
   and the maintenance paths that rewrite data.
 - `PERF.md`: benchmark journal. New numbers are added, not substituted.
-- `manual.md`: **stale.** Written for the pre-rewrite CLI and not yet updated.
+- `diagrams/`: Mermaid diagrams for individual mechanisms (parity layout,
+  pack dispatch, GFS promotion, dedup cascade, FUSE ring).
 
 ## License
 
