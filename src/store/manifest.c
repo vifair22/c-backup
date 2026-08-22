@@ -16,11 +16,25 @@
  *   header:  magic u32 | version u16 | count u32
  *   entry:   name_len u16 | link_len u16 | type u8 | mode u32 | uid u32 |
  *            gid u32 | size u64 | mtime_sec u64 | mtime_nsec u64 |
- *            inode_identity u64 | target_hash[32] | xattr_hash[32] |
- *            acl_hash[32] | name | link_target
+ *            inode_identity u64 | dev_major u32 | dev_minor u32 (v2+) |
+ *            target_hash[32] | xattr_hash[32] | acl_hash[32] |
+ *            name | link_target
+ *
+ * Version 2 added the device pair. Readers accept both; writers always emit
+ * the current version, so the first backup after the upgrade re-serialises
+ * every directory and stores a new object for each one. That is a one-time
+ * ~100% new-tree run, which is otherwise the signature of determinism
+ * breaking - see the note on manifest_serialise. It settles back to the
+ * usual few percent on the next snapshot.
  */
 #define MANIFEST_TREE_MAGIC   0x52544243u   /* "CBTR" little-endian */
-#define MANIFEST_TREE_VERSION 1u
+#define MANIFEST_TREE_VERSION 2u
+#define MANIFEST_TREE_VERSION_V1 1u
+
+/* Fixed-width part of one entry, per format version. */
+#define MANIFEST_FIXED_V1 (2u + 2u + 1u + 4u + 4u + 4u + 8u + 8u + 8u + 8u \
+                           + 3u * OBJECT_HASH_SIZE)
+#define MANIFEST_FIXED_V2 (MANIFEST_FIXED_V1 + 4u + 4u)
 
 typedef struct {
     uint8_t *buf;
@@ -125,6 +139,8 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
         put_u64(&b, e->mtime_sec);
         put_u64(&b, e->mtime_nsec);
         put_u64(&b, e->inode_identity);
+        put_u32(&b, e->dev_major);
+        put_u32(&b, e->dev_minor);
         put_bytes(&b, e->target_hash, OBJECT_HASH_SIZE);
         put_bytes(&b, e->xattr_hash,  OBJECT_HASH_SIZE);
         put_bytes(&b, e->acl_hash,    OBJECT_HASH_SIZE);
@@ -179,11 +195,14 @@ status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         return set_error(ERR_CORRUPT, "manifest_read_tree: object type %u is not a tree", type);
     }
     uint16_t ver = get_u16(p + 4);
-    if (ver != MANIFEST_TREE_VERSION) {
+    /* Version 1 trees stay readable: a repository written before the device
+     * pair existed is still a valid repository, and reindex has to be able
+     * to walk it. Their entries simply have no device numbers. */
+    if (ver != MANIFEST_TREE_VERSION && ver != MANIFEST_TREE_VERSION_V1) {
         free(data);
         return set_error(ERR_CORRUPT,
-                         "manifest_read_tree: tree version %u, expected %u",
-                         ver, MANIFEST_TREE_VERSION);
+                         "manifest_read_tree: tree version %u, expected %u or %u",
+                         ver, MANIFEST_TREE_VERSION_V1, MANIFEST_TREE_VERSION);
     }
     uint32_t count = get_u32(p + 6);
 
@@ -194,7 +213,8 @@ status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     }
 
     size_t off = 10;
-    const size_t fixed = 2 + 2 + 1 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 3 * OBJECT_HASH_SIZE;
+    const size_t fixed = (ver == MANIFEST_TREE_VERSION_V1)
+                         ? MANIFEST_FIXED_V1 : MANIFEST_FIXED_V2;
     for (uint32_t i = 0; i < count; i++) {
         if (off + fixed > len) goto corrupt;
         manifest_entry_t *e = &out[i];
@@ -208,6 +228,10 @@ status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         e->mtime_sec       = get_u64(p + off); off += 8;
         e->mtime_nsec      = get_u64(p + off); off += 8;
         e->inode_identity  = get_u64(p + off); off += 8;
+        if (ver != MANIFEST_TREE_VERSION_V1) {
+            e->dev_major = get_u32(p + off); off += 4;
+            e->dev_minor = get_u32(p + off); off += 4;
+        }
         memcpy(e->target_hash, p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->xattr_hash,  p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->acl_hash,    p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;

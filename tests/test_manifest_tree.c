@@ -278,6 +278,91 @@ static void test_symlink_target_survives(void **state)
 
 /* A truncated or foreign object must be rejected, not misparsed into
  * plausible-looking garbage. */
+/*
+ * A version 1 tree, hand-assembled, still reads.
+ *
+ * Version 2 added the device pair, so every field after inode_identity moved.
+ * A reader that assumed one layout would misparse every tree written before
+ * the change - hashes read as names, an entry count walking off the end - and
+ * a repository predating the upgrade would be unrecoverable rather than
+ * merely missing device numbers.
+ */
+static void test_v1_tree_is_still_readable(void **state)
+{
+    (void)state;
+
+    /* Layout: magic u32 | version u16 | count u32, then one entry with the
+     * v1 fixed part (no dev pair) followed by the name. */
+    const char *name = "old.txt";
+    uint16_t name_len = (uint16_t)strlen(name);
+    uint8_t buf[256];
+    size_t o = 0;
+    #define PUT16(v) do { buf[o++] = (uint8_t)((v) & 0xFF);                           buf[o++] = (uint8_t)(((v) >> 8) & 0xFF); } while (0)
+    #define PUT32(v) do { for (int b = 0; b < 4; b++)                               buf[o++] = (uint8_t)(((uint32_t)(v) >> (8 * b)) & 0xFF); } while (0)
+    #define PUT64(v) do { for (int b = 0; b < 8; b++)                               buf[o++] = (uint8_t)(((uint64_t)(v) >> (8 * b)) & 0xFF); } while (0)
+
+    PUT32(0x52544243u);      /* magic "CBTR" */
+    PUT16(1);                /* version 1 */
+    PUT32(1);                /* one entry */
+
+    PUT16(name_len);
+    PUT16(0);                /* link_target_len */
+    buf[o++] = NODE_TYPE_REG;
+    PUT32(0100644);          /* mode */
+    PUT32(1000);             /* uid */
+    PUT32(1000);             /* gid */
+    PUT64(42);               /* size */
+    PUT64(1700000000);       /* mtime_sec */
+    PUT64(0);                /* mtime_nsec */
+    PUT64(0x1234abcd);       /* inode_identity */
+    /* No device pair here: that is the whole point. */
+    for (int b = 0; b < OBJECT_HASH_SIZE; b++) buf[o++] = (uint8_t)(b + 1);  /* target */
+    for (int b = 0; b < OBJECT_HASH_SIZE; b++) buf[o++] = 0;                 /* xattr */
+    for (int b = 0; b < OBJECT_HASH_SIZE; b++) buf[o++] = 0;                 /* acl */
+    memcpy(buf + o, name, name_len); o += name_len;
+    #undef PUT16
+    #undef PUT32
+    #undef PUT64
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_TREE, buf, o, hash), OK);
+
+    manifest_entry_t *entries = NULL;
+    uint32_t count = 0;
+    assert_int_equal(manifest_read_tree(store, hash, &entries, &count), OK);
+    assert_int_equal(count, 1);
+    assert_string_equal(entries[0].name, name);
+    assert_int_equal(entries[0].size, 42);
+    assert_int_equal(entries[0].uid, 1000);
+    assert_int_equal(entries[0].inode_identity, 0x1234abcd);
+    assert_int_equal(entries[0].target_hash[0], 1);
+    assert_int_equal(entries[0].target_hash[OBJECT_HASH_SIZE - 1], OBJECT_HASH_SIZE);
+    /* Absent, not garbage. */
+    assert_int_equal(entries[0].dev_major, 0);
+    assert_int_equal(entries[0].dev_minor, 0);
+    manifest_free_entries(entries, count);
+}
+
+/* The device pair is part of the hash, or two different devices with the
+ * same name would dedup to one tree. */
+static void test_device_numbers_affect_the_hash(void **state)
+{
+    (void)state;
+    manifest_entry_t e = { 0 };
+    e.name = "null";
+    e.name_len = 4;
+    e.type = NODE_TYPE_CHR;
+    e.mode = 020666;
+    e.dev_major = 1;
+    e.dev_minor = 3;
+
+    uint8_t a[OBJECT_HASH_SIZE], b[OBJECT_HASH_SIZE];
+    assert_int_equal(manifest_write_tree(store, &e, 1, a), OK);
+    e.dev_minor = 5;   /* /dev/zero rather than /dev/null */
+    assert_int_equal(manifest_write_tree(store, &e, 1, b), OK);
+    assert_memory_not_equal(a, b, OBJECT_HASH_SIZE);
+}
+
 static void test_rejects_non_tree_object(void **state)
 {
     (void)state;
@@ -301,6 +386,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_subtree_change_propagates, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_tree, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlink_target_survives, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_v1_tree_is_still_readable, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_device_numbers_affect_the_hash, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_non_tree_object, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -163,14 +163,18 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
         char ahex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(e->acl_hash, ahex);
 
+        char dmaj[16], dmin[16];
+        snprintf(dmaj, sizeof(dmaj), "%u", e->dev_major);
+        snprintf(dmin, sizeof(dmin), "%u", e->dev_minor);
+
         int rc = db_execute_non_query(ctx->db,
             "INSERT OR REPLACE INTO nodes"
             " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
             "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-            "  hardlink_group_id, xattr_hash, acl_hash)"
+            "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
             "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-            "         NULLIF(?,''), NULLIF(?,''))",
+            "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
             (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
                               uid, gid, mtime, size,
                               (have_target && !is_dir) ? thex : "",
@@ -178,7 +182,7 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
                               ltarget, hgroup,
                               hash_is_zero(e->xattr_hash) ? "" : xhex,
                               hash_is_zero(e->acl_hash)   ? "" : ahex,
-                              NULL }, NULL);
+                              dmaj, dmin, NULL }, NULL);
         if (rc != 0) {
             st = set_error(ERR_IO, "reindex: cannot insert node");
             break;

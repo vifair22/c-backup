@@ -42,6 +42,12 @@ typedef struct {
      * are the same file, which is different from two files that happen to
      * hold the same bytes. Stable across backups of the same filesystem. */
     uint64_t    inode_identity;
+    /* Character and block devices only. A device node has no content: the
+     * pair of numbers is the whole file, so without them a restore can
+     * recreate the name and the mode and nothing that makes it a device.
+     * Zero for every other type, including on trees written before the
+     * format carried them. */
+    uint32_t    dev_major, dev_minor;
     uint8_t     target_hash[OBJECT_HASH_SIZE];  /* content hash; subtree hash for dirs */
     uint8_t     xattr_hash[OBJECT_HASH_SIZE];
     uint8_t     acl_hash[OBJECT_HASH_SIZE];

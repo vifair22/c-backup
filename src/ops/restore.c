@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -422,7 +423,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_execute(db,
             "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type,"
             "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
-            "       COALESCE(xattr_hash,''), COALESCE(acl_hash,'')"
+            "       COALESCE(xattr_hash,''), COALESCE(acl_hash,''),"
+            "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0)"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -510,6 +512,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         uint64_t    hgroup  = (uint64_t)strtoll(r->rows[i][10], NULL, 10);
         const char *xhash   = r->rows[i][11];
         const char *ahash   = r->rows[i][12];
+        uint32_t    dmajor  = (uint32_t)strtoul(r->rows[i][13], NULL, 10);
+        uint32_t    dminor  = (uint32_t)strtoul(r->rows[i][14], NULL, 10);
 
         char rel[PATH_MAX];
         if (node_rel_path(db, repo, snap, id, rel, sizeof(rel)) != OK) {
@@ -570,6 +574,50 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             continue;
         }
 
+        /*
+         * FIFOs and device nodes have no content object: the mode, and for a
+         * device the major/minor pair, are the entire file. They were
+         * scanned and indexed all along and then silently skipped here, so a
+         * restored tree came back missing them.
+         *
+         * A device node needs CAP_MKNOD, which an unprivileged restore does
+         * not have. That is a warning rather than a failure, the same
+         * treatment ownership gets: the rest of the tree is still correct
+         * and re-running as root fills these in.
+         */
+        if (ntype == NODE_TYPE_FIFO || ntype == NODE_TYPE_CHR ||
+            ntype == NODE_TYPE_BLK) {
+            if (make_parents(full) != OK) { st = ERR_IO; break; }
+            if (opts->overwrite) unlink(full);
+
+            int made;
+            if (ntype == NODE_TYPE_FIFO) {
+                made = mkfifo(full, (mode_t)(mode & 07777));
+            } else if (dmajor == 0 && dminor == 0) {
+                /* Version 1 trees never recorded the pair, so it cannot be
+                 * recovered. A device pointing at the wrong driver is worse
+                 * than an absent one. */
+                log_warn("restore: %s has no recorded device numbers "
+                         "(pre-v2 snapshot), skipping", rel);
+                res.skipped++;
+                continue;
+            } else {
+                mode_t kind = (ntype == NODE_TYPE_CHR) ? S_IFCHR : S_IFBLK;
+                made = mknod(full, kind | (mode_t)(mode & 07777),
+                             makedev(dmajor, dminor));
+            }
+
+            if (made != 0 && errno != EEXIST) {
+                log_warn("restore: cannot create %s: %s", full, strerror(errno));
+                res.skipped++;
+                continue;
+            }
+            apply_metadata(full, mode, uid, gid, mtime);
+            apply_xattrs(store, full, xhash);
+            apply_acls(store, full, ahash, 0);
+            res.specials++;
+            continue;
+        }
 
         /*
          * Anything sharing an inode with something already restored is
@@ -664,10 +712,11 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
-             "%llu symlinks, %llu hardlinks, %llu skipped",
+             "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped",
              (long long)snap_id, dest, (unsigned long long)res.files,
              (unsigned long long)res.dirs, (unsigned long long)res.symlinks,
-             (unsigned long long)res.hardlinks, (unsigned long long)res.skipped);
+             (unsigned long long)res.hardlinks,
+             (unsigned long long)res.specials, (unsigned long long)res.skipped);
     if (out) *out = res;
     return OK;
 }

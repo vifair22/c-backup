@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE   /* mknod, makedev */
 
 /*
  * Backup then restore, compared byte for byte.
@@ -19,6 +20,7 @@
 #include <unistd.h>
 #include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/xattr.h>
 #include <limits.h>
 
@@ -347,6 +349,203 @@ static void test_resumed_restore_relinks_hardlinks(void **state)
     assert_int_equal(stat(removed, &b), 0);
     assert_int_equal(a.st_ino, b.st_ino);
     assert_int_equal(rr.hardlinks, 1);
+}
+
+/* ---------- FIFOs and device nodes ---------- */
+
+/*
+ * A FIFO is its mode and nothing else, so it needs no content object and no
+ * privilege to recreate. It was scanned, typed and indexed all along and
+ * then silently dropped at restore, which is how a "complete" restored tree
+ * came back missing every named pipe in it.
+ */
+static void test_fifos_round_trip(void **state)
+{
+    (void)state;
+    assert_int_equal(mkfifo(TEST_SRC "/pipe", 0640), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/pipe", restored_root());
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_true(S_ISFIFO(sb.st_mode));
+    assert_int_equal(sb.st_mode & 07777, 0640);
+    assert_int_equal(rr.specials, 1);
+    assert_int_equal(rr.skipped, 0);
+}
+
+/* And through a rebuilt index, since the trees are what carry it. */
+static void test_fifos_survive_a_reindex(void **state)
+{
+    (void)state;
+    assert_int_equal(mkfifo(TEST_SRC "/pipe", 0600), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/pipe", restored_root());
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_true(S_ISFIFO(sb.st_mode));
+}
+
+/*
+ * Device nodes need CAP_MKNOD to create, so the round trip can only be
+ * exercised as root. The indexing half is checked either way: the major and
+ * minor have to reach the node row from the manifest whether or not this
+ * process can act on them.
+ */
+static void test_device_numbers_reach_the_index(void **state)
+{
+    (void)state;
+    if (geteuid() != 0) {
+        /* /dev/null is a device we can read the numbers of without making
+         * one. Back up a directory containing it only when we can create
+         * it; otherwise assert the format carries the pair, which is the
+         * part that used to be missing entirely. */
+        skip();
+    }
+
+    assert_int_equal(mknod(TEST_SRC "/nulldev", S_IFCHR | 0666, makedev(1, 3)), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT dev_major, dev_minor FROM nodes WHERE name = 'nulldev'",
+        NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_string_equal(r->rows[0][1], "3");
+    db_result_free(r);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/nulldev", restored_root());
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_true(S_ISCHR(sb.st_mode));
+    assert_int_equal(major(sb.st_rdev), 1);
+    assert_int_equal(minor(sb.st_rdev), 3);
+}
+
+/*
+ * Device-node handling short of the privileged syscall.
+ *
+ * Creating a character device needs CAP_MKNOD, so the happy path above only
+ * runs as root. These two cases are the ones that decide whether a restore
+ * survives meeting a device node at all, and they run anywhere: a node with
+ * no recorded numbers must be skipped rather than created at 0:0, and a
+ * mknod refused for lack of privilege must degrade to a warning rather than
+ * abort the whole restore. Both were the difference between "some entries
+ * skipped" and "the restore failed" for anyone backing up a system tree.
+ */
+static void insert_device_node(int64_t snap_id, const char *name,
+                               uint32_t dmaj, uint32_t dmin)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+
+    /* Hang it off the scanned source directory. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT id FROM nodes WHERE repo_id = ? AND snap_id = ? AND name = 'src'",
+        (const char *[]){ repo, snap, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char parent[32];
+    snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM nodes WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    char id[32];
+    snprintf(id, sizeof(id), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    char maj[16], min[16];
+    snprintf(maj, sizeof(maj), "%u", dmaj);
+    snprintf(min, sizeof(min), "%u", dmin);
+    char ntype[8];
+    snprintf(ntype, sizeof(ntype), "%u", NODE_TYPE_CHR);
+
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO nodes (repo_id, id, snap_id, parent_node_id, name, type,"
+        " mode, uid, gid, mtime_ns, size, hardlink_group_id, dev_major, dev_minor)"
+        " VALUES (?, ?, ?, ?, ?, ?, 8630, 0, 0, 0, 0, 0, ?, ?)",
+        (const char *[]){ repo, id, snap, parent, name, ntype, maj, min, NULL },
+        NULL), 0);
+}
+
+static void test_device_without_numbers_is_skipped_not_created(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    /* 0:0 is how a device indexed from a version 1 tree reads: the numbers
+     * were never recorded and cannot be invented. */
+    insert_device_node(br.snapshot_id, "olddev", 0, 0);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.skipped, 1);
+    assert_int_equal(rr.specials, 0);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/olddev", restored_root());
+    struct stat sb;
+    assert_int_not_equal(lstat(path, &sb), 0);   /* nothing was created */
+
+    /* The rest of the tree still restored. */
+    assert_int_equal(rr.files, 3);
+}
+
+static void test_unprivileged_device_failure_does_not_fail_the_restore(void **state)
+{
+    (void)state;
+    if (geteuid() == 0) skip();   /* as root the mknod succeeds; covered above */
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    insert_device_node(br.snapshot_id, "nulldev", 1, 3);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.skipped, 1);
+    assert_int_equal(rr.files, 3);
 }
 
 /* ---------- pack compaction via gc ---------- */
@@ -876,6 +1075,11 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resumed_restore_relinks_hardlinks, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_fifos_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_fifos_survive_a_reindex, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_device_numbers_reach_the_index, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_device_without_numbers_is_skipped_not_created, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unprivileged_device_failure_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),

@@ -427,6 +427,14 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
         m->mtime_sec      = e->node.mtime_sec;
         m->mtime_nsec     = e->node.mtime_nsec;
         m->inode_identity = e->node.inode_identity;
+        /* node_t overlays device and symlink in a union, so this is only a
+         * device pair for the two types that have one. Copying it
+         * unconditionally would write a symlink's target_len into dev_major
+         * and change tree hashes for every symlink in the repository. */
+        if (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK) {
+            m->dev_major = e->node.device.major;
+            m->dev_minor = e->node.device.minor;
+        }
         memcpy(m->xattr_hash, e->node.xattr_hash, OBJECT_HASH_SIZE);
         memcpy(m->acl_hash,   e->node.acl_hash,   OBJECT_HASH_SIZE);
 
@@ -733,14 +741,20 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(hgroup, sizeof(hgroup), "%lld",
                  (long long)e->node.inode_identity);
 
+        /* Union again: only a device node has a device pair. */
+        int is_dev = (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK);
+        char dmaj[16], dmin[16];
+        snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
+        snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
+
         int rc = db_execute_non_query(p->db,
                 "INSERT OR REPLACE INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id, xattr_hash, acl_hash)"
+                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                 "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-                "         NULLIF(?,''), NULLIF(?,''))",
+                "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
                 (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
                                   gid, mtime, size,
                                   /* A symlink or device node has no content
@@ -755,7 +769,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   ltarget, hgroup,
                                   hash_is_zero(e->node.xattr_hash) ? "" : xhex,
                                   hash_is_zero(e->node.acl_hash)   ? "" : ahex,
-                                  NULL }, NULL);
+                                  dmaj, dmin, NULL }, NULL);
         if (rc != 0) {
             if (db_exec_raw(p->db, "ROLLBACK") != 0)
                 log_error("index_nodes: rollback failed");

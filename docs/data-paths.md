@@ -98,7 +98,9 @@ Each entry carries the absolute path, the `lstat` result, a scan-assigned
    near-sequential ones. Dotfiles are kept; `.` and `..` are not.
 3. **Per-entry classification.** `lstat` maps to a node type: regular,
    directory, symlink, FIFO, character device, block device. Sockets and
-   anything unrecognised become type 0 and carry no content.
+   anything unrecognised become type 0 and carry no content. Device nodes
+   additionally record their major/minor pair, which is the entire content
+   of a device file.
 4. **Hardlink detection.** A regular file with `st_nlink > 1` looks up its
    `inode_identity` (an FNV hash of `st_dev` and `st_ino`) in an inode map
    shared across all source roots of the run, so links spanning roots are
@@ -260,16 +262,21 @@ the whole pass linear in entries. (This pass was quadratic once; at 25,000
 directories it did not finish. Anything added here has to stay linear.)
 
 Each manifest entry carries: name, type, mode, uid, gid, size, mtime,
-`inode_identity`, the target hash (child tree hash for directories, content
-hash for files, zero otherwise), the symlink target string, and the
-reserved xattr/ACL hashes. The wire format is fixed-width little-endian,
-entries sorted in `memcmp` byte order, and contains **no snapshot-scoped
-values**: no node id, no parent pointer, no backup timestamp. That is the
+`inode_identity`, the device major/minor pair (devices only), the target
+hash (child tree hash for directories, content hash for files, zero
+otherwise), the symlink target string, and the xattr/ACL blob hashes. The wire format is versioned (currently 2; version 1 trees stay readable so
+a repository predating the device pair is still recoverable), fixed-width
+little-endian, entries sorted in `memcmp` byte order, and contains **no
+snapshot-scoped values**: no node id, no parent pointer, no backup timestamp. That is the
 determinism contract from `repo-format.md`: an unchanged directory must
 serialise to byte-identical output so `object_store_ex` sees an existing
 hash and writes nothing. `trees_new` vs `trees_reused` in the backup result
 is the health metric; the measured baseline is about 3% new trees per
-incremental, and a number near 100% means determinism broke silently.
+incremental, and a number near 100% means determinism broke silently. The
+one legitimate exception is the first backup after a tree-format version
+bump, which re-serialises every directory exactly once. That is cheaper
+than it sounds: measured on a 39,240-file tree, the 314 tree objects cost
+2.0 MiB physical against a 182 MiB repository, roughly 1%.
 
 A synthetic root tree ties all source roots of the run together; its hash
 is the snapshot's identity.
@@ -499,12 +506,14 @@ Type-specific behaviour, spelled out:
 - **Overwrite**: with `overwrite` off, an existing destination file is
   skipped; with it on, symlink/hardlink sites `unlink` first and regular
   files are `O_TRUNC`ed.
-- **FIFOs and device nodes**: **Gap.** They are scanned and indexed (type,
-  mode, ownership), but restore currently skips them with a warning, and
-  device major/minor numbers are not part of the manifest wire format at
-  all, so they do not survive reindex. If device-node fidelity is ever
-  needed, the manifest format needs a field before restore can grow the
-  `mknod` branch.
+- **FIFOs and device nodes**: recreated by `mkfifo`/`mknod`, then metadata,
+  xattrs and ACLs like any other node. Neither has a content object; for a
+  device the major/minor pair is the whole file, which is why the manifest
+  format carries it (tree version 2). Two guards matter here: a device
+  indexed from a version 1 tree has no recorded numbers and is skipped
+  rather than created at 0:0 pointing at the wrong driver, and a `mknod`
+  refused for lack of `CAP_MKNOD` is a warning, not a failed restore.
+  Sockets are scanned but have no meaningful restore and are skipped.
 
 Per-file failures (unreadable object, unwritable destination) are counted
 as skips and logged; the restore completes and reports

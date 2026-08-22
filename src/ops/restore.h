@@ -28,6 +28,8 @@ typedef struct {
     uint64_t dirs;
     uint64_t symlinks;
     uint64_t hardlinks;
+    /* FIFOs and device nodes: recreated by mknod, no content involved. */
+    uint64_t specials;
     uint64_t bytes;
     uint64_t skipped;
 } restore_result_t;
