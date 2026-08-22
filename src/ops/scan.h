@@ -56,7 +56,6 @@ typedef struct {
     int          verbose;
     int          collect_meta; /* collect xattr/ACL blobs during scan (default: on) */
     int          one_filesystem; /* skip entries on different devices (mount points) */
-    dev_t        root_dev;      /* set by scan_tree when one_filesystem is set */
     void       (*progress_cb)(uint32_t scanned_entries, void *ctx);
     void       (*progress_clear_cb)(void *ctx);
     void        *progress_ctx;

@@ -285,14 +285,24 @@ status_t scan_entry_collect_metadata(scan_entry_t *e) {
     return OK;
 }
 
+/*
+ * root_dev is threaded through the recursion rather than stored in
+ * scan_opts_t. It used to live there, which meant scan_tree had to cast away
+ * the const on its own options argument to record it: an output smuggled into
+ * an input. Callers never set it and never read it, so it was never really
+ * part of the options.
+ */
+
 /* Forward declaration */
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
-                         const scan_opts_t *opts, scan_result_t *res);
+                         const scan_opts_t *opts, dev_t root_dev,
+                         scan_result_t *res);
 
 static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
                                 size_t strip_prefix_len, imap_t *imap,
-                                const scan_opts_t *opts, scan_result_t *res) {
+                                const scan_opts_t *opts, dev_t root_dev,
+                                scan_result_t *res) {
     struct stat st;
     if (lstat(path, &st) == -1) {
         if (opts && opts->progress_clear_cb)
@@ -305,8 +315,8 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     }
 
     /* Skip entries on different filesystems (mount point crossing) */
-    if (opts && opts->one_filesystem && opts->root_dev != 0 &&
-        st.st_dev != opts->root_dev) {
+    if (opts && opts->one_filesystem && root_dev != 0 &&
+        st.st_dev != root_dev) {
         char msg[PATH_MAX + 96];
         snprintf(msg, sizeof(msg), "skipping mount point: %s (different device)", path);
         scan_warn(res, msg);
@@ -385,7 +395,8 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     }
 
     if (S_ISDIR(st.st_mode))
-        return scan_dir(path, this_node_id, strip_prefix_len, imap, opts, res);
+        return scan_dir(path, this_node_id, strip_prefix_len, imap, opts,
+                        root_dev, res);
     return OK;
 }
 
@@ -424,7 +435,8 @@ static int scan_dirent_cmp(const void *a, const void *b) {
 
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
-                         const scan_opts_t *opts, scan_result_t *res) {
+                         const scan_opts_t *opts, dev_t root_dev,
+                         scan_result_t *res) {
     DIR *d = opendir(path);
     if (!d) {
         if (opts && opts->progress_clear_cb)
@@ -484,7 +496,8 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         child[plen] = '/';
         memcpy(child + plen + 1, batch[i].name, nlen + 1);
         if (is_excluded(child, opts)) continue;
-        st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts, res);
+        st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts,
+                           root_dev, res);
     }
     free(batch);
     return st;
@@ -516,13 +529,9 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         return OK;
     }
 
-    /* Record root device for mount-crossing detection.
-     * Caller should set opts->root_dev = 0; scan_tree sets it from root stat. */
-    if (opts && opts->one_filesystem && opts->root_dev == 0) {
-        /* root_dev is set once per scan_tree call; safe to cast away const
-         * since the field is output-only (set by scan_tree, read by children). */
-        ((scan_opts_t *)(void *)opts)->root_dev = root_st.st_dev;
-    }
+    /* Root device for mount-crossing detection, fixed for this whole scan and
+     * compared against every entry's st_dev by scan_entry_at. */
+    dev_t root_dev = (opts && opts->one_filesystem) ? root_st.st_dev : 0;
 
     uint64_t root_parent_id = 0;
     if (root[0] == '/' && strip_prefix_len == 1) {
@@ -606,7 +615,8 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         return OK;
     }
 
-    status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts, res);
+    status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts,
+                                root_dev, res);
     if (st != OK) { scan_result_free(res); return st; }
     *out = res;
     return OK;

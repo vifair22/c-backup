@@ -232,6 +232,70 @@ static void test_scan_warns_on_unreadable_dir(void **state) {
     chmod(TEST_ROOT1 "/noperm", 0755);
 }
 
+/*
+ * one_filesystem must be evaluated per scan_tree call, not once per options
+ * struct. backup_run reuses one scan_opts_t across every source root, and the
+ * root device used to be cached in that struct, so the second root inherited
+ * the first root's device and was skipped whole as a "mount point". Nothing
+ * failed: the backup succeeded, missing an entire source tree.
+ *
+ * /dev/shm is a separate tmpfs from /tmp on Linux and inside a container, so
+ * two roots there are genuinely on different devices. If they are not, the
+ * test cannot say anything and says so rather than passing quietly.
+ */
+static void test_one_filesystem_is_per_root(void **state) {
+    (void)state;
+
+    const char *shm_root = "/dev/shm/c_backup_scan_shm";
+    int rc = system("rm -rf /dev/shm/c_backup_scan_shm");
+    (void)rc;
+    if (mkdir(shm_root, 0755) != 0) {
+        print_message("skipped: cannot create %s\n", shm_root);
+        return;
+    }
+    write_file("/dev/shm/c_backup_scan_shm/shm.txt", "on the other device");
+
+    struct stat a, b;
+    assert_int_equal(stat(TEST_ROOT1, &a), 0);
+    assert_int_equal(stat(shm_root, &b), 0);
+    if (a.st_dev == b.st_dev) {
+        print_message("skipped: %s and %s share a device\n", TEST_ROOT1, shm_root);
+        rc = system("rm -rf /dev/shm/c_backup_scan_shm");
+        (void)rc;
+        return;
+    }
+
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+
+    /* One options struct, two roots, exactly as backup_run does it. */
+    scan_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.one_filesystem = 1;
+
+    scan_result_t *first = NULL;
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, &first), OK);
+    assert_non_null(first);
+    assert_true(first->count > 0);
+
+    scan_result_t *second = NULL;
+    assert_int_equal(scan_tree(shm_root, imap, &opts, &second), OK);
+    assert_non_null(second);
+
+    int found = 0;
+    for (uint32_t i = 0; i < second->count; i++) {
+        if (second->entries[i].path && strstr(second->entries[i].path, "shm.txt"))
+            found = 1;
+    }
+    assert_true(found);
+
+    scan_result_free(first);
+    scan_result_free(second);
+    scan_imap_free(imap);
+    rc = system("rm -rf /dev/shm/c_backup_scan_shm");
+    (void)rc;
+}
+
 static void test_scan_entry_collect_metadata_invalid_args(void **state) {
     (void)state;
     assert_int_equal(scan_entry_collect_metadata(NULL), ERR_INVALID);
@@ -250,6 +314,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_one_filesystem_is_per_root, setup, teardown),
         cmocka_unit_test(test_scan_entry_collect_metadata_invalid_args),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
