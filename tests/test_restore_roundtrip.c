@@ -238,6 +238,47 @@ static void test_reindex_rebuilds_the_index(void **state)
     db_result_free(r);
 }
 
+/*
+ * A rebuilt snapshot must describe itself the same way a written one does.
+ * file_count was taking the node total, so a rebuilt snapshot claimed every
+ * directory as a file and the count silently changed under the user the first
+ * time a repository was recovered.
+ */
+static void test_reindex_preserves_the_file_count(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT file_count FROM snapshots WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    int written = atoi(r->rows[0][0]);
+    db_result_free(r);
+    assert_int_equal(written, (int)br.files);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT file_count FROM snapshots WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(atoi(r->rows[0][0]), written);
+    db_result_free(r);
+
+    /* Directories were counted too, so the bug showed as rebuilt > written. */
+    assert_true(rx.nodes > rx.files);
+}
+
 /* And the rebuilt index must be good enough to restore from. */
 static void test_restore_after_reindex_is_identical(void **state)
 {
@@ -319,6 +360,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_preserves_the_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_after_reindex_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_handles_multiple_snapshots, setup, teardown),

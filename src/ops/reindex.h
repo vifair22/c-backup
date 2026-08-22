@@ -22,6 +22,10 @@
 typedef struct {
     uint64_t snapshots;
     uint64_t nodes;
+    /* Regular files only. snapshots.file_count means the same thing whether a
+     * snapshot was written by a backup or rebuilt here, so counting nodes
+     * would make a rebuilt snapshot claim more files than it has. */
+    uint64_t files;
     uint64_t trees_read;
 } reindex_result_t;
 

@@ -134,6 +134,7 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
         }
 
         ctx->res->nodes++;
+        if (e->type == NODE_TYPE_REG) ctx->res->files++;
 
         if (is_dir && have_target)
             st = walk_tree(ctx, e->target_hash, node_id);
@@ -233,16 +234,16 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     if (!failed) {
-        char tsbuf[32], nodes[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
+        char tsbuf[32], files[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
         snprintf(tsbuf, sizeof(tsbuf), "%lld", (long long)ts);
-        snprintf(nodes, sizeof(nodes), "%llu", (unsigned long long)res.nodes);
+        snprintf(files, sizeof(files), "%llu", (unsigned long long)res.files);
         hash_hex(root, rhex);
         if (db_execute_non_query(db,
                 "INSERT OR REPLACE INTO snapshots (repo_id, id, ts, label,"
                 " file_count, completed_at, root_tree_hash, nodes_materialized)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                 (const char *[]){ repo, snap, tsbuf, label ? label : "",
-                                  nodes, tsbuf, rhex, NULL }, NULL) != 0)
+                                  files, tsbuf, rhex, NULL }, NULL) != 0)
             failed = 1;
     }
 
