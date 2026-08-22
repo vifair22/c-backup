@@ -124,23 +124,11 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     return path;
 }
 
-/* /repos/<id>/backup */
-static int64_t repo_id_from_url(const char *url, const char *suffix)
+api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
+                                 const char *rest)
 {
-    if (strncmp(url, "/repos/", 7) != 0) return -1;
-    const char *rest = url + 7;
-    char *end = NULL;
-    long long id = strtoll(rest, &end, 10);
-    if (id <= 0 || !end) return -1;
-    if (suffix && strcmp(end, suffix) != 0) return -1;
-    return id;
-}
-
-static api_response_t handle_backup(const api_request_t *req, void *ud)
-{
-    backup_ctx_t *ctx = ud;
-    int64_t repo_id = repo_id_from_url(req->url, "/backup");
-    if (repo_id < 0) return api_error(400, "invalid repo id");
+    backup_ctx_t *ctx = &g_ctx;
+    if (strcmp(rest, "/backup") != 0) return api_error(404, "not found");
 
     char *repo_path = repo_path_for(ctx->db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
@@ -286,7 +274,6 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)
 {
     g_ctx.db = db;
     g_ctx.jm = jm;
-    if (api_server_route(srv, "/repos/*", API_POST, handle_backup, &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs",    API_GET,  list_jobs,     &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_GET,  get_job,       &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_POST, cancel_job,    &g_ctx) != 0) return -1;

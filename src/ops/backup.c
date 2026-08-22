@@ -337,15 +337,32 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         hash_hex(p->links[i].tree_hash, shex);
         int is_dir = (e->node.type == NODE_TYPE_DIR);
 
-        if (db_execute_non_query(p->db,
+        char ntype[8];
+        snprintf(ntype, sizeof(ntype), "%u", e->node.type);
+
+        /*
+         * Two statements rather than one with a conditional NULL. The params
+         * array is NULL-terminated, so passing NULL as a value silently
+         * truncates the list and leaves later columns unbound: that is how
+         * subtree_hash ended up NULL for every directory and made
+         * directories indistinguishable from files in the index.
+         */
+        int rc = is_dir
+            ? db_execute_non_query(p->db,
                 "INSERT OR REPLACE INTO nodes"
-                " (repo_id, id, snap_id, parent_node_id, name, mode, uid, gid,"
-                "  mtime_ns, size, content_hash, subtree_hash)"
+                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
+                "  gid, mtime_ns, size, subtree_hash)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, id, snap, parent, name, mode, uid, gid,
-                                  mtime, size,
-                                  is_dir ? NULL : chex,
-                                  is_dir ? shex : NULL, NULL }, NULL) != 0) {
+                (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
+                                  gid, mtime, size, shex, NULL }, NULL)
+            : db_execute_non_query(p->db,
+                "INSERT OR REPLACE INTO nodes"
+                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
+                "  gid, mtime_ns, size, content_hash)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
+                                  gid, mtime, size, chex, NULL }, NULL);
+        if (rc != 0) {
             if (db_exec_raw(p->db, "ROLLBACK") != 0)
                 log_error("index_nodes: rollback failed");
             return set_error(ERR_IO, "index_nodes: insert failed");

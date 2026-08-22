@@ -126,6 +126,11 @@ CREATE TABLE nodes (
     snap_id           INTEGER NOT NULL,
     parent_node_id    INTEGER,
     name              TEXT NOT NULL,
+    -- NODE_TYPE_*. Explicit rather than inferred from which hash column is
+    -- populated: a directory with no children and a file with no content
+    -- would otherwise be indistinguishable, and the inference silently
+    -- collapses if a hash is ever left unset.
+    type              INTEGER NOT NULL,
     mode              INTEGER NOT NULL,
     uid               INTEGER NOT NULL,
     gid               INTEGER NOT NULL,

@@ -152,11 +152,50 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
     return api_no_content();
 }
 
+/*
+ * Everything under /repos/<id>/ funnels through here.
+ *
+ * The router returns the first pattern that matches, so registering that pattern
+ * from three different modules would leave two of them permanently
+ * unreachable with no error at startup. One owner, explicit dispatch.
+ */
+static int64_t split_repo_url(const char *url, const char **rest)
+{
+    if (strncmp(url, "/repos/", 7) != 0) return -1;
+    const char *p = url + 7;
+    char *end = NULL;
+    long long id = strtoll(p, &end, 10);
+    if (id <= 0 || !end) return -1;
+    if (rest) *rest = end;
+    return id;
+}
+
+static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
+{
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(req->url, &rest);
+    if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (*rest == '\0') return get_repo(req, ud);
+    return snapshots_route_get(req, repo_id, rest);
+}
+
+static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
+{
+    (void)ud;
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(req->url, &rest);
+    if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (strcmp(rest, "/backup") == 0)
+        return backup_route_post(req, repo_id, rest);
+    return snapshots_route_post(req, repo_id, rest);
+}
+
 int routes_register_repos(api_server_t *srv, cutils_db_t *db)
 {
-    if (api_server_route(srv, "/repos",  API_GET,    list_repos,  db) != 0) return -1;
-    if (api_server_route(srv, "/repos",  API_POST,   create_repo, db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_GET,    get_repo,    db) != 0) return -1;
-    if (api_server_route(srv, "/repos/*", API_DELETE, delete_repo, db) != 0) return -1;
+    if (api_server_route(srv, "/repos",   API_GET,    list_repos,       db) != 0) return -1;
+    if (api_server_route(srv, "/repos",   API_POST,   create_repo,      db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_GET,    repo_scoped_get,  db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_POST,   repo_scoped_post, db) != 0) return -1;
+    if (api_server_route(srv, "/repos/*", API_DELETE, delete_repo,      db) != 0) return -1;
     return 0;
 }
