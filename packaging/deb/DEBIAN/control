@@ -1,0 +1,15 @@
+Package: c-backup
+Version: 0.10.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: libc6, libssl3, liblz4-1, libacl1, libsqlite3-0, libmicrohttpd12, libcurl4, systemd
+Maintainer: XxI0NICxX <vifair22@gmail.com>
+Description: Content-addressed backup daemon
+ One daemon per machine, owning every repository on it. Content-addressed
+ storage with LZ4 compression, Reed-Solomon parity, sparse-file handling and
+ pack coalescing, exposed over an HTTP API on a unix socket and a TCP port.
+ .
+ Repositories are self-describing: manifest trees stored alongside the data
+ mean the index can be rebuilt from a repository at any time, so losing the
+ daemon database costs time rather than backups.

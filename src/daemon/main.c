@@ -176,7 +176,9 @@ int main(int argc, char *argv[])
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||
-        routes_register_jobs(srv, db, jm) != 0) {
+        routes_register_jobs(srv, db, jm) != 0 ||
+        routes_register_metrics(srv, db) != 0 ||
+        routes_register_stream(srv, db) != 0) {
         log_error("cannot register routes");
         api_server_stop(srv);
         appguard_shutdown(guard);

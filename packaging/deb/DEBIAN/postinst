@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# The unit runs as root and StateDirectory handles /var/lib/c-backupd, but a
+# fresh install needs the config in place before the daemon first starts, and
+# it holds Pushover credentials, so it is not world-readable.
+if [ ! -f /etc/c-backupd/config.yaml ]; then
+    mkdir -p /etc/c-backupd
+    cp /usr/share/c-backup/config.yaml /etc/c-backupd/config.yaml
+    chmod 0600 /etc/c-backupd/config.yaml
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    # Not started automatically: the operator should set an admin password
+    # before the TCP listener accepts anything, and starting first would leave
+    # a window where it does not.
+    echo "c-backup installed. Review /etc/c-backupd/config.yaml, then:"
+    echo "  systemctl enable --now c-backupd"
+fi

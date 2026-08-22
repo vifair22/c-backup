@@ -1,238 +1,113 @@
 # c-backup
 
-A deduplicating filesystem backup tool for Linux, written in C.
+A content-addressed backup daemon. One `c-backupd` per machine owns every
+repository on it and is the only writer; `c-backup` is a thin HTTP client, and
+the Electron app talks to the same API.
 
----
+**Status: mid-rewrite.** The daemon backs up, restores, prunes and schedules.
+Several UI panels are still blocked on introspection endpoints that are
+designed but not built. See `daemonization-spec.md` for the plan and the
+per-phase record of what changed and why.
 
 ## What it does
 
-`c-backup` captures incremental, deduplicated snapshots of one or more directory trees. Every file is content-addressed by its SHA-256 hash and stored exactly once across all snapshots. Restores are fully offline and metadata-exact: permissions, ownership, xattrs, ACLs, symlinks, hardlinks, sparse files, and device nodes are all preserved.
-
-**Design constraints:**
-
-- Individual files and total repository size may be arbitrarily large — no limit short of available disk space.
-- Any single file may exceed available RAM. All large-object paths stream rather than buffer.
-- Repositories with millions of inodes are expected. Change detection is O(n), not O(n2).
-- Pre-compressed content (video, audio, database files) is detected at intake and stored verbatim — no CPU wasted re-compressing incompressible data.
-
-For usage documentation, CLI reference, and technical internals see [manual.md](manual.md).
-
----
-
-## Dependencies
-
-### Build toolchain
-
-| Package | Notes |
-|---------|-------|
-| GCC (C11) | Primary compiler; Clang may work but is not tested |
-| GNU Make | Parallel builds via `-j$(nproc)` |
-| `liblz4-dev` | LZ4 compression headers and library |
-| `libssl-dev` | OpenSSL headers (SHA-256) |
-| `libacl1-dev` | POSIX ACL headers |
-| `libcmocka-dev` | Unit test framework (test builds only) |
-| `libasan` | AddressSanitizer runtime (`make asan` only) |
-| `gcovr` | Coverage report generation (`make coverage` only) |
-
-### Runtime libraries
-
-| Library | Purpose |
-|---------|---------|
-| `liblz4` | Object compression |
-| `libssl` / `libcrypto` (OpenSSL) | SHA-256 hashing |
-| `libacl` | POSIX ACL backup and restore |
-| `libpthread` | Parallel worker pools |
-
-### Electron UI (optional)
-
-The desktop application lives in `ui/` and targets Node.js 24 LTS and Electron 41. It is self-contained: `cd ui && npm install && npm run dev` for a development build, or `npm run build` for a packaged distribution. No system-wide runtime dependencies are required beyond a working Linux desktop stack (GTK/Wayland). See [manual.md §9](manual.md#9-electron-ui) for the full architecture and usage reference.
-
----
+- **Content-addressed storage.** SHA-256 objects, LZ4 with a 64 KiB probe that
+  gives up quickly on incompressible data, Reed-Solomon parity in every object
+  and pack trailer, sparse-file handling, and pack coalescing.
+- **Manifest trees.** A snapshot's metadata is one content-addressed object per
+  directory, so an unchanged directory costs nothing on the next backup.
+  Measured: 3.3% new tree objects per incremental snapshot.
+- **A repository that describes itself.** The database is an index over the
+  trees in the repository, not the only copy. Lose it and `reindex` rebuilds
+  it; you lose query speed and job history, not backups.
+- **Real scheduling.** Interval triggers anchored to the last successful run,
+  and calendar triggers that handle DST, month ends and leap days.
+- **GFS retention.** Daily, weekly, monthly and yearly tiers as a bitfield, so
+  one snapshot can hold several at once. Tagged snapshots are never pruned.
 
 ## Building
 
-Requires GCC with C11 support and GNU Make. Builds use all available CPU cores automatically.
-
-### Build targets
-
-| Target | Output | Optimisation | Description |
-|--------|--------|-------------|-------------|
-| `make` | `build/bins/backup` | `-O3` | Release build |
-| `make static` | `build/bins/backup-static` | `-O3` | Statically linked release |
-| `make debug` | `build/bins/backup-debug` | `-Og -g` | Debug build with full symbols |
-| `make asan` | `build/bins/backup-asan` | `-O1 -g -fsanitize=address` | AddressSanitizer build |
-| `make clean` | — | — | Remove `build/` |
-
-Each build type compiles into its own subdirectory (`build/release/`, `build/static/`, `build/debug/`, `build/asan/`) so you can switch between them without stale object conflicts. All final binaries are placed in `build/bins/`.
-
-Compiler warnings include `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-qual -Wnull-dereference -Wmissing-prototypes` and more. Vendor code (`vendor/`) is compiled with relaxed flags.
-
-### Versioning
-
-The binary embeds a version string in the format `SEMVER_YYYYMMDD.HHMM.TYPE`:
-
-```
-$ build/bins/backup --version
-c-backup 0.1.0_20260406.1944.release
-```
-
-- **SEMVER** is read from `release_version` (controlled, bumped for releases).
-- **YYYYMMDD.HHMM** is the UTC build timestamp.
-- **TYPE** is one of `release`, `static`, `debug`, or `asan`.
-
----
-
-## Testing
-
-Tests use the [cmocka](https://cmocka.org/) framework.
+Needs a sibling checkout of [c-utils](https://git.airies.net/vifair22/c-utils)
+at `../c-utils`, or `CUTILS_DIR` pointing elsewhere. The pinned version is in
+`cutils_version`.
 
 ```sh
-make test           # build release + all tests + static analysis, then run
-make test-asan      # build asan + all tests under AddressSanitizer, then run
+make            # c-backupd and c-backup into build/bins/
+make debug      # -Og -g
+make asan       # -fsanitize=address
+make analyze    # stack-usage (64 KiB limit), gcc -fanalyzer, cppcheck
+make test       # unit suites, then the HTTP and CLI end-to-end suites
+make coverage   # gcovr report with the src/store ratchet
+make bench      # microbenchmarks and browse-path benchmarks
 ```
 
-Individual test binaries can be run directly:
+Build dependencies on Debian:
 
 ```sh
-build/bins/test_parity
-build/bins/test_restore
-build/bins/test_pack_gc
+apt-get install build-essential pkg-config libssl-dev liblz4-dev \
+                libacl1-dev libsqlite3-dev libmicrohttpd-dev \
+                libcurl4-openssl-dev libcmocka-dev
 ```
 
-Test binary names mirror source filenames under `tests/`. There are 33 test suites covering snapshots, objects, packing, GC, coalescing, parity, restore, export/import, CLI options, and fault injection.
-
-The `make test` target also runs static analysis:
-
-| Analyser | What it checks |
-|----------|---------------|
-| Stack usage | Flags any function exceeding 64 KiB stack frame |
-| `gcc -fanalyzer` | GCC's built-in static analyser |
-| `cppcheck` | Supplemental static analysis (if installed) |
-
-### Coverage
+## Running
 
 ```sh
-make coverage
+sudo mkdir -p /etc/c-backupd
+sudo cp packaging/config.yaml /etc/c-backupd/config.yaml
+sudo chmod 600 /etc/c-backupd/config.yaml    # it holds Pushover credentials
+sudo cp packaging/systemd/c-backupd.service /etc/systemd/system/
+sudo systemctl enable --now c-backupd
 ```
 
-Builds with `--coverage`, runs all tests, and generates an HTML report at `build/coverage/coverage.html` via `gcovr`.
-
----
-
-## Benchmarks
-
-Two benchmark suites live under `bench/`:
-
-| Suite | Binary | What it measures |
-|-------|--------|-----------------|
-| Micro | `build/bins/bench_micro` | SHA-256, CRC-32C, LZ4 compress/decompress, RS encode/decode, XOR parity, object store/load round-trips |
-| Phases | `build/bins/bench_phases` | End-to-end per-phase timing: scan, backup, pack, verify, GC, restore with synthetic test data |
+Then set an admin password. Until you do, the TCP listener is open so the
+daemon can be bootstrapped; the unix socket is always gated by filesystem
+permissions instead.
 
 ```sh
-make bench            # build and run all benchmarks
-make bench-micro      # micro only
-make bench-phases     # phases only
+curl -X POST -d '{"password":"..."}' http://localhost:8765/api/auth/setup
 ```
 
-Both binaries support name filtering and listing:
+## Using it
 
 ```sh
-build/bins/bench_micro sha256       # run only benchmarks matching "sha256"
-build/bins/bench_micro -l           # list available benchmarks
+c-backup repo add /srv/backup/main main
+c-backup backup 1 /home/me/documents
+c-backup jobs                       # watch it
+c-backup snapshots 1
+c-backup ls 1 1                     # browse a snapshot
+c-backup search 1 invoice
+c-backup restore 1 1 /tmp/restored
 ```
 
-Benchmarks link against the full library (everything except `main.o`) and do not require cmocka.
+Every command is an HTTP request over the daemon's socket. If the daemon is
+not running the CLI says so and exits; there is no standalone mode, because
+having exactly one writer is the point.
 
----
+Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
 
-## Source layout
+## Layout
 
-```
-c-backup/
-├── src/                    # Core C source (21 .c, 23 .h)
-│   ├── main.c              #   CLI entry point and command dispatch
-│   ├── backup.c            #   Backup pipeline (scan, compare, parallel store)
-│   ├── restore.c           #   Restore engine (pack-sorted, parallel)
-│   ├── snapshot.c          #   Snapshot manifest read/write
-│   ├── object.c            #   Object store (loose read/write, FUSE ring, streaming)
-│   ├── pack.c              #   Pack system (creation, GC, coalesce, workers)
-│   ├── pack_index.c        #   Global pack index (mmap'd, fanout + binary search)
-│   ├── parity.c            #   CRC-32C, XOR parity, Reed-Solomon RS(255,239)
-│   ├── parity_stream.c     #   Bounded-RAM streaming RS parity accumulator
-│   ├── scan.c              #   Filesystem scanner (inode-sorted, exclusions, hardlinks)
-│   ├── gc.c                #   Garbage collection (reference collection, loose + pack GC)
-│   ├── gfs.c               #   GFS retention engine (tier assignment, prune logic)
-│   ├── diff.c              #   Snapshot-to-snapshot diff
-│   ├── ls.c                #   In-snapshot directory listing and search
-│   ├── xfer.c              #   Bundle export/import, TAR export
-│   ├── json_api.c          #   JSON RPC API (single-shot and session modes)
-│   ├── repo.c              #   Repository open/close, locking, DAT cache, loose set
-│   ├── policy.c            #   policy.toml parser and writer
-│   ├── tag.c               #   Tag management
-│   ├── stats.c             #   Repository statistics
-│   ├── error.c             #   Thread-local error context
-│   └── types.h             #   Core type definitions (node_t, object_header_t, etc.)
-│
-├── tests/                  # cmocka test suites (34 files)
-│   ├── test_backup.c       #   End-to-end backup pipeline
-│   ├── test_restore.c      #   Restore correctness
-│   ├── test_pack_gc.c      #   Pack GC and rewrite
-│   ├── test_parity.c       #   Parity encode/decode/repair
-│   ├── test_*_fault.c      #   Fault injection tests (malloc/IO failure paths)
-│   └── fault_inject.c      #   Shared fault injection harness (--wrap)
-│
-├── bench/                  # Benchmark suites
-│   ├── micro.c             #   Primitive-level throughput benchmarks
-│   ├── phases.c            #   End-to-end pipeline phase timing
-│   └── fuse_xfer.c         #   FUSE transfer benchmarks
-│
-├── vendor/                 # Third-party (vendored, relaxed warnings)
-│   ├── cJSON.{c,h}         #   JSON parser (MIT)
-│   ├── toml.{c,h}          #   TOML parser (MIT)
-│   └── log.h               #   Logging macros
-│
-├── ui/                     # Electron desktop application
-│   ├── src/
-│   │   ├── main/           #   Main process: connection manager, RPC client,
-│   │   │                   #   SSH transport, safeStorage-backed credential store
-│   │   ├── preload/        #   Context-bridge preload scripts
-│   │   ├── renderer/       #   React 19 + TypeScript + Tailwind UI
-│   │   └── shared/         #   Types shared across processes
-│   ├── package.json        #   Dependencies and build scripts
-│   └── electron-vite.config.ts
-│
-├── Makefile                # GNU Makefile (parallel, multi-target)
-├── release_version         # SemVer string (e.g. "0.1.0")
-├── manual.md               # Full technical manual
-└── README.md               # This file
-```
-
----
-
-## Releases
-
-Version numbers follow [Semantic Versioning](https://semver.org/). The release version is stored in `release_version` and baked into every binary at build time.
-
-To cut a release:
-
-1. Update `release_version` with the new version (e.g. `0.2.0`).
-2. Build all targets (`make`, `make static`, `make debug`).
-3. Tag the commit: `git tag v0.2.0`.
-4. The resulting binaries embed the full version string (e.g. `0.2.0_20260407.1200.release`).
-
----
+| Path | Contents |
+|---|---|
+| `src/store/` | Storage engine: objects, packs, parity, manifest trees |
+| `src/ops/` | Backup, restore, reindex, GC, prune, GFS, scan |
+| `src/api/` | HTTP server, auth, routes |
+| `src/scheduler/` | Triggers, schedule loop, job manager |
+| `src/meta/` | Repository identity and per-repo locks |
+| `src/daemon/`, `src/cli/` | The two entry points |
+| `ui/` | Electron app |
+| `docs/` | `api.md`, `repo-format.md` |
+| `bench/` | Benchmarks; results journalled in `PERF.md` |
 
 ## Documentation
 
-See [manual.md](manual.md) for:
+- `docs/repo-format.md`: on-disk layout, manifest trees, and why determinism
+  matters more than it looks.
+- `docs/api.md`: every endpoint, with the reasoning behind pagination, auth
+  and the trigger model.
+- `PERF.md`: benchmark journal. New numbers are added, not substituted.
+- `manual.md`: **stale.** Written for the pre-rewrite CLI and not yet updated.
 
-- Complete CLI reference with all flags and examples
-- `policy.toml` field reference
-- Common configuration recipes
-- Troubleshooting guide
-- Environment variables
-- Storage model, data flow, and algorithm internals
-- On-disk file format specifications
-- JSON RPC API reference
-- Parity error correction details
-- On-disk format version history
+## License
+
+GPL. See `LICENSE`.

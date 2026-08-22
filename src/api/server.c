@@ -76,19 +76,31 @@ static api_method_t method_from_string(const char *method)
 static const route_entry_t *find_route(const api_server_t *srv,
                                        const char *url, api_method_t method)
 {
+    /*
+     * Most specific wins, not first registered.
+     *
+     * With first-match, two modules registering overlapping patterns leaves
+     * one of them permanently unreachable, and nothing reports it: the daemon
+     * starts cleanly and the endpoint simply does not exist. That has now
+     * happened twice. An exact match beats any prefix, and among prefixes the
+     * longest pattern wins, so registration order stops mattering.
+     */
+    const route_entry_t *best = NULL;
+    size_t best_len = 0;
+
     for (int i = 0; i < srv->nroutes; i++) {
         if (srv->routes[i].method != method) continue;
         const char *pat = srv->routes[i].pattern;
         size_t plen = strlen(pat);
-        /* Prefix match: pattern ending with '*' */
+
         if (plen > 0 && pat[plen - 1] == '*') {
-            if (strncmp(url, pat, plen - 1) == 0)
-                return &srv->routes[i];
+            if (strncmp(url, pat, plen - 1) != 0) continue;
+            if (!best || plen > best_len) { best = &srv->routes[i]; best_len = plen; }
         } else if (strcmp(pat, url) == 0) {
-            return &srv->routes[i];
+            return &srv->routes[i];   /* exact match is always the answer */
         }
     }
-    return NULL;
+    return best;
 }
 
 static const char *get_header(struct MHD_Connection *conn, const char *name)

@@ -1,0 +1,155 @@
+# c-backup pipeline.
+#
+# Stages short-circuit: nothing is built if the tests fail, and nothing is
+# deployed if the build fails. Coverage is a ratchet rather than a fixed
+# target, because a gate set to an aspiration gets overridden until it means
+# nothing, while one set to the current floor catches real regressions.
+
+stages:
+  - test
+  - analyze
+  - coverage
+  - build
+  - deploy
+
+variables:
+  CUTILS_DIR: /tmp/c-utils
+  DEBIAN_FRONTEND: noninteractive
+
+.debian_deps: &debian_deps
+  - apt-get update -qq
+  - apt-get install -y -qq --no-install-recommends
+      build-essential git pkg-config ca-certificates
+      libssl-dev liblz4-dev libacl1-dev libsqlite3-dev
+      libmicrohttpd-dev libcurl4-openssl-dev libcmocka-dev
+      sqlite3 curl gcovr cppcheck
+
+# c-utils is pinned by the cutils_version file rather than tracking its
+# master, so a change over there cannot break this build without someone
+# choosing to move the pin.
+.fetch_cutils: &fetch_cutils
+  - git clone -q https://git.airies.net/vifair22/c-utils.git "$CUTILS_DIR"
+  - git -C "$CUTILS_DIR" checkout -q "$(tr -d '[:space:]' < cutils_version)"
+  - make -s -C "$CUTILS_DIR"
+
+test:
+  stage: test
+  image: debian:trixie
+  tags: [docker]
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - make
+    # Unit suites, then the two shell suites. The shell ones drive a real
+    # daemon over HTTP and the CLI over its socket, which is the only way to
+    # cover the routes, the auth middleware and the job manager.
+    - make test
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - build/bins/
+
+analyze:
+  stage: analyze
+  image: debian:trixie
+  tags: [docker]
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    # 64 KiB per-function stack limit, gcc -fanalyzer, cppcheck. Worker
+    # threads get 2-8 MiB stacks, so a function that quietly grows past the
+    # limit is a crash waiting for a deep enough tree.
+    - make analyze
+
+coverage:
+  stage: coverage
+  image: debian:trixie
+  tags: [docker]
+  before_script:
+    - *debian_deps
+    - *fetch_cutils
+  script:
+    - make coverage
+  coverage: '/^lines:\s*(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - build/coverage/coverage.html
+
+build:image:
+  stage: build
+  image: docker:latest
+  tags: [docker, unraid]
+  services:
+    - docker:dind
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    # An image that builds but dies on startup is the failure this catches:
+    # run it, wait, and confirm it is still up before pushing.
+    - docker run -d --name smoke "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - sleep 5
+    - docker ps --filter name=smoke --filter status=running | grep -q smoke
+    - docker logs smoke
+    - docker rm -f smoke
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  only:
+    - master
+
+# Deploy fans out to one child job per target so a host can be added or
+# removed by editing a CI variable rather than this file.
+generate_deploy_child_pipeline:
+  stage: deploy
+  image: debian:trixie
+  tags: [docker]
+  script:
+    - |
+      : > deploy-child.yml
+      echo "stages: [deploy]" >> deploy-child.yml
+      i=0
+      printf '%s\n' "$CBACKUP_DEPLOY_TARGETS" | while IFS='|' read -r host network ip; do
+        [ -z "$host" ] && continue
+        i=$((i+1))
+        cat >> deploy-child.yml <<CHILD
+      deploy_${i}_${host}:
+        stage: deploy
+        image: debian:trixie
+        tags: [docker, unraid]
+        needs:
+          - pipeline: $CI_PIPELINE_ID
+            job: build:image
+        script:
+          - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client
+          - mkdir -p ~/.ssh && cp "\$DEPLOY_SSH_KEY" ~/.ssh/id_ed25519
+          # GitLab File variables strip the trailing newline and OpenSSH
+          # refuses a key without one, surfacing as a libcrypto error and
+          # then permission denied.
+          - printf '\n' >> ~/.ssh/id_ed25519
+          - chmod 600 ~/.ssh/id_ed25519
+          - ssh -o StrictHostKeyChecking=no root@${host} "docker pull \$CI_REGISTRY_IMAGE:\$CI_COMMIT_SHORT_SHA"
+          - ssh -o StrictHostKeyChecking=no root@${host} "docker rm -f c-backupd || true"
+          - ssh -o StrictHostKeyChecking=no root@${host} "docker run -d --name c-backupd --network ${network} --ip ${ip} -l net.unraid.docker.managed=dockerman --restart unless-stopped -v /mnt/user/appdata/c-backupd:/var/lib/c-backupd \$CI_REGISTRY_IMAGE:\$CI_COMMIT_SHORT_SHA"
+      CHILD
+      done
+  artifacts:
+    paths:
+      - deploy-child.yml
+  only:
+    - master
+
+trigger_deploy:
+  stage: deploy
+  needs: [generate_deploy_child_pipeline]
+  trigger:
+    include:
+      - artifact: deploy-child.yml
+        job: generate_deploy_child_pipeline
+    # depend so the parent pipeline reflects the children's status rather
+    # than going green the moment the trigger is accepted.
+    strategy: depend
+  only:
+    - master

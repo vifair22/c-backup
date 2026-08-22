@@ -77,3 +77,11 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
                                int64_t schedule_id);
 api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
                                 int64_t schedule_id);
+
+/* Prometheus metrics. Public, like the health endpoints: a metrics endpoint
+ * that needs a credential cannot report a daemon that is too unhealthy to
+ * authenticate. */
+int routes_register_metrics(api_server_t *srv, cutils_db_t *db);
+
+/* SSE progress stream for one job. */
+int routes_register_stream(api_server_t *srv, cutils_db_t *db);
