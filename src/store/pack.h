@@ -24,7 +24,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
  * Complete any interrupted pack installs from a previous crash.
  * Call before repo_pack() to recover staging directories.
  */
-void pack_resume_installing(store_t *store);
 
 /* --- used by object.c -------------------------------------------- */
 
@@ -86,7 +85,6 @@ void pack_cache_invalidate(store_t *store);
  * Returns OK on success.  *out_migrated receives the number of idx files
  * rewritten (may be NULL).
  */
-status_t pack_migrate_idx_v4(store_t *store, uint32_t *out_migrated);
 
 /*
  * Resolve a hash to its pack location.  Returns OK and fills out_pack_num +
@@ -202,9 +200,6 @@ typedef struct {
 
 typedef void (*pack_idx_entry_cb)(const pack_idx_info_t *info, void *ctx);
 
-status_t pack_enumerate_idx(store_t *store, const char *idx_name,
-                             uint32_t *out_version, uint32_t *out_count,
-                             pack_idx_entry_cb cb, void *ctx);
 
 /* --- path helpers (shared with json_api.c) ------------------------- */
 

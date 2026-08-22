@@ -10,26 +10,26 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "repo.h"
+#include "store.h"
 #include "object.h"
 #include "types.h"
 
 #define TEST_REPO "/tmp/c_backup_test_repo"
 
-static repo_t *repo;
+static store_t *store;
 
 static int setup(void **state) {
     (void)state;
     int rc = system("rm -rf " TEST_REPO);
     (void)rc;
-    if (repo_init(TEST_REPO) != OK) return -1;
-    if (repo_open(TEST_REPO, &repo) != OK) return -1;
+    if (store_init_dirs(TEST_REPO) != OK) return -1;
+    if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
     return 0;
 }
 
 static int teardown(void **state) {
     (void)state;
-    repo_close(repo);
+    store_close(store);
     int rc = system("rm -rf " TEST_REPO);
     (void)rc;
     return 0;
@@ -59,11 +59,11 @@ static void test_store_and_load(void **state) {
     size_t len = strlen(data);
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
 
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE,
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE,
                                   data, len, hash), OK);
 
     void *out = NULL; size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, len);
     assert_memory_equal(out, data, len);
     free(out);
@@ -76,8 +76,8 @@ static void test_dedup(void **state) {
     uint8_t hash1[OBJECT_HASH_SIZE] = {0};
     uint8_t hash2[OBJECT_HASH_SIZE] = {0};
 
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash1), OK);
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash2), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash1), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash2), OK);
     assert_memory_equal(hash1, hash2, OBJECT_HASH_SIZE);
 }
 
@@ -85,9 +85,9 @@ static void test_object_exists(void **state) {
     (void)state;
     const char *data = "existence check";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE,
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE,
                                   data, strlen(data), hash), OK);
-    assert_true(object_exists(repo, hash));
+    assert_true(object_exists(store, hash));
 }
 
 static void test_repo_init_requires_empty_dir(void **state) {
@@ -104,7 +104,7 @@ static void test_repo_init_requires_empty_dir(void **state) {
     fputs("do not clobber\n", f);
     fclose(f);
 
-    assert_int_not_equal(repo_init(path), OK);
+    assert_int_not_equal(store_init_dirs(path), OK);
 
     rc = system("rm -rf /tmp/c_backup_nonempty_repo");
     (void)rc;
@@ -129,7 +129,7 @@ static void test_object_load_detects_hash_mismatch(void **state) {
     (void)state;
     const char *data = "integrity check payload";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
@@ -140,14 +140,14 @@ static void test_object_load_detects_hash_mismatch(void **state) {
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), ERR_CORRUPT);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), ERR_CORRUPT);
 }
 
 static void test_object_load_detects_unknown_compression(void **state) {
     (void)state;
     const char *data = "compression marker";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
@@ -166,14 +166,14 @@ static void test_object_load_detects_unknown_compression(void **state) {
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), ERR_CORRUPT);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), ERR_CORRUPT);
 }
 
 static void test_object_load_detects_truncated_payload(void **state) {
     (void)state;
     const char *data = "truncate me";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
@@ -191,14 +191,14 @@ static void test_object_load_detects_truncated_payload(void **state) {
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), ERR_CORRUPT);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), ERR_CORRUPT);
 }
 
 static void test_object_load_rejects_none_size_mismatch(void **state) {
     (void)state;
     const char *data = "size mismatch";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
@@ -218,7 +218,7 @@ static void test_object_load_rejects_none_size_mismatch(void **state) {
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), ERR_CORRUPT);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), ERR_CORRUPT);
 }
 
 static void test_object_store_file_sparse_roundtrip(void **state) {
@@ -236,13 +236,13 @@ static void test_object_store_file_sparse_roundtrip(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     assert_true(out_type == OBJECT_TYPE_SPARSE || out_type == OBJECT_TYPE_FILE);
     if (out_type == OBJECT_TYPE_SPARSE) {
         assert_true(out_len >= sizeof(sparse_hdr_t));
@@ -260,21 +260,21 @@ static void test_object_physical_size_edge_cases(void **state) {
     (void)state;
     const char *data = "phys-size-check";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
-    assert_int_equal(object_physical_size(repo, hash, NULL), ERR_INVALID);
+    assert_int_equal(object_physical_size(store, hash, NULL), ERR_INVALID);
 
     uint8_t missing[OBJECT_HASH_SIZE];
     memset(missing, 0xAB, sizeof(missing));
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(repo, missing, &bytes), ERR_NOT_FOUND);
+    assert_int_equal(object_physical_size(store, missing, &bytes), ERR_NOT_FOUND);
 }
 
 static void test_object_physical_size_returns_file_size(void **state) {
     (void)state;
     const char *data = "phys-size-with-trailer";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     char path[512];
     object_hash_path(hash, path);
@@ -283,7 +283,7 @@ static void test_object_physical_size_returns_file_size(void **state) {
     assert_int_equal(stat(path, &st), 0);
 
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(repo, hash, &bytes), OK);
+    assert_int_equal(object_physical_size(store, hash, &bytes), OK);
     /* physical_size should return the full file size including parity trailer */
     assert_int_equal(bytes, (uint64_t)st.st_size);
 }

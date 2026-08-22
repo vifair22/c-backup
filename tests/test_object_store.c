@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "repo.h"
+#include "store.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -25,24 +25,85 @@
 #define TEST_REPO "/tmp/c_backup_objstore_repo"
 #define TEST_SRC  "/tmp/c_backup_objstore_src"
 
-static repo_t *repo;
+static store_t *store;
 
 static void cleanup(void) {
     int rc = system("rm -rf " TEST_REPO " " TEST_SRC);
     (void)rc;
 }
 
+/*
+ * Stand-in for the daemon's pack bookkeeping.
+ *
+ * The engine has no index of its own since the .idx sidecar was removed: it
+ * learns what went into a pack from the commit callback and asks the locate
+ * callback where things live. In production both sides are the pack_objects
+ * table. Here they are an array, which is enough to exercise the same
+ * contract, and it means these tests fail if that contract regresses rather
+ * than silently reading through some fallback path.
+ */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t pack_id;
+    uint64_t offset;
+    uint32_t pack_version;
+    uint32_t entry_index;
+} fake_row_t;
+
+static fake_row_t fake_rows[4096];
+static size_t     fake_row_cnt;
+
+static void fake_commit(void *user, const pack_commit_info_t *info) {
+    (void)user;
+    for (uint32_t i = 0; i < info->entry_count; i++) {
+        if (fake_row_cnt >= sizeof(fake_rows) / sizeof(fake_rows[0])) return;
+        /* A rewritten pack replaces any earlier row for the same hash. */
+        size_t slot = fake_row_cnt;
+        for (size_t j = 0; j < fake_row_cnt; j++) {
+            if (memcmp(fake_rows[j].hash, info->entries[i].hash, OBJECT_HASH_SIZE) == 0) {
+                slot = j;
+                break;
+            }
+        }
+        memcpy(fake_rows[slot].hash, info->entries[i].hash, OBJECT_HASH_SIZE);
+        fake_rows[slot].pack_id      = info->pack_id;
+        fake_rows[slot].offset       = info->entries[i].offset;
+        fake_rows[slot].pack_version = PACK_VERSION;
+        fake_rows[slot].entry_index  = i;
+        if (slot == fake_row_cnt) fake_row_cnt++;
+    }
+}
+
+static status_t fake_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
+                            store_location_t *out) {
+    (void)user;
+    for (size_t i = 0; i < fake_row_cnt; i++) {
+        if (memcmp(fake_rows[i].hash, hash, OBJECT_HASH_SIZE) != 0) continue;
+        memset(out, 0, sizeof(*out));
+        out->in_pack      = 1;
+        out->pack_id      = fake_rows[i].pack_id;
+        out->offset       = fake_rows[i].offset;
+        out->pack_version = fake_rows[i].pack_version;
+        out->entry_index  = fake_rows[i].entry_index;
+        return OK;
+    }
+    return ERR_NOT_FOUND;
+}
+
 static int setup_basic(void **state) {
     (void)state;
     cleanup();
-    if (repo_init(TEST_REPO) != OK) return -1;
-    if (repo_open(TEST_REPO, &repo) != OK) return -1;
+    fake_row_cnt = 0;
+    if (store_init_dirs(TEST_REPO) != OK) return -1;
+    if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
+    store_set_pack_commit_cb(store, fake_commit, NULL);
+    store_set_locate_cb(store, fake_locate, NULL);
     return 0;
 }
 
 static int teardown_basic(void **state) {
     (void)state;
-    repo_close(repo);
+    store_close(store);
     cleanup();
     return 0;
 }
@@ -54,12 +115,12 @@ static int teardown_basic(void **state) {
 static void test_object_empty(void **state) {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, "", 0, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, "", 0, hash), OK);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t typ = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &typ), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &typ), OK);
     assert_int_equal(out_len, 0);
     assert_int_equal(typ, OBJECT_TYPE_FILE);
     free(out);
@@ -69,11 +130,11 @@ static void test_object_tiny(void **state) {
     (void)state;
     const char d = 'X';
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, &d, 1, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, &d, 1, hash), OK);
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, 1);
     assert_int_equal(*(char *)out, 'X');
     free(out);
@@ -88,11 +149,11 @@ static void test_object_compressible_10k(void **state) {
     for (size_t i = 0; i < len; i++) data[i] = pat[i % 12];
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, len);
     assert_memory_equal(out, data, len);
     free(out);
@@ -111,11 +172,11 @@ static void test_object_incompressible_64k(void **state) {
     }
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, len);
     assert_memory_equal(out, data, len);
     free(out);
@@ -126,8 +187,8 @@ static void test_object_dedup(void **state) {
     (void)state;
     const char *data = "deduplicate me across snapshots";
     uint8_t h1[OBJECT_HASH_SIZE], h2[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), h1), OK);
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), h2), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), h1), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), h2), OK);
     assert_memory_equal(h1, h2, OBJECT_HASH_SIZE);
 }
 
@@ -135,23 +196,23 @@ static void test_object_exists_check(void **state) {
     (void)state;
     const char *data = "existence verification";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
-    assert_true(object_exists(repo, hash));
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_true(object_exists(store, hash));
 
     uint8_t missing[OBJECT_HASH_SIZE];
     memset(missing, 0xAB, OBJECT_HASH_SIZE);
-    assert_false(object_exists(repo, missing));
+    assert_false(object_exists(store, missing));
 }
 
 static void test_object_get_info(void **state) {
     (void)state;
     const char *data = "info query test payload";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     uint64_t sz = 0;
     uint8_t typ = 0;
-    assert_int_equal(object_get_info(repo, hash, &sz, &typ), OK);
+    assert_int_equal(object_get_info(store, hash, &sz, &typ), OK);
     assert_int_equal(sz, strlen(data));
     assert_int_equal(typ, OBJECT_TYPE_FILE);
 }
@@ -160,10 +221,10 @@ static void test_object_physical_size(void **state) {
     (void)state;
     const char *data = "physical size check";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(repo, hash, &bytes), OK);
+    assert_int_equal(object_physical_size(store, hash, &bytes), OK);
     assert_true(bytes > 0);
     assert_true(bytes >= sizeof(object_header_t) + strlen(data));
 }
@@ -177,13 +238,13 @@ static void test_exists_loose_and_pack_fallback(void **state) {
     (void)state;
     const char *data = "exists-loose-then-pack";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     /* Object is loose — should exist. */
-    assert_true(object_exists(repo, hash));
+    assert_true(object_exists(store, hash));
 
     /* Pack the loose object. */
-    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
 
     /* Now delete the loose file. */
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -193,7 +254,7 @@ static void test_exists_loose_and_pack_fallback(void **state) {
     unlink(path);
 
     /* Should still exist via pack fallback. */
-    assert_true(object_exists(repo, hash));
+    assert_true(object_exists(store, hash));
 }
 
 /* object_get_info: via loose and packed paths */
@@ -201,17 +262,17 @@ static void test_get_info_loose_and_packed(void **state) {
     (void)state;
     const char *data = "get-info-both-paths";
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     /* Loose path */
     uint64_t sz = 0;
     uint8_t typ = 0;
-    assert_int_equal(object_get_info(repo, hash, &sz, &typ), OK);
+    assert_int_equal(object_get_info(store, hash, &sz, &typ), OK);
     assert_int_equal(sz, strlen(data));
     assert_int_equal(typ, OBJECT_TYPE_FILE);
 
     /* Pack, delete loose */
-    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(hash, hex);
     char path[512];
@@ -221,7 +282,7 @@ static void test_get_info_loose_and_packed(void **state) {
     /* Packed path */
     sz = 0;
     typ = 0;
-    assert_int_equal(object_get_info(repo, hash, &sz, &typ), OK);
+    assert_int_equal(object_get_info(store, hash, &sz, &typ), OK);
     assert_int_equal(sz, strlen(data));
     assert_int_equal(typ, OBJECT_TYPE_FILE);
 }
@@ -240,14 +301,14 @@ static void test_load_stream_compress_none(void **state) {
     }
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
 
     /* Stream load to /dev/null */
     int null_fd = open("/dev/null", O_WRONLY);
     assert_true(null_fd >= 0);
     uint64_t stream_sz = 0;
     uint8_t obj_type = 0;
-    assert_int_equal(object_load_stream(repo, hash, null_fd, &stream_sz, &obj_type), OK);
+    assert_int_equal(object_load_stream(store, hash, null_fd, &stream_sz, &obj_type), OK);
     close(null_fd);
     assert_true(stream_sz == len);
     assert_int_equal(obj_type, OBJECT_TYPE_FILE);
@@ -263,7 +324,7 @@ static void test_store_ex_is_new_and_phys(void **state) {
     int is_new = 0;
     uint64_t phys = 0;
 
-    assert_int_equal(object_store_ex(repo, OBJECT_TYPE_FILE, data, strlen(data),
+    assert_int_equal(object_store_ex(store, OBJECT_TYPE_FILE, data, strlen(data),
                                       hash, &is_new, &phys), OK);
     assert_true(is_new == 1);
     assert_true(phys > 0);
@@ -272,7 +333,7 @@ static void test_store_ex_is_new_and_phys(void **state) {
     uint8_t hash2[OBJECT_HASH_SIZE] = {0};
     int is_new2 = 0;
     uint64_t phys2 = 0;
-    assert_int_equal(object_store_ex(repo, OBJECT_TYPE_FILE, data, strlen(data),
+    assert_int_equal(object_store_ex(store, OBJECT_TYPE_FILE, data, strlen(data),
                                       hash2, &is_new2, &phys2), OK);
     assert_memory_equal(hash, hash2, OBJECT_HASH_SIZE);
     assert_true(is_new2 == 0);
@@ -294,7 +355,7 @@ static void test_store_fd_roundtrip(void **state) {
 
     /* Compute expected hash by storing via object_store first */
     uint8_t expected_hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, expected_hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, expected_hash), OK);
 
     /* Delete the loose object so store_fd can re-create */
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -306,14 +367,14 @@ static void test_store_fd_roundtrip(void **state) {
     /* Store via fd */
     int fd = open(path, O_RDONLY);
     assert_true(fd >= 0);
-    assert_int_equal(object_store_fd(repo, OBJECT_TYPE_FILE, fd, (uint64_t)len,
+    assert_int_equal(object_store_fd(store, OBJECT_TYPE_FILE, fd, (uint64_t)len,
                                       expected_hash), OK);
     close(fd);
 
     /* Load back and verify */
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, expected_hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, expected_hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, len);
     assert_memory_equal(out, data, len);
     free(out);
@@ -339,7 +400,7 @@ static void test_store_fd_hash_mismatch(void **state) {
 
     int fd = open(path, O_RDONLY);
     assert_true(fd >= 0);
-    status_t st = object_store_fd(repo, OBJECT_TYPE_FILE, fd, (uint64_t)len, bad_hash);
+    status_t st = object_store_fd(store, OBJECT_TYPE_FILE, fd, (uint64_t)len, bad_hash);
     close(fd);
     assert_int_equal(st, ERR_CORRUPT);
 }
@@ -355,10 +416,10 @@ static void test_load_stream_pack_fallback(void **state) {
     const char *data = "load-stream-pack-fallback-test";
     size_t len = strlen(data);
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
 
     /* Pack the object (also deletes loose) */
-    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
 
     /* Verify loose file is gone */
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -373,7 +434,7 @@ static void test_load_stream_pack_fallback(void **state) {
     assert_true(null_fd >= 0);
     uint64_t ssz = 0;
     uint8_t typ = 0;
-    assert_int_equal(object_load_stream(repo, hash, null_fd, &ssz, &typ), OK);
+    assert_int_equal(object_load_stream(store, hash, null_fd, &ssz, &typ), OK);
     close(null_fd);
     assert_true(ssz == len);
     assert_int_equal(typ, OBJECT_TYPE_FILE);
@@ -385,13 +446,13 @@ static void test_load_stream_pack_fallback_null_params(void **state) {
     const char *data = "null-params-pack-fallback";
     size_t len = strlen(data);
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, data, len, hash), OK);
-    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
 
     int null_fd = open("/dev/null", O_WRONLY);
     assert_true(null_fd >= 0);
     /* Pass NULL for both out_size and out_type */
-    assert_int_equal(object_load_stream(repo, hash, null_fd, NULL, NULL), OK);
+    assert_int_equal(object_load_stream(store, hash, null_fd, NULL, NULL), OK);
     close(null_fd);
 }
 
@@ -403,7 +464,7 @@ static void test_load_stream_missing_hash(void **state) {
 
     int null_fd = open("/dev/null", O_WRONLY);
     assert_true(null_fd >= 0);
-    status_t st = object_load_stream(repo, bad_hash, null_fd, NULL, NULL);
+    status_t st = object_load_stream(store, bad_hash, null_fd, NULL, NULL);
     close(null_fd);
     assert_int_not_equal(st, OK);
 }
@@ -423,24 +484,24 @@ static void test_load_from_pack_various_sizes(void **state) {
     }
 
     uint8_t h_small[OBJECT_HASH_SIZE], h_medium[OBJECT_HASH_SIZE], h_large[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, small, 1, h_small), OK);
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, medium, sizeof(medium), h_medium), OK);
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, large, sizeof(large), h_large), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, small, 1, h_small), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, medium, sizeof(medium), h_medium), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, large, sizeof(large), h_large), OK);
 
-    assert_int_equal(repo_pack(repo, NULL, NULL, NULL), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
 
     /* Load all three from pack */
     void *data = NULL;
     size_t sz = 0;
-    assert_int_equal(object_load(repo, h_small, &data, &sz, NULL), OK);
+    assert_int_equal(object_load(store, h_small, &data, &sz, NULL), OK);
     assert_int_equal(sz, 1);
     free(data);
 
-    assert_int_equal(object_load(repo, h_medium, &data, &sz, NULL), OK);
+    assert_int_equal(object_load(store, h_medium, &data, &sz, NULL), OK);
     assert_int_equal(sz, sizeof(medium));
     free(data);
 
-    assert_int_equal(object_load(repo, h_large, &data, &sz, NULL), OK);
+    assert_int_equal(object_load(store, h_large, &data, &sz, NULL), OK);
     assert_int_equal(sz, sizeof(large));
     free(data);
 }

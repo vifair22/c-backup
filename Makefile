@@ -306,10 +306,11 @@ bench-manifest: $(BINS)/bench_manifest
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
 COV_CFLAGS  := -std=c11 -Wall -Wextra -O0 -g --coverage -march=znver3 \
-               -Wno-unused-result -Wno-format-truncation -I src -I vendor
+               -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) -I vendor \
+               $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 COV_LDFLAGS := --coverage $(LDFLAGS)
 COV_OBJS    := $(patsubst $(SRC)/%.c, $(COV_DIR)/%.o, $(SRCS))
-COV_VENDOR  := $(COV_DIR)/toml.o $(COV_DIR)/cJSON.o
+COV_VENDOR  := $(COV_DIR)/cJSON.o $(COV_DIR)/app_migrations.o
 COV_OBJS    += $(COV_VENDOR)
 COV_MAIN    := $(COV_DIR)/main.o
 COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
@@ -319,20 +320,32 @@ $(COV_DIR):
 	mkdir -p $(COV_DIR)
 
 $(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(COV_CFLAGS) -c $< -o $@
 
-$(COV_DIR)/toml.o: vendor/toml.c | $(COV_DIR)
-	$(CC) -std=c11 -O0 -g --coverage -I src -I vendor -c $< -o $@
+$(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
+	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -I vendor -c $< -o $@
 $(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
-	$(CC) -std=c11 -O0 -g --coverage -I src -I vendor -c $< -o $@
+	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -I vendor -c $< -o $@
 
 $(COV_DIR)/%: $(TESTS)/%.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
+
+# Ratchet, not aspiration: the floor is what the current phase actually
+# achieves, raised as each phase lands. src/store/ is gated separately because
+# it is the code that survives; the shim modules are excluded because they are
+# scheduled for deletion and testing them would be wasted work.
+# See daemonization-spec.md section 14.
+COV_STORE_MIN := 45
 
 coverage: $(COV_TESTS)
 	@for t in $(COV_TESTS); do $$t >/dev/null 2>&1 || true; done
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
 	    --exclude '.*vendor.*' -s
+	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
+	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
+	    --exclude 'src/store/snapshot.c' \
+	    --fail-under-line $(COV_STORE_MIN) -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 
 .PHONY: coverage

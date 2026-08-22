@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "repo.h"
+#include "store.h"
 #include "object.h"
 #include "parity.h"
 #include "types.h"
@@ -24,7 +24,7 @@
 #define TEST_REPO "/tmp/c_backup_objsparse_repo"
 #define TEST_SRC  "/tmp/c_backup_objsparse_src"
 
-static repo_t *repo;
+static store_t *store;
 
 static void cleanup(void) {
     int rc = system("rm -rf " TEST_REPO " " TEST_SRC);
@@ -34,14 +34,14 @@ static void cleanup(void) {
 static int setup_basic(void **state) {
     (void)state;
     cleanup();
-    if (repo_init(TEST_REPO) != OK) return -1;
-    if (repo_open(TEST_REPO, &repo) != OK) return -1;
+    if (store_init_dirs(TEST_REPO) != OK) return -1;
+    if (store_open(TEST_REPO, NULL, &store) != OK) return -1;
     return 0;
 }
 
 static int teardown_basic(void **state) {
     (void)state;
-    repo_close(repo);
+    store_close(store);
     cleanup();
     return 0;
 }
@@ -65,13 +65,13 @@ static void test_sparse_single_hole(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     assert_true(out_type == OBJECT_TYPE_SPARSE || out_type == OBJECT_TYPE_FILE);
     if (out_type == OBJECT_TYPE_SPARSE) {
         assert_true(out_len >= sizeof(sparse_hdr_t));
@@ -110,13 +110,13 @@ static void test_sparse_multi_region(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     if (out_type == OBJECT_TYPE_SPARSE) {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));
@@ -138,13 +138,13 @@ static void test_sparse_all_hole(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     if (out_type == OBJECT_TYPE_SPARSE) {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));
@@ -162,12 +162,12 @@ static void test_sparse_empty_file(void **state) {
     assert_true(fd >= 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, 0, hash), OK);
+    assert_int_equal(object_store_file(store, fd, 0, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
     assert_int_equal(out_len, 0);
     free(out);
     unlink(path);
@@ -181,12 +181,12 @@ static void test_sparse_empty_file(void **state) {
 static void test_store_empty_file(void **state) {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store(repo, OBJECT_TYPE_FILE, "", 0, hash), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, "", 0, hash), OK);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t typ = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &typ), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &typ), OK);
     assert_int_equal(out_len, 0);
     assert_int_equal(typ, OBJECT_TYPE_FILE);
     free(out);
@@ -205,14 +205,14 @@ static void test_store_all_holes_sparse(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     /* Verify it loads and has SPARSE type with 0 regions */
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     if (out_type == OBJECT_TYPE_SPARSE) {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));
@@ -252,13 +252,13 @@ static void test_store_multi_region_sparse(void **state) {
     assert_int_equal(fstat(fd, &st), 0);
 
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
-    assert_int_equal(object_store_file(repo, fd, (uint64_t)st.st_size, hash), OK);
+    assert_int_equal(object_store_file(store, fd, (uint64_t)st.st_size, hash), OK);
     close(fd);
 
     void *out = NULL;
     size_t out_len = 0;
     uint8_t out_type = 0;
-    assert_int_equal(object_load(repo, hash, &out, &out_len, &out_type), OK);
+    assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
     assert_true(out_type == OBJECT_TYPE_SPARSE || out_type == OBJECT_TYPE_FILE);
     if (out_type == OBJECT_TYPE_SPARSE) {
         sparse_hdr_t hdr;

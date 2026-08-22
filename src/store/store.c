@@ -23,76 +23,16 @@
 /* Parse a version string of the form "MAJ.MIN.PAT_YYYYMMDD.HHMM.variant".
  * Returns 0 on success, -1 if any required field is missing/unparseable.
  * The variant suffix is ignored. Trailing whitespace/newlines are tolerated. */
-static int parse_version_string(const char *s,
-                                int *maj, int *min_, int *pat,
-                                long *date, long *tim) {
-    if (!s) return -1;
-    int a=0, b=0, c=0; long d=0, t=0;
-    if (sscanf(s, "%d.%d.%d_%ld.%ld", &a, &b, &c, &d, &t) != 5) return -1;
-    if (a < 0 || b < 0 || c < 0 || d <= 0 || t < 0) return -1;
-    *maj = a; *min_ = b; *pat = c; *date = d; *tim = t;
-    return 0;
-}
 
 /* Compare two parsed versions. Returns -1 if A<B, 0 if equal, +1 if A>B. */
-static int compare_parsed_versions(int a_maj, int a_min, int a_pat, long a_date, long a_time,
-                                   int b_maj, int b_min, int b_pat, long b_date, long b_time) {
-    if (a_maj != b_maj) return a_maj < b_maj ? -1 : 1;
-    if (a_min != b_min) return a_min < b_min ? -1 : 1;
-    if (a_pat != b_pat) return a_pat < b_pat ? -1 : 1;
-    if (a_date != b_date) return a_date < b_date ? -1 : 1;
-    if (a_time != b_time) return a_time < b_time ? -1 : 1;
-    return 0;
-}
 
 /* Read the repo's last_written version file and refuse to open if it was
  * written by a binary newer than the current one. Missing/unparseable files
  * are tolerated (older repos predate this check). */
-static status_t check_repo_version_compat(const char *store_root) {
-    char p[PATH_MAX];
-    snprintf(p, sizeof(p), "%s/last_written", store_root);
-    FILE *f = fopen(p, "r");
-    if (!f) return OK;  /* no record — tolerate */
-    char stored[64] = {0};
-    size_t n = fread(stored, 1, sizeof(stored) - 1, f);
-    fclose(f);
-    if (n == 0) return OK;
-    stored[n] = '\0';
-
-    int s_maj, s_min, s_pat; long s_date, s_time;
-    if (parse_version_string(stored, &s_maj, &s_min, &s_pat, &s_date, &s_time) != 0)
-        return OK;  /* unparseable — tolerate */
-
-    int c_maj, c_min, c_pat; long c_date, c_time;
-    if (parse_version_string(VERSION_STRING, &c_maj, &c_min, &c_pat, &c_date, &c_time) != 0)
-        return OK;  /* current binary has no parseable version — tolerate */
-
-    if (compare_parsed_versions(c_maj, c_min, c_pat, c_date, c_time,
-                                s_maj, s_min, s_pat, s_date, s_time) < 0) {
-        /* Strip trailing newline for a cleaner error message. */
-        char *nl = strchr(stored, '\n'); if (nl) *nl = '\0';
-        return set_error(ERR_CORRUPT,
-                         "repository was last written by a newer binary (%s); "
-                         "current binary is %s — refusing to open",
-                         stored, VERSION_STRING);
-    }
-    return OK;
-}
 
 /* Write the build version string to a file in the repo directory.
  * Uses atomic tmp+rename for safety. Errors are silently ignored
  * since this is best-effort housekeeping. */
-static void write_version_file(const char *store_root, const char *filename) {
-    char tmp[PATH_MAX], final[PATH_MAX];
-    snprintf(final, sizeof(final), "%s/%s", store_root, filename);
-    snprintf(tmp, sizeof(tmp), "%s/tmp/.%s.tmp", store_root, filename);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd == -1) return;
-    const char *ver = VERSION_STRING "\n";
-    if (write(fd, ver, strlen(ver)) < 0) { close(fd); unlink(tmp); return; }
-    close(fd);
-    rename(tmp, final);
-}
 
 /* Dynamic open-addressing hash table for .dat FILE* handles.
  * No eviction — all handles stay open until store_close() or flush.
@@ -286,8 +226,6 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->commit_cb       = NULL;
     r->commit_user     = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
-
-    write_version_file(path, "last_accessed");
 
     *out = r;
     return OK;

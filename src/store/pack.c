@@ -153,11 +153,6 @@ static int pack_dat_path(char *buf, size_t sz, const char *store,
                     store, pack_num / 256, pack_num);
 }
 
-static int pack_idx_path(char *buf, size_t sz, const char *store,
-                         uint32_t pack_num) {
-    return path_fmt(buf, sz, "%s/packs/%04x/pack-%08u.idx",
-                    store, pack_num / 256, pack_num);
-}
 
 /* Build sharded path; if file doesn't exist, try flat layout. */
 int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
@@ -167,12 +162,6 @@ int pack_dat_path_resolve(char *buf, size_t sz, const char *store,
     return path_fmt(buf, sz, "%s/packs/pack-%08u.dat", store, pack_num);
 }
 
-static int pack_idx_path_resolve(char *buf, size_t sz, const char *store,
-                                 uint32_t pack_num) {
-    if (pack_idx_path(buf, sz, store, pack_num) != 0) return -1;
-    if (access(buf, F_OK) == 0) return 0;
-    return path_fmt(buf, sz, "%s/packs/pack-%08u.idx", store, pack_num);
-}
 
 /* Ensure the shard directory exists for a pack_num. */
 static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
@@ -1302,36 +1291,28 @@ static int loose_objects_exist(store_t *store) {
 /* ------------------------------------------------------------------ */
 
 static status_t open_new_pack(store_t *store, uint32_t pack_num,
-                              FILE **dat_f, FILE **idx_f,
-                              char *dat_tmp, char *idx_tmp,
+                              FILE **dat_f, char *dat_tmp,
                               pack_dat_hdr_t *dat_hdr)
 {
-    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0 ||
-        path_fmt(idx_tmp, PATH_MAX, "%s/tmp/pack-idx.XXXXXX", store_root(store)) != 0)
+    if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0)
         return set_error(ERR_IO, "open_new_pack: tmp path too long");
 
     int dat_fd = mkstemp(dat_tmp);
     if (dat_fd == -1) return set_error_errno(ERR_IO, "open_new_pack: mkstemp(%s)", dat_tmp);
-    int idx_fd = mkstemp(idx_tmp);
-    if (idx_fd == -1) { close(dat_fd); unlink(dat_tmp); return set_error_errno(ERR_IO, "open_new_pack: mkstemp(%s)", idx_tmp); }
 
     *dat_f = fdopen(dat_fd, "w+b");  /* r+w: write_dat_parity reads back entries */
-    *idx_f = fdopen(idx_fd, "wb");
-    if (!*dat_f || !*idx_f) {
-        if (*dat_f) fclose(*dat_f); else { close(dat_fd); unlink(dat_tmp); }
-        if (*idx_f) fclose(*idx_f); else { close(idx_fd); unlink(idx_tmp); }
-        *dat_f = NULL; *idx_f = NULL;
+    if (!*dat_f) {
+        close(dat_fd); unlink(dat_tmp);
         return set_error_errno(ERR_IO, "open_new_pack: fdopen failed");
     }
 
     (void)setvbuf(*dat_f, NULL, _IOFBF, 8u * 1024u * 1024u);
-    (void)setvbuf(*idx_f, NULL, _IOFBF, 8u * 1024u * 1024u);
 
     *dat_hdr = (pack_dat_hdr_t){ PACK_DAT_MAGIC, PACK_VERSION, 0 };
     if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) {
-        fclose(*dat_f); fclose(*idx_f);
-        unlink(dat_tmp); unlink(idx_tmp);
-        *dat_f = NULL; *idx_f = NULL;
+        fclose(*dat_f);
+        unlink(dat_tmp);
+        *dat_f = NULL;
         return set_error_errno(ERR_IO, "open_new_pack: fwrite dat header failed");
     }
 
@@ -1566,39 +1547,6 @@ static status_t write_dat_parity_precomputed(FILE *dat_f,
     return OK;
 }
 
-/* Write parity trailer for a .idx file.  idx_f must be positioned after
- * the idx entries.  entries_blob / entries_sz is the raw idx entries data. */
-static status_t write_idx_parity(FILE *idx_f, const pack_idx_hdr_t *idx_hdr,
-                                 const void *entries_blob, size_t entries_sz,
-                                 uint32_t packed) {
-    rs_init();
-
-    /* 1. File header CRC */
-    uint32_t fhdr_crc = crc32c(idx_hdr, sizeof(*idx_hdr));
-    if (fwrite(&fhdr_crc, sizeof(fhdr_crc), 1, idx_f) != 1) return set_error_errno(ERR_IO, "write_idx_parity: fwrite header CRC failed");
-
-    /* 2. XOR parity over all idx entries as one blob */
-    parity_record_t whole_par;
-    parity_record_compute(entries_blob, entries_sz, &whole_par);
-    if (fwrite(&whole_par, sizeof(whole_par), 1, idx_f) != 1) return set_error_errno(ERR_IO, "write_idx_parity: fwrite XOR parity failed");
-
-    /* 3. Per-entry CRCs */
-    const uint8_t *p = entries_blob;
-    size_t entry_sz = sizeof(pack_idx_disk_entry_t);
-    for (uint32_t i = 0; i < packed; i++) {
-        uint32_t ecrc = crc32c(p + i * entry_sz, entry_sz);
-        if (fwrite(&ecrc, sizeof(ecrc), 1, idx_f) != 1) return set_error_errno(ERR_IO, "write_idx_parity: fwrite entry CRC %u failed", i);
-    }
-
-    /* 4. Parity footer */
-    uint32_t trailer_size = (uint32_t)(sizeof(fhdr_crc) + sizeof(whole_par) +
-                             (size_t)packed * sizeof(uint32_t) +
-                             sizeof(parity_footer_t));
-    parity_footer_t footer = { PARITY_FOOTER_MAGIC, PARITY_VERSION, trailer_size };
-    if (fwrite(&footer, sizeof(footer), 1, idx_f) != 1) return set_error_errno(ERR_IO, "write_idx_parity: fwrite footer failed");
-
-    return OK;
-}
 
 /* ------------------------------------------------------------------ */
 /* Parallel RS parity computation                                      */
@@ -1614,8 +1562,20 @@ static int idx_offset_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static status_t finalize_pack(store_t *store, FILE **dat_f, FILE **idx_f,
-                              char *dat_tmp, char *idx_tmp,
+/*
+ * Seal a pack: patch its header, write the parity trailer, install it, and
+ * hand its contents to the daemon.
+ *
+ * There is no .idx sidecar any more. Pack contents are rows in pack_objects,
+ * delivered through the pack-commit callback, so the install is a single file
+ * and the second half of the old two-file staging dance is now a database
+ * insert the caller performs. That pair is not atomic and cannot be; the
+ * ordering (install first, then rows) is deliberate, so an interruption
+ * leaves objects invisible rather than advertised-but-absent. See
+ * daemonization-spec.md section 12.
+ */
+static status_t finalize_pack(store_t *store, FILE **dat_f,
+                              char *dat_tmp,
                               pack_dat_hdr_t *dat_hdr,
                               pack_idx_disk_entry_t *idx_entries,
                               uint32_t packed, uint32_t pack_num,
@@ -1644,118 +1604,84 @@ static status_t finalize_pack(store_t *store, FILE **dat_f, FILE **idx_f,
     }
     if (st != OK) goto fail;
 
+    uint64_t dat_size = 0;
+    {
+        off_t end = ftello(*dat_f);
+        if (end > 0) dat_size = (uint64_t)end;
+    }
+
     if (fflush(*dat_f) != 0 || fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
     fclose(*dat_f); *dat_f = NULL;
 
-    /* Sort idx entries by hash, write idx file */
+    /* Sorting by hash is no longer for an on-disk index, but the commit
+     * entries and the loose-object unlink batch both benefit from it. */
     qsort(idx_entries, packed, sizeof(*idx_entries), idx_disk_cmp);
-    pack_idx_hdr_t idx_hdr = { PACK_IDX_MAGIC, PACK_VERSION, packed };
-    if (fwrite(&idx_hdr, sizeof(idx_hdr), 1, *idx_f) != 1) { st = ERR_IO; goto fail; }
-    if (fwrite(idx_entries, sizeof(*idx_entries), packed, *idx_f) != packed) {
-        st = ERR_IO; goto fail;
-    }
 
-    /* Write idx parity trailer */
-    st = write_idx_parity(*idx_f, &idx_hdr, idx_entries,
-                          (size_t)packed * sizeof(*idx_entries), packed);
-    if (st != OK) goto fail;
-
-    if (fflush(*idx_f) != 0 || fsync(fileno(*idx_f)) != 0) { st = ERR_IO; goto fail; }
-    fclose(*idx_f); *idx_f = NULL;
-
-    /* Atomically install both files via staging directory.
-     *
-     * 1. Create packs/.installing-NNNNNNNN/
-     * 2. Rename .dat and .idx into the staging dir, fsync it
-     * 3. Rename each file from staging dir into packs/
-     * 4. fsync packs/, remove empty staging dir
-     *
-     * The staging dir acts as a journal: pack_resume_installing()
-     * on startup finishes any incomplete installs. */
+    /* Install: single file, so a plain rename is already atomic. The staging
+     * directory the two-file version needed, and pack_resume_installing()
+     * which replayed interrupted moves, are both gone with it. */
     {
-        char dat_final[PATH_MAX], idx_final[PATH_MAX];
-        char stage_dir[PATH_MAX];
-        char stage_dat[PATH_MAX], stage_idx[PATH_MAX];
+        char dat_final[PATH_MAX];
         if (pack_dat_path(dat_final, sizeof(dat_final),
-                          store_root(store), pack_num) != 0 ||
-            pack_idx_path(idx_final, sizeof(idx_final),
-                          store_root(store), pack_num) != 0 ||
-            path_fmt(stage_dir, sizeof(stage_dir), "%s/packs/.installing-%08u",
-                     store_root(store), pack_num) != 0 ||
-            path_fmt(stage_dat, sizeof(stage_dat), "%s/packs/.installing-%08u/pack-%08u.dat",
-                     store_root(store), pack_num, pack_num) != 0 ||
-            path_fmt(stage_idx, sizeof(stage_idx), "%s/packs/.installing-%08u/pack-%08u.idx",
-                     store_root(store), pack_num, pack_num) != 0) {
+                          store_root(store), pack_num) != 0) {
             st = set_error(ERR_IO, "finalize_pack: path too long"); goto fail;
         }
 
-        /* Ensure the shard subdirectory exists */
         pack_ensure_shard_dir(store_root(store), pack_num);
 
-        /* Defensive: refuse to overwrite an existing pack with this number.
-         * next_pack_num() returns max+1 so this should never trigger, but if
-         * it does we'd silently destroy data — better to fail loudly. */
+        /* next_pack_num() returns max+1 so this should never trigger, but if
+         * it does we would silently destroy data. Fail loudly instead. */
         struct stat _st_chk;
-        if (stat(dat_final, &_st_chk) == 0 || stat(idx_final, &_st_chk) == 0) {
+        if (stat(dat_final, &_st_chk) == 0) {
             st = set_error(ERR_IO,
-                           "finalize_pack: pack %08u already exists — refusing to overwrite",
+                           "finalize_pack: pack %08u already exists - refusing to overwrite",
                            pack_num);
             goto fail;
         }
 
-        if (mkdir(stage_dir, 0755) != 0) {
-            st = set_error_errno(ERR_IO, "finalize_pack: mkdir(%s)", stage_dir);
-            goto fail;
-        }
-
-        /* Move temp files into staging dir */
-        if (rename(dat_tmp, stage_dat) != 0) {
-            rmdir(stage_dir);
-            st = set_error_errno(ERR_IO, "finalize_pack: rename dat to staging");
-            goto fail;
-        }
-        if (rename(idx_tmp, stage_idx) != 0) {
-            rename(stage_dat, dat_tmp);  /* recover dat */
-            rmdir(stage_dir);
-            st = set_error_errno(ERR_IO, "finalize_pack: rename idx to staging");
-            goto fail;
-        }
-
-        /* fsync staging dir — both files are now durable in it */
-        int sfd = open(stage_dir, O_RDONLY | O_DIRECTORY);
-        if (sfd >= 0) { fsync(sfd); close(sfd); }
-
-        /* Move from staging into packs/ — recoverable by pack_resume_installing */
-        if (rename(stage_dat, dat_final) != 0) {
+        if (rename(dat_tmp, dat_final) != 0) {
             st = set_error_errno(ERR_IO, "finalize_pack: rename dat to final");
             goto fail;
         }
-        if (rename(stage_idx, idx_final) != 0) {
-            st = set_error_errno(ERR_IO, "finalize_pack: rename idx to final");
-            goto fail;
-        }
 
-        /* Verify both files landed */
         struct stat dst_stat;
-        if (stat(dat_final, &dst_stat) != 0 || dst_stat.st_size == 0 ||
-            stat(idx_final, &dst_stat) != 0 || dst_stat.st_size == 0) {
+        if (stat(dat_final, &dst_stat) != 0 || dst_stat.st_size == 0) {
             st = set_error(ERR_IO, "finalize_pack: post-rename verification failed");
             goto fail;
         }
+        if (dat_size == 0) dat_size = (uint64_t)dst_stat.st_size;
+    }
 
-        /* Remove the now-empty staging dir.  The packs/ directory fsync
-         * is deferred and done once after all packs are written — safe
-         * because pack_resume_installing() replays incomplete installs. */
-        rmdir(stage_dir);
+    /* Hand the contents to the daemon. Only after the file is durably in
+     * place: rows that point at a pack which does not exist yet would make
+     * readers fail on objects the index claims are present. */
+    if (packed > 0) {
+        pack_commit_entry_t *ce = malloc((size_t)packed * sizeof(*ce));
+        if (!ce) return set_error(ERR_NOMEM, "finalize_pack: commit entries");
+        for (uint32_t i = 0; i < packed; i++) {
+            memcpy(ce[i].hash, idx_entries[i].hash, OBJECT_HASH_SIZE);
+            ce[i].offset    = idx_entries[i].dat_offset;
+            ce[i].comp_size = 0;   /* filled by the reader from the entry header */
+            ce[i].orig_size = 0;
+        }
+        char fname[64];
+        snprintf(fname, sizeof(fname), "pack-%08u.dat", pack_num);
+        pack_commit_info_t info = {
+            .pack_id     = pack_num,
+            .filename    = fname,
+            .size        = dat_size,
+            .entry_count = packed,
+            .entries     = ce,
+        };
+        store_emit_pack_commit(store, &info);
+        free(ce);
     }
 
     return OK;
 
 fail:
     if (*dat_f) { fclose(*dat_f); *dat_f = NULL; }
-    if (*idx_f) { fclose(*idx_f); *idx_f = NULL; }
     unlink(dat_tmp);
-    unlink(idx_tmp);
     return st;
 }
 
@@ -1903,8 +1829,8 @@ static void pw_free_parity(pack_writer_t *pw) {
 static status_t pw_finalize(pack_writer_t *pw) {
     if (!pw->dat_f || pw->packed == 0) return OK;
 
-    status_t st = finalize_pack(pw->store, &pw->dat_f, &pw->idx_f,
-                                pw->dat_tmp, pw->idx_tmp, &pw->dat_hdr,
+    status_t st = finalize_pack(pw->store, &pw->dat_f,
+                                pw->dat_tmp, &pw->dat_hdr,
                                 pw->idx_entries, pw->packed, pw->pack_num,
                                 pw->entry_parity);
     if (st == OK) {
@@ -1922,8 +1848,8 @@ static status_t pw_open(pack_writer_t *pw, pack_unified_ctx_t *ctx) {
     pw->pack_num = atomic_fetch_add(&ctx->next_pack_num, 1);
     pw->packed = 0;
     pw->body_offset = 0;
-    return open_new_pack(pw->store, pw->pack_num, &pw->dat_f, &pw->idx_f,
-                         pw->dat_tmp, pw->idx_tmp, &pw->dat_hdr);
+    return open_new_pack(pw->store, pw->pack_num, &pw->dat_f,
+                         pw->dat_tmp, &pw->dat_hdr);
 }
 
 static void pw_destroy(pack_writer_t *pw) {
@@ -2689,41 +2615,6 @@ static int ref_cmp(const void *key, const void *entry) {
 
 /* Read idx entries from file, normalising v1/v2/v3 to v4 (62-byte).
  * Caller provides an array of at least count v4 entries. */
-static int read_idx_entries(FILE *f, uint32_t version, uint32_t count,
-                            pack_idx_disk_entry_t *out) {
-    if (version == PACK_VERSION) {
-        /* v4: 62-byte entries — native format */
-        return (fread(out, sizeof(*out), count, f) == count) ? 0 : -1;
-    }
-    if (version == PACK_VERSION_V3) {
-        /* v3: 44-byte entries — no type/sizes */
-        for (uint32_t i = 0; i < count; i++) {
-            pack_idx_disk_entry_v3_t de3;
-            if (fread(&de3, sizeof(de3), 1, f) != 1) return -1;
-            memcpy(out[i].hash, de3.hash, OBJECT_HASH_SIZE);
-            out[i].dat_offset         = de3.dat_offset;
-            out[i].entry_index        = de3.entry_index;
-            out[i].type               = 0;
-            out[i].compression        = 0;
-            out[i].uncompressed_size  = 0;
-            out[i].compressed_size    = 0;
-        }
-        return 0;
-    }
-    /* v1/v2: 40-byte entries */
-    for (uint32_t i = 0; i < count; i++) {
-        pack_idx_disk_entry_v2_t de2;
-        if (fread(&de2, sizeof(de2), 1, f) != 1) return -1;
-        memcpy(out[i].hash, de2.hash, OBJECT_HASH_SIZE);
-        out[i].dat_offset         = de2.dat_offset;
-        out[i].entry_index        = UINT32_MAX;
-        out[i].type               = 0;
-        out[i].compression        = 0;
-        out[i].uncompressed_size  = 0;
-        out[i].compressed_size    = 0;
-    }
-    return 0;
-}
 
 static int pack_meta_small_cmp(const void *a, const void *b) {
     const pack_meta_t *pa = a;
@@ -2767,28 +2658,30 @@ static status_t collect_pack_meta(store_t *store,
 
     for (size_t i = 0; i < num_cnt; i++) {
         uint32_t n = pack_nums[i];
-        char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), n) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), n) != 0)
+        char dat_path[PATH_MAX];
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), n) != 0)
             continue;
 
         struct stat st;
         if (stat(dat_path, &st) != 0) continue;
 
-        FILE *idxf = fopen(idx_path, "rb");
-        if (!idxf) continue;
-        pack_idx_hdr_t ihdr;
-        if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
-            ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
-             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
-            fclose(idxf);
+        /* Object count and format version both come from the .dat header.
+         * This used to read the .idx header for the same two fields, which
+         * was the only reason coalesce planning needed the sidecar at all. */
+        FILE *datf = fopen(dat_path, "rb");
+        if (!datf) continue;
+        pack_dat_hdr_t dhdr;
+        if (fread(&dhdr, sizeof(dhdr), 1, datf) != 1 ||
+            dhdr.magic != PACK_DAT_MAGIC ||
+            (dhdr.version != PACK_VERSION_V1 && dhdr.version != PACK_VERSION_V2 &&
+             dhdr.version != PACK_VERSION_V3 && dhdr.version != PACK_VERSION)) {
+            fclose(datf);
             continue;
         }
-        fclose(idxf);
+        fclose(datf);
 
         arr[cnt].num = n;
-        arr[cnt].count = ihdr.count;
+        arr[cnt].count = dhdr.count;
         arr[cnt].dat_bytes = (uint64_t)st.st_size;
         *out_total_dat += arr[cnt].dat_bytes;
         if (arr[cnt].dat_bytes < PACK_COALESCE_SMALL_BYTES) (*out_small_cnt)++;
@@ -2799,84 +2692,6 @@ static status_t collect_pack_meta(store_t *store,
     *out_meta = arr;
     *out_cnt = cnt;
     return OK;
-}
-
-/* Resume any interrupted pack installs by scanning for .installing-NNNNNNNN
- * staging directories in packs/.  For each:
- *   - If both .dat and .idx are in packs/ already: remove staging dir
- *   - If files remain in staging dir: move them to packs/
- *   - If staging dir is incomplete (only one file): remove it entirely
- *     since the temp source files are gone and we can't finish the install */
-void pack_resume_installing(store_t *store) {
-    char packs_dir[PATH_MAX];
-    if (snprintf(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store))
-        >= (int)sizeof(packs_dir))
-        return;
-
-    DIR *dir = opendir(packs_dir);
-    if (!dir) return;
-
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        uint32_t pack_num;
-        if (sscanf(de->d_name, ".installing-%08u", &pack_num) != 1) continue;
-
-        char stage_dir[PATH_MAX];
-        if (snprintf(stage_dir, sizeof(stage_dir), "%s/%s",
-                     packs_dir, de->d_name) >= (int)sizeof(stage_dir))
-            continue;
-
-        char stage_dat[PATH_MAX], stage_idx[PATH_MAX];
-        char dat_final[PATH_MAX], idx_final[PATH_MAX];
-        if (path_fmt(stage_dat, sizeof(stage_dat), "%s/pack-%08u.dat", stage_dir, pack_num) != 0 ||
-            path_fmt(stage_idx, sizeof(stage_idx), "%s/pack-%08u.idx", stage_dir, pack_num) != 0 ||
-            pack_dat_path(dat_final, sizeof(dat_final), store_root(store), pack_num) != 0 ||
-            pack_idx_path(idx_final, sizeof(idx_final), store_root(store), pack_num) != 0)
-            continue;
-
-        /* Ensure the shard subdirectory exists for final paths */
-        pack_ensure_shard_dir(store_root(store), pack_num);
-
-        /* Check what's already in packs/ vs staging */
-        int dat_staged = (access(stage_dat, F_OK) == 0);
-        int idx_staged = (access(stage_idx, F_OK) == 0);
-        int dat_final_ok = (access(dat_final, F_OK) == 0);
-        int idx_final_ok = (access(idx_final, F_OK) == 0);
-
-        if (dat_staged && idx_staged) {
-            /* Both still in staging — complete the install */
-            if (rename(stage_dat, dat_final) != 0) goto remove_stage;
-            if (rename(stage_idx, idx_final) != 0) goto remove_stage;
-        } else if (dat_staged && !idx_staged) {
-            if (idx_final_ok) {
-                /* idx already moved; finish moving dat */
-                if (rename(stage_dat, dat_final) != 0) goto remove_stage;
-            } else {
-                /* Incomplete pair — can't finish, discard */
-                unlink(stage_dat);
-                goto remove_stage;
-            }
-        } else if (!dat_staged && idx_staged) {
-            if (dat_final_ok) {
-                /* dat already moved; finish moving idx */
-                if (rename(stage_idx, idx_final) != 0) goto remove_stage;
-            } else {
-                /* Incomplete pair — can't finish, discard */
-                unlink(stage_idx);
-                goto remove_stage;
-            }
-        }
-        /* else: both already in final — just clean up staging dir */
-
-remove_stage:
-        rmdir(stage_dir);
-    }
-    closedir(dir);
-
-    /* fsync packs/ to persist any completed installs */
-    int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
-    if (pfd >= 0) { fsync(pfd); close(pfd); }
-
 }
 
 /* Resume any interrupted coalesce deletions by scanning for .deleting-NNNNNNNN
@@ -2905,14 +2720,11 @@ static void pack_resume_deleting(store_t *store) {
 
         uint32_t pnum;
         while (fscanf(mf, "%u", &pnum) == 1) {
-            char dat_path[PATH_MAX], idx_path[PATH_MAX];
+            char dat_path[PATH_MAX];
             /* Try sharded path first, then flat fallback */
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
                                       store_root(store), pnum) == 0)
                 unlink(dat_path);
-            if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
-                                      store_root(store), pnum) == 0)
-                unlink(idx_path);
         }
         fclose(mf);
         unlink(marker_path);
@@ -2921,9 +2733,42 @@ static void pack_resume_deleting(store_t *store) {
 
 }
 
+/*
+ * Rebuild a pack's (hash, offset) table by walking its .dat.
+ *
+ * Coalescing used to read this straight out of the .idx sidecar. With that
+ * gone the same information is recovered from the entry headers, which carry
+ * the hash and compressed size, so offsets accumulate as we walk. Costs one
+ * sequential pass over the pack instead of a small random read, which is a
+ * fair trade for not maintaining a second copy of the same data on disk.
+ *
+ * Expects f positioned immediately after the pack header.
+ */
+static int build_disk_idx_from_dat(FILE *f, uint32_t version, uint32_t count,
+                                   pack_idx_disk_entry_t *out)
+{
+    uint64_t offset = sizeof(pack_dat_hdr_t);
+    for (uint32_t i = 0; i < count; i++) {
+        if (version == PACK_VERSION_V1) {
+            pack_dat_entry_hdr_v1_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
+            memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
+            out[i].dat_offset = offset;
+            offset += sizeof(eh) + (uint64_t)eh.compressed_size;
+        } else {
+            pack_dat_entry_hdr_t eh;
+            if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
+            memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
+            out[i].dat_offset = offset;
+            offset += sizeof(eh) + eh.compressed_size;
+        }
+        if (fseeko(f, (off_t)offset, SEEK_SET) != 0) return -1;
+    }
+    return 0;
+}
+
 static status_t maybe_coalesce_packs(store_t *store,
                                      const uint8_t *refs, size_t refs_cnt) {
-    pack_resume_installing(store);
     pack_resume_deleting(store);
     pack_meta_t *meta = NULL;
     size_t pack_cnt = 0;
@@ -2981,8 +2826,8 @@ static status_t maybe_coalesce_packs(store_t *store,
     dat_tmp[0] = '\0'; idx_tmp[0] = '\0';
     pack_dat_hdr_t dhdr;
 
-    rc = open_new_pack(store, new_pack_num, &new_dat, &new_idx,
-                       dat_tmp, idx_tmp, &dhdr);
+    rc = open_new_pack(store, new_pack_num, &new_dat,
+                       dat_tmp, &dhdr);
     if (rc != OK) {
         free(new_disk_idx); free(cand);
         return rc;
@@ -2996,51 +2841,40 @@ static status_t maybe_coalesce_packs(store_t *store,
     size_t cpayload_cap = 0;
 
     for (size_t ci = 0; rc == OK && ci < n_cand; ci++) {
-        char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), cand[ci].num) != 0) {
+        char dat_path[PATH_MAX];
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) != 0) {
             rc = ERR_IO;
             break;
         }
 
-        FILE *idxf = fopen(idx_path, "rb");
         FILE *datf = fopen(dat_path, "rb");
-        if (!idxf || !datf) {
-            if (idxf) fclose(idxf);
-            if (datf) fclose(datf);
-            rc = ERR_IO;
-            break;
-        }
+        if (!datf) { rc = ERR_IO; break; }
 
-        pack_idx_hdr_t ihdr;
-        if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
-            ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
-             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
-            fclose(idxf);
+        pack_dat_hdr_t chdr;
+        if (fread(&chdr, sizeof(chdr), 1, datf) != 1 ||
+            chdr.magic != PACK_DAT_MAGIC ||
+            (chdr.version != PACK_VERSION_V1 && chdr.version != PACK_VERSION_V2 &&
+             chdr.version != PACK_VERSION_V3 && chdr.version != PACK_VERSION)) {
             fclose(datf);
             rc = ERR_CORRUPT;
             break;
         }
-        uint32_t dat_version = ihdr.version;
+        uint32_t dat_version = chdr.version;
 
-        pack_idx_disk_entry_t *disk_idx = malloc((size_t)ihdr.count * sizeof(*disk_idx));
+        pack_idx_disk_entry_t *disk_idx = malloc((size_t)chdr.count * sizeof(*disk_idx));
         if (!disk_idx) {
-            fclose(idxf);
             fclose(datf);
             rc = ERR_NOMEM;
             break;
         }
-        if (read_idx_entries(idxf, ihdr.version, ihdr.count, disk_idx) != 0) {
+        if (build_disk_idx_from_dat(datf, chdr.version, chdr.count, disk_idx) != 0) {
             free(disk_idx);
-            fclose(idxf);
             fclose(datf);
             rc = ERR_CORRUPT;
             break;
         }
-        fclose(idxf);
 
-        for (uint32_t i = 0; rc == OK && i < ihdr.count; i++) {
+        for (uint32_t i = 0; rc == OK && i < chdr.count; i++) {
             if (!bsearch(disk_idx[i].hash, refs, refs_cnt, OBJECT_HASH_SIZE, ref_cmp)) continue;
             if (fseeko(datf, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) { rc = ERR_IO; break; }
             pack_dat_entry_hdr_t ehdr;
@@ -3050,7 +2884,7 @@ static status_t maybe_coalesce_packs(store_t *store,
 
             /* Split: finalize current pack if adding this entry would exceed cap */
             if (live_count > 0 && body_offset + entry_total > PACK_MAX_MULTI_BYTES) {
-                rc = finalize_pack(store, &new_dat, &new_idx, dat_tmp, idx_tmp,
+                rc = finalize_pack(store, &new_dat, dat_tmp,
                                    &dhdr, new_disk_idx, live_count, new_pack_num,
                                    NULL);
                 if (rc != OK) break;
@@ -3060,8 +2894,8 @@ static status_t maybe_coalesce_packs(store_t *store,
                 live_count = 0;
                 body_offset = 0;
 
-                rc = open_new_pack(store, new_pack_num, &new_dat, &new_idx,
-                                   dat_tmp, idx_tmp, &dhdr);
+                rc = open_new_pack(store, new_pack_num, &new_dat,
+                       dat_tmp, &dhdr);
                 if (rc != OK) break;
             }
 
@@ -3125,7 +2959,7 @@ static status_t maybe_coalesce_packs(store_t *store,
 
     /* Finalize the last output pack */
     if (rc == OK && live_count > 0) {
-        rc = finalize_pack(store, &new_dat, &new_idx, dat_tmp, idx_tmp,
+        rc = finalize_pack(store, &new_dat, dat_tmp,
                            &dhdr, new_disk_idx, live_count, new_pack_num,
                            NULL);
         if (rc == OK) {
@@ -3157,11 +2991,9 @@ static status_t maybe_coalesce_packs(store_t *store,
         }
 
         for (size_t ci = 0; ci < n_cand; ci++) {
-            char dat_path[PATH_MAX], idx_path[PATH_MAX];
+            char dat_path[PATH_MAX];
             if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), cand[ci].num) == 0)
                 unlink(dat_path);
-            if (pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), cand[ci].num) == 0)
-                unlink(idx_path);
         }
 
         if (del_marker[0] != '\0') unlink(del_marker);
@@ -3320,33 +3152,31 @@ status_t pack_gc(store_t *store,
         }
         uint32_t pnum = pack_nums[pi];
 
-        char dat_path[PATH_MAX], idx_path[PATH_MAX];
-        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), pnum) != 0 ||
-            pack_idx_path_resolve(idx_path, sizeof(idx_path), store_root(store), pnum) != 0) {
+        char dat_path[PATH_MAX];
+        if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store), pnum) != 0)
             continue;
-        }
 
-        /* Read idx to learn entry count and offsets */
-        FILE *idxf = fopen(idx_path, "rb");
-        if (!idxf) continue;
-        pack_idx_hdr_t ihdr;
-        if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
-            ihdr.magic != PACK_IDX_MAGIC ||
-            (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
-             ihdr.version != PACK_VERSION_V3 && ihdr.version != PACK_VERSION)) {
-            fclose(idxf); continue;
+        /* Walk the .dat to learn entry count and offsets. */
+        FILE *gcidxf = fopen(dat_path, "rb");
+        if (!gcidxf) continue;
+        pack_dat_hdr_t ghdr;
+        if (fread(&ghdr, sizeof(ghdr), 1, gcidxf) != 1 ||
+            ghdr.magic != PACK_DAT_MAGIC ||
+            (ghdr.version != PACK_VERSION_V1 && ghdr.version != PACK_VERSION_V2 &&
+             ghdr.version != PACK_VERSION_V3 && ghdr.version != PACK_VERSION)) {
+            fclose(gcidxf); continue;
         }
-        uint32_t dat_version = ihdr.version;
-        uint32_t count = ihdr.count;
+        uint32_t dat_version = ghdr.version;
+        uint32_t count = ghdr.count;
         if (count > 10000000u) {
-            fclose(idxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: idx entry count too large (%u) in pack %u", count, pnum);
+            fclose(gcidxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
         }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
-        if (!disk_idx) { fclose(idxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
-        if (read_idx_entries(idxf, ihdr.version, count, disk_idx) != 0) {
-            free(disk_idx); fclose(idxf); continue;
+        if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
+        if (build_disk_idx_from_dat(gcidxf, ghdr.version, count, disk_idx) != 0) {
+            free(disk_idx); fclose(gcidxf); continue;
         }
-        fclose(idxf);
+        fclose(gcidxf);
 
         /* Check how many entries are unreferenced */
         uint32_t n_dead = 0;
@@ -3366,7 +3196,6 @@ status_t pack_gc(store_t *store,
         if (n_dead == count) {
             /* Every entry is dead — delete the whole pack */
             unlink(dat_path);
-            unlink(idx_path);
             total_deleted += count;
             free(disk_idx);
             continue;
@@ -3496,42 +3325,52 @@ status_t pack_gc(store_t *store,
         fclose(new_dat); new_dat = NULL;
         fclose(old_dat); old_dat = NULL;
 
-        /* Sort new idx and write */
         qsort(new_disk_idx, live_count, sizeof(*new_disk_idx), idx_disk_cmp);
-        pack_idx_hdr_t new_ihdr = { PACK_IDX_MAGIC, PACK_VERSION, live_count };
-        if (fwrite(&new_ihdr, sizeof(new_ihdr), 1, new_idx) != 1 ||
-            fwrite(new_disk_idx, sizeof(*new_disk_idx), live_count, new_idx) != live_count) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        /* Write idx parity trailer */
-        st = write_idx_parity(new_idx, &new_ihdr, new_disk_idx,
-                              (size_t)live_count * sizeof(*new_disk_idx), live_count);
-        free(new_disk_idx);
-        if (st != OK) goto pack_fail;
-        if (fflush(new_idx) != 0 || fsync(fileno(new_idx)) != 0) {
-            st = ERR_IO; goto pack_fail;
-        }
-        fclose(new_idx); new_idx = NULL;
 
-        /* Replace old pack with new */
+        /* Replace old pack with new. One file, so one rename. */
         if (rename(dat_tmp, dat_path) != 0) {
-            st = ERR_IO; goto pack_fail;
-        }
-        if (rename(idx_tmp, idx_path) != 0) {
-            rename(dat_path, dat_tmp);  /* roll back dat rename */
-            st = ERR_IO; goto pack_fail;
+            st = ERR_IO; free(new_disk_idx); goto pack_fail;
         }
         {
             struct stat gc_dst_stat;
-            if (stat(dat_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0 ||
-                stat(idx_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0) {
-                st = ERR_IO; goto pack_fail;
+            if (stat(dat_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0) {
+                st = ERR_IO; free(new_disk_idx); goto pack_fail;
             }
         }
         {
             int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
             if (pfd >= 0) { fsync(pfd); close(pfd); }
         }
+
+        /* Re-announce the rewritten pack. GC drops dead objects, so the
+         * daemon's pack_objects rows for this pack are now wrong; the commit
+         * callback replaces them. Emitted after the rename for the same
+         * reason as in finalize_pack: rows must never describe a pack that
+         * is not on disk yet. */
+        if (live_count > 0) {
+            pack_commit_entry_t *ce = malloc((size_t)live_count * sizeof(*ce));
+            if (ce) {
+                for (uint32_t ei = 0; ei < live_count; ei++) {
+                    memcpy(ce[ei].hash, new_disk_idx[ei].hash, OBJECT_HASH_SIZE);
+                    ce[ei].offset    = new_disk_idx[ei].dat_offset;
+                    ce[ei].comp_size = 0;
+                    ce[ei].orig_size = 0;
+                }
+                struct stat gc_sz;
+                char fname[64];
+                snprintf(fname, sizeof(fname), "pack-%08u.dat", pnum);
+                pack_commit_info_t info = {
+                    .pack_id     = pnum,
+                    .filename    = fname,
+                    .size        = (stat(dat_path, &gc_sz) == 0) ? (uint64_t)gc_sz.st_size : 0,
+                    .entry_count = live_count,
+                    .entries     = ce,
+                };
+                store_emit_pack_commit(store, &info);
+                free(ce);
+            }
+        }
+        free(new_disk_idx);
         free(disk_idx);
         continue;
 
@@ -3571,167 +3410,13 @@ pack_fail:
 }
 
 /* ------------------------------------------------------------------ */
-/* Migrate pre-v4 .idx files to v4 (adds type+sizes from .dat)         */
 /* ------------------------------------------------------------------ */
 
-/* Migrate a single pack's .idx from pre-v4 to v4.
+/*
  * Reads entry headers from the .dat to get type, compression, sizes. */
-static status_t migrate_one_idx(const char *idx_path, const char *dat_path,
-                                uint32_t pack_num)
-{
-    FILE *idxf = fopen(idx_path, "rb");
-    if (!idxf) return OK;  /* skip unreadable */
-
-    pack_idx_hdr_t ihdr;
-    if (fread(&ihdr, sizeof(ihdr), 1, idxf) != 1 ||
-        ihdr.magic != PACK_IDX_MAGIC) {
-        fclose(idxf);
-        return OK;
-    }
-    if (ihdr.version == PACK_VERSION) {
-        fclose(idxf);  /* already v4 */
-        return OK;
-    }
-    if (ihdr.version != PACK_VERSION_V1 && ihdr.version != PACK_VERSION_V2 &&
-        ihdr.version != PACK_VERSION_V3) {
-        fclose(idxf);
-        return OK;  /* unknown version, skip */
-    }
-
-    uint32_t count = ihdr.count;
-    if (count > 10000000u) { fclose(idxf); return OK; }
-
-    /* Read old idx entries */
-    pack_idx_disk_entry_t *entries = malloc((size_t)count * sizeof(*entries));
-    if (!entries) { fclose(idxf); return ERR_NOMEM; }
-    if (read_idx_entries(idxf, ihdr.version, count, entries) != 0) {
-        free(entries); fclose(idxf);
-        return OK;  /* skip corrupt */
-    }
-    fclose(idxf);
-
-    /* Read .dat to get type+sizes for each entry */
-    FILE *datf = fopen(dat_path, "rb");
-    if (!datf) { free(entries); return OK; }
-
-    pack_dat_hdr_t dhdr;
-    if (fread(&dhdr, sizeof(dhdr), 1, datf) != 1 ||
-        dhdr.magic != PACK_DAT_MAGIC) {
-        fclose(datf); free(entries);
-        return OK;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        if (fseeko(datf, (off_t)entries[i].dat_offset, SEEK_SET) != 0) {
-            fclose(datf); free(entries);
-            return set_error(ERR_IO, "migrate_one_idx: seek failed pack %u entry %u",
-                             pack_num, i);
-        }
-        pack_dat_entry_hdr_t ehdr;
-        if (read_entry_hdr(datf, &ehdr, dhdr.version) != 0) {
-            fclose(datf); free(entries);
-            return set_error(ERR_CORRUPT,
-                             "migrate_one_idx: bad entry header pack %u entry %u",
-                             pack_num, i);
-        }
-        entries[i].type              = ehdr.type;
-        entries[i].compression       = ehdr.compression;
-        entries[i].uncompressed_size = ehdr.uncompressed_size;
-        entries[i].compressed_size   = ehdr.compressed_size;
-    }
-    fclose(datf);
-
-    /* Write new v4 idx via temp file + atomic rename */
-    char tmp_path[PATH_MAX];
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.v4tmp", idx_path)
-        >= (int)sizeof(tmp_path)) {
-        free(entries);
-        return set_error(ERR_IO, "migrate_one_idx: tmp path too long");
-    }
-
-    FILE *out = fopen(tmp_path, "wb");
-    if (!out) { free(entries); return set_error_errno(ERR_IO, "migrate_one_idx: fopen tmp"); }
-
-    pack_idx_hdr_t new_hdr = { PACK_IDX_MAGIC, PACK_VERSION, count };
-    if (fwrite(&new_hdr, sizeof(new_hdr), 1, out) != 1 ||
-        fwrite(entries, sizeof(*entries), count, out) != count) {
-        fclose(out); unlink(tmp_path); free(entries);
-        return set_error_errno(ERR_IO, "migrate_one_idx: write failed");
-    }
-
-    /* Write idx parity trailer */
-    status_t st = write_idx_parity(out, &new_hdr, entries,
-                                   (size_t)count * sizeof(*entries), count);
-    free(entries);
-    if (st != OK) { fclose(out); unlink(tmp_path); return st; }
-
-    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
-        fclose(out); unlink(tmp_path);
-        return set_error_errno(ERR_IO, "migrate_one_idx: fsync failed");
-    }
-    fclose(out);
-
-    if (rename(tmp_path, idx_path) != 0) {
-        unlink(tmp_path);
-        return set_error_errno(ERR_IO, "migrate_one_idx: rename failed");
-    }
-
-    return OK;
-}
-
-status_t pack_migrate_idx_v4(store_t *store, uint32_t *out_migrated)
-{
-    if (out_migrated) *out_migrated = 0;
-
-    char packs_dir[PATH_MAX];
-    if (path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0)
-        return OK;
-
-    collect_pack_nums_ctx_t cpn = { NULL, 0, 0 };
-    cpn.nums = malloc(256 * sizeof(*cpn.nums));
-    if (!cpn.nums) return ERR_NOMEM;
-    cpn.cap = 256;
-    pack_for_each_num(packs_dir, collect_pack_num_cb, &cpn);
-
-    uint32_t migrated = 0;
-    status_t st = OK;
-
-    for (size_t i = 0; i < cpn.cnt && st == OK; i++) {
-        uint32_t pnum = cpn.nums[i];
-        char idx_path[PATH_MAX], dat_path[PATH_MAX];
-        if (pack_idx_path_resolve(idx_path, sizeof(idx_path),
-                                  store_root(store), pnum) != 0 ||
-            pack_dat_path_resolve(dat_path, sizeof(dat_path),
-                                  store_root(store), pnum) != 0)
-            continue;
-
-        /* Check if already v4 */
-        FILE *f = fopen(idx_path, "rb");
-        if (!f) continue;
-        pack_idx_hdr_t hdr;
-        int ok = (fread(&hdr, sizeof(hdr), 1, f) == 1 &&
-                  hdr.magic == PACK_IDX_MAGIC);
-        fclose(f);
-        if (!ok || hdr.version == PACK_VERSION) continue;
-
-        st = migrate_one_idx(idx_path, dat_path, pnum);
-        if (st == OK) {
-            migrated++;
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "migrate-v4: pack %u migrated (%u entries)",
-                     pnum, hdr.count);
-            log_msg("INFO", msg);
-        }
-    }
-
-    free(cpn.nums);
-    if (out_migrated) *out_migrated = migrated;
-    return st;
-}
 
 /* ------------------------------------------------------------------ */
-/* Read-only enumeration of pack .dat and .idx files                   */
+/* Read-only enumeration of pack .dat files                            */
 /* ------------------------------------------------------------------ */
 
 status_t pack_enumerate_dat(store_t *store, const char *dat_name,
@@ -3804,69 +3489,3 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
     return OK;
 }
 
-status_t pack_enumerate_idx(store_t *store, const char *idx_name,
-                             uint32_t *out_version, uint32_t *out_count,
-                             pack_idx_entry_cb cb, void *ctx)
-{
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/packs/%s", store_root(store), idx_name);
-
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        /* Try sharded path: parse pack_num from name */
-        uint32_t pnum;
-        int end = 0;
-        if (sscanf(idx_name, "pack-%08u.idx%n", &pnum, &end) == 1 &&
-            idx_name[end] == '\0' &&
-            pack_idx_path_resolve(path, sizeof(path), store_root(store), pnum) == 0)
-            f = fopen(path, "rb");
-        if (!f)
-            return set_error_errno(ERR_IO, "pack_enumerate_idx: open %s", idx_name);
-    }
-
-    pack_idx_hdr_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_IDX_MAGIC) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "pack_enumerate_idx: bad header in %s", idx_name);
-    }
-    if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
-        hdr.version != PACK_VERSION_V3 && hdr.version != PACK_VERSION) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "pack_enumerate_idx: unknown version %u in %s",
-                         hdr.version, idx_name);
-    }
-
-    if (out_version) *out_version = hdr.version;
-    if (out_count)   *out_count   = hdr.count;
-
-    if (!cb) { fclose(f); return OK; }
-
-    for (uint32_t i = 0; i < hdr.count; i++) {
-        pack_idx_info_t info;
-
-        if (hdr.version <= PACK_VERSION_V2) {
-            pack_idx_disk_entry_v2_t e;
-            if (fread(&e, sizeof(e), 1, f) != 1) break;
-            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
-            info.dat_offset  = e.dat_offset;
-            info.entry_index = 0;
-        } else if (hdr.version == PACK_VERSION_V3) {
-            pack_idx_disk_entry_v3_t e;
-            if (fread(&e, sizeof(e), 1, f) != 1) break;
-            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
-            info.dat_offset  = e.dat_offset;
-            info.entry_index = e.entry_index;
-        } else {
-            pack_idx_disk_entry_t e;
-            if (fread(&e, sizeof(e), 1, f) != 1) break;
-            memcpy(info.hash, e.hash, OBJECT_HASH_SIZE);
-            info.dat_offset  = e.dat_offset;
-            info.entry_index = e.entry_index;
-        }
-
-        cb(&info, ctx);
-    }
-
-    fclose(f);
-    return OK;
-}

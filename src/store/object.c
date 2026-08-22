@@ -551,7 +551,13 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
     }
 
-    int is_fuse = fd_is_fuse(src_fd);
+    /* The readahead ring overlaps FUSE reads with disk writes and is a real
+     * throughput win, but it is implicated in short-read failures under load
+     * (dd sustains 172 MB/s on the same source where the backup path drops to
+     * 51 MB/s and then fails with ENXIO). Off unless the operator opts in,
+     * until that is understood; the non-ring path is correct, just slower. */
+    const store_config_t *scfg = store_config(store);
+    int is_fuse = (scfg && scfg->enable_fuse_readahead) && fd_is_fuse(src_fd);
 
     /* Non-FUSE path uses a single large buffer; FUSE path uses ring buffers */
     uint8_t *buf = NULL;
