@@ -27,6 +27,7 @@
 #include <stdio.h>
 
 typedef struct store store_t;
+struct repo_key;
 
 typedef struct {
     /* Off by default pending the FUSE ENXIO fix. The readahead ring speeds
@@ -68,6 +69,19 @@ typedef struct {
 typedef status_t (*store_locate_fn)(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
                                     store_location_t *out);
 void store_set_locate_cb(store_t *st, store_locate_fn cb, void *user);
+
+/*
+ * The repository key, when there is one.
+ *
+ * Set once after opening, by whoever loaded it from the host keyfile. The
+ * store copies it: callers wipe their own copy and the engine keeps working.
+ * With no key set, everything behaves exactly as it did before encryption
+ * existed, which is what an unencrypted repository needs.
+ */
+void store_set_key(store_t *st, const struct repo_key *key);
+
+/* NULL when the repository is not encrypted. */
+const struct repo_key *store_key(const store_t *st);
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 

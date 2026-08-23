@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "object.h"
+#include "object_crypt.h"
 #include "pack.h"
 #include "parity.h"
 #include "parity_stream.h"
@@ -123,11 +124,29 @@ static status_t write_object(store_t *store, uint8_t type,
     size_t payload_size = len;
     char *compressed = NULL;
 
+    /*
+     * Encrypt after compression and before parity, so the trailer protects
+     * what is actually on disk and a scrub can verify an offsite copy without
+     * the key.
+     */
+    uint8_t encryption_flag = 0;
+    uint8_t *ciphertext = NULL;
+    const repo_key_t *key = store_key(store);
+    if (key) {
+        ciphertext = malloc(payload_size + OBJECT_CRYPT_TAG_BYTES);
+        if (!ciphertext) return set_error(ERR_NOMEM, "write_object: cipher buffer");
+        status_t est = object_encrypt(key, out_hash, payload, payload_size, ciphertext);
+        if (est != OK) { free(ciphertext); return est; }
+        payload = ciphertext;
+        payload_size += OBJECT_CRYPT_TAG_BYTES;
+        encryption_flag = COMPRESS_ENCRYPTED;
+    }
+
     object_header_t hdr = {
         .magic             = OBJECT_MAGIC,
         .version           = OBJECT_HDR_VERSION,
         .type              = type,
-        .compression       = COMPRESS_NONE,
+        .compression       = (uint8_t)(COMPRESS_NONE | encryption_flag),
         .pack_skip_ver     = 0,
         .uncompressed_size = (uint64_t)len,
         .compressed_size   = (uint64_t)payload_size,
@@ -138,22 +157,22 @@ static status_t write_object(store_t *store, uint8_t type,
     hash_to_path(out_hash, subdir, fname);
 
     int objfd = store_objects_fd(store);
-    if (objfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(objects)"); }
+    if (objfd == -1) { free(compressed); free(ciphertext); return set_error_errno(ERR_IO, "openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
-        free(compressed);
+        free(compressed); free(ciphertext);
         return set_error_errno(ERR_IO, "mkdirat(%s)", subdir);
     }
     if (errno == EEXIST) errno = 0;
     int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-    if (subfd == -1) { free(compressed); return set_error_errno(ERR_IO, "openat(%s)", subdir); }
+    if (subfd == -1) { free(compressed); free(ciphertext); return set_error_errno(ERR_IO, "openat(%s)", subdir); }
 
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
         >= (int)sizeof(tmppath)) {
-        close(subfd); free(compressed); return set_error(ERR_IO, "write_object: tmppath too long");
+        close(subfd); free(compressed); free(ciphertext); return set_error(ERR_IO, "write_object: tmppath too long");
     }
     int fd = mkstemp(tmppath);
-    if (fd == -1) { close(subfd); free(compressed); return set_error_errno(ERR_IO, "mkstemp(%s)", tmppath); }
+    if (fd == -1) { close(subfd); free(compressed); free(ciphertext); return set_error_errno(ERR_IO, "mkstemp(%s)", tmppath); }
 
     status_t st = OK;
     if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
@@ -225,13 +244,13 @@ static status_t write_object(store_t *store, uint8_t type,
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             unlink(tmppath);
-            close(subfd); free(compressed);
+            close(subfd); free(compressed); free(ciphertext);
             return OK;
         }
         st = set_error_errno(ERR_IO, "rename(%s, %s)", tmppath, dstpath);
         goto fail;
     }
-    close(subfd); free(compressed);
+    close(subfd); free(compressed); free(ciphertext);
     store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = total_phys;
@@ -239,7 +258,7 @@ static status_t write_object(store_t *store, uint8_t type,
 fail:
     if (fd >= 0) close(fd);
     unlink(tmppath);
-    close(subfd); free(compressed);
+    close(subfd); free(compressed); free(ciphertext);
     return st;
 }
 
@@ -499,6 +518,22 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
                                          void *progress_ctx) {
+    /*
+     * Not yet: this path does not encrypt.
+     *
+     * Refusing is the only safe answer. Writing here regardless would put
+     * plaintext into a repository that everything else believes is
+     * encrypted, and nothing downstream would notice - the object would read
+     * back perfectly.
+     */
+    if (store_key(store)) {
+        if (src_path) close(src_fd);
+        return set_error(ERR_INVALID,
+                         "encrypted repositories cannot yet store objects "
+                         "larger than %llu bytes",
+                         (unsigned long long)STREAM_LOAD_MAX);
+    }
+
     /* Always store uncompressed; the pack sweeper handles compression. */
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
         if (src_path) close(src_fd);
@@ -1035,6 +1070,12 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
                                            uint8_t out_hash[OBJECT_HASH_SIZE],
                                            int *out_is_new,
                                            uint64_t *out_phys_bytes) {
+    if (store_key(store)) {
+        if (src_path) close(fd);
+        return set_error(ERR_INVALID,
+                         "encrypted repositories cannot yet store sparse objects");
+    }
+
     (void)file_size;  /* uncompressed_size is the sparse payload size, not file size */
 
     /* Compute total payload size (header + regions table + region data) */
@@ -1412,7 +1453,8 @@ status_t object_load(store_t *store,
     }
 
     /* Large uncompressed objects must be loaded via object_load_stream. */
-    if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_LOAD_MAX) {
+    if ((hdr.compression & (uint8_t)~COMPRESS_ENCRYPTED) == COMPRESS_NONE &&
+        hdr.compressed_size > STREAM_LOAD_MAX) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
         close(fd);
         return set_error(ERR_TOO_LARGE, "object %s: %lu bytes, use streaming load", hex, (unsigned long)hdr.compressed_size);
@@ -1476,9 +1518,33 @@ status_t object_load(store_t *store,
     }
     close(fd);
 
+    /*
+     * Decrypt before anything looks at the payload. compressed_size counts
+     * the tag, so the plaintext is that much shorter; decrypting in place
+     * keeps the buffer the caller already owns.
+     */
+    uint8_t codec = hdr.compression & (uint8_t)~COMPRESS_ENCRYPTED;
+    if (hdr.compression & COMPRESS_ENCRYPTED) {
+        const repo_key_t *key = store_key(store);
+        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+        if (!key) {
+            free(cpayload);
+            return set_error(ERR_INVALID,
+                             "object %s is encrypted and no key is loaded", hex);
+        }
+        if (hdr.compressed_size < OBJECT_CRYPT_TAG_BYTES) {
+            free(cpayload);
+            return set_error(ERR_CORRUPT, "object %s: truncated ciphertext", hex);
+        }
+        size_t ptlen = (size_t)hdr.compressed_size - OBJECT_CRYPT_TAG_BYTES;
+        status_t dst = object_decrypt(key, hash, cpayload, ptlen, cpayload);
+        if (dst != OK) { free(cpayload); return dst; }
+        hdr.compressed_size = ptlen;
+    }
+
     void *data;
     size_t data_sz;
-    if (hdr.compression == COMPRESS_NONE) {
+    if (codec == COMPRESS_NONE) {
         if (hdr.uncompressed_size != hdr.compressed_size) {
             char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
             free(cpayload);
@@ -1891,6 +1957,10 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
     /* Check existence first to avoid redundant work. */
     if (object_exists(store, expected_hash)) return OK;
+
+    if (store_key(store))
+        return set_error(ERR_INVALID,
+                         "encrypted repositories cannot yet import objects by fd");
 
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))

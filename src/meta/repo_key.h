@@ -44,7 +44,9 @@ typedef enum {
     REPO_ENC_PASSPHRASE,
 } repo_enc_mode_t;
 
-typedef struct {
+/* Named so store.h can forward-declare it without pulling in this header,
+ * which would drag the meta layer into every store translation unit. */
+typedef struct repo_key {
     uint8_t key[REPO_KEY_BYTES];
     /* A short public fingerprint of the key, stored in the marker so a
      * mismatched keyfile is caught when the repository is opened rather than

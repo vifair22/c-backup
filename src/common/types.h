@@ -39,6 +39,20 @@
 #define ACL_BLOB_ACCESS  1
 #define ACL_BLOB_DEFAULT 2
 
+/*
+ * Encryption rides as a flag on the compression byte rather than a new header
+ * field, so the header stays 56 bytes and every offset computed from
+ * sizeof(object_header_t) keeps working untouched. A build that predates
+ * encryption sees an unknown compression codec and refuses the object, which
+ * is the right answer; it will not have got that far anyway, because the
+ * repository marker is version 2 and it refuses those outright.
+ *
+ * compressed_size counts what is stored, tag included, so trailer offsets and
+ * parity coverage need no special case either. The decrypting reader is the
+ * only code that has to subtract the tag.
+ */
+#define COMPRESS_ENCRYPTED 0x80u
+
 #define COMPRESS_NONE      0
 #define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
 #define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */

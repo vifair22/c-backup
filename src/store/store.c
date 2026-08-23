@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
+#include "repo_key.h"
+
+#include <openssl/crypto.h>
 #include <cutils/log.h>
 
 #include <errno.h>
@@ -68,6 +71,11 @@ struct store {
     void                 *commit_user;
     store_pack_removed_fn removed_cb;
     void                 *removed_user;
+
+    /* Repository key, copied in. has_key is separate from a zero check
+     * because an all-zero key is a valid key, just an unlucky one. */
+    repo_key_t            key;
+    int                   has_key;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -90,6 +98,19 @@ static int dir_is_empty(const char *path) {
     }
     closedir(d);
     return 1;
+}
+
+void store_set_key(store_t *st, const struct repo_key *key)
+{
+    if (!st) return;
+    if (!key) { OPENSSL_cleanse(&st->key, sizeof(st->key)); st->has_key = 0; return; }
+    st->key = *key;
+    st->has_key = 1;
+}
+
+const struct repo_key *store_key(const store_t *st)
+{
+    return (st && st->has_key) ? &st->key : NULL;
 }
 
 status_t store_init_dirs(const char *path) {
@@ -182,6 +203,11 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
 
 void store_close(store_t *st) {
     if (!st) return;
+
+    /* The key does not outlive the handle that used it. */
+    OPENSSL_cleanse(&st->key, sizeof(st->key));
+    st->has_key = 0;
+
     store_dat_cache_flush(st);
     free(st->dat_cache);
     st->dat_cache = NULL;

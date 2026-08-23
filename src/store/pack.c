@@ -2350,6 +2350,20 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
     int show_progress = pack_progress_enabled();
 
+    /*
+     * Packing an encrypted repository is not implemented yet, and doing it
+     * wrong is worse than not doing it: the pack writer would copy ciphertext
+     * into an entry whose header says it is plaintext, and every later read
+     * would hand back encrypted bytes as if they were the file. Refuse
+     * loudly. Backups still complete - packing is not allowed to fail one -
+     * and the objects stay readable loose.
+     */
+    if (store_key(store)) {
+        if (out_packed) *out_packed = 0;
+        return set_error(ERR_INVALID,
+                         "packing an encrypted repository is not implemented yet");
+    }
+
     if (!loose_objects_exist(store)) {
         log_info("pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;
