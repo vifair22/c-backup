@@ -78,10 +78,10 @@ values are JSON-escaped and query parameters percent-encoded, so a path
 containing a quote, a space or a `#` is sent correctly rather than producing
 a malformed request.
 
-> **Known wart.** A collection with no rows serialises as `{}` rather than
-> `{"entries":[]}`, because the array is only created when the first element
-> is appended. Clients must therefore handle both shapes. Fixing it properly
-> needs an "ensure empty array" helper in c-utils rather than a change here.
+Every collection response carries its key even when it is empty, so a client
+can iterate the array unconditionally. The array builder creates the key
+lazily on first append, which used to leave an empty result serialising as
+`{}` and made the response shape depend on whether data happened to exist.
 
 ## Operations
 

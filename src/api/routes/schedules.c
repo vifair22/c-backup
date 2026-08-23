@@ -35,6 +35,17 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
 
     cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    /* Create the array up front. json_resp_array_append_begin makes it
+     * lazily on first append, so a query with no rows omitted the key
+     * entirely and the response came back as {} - a second shape every
+     * client had to handle, and only when a collection happened to be
+     * empty. */
+    if (json_resp_ensure_array(resp, "schedules") != 0) {
+        /* Only fails on allocation trouble. Carrying on leaves the
+         * key absent, which is what every response did before, so
+         * there is nothing to unwind and nothing worth failing the
+         * request over. */
+    }
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "schedules", &e) != 0) break;

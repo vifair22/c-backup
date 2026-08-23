@@ -130,12 +130,9 @@ echo "full command coverage"
 contains "stats"    '"per_type"' "$(cb stats 1)"
 contains "summary"  '"'          "$(cb summary 1)"
 contains "objects"  '"'          "$(cb objects 1 --limit 5)"
-# Packed, because a backup packs on completion and the loose side may be
-# empty. Note that an empty collection serialises as {} rather than an empty
-# array, so the assertion is on reaching the endpoint, not on shape.
-contains "objects filtered by location" '"' "$(cb objects 1 --location packed --limit 5)"
-check    "objects location filter exits clean" 0 \
-    "$(cb objects 1 --location loose --limit 5 > /dev/null 2>&1; echo $?)"
+contains "objects filtered by location" '"objects"' "$(cb objects 1 --location packed --limit 5)"
+contains "empty location filter keeps its key" '"objects"' \
+    "$(cb objects 1 --location loose --limit 5)"
 contains "packs"    '"'          "$(cb packs 1)"
 contains "fanout"   '"'          "$(cb fanout 1)"
 contains "metrics"  'cbackup_'   "$(cb metrics)"
@@ -145,10 +142,9 @@ contains "health live" 'ok'      "$(cb health live)"
 OBJ_HASH=$(cb objects 1 --limit 1 | sed -n 's/.*"hash":"\([0-9a-f]*\)".*/\1/p' | head -1)
 if [ -n "$OBJ_HASH" ]; then
     contains "object locate" '"' "$(cb object 1 "$OBJ_HASH")"
-    # A tree object has no node referencing it, and an empty collection comes
-    # back as {}, so this asserts the endpoint is reached rather than a shape
-    # that depends on which object the listing happened to return first.
-    check "object refs" 0 "$(cb object 1 "$OBJ_HASH" refs > /dev/null 2>&1; echo $?)"
+    # A tree object has no node referencing it, so this may legitimately be
+    # empty - but the key is present either way now.
+    contains "object refs" '"refs"' "$(cb object 1 "$OBJ_HASH" refs)"
     contains "object layout" '"' "$(cb object 1 "$OBJ_HASH" layout)"
 else
     bad "object listing yields a hash" "a hash" "none"
@@ -173,8 +169,7 @@ for _ in $(seq 1 300); do
 done
 contains "deep verify completed" '"state":"completed"' "$(cb jobs "$VERIFY_JOB")"
 contains "gc dry run"      '"job_id"' "$(cb gc 1 --dry-run)"
-check "journal result filter exits clean" 0 \
-    "$(cb journal 1 --result ok --limit 5 > /dev/null 2>&1; echo $?)"
+contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
 
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.

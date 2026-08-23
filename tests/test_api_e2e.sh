@@ -355,6 +355,17 @@ check "unknown verify level rejected" 400 \
        "http://localhost/repos/1/verify?level=sideways")"
 contains "verify age metric present" 'cbackup_last_verify_age_seconds' "$(sock_body /metrics)"
 
+# An empty collection must still carry its key. The array is created lazily
+# on first append, so a query with no rows used to serialise as {} and every
+# client had to handle two shapes depending on whether data happened to exist.
+echo "empty collections"
+contains "empty journal filter keeps its key" '"entries"' \
+    "$(sock_body '/repos/1/journal?result=nonesuch')"
+contains "empty search keeps its key" '"results"' \
+    "$(sock_body '/repos/1/search?q=zzzznotathing')"
+contains "empty object refs keep their key" '"refs"' \
+    "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
+
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 for _ in $(seq 1 50); do
