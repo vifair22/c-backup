@@ -47,6 +47,9 @@ contains "unknown command explains itself" "unknown command" "$OUT"
 
 mkdir -p "$WORK/src"
 echo "content one" > "$WORK/src/one.txt"
+# Incompressible, so it is stored raw: compression would hide plaintext from
+# the encryption check further down regardless of whether it was encrypted.
+head -c 65536 /dev/urandom > "$WORK/src/random.bin"
 echo "content two" > "$WORK/src/two.txt"
 
 cat > "$WORK/config.yaml" <<EOF
@@ -73,12 +76,10 @@ contains "repo add" '"id":1' "$(cb repo add "$WORK/repo" main)"
 contains "repo list" '"path"' "$(cb repo list)"
 contains "repo show" '"uuid"' "$(cb repo show 1)"
 
-contains "backup submits a job" '"job_id"' "$(cb backup 1 "$WORK/src")"
-for _ in $(seq 1 60); do
-    case "$(cb jobs 1)" in *'"state":"completed"'*|*'"state":"failed"'*) break ;; esac
-    sleep 0.2
-done
-contains "job completed" '"state":"completed"' "$(cb jobs 1)"
+# Job commands wait for their job and report what happened, so there is
+# nothing to poll and the assertion is on the outcome rather than on the
+# daemon having accepted the request.
+contains "backup waits and completes" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":"1"'            "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
@@ -92,33 +93,14 @@ contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
 check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?)"
 
-contains "gc"      '"job_id"' "$(cb gc 1)"
-contains "reindex" '"job_id"' "$(cb reindex 1)"
-contains "gfs"     '"job_id"' "$(cb gfs 1)"
+contains "gc"      '"state":"completed"' "$(cb gc 1)"
+contains "reindex" '"state":"completed"' "$(cb reindex 1)"
+contains "gfs"     '"state":"completed"' "$(cb gfs 1)"
 contains "journal" 'entries'  "$(cb journal 1)"
 
-# Poll the restore's own job, not "is anything running". The maintenance jobs
-# above may still be queued ahead of it, and a global check breaks out while
-# the restore has not started.
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
-contains "restore submits a job" '"job_id"' "$RESTORE_OUT"
-RESTORE_JOB=$(printf '%s' "$RESTORE_OUT" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-# Three maintenance jobs were queued just above and there are two workers, so
-# the restore can sit behind them. The old twenty-second budget ran out on a
-# loaded machine and the loop fell through silently, leaving the tree
-# comparison below to report a difference that was really "not finished yet".
-RESTORE_DONE=0
-for _ in $(seq 1 600); do
-    case "$(cb jobs "$RESTORE_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*|*'"state":"cancelled"'*)
-            RESTORE_DONE=1; break ;;
-    esac
-    sleep 0.2
-done
-check "restore job reached a terminal state" 1 "$RESTORE_DONE"
-# Completed, not merely terminal. Accepting "failed" here is what let a
-# restore rejected with "repo is busy" masquerade as a tree difference.
-contains "restore job completed" '"state":"completed"' "$(cb jobs "$RESTORE_JOB")"
+contains "restore waits and completes" '"state":"completed"' "$RESTORE_OUT"
+
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
@@ -159,32 +141,18 @@ contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
 contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
-contains "pack"   '"job_id"' "$(cb pack 1)"
-contains "verify" '"job_id"' "$(cb verify 1 --level index)"
+contains "pack"   '"state":"completed"' "$(cb pack 1)"
+contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
 VERIFY_OUT=$(cb verify 1 --level deep)
-VERIFY_JOB=$(printf '%s' "$VERIFY_OUT" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-for _ in $(seq 1 300); do
-    case "$(cb jobs "$VERIFY_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
-contains "deep verify completed" '"state":"completed"' "$(cb jobs "$VERIFY_JOB")"
-contains "gc dry run"      '"job_id"' "$(cb gc 1 --dry-run)"
+contains "deep verify reports its run" '"level":"deep"' "$VERIFY_OUT"
+contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
+contains "gc dry run" '"state":"completed"' "$(cb gc 1 --dry-run)"
 contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
 
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"
-B2=$(cb backup 1 "$WORK/src")
-B2_JOB=$(printf '%s' "$B2" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-for _ in $(seq 1 300); do
-    case "$(cb jobs "$B2_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
-contains "second backup completed" '"state":"completed"' "$(cb jobs "$B2_JOB")"
+contains "second backup completed" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "diff" '"added"' "$(cb diff 1 1 2)"
 
 # Exclusions have to work from the CLI too, which is where anyone would
@@ -193,15 +161,8 @@ mkdir -p "$WORK/exsrc/cache"
 echo "keepme"  > "$WORK/exsrc/keep.txt"
 echo "dropme"  > "$WORK/exsrc/cache/junk.bin"
 echo "dropme2" > "$WORK/exsrc/big.iso"
-EX=$(cb backup 1 "$WORK/exsrc" --exclude cache --exclude '*.iso')
-EX_JOB=$(printf '%s' "$EX" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-for _ in $(seq 1 300); do
-    case "$(cb jobs "$EX_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
-contains "excluding backup completed" '"state":"completed"' "$(cb jobs "$EX_JOB")"
+contains "excluding backup completed" '"state":"completed"' \
+    "$(cb backup 1 "$WORK/exsrc" --exclude cache --exclude '*.iso')"
 contains "unexcluded file present" 'keep.txt' "$(cb search 1 keep)"
 case "$(cb search 1 junk)" in
     *junk.bin*) bad "cli --exclude drops the directory" "absent" "present" ;;
@@ -220,14 +181,7 @@ contains "schedule enable/disable" '"ok"' \
 # "which backup still has that line" had no answer short of restoring one.
 echo "grep"
 echo "the passphrase is hunter2" > "$WORK/src/secrets.txt"
-G1=$(cb backup 1 "$WORK/src")
-G1_JOB=$(printf '%s' "$G1" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
-for _ in $(seq 1 300); do
-    case "$(cb jobs "$G1_JOB")" in
-        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
-    esac
-    sleep 0.2
-done
+cb backup 1 "$WORK/src" > /dev/null
 GREP_OUT=$(cb grep 1 'passphrase is hunter2')
 contains "grep finds the line"    'secrets.txt' "$GREP_OUT"
 contains "grep reports the text"  'hunter2'     "$GREP_OUT"
@@ -290,6 +244,60 @@ contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
 contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
+
+# Data written into an encrypted repository has to actually be encrypted.
+# Everything above this tests key management, which was all working while the
+# key was never handed to the store and every byte went to disk in the clear.
+cb backup "$ENC_ID" "$WORK/src" >/dev/null
+ENC_DAT=$(find "$WORK/encrepo/packs" -name '*.dat' | head -1)
+if [ -n "$ENC_DAT" ]; then
+    ok "encrypted repo produced a pack"
+    # Entry header: hash[32] type[1] compression[1] encryption[1] sizes[16].
+    ENCBYTE=$(od -An -tu1 -j 46 -N 1 "$ENC_DAT" | tr -d ' ')
+    check "pack entries are encrypted" 1 "$ENCBYTE"
+else
+    bad "encrypted repo produced a pack" "a pack file" "none"
+fi
+
+# A file that is stored raw would appear verbatim in the pack if the repo
+# were not encrypted; grep is useless for compressed text, so use the
+# incompressible fixture.
+if grep -qa "$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)" "$ENC_DAT" 2>/dev/null; then
+    bad "no plaintext in the encrypted pack" "absent" "present"
+else
+    ok "no plaintext in the encrypted pack"
+fi
+
+# And it restores to exactly what went in.
+cb restore "$ENC_ID" 1 "$WORK/encout" >/dev/null
+if diff -r "$WORK/src" "$WORK/encout$WORK/src" >/dev/null 2>&1; then
+    ok "encrypted round trip is byte-identical"
+else
+    bad "encrypted round trip is byte-identical" "identical" "differs"
+fi
+
+# Verify records runs and findings, and both were unreachable until now: the
+# counters reached an operator only through /metrics and the findings not at
+# all. A scrub whose answer you cannot read is a scrub you did not run.
+VOUT=$(cb verify "$ENC_ID" --level deep)
+contains "verify waits and reports its run" '"level":"deep"' "$VOUT"
+contains "verify reports what it checked"   '"checked"'      "$VOUT"
+contains "verify reports findings"          '"findings"'     "$VOUT"
+contains "clean repo has no findings"       '"findings":[]'  "$VOUT"
+contains "verify list shows past runs"      '"runs"'         "$(cb verify list "$ENC_ID" --limit 2)"
+
+# Job commands wait by default and exit non-zero when the job fails.
+OUT=$(cb pack "$ENC_ID"); RC=$?
+check    "pack waits for its job"  0            "$RC"
+contains "pack reports completion" '"completed"' "$OUT"
+contains "--no-wait returns the id" '"job_id"'   "$(cb verify "$ENC_ID" --no-wait)"
+
+# Search takes a filename, not an FTS expression. A dot used to be a syntax
+# error, which made the most obvious query anyone would type a 400.
+contains "search accepts a filename" 'one.txt' "$(cb search "$ENC_ID" 'one.txt' 2>&1 || true)"
+OUT=$(cb search "$ENC_ID" "ab" 2>&1); RC=$?
+check    "search rejects a too-short query" 1 "$RC"
+contains "short query explains itself" "3 characters" "$OUT"
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?

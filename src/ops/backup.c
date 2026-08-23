@@ -684,19 +684,44 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
     snprintf(repo, sizeof(repo), "%lld", (long long)p->repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
+    /*
+     * Node ids are unique per repository, and there are two things that
+     * allocate them: this, from the scan's own numbering, and reindex, from
+     * MAX(id) in the table. They disagreed, and the insert below was INSERT
+     * OR REPLACE, so a backup after a reindex quietly overwrote an older
+     * snapshot's rows with its own - that snapshot kept nodes_materialized=1
+     * and had nothing left to browse or restore. The manifest trees were
+     * fine, so nothing was lost that a reindex could not rebuild, and nothing
+     * said a word.
+     *
+     * Starting past whatever the repository already holds makes the two
+     * agree. They are an index artifact: nothing in the repo refers to them,
+     * which is what lets the database be rebuilt without preserving them.
+     */
+    uint64_t id_base = 0;
+    {
+        db_result_t *r = NULL;
+        if (db_execute(p->db, "SELECT COALESCE(MAX(id), 0) FROM nodes WHERE repo_id = ?",
+                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+            id_base = strtoull(r->rows[0][0], NULL, 10);
+        db_result_free(r);
+    }
+
     if (db_exec_raw(p->db, "BEGIN") != 0)
         return set_error(ERR_IO, "index_nodes: begin");
 
-    /* Node ids are global per repo and assigned here. They are an index
-     * artifact: nothing in the repo refers to them, which is what lets the
-     * database be rebuilt without preserving them. */
     for (uint32_t i = 0; i < p->count; i++) {
         scan_entry_t *e = &p->scan->entries[i];
         const char *name = basename_of(e->path);
 
         char id[32], parent[32], mode[16], uid[16], gid[16], mtime[32], size[32];
-        snprintf(id,     sizeof(id),     "%llu", (unsigned long long)e->node.node_id);
-        snprintf(parent, sizeof(parent), "%llu", (unsigned long long)p->links[i].parent_id);
+        /* Both offset, and together: parent_node_id refers to one of these
+         * ids. A root's parent stays 0, which is not an id. */
+        snprintf(id,     sizeof(id),     "%llu",
+                 (unsigned long long)(e->node.node_id + id_base));
+        snprintf(parent, sizeof(parent), "%llu",
+                 (unsigned long long)(p->links[i].parent_id
+                                      ? p->links[i].parent_id + id_base : 0));
         snprintf(mode,   sizeof(mode),   "%u",   e->node.mode);
         snprintf(uid,    sizeof(uid),    "%u",   e->node.uid);
         snprintf(gid,    sizeof(gid),    "%u",   e->node.gid);
@@ -748,7 +773,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
 
         int rc = db_execute_non_query(p->db,
-                "INSERT OR REPLACE INTO nodes"
+                "INSERT INTO nodes"
                 " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
                 "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
                 "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"

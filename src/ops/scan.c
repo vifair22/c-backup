@@ -17,8 +17,6 @@
 #include <unistd.h>
 #include <acl/libacl.h>
 
-static uint64_t next_node_id = 1;
-
 static uint64_t inode_identity(dev_t dev, ino_t ino) {
     uint64_t h = 1469598103934665603ULL;
     uint64_t d = (uint64_t)dev;
@@ -47,6 +45,22 @@ struct scan_imap {
     size_t cap;
     size_t cnt;
 
+    /*
+     * Node ids for this backup run.
+     *
+     * This was a file-static that started at 1 and was never reset, so it
+     * counted across every scan the process ever did and two repositories
+     * backing up at once shared it. The imap is already the thing that spans
+     * one run's scan_tree calls and nothing else, which is exactly the scope
+     * a node id needs: unique within a run, restarting each run, private to
+     * it.
+     *
+     * These are not the ids that reach the database. index_nodes offsets them
+     * past whatever the repository already holds, because reindex allocates
+     * from the table itself and the two have to agree.
+     */
+    uint64_t next_node_id;
+
     char     **dir_keys;  /* relative path (no leading slash) */
     uint64_t  *dir_vals;  /* node_id */
     size_t     dir_count;
@@ -60,6 +74,7 @@ scan_imap_t *scan_imap_new(void) {
     m->s = calloc(256, sizeof(imap_slot_t));
     if (!m->s) { free(m); return NULL; }
     m->cap = 256;
+    m->next_node_id = 1;
     return m;
 }
 void scan_imap_free(scan_imap_t *m) {
@@ -434,7 +449,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     e.st               = st;
 
     node_t *nd = &e.node;
-    nd->node_id        = next_node_id++;
+    nd->node_id        = imap->next_node_id++;
     nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
     nd->type           = stat_to_node_type(&st);
     nd->mode           = (uint32_t)st.st_mode;
@@ -745,7 +760,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
             e.st = st;
 
             node_t *nd = &e.node;
-            nd->node_id        = next_node_id++;
+            nd->node_id        = imap->next_node_id++;
             nd->inode_identity = inode_identity(st.st_dev, st.st_ino);
             nd->type           = NODE_TYPE_DIR;
             nd->mode           = (uint32_t)st.st_mode;

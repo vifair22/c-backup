@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -27,6 +28,7 @@
 #include "gc.h"
 #include "pack.h"
 #include "prune.h"
+#include "reindex.h"
 #include "repo.h"
 #include "restore.h"
 #include "store.h"
@@ -289,6 +291,91 @@ static void test_gc_refuses_to_sweep_on_unreadable_tree(void **state)
     assert_int_equal(count("SELECT COUNT(*) FROM objects WHERE repo_id = ?"), before);
 }
 
+/* ---------- node id allocation ---------- */
+
+static int64_t node_rows_for(int64_t snap)
+{
+    char repo[32], sn[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(sn,   sizeof(sn),   "%lld", (long long)snap);
+    db_result_t *r = NULL;
+    int64_t n = -1;
+    if (db_execute(db, "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = ?",
+                   (const char *[]){ repo, sn, NULL }, &r) == 0 && r && r->nrows == 1)
+        n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * Two things allocate node ids: a backup, from the scan's own numbering, and
+ * reindex, from MAX(id) in the table. They disagreed, and the insert was
+ * INSERT OR REPLACE, so the first backup after a reindex overwrote an older
+ * snapshot's rows with its own. That snapshot kept nodes_materialized = 1 and
+ * had nothing left in it: browsing showed an empty tree and restoring failed
+ * with "snapshot has no nodes", on a repository where the manifest trees were
+ * perfectly intact the whole time.
+ *
+ * Nothing was permanently lost - another reindex rebuilds it - but a backup
+ * silently emptying an older snapshot's index is not something to find out
+ * about during a restore.
+ */
+static void test_backup_after_reindex_keeps_older_snapshots(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t b1, b2;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &b1), OK);
+    write_file(TEST_SRC "/second.txt", "a second file\n");
+    assert_int_equal(backup_run(store, db, repo_id, &o, &b2), OK);
+
+    int64_t n1 = node_rows_for(b1.snapshot_id);
+    int64_t n2 = node_rows_for(b2.snapshot_id);
+    assert_true(n1 > 0);
+    assert_true(n2 > 0);
+
+    /* Reindex renumbers from the table; the next backup must not collide. */
+    assert_int_equal(reindex_snapshot(store, db, repo_id, b1.snapshot_id, NULL), OK);
+    assert_int_equal(reindex_snapshot(store, db, repo_id, b2.snapshot_id, NULL), OK);
+
+    backup_result_t b3;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &b3), OK);
+
+    assert_int_equal(node_rows_for(b1.snapshot_id), n1);
+    assert_int_equal(node_rows_for(b2.snapshot_id), n2);
+    assert_true(node_rows_for(b3.snapshot_id) > 0);
+
+    /* And the oldest still restores, which is what the rows are for. */
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, b1.snapshot_id,
+                                 TEST_DIR "/out", NULL, &rr), OK);
+    assert_true(rr.files > 0);
+}
+
+/* Every node id in a repository is unique, whoever allocated it. */
+static void test_node_ids_do_not_repeat_across_snapshots(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    for (int i = 0; i < 3; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), TEST_SRC "/gen%d.txt", i);
+        write_file(path, "generation\n");
+        assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    }
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*), COUNT(DISTINCT id) FROM nodes WHERE repo_id = ?",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], r->rows[0][1]);
+    db_result_free(r);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -301,6 +388,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_prune_of_unknown_snapshot_is_harmless, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_clears_pack_locations_for_swept_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_refuses_to_sweep_on_unreadable_tree, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_after_reindex_keeps_older_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_node_ids_do_not_repeat_across_snapshots, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

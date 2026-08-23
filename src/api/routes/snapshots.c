@@ -187,10 +187,51 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     return api_ok(body);
 }
 
+/*
+ * FTS5 reads its right-hand side as a query expression, not as text. A
+ * filename is full of characters that expression grammar reserves - a dot, a
+ * hyphen, a star, a colon - so passing one straight through made the single
+ * most obvious thing to type ("search a.txt") a 400 telling the user to check
+ * their syntax, while "txt" worked. Nobody searching a backup for a file is
+ * writing a query expression.
+ *
+ * Wrapping it in double quotes makes FTS5 treat the whole thing as one
+ * literal string, which over a trigram index is a substring match: exactly
+ * what search means here. A literal double quote is escaped by doubling it,
+ * per FTS5's own rules.
+ */
+static char *fts_quote(const char *q)
+{
+    size_t n = strlen(q), quotes = 0;
+    for (size_t i = 0; i < n; i++) if (q[i] == '"') quotes++;
+    char *out = malloc(n + quotes + 3);
+    if (!out) return NULL;
+    char *w = out;
+    *w++ = '"';
+    for (size_t i = 0; i < n; i++) {
+        if (q[i] == '"') *w++ = '"';
+        *w++ = q[i];
+    }
+    *w++ = '"';
+    *w = '\0';
+    return out;
+}
+
 static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
 {
     const char *q = api_query_param(req, "q");
     if (!q || !q[0]) return api_error(400, "q is required");
+
+    /* The index is trigram, so it holds nothing shorter than three
+     * characters and a two-character query matches nothing at all. Returning
+     * an empty list for that reads as "no such file", which is a different
+     * and wrong answer. */
+    if (strlen(q) < 3)
+        return api_error(400, "search needs at least 3 characters "
+                              "(the name index is built from trigrams)");
+
+    char *mq = fts_quote(q);
+    if (!mq) return api_error(500, "out of memory");
 
     char repo[32], lim[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -199,10 +240,12 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     /* Through the trigram index, not LIKE: a scan of the nodes table loses to
      * the pre-rewrite implementation, while this beats it by ~50x. */
     db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
+    int rc = db_execute(g_ctx.db,
             "SELECT node_id, snap_id, name FROM node_fts"
             " WHERE repo_id = ? AND name MATCH ? LIMIT ?",
-            (const char *[]){ repo, q, lim, NULL }, &r) != 0) {
+            (const char *[]){ repo, mq, lim, NULL }, &r);
+    free(mq);
+    if (rc != 0) {
         db_result_free(r);
         return api_error(400, "search failed (check the query syntax)");
     }
@@ -641,12 +684,130 @@ static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
     return api_ok(body);
 }
 
+/*
+ * What the last scrub found.
+ *
+ * verify has recorded its runs and its findings since it was written, and
+ * nothing could read them: no route, no command. The counters reached the
+ * operator only through /metrics, and the per-object findings - the hash, the
+ * blast radius, the sample paths, which is the part that says what was
+ * actually lost - reached them not at all, short of opening the state
+ * database by hand. A scrub whose answer you cannot get is a scrub you did
+ * not run.
+ *
+ * Shaped like the grep routes above, because they are the same thing: a job
+ * whose result outlives the request that started it.
+ */
+static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    const char *lim = api_query_param(req, "limit");
+    char limit[16];
+    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db,
+            "SELECT id, started_at, finished_at, level, completed, checked, ok,"
+            "       repaired, unrecoverable, missing, bytes_read,"
+            "       affected_files, affected_snapshots"
+            "  FROM verify_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
+            (const char *[]){ repo, limit, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot list verify runs");
+    }
+
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_ensure_array(resp, "runs") != 0) { /* stays absent on OOM */ }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "id",                 r->rows[i][0]) != 0
+               || json_elem_add_str(&e, "started_at",         r->rows[i][1]) != 0
+               || json_elem_add_str(&e, "finished_at",        r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "level",              r->rows[i][3]) != 0
+               || json_elem_add_str(&e, "completed",          r->rows[i][4]) != 0
+               || json_elem_add_str(&e, "checked",            r->rows[i][5]) != 0
+               || json_elem_add_str(&e, "ok",                 r->rows[i][6]) != 0
+               || json_elem_add_str(&e, "repaired",           r->rows[i][7]) != 0
+               || json_elem_add_str(&e, "unrecoverable",      r->rows[i][8]) != 0
+               || json_elem_add_str(&e, "missing",            r->rows[i][9]) != 0
+               || json_elem_add_str(&e, "bytes_read",         r->rows[i][10]) != 0
+               || json_elem_add_str(&e, "affected_files",     r->rows[i][11]) != 0
+               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][12]) != 0;
+        json_elem_commit(&e);
+        if (bad) break;
+    }
+    db_result_free(r);
+
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
+    return api_ok(body);
+}
+
+/* One run's damaged objects, blast radius already resolved. */
+static api_response_t verify_findings_get(const api_request_t *req, int64_t repo_id,
+                                          int64_t run_id)
+{
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    const char *lim = api_query_param(req, "limit");
+    const char *off = api_query_param(req, "offset");
+    char limit[16], offset[16];
+    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
+    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db,
+            "SELECT hash, status, affected_files, sample_paths, affected_snapshots"
+            "  FROM verify_findings WHERE repo_id = ? AND run_id = ?"
+            " ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ repo, run, limit, offset, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot read verify findings");
+    }
+
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_ensure_array(resp, "findings") != 0) { /* stays absent on OOM */ }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "findings", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "hash",               r->rows[i][0]) != 0
+               || json_elem_add_str(&e, "status",             r->rows[i][1]) != 0
+               || json_elem_add_str(&e, "affected_files",     r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "sample_paths",       r->rows[i][3]) != 0
+               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][4]) != 0;
+        json_elem_commit(&e);
+        if (bad) break;
+    }
+    db_result_free(r);
+
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
+    return api_ok(body);
+}
+
 api_response_t snapshots_route_get(const api_request_t *req, int64_t repo_id,
                                    const char *rest)
 {
     if (strcmp(rest, "/snapshots") == 0) return list_snapshots(req, repo_id);
     if (strcmp(rest, "/search") == 0)    return search_nodes(req, repo_id);
     if (strcmp(rest, "/grep") == 0)      return grep_runs_get(req, repo_id);
+    if (strcmp(rest, "/verify") == 0)    return verify_runs_get(req, repo_id);
+
+    /* /repos/<id>/verify/<run-id>: what that scrub found. */
+    if (strncmp(rest, "/verify/", 8) == 0) {
+        char *end = NULL;
+        long long rid = strtoll(rest + 8, &end, 10);
+        if (rid > 0 && end && *end == '\0')
+            return verify_findings_get(req, repo_id, rid);
+        return api_error(404, "not found");
+    }
 
     /* /repos/<id>/grep/<run-id>: the hits from one search. */
     if (strncmp(rest, "/grep/", 6) == 0) {

@@ -269,6 +269,93 @@ static int cmd_metrics(int argc, char **argv)
     return call("GET", "/metrics", NULL);
 }
 
+/* ------------------------------------------------------------------ */
+/* Jobs: submit, wait, report                                          */
+/*                                                                     */
+/* Everything the daemon does that takes time is a job, and every       */
+/* command that started one used to print {"job_id":N} and exit. That   */
+/* is the honest shape of the API and a poor shape for a person: the    */
+/* answer to "verify this repository" is not a number, and finding out  */
+/* what happened meant polling 'jobs' by hand. Commands now wait and    */
+/* report, with --no-wait for the case the API shape was right for -    */
+/* a long scrub the operator wants to leave running.                    */
+/* ------------------------------------------------------------------ */
+
+/* Submit a job and return its id, or -1 with the error already printed. */
+static long job_submit(const char *method, const char *path, const char *body)
+{
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    status_t st = http_request(g_socket, method, path, body, &resp);
+    if (st == ERR_NOT_FOUND) {
+        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+        return -1;
+    }
+    if (st != OK) { fail("%s", err_msg()); return -1; }
+    if (resp.status < 200 || resp.status >= 300) {
+        if (resp.body) fputs(resp.body, stderr);
+        fprintf(stderr, "\nc-backup: request failed with HTTP %d\n", resp.status);
+        http_response_free(&resp);
+        return -1;
+    }
+    long job = -1;
+    const char *jp = resp.body ? strstr(resp.body, "\"job_id\":") : NULL;
+    if (jp) job = strtol(jp + 9, NULL, 10);
+    http_response_free(&resp);
+    if (job < 0) fail("daemon did not return a job id");
+    return job;
+}
+
+/*
+ * Poll until the job reaches a terminal state. Returns 0 if it completed, 1
+ * otherwise - and on failure prints the job record, because the daemon puts
+ * the reason in its error field and that is the whole point of waiting.
+ */
+static int job_wait(long job, int quiet)
+{
+    for (int i = 0; i < 36000; i++) {
+        http_response_t jr;
+        memset(&jr, 0, sizeof(jr));
+        char jpath[64];
+        snprintf(jpath, sizeof(jpath), "/jobs/%ld", job);
+        if (http_request(g_socket, "GET", jpath, NULL, &jr) != OK) {
+            http_response_free(&jr);
+            return fail("lost contact with the daemon while waiting for job %ld", job);
+        }
+        int done = jr.body && (strstr(jr.body, "\"state\":\"completed\"") ||
+                               strstr(jr.body, "\"state\":\"failed\"") ||
+                               strstr(jr.body, "\"state\":\"cancelled\""));
+        int ok = jr.body && strstr(jr.body, "\"state\":\"completed\"") != NULL;
+        if (done) {
+            if (!ok || !quiet) {
+                if (jr.body) { fputs(jr.body, ok ? stdout : stderr); fputc('\n', ok ? stdout : stderr); }
+            }
+            http_response_free(&jr);
+            return ok ? 0 : 1;
+        }
+        http_response_free(&jr);
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return fail("job %ld did not finish within an hour (see 'c-backup jobs %ld')", job, job);
+}
+
+/* Submit and wait, printing the finished job. quiet suppresses the success
+ * record for callers that print something better afterwards. */
+static int job_run(const char *method, const char *path, const char *body,
+                   int no_wait, int quiet, long *out_job)
+{
+    if (no_wait) {
+        int rc = call(method, path, body);
+        if (out_job) *out_job = -1;
+        return rc;
+    }
+    long job = job_submit(method, path, body);
+    if (job < 0) return 1;
+    if (out_job) *out_job = job;
+    return job_wait(job, quiet);
+}
+
 static int cmd_repo(int argc, char **argv)
 {
     if (argc < 1) return fail("usage: repo <list|add|show|remove> [args]");
@@ -351,7 +438,8 @@ static int cmd_repo(int argc, char **argv)
 static int cmd_backup(int argc, char **argv)
 {
     const char *label = take_opt(&argc, argv, "--label");
-    int onefs = take_flag(&argc, argv, "--one-filesystem");
+    int onefs   = take_flag(&argc, argv, "--one-filesystem");
+    int no_wait = take_flag(&argc, argv, "--no-wait");
 
     /* Excludes repeat, so they are drained rather than read once. */
     const char *excl[64];
@@ -367,7 +455,8 @@ static int cmd_backup(int argc, char **argv)
 
     if (argc < 2)
         return fail("usage: backup <repo-id> <path> [path...] "
-                    "[--exclude PATTERN]... [--one-filesystem] [--label TEXT]");
+                    "[--exclude PATTERN]... [--one-filesystem] [--label TEXT] "
+                    "[--no-wait]");
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"paths\":[");
@@ -393,7 +482,7 @@ static int cmd_backup(int argc, char **argv)
     sb_puts(&p, argv[0]);
     sb_puts(&p, "/backup");
     if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
-    int rc = call("POST", p.buf, b.buf);
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
     free(p.buf); free(b.buf);
     return rc;
 }
@@ -402,9 +491,10 @@ static int cmd_restore(int argc, char **argv)
 {
     const char *subpath = take_opt(&argc, argv, "--subpath");
     int overwrite = take_flag(&argc, argv, "--overwrite");
+    int no_wait   = take_flag(&argc, argv, "--no-wait");
     if (argc < 3)
         return fail("usage: restore <repo-id> <snapshot-id> <dest> "
-                    "[--subpath PATH] [--overwrite]");
+                    "[--subpath PATH] [--overwrite] [--no-wait]");
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"dest\":");
@@ -418,7 +508,7 @@ static int cmd_restore(int argc, char **argv)
     sb_puts(&p, "/snapshots/"); sb_puts(&p, argv[1]);
     sb_puts(&p, "/restore");
     if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
-    int rc = call("POST", p.buf, b.buf);
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
     free(p.buf); free(b.buf);
     return rc;
 }
@@ -559,52 +649,11 @@ static int cmd_grep(int argc, char **argv)
     sb_puts(&p, "/repos/"); sb_puts(&p, argv[0]); sb_puts(&p, "/grep");
     if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
 
-    if (no_wait) {
-        int rc = call("POST", p.buf, b.buf);
-        free(p.buf); free(b.buf);
-        return rc;
-    }
-
-    /* Submit quietly: the job id is plumbing, the hits are the answer. */
-    http_response_t resp;
-    memset(&resp, 0, sizeof(resp));
-    status_t st = http_request(g_socket, "POST", p.buf, b.buf, &resp);
-    free(p.buf); free(b.buf);
-    if (st == ERR_NOT_FOUND) {
-        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
-        return 1;
-    }
-    if (st != OK) return fail("%s", err_msg());
-    if (resp.status < 200 || resp.status >= 300) {
-        if (resp.body) fputs(resp.body, stderr);
-        fprintf(stderr, "\nc-backup: request failed with HTTP %d\n", resp.status);
-        http_response_free(&resp);
-        return 1;
-    }
     long job = -1;
-    const char *jp = resp.body ? strstr(resp.body, "\"job_id\":") : NULL;
-    if (jp) job = strtol(jp + 9, NULL, 10);
-    http_response_free(&resp);
-    if (job < 0) return fail("daemon did not return a job id");
-
-    /* Poll rather than stream: the job endpoint is the one contract every
-     * other command already relies on. */
-    for (int i = 0; i < 36000; i++) {
-        http_response_t jr;
-        memset(&jr, 0, sizeof(jr));
-        char jpath[64];
-        snprintf(jpath, sizeof(jpath), "/jobs/%ld", job);
-        if (http_request(g_socket, "GET", jpath, NULL, &jr) != OK) break;
-        int done = jr.body && (strstr(jr.body, "\"state\":\"completed\"") ||
-                               strstr(jr.body, "\"state\":\"failed\"") ||
-                               strstr(jr.body, "\"state\":\"cancelled\""));
-        int failed = jr.body && !strstr(jr.body, "\"state\":\"completed\"") && done;
-        http_response_free(&jr);
-        if (failed) return fail("search job did not complete (see 'c-backup jobs %ld')", job);
-        if (done) break;
-        struct timespec ts = { 0, 100 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
+    /* Quiet on success: the hits are the answer, not the job record. */
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 1, &job);
+    free(p.buf); free(b.buf);
+    if (rc != 0 || no_wait) return rc;
 
     /* Newest run for this repo is the one just finished. */
     sbuf_t rp = { 0 };
@@ -653,44 +702,120 @@ static int cmd_jobs(int argc, char **argv)
 }
 
 /* Maintenance actions share a shape: POST /repos/<id>/<action>. */
-static int maintenance(const char *action, int argc, char **argv, const char *query)
+static int maintenance_ex(const char *action, int argc, char **argv,
+                          const char *query, int no_wait, int quiet, long *out_job)
 {
-    if (argc < 1) return fail("usage: %s <repo-id>", action);
+    if (argc < 1) return fail("usage: %s <repo-id> [--no-wait]", action);
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_puts(&p, argv[0]);
     sb_puts(&p, "/"); sb_puts(&p, action);
     if (query && *query) { sb_puts(&p, "?"); sb_puts(&p, query); }
-    return call_path_sb("POST", &p, NULL);
+    if (p.oom) { free(p.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, NULL, no_wait, quiet, out_job);
+    free(p.buf);
+    return rc;
+}
+
+static int maintenance(const char *action, int argc, char **argv,
+                       const char *query, int no_wait)
+{
+    return maintenance_ex(action, argc, argv, query, no_wait, 0, NULL);
 }
 
 static int cmd_gc(int argc, char **argv)
 {
+    int nw  = take_flag(&argc, argv, "--no-wait");
     int dry = take_flag(&argc, argv, "--dry-run");
-    return maintenance("gc", argc, argv, dry ? "dry_run=1" : NULL);
+    return maintenance("gc", argc, argv, dry ? "dry_run=1" : NULL, nw);
 }
 
 static int cmd_gfs(int argc, char **argv)
 {
+    int nw  = take_flag(&argc, argv, "--no-wait");
     int dry = take_flag(&argc, argv, "--dry-run");
-    return maintenance("gfs", argc, argv, dry ? "dry_run=1" : NULL);
+    return maintenance("gfs", argc, argv, dry ? "dry_run=1" : NULL, nw);
 }
 
-static int cmd_reindex(int argc, char **argv) { return maintenance("reindex", argc, argv, NULL); }
-static int cmd_pack(int argc, char **argv)    { return maintenance("pack", argc, argv, NULL); }
+static int cmd_reindex(int argc, char **argv)
+{
+    int nw = take_flag(&argc, argv, "--no-wait");
+    return maintenance("reindex", argc, argv, NULL, nw);
+}
 
+static int cmd_pack(int argc, char **argv)
+{
+    int nw = take_flag(&argc, argv, "--no-wait");
+    return maintenance("pack", argc, argv, NULL, nw);
+}
+
+/*
+ * Scrub, wait, and say what was found.
+ *
+ * The findings have been recorded since verify was written and there was no
+ * way to read them: the run counters reached an operator only through
+ * /metrics and the per-object findings not at all. Printing the run and then
+ * its findings is the answer to "verify this repository"; the job id is not.
+ *
+ * verify list / verify show read past runs, in the same shape as repo list
+ * and policy list.
+ */
 static int cmd_verify(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[0], "list") == 0) {
+        sbuf_t q = { 0 };
+        const char *lim = take_opt(&argc, argv, "--limit");
+        if (lim) { sb_puts(&q, "limit="); sb_query_val(&q, lim); }
+        int rc = get_repo_scoped(argv[1], "/verify", q.buf);
+        free(q.buf);
+        return rc;
+    }
+    if (argc >= 3 && strcmp(argv[0], "show") == 0) {
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/verify/"); sb_puts(&p, argv[2]);
+        if (p.oom) { free(p.buf); return fail("request too large"); }
+        int rc = get_repo_scoped(argv[1], p.buf, NULL);
+        free(p.buf);
+        return rc;
+    }
+
     const char *level = take_opt(&argc, argv, "--level");
     int no_repair = take_flag(&argc, argv, "--no-repair");
-    int dry = take_flag(&argc, argv, "--dry-run");
+    int dry     = take_flag(&argc, argv, "--dry-run");
+    int no_wait = take_flag(&argc, argv, "--no-wait");
 
     sbuf_t q = { 0 };
     if (level) { sb_puts(&q, "level="); sb_query_val(&q, level); }
     if (no_repair) sb_puts(&q, q.len ? "&repair=0" : "repair=0");
     if (dry) sb_puts(&q, q.len ? "&dry_run=1" : "dry_run=1");
-    int rc = maintenance("verify", argc, argv, q.buf);
+    long job = -1;
+    /* Quiet: the run record below says everything the job record does, and
+     * more. A failed run still prints the job, which carries the reason. */
+    int rc = maintenance_ex("verify", argc, argv, q.buf, no_wait, 1, &job);
     free(q.buf);
-    return rc;
+    if (rc != 0 || no_wait) return rc;
+
+    /* Newest run for this repo is the one just finished. */
+    http_response_t rr;
+    memset(&rr, 0, sizeof(rr));
+    sbuf_t rp = { 0 };
+    sb_puts(&rp, "/repos/"); sb_puts(&rp, argv[0]); sb_puts(&rp, "/verify?limit=1");
+    if (rp.oom) { free(rp.buf); return fail("request too large"); }
+    status_t st = http_request(g_socket, "GET", rp.buf, NULL, &rr);
+    free(rp.buf);
+    if (st != OK) return fail("%s", err_msg());
+    long run = -1;
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
+    if (ip) run = strtol(ip + 6, NULL, 10);
+    if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
+    http_response_free(&rr);
+    if (run < 0) return 0;
+
+    sbuf_t fp = { 0 };
+    sb_puts(&fp, "/repos/"); sb_puts(&fp, argv[0]); sb_puts(&fp, "/verify/");
+    char runbuf[32];
+    snprintf(runbuf, sizeof(runbuf), "%ld", run);
+    sb_puts(&fp, runbuf);
+    return call_path_sb("GET", &fp, NULL);
 }
 
 static int cmd_stats(int argc, char **argv)
@@ -930,19 +1055,19 @@ static const struct {
     const char *usage;
 } COMMANDS[] = {
     { "repo",      cmd_repo,      "repo <list|add|show|remove|key> [args]  (add: [--encrypt system|passphrase] [--passphrase TEXT]; key: <export|import|ack> <repo-id>)" },
-    { "backup",    cmd_backup,    "backup <repo-id> <path>... [--exclude PAT]... [--one-filesystem] [--label TEXT]" },
-    { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite]" },
+    { "backup",    cmd_backup,    "backup <repo-id> <path>... [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
+    { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite] [--no-wait]" },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
     { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
     { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
-    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run]" },
-    { "gc",        cmd_gc,        "gc <repo-id> [--dry-run]" },
-    { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run]" },
-    { "pack",      cmd_pack,      "pack <repo-id>" },
-    { "reindex",   cmd_reindex,   "reindex <repo-id>" },
+    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },
+    { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
+    { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
+    { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
+    { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
     { "stats",     cmd_stats,     "stats <repo-id>" },
     { "summary",   cmd_summary,   "summary <repo-id>" },
     { "objects",   cmd_objects,   "objects <repo-id> [--location loose|packed] [--limit N]" },
