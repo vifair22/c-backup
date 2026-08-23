@@ -214,6 +214,36 @@ check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
 contains "schedule enable/disable" '"ok"' \
     "$(cb schedule add 1 verify 7200 > /dev/null; cb schedule list 1 | grep -q verify && cb schedule disable 1 2 || echo miss)"
 
+# Content search. The pre-daemon CLI had this and the rewrite dropped it, so
+# "which backup still has that line" had no answer short of restoring one.
+echo "grep"
+echo "the passphrase is hunter2" > "$WORK/src/secrets.txt"
+G1=$(cb backup 1 "$WORK/src")
+G1_JOB=$(printf '%s' "$G1" | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 300); do
+    case "$(cb jobs "$G1_JOB")" in
+        *'"state":"completed"'*|*'"state":"failed"'*) break ;;
+    esac
+    sleep 0.2
+done
+GREP_OUT=$(cb grep 1 'passphrase is hunter2')
+contains "grep finds the line"    'secrets.txt' "$GREP_OUT"
+contains "grep reports the text"  'hunter2'     "$GREP_OUT"
+contains "grep reports a line no" '"line"'      "$GREP_OUT"
+contains "grep regex syntax"      'secrets.txt' "$(cb grep 1 '^the pass[a-z]+ is')"
+case "$(cb grep 1 'zzznotinanyfile')" in
+    *'"hits"'*) ok "grep with no match still answers" ;;
+    *)          bad "grep with no match still answers" '"hits"' "$(cb grep 1 zzznotinanyfile)" ;;
+esac
+contains "grep ignore case" 'secrets.txt' "$(cb grep 1 'HUNTER2' -i)"
+case "$(cb grep 1 'hunter2' --path-prefix "$WORK/src/docs")" in
+    *secrets.txt*) bad "grep path prefix scopes the search" "absent" "present" ;;
+    *)             ok  "grep path prefix scopes the search" ;;
+esac
+OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
+check "grep rejects a bad pattern" 1 "$RC"
+contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"

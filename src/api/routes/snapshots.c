@@ -10,6 +10,7 @@
 #include "prune.h"
 #include "pack.h"
 #include "reindex.h"
+#include "grep.h"
 #include "verify.h"
 #include "restore.h"
 #include "store.h"
@@ -245,6 +246,7 @@ typedef enum {
     SNAP_JOB_GFS,
     SNAP_JOB_PACK,
     SNAP_JOB_VERIFY,
+    SNAP_JOB_GREP,
 } snap_job_kind_t;
 
 typedef struct {
@@ -258,6 +260,10 @@ typedef struct {
     int             dry_run;
     verify_level_t  verify_level;
     int             verify_repair;
+    char           *pattern;
+    char           *path_prefix;
+    int             ignore_case;
+    uint32_t        max_files;
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -268,6 +274,8 @@ static void snap_job_free(void *p)
     free(j->repo_path);
     free(j->dest);
     free(j->subpath);
+    free(j->pattern);
+    free(j->path_prefix);
     free(j);
 }
 
@@ -342,6 +350,16 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          * pack time, so an unpacked repository stores more than its source
          * and keeps one inode per object. */
         st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+    } else if (j->kind == SNAP_JOB_GREP) {
+        grep_opts_t go;
+        memset(&go, 0, sizeof(go));
+        go.pattern           = j->pattern;
+        go.path_prefix       = j->path_prefix;
+        go.ignore_case       = j->ignore_case;
+        go.max_files         = j->max_files;
+        go.max_hits_per_file = 10;
+        st = grep_run(store, j->db, j->repo_id, j->snap_id, &go, cancel,
+                      progress, progress_ctx, NULL);
     } else if (j->kind == SNAP_JOB_VERIFY) {
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, NULL);
@@ -443,6 +461,50 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         if (j->dry_run) j->verify_repair = 0;
     }
 
+    if (kind == SNAP_JOB_GREP) {
+        if (!req->body || req->body_len == 0) {
+            snap_job_free(j);
+            return api_error(400, "pattern is required");
+        }
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
+        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+            snap_job_free(j);
+            return api_error(400, "invalid JSON");
+        }
+        if (json_req_get_str(body, "pattern", &j->pattern) != 0 || !j->pattern) {
+            snap_job_free(j);
+            return api_error(400, "pattern is required");
+        }
+        if (json_req_get_str(body, "path_prefix", &j->path_prefix) != 0)
+            j->path_prefix = NULL;
+        uint32_t ic = 0;
+        if (json_req_get_u32(body, "ignore_case", &ic, 0, 1) == 0)
+            j->ignore_case = (int)ic;
+        uint32_t mf = 0;
+        if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
+            j->max_files = mf;
+
+        /* Which snapshot: the newest unless one was named. Searching "the
+         * backup" almost always means the current one. */
+        uint32_t sid = 0;
+        if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) == 0) {
+            j->snap_id = (int64_t)sid;
+        } else {
+            char repo[32];
+            snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+            db_result_t *r = NULL;
+            if (db_execute(g_ctx.db,
+                    "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
+                    (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+                j->snap_id = strtoll(r->rows[0][0], NULL, 10);
+            db_result_free(r);
+            if (j->snap_id <= 0) {
+                snap_job_free(j);
+                return api_error(404, "repo has no snapshots to search");
+            }
+        }
+    }
+
     if (kind == SNAP_JOB_RESTORE) {
         if (!req->body || req->body_len == 0) {
             snap_job_free(j);
@@ -466,7 +528,8 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     }
 
     int64_t job_id = 0;
-    const char *action = kind == SNAP_JOB_VERIFY  ? "verify"
+    const char *action = kind == SNAP_JOB_GREP    ? "grep"
+                       : kind == SNAP_JOB_VERIFY  ? "verify"
                        : kind == SNAP_JOB_REINDEX ? "reindex"
                        : kind == SNAP_JOB_GC      ? "gc"
                        : kind == SNAP_JOB_GFS     ? "gfs"
@@ -484,11 +547,114 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
 
 /* ---------- dispatch ---------- */
 
+/*
+ * A search is a job, so its answer outlives the request that started it and
+ * has to be fetched separately. Listing runs newest-first is what lets a
+ * client that just submitted one find it without threading the run id back
+ * through the job record.
+ */
+static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    const char *lim = api_query_param(req, "limit");
+    char limit[16];
+    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db,
+            "SELECT id, snap_id, pattern, started_at, finished_at, completed,"
+            "       files_scanned, files_matched, hits, truncated"
+            "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
+            (const char *[]){ repo, limit, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot list searches");
+    }
+
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_ensure_array(resp, "runs") != 0) { /* stays absent on OOM */ }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "id",            r->rows[i][0]) != 0
+               || json_elem_add_str(&e, "snapshot",      r->rows[i][1]) != 0
+               || json_elem_add_str(&e, "pattern",       r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "started_at",    r->rows[i][3]) != 0
+               || json_elem_add_str(&e, "finished_at",   r->rows[i][4]) != 0
+               || json_elem_add_str(&e, "completed",     r->rows[i][5]) != 0
+               || json_elem_add_str(&e, "files_scanned", r->rows[i][6]) != 0
+               || json_elem_add_str(&e, "files_matched", r->rows[i][7]) != 0
+               || json_elem_add_str(&e, "hits",          r->rows[i][8]) != 0
+               || json_elem_add_str(&e, "truncated",     r->rows[i][9]) != 0;
+        json_elem_commit(&e);
+        if (bad) break;
+    }
+    db_result_free(r);
+
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
+    return api_ok(body);
+}
+
+static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
+                                    int64_t run_id)
+{
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    const char *lim = api_query_param(req, "limit");
+    const char *off = api_query_param(req, "offset");
+    char limit[16], offset[16];
+    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
+    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db,
+            "SELECT path, line_no, excerpt, node_id FROM grep_hits"
+            " WHERE repo_id = ? AND run_id = ? ORDER BY id LIMIT ? OFFSET ?",
+            (const char *[]){ repo, run, limit, offset, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot read search results");
+    }
+
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    if (json_resp_ensure_array(resp, "hits") != 0) { /* stays absent on OOM */ }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "hits", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "path",    r->rows[i][0]) != 0
+               || json_elem_add_str(&e, "line",    r->rows[i][1]) != 0
+               || json_elem_add_str(&e, "excerpt", r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "node_id", r->rows[i][3]) != 0;
+        json_elem_commit(&e);
+        if (bad) break;
+    }
+    db_result_free(r);
+
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
+    return api_ok(body);
+}
+
 api_response_t snapshots_route_get(const api_request_t *req, int64_t repo_id,
                                    const char *rest)
 {
     if (strcmp(rest, "/snapshots") == 0) return list_snapshots(req, repo_id);
     if (strcmp(rest, "/search") == 0)    return search_nodes(req, repo_id);
+    if (strcmp(rest, "/grep") == 0)      return grep_runs_get(req, repo_id);
+
+    /* /repos/<id>/grep/<run-id>: the hits from one search. */
+    if (strncmp(rest, "/grep/", 6) == 0) {
+        char *end = NULL;
+        long long rid = strtoll(rest + 6, &end, 10);
+        if (rid > 0 && end && *end == '\0')
+            return grep_hits_get(req, repo_id, rid);
+        return api_error(404, "not found");
+    }
 
     /* /repos/<id>/snapshots/<sid>/tree */
     if (strncmp(rest, "/snapshots/", 11) == 0) {
@@ -509,6 +675,7 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
     if (strcmp(rest, "/gfs") == 0)     return submit_snap_job(repo_id, 0, req, SNAP_JOB_GFS);
     if (strcmp(rest, "/pack") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_PACK);
     if (strcmp(rest, "/verify") == 0)  return submit_snap_job(repo_id, 0, req, SNAP_JOB_VERIFY);
+    if (strcmp(rest, "/grep") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_GREP);
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;
@@ -564,6 +731,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
 {
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
+    else if (strcmp(action, "grep") == 0)    kind = SNAP_JOB_GREP;
     else if (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
     else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
     else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;

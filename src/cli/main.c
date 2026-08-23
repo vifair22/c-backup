@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -485,6 +486,107 @@ static int cmd_diff(int argc, char **argv)
     return call_path_sb("GET", &p, NULL);
 }
 
+/*
+ * Content search. Submits the job, waits for it, then prints the hits - so it
+ * behaves like grep(1) even though the work happens in the daemon and
+ * survives the client going away. --no-wait returns the job id instead, for
+ * a search over a large repository that the operator wants to leave running.
+ */
+static int cmd_grep(int argc, char **argv)
+{
+    const char *prefix = take_opt(&argc, argv, "--path-prefix");
+    const char *snap   = take_opt(&argc, argv, "--snapshot");
+    const char *maxf   = take_opt(&argc, argv, "--limit");
+    int icase   = take_flag(&argc, argv, "-i") | take_flag(&argc, argv, "--ignore-case");
+    int no_wait = take_flag(&argc, argv, "--no-wait");
+
+    if (argc < 2)
+        return fail("usage: grep <repo-id> <pattern> [--snapshot N] "
+                    "[--path-prefix PATH] [--limit N] [-i] [--no-wait]");
+
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"pattern\":");
+    sb_json_str(&b, argv[1]);
+    if (prefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, prefix); }
+    if (snap)   { sb_puts(&b, ",\"snapshot\":");    sb_puts(&b, snap); }
+    if (maxf)   { sb_puts(&b, ",\"max_files\":");   sb_puts(&b, maxf); }
+    if (icase)  sb_puts(&b, ",\"ignore_case\":1");
+    sb_puts(&b, "}");
+
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_puts(&p, argv[0]); sb_puts(&p, "/grep");
+    if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+
+    if (no_wait) {
+        int rc = call("POST", p.buf, b.buf);
+        free(p.buf); free(b.buf);
+        return rc;
+    }
+
+    /* Submit quietly: the job id is plumbing, the hits are the answer. */
+    http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    status_t st = http_request(g_socket, "POST", p.buf, b.buf, &resp);
+    free(p.buf); free(b.buf);
+    if (st == ERR_NOT_FOUND) {
+        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+        return 1;
+    }
+    if (st != OK) return fail("%s", err_msg());
+    if (resp.status < 200 || resp.status >= 300) {
+        if (resp.body) fputs(resp.body, stderr);
+        fprintf(stderr, "\nc-backup: request failed with HTTP %d\n", resp.status);
+        http_response_free(&resp);
+        return 1;
+    }
+    long job = -1;
+    const char *jp = resp.body ? strstr(resp.body, "\"job_id\":") : NULL;
+    if (jp) job = strtol(jp + 9, NULL, 10);
+    http_response_free(&resp);
+    if (job < 0) return fail("daemon did not return a job id");
+
+    /* Poll rather than stream: the job endpoint is the one contract every
+     * other command already relies on. */
+    for (int i = 0; i < 36000; i++) {
+        http_response_t jr;
+        memset(&jr, 0, sizeof(jr));
+        char jpath[64];
+        snprintf(jpath, sizeof(jpath), "/jobs/%ld", job);
+        if (http_request(g_socket, "GET", jpath, NULL, &jr) != OK) break;
+        int done = jr.body && (strstr(jr.body, "\"state\":\"completed\"") ||
+                               strstr(jr.body, "\"state\":\"failed\"") ||
+                               strstr(jr.body, "\"state\":\"cancelled\""));
+        int failed = jr.body && !strstr(jr.body, "\"state\":\"completed\"") && done;
+        http_response_free(&jr);
+        if (failed) return fail("search job did not complete (see 'c-backup jobs %ld')", job);
+        if (done) break;
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+
+    /* Newest run for this repo is the one just finished. */
+    sbuf_t rp = { 0 };
+    sb_puts(&rp, "/repos/"); sb_puts(&rp, argv[0]); sb_puts(&rp, "/grep?limit=1");
+    http_response_t rr;
+    memset(&rr, 0, sizeof(rr));
+    status_t rst = http_request(g_socket, "GET", rp.buf, NULL, &rr);
+    free(rp.buf);
+    if (rst != OK) return fail("%s", err_msg());
+    long run = -1;
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
+    if (ip) run = strtol(ip + 6, NULL, 10);
+    if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
+    http_response_free(&rr);
+    if (run < 0) return 0;
+
+    sbuf_t hp = { 0 };
+    sb_puts(&hp, "/repos/"); sb_puts(&hp, argv[0]); sb_puts(&hp, "/grep/");
+    char runbuf[32];
+    snprintf(runbuf, sizeof(runbuf), "%ld", run);
+    sb_puts(&hp, runbuf);
+    return call_path_sb("GET", &hp, NULL);
+}
+
 static int cmd_jobs(int argc, char **argv)
 {
     if (argc >= 1 && strcmp(argv[0], "cancel") == 0) {
@@ -792,6 +894,7 @@ static const struct {
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
     { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
+    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run]" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run]" },

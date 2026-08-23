@@ -93,6 +93,9 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
+| POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
+| GET | `/repos/<id>/grep` | Recent searches, newest first |
+| GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
@@ -122,6 +125,26 @@ request could carry any exclusions it liked and back up the whole tree
 regardless. `one_filesystem` was in the same position, which is the
 difference between backing up a home directory and backing up every network
 mount under it.
+
+`grep` searches file *contents*, which is what `/search` does not do: that
+one matches names. It runs as a job because reading a repository through a
+regular expression takes minutes, and it runs in the daemon because the
+daemon is the only side that can resolve an object - and once repositories
+are encrypted, the only side that can read one.
+
+Matching is POSIX extended regular expressions, line by line, over every
+distinct object in the snapshot. Distinct, not every path: a file present
+under several names is one object, so it is read once and reported once
+rather than re-read per copy. Objects are visited in pack order for the same
+reason verify is. Files with NUL bytes are searched and reported without an
+excerpt, the way `grep -a` summarises a binary. `max_files` stops the search
+once it has found enough, and the run records whether it stopped early so a
+caller can tell "no more matches" from "stopped looking".
+
+The hits outlive the job, so they are fetched separately: `GET
+/repos/<id>/grep` lists runs newest-first and `GET /repos/<id>/grep/<run-id>`
+returns the hits. `c-backup grep` does all three steps and prints the
+matches, so it feels like `grep(1)` despite the work happening elsewhere.
 
 Verify is the answer to "is the backup still good", which is a different
 question from "did the backup run". Three levels, because the cost spread is
