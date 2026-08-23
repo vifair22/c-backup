@@ -25,14 +25,7 @@
  * plaintexts under one key.
  */
 
-/*
- * Open the cipher with the content hash as associated data. The hash is the
- * object's name, so binding it in means a payload moved into another object's
- * file fails to authenticate instead of decrypting to something that then
- * fails a hash check further along with a less useful message.
- */
 static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
-                           const uint8_t *hash,
                            uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES], int encrypting)
 {
     if (encrypting && RAND_bytes(nonce, OBJECT_CRYPT_NONCE_BYTES) != 1)
@@ -42,19 +35,13 @@ static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
         ? EVP_EncryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce)
         : EVP_DecryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce);
     if (ok != 1) return set_error(ERR_IO, "object_crypt: cipher init failed");
-
-    int outl = 0;
-    ok = encrypting
-        ? EVP_EncryptUpdate(c, NULL, &outl, hash, OBJECT_HASH_SIZE)
-        : EVP_DecryptUpdate(c, NULL, &outl, hash, OBJECT_HASH_SIZE);
-    if (ok != 1) return set_error(ERR_IO, "object_crypt: associated data failed");
     return OK;
 }
 
-status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
+status_t object_encrypt(const repo_key_t *key,
                         const void *in, size_t len, void *out)
 {
-    if (!key || !hash || (!in && len) || !out)
+    if (!key || (!in && len) || !out)
         return set_error(ERR_INVALID, "object_encrypt: null argument");
     if (len > INT_MAX)
         return set_error(ERR_TOO_LARGE, "object_encrypt: use the streaming form");
@@ -63,7 +50,7 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
     if (!c) return set_error(ERR_NOMEM, "object_encrypt: cipher context");
 
     uint8_t *o = out;
-    status_t st = crypt_init(c, key, hash, o, 1);
+    status_t st = crypt_init(c, key, o, 1);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
     /* Layout: nonce, then ciphertext, then tag. */
@@ -84,10 +71,10 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
     return OK;
 }
 
-status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
+status_t object_decrypt(const repo_key_t *key,
                         const void *in, size_t len, void *out)
 {
-    if (!key || !hash || !in || (!out && len))
+    if (!key || !in || (!out && len))
         return set_error(ERR_INVALID, "object_decrypt: null argument");
     if (len > INT_MAX)
         return set_error(ERR_TOO_LARGE, "object_decrypt: use the streaming form");
@@ -98,7 +85,7 @@ status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
     const uint8_t *i = in;
     uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
     memcpy(nonce, i, sizeof(nonce));
-    status_t st = crypt_init(c, key, hash, nonce, 0);
+    status_t st = crypt_init(c, key, nonce, 0);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
     const uint8_t *ct = i + OBJECT_CRYPT_NONCE_BYTES;
@@ -133,11 +120,11 @@ struct object_crypt_stream {
 };
 
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
-                                   const repo_key_t *key, const uint8_t *hash,
+                                   const repo_key_t *key,
                                    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
                                    int encrypting)
 {
-    if (!out || !key || !hash)
+    if (!out || !key)
         return set_error(ERR_INVALID, "object_crypt_stream: null argument");
 
     object_crypt_stream_t *s = calloc(1, sizeof(*s));
@@ -146,7 +133,7 @@ status_t object_crypt_stream_begin(object_crypt_stream_t **out,
     s->encrypting = encrypting;
     if (!s->ctx) { free(s); return set_error(ERR_NOMEM, "object_crypt_stream: context"); }
 
-    status_t st = crypt_init(s->ctx, key, hash, nonce, encrypting);
+    status_t st = crypt_init(s->ctx, key, nonce, encrypting);
     if (st != OK) { object_crypt_stream_free(s); return st; }
     *out = s;
     return OK;
@@ -178,12 +165,18 @@ status_t object_crypt_stream_finish(object_crypt_stream_t *s,
     uint8_t scratch[64];
     int finl = 0;
     if (s->encrypting) {
+        if (!tag_out)
+            return set_error(ERR_INVALID, "object_crypt_stream: nowhere to put the tag");
         if (EVP_EncryptFinal_ex(s->ctx, scratch, &finl) != 1 ||
             EVP_CIPHER_CTX_ctrl(s->ctx, EVP_CTRL_AEAD_GET_TAG,
                                 OBJECT_CRYPT_TAG_BYTES, tag_out) != 1)
             return set_error(ERR_IO, "object_crypt_stream: tag failed");
         return OK;
     }
+
+    /* Decrypting without a tag to check would authenticate nothing. */
+    if (!tag_in)
+        return set_error(ERR_INVALID, "object_crypt_stream: no tag to verify");
 
     uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
     memcpy(tag, tag_in, sizeof(tag));

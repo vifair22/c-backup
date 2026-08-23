@@ -49,10 +49,10 @@ static void test_round_trip(void **state)
     size_t len = strlen(plain);
     uint8_t ct[128], pt[128];
 
-    assert_int_equal(object_encrypt(&k, h, plain, len, ct), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, ct), OK);
     /* Ciphertext is not plaintext, and carries a tag beyond the payload. */
     assert_memory_not_equal(ct, plain, len);
-    assert_int_equal(object_decrypt(&k, h, ct, len, pt), OK);
+    assert_int_equal(object_decrypt(&k, ct, len, pt), OK);
     assert_memory_equal(pt, plain, len);
 }
 
@@ -74,14 +74,14 @@ static void test_same_plaintext_encrypts_differently_each_time(void **state)
     size_t len = strlen(plain);
     uint8_t a[128], b[128];
 
-    assert_int_equal(object_encrypt(&k, h, plain, len, a), OK);
-    assert_int_equal(object_encrypt(&k, h, plain, len, b), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, a), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, b), OK);
     assert_memory_not_equal(a, b, len + OBJECT_CRYPT_OVERHEAD);
 
     /* Both still decrypt to the same thing. */
     uint8_t p1[128], p2[128];
-    assert_int_equal(object_decrypt(&k, h, a, len, p1), OK);
-    assert_int_equal(object_decrypt(&k, h, b, len, p2), OK);
+    assert_int_equal(object_decrypt(&k, a, len, p1), OK);
+    assert_int_equal(object_decrypt(&k, b, len, p2), OK);
     assert_memory_equal(p1, plain, len);
     assert_memory_equal(p2, plain, len);
 }
@@ -104,8 +104,8 @@ static void test_two_encryptions_never_share_a_keystream(void **state)
     memset(p2, 'B', sizeof(p2));
 
     uint8_t c1[64 + OBJECT_CRYPT_OVERHEAD], c2[64 + OBJECT_CRYPT_OVERHEAD];
-    assert_int_equal(object_encrypt(&k, h, p1, sizeof(p1), c1), OK);
-    assert_int_equal(object_encrypt(&k, h, p2, sizeof(p2), c2), OK);
+    assert_int_equal(object_encrypt(&k, p1, sizeof(p1), c1), OK);
+    assert_int_equal(object_encrypt(&k, p2, sizeof(p2), c2), OK);
 
     const uint8_t *x1 = c1 + OBJECT_CRYPT_NONCE_BYTES;
     const uint8_t *x2 = c2 + OBJECT_CRYPT_NONCE_BYTES;
@@ -133,8 +133,8 @@ static void test_different_objects_produce_different_ciphertext(void **state)
     size_t len = strlen(plain);
     uint8_t a[128], b[128];
 
-    assert_int_equal(object_encrypt(&k, h1, plain, len, a), OK);
-    assert_int_equal(object_encrypt(&k, h2, plain, len, b), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, a), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, b), OK);
     assert_memory_not_equal(a, b, len);
 }
 
@@ -149,8 +149,8 @@ static void test_different_keys_produce_different_ciphertext(void **state)
     size_t len = strlen(plain);
     uint8_t a[128], b[128];
 
-    assert_int_equal(object_encrypt(&k1, h, plain, len, a), OK);
-    assert_int_equal(object_encrypt(&k2, h, plain, len, b), OK);
+    assert_int_equal(object_encrypt(&k1, plain, len, a), OK);
+    assert_int_equal(object_encrypt(&k2, plain, len, b), OK);
     assert_memory_not_equal(a, b, len);
 }
 
@@ -164,34 +164,13 @@ static void test_wrong_key_fails_authentication(void **state)
     const char *plain = "only the right key reads this";
     size_t len = strlen(plain);
     uint8_t ct[128], pt[128];
-    assert_int_equal(object_encrypt(&right, h, plain, len, ct), OK);
+    assert_int_equal(object_encrypt(&right, plain, len, ct), OK);
 
     /* Not merely wrong output: a refusal. */
-    assert_int_not_equal(object_decrypt(&wrong, h, ct, len, pt), OK);
+    assert_int_not_equal(object_decrypt(&wrong, ct, len, pt), OK);
     err_clear();
 }
 
-/*
- * The hash is associated data, so a payload lifted into another object's file
- * fails here rather than decrypting to garbage that fails a hash check
- * somewhere else with a less useful explanation.
- */
-static void test_payload_moved_to_another_object_is_rejected(void **state)
-{
-    (void)state;
-    repo_key_t k = make_key(9);
-    uint8_t h1[OBJECT_HASH_SIZE], h2[OBJECT_HASH_SIZE];
-    make_hash(h1, 9);
-    make_hash(h2, 10);
-
-    const char *plain = "filed under one name";
-    size_t len = strlen(plain);
-    uint8_t ct[128], pt[128];
-    assert_int_equal(object_encrypt(&k, h1, plain, len, ct), OK);
-
-    assert_int_not_equal(object_decrypt(&k, h2, ct, len, pt), OK);
-    err_clear();
-}
 
 static void test_tampered_ciphertext_is_rejected(void **state)
 {
@@ -203,16 +182,16 @@ static void test_tampered_ciphertext_is_rejected(void **state)
     const char *plain = "authenticated, not merely encrypted";
     size_t len = strlen(plain);
     uint8_t ct[128], pt[128];
-    assert_int_equal(object_encrypt(&k, h, plain, len, ct), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, ct), OK);
 
     ct[3] ^= 0x01;
-    assert_int_not_equal(object_decrypt(&k, h, ct, len, pt), OK);
+    assert_int_not_equal(object_decrypt(&k, ct, len, pt), OK);
     err_clear();
 
     /* And a tampered tag, which is the other half of the same guarantee. */
     ct[3] ^= 0x01;
     ct[len + 2] ^= 0x01;
-    assert_int_not_equal(object_decrypt(&k, h, ct, len, pt), OK);
+    assert_int_not_equal(object_decrypt(&k, ct, len, pt), OK);
     err_clear();
 }
 
@@ -224,8 +203,8 @@ static void test_empty_payload(void **state)
     make_hash(h, 12);
 
     uint8_t ct[OBJECT_CRYPT_OVERHEAD], pt[1];
-    assert_int_equal(object_encrypt(&k, h, "", 0, ct), OK);
-    assert_int_equal(object_decrypt(&k, h, ct, 0, pt), OK);
+    assert_int_equal(object_encrypt(&k, "", 0, ct), OK);
+    assert_int_equal(object_decrypt(&k, ct, 0, pt), OK);
 }
 
 /*
@@ -250,7 +229,7 @@ static void test_streaming_output_decrypts_one_shot(void **state)
 
     /* Layout is the caller's job: nonce first, then ciphertext, then tag. */
     object_crypt_stream_t *s = NULL;
-    assert_int_equal(object_crypt_stream_begin(&s, &k, h, buf, 1), OK);
+    assert_int_equal(object_crypt_stream_begin(&s, &k, buf, 1), OK);
     uint8_t *ct = buf + OBJECT_CRYPT_NONCE_BYTES;
 
     /* Deliberately uneven chunks: a real stream does not arrive in tidy
@@ -265,7 +244,7 @@ static void test_streaming_output_decrypts_one_shot(void **state)
     assert_int_equal(object_crypt_stream_finish(s, ct + len, NULL), OK);
     object_crypt_stream_free(s);
 
-    assert_int_equal(object_decrypt(&k, h, buf, len, out), OK);
+    assert_int_equal(object_decrypt(&k, buf, len, out), OK);
     assert_memory_equal(out, plain, len);
     free(plain); free(buf); free(out);
 }
@@ -283,14 +262,14 @@ static void test_one_shot_output_decrypts_streaming(void **state)
     uint8_t *out   = malloc(len);
     assert_non_null(plain); assert_non_null(buf); assert_non_null(out);
     for (size_t i = 0; i < len; i++) plain[i] = (uint8_t)(i ^ 0x5A);
-    assert_int_equal(object_encrypt(&k, h, plain, len, buf), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, buf), OK);
 
     uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
     memcpy(nonce, buf, sizeof(nonce));
     const uint8_t *ct = buf + OBJECT_CRYPT_NONCE_BYTES;
 
     object_crypt_stream_t *s = NULL;
-    assert_int_equal(object_crypt_stream_begin(&s, &k, h, nonce, 0), OK);
+    assert_int_equal(object_crypt_stream_begin(&s, &k, nonce, 0), OK);
     size_t off = 0;
     while (off < len) {
         size_t n = (len - off < 4096) ? len - off : 4096;
@@ -319,7 +298,7 @@ static void test_streaming_detects_tampering_at_the_end(void **state)
     uint8_t *out   = malloc(len);
     assert_non_null(plain); assert_non_null(buf); assert_non_null(out);
     memset(plain, 'x', len);
-    assert_int_equal(object_encrypt(&k, h, plain, len, buf), OK);
+    assert_int_equal(object_encrypt(&k, plain, len, buf), OK);
 
     uint8_t *ct = buf + OBJECT_CRYPT_NONCE_BYTES;
     ct[len / 2] ^= 0xFF;
@@ -327,7 +306,7 @@ static void test_streaming_detects_tampering_at_the_end(void **state)
     uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
     memcpy(nonce, buf, sizeof(nonce));
     object_crypt_stream_t *s = NULL;
-    assert_int_equal(object_crypt_stream_begin(&s, &k, h, nonce, 0), OK);
+    assert_int_equal(object_crypt_stream_begin(&s, &k, nonce, 0), OK);
     /* The chunks themselves decrypt without complaint; only the tag knows. */
     assert_int_equal(object_crypt_stream_update(s, ct, len, out), OK);
     assert_int_not_equal(object_crypt_stream_finish(s, NULL, ct + len), OK);
@@ -345,7 +324,6 @@ int main(void)
         cmocka_unit_test(test_different_objects_produce_different_ciphertext),
         cmocka_unit_test(test_different_keys_produce_different_ciphertext),
         cmocka_unit_test(test_wrong_key_fails_authentication),
-        cmocka_unit_test(test_payload_moved_to_another_object_is_rejected),
         cmocka_unit_test(test_tampered_ciphertext_is_rejected),
         cmocka_unit_test(test_empty_payload),
         cmocka_unit_test(test_streaming_output_decrypts_one_shot),

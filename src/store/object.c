@@ -152,7 +152,7 @@ static status_t write_object(store_t *store, uint8_t type,
     if (key) {
         ciphertext = malloc(payload_size + OBJECT_CRYPT_OVERHEAD);
         if (!ciphertext) return set_error(ERR_NOMEM, "write_object: cipher buffer");
-        status_t est = object_encrypt(key, out_hash, payload, payload_size, ciphertext);
+        status_t est = object_encrypt(key, payload, payload_size, ciphertext);
         if (est != OK) { free(ciphertext); return est; }
         payload = ciphertext;
         payload_size += OBJECT_CRYPT_OVERHEAD;
@@ -536,22 +536,6 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
                                          void *progress_ctx) {
-    /*
-     * Not yet: this path does not encrypt.
-     *
-     * Refusing is the only safe answer. Writing here regardless would put
-     * plaintext into a repository that everything else believes is
-     * encrypted, and nothing downstream would notice - the object would read
-     * back perfectly.
-     */
-    if (store_key(store)) {
-        if (src_path) close(src_fd);
-        return set_error(ERR_INVALID,
-                         "encrypted repositories cannot yet store objects "
-                         "larger than %llu bytes",
-                         (unsigned long long)STREAM_LOAD_MAX);
-    }
-
     /* Always store uncompressed; the pack sweeper handles compression. */
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
         if (src_path) close(src_fd);
@@ -592,6 +576,34 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     }
 
     uint64_t total_written = 0;
+
+    /*
+     * Encryption, when the repository has a key.
+     *
+     * The nonce is drawn now and written ahead of the ciphertext, so a reader
+     * has it before the first byte it needs to decrypt. Chunks are encrypted
+     * in place: the plaintext is hashed first, and the buffer is ours until
+     * it is written, so a second buffer the size of a stream chunk would be
+     * 128 MiB of nothing.
+     */
+    const repo_key_t *enc_key = store_key(store);
+    object_crypt_stream_t *cs = NULL;
+    if (enc_key) {
+        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+        status_t cst = object_crypt_stream_begin(&cs, enc_key, nonce, 1);
+        if (cst != OK) {
+            if (src_path) close(src_fd);
+            close(tfd); unlink(tmppath);
+            return cst;
+        }
+        if (write(tfd, nonce, sizeof(nonce)) != (ssize_t)sizeof(nonce)) {
+            object_crypt_stream_free(cs);
+            if (src_path) close(src_fd);
+            close(tfd); unlink(tmppath);
+            return set_error_errno(ERR_IO, "stream: write nonce");
+        }
+        total_written += sizeof(nonce);
+    }
 
     /* ----------------------------------------------------------------
      * Hash context + read buffer
@@ -651,6 +663,18 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     uint32_t stream_crc = 0;
     uint64_t offset = 0;
 
+    /* Parity protects what is stored, and the nonce is stored. */
+    if (cs) {
+        uint8_t nonce_copy[OBJECT_CRYPT_NONCE_BYTES];
+        if (pread(tfd, nonce_copy, sizeof(nonce_copy), 0) == (ssize_t)sizeof(nonce_copy)) {
+            stream_crc = crc32c_update(stream_crc, nonce_copy, sizeof(nonce_copy));
+            if (rs_parity_stream_feed(&ps, nonce_copy, sizeof(nonce_copy)) != 0)
+                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (nonce)");
+        } else {
+            st = set_error_errno(ERR_IO, "stream: cannot re-read nonce");
+        }
+    }
+
     /* Helper: push the progress line down before logging so our messages
      * aren't overwritten by the \r-based progress display. */
     #define STREAM_LOG(logfn, msg) do { \
@@ -699,6 +723,12 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
 
             if (EVP_DigestUpdate(mdctx, chunk_buf, got) != 1) {
                 st = set_error(ERR_IO, "stream: SHA256 update failed");
+                fuse_ring_release(&ring); break;
+            }
+            /* Hashed as plaintext, stored as ciphertext. In place: the ring
+             * slot is ours until it is released just below. */
+            if (cs && object_crypt_stream_update(cs, chunk_buf, got, chunk_buf) != OK) {
+                st = set_error(ERR_IO, "stream: encryption failed");
                 fuse_ring_release(&ring); break;
             }
             if (write(tfd, chunk_buf, got) != (ssize_t)got) {
@@ -891,7 +921,12 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                 st = set_error(ERR_IO, "stream: SHA256 update failed"); goto done;
             }
 
-            /* Write raw bytes (always uncompressed) */
+            /* Hashed as plaintext, stored as ciphertext, encrypted in place. */
+            if (cs && object_crypt_stream_update(cs, buf, got, buf) != OK) {
+                st = set_error(ERR_IO, "stream: encryption failed"); goto done;
+            }
+
+            /* Write the payload chunk */
             if (write(tfd, buf, got) != (ssize_t)got) {
                 if (errno == 0) errno = EIO;
                 st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto done;
@@ -919,6 +954,28 @@ done:
 
     /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
 
+    /*
+     * Close the cipher and store its tag with the payload. It has to land
+     * before the parity trailer, because parity covers what is stored and
+     * the tag is part of that.
+     */
+    if (st == OK && cs) {
+        uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
+        st = object_crypt_stream_finish(cs, tag, NULL);
+        if (st == OK) {
+            if (write(tfd, tag, sizeof(tag)) != (ssize_t)sizeof(tag)) {
+                st = set_error_errno(ERR_IO, "stream: write tag");
+            } else {
+                total_written += sizeof(tag);
+                stream_crc = crc32c_update(stream_crc, tag, sizeof(tag));
+                if (rs_parity_stream_feed(&ps, tag, sizeof(tag)) != 0)
+                    st = set_error_errno(ERR_IO, "stream: RS parity feed failed (tag)");
+            }
+        }
+    }
+    object_crypt_stream_free(cs);
+    cs = NULL;
+
     /* Flush final partial RS group */
     if (st == OK) {
         if (rs_parity_stream_finish(&ps) != 0)
@@ -945,7 +1002,8 @@ done:
 
     /* Patch header: fill in sizes and hash now that we know them */
     hdr.uncompressed_size = file_size;
-    hdr.compressed_size   = total_written;
+    hdr.compressed_size   = total_written;   /* nonce, ciphertext and tag */
+    hdr.encryption        = enc_key ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
     memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
     if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
         if (errno == 0) errno = EIO;
@@ -1547,7 +1605,7 @@ status_t object_load(store_t *store,
             return set_error(ERR_CORRUPT, "object %s: truncated ciphertext", hex);
         }
         size_t ptlen = (size_t)hdr.compressed_size - OBJECT_CRYPT_OVERHEAD;
-        status_t dst = object_decrypt(key, hash, cpayload, ptlen, cpayload);
+        status_t dst = object_decrypt(key, cpayload, ptlen, cpayload);
         if (dst != OK) { free(cpayload); return dst; }
         hdr.compressed_size = ptlen;
     }
@@ -1826,16 +1884,62 @@ status_t object_load_stream(store_t *store,
         uint8_t *buf = malloc(STREAM_LOAD_MAX);
         if (!buf) { EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_LOAD_MAX); }
 
-        uint64_t remaining = hdr.compressed_size;
         status_t st = OK;
+
+        /*
+         * Encrypted payloads are stored as nonce, ciphertext, tag. The nonce
+         * comes off the front so the cipher can start, and the tag is only
+         * reached at the end - so a streamed read cannot know the payload is
+         * authentic until it has emitted all of it. That was already true of
+         * the hash check these paths have always ended with.
+         */
+        object_crypt_stream_t *cs = NULL;
+        uint64_t remaining = hdr.compressed_size;
+        if (hdr.encryption != ENCRYPT_NONE) {
+            const repo_key_t *key = store_key(store);
+            if (!key) {
+                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
+                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+                return set_error(ERR_INVALID,
+                                 "object %s is encrypted and no key is loaded", hex);
+            }
+            if (hdr.compressed_size < OBJECT_CRYPT_OVERHEAD) {
+                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
+                return set_error(ERR_CORRUPT, "load_stream: truncated ciphertext");
+            }
+            uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+            if (io_read_full(fd, nonce, sizeof(nonce)) != 0) {
+                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
+                return set_error(ERR_CORRUPT, "load_stream: truncated nonce");
+            }
+            st = object_crypt_stream_begin(&cs, key, nonce, 0);
+            if (st != OK) {
+                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
+                return st;
+            }
+            remaining = hdr.compressed_size - OBJECT_CRYPT_OVERHEAD;
+        }
+
         while (remaining > 0 && st == OK) {
             size_t want = (remaining > STREAM_LOAD_MAX) ? STREAM_LOAD_MAX : (size_t)remaining;
             if (io_read_full(fd, buf, want) != 0)           { st = set_error(ERR_CORRUPT, "load_stream: truncated payload"); break; }
+            /* Decrypt in place, then hash and emit the plaintext. */
+            if (cs && object_crypt_stream_update(cs, buf, want, buf) != OK) {
+                st = set_error(ERR_CORRUPT, "load_stream: decryption failed"); break;
+            }
             if (EVP_DigestUpdate(mdctx, buf, want) != 1) { st = set_error(ERR_IO, "load_stream: SHA256 update failed"); break; }
             if (io_write_full(out_fd, buf, want) != 0)      { st = set_error_errno(ERR_IO, "load_stream: write to out_fd"); break; }
             remaining -= want;
         }
         free(buf);
+
+        if (cs) {
+            uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
+            if (st == OK && io_read_full(fd, tag, sizeof(tag)) != 0)
+                st = set_error(ERR_CORRUPT, "load_stream: truncated tag");
+            if (st == OK) st = object_crypt_stream_finish(cs, NULL, tag);
+            object_crypt_stream_free(cs);
+        }
 
         int hash_bad = 0;
         if (st == OK) {

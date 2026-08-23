@@ -53,17 +53,21 @@
  * which for a stream cipher is the one fatal mistake. A fresh random nonce
  * per encryption cannot collide and costs twelve bytes.
  *
- * hash is the associated data, binding the ciphertext to the object it is
- * filed under, so a payload moved into another object's file is detected
- * here rather than decrypting into nonsense that fails later.
+ * There is no associated data. Binding the ciphertext to the object it is
+ * filed under would mean feeding in the content hash, and a streamed object
+ * has no hash until it has been read to the end - the same ordering problem
+ * that made a derived nonce unworkable. It is not needed: object_load hashes
+ * what it decrypted and compares, so a payload moved into another object's
+ * file is caught there. Prefix reads skip that check, but they skip it for
+ * unencrypted objects too, so nothing is lost that was previously held.
  */
-status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
+status_t object_encrypt(const repo_key_t *key,
                         const void *in, size_t len, void *out);
 
 /* Decrypt in one shot. in holds len + OBJECT_CRYPT_OVERHEAD bytes as written
  * by object_encrypt; out holds len. ERR_CORRUPT when the tag does not
  * verify. */
-status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
+status_t object_decrypt(const repo_key_t *key,
                         const void *in, size_t len, void *out);
 
 /*
@@ -80,7 +84,7 @@ typedef struct object_crypt_stream object_crypt_stream_t;
  * decrypting takes the one that was stored.
  */
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
-                                   const repo_key_t *key, const uint8_t *hash,
+                                   const repo_key_t *key,
                                    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
                                    int encrypting);
 status_t object_crypt_stream_update(object_crypt_stream_t *s,

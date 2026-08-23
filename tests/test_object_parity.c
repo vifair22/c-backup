@@ -31,6 +31,7 @@
 #include "fake_index.h"
 #include "manifest.h"
 #include "object.h"
+#include "repo_key.h"
 #include "pack.h"
 #include "parity.h"
 #include "store.h"
@@ -246,6 +247,57 @@ static void test_tree_object_corruption_is_repaired(void **state)
     assert_true(parity_stats_get().repaired > 0);
 }
 
+/*
+ * A payload moved into another object's file must not read back as that
+ * object.
+ *
+ * The cipher no longer binds the object hash in as associated data - it
+ * cannot, because a streamed object has no hash until it has been read to the
+ * end - so this is guarded by the SHA-256 check that every load ends with.
+ * Testing it here rather than against the cipher is testing the guarantee
+ * that is actually promised.
+ */
+static void test_swapped_payload_is_rejected(void **state)
+{
+    (void)state;
+    repo_key_t key;
+    assert_int_equal(repo_key_generate(&key), OK);
+    store_set_key(store, &key);
+
+    uint8_t h1[OBJECT_HASH_SIZE], h2[OBJECT_HASH_SIZE];
+    char p1[512], p2[512];
+    store_and_path("the first object, filed under its own hash", h1, p1);
+    store_and_path("the second object, entirely different bytes", h2, p2);
+
+    /* Give the first object the second one's payload, header untouched. */
+    struct stat sb;
+    assert_int_equal(stat(p2, &sb), 0);
+    uint8_t *body = malloc((size_t)sb.st_size);
+    assert_non_null(body);
+    int fd = open(p2, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(read(fd, body, (size_t)sb.st_size), sb.st_size);
+    close(fd);
+
+    fd = open(p1, O_WRONLY);
+    assert_true(fd >= 0);
+    /* Everything after the header: nonce, ciphertext and tag together, so
+     * the payload is internally consistent and only the name is wrong. */
+    assert_true(pwrite(fd, body + sizeof(object_header_t),
+                       (size_t)sb.st_size - sizeof(object_header_t),
+                       (off_t)sizeof(object_header_t)) > 0);
+    close(fd);
+    free(body);
+
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_not_equal(object_load(store, h1, &out, &len, NULL), OK);
+    err_clear();
+    free(out);
+
+    store_set_key(store, NULL);
+}
+
 int main(void)
 {
     rs_init();
@@ -256,6 +308,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_double_header_corruption_is_reported, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_persists_the_correction, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_of_clean_object_is_a_noop, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_swapped_payload_is_rejected, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tree_object_corruption_is_repaired, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
