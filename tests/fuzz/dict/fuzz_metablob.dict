@@ -1,0 +1,11 @@
+# The selector byte, then record shapes for both formats.
+pick_xattr="\x01"
+pick_acl="\x00"
+acl_access="\x01"
+acl_default="\x02"
+nul="\x00"
+len_1_le16="\x01\x00"
+len_max_le16="\xff\xff"
+len_max_le32="\xff\xff\xff\xff"
+user_prefix="user."
+security_prefix="security."

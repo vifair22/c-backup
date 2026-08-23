@@ -171,41 +171,53 @@ status_t manifest_write_tree(store_t *store, manifest_entry_t *entries,
     return st;
 }
 
-status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
-                            manifest_entry_t **out_entries, uint32_t *out_count)
+/*
+ * Bytes to entries, with nothing else attached.
+ *
+ * Split from manifest_read_tree so the parse can be exercised on its own.
+ * Everything this reads came off a disk, and a disk is allowed to be wrong:
+ * an offsite copy that came back changed, a sector that rotted, a file
+ * someone else wrote into the repository. The hash check upstream catches
+ * that eventually, but it runs after this does, so this has to survive
+ * arbitrary bytes on its own. It is the fuzz target for exactly that reason.
+ */
+status_t manifest_parse(const void *buf, size_t len,
+                        manifest_entry_t **out_entries, uint32_t *out_count)
 {
     if (!out_entries || !out_count)
-        return set_error(ERR_INVALID, "manifest_read_tree: null out");
+        return set_error(ERR_INVALID, "manifest_parse: null out");
+    *out_entries = NULL;
+    *out_count = 0;
+    if (!buf && len)
+        return set_error(ERR_INVALID, "manifest_parse: null buffer");
 
-    void *data = NULL;
-    size_t len = 0;
-    uint8_t type = 0;
-    status_t st = object_load(store, hash, &data, &len, &type);
-    if (st != OK) return st;
+    const uint8_t *p = buf;
+    if (len < 10 || get_u32(p) != MANIFEST_TREE_MAGIC)
+        return set_error(ERR_CORRUPT, "manifest_parse: not a tree object");
 
-    const uint8_t *p = data;
-    if (len < 10 || get_u32(p) != MANIFEST_TREE_MAGIC) {
-        free(data);
-        return set_error(ERR_CORRUPT, "manifest_read_tree: not a tree object");
-    }
-    if (type != OBJECT_TYPE_TREE) {
-        free(data);
-        return set_error(ERR_CORRUPT, "manifest_read_tree: object type %u is not a tree", type);
-    }
     uint16_t ver = get_u16(p + 4);
-    if (ver != MANIFEST_TREE_VERSION) {
-        free(data);
+    if (ver != MANIFEST_TREE_VERSION)
         return set_error(ERR_CORRUPT,
-                         "manifest_read_tree: tree version %u, expected %u",
+                         "manifest_parse: tree version %u, expected %u",
                          ver, MANIFEST_TREE_VERSION);
-    }
+
     uint32_t count = get_u32(p + 6);
 
+    /*
+     * A count field is a promise about bytes that may not be there. Every
+     * entry costs at least MANIFEST_FIXED on the wire, so a count implying
+     * more than the buffer can hold is a lie, and believing it would mean
+     * allocating gigabytes on behalf of a corrupt eight-byte header before
+     * discovering the truncation entry by entry.
+     */
+    if (count > (len - 10) / MANIFEST_FIXED)
+        return set_error(ERR_CORRUPT,
+                         "manifest_parse: %u entries do not fit in %zu bytes",
+                         count, len);
+
     manifest_entry_t *out = count ? calloc(count, sizeof(*out)) : NULL;
-    if (count && !out) {
-        free(data);
-        return set_error(ERR_NOMEM, "manifest_read_tree: alloc");
-    }
+    if (count && !out)
+        return set_error(ERR_NOMEM, "manifest_parse: alloc");
 
     size_t off = 10;
     const size_t fixed = MANIFEST_FIXED;
@@ -228,6 +240,7 @@ status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         memcpy(e->xattr_hash,  p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->acl_hash,    p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
 
+        /* Both lengths are 16-bit and off is size_t, so this cannot wrap. */
         if (off + e->name_len + e->link_target_len > len) goto corrupt;
 
         char *nm = malloc((size_t)e->name_len + 1);
@@ -247,19 +260,39 @@ status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         }
     }
 
-    free(data);
     *out_entries = out;
     *out_count = count;
     return OK;
 
 corrupt:
     manifest_free_entries(out, count);
-    free(data);
-    return set_error(ERR_CORRUPT, "manifest_read_tree: truncated tree object");
+    return set_error(ERR_CORRUPT, "manifest_parse: truncated tree object");
 oom:
     manifest_free_entries(out, count);
+    return set_error(ERR_NOMEM, "manifest_parse: alloc");
+}
+
+status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                            manifest_entry_t **out_entries, uint32_t *out_count)
+{
+    if (!out_entries || !out_count)
+        return set_error(ERR_INVALID, "manifest_read_tree: null out");
+
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = object_load(store, hash, &data, &len, &type);
+    if (st != OK) return st;
+
+    if (type != OBJECT_TYPE_TREE) {
+        free(data);
+        return set_error(ERR_CORRUPT,
+                         "manifest_read_tree: object type %u is not a tree", type);
+    }
+
+    st = manifest_parse(data, len, out_entries, out_count);
     free(data);
-    return set_error(ERR_NOMEM, "manifest_read_tree: alloc");
+    return st;
 }
 
 /*

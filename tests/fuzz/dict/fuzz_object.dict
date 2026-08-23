@@ -1,0 +1,18 @@
+# Magic numbers and codec values the object reader branches on. Without
+# these a fuzzer spends its budget guessing four-byte constants.
+magic_bcoj="\x4a\x4f\x43\x42"
+parity_footer="PARF"
+hdr_version="\x03"
+type_file="\x01"
+type_xattr="\x02"
+type_acl="\x03"
+type_sparse="\x04"
+type_tree="\x05"
+compress_none="\x00"
+compress_lz4="\x01"
+compress_lz4_frame="\x02"
+encrypt_none="\x00"
+encrypt_chacha="\x01"
+zero64="\x00\x00\x00\x00\x00\x00\x00\x00"
+max32="\xff\xff\xff\xff"
+max64="\xff\xff\xff\xff\xff\xff\xff\xff"

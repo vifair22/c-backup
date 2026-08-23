@@ -352,6 +352,51 @@ static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
     free(data);
 }
 
+/*
+ * A pack header claiming more entries than the file could possibly hold.
+ *
+ * pack_enumerate_dat walked the entry list by adding each entry's
+ * compressed_size to a running offset, on a uint64 that came off disk. A
+ * large enough value wrapped the sum, the next seek landed earlier in the
+ * file than it started, and the loop read the same bytes forever. Not a
+ * crash - a pinned core, in the enumerator that GC, coalescing, reindex and
+ * the introspection routes all walk with.
+ *
+ * A fuzzer found it as a timeout rather than a crash, which is the only way
+ * it was ever going to show up: nothing was corrupted and nothing faulted,
+ * the walk simply never ended. The reproducer was a 750-byte file claiming
+ * 582 million entries.
+ */
+static void test_absurd_entry_count_is_refused(void **state)
+{
+    (void)state;
+    /* One real object, packed, so there is a genuine pack to corrupt. */
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char *body = "an object to give the pack something to hold";
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+
+    pack_dat_hdr_t hdr;
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    hdr.count = 582156299u;
+    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    close(fd);
+
+    pack_cache_invalidate(store);
+
+    /* Must refuse rather than start walking. If this regresses the suite
+     * does not fail, it hangs - which is itself the signal. */
+    uint32_t version = 0, count = 0;
+    char name[64];
+    snprintf(name, sizeof(name), "%s", strrchr(path, '/') + 1);
+    assert_int_not_equal(pack_enumerate_dat(store, name, &version, &count, NULL, NULL), OK);
+}
+
 int main(void)
 {
     rs_init();
@@ -365,6 +410,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_repair_persists_and_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_detected_not_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

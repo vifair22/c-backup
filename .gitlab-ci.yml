@@ -69,6 +69,42 @@ analyze:
     # limit is a crash waiting for a deep enough tree.
     - make analyze
 
+# Fuzzing, on a budget a pipeline can afford.
+#
+# Two things happen here. The replay is the gate: it runs every input a
+# fuzzer ever found interesting - including the reproducers for the three
+# bugs that were found this way - and takes seconds. The short search is the
+# opportunistic half: sixty seconds per target will not exhaust anything, but
+# it is sixty seconds of a genuinely different test strategy on every push,
+# and the corpus it grows comes back as an artifact to be committed.
+#
+# clang, because libFuzzer is an LLVM component. The strict-flag guarantees
+# still come from the ordinary gcc build in the test stage; this exists to
+# run the parsers against bytes nobody intended.
+fuzz:
+  stage: analyze
+  image: debian:trixie
+  tags: [docker]
+  before_script:
+    - *debian_deps
+    - apt-get install -y -qq --no-install-recommends clang
+    - *fetch_cutils
+  script:
+    # The gate. Any crash, timeout or sanitizer report on a known input fails
+    # the pipeline.
+    - make fuzz-regress
+    # The search. A crash here fails the job too.
+    - make fuzz-run FUZZ_TIME=60
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - tests/fuzz/corpus/
+      # Crash reproducers libFuzzer writes beside the binary.
+      - crash-*
+      - timeout-*
+      - oom-*
+
 coverage:
   stage: coverage
   image: debian:trixie

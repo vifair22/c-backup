@@ -144,16 +144,32 @@ int parity_record_check(void *data, size_t len, const parity_record_t *rec)
     for (size_t i = 0; i < len; i++)
         recomputed[i % PARITY_STRIDE] ^= d[i];
 
-    /* XOR with stored parity gives syndrome per column. */
+    /*
+     * XOR with stored parity gives the syndrome per column.
+     *
+     * Only the first min(len, PARITY_STRIDE) columns can name a byte that
+     * exists. Every caller here passes a buffer smaller than the stride - an
+     * object header is 64 bytes, a pack entry header 51, against a stride of
+     * 256 - so a record claiming damage in a column beyond the data was
+     * naming a byte off the end of the caller's buffer, and the correction
+     * below wrote to it. On the stack, in the code that runs while reading a
+     * damaged object. A fuzzer found it in ninety seconds.
+     *
+     * parity_record_compute leaves those columns zero, so a nonzero syndrome
+     * there is not damage in the data: it is proof this record does not
+     * describe this buffer. Uncorrectable, and it says so.
+     */
+    size_t cols = len < PARITY_STRIDE ? len : PARITY_STRIDE;
     uint8_t syndrome[PARITY_STRIDE];
     int bad_cols = 0;
     int last_bad = -1;
     for (int i = 0; i < PARITY_STRIDE; i++) {
         syndrome[i] = recomputed[i] ^ rec->parity[i];
-        if (syndrome[i] != 0) {
-            bad_cols++;
-            last_bad = i;
-        }
+        if (syndrome[i] == 0) continue;
+        if ((size_t)i >= cols)
+            return -1;  /* names a byte the buffer does not have */
+        bad_cols++;
+        last_bad = i;
     }
 
     if (bad_cols == 0)

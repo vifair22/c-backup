@@ -20,3 +20,9 @@ daemonization-spec.md
 *.db
 *.db-wal
 *.db-shm
+fuzz-*.log
+crash-*
+timeout-*
+oom-*
+slow-unit-*
+leak-*

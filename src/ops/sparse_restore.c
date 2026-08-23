@@ -23,6 +23,73 @@
 #include <string.h>
 #include <unistd.h>
 
+/*
+ * Header and region table validation, split out so arbitrary bytes can be
+ * thrown at them directly.
+ *
+ * A sparse object's region table is a list of offsets and lengths that a
+ * restore turns straight into lseek and write against a file it just
+ * created. Every value in it came off a disk. Getting this wrong does not
+ * corrupt an object somewhere - it writes to arbitrary offsets in a file on
+ * the machine being restored to, which is why the checks are here and up
+ * front rather than interleaved with the writing.
+ *
+ * The rules, and why each one:
+ *   - the magic must match, or this is not a region table at all
+ *   - a zero region count means a sparse object with no data, which the
+ *     writer never produces
+ *   - region_count is bounded by what the table could physically describe,
+ *     so a corrupt count cannot ask for a multi-gigabyte allocation
+ *   - regions ascend and do not overlap, so the file is written once
+ *     forwards rather than seeking backwards over itself
+ *   - every region lies inside the file, computed without overflowing
+ */
+
+/* One region per byte of file is already absurd; this is a sanity ceiling
+ * that keeps region_count * sizeof(region) from overflowing a size_t. */
+#define SPARSE_MAX_REGIONS (1u << 24)
+
+status_t sparse_header_check(const sparse_hdr_t *h, uint64_t file_size)
+{
+    if (!h) return set_error(ERR_INVALID, "sparse: null header");
+    if (h->magic != SPARSE_MAGIC)
+        return set_error(ERR_CORRUPT, "sparse: bad magic");
+    if (h->region_count == 0)
+        return set_error(ERR_CORRUPT, "sparse: no regions");
+    if (h->region_count > SPARSE_MAX_REGIONS)
+        return set_error(ERR_CORRUPT, "sparse: %u regions is not plausible",
+                         h->region_count);
+    /* Each region needs at least one byte of file to describe. */
+    if ((uint64_t)h->region_count > file_size)
+        return set_error(ERR_CORRUPT,
+                         "sparse: %u regions in a %llu byte file",
+                         h->region_count, (unsigned long long)file_size);
+    return OK;
+}
+
+status_t sparse_regions_check(const sparse_region_t *r, uint32_t count,
+                              uint64_t file_size)
+{
+    if (!r && count) return set_error(ERR_INVALID, "sparse: null regions");
+
+    uint64_t prev_end = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (r[i].length == 0)
+            return set_error(ERR_CORRUPT, "sparse: region %u is empty", i);
+        if (r[i].offset < prev_end)
+            return set_error(ERR_CORRUPT,
+                             "sparse: region %u overlaps or precedes the last", i);
+        if (r[i].offset > file_size)
+            return set_error(ERR_CORRUPT, "sparse: region %u starts past EOF", i);
+        /* Subtraction, not addition: offset <= file_size is already known,
+         * so this cannot wrap the way offset + length can. */
+        if (r[i].length > file_size - r[i].offset)
+            return set_error(ERR_CORRUPT, "sparse: region %u runs past EOF", i);
+        prev_end = r[i].offset + r[i].length;
+    }
+    return OK;
+}
+
 /* Streaming sparse restore: decompress a sparse object through a pipe,
  * parse the header + region table, and scatter data to the correct offsets
  * in out_fd.  Bounded-RAM — safe for sparse objects that exceed STREAM_LOAD_MAX. */
@@ -75,10 +142,9 @@ status_t restore_sparse_streaming(store_t *store,
         st = set_error(ERR_CORRUPT, "restore sparse: short header for %s", full);
         goto done;
     }
-    if (shdr.magic != SPARSE_MAGIC || shdr.region_count == 0) {
-        st = set_error(ERR_CORRUPT, "restore sparse: bad header for %s", full);
-        goto done;
-    }
+    st = sparse_header_check(&shdr, file_size);
+    if (st != OK) goto done;
+
     size_t rt_sz = (size_t)shdr.region_count * sizeof(sparse_region_t);
     rgns = malloc(rt_sz);
     if (!rgns) { st = set_error(ERR_NOMEM, "restore sparse: regions"); goto done; }
@@ -86,6 +152,8 @@ status_t restore_sparse_streaming(store_t *store,
         st = set_error(ERR_CORRUPT, "restore sparse: short regions for %s", full);
         goto done;
     }
+    st = sparse_regions_check(rgns, shdr.region_count, file_size);
+    if (st != OK) goto done;
     if (ftruncate(out_fd, (off_t)file_size) == -1 && file_size > 0) {
         st = set_error_errno(ERR_IO, "restore sparse: ftruncate(%s)", full);
         goto done;
@@ -94,13 +162,7 @@ status_t restore_sparse_streaming(store_t *store,
     buf = malloc(SP_BUF);
     if (!buf) { st = set_error(ERR_NOMEM, "restore sparse: buf"); goto done; }
 
-    uint64_t prev_end = 0;
     for (uint32_t r = 0; r < shdr.region_count && st == OK; r++) {
-        if (rgns[r].offset < prev_end || rgns[r].offset > file_size ||
-            rgns[r].length > file_size - rgns[r].offset) {
-            st = set_error(ERR_CORRUPT, "restore sparse: region %u OOB for %s", r, full);
-            break;
-        }
         if (lseek(out_fd, (off_t)rgns[r].offset, SEEK_SET) == (off_t)-1) {
             st = set_error_errno(ERR_IO, "restore sparse: lseek(%s)", full); break;
         }
@@ -115,7 +177,6 @@ status_t restore_sparse_streaming(store_t *store,
             }
             rem -= (uint64_t)got;
         }
-        prev_end = rgns[r].offset + rgns[r].length;
     }
 
 done:

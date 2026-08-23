@@ -3895,6 +3895,33 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                          dat_name, hdr.version, PACK_VERSION);
     }
 
+    /*
+     * The entry count is a promise about bytes that may not be there, and
+     * every entry costs at least a header on the wire. A 750-byte file
+     * claiming 582 million entries is not a file to start walking.
+     */
+    if (fseeko(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_enumerate_dat: seek %s", dat_name);
+    }
+    off_t end = ftello(f);
+    if (end < (off_t)sizeof(hdr)) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_dat: %s is truncated", dat_name);
+    }
+    uint64_t file_size = (uint64_t)end;
+    uint64_t body      = file_size - sizeof(hdr);
+    if ((uint64_t)hdr.count > body / sizeof(pack_dat_entry_hdr_t)) {
+        fclose(f);
+        return set_error(ERR_CORRUPT,
+                         "pack_enumerate_dat: %s claims %u entries in %llu bytes",
+                         dat_name, hdr.count, (unsigned long long)body);
+    }
+    if (fseeko(f, (off_t)sizeof(hdr), SEEK_SET) != 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_enumerate_dat: rewind %s", dat_name);
+    }
+
     if (out_version) *out_version = hdr.version;
     if (out_count)   *out_count   = hdr.count;
 
@@ -3915,6 +3942,20 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
         info.payload_offset    = offset + sizeof(eh);
         info.entry_offset      = offset;
         info.entry_index       = i;
+        /*
+         * Where the next entry starts, computed so a corrupt length cannot
+         * send us backwards. This was a bare addition on a caller-controlled
+         * uint64: a large enough compressed_size wrapped the sum, the seek
+         * landed earlier in the file than it started, and the loop read the
+         * same bytes forever - a pinned core, in the enumerator that GC,
+         * coalescing and reindex all walk with. Found by a fuzzer as a
+         * timeout rather than a crash, which is the only way it would ever
+         * have shown up.
+         */
+        if (eh.compressed_size > file_size - offset - sizeof(eh)) {
+            /* Claims a payload that runs past the end of the file. */
+            break;
+        }
         offset += sizeof(eh) + eh.compressed_size;
         if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
 

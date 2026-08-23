@@ -572,6 +572,75 @@ static void test_load_from_pack_various_sizes(void **state) {
     free(data);
 }
 
+/*
+ * A header that claims a payload larger than the file holding it.
+ *
+ * The guard against an oversized in-memory load only applied to
+ * COMPRESS_NONE, so a header with a codec byte that is none of the three we
+ * write slipped past it and reached malloc with whatever the size field
+ * said. A fuzzer produced one asking for 3.6 exabytes inside a minute.
+ * malloc refuses that and the load fails cleanly, so nothing was unsafe -
+ * but relying on the allocator to say no is not a bound, and on a machine
+ * with overcommit it is not even a reliable one.
+ *
+ * Found by fuzz_object. The header is now checked against the file's actual
+ * size, which is the only number that cannot be lied about.
+ */
+static void test_header_claiming_more_than_the_file_is_refused(void **state) {
+    (void)state;
+    const char *data = "a short object";
+    uint8_t hash[OBJECT_HASH_SIZE] = {0};
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+
+    object_header_t hdr;
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+
+    /* Absurd payload size, and a codec that is not one of ours - which is
+     * how the original slipped past the size guard. */
+    hdr.compressed_size = 0x3252e50000000001ull;
+    hdr.compression     = 0xb0;
+    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    close(fd);
+
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
+    assert_null(out);
+}
+
+/* An unknown codec on its own is refused too, rather than reaching a
+ * decompressor that does not exist. */
+static void test_unknown_codec_is_refused(void **state) {
+    (void)state;
+    const char *data = "another short object";
+    uint8_t hash[OBJECT_HASH_SIZE] = {0};
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+
+    object_header_t hdr;
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    hdr.compression = 99;
+    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
+    close(fd);
+
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
+}
+
 /* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
@@ -599,6 +668,8 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_store_fd_hash_mismatch, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_store_fd_writes_a_parity_trailer, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_store_fd_encrypted_roundtrip, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_header_claiming_more_than_the_file_is_refused, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_unknown_codec_is_refused, setup_basic, teardown_basic),
 
         /* Pack fallback coverage */
         cmocka_unit_test_setup_teardown(test_load_stream_pack_fallback, setup_basic, teardown_basic),

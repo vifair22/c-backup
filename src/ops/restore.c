@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "restore.h"
+#include "metablob.h"
 
 #include "object.h"
 #include "sparse_restore.h"
@@ -207,6 +208,17 @@ static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
  * only come from corruption the object layer failed to catch, and quietly
  * applying half of it would be worse than applying none.
  */
+struct xattr_ctx { const char *path; };
+
+static void apply_one_xattr(const char *name, const void *value, size_t vlen,
+                            void *vctx)
+{
+    const struct xattr_ctx *c = vctx;
+    if (lsetxattr(c->path, name, value, vlen, 0) != 0)
+        log_warn("restore: cannot set xattr %s on %s: %s",
+                 name, c->path, strerror(errno));
+}
+
 static void apply_xattrs(store_t *store, const char *path, const char *xhex)
 {
     if (!xhex || !xhex[0] || hash_is_zero_hex(xhex)) return;
@@ -221,34 +233,10 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
         return;
     }
 
-    const uint8_t *p   = data;
-    size_t         rem = len;
-    while (rem >= sizeof(uint16_t)) {
-        uint16_t nlen = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-        p += sizeof(uint16_t); rem -= sizeof(uint16_t);
-        if (nlen == 0 || nlen > rem || p[nlen - 1] != '\0') {
-            log_warn("restore: malformed xattr blob for %s", path);
-            break;
-        }
-        const char *name = (const char *)p;
-        p += nlen; rem -= nlen;
-
-        if (rem < sizeof(uint32_t)) {
-            log_warn("restore: malformed xattr blob for %s", path);
-            break;
-        }
-        uint32_t vlen = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
-                      | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-        p += sizeof(uint32_t); rem -= sizeof(uint32_t);
-        if (vlen > rem) {
-            log_warn("restore: malformed xattr blob for %s", path);
-            break;
-        }
-
-        if (lsetxattr(path, name, p, vlen, 0) != 0)
-            log_warn("restore: cannot set xattr %s on %s: %s",
-                     name, path, strerror(errno));
-        p += vlen; rem -= vlen;
+    struct xattr_ctx xctx = { path };
+    if (xattr_blob_foreach(data, len, apply_one_xattr, &xctx) != OK) {
+        log_warn("restore: malformed xattr blob for %s: %s", path, err_msg());
+        err_clear();
     }
     free(data);
 }
@@ -261,6 +249,27 @@ static void apply_xattrs(store_t *store, const char *path, const char *xhex)
  * restored, is harmless because every child's own recorded state is applied
  * over anything it inherits.
  */
+struct acl_ctx { const char *path; int is_dir; };
+
+static void apply_one_acl(uint8_t kind, const char *text, void *vctx)
+{
+    const struct acl_ctx *c = vctx;
+    /* A default ACL only means anything on a directory. */
+    if (kind == ACL_BLOB_DEFAULT && !c->is_dir) return;
+
+    acl_t acl = acl_from_text(text);
+    if (!acl) {
+        log_warn("restore: unparseable ACL text for %s", c->path);
+        return;
+    }
+    acl_type_t t = (kind == ACL_BLOB_DEFAULT) ? ACL_TYPE_DEFAULT : ACL_TYPE_ACCESS;
+    if (acl_set_file(c->path, t, acl) != 0)
+        log_warn("restore: cannot set %s ACL on %s: %s",
+                 kind == ACL_BLOB_DEFAULT ? "default" : "access",
+                 c->path, strerror(errno));
+    acl_free(acl);
+}
+
 static void apply_acls(store_t *store, const char *path, const char *ahex,
                        int is_dir)
 {
@@ -276,34 +285,10 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         return;
     }
 
-    const uint8_t *p   = data;
-    size_t         rem = len;
-    while (rem >= 1 + sizeof(uint32_t)) {
-        uint8_t kind = *p++;
-        rem--;
-        uint32_t tlen = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
-                      | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-        p += sizeof(uint32_t); rem -= sizeof(uint32_t);
-        if (tlen == 0 || tlen > rem || p[tlen - 1] != '\0') {
-            log_warn("restore: malformed ACL blob for %s", path);
-            break;
-        }
-
-        if (kind == ACL_BLOB_ACCESS || (kind == ACL_BLOB_DEFAULT && is_dir)) {
-            acl_t acl = acl_from_text((const char *)p);
-            if (!acl) {
-                log_warn("restore: unparseable ACL text for %s", path);
-            } else {
-                acl_type_t t = (kind == ACL_BLOB_DEFAULT)
-                               ? ACL_TYPE_DEFAULT : ACL_TYPE_ACCESS;
-                if (acl_set_file(path, t, acl) != 0)
-                    log_warn("restore: cannot set %s ACL on %s: %s",
-                             kind == ACL_BLOB_DEFAULT ? "default" : "access",
-                             path, strerror(errno));
-                acl_free(acl);
-            }
-        }
-        p += tlen; rem -= tlen;
+    struct acl_ctx actx = { path, is_dir };
+    if (acl_blob_foreach(data, len, apply_one_acl, &actx) != OK) {
+        log_warn("restore: malformed ACL blob for %s: %s", path, err_msg());
+        err_clear();
     }
     free(data);
 }

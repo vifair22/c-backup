@@ -69,6 +69,23 @@ static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) 
  * older repositories to accommodate, so there is nothing to branch on.
  * Leaves the file positioned at the start of the payload.
  */
+/*
+ * Read and sanity-check an object header.
+ *
+ * compressed_size is eight bytes that decide how much memory the reader is
+ * about to allocate, and they came off a disk. Checking the magic and the
+ * version is not enough: a header whose codec byte is neither of the three
+ * we write slips past the "too large for an in-memory load" guard further
+ * down, which only applies to COMPRESS_NONE, and reaches malloc with
+ * whatever the field says. A fuzzer found that in under a minute - a
+ * corrupt header asking for 3.6 exabytes. malloc returns NULL for that and
+ * the load fails cleanly, so nothing was ever unsafe, but the check that
+ * matters is cheaper and more honest than relying on the allocator to
+ * refuse: the payload cannot be bigger than the file holding it.
+ *
+ * The codecs are checked here too, so exactly one place decides what a
+ * plausible header looks like.
+ */
 static status_t read_object_header(int fd, object_header_t *hdr)
 {
     if (io_read_full(fd, hdr, sizeof(*hdr)) != 0)
@@ -77,6 +94,28 @@ static status_t read_object_header(int fd, object_header_t *hdr)
         return set_error(ERR_CORRUPT, "object: bad magic");
     if (hdr->version != OBJECT_HDR_VERSION)
         return set_error(ERR_CORRUPT, "object: unsupported version %u", hdr->version);
+    if (hdr->compression != COMPRESS_NONE &&
+        hdr->compression != COMPRESS_LZ4 &&
+        hdr->compression != COMPRESS_LZ4_FRAME)
+        return set_error(ERR_CORRUPT, "object: unknown compression codec %u",
+                         hdr->compression);
+    if (hdr->encryption != ENCRYPT_NONE && hdr->encryption != ENCRYPT_CHACHA20)
+        return set_error(ERR_CORRUPT, "object: unknown encryption codec %u",
+                         hdr->encryption);
+
+    struct stat sb;
+    if (fstat(fd, &sb) != 0)
+        return set_error_errno(ERR_IO, "object: fstat");
+    /* The payload starts after the header and the parity trailer follows it,
+     * so the file is at least header + payload. Anything larger than that is
+     * a lie the allocator should not be asked to believe. */
+    uint64_t avail = (uint64_t)sb.st_size > sizeof(*hdr)
+                     ? (uint64_t)sb.st_size - sizeof(*hdr) : 0;
+    if (hdr->compressed_size > avail)
+        return set_error(ERR_CORRUPT,
+                         "object: header claims %llu payload bytes, file holds %llu",
+                         (unsigned long long)hdr->compressed_size,
+                         (unsigned long long)avail);
     return OK;
 }
 

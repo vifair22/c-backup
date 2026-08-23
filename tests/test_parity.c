@@ -10,6 +10,9 @@
 
 #include "parity.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 /* ---- CRC-32C tests ---- */
 
 static void test_crc32c_empty(void **state)
@@ -405,6 +408,75 @@ static void test_rs_interleaved_small_data(void **state)
 
 /* ---- Footer structure tests ---- */
 
+/*
+ * A parity record that names a column past the end of the data.
+ *
+ * PARITY_STRIDE is 256 and every caller in the tree checks something
+ * smaller: an object header is 64 bytes, a pack entry header 51. Columns
+ * beyond the data are always zero in a record parity_record_compute wrote,
+ * so a nonzero one there means the record does not describe this buffer -
+ * but the repair path took the highest nonzero column as the byte to fix and
+ * wrote to it, past the end of the caller's stack buffer.
+ *
+ * Found by fuzz_parity in ninety seconds. Reachable from any corrupt object
+ * header or pack entry parity record on disk.
+ *
+ * A guard page, not a canary. The repair writes the byte, checks the CRC,
+ * and on failure writes it back - so the net effect on memory is zero and a
+ * canary sees nothing. Only the access itself is observable, which a
+ * sanitizer notices and ordinary bytes do not. Putting the buffer against an
+ * unmapped page makes the access fault on any build, so this catches the
+ * regression during a plain make test rather than only under make test-asan.
+ */
+static void test_record_naming_a_column_past_the_data(void **state)
+{
+    (void)state;
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t datalen = 51;
+
+    /* Two pages; the second is unmapped-in-effect. The buffer sits flush
+     * against it, so byte datalen is the first byte of the guard. */
+    uint8_t *base = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert_true(base != MAP_FAILED);
+    assert_int_equal(mprotect(base + page, page, PROT_NONE), 0);
+
+    uint8_t *data = base + page - datalen;
+    memset(data, 0xAB, datalen);
+
+    parity_record_t rec;
+    parity_record_compute(data, datalen, &rec);
+
+    /* Break the CRC so the fast path is skipped, and claim damage in a
+     * column that no byte of a 51-byte buffer occupies. */
+    rec.crc ^= 0xFFFFFFFFu;
+    rec.parity[200] ^= 0x7F;
+
+    int rc = parity_record_check(data, datalen, &rec);
+    assert_int_equal(rc, -1);
+
+    assert_int_equal(munmap(base, page * 2), 0);
+}
+
+/* The ordinary short-buffer repair still works: damage inside the data is
+ * corrected, which is the behaviour the fix must not have cost. */
+static void test_short_buffer_repair_still_works(void **state)
+{
+    (void)state;
+    uint8_t data[51];
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)(i * 7 + 1);
+
+    parity_record_t rec;
+    parity_record_compute(data, sizeof(data), &rec);
+
+    uint8_t want[51];
+    memcpy(want, data, sizeof(want));
+
+    data[20] ^= 0x40;
+    assert_int_equal(parity_record_check(data, sizeof(data), &rec), 1);
+    assert_memory_equal(data, want, sizeof(want));
+}
+
 static void test_parity_footer_size(void **state)
 {
     (void)state;
@@ -441,6 +513,8 @@ int main(void)
         cmocka_unit_test(test_rs_interleaved_uncorrectable),
         cmocka_unit_test(test_rs_interleaved_small_data),
         /* Footer struct */
+        cmocka_unit_test(test_record_naming_a_column_past_the_data),
+        cmocka_unit_test(test_short_buffer_repair_still_works),
         cmocka_unit_test(test_parity_footer_size),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -65,6 +65,14 @@ status_t manifest_write_tree(store_t *store,
 
 /* Read a tree back. Used by reindex and by GC's mark phase. The returned
  * entries own their strings; free with manifest_free_entries. */
+/*
+ * Parse a serialised tree. Split out from manifest_read_tree so it can be
+ * driven with arbitrary bytes: everything it reads came off a disk, and the
+ * hash check that would notice corruption runs after it, not before.
+ */
+status_t manifest_parse(const void *buf, size_t len,
+                        manifest_entry_t **out_entries, uint32_t *out_count);
+
 status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                             manifest_entry_t **out_entries, uint32_t *out_count);
 

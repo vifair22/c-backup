@@ -261,6 +261,112 @@ test-asan: asan $(ASAN_TEST_BINS)
 
 .PHONY: test-asan
 
+# ---- Fuzzing ----------------------------------------------------------
+#
+# libFuzzer under clang, with ASan and UBSan, in its own build/fuzz tree.
+# Clang rather than the gcc the rest of the build uses, because libFuzzer is
+# an LLVM component; the strict-flag guarantees still come from the ordinary
+# build, this one exists to run the parsers against bytes nobody intended.
+#
+# The targets are the places where data that came off a disk becomes
+# structure, before anything has checked a hash. That is the whole surface
+# worth fuzzing in a program whose job is reading back arbitrary bytes it
+# wrote months ago: a corrupt length field is not an attacker, it is a
+# Tuesday.
+FUZZ_CC       ?= clang
+FUZZ_OBJ_DIR  := $(BUILD)/fuzz
+FUZZ_BIN_DIR  := $(BUILD)/fuzz/bin
+FUZZ_SRCS     := $(wildcard $(TESTS)/fuzz/fuzz_*.c)
+FUZZ_BINS     := $(patsubst $(TESTS)/fuzz/%.c, $(FUZZ_BIN_DIR)/%, $(FUZZ_SRCS))
+FUZZ_LIB_OBJS := $(patsubst %.c, $(FUZZ_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
+                 $(FUZZ_OBJ_DIR)/cJSON.o $(FUZZ_OBJ_DIR)/app_migrations.o
+
+FUZZ_SAN    := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g
+FUZZ_CFLAGS := -std=c11 -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
+               $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
+                $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+
+$(FUZZ_OBJ_DIR) $(FUZZ_BIN_DIR):
+	mkdir -p $@
+
+define FUZZ_OBJ_RULE
+$(FUZZ_OBJ_DIR)/$(notdir $(basename $(1))).o: $(1) | $(FUZZ_OBJ_DIR)
+	$$(FUZZ_CC) $$(FUZZ_CFLAGS) -c $$< -o $$@
+endef
+$(foreach s,$(SRCS),$(eval $(call FUZZ_OBJ_RULE,$(s))))
+
+$(FUZZ_OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -Wno-everything -c $< -o $@
+
+$(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -c $< -o $@
+
+$(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) | $(FUZZ_BIN_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
+
+.PHONY: fuzz
+fuzz: $(MIGRATE_SRC) $(FUZZ_BINS)
+	@echo "fuzz targets: $(notdir $(FUZZ_BINS))"
+
+# Seeds come from a real repository rather than from imagination: a fuzzer
+# handed valid structures finds the interesting mutations, one starting from
+# nothing spends its budget rediscovering magic numbers.
+FUZZ_CORPUS := $(TESTS)/fuzz/corpus
+FUZZ_DICT   := $(TESTS)/fuzz/dict
+
+# CI budget per target. A soak is the same command with a bigger number, run
+# by hand: make fuzz-run FUZZ_TIME=3600
+FUZZ_TIME ?= 60
+FUZZ_JOBS ?= 1
+
+.PHONY: fuzz-run
+fuzz-run: fuzz
+	@rc=0; \
+	for t in $(FUZZ_BINS); do \
+	    n=$$(basename $$t); \
+	    mkdir -p $(FUZZ_CORPUS)/$$n; \
+	    d=""; [ -f $(FUZZ_DICT)/$$n.dict ] && d="-dict=$(FUZZ_DICT)/$$n.dict"; \
+	    echo "=== $$n ($(FUZZ_TIME)s) ==="; \
+	    $$t $(FUZZ_CORPUS)/$$n $$d -max_total_time=$(FUZZ_TIME) \
+	        -jobs=$(FUZZ_JOBS) -workers=$(FUZZ_JOBS) -timeout=25 \
+	        -rss_limit_mb=2048 -print_final_stats=1 -error_exitcode=77 || rc=1; \
+	done; \
+	exit $$rc
+
+# Shrink the corpus to the smallest set that still reaches everything the
+# big one did. A fuzzing run leaves hundreds of inputs that are variations on
+# each other; committing those costs repository size forever and buys nothing,
+# because the coverage is what matters and it is already covered.
+.PHONY: fuzz-min
+fuzz-min: fuzz
+	@for t in $(FUZZ_BINS); do \
+	    n=$$(basename $$t); \
+	    [ -d $(FUZZ_CORPUS)/$$n ] || continue; \
+	    tmp=$$(mktemp -d); \
+	    before=$$(find $(FUZZ_CORPUS)/$$n -type f | wc -l); \
+	    $$t -merge=1 -timeout=25 $$tmp $(FUZZ_CORPUS)/$$n >/dev/null 2>&1 || true; \
+	    rm -rf $(FUZZ_CORPUS)/$$n; mv $$tmp $(FUZZ_CORPUS)/$$n; \
+	    after=$$(find $(FUZZ_CORPUS)/$$n -type f | wc -l); \
+	    echo "$$n: $$before -> $$after"; \
+	done
+
+# Replay the committed corpus and stop. This is the regression check: it
+# runs every input a fuzzer ever found interesting, in seconds, without
+# searching for new ones. Suitable for a pipeline that must not take
+# minutes.
+.PHONY: fuzz-regress
+fuzz-regress: fuzz
+	@rc=0; \
+	for t in $(FUZZ_BINS); do \
+	    n=$$(basename $$t); \
+	    if [ -d $(FUZZ_CORPUS)/$$n ]; then \
+	        echo "=== $$n (replay) ==="; \
+	        $$t -runs=0 -error_exitcode=77 $(FUZZ_CORPUS)/$$n || rc=1; \
+	    fi; \
+	done; \
+	exit $$rc
+
 # ---- Static analysis --------------------------------------------------
 ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
