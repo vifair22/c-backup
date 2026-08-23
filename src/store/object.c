@@ -588,8 +588,8 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
      */
     const repo_key_t *enc_key = store_key(store);
     object_crypt_stream_t *cs = NULL;
+    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
     if (enc_key) {
-        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
         status_t cst = object_crypt_stream_begin(&cs, enc_key, nonce, 1);
         if (cst != OK) {
             if (src_path) close(src_fd);
@@ -663,16 +663,21 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     uint32_t stream_crc = 0;
     uint64_t offset = 0;
 
-    /* Parity protects what is stored, and the nonce is stored. */
+    /*
+     * Parity protects what is stored, and the nonce is stored.
+     *
+     * This fed back the first twelve bytes of the file for one commit, which
+     * is the object header, not the nonce - the nonce follows it. CRC and
+     * parity then described a payload that did not exist, so every whole-file
+     * load of an encrypted object failed its CRC and ran an RS decode against
+     * parity computed over the wrong bytes. The streaming reader never
+     * noticed because it checks the hash rather than the CRC, which is why a
+     * clean large-object round trip proved nothing.
+     */
     if (cs) {
-        uint8_t nonce_copy[OBJECT_CRYPT_NONCE_BYTES];
-        if (pread(tfd, nonce_copy, sizeof(nonce_copy), 0) == (ssize_t)sizeof(nonce_copy)) {
-            stream_crc = crc32c_update(stream_crc, nonce_copy, sizeof(nonce_copy));
-            if (rs_parity_stream_feed(&ps, nonce_copy, sizeof(nonce_copy)) != 0)
-                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (nonce)");
-        } else {
-            st = set_error_errno(ERR_IO, "stream: cannot re-read nonce");
-        }
+        stream_crc = crc32c_update(stream_crc, nonce, sizeof(nonce));
+        if (rs_parity_stream_feed(&ps, nonce, sizeof(nonce)) != 0)
+            st = set_error_errno(ERR_IO, "stream: RS parity feed failed (nonce)");
     }
 
     /* Helper: push the progress line down before logging so our messages
@@ -1135,6 +1140,58 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx);
 
+/*
+ * One place where a sparse payload turns into stored bytes.
+ *
+ * This was a macro that hashed, wrote, CRC'd and fed parity in four lines.
+ * Encryption does not fit that shape: the hash covers the plaintext and
+ * everything after it covers the ciphertext, and two of the three callers
+ * hand over memory they do not own (a stack struct and the caller's region
+ * table), so encrypting in place is not available the way it is on the
+ * ordinary streaming path. A scratch buffer and a real function cost one
+ * copy per chunk and make the ordering explicit.
+ */
+typedef struct {
+    int                    tfd;
+    EVP_MD_CTX            *mdctx;
+    rs_parity_stream_t    *ps;
+    object_crypt_stream_t *cs;    /* NULL when the repository has no key */
+    uint8_t               *cbuf;  /* STREAM_CHUNK ciphertext scratch, cs only */
+    uint32_t               crc;
+    uint64_t               total_written;
+} sparse_emit_t;
+
+/* Store n bytes: hash the plaintext, encrypt if the repository has a key,
+ * then write and cover what was written with CRC and parity. */
+static status_t sp_emit(sparse_emit_t *e, const void *data, size_t n)
+{
+    if (n == 0) return OK;
+    if (EVP_DigestUpdate(e->mdctx, data, n) != 1)
+        return set_error(ERR_IO, "sparse_stream: SHA256 update");
+
+    const uint8_t *p = data;
+    size_t left = n;
+    while (left > 0) {
+        size_t chunk = left;
+        const uint8_t *out = p;
+        if (e->cs) {
+            if (chunk > STREAM_CHUNK) chunk = STREAM_CHUNK;
+            status_t cst = object_crypt_stream_update(e->cs, p, chunk, e->cbuf);
+            if (cst != OK) return cst;
+            out = e->cbuf;
+        }
+        if (io_write_full(e->tfd, out, chunk) != 0)
+            return set_error_errno(ERR_IO, "sparse_stream: write tfd");
+        e->crc = crc32c_update(e->crc, out, chunk);
+        if (rs_parity_stream_feed(e->ps, out, chunk) != 0)
+            return set_error_errno(ERR_IO, "sparse_stream: rs feed");
+        e->total_written += chunk;
+        p += chunk;
+        left -= chunk;
+    }
+    return OK;
+}
+
 /* Streaming writer for sparse objects. Writes [sparse_hdr_t][regions[]][data]
  * to a new object without ever materializing the full payload in RAM.
  * Takes ownership of fd (closes on return). */
@@ -1146,12 +1203,6 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
                                            uint8_t out_hash[OBJECT_HASH_SIZE],
                                            int *out_is_new,
                                            uint64_t *out_phys_bytes) {
-    if (store_key(store)) {
-        if (src_path) close(fd);
-        return set_error(ERR_INVALID,
-                         "encrypted repositories cannot yet store sparse objects");
-    }
-
     (void)file_size;  /* uncompressed_size is the sparse payload size, not file size */
 
     /* Compute total payload size (header + regions table + region data) */
@@ -1212,33 +1263,46 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
         return set_error(ERR_NOMEM, "sparse_stream: rs init");
     }
 
-    uint32_t crc = 0;
-    uint64_t total_written = 0;
     status_t st = OK;
+    sparse_emit_t em = { .tfd = tfd, .mdctx = mdctx, .ps = &ps };
+    uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
 
-    /* Helper macro: hash + crc + rs + write to tfd */
-    #define SP_EMIT(buf, n) do {                                               \
-        if (EVP_DigestUpdate(mdctx, (buf), (n)) != 1) {                        \
-            st = set_error(ERR_IO, "sparse_stream: SHA256 update"); goto sp_done; \
-        }                                                                      \
-        if (io_write_full(tfd, (buf), (n)) != 0) {                             \
-            st = set_error_errno(ERR_IO, "sparse_stream: write tfd"); goto sp_done; \
-        }                                                                      \
-        crc = crc32c_update(crc, (buf), (n));                                  \
-        if (rs_parity_stream_feed(&ps, (buf), (n)) != 0) {                     \
-            st = set_error_errno(ERR_IO, "sparse_stream: rs feed"); goto sp_done; \
-        }                                                                      \
-        total_written += (uint64_t)(n);                                        \
-    } while (0)
+    /*
+     * The nonce goes down first, before the sparse header, so a reader has it
+     * before the first byte it has to decrypt. It is part of what is stored,
+     * so CRC and parity cover it; it is not part of what is hashed, because
+     * the hash names the payload and two stores of the same payload draw
+     * different nonces.
+     */
+    const repo_key_t *enc_key = store_key(store);
+    if (enc_key) {
+        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+        st = object_crypt_stream_begin(&em.cs, enc_key, nonce, 1);
+        if (st == OK) {
+            em.cbuf = malloc(STREAM_CHUNK);
+            if (!em.cbuf) st = set_error(ERR_NOMEM, "sparse_stream: cipher buf");
+        }
+        if (st == OK) {
+            if (io_write_full(tfd, nonce, sizeof(nonce)) != 0) {
+                st = set_error_errno(ERR_IO, "sparse_stream: write nonce");
+            } else {
+                em.crc = crc32c_update(em.crc, nonce, sizeof(nonce));
+                if (rs_parity_stream_feed(&ps, nonce, sizeof(nonce)) != 0)
+                    st = set_error_errno(ERR_IO, "sparse_stream: rs feed (nonce)");
+                em.total_written += sizeof(nonce);
+            }
+        }
+        if (st != OK) goto sp_done;
+    }
 
-    /* Write sparse header */
+    /* Sparse header, then the regions table, then each region's data. */
     sparse_hdr_t shdr = { .magic = SPARSE_MAGIC, .region_count = n_regions };
-    SP_EMIT(&shdr, sizeof(shdr));
+    st = sp_emit(&em, &shdr, sizeof(shdr));
+    if (st != OK) goto sp_done;
 
-    /* Write regions table */
-    SP_EMIT(regions, (size_t)n_regions * sizeof(sparse_region_t));
+    st = sp_emit(&em, regions, (size_t)n_regions * sizeof(sparse_region_t));
+    if (st != OK) goto sp_done;
 
-    /* Stream each region's data */
     uint8_t *buf = malloc(STREAM_CHUNK);
     if (!buf) { st = set_error(ERR_NOMEM, "sparse_stream: buf alloc"); goto sp_done; }
 
@@ -1255,15 +1319,34 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
                 st = set_error_errno(ERR_IO, "sparse_stream: read region %u", r);
                 break;
             }
-            SP_EMIT(buf, (size_t)got);
+            st = sp_emit(&em, buf, (size_t)got);
+            if (st != OK) break;
             remaining -= (uint64_t)got;
         }
     }
     free(buf);
 
-    #undef SP_EMIT
+    /* The tag closes the payload and lands before the parity trailer, so
+     * parity covers it like everything else that is stored. */
+    if (st == OK && em.cs) {
+        st = object_crypt_stream_finish(em.cs, tag, NULL);
+        if (st == OK) {
+            if (io_write_full(tfd, tag, sizeof(tag)) != 0) {
+                st = set_error_errno(ERR_IO, "sparse_stream: write tag");
+            } else {
+                em.crc = crc32c_update(em.crc, tag, sizeof(tag));
+                if (rs_parity_stream_feed(&ps, tag, sizeof(tag)) != 0)
+                    st = set_error_errno(ERR_IO, "sparse_stream: rs feed (tag)");
+                em.total_written += sizeof(tag);
+            }
+        }
+    }
 
 sp_done:
+    object_crypt_stream_free(em.cs);
+    free(em.cbuf);
+    uint32_t crc = em.crc;
+    uint64_t total_written = em.total_written;
     if (src_path) close(fd);
 
     if (st != OK) {
@@ -1272,11 +1355,13 @@ sp_done:
         return st;
     }
 
-    if (total_written != payload_sz) {
+    uint64_t expect_written = payload_sz + (enc_key ? OBJECT_CRYPT_OVERHEAD : 0);
+    if (total_written != expect_written) {
         rs_parity_stream_destroy(&ps);
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
         return set_error(ERR_IO, "sparse_stream: payload size mismatch %llu != %llu",
-                         (unsigned long long)total_written, (unsigned long long)payload_sz);
+                         (unsigned long long)total_written,
+                         (unsigned long long)expect_written);
     }
 
     if (rs_parity_stream_finish(&ps) != 0) {
@@ -1300,7 +1385,10 @@ sp_done:
         return OK;
     }
 
+    /* compressed_size counts what is stored - nonce and tag included - so
+     * every trailer offset and parity length stays a plain byte count. */
     hdr.compressed_size = total_written;
+    hdr.encryption      = enc_key ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
     memcpy(hdr.hash, out_hash, OBJECT_HASH_SIZE);
     if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);

@@ -298,6 +298,58 @@ static void test_swapped_payload_is_rejected(void **state)
     store_set_key(store, NULL);
 }
 
+/*
+ * An encrypted object written by the streaming path must read back clean.
+ *
+ * The nonce is stored ahead of the ciphertext, so CRC and parity have to
+ * cover it. For one commit they covered the first twelve bytes of the file
+ * instead, which is the object header - the nonce follows it. Every whole
+ * load of an encrypted object then failed its CRC and ran an RS decode
+ * against parity describing bytes that were never there. Nothing failed
+ * loudly: the decode reported a repair, the payload survived, and the only
+ * visible trace was a warning in the log.
+ *
+ * The parity counters are the assertion. A clean object must need no repair.
+ */
+static void test_encrypted_object_reads_without_repair(void **state)
+{
+    (void)state;
+    repo_key_t key;
+    assert_int_equal(repo_key_generate(&key), OK);
+    store_set_key(store, &key);
+
+    /* An fd, so this takes the streaming writer; under the 16 MiB load
+     * threshold, so reading it back takes the whole-file reader that checks
+     * the CRC. Both halves of the bug are needed to see it. */
+    const char *src = TEST_REPO "/tmp/parity_enc_src.bin";
+    int fd = open(src, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    assert_true(fd >= 0);
+    enum { N = 256 * 1024 };
+    uint8_t *body = malloc(N);
+    assert_non_null(body);
+    for (size_t i = 0; i < N; i++) body[i] = (uint8_t)(i * 7 + (i >> 11));
+    assert_int_equal(write(fd, body, N), (ssize_t)N);
+    assert_int_equal(lseek(fd, 0, SEEK_SET), 0);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store_file(store, fd, N, hash), OK);
+    close(fd);
+    unlink(src);
+
+    parity_stats_reset();
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, N);
+    assert_memory_equal(out, body, N);
+    free(out);
+    free(body);
+
+    parity_stats_t ps = parity_stats_get();
+    assert_int_equal((int)ps.repaired, 0);
+    assert_int_equal((int)ps.uncorrectable, 0);
+}
+
 int main(void)
 {
     rs_init();
@@ -309,6 +361,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_repair_persists_the_correction, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_of_clean_object_is_a_noop, setup, teardown),
         cmocka_unit_test_setup_teardown(test_swapped_payload_is_rejected, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_encrypted_object_reads_without_repair, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tree_object_corruption_is_repaired, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
