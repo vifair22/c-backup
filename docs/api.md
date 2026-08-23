@@ -74,11 +74,36 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 | POST | `/repos/<id>/gfs` | Apply retention |
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
+| POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
 either as it appears in the browser or without its leading slash, and matches
 on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
+
+Verify is the answer to "is the backup still good", which is a different
+question from "did the backup run". Three levels, because the cost spread is
+enormous: `index` confirms every registered object still resolves and reads no
+payloads; `structure` additionally parses each object header; `deep` reads
+every payload and checks its SHA-256, which is the only level that can prove
+the bytes are right.
+
+By default a deep verify repairs what it can. Every object carries Reed-Solomon
+parity, and the read that proves damage exists is the expensive part, so
+writing the correction while already there costs almost nothing extra. Pass
+`repair=0` (or `dry_run=1`) for a scrub that touches nothing; it still reports
+damage, and for small objects it still distinguishes recoverable damage from
+loss, because it can apply parity in memory without writing.
+
+A checking-only verify takes the repository read lock, so a backup can run
+underneath it. With repair on it takes the write lock like any other writer.
+
+Findings name files, not hashes: a damaged object is reported with how many
+files reference it, a sample of their names, and which snapshots contain them,
+so the report says what was lost and what is still clean. Runs are recorded,
+and `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
+`cbackup_last_snapshot_age_seconds` - between them, an alert can tell that
+backups are running *and* that what they wrote is still readable.
 
 Packing runs automatically at the end of every backup, because compression
 only happens at pack time: a backup that stopped at the snapshot would have

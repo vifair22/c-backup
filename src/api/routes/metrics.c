@@ -118,6 +118,31 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "SELECT CAST(strftime('%s','now') AS INTEGER) - COALESCE(MAX(ts), "
                 "CAST(strftime('%s','now') AS INTEGER)) FROM snapshots");
 
+    /*
+     * The verify counterpart. A backup that ran is not the same as a backup
+     * that is still readable, and the second question had no answer at all
+     * until there was something to scrub with. Age since the last completed
+     * scrub is what an alert should watch; the damage counters are what it
+     * should page on.
+     */
+    emit_scalar(&m, "cbackup_last_verify_age_seconds",
+                "Seconds since the most recent completed verify finished.", "gauge",
+                "SELECT CAST(strftime('%s','now') AS INTEGER) - COALESCE(MAX(finished_at), "
+                "CAST(strftime('%s','now') AS INTEGER)) FROM verify_runs WHERE completed = 1");
+    emit_scalar(&m, "cbackup_verify_unrecoverable_objects",
+                "Objects the most recent completed verify could not reconstruct.", "gauge",
+                "SELECT COALESCE((SELECT unrecoverable + missing FROM verify_runs"
+                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+    emit_scalar(&m, "cbackup_verify_repaired_objects",
+                "Objects repaired from parity by the most recent completed verify.", "gauge",
+                "SELECT COALESCE((SELECT repaired FROM verify_runs"
+                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+    emit_scalar(&m, "cbackup_verify_affected_files",
+                "Files affected by damage the most recent completed verify could not repair.",
+                "gauge",
+                "SELECT COALESCE((SELECT affected_files FROM verify_runs"
+                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+
     if (!m.buf) return api_error(500, "cannot build metrics");
 
     api_response_t resp = api_ok(m.buf);

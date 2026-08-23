@@ -550,6 +550,15 @@ never outlive their pack.
   bytes yields ceil(B/256 MiB) packs, so the reduction is known before a
   byte is copied. Every rewrite emits its removal and commit callbacks,
   so the derived index never drifts.
+- **Verify** (`src/ops/verify.c`): the scrub. Walks every registered object in
+  pack order (sequential within each `.dat`, loose objects last), reads it
+  back, and compares against its SHA-256. Objects up to 16 MiB are read
+  through `object_load`, which applies the payload Reed-Solomon parity in
+  memory; larger ones stream, which checks the hash but cannot use payload
+  parity (see the gap note below). Damage that parity covers is written back
+  to disk via `object_repair`/`pack_object_repair` - the only callers those
+  functions have ever had. Damage beyond parity is reported with its blast
+  radius resolved through `nodes.content_hash`: which files, which snapshots.
 - **Prune / GFS** (`src/ops/prune.c`, `gfs.c`): retention deletes snapshot
   records and node rows; the objects they referenced become GC's problem,
   which is the correct division - prune decides *what* is dead, GC decides
@@ -563,6 +572,15 @@ never outlive their pack.
   database.
 
 ---
+
+> **Gap: streamed reads cannot use payload parity.** `object_load` applies
+> Reed-Solomon to a damaged payload and recovers it; `object_load_stream`
+> repairs only the object header and then fails the SHA-256 check. Restore
+> uses the streaming path, so today a single flipped byte in an object above
+> 16 MiB fails to restore even though the parity that would fix it is sitting
+> in the same file. A repairing verify can still rescue it, because
+> `object_repair` reads the whole payload into memory - which is itself
+> unbounded and needs the same streaming decode to fix properly.
 
 ## Part 6: sizes, thresholds and where they live
 

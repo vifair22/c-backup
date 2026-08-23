@@ -10,6 +10,7 @@
 #include "prune.h"
 #include "pack.h"
 #include "reindex.h"
+#include "verify.h"
 #include "restore.h"
 #include "store.h"
 #include "store_index.h"
@@ -210,6 +211,7 @@ typedef enum {
     SNAP_JOB_GC,
     SNAP_JOB_GFS,
     SNAP_JOB_PACK,
+    SNAP_JOB_VERIFY,
 } snap_job_kind_t;
 
 typedef struct {
@@ -221,6 +223,8 @@ typedef struct {
     char           *subpath;
     int             overwrite;
     int             dry_run;
+    verify_level_t  verify_level;
+    int             verify_repair;
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -272,10 +276,23 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 {
     snap_job_t *j = arg;
 
-    /* Restore reads the repo; reindex rewrites index rows for it. Both take
+    /*
+     * Restore reads the repo; reindex rewrites index rows for it. Both take
      * the write lock, because a reindex racing a backup would interleave two
-     * writers over the same snapshot rows. */
-    status_t st = repo_trylock_write(j->repo_id);
+     * writers over the same snapshot rows.
+     *
+     * A verify that only checks is the one job that does not write anything,
+     * so it takes the read lock and a backup can run underneath it. With
+     * repair on it rewrites object bytes and needs the write lock like
+     * everything else.
+     */
+    status_t st;
+    int read_only_job = (j->kind == SNAP_JOB_VERIFY && !j->verify_repair);
+    if (read_only_job) {
+        st = repo_lock_read(j->repo_id);
+    } else {
+        st = repo_trylock_write(j->repo_id);
+    }
     if (st != OK) return st;
 
     store_t *store = NULL;
@@ -292,6 +309,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          * pack time, so an unpacked repository stores more than its source
          * and keeps one inode per object. */
         st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+    } else if (j->kind == SNAP_JOB_VERIFY) {
+        st = verify_run(store, j->db, j->repo_id, j->verify_level,
+                        j->verify_repair, cancel, progress, progress_ctx, NULL);
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
@@ -367,6 +387,29 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         j->dry_run = dry && (strcmp(dry, "1") == 0 || strcmp(dry, "true") == 0);
     }
 
+    /*
+     * Verify defaults: deep, and repairing. A scrub that finds correctable
+     * damage and leaves it on disk has done half the job, and the read that
+     * proves the damage exists is the expensive part - not writing the fix
+     * while we are already there would mean paying it twice.
+     */
+    if (kind == SNAP_JOB_VERIFY) {
+        j->verify_level  = VERIFY_LEVEL_DEEP;
+        j->verify_repair = 1;
+
+        const char *lvl = api_query_param(req, "level");
+        if (lvl && verify_level_from_string(lvl, &j->verify_level) != 0) {
+            snap_job_free(j);
+            return api_error(400, "level must be index, structure or deep");
+        }
+        const char *rep = api_query_param(req, "repair");
+        if (rep && (strcmp(rep, "0") == 0 || strcmp(rep, "false") == 0))
+            j->verify_repair = 0;
+        /* A dry run is a check that must not write, whatever else was
+         * asked for. */
+        if (j->dry_run) j->verify_repair = 0;
+    }
+
     if (kind == SNAP_JOB_RESTORE) {
         if (!req->body || req->body_len == 0) {
             snap_job_free(j);
@@ -390,7 +433,8 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     }
 
     int64_t job_id = 0;
-    const char *action = kind == SNAP_JOB_REINDEX ? "reindex"
+    const char *action = kind == SNAP_JOB_VERIFY  ? "verify"
+                       : kind == SNAP_JOB_REINDEX ? "reindex"
                        : kind == SNAP_JOB_GC      ? "gc"
                        : kind == SNAP_JOB_GFS     ? "gfs"
                        : kind == SNAP_JOB_PACK    ? "pack"
@@ -431,6 +475,7 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
     if (strcmp(rest, "/gc") == 0)      return submit_snap_job(repo_id, 0, req, SNAP_JOB_GC);
     if (strcmp(rest, "/gfs") == 0)     return submit_snap_job(repo_id, 0, req, SNAP_JOB_GFS);
     if (strcmp(rest, "/pack") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_PACK);
+    if (strcmp(rest, "/verify") == 0)  return submit_snap_job(repo_id, 0, req, SNAP_JOB_VERIFY);
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;
@@ -485,7 +530,8 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                  const char *action, int64_t *out_job_id)
 {
     snap_job_kind_t kind;
-    if      (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
+    if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
+    else if (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
     else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
     else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;
     else if (strcmp(action, "pack") == 0)    kind = SNAP_JOB_PACK;
