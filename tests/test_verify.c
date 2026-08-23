@@ -368,6 +368,124 @@ static void test_cancelled_run_is_marked_incomplete(void **state)
     db_result_free(r);
 }
 
+/*
+ * Large objects are the case that mattered and the case that did not work.
+ *
+ * Anything above STREAM_LOAD_MAX cannot be loaded whole, so it is streamed,
+ * and the streaming path checked only the SHA-256: the parity in the same
+ * file went unused and a single flipped byte made the object unreadable.
+ * Large incompressible objects stay loose permanently by design, so this was
+ * exactly the video and disk-image case. 17 MiB of incompressible bytes is
+ * the smallest fixture that reproduces it.
+ */
+static void write_incompressible(const char *path, size_t len, unsigned seed)
+{
+    FILE *f = fopen(path, "wb");
+    assert_non_null(f);
+    unsigned st = seed;
+    uint8_t chunk[65536];
+    size_t written = 0;
+    while (written < len) {
+        for (size_t i = 0; i < sizeof(chunk); i++) {
+            st = st * 1103515245u + 12345u;
+            chunk[i] = (uint8_t)(st >> 16);
+        }
+        size_t want = len - written < sizeof(chunk) ? len - written : sizeof(chunk);
+        assert_int_equal(fwrite(chunk, 1, want, f), want);
+        written += want;
+    }
+    fclose(f);
+}
+
+#define BIG_OBJECT_BYTES ((size_t)(17 * 1024 * 1024))
+
+/*
+ * Note what this does and does not prove. A repairing verify could always
+ * rescue a large object, because object_repair read the whole payload into
+ * memory to do it - which is fine at 17 MiB and fatal at 40 GiB. The repair
+ * is now group-at-a-time, but no test here can demonstrate that bound
+ * without an object bigger than the machine's RAM. This is a regression test
+ * for the repair path; the memory ceiling is argued in the code, not
+ * measured here.
+ */
+static void test_large_object_damage_is_repaired(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 7u);
+    run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", hex);
+    char path[PATH_MAX];
+    loose_path_of(hex, path, sizeof(path));
+
+    /* Well past the 16 MiB in-memory ceiling, so every read of it streams. */
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_true((size_t)sb.st_size > 16 * 1024 * 1024);
+
+    /* One byte, deep inside the payload. Recoverable, and before this the
+     * object was simply lost. */
+    flip_byte(path, (off_t)sizeof(object_header_t) + 9 * 1024 * 1024);
+
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.unrecoverable, 0);
+    assert_int_equal(res.repaired, 1);
+
+    /* And the correction is on disk: a second scrub finds nothing to do. */
+    verify_result_t again;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &again), OK);
+    assert_int_equal(again.repaired, 0);
+    assert_int_equal(again.ok, again.checked);
+}
+
+/*
+ * This is the one that was broken. A plain streaming read of a damaged large
+ * object - which is precisely what restore does - used to fail outright, with
+ * the parity that would have fixed it sitting unread in the same file.
+ */
+static void test_large_object_streams_through_damage(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 11u);
+    run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", hex);
+    char path[PATH_MAX];
+    loose_path_of(hex, path, sizeof(path));
+    flip_byte(path, (off_t)sizeof(object_header_t) + 4 * 1024 * 1024);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(hex + i * 2, "%2x", &v), 1);
+        hash[i] = (uint8_t)v;
+    }
+
+    char out[PATH_MAX];
+    snprintf(out, sizeof(out), "%s/restored.bin", TEST_DIR);
+    int fd = open(out, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+
+    uint64_t sz = 0;
+    uint8_t  type = 0;
+    parity_stats_reset();
+    assert_int_equal(object_load_stream(store, hash, fd, &sz, &type), OK);
+    close(fd);
+
+    /* Corrected, not merely tolerated: the bytes written out are the
+     * original file, byte for byte. */
+    assert_int_equal(sz, BIG_OBJECT_BYTES);
+    assert_true(parity_stats_get().repaired > 0);
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof(cmd), "cmp -s '%s' '%s'", TEST_SRC "/big.bin", out);
+    assert_int_equal(system(cmd), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -380,6 +498,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_verify_covers_packed_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_run_is_recorded, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelled_run_is_marked_incomplete, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_object_damage_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_object_streams_through_damage, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

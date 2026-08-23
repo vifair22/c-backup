@@ -554,8 +554,8 @@ never outlive their pack.
   pack order (sequential within each `.dat`, loose objects last), reads it
   back, and compares against its SHA-256. Objects up to 16 MiB are read
   through `object_load`, which applies the payload Reed-Solomon parity in
-  memory; larger ones stream, which checks the hash but cannot use payload
-  parity (see the gap note below). Damage that parity covers is written back
+  memory; larger ones stream and self-correct on a second pass when the hash
+  disagrees. Damage that parity covers is written back
   to disk via `object_repair`/`pack_object_repair` - the only callers those
   functions have ever had. Damage beyond parity is reported with its blast
   radius resolved through `nodes.content_hash`: which files, which snapshots.
@@ -573,14 +573,15 @@ never outlive their pack.
 
 ---
 
-> **Gap: streamed reads cannot use payload parity.** `object_load` applies
-> Reed-Solomon to a damaged payload and recovers it; `object_load_stream`
-> repairs only the object header and then fails the SHA-256 check. Restore
-> uses the streaming path, so today a single flipped byte in an object above
-> 16 MiB fails to restore even though the parity that would fix it is sitting
-> in the same file. A repairing verify can still rescue it, because
-> `object_repair` reads the whole payload into memory - which is itself
-> unbounded and needs the same streaming decode to fix properly.
+Parity applies on every read path, at every size. Objects that fit in memory
+are corrected inline by `object_load`. Larger ones stream: the first pass
+hashes and emits, and only a hash mismatch triggers a second pass that
+re-reads group by group, corrects each group from its parity and re-emits, so
+a clean object pays nothing for the machinery. That second pass needs a
+destination it can rewind - a regular file or `/dev/null` - which covers
+restore and verify; a non-rewindable sink (the pipe inside sparse restore)
+falls back to an explicit repairing verify. Repair on disk is bounded the
+same way, one 15 KiB group at a time regardless of object size.
 
 ## Part 6: sizes, thresholds and where they live
 

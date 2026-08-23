@@ -1510,6 +1510,178 @@ status_t object_load(store_t *store,
     return OK;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Streaming payload repair                                            */
+/*                                                                     */
+/* An object larger than STREAM_LOAD_MAX cannot be loaded whole, so it */
+/* is streamed - and until now the streaming path checked the SHA-256  */
+/* and nothing else. The Reed-Solomon parity sitting in the same file  */
+/* went unused, so a single flipped byte made a large object           */
+/* unreadable even though the bytes to rebuild it were right there.    */
+/* Large incompressible objects stay loose permanently by design, so   */
+/* the exposure was exactly the video, audio and image files that      */
+/* dominate a real backup.                                             */
+/*                                                                     */
+/* Detection is free: the hash is already computed, and a clean object */
+/* costs nothing extra. Only a mismatch triggers a second, corrective  */
+/* pass, group by group, in bounded memory.                            */
+/* ------------------------------------------------------------------ */
+
+/* One RS interleave group: RS_K * RS_INTERLEAVE data bytes protected by
+ * RS_2T * RS_INTERLEAVE parity bytes. Groups are independent, which is what
+ * makes correction streamable at all. */
+#define RS_STREAM_GROUP_DATA ((size_t)RS_K * RS_INTERLEAVE)
+#define RS_STREAM_GROUP_PAR  ((size_t)RS_2T * RS_INTERLEAVE)
+
+/*
+ * Can the destination be rewound so a corrective pass may replace what the
+ * first pass already wrote?
+ *
+ * A regular file can be truncated back. A character device - /dev/null, which
+ * is what verify streams into - swallows everything, so there is nothing to
+ * undo. A pipe cannot unsend, which is the sparse-restore path: those objects
+ * fall back to an explicit repair.
+ */
+static int out_fd_rewindable(int out_fd)
+{
+    struct stat sb;
+    if (fstat(out_fd, &sb) != 0) return 0;
+    return S_ISREG(sb.st_mode) || S_ISCHR(sb.st_mode);
+}
+
+static int out_fd_rewind(int out_fd)
+{
+    struct stat sb;
+    if (fstat(out_fd, &sb) != 0) return -1;
+    if (!S_ISREG(sb.st_mode)) return 0;   /* nothing written that persists */
+    if (lseek(out_fd, 0, SEEK_SET) == (off_t)-1) return -1;
+    return ftruncate(out_fd, 0);
+}
+
+/*
+ * Read the RS parity block out of a loose object's trailer.
+ * Returns 0 and fills *out_par (caller frees) when parity is present and the
+ * footer agrees with the layout; -1 when there is nothing usable.
+ */
+static int load_loose_rs_parity(int fd, const object_header_t *hdr,
+                                uint8_t **out_par, size_t *out_par_sz)
+{
+    *out_par = NULL;
+    *out_par_sz = 0;
+    if (hdr->version != 2) return -1;
+
+    size_t rs_sz = rs_parity_size((size_t)hdr->compressed_size);
+    if (rs_sz == 0) return -1;
+
+    off_t trailer_off = (off_t)sizeof(*hdr) + (off_t)hdr->compressed_size;
+    off_t ftr_off = trailer_off + (off_t)sizeof(parity_record_t) + (off_t)rs_sz
+                  + (off_t)(sizeof(uint32_t) * 2);
+    parity_footer_t pftr;
+    if (pread(fd, &pftr, sizeof(pftr), ftr_off) != (ssize_t)sizeof(pftr) ||
+        pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION)
+        return -1;
+
+    uint8_t *par = malloc(rs_sz);
+    if (!par) return -1;
+    if (pread(fd, par, rs_sz, trailer_off + (off_t)sizeof(parity_record_t))
+        != (ssize_t)rs_sz) {
+        free(par);
+        return -1;
+    }
+    *out_par = par;
+    *out_par_sz = rs_sz;
+    return 0;
+}
+
+/*
+ * Second pass: re-read the payload group by group, correct each group from
+ * its parity, and re-emit. Bounded by one group buffer (about 15 KiB)
+ * regardless of how large the object is, which is design constraint 2 - the
+ * old whole-payload repair path could not honour it.
+ */
+static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
+                                        const uint8_t hash[OBJECT_HASH_SIZE],
+                                        int out_fd)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+
+    if (!out_fd_rewindable(out_fd)) {
+        log_warn("object %s: damaged, and the destination cannot be rewound "
+                 "to rewrite it; run a repairing verify", hex);
+        return ERR_CORRUPT;
+    }
+
+    uint8_t *rs_par = NULL;
+    size_t   rs_sz  = 0;
+    if (load_loose_rs_parity(fd, hdr, &rs_par, &rs_sz) != 0) {
+        log_warn("object %s: damaged and has no usable parity", hex);
+        return ERR_CORRUPT;
+    }
+
+    if (out_fd_rewind(out_fd) != 0) {
+        free(rs_par);
+        return ERR_IO;
+    }
+
+    uint8_t *gbuf = malloc(RS_STREAM_GROUP_DATA);
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!gbuf || !mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        free(gbuf); EVP_MD_CTX_free(mdctx); free(rs_par);
+        return ERR_NOMEM;
+    }
+
+    rs_init();
+    status_t st = OK;
+    uint64_t remaining = hdr->compressed_size;
+    off_t    off = (off_t)sizeof(*hdr);
+    const uint8_t *par = rs_par;
+    size_t   par_left = rs_sz;
+    int      corrected = 0;
+
+    while (remaining > 0 && st == OK) {
+        size_t want = (remaining < RS_STREAM_GROUP_DATA)
+                      ? (size_t)remaining : RS_STREAM_GROUP_DATA;
+        if (pread(fd, gbuf, want, off) != (ssize_t)want) { st = ERR_CORRUPT; break; }
+
+        if (par_left >= RS_STREAM_GROUP_PAR) {
+            int rc = rs_parity_decode(gbuf, want, par);
+            if (rc > 0) corrected += rc;
+            else if (rc < 0) { st = ERR_CORRUPT; break; }
+            par += RS_STREAM_GROUP_PAR;
+            par_left -= RS_STREAM_GROUP_PAR;
+        }
+
+        if (EVP_DigestUpdate(mdctx, gbuf, want) != 1) { st = ERR_IO; break; }
+        if (io_write_full(out_fd, gbuf, want) != 0)   { st = ERR_IO; break; }
+        off += (off_t)want;
+        remaining -= want;
+    }
+
+    if (st == OK) {
+        uint8_t got[OBJECT_HASH_SIZE];
+        unsigned dlen = 0;
+        if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
+            dlen != OBJECT_HASH_SIZE ||
+            memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
+            st = ERR_CORRUPT;
+    }
+
+    free(gbuf);
+    EVP_MD_CTX_free(mdctx);
+    free(rs_par);
+
+    if (st == OK) {
+        log_warn("object %s: %d byte(s) corrected from parity while streaming",
+                 hex, corrected);
+        parity_stats_add_repaired(1);
+    } else {
+        parity_stats_add_uncorrectable(1);
+    }
+    return st;
+}
+
 status_t object_load_stream(store_t *store,
                              const uint8_t hash[OBJECT_HASH_SIZE],
                              int out_fd,
@@ -1596,19 +1768,34 @@ status_t object_load_stream(store_t *store,
             remaining -= want;
         }
         free(buf);
-        close(fd);
 
+        int hash_bad = 0;
         if (st == OK) {
             uint8_t got[OBJECT_HASH_SIZE];
             unsigned dlen = 0;
             if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
                 dlen != OBJECT_HASH_SIZE ||
-                memcmp(got, hash, OBJECT_HASH_SIZE) != 0) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-                st = set_error(ERR_CORRUPT, "object %s: hash mismatch (stream)", hex);
-            }
+                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
+                hash_bad = 1;
         }
         EVP_MD_CTX_free(mdctx);
+
+        /*
+         * The bytes on disk do not match the name they are filed under.
+         * Parity may still be able to rebuild them, one group at a time, in
+         * bounded memory - which is the whole reason the trailer exists. The
+         * first pass has already written what it read, so this only runs
+         * where that can be taken back.
+         */
+        if (st == OK && hash_bad) {
+            st = stream_payload_repaired(fd, &hdr, hash, out_fd);
+            if (st != OK) {
+                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+                close(fd);
+                return set_error(ERR_CORRUPT, "object %s: hash mismatch (stream)", hex);
+            }
+        }
+        close(fd);
         return st;
 
     } else {
@@ -1832,40 +2019,71 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
         }
     }
 
-    /* Payload: CRC check then RS repair */
-    if (hdr.compressed_size > 0 && hdr.compressed_size <= (128ull * 1024 * 1024 * 1024)) {
-        size_t csize = (size_t)hdr.compressed_size;
-        uint32_t stored_crc;
+    /*
+     * Payload: CRC pre-check, then correct group by group.
+     *
+     * This used to read the entire payload into memory and write it all
+     * back, guarded only by a 128 GiB sanity limit - which is not a limit
+     * on a machine with 32 GiB of RAM. Objects are allowed to exceed memory
+     * (design constraint 2), and the ones that stay loose the longest are
+     * the large incompressible ones, so the repair path was unusable
+     * exactly where it was most needed. Groups are independent, so
+     * correcting one at a time costs a 15 KiB buffer whatever the size.
+     */
+    if (hdr.compressed_size > 0) {
+        size_t   csize = (size_t)hdr.compressed_size;
+        size_t   rs_sz = rs_parity_size(csize);
+        uint32_t stored_crc = 0;
         off_t crc_off = file_end - (off_t)sizeof(pftr)
                         - (off_t)sizeof(uint32_t) - (off_t)sizeof(uint32_t);
-        if (pread(fd, &stored_crc, sizeof(stored_crc), crc_off) == (ssize_t)sizeof(stored_crc)) {
-            char *cpayload = malloc(csize);
-            if (cpayload) {
-                if (pread(fd, cpayload, csize, (off_t)sizeof(hdr)) == (ssize_t)csize) {
-                    uint32_t cur_crc = crc32c(cpayload, csize);
-                    if (cur_crc != stored_crc) {
-                        size_t rs_sz = rs_parity_size(csize);
-                        if (rs_sz > 0) {
-                            uint8_t *rs_par = malloc(rs_sz);
-                            if (rs_par) {
-                                off_t rs_off = trailer_start + (off_t)sizeof(hdr_par);
-                                if (pread(fd, rs_par, rs_sz, rs_off) == (ssize_t)rs_sz) {
-                                    rs_init();
-                                    int rrc = rs_parity_decode(cpayload, csize, rs_par);
-                                    if (rrc > 0) {
-                                        /* Write corrected payload back */
-                                        if (pwrite(fd, cpayload, csize, (off_t)sizeof(hdr))
-                                            == (ssize_t)csize)
-                                            total_fixed += rrc;
-                                    }
-                                }
-                                free(rs_par);
-                            }
+
+        if (rs_sz > 0 &&
+            pread(fd, &stored_crc, sizeof(stored_crc), crc_off) == (ssize_t)sizeof(stored_crc)) {
+
+            uint8_t *gbuf = malloc(RS_STREAM_GROUP_DATA);
+            uint8_t *gpar = malloc(RS_STREAM_GROUP_PAR);
+            if (gbuf && gpar) {
+                /* One sequential pass to see whether anything is wrong at
+                 * all: a clean object must not pay for syndrome work. */
+                uint32_t cur_crc = 0;
+                size_t   left = csize;
+                off_t    off = (off_t)sizeof(hdr);
+                int      readable = 1;
+                while (left > 0) {
+                    size_t want = left < RS_STREAM_GROUP_DATA ? left : RS_STREAM_GROUP_DATA;
+                    if (pread(fd, gbuf, want, off) != (ssize_t)want) { readable = 0; break; }
+                    cur_crc = crc32c_update(cur_crc, gbuf, want);
+                    off  += (off_t)want;
+                    left -= want;
+                }
+
+                if (readable && cur_crc != stored_crc) {
+                    rs_init();
+                    left = csize;
+                    off  = (off_t)sizeof(hdr);
+                    off_t par_off = trailer_start + (off_t)sizeof(hdr_par);
+                    size_t par_left = rs_sz;
+
+                    while (left > 0 && par_left >= RS_STREAM_GROUP_PAR) {
+                        size_t want = left < RS_STREAM_GROUP_DATA ? left : RS_STREAM_GROUP_DATA;
+                        if (pread(fd, gbuf, want, off) != (ssize_t)want) break;
+                        if (pread(fd, gpar, RS_STREAM_GROUP_PAR, par_off)
+                            != (ssize_t)RS_STREAM_GROUP_PAR) break;
+
+                        int rrc = rs_parity_decode(gbuf, want, gpar);
+                        if (rrc > 0) {
+                            if (pwrite(fd, gbuf, want, off) == (ssize_t)want)
+                                total_fixed += rrc;
                         }
+                        off      += (off_t)want;
+                        par_off  += (off_t)RS_STREAM_GROUP_PAR;
+                        par_left -= RS_STREAM_GROUP_PAR;
+                        left     -= want;
                     }
                 }
-                free(cpayload);
             }
+            free(gbuf);
+            free(gpar);
         }
     }
 
