@@ -207,40 +207,6 @@ static void test_repair_of_clean_object_is_a_noop(void **state)
     assert_int_equal(object_repair(store, hash), 0);
 }
 
-/*
- * Objects written before the parity trailer existed still have to load. The
- * repo predates the rewrite in the field, and refusing to read v1 objects
- * would strand data that is perfectly intact.
- */
-static void test_v1_object_without_parity_still_loads(void **state)
-{
-    (void)state;
-    const char *data = "a v1 object carries no parity trailer at all";
-    uint8_t hash[OBJECT_HASH_SIZE];
-    char path[512];
-    store_and_path(data, hash, path);
-
-    int fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-    struct stat sb;
-    assert_int_equal(fstat(fd, &sb), 0);
-    uint8_t *buf = malloc((size_t)sb.st_size);
-    assert_non_null(buf);
-    assert_int_equal(read(fd, buf, (size_t)sb.st_size), (ssize_t)sb.st_size);
-    close(fd);
-
-    object_header_t *hdr = (object_header_t *)buf;
-    size_t trunc = sizeof(object_header_t) + (size_t)hdr->compressed_size;
-    hdr->version = 1;
-
-    fd = open(path, O_WRONLY | O_TRUNC);
-    assert_true(fd >= 0);
-    assert_int_equal(write(fd, buf, trunc), (ssize_t)trunc);
-    close(fd);
-    free(buf);
-
-    assert_loads_as(hash, data);
-}
 
 /*
  * Manifest trees are objects like any other, which is the whole point of
@@ -290,7 +256,6 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_double_header_corruption_is_reported, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_persists_the_correction, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_of_clean_object_is_a_noop, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_v1_object_without_parity_still_loads, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tree_object_corruption_is_repaired, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -37,6 +37,27 @@
 #define OBJECT_CRYPT_NONCE_BYTES 12
 
 /*
+ * Which storage form the payload is being encrypted for.
+ *
+ * The nonce comes from the content hash, so the same file always encrypts to
+ * the same bytes and dedup survives. That is safe only while the same nonce
+ * always covers the same plaintext - and an object is stored twice in
+ * different forms: raw while it is loose, LZ4-compressed once it is packed.
+ * Same file, same hash, same nonce, two different plaintexts is the one thing
+ * a stream cipher must never do: XOR the two ciphertexts and the keystream
+ * cancels, leaving the XOR of the two plaintexts with the key not involved.
+ * Since one of them is the LZ4 encoding of the other, that is recoverable.
+ *
+ * Mixing the form into the derivation gives the two forms unrelated
+ * keystreams. It is not secret and is not stored: the reader always knows
+ * which form it is holding.
+ */
+typedef enum {
+    OBJECT_FORM_LOOSE  = 0,
+    OBJECT_FORM_PACKED = 1,
+} object_form_t;
+
+/*
  * Encrypt in one shot. out must hold len + OBJECT_CRYPT_TAG_BYTES; the tag is
  * appended, so the stored payload is longer than the plaintext by exactly the
  * tag. hash is the object's content hash and supplies both the nonce and the
@@ -45,12 +66,12 @@
  * decrypted into nonsense.
  */
 status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
-                        const void *in, size_t len, void *out);
+                        object_form_t form, const void *in, size_t len, void *out);
 
 /* Decrypt in one shot. in holds len + OBJECT_CRYPT_TAG_BYTES bytes; out holds
  * len. Returns ERR_CORRUPT when the tag does not verify. */
 status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
-                        const void *in, size_t len, void *out);
+                        object_form_t form, const void *in, size_t len, void *out);
 
 /*
  * Streaming, for payloads that do not fit in memory. The AEAD is fed
@@ -62,7 +83,7 @@ typedef struct object_crypt_stream object_crypt_stream_t;
 
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
                                    const repo_key_t *key, const uint8_t *hash,
-                                   int encrypting);
+                                   object_form_t form, int encrypting);
 status_t object_crypt_stream_update(object_crypt_stream_t *s,
                                     const void *in, size_t len, void *out);
 /* Encrypting: writes the tag to tag_out. Decrypting: verifies tag_in. */

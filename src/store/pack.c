@@ -146,7 +146,7 @@ static int idx_disk_cmp(const void *a, const void *b) {
 static void update_loose_header_parity(int fd, uint64_t compressed_size) {
     object_header_t hdr;
     if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return;
-    if (hdr.version != 2) return;
+    if (hdr.version < 2) return;
     off_t par_off = (off_t)sizeof(hdr) + (off_t)compressed_size;
     parity_record_t hdr_par;
     parity_record_compute(&hdr, sizeof(hdr), &hdr_par);

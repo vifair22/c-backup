@@ -40,25 +40,31 @@
 #define ACL_BLOB_DEFAULT 2
 
 /*
- * Encryption rides as a flag on the compression byte rather than a new header
- * field, so the header stays 56 bytes and every offset computed from
- * sizeof(object_header_t) keeps working untouched. A build that predates
- * encryption sees an unknown compression codec and refuses the object, which
- * is the right answer; it will not have got that far anyway, because the
- * repository marker is version 2 and it refuses those outright.
- *
- * compressed_size counts what is stored, tag included, so trailer offsets and
- * parity coverage need no special case either. The decrypting reader is the
- * only code that has to subtract the tag.
+ * Encryption codecs, in their own header field rather than packed into the
+ * compression byte. compressed_size counts what is stored, tag included, so
+ * trailer offsets and parity coverage need no special case; the decrypting
+ * reader is the only code that subtracts the tag.
  */
-#define COMPRESS_ENCRYPTED 0x80u
+#define ENCRYPT_NONE       0
+#define ENCRYPT_CHACHA20   1
 
 #define COMPRESS_NONE      0
 #define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
 #define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */
 
 #define OBJECT_MAGIC        0x42434F4Au  /* "BCOJ" */
-#define OBJECT_HDR_VERSION  2u
+/*
+ * One header layout, 64 bytes, and readers accept only this.
+ *
+ * There is no format compatibility to preserve: no repository written by an
+ * older build exists anywhere. Carrying version-dependent header sizes to
+ * protect repositories that do not exist would mean every one of the places
+ * that derives a payload offset needing to ask which version wrote it, and
+ * each of those is silently wrong rather than loudly broken when it gets the
+ * answer wrong. The eight reserved bytes are so the next field to arrive does
+ * not reopen the question.
+ */
+#define OBJECT_HDR_VERSION  3u
 #define PROBER_VERSION      1u
 
 #define NODE_TYPE_REG   1
@@ -80,7 +86,9 @@ typedef struct {
     uint64_t uncompressed_size;
     uint64_t compressed_size;
     uint8_t  hash[OBJECT_HASH_SIZE];
-} __attribute__((packed)) object_header_t;  /* 56 bytes */
+    uint8_t  encryption;   /* ENCRYPT_* */
+    uint8_t  reserved[7];
+} __attribute__((packed)) object_header_t;  /* 64 bytes */
 
 /* ---------- snapshot ---------- */
 

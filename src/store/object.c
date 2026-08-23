@@ -63,6 +63,23 @@ static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) 
     SHA256((const unsigned char *)data, len, out);
 }
 
+
+/*
+ * Read and validate an object header. One layout, one size: there are no
+ * older repositories to accommodate, so there is nothing to branch on.
+ * Leaves the file positioned at the start of the payload.
+ */
+static status_t read_object_header(int fd, object_header_t *hdr)
+{
+    if (io_read_full(fd, hdr, sizeof(*hdr)) != 0)
+        return set_error(ERR_CORRUPT, "object: truncated header");
+    if (hdr->magic != OBJECT_MAGIC)
+        return set_error(ERR_CORRUPT, "object: bad magic");
+    if (hdr->version != OBJECT_HDR_VERSION)
+        return set_error(ERR_CORRUPT, "object: unsupported version %u", hdr->version);
+    return OK;
+}
+
 static int obj_name_exists_at(int subfd, const char *fname) {
     return faccessat(subfd, fname, F_OK, 0) == 0;
 }
@@ -129,24 +146,25 @@ static status_t write_object(store_t *store, uint8_t type,
      * what is actually on disk and a scrub can verify an offsite copy without
      * the key.
      */
-    uint8_t encryption_flag = 0;
+    uint8_t encryption = ENCRYPT_NONE;
     uint8_t *ciphertext = NULL;
     const repo_key_t *key = store_key(store);
     if (key) {
         ciphertext = malloc(payload_size + OBJECT_CRYPT_TAG_BYTES);
         if (!ciphertext) return set_error(ERR_NOMEM, "write_object: cipher buffer");
-        status_t est = object_encrypt(key, out_hash, payload, payload_size, ciphertext);
+        status_t est = object_encrypt(key, out_hash, OBJECT_FORM_LOOSE, payload, payload_size, ciphertext);
         if (est != OK) { free(ciphertext); return est; }
         payload = ciphertext;
         payload_size += OBJECT_CRYPT_TAG_BYTES;
-        encryption_flag = COMPRESS_ENCRYPTED;
+        encryption = ENCRYPT_CHACHA20;
     }
 
     object_header_t hdr = {
         .magic             = OBJECT_MAGIC,
         .version           = OBJECT_HDR_VERSION,
         .type              = type,
-        .compression       = (uint8_t)(COMPRESS_NONE | encryption_flag),
+        .compression       = COMPRESS_NONE,
+        .encryption        = encryption,
         .pack_skip_ver     = 0,
         .uncompressed_size = (uint64_t)len,
         .compressed_size   = (uint64_t)payload_size,
@@ -1439,22 +1457,14 @@ status_t object_load(store_t *store,
     }
 
     object_header_t hdr;
-    if (io_read_full(fd, &hdr, sizeof(hdr)) != 0) {
+    if (read_object_header(fd, &hdr) != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: truncated header", hex);
-    }
-    if (hdr.magic != OBJECT_MAGIC) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: bad magic", hex);
-    }
-    if (hdr.version != 1 && hdr.version != 2) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: unsupported version %u", hex, hdr.version);
+        close(fd);
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
     }
 
     /* Large uncompressed objects must be loaded via object_load_stream. */
-    if ((hdr.compression & (uint8_t)~COMPRESS_ENCRYPTED) == COMPRESS_NONE &&
-        hdr.compressed_size > STREAM_LOAD_MAX) {
+    if (hdr.compression == COMPRESS_NONE && hdr.compressed_size > STREAM_LOAD_MAX) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
         close(fd);
         return set_error(ERR_TOO_LARGE, "object %s: %lu bytes, use streaming load", hex, (unsigned long)hdr.compressed_size);
@@ -1467,8 +1477,8 @@ status_t object_load(store_t *store,
         free(cpayload); close(fd); return set_error(ERR_CORRUPT, "object %s: truncated payload", hex);
     }
 
-    /* ---- Parity check/repair for version 2 objects ---- */
-    if (hdr.version == 2) {
+    /* ---- Parity check and repair ---- */
+    if (hdr.version >= 2) {
         /* Read the entire parity trailer in one sequential read — the file
          * position is already right after the payload, which is the trailer
          * start.  This avoids 4-5 extra seeks per loose object on HDD. */
@@ -1523,8 +1533,8 @@ status_t object_load(store_t *store,
      * the tag, so the plaintext is that much shorter; decrypting in place
      * keeps the buffer the caller already owns.
      */
-    uint8_t codec = hdr.compression & (uint8_t)~COMPRESS_ENCRYPTED;
-    if (hdr.compression & COMPRESS_ENCRYPTED) {
+    uint8_t codec = hdr.compression;
+    if (hdr.encryption != ENCRYPT_NONE) {
         const repo_key_t *key = store_key(store);
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
         if (!key) {
@@ -1537,7 +1547,7 @@ status_t object_load(store_t *store,
             return set_error(ERR_CORRUPT, "object %s: truncated ciphertext", hex);
         }
         size_t ptlen = (size_t)hdr.compressed_size - OBJECT_CRYPT_TAG_BYTES;
-        status_t dst = object_decrypt(key, hash, cpayload, ptlen, cpayload);
+        status_t dst = object_decrypt(key, hash, OBJECT_FORM_LOOSE, cpayload, ptlen, cpayload);
         if (dst != OK) { free(cpayload); return dst; }
         hdr.compressed_size = ptlen;
     }
@@ -1642,7 +1652,7 @@ static int locate_loose_rs_parity(int fd, const object_header_t *hdr,
 {
     *out_off = 0;
     *out_sz = 0;
-    if (hdr->version != 2) return -1;
+    if (hdr->version < 2) return -1;
 
     size_t rs_sz = rs_parity_size((size_t)hdr->compressed_size);
     if (rs_sz == 0) return -1;
@@ -1770,22 +1780,15 @@ status_t object_load_stream(store_t *store,
     }
 
     object_header_t hdr;
-    if (io_read_full(fd, &hdr, sizeof(hdr)) != 0) {
+    if (read_object_header(fd, &hdr) != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: truncated header", hex);
-    }
-    if (hdr.magic != OBJECT_MAGIC) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: bad magic", hex);
-    }
-    if (hdr.version != 1 && hdr.version != 2) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd); return set_error(ERR_CORRUPT, "object %s: unsupported version %u", hex, hdr.version);
+        close(fd);
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
     }
 
     /* For version 2 objects, attempt header repair via parity.
      * Use pread at known trailer offset (header + payload) to avoid seeking. */
-    if (hdr.version == 2) {
+    if (hdr.version >= 2) {
         off_t trailer_off = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size;
         parity_record_t hpar;
         parity_footer_t pftr;
@@ -1891,10 +1894,7 @@ status_t object_load_prefix(store_t *store,
     }
 
     object_header_t hdr;
-    if (io_read_full(fd, &hdr, sizeof(hdr)) != 0) {
-        close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: truncated header");
-    }
-    if (hdr.magic != OBJECT_MAGIC || (hdr.version != 1 && hdr.version != 2)) {
+    if (read_object_header(fd, &hdr) != OK) {
         close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: bad header");
     }
 
@@ -1931,15 +1931,11 @@ status_t object_get_info(store_t *store,
         return pack_object_get_info(store, hash, out_size, out_type);
 
     object_header_t hdr;
-    int rc = io_read_full(fd, &hdr, sizeof(hdr));
+    status_t hst = read_object_header(fd, &hdr);
     close(fd);
-    if (rc != 0) {
+    if (hst != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        return set_error(ERR_CORRUPT, "object %s: truncated header", hex);
-    }
-    if (hdr.magic != OBJECT_MAGIC) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        return set_error(ERR_CORRUPT, "object %s: bad magic", hex);
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
     }
 
     if (out_size) *out_size = hdr.uncompressed_size;
@@ -2056,8 +2052,9 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     if (fd == -1) return -1;  /* not a loose object or not writable */
 
     object_header_t hdr;
-    if (io_read_full(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return -1; }
-    if (hdr.magic != OBJECT_MAGIC || hdr.version != 2) { close(fd); return 0; }
+    if (read_object_header(fd, &hdr) != OK) { err_clear(); close(fd); return -1; }
+    /* Version 1 has no parity to repair from. */
+    if (hdr.version < 2) { close(fd); return 0; }
 
     /* Read parity footer */
     parity_footer_t pftr;

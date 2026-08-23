@@ -237,8 +237,12 @@ test-cli: all
 test-api: analyze
 test-cli: test-api
 
+# || exit 1, because without it a failing unit suite is invisible: cmocka
+# exits non-zero, the loop swallows it, make reports success, and every gate
+# check downstream believes the tree is green. The shell suites and the
+# analyzers always failed the target properly; the C ones never did.
 test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli
-	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t; done
+	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t || exit 1; done
 
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan

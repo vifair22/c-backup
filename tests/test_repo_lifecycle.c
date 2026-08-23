@@ -80,9 +80,7 @@ static void test_register_creates_missing_dir(void **state)
 
     repo_marker_t m;
     assert_int_equal(repo_marker_read(TEST_ROOT "/fresh", &m), OK);
-    /* Plaintext repositories stay at the older marker version so a build
-     * predating encryption still reads them; only encrypted ones move up. */
-    assert_int_equal(m.version, CBACKUP_FORMAT_VER_PLAIN);
+    assert_int_equal(m.version, CBACKUP_FORMAT_VER);
     assert_true(strlen(m.uuid) > 0);
 
     struct stat sb;
@@ -333,19 +331,6 @@ static void test_passphrase_mode_requires_a_passphrase(void **state)
     err_clear();
 }
 
-/* An unencrypted repository stays a version 1 marker, so a build that
- * predates encryption still reads it. */
-static void test_plain_repo_keeps_the_old_marker_version(void **state)
-{
-    (void)state;
-    int64_t id = 0;
-    assert_int_equal(repo_register(db, TEST_ROOT "/plainmarker", "p", &id), OK);
-    repo_marker_t m;
-    assert_int_equal(repo_marker_read(TEST_ROOT "/plainmarker", &m), OK);
-    assert_int_equal(m.version, CBACKUP_FORMAT_VER_PLAIN);
-    assert_int_equal(m.enc_mode, REPO_ENC_NONE);
-}
-
 /* A marker claiming encryption it cannot describe must not read as plaintext:
  * that would write unencrypted objects into an encrypted repository. */
 static void test_marker_with_broken_encryption_block_is_refused(void **state)
@@ -388,7 +373,6 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_system_encryption_returns_the_key_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_repo_is_recoverable_from_the_marker_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_mode_requires_a_passphrase, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_plain_repo_keeps_the_old_marker_version, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_with_broken_encryption_block_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_encryption_mode_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_dir, setup, teardown),

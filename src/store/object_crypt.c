@@ -29,6 +29,7 @@
  * requires a SHA-256 collision.
  */
 static status_t derive_nonce(const repo_key_t *key, const uint8_t *hash,
+                             object_form_t form,
                              uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES])
 {
     EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
@@ -37,20 +38,23 @@ static status_t derive_nonce(const repo_key_t *key, const uint8_t *hash,
     EVP_KDF_free(kdf);
     if (!ctx) return set_error(ERR_NOMEM, "object_crypt: KDF context");
 
-    static const char info[] = "c-backup object nonce v1";
+    /* The form is the domain separator: the same object stored loose and
+     * stored packed must not share a keystream. */
+    char info[40];
+    int infolen = snprintf(info, sizeof(info), "c-backup object nonce v1 %s",
+                           form == OBJECT_FORM_PACKED ? "packed" : "loose");
     char *digest = "SHA256";
     uint8_t keybuf[REPO_KEY_BYTES];
     memcpy(keybuf, key->key, REPO_KEY_BYTES);
     uint8_t hashbuf[OBJECT_HASH_SIZE];
     memcpy(hashbuf, hash, OBJECT_HASH_SIZE);
-    char infobuf[sizeof(info)];
-    memcpy(infobuf, info, sizeof(info));
+
 
     OSSL_PARAM params[] = {
         OSSL_PARAM_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, strlen(digest)),
         OSSL_PARAM_octet_string(OSSL_KDF_PARAM_KEY, keybuf, sizeof(keybuf)),
         OSSL_PARAM_octet_string(OSSL_KDF_PARAM_SALT, hashbuf, sizeof(hashbuf)),
-        OSSL_PARAM_octet_string(OSSL_KDF_PARAM_INFO, infobuf, sizeof(infobuf) - 1),
+        OSSL_PARAM_octet_string(OSSL_KDF_PARAM_INFO, info, (size_t)infolen),
         OSSL_PARAM_END,
     };
 
@@ -68,10 +72,10 @@ static status_t derive_nonce(const repo_key_t *key, const uint8_t *hash,
  * fails a hash check further along with a less useful message.
  */
 static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
-                           const uint8_t *hash, int encrypting)
+                           const uint8_t *hash, object_form_t form, int encrypting)
 {
     uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
-    status_t st = derive_nonce(key, hash, nonce);
+    status_t st = derive_nonce(key, hash, form, nonce);
     if (st != OK) return st;
 
     int ok = encrypting
@@ -89,7 +93,7 @@ static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
 }
 
 status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
-                        const void *in, size_t len, void *out)
+                        object_form_t form, const void *in, size_t len, void *out)
 {
     if (!key || !hash || (!in && len) || !out)
         return set_error(ERR_INVALID, "object_encrypt: null argument");
@@ -99,7 +103,7 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     if (!c) return set_error(ERR_NOMEM, "object_encrypt: cipher context");
 
-    status_t st = crypt_init(c, key, hash, 1);
+    status_t st = crypt_init(c, key, hash, form, 1);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
     int outl = 0;
@@ -120,7 +124,7 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
 }
 
 status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
-                        const void *in, size_t len, void *out)
+                        object_form_t form, const void *in, size_t len, void *out)
 {
     if (!key || !hash || !in || (!out && len))
         return set_error(ERR_INVALID, "object_decrypt: null argument");
@@ -130,7 +134,7 @@ status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     if (!c) return set_error(ERR_NOMEM, "object_decrypt: cipher context");
 
-    status_t st = crypt_init(c, key, hash, 0);
+    status_t st = crypt_init(c, key, hash, form, 0);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
     const uint8_t *i = in;
@@ -166,7 +170,7 @@ struct object_crypt_stream {
 
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
                                    const repo_key_t *key, const uint8_t *hash,
-                                   int encrypting)
+                                   object_form_t form, int encrypting)
 {
     if (!out || !key || !hash)
         return set_error(ERR_INVALID, "object_crypt_stream: null argument");
@@ -177,7 +181,7 @@ status_t object_crypt_stream_begin(object_crypt_stream_t **out,
     s->encrypting = encrypting;
     if (!s->ctx) { free(s); return set_error(ERR_NOMEM, "object_crypt_stream: context"); }
 
-    status_t st = crypt_init(s->ctx, key, hash, encrypting);
+    status_t st = crypt_init(s->ctx, key, hash, form, encrypting);
     if (st != OK) { object_crypt_stream_free(s); return st; }
     *out = s;
     return OK;

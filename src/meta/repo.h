@@ -17,15 +17,10 @@
 
 #define CBACKUP_MARKER      ".cbackup"
 #define CBACKUP_FORMAT      "cbackup-repo"
-/*
- * Marker version 2 exists so an older binary refuses an encrypted repository
- * outright. A build that predates encryption would otherwise read the marker,
- * ignore a field it does not know, and write plaintext objects into a
- * repository everything else believes is encrypted. Plaintext repositories
- * are still written as version 1 and stay readable by both.
- */
-#define CBACKUP_FORMAT_VER      2
-#define CBACKUP_FORMAT_VER_PLAIN 1
+/* One marker version. There are no repositories from an older build to stay
+ * compatible with, and a second version existed only to be compatible with
+ * them. */
+#define CBACKUP_FORMAT_VER  2
 #define CBACKUP_UUID_LEN    37   /* RFC-4122 text plus NUL */
 #define CBACKUP_CIPHER      "chacha20-poly1305"
 

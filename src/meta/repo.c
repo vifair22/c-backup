@@ -164,8 +164,7 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
 
     repo_marker_t m;
     if (in) m = *in; else memset(&m, 0, sizeof(m));
-    m.version = (m.enc_mode == REPO_ENC_NONE) ? CBACKUP_FORMAT_VER_PLAIN
-                                              : CBACKUP_FORMAT_VER;
+    m.version = CBACKUP_FORMAT_VER;
     status_t st = gen_uuid(m.uuid);
     if (st != OK) return st;
 
@@ -254,8 +253,7 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
         return set_error(ERR_INVALID, "marker needs a uuid");
 
     repo_marker_t m = *in;
-    m.version = (m.enc_mode == REPO_ENC_NONE) ? CBACKUP_FORMAT_VER_PLAIN
-                                              : CBACKUP_FORMAT_VER;
+    m.version = CBACKUP_FORMAT_VER;
     status_t st = marker_emit(mp, &m);
     if (st != OK) return st;
     if (out) *out = m;
