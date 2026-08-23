@@ -2701,6 +2701,15 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
     int show_progress = pack_progress_enabled();
 
+    /* Packing rewrites every object it touches, so without the key it would
+     * turn an encrypted repository into a plaintext one, one pack at a time. */
+    if (store_needs_key(store)) {
+        if (out_packed) *out_packed = 0;
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to pack");
+    }
+
     if (!loose_objects_exist(store)) {
         log_info("pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;

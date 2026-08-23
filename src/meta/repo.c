@@ -48,6 +48,45 @@ static status_t gen_uuid(char out[CBACKUP_UUID_LEN])
     return OK;
 }
 
+status_t repo_store_open(const char *path, const store_config_t *cfg,
+                         store_t **out)
+{
+    status_t st = store_open(path, cfg, out);
+    if (st != OK) return st;
+
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) {
+        /* No marker, or an unreadable one. store_open succeeded, so this is
+         * a bare object store - tests and benchmarks use those. Nothing to
+         * attach, and nothing to guard against. */
+        err_clear();
+        return OK;
+    }
+    if (m.enc_mode == REPO_ENC_NONE) return OK;
+
+    store_set_encrypted(*out, 1);
+
+    repo_key_t k;
+    if (repo_key_load(repo_key_dir(), m.uuid, &k) != OK) {
+        err_clear();
+        log_warn("repo %s: encrypted, but no key in %s - "
+                 "verification and repair will work, reading content will not",
+                 m.uuid, repo_key_dir());
+        return OK;
+    }
+    if (strcmp(k.id, m.key_id) != 0) {
+        repo_key_wipe(&k);
+        store_close(*out);
+        *out = NULL;
+        return set_error(ERR_INVALID,
+                         "repo %s: the key in %s is not this repository's key "
+                         "(marker says %s)", m.uuid, repo_key_dir(), m.key_id);
+    }
+    store_set_key(*out, &k);
+    repo_key_wipe(&k);
+    return OK;
+}
+
 status_t repo_marker_read(const char *path, repo_marker_t *out)
 {
     char mp[PATH_MAX];

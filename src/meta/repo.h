@@ -12,6 +12,7 @@
 
 #include "error.h"
 #include "repo_key.h"
+#include "store.h"
 #include <cutils/db.h>
 #include <stdint.h>
 
@@ -50,6 +51,25 @@ typedef struct {
      * write it down. Empty otherwise. */
     char            key_hex[REPO_KEY_BYTES * 2 + 1];
 } repo_enc_request_t;
+
+/*
+ * Open a repository's object store with its encryption key attached.
+ *
+ * Use this and not store_open anywhere a repository is being opened. The
+ * store layer has no idea a marker exists, so store_open alone yields a
+ * store with no key: writes then produce plaintext objects in a repository
+ * whose marker says encrypted, and nothing complains. That is exactly what
+ * happened - repositories created with encryption were written entirely in
+ * the clear - so the store is told it is encrypted even when the key cannot
+ * be found, which makes its write paths refuse rather than proceed.
+ *
+ * A missing key is not an error here. An offsite copy has the repository and
+ * not the key, and verifying and repairing it is meant to work: parity
+ * covers ciphertext for that reason. Reading content back is what fails, and
+ * it fails with a message that says which.
+ */
+status_t repo_store_open(const char *path, const store_config_t *cfg,
+                         store_t **out);
 
 /* Read the marker from a repo directory. ERR_NOT_FOUND if absent,
  * ERR_CORRUPT if present but malformed or of an unknown format. */

@@ -517,7 +517,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         char rel[PATH_MAX];
         if (node_rel_path(db, repo, snap, id, rel, sizeof(rel)) != OK) {
-            res.skipped++;
+            log_warn("restore: cannot reconstruct the path of node %s", r->rows[i][0]);
+            res.failed++;
             err_clear();
             continue;
         }
@@ -527,7 +528,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
-            res.skipped++;
+            log_warn("restore: destination path too long for %s", rel);
+            res.failed++;
             continue;
         }
 
@@ -553,14 +555,14 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (ntype == NODE_TYPE_SYMLINK) {
             if (!ltarget || !ltarget[0]) {
                 log_warn("restore: symlink %s has no recorded target, skipping", rel);
-                res.skipped++;
+                res.failed++;
                 continue;
             }
             if (make_parents(full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
             if (symlink(ltarget, full) != 0 && errno != EEXIST) {
                 log_warn("restore: cannot create symlink %s: %s", full, strerror(errno));
-                res.skipped++;
+                res.failed++;
                 continue;
             }
             /* Mode is not applied: a symlink's own permissions are ignored by
@@ -642,7 +644,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             if (ntype != NODE_TYPE_REG)
                 log_warn("restore: %s is an unsupported node type %u, skipping",
                          rel, ntype);
-            res.skipped++;
+            res.failed++;
             continue;
         }
 
@@ -669,7 +671,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd == -1) {
             log_warn("restore: cannot create %s: %s", full, strerror(errno));
-            res.skipped++;
+            res.failed++;
             continue;
         }
 
@@ -703,7 +705,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             if (unlink(full) != 0 && errno != ENOENT)
                 log_warn("restore: cannot remove incomplete %s: %s",
                          full, strerror(errno));
-            res.skipped++;
+            res.failed++;
             continue;
         }
 
@@ -723,11 +725,24 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
-             "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped",
+             "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped, "
+             "%llu failed",
              (long long)snap_id, dest, (unsigned long long)res.files,
              (unsigned long long)res.dirs, (unsigned long long)res.symlinks,
              (unsigned long long)res.hardlinks,
-             (unsigned long long)res.specials, (unsigned long long)res.skipped);
+             (unsigned long long)res.specials, (unsigned long long)res.skipped,
+             (unsigned long long)res.failed);
     if (out) *out = res;
+
+    /* Everything that could be written has been. Say what could not, rather
+     * than reporting a restore that produced nothing as a success. */
+    if (res.failed)
+        return set_error(ERR_CORRUPT,
+                         "restore incomplete: %llu entr%s could not be restored "
+                         "(%llu written); see the log for which",
+                         (unsigned long long)res.failed,
+                         res.failed == 1 ? "y" : "ies",
+                         (unsigned long long)(res.files + res.dirs + res.symlinks
+                                              + res.hardlinks + res.specials));
     return OK;
 }

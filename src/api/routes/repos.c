@@ -76,11 +76,6 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
     return api_ok(body);
 }
 
-/*
- * Where repository keys live. Set once at startup from config; the routes
- * need it to create a repository and to hand a key back for escrow.
- */
-static char g_key_dir[512] = "/etc/c-backupd/keys";
 
 /*
  * The key handlers are reached through the repo-scoped dispatcher, which
@@ -92,7 +87,9 @@ static cutils_db_t *g_db_for_keys;
 
 void routes_repos_set_key_dir(const char *dir)
 {
-    if (dir && *dir) snprintf(g_key_dir, sizeof(g_key_dir), "%s", dir);
+    /* The meta layer owns this now: opening a repository needs it, and that
+     * is not an HTTP concern. Kept as the startup entry point. */
+    repo_key_dir_set(dir);
 }
 
 /* The repository UUID, which is what a keyfile is named after. */
@@ -137,7 +134,7 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     char *encstr = NULL, *passphrase = NULL;
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
-    enc.key_dir = g_key_dir;
+    enc.key_dir = repo_key_dir();
     if (json_req_get_str_opt(jr, "encrypt", &encstr) == 0 && encstr) {
         if (repo_enc_mode_parse(encstr, &enc.mode) != 0) {
             free(path); free(label); free(encstr);
@@ -212,7 +209,7 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         if (enc.mode == REPO_ENC_SYSTEM)
             log_warn("repo %lld holds a system-managed key that exists only in %s; "
                      "copy it elsewhere or a lost host means lost backups",
-                     (long long)id, g_key_dir);
+                     (long long)id, repo_key_dir());
     }
 
     if (enc.key_hex[0]) OPENSSL_cleanse(enc.key_hex, sizeof(enc.key_hex));
@@ -318,7 +315,7 @@ static api_response_t key_export(const api_request_t *req, int64_t repo_id)
         return api_error(404, "no such repo");
 
     repo_key_t k;
-    status_t st = repo_key_load(g_key_dir, uuid, &k);
+    status_t st = repo_key_load(repo_key_dir(), uuid, &k);
     if (st != OK)
         return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
 
@@ -382,7 +379,7 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
         return api_error(400, "key does not belong to this repository");
     }
 
-    st = repo_key_save(g_key_dir, m.uuid, &k);
+    st = repo_key_save(repo_key_dir(), m.uuid, &k);
     repo_key_wipe(&k);
     if (st != OK) return api_error(500, err_msg());
 

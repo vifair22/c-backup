@@ -193,6 +193,18 @@ status_t repo_key_save(const char *key_dir, const char *uuid, const repo_key_t *
     return OK;
 }
 
+static char g_key_dir[512] = "/etc/c-backupd/keys";
+
+void repo_key_dir_set(const char *dir)
+{
+    if (dir && *dir) snprintf(g_key_dir, sizeof(g_key_dir), "%s", dir);
+}
+
+const char *repo_key_dir(void)
+{
+    return g_key_dir;
+}
+
 status_t repo_key_load(const char *key_dir, const char *uuid, repo_key_t *out)
 {
     if (!key_dir || !uuid || !out)

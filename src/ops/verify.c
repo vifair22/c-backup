@@ -233,6 +233,28 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "verify: cannot list objects");
     }
 
+    /*
+     * Deep verify proves the bytes by reading them and hashing the result,
+     * so it needs the plaintext and therefore the key. Without one, every
+     * object fails to read and the run reports the whole repository as
+     * unrecoverable - a healthy 49-object repository came back as 49
+     * unrecoverable objects across 42 affected files, which is worse than
+     * useless: it is an alarm that sends an operator looking for corruption
+     * that is not there.
+     *
+     * Structure level reads only headers, which are not encrypted, so it
+     * still works and is what an offsite copy can check today. Checking a
+     * payload without decrypting it is possible - parity and the CRC cover
+     * the stored bytes for exactly that reason - but no level does it yet.
+     */
+    if (level == VERIFY_LEVEL_DEEP && store_needs_key(store)) {
+        db_result_free(objs);
+        return set_error(ERR_INVALID,
+                         "deep verify reads payloads and this repository is "
+                         "encrypted with no key loaded; use level 'structure', "
+                         "which checks headers and needs no key");
+    }
+
     int devnull = -1;
     if (level == VERIFY_LEVEL_DEEP) {
         devnull = open("/dev/null", O_WRONLY);

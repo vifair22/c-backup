@@ -13,6 +13,7 @@
 #include "grep.h"
 #include "verify.h"
 #include "restore.h"
+#include "repo.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -338,7 +339,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = store_open(j->repo_path, NULL, &store);
+    st = repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
@@ -706,7 +707,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     if (st != OK) { free(repo_path); return api_error(503, "repo is busy"); }
 
     store_t *store = NULL;
-    st = store_open(repo_path, NULL, &store);
+    st = repo_store_open(repo_path, NULL, &store);
     free(repo_path);
     if (st != OK) { repo_unlock(repo_id); return api_error(500, err_msg()); }
 

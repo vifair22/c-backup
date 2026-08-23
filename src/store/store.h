@@ -80,6 +80,23 @@ void store_set_locate_cb(store_t *st, store_locate_fn cb, void *user);
  */
 void store_set_key(store_t *st, const struct repo_key *key);
 
+/*
+ * Record that the repository marker says this store is encrypted, whether or
+ * not a key was found. A store in that state with no key can still be walked
+ * and scrubbed - parity covers ciphertext, which is the whole point - but
+ * every write path refuses.
+ *
+ * This exists because the key was once loaded nowhere at all: a repository
+ * created with encryption produced a keyfile, an escrow warning, and packs
+ * full of plaintext, and nothing anywhere said so. The guard is what makes
+ * that failure loud instead of silent, including for a write path added
+ * later by someone who has not read this.
+ */
+void store_set_encrypted(store_t *st, int encrypted);
+
+/* Encrypted per the marker, but no key is loaded: refuse to write. */
+int  store_needs_key(const store_t *st);
+
 /* NULL when the repository is not encrypted. */
 const struct repo_key *store_key(const store_t *st);
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],

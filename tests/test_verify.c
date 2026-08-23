@@ -521,9 +521,16 @@ static void test_failed_restore_leaves_no_plausible_file(void **state)
 
     char dst[PATH_MAX];
     snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
+    /*
+     * An object the store cannot produce is a failure, not a skip, and the
+     * caller has to be told: this returned OK with a silently empty
+     * destination until restore_result_t grew the distinction.
+     */
     restore_result_t rr;
-    assert_int_equal(restore_run(store, db, repo_id, snap, dst, NULL, &rr), OK);
-    assert_int_equal(rr.skipped, 1);
+    assert_int_equal(restore_run(store, db, repo_id, snap, dst, NULL, &rr),
+                     ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    assert_int_equal(rr.skipped, 0);
 
     char restored[PATH_MAX];
     snprintf(restored, sizeof(restored), "%s%s/big.bin", dst, TEST_SRC);

@@ -131,6 +131,11 @@ static status_t write_object(store_t *store, uint8_t type,
                              const void *data, size_t len,
                              uint8_t out_hash[OBJECT_HASH_SIZE],
                              int *out_is_new, uint64_t *out_phys_bytes) {
+    if (store_needs_key(store))
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to write a plaintext object");
+
     sha256(data, len, out_hash);
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
@@ -536,6 +541,13 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
                                          void *progress_ctx) {
+    if (store_needs_key(store)) {
+        if (src_path) close(src_fd);
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to write a plaintext object");
+    }
+
     /* Always store uncompressed; the pack sweeper handles compression. */
     if (lseek(src_fd, 0, SEEK_SET) == (off_t)-1) {
         if (src_path) close(src_fd);
@@ -1203,6 +1215,13 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
                                            uint8_t out_hash[OBJECT_HASH_SIZE],
                                            int *out_is_new,
                                            uint64_t *out_phys_bytes) {
+    if (store_needs_key(store)) {
+        if (src_path) close(fd);
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to write a plaintext object");
+    }
+
     (void)file_size;  /* uncompressed_size is the sparse payload size, not file size */
 
     /* Compute total payload size (header + regions table + region data) */
@@ -2152,6 +2171,11 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
     /* Check existence first to avoid redundant work. */
     if (object_exists(store, expected_hash)) return OK;
+
+    if (store_needs_key(store))
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to write a plaintext object");
 
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))

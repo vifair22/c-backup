@@ -76,6 +76,9 @@ struct store {
      * because an all-zero key is a valid key, just an unlucky one. */
     repo_key_t            key;
     int                   has_key;
+    /* The marker said encrypted. Independent of has_key: a scrub of an
+     * offsite copy is encrypted with no key, and must still work. */
+    int                   encrypted;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -111,6 +114,16 @@ void store_set_key(store_t *st, const struct repo_key *key)
 const struct repo_key *store_key(const store_t *st)
 {
     return (st && st->has_key) ? &st->key : NULL;
+}
+
+void store_set_encrypted(store_t *st, int encrypted)
+{
+    if (st) st->encrypted = encrypted ? 1 : 0;
+}
+
+int store_needs_key(const store_t *st)
+{
+    return st && st->encrypted && !st->has_key;
 }
 
 status_t store_init_dirs(const char *path) {

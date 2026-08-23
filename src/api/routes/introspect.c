@@ -5,6 +5,7 @@
 
 #include "manifest.h"
 #include "object.h"
+#include "repo.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -88,7 +89,7 @@ static status_t open_bound_store(int64_t repo_id, store_t **out_store,
     char *path = repo_path_of(repo_id);
     if (!path) return set_error(ERR_NOT_FOUND, "no such repo");
 
-    status_t st = store_open(path, NULL, out_store);
+    status_t st = repo_store_open(path, NULL, out_store);
     free(path);
     if (st != OK) return st;
 

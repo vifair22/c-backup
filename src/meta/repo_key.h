@@ -100,3 +100,14 @@ status_t repo_key_unwrap(const char *wrapped_hex, const repo_kdf_params_t *param
 
 /* Overwrite key material rather than merely freeing it. */
 void repo_key_wipe(repo_key_t *k);
+
+/*
+ * Where host keyfiles live, set once at startup from security.key_dir.
+ *
+ * Held here rather than in the HTTP layer because opening a repository needs
+ * it, and opening a repository is not an HTTP concern. It used to live as a
+ * static in the repos route, which is why nothing outside that file could
+ * load a key - and so nothing did.
+ */
+void        repo_key_dir_set(const char *dir);
+const char *repo_key_dir(void);

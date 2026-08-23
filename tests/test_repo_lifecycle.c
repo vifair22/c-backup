@@ -21,8 +21,11 @@
 #include <cmocka.h>
 #include <cutils/db.h>
 
+#include "object.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "store.h"
+#include "types.h"
 #include "lock.h"
 
 #define TEST_DB   "/tmp/c_backup_test_lifecycle.db"
@@ -367,6 +370,120 @@ static void test_unknown_encryption_mode_is_refused(void **state)
     err_clear();
 }
 
+/* ---------- opening an encrypted repository ---------- */
+
+/*
+ * The bug this exists for: store_set_key had no caller anywhere in the
+ * daemon. Creating a repository with encryption generated a key, wrote a
+ * keyfile, printed the escrow warning, recorded the mode in the marker and
+ * the database - and then every backup into it opened the store with
+ * store_open, which knows nothing about markers, and wrote the whole
+ * repository in plaintext. Nothing failed. It was noticed only because the
+ * packs still read back after the keyfile was deleted.
+ *
+ * So: opening a repository must attach its key, and a repository that says
+ * it is encrypted must refuse to be written without one.
+ */
+static void test_open_attaches_the_repository_key(void **state)
+{
+    (void)state;
+    char keydir[512];
+    snprintf(keydir, sizeof(keydir), "%s/keys", TEST_ROOT);
+    assert_int_equal(mkdir(keydir, 0700), 0);
+    repo_key_dir_set(keydir);
+
+    repo_enc_request_t enc = { .mode = REPO_ENC_SYSTEM, .key_dir = keydir };
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/enc", NULL, &enc, &id), OK);
+
+    store_t *store = NULL;
+    assert_int_equal(repo_store_open(TEST_ROOT "/enc", NULL, &store), OK);
+    assert_non_null(store_key(store));
+    assert_int_equal(store_needs_key(store), 0);
+
+    /* And what it writes is actually encrypted. */
+    const char *data = "this must not be legible on disk";
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char obj[640];
+    snprintf(obj, sizeof(obj), "%s/enc/objects/%.2s/%s", TEST_ROOT, hex, hex + 2);
+    FILE *f = fopen(obj, "rb");
+    assert_non_null(f);
+    char blob[4096];
+    size_t n = fread(blob, 1, sizeof(blob), f);
+    fclose(f);
+    int legible = 0;
+    for (size_t i = 0; i + strlen(data) <= n; i++)
+        if (memcmp(blob + i, data, strlen(data)) == 0) { legible = 1; break; }
+    assert_false(legible);
+
+    store_close(store);
+}
+
+/*
+ * The repository is here, the key is not - an offsite copy. It must open,
+ * because verifying and repairing it is meant to work without the key, and
+ * it must refuse every write, because otherwise it fills up with plaintext
+ * objects that the rest of the repository's readers will not understand.
+ */
+static void test_open_without_the_key_refuses_writes(void **state)
+{
+    (void)state;
+    char keydir[512];
+    snprintf(keydir, sizeof(keydir), "%s/keys", TEST_ROOT);
+    assert_int_equal(mkdir(keydir, 0700), 0);
+    repo_key_dir_set(keydir);
+
+    repo_enc_request_t enc = { .mode = REPO_ENC_SYSTEM, .key_dir = keydir };
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/off", NULL, &enc, &id), OK);
+
+    /* Take the key away, as shipping the repository elsewhere would. */
+    char rmcmd[600];
+    snprintf(rmcmd, sizeof(rmcmd), "rm -f '%s'/*.key", keydir);
+    int rc = system(rmcmd); (void)rc;
+
+    store_t *store = NULL;
+    assert_int_equal(repo_store_open(TEST_ROOT "/off", NULL, &store), OK);
+    assert_null(store_key(store));
+    assert_int_equal(store_needs_key(store), 1);
+
+    const char *data = "a write that must not happen";
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_not_equal(object_store(store, OBJECT_TYPE_FILE, data,
+                                      strlen(data), hash), OK);
+    store_close(store);
+}
+
+/* A keyfile belonging to some other repository is caught by the marker's
+ * fingerprint rather than by a wall of objects that will not decrypt. */
+static void test_open_rejects_the_wrong_key(void **state)
+{
+    (void)state;
+    char keydir[512];
+    snprintf(keydir, sizeof(keydir), "%s/keys", TEST_ROOT);
+    assert_int_equal(mkdir(keydir, 0700), 0);
+    repo_key_dir_set(keydir);
+
+    repo_enc_request_t enc = { .mode = REPO_ENC_SYSTEM, .key_dir = keydir };
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/wrong", NULL, &enc, &id), OK);
+
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/wrong", &m), OK);
+
+    repo_key_t other;
+    assert_int_equal(repo_key_generate(&other), OK);
+    assert_int_equal(repo_key_save(keydir, m.uuid, &other), OK);
+
+    store_t *store = NULL;
+    assert_int_not_equal(repo_store_open(TEST_ROOT "/wrong", NULL, &store), OK);
+    assert_null(store);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -385,6 +502,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deregister_removes_row, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_open_attaches_the_repository_key, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_open_without_the_key_refuses_writes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_open_rejects_the_wrong_key, setup, teardown),
         cmocka_unit_test(test_write_lock_is_exclusive),
         cmocka_unit_test(test_locks_are_per_repo),
         cmocka_unit_test(test_read_locks_share),

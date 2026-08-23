@@ -71,7 +71,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = store_open(j->repo_path, NULL, &store);
+    st = repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
 
     st = store_index_bind(store, j->db, j->repo_id, &idx);
