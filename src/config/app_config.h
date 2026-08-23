@@ -33,6 +33,17 @@ static const config_key_t app_file_keys[] = {
      * directories are registered at runtime and never appear in this file.
      */
 
+    /*
+     * Where repository keys live. One file per repository UUID, 0600.
+     * File-backed rather than DB-backed on purpose: a key directory that
+     * could be changed at runtime through the API would mean an attacker
+     * with API access could point the daemon at keys they control, and it
+     * has to be readable before any repository is opened anyway.
+     */
+    { "security.key_dir", CFG_STRING, "/etc/c-backupd/keys",
+      "Directory holding per-repository encryption keys (0600, root-owned)",
+      CFG_STORE_FILE, 0 },
+
     { "log.level",   CFG_STRING, "info",
       "Minimum log level: debug, info, warn, error",
       CFG_STORE_FILE, 0 },

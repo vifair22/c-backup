@@ -22,6 +22,9 @@ int routes_register_auth(api_server_t *srv, cutils_db_t *db);
 
 /* Repo lifecycle endpoints. */
 int routes_register_repos(api_server_t *srv, cutils_db_t *db);
+
+/* Where per-repository keys are stored. Set from config at startup. */
+void routes_repos_set_key_dir(const char *dir);
 void routes_auth_set_config(cutils_config_t *cfg);
 
 /* Backup submission and job inspection. Needs the job manager because a

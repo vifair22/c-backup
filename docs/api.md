@@ -64,6 +64,55 @@ Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
 
+## Encryption
+
+A repository is encrypted or not, decided at creation and never afterwards.
+Converting in place would mean rewriting every object with both forms live;
+replicating into a fresh repository is the supported path instead.
+
+`POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
+last, a `passphrase`.
+
+| Mode | Key lives | Recovery needs | Escrow |
+|---|---|---|---|
+| `system` (recommended default) | host keyfile only | that key | the API returns it once |
+| `passphrase` | wrapped in the repository, cached in a host keyfile | the repository and the passphrase | nothing to do |
+
+The daemon holds the key on the host either way, because a scheduler that
+stops for a prompt is not a scheduler.
+
+**A system-managed key exists in exactly one place: a file on the machine
+being backed up.** Lose that machine and every offsite copy of its repository
+is unreadable, which is the disaster the offsite copy existed for. So the key
+is returned once at creation and the repository is counted by
+`cbackup_repos_key_unescrowed` until someone confirms they have stored it
+elsewhere, with a warning on every backup and a journal entry to match. This
+is deliberately a persistent nag rather than a message shown once.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/repos/<id>/key` | Export the key for escrow |
+| POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. Refused unless it matches the fingerprint in the marker |
+| POST | `/repos/<id>/key/ack` | Confirm the key is stored elsewhere; clears the warning |
+
+The marker records the mode, cipher and a one-way fingerprint of the key, and
+for passphrase mode the Argon2id parameters and wrapped key. It never contains
+the key itself. Encrypted repositories use marker version 2, which a build
+predating encryption refuses outright rather than writing plaintext objects
+into.
+
+Keys are ChaCha20-Poly1305, chosen over AES-GCM because ARM64 is a deploy
+target and it does not depend on AES-NI. `security.key_dir` sets where host
+keyfiles live (default `/etc/c-backupd/keys`, one file per repository UUID,
+mode 0600). It is file-backed configuration rather than runtime-settable: a
+key directory changeable through the API would let an attacker with API access
+point the daemon at keys they control.
+
+What this protects is the repository wherever it travels. What it does not
+protect is the machine running the daemon, which holds the key and a
+plaintext index; that is the operating system's job, through full-disk
+encryption and ordinary access control.
+
 ## The CLI covers all of this
 
 `c-backup` is a thin client over these endpoints and deliberately exposes

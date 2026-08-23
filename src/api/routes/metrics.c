@@ -119,6 +119,20 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "CAST(strftime('%s','now') AS INTEGER)) FROM snapshots");
 
     /*
+     * Repositories whose key exists only on this machine and which nobody has
+     * confirmed a copy of. This is a gauge that should read zero: while it
+     * does not, losing this host loses the ability to read those backups, and
+     * the offsite copies are decoration.
+     */
+    emit_scalar(&m, "cbackup_repos_key_unescrowed",
+                "Encrypted repositories whose key has not been confirmed saved elsewhere.",
+                "gauge",
+                "SELECT COUNT(*) FROM repos WHERE encryption != 'none' AND key_escrowed = 0");
+    emit_scalar(&m, "cbackup_repos_encrypted",
+                "Repositories with encryption enabled.", "gauge",
+                "SELECT COUNT(*) FROM repos WHERE encryption != 'none'");
+
+    /*
      * The verify counterpart. A backup that ran is not the same as a backup
      * that is still readable, and the second question had no answer at all
      * until there was something to scrub with. Age since the last completed

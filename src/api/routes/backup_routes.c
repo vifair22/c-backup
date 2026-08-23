@@ -119,6 +119,35 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     o.progress_cb  = progress;
     o.progress_ctx = progress_ctx;
 
+    /*
+     * Say it again, every backup, until someone acts on it.
+     *
+     * A key that exists only on the machine being backed up makes every
+     * offsite copy unreadable the moment that machine is lost, which is the
+     * scenario the offsite copy was for. Mentioning that once at creation and
+     * never again is how it gets forgotten, so this warns on each run and the
+     * journal keeps the record.
+     */
+    {
+        char rid[32];
+        snprintf(rid, sizeof(rid), "%lld", (long long)j->repo_id);
+        db_result_t *kr = NULL;
+        if (db_execute(j->db,
+                "SELECT encryption, key_escrowed FROM repos WHERE id = ?",
+                (const char *[]){ rid, NULL }, &kr) == 0 && kr && kr->nrows == 1 &&
+            strcmp(kr->rows[0][0], "none") != 0 &&
+            strcmp(kr->rows[0][1], "0") == 0) {
+            log_warn("repo %lld: encryption key has not been saved anywhere but "
+                     "this host; run 'c-backup repo key export %lld' and store it, "
+                     "then 'c-backup repo key ack %lld'",
+                     (long long)j->repo_id, (long long)j->repo_id,
+                     (long long)j->repo_id);
+            journal_record(j->db, j->repo_id, "backup", "key-escrow", "warning", 0,
+                           "encryption key not confirmed saved off this host");
+        }
+        db_result_free(kr);
+    }
+
     backup_result_t res;
     memset(&res, 0, sizeof(res));
     st = backup_run(store, j->db, j->repo_id, &o, &res);

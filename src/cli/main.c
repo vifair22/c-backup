@@ -277,14 +277,56 @@ static int cmd_repo(int argc, char **argv)
         return call("GET", "/repos", NULL);
 
     if (strcmp(argv[0], "add") == 0) {
-        if (argc < 2) return fail("usage: repo add <path> [label]");
+        int a = argc; char **v = argv;
+        const char *encmode = take_opt(&a, v, "--encrypt");
+        const char *pass    = take_opt(&a, v, "--passphrase");
+        if (a < 2)
+            return fail("usage: repo add <path> [label] "
+                        "[--encrypt system|passphrase|none] [--passphrase TEXT]");
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"path\":");
-        sb_json_str(&b, argv[1]);
+        sb_json_str(&b, v[1]);
         sb_puts(&b, ",\"label\":");
-        sb_json_str(&b, argc > 2 ? argv[2] : "");
+        sb_json_str(&b, a > 2 ? v[2] : "");
+        if (encmode) { sb_puts(&b, ",\"encrypt\":"); sb_json_str(&b, encmode); }
+        if (pass)    { sb_puts(&b, ",\"passphrase\":"); sb_json_str(&b, pass); }
         sb_puts(&b, "}");
         return call_sb("POST", "/repos", &b);
+    }
+
+    /*
+     * The key subcommands exist because a system-managed key lives in one
+     * file on this machine. export is how it gets somewhere else, import is
+     * how a replacement machine gets it back, and ack is the operator saying
+     * they have done the first - which is what stops every backup warning
+     * about it.
+     */
+    if (strcmp(argv[0], "key") == 0) {
+        if (argc < 3) return fail("usage: repo key <export|import|ack> <repo-id> [key]");
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/repos/"); sb_puts(&p, argv[2]);
+        if (strcmp(argv[1], "export") == 0) {
+            sb_puts(&p, "/key");
+            return call_path_sb("GET", &p, NULL);
+        }
+        if (strcmp(argv[1], "ack") == 0) {
+            sb_puts(&p, "/key/ack");
+            return call_path_sb("POST", &p, NULL);
+        }
+        if (strcmp(argv[1], "import") == 0) {
+            if (argc < 4) { free(p.buf); return fail("usage: repo key import <repo-id> <key-hex>"); }
+            sb_puts(&p, "/key/import");
+            sbuf_t b = { 0 };
+            sb_puts(&b, "{\"key\":");
+            sb_json_str(&b, argv[3]);
+            sb_puts(&b, "}");
+            if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+            int rc = call("POST", p.buf, b.buf);
+            free(p.buf); free(b.buf);
+            return rc;
+        }
+        free(p.buf);
+        return fail("unknown repo key subcommand '%s'", argv[1]);
     }
 
     if (strcmp(argv[0], "show") == 0) {
@@ -887,7 +929,7 @@ static const struct {
     int (*fn)(int argc, char **argv);
     const char *usage;
 } COMMANDS[] = {
-    { "repo",      cmd_repo,      "repo <list|add|show|remove> [args]" },
+    { "repo",      cmd_repo,      "repo <list|add|show|remove|key> [args]  (add: [--encrypt system|passphrase] [--passphrase TEXT]; key: <export|import|ack> <repo-id>)" },
     { "backup",    cmd_backup,    "backup <repo-id> <path>... [--exclude PAT]... [--one-filesystem] [--label TEXT]" },
     { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite]" },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },

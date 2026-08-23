@@ -170,6 +170,7 @@ int main(int argc, char *argv[])
     }
 
     routes_auth_set_config(cfg);
+    routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);
     routes_metadata_init(db);
     routes_introspect_init(db);

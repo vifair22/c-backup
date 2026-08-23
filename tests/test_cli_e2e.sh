@@ -58,6 +58,8 @@ http:
   bind: 127.0.0.1
 log:
   level: warn
+security:
+  key_dir: $WORK/keys
 EOF
 
 C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
@@ -243,6 +245,51 @@ esac
 OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
 check "grep rejects a bad pattern" 1 "$RC"
 contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
+
+# Encryption at creation, and the escrow path that keeps a system-managed key
+# from existing only on the machine being backed up.
+echo "encryption"
+ENC_OUT=$(cb repo add "$WORK/encrepo" enc --encrypt system)
+contains "encrypted repo created"     '"encryption":"system"' "$ENC_OUT"
+contains "key returned once"          '"key":"'               "$ENC_OUT"
+contains "key not yet escrowed"       '"key_escrowed":false'  "$ENC_OUT"
+contains "creation warns about escrow" 'Save this key'        "$ENC_OUT"
+ENC_ID=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ENC_KEY=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"key":"\([0-9a-f]*\)".*/\1/p')
+
+# The key is on disk, private, and the marker names it without holding it.
+test -f "$WORK/keys"/*.key && ok "keyfile written" || bad "keyfile written" "present" "absent"
+KEYMODE=$(stat -c %a "$WORK"/keys/*.key)
+check "keyfile is private" 600 "$KEYMODE"
+contains "marker records encryption" '"mode":"system"' "$(cat "$WORK/encrepo/.cbackup")"
+case "$(cat "$WORK/encrepo/.cbackup")" in
+    *"$ENC_KEY"*) bad "marker does not contain the key" "absent" "present" ;;
+    *)            ok  "marker does not contain the key" ;;
+esac
+
+contains "unescrowed repo counted" 'cbackup_repos_key_unescrowed 1' "$(cb metrics)"
+EXPORTED=$(cb repo key export "$ENC_ID")
+contains "key export matches creation" "$ENC_KEY" "$EXPORTED"
+contains "key ack accepted" '"ok"' "$(cb repo key ack "$ENC_ID")"
+contains "escrow gauge clears" 'cbackup_repos_key_unescrowed 0' "$(cb metrics)"
+
+# Recovery: a host that lost its keyfile takes it back from escrow.
+rm -f "$WORK"/keys/*.key
+OUT=$(cb repo key export "$ENC_ID" 2>&1); RC=$?
+check "export without a keyfile fails" 1 "$RC"
+contains "key import accepted" '"ok"' "$(cb repo key import "$ENC_ID" "$ENC_KEY")"
+contains "key readable again" "$ENC_KEY" "$(cb repo key export "$ENC_ID")"
+OUT=$(cb repo key import "$ENC_ID" "$(printf '0%.0s' $(seq 1 64))" 2>&1); RC=$?
+check "wrong key refused" 1 "$RC"
+
+# Passphrase mode needs nothing escrowed: the wrapped key travels with the
+# repository, so the passphrase alone recovers it.
+PASS_OUT=$(cb repo add "$WORK/passrepo" pass --encrypt passphrase --passphrase 'correct horse')
+contains "passphrase repo created"   '"encryption":"passphrase"' "$PASS_OUT"
+contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
+contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
+OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
+check "passphrase mode requires a passphrase" 1 "$RC"
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
