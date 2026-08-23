@@ -4,6 +4,7 @@
 #include <cutils/log.h>
 
 #include <dirent.h>
+#include <fnmatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -513,12 +514,81 @@ static int path_has_prefix(const char *path, const char *prefix) {
     return path[plen] == '\0' || path[plen] == '/';
 }
 
+static int pattern_has_glob(const char *s) {
+    return strpbrk(s, "*?[") != NULL;
+}
+
+/*
+ * Match a pattern against every component-aligned tail of the path, so a
+ * fragment like "src/tmp" excludes /anywhere/src/tmp without the caller
+ * having to know where the tree is rooted.
+ */
+static int match_path_tail(const char *pat, const char *full, int cross) {
+    int flags = cross ? 0 : FNM_PATHNAME;
+    const char *seg = full;
+    for (;;) {
+        if (fnmatch(pat, seg, flags) == 0) return 1;
+        const char *slash = strchr(seg, '/');
+        if (!slash) return 0;
+        seg = slash + 1;
+    }
+}
+
+/*
+ * One exclude pattern against one absolute path.
+ *
+ * Four forms, decided by what the pattern contains rather than by a flag:
+ *
+ *   /var/cache        absolute and literal - prefix match at a component
+ *                     boundary, so it excludes the directory and its subtree
+ *                     but not /var/cache-manager
+ *   /home/x/D*        absolute with wildcards - matched against the whole
+ *                     path, wildcards stopping at '/'
+ *   build/tmp         contains a slash - matched against any component
+ *                     aligned tail of the path
+ *   node_modules      no slash - matched against the basename, at any depth
+ *
+ * A pattern containing ** lets its wildcards cross '/' as well.
+ *
+ * Directories are tested before the walk descends into them, so excluding a
+ * directory prunes its whole subtree rather than filtering entries one by
+ * one on the way out.
+ */
+static int pattern_matches(const char *pat, const char *full) {
+    if (!pat || !*pat) return 0;
+
+    /* "node_modules/" and "node_modules" mean the same thing to everyone
+     * who has written a .gitignore, so accept both. */
+    char trimmed[PATH_MAX];
+    size_t plen = strlen(pat);
+    while (plen > 1 && pat[plen - 1] == '/') plen--;
+    if (plen >= sizeof(trimmed)) return 0;
+    memcpy(trimmed, pat, plen);
+    trimmed[plen] = '\0';
+
+    int cross = strstr(trimmed, "**") != NULL;
+
+    if (trimmed[0] == '/') {
+        if (!pattern_has_glob(trimmed)) return path_has_prefix(full, trimmed);
+        return fnmatch(trimmed, full, cross ? 0 : FNM_PATHNAME) == 0;
+    }
+    if (strchr(trimmed, '/')) return match_path_tail(trimmed, full, cross);
+
+    const char *slash = strrchr(full, '/');
+    return fnmatch(trimmed, slash ? slash + 1 : full, 0) == 0;
+}
+
+/*
+ * This used to accept absolute prefixes only, and skip anything else without
+ * a word. Passing --exclude '*.iso' or 'node_modules' therefore excluded
+ * nothing, reported nothing, and backed the lot up: the operator believed
+ * they had excluded something and the only evidence otherwise was the size
+ * of the repository months later.
+ */
 static int is_excluded(const char *full_path, const scan_opts_t *opts) {
     if (!opts || !opts->exclude || opts->n_exclude == 0) return 0;
     for (int i = 0; i < opts->n_exclude; i++) {
-        const char *ex = opts->exclude[i];
-        if (!ex || ex[0] != '/') continue;
-        if (path_has_prefix(full_path, ex)) return 1;
+        if (pattern_matches(opts->exclude[i], full_path)) return 1;
     }
     return 0;
 }

@@ -300,6 +300,61 @@ well_formed "job list is well formed"    "$(sock_body /jobs)"
 sleep 1
 contains "journal readable" 'entries' "$(sock_body /repos/1/journal)"
 
+# Exclusions reach the engine only if the route parses them. It did not: the
+# field looked accepted and was ignored, so every backup took the whole tree.
+#
+# Its own repo and its own source tree on purpose. Backing up into repo 1
+# would shift its snapshot numbering and add files the earlier restore and
+# diff assertions compare against, which is exactly what happened the first
+# time this was written.
+echo "exclude"
+mkdir -p "$WORK/exsrc/node_modules" "$WORK/exsrc/build"
+echo "kept"     > "$WORK/exsrc/kept.txt"
+echo "vendored" > "$WORK/exsrc/node_modules/dep.js"
+echo "object"   > "$WORK/exsrc/build/out.o"
+echo "artifact" > "$WORK/exsrc/disk.iso"
+check "register exclude repo" 201 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+       -d "{\"path\":\"$WORK/exrepo\"}" http://localhost/repos)"
+EX_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"paths\":[\"$WORK/exsrc\"],\"exclude\":[\"node_modules\",\"*.iso\",\"build\"]}" \
+          http://localhost/repos/2/backup)
+EX_JOB=$(job_id "$EX_RESP")
+wait_job "$EX_JOB"
+contains "excluding backup completed" '"state":"completed"' "$(sock_body "/jobs/$EX_JOB")"
+contains "unexcluded file backed up" 'kept.txt' "$(sock_body '/repos/2/search?q=kept')"
+case "$(sock_body '/repos/2/search?q=dep')" in
+    *dep.js*) bad "node_modules excluded" "absent" "present" ;;
+    *)        ok  "node_modules excluded" ;;
+esac
+case "$(sock_body '/repos/2/search?q=disk')" in
+    *disk.iso*) bad "glob *.iso excluded" "absent" "present" ;;
+    *)          ok  "glob *.iso excluded" ;;
+esac
+case "$(sock_body '/repos/2/search?q=out')" in
+    *out.o*) bad "build dir excluded" "absent" "present" ;;
+    *)       ok  "build dir excluded" ;;
+esac
+
+# Verify had unit coverage and no end-to-end coverage: the route, the job
+# wiring and the level parameter were never exercised through the daemon.
+echo "verify"
+VERIFY_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
+              "http://localhost/repos/1/verify?level=index")
+contains "verify submit" '"job_id"' "$VERIFY_RESP"
+VERIFY_JOB=$(job_id "$VERIFY_RESP")
+wait_job "$VERIFY_JOB"
+contains "verify job completed" '"state":"completed"' "$(sock_body "/jobs/$VERIFY_JOB")"
+DEEP_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
+            "http://localhost/repos/1/verify?level=deep")
+DEEP_JOB=$(job_id "$DEEP_RESP")
+wait_job "$DEEP_JOB"
+contains "deep verify completed" '"state":"completed"' "$(sock_body "/jobs/$DEEP_JOB")"
+check "unknown verify level rejected" 400 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+       "http://localhost/repos/1/verify?level=sideways")"
+contains "verify age metric present" 'cbackup_last_verify_age_seconds' "$(sock_body /metrics)"
+
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 for _ in $(seq 1 50); do

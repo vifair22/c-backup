@@ -152,6 +152,110 @@ static void test_scan_missing_root_is_nonfatal(void **state) {
     scan_imap_free(imap);
 }
 
+/*
+ * Patterns that are not absolute paths.
+ *
+ * These were accepted by every caller and then silently dropped: the matcher
+ * skipped anything not starting with '/', so --exclude '*.tmp' excluded
+ * nothing and said nothing about it. Whoever wrote the pattern believed the
+ * files were out of the backup, and the only evidence otherwise was the
+ * repository size months later.
+ */
+static void scan_with(const char **ex, int n, scan_result_t **out) {
+    scan_imap_t *imap = scan_imap_new();
+    assert_non_null(imap);
+    scan_opts_t opts = { .exclude = ex, .n_exclude = n };
+    assert_int_equal(scan_tree(TEST_ROOT1, imap, &opts, out), OK);
+    assert_non_null(*out);
+    scan_imap_free(imap);
+}
+
+static int saw(const scan_result_t *res, const char *needle) {
+    for (uint32_t i = 0; i < res->count; i++)
+        if (strstr(res->entries[i].path, needle)) return 1;
+    return 0;
+}
+
+static void test_exclude_by_glob_on_basename(void **state) {
+    (void)state;
+    const char *ex[] = { "*.tmp" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "skip.tmp"));
+    assert_true(saw(res, "keep.txt"));
+    scan_result_free(res);
+}
+
+static void test_exclude_by_bare_name_at_any_depth(void **state) {
+    (void)state;
+    /* "sub" names a directory one level down; the pattern knows nothing
+     * about where the tree is rooted. */
+    const char *ex[] = { "sub" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "sub/nested.txt"));
+    assert_true(saw(res, "keep.txt"));
+    scan_result_free(res);
+}
+
+/* A directory match prunes the subtree rather than filtering its entries
+ * one at a time on the way out. */
+static void test_exclude_of_directory_prunes_subtree(void **state) {
+    (void)state;
+    mkdir(TEST_ROOT1 "/sub/deeper", 0755);
+    write_file(TEST_ROOT1 "/sub/deeper/leaf.txt", "leaf");
+    const char *ex[] = { "sub" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "deeper"));
+    assert_false(saw(res, "leaf.txt"));
+    scan_result_free(res);
+}
+
+static void test_exclude_by_path_fragment(void **state) {
+    (void)state;
+    const char *ex[] = { "sub/nested.txt" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "nested.txt"));
+    assert_true(saw(res, "keep.txt"));
+    scan_result_free(res);
+}
+
+static void test_exclude_absolute_glob(void **state) {
+    (void)state;
+    const char *ex[] = { TEST_ROOT1 "/*.tmp" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "skip.tmp"));
+    assert_true(saw(res, "keep.txt"));
+    scan_result_free(res);
+}
+
+/* A trailing slash is how everyone writes a directory in a .gitignore. */
+static void test_exclude_tolerates_trailing_slash(void **state) {
+    (void)state;
+    const char *ex[] = { "sub/" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "nested.txt"));
+    scan_result_free(res);
+}
+
+/* An absolute literal still matches on component boundaries only, so a
+ * pattern must not swallow a sibling that merely starts the same way. */
+static void test_absolute_exclude_stops_at_component_boundary(void **state) {
+    (void)state;
+    mkdir(TEST_ROOT1 "/subterranean", 0755);
+    write_file(TEST_ROOT1 "/subterranean/x.txt", "x");
+    const char *ex[] = { TEST_ROOT1 "/sub" };
+    scan_result_t *res = NULL;
+    scan_with(ex, 1, &res);
+    assert_false(saw(res, "sub/nested.txt"));
+    assert_true(saw(res, "subterranean/x.txt"));
+    scan_result_free(res);
+}
+
 static void test_scan_root_excluded_returns_empty(void **state) {
     (void)state;
     scan_imap_t *imap = scan_imap_new();
@@ -311,6 +415,13 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_scan_excludes_absolute_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_hardlink_across_roots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_missing_root_is_nonfatal, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_by_glob_on_basename, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_by_bare_name_at_any_depth, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_of_directory_prunes_subtree, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_by_path_fragment, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_absolute_glob, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_exclude_tolerates_trailing_slash, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_absolute_exclude_stops_at_component_boundary, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),

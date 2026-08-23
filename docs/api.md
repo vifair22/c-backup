@@ -68,7 +68,7 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/repos/<id>/backup` | `{paths:[...], label}` |
+| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
@@ -80,6 +80,29 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 pulling a single file back does not cost a full restore. It accepts the path
 either as it appears in the browser or without its leading slash, and matches
 on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
+
+`exclude` takes patterns, and how one is matched follows from what it
+contains rather than from a flag:
+
+| Pattern | Matches |
+|---|---|
+| `/var/cache` | that directory and its subtree, on component boundaries, so not `/var/cache-manager` |
+| `/home/*/Downloads` | absolute with wildcards, `*` stopping at `/` |
+| `build/tmp` | any component-aligned tail of a path, at any depth |
+| `node_modules`, `*.iso` | the basename, at any depth |
+| anything containing `**` | as above, but wildcards may cross `/` |
+
+A trailing slash is accepted and ignored, so `node_modules/` and
+`node_modules` mean the same thing. Directories are tested before the walk
+descends, so excluding one prunes its subtree rather than filtering entries
+on the way out.
+
+Before this, the matcher accepted absolute prefixes only and silently
+skipped everything else, and the route did not read the field at all: a
+request could carry any exclusions it liked and back up the whole tree
+regardless. `one_filesystem` was in the same position, which is the
+difference between backing up a home directory and backing up every network
+mount under it.
 
 Verify is the answer to "is the backup still good", which is a different
 question from "did the backup run". Three levels, because the cost spread is

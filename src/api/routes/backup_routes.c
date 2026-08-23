@@ -40,6 +40,9 @@ typedef struct {
     char        *label;
     char       **paths;
     int          n_paths;
+    char       **excludes;
+    int          n_excludes;
+    int          one_filesystem;
 } backup_job_t;
 
 static void backup_job_free(void *p)
@@ -48,6 +51,8 @@ static void backup_job_free(void *p)
     if (!j) return;
     for (int i = 0; i < j->n_paths; i++) free(j->paths[i]);
     free(j->paths);
+    for (int i = 0; i < j->n_excludes; i++) free(j->excludes[i]);
+    free(j->excludes);
     free(j->repo_path);
     free(j->label);
     free(j);
@@ -89,10 +94,26 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     }
     for (int i = 0; i < j->n_paths; i++) cpaths[i] = j->paths[i];
 
+    const char **cexcl = NULL;
+    if (j->n_excludes > 0) {
+        cexcl = malloc((size_t)j->n_excludes * sizeof(*cexcl));
+        if (!cexcl) {
+            free(cpaths);
+            store_index_free(idx);
+            store_close(store);
+            repo_unlock(j->repo_id);
+            return set_error(ERR_NOMEM, "backup job: excludes");
+        }
+        for (int i = 0; i < j->n_excludes; i++) cexcl[i] = j->excludes[i];
+    }
+
     backup_opts_t o;
     memset(&o, 0, sizeof(o));
-    o.paths        = cpaths;
-    o.n_paths      = j->n_paths;
+    o.paths          = cpaths;
+    o.n_paths        = j->n_paths;
+    o.exclude        = cexcl;
+    o.n_exclude      = j->n_excludes;
+    o.one_filesystem = j->one_filesystem;
     o.label        = j->label;
     o.cancel       = cancel;
     o.progress_cb  = progress;
@@ -127,6 +148,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     }
 
     free(cpaths);
+    free(cexcl);
     store_index_free(idx);
     store_close(store);
     repo_unlock(j->repo_id);
@@ -186,6 +208,32 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
                 j->paths[j->n_paths++] = p;
             }
         }
+
+        /*
+         * Exclusions. The engine has always supported them and the daemon
+         * never passed any, so through the API nothing could be excluded at
+         * all: every backup took the whole tree, caches and build
+         * directories included, however the request was written.
+         */
+        CUTILS_AUTO_JSON_ITER cutils_json_iter_t ex;
+        if (json_iter_begin(body, "exclude", &ex) == 0) {
+            while (json_iter_next(&ex)) {
+                char *p = NULL;
+                if (json_iter_get_str(&ex, "", &p) != 0 || !p) continue;
+                if (!*p) { free(p); continue; }
+                char **grown = realloc(j->excludes,
+                                       (size_t)(j->n_excludes + 1) * sizeof(*grown));
+                if (!grown) { free(p); break; }
+                j->excludes = grown;
+                j->excludes[j->n_excludes++] = p;
+            }
+        }
+
+        /* Staying on one filesystem is the difference between backing up a
+         * home directory and backing up every network mount under it. */
+        uint32_t onefs = 0;
+        if (json_req_get_u32(body, "one_filesystem", &onefs, 0, 1) == 0)
+            j->one_filesystem = (int)onefs;
     }
 
     if (j->n_paths == 0) {

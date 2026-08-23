@@ -108,9 +108,14 @@ Each entry carries the absolute path, the `lstat` result, a scan-assigned
 5. **Symlink targets** are read with `readlinkat` through an
    `O_PATH|O_NOFOLLOW` fd to close the TOCTOU window between `lstat` and
    the read. The target string travels with the entry.
-6. **Filters.** `exclude` prefixes are matched at path-component
-   boundaries; `one_filesystem` compares each entry's `st_dev` against the
-   root's and skips mount crossings.
+6. **Filters.** `exclude` patterns are matched by shape: an absolute
+   literal is a prefix match on component boundaries, an absolute pattern
+   with wildcards matches the whole path, a pattern containing a slash
+   matches any component-aligned tail, and a bare name matches the basename
+   at any depth (`**` lets wildcards cross `/`). Directories are tested
+   before the walk descends, so an excluded directory prunes its subtree.
+   `one_filesystem` compares each entry's `st_dev` against the root's and
+   skips mount crossings.
 7. **Failures are warnings.** A file that vanishes, a directory that cannot
    be opened, a path that overflows `PATH_MAX`: each is recorded as a
    warning and skipped. A live filesystem changes underneath the scan and
