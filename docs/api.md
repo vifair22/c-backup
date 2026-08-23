@@ -64,6 +64,25 @@ Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
 
+## The CLI covers all of this
+
+`c-backup` is a thin client over these endpoints and deliberately exposes
+every one of them. A capability reachable through the API but not the CLI
+means an operator has to hand-write a `curl --unix-socket` call, or open the
+desktop app, to run their own backup tool - which is the friction the daemon
+rewrite existed to remove. When an endpoint is added, a command goes with it,
+and `tests/test_cli_e2e.sh` exercises the whole table.
+
+`c-backup help` lists the commands. Flags may appear anywhere in a command,
+values are JSON-escaped and query parameters percent-encoded, so a path
+containing a quote, a space or a `#` is sent correctly rather than producing
+a malformed request.
+
+> **Known wart.** A collection with no rows serialises as `{}` rather than
+> `{"entries":[]}`, because the array is only created when the first element
+> is appended. Clients must therefore handle both shapes. Fixing it properly
+> needs an "ensure empty array" helper in c-utils rather than a change here.
+
 ## Operations
 
 | Method | Path | Purpose |
