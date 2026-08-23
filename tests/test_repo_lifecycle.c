@@ -22,6 +22,7 @@
 #include <cutils/db.h>
 
 #include "repo.h"
+#include "repo_key.h"
 #include "lock.h"
 
 #define TEST_DB   "/tmp/c_backup_test_lifecycle.db"
@@ -79,7 +80,9 @@ static void test_register_creates_missing_dir(void **state)
 
     repo_marker_t m;
     assert_int_equal(repo_marker_read(TEST_ROOT "/fresh", &m), OK);
-    assert_int_equal(m.version, CBACKUP_FORMAT_VER);
+    /* Plaintext repositories stay at the older marker version so a build
+     * predating encryption still reads them; only encrypted ones move up. */
+    assert_int_equal(m.version, CBACKUP_FORMAT_VER_PLAIN);
     assert_true(strlen(m.uuid) > 0);
 
     struct stat sb;
@@ -250,9 +253,144 @@ static void test_read_locks_share(void **state)
     repo_locks_shutdown();
 }
 
+/* ---------- encryption at creation ---------- */
+
+#define TEST_KEYS TEST_ROOT "/keys"
+
+static repo_enc_request_t enc_request(repo_enc_mode_t mode, const char *pass)
+{
+    repo_enc_request_t e;
+    memset(&e, 0, sizeof(e));
+    e.mode = mode;
+    e.key_dir = TEST_KEYS;
+    e.passphrase = pass;
+    return e;
+}
+
+/*
+ * System mode: the key exists on the host and nowhere else, so registration
+ * has to hand it back. If it did not, the only copy would be a file on the
+ * machine being backed up, and losing that machine would take every offsite
+ * copy of its repository with it.
+ */
+static void test_system_encryption_returns_the_key_once(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_SYSTEM, NULL);
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/sysenc", "s", &e, &id), OK);
+    assert_int_equal(strlen(e.key_hex), REPO_KEY_BYTES * 2);
+
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/sysenc", &m), OK);
+    assert_int_equal(m.enc_mode, REPO_ENC_SYSTEM);
+    assert_int_equal(m.version, CBACKUP_FORMAT_VER);
+    assert_string_equal(m.cipher, CBACKUP_CIPHER);
+
+    /* The marker names the key without containing it. */
+    assert_null(strstr(e.key_hex, m.key_id));
+
+    repo_key_t k;
+    assert_int_equal(repo_key_load(TEST_KEYS, m.uuid, &k), OK);
+    assert_string_equal(k.id, m.key_id);
+}
+
+/*
+ * Passphrase mode: the wrapped key travels with the repository, so an offsite
+ * copy plus the passphrase is enough. Nothing on the original host is needed.
+ */
+static void test_passphrase_repo_is_recoverable_from_the_marker_alone(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, "correct horse");
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/passenc", "p", &e, &id), OK);
+    /* Nothing to display: the operator already has the secret. */
+    assert_int_equal(e.key_hex[0], '\0');
+
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/passenc", &m), OK);
+    assert_int_equal(m.enc_mode, REPO_ENC_PASSPHRASE);
+    assert_true(m.kdf.iterations > 0);
+    assert_true(m.kdf.memory_kib > 0);
+
+    repo_key_t recovered;
+    assert_int_equal(repo_key_unwrap(m.wrapped, &m.kdf, "correct horse", &recovered), OK);
+    assert_string_equal(recovered.id, m.key_id);
+
+    /* And the same key is cached on the host for unattended backups. */
+    repo_key_t cached;
+    assert_int_equal(repo_key_load(TEST_KEYS, m.uuid, &cached), OK);
+    assert_memory_equal(cached.key, recovered.key, REPO_KEY_BYTES);
+}
+
+static void test_passphrase_mode_requires_a_passphrase(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, NULL);
+    int64_t id = 0;
+    assert_int_not_equal(repo_register_ex(db, TEST_ROOT "/nopass", "x", &e, &id), OK);
+    err_clear();
+}
+
+/* An unencrypted repository stays a version 1 marker, so a build that
+ * predates encryption still reads it. */
+static void test_plain_repo_keeps_the_old_marker_version(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/plainmarker", "p", &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/plainmarker", &m), OK);
+    assert_int_equal(m.version, CBACKUP_FORMAT_VER_PLAIN);
+    assert_int_equal(m.enc_mode, REPO_ENC_NONE);
+}
+
+/* A marker claiming encryption it cannot describe must not read as plaintext:
+ * that would write unencrypted objects into an encrypted repository. */
+static void test_marker_with_broken_encryption_block_is_refused(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_ROOT "/broken", 0700), 0);
+    FILE *f = fopen(TEST_ROOT "/broken/.cbackup", "w");
+    assert_non_null(f);
+    fputs("{\"format\":\"cbackup-repo\",\"version\":2,"
+          "\"uuid\":\"3f2504e0-4f89-11d3-9a0c-0305e82c3301\","
+          "\"encryption\":{\"mode\":\"passphrase\","
+          "\"cipher\":\"chacha20-poly1305\",\"key_id\":\"aabbccddeeff0011\"}}\n", f);
+    fclose(f);
+
+    repo_marker_t m;
+    assert_int_not_equal(repo_marker_read(TEST_ROOT "/broken", &m), OK);
+    err_clear();
+}
+
+static void test_unknown_encryption_mode_is_refused(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_ROOT "/future", 0700), 0);
+    FILE *f = fopen(TEST_ROOT "/future/.cbackup", "w");
+    assert_non_null(f);
+    fputs("{\"format\":\"cbackup-repo\",\"version\":2,"
+          "\"uuid\":\"3f2504e0-4f89-11d3-9a0c-0305e82c3302\","
+          "\"encryption\":{\"mode\":\"quantum\",\"cipher\":\"chacha20-poly1305\","
+          "\"key_id\":\"aabbccddeeff0011\"}}\n", f);
+    fclose(f);
+
+    repo_marker_t m;
+    assert_int_not_equal(repo_marker_read(TEST_ROOT "/future", &m), OK);
+    err_clear();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_system_encryption_returns_the_key_once, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_passphrase_repo_is_recoverable_from_the_marker_alone, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_passphrase_mode_requires_a_passphrase, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_plain_repo_keeps_the_old_marker_version, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_marker_with_broken_encryption_block_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unknown_encryption_mode_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_adopts_empty_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_is_idempotent, setup, teardown),
