@@ -7,24 +7,24 @@ How snapshots are assigned to GFS tiers (daily/weekly/monthly/yearly) and how th
 ```mermaid
 flowchart TD
     subgraph "Calendar Boundaries (UTC)"
-        DAY["Daily boundary:<br/>Last backup per<br/>calendar day"]
-        WEEK["Weekly boundary:<br/>Sunday daily of<br/>Mon-Sun week"]
-        MONTH["Monthly boundary:<br/>Last Sunday<br/>of the month"]
-        YEAR["Yearly boundary:<br/>December monthly"]
+        DAY["Daily boundary:<br>Last backup per<br>calendar day"]
+        WEEK["Weekly boundary:<br>Sunday daily of<br>Mon-Sun week"]
+        MONTH["Monthly boundary:<br>Last Sunday<br>of the month"]
+        YEAR["Yearly boundary:<br>December monthly"]
     end
 
     subgraph "Promotion Cascade"
-        SNAP["All snapshots<br/>in scan window"]
+        SNAP["All snapshots<br>in scan window"]
         
-        P1["Pass 1: Daily election<br/>For each closed day,<br/>find latest snapshot<br/>→ set GFS_DAILY"]
+        P1["Pass 1: Daily election<br>For each closed day,<br>find latest snapshot<br>-> set GFS_DAILY"]
         
-        P2["Pass 2: Weekly election<br/>For each Sunday,<br/>find best daily in Mon-Sun<br/>→ set GFS_WEEKLY"]
+        P2["Pass 2: Weekly election<br>For each Sunday,<br>find best daily in Mon-Sun<br>-> set GFS_WEEKLY"]
         
-        P3["Pass 3: Monthly election<br/>For each month,<br/>find best weekly<br/>→ set GFS_MONTHLY"]
+        P3["Pass 3: Monthly election<br>For each month,<br>find best weekly<br>-> set GFS_MONTHLY"]
         
-        P4["Pass 4: Yearly election<br/>For each year,<br/>find best monthly<br/>→ set GFS_YEARLY"]
+        P4["Pass 4: Yearly election<br>For each year,<br>find best monthly<br>-> set GFS_YEARLY"]
         
-        FLUSH["Flush changed flags<br/>snapshot_replace_gfs_flags()"]
+        FLUSH["Flush changed flags<br>snapshot_replace_gfs_flags()"]
     end
 
     SNAP -->|start cascade| P1 -->|dailies fixed| P2 -->|weeklies fixed| P3 -->|monthlies fixed| P4 -->|persist| FLUSH
@@ -46,21 +46,21 @@ flowchart TD
 flowchart TD
     SNAP_IN(["For each snapshot"])
 
-    IS_HEAD{"Is HEAD<br/>(newest)?"}
+    IS_HEAD{"Is HEAD<br>(newest)?"}
     IS_HEAD -- "Yes" --> KEEP_HEAD(["KEEP"])
 
-    IS_HEAD -- "No" --> HAS_TIER{"Has GFS tier<br/>flag?"}
+    IS_HEAD -- "No" --> HAS_TIER{"Has GFS tier<br>flag?"}
 
-    HAS_TIER -- "Yes" --> TIER_CHECK{"Tier within<br/>keep limit?<br/>count newer at<br/>same tier < keep_N"}
-    TIER_CHECK -- "Yes" --> KEEP_TIER(["KEEP<br/>(GFS anchor)"])
+    HAS_TIER -- "Yes" --> TIER_CHECK{"Tier within<br>keep limit?<br>count newer at<br>same tier < keep_N"}
+    TIER_CHECK -- "Yes" --> KEEP_TIER(["KEEP<br>(GFS anchor)"])
     TIER_CHECK -- "No: tier expired" --> WINDOW_CHECK
 
-    HAS_TIER -- "No" --> WINDOW_CHECK{"Within<br/>keep_snaps<br/>rolling window?"}
+    HAS_TIER -- "No" --> WINDOW_CHECK{"Within<br>keep_snaps<br>rolling window?"}
 
-    WINDOW_CHECK -- "Yes" --> KEEP_WINDOW(["KEEP<br/>(rolling window)"])
+    WINDOW_CHECK -- "Yes" --> KEEP_WINDOW(["KEEP<br>(rolling window)"])
 
-    WINDOW_CHECK -- "No" --> PRESERVED{"Has preserved<br/>tag?"}
-    PRESERVED -- "Yes" --> KEEP_TAG(["KEEP<br/>(preserved)"])
+    WINDOW_CHECK -- "No" --> PRESERVED{"Has preserved<br>tag?"}
+    PRESERVED -- "Yes" --> KEEP_TAG(["KEEP<br>(preserved)"])
     PRESERVED -- "No" --> DELETE(["DELETE"])
 
     style KEEP_HEAD fill:#d4edda,stroke:#28a745

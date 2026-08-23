@@ -6,21 +6,21 @@ The layered existence check that determines whether an object needs to be stored
 flowchart TD
     START(["object_exists(hash)"])
 
-    CHECK1{"Loose hash set<br/>repo_loose_set_contains()<br/>(in-memory O(1))"}
+    CHECK1{"Loose hash set<br>repo_loose_set_contains()<br>(in-memory O(1))"}
     START --> CHECK1
-    CHECK1 -- "Hit" --> EXISTS(["Return 1<br/>Object exists"])
+    CHECK1 -- "Hit" --> EXISTS(["Return 1<br>Object exists"])
 
-    CHECK1 -- "Miss" --> READY{"Loose set<br/>built?<br/>repo_loose_set_ready()"}
+    CHECK1 -- "Miss" --> READY{"Loose set<br>built?<br>repo_loose_set_ready()"}
 
-    READY -- "No" --> CHECK2{"On-disk fallback<br/>faccessat()<br/>objects/XX/rest"}
+    READY -- "No" --> CHECK2{"On-disk fallback<br>faccessat()<br>objects/XX/rest"}
     CHECK2 -- "File exists" --> EXISTS
 
-    READY -- "Yes: set is<br/>authoritative" --> CHECK3
+    READY -- "Yes: set is<br>authoritative" --> CHECK3
     CHECK2 -- "ENOENT" --> CHECK3
 
-    CHECK3{"Pack index<br/>pack_object_exists()<br/>bsearch on cache"}
+    CHECK3{"Pack index<br>pack_object_exists()<br>bsearch on cache"}
     CHECK3 -- "Found" --> EXISTS
-    CHECK3 -- "Not found" --> NOT_EXISTS(["Return 0<br/>Object is new"])
+    CHECK3 -- "Not found" --> NOT_EXISTS(["Return 0<br>Object is new"])
 
     style EXISTS fill:#d4edda,stroke:#28a745
     style NOT_EXISTS fill:#f8d7da,stroke:#dc3545

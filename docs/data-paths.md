@@ -147,15 +147,15 @@ The scan list is walked once. Per entry:
 flowchart TD
     E[scan entry] --> TY{node type}
     TY -->|directory| D[counted, no content]
-    TY -->|symlink, fifo, device| N[no content object<br/>metadata only]
+    TY -->|symlink, fifo, device| N[no content object<br>metadata only]
     TY -->|regular| CACHE{file_cache hit?}
-    CACHE -->|yes| HIT[reuse cached hash<br/>file never opened]
+    CACHE -->|yes| HIT[reuse cached hash<br>file never opened]
     CACHE -->|no| OPEN[open O_RDONLY]
     OPEN --> SZ{size?}
     SZ -->|zero bytes| EMPTY[empty object]
     SZ -->|nonzero| SPARSE{SEEK_DATA finds holes?}
-    SPARSE -->|yes| SPOBJ[OBJECT_TYPE_SPARSE<br/>region table + data, streamed]
-    SPARSE -->|no| STREAM[OBJECT_TYPE_FILE<br/>streamed whole]
+    SPARSE -->|yes| SPOBJ[OBJECT_TYPE_SPARSE<br>region table + data, streamed]
+    SPARSE -->|no| STREAM[OBJECT_TYPE_FILE<br>streamed whole]
     SPOBJ --> DEDUP{hash already stored?}
     STREAM --> DEDUP
     EMPTY --> DEDUP
@@ -460,7 +460,7 @@ flowchart TD
     T -->|directory| MD[mkdir -p + metadata]
     T -->|symlink| SL{link_target recorded?}
     SL -->|no| SKIP1[warn + skip]
-    SL -->|yes| SLC[symlink + lchown/utimensat NOFOLLOW<br/>no chmod: it would follow the link]
+    SL -->|yes| SLC[symlink + lchown/utimensat NOFOLLOW<br>no chmod: it would follow the link]
     T -->|regular| HL{hardlink group already restored?}
     HL -->|yes| LN[link to first member]
     LN -->|EXDEV/unsupported| CP[fall through: copy content]
@@ -469,10 +469,10 @@ flowchart TD
     CH -->|null or zero| SKIP2[skip; warn if unexpected type]
     CH -->|yes| ST[object_load_stream to dest fd]
     ST --> SP{OBJECT_TYPE_SPARSE?}
-    SP -->|yes| SCAT[reopen + scatter regions via<br/>restore_sparse_streaming]
+    SP -->|yes| SCAT[reopen + scatter regions via<br>restore_sparse_streaming]
     SP -->|no| META[apply mode/owner/mtime]
     SCAT --> META
-    META --> REM[first of a hardlink group:<br/>remember path for later members]
+    META --> REM[first of a hardlink group:<br>remember path for later members]
 ```
 
 Type-specific behaviour, spelled out:
