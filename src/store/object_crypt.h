@@ -35,43 +35,36 @@
 
 #define OBJECT_CRYPT_TAG_BYTES   16
 #define OBJECT_CRYPT_NONCE_BYTES 12
+/* Nonce and tag, both stored with the payload. */
+#define OBJECT_CRYPT_OVERHEAD (OBJECT_CRYPT_NONCE_BYTES + OBJECT_CRYPT_TAG_BYTES)
 
 /*
- * Which storage form the payload is being encrypted for.
+ * Encrypt in one shot. out holds nonce, ciphertext and tag, so it must be
+ * len + OBJECT_CRYPT_OVERHEAD bytes.
  *
- * The nonce comes from the content hash, so the same file always encrypts to
- * the same bytes and dedup survives. That is safe only while the same nonce
- * always covers the same plaintext - and an object is stored twice in
- * different forms: raw while it is loose, LZ4-compressed once it is packed.
- * Same file, same hash, same nonce, two different plaintexts is the one thing
- * a stream cipher must never do: XOR the two ciphertexts and the keystream
- * cancels, leaving the XOR of the two plaintexts with the key not involved.
- * Since one of them is the LZ4 encoding of the other, that is recoverable.
+ * The nonce is random and stored, not derived from the content.
  *
- * Mixing the form into the derivation gives the two forms unrelated
- * keystreams. It is not secret and is not stored: the reader always knows
- * which form it is holding.
- */
-typedef enum {
-    OBJECT_FORM_LOOSE  = 0,
-    OBJECT_FORM_PACKED = 1,
-} object_form_t;
-
-/*
- * Encrypt in one shot. out must hold len + OBJECT_CRYPT_TAG_BYTES; the tag is
- * appended, so the stored payload is longer than the plaintext by exactly the
- * tag. hash is the object's content hash and supplies both the nonce and the
- * associated data, which binds the ciphertext to the name it is filed under:
- * moving a payload to another object's file is then detected rather than
- * decrypted into nonsense.
+ * Deriving it from the hash would make identical files encrypt identically,
+ * which sounds like what a deduplicating store wants and is not: dedup is
+ * decided by looking up the plaintext hash before anything is written, so a
+ * duplicate never reaches this function. What determinism would actually buy
+ * is a way for the same object stored in two forms - raw while loose,
+ * compressed once packed - to share a nonce across different plaintexts,
+ * which for a stream cipher is the one fatal mistake. A fresh random nonce
+ * per encryption cannot collide and costs twelve bytes.
+ *
+ * hash is the associated data, binding the ciphertext to the object it is
+ * filed under, so a payload moved into another object's file is detected
+ * here rather than decrypting into nonsense that fails later.
  */
 status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
-                        object_form_t form, const void *in, size_t len, void *out);
+                        const void *in, size_t len, void *out);
 
-/* Decrypt in one shot. in holds len + OBJECT_CRYPT_TAG_BYTES bytes; out holds
- * len. Returns ERR_CORRUPT when the tag does not verify. */
+/* Decrypt in one shot. in holds len + OBJECT_CRYPT_OVERHEAD bytes as written
+ * by object_encrypt; out holds len. ERR_CORRUPT when the tag does not
+ * verify. */
 status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
-                        object_form_t form, const void *in, size_t len, void *out);
+                        const void *in, size_t len, void *out);
 
 /*
  * Streaming, for payloads that do not fit in memory. The AEAD is fed
@@ -81,9 +74,15 @@ status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
  */
 typedef struct object_crypt_stream object_crypt_stream_t;
 
+/*
+ * Streaming, for payloads that do not fit in memory. Encrypting generates the
+ * nonce and returns it for the caller to store ahead of the ciphertext;
+ * decrypting takes the one that was stored.
+ */
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
                                    const repo_key_t *key, const uint8_t *hash,
-                                   object_form_t form, int encrypting);
+                                   uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
+                                   int encrypting);
 status_t object_crypt_stream_update(object_crypt_stream_t *s,
                                     const void *in, size_t len, void *out);
 /* Encrypting: writes the tag to tag_out. Decrypting: verifies tag_in. */

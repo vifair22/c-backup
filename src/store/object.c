@@ -150,12 +150,12 @@ static status_t write_object(store_t *store, uint8_t type,
     uint8_t *ciphertext = NULL;
     const repo_key_t *key = store_key(store);
     if (key) {
-        ciphertext = malloc(payload_size + OBJECT_CRYPT_TAG_BYTES);
+        ciphertext = malloc(payload_size + OBJECT_CRYPT_OVERHEAD);
         if (!ciphertext) return set_error(ERR_NOMEM, "write_object: cipher buffer");
-        status_t est = object_encrypt(key, out_hash, OBJECT_FORM_LOOSE, payload, payload_size, ciphertext);
+        status_t est = object_encrypt(key, out_hash, payload, payload_size, ciphertext);
         if (est != OK) { free(ciphertext); return est; }
         payload = ciphertext;
-        payload_size += OBJECT_CRYPT_TAG_BYTES;
+        payload_size += OBJECT_CRYPT_OVERHEAD;
         encryption = ENCRYPT_CHACHA20;
     }
 
@@ -1542,12 +1542,12 @@ status_t object_load(store_t *store,
             return set_error(ERR_INVALID,
                              "object %s is encrypted and no key is loaded", hex);
         }
-        if (hdr.compressed_size < OBJECT_CRYPT_TAG_BYTES) {
+        if (hdr.compressed_size < OBJECT_CRYPT_OVERHEAD) {
             free(cpayload);
             return set_error(ERR_CORRUPT, "object %s: truncated ciphertext", hex);
         }
-        size_t ptlen = (size_t)hdr.compressed_size - OBJECT_CRYPT_TAG_BYTES;
-        status_t dst = object_decrypt(key, hash, OBJECT_FORM_LOOSE, cpayload, ptlen, cpayload);
+        size_t ptlen = (size_t)hdr.compressed_size - OBJECT_CRYPT_OVERHEAD;
+        status_t dst = object_decrypt(key, hash, cpayload, ptlen, cpayload);
         if (dst != OK) { free(cpayload); return dst; }
         hdr.compressed_size = ptlen;
     }

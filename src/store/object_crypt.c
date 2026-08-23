@@ -12,58 +12,18 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
+#include <openssl/rand.h>
 
 /*
- * The nonce is derived, not stored.
+ * A fresh nonce for every encryption, from the CSPRNG.
  *
- * HKDF over the content hash under the repository key gives a nonce that is
- * unique per distinct plaintext (distinct plaintext means distinct hash) and
- * identical for the same plaintext, which is what lets two copies of a file
- * dedup to one object. Storing a random nonce instead would cost twelve bytes
- * per object and break that, since the same content would encrypt differently
- * every time.
- *
- * Reusing a nonce for the same key and the same plaintext is safe: it
- * produces the same ciphertext, which is the intended outcome here. What
- * would be catastrophic is reusing one across different plaintexts, and that
- * requires a SHA-256 collision.
+ * The alternative - deriving it from the content hash - would give identical
+ * plaintexts identical ciphertext. That is not needed: dedup is settled by a
+ * hash lookup before anything is encrypted, so a duplicate never gets here.
+ * And it would be dangerous, because one object is stored raw while loose and
+ * compressed once packed, so a hash-derived nonce would cover two different
+ * plaintexts under one key.
  */
-static status_t derive_nonce(const repo_key_t *key, const uint8_t *hash,
-                             object_form_t form,
-                             uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES])
-{
-    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
-    if (!kdf) return set_error(ERR_IO, "object_crypt: HKDF unavailable");
-    EVP_KDF_CTX *ctx = EVP_KDF_CTX_new(kdf);
-    EVP_KDF_free(kdf);
-    if (!ctx) return set_error(ERR_NOMEM, "object_crypt: KDF context");
-
-    /* The form is the domain separator: the same object stored loose and
-     * stored packed must not share a keystream. */
-    char info[40];
-    int infolen = snprintf(info, sizeof(info), "c-backup object nonce v1 %s",
-                           form == OBJECT_FORM_PACKED ? "packed" : "loose");
-    char *digest = "SHA256";
-    uint8_t keybuf[REPO_KEY_BYTES];
-    memcpy(keybuf, key->key, REPO_KEY_BYTES);
-    uint8_t hashbuf[OBJECT_HASH_SIZE];
-    memcpy(hashbuf, hash, OBJECT_HASH_SIZE);
-
-
-    OSSL_PARAM params[] = {
-        OSSL_PARAM_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, strlen(digest)),
-        OSSL_PARAM_octet_string(OSSL_KDF_PARAM_KEY, keybuf, sizeof(keybuf)),
-        OSSL_PARAM_octet_string(OSSL_KDF_PARAM_SALT, hashbuf, sizeof(hashbuf)),
-        OSSL_PARAM_octet_string(OSSL_KDF_PARAM_INFO, info, (size_t)infolen),
-        OSSL_PARAM_END,
-    };
-
-    int rc = EVP_KDF_derive(ctx, nonce, OBJECT_CRYPT_NONCE_BYTES, params);
-    EVP_KDF_CTX_free(ctx);
-    OPENSSL_cleanse(keybuf, sizeof(keybuf));
-    if (rc != 1) return set_error(ERR_IO, "object_crypt: nonce derivation failed");
-    return OK;
-}
 
 /*
  * Open the cipher with the content hash as associated data. The hash is the
@@ -72,16 +32,15 @@ static status_t derive_nonce(const repo_key_t *key, const uint8_t *hash,
  * fails a hash check further along with a less useful message.
  */
 static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
-                           const uint8_t *hash, object_form_t form, int encrypting)
+                           const uint8_t *hash,
+                           uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES], int encrypting)
 {
-    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
-    status_t st = derive_nonce(key, hash, form, nonce);
-    if (st != OK) return st;
+    if (encrypting && RAND_bytes(nonce, OBJECT_CRYPT_NONCE_BYTES) != 1)
+        return set_error(ERR_IO, "object_crypt: CSPRNG failed");
 
     int ok = encrypting
         ? EVP_EncryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce)
         : EVP_DecryptInit_ex(c, EVP_chacha20_poly1305(), NULL, key->key, nonce);
-    OPENSSL_cleanse(nonce, sizeof(nonce));
     if (ok != 1) return set_error(ERR_IO, "object_crypt: cipher init failed");
 
     int outl = 0;
@@ -93,7 +52,7 @@ static status_t crypt_init(EVP_CIPHER_CTX *c, const repo_key_t *key,
 }
 
 status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
-                        object_form_t form, const void *in, size_t len, void *out)
+                        const void *in, size_t len, void *out)
 {
     if (!key || !hash || (!in && len) || !out)
         return set_error(ERR_INVALID, "object_encrypt: null argument");
@@ -103,19 +62,21 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     if (!c) return set_error(ERR_NOMEM, "object_encrypt: cipher context");
 
-    status_t st = crypt_init(c, key, hash, form, 1);
+    uint8_t *o = out;
+    status_t st = crypt_init(c, key, hash, o, 1);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
+    /* Layout: nonce, then ciphertext, then tag. */
+    uint8_t *ct = o + OBJECT_CRYPT_NONCE_BYTES;
     int outl = 0;
-    uint8_t *o = out;
-    if (len && EVP_EncryptUpdate(c, o, &outl, in, (int)len) != 1) {
+    if (len && EVP_EncryptUpdate(c, ct, &outl, in, (int)len) != 1) {
         EVP_CIPHER_CTX_free(c);
         return set_error(ERR_IO, "object_encrypt: encryption failed");
     }
     int finl = 0;
-    if (EVP_EncryptFinal_ex(c, o + outl, &finl) != 1 ||
+    if (EVP_EncryptFinal_ex(c, ct + outl, &finl) != 1 ||
         EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, OBJECT_CRYPT_TAG_BYTES,
-                            o + len) != 1) {
+                            ct + len) != 1) {
         EVP_CIPHER_CTX_free(c);
         return set_error(ERR_IO, "object_encrypt: tag failed");
     }
@@ -124,7 +85,7 @@ status_t object_encrypt(const repo_key_t *key, const uint8_t *hash,
 }
 
 status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
-                        object_form_t form, const void *in, size_t len, void *out)
+                        const void *in, size_t len, void *out)
 {
     if (!key || !hash || !in || (!out && len))
         return set_error(ERR_INVALID, "object_decrypt: null argument");
@@ -134,18 +95,21 @@ status_t object_decrypt(const repo_key_t *key, const uint8_t *hash,
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     if (!c) return set_error(ERR_NOMEM, "object_decrypt: cipher context");
 
-    status_t st = crypt_init(c, key, hash, form, 0);
+    const uint8_t *i = in;
+    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+    memcpy(nonce, i, sizeof(nonce));
+    status_t st = crypt_init(c, key, hash, nonce, 0);
     if (st != OK) { EVP_CIPHER_CTX_free(c); return st; }
 
-    const uint8_t *i = in;
+    const uint8_t *ct = i + OBJECT_CRYPT_NONCE_BYTES;
     int outl = 0;
-    if (len && EVP_DecryptUpdate(c, out, &outl, i, (int)len) != 1) {
+    if (len && EVP_DecryptUpdate(c, out, &outl, ct, (int)len) != 1) {
         EVP_CIPHER_CTX_free(c);
         return set_error(ERR_CORRUPT, "object_decrypt: decryption failed");
     }
 
     uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
-    memcpy(tag, i + len, sizeof(tag));
+    memcpy(tag, ct + len, sizeof(tag));
     int finl = 0;
     if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, sizeof(tag), tag) != 1 ||
         EVP_DecryptFinal_ex(c, (uint8_t *)out + outl, &finl) != 1) {
@@ -170,7 +134,8 @@ struct object_crypt_stream {
 
 status_t object_crypt_stream_begin(object_crypt_stream_t **out,
                                    const repo_key_t *key, const uint8_t *hash,
-                                   object_form_t form, int encrypting)
+                                   uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES],
+                                   int encrypting)
 {
     if (!out || !key || !hash)
         return set_error(ERR_INVALID, "object_crypt_stream: null argument");
@@ -181,7 +146,7 @@ status_t object_crypt_stream_begin(object_crypt_stream_t **out,
     s->encrypting = encrypting;
     if (!s->ctx) { free(s); return set_error(ERR_NOMEM, "object_crypt_stream: context"); }
 
-    status_t st = crypt_init(s->ctx, key, hash, form, encrypting);
+    status_t st = crypt_init(s->ctx, key, hash, nonce, encrypting);
     if (st != OK) { object_crypt_stream_free(s); return st; }
     *out = s;
     return OK;

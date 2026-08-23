@@ -313,6 +313,14 @@ static void test_scan_collect_meta_off_and_collect_on_demand(void **state) {
 
 static void test_scan_warns_on_unreadable_dir(void **state) {
     (void)state;
+    /*
+     * Root ignores the permission bits, so there is no such thing as a
+     * directory it cannot read and nothing to warn about. CI runs as root,
+     * which is why this failed there and passed everywhere else - invisibly,
+     * until the test target started reporting unit failures at all.
+     */
+    if (geteuid() == 0) skip();
+
     /* Create a directory we can't read */
     mkdir(TEST_ROOT1 "/noperm", 0000);
 
