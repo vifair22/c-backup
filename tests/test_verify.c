@@ -33,6 +33,7 @@
 #include "parity.h"
 #include "repo.h"
 #include "store.h"
+#include "restore.h"
 #include "store_index.h"
 #include "verify.h"
 
@@ -486,6 +487,50 @@ static void test_large_object_streams_through_damage(void **state)
     assert_int_equal(system(cmd), 0);
 }
 
+/*
+ * A restore that cannot reconstruct an object must not leave a file behind.
+ *
+ * The streaming read emits as it goes and checks the hash at the end, so
+ * before this a failed object left a file of exactly the right name and size
+ * holding corrupt bytes, and the restore reported success with the failure
+ * visible only as a counter. On a real tree that is indistinguishable from a
+ * good restore until someone opens the file.
+ */
+static void test_failed_restore_leaves_no_plausible_file(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 23u);
+    int64_t snap = run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", hex);
+    char path[PATH_MAX];
+    loose_path_of(hex, path, sizeof(path));
+
+    /* Shred a whole region: far past what parity can rebuild. */
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    size_t n = 512 * 1024;
+    uint8_t *junk = malloc(n);
+    assert_non_null(junk);
+    memset(junk, 0x5A, n);
+    assert_int_equal(pwrite(fd, junk, n, (off_t)sizeof(object_header_t) + 1024),
+                     (ssize_t)n);
+    free(junk);
+    close(fd);
+
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "%s/dst", TEST_DIR);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, dst, NULL, &rr), OK);
+    assert_int_equal(rr.skipped, 1);
+
+    char restored[PATH_MAX];
+    snprintf(restored, sizeof(restored), "%s%s/big.bin", dst, TEST_SRC);
+    struct stat sb;
+    assert_int_not_equal(lstat(restored, &sb), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -500,6 +545,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancelled_run_is_marked_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_object_damage_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_object_streams_through_damage, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_restore_leaves_no_plausible_file, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -6,6 +6,62 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-08-22 - Streaming parity repair
+
+A/B against the commit before the fix (04b16ca), measured with a driver
+calling the engine directly. Two questions: does a clean read pay anything
+for the repair machinery, and is the repair path actually bounded.
+
+### Clean-path throughput, 2 GiB loose object, page cache warm
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| before | 1736 MB/s | 1740 MB/s | 1783 MB/s |
+| after | 1662 MB/s | 1768 MB/s | 1774 MB/s |
+
+Within noise, as intended: detection rides on the SHA-256 that was already
+being computed, so an intact object never enters the corrective path.
+
+### Damaged 2 GiB loose object, one flipped byte
+
+| | before | after |
+|---|---|---|
+| `object_load_stream` | **FAILED** (hash mismatch) | OK, 1 byte corrected, 595 MB/s |
+| `object_repair` | fixed=0, peak RSS **2,115 MiB** | fixed=1, peak RSS **18 MiB** |
+| streaming repair peak RSS | n/a | 34 MiB (was 158 MiB before parity was read per group) |
+
+Two separate defects showed up here that the unit tests could not:
+
+- `object_repair` read the whole payload with a single `pread`, and Linux
+  caps one transfer at 2 GiB - 4 KiB. Objects of 2 GiB or more therefore
+  failed the length comparison and were never repaired at all, silently,
+  regardless of memory. That is why the before column reads fixed=0.
+- The first version of the streaming repair loaded the entire parity block
+  (about 1 KiB per 15 KiB of payload: 144 MiB for this object, gigabytes for
+  a large one). Reading parity a group at a time brought peak RSS to a
+  constant.
+
+### Mixed repository, 10,798 objects, 11 injected single-byte faults
+
+Corpus: a real 39,244-file tree plus three 60 MiB incompressible files
+(which stay loose by design) and one large compressible file. Damage spread
+across three storage classes: 3 large loose, 3 large packed, 5 small packed.
+
+| Measure | Result |
+|---|---|
+| Deep verify with repair | 1.6s, 1.55 GB read, 957 MB/s, peak RSS 49 MiB |
+| Found and repaired | 11 of 11, zero unrecoverable |
+| False positives | 0 of 10,787 clean objects |
+| Second verify | 10,798 ok, 0 repaired (corrections persisted) |
+| Restore + `diff -r` vs source | 39,244 files, 0 skipped, **zero differences** |
+
+### Restore of unrecoverable damage
+
+Before, a failed object left a file of the right name and the right length
+holding corrupt bytes, and the restore reported success with the failure
+visible only in a counter: two 80 MiB videos looked restored and were not.
+Restore now removes what it wrote when reconstruction fails.
+
 ## 2026-08-22 - xattr/ACL persistence cost
 
 The metadata was always collected at scan time and discarded; this measures

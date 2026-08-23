@@ -692,6 +692,17 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (lst != OK) {
             log_warn("restore: cannot write %s: %s", full, err_msg());
             err_clear();
+            /*
+             * Remove what was written before the failure. The streaming read
+             * emits as it goes and only checks the hash at the end, so a
+             * failed object leaves a file of exactly the right name and
+             * length holding wrong bytes - which looks complete to anyone
+             * reading the restored tree, and to any tool that compares
+             * sizes. An absent file is honest; a plausible one is not.
+             */
+            if (unlink(full) != 0 && errno != ENOENT)
+                log_warn("restore: cannot remove incomplete %s: %s",
+                         full, strerror(errno));
             res.skipped++;
             continue;
         }

@@ -1560,15 +1560,22 @@ static int out_fd_rewind(int out_fd)
 }
 
 /*
- * Read the RS parity block out of a loose object's trailer.
- * Returns 0 and fills *out_par (caller frees) when parity is present and the
- * footer agrees with the layout; -1 when there is nothing usable.
+ * Locate the RS parity block in a loose object's trailer without reading it.
+ *
+ * The block is proportional to the payload - about 1 KiB per 15 KiB of data,
+ * so 144 MiB for a 2 GiB object and several gigabytes for the large ones this
+ * path exists to serve. Loading it whole to repair a stream would reintroduce
+ * the unbounded allocation one level down, which is exactly the bug being
+ * fixed here. Groups are read one at a time from this offset instead.
+ *
+ * Returns 0 with the offset and size of the parity block when the footer
+ * agrees with the layout, -1 when there is nothing usable.
  */
-static int load_loose_rs_parity(int fd, const object_header_t *hdr,
-                                uint8_t **out_par, size_t *out_par_sz)
+static int locate_loose_rs_parity(int fd, const object_header_t *hdr,
+                                  off_t *out_off, size_t *out_sz)
 {
-    *out_par = NULL;
-    *out_par_sz = 0;
+    *out_off = 0;
+    *out_sz = 0;
     if (hdr->version != 2) return -1;
 
     size_t rs_sz = rs_parity_size((size_t)hdr->compressed_size);
@@ -1582,15 +1589,8 @@ static int load_loose_rs_parity(int fd, const object_header_t *hdr,
         pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION)
         return -1;
 
-    uint8_t *par = malloc(rs_sz);
-    if (!par) return -1;
-    if (pread(fd, par, rs_sz, trailer_off + (off_t)sizeof(parity_record_t))
-        != (ssize_t)rs_sz) {
-        free(par);
-        return -1;
-    }
-    *out_par = par;
-    *out_par_sz = rs_sz;
+    *out_off = trailer_off + (off_t)sizeof(parity_record_t);
+    *out_sz  = rs_sz;
     return 0;
 }
 
@@ -1613,22 +1613,20 @@ static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
         return ERR_CORRUPT;
     }
 
-    uint8_t *rs_par = NULL;
-    size_t   rs_sz  = 0;
-    if (load_loose_rs_parity(fd, hdr, &rs_par, &rs_sz) != 0) {
+    off_t  par_off = 0;
+    size_t rs_sz   = 0;
+    if (locate_loose_rs_parity(fd, hdr, &par_off, &rs_sz) != 0) {
         log_warn("object %s: damaged and has no usable parity", hex);
         return ERR_CORRUPT;
     }
 
-    if (out_fd_rewind(out_fd) != 0) {
-        free(rs_par);
-        return ERR_IO;
-    }
+    if (out_fd_rewind(out_fd) != 0) return ERR_IO;
 
     uint8_t *gbuf = malloc(RS_STREAM_GROUP_DATA);
+    uint8_t *gpar = malloc(RS_STREAM_GROUP_PAR);
     EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!gbuf || !mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
-        free(gbuf); EVP_MD_CTX_free(mdctx); free(rs_par);
+    if (!gbuf || !gpar || !mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+        free(gbuf); free(gpar); EVP_MD_CTX_free(mdctx);
         return ERR_NOMEM;
     }
 
@@ -1636,7 +1634,6 @@ static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
     status_t st = OK;
     uint64_t remaining = hdr->compressed_size;
     off_t    off = (off_t)sizeof(*hdr);
-    const uint8_t *par = rs_par;
     size_t   par_left = rs_sz;
     int      corrected = 0;
 
@@ -1646,10 +1643,12 @@ static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
         if (pread(fd, gbuf, want, off) != (ssize_t)want) { st = ERR_CORRUPT; break; }
 
         if (par_left >= RS_STREAM_GROUP_PAR) {
-            int rc = rs_parity_decode(gbuf, want, par);
+            if (pread(fd, gpar, RS_STREAM_GROUP_PAR, par_off)
+                != (ssize_t)RS_STREAM_GROUP_PAR) { st = ERR_CORRUPT; break; }
+            int rc = rs_parity_decode(gbuf, want, gpar);
             if (rc > 0) corrected += rc;
             else if (rc < 0) { st = ERR_CORRUPT; break; }
-            par += RS_STREAM_GROUP_PAR;
+            par_off  += (off_t)RS_STREAM_GROUP_PAR;
             par_left -= RS_STREAM_GROUP_PAR;
         }
 
@@ -1669,8 +1668,8 @@ static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
     }
 
     free(gbuf);
+    free(gpar);
     EVP_MD_CTX_free(mdctx);
-    free(rs_par);
 
     if (st == OK) {
         log_warn("object %s: %d byte(s) corrected from parity while streaming",
