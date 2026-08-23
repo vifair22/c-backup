@@ -8,10 +8,23 @@
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
-#define PACK_VERSION_V1  1u            /* compressed_size was uint32_t */
-#define PACK_VERSION_V2  2u            /* compressed_size is uint64_t  */
-#define PACK_VERSION_V3  3u            /* parity trailers + idx entry_index */
-#define PACK_VERSION     4u            /* idx includes type + sizes for fast stats */
+/*
+ * One pack layout, and readers accept only this.
+ *
+ * Versions 1 to 4 are gone rather than kept readable. They differed in the
+ * width of an entry header field and in what the index carried, so every
+ * place that turned an entry offset into a payload offset had to ask which
+ * version wrote the file - twelve of them, and each one is silently wrong
+ * rather than loudly broken when it gets the answer wrong. Adding encryption
+ * would have made it thirteen. No repository written by an older build
+ * exists outside this machine, and the ones on it are test corpora that can
+ * be rebuilt by running a backup again, so the compatibility was protecting
+ * nothing and costing the one thing that matters here.
+ *
+ * A pack file at any other version is refused with a message that says to
+ * rebuild it, not decoded on a guess.
+ */
+#define PACK_VERSION     5u
 
 /*
  * Pack all loose objects into a new pack file.
@@ -123,23 +136,21 @@ typedef struct {
     uint32_t count;
 } __attribute__((packed)) pack_dat_hdr_t;
 
-/* Per-object header inside the .dat body — v2/v3 (current) */
+/*
+ * Per-object header inside the .dat body.
+ *
+ * compressed_size counts what is stored, so for an encrypted entry that is
+ * nonce, ciphertext and tag together - the same convention the loose object
+ * header uses, which keeps every offset in this file a plain byte count.
+ */
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
     uint8_t  type;                     /*  1 */
     uint8_t  compression;              /*  1 */
+    uint8_t  encryption;               /*  1 */
     uint64_t uncompressed_size;        /*  8 */
     uint64_t compressed_size;          /*  8 */
-} __attribute__((packed)) pack_dat_entry_hdr_t;  /* 50 bytes */
-
-/* V1 entry header — used only when reading existing v1 packs */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint8_t  type;                     /*  1 */
-    uint8_t  compression;              /*  1 */
-    uint64_t uncompressed_size;        /*  8 */
-    uint32_t compressed_size;          /*  4 */
-} __attribute__((packed)) pack_dat_entry_hdr_v1_t;  /* 46 bytes */
+} __attribute__((packed)) pack_dat_entry_hdr_t;  /* 51 bytes */
 
 /* Pack index file header (12 bytes) */
 typedef struct {
@@ -148,30 +159,20 @@ typedef struct {
     uint32_t count;
 } __attribute__((packed)) pack_idx_hdr_t;
 
-/* On-disk index entry v2 (40 bytes, sorted by hash) */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 */
-} __attribute__((packed)) pack_idx_disk_entry_v2_t;
-
-/* On-disk index entry v3 (44 bytes, sorted by hash) */
-typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 */
-    uint32_t entry_index;              /*  4 */
-} __attribute__((packed)) pack_idx_disk_entry_v3_t;
-
-/* On-disk index entry v4 (62 bytes, sorted by hash) — current write format.
- * Adds type + sizes so stats can be computed from idx alone (no .dat seeks). */
+/*
+ * On-disk index entry, sorted by hash. Carries type and sizes so repository
+ * statistics can be computed from the index alone, without seeking the .dat.
+ */
 typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
     uint64_t dat_offset;               /*  8 */
     uint32_t entry_index;              /*  4 */
     uint8_t  type;                     /*  1 */
     uint8_t  compression;              /*  1 */
+    uint8_t  encryption;               /*  1 */
     uint64_t uncompressed_size;        /*  8 */
     uint64_t compressed_size;          /*  8 */
-} __attribute__((packed)) pack_idx_disk_entry_t;
+} __attribute__((packed)) pack_idx_disk_entry_t;  /* 63 bytes */
 
 /* ------------------------------------------------------------------ */
 /* Pack enumeration (read-only iteration)                              */
@@ -181,12 +182,12 @@ typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint8_t  type;
     uint8_t  compression;
+    uint8_t  encryption;
     uint64_t uncompressed_size;
     uint64_t compressed_size;
     uint64_t payload_offset;
     /* Start of the entry, header included. This is what a reader seeks to and
-     * what pack_objects.offset holds; payload_offset is past the header and
-     * cannot be turned back into it without knowing the pack version. */
+     * what pack_objects.offset holds; payload_offset is past the header. */
     uint64_t entry_offset;
     /* Position in on-disk entry order, which is what indexes the parity
      * trailer. Enumeration is in that order, so it is simply the iteration

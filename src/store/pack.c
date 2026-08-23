@@ -4,6 +4,7 @@
 #include "parity.h"
 #include "parity_stream.h"
 #include "object.h"
+#include "object_crypt.h"
 #include "store.h"
 #include "progress.h"
 #include "util.h"
@@ -67,7 +68,7 @@ typedef struct {
     uint8_t  hash[OBJECT_HASH_SIZE];
     uint64_t dat_offset;
     uint32_t pack_num;
-    uint32_t pack_version;  /* PACK_VERSION_V1, _V2, or PACK_VERSION */
+    uint32_t pack_version;  /* always PACK_VERSION; kept so a stale cache entry is caught */
     uint32_t entry_index;   /* position in .dat entry order (UINT32_MAX for pre-v3) */
 } pack_cache_entry_t;
 
@@ -284,20 +285,8 @@ static uint32_t next_pack_num(store_t *store) {
 /* read_full_fd: uses io_read_full from util.h */
 #define read_full_fd io_read_full
 
-/* Read a pack dat entry header, normalising v1 (uint32 compressed_size)
- * to the current v2 layout (uint64).  version must be PACK_VERSION_V1
- * or PACK_VERSION. */
-static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out, uint32_t version) {
-    if (version == PACK_VERSION_V1) {
-        pack_dat_entry_hdr_v1_t v1;
-        if (fread(&v1, sizeof(v1), 1, f) != 1) return -1;
-        memcpy(out->hash, v1.hash, OBJECT_HASH_SIZE);
-        out->type              = v1.type;
-        out->compression       = v1.compression;
-        out->uncompressed_size = v1.uncompressed_size;
-        out->compressed_size   = v1.compressed_size;
-        return 0;
-    }
+/* Read a pack dat entry header. One layout, so no version to consult. */
+static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
     return fread(out, sizeof(*out), 1, f) == 1 ? 0 : -1;
 }
 
@@ -456,16 +445,12 @@ status_t pack_object_physical_size(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
+    if (read_entry_hdr(f, &ehdr) != 0) {
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
-    /* Physical size accounts for the on-disk header size of the actual version */
-    size_t hdr_sz = (found.pack_version == PACK_VERSION_V1)
-                    ? sizeof(pack_dat_entry_hdr_v1_t)
-                    : sizeof(pack_dat_entry_hdr_t);
-    *out_bytes = (uint64_t)hdr_sz + ehdr.compressed_size;
+    *out_bytes = (uint64_t)sizeof(pack_dat_entry_hdr_t) + ehdr.compressed_size;
     return OK;
 }
 
@@ -484,7 +469,7 @@ status_t pack_object_get_info(store_t *store,
         fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found.pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
+    if (read_entry_hdr(f, &ehdr) != 0) {
         fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
@@ -584,6 +569,63 @@ static int load_entry_parity(FILE *f, uint32_t entry_index,
     return 0;
 }
 
+/*
+ * Decrypt an entry payload in place, before anything decompresses it.
+ *
+ * compressed_size counts what is stored, so it shrinks by the nonce and tag
+ * and what is left is the compressed plaintext the codec expects. Reversing
+ * the two - decompressing before decrypting - would hand LZ4 ciphertext.
+ *
+ * Order on the way in was compress then encrypt, and this is its mirror. It
+ * is also why parity and the CRC sit outside both: they cover the stored
+ * bytes, so a scrub can verify and repair an offsite copy with no key at all.
+ */
+static status_t entry_decrypt_inplace(store_t *store, pack_dat_entry_hdr_t *ehdr,
+                                      void *payload)
+{
+    if (ehdr->encryption == ENCRYPT_NONE) return OK;
+
+    const repo_key_t *key = store_key(store);
+    if (!key)
+        return set_error(ERR_INVALID,
+                         "pack entry is encrypted and no key is loaded");
+    if (ehdr->compressed_size < OBJECT_CRYPT_OVERHEAD)
+        return set_error(ERR_CORRUPT, "pack entry: truncated ciphertext");
+
+    size_t plain = (size_t)ehdr->compressed_size - OBJECT_CRYPT_OVERHEAD;
+    status_t st = object_decrypt(key, payload, plain, payload);
+    if (st != OK) return st;
+    ehdr->compressed_size = plain;
+    return OK;
+}
+
+/*
+ * Begin decrypting an entry that is being streamed, consuming the nonce that
+ * leads its payload. *remaining is reduced to the ciphertext length, leaving
+ * the tag for the caller to read and check at the end - or, for a prefix
+ * read, to skip, exactly as an unencrypted prefix read skips the hash check.
+ */
+static status_t entry_decrypt_begin(store_t *store, const pack_dat_entry_hdr_t *ehdr,
+                                    FILE *f, object_crypt_stream_t **out,
+                                    uint64_t *remaining)
+{
+    *out = NULL;
+    if (ehdr->encryption == ENCRYPT_NONE) return OK;
+
+    const repo_key_t *key = store_key(store);
+    if (!key)
+        return set_error(ERR_INVALID,
+                         "pack entry is encrypted and no key is loaded");
+    if (ehdr->compressed_size < OBJECT_CRYPT_OVERHEAD)
+        return set_error(ERR_CORRUPT, "pack entry: truncated ciphertext");
+
+    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+    if (fread_full(nonce, sizeof(nonce), f) != 0)
+        return set_error(ERR_CORRUPT, "pack entry: truncated nonce");
+    *remaining = ehdr->compressed_size - OBJECT_CRYPT_OVERHEAD;
+    return object_crypt_stream_begin(out, key, nonce, 0);
+}
+
 status_t pack_object_load(store_t *store,
                           const uint8_t hash[OBJECT_HASH_SIZE],
                           void **out_data, size_t *out_size,
@@ -606,11 +648,10 @@ status_t pack_object_load(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
+    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
 
-    /* --- Parity: attempt entry header repair for v3 packs --- */
-    if ((found.pack_version == PACK_VERSION_V3 || found.pack_version == PACK_VERSION) &&
-        found.entry_index != UINT32_MAX) {
+    /* --- Parity: attempt entry header repair --- */
+    if (found.pack_version == PACK_VERSION && found.entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         uint32_t pay_crc = 0;
         uint8_t *rs_par = NULL;
@@ -629,10 +670,7 @@ status_t pack_object_load(store_t *store,
             }
 
             /* Re-seek to payload position after header repair */
-            size_t hdr_disk_sz = (found.pack_version == PACK_VERSION_V1)
-                                 ? sizeof(pack_dat_entry_hdr_v1_t)
-                                 : sizeof(pack_dat_entry_hdr_t);
-            if (fseeko(f, (off_t)(found.dat_offset + (uint64_t)hdr_disk_sz),
+            if (fseeko(f, (off_t)(found.dat_offset + sizeof(pack_dat_entry_hdr_t)),
                        SEEK_SET) != 0) {
                 free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load: fseeko after parity repair in %s", dat_path);
             }
@@ -666,6 +704,9 @@ status_t pack_object_load(store_t *store,
                     }
                 }
                 free(rs_par); rs_par = NULL;
+
+                status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
+                if (dst != OK) { free(cpayload); return dst; }
 
                 /* Decompress */
                 void *data;
@@ -711,7 +752,7 @@ status_t pack_object_load(store_t *store,
         if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
             fclose(f); return set_error_errno(ERR_IO, "pack_object_load: re-seek failed in %s", dat_path);
         }
-        if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
+        if (read_entry_hdr(f, &ehdr) != 0) {
             fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header on re-read in %s", dat_path);
         }
     }
@@ -736,6 +777,11 @@ status_t pack_object_load(store_t *store,
         free(cpayload); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
     }
     dat_return_or_close(store, pnum, f);
+
+    {
+        status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
+        if (dst != OK) { free(cpayload); return dst; }
+    }
 
     void *data;
     size_t data_sz;
@@ -799,7 +845,7 @@ status_t pack_object_load_prefix(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) {
+    if (read_entry_hdr(f, &ehdr) != 0) {
         fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_prefix: bad entry header");
     }
 
@@ -810,13 +856,27 @@ status_t pack_object_load_prefix(store_t *store,
     if (want > ehdr.uncompressed_size) want = (size_t)ehdr.uncompressed_size;
 
     if (ehdr.compression == COMPRESS_NONE) {
-        /* Uncompressed — just read the prefix */
+        /* Uncompressed: just read the prefix. ChaCha20 is a stream cipher,
+         * so a prefix decrypts on its own; the tag at the far end is not read
+         * and not checked, which is the same bargain a prefix read already
+         * makes with the SHA-256 it never gets to verify. */
+        object_crypt_stream_t *cs = NULL;
+        uint64_t avail = ehdr.compressed_size;
+        status_t bst = entry_decrypt_begin(store, &ehdr, f, &cs, &avail);
+        if (bst != OK) { fclose(f); return bst; }
+        if (want > avail) want = (size_t)avail;
+
         char *buf = malloc(want);
-        if (!buf) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: alloc"); }
+        if (!buf) { object_crypt_stream_free(cs); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_prefix: alloc"); }
         if (fread_full(buf, want, f) != 0) {
-            free(buf); fclose(f);
+            free(buf); object_crypt_stream_free(cs); fclose(f);
             return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
         }
+        if (cs && object_crypt_stream_update(cs, buf, want, buf) != OK) {
+            free(buf); object_crypt_stream_free(cs); fclose(f);
+            return set_error(ERR_CORRUPT, "pack_object_load_prefix: decryption failed");
+        }
+        object_crypt_stream_free(cs);
         dat_return_or_close(store, pnum, f);
         *out_data = buf;
         *out_size = want;
@@ -835,6 +895,13 @@ status_t pack_object_load_prefix(store_t *store,
             return set_error(ERR_CORRUPT, "pack_object_load_prefix: short read");
         }
         dat_return_or_close(store, pnum, f);
+
+        /* An LZ4 block is atomic, so the whole payload is here and the tag
+         * can be checked properly. */
+        {
+            status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
+            if (dst != OK) { free(cpayload); return dst; }
+        }
 
         char *out = malloc(want);
         if (!out) { free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_prefix: output alloc"); }
@@ -868,6 +935,13 @@ status_t pack_object_load_prefix(store_t *store,
         }
 
         uint64_t remaining = ehdr.compressed_size;
+        object_crypt_stream_t *cs = NULL;
+        status_t bst = entry_decrypt_begin(store, &ehdr, f, &cs, &remaining);
+        if (bst != OK) {
+            free(cbuf); free(out);
+            LZ4F_freeDecompressionContext(dctx); fclose(f);
+            return bst;
+        }
         size_t dst_pos = 0;
         size_t cbuf_have = 0;
         size_t cbuf_pos = 0;
@@ -878,6 +952,9 @@ status_t pack_object_load_prefix(store_t *store,
                 if (remaining == 0) break;
                 size_t n = (remaining > CHUNK) ? (size_t)CHUNK : (size_t)remaining;
                 if (fread_full(cbuf, n, f) != 0) { corrupt = 1; break; }
+                if (cs && object_crypt_stream_update(cs, cbuf, n, cbuf) != OK) {
+                    corrupt = 1; break;
+                }
                 cbuf_have = n;
                 cbuf_pos = 0;
                 remaining -= n;
@@ -894,6 +971,7 @@ status_t pack_object_load_prefix(store_t *store,
             if (dst_remaining == 0 && src_remaining == 0) break;  /* EOF from decoder */
         }
 
+        object_crypt_stream_free(cs);
         LZ4F_freeDecompressionContext(dctx);
         free(cbuf);
         /* Pack file position is mid-entry now; always close rather than
@@ -911,6 +989,120 @@ status_t pack_object_load_prefix(store_t *store,
 
     fclose(f);
     return set_error(ERR_CORRUPT, "pack_object_load_prefix: unknown compression %u", ehdr.compression);
+}
+
+/*
+ * Stored entry bytes in, plaintext out, in order and in bounded memory.
+ *
+ * An encrypted entry is nonce, ciphertext, tag, and parity and the CRC cover
+ * all three - that is what lets a scrub verify an offsite copy with no key.
+ * So repair has to run on the stored bytes and decryption has to come after
+ * it, which means whatever peels the nonce off the front and holds the tag
+ * back at the end must cope with arbitrary chunk boundaries: the RS group
+ * size, the read buffer size, and the positions of those two fields have
+ * nothing to do with each other.
+ *
+ * Positional rather than incremental, because the arithmetic is where this
+ * would otherwise go wrong. Every chunk is intersected against three fixed
+ * ranges of the stored payload and each part handled once.
+ */
+typedef struct {
+    int                    encrypted;
+    const repo_key_t      *key;
+    object_crypt_stream_t *cs;
+    uint64_t               total;      /* stored payload length */
+    uint64_t               pos;        /* stored bytes consumed so far */
+    uint8_t                nonce[OBJECT_CRYPT_NONCE_BYTES];
+    size_t                 nonce_have;
+    uint8_t                tag[OBJECT_CRYPT_TAG_BYTES];
+    size_t                 tag_have;
+} plain_sink_t;
+
+static status_t sink_init(plain_sink_t *sk, store_t *store,
+                          const pack_dat_entry_hdr_t *ehdr)
+{
+    memset(sk, 0, sizeof(*sk));
+    sk->total = ehdr->compressed_size;
+    if (ehdr->encryption == ENCRYPT_NONE) return OK;
+
+    sk->key = store_key(store);
+    if (!sk->key)
+        return set_error(ERR_INVALID,
+                         "pack entry is encrypted and no key is loaded");
+    if (sk->total < OBJECT_CRYPT_OVERHEAD)
+        return set_error(ERR_CORRUPT, "pack entry: truncated ciphertext");
+    sk->encrypted = 1;
+    return OK;
+}
+
+/* Decrypts in place. *out / *out_n describe the plaintext this chunk yielded,
+ * which is shorter than n wherever the chunk overlapped the nonce or tag. */
+static status_t sink_push(plain_sink_t *sk, uint8_t *buf, size_t n,
+                          uint8_t **out, size_t *out_n)
+{
+    if (!sk->encrypted) {
+        sk->pos += n;
+        *out = buf; *out_n = n;
+        return OK;
+    }
+
+    const uint64_t nb = OBJECT_CRYPT_NONCE_BYTES;
+    const uint64_t tb = OBJECT_CRYPT_TAG_BYTES;
+    uint64_t start = sk->pos, end = start + n;
+    uint64_t ct_end = sk->total - tb;
+
+    /* Nonce: stored bytes [0, nb). */
+    uint64_t ns = start < nb ? start : nb;
+    uint64_t ne = end   < nb ? end   : nb;
+    if (ne > ns) {
+        memcpy(sk->nonce + sk->nonce_have, buf + (ns - start), (size_t)(ne - ns));
+        sk->nonce_have += (size_t)(ne - ns);
+        if (sk->nonce_have == nb) {
+            status_t st = object_crypt_stream_begin(&sk->cs, sk->key, sk->nonce, 0);
+            if (st != OK) return st;
+        }
+    }
+
+    /* Ciphertext: stored bytes [nb, total - tb). */
+    uint8_t *pp = buf;
+    size_t   pn = 0;
+    uint64_t cs0 = start > nb     ? start : nb;
+    uint64_t ce0 = end   < ct_end ? end   : ct_end;
+    if (ce0 > cs0) {
+        if (!sk->cs) return set_error(ERR_CORRUPT, "pack entry: ciphertext before nonce");
+        pp = buf + (cs0 - start);
+        pn = (size_t)(ce0 - cs0);
+        status_t st = object_crypt_stream_update(sk->cs, pp, pn, pp);
+        if (st != OK) return st;
+    }
+
+    /* Tag: stored bytes [total - tb, total). */
+    uint64_t ts = start > ct_end ? start : ct_end;
+    if (end > ts) {
+        size_t take = (size_t)(end - ts);
+        if (sk->tag_have + take > sizeof(sk->tag))
+            return set_error(ERR_CORRUPT, "pack entry: oversized tag");
+        memcpy(sk->tag + sk->tag_have, buf + (ts - start), take);
+        sk->tag_have += take;
+    }
+
+    sk->pos = end;
+    *out = pp; *out_n = pn;
+    return OK;
+}
+
+static status_t sink_finish(plain_sink_t *sk)
+{
+    if (!sk->encrypted) return OK;
+    if (!sk->cs || sk->tag_have != OBJECT_CRYPT_TAG_BYTES)
+        return set_error(ERR_CORRUPT, "pack entry: truncated ciphertext");
+    return object_crypt_stream_finish(sk->cs, NULL, sk->tag);
+}
+
+static void sink_free(plain_sink_t *sk)
+{
+    object_crypt_stream_free(sk->cs);
+    sk->cs = NULL;
 }
 
 status_t pack_object_load_stream(store_t *store,
@@ -934,7 +1126,7 @@ status_t pack_object_load_stream(store_t *store,
     if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr, found.pack_version) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
+    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
 
     /* Parity: load entry parity for v3 packs (persists across codec paths) */
     uint32_t pay_crc = 0;
@@ -942,8 +1134,7 @@ status_t pack_object_load_stream(store_t *store,
     size_t rs_par_sz = 0;
     int have_parity = 0;
 
-    if ((found.pack_version == PACK_VERSION_V3 || found.pack_version == PACK_VERSION) &&
-        found.entry_index != UINT32_MAX) {
+    if (found.pack_version == PACK_VERSION && found.entry_index != UINT32_MAX) {
         parity_record_t hdr_par;
         if (load_entry_parity(f, found.entry_index, &hdr_par,
                               &pay_crc, &rs_par, &rs_par_sz) == 0) {
@@ -958,10 +1149,7 @@ status_t pack_object_load_stream(store_t *store,
             }
         }
         /* Re-seek to payload position */
-        size_t hdr_disk_sz = (found.pack_version == PACK_VERSION_V1)
-                             ? sizeof(pack_dat_entry_hdr_v1_t)
-                             : sizeof(pack_dat_entry_hdr_t);
-        if (fseeko(f, (off_t)(found.dat_offset + (uint64_t)hdr_disk_sz),
+        if (fseeko(f, (off_t)(found.dat_offset + sizeof(pack_dat_entry_hdr_t)),
                    SEEK_SET) != 0) {
             free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko after parity in %s", dat_path);
         }
@@ -1001,6 +1189,11 @@ status_t pack_object_load_stream(store_t *store,
         }
         free(rs_par);
 
+        {
+            status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
+            if (dst != OK) { free(cpayload); return dst; }
+        }
+
         char *out = malloc((size_t)ehdr.uncompressed_size);
         if (!out) { free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_stream: decompress alloc failed (%llu bytes)", (unsigned long long)ehdr.uncompressed_size); }
         int r = LZ4_decompress_safe(cpayload, out,
@@ -1037,15 +1230,26 @@ status_t pack_object_load_stream(store_t *store,
 
         uint32_t running_crc = 0;
         uint64_t remaining = ehdr.compressed_size;
-        status_t fst = OK;
+        plain_sink_t sink;
+        status_t fst = sink_init(&sink, store, &ehdr);
+        if (fst != OK) {
+            EVP_MD_CTX_free(mdctx);
+            LZ4F_freeDecompressionContext(dctx);
+            free(src); free(dst); free(rs_par); fclose(f);
+            return fst;
+        }
         while (remaining > 0 && fst == OK) {
             size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                           (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
             if (fread(src, 1, want, f) != want) { fst = ERR_CORRUPT; break; }
+            /* CRC covers the stored bytes, so it runs before decryption. */
             if (have_parity)
                 running_crc = crc32c_update(running_crc, src, want);
-            size_t src_left = want;
-            uint8_t *srcp = src;
+            uint8_t *srcp = NULL;
+            size_t   src_left = 0;
+            fst = sink_push(&sink, src, want, &srcp, &src_left);
+            if (fst != OK) break;
+            remaining -= want;
             while (src_left > 0 && fst == OK) {
                 size_t dst_sz = PACK_STREAM_THRESHOLD;
                 size_t src_sz = src_left;
@@ -1059,8 +1263,9 @@ status_t pack_object_load_stream(store_t *store,
                 srcp     += src_sz;
                 src_left -= src_sz;
             }
-            remaining -= want;
         }
+        if (fst == OK) fst = sink_finish(&sink);
+        sink_free(&sink);
         dat_return_or_close(store, pnum, f);
         free(src); free(dst);
         LZ4F_freeDecompressionContext(dctx);
@@ -1143,13 +1348,20 @@ status_t pack_object_load_stream(store_t *store,
 
         uint64_t remaining = ehdr.compressed_size;
         const uint8_t *par_ptr = rs_par;
-        status_t stream_st = OK;
+        plain_sink_t sink;
+        status_t stream_st = sink_init(&sink, store, &ehdr);
+        if (stream_st != OK) {
+            free(gbuf); EVP_MD_CTX_free(mdctx); free(rs_par); fclose(f);
+            return stream_st;
+        }
         int total_corrected = 0;
 
         while (remaining > 0 && stream_st == OK) {
             size_t want = (remaining < grp_data) ? (size_t)remaining : grp_data;
             if (fread(gbuf, 1, want, f) != want) { stream_st = ERR_CORRUPT; break; }
 
+            /* Repair the stored bytes, then decrypt what was repaired. The
+             * parity groups know nothing about where the nonce and tag fall. */
             int rrc = rs_parity_decode(gbuf, want, par_ptr);
             if (rrc > 0) {
                 total_corrected += rrc;
@@ -1159,11 +1371,18 @@ status_t pack_object_load_stream(store_t *store,
                 /* Continue — write what we have, SHA-256 will catch it */
             }
 
-            if (EVP_DigestUpdate(mdctx, gbuf, want) != 1) { stream_st = ERR_IO; break; }
-            if (write_full_fd(out_fd, gbuf, want) != 0)   { stream_st = ERR_IO; break; }
+            uint8_t *pp = NULL; size_t pn = 0;
+            stream_st = sink_push(&sink, gbuf, want, &pp, &pn);
+            if (stream_st != OK) break;
+            if (pn) {
+                if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = ERR_IO; break; }
+                if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = ERR_IO; break; }
+            }
             par_ptr += grp_par;
             remaining -= want;
         }
+        if (stream_st == OK) stream_st = sink_finish(&sink);
+        sink_free(&sink);
         free(gbuf);
 
         if (total_corrected > 0) {
@@ -1193,15 +1412,23 @@ status_t pack_object_load_stream(store_t *store,
     if (!buf) { EVP_MD_CTX_free(mdctx); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: stream buffer alloc failed"); }
 
     uint64_t remaining = ehdr.compressed_size;
-    status_t stream_st = OK;
+    plain_sink_t sink;
+    status_t stream_st = sink_init(&sink, store, &ehdr);
     while (remaining > 0 && stream_st == OK) {
         size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                       (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
         if (fread(buf, 1, want, f) != want)           { stream_st = ERR_CORRUPT; break; }
-        if (EVP_DigestUpdate(mdctx, buf, want) != 1)  { stream_st = ERR_IO;      break; }
-        if (write_full_fd(out_fd, buf, want) != 0)    { stream_st = ERR_IO;      break; }
+        uint8_t *pp = NULL; size_t pn = 0;
+        stream_st = sink_push(&sink, buf, want, &pp, &pn);
+        if (stream_st != OK) break;
+        if (pn) {
+            if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = ERR_IO; break; }
+            if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = ERR_IO; break; }
+        }
         remaining -= want;
     }
+    if (stream_st == OK) stream_st = sink_finish(&sink);
+    sink_free(&sink);
     free(buf);
     dat_return_or_close(store, pnum, f);
 
@@ -1897,28 +2124,48 @@ static void pw_destroy(pack_writer_t *pw) {
 static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                                 pack_obj_meta_t *m, int fd)
 {
-    /* Read full payload */
+    /* Read full payload, which for an encrypted object is nonce, ciphertext
+     * and tag together - m->compressed_size counts what is stored. */
     if (read_full_fd(fd, pw->io_buf, (size_t)m->compressed_size) != 0)
         return ERR_CORRUPT;
 
     /* Skip objects already marked as incompressible by the prober */
     if (m->skip_ver == PROBER_VERSION) return OK; /* silently skip */
 
+    /*
+     * Decrypt before anything looks at the bytes.
+     *
+     * Everything below this point - the compressibility probe, LZ4, the size
+     * comparison that decides whether compressing was worth it - has to see
+     * the plaintext. Ciphertext is indistinguishable from random, so a prober
+     * fed ciphertext finds every object incompressible, skip-marks it, and an
+     * encrypted repository silently never packs anything at all. Nothing
+     * fails; the packer just quietly stops working.
+     */
+    const repo_key_t *key = store_key(pw->store);
     uint8_t  compression       = m->compression;
     uint64_t compressed_size   = m->compressed_size;
     uint64_t uncompressed_size = m->uncompressed_size;
     uint8_t *payload = pw->io_buf;
     uint8_t *owned_payload = NULL;  /* non-NULL if we malloc'd a compressed copy */
 
+    if (key) {
+        if (compressed_size < OBJECT_CRYPT_OVERHEAD) return ERR_CORRUPT;
+        uint64_t plain = compressed_size - OBJECT_CRYPT_OVERHEAD;
+        if (object_decrypt(key, pw->io_buf, (size_t)plain, pw->io_buf) != OK)
+            return ERR_CORRUPT;
+        compressed_size = plain;
+    }
+
     /* Attempt LZ4 compression on uncompressed payloads */
     if (compression == COMPRESS_NONE &&
-        m->compressed_size >= 4096 &&
-        m->compressed_size <= (uint64_t)INT_MAX) {
+        compressed_size >= 4096 &&
+        compressed_size <= (uint64_t)INT_MAX) {
 
         /* For large-ish objects (>= PACK_SIZE_THRESHOLD), probe first */
         if (m->uncompressed_size >= PACK_SIZE_THRESHOLD) {
-            int sample_len = (m->compressed_size > PACK_PROBE_SIZE)
-                             ? PACK_PROBE_SIZE : (int)m->compressed_size;
+            int sample_len = (compressed_size > PACK_PROBE_SIZE)
+                             ? PACK_PROBE_SIZE : (int)compressed_size;
             int sc = LZ4_compress_default((const char *)payload,
                                           (char *)pw->comp_buf,
                                           sample_len, pw->comp_buf_size);
@@ -1943,7 +2190,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         }
 
         int try_full = 1;
-        int sample_len = (m->compressed_size > 65536) ? 65536 : (int)m->compressed_size;
+        int sample_len = (compressed_size > 65536) ? 65536 : (int)compressed_size;
         int sc = LZ4_compress_default((const char *)payload,
                                       (char *)pw->comp_buf,
                                       sample_len, pw->comp_buf_size);
@@ -1953,7 +2200,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         if (try_full) {
             int csz = LZ4_compress_default((const char *)payload,
                                            (char *)pw->comp_buf,
-                                           (int)m->compressed_size,
+                                           (int)compressed_size,
                                            pw->comp_buf_size);
             if (csz > 0 && (uint64_t)csz < compressed_size) {
                 owned_payload = malloc((size_t)csz);
@@ -1967,11 +2214,36 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         }
     }
 
+    /*
+     * Re-encrypt last, so parity and the CRC below cover ciphertext and a
+     * scrub of an offsite copy needs no key. Compressing first and encrypting
+     * after is the only order that works: ciphertext does not compress.
+     *
+     * A fresh nonce, not the loose object's. The same plaintext is stored
+     * twice in an encrypted repository - raw while loose, compressed once
+     * packed - and reusing a nonce across two different plaintexts under one
+     * key is the one mistake a stream cipher does not survive.
+     */
+    uint8_t encryption = ENCRYPT_NONE;
+    if (key) {
+        uint8_t *enc = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
+        if (!enc) { free(owned_payload); return ERR_NOMEM; }
+        if (object_encrypt(key, payload, (size_t)compressed_size, enc) != OK) {
+            free(enc); free(owned_payload); return ERR_IO;
+        }
+        free(owned_payload);
+        owned_payload   = enc;
+        payload         = enc;
+        compressed_size += OBJECT_CRYPT_OVERHEAD;
+        encryption      = ENCRYPT_CHACHA20;
+    }
+
     /* Write entry header + payload to dat */
     pack_dat_entry_hdr_t ehdr;
     memcpy(ehdr.hash, m->hash, OBJECT_HASH_SIZE);
     ehdr.type              = m->type;
     ehdr.compression       = compression;
+    ehdr.encryption        = encryption;
     ehdr.uncompressed_size = uncompressed_size;
     ehdr.compressed_size   = compressed_size;
 
@@ -2014,6 +2286,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     pw->idx_entries[pw->packed].entry_index       = pw->packed;
     pw->idx_entries[pw->packed].type              = ehdr.type;
     pw->idx_entries[pw->packed].compression       = ehdr.compression;
+    pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
     pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
     pw->idx_entries[pw->packed].compressed_size   = compressed_size;
 
@@ -2041,12 +2314,14 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     memcpy(ehdr.hash, m->hash, OBJECT_HASH_SIZE);
     ehdr.type              = m->type;
     ehdr.compression       = m->compression;
+    ehdr.encryption        = ENCRYPT_NONE;
     ehdr.uncompressed_size = m->uncompressed_size;
     ehdr.compressed_size   = m->compressed_size;
 
     if (pw_ensure_capacity(pw, pw->packed + 1) != 0)
         return ERR_NOMEM;
 
+    const repo_key_t *key = store_key(pw->store);
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
     uint64_t actual_compressed_size = m->compressed_size;
     uint32_t running_crc = 0;
@@ -2080,6 +2355,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
 
         /* Write placeholder entry header — will patch compressed_size later */
         ehdr.compression = COMPRESS_LZ4_FRAME;
+        ehdr.encryption  = key ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
         ehdr.compressed_size = 0;
         off_t ehdr_offset = (off_t)dat_off;
 
@@ -2090,25 +2366,74 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
 
         uint64_t compressed_written = 0;
 
+        /*
+         * Two cipher streams run through this loop in opposite directions:
+         * one decrypting what comes off the loose object so LZ4 sees
+         * plaintext, one encrypting what LZ4 produces so the pack holds
+         * ciphertext. They use different nonces and are not the same key
+         * stream; the compressed form is a different plaintext from the raw
+         * one, and giving them one nonce would be the mistake that makes both
+         * recoverable without the key.
+         */
+        object_crypt_stream_t *dec = NULL, *enc = NULL;
+        uint64_t plain_remaining = m->compressed_size;
+        if (key) {
+            uint8_t in_nonce[OBJECT_CRYPT_NONCE_BYTES];
+            uint8_t out_nonce[OBJECT_CRYPT_NONCE_BYTES];
+            if (m->compressed_size < OBJECT_CRYPT_OVERHEAD ||
+                read_full_fd(fd, in_nonce, sizeof(in_nonce)) != 0) {
+                free(comp_out); LZ4F_freeCompressionContext(cctx);
+                st = ERR_CORRUPT; goto done;
+            }
+            plain_remaining = m->compressed_size - OBJECT_CRYPT_OVERHEAD;
+            if (object_crypt_stream_begin(&dec, key, in_nonce, 0) != OK ||
+                object_crypt_stream_begin(&enc, key, out_nonce, 1) != OK) {
+                object_crypt_stream_free(dec); object_crypt_stream_free(enc);
+                free(comp_out); LZ4F_freeCompressionContext(cctx);
+                st = ERR_IO; goto done;
+            }
+            /* The pack's own nonce leads its payload, exactly as it does in a
+             * loose object, so a reader has it before the first byte. */
+            if (fwrite(out_nonce, 1, sizeof(out_nonce), pw->dat_f) != sizeof(out_nonce)) {
+                object_crypt_stream_free(dec); object_crypt_stream_free(enc);
+                free(comp_out); LZ4F_freeCompressionContext(cctx);
+                st = ERR_IO; goto done;
+            }
+            running_crc = crc32c_update(running_crc, out_nonce, sizeof(out_nonce));
+            if (rs_parity_stream_feed(ps, out_nonce, sizeof(out_nonce)) != 0) {
+                object_crypt_stream_free(dec); object_crypt_stream_free(enc);
+                free(comp_out); LZ4F_freeCompressionContext(cctx);
+                st = ERR_IO; goto done;
+            }
+            compressed_written += sizeof(out_nonce);
+        }
+
+        /* Encrypt LZ4's output in place and account for it. comp_out is ours
+         * until it is written, so no second buffer is needed. No control flow
+         * in here: a break inside a macro leaves the macro's own do-while and
+         * not the loop the reader thinks it does. */
+        #define PW_EMIT(buf, n) do {                                          \
+            size_t _n = (n);                                                  \
+            if (st == OK && _n) {                                             \
+                if (enc && object_crypt_stream_update(enc, (buf), _n, (buf)) != OK) \
+                    st = ERR_IO;                                              \
+                else if (fwrite((buf), 1, _n, pw->dat_f) != _n)               \
+                    st = ERR_IO;                                              \
+                else if (running_crc = crc32c_update(running_crc, (buf), _n), \
+                         rs_parity_stream_feed(ps, (buf), _n) != 0)           \
+                    st = ERR_IO;                                              \
+                else                                                          \
+                    compressed_written += _n;                                 \
+            }                                                                 \
+        } while (0)
+
         /* LZ4 frame header */
         size_t hdr_sz = LZ4F_compressBegin(cctx, comp_out, comp_bound, NULL);
-        if (LZ4F_isError(hdr_sz)) {
-            free(comp_out); LZ4F_freeCompressionContext(cctx);
-            st = ERR_IO; goto done;
-        }
-        if (fwrite(comp_out, 1, hdr_sz, pw->dat_f) != hdr_sz) {
-            free(comp_out); LZ4F_freeCompressionContext(cctx);
-            st = ERR_IO; goto done;
-        }
-        running_crc = crc32c_update(running_crc, comp_out, hdr_sz);
-        if (rs_parity_stream_feed(ps, comp_out, hdr_sz) != 0) {
-            free(comp_out); LZ4F_freeCompressionContext(cctx);
-            st = ERR_IO; goto done;
-        }
-        compressed_written += hdr_sz;
+        if (LZ4F_isError(hdr_sz)) st = ERR_IO;
+        else PW_EMIT(comp_out, hdr_sz);
 
-        /* Stream: read → compress → write */
-        uint64_t remaining = m->compressed_size;
+        /* Stream: read -> decrypt -> compress -> encrypt -> write */
+        uint64_t remaining = plain_remaining;
         while (remaining > 0 && st == OK) {
             size_t want = (remaining > (256 * 1024))
                           ? (256 * 1024) : (size_t)remaining;
@@ -2118,35 +2443,57 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                 st = (got == 0) ? ERR_CORRUPT : ERR_IO;
                 break;
             }
+            if (dec && object_crypt_stream_update(dec, stream_buf, (size_t)got,
+                                                  stream_buf) != OK) {
+                st = ERR_CORRUPT; break;
+            }
             size_t out_sz = LZ4F_compressUpdate(cctx, comp_out, comp_bound,
                                                 stream_buf, (size_t)got, NULL);
             if (LZ4F_isError(out_sz)) { st = ERR_IO; break; }
-            if (out_sz > 0) {
-                if (fwrite(comp_out, 1, out_sz, pw->dat_f) != out_sz) {
-                    st = ERR_IO; break;
-                }
-                running_crc = crc32c_update(running_crc, comp_out, out_sz);
-                if (rs_parity_stream_feed(ps, comp_out, out_sz) != 0) { st = ERR_IO; break; }
-                compressed_written += out_sz;
-            }
+            PW_EMIT(comp_out, out_sz);
+            if (st != OK) break;
             atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
             remaining -= (uint64_t)got;
+        }
+
+        /* The loose object's tag closes its stream. Checking it here is the
+         * only chance to notice that what we just packed was not what was
+         * stored; past this point the plaintext is already compressed. */
+        if (st == OK && dec) {
+            uint8_t in_tag[OBJECT_CRYPT_TAG_BYTES];
+            if (read_full_fd(fd, in_tag, sizeof(in_tag)) != 0 ||
+                object_crypt_stream_finish(dec, NULL, in_tag) != OK)
+                st = ERR_CORRUPT;
         }
 
         if (st == OK) {
             /* LZ4 frame footer */
             size_t end_sz = LZ4F_compressEnd(cctx, comp_out, comp_bound, NULL);
-            if (LZ4F_isError(end_sz)) {
-                st = ERR_IO;
-            } else if (fwrite(comp_out, 1, end_sz, pw->dat_f) != end_sz) {
-                st = ERR_IO;
-            } else {
-                running_crc = crc32c_update(running_crc, comp_out, end_sz);
-                if (rs_parity_stream_feed(ps, comp_out, end_sz) != 0) { st = ERR_IO; }
-                else compressed_written += end_sz;
+            if (LZ4F_isError(end_sz)) st = ERR_IO;
+            else PW_EMIT(comp_out, end_sz);
+        }
+
+        /* Our own tag lands after the payload, inside compressed_size, so
+         * every offset stays a plain byte count. */
+        if (st == OK && enc) {
+            uint8_t out_tag[OBJECT_CRYPT_TAG_BYTES];
+            if (object_crypt_stream_finish(enc, out_tag, NULL) != OK) st = ERR_IO;
+            else {
+                if (fwrite(out_tag, 1, sizeof(out_tag), pw->dat_f) != sizeof(out_tag))
+                    st = ERR_IO;
+                else {
+                    running_crc = crc32c_update(running_crc, out_tag, sizeof(out_tag));
+                    if (rs_parity_stream_feed(ps, out_tag, sizeof(out_tag)) != 0)
+                        st = ERR_IO;
+                    else compressed_written += sizeof(out_tag);
+                }
             }
         }
 
+        #undef PW_EMIT
+
+        object_crypt_stream_free(dec);
+        object_crypt_stream_free(enc);
         free(comp_out);
         LZ4F_freeCompressionContext(cctx);
 
@@ -2161,7 +2508,10 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         fseeko(pw->dat_f, 0, SEEK_END);
     } else {
 raw_copy:
-        /* Raw-copy path for already-compressed objects */
+        /* Raw-copy path for already-compressed objects. An encrypted object
+         * copies verbatim: nonce, ciphertext and tag are already the stored
+         * form, and reproducing them is exactly right. */
+        ehdr.encryption = key ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
         if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1) { st = ERR_IO; goto done; }
 
         uint64_t remaining = m->compressed_size;
@@ -2235,6 +2585,7 @@ done:
     pw->idx_entries[pw->packed].entry_index       = pw->packed;
     pw->idx_entries[pw->packed].type              = ehdr.type;
     pw->idx_entries[pw->packed].compression       = ehdr.compression;
+    pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
     pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
     pw->idx_entries[pw->packed].compressed_size   = actual_compressed_size;
 
@@ -2350,20 +2701,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
     int show_progress = pack_progress_enabled();
 
-    /*
-     * Packing an encrypted repository is not implemented yet, and doing it
-     * wrong is worse than not doing it: the pack writer would copy ciphertext
-     * into an entry whose header says it is plaintext, and every later read
-     * would hand back encrypted bytes as if they were the file. Refuse
-     * loudly. Backups still complete - packing is not allowed to fail one -
-     * and the objects stay readable loose.
-     */
-    if (store_key(store)) {
-        if (out_packed) *out_packed = 0;
-        return set_error(ERR_INVALID,
-                         "packing an encrypted repository is not implemented yet");
-    }
-
     if (!loose_objects_exist(store)) {
         log_info("pack: no loose objects to pack");
         if (out_packed) *out_packed = 0;
@@ -2458,6 +2795,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
 
     /* --- Probe pass: filter incompressible large COMPRESS_NONE objects --- */
     {
+        const repo_key_t *probe_key = store_key(store);
         size_t new_cnt = 0;
         for (size_t i = 0; i < packable_cnt; i++) {
             pack_obj_meta_t *lm = &meta[indices[i]];
@@ -2477,11 +2815,37 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                     }
                 }
                 if (pfd >= 0) {
-                    size_t probe_len = (size_t)(lm->compressed_size < PACK_PROBE_SIZE
-                                               ? lm->compressed_size : PACK_PROBE_SIZE);
+                    /*
+                     * The prober measures entropy, so it has to see plaintext.
+                     * Ciphertext is by construction indistinguishable from
+                     * random: probing it finds every object incompressible,
+                     * skip-marks it, and an encrypted repository quietly never
+                     * packs anything. Authentication is skipped here on
+                     * purpose - the tag is at the far end of an object we are
+                     * only sampling the front of, and a wrong answer costs
+                     * compression ratio rather than correctness. The real
+                     * check happens when the object is actually packed.
+                     */
+                    uint64_t stored_len = lm->compressed_size;
+                    object_crypt_stream_t *pdec = NULL;
+                    if (probe_key) {
+                        uint8_t pnonce[OBJECT_CRYPT_NONCE_BYTES];
+                        if (stored_len < OBJECT_CRYPT_OVERHEAD ||
+                            read_full_fd(pfd, pnonce, sizeof(pnonce)) != 0 ||
+                            object_crypt_stream_begin(&pdec, probe_key, pnonce, 0) != OK) {
+                            close(lm->fd); lm->fd = -1;
+                            indices[new_cnt++] = indices[i];
+                            continue;
+                        }
+                        stored_len -= OBJECT_CRYPT_OVERHEAD;
+                    }
+                    size_t probe_len = (size_t)(stored_len < PACK_PROBE_SIZE
+                                               ? stored_len : PACK_PROBE_SIZE);
                     uint8_t *pbuf = malloc(probe_len);
                     int skip = 0;
-                    if (pbuf && read_full_fd(pfd, pbuf, probe_len) == 0) {
+                    if (pbuf && read_full_fd(pfd, pbuf, probe_len) == 0 &&
+                        (!pdec || object_crypt_stream_update(pdec, pbuf, probe_len,
+                                                             pbuf) == OK)) {
                         int cbound = LZ4_compressBound((int)probe_len);
                         char *cbuf = malloc((size_t)cbound);
                         if (cbuf) {
@@ -2510,6 +2874,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                         }
                     }
                     free(pbuf);
+                    object_crypt_stream_free(pdec);
                     if (skip) {
                         close(lm->fd);
                         lm->fd = -1;
@@ -2714,8 +3079,7 @@ static status_t collect_pack_meta(store_t *store,
         pack_dat_hdr_t dhdr;
         if (fread(&dhdr, sizeof(dhdr), 1, datf) != 1 ||
             dhdr.magic != PACK_DAT_MAGIC ||
-            (dhdr.version != PACK_VERSION_V1 && dhdr.version != PACK_VERSION_V2 &&
-             dhdr.version != PACK_VERSION_V3 && dhdr.version != PACK_VERSION)) {
+            dhdr.version != PACK_VERSION) {
             fclose(datf);
             continue;
         }
@@ -2786,24 +3150,21 @@ static void pack_resume_deleting(store_t *store) {
  *
  * Expects f positioned immediately after the pack header.
  */
-static int build_disk_idx_from_dat(FILE *f, uint32_t version, uint32_t count,
+static int build_disk_idx_from_dat(FILE *f, uint32_t count,
                                    pack_idx_disk_entry_t *out)
 {
     uint64_t offset = sizeof(pack_dat_hdr_t);
     for (uint32_t i = 0; i < count; i++) {
-        if (version == PACK_VERSION_V1) {
-            pack_dat_entry_hdr_v1_t eh;
-            if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
-            memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
-            out[i].dat_offset = offset;
-            offset += sizeof(eh) + (uint64_t)eh.compressed_size;
-        } else {
-            pack_dat_entry_hdr_t eh;
-            if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
-            memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
-            out[i].dat_offset = offset;
-            offset += sizeof(eh) + eh.compressed_size;
-        }
+        pack_dat_entry_hdr_t eh;
+        if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
+        /* Only the hash and the offset are wanted here - callers rebuild the
+         * rest from the entry header they read themselves. Zeroed anyway so
+         * a future caller that reads more than that gets zeros, not stack
+         * dust from a previous allocation. */
+        memset(&out[i], 0, sizeof(out[i]));
+        memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
+        out[i].dat_offset = offset;
+        offset += sizeof(eh) + eh.compressed_size;
         if (fseeko(f, (off_t)offset, SEEK_SET) != 0) return -1;
     }
     return 0;
@@ -2917,13 +3278,11 @@ static status_t maybe_coalesce_packs(store_t *store,
         pack_dat_hdr_t chdr;
         if (fread(&chdr, sizeof(chdr), 1, datf) != 1 ||
             chdr.magic != PACK_DAT_MAGIC ||
-            (chdr.version != PACK_VERSION_V1 && chdr.version != PACK_VERSION_V2 &&
-             chdr.version != PACK_VERSION_V3 && chdr.version != PACK_VERSION)) {
+            chdr.version != PACK_VERSION) {
             fclose(datf);
             rc = ERR_CORRUPT;
             break;
         }
-        uint32_t dat_version = chdr.version;
 
         pack_idx_disk_entry_t *disk_idx = malloc((size_t)chdr.count * sizeof(*disk_idx));
         if (!disk_idx) {
@@ -2931,7 +3290,7 @@ static status_t maybe_coalesce_packs(store_t *store,
             rc = ERR_NOMEM;
             break;
         }
-        if (build_disk_idx_from_dat(datf, chdr.version, chdr.count, disk_idx) != 0) {
+        if (build_disk_idx_from_dat(datf, chdr.count, disk_idx) != 0) {
             free(disk_idx);
             fclose(datf);
             rc = ERR_CORRUPT;
@@ -2942,7 +3301,7 @@ static status_t maybe_coalesce_packs(store_t *store,
             if (!bsearch(disk_idx[i].hash, refs, refs_cnt, OBJECT_HASH_SIZE, ref_cmp)) continue;
             if (fseeko(datf, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) { rc = ERR_IO; break; }
             pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(datf, &ehdr, dat_version) != 0) { rc = ERR_CORRUPT; break; }
+            if (read_entry_hdr(datf, &ehdr) != 0) { rc = ERR_CORRUPT; break; }
 
             uint64_t entry_total = sizeof(ehdr) + ehdr.compressed_size;
 
@@ -3009,6 +3368,7 @@ static status_t maybe_coalesce_packs(store_t *store,
             new_disk_idx[live_count].entry_index        = live_count;
             new_disk_idx[live_count].type               = ehdr.type;
             new_disk_idx[live_count].compression        = ehdr.compression;
+            new_disk_idx[live_count].encryption         = ehdr.encryption;
             new_disk_idx[live_count].uncompressed_size  = ehdr.uncompressed_size;
             new_disk_idx[live_count].compressed_size    = ehdr.compressed_size;
             live_count++;
@@ -3088,8 +3448,7 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t found;
     if (pack_find_entry(store, hash, &found) != OK) return -1;
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
-    if ((found.pack_version != PACK_VERSION_V3 && found.pack_version != PACK_VERSION) ||
-        found.entry_index == UINT32_MAX)
+    if (found.pack_version != PACK_VERSION || found.entry_index == UINT32_MAX)
         return -1;
 
     char dat_path[PATH_MAX];
@@ -3227,18 +3586,16 @@ status_t pack_gc(store_t *store,
         pack_dat_hdr_t ghdr;
         if (fread(&ghdr, sizeof(ghdr), 1, gcidxf) != 1 ||
             ghdr.magic != PACK_DAT_MAGIC ||
-            (ghdr.version != PACK_VERSION_V1 && ghdr.version != PACK_VERSION_V2 &&
-             ghdr.version != PACK_VERSION_V3 && ghdr.version != PACK_VERSION)) {
+            ghdr.version != PACK_VERSION) {
             fclose(gcidxf); continue;
         }
-        uint32_t dat_version = ghdr.version;
         uint32_t count = ghdr.count;
         if (count > 10000000u) {
             fclose(gcidxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
         }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
         if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
-        if (build_disk_idx_from_dat(gcidxf, ghdr.version, count, disk_idx) != 0) {
+        if (build_disk_idx_from_dat(gcidxf, count, disk_idx) != 0) {
             free(disk_idx); fclose(gcidxf); continue;
         }
         fclose(gcidxf);
@@ -3327,7 +3684,7 @@ status_t pack_gc(store_t *store,
                 st = ERR_IO; free(new_disk_idx); goto pack_fail;
             }
             pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(old_dat, &ehdr, dat_version) != 0) {
+            if (read_entry_hdr(old_dat, &ehdr) != 0) {
                 st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
             }
             if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
@@ -3356,6 +3713,7 @@ status_t pack_gc(store_t *store,
             new_disk_idx[live_count].entry_index        = live_count;
             new_disk_idx[live_count].type               = ehdr.type;
             new_disk_idx[live_count].compression        = ehdr.compression;
+            new_disk_idx[live_count].encryption         = ehdr.encryption;
             new_disk_idx[live_count].uncompressed_size  = ehdr.uncompressed_size;
             new_disk_idx[live_count].compressed_size    = ehdr.compressed_size;
             live_count++;
@@ -3520,11 +3878,12 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_enumerate_dat: bad header in %s", dat_name);
     }
-    if (hdr.version != PACK_VERSION_V1 && hdr.version != PACK_VERSION_V2 &&
-        hdr.version != PACK_VERSION_V3 && hdr.version != PACK_VERSION) {
+    if (hdr.version != PACK_VERSION) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_enumerate_dat: unknown version %u in %s",
-                         hdr.version, dat_name);
+        return set_error(ERR_CORRUPT,
+                         "pack_enumerate_dat: %s is pack version %u, this build "
+                         "reads only version %u - rebuild the repository",
+                         dat_name, hdr.version, PACK_VERSION);
     }
 
     if (out_version) *out_version = hdr.version;
@@ -3536,33 +3895,19 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
     for (uint32_t i = 0; i < hdr.count; i++) {
         pack_entry_info_t info;
 
-        if (hdr.version == PACK_VERSION_V1) {
-            pack_dat_entry_hdr_v1_t eh;
-            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
-            memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
-            info.type              = eh.type;
-            info.compression       = eh.compression;
-            info.uncompressed_size = eh.uncompressed_size;
-            info.compressed_size   = (uint64_t)eh.compressed_size;
-            info.payload_offset    = offset + sizeof(eh);
-            info.entry_offset      = offset;
-            info.entry_index       = i;
-            offset += sizeof(eh) + (uint64_t)eh.compressed_size;
-            if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
-        } else {
-            pack_dat_entry_hdr_t eh;
-            if (fread(&eh, sizeof(eh), 1, f) != 1) break;
-            memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
-            info.type              = eh.type;
-            info.compression       = eh.compression;
-            info.uncompressed_size = eh.uncompressed_size;
-            info.compressed_size   = eh.compressed_size;
-            info.payload_offset    = offset + sizeof(eh);
-            info.entry_offset      = offset;
-            info.entry_index       = i;
-            offset += sizeof(eh) + eh.compressed_size;
-            if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
-        }
+        pack_dat_entry_hdr_t eh;
+        if (fread(&eh, sizeof(eh), 1, f) != 1) break;
+        memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
+        info.type              = eh.type;
+        info.compression       = eh.compression;
+        info.encryption        = eh.encryption;
+        info.uncompressed_size = eh.uncompressed_size;
+        info.compressed_size   = eh.compressed_size;
+        info.payload_offset    = offset + sizeof(eh);
+        info.entry_offset      = offset;
+        info.entry_index       = i;
+        offset += sizeof(eh) + eh.compressed_size;
+        if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
 
         cb(&info, ctx);
     }
