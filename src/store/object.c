@@ -2137,18 +2137,21 @@ status_t object_get_info(store_t *store,
 
 /*
  * Stream `size` bytes from src_fd into the object store as object type `type`.
- * The data is stored uncompressed (COMPRESS_NONE).  The SHA-256 of the raw
- * bytes is computed while streaming and verified against expected_hash.
- * Returns OK, ERR_NOMEM, ERR_IO, or ERR_CORRUPT (hash mismatch).
+ * The SHA-256 of the raw bytes is computed while streaming and verified
+ * against expected_hash. Returns OK, ERR_NOMEM, ERR_IO, or ERR_CORRUPT.
+ *
+ * This is the import half of xfer, which Phase 0 deferred and which has not
+ * been rebuilt, so nothing in the daemon calls it. It is kept because an
+ * import path will want it, and it was finished rather than left refusing an
+ * encrypted repository: for two commits it was also the only writer here
+ * that emitted no parity trailer, so every object it produced was the one
+ * kind this store does not know how to repair. A dead path that is quietly
+ * wrong is worse than one that is merely unused.
  */
 status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size,
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
     /* Check existence first to avoid redundant work. */
     if (object_exists(store, expected_hash)) return OK;
-
-    if (store_key(store))
-        return set_error(ERR_INVALID,
-                         "encrypted repositories cannot yet import objects by fd");
 
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
@@ -2164,7 +2167,7 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
         .compression       = COMPRESS_NONE,
         .pack_skip_ver     = 0,
         .uncompressed_size = size,
-        .compressed_size   = size,
+        .compressed_size   = 0,   /* patched below */
     };
     memcpy(hdr.hash, expected_hash, OBJECT_HASH_SIZE);
     if (write(tfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
@@ -2177,22 +2180,77 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_IO, "store_fd: SHA256 init failed");
     }
 
+    char ps_tmp_dir[PATH_MAX];
+    snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", store_root(store));
+    rs_parity_stream_t ps;
+    if (rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir) != 0) {
+        EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "store_fd: rs parity stream init");
+    }
+
     uint8_t *buf = malloc(STREAM_LOAD_MAX);
     if (!buf) {
+        rs_parity_stream_destroy(&ps);
         EVP_MD_CTX_free(mdctx); close(tfd); unlink(tmppath); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_LOAD_MAX);
     }
 
-    uint64_t remaining = size;
+    uint32_t crc = 0;
+    uint64_t total_written = 0;
     status_t st = OK;
-    while (remaining > 0) {
+
+    /* Nonce first, then ciphertext, then tag - the layout every other writer
+     * here uses. All three are stored, so CRC and parity cover all three. */
+    const repo_key_t *enc_key = store_key(store);
+    object_crypt_stream_t *cs = NULL;
+    uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+    if (enc_key) {
+        st = object_crypt_stream_begin(&cs, enc_key, nonce, 1);
+        if (st == OK && io_write_full(tfd, nonce, sizeof(nonce)) != 0)
+            st = set_error_errno(ERR_IO, "store_fd: write nonce");
+        if (st == OK) {
+            crc = crc32c_update(crc, nonce, sizeof(nonce));
+            if (rs_parity_stream_feed(&ps, nonce, sizeof(nonce)) != 0)
+                st = set_error_errno(ERR_IO, "store_fd: rs feed (nonce)");
+            total_written += sizeof(nonce);
+        }
+    }
+
+    uint64_t remaining = size;
+    while (remaining > 0 && st == OK) {
         size_t want = (remaining < STREAM_LOAD_MAX) ? (size_t)remaining : STREAM_LOAD_MAX;
         ssize_t r = read(src_fd, buf, want);
-        if (r <= 0) { st = set_error_errno(ERR_IO, "store_fd: read src_fd"); break; }
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            st = set_error_errno(ERR_IO, "store_fd: read src_fd"); break;
+        }
+        /* Hash the plaintext, then encrypt in place: the buffer is ours until
+         * it is written, so a second one would buy nothing. */
         if (EVP_DigestUpdate(mdctx, buf, (size_t)r) != 1) { st = set_error(ERR_IO, "store_fd: SHA256 update failed"); break; }
+        if (cs) {
+            st = object_crypt_stream_update(cs, buf, (size_t)r, buf);
+            if (st != OK) break;
+        }
         if (io_write_full(tfd, buf, (size_t)r) != 0) { st = set_error_errno(ERR_IO, "store_fd: write payload"); break; }
+        crc = crc32c_update(crc, buf, (size_t)r);
+        if (rs_parity_stream_feed(&ps, buf, (size_t)r) != 0) { st = set_error_errno(ERR_IO, "store_fd: rs feed"); break; }
+        total_written += (uint64_t)r;
         remaining -= (uint64_t)r;
     }
     free(buf);
+
+    if (st == OK && cs) {
+        uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
+        st = object_crypt_stream_finish(cs, tag, NULL);
+        if (st == OK && io_write_full(tfd, tag, sizeof(tag)) != 0)
+            st = set_error_errno(ERR_IO, "store_fd: write tag");
+        if (st == OK) {
+            crc = crc32c_update(crc, tag, sizeof(tag));
+            if (rs_parity_stream_feed(&ps, tag, sizeof(tag)) != 0)
+                st = set_error_errno(ERR_IO, "store_fd: rs feed (tag)");
+            total_written += sizeof(tag);
+        }
+    }
+    object_crypt_stream_free(cs);
 
     if (st == OK) {
         uint8_t got[OBJECT_HASH_SIZE];
@@ -2206,7 +2264,57 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
     }
     EVP_MD_CTX_free(mdctx);
 
-    if (st != OK) { close(tfd); unlink(tmppath); return st; }
+    if (st == OK && rs_parity_stream_finish(&ps) != 0)
+        st = set_error_errno(ERR_IO, "store_fd: rs finish");
+
+    if (st != OK) {
+        rs_parity_stream_destroy(&ps);
+        close(tfd); unlink(tmppath); return st;
+    }
+
+    hdr.compressed_size = total_written;
+    hdr.encryption      = enc_key ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
+    if (pwrite(tfd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: pwrite header");
+    }
+
+    /* Parity trailer: header XOR record, RS payload parity, CRC, footer. */
+    parity_record_t hpar;
+    parity_record_compute(&hdr, sizeof(hdr), &hpar);
+    if (lseek(tfd, 0, SEEK_END) == (off_t)-1 ||
+        write(tfd, &hpar, sizeof(hpar)) != (ssize_t)sizeof(hpar)) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: write hpar");
+    }
+    size_t rs_sz = rs_parity_stream_total(&ps);
+    if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: write rs parity");
+    }
+    rs_parity_stream_destroy(&ps);
+
+    if (write(tfd, &crc, sizeof(crc)) != (ssize_t)sizeof(crc)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: write crc");
+    }
+    /* Deprecated rs_data_len field - always 0, see parity.h. */
+    uint32_t rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
+    if (write(tfd, &rs_data_len, sizeof(rs_data_len)) != (ssize_t)sizeof(rs_data_len)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: write rs_data_len");
+    }
+    parity_footer_t pftr = {
+        .magic        = PARITY_FOOTER_MAGIC,
+        .version      = PARITY_VERSION,
+        .trailer_size = (uint32_t)(sizeof(hpar) + rs_sz + sizeof(crc)
+                                   + sizeof(rs_data_len) + sizeof(parity_footer_t)),
+    };
+    if (write(tfd, &pftr, sizeof(pftr)) != (ssize_t)sizeof(pftr)) {
+        close(tfd); unlink(tmppath);
+        return set_error_errno(ERR_IO, "store_fd: write footer");
+    }
+
     if (async_writeback(tfd) != 0) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "store_fd: fdatasync"); }
     close(tfd);
 

@@ -22,6 +22,7 @@
 #include "pack.h"
 #include "parity.h"
 #include "types.h"
+#include "repo_key.h"
 
 #define TEST_REPO "/tmp/c_backup_objstore_repo"
 #define TEST_SRC  "/tmp/c_backup_objstore_src"
@@ -322,6 +323,129 @@ static void test_store_fd_roundtrip(void **state) {
     free(out);
 }
 
+/*
+ * object_store_fd has no production caller: it is the import half of xfer,
+ * which was deferred. It is tested anyway, because for two commits it wrote
+ * objects with no parity trailer at all - the only writer here that did -
+ * and would have refused an encrypted repository outright. Both are the kind
+ * of gap that is invisible until something depends on it.
+ */
+static void test_store_fd_writes_a_parity_trailer(void **state) {
+    (void)state;
+    int rc = system("mkdir -p " TEST_SRC);
+    (void)rc;
+    const char *path = TEST_SRC "/fd_parity.bin";
+    const char *data = "an imported object must be repairable like any other";
+    size_t len = strlen(data);
+
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fwrite(data, 1, len, f);
+    fclose(f);
+
+    uint8_t hash[OBJECT_HASH_SIZE] = {0};
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char obj_path[512];
+    snprintf(obj_path, sizeof(obj_path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+    unlink(obj_path);
+
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(object_store_fd(store, OBJECT_TYPE_FILE, fd, (uint64_t)len, hash), OK);
+    close(fd);
+
+    /* The footer is the last thing in the file, and it has to be there. */
+    int ofd = open(obj_path, O_RDONLY);
+    assert_true(ofd >= 0);
+    off_t end = lseek(ofd, 0, SEEK_END);
+    parity_footer_t pftr;
+    assert_int_equal(pread(ofd, &pftr, sizeof(pftr), end - (off_t)sizeof(pftr)),
+                     (ssize_t)sizeof(pftr));
+    close(ofd);
+    assert_int_equal(pftr.magic, PARITY_FOOTER_MAGIC);
+    assert_int_equal(pftr.version, PARITY_VERSION);
+    assert_true(pftr.trailer_size > sizeof(pftr));
+
+    /* And a flipped payload byte has to come back repaired. */
+    ofd = open(obj_path, O_RDWR);
+    assert_true(ofd >= 0);
+    unsigned char b = 0;
+    off_t target = (off_t)sizeof(object_header_t) + 3;
+    assert_int_equal(pread(ofd, &b, 1, target), 1);
+    b ^= 0x40;
+    assert_int_equal(pwrite(ofd, &b, 1, target), 1);
+    close(ofd);
+
+    void *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(out_len, len);
+    assert_memory_equal(out, data, len);
+    free(out);
+}
+
+/* The same import into an encrypted repository: unreadable on disk, exact
+ * on the way back. */
+static void test_store_fd_encrypted_roundtrip(void **state) {
+    (void)state;
+    int rc = system("mkdir -p " TEST_SRC);
+    (void)rc;
+    const char *path = TEST_SRC "/fd_enc.bin";
+    const char *data = "plainly legible until it is not: import under a key";
+    size_t len = strlen(data);
+
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fwrite(data, 1, len, f);
+    fclose(f);
+
+    /* Name it by its plaintext hash, as an importer would. */
+    uint8_t hash[OBJECT_HASH_SIZE] = {0};
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, hash), OK);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char obj_path[512];
+    snprintf(obj_path, sizeof(obj_path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
+    unlink(obj_path);
+
+    repo_key_t key;
+    assert_int_equal(repo_key_generate(&key), OK);
+    store_set_key(store, &key);
+
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(object_store_fd(store, OBJECT_TYPE_FILE, fd, (uint64_t)len, hash), OK);
+    close(fd);
+
+    /* No plaintext anywhere in the object file. */
+    int ofd = open(obj_path, O_RDONLY);
+    assert_true(ofd >= 0);
+    off_t end = lseek(ofd, 0, SEEK_END);
+    char *all = malloc((size_t)end + 1);
+    assert_non_null(all);
+    assert_int_equal(pread(ofd, all, (size_t)end, 0), (ssize_t)end);
+    close(ofd);
+    all[end] = 0;
+    int found = 0;
+    for (off_t i = 0; i + (off_t)len <= end; i++)
+        if (memcmp(all + i, data, len) == 0) { found = 1; break; }
+    free(all);
+    assert_false(found);
+
+    void *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(object_load(store, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(out_len, len);
+    assert_memory_equal(out, data, len);
+    free(out);
+
+    /* And the hash still has to be the plaintext's, or dedup is broken. */
+    store_set_key(store, NULL);
+    assert_int_not_equal(object_load(store, hash, &out, &out_len, NULL), OK);
+}
+
 /* object_store_fd: wrong hash → ERR_CORRUPT */
 static void test_store_fd_hash_mismatch(void **state) {
     (void)state;
@@ -473,6 +597,8 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_store_ex_is_new_and_phys, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_store_fd_roundtrip, setup_basic, teardown_basic),
         cmocka_unit_test_setup_teardown(test_store_fd_hash_mismatch, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_store_fd_writes_a_parity_trailer, setup_basic, teardown_basic),
+        cmocka_unit_test_setup_teardown(test_store_fd_encrypted_roundtrip, setup_basic, teardown_basic),
 
         /* Pack fallback coverage */
         cmocka_unit_test_setup_teardown(test_load_stream_pack_fallback, setup_basic, teardown_basic),
