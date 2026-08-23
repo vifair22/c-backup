@@ -351,6 +351,64 @@ fuzz-min: fuzz
 	    echo "$$n: $$before -> $$after"; \
 	done
 
+# What the corpus actually reaches.
+#
+# A separate clang build with source-based coverage instead of libFuzzer's
+# own counters, because the question is which lines of the parsers the corpus
+# exercises, not how the fuzzer is doing. Replays every committed input and
+# reports per-function.
+#
+# Read it per function, never as a total: these binaries link the whole
+# daemon, so a whole-binary figure is dominated by the routes, the scheduler
+# and the job manager, which no fuzz target has any business reaching.
+FUZZCOV_DIR  := $(BUILD)/fuzzcov
+FUZZCOV_OBJ  := $(FUZZCOV_DIR)/obj
+FUZZCOV_BIN  := $(FUZZCOV_DIR)/bin
+FUZZCOV_CF   := -std=c11 -O1 -g -fsanitize=fuzzer-no-link \
+                -fprofile-instr-generate -fcoverage-mapping -Wno-unused-result \
+                $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+LLVM_PROFDATA ?= llvm-profdata
+LLVM_COV      ?= llvm-cov
+
+.PHONY: fuzz-cov
+fuzz-cov: $(MIGRATE_SRC)
+	@mkdir -p $(FUZZCOV_OBJ) $(FUZZCOV_BIN)
+	@for f in $(SRCS); do \
+	    $(FUZZ_CC) $(FUZZCOV_CF) -c $$f -o $(FUZZCOV_OBJ)/$$(basename $${f%.c}).o || exit 1; \
+	done
+	@$(FUZZ_CC) $(FUZZCOV_CF) -Wno-everything -c vendor/cJSON.c -o $(FUZZCOV_OBJ)/cJSON.o
+	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(MIGRATE_SRC) -o $(FUZZCOV_OBJ)/app_migrations.o
+	@for t in $(FUZZ_SRCS); do \
+	    n=$$(basename $${t%.c}); \
+	    $(FUZZ_CC) $(FUZZCOV_CF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \
+	        -fsanitize=fuzzer -fprofile-instr-generate -fcoverage-mapping \
+	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread || exit 1; \
+	done
+	@rm -rf $(FUZZCOV_DIR)/prof && mkdir -p $(FUZZCOV_DIR)/prof
+	@for t in $(FUZZCOV_BIN)/*; do \
+	    n=$$(basename $$t); \
+	    [ -d $(FUZZ_CORPUS)/$$n ] || continue; \
+	    LLVM_PROFILE_FILE=$(FUZZCOV_DIR)/prof/$$n.profraw \
+	        $$t -runs=0 $(FUZZ_CORPUS)/$$n >/dev/null 2>&1 || true; \
+	done
+	@$(LLVM_PROFDATA) merge -sparse $(FUZZCOV_DIR)/prof/*.profraw \
+	    -o $(FUZZCOV_DIR)/fuzz.profdata
+	@first=$$(ls $(FUZZCOV_BIN)/* | head -1); \
+	 rest=""; for t in $(FUZZCOV_BIN)/*; do [ "$$t" = "$$first" ] || rest="$$rest -object $$t"; done; \
+	 for f in $(FUZZ_COV_FILES); do \
+	    echo "=== $$f ==="; \
+	    $(LLVM_COV) report $$first -instr-profile=$(FUZZCOV_DIR)/fuzz.profdata $$rest \
+	        -show-functions $$f 2>/dev/null \
+	      | awk 'NR>2 && $$1!~/^-/ && $$1!="TOTAL" && $$1!~/^fuzz_/ {printf "  %-44s %8s\n", $$1, $$(NF-3)}'; \
+	 done
+
+# The files a fuzz target is actually aimed at. Listed rather than globbed:
+# the point is to see whether the parsers are covered, and a list that has to
+# be edited when a target is added is a list somebody has looked at.
+FUZZ_COV_FILES := src/common/metablob.c src/store/manifest.c \
+                  src/ops/sparse_restore.c src/store/parity.c \
+                  src/store/object.c src/store/object_crypt.c src/store/pack.c
+
 # Replay the committed corpus and stop. This is the regression check: it
 # runs every input a fuzzer ever found interesting, in seconds, without
 # searching for new ones. Suitable for a pipeline that must not take
