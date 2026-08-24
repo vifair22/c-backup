@@ -57,6 +57,12 @@ static int teardown_basic(void **state) {
  * this file about sparse handling passes without the sparse writer having
  * run. Probe for a directory that reports holes and use that; if none does,
  * the sparse tests say so instead of passing for the wrong reason.
+ *
+ * The probe has to build the shape the tests need, not an easier one. It
+ * used to write four bytes into a 1 MiB file, which almost anything keeps
+ * sparse - CI's filesystem passed that and then stored the real fixture
+ * dense, so the tests ran where they should have skipped. Three 4 KiB
+ * islands in 128 KiB is what they actually use, so that is what gets asked.
  */
 static const char *sparse_dir(void) {
     static char chosen[256];
@@ -71,12 +77,26 @@ static const char *sparse_dir(void) {
         snprintf(probe, sizeof(probe), "%s/.sparse_probe", cands[i]);
         int fd = open(probe, O_CREAT | O_TRUNC | O_RDWR, 0644);
         if (fd < 0) continue;
+
         int holes = 0;
-        if (ftruncate(fd, 1 << 20) == 0 &&
-            lseek(fd, 0, SEEK_SET) == 0 &&
-            write(fd, "data", 4) == 4) {
-            off_t h = lseek(fd, 0, SEEK_HOLE);
-            holes = (h > 0 && h < (1 << 20));
+        static const off_t isl[] = { 0, 32768, 98304 };
+        char island[4096];
+        memset(island, 'P', sizeof(island));
+        if (ftruncate(fd, 131072) == 0) {
+            int wrote = 1;
+            for (size_t k = 0; k < sizeof(isl) / sizeof(isl[0]); k++) {
+                if (lseek(fd, isl[k], SEEK_SET) != isl[k] ||
+                    write(fd, island, sizeof(island)) != (ssize_t)sizeof(island)) {
+                    wrote = 0;
+                    break;
+                }
+            }
+            /* The gap between the first and second island is what the
+             * writer has to see. Ask for exactly that. */
+            if (wrote) {
+                off_t h = lseek(fd, 4096, SEEK_HOLE);
+                holes = (h >= 4096 && h < 32768);
+            }
         }
         close(fd);
         unlink(probe);
@@ -124,7 +144,11 @@ static void test_sparse_single_hole(void **state) {
     size_t out_len = 0;
     uint8_t out_type = 0;
     assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
-    assert_true(out_type == OBJECT_TYPE_SPARSE || out_type == OBJECT_TYPE_FILE);
+    /* The fixture has holes - sparse_dir() proved this filesystem keeps
+     * them for exactly this shape - so anything but SPARSE means the writer
+     * did not see them. Accepting OBJECT_TYPE_FILE here is what let this
+     * test pass on a filesystem that stored the fixture dense. */
+    assert_int_equal(out_type, OBJECT_TYPE_SPARSE);
     if (out_type == OBJECT_TYPE_SPARSE) {
         assert_true(out_len >= sizeof(sparse_hdr_t));
         sparse_hdr_t hdr;
@@ -319,7 +343,11 @@ static void test_store_multi_region_sparse(void **state) {
     size_t out_len = 0;
     uint8_t out_type = 0;
     assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
-    assert_true(out_type == OBJECT_TYPE_SPARSE || out_type == OBJECT_TYPE_FILE);
+    /* The fixture has holes - sparse_dir() proved this filesystem keeps
+     * them for exactly this shape - so anything but SPARSE means the writer
+     * did not see them. Accepting OBJECT_TYPE_FILE here is what let this
+     * test pass on a filesystem that stored the fixture dense. */
+    assert_int_equal(out_type, OBJECT_TYPE_SPARSE);
     if (out_type == OBJECT_TYPE_SPARSE) {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));

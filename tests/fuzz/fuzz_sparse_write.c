@@ -66,11 +66,27 @@ static const char *hole_dir(void)
         snprintf(probe, sizeof(probe), "%s/.fuzz_sparse_probe", cands[i]);
         int fd = open(probe, O_CREAT | O_TRUNC | O_RDWR, 0644);
         if (fd < 0) continue;
+        /* The shape the harness actually writes, not an easier one. Four
+         * bytes in a 1 MiB file stays sparse almost anywhere; a run of 4 KiB
+         * islands does not, and asking the easy question means probing
+         * successfully and then testing the dense path for ever. */
         int holes = 0;
-        if (ftruncate(fd, 1 << 20) == 0 && lseek(fd, 0, SEEK_SET) == 0 &&
-            write(fd, "data", 4) == 4) {
-            off_t h = lseek(fd, 0, SEEK_HOLE);
-            holes = (h > 0 && h < (1 << 20));
+        static const off_t isl[] = { 0, 32768, 98304 };
+        char island[4096];
+        memset(island, 'P', sizeof(island));
+        if (ftruncate(fd, 131072) == 0) {
+            int wrote = 1;
+            for (size_t k = 0; k < sizeof(isl) / sizeof(isl[0]); k++) {
+                if (lseek(fd, isl[k], SEEK_SET) != isl[k] ||
+                    write(fd, island, sizeof(island)) != (ssize_t)sizeof(island)) {
+                    wrote = 0;
+                    break;
+                }
+            }
+            if (wrote) {
+                off_t h = lseek(fd, 4096, SEEK_HOLE);
+                holes = (h >= 4096 && h < 32768);
+            }
         }
         close(fd);
         unlink(probe);
