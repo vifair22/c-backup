@@ -28,6 +28,7 @@ variables:
       libssl-dev liblz4-dev libacl1-dev libsqlite3-dev
       libmicrohttpd-dev libcurl4-openssl-dev libcmocka-dev
       sqlite3 curl gcovr cppcheck
+      e2fsprogs
 
 # c-utils is pinned by the cutils_version file rather than tracking its
 # master, so a change over there cannot break this build without someone
@@ -43,8 +44,6 @@ test:
   tags: [docker]
   before_script:
     - *debian_deps
-    # For the loopback fallback in tests/ci-sparse-fs.sh.
-    - apt-get install -y -qq --no-install-recommends e2fsprogs
     - *fetch_cutils
   script:
     - make
@@ -97,7 +96,7 @@ fuzz:
     # ships the sanitizer runtimes separately, so -fsanitize=fuzzer,address
     # fails at link with "cannot find libclang_rt.asan.a". Unversioned so
     # this does not pin the job to whichever clang trixie ships today.
-    - apt-get install -y -qq --no-install-recommends clang libclang-rt-dev e2fsprogs
+    - apt-get install -y -qq --no-install-recommends clang libclang-rt-dev
     - *fetch_cutils
   script:
     # Without this fuzz_sparse_write returns at its first line, and spends
@@ -127,6 +126,10 @@ coverage:
     - *debian_deps
     - *fetch_cutils
   script:
+    # Same as the test job: this one builds and runs its own binaries, so
+    # without it the sparse suites skip here and the figure the gate reads
+    # is missing everything they cover.
+    - . tests/ci-sparse-fs.sh
     - make coverage
   coverage: '/^lines:\s*(\d+\.\d+)%/'
   artifacts:
