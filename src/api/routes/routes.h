@@ -67,8 +67,11 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
  */
 int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def);
 
+/* params is the schedules.params column, action-specific and possibly empty.
+ * Replication reads its destination out of it. */
 status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
-                                 const char *action, int64_t *out_job_id);
+                                 const char *action, const char *params,
+                                 int64_t *out_job_id);
 
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */

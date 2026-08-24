@@ -355,6 +355,46 @@ cb replicate "$ENC_ID" "$REPL" >/dev/null
 AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
 
+# Replication can be scheduled, which is the point of an offsite copy: one
+# that only runs when somebody remembers is not a backup strategy. The
+# destination lives in schedules.params, a column that has existed since the
+# first migration and was never written to until now.
+OUT=$(cb schedule add "$ENC_ID" replicate 3600 --dest "$WORK/sched-replica" 2>&1); RC=$?
+check    "replicate schedule accepted" 0 "$RC"
+contains "schedule records its destination" "sched-replica" "$(cb schedule list "$ENC_ID")"
+
+# And one without a destination is refused at creation rather than failing
+# every night at two in the morning with only the log to say why.
+OUT=$(cb schedule add "$ENC_ID" replicate 3600 2>&1); RC=$?
+check    "replicate schedule without a dest is refused" 1 "$RC"
+contains "and says what is missing" "dest is required" "$OUT"
+
+# Creating a schedule is not running one. A one-second interval fires almost
+# immediately, which proves the whole chain: the scheduler reads params, the
+# dispatch hands them on, and the job finds a destination in them. Without
+# this the tests above only prove a row was written.
+cb schedule add "$ENC_ID" replicate 1 --dest "$WORK/fired-replica" >/dev/null 2>&1
+# Wait for the destination to exist rather than for the job to appear in the
+# list: a job is listed as soon as it is queued, so checking then races the
+# work itself and fails about half the time.
+FIRED=0
+for _ in $(seq 1 60); do
+    if find "$WORK/fired-replica/packs" -name '*.dat' 2>/dev/null | grep -q .; then
+        FIRED=1; break
+    fi
+    sleep 0.25
+done
+check "a scheduled replicate fires and writes its pack" 1 "$FIRED"
+contains "the fired job ran as a replicate job" '"action":"replicate"' "$(cb jobs)"
+# Stop it before it fires again under the rest of the suite.
+SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true
+
+# A relative path would be resolved against the daemon's working directory,
+# which is not where the operator was standing when they typed it.
+OUT=$(cb schedule add "$ENC_ID" replicate 3600 --dest relative/path 2>&1); RC=$?
+check    "relative dest is refused" 1 "$RC"
+
 # The drill: lose the primary, recover from the replica.
 #
 # This is the only assertion that proves replication did its job. Everything

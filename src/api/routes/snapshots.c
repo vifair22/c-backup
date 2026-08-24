@@ -936,7 +936,8 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
  * supply.
  */
 status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
-                                 const char *action, int64_t *out_job_id)
+                                 const char *action, const char *params,
+                                 int64_t *out_job_id)
 {
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
@@ -945,6 +946,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
     else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;
     else if (strcmp(action, "pack") == 0)    kind = SNAP_JOB_PACK;
+    else if (strcmp(action, "replicate") == 0) kind = SNAP_JOB_REPLICATE;
     else return set_error(ERR_INVALID, "no scheduled job for action '%s'", action);
 
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
@@ -956,6 +958,24 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     j->repo_id = repo_id;
     j->repo_path = repo_path;
     j->kind = kind;
+
+    /*
+     * Replication is the one scheduled action that takes a parameter. The
+     * route validates it at creation, so reaching here without one means the
+     * row was written by something else - refuse rather than dispatch a job
+     * that can only fail.
+     */
+    if (kind == SNAP_JOB_REPLICATE) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *p = NULL;
+        if (!params || !*params ||
+            json_req_parse(params, strlen(params), &p) != 0 ||
+            json_req_get_str(p, "dest", &j->dest) != 0 || !j->dest) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID,
+                             "replicate schedule for repo %lld has no destination",
+                             (long long)repo_id);
+        }
+    }
 
     return job_submit(jm ? jm : g_ctx.jm, repo_id, action, NULL,
                       snap_job_run, j, snap_job_free, out_job_id);

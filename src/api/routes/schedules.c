@@ -26,7 +26,7 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT id, action, trigger_type, trigger_spec, on_overlap, catchup,"
-            "       enabled, last_fired_at, next_due_at"
+            "       enabled, last_fired_at, next_due_at, params"
             "  FROM schedules WHERE repo_id = ? ORDER BY id",
             (const char *[]){ repo, NULL }, &r) != 0) {
         db_result_free(r);
@@ -56,6 +56,10 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
                || json_elem_add_str(&e, "catchup",   r->rows[i][5]) != 0
                || json_elem_add_str(&e, "enabled",   r->rows[i][6]) != 0
                || json_elem_add_str(&e, "next_due",  r->rows[i][8]) != 0;
+        /* Only where there is one: an empty string is what a NULL column
+         * reads back as, and every action but replicate has no parameters. */
+        if (!bad && r->rows[i][9] && r->rows[i][9][0])
+            bad = json_elem_add_str(&e, "params", r->rows[i][9]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -83,6 +87,36 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (json_req_get_str_opt(body, "catchup", &catchup) != 0) catchup = NULL;
 
     /*
+     * Per-action parameters, stored in the schedules.params column that has
+     * existed since the first migration and was never written to.
+     *
+     * Replication is the first action that needs one, and it is validated
+     * here rather than at fire time for the same reason the trigger is: a
+     * schedule that turns out to have nowhere to send anything fails every
+     * night at two in the morning, and the log is the only place that says
+     * so.
+     */
+    CUTILS_AUTOFREE char *dest = NULL;
+    CUTILS_AUTOFREE char *params = NULL;
+    if (json_req_get_str_opt(body, "dest", &dest) != 0) dest = NULL;
+
+    if (strcmp(action, "replicate") == 0) {
+        if (!dest || !*dest)
+            return api_error(400, "dest is required for a replicate schedule");
+        if (dest[0] != '/')
+            return api_error(400, "dest must be an absolute path");
+
+        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
+        char  *pbuf = NULL;
+        size_t plen = 0;
+        if (json_resp_new(&pr) != 0 ||
+            json_resp_add_str(pr, "dest", dest) != 0 ||
+            json_resp_finalize(pr, &pbuf, &plen) != 0)
+            return api_error(500, "cannot encode schedule parameters");
+        params = pbuf;
+    }
+
+    /*
      * The trigger arrives as a nested object, not a string of JSON inside
      * JSON, and is validated here rather than at fire time: a schedule the
      * scheduler will silently disable on its first tick is a confusing way to
@@ -103,11 +137,14 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     time_t now = time(NULL);
     snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, 0));
 
+    /* A NULL in a c-utils params array terminates it rather than binding a
+     * NULL column, so an absent params value is bound as an empty string and
+     * read back as one. Testing the string is the only way to tell. */
     if (db_execute_non_query(g_db,
-            "INSERT INTO schedules (repo_id, action, trigger_type, trigger_spec,"
+            "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
             " on_overlap, catchup, enabled, next_due_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-            (const char *[]){ repo, action,
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (const char *[]){ repo, action, params ? params : "",
                               t.type == TRIGGER_INTERVAL ? "interval" : "calendar",
                               spec, overlap ? overlap : "skip",
                               catchup ? catchup : "skip", due, NULL }, NULL) != 0)

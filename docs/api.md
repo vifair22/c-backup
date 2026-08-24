@@ -250,6 +250,21 @@ comparison and an unchanged repository replicates in one question.
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.
 
+Replication is schedulable, which is the point of an offsite copy: one that
+runs only when somebody remembers is not a strategy. The destination goes in
+the schedule, since it belongs to the target rather than to the timing:
+
+```json
+{"action":"replicate","dest":"/mnt/nas/replica",
+ "trigger":{"type":"calendar","every":"day","at":"03:00"}}
+```
+
+`dest` is required for a `replicate` schedule and must be absolute, both
+checked when the schedule is created rather than when it first fires - a
+schedule that turns out to have nowhere to send anything otherwise fails
+every night with only the log to say why. It is stored in `schedules.params`
+and returned by `GET /repos/<id>/schedules`.
+
 ## Jobs
 
 | Method | Path | Purpose |
