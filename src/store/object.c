@@ -1717,7 +1717,7 @@ status_t object_load(store_t *store,
                 uint32_t cur_crc = crc32c(cpayload, (size_t)hdr.compressed_size);
                 if (cur_crc != stored_crc && rs_sz > 0) {
                     int rrc = rs_parity_decode(cpayload, (size_t)hdr.compressed_size,
-                                               trailer + sizeof(hdr_par));
+                                               trailer + sizeof(hdr_par), rs_sz);
                     if (rrc > 0) {
                         log_warn("object: RS repaired corrupt payload bytes");
                         parity_stats_add_repaired(1);
@@ -1925,7 +1925,7 @@ static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
         if (par_left >= RS_STREAM_GROUP_PAR) {
             if (pread(fd, gpar, RS_STREAM_GROUP_PAR, par_off)
                 != (ssize_t)RS_STREAM_GROUP_PAR) { st = ERR_CORRUPT; break; }
-            int rc = rs_parity_decode(gbuf, want, gpar);
+            int rc = rs_parity_decode(gbuf, want, gpar, RS_STREAM_GROUP_PAR);
             if (rc > 0) corrected += rc;
             else if (rc < 0) { st = ERR_CORRUPT; break; }
             par_off  += (off_t)RS_STREAM_GROUP_PAR;
@@ -2499,7 +2499,7 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
                         if (pread(fd, gpar, RS_STREAM_GROUP_PAR, par_off)
                             != (ssize_t)RS_STREAM_GROUP_PAR) break;
 
-                        int rrc = rs_parity_decode(gbuf, want, gpar);
+                        int rrc = rs_parity_decode(gbuf, want, gpar, RS_STREAM_GROUP_PAR);
                         if (rrc > 0) {
                             if (pwrite(fd, gbuf, want, off) == (ssize_t)want)
                                 total_fixed += rrc;

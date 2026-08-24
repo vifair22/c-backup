@@ -407,7 +407,8 @@ fuzz-cov: $(MIGRATE_SRC)
 # be edited when a target is added is a list somebody has looked at.
 FUZZ_COV_FILES := src/common/metablob.c src/store/manifest.c \
                   src/ops/sparse_restore.c src/store/parity.c \
-                  src/store/object.c src/store/object_crypt.c src/store/pack.c
+                  src/store/parity_stream.c src/store/object.c \
+                  src/store/object_crypt.c src/store/pack.c
 
 # Replay the committed corpus and stop. This is the regression check: it
 # runs every input a fuzzer ever found interesting, in seconds, without

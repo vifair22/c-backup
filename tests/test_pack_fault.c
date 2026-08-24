@@ -280,6 +280,70 @@ static void test_pack_gc_malloc_fail(void **state)
     assert_all_readable();
 }
 
+/*
+ * A parity offsets table whose entries run backwards.
+ *
+ * Each parity block's size is the distance to the next entry's offset. Both
+ * come out of the file, and the subtraction was done blind: an offset table
+ * where entry N+1 sits before entry N wrapped the difference to just under
+ * 4 GiB, which the reader passed straight to malloc.
+ *
+ * Nothing about that is visible from the return value. The read still fails,
+ * with the same status a truncated trailer produces, because the giant
+ * buffer short-reads and parity is reported unavailable. On a machine with
+ * overcommit the allocation itself succeeds. The only evidence is how much
+ * was asked for, which is what fault_malloc_peak exists to see.
+ *
+ * Found by fuzz_pack_read; the reproducer is in its corpus.
+ */
+static void test_backwards_parity_offsets_do_not_allocate(void **state)
+{
+    (void)state;
+
+    char path[512];
+    {
+        FILE *p = popen("find '" TEST_REPO "/packs' -name 'pack-*.dat' | head -1", "r");
+        assert_non_null(p);
+        assert_non_null(fgets(path, sizeof(path), p));
+        pclose(p);
+        path[strcspn(path, "\n")] = '\0';
+    }
+
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    off_t end = lseek(fd, 0, SEEK_END);
+    assert_true(end > 32);
+
+    /* Trailer tail: entry_parity_offsets[N] then entry_count(4) then the
+     * 12-byte footer, so the count sits at end - 16. */
+    uint32_t count = 0;
+    assert_int_equal(pread(fd, &count, sizeof(count), end - 16), (ssize_t)sizeof(count));
+    assert_true(count >= 3);
+    off_t offsets_start = end - 16 - (off_t)count * 8;
+    assert_true(offsets_start > 0);
+
+    /* Point entry 2 at the very start of the block region, which is before
+     * entry 1. Entry 1 is then a non-final entry whose successor precedes
+     * it - the exact shape the fuzzer produced. */
+    uint64_t backwards = 1;
+    assert_int_equal(pwrite(fd, &backwards, sizeof(backwards), offsets_start + 16),
+                     (ssize_t)sizeof(backwards));
+    close(fd);
+    pack_cache_invalidate(store);
+
+    /* Whatever each read returns, none of them may ask for a buffer that
+     * only a wrapped subtraction could have produced. The objects here are
+     * a couple of hundred bytes each. */
+    fault_reset_all();
+    for (int i = 0; i < NOBJ; i++) {
+        void *data = NULL;
+        size_t len = 0;
+        if (pack_object_load(store, hashes[i], &data, &len, NULL) == OK) free(data);
+        err_clear();
+    }
+    assert_true(fault_malloc_peak < (64u << 20));
+}
+
 int main(void)
 {
     rs_init();
@@ -292,6 +356,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_pack_write_fwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),
+        cmocka_unit_test_setup_teardown(test_backwards_parity_offsets_do_not_allocate, setup_packed, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -255,7 +255,7 @@ static void test_rs_interleaved_clean(void **state)
     assert_non_null(par);
 
     rs_parity_encode(data, len, par);
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_int_equal(rc, 0);
 
     free(par);
@@ -282,7 +282,7 @@ static void test_rs_interleaved_single_error(void **state)
     /* Corrupt one byte. */
     data[1000] ^= 0xCC;
 
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_true(rc >= 1);
     assert_memory_equal(data, orig, len);
 
@@ -314,7 +314,7 @@ static void test_rs_interleaved_burst_512(void **state)
     for (size_t i = burst_start; i < burst_start + 512; i++)
         data[i] ^= 0xFF;
 
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_true(rc > 0);
     assert_memory_equal(data, orig, len);
 
@@ -346,7 +346,7 @@ static void test_rs_interleaved_multi_group(void **state)
     data[20000] ^= 0x22;
     data[40000] ^= 0x33;
 
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_true(rc >= 3);
     assert_memory_equal(data, orig, len);
 
@@ -375,7 +375,7 @@ static void test_rs_interleaved_uncorrectable(void **state)
     for (int i = 0; i < 9; i++)
         data[(size_t)i * RS_INTERLEAVE] ^= (uint8_t)(0x10 + i);
 
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_int_equal(rc, -1);
 
     free(par);
@@ -399,7 +399,7 @@ static void test_rs_interleaved_small_data(void **state)
     rs_parity_encode(data, len, par);
     data[5] ^= 0xFF;
 
-    int rc = rs_parity_decode(data, len, par);
+    int rc = rs_parity_decode(data, len, par, rs_parity_size(len));
     assert_true(rc >= 1);
     assert_memory_equal(data, orig, len);
 
@@ -486,6 +486,53 @@ static void test_parity_footer_size(void **state)
 
 /* ---- main ---- */
 
+/*
+ * Parity shorter than the data it claims to cover.
+ *
+ * rs_parity_decode used to take the parity buffer's length on faith and
+ * consume rs_parity_size(len) bytes of it. Inside a pack that is not a
+ * theoretical mismatch: the payload length comes from the entry header and
+ * the parity length from the trailer's block boundaries, two places a
+ * single bad sector can put out of step. A fuzzer reached it and read
+ * sixteen bytes off the end of the heap.
+ *
+ * The buffer here is allocated at exactly the short length so a sanitizer
+ * build faults on the overread rather than quietly succeeding; an ordinary
+ * build sees the refusal.
+ */
+static void test_parity_shorter_than_data_is_refused(void **state)
+{
+    (void)state;
+    size_t len = 32768;
+    uint8_t *data = malloc(len);
+    assert_non_null(data);
+    for (size_t i = 0; i < len; i++) data[i] = (uint8_t)(i & 0xFF);
+
+    size_t full = rs_parity_size(len);
+    assert_true(full > ((size_t)RS_2T * RS_INTERLEAVE));
+
+    uint8_t *par = malloc(full);
+    assert_non_null(par);
+    rs_parity_encode(data, len, par);
+
+    /* One group short, and only that much is addressable. */
+    size_t short_len = full - ((size_t)RS_2T * RS_INTERLEAVE);
+    uint8_t *shortpar = malloc(short_len);
+    assert_non_null(shortpar);
+    memcpy(shortpar, par, short_len);
+
+    data[9000] ^= 0xCC;   /* damage, so the decoder would want to work */
+    assert_int_equal(rs_parity_decode(data, len, shortpar, short_len), -1);
+
+    /* And the full-length call over the same data still repairs, so the
+     * refusal is about the length and not about the damage. */
+    assert_true(rs_parity_decode(data, len, par, full) >= 1);
+
+    free(shortpar);
+    free(par);
+    free(data);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -512,6 +559,7 @@ int main(void)
         cmocka_unit_test(test_rs_interleaved_multi_group),
         cmocka_unit_test(test_rs_interleaved_uncorrectable),
         cmocka_unit_test(test_rs_interleaved_small_data),
+        cmocka_unit_test(test_parity_shorter_than_data_is_refused),
         /* Footer struct */
         cmocka_unit_test(test_record_naming_a_column_past_the_data),
         cmocka_unit_test(test_short_buffer_repair_still_works),

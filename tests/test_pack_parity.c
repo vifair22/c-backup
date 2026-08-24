@@ -397,6 +397,55 @@ static void test_absurd_entry_count_is_refused(void **state)
     assert_int_not_equal(pack_enumerate_dat(store, name, &version, &count, NULL, NULL), OK);
 }
 
+/*
+ * An entry header that describes bytes the pack does not contain.
+ *
+ * pack_object_load reached malloc with a compressed_size of nine exabytes.
+ * The checks that would have refused the entry - the codec is unknown, the
+ * payload is longer than the file - all ran after the allocation, and an
+ * unknown codec falls past every one of the size guards on the way there.
+ * On a machine with overcommit the malloc can even succeed.
+ *
+ * The tell is the status, not a crash: with the header unchecked the
+ * allocation fails and the reader reports ERR_NOMEM, blaming the machine
+ * for a pack that is corrupt. A sanitizer catches the size, an ordinary
+ * build does not, so this asserts the thing that is true on both.
+ *
+ * Found by fuzz_pack_read within a minute of that harness existing.
+ */
+static void test_entry_header_beyond_file_is_refused(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char *body = "an object to give the pack something to hold";
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    uint64_t off = entry_offset(hash);
+
+    pack_dat_entry_hdr_t eh;
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &eh, sizeof(eh), (off_t)off), (ssize_t)sizeof(eh));
+
+    /* A codec no build has ever written, and a length no disk has ever
+     * held. Both are what a single flipped bit can produce. */
+    eh.compression      = 0x2a;
+    eh.compressed_size  = 0x8449f5322526062dull;
+    assert_int_equal(pwrite(fd, &eh, sizeof(eh), (off_t)off), (ssize_t)sizeof(eh));
+    close(fd);
+    pack_cache_invalidate(store);
+
+    void  *out = NULL;
+    size_t got = 0;
+    status_t st = object_load(store, hash, &out, &got, NULL);
+    assert_int_not_equal(st, OK);
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_null(out);
+}
+
 int main(void)
 {
     rs_init();
@@ -411,6 +460,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_frame_codec_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_detected_not_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_entry_header_beyond_file_is_refused, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

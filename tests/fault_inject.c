@@ -11,8 +11,14 @@ _Thread_local int fault_fread_at   = -1;
 _Thread_local int fault_fwrite_at  = -1;
 _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
+_Thread_local size_t fault_malloc_peak = 0;
+
+static void note_alloc(size_t size) {
+    if (size > fault_malloc_peak) fault_malloc_peak = size;
+}
 
 void *__wrap_malloc(size_t size) {
+    note_alloc(size);
     if (fault_malloc_at < 0) return __real_malloc(size);
     if (fault_malloc_at == 0) { fault_malloc_at = -1; errno = ENOMEM; return NULL; }
     fault_malloc_at--;
@@ -20,6 +26,7 @@ void *__wrap_malloc(size_t size) {
 }
 
 void *__wrap_calloc(size_t nmemb, size_t size) {
+    note_alloc(nmemb * size);
     if (fault_malloc_at < 0) return __real_calloc(nmemb, size);
     if (fault_malloc_at == 0) { fault_malloc_at = -1; errno = ENOMEM; return NULL; }
     fault_malloc_at--;
@@ -27,6 +34,7 @@ void *__wrap_calloc(size_t nmemb, size_t size) {
 }
 
 void *__wrap_realloc(void *ptr, size_t size) {
+    note_alloc(size);
     if (fault_malloc_at < 0) return __real_realloc(ptr, size);
     if (fault_malloc_at == 0) { fault_malloc_at = -1; errno = ENOMEM; return NULL; }
     fault_malloc_at--;

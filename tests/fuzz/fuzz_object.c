@@ -80,10 +80,25 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (write(fd, data, size) != (ssize_t)size) { close(fd); return 0; }
     close(fd);
 
-    /* Both readers, with and without a key: the decrypting path derives
-     * different offsets from the same header. */
-    for (int keyed = 0; keyed < 2; keyed++) {
-        store_set_key(g_store, keyed ? &g_key : NULL);
+    /* Read without a key, then with one - the decrypting path derives
+     * different offsets from the same header - then repair and read again. */
+    for (int pass = 0; pass < 3; pass++) {
+        /*
+         * The third pass is repair, then a read.
+         *
+         * object_repair is the only thing here that writes: it pwrites
+         * Reed-Solomon corrections back into the file, using a trailer
+         * whose own offsets came out of the same unverified bytes. A repair
+         * that miscomputes where the payload starts does not fail, it
+         * rewrites bytes that were correct - the exact shape of bug that
+         * cost this file its nonce once already. Reading afterwards is what
+         * turns that from silent into observable.
+         */
+        if (pass == 2) {
+            object_repair(g_store, hash);
+            err_clear();
+        }
+        store_set_key(g_store, pass == 1 ? &g_key : NULL);
 
         void *out = NULL;
         size_t len = 0;

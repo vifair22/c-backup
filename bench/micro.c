@@ -280,9 +280,9 @@ static void bench_rs_parity_decode_clean_16m(double *tp)
     rs_init();
     rs_parity_encode(data, g_buf_sz, par);
     uint64_t iters = 0;
-    for (int i = 0; i < BENCH_WARMUP; i++) rs_parity_decode(data, g_buf_sz, par);
+    for (int i = 0; i < BENCH_WARMUP; i++) rs_parity_decode(data, g_buf_sz, par, rs_parity_size(g_buf_sz));
     double t0 = now_sec(), elapsed;
-    do { rs_parity_decode(data, g_buf_sz, par); iters++; elapsed = now_sec() - t0; }
+    do { rs_parity_decode(data, g_buf_sz, par, rs_parity_size(g_buf_sz)); iters++; elapsed = now_sec() - t0; }
     while (elapsed < BENCH_MIN_SECS);
     free(par); free(data);
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;

@@ -80,11 +80,34 @@ for repo in "$W/plain" "$W/enc"; do
     done < <(find "$repo/objects" -type f 2>/dev/null | head -20)
 done
 
-# Pack files.
+# Pack files. fuzz_pack takes the file as-is; fuzz_pack_read prefixes it
+# with the location the resolver will hand back, and 12 / 0 is the first
+# entry, so the seed starts from a lookup that resolves.
+mkdir -p "$CORPUS/fuzz_pack_read"
 n=0
 while IFS= read -r f; do
-    cp "$f" "$CORPUS/fuzz_pack/seed_$n" && n=$((n + 1))
+    cp "$f" "$CORPUS/fuzz_pack/seed_$n"
+    { printf '\014\000\000\000\000\000\000\000'; cat "$f"; } \
+        > "$CORPUS/fuzz_pack_read/seed_$n"
+    n=$((n + 1))
 done < <(find "$W/plain/packs" "$W/enc/packs" -name '*.dat' 2>/dev/null)
+
+# The parity stream has no on-disk format to steal, so its seeds are shaped
+# by hand: one per interesting size relative to the 15,296-byte RS group,
+# crossed with a cap that spills and one that does not. The prefix is the
+# memory cap and the three chunk sizes.
+mkdir -p "$CORPUS/fuzz_parity_stream"
+n=0
+for len in 1 4096 15295 15296 15297 30592 45888; do
+    for cap in 0 2 200; do
+        {
+            printf "$(printf '\\%03o' "$cap")"
+            printf '\001\020\377'
+            head -c "$len" /dev/urandom
+        } > "$CORPUS/fuzz_parity_stream/seed_$n"
+        n=$((n + 1))
+    done
+done
 
 # Manifest trees have to come out decoded: on disk they are wrapped in an
 # object header and possibly compressed or encrypted, and fuzz_manifest

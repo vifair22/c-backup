@@ -60,7 +60,20 @@ void   rs_parity_encode(const void *data, size_t len, void *parity_out);
 
 /* Decode/repair data using its parity block.
  * Returns: 0=clean, >0=bytes corrected, -1=uncorrectable */
-int    rs_parity_decode(void *data, size_t len, const void *parity);
+/*
+ * Repair data in place using parity. Returns bytes corrected, 0 if clean,
+ * -1 if uncorrectable or if parity_len is too short to cover len.
+ *
+ * parity_len is not redundant with rs_parity_size(len). Inside a pack, the
+ * payload length comes from the entry header and the parity length comes
+ * from the trailer's block boundaries, and those are separate parts of the
+ * file that a single bad sector can put out of step. When they disagreed,
+ * this function walked rs_parity_size(len) bytes of a buffer that was
+ * shorter than that - a heap overread reachable from any corrupt pack, and
+ * one that no caller could have prevented without being told the length.
+ */
+int    rs_parity_decode(void *data, size_t len, const void *parity,
+                        size_t parity_len);
 
 /* ---- Global parity statistics (atomic, process-wide) ---- */
 

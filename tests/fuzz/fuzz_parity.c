@@ -35,12 +35,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (!payload) return 0;
     memcpy(payload, data, payload_len);
 
-    size_t need = rs_parity_size(payload_len);
-    if (need > 0 && par_len >= need) {
-        uint8_t *par = malloc(need);
+    /*
+     * The parity buffer is exactly as long as the fuzzer left it, which is
+     * usually not rs_parity_size(payload_len). That mismatch is the
+     * interesting case rather than an input to skip: a pack's payload
+     * length and its parity length come from different parts of the file,
+     * and when they disagreed the decoder read off the end of this buffer.
+     * Allocating only what was given is what lets a sanitizer see it.
+     */
+    if (par_len > 0) {
+        uint8_t *par = malloc(par_len);
         if (par) {
-            memcpy(par, data + payload_len, need);
-            rs_parity_decode(payload, payload_len, par);
+            memcpy(par, data + payload_len, par_len);
+            rs_parity_decode(payload, payload_len, par, par_len);
             free(par);
         }
     }

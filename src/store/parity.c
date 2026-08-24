@@ -792,9 +792,13 @@ void rs_parity_encode(const void *data, size_t len, void *parity_out)
     }
 }
 
-int rs_parity_decode(void *data, size_t len, const void *parity)
+int rs_parity_decode(void *data, size_t len, const void *parity,
+                     size_t parity_len)
 {
     rs_init();
+
+    /* The loop below consumes exactly this much, one group at a time. */
+    if (parity_len < rs_parity_size(len)) return -1;
 
     uint8_t *dst = (uint8_t *)data;
     const uint8_t *par = (const uint8_t *)parity;
