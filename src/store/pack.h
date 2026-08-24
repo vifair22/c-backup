@@ -88,6 +88,47 @@ status_t pack_object_read_stored(store_t *store,
                                  uint64_t *out_uncompressed_size,
                                  void **out_payload, size_t *out_len);
 
+/*
+ * Write a pack out of objects that are already in stored form.
+ *
+ * Everything repo_pack does on the way in - decrypt, probe, compress,
+ * encrypt - is skipped, because these bytes have already been through it
+ * somewhere else. Replication is the caller: it moves objects exactly as
+ * they sit on disk so that a target which never receives the key can still
+ * hold them, and a compressed object has nowhere to live except a pack. The
+ * loose format carries a compression field but every loose reader refuses
+ * anything but COMPRESS_NONE, on the correct grounds that only packing
+ * compresses.
+ *
+ * No key is required and none is used.
+ *
+ * Entries are appended in call order and entry_index records that order,
+ * which is the position the parity trailer is indexed by. finalize_pack
+ * sorts by hash afterwards for the commit; the index recorded here is the
+ * on-disk one and must not be recomputed from the sorted array.
+ */
+typedef struct pack_stored_writer pack_stored_writer_t;
+
+status_t pack_stored_open(store_t *store, pack_stored_writer_t **out);
+
+status_t pack_stored_add(pack_stored_writer_t *w,
+                         const uint8_t hash[OBJECT_HASH_SIZE],
+                         uint8_t type, uint8_t compression, uint8_t encryption,
+                         uint64_t uncompressed_size,
+                         const void *payload, size_t len);
+
+/* Has this writer already staged that hash in the current pack? Objects not
+ * yet finalised are invisible to any lookup that reads the repository. */
+int pack_stored_has(const pack_stored_writer_t *w,
+                    const uint8_t hash[OBJECT_HASH_SIZE]);
+
+uint32_t pack_stored_count(const pack_stored_writer_t *w);
+
+/* Install the pack and emit the commit callback. The writer is freed either
+ * way; on failure the staging file is removed. */
+status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed);
+void     pack_stored_abort(pack_stored_writer_t *w);
+
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
 int pack_object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 

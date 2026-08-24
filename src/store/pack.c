@@ -2062,6 +2062,199 @@ fail:
     return st;
 }
 
+/* ------------------------------------------------------------------ */
+/* Packing objects that are already in stored form                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A membership set over the hashes staged so far.
+ *
+ * Needed because a staged entry is invisible: nothing that reads the
+ * repository can see a pack that has not been installed yet, so without
+ * this a duplicate arriving twice in one run would be written twice, and
+ * two entries under one hash is a pack whose index cannot be built.
+ *
+ * Open addressing on the first bytes of the hash, which are already
+ * uniformly distributed - the hash is the digest, so there is nothing to
+ * gain by hashing it again.
+ */
+typedef struct {
+    uint32_t *slots;      /* index into entries, biased by 1; 0 is empty */
+    uint32_t  cap;        /* power of two */
+} staged_set_t;
+
+struct pack_stored_writer {
+    store_t               *store;
+    FILE                  *dat_f;
+    char                   dat_tmp[PATH_MAX];
+    pack_dat_hdr_t         dat_hdr;
+    uint32_t               pack_num;
+
+    pack_idx_disk_entry_t *entries;
+    uint32_t               count;
+    uint32_t               cap;
+
+    staged_set_t           seen;
+};
+
+static uint32_t hash_slot(const uint8_t h[OBJECT_HASH_SIZE], uint32_t cap)
+{
+    uint32_t v;
+    memcpy(&v, h, sizeof(v));
+    return v & (cap - 1u);
+}
+
+static int staged_set_grow(pack_stored_writer_t *w)
+{
+    uint32_t ncap = w->seen.cap ? w->seen.cap * 2u : 1024u;
+    uint32_t *ns = calloc(ncap, sizeof(*ns));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < w->count; i++) {
+        uint32_t k = hash_slot(w->entries[i].hash, ncap);
+        while (ns[k]) k = (k + 1u) & (ncap - 1u);
+        ns[k] = i + 1u;
+    }
+    free(w->seen.slots);
+    w->seen.slots = ns;
+    w->seen.cap = ncap;
+    return 0;
+}
+
+int pack_stored_has(const pack_stored_writer_t *w,
+                    const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!w || !w->seen.cap) return 0;
+    uint32_t k = hash_slot(hash, w->seen.cap);
+    while (w->seen.slots[k]) {
+        uint32_t idx = w->seen.slots[k] - 1u;
+        if (memcmp(w->entries[idx].hash, hash, OBJECT_HASH_SIZE) == 0) return 1;
+        k = (k + 1u) & (w->seen.cap - 1u);
+    }
+    return 0;
+}
+
+uint32_t pack_stored_count(const pack_stored_writer_t *w)
+{
+    return w ? w->count : 0;
+}
+
+status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
+{
+    if (!store || !out) return set_error(ERR_INVALID, "pack_stored_open: null argument");
+
+    pack_stored_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) return set_error(ERR_NOMEM, "pack_stored_open: alloc");
+    w->store = store;
+    w->pack_num = next_pack_num(store) + 1u;
+
+    status_t st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
+    if (st != OK) { free(w); return st; }
+
+    *out = w;
+    return OK;
+}
+
+status_t pack_stored_add(pack_stored_writer_t *w,
+                         const uint8_t hash[OBJECT_HASH_SIZE],
+                         uint8_t type, uint8_t compression, uint8_t encryption,
+                         uint64_t uncompressed_size,
+                         const void *payload, size_t len)
+{
+    if (!w || !w->dat_f) return set_error(ERR_INVALID, "pack_stored_add: no writer");
+    if (pack_stored_has(w, hash)) return OK;
+
+    if (w->count == w->cap) {
+        uint32_t ncap = w->cap ? w->cap * 2u : 256u;
+        pack_idx_disk_entry_t *ne = realloc(w->entries, (size_t)ncap * sizeof(*ne));
+        if (!ne) return set_error(ERR_NOMEM, "pack_stored_add: entry array");
+        w->entries = ne;
+        w->cap = ncap;
+    }
+    /* Keep the set no more than half full, so probing stays short. */
+    if (w->seen.cap == 0 || (w->count + 1u) * 2u >= w->seen.cap) {
+        if (staged_set_grow(w) != 0)
+            return set_error(ERR_NOMEM, "pack_stored_add: staged set");
+    }
+
+    off_t at = ftello(w->dat_f);
+    if (at < 0) return set_error_errno(ERR_IO, "pack_stored_add: ftello");
+
+    pack_dat_entry_hdr_t eh;
+    memset(&eh, 0, sizeof(eh));
+    memcpy(eh.hash, hash, OBJECT_HASH_SIZE);
+    eh.type              = type;
+    eh.compression       = compression;
+    eh.encryption        = encryption;
+    eh.uncompressed_size = uncompressed_size;
+    eh.compressed_size   = len;
+
+    if (fwrite(&eh, sizeof(eh), 1, w->dat_f) != 1)
+        return set_error_errno(ERR_IO, "pack_stored_add: write entry header");
+    if (len && fwrite(payload, 1, len, w->dat_f) != len)
+        return set_error_errno(ERR_IO, "pack_stored_add: write payload");
+
+    pack_idx_disk_entry_t *e = &w->entries[w->count];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->hash, hash, OBJECT_HASH_SIZE);
+    e->dat_offset        = (uint64_t)at;
+    /* The on-disk position, which is what the parity trailer is indexed by.
+     * finalize_pack sorts this array by hash before committing; recording
+     * anything derived from that order sends every parity lookup to another
+     * entry's offsets, and nothing fails until a repair is attempted. */
+    e->entry_index       = w->count;
+    e->type              = type;
+    e->compression       = compression;
+    e->encryption        = encryption;
+    e->uncompressed_size = uncompressed_size;
+    e->compressed_size   = len;
+
+    uint32_t k = hash_slot(hash, w->seen.cap);
+    while (w->seen.slots[k]) k = (k + 1u) & (w->seen.cap - 1u);
+    w->seen.slots[k] = w->count + 1u;
+
+    w->count++;
+    return OK;
+}
+
+static void pack_stored_free(pack_stored_writer_t *w)
+{
+    if (!w) return;
+    free(w->entries);
+    free(w->seen.slots);
+    free(w);
+}
+
+status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
+{
+    if (!w) return set_error(ERR_INVALID, "pack_stored_finish: no writer");
+
+    if (w->count == 0) {
+        /* Nothing arrived. An empty pack is a file every later enumeration
+         * has to open to learn it holds nothing. */
+        if (w->dat_f) fclose(w->dat_f);
+        unlink(w->dat_tmp);
+        if (out_packed) *out_packed = 0;
+        pack_stored_free(w);
+        return OK;
+    }
+
+    /* NULL parity: finalize_pack recomputes it by reading the entries back,
+     * which keeps peak memory independent of how large the objects were. */
+    status_t st = finalize_pack(w->store, &w->dat_f, w->dat_tmp, &w->dat_hdr,
+                                w->entries, w->count, w->pack_num, NULL);
+    if (st == OK && out_packed) *out_packed = w->count;
+    pack_stored_free(w);
+    return st;
+}
+
+void pack_stored_abort(pack_stored_writer_t *w)
+{
+    if (!w) return;
+    if (w->dat_f) fclose(w->dat_f);
+    unlink(w->dat_tmp);
+    pack_stored_free(w);
+}
+
 /* Batch-unlink loose objects by grouping by first hash byte (bucket).
  * Uses a 256-entry index to skip empty buckets and avoid O(256*N) scanning. */
 static void unlink_loose_batch(store_t *store,

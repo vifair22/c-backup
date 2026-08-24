@@ -36,6 +36,7 @@
 #include "fake_index.h"
 #include "manifest.h"
 #include "object.h"
+#include "pack.h"
 #include "parity.h"
 #include "replicate.h"
 #include "repo.h"
@@ -299,8 +300,12 @@ static void test_replica_holds_the_same_objects(void **state)
     /* Eight objects: four blobs and four trees. */
     assert_int_equal(res.objects_sent, 8);
 
-    store_t *dst = NULL;
-    assert_int_equal(store_open(DST_REPO, NULL, &dst), OK);
+    /* A replica has no database, so its packed objects need an index built
+     * from the packs before anything can read them. That is what a restore
+     * from a replica does too, by way of reindex. */
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(DST_REPO, &rd), OK);
+    store_t *dst = replica_reader_store(rd);
     assert_same_object(src, dst, root);
 
     manifest_entry_t *ents = NULL;
@@ -334,7 +339,7 @@ static void test_replica_holds_the_same_objects(void **state)
         manifest_free_entries(de, dn);
     }
     manifest_free_entries(re, rn);
-    store_close(dst);
+    replica_reader_close(rd);
 }
 
 static void test_second_run_sends_nothing(void **state)
@@ -447,12 +452,12 @@ static void test_interrupted_transfer_leaves_no_lying_tree(void **state)
         err_clear();
         t.inner.v->close(t.inner.ctx);
 
-        store_t *dst = NULL;
-        assert_int_equal(store_open(DST_REPO, NULL, &dst), OK);
+        replica_reader_t *rd = NULL;
+        assert_int_equal(replica_reader_open(DST_REPO, &rd), OK);
 
         /* Whatever arrived, no tree among it may reference a missing object. */
-        assert_int_equal(check_tree_complete(dst, root, 0), OK);
-        store_close(dst);
+        assert_int_equal(check_tree_complete(replica_reader_store(rd), root, 0), OK);
+        replica_reader_close(rd);
     }
 }
 
@@ -511,6 +516,59 @@ static void test_replica_carries_the_source_identity(void **state)
     assert_string_equal(m.uuid, src_marker.uuid);
 }
 
+/*
+ * A source whose objects have been packed.
+ *
+ * This is the normal state of a repository, not an edge case: backup packs
+ * on completion. Compression only happens at pack time, so every object in
+ * a packed repository carries a codec, and those are the bytes replication
+ * moves. The replica has to read them back - a copy that arrives intact and
+ * cannot be opened is not a backup, and nothing about the transfer itself
+ * would say so.
+ *
+ * Every other test here replicates a source whose objects are still loose,
+ * which is why they all passed while this did not work at all.
+ */
+static void test_packed_source_replicates_readably(void **state)
+{
+    (void)state;
+
+    /* Compressible, so the packer actually applies a codec rather than
+     * storing it raw and accidentally satisfying the loose-object rule. */
+    char body[16384];
+    memset(body, 'a', sizeof(body));
+    uint8_t blob[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(src, OBJECT_TYPE_FILE, body, sizeof(body), blob), OK);
+
+    uint8_t root[OBJECT_HASH_SIZE];
+    manifest_entry_t e[1] = { mk_file("big.txt", blob, sizeof(body)) };
+    assert_int_equal(manifest_write_tree(src, e, 1, root), OK);
+
+    assert_int_equal(repo_pack(src, NULL, NULL, NULL), OK);
+    pack_cache_invalidate(src);
+
+    replica_sink_t sink;
+    assert_int_equal(replica_sink_local_open(DST_REPO, &src_marker, &sink), OK);
+    replicate_result_t res;
+    assert_int_equal(walk_one(&sink, root, &res), OK);
+    sink.v->close(sink.ctx);
+
+    replica_reader_t *rd = NULL;
+    assert_int_equal(replica_reader_open(DST_REPO, &rd), OK);
+    store_t *dst = replica_reader_store(rd);
+
+    /* The bytes are what matter, not that a file appeared. */
+    void  *got = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(dst, blob, &got, &len, NULL), OK);
+    assert_int_equal(len, sizeof(body));
+    assert_memory_equal(got, body, sizeof(body));
+    free(got);
+
+    assert_int_equal(check_tree_complete(dst, root, 0), OK);
+    replica_reader_close(rd);
+}
+
 int main(void)
 {
     rs_init();
@@ -522,6 +580,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_existing_objects_are_never_rewritten, setup, teardown),
         cmocka_unit_test_setup_teardown(test_target_of_another_repository_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replica_carries_the_source_identity, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_packed_source_replicates_readably, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

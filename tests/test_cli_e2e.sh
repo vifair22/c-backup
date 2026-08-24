@@ -17,6 +17,8 @@ PASS=0
 FAIL=0
 
 cleanup() {
+    [ -n "${DAEMON2_PID:-}" ] && kill "$DAEMON2_PID" 2>/dev/null
+    wait "${DAEMON2_PID:-}" 2>/dev/null
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
     wait "${DAEMON_PID:-}" 2>/dev/null
     rm -rf "$WORK"
@@ -320,19 +322,27 @@ else
     bad "replica carries the source uuid" "$SRC_UUID" "$RPL_UUID"
 fi
 
-# Objects actually arrived.
-NOBJ=$(find "$REPL/objects" -type f 2>/dev/null | wc -l)
-if [ "$NOBJ" -gt 0 ]; then
-    ok "replica holds objects ($NOBJ)"
+# Objects arrive in a pack, not loose: they are already compressed, and every
+# loose reader refuses a compressed loose object because only packing
+# compresses. A replica written loose received every byte and could not be
+# opened.
+NPACK=$(find "$REPL/packs" -name '*.dat' 2>/dev/null | wc -l)
+if [ "$NPACK" -gt 0 ]; then
+    ok "replica holds a pack"
 else
-    bad "replica holds objects" ">0" "$NOBJ"
+    bad "replica holds a pack" ">0" "$NPACK"
+fi
+if [ -z "$(find "$REPL/objects" -type f 2>/dev/null)" ]; then
+    ok "replica writes no loose objects"
+else
+    bad "replica writes no loose objects" "none" "$(find "$REPL/objects" -type f | wc -l)"
 fi
 
-# And they are still ciphertext. The same fixture the pack test uses, for the
+# And it is still ciphertext. The same fixture the pack test uses, for the
 # same reason: compressed text is unsearchable either way, so look for the
 # incompressible one.
 NEEDLE=$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)
-if grep -qra "$NEEDLE" "$REPL/objects" 2>/dev/null; then
+if grep -qra "$NEEDLE" "$REPL" 2>/dev/null; then
     bad "replica holds no plaintext" "absent" "present"
 else
     ok "replica holds no plaintext"
@@ -340,10 +350,58 @@ fi
 
 # Running it again moves nothing: the target already has the root tree, so
 # one question ends the walk.
-BEFORE=$(find "$REPL/objects" -type f | wc -l)
+BEFORE=$(find "$REPL" -type f | wc -l)
 cb replicate "$ENC_ID" "$REPL" >/dev/null
-AFTER=$(find "$REPL/objects" -type f | wc -l)
+AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
+
+# The drill: lose the primary, recover from the replica.
+#
+# This is the only assertion that proves replication did its job. Everything
+# above says bytes arrived; this says they can be turned back into files. It
+# is also the one that caught the replica being written as loose objects -
+# every other check passed while the copy was unopenable, because the
+# transfer itself was fine and only a reader would ever notice.
+#
+# A second daemon with its own database, so nothing of the source's index is
+# available to it. The system key lives on the host keyed by repo uuid, so it
+# has to be carried across too: that is what "the key is stored on the daemon
+# host" means, and a replica of an encrypted repository is useless without it.
+SOCK2="$WORK/c2.sock"
+mkdir -p "$WORK/keys2"
+cp "$WORK/keys"/* "$WORK/keys2/" 2>/dev/null
+cat > "$WORK/config2.yaml" <<EOF
+db:
+  path: $WORK/state2.db
+http:
+  socket: $SOCK2
+  port: 18802
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/keys2
+EOF
+C_BACKUP_CONFIG_PATH="$WORK/config2.yaml" "$DAEMON" > "$WORK/daemon2.log" 2>&1 &
+DAEMON2_PID=$!
+for _ in $(seq 1 50); do [ -S "$SOCK2" ] && break; sleep 0.1; done
+cb2() { "$CLI" --socket "$SOCK2" "$@"; }
+
+if [ -S "$SOCK2" ]; then
+    contains "second daemon adopts the replica" '"id":1' "$(cb2 repo add "$REPL" recovered)"
+    contains "replica reindexes"        '"completed"' "$(cb2 reindex 1)"
+    contains "replica lists a snapshot" '"snapshots"' "$(cb2 snapshots 1)"
+    OUT=$(cb2 restore 1 1 "$WORK/recovered" 2>&1); RC=$?
+    check    "restore from the replica succeeds" 0 "$RC"
+    contains "restore from the replica completes" '"completed"' "$OUT"
+    if diff -r "$WORK/src" "$WORK/recovered$WORK/src" >/dev/null 2>&1; then
+        ok "recovered tree is byte-identical to the original"
+    else
+        bad "recovered tree is byte-identical to the original" "identical" "differs"
+    fi
+else
+    bad "second daemon starts" "socket" "absent"
+fi
 
 # A path already holding a different repository is refused rather than mixed.
 cb repo add "$WORK/otherrepo" other >/dev/null 2>&1

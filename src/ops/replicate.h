@@ -211,6 +211,25 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
  * wrapped key would be missing - which is precisely what the marker carries
  * so that an offsite copy can be opened without the source.
  */
+/*
+ * Open a replica for reading.
+ *
+ * A replica is a repository with no database behind it, and the database is
+ * where packed objects are looked up - so its objects are invisible until
+ * something indexes them. The daemon's answer is reindex, which needs a
+ * schema; this is the answer for anything that just wants to read one:
+ * inspect a copy, verify it, or restore from it without registering it
+ * anywhere.
+ *
+ * The index is built by reading the packs, the same way reindex rebuilds
+ * pack_objects, and lives only as long as the reader.
+ */
+typedef struct replica_reader replica_reader_t;
+
+status_t  replica_reader_open(const char *path, replica_reader_t **out);
+store_t  *replica_reader_store(replica_reader_t *r);
+void      replica_reader_close(replica_reader_t *r);
+
 status_t replica_sink_local_open(const char *path,
                                  const repo_marker_t *source_marker,
                                  replica_sink_t *out);

@@ -4,6 +4,7 @@
 #include "replicate.h"
 
 #include "object.h"
+#include "pack.h"
 #include "parity.h"
 #include "repo.h"
 #include "util.h"
@@ -27,23 +28,118 @@
  * is why this is the sink worth having first - and it needs no network, so
  * it is also the one the engine's tests can drive.
  *
- * Objects are written as loose files and left that way. The target packs on
- * its own schedule, which is the point of replicating objects rather than
- * packs: the two sides are free to disagree about physical layout and still
- * hold provably the same data.
+ * Objects arrive already compressed and already encrypted, so they are
+ * written into a pack rather than as loose files. Not an optimisation: a
+ * loose object header carries a compression field but every loose reader
+ * refuses anything but COMPRESS_NONE, on the correct grounds that only
+ * packing compresses. Since backup packs on completion, essentially every
+ * object in a real repository carries a codec - so writing them loose
+ * produced a replica that received every byte intact and could not be
+ * opened, with nothing in the transfer to say so.
  *
- * The writing is done here rather than through object_store because what
- * arrives is already compressed and already encrypted. object_store would
- * do both again - decrypting first would need the key, and re-encrypting
- * would produce ciphertext under whatever key this end holds, which is
- * exactly the property a replica is not allowed to have.
+ * object_store is not used for the same reason it cannot be: it would
+ * decrypt (needing a key this end is not supposed to have) and re-encrypt
+ * under a different one, which is exactly the property a replica must not
+ * have.
+ *
+ * Each run writes one pack. The target coalesces on its own schedule, which
+ * is the point of replicating objects rather than pack files: the two sides
+ * are free to disagree about physical layout and still hold provably the
+ * same data.
  */
 
+/*
+ * What the target already holds, read off its packs at open time.
+ *
+ * A replica has no database - it is a repository, and the database is the
+ * daemon's derived index of one. So the lookup that answers "do you have
+ * this" has to be built from the packs themselves, the same way reindex
+ * rebuilds pack_objects. Without it every packed object is invisible and
+ * every run re-sends the entire repository.
+ */
 typedef struct {
-    char     root[PATH_MAX];
-    store_t *store;          /* the target, for existence checks */
-    int      owns_store;
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t pack_id;
+    uint64_t offset;
+    uint32_t entry_index;
+} idx_row_t;
+
+typedef struct {
+    char       root[PATH_MAX];
+    store_t   *store;          /* the target, for existence checks */
+    int        owns_store;
+
+    idx_row_t *rows;
+    size_t     nrows, cap;
+
+    pack_stored_writer_t *w;   /* this run's pack, until close */
 } local_ctx_t;
+
+static int idx_cmp(const void *a, const void *b)
+{
+    return memcmp(((const idx_row_t *)a)->hash, ((const idx_row_t *)b)->hash,
+                  OBJECT_HASH_SIZE);
+}
+
+static status_t idx_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
+                           store_location_t *out)
+{
+    local_ctx_t *c = user;
+    if (!c->nrows) return ERR_NOT_FOUND;
+    /* Zeroed whole, not just the hash: only the hash is compared, but
+     * handing bsearch a struct with uninitialised tail bytes is the kind of
+     * thing that is harmless until someone extends the comparator. */
+    idx_row_t key;
+    memset(&key, 0, sizeof(key));
+    memcpy(key.hash, hash, OBJECT_HASH_SIZE);
+    const idx_row_t *r = bsearch(&key, c->rows, c->nrows, sizeof(*c->rows), idx_cmp);
+    if (!r) return ERR_NOT_FOUND;
+    memset(out, 0, sizeof(*out));
+    out->in_pack      = 1;
+    out->pack_id      = r->pack_id;
+    out->offset       = r->offset;
+    out->pack_version = PACK_VERSION;
+    out->entry_index  = r->entry_index;
+    return OK;
+}
+
+typedef struct { local_ctx_t *c; uint32_t pack_num; } scan_ctx_t;
+
+static void scan_entry(const pack_entry_info_t *info, void *vctx)
+{
+    scan_ctx_t *sc = vctx;
+    local_ctx_t *c = sc->c;
+    if (c->nrows == c->cap) {
+        size_t ncap = c->cap ? c->cap * 2 : 1024;
+        idx_row_t *nr = realloc(c->rows, ncap * sizeof(*nr));
+        if (!nr) return;              /* a short index costs a re-send, not correctness */
+        c->rows = nr;
+        c->cap = ncap;
+    }
+    idx_row_t *r = &c->rows[c->nrows++];
+    memcpy(r->hash, info->hash, OBJECT_HASH_SIZE);
+    r->pack_id     = sc->pack_num;
+    r->offset      = info->entry_offset;
+    r->entry_index = info->entry_index;
+}
+
+static void scan_pack(uint32_t pack_num, void *vctx)
+{
+    local_ctx_t *c = vctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
+    uint32_t version = 0, count = 0;
+    scan_ctx_t sc = { c, pack_num };
+    if (pack_enumerate_dat(c->store, name, &version, &count, scan_entry, &sc) != OK)
+        err_clear();   /* an unreadable pack is the target's problem to scrub */
+}
+
+static void build_index(local_ctx_t *c)
+{
+    if (pack_list(c->store, scan_pack, c) != OK) err_clear();
+    if (c->nrows > 1) qsort(c->rows, c->nrows, sizeof(*c->rows), idx_cmp);
+    store_set_locate_cb(c->store, idx_locate, c);
+}
 
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
@@ -59,122 +155,36 @@ static status_t local_has_objects(void *vctx, const uint8_t *hashes, size_t n,
                                   uint8_t *out_present)
 {
     local_ctx_t *c = vctx;
-    for (size_t i = 0; i < n; i++)
-        out_present[i] = object_exists(c->store, hashes + i * OBJECT_HASH_SIZE) ? 1u : 0u;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *h = hashes + i * OBJECT_HASH_SIZE;
+        /* Staged but not yet installed counts as held: the pack this run is
+         * building is invisible to anything that reads the repository, and
+         * answering "no" would write a second entry under the same hash. */
+        out_present[i] = (object_exists(c->store, h) || pack_stored_has(c->w, h))
+                         ? 1u : 0u;
+    }
     return OK;
 }
 
 /*
- * Write one object, or leave the existing one alone.
+ * Take one object, or leave the existing one alone.
  *
- * The early return on an object that is already here is the append-only
- * property, and it is a property of the code rather than of a policy
- * setting: a hash that is present is by definition the right bytes, so
- * there is never a reason to rewrite one, and never rewriting means a
- * source that has been compromised cannot replace good data under a name
- * that still verifies.
+ * The early return on an object already held is the append-only property,
+ * and it is a property of the code rather than of a policy setting: a hash
+ * that is present is by definition the right bytes, so there is never a
+ * reason to rewrite one, and never rewriting means a source that has been
+ * compromised cannot replace good data under a name that still verifies.
  */
 static status_t local_put_object(void *vctx, const replica_object_t *obj)
 {
     local_ctx_t *c = vctx;
 
-    if (object_exists(c->store, obj->hash)) return OK;
+    if (object_exists(c->store, obj->hash) || pack_stored_has(c->w, obj->hash))
+        return OK;
 
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_hex(obj->hash, hex);
-
-    char dir[PATH_MAX], final[PATH_MAX], tmp[PATH_MAX];
-    if (snprintf(dir, sizeof(dir), "%s/objects/%.2s", c->root, hex) >= (int)sizeof(dir) ||
-        snprintf(final, sizeof(final), "%s/%s", dir, hex + 2) >= (int)sizeof(final) ||
-        snprintf(tmp, sizeof(tmp), "%s/tmp/obj.XXXXXX", c->root) >= (int)sizeof(tmp))
-        return set_error(ERR_IO, "replica: path too long");
-
-    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
-        return set_error_errno(ERR_IO, "replica: mkdir %s", dir);
-
-    int fd = mkstemp(tmp);
-    if (fd == -1) return set_error_errno(ERR_IO, "replica: mkstemp");
-
-    /*
-     * The header records what arrived, not what this end would have chosen.
-     * pack_skip_ver is reset: it is the source prober's note to itself about
-     * whether compressing this object was worth it, and the target's packer
-     * gets to reach its own conclusion.
-     */
-    object_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic             = OBJECT_MAGIC;
-    hdr.version           = OBJECT_HDR_VERSION;
-    hdr.type              = obj->type;
-    hdr.compression       = obj->compression;
-    hdr.encryption        = obj->encryption;
-    hdr.pack_skip_ver     = 0;
-    hdr.uncompressed_size = obj->uncompressed_size;
-    hdr.compressed_size   = obj->payload_len;
-    memcpy(hdr.hash, obj->hash, OBJECT_HASH_SIZE);
-
-    status_t st = OK;
-    if (io_write_full(fd, &hdr, sizeof(hdr)) != 0)
-        st = set_error_errno(ERR_IO, "replica: write header");
-    if (st == OK && obj->payload_len &&
-        io_write_full(fd, obj->payload, obj->payload_len) != 0)
-        st = set_error_errno(ERR_IO, "replica: write payload");
-
-    /*
-     * Parity is computed here rather than copied from the source, because it
-     * covers the bytes this file actually holds. The payload is identical to
-     * the source's, so the Reed-Solomon block would match, but the header is
-     * not - pack_skip_ver above differs - and a trailer that describes
-     * somebody else's header is worse than none: a scrub would "repair"
-     * toward bytes this file was never meant to contain.
-     */
-    if (st == OK) {
-        parity_record_t hdr_par;
-        parity_record_compute(&hdr, sizeof(hdr), &hdr_par);
-
-        uint32_t crc = obj->payload_len ? crc32c(obj->payload, obj->payload_len) : 0;
-        size_t   rs_sz = rs_parity_size(obj->payload_len);
-        uint8_t *rs = NULL;
-        if (rs_sz) {
-            rs = malloc(rs_sz);
-            if (!rs) st = set_error(ERR_NOMEM, "replica: parity alloc");
-            else rs_parity_encode(obj->payload, obj->payload_len, rs);
-        }
-
-        if (st == OK && io_write_full(fd, &hdr_par, sizeof(hdr_par)) != 0)
-            st = set_error_errno(ERR_IO, "replica: write header parity");
-        if (st == OK && rs_sz && io_write_full(fd, rs, rs_sz) != 0)
-            st = set_error_errno(ERR_IO, "replica: write rs parity");
-        if (st == OK && io_write_full(fd, &crc, sizeof(crc)) != 0)
-            st = set_error_errno(ERR_IO, "replica: write crc");
-        /* The deprecated rs_data_len field, always zero. See parity.h. */
-        uint32_t dep = 0;
-        if (st == OK && io_write_full(fd, &dep, sizeof(dep)) != 0)
-            st = set_error_errno(ERR_IO, "replica: write reserved");
-        if (st == OK) {
-            parity_footer_t ftr = {
-                .magic        = PARITY_FOOTER_MAGIC,
-                .version      = PARITY_VERSION,
-                .trailer_size = (uint32_t)(sizeof(hdr_par) + rs_sz +
-                                           sizeof(crc) + sizeof(dep) + sizeof(parity_footer_t)),
-            };
-            if (io_write_full(fd, &ftr, sizeof(ftr)) != 0)
-                st = set_error_errno(ERR_IO, "replica: write footer");
-        }
-        free(rs);
-    }
-
-    if (st == OK && fsync(fd) != 0)
-        st = set_error_errno(ERR_IO, "replica: fsync");
-    close(fd);
-
-    if (st != OK) { unlink(tmp); return st; }
-
-    if (rename(tmp, final) != 0) {
-        unlink(tmp);
-        return set_error_errno(ERR_IO, "replica: rename into place");
-    }
-    return OK;
+    return pack_stored_add(c->w, obj->hash, obj->type, obj->compression,
+                           obj->encryption, obj->uncompressed_size,
+                           obj->payload, obj->payload_len);
 }
 
 /*
@@ -250,12 +260,71 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     return OK;
 }
 
+/*
+ * Install the pack, then release everything.
+ *
+ * A failure here is logged rather than returned: close has no way to report
+ * one, and the alternative - dropping the staging file silently - would lose
+ * a whole transfer's worth of objects while the run that produced them
+ * reported success. Anything already committed stays committed; the next run
+ * asks the target what it has and re-sends the rest.
+ */
 static void local_close(void *vctx)
 {
     local_ctx_t *c = vctx;
     if (!c) return;
+    if (c->w) {
+        uint32_t packed = 0;
+        if (pack_stored_finish(c->w, &packed) != OK)
+            log_error("replica: could not install the pack for %s: %s",
+                      c->root, err_msg());
+        else if (packed > 0)
+            log_info("replica: %s gained %u object(s)", c->root, packed);
+        c->w = NULL;
+    }
     if (c->owns_store && c->store) store_close(c->store);
+    free(c->rows);
     free(c);
+}
+
+/* ------------------------------------------------------------------ */
+/* Reading a replica                                                    */
+/* ------------------------------------------------------------------ */
+
+struct replica_reader {
+    local_ctx_t c;
+};
+
+status_t replica_reader_open(const char *path, replica_reader_t **out)
+{
+    if (!path || !out) return set_error(ERR_INVALID, "replica_reader_open: null argument");
+
+    replica_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "replica_reader: alloc");
+    if (snprintf(r->c.root, sizeof(r->c.root), "%s", path) >= (int)sizeof(r->c.root)) {
+        free(r);
+        return set_error(ERR_IO, "replica_reader: path too long");
+    }
+
+    status_t st = store_open(path, NULL, &r->c.store);
+    if (st != OK) { free(r); return st; }
+    r->c.owns_store = 1;
+    build_index(&r->c);
+    *out = r;
+    return OK;
+}
+
+store_t *replica_reader_store(replica_reader_t *r)
+{
+    return r ? r->c.store : NULL;
+}
+
+void replica_reader_close(replica_reader_t *r)
+{
+    if (!r) return;
+    if (r->c.owns_store && r->c.store) store_close(r->c.store);
+    free(r->c.rows);
+    free(r);
 }
 
 static const replica_sink_vtbl_t local_vtbl = {
@@ -316,6 +385,16 @@ status_t replica_sink_local_open(const char *path,
     st = store_open(path, NULL, &c->store);
     if (st != OK) { free(c); return st; }
     c->owns_store = 1;
+
+    build_index(c);
+
+    st = pack_stored_open(c->store, &c->w);
+    if (st != OK) {
+        store_close(c->store);
+        free(c->rows);
+        free(c);
+        return st;
+    }
 
     out->v   = &local_vtbl;
     out->ctx = c;
