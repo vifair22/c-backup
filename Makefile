@@ -278,12 +278,17 @@ FUZZ_OBJ_DIR  := $(BUILD)/fuzz
 FUZZ_BIN_DIR  := $(BUILD)/fuzz/bin
 FUZZ_SRCS     := $(wildcard $(TESTS)/fuzz/fuzz_*.c)
 FUZZ_BINS     := $(patsubst $(TESTS)/fuzz/%.c, $(FUZZ_BIN_DIR)/%, $(FUZZ_SRCS))
+# fake_index stands in for the daemon's pack bookkeeping. A harness that
+# packs anything needs it: since the .idx sidecar went away the engine has
+# no index of its own and asks a callback where a hash lives, so without one
+# a packed object is simply not found.
 FUZZ_LIB_OBJS := $(patsubst %.c, $(FUZZ_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                 $(FUZZ_OBJ_DIR)/cJSON.o $(FUZZ_OBJ_DIR)/app_migrations.o
+                 $(FUZZ_OBJ_DIR)/cJSON.o $(FUZZ_OBJ_DIR)/app_migrations.o \
+                 $(FUZZ_OBJ_DIR)/fake_index.o
 
 FUZZ_SAN    := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g
 FUZZ_CFLAGS := -std=c11 -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
-               $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+               $(SRC_INCLUDES) -I vendor -I $(TESTS) $(CUTILS_VERSION_DEF)
 FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
                 $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
 
@@ -301,6 +306,9 @@ $(FUZZ_OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(FUZZ_OBJ_DIR)
 
 $(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(FUZZ_OBJ_DIR)
 	$(FUZZ_CC) $(FUZZ_CFLAGS) -c $< -o $@
+
+$(FUZZ_OBJ_DIR)/fake_index.o: $(TESTS)/fake_index.c | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -I $(TESTS) -c $< -o $@
 
 $(FUZZ_BIN_DIR)/%: $(TESTS)/fuzz/%.c $(FUZZ_LIB_OBJS) | $(FUZZ_BIN_DIR)
 	$(FUZZ_CC) $(FUZZ_CFLAGS) $^ -o $@ $(FUZZ_LDFLAGS)
@@ -366,7 +374,7 @@ FUZZCOV_OBJ  := $(FUZZCOV_DIR)/obj
 FUZZCOV_BIN  := $(FUZZCOV_DIR)/bin
 FUZZCOV_CF   := -std=c11 -O1 -g -fsanitize=fuzzer-no-link \
                 -fprofile-instr-generate -fcoverage-mapping -Wno-unused-result \
-                $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+                $(SRC_INCLUDES) -I vendor -I $(TESTS) $(CUTILS_VERSION_DEF)
 LLVM_PROFDATA ?= llvm-profdata
 LLVM_COV      ?= llvm-cov
 
@@ -378,6 +386,7 @@ fuzz-cov: $(MIGRATE_SRC)
 	done
 	@$(FUZZ_CC) $(FUZZCOV_CF) -Wno-everything -c vendor/cJSON.c -o $(FUZZCOV_OBJ)/cJSON.o
 	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(MIGRATE_SRC) -o $(FUZZCOV_OBJ)/app_migrations.o
+	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(TESTS)/fake_index.c -o $(FUZZCOV_OBJ)/fake_index.o
 	@for t in $(FUZZ_SRCS); do \
 	    n=$$(basename $${t%.c}); \
 	    $(FUZZ_CC) $(FUZZCOV_CF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \

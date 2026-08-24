@@ -101,16 +101,54 @@ static uint64_t get_u64(const uint8_t *p)
  * Sort by name in memcmp byte order, not locale collation. Locale-aware
  * ordering would make a tree's hash depend on the environment of whichever
  * process wrote it.
+ *
+ * The comparator has to be a total order, not just an order on names. qsort
+ * is not stable, so two entries it calls equal come out in whatever order
+ * the implementation and the input happened to produce - and this file's
+ * one job is that a directory's bytes depend on its contents and nothing
+ * else. No directory holds two entries with the same name, so the tie-break
+ * below never runs on anything a scan produced; it is here so the promise
+ * in manifest.h holds for any caller rather than only for callers that
+ * happen to pass distinct names. Entries equal in every field are
+ * indistinguishable and may compare equal.
  */
+#define CMP_SCALAR(f) do { \
+    if (x->f != y->f) return x->f < y->f ? -1 : 1; \
+} while (0)
+
 static int entry_cmp(const void *a, const void *b)
 {
     const manifest_entry_t *x = a, *y = b;
     size_t n = x->name_len < y->name_len ? x->name_len : y->name_len;
     int c = memcmp(x->name, y->name, n);
     if (c) return c;
-    if (x->name_len == y->name_len) return 0;
-    return x->name_len < y->name_len ? -1 : 1;
+    if (x->name_len != y->name_len)
+        return x->name_len < y->name_len ? -1 : 1;
+
+    CMP_SCALAR(type);
+    CMP_SCALAR(mode);
+    CMP_SCALAR(uid);
+    CMP_SCALAR(gid);
+    CMP_SCALAR(size);
+    CMP_SCALAR(mtime_sec);
+    CMP_SCALAR(mtime_nsec);
+    CMP_SCALAR(inode_identity);
+    CMP_SCALAR(dev_major);
+    CMP_SCALAR(dev_minor);
+
+    if ((c = memcmp(x->target_hash, y->target_hash, OBJECT_HASH_SIZE)) != 0) return c;
+    if ((c = memcmp(x->xattr_hash,  y->xattr_hash,  OBJECT_HASH_SIZE)) != 0) return c;
+    if ((c = memcmp(x->acl_hash,    y->acl_hash,    OBJECT_HASH_SIZE)) != 0) return c;
+
+    if (x->link_target_len != y->link_target_len)
+        return x->link_target_len < y->link_target_len ? -1 : 1;
+    if (x->link_target_len)
+        return memcmp(x->link_target, y->link_target, x->link_target_len);
+
+    return 0;
 }
+
+#undef CMP_SCALAR
 
 status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
                             uint8_t **out_buf, size_t *out_len)

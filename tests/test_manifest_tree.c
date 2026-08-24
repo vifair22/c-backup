@@ -130,6 +130,41 @@ static void test_input_order_does_not_matter(void **state)
 }
 
 /*
+ * Entries with the same name still order deterministically.
+ *
+ * The comparator sorted on the name alone and returned 0 when two names
+ * matched, and qsort is not stable - so which of two same-named entries
+ * came first depended on the order the caller passed them in, and the tree
+ * hash with it. No directory contains two entries with the same name, so
+ * nothing a scan produces reaches this. It matters because the promise in
+ * manifest.h is unconditional and because the failure is the silent kind:
+ * a tree that hashes differently for the same contents rewrites itself on
+ * every backup and the only symptom is a repository that will not stop
+ * growing.
+ *
+ * Found by fuzz_manifest_write, which reverses its entry list and requires
+ * the bytes not to move.
+ */
+static void test_duplicate_names_still_order_deterministically(void **state)
+{
+    (void)state;
+    manifest_entry_t fwd[3] = { mk("dup", NODE_TYPE_REG, 1),
+                                mk("dup", NODE_TYPE_REG, 2),
+                                mk("dup", NODE_TYPE_REG, 3) };
+    manifest_entry_t rev[3] = { mk("dup", NODE_TYPE_REG, 3),
+                                mk("dup", NODE_TYPE_REG, 2),
+                                mk("dup", NODE_TYPE_REG, 1) };
+
+    uint8_t *bf = NULL, *br = NULL;
+    size_t lf = 0, lr = 0;
+    assert_int_equal(manifest_serialise(fwd, 3, &bf, &lf), OK);
+    assert_int_equal(manifest_serialise(rev, 3, &br, &lr), OK);
+    assert_int_equal(lf, lr);
+    assert_memory_equal(bf, br, lf);
+    free(bf); free(br);
+}
+
+/*
  * Sorting is memcmp byte order, not locale collation. Under a locale-aware
  * comparison "a" and "B" can order either way depending on the environment
  * of whichever process happened to write the tree.
@@ -315,6 +350,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_serialisation_is_stable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_input_order_does_not_matter, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_duplicate_names_still_order_deterministically, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sort_is_byte_order, setup, teardown),
         cmocka_unit_test_setup_teardown(test_identical_tree_stores_nothing_new, setup, teardown),
         cmocka_unit_test_setup_teardown(test_every_field_affects_the_hash, setup, teardown),

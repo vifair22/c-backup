@@ -2148,19 +2148,76 @@ status_t object_load_prefix(store_t *store,
         close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: bad header");
     }
 
-    /* Loose objects are always uncompressed — read just the prefix */
     if (out_full_size) *out_full_size = hdr.uncompressed_size;
     if (out_type) *out_type = hdr.type;
+
+    /*
+     * A loose payload is never compressed - packing is the only thing that
+     * compresses - so the prefix is a plain read from the front. It can be
+     * encrypted, though, and for a while this function did not know that:
+     * it read the bytes off disk and handed the caller ciphertext, with an
+     * OK status and the right length. Nothing downstream would have
+     * noticed, because a prefix is precisely the thing that skips the
+     * SHA-256 check.
+     *
+     * Assert the codec rather than assume it. If loose objects ever start
+     * being compressed, this returns compressed bytes just as silently.
+     */
+    if (hdr.compression != COMPRESS_NONE) {
+        close(fd);
+        return set_error(ERR_CORRUPT,
+                         "object_load_prefix: loose object has codec %u, expected none",
+                         hdr.compression);
+    }
 
     size_t want = max_bytes;
     if (want > hdr.uncompressed_size) want = (size_t)hdr.uncompressed_size;
 
-    char *buf = malloc(want);
-    if (!buf) { close(fd); return set_error(ERR_NOMEM, "object_load_prefix: alloc"); }
-    if (io_read_full(fd, buf, want) != 0) {
-        free(buf); close(fd);
+    /*
+     * ChaCha20 is a stream cipher, so a prefix decrypts on its own without
+     * the rest of the ciphertext. The Poly1305 tag sits at the far end and
+     * is neither read nor checked, which is the same bargain this function
+     * already makes with the hash it never gets to verify.
+     */
+    object_crypt_stream_t *cs = NULL;
+    if (hdr.encryption != ENCRYPT_NONE) {
+        const repo_key_t *key = store_key(store);
+        if (!key) {
+            close(fd);
+            char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+            return set_error(ERR_INVALID,
+                             "object %s is encrypted and no key is loaded", hex);
+        }
+        if (hdr.compressed_size < OBJECT_CRYPT_OVERHEAD) {
+            close(fd);
+            return set_error(ERR_CORRUPT, "object_load_prefix: truncated ciphertext");
+        }
+        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
+        if (io_read_full(fd, nonce, sizeof(nonce)) != 0) {
+            close(fd);
+            return set_error(ERR_CORRUPT, "object_load_prefix: truncated nonce");
+        }
+        status_t cst = object_crypt_stream_begin(&cs, key, nonce, 0);
+        if (cst != OK) { close(fd); return cst; }
+
+        uint64_t avail = hdr.compressed_size - OBJECT_CRYPT_OVERHEAD;
+        if (want > avail) want = (size_t)avail;
+    }
+
+    char *buf = malloc(want ? want : 1);
+    if (!buf) {
+        object_crypt_stream_free(cs); close(fd);
+        return set_error(ERR_NOMEM, "object_load_prefix: alloc");
+    }
+    if (want && io_read_full(fd, buf, want) != 0) {
+        free(buf); object_crypt_stream_free(cs); close(fd);
         return set_error(ERR_CORRUPT, "object_load_prefix: short read");
     }
+    if (cs && want && object_crypt_stream_update(cs, buf, want, buf) != OK) {
+        free(buf); object_crypt_stream_free(cs); close(fd);
+        return set_error(ERR_CORRUPT, "object_load_prefix: decryption failed");
+    }
+    object_crypt_stream_free(cs);
     close(fd);
 
     *out_data = buf;

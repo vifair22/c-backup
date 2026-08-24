@@ -205,6 +205,41 @@ static void assert_no_plaintext_in_packs(const uint8_t *needle, size_t n)
  * object incompressible and it never packs at all, so this asserts both that
  * it packed and that packing made it smaller.
  */
+/*
+ * A prefix read of an encrypted object that has not been packed.
+ *
+ * Every other assertion in this file packs first, and the packed prefix
+ * reader decrypts correctly. The loose one did not: it read the payload
+ * straight off disk on the strength of a comment saying loose objects are
+ * uncompressed - which is still true - and handed the caller ciphertext
+ * with an OK status and the right length. A prefix read is exactly the path
+ * that skips the SHA-256 check, so nothing downstream would have noticed.
+ *
+ * Nothing in the daemon calls object_load_prefix today, which is the only
+ * reason this never shipped as a browse route serving 4 KiB of noise.
+ *
+ * Found by fuzz_roundtrip on its first input.
+ */
+static void test_prefix_read_of_a_loose_object_decrypts(void **state)
+{
+    (void)state;
+    enum { N = 8192 };
+    uint8_t *buf = malloc(N);
+    assert_non_null(buf);
+    fill_compressible(buf, N);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    store_obj(buf, N, hash);
+
+    /* Deliberately no repo_pack: this is the loose reader. */
+    assert_prefix_read_matches(hash, buf, 4096);
+
+    /* And the whole object, so a prefix that matched by returning nothing
+     * useful still has to agree with the full read. */
+    assert_buffered_read_matches(hash, buf, N);
+    free(buf);
+}
+
 static void test_compressible_object_still_compresses(void **state)
 {
     (void)state;
@@ -397,6 +432,7 @@ int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_prefix_read_of_a_loose_object_decrypts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_compressible_object_still_compresses, setup, teardown),
         cmocka_unit_test_setup_teardown(test_incompressible_object_roundtrips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_object_roundtrips, setup, teardown),
