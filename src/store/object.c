@@ -2225,6 +2225,62 @@ status_t object_load_prefix(store_t *store,
     return OK;
 }
 
+/*
+ * The object exactly as it sits on disk, loose or packed.
+ *
+ * No parity check, no decrypt, no decompress, no hash comparison - see the
+ * note in object.h. The parity trailer is skipped rather than verified
+ * because it covers the stored bytes, and the target computes its own over
+ * whatever it stores.
+ */
+status_t object_read_stored(store_t *store,
+                            const uint8_t hash[OBJECT_HASH_SIZE],
+                            object_stored_info_t *out_info,
+                            void **out_payload, size_t *out_len) {
+    if (!store || !out_info || !out_payload || !out_len)
+        return set_error(ERR_INVALID, "object_read_stored: null argument");
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
+
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+        return pack_object_read_stored(store, hash, &out_info->type,
+                                       &out_info->compression,
+                                       &out_info->encryption,
+                                       &out_info->uncompressed_size,
+                                       out_payload, out_len);
+
+    object_header_t hdr;
+    status_t hst = read_object_header(fd, &hdr);
+    if (hst != OK) { close(fd); return hst; }
+
+    /* read_object_header has already refused a payload longer than the file,
+     * so this cannot be asked for more than the object occupies. */
+    void *buf = malloc(hdr.compressed_size ? (size_t)hdr.compressed_size : 1);
+    if (!buf) {
+        close(fd);
+        return set_error(ERR_NOMEM, "object_read_stored: alloc %llu",
+                         (unsigned long long)hdr.compressed_size);
+    }
+    if (hdr.compressed_size && io_read_full(fd, buf, (size_t)hdr.compressed_size) != 0) {
+        free(buf);
+        close(fd);
+        return set_error(ERR_CORRUPT, "object_read_stored: short read");
+    }
+    close(fd);
+
+    out_info->type              = hdr.type;
+    out_info->compression       = hdr.compression;
+    out_info->encryption        = hdr.encryption;
+    out_info->uncompressed_size = hdr.uncompressed_size;
+    *out_payload = buf;
+    *out_len     = (size_t)hdr.compressed_size;
+    return OK;
+}
+
 status_t object_get_info(store_t *store,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint64_t *out_size, uint8_t *out_type) {

@@ -76,6 +76,18 @@ status_t pack_object_load_prefix(store_t *store,
                                   uint64_t *out_full_size,
                                   uint8_t *out_type);
 
+/*
+ * Read a packed object's entry without decrypting or decompressing it.
+ * The loose-object counterpart is object_read_stored, which dispatches here.
+ * Caller frees *out_payload.
+ */
+status_t pack_object_read_stored(store_t *store,
+                                 const uint8_t hash[OBJECT_HASH_SIZE],
+                                 uint8_t *out_type, uint8_t *out_compression,
+                                 uint8_t *out_encryption,
+                                 uint64_t *out_uncompressed_size,
+                                 void **out_payload, size_t *out_len);
+
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
 int pack_object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 

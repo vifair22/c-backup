@@ -114,6 +114,40 @@ status_t object_physical_size(store_t *store,
                               uint64_t *out_bytes);
 
 /*
+ * What an object looks like on disk, without decoding it.
+ *
+ * Everything a reader needs to interpret the payload, which is what the
+ * loose header and the pack entry header both carry - the two forms differ
+ * in layout, not in content.
+ */
+typedef struct {
+    uint8_t  type;
+    uint8_t  compression;
+    uint8_t  encryption;
+    uint64_t uncompressed_size;
+} object_stored_info_t;
+
+/*
+ * Read an object without decrypting or decompressing it.
+ *
+ * The payload comes back exactly as stored: compressed, then encrypted, with
+ * the nonce and tag included. Replication uses this so that a copy holds
+ * what the source holds and a target which never receives the key can still
+ * store, verify and repair it - parity covers ciphertext for that reason.
+ *
+ * The hash is not checked, and cannot be: it covers the plaintext, which is
+ * the one thing this function deliberately does not produce. A caller
+ * handing these bytes to something else is moving a sealed box, not
+ * vouching for what is inside it. Whoever eventually decrypts it checks.
+ *
+ * Caller frees *out_payload.
+ */
+status_t object_read_stored(store_t *store,
+                            const uint8_t hash[OBJECT_HASH_SIZE],
+                            object_stored_info_t *out_info,
+                            void **out_payload, size_t *out_len);
+
+/*
  * Attempt to repair a loose object file in-place using its parity data.
  * Reads the file, applies XOR/RS parity correction, writes corrected bytes
  * back via pwrite.  Only works on version-2 loose objects with parity trailers.

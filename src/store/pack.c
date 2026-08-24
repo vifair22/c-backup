@@ -511,6 +511,76 @@ status_t pack_object_get_info(store_t *store,
     return OK;
 }
 
+/*
+ * The entry exactly as it sits in the .dat, with nothing decoded.
+ *
+ * Deliberately shorter than pack_object_load: no parity check, no CRC, no
+ * decrypt, no decompress, no hash comparison. A caller moving these bytes
+ * somewhere else is not vouching for them, and cannot - the hash covers
+ * plaintext, which is what it is choosing not to produce. Verification
+ * happens wherever the box is eventually opened.
+ *
+ * Skipping the parity check is not a shortcut around damage. Damage that a
+ * scrub would repair here is copied faithfully, and the target's own parity
+ * covers what it stored, so a corrupt object arrives corrupt and is caught
+ * by the first read that decrypts it - at either end.
+ */
+status_t pack_object_read_stored(store_t *store,
+                                 const uint8_t hash[OBJECT_HASH_SIZE],
+                                 uint8_t *out_type, uint8_t *out_compression,
+                                 uint8_t *out_encryption,
+                                 uint64_t *out_uncompressed_size,
+                                 void **out_payload, size_t *out_len) {
+    pack_cache_entry_t found;
+    status_t st = pack_find_entry(store, hash, &found);
+    if (st != OK) return st;
+
+    uint32_t pnum = found.pack_num;
+    char dat_path[PATH_MAX];
+    if (pack_dat_path_resolve(dat_path, sizeof(dat_path),
+                              store_root(store), pnum) != 0)
+        return set_error(ERR_IO, "pack_object_read_stored: path too long");
+
+    FILE *f = dat_open_or_checkout(store, pnum);
+    if (!f) return set_error_errno(ERR_IO, "pack_object_read_stored: fopen(%s)", dat_path);
+
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_object_read_stored: fseeko(%s)", dat_path);
+    }
+
+    pack_dat_entry_hdr_t ehdr;
+    if (read_entry_hdr(f, &ehdr) != 0) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_object_read_stored: bad entry header in %s", dat_path);
+    }
+
+    /* read_entry_hdr has already refused a length the file cannot hold, so
+     * this allocation is bounded by the pack's own size. */
+    void *buf = malloc(ehdr.compressed_size ? (size_t)ehdr.compressed_size : 1);
+    if (!buf) {
+        fclose(f);
+        return set_error(ERR_NOMEM, "pack_object_read_stored: alloc %llu",
+                         (unsigned long long)ehdr.compressed_size);
+    }
+    if (ehdr.compressed_size &&
+        fread_full(buf, (size_t)ehdr.compressed_size, f) != 0) {
+        free(buf);
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_object_read_stored: short read in %s", dat_path);
+    }
+    dat_return_or_close(store, pnum, f);
+
+    if (out_type)              *out_type = ehdr.type;
+    if (out_compression)       *out_compression = ehdr.compression;
+    if (out_encryption)        *out_encryption = ehdr.encryption;
+    if (out_uncompressed_size) *out_uncompressed_size = ehdr.uncompressed_size;
+    *out_payload = buf;
+    *out_len = (size_t)ehdr.compressed_size;
+    return OK;
+}
+
+
 /* Load parity data for a pack entry from the .dat parity trailer.
  * On success, *out_hdr_par, *out_payload_crc, *out_rs_par (caller frees) are
  * populated.  Returns 0 on success, -1 if parity is unavailable. */
