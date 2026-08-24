@@ -87,7 +87,11 @@ fuzz:
   tags: [docker]
   before_script:
     - *debian_deps
-    - apt-get install -y -qq --no-install-recommends clang
+    # clang alone is the driver with an empty resource directory: Debian
+    # ships the sanitizer runtimes separately, so -fsanitize=fuzzer,address
+    # fails at link with "cannot find libclang_rt.asan.a". Unversioned so
+    # this does not pin the job to whichever clang trixie ships today.
+    - apt-get install -y -qq --no-install-recommends clang libclang-rt-dev
     - *fetch_cutils
   script:
     # The gate. Any crash, timeout or sanitizer report on a known input fails
