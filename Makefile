@@ -467,6 +467,25 @@ lint:
 	@clang-tidy $(SRCS) -- -std=c11 $(SRC_INCLUDES) -I vendor 2>&1 | \
 	    grep -E "warning:|error:" || echo "clang-tidy: OK"
 
+# ---- Editor index -----------------------------------------------------
+#
+# clangd reads compile_commands.json and nothing else, so a stale one is
+# worse than none: it answers for files that no longer exist and falls back
+# to guessed flags for the ones that do, which reports every include in the
+# tree as missing. The one here predated the daemonization rewrite by five
+# months and named src/xfer.c.
+#
+# Regenerate after adding a source file, moving one, or changing the include
+# paths. bear observes a real build, so it has to be a build that actually
+# runs the compiler - hence the clean.
+.PHONY: compile-commands
+compile-commands:
+	@command -v bear >/dev/null || { echo "bear not installed"; exit 1; }
+	rm -rf $(BUILD)
+	bear --output compile_commands.json -- $(MAKE) -j8 \
+	    all $(TEST_BINS) $(FAULT_BINS) fuzz
+	@echo "compile_commands.json: $$(python3 -c 'import json;print(len(json.load(open("compile_commands.json"))))') entries"
+
 # ---- Benchmarks -------------------------------------------------------
 BENCH        := bench
 BENCH_CFLAGS := -std=c11 -Wall -Wextra -O3 -flto=auto $(ARCH_CFLAGS) -Wno-unused-result -I src -I src/cli -I src/ops -I src/store -I src/api -I src/common -I vendor
