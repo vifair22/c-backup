@@ -43,9 +43,15 @@ test:
   tags: [docker]
   before_script:
     - *debian_deps
+    # For the loopback fallback in tests/ci-sparse-fs.sh.
+    - apt-get install -y -qq --no-install-recommends e2fsprogs
     - *fetch_cutils
   script:
     - make
+    # Find somewhere the sparse fixtures can have real holes. Sourced, not
+    # run: it exports the directory the suites read. Never fails the job -
+    # if nothing here supports holes the suites skip, exactly as before.
+    - . tests/ci-sparse-fs.sh
     # Unit suites, then the two shell suites. The shell ones drive a real
     # daemon over HTTP and the CLI over its socket, which is the only way to
     # cover the routes, the auth middleware and the job manager.
@@ -91,9 +97,13 @@ fuzz:
     # ships the sanitizer runtimes separately, so -fsanitize=fuzzer,address
     # fails at link with "cannot find libclang_rt.asan.a". Unversioned so
     # this does not pin the job to whichever clang trixie ships today.
-    - apt-get install -y -qq --no-install-recommends clang libclang-rt-dev
+    - apt-get install -y -qq --no-install-recommends clang libclang-rt-dev e2fsprogs
     - *fetch_cutils
   script:
+    # Without this fuzz_sparse_write returns at its first line, and spends
+    # its whole budget doing so: 23 million no-op executions in the run that
+    # measured it, against 63 a second when it has somewhere to work.
+    - . tests/ci-sparse-fs.sh
     # The gate. Any crash, timeout or sanitizer report on a known input fails
     # the pipeline.
     - make fuzz-regress
