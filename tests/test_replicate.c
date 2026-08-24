@@ -308,6 +308,32 @@ static void test_replica_holds_the_same_objects(void **state)
     assert_int_equal(manifest_read_tree(dst, root, &ents, &n), OK);
     assert_int_equal(n, 3);
     manifest_free_entries(ents, n);
+
+    /* Every object the whole tree names is present, not just the root's
+     * immediate entries: a copy that is readable at the top and hollow
+     * underneath is the failure this is here to exclude. */
+    assert_int_equal(check_tree_complete(dst, root, 0), OK);
+
+    /* And a leaf two directories down reads back identically, so the walk
+     * really did descend rather than stopping at the first level. */
+    manifest_entry_t *re = NULL;
+    uint32_t rn = 0;
+    assert_int_equal(manifest_read_tree(dst, root, &re, &rn), OK);
+    for (uint32_t i = 0; i < rn; i++) {
+        if (strcmp(re[i].name, "deep") != 0) continue;
+        manifest_entry_t *de = NULL;
+        uint32_t dn = 0;
+        assert_int_equal(manifest_read_tree(dst, re[i].target_hash, &de, &dn), OK);
+        assert_int_equal(dn, 1);
+        manifest_entry_t *ie = NULL;
+        uint32_t in = 0;
+        assert_int_equal(manifest_read_tree(dst, de[0].target_hash, &ie, &in), OK);
+        assert_int_equal(in, 1);
+        assert_same_object(src, dst, ie[0].target_hash);
+        manifest_free_entries(ie, in);
+        manifest_free_entries(de, dn);
+    }
+    manifest_free_entries(re, rn);
     store_close(dst);
 }
 

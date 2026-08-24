@@ -742,6 +742,34 @@ static int cmd_reindex(int argc, char **argv)
     return maintenance("reindex", argc, argv, NULL, nw);
 }
 
+/*
+ * Copy this repository into another one.
+ *
+ * The destination is a path, so anything this machine can mount is a valid
+ * target: a second disk, a NAS share, a USB dock. Objects move in the form
+ * they are stored in, so an encrypted repository stays encrypted at the far
+ * end and the target never needs the key.
+ */
+static int cmd_replicate(int argc, char **argv)
+{
+    int no_wait = take_flag(&argc, argv, "--no-wait");
+    if (argc < 2)
+        return fail("usage: replicate <repo-id> <dest-path> [--no-wait]");
+
+    sbuf_t b = { 0 };
+    sb_puts(&b, "{\"dest\":");
+    sb_json_str(&b, argv[1]);
+    sb_puts(&b, "}");
+
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/repos/"); sb_puts(&p, argv[0]);
+    sb_puts(&p, "/replicate");
+    if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+    int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
+    free(p.buf); free(b.buf);
+    return rc;
+}
+
 static int cmd_pack(int argc, char **argv)
 {
     int nw = take_flag(&argc, argv, "--no-wait");
@@ -1067,6 +1095,7 @@ static const struct {
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
+    { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--no-wait]" },
     { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
     { "stats",     cmd_stats,     "stats <repo-id>" },
     { "summary",   cmd_summary,   "summary <repo-id>" },

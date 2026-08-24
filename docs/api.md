@@ -146,6 +146,7 @@ lazily on first append, which used to leave an empty result serialising as
 | GET | `/repos/<id>/grep` | Recent searches, newest first |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
+| POST | `/repos/<id>/replicate` | Copy this repository into another one: `{dest}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -224,6 +225,30 @@ only happens at pack time: a backup that stopped at the snapshot would have
 written more bytes than it read and left one file per object behind. Set the
 policy key `maintenance.auto_pack` to `false` to turn it off, and use this
 endpoint or a schedule to pack on your own terms instead.
+
+### Replication
+
+`dest` is a path, so any target this machine can mount is valid: a second
+disk, a NAS share, a USB dock. What is copied is objects, not files - packs
+get rewritten by GC and by coalescing, and a file-level copy would re-send a
+whole pack because one object inside it was collected. The target stores what
+it receives and packs it on its own schedule, so the two sides may disagree
+about physical layout while holding provably the same data.
+
+Objects move in the form they are stored in, still compressed and still
+encrypted. A replica of an encrypted repository is therefore encrypted with
+the source's key and the target never needs it, which is what lets a replica
+live somewhere less trusted than the source. The replica carries the source's
+uuid and key fingerprint rather than an identity of its own: it is the same
+repository in another place, and replicating into a path that already holds a
+different repository is refused rather than merged.
+
+Only what is missing is sent. A directory's tree hash covers everything
+beneath it, so a subtree the target already holds is dismissed by a single
+comparison and an unchanged repository replicates in one question.
+
+There is no delete. Retention at the target belongs to the target, which is
+what stops a compromised source from taking the offsite copy with it.
 
 ## Jobs
 

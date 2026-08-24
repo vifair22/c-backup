@@ -299,6 +299,57 @@ OUT=$(cb search "$ENC_ID" "ab" 2>&1); RC=$?
 check    "search rejects a too-short query" 1 "$RC"
 contains "short query explains itself" "3 characters" "$OUT"
 
+echo "replication"
+
+# An encrypted repository replicated to a second path on this machine. The
+# point of doing it with the encrypted one is that the replica must come out
+# encrypted too: objects move in the form they are stored in, so the copy
+# holds ciphertext under the source's key and the far end never needs it.
+REPL="$WORK/replica"
+OUT=$(cb replicate "$ENC_ID" "$REPL"); RC=$?
+check    "replicate waits for its job"  0             "$RC"
+contains "replicate reports completion" '"completed"' "$OUT"
+
+# The replica is the same repository, not a new one. A fresh uuid would mean
+# nothing that reads a marker could tell the two are related.
+SRC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/encrepo/.cbackup" 2>/dev/null | head -1)
+RPL_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$REPL/.cbackup" 2>/dev/null | head -1)
+if [ -n "$SRC_UUID" ] && [ "$SRC_UUID" = "$RPL_UUID" ]; then
+    ok "replica carries the source uuid"
+else
+    bad "replica carries the source uuid" "$SRC_UUID" "$RPL_UUID"
+fi
+
+# Objects actually arrived.
+NOBJ=$(find "$REPL/objects" -type f 2>/dev/null | wc -l)
+if [ "$NOBJ" -gt 0 ]; then
+    ok "replica holds objects ($NOBJ)"
+else
+    bad "replica holds objects" ">0" "$NOBJ"
+fi
+
+# And they are still ciphertext. The same fixture the pack test uses, for the
+# same reason: compressed text is unsearchable either way, so look for the
+# incompressible one.
+NEEDLE=$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)
+if grep -qra "$NEEDLE" "$REPL/objects" 2>/dev/null; then
+    bad "replica holds no plaintext" "absent" "present"
+else
+    ok "replica holds no plaintext"
+fi
+
+# Running it again moves nothing: the target already has the root tree, so
+# one question ends the walk.
+BEFORE=$(find "$REPL/objects" -type f | wc -l)
+cb replicate "$ENC_ID" "$REPL" >/dev/null
+AFTER=$(find "$REPL/objects" -type f | wc -l)
+check "second replicate is a no-op" "$BEFORE" "$AFTER"
+
+# A path already holding a different repository is refused rather than mixed.
+cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
+OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
+check "replicate into a foreign repo fails" 1 "$RC"
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"

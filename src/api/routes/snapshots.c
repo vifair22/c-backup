@@ -6,6 +6,7 @@
 #include "job_manager.h"
 #include "lock.h"
 #include "gc.h"
+#include "replicate.h"
 #include "gfs.h"
 #include "prune.h"
 #include "pack.h"
@@ -291,6 +292,7 @@ typedef enum {
     SNAP_JOB_PACK,
     SNAP_JOB_VERIFY,
     SNAP_JOB_GREP,
+    SNAP_JOB_REPLICATE,
 } snap_job_kind_t;
 
 typedef struct {
@@ -407,6 +409,33 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     } else if (j->kind == SNAP_JOB_VERIFY) {
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, NULL);
+    } else if (j->kind == SNAP_JOB_REPLICATE) {
+        /*
+         * A replica carries the source's identity, so the source's marker is
+         * what opens or creates it. Reading it here rather than inside the
+         * sink keeps the sink ignorant of where repositories are registered.
+         */
+        repo_marker_t m;
+        st = repo_marker_read(j->repo_path, &m);
+        if (st == OK) {
+            replica_sink_t sink;
+            st = replica_sink_local_open(j->dest, &m, &sink);
+            if (st == OK) {
+                replicate_result_t rr;
+                memset(&rr, 0, sizeof(rr));
+                st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
+                                   NULL, NULL, &rr);
+                sink.v->close(sink.ctx);
+                if (st == OK)
+                    log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
+                             "%llu object(s), %llu byte(s), %llu subtree(s) skipped",
+                             (long long)j->repo_id, j->dest,
+                             (unsigned long long)rr.snapshots_sent,
+                             (unsigned long long)rr.objects_sent,
+                             (unsigned long long)rr.bytes_sent,
+                             (unsigned long long)rr.subtrees_skipped);
+            }
+        }
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
@@ -549,6 +578,22 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         }
     }
 
+    if (kind == SNAP_JOB_REPLICATE) {
+        if (!req->body || req->body_len == 0) {
+            snap_job_free(j);
+            return api_error(400, "dest is required");
+        }
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
+        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+            snap_job_free(j);
+            return api_error(400, "invalid JSON");
+        }
+        if (json_req_get_str(body, "dest", &j->dest) != 0 || !j->dest) {
+            snap_job_free(j);
+            return api_error(400, "dest is required");
+        }
+    }
+
     if (kind == SNAP_JOB_RESTORE) {
         if (!req->body || req->body_len == 0) {
             snap_job_free(j);
@@ -578,6 +623,7 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                        : kind == SNAP_JOB_GC      ? "gc"
                        : kind == SNAP_JOB_GFS     ? "gfs"
                        : kind == SNAP_JOB_PACK    ? "pack"
+                       : kind == SNAP_JOB_REPLICATE ? "replicate"
                                                   : "restore";
     status_t st = job_submit(g_ctx.jm, repo_id, action,
                              NULL, snap_job_run, j, snap_job_free, &job_id);
@@ -838,6 +884,7 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
     if (strcmp(rest, "/pack") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_PACK);
     if (strcmp(rest, "/verify") == 0)  return submit_snap_job(repo_id, 0, req, SNAP_JOB_VERIFY);
     if (strcmp(rest, "/grep") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_GREP);
+    if (strcmp(rest, "/replicate") == 0) return submit_snap_job(repo_id, 0, req, SNAP_JOB_REPLICATE);
 
     if (strncmp(rest, "/snapshots/", 11) == 0) {
         const char *p = rest + 11;

@@ -241,6 +241,10 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     replicate_result_t res;
     memset(&res, 0, sizeof(res));
+    /* Set now, not only on the way out: the query below can fail, and a
+     * caller reading counters after a failure should see zero rather than
+     * whatever its stack happened to hold. */
+    if (out) *out = res;
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
