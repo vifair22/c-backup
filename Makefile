@@ -369,6 +369,20 @@ fuzz-min: fuzz
 # Read it per function, never as a total: these binaries link the whole
 # daemon, so a whole-binary figure is dominated by the routes, the scheduler
 # and the job manager, which no fuzz target has any business reaching.
+#
+# This number stays out of `make coverage` and out of the gate it enforces,
+# deliberately. Merging them would raise the figure without raising
+# confidence, because the two measure different things: a unit test asserts
+# what a line does, a fuzz harness mostly asserts that a round trip survived
+# and that nothing faulted. Lines the corpus merely executes would count the
+# same as lines something checked.
+#
+# The worse effect is on the ratchet. A gate exists to notice when cover is
+# lost - and if the corpus also lights up a line, deleting the test that
+# actually asserted its behaviour leaves the number unchanged. The gate
+# would go quiet exactly when it should complain.
+#
+# So: two numbers, two purposes. `make coverage` gates, this reports.
 FUZZCOV_DIR  := $(BUILD)/fuzzcov
 FUZZCOV_OBJ  := $(FUZZCOV_DIR)/obj
 FUZZCOV_BIN  := $(FUZZCOV_DIR)/bin
