@@ -443,6 +443,25 @@ else
     bad "second daemon starts" "socket" "absent"
 fi
 
+# Registering a replica on the daemon that owns the source used to repoint
+# the source at the copy and report success: re-link-by-uuid exists for a
+# repository that moved, and until replication existed no two directories
+# could hold the same uuid. Every backup after that wrote to the replica.
+BEFORE_PATH=$(cb repo show "$ENC_ID" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+OUT=$(cb repo add "$REPL" hijack 2>&1); RC=$?
+check    "registering a replica beside its source is refused" 1 "$RC"
+contains "and says which repo would have moved" "still registered as repo" "$OUT"
+AFTER_PATH=$(cb repo show "$ENC_ID" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+check    "the source keeps its path" "$BEFORE_PATH" "$AFTER_PATH"
+
+# The case that rule is guarding must still work: a repository that actually
+# moved re-links to its new path, because the old one is gone.
+cb repo add "$WORK/driftrepo" drift >/dev/null
+DRIFT_ID=$(cb repo list | tr '}' '\n' | grep driftrepo | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+mv "$WORK/driftrepo" "$WORK/driftmoved"
+contains "a moved repository re-links" '"id"' "$(cb repo add "$WORK/driftmoved" drift 2>&1)"
+contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID")"
+
 # A path already holding a different repository is refused rather than mixed.
 cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?

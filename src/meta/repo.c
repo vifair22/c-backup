@@ -454,12 +454,48 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                          "%s was written by a newer c-backup (marker version %d)",
                          path, marker.version);
 
-    /* Known UUID: re-link, updating the path in case the repo moved. */
+    /*
+     * Known UUID: re-link, updating the path in case the repo moved.
+     *
+     * Moved is the case this exists for - a mount point that changed, a
+     * database restored beside a repository that now lives elsewhere. It
+     * assumes one directory can hold that uuid, which was true until
+     * replication: a replica is deliberately the same repository in another
+     * place, so registering one used to repoint the original at the copy and
+     * report success. Every backup after that wrote to the replica while the
+     * source sat unregistered, and the only visible sign was a path in
+     * `repo list` that nobody had reason to re-read.
+     *
+     * So re-linking now requires the old path to have actually gone. If both
+     * hold the same repository they are a source and a copy, and which one
+     * is meant is not something to guess.
+     */
     db_result_t *r = NULL;
-    if (db_execute(db, "SELECT id FROM repos WHERE uuid = ?",
+    if (db_execute(db, "SELECT id, path FROM repos WHERE uuid = ?",
                    (const char *[]){ marker.uuid, NULL }, &r) == 0 &&
         r && r->nrows == 1) {
         int64_t id = strtoll(r->rows[0][0], NULL, 10);
+        const char *known = r->rows[0][1];
+
+        if (known && *known && strcmp(known, path) != 0) {
+            repo_marker_t other;
+            if (repo_marker_read(known, &other) == OK &&
+                strcmp(other.uuid, marker.uuid) == 0) {
+                char known_copy[PATH_MAX];
+                snprintf(known_copy, sizeof(known_copy), "%s", known);
+                db_result_free(r);
+                return set_error(ERR_INVALID,
+                                 "%s holds the same repository as %s, which is still "
+                                 "registered as repo %lld. Registering it would repoint "
+                                 "that repo at this copy; deregister it first if that is "
+                                 "what you meant",
+                                 path, known_copy, (long long)id);
+            }
+            /* The old path is gone or is no longer this repository, which is
+             * the drift this branch was written for. */
+            err_clear();
+        }
+
         db_result_free(r);
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
