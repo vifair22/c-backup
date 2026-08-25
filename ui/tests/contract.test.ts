@@ -329,6 +329,38 @@ describe('the flows behind the buttons', () => {
     assert.deepEqual((list.body as { schedules?: unknown[] }).schedules ?? [], [])
   })
 
+  test('integrity: run a verify and read its result back', async () => {
+    /*
+     * Verify has recorded runs and findings since it was written and
+     * neither was reachable from the app. Starting a scrub and then having
+     * nowhere to show the answer is worse than not offering the button, so
+     * this walks the whole loop.
+     */
+    const started = await request(toEndpoint({ kind: 'verify', repoId: 1, level: 'deep' }))
+    assert.equal(started.status, 202, `verify was refused: ${JSON.stringify(started.body)}`)
+
+    /* The run has to appear, and has to say it finished. */
+    let runs: { id: string; completed: string; checked: string }[] = []
+    for (let i = 0; i < 60; i++) {
+      const r = await request(toEndpoint({ kind: 'verifyRuns', repoId: 1, limit: 5 }))
+      runs = (r.body as { runs?: typeof runs }).runs ?? []
+      if (runs.length > 0 && runs[0].completed === '1') break
+      await sleep(250)
+    }
+    assert.ok(runs.length > 0, 'the scrub recorded no run')
+    assert.equal(runs[0].completed, '1')
+    assert.ok(Number(runs[0].checked) > 0, 'the scrub checked nothing')
+
+    /* And its findings are fetchable, which is the half that had no reader.
+     * A clean repository has none, and an empty list is the right answer -
+     * the assertion is that the endpoint answers, not that damage exists. */
+    const found = await request(toEndpoint({
+      kind: 'verifyFindings', repoId: 1, runId: Number(runs[0].id),
+    }))
+    assert.equal(found.status, 200)
+    assert.ok(Array.isArray((found.body as { findings?: unknown[] }).findings))
+  })
+
   test('the maintenance menu starts every operation it offers', async () => {
     const ops = ['verify', 'pack', 'gc', 'gfs', 'reindex'] as const
     for (const kind of ops) {

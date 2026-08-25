@@ -93,6 +93,7 @@ interface Props {
   onViewJournal?: () => void
   onViewTags?: () => void
   onViewSchedules?: () => void
+  onViewVerify?: () => void
   onRunBackup?: () => void
   onRunOperation?: (command: MaintenanceOp) => void
   onViewTasks?: () => void
@@ -101,7 +102,7 @@ interface Props {
   onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
   const [stats, setStats] = useState<Stats | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -245,6 +246,7 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
         {onEditPolicy && <QBtn onClick={onEditPolicy}>Policy</QBtn>}
         {onViewTags && <QBtn onClick={onViewTags}>Tags</QBtn>}
         {onViewSchedules && <QBtn onClick={onViewSchedules}>Schedules</QBtn>}
+        {onViewVerify && <QBtn onClick={onViewVerify}>Integrity</QBtn>}
 
         <div className="border-l border-border-default h-4 mx-0.5" />
 
