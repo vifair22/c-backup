@@ -467,6 +467,45 @@ cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
 
+echo "listen address"
+
+# http.bind has been a documented setting since the config was written,
+# describing itself as the way to "force remote access through a reverse
+# proxy", and it was never read: MHD was started without a socket address,
+# which binds every interface. Setting it to 127.0.0.1 produced a port
+# answering on the LAN and a config file saying it did not.
+BINDPORT=18809
+cat > "$WORK/bindcfg.yaml" <<EOF
+db:
+  path: $WORK/bind.db
+http:
+  socket: $WORK/bind.sock
+  port: $BINDPORT
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/keys
+EOF
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind.log" 2>&1 &
+BIND_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/bind.sock" ] && break; sleep 0.1; done
+LISTEN=$(ss -ltn 2>/dev/null | grep ":$BINDPORT" | awk '{print $4}' | head -1)
+case "$LISTEN" in
+    127.0.0.1:*) ok "bind 127.0.0.1 listens on loopback only" ;;
+    "")          ok "bind 127.0.0.1 listens on loopback only (ss unavailable, skipped)" ;;
+    *)           bad "bind 127.0.0.1 listens on loopback only" "127.0.0.1:$BINDPORT" "$LISTEN" ;;
+esac
+kill $BIND_PID 2>/dev/null; wait $BIND_PID 2>/dev/null
+
+# A bind address that will not parse stops the daemon. Falling back would
+# mean opening the port to the network because a config line had a typo in
+# it, which is the one outcome worth refusing to reach by accident.
+sed -i 's/  bind: 127.0.0.1/  bind: not-an-address/' "$WORK/bindcfg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind2.log" 2>&1
+check    "an unparseable bind address stops the daemon" 1 "$?"
+contains "and says which value was rejected" "not-an-address" "$(cat "$WORK/bind2.log")"
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"

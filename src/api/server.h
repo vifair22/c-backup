@@ -114,10 +114,15 @@ typedef struct api_server api_server_t;
 
 /* Create the API server.
  * tcp_port: port for web UI (0 = disabled).
+ * bind_addr: address to listen on. NULL or "0.0.0.0" means every
+ *            interface; "127.0.0.1" confines it to loopback. An address
+ *            that cannot be parsed is refused rather than widened, because
+ *            the failure mode of guessing is a port open to the network.
  * socket_path: unix socket for CLI (NULL = disabled).
  * static_dir: directory for static files (NULL = disabled).
  * Returns NULL on failure. */
-api_server_t *api_server_create(int tcp_port, const char *socket_path,
+api_server_t *api_server_create(int tcp_port, const char *bind_addr,
+                                const char *socket_path,
                                 const char *static_dir);
 
 /* Register a route handler.

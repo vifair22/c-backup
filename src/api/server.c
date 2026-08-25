@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -54,6 +56,9 @@ struct api_server {
     void              *auth_ud;
     void              *_tcp_cls;   /* mhd_cls_t for TCP daemon */
     void              *_unix_cls;  /* mhd_cls_t for unix daemon */
+    /* Held for the daemon's lifetime: MHD keeps the pointer it is given
+     * rather than copying the address. */
+    struct sockaddr_in bind_addr;
 };
 
 /* Wrapper passed as cls to MHD - carries the server + transport flag */
@@ -543,7 +548,8 @@ static enum MHD_Result request_handler(void *cls,
 
 /* --- Public API --- */
 
-api_server_t *api_server_create(int tcp_port, const char *socket_path,
+api_server_t *api_server_create(int tcp_port, const char *bind_addr,
+                                const char *socket_path,
                                 const char *static_dir)
 {
     api_server_t *srv = calloc(1, sizeof(*srv));
@@ -567,6 +573,34 @@ api_server_t *api_server_create(int tcp_port, const char *socket_path,
      * socket is still in TIME_WAIT - without it, systemctl restart races
      * the kernel's socket cleanup and the new daemon refuses to start. */
     if (tcp_port > 0) {
+        /*
+         * Bind where the operator said, not everywhere.
+         *
+         * http.bind has been a documented setting since the config was
+         * written, describing itself as the way to "force remote access
+         * through a reverse proxy", and it was never read: MHD was started
+         * without a socket address, which means every interface. Anyone who
+         * set it to 127.0.0.1 got a port answering on the LAN and a config
+         * file saying otherwise.
+         *
+         * An address that will not parse stops the daemon rather than
+         * falling back. Falling back means opening the port to the network
+         * because a config line had a typo in it, which is the one outcome
+         * worth refusing to reach by accident.
+         */
+        struct sockaddr_in addr4;
+        memset(&addr4, 0, sizeof(addr4));
+        addr4.sin_family = AF_INET;
+        addr4.sin_port   = htons((uint16_t)tcp_port);
+
+        const char *want = (bind_addr && *bind_addr) ? bind_addr : "0.0.0.0";
+        if (inet_pton(AF_INET, want, &addr4.sin_addr) != 1) {
+            log_error("http.bind: '%s' is not an IPv4 address", want);
+            api_server_stop(srv);
+            return NULL;
+        }
+        srv->bind_addr = addr4;
+
         srv->tcp_daemon = MHD_start_daemon(
             /* Thread-per-connection because the SSE streaming-route
              * handler blocks in pthread_cond_timedwait while waiting for
@@ -584,6 +618,7 @@ api_server_t *api_server_create(int tcp_port, const char *socket_path,
             NULL, NULL,
             request_handler, tcp_cls,
             MHD_OPTION_LISTENING_ADDRESS_REUSE, (unsigned int)1,
+            MHD_OPTION_SOCK_ADDR, (struct sockaddr *)&srv->bind_addr,
             MHD_OPTION_END);
 
         if (!srv->tcp_daemon) {
@@ -591,7 +626,7 @@ api_server_t *api_server_create(int tcp_port, const char *socket_path,
             api_server_stop(srv);
             return NULL;
         }
-        log_info("HTTP server listening on port %d", tcp_port);
+        log_info("HTTP server listening on %s:%d", want, tcp_port);
     }
 
     /* Unix socket daemon */

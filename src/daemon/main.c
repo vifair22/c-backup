@@ -157,11 +157,12 @@ int main(int argc, char *argv[])
 
     const char *socket_path = config_get_str(cfg, "http.socket");
     int tcp_port = config_get_int(cfg, "http.port", 8765);
+    const char *bind_addr = config_get_str(cfg, "http.bind");
 
     /* static_dir is NULL: the daemon serves an API, not a web UI. The
      * lifted server retains its static-file path so it stays diffable
      * against airies-ups, but nothing reaches it here. */
-    api_server_t *srv = api_server_create(tcp_port, socket_path, NULL);
+    api_server_t *srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
     if (!srv) {
         log_error("cannot create API server");
         appguard_shutdown(guard);
