@@ -69,7 +69,7 @@ export function App(): React.ReactElement {
        || activeRepo.path.split('/').pop() || activeRepo.path)
     : ''
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep'; prefix?: string }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   /*
    * The daemon status screen is scoped to a connection, not a repository, so
@@ -729,6 +729,7 @@ export function App(): React.ReactElement {
                 initialPath={currentView.path}
                 onBack={navBack}
                 onRestore={(sid, fp) => { setRestoreModal({ snapId: sid, filePath: fp }); setRestoreDest(''); setRestoreVerify(false) }}
+                onSearchHere={(path) => navigateTo({ view: 'grep', prefix: path })}
               />
             )}
             {currentView.view === 'tasks' && (
@@ -759,6 +760,7 @@ export function App(): React.ReactElement {
             )}
             {currentView.view === 'grep' && (
               <GrepView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                initialPrefix={currentView.prefix}
                 onBack={navBack}
               />
             )}

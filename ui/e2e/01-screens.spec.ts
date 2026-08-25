@@ -410,3 +410,68 @@ test('snapshots: deleting one, which the app could not do at all', async () => {
   await expect(h.page.getByText('#2', { exact: true })).toBeVisible()
   await expect(h.page.getByText('#1', { exact: true })).toHaveCount(0)
 })
+
+test('find in files: scoping to a directory reads fewer files', async () => {
+  /*
+   * The whole point of a path prefix is that it decides which files get
+   * opened. So the assertion is on the files-scanned count, not on the hits:
+   * the hits are the same either way, which is exactly how this shipped
+   * broken - a prefix that only filtered results looked correct while
+   * costing more than not using one.
+   *
+   * The fixture has notes.txt at the source root and two files under docs/,
+   * so a search scoped to docs/ must open strictly fewer than an unscoped
+   * one.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /find in files/i }).first().click()
+  await expect(h.page.getByText('Search file contents').first()).toBeVisible()
+
+  /* Unscoped first, to establish what "all of them" is. */
+  await h.page.getByPlaceholder(/text to look for/i).fill('quick brown')
+  await h.page.getByRole('button', { name: /^search$/i }).click()
+  await expect(h.page.getByText('notes.txt', { exact: false }).first())
+    .toBeVisible({ timeout: 20_000 })
+
+  const allScanned = Number(
+    await h.page.locator('tbody tr').first().locator('td').nth(1).innerText())
+  expect(allScanned, 'an unscoped search opens every file').toBeGreaterThan(1)
+
+  /* Now scope it to the docs subdirectory, which does not contain the
+   * matching file at all. */
+  const src = `${h.work}/src/docs`
+  await h.page.getByPlaceholder('the whole snapshot').fill(src)
+  await h.page.getByRole('button', { name: /^search$/i }).click()
+  await expect(h.page.locator('tbody tr').first().locator('td').nth(1))
+    .not.toHaveText(String(allScanned), { timeout: 20_000 })
+
+  const scoped = Number(
+    await h.page.locator('tbody tr').first().locator('td').nth(1).innerText())
+  expect(scoped, 'a scoped search opens only what is under the path')
+    .toBeLessThan(allScanned)
+
+  await h.page.screenshot({ path: 'test-results/grep-scoped.png', fullPage: true })
+})
+
+test('browse: "search here" carries the directory into the search', async () => {
+  /*
+   * The prefix worth having is the one somebody did not have to type. A
+   * person looking at a directory already knows the scope they want.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /^snapshots$/i }).first().click()
+  await h.page.locator('tbody tr').first().click()
+  await expect(h.page.getByText(/Snapshot #/).first()).toBeVisible()
+  await descendTo(h.page, h.work)
+
+  /* The control is on the directory row itself, revealed on hover. */
+  const docsRow = h.page.locator('tbody tr', { hasText: 'docs' }).first()
+  await docsRow.hover()
+  await docsRow.getByRole('button', { name: /search here/i }).click()
+
+  await expect(h.page.getByText('Search file contents').first()).toBeVisible()
+  await expect(h.page.getByPlaceholder('the whole snapshot')).toHaveValue(/\/docs$/)
+  await h.page.screenshot({ path: 'test-results/grep-search-here.png', fullPage: true })
+})

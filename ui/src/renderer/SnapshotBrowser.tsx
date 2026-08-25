@@ -128,9 +128,13 @@ interface Props {
   initialPath?: string
   onBack: () => void
   onRestore?: (snapId: number, filePath?: string) => void
+  /* Search inside the files of one directory rather than the whole
+   * snapshot. This is where a path prefix comes from that is worth having:
+   * somebody looking at a directory already knows the scope they want. */
+  onSearchHere?: (path: string) => void
 }
 
-export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack, onRestore }: Props): React.ReactElement {
+export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack, onRestore, onSearchHere }: Props): React.ReactElement {
   const repoId = Number(repoPath)
 
   const [header, setHeader] = useState<SnapHeader | null>(null)
@@ -351,7 +355,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
             ? () => toggleDir(node, depth, parentChain)
             : () => setSelectedFile({ node, path: filePath })
           }
-          className={`border-t border-border-default hover:bg-surface-hover text-text-primary cursor-pointer ${
+          className={`group border-t border-border-default hover:bg-surface-hover text-text-primary cursor-pointer ${
             isHighlighted ? 'bg-accent/10 ring-1 ring-accent/30' :
             isSelected ? 'bg-accent/10' : ''
           }`}>
@@ -372,6 +376,16 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
               )}
               <span className={nodeStyle(node.type, node.size)}>{node.name}</span>
               {isDir && <span className="text-blue-400 text-[10px]">/</span>}
+              {isDir && onSearchHere && (
+                <button
+                  onClick={e => { e.stopPropagation(); onSearchHere(filePath) }}
+                  title={`Search inside the files under ${filePath}`}
+                  className="text-[10px] underline cursor-pointer bg-transparent
+                             border-none text-accent p-0 ml-2 opacity-0
+                             group-hover:opacity-100">
+                  search here
+                </button>
+              )}
               {node.type === NODE_SYMLINK && <span className="text-text-muted text-[10px] ml-1">symlink</span>}
               {node.type === NODE_HARDLINK && <span className="text-amber-500 text-[10px] ml-1">hardlink</span>}
             </span>

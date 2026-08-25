@@ -42,15 +42,27 @@ interface Hit {
 interface Props {
   connName: string
   repoPath: string
+  /* Set when arriving from a directory in the snapshot browser. */
+  initialPrefix?: string
   onBack: () => void
 }
 
 const n = (v?: string): number => Number(v ?? '0')
 
-export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElement {
+export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)
 
   const [pattern, setPattern] = useState('')
+  /*
+   * Empty unless somebody arrived here from a directory.
+   *
+   * Deliberately not defaulted to the snapshot root. A prefix decides which
+   * files are read, so a narrow one is the difference between reading three
+   * files and reading all of them - but a prefix covering everything
+   * excludes nothing and still costs the walk to prove it. Pre-filling this
+   * with "/" would make the feature a tax on every search.
+   */
+  const [prefix, setPrefix] = useState(initialPrefix ?? '')
   const [ignoreCase, setIgnoreCase] = useState(true)
   const [runs, setRuns] = useState<GrepRun[]>([])
   const [selected, setSelected] = useState<GrepRun | null>(null)
@@ -74,6 +86,10 @@ export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElem
   }, [connName, repoId])
 
   useEffect(() => { void loadRuns().catch(err => setError(String(err))) }, [loadRuns])
+
+  /* Arriving from a different directory rescopes rather than keeping the
+   * path from the last visit. */
+  useEffect(() => { setPrefix(initialPrefix ?? '') }, [initialPrefix])
 
   const openRun = async (run: GrepRun) => {
     setSelected(run)
@@ -99,7 +115,10 @@ export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElem
     setHits([])
     setSelected(null)
     try {
-      await api.apiCall(connName, { kind: 'grepStart', repoId, pattern: p, ignoreCase })
+      await api.apiCall(connName, {
+        kind: 'grepStart', repoId, pattern: p, ignoreCase,
+        ...(prefix.trim() ? { pathPrefix: prefix.trim() } : {}),
+      })
 
       /*
        * Watch for the run to finish rather than blocking on it. The daemon
@@ -160,10 +179,37 @@ export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElem
         </button>
       </div>
 
+      <div className="flex gap-2 items-center mb-3">
+        <label className="text-xs text-text-secondary whitespace-nowrap">Within</label>
+        <input
+          value={prefix}
+          onChange={e => setPrefix(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') void search() }}
+          placeholder="the whole snapshot"
+          className="flex-1 text-xs p-2 rounded bg-surface-tertiary text-text-primary
+                     border border-border-default font-mono"
+          style={{ maxWidth: '28rem' }}
+        />
+        {prefix && (
+          <button onClick={() => setPrefix('')}
+            className="text-[11px] underline cursor-pointer bg-transparent border-none
+                       text-accent p-0">
+            clear
+          </button>
+        )}
+        <span className="text-xs text-text-muted">
+          {prefix
+            ? 'Only files under this path are opened'
+            : 'Narrowing this is what makes a search fast'}
+        </span>
+      </div>
+
       {searching && (
         <div className="text-xs text-text-muted mb-3">
-          Reading every file in the newest snapshot. This is the one thing
-          here that takes a while - the results appear when it finishes.
+          {prefix
+            ? `Reading every file under ${prefix}. The results appear when it finishes.`
+            : 'Reading every file in the newest snapshot. This is the one thing here '
+              + 'that takes a while - narrow it with a path above to read fewer.'}
         </div>
       )}
 
@@ -185,6 +231,7 @@ export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElem
               <thead>
                 <tr className="text-text-secondary text-left">
                   <th className="py-1 pr-3 font-medium">Pattern</th>
+                  <th className="py-1 pr-3 font-medium">Files</th>
                   <th className="py-1 pr-3 font-medium">Hits</th>
                   <th className="py-1 font-medium">When</th>
                 </tr>
@@ -195,6 +242,9 @@ export function GrepView({ connName, repoPath, onBack }: Props): React.ReactElem
                     className={`border-t border-border-subtle cursor-pointer
                                 ${selected?.id === r.id ? 'bg-surface-secondary' : 'hover:bg-surface-hover'}`}>
                     <td className="py-1.5 pr-3 font-mono truncate max-w-[9rem]">{r.pattern}</td>
+                    {/* How many files the run opened. With a path set this is
+                      * the number that shows the scoping worked. */}
+                    <td className="py-1.5 pr-3 text-text-muted">{n(r.files_scanned)}</td>
                     <td className="py-1.5 pr-3">{n(r.hits)}</td>
                     <td className="py-1.5 whitespace-nowrap">{absoluteTime(r.started_at)}</td>
                   </tr>
