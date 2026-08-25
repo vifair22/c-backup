@@ -214,7 +214,25 @@ export class ConnectionManager extends EventEmitter {
     if (!entry) throw new Error(`no connection '${name}'`)
     if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
 
-    const res = await this.requestVia<T>(entry, req)
+    /*
+     * A daemon that dies after a connection is established used to leave the
+     * sidebar saying "connected" while every request failed: unreachability
+     * was only ever handled during connect. The status is what somebody
+     * looks at to decide whether the problem is theirs, so it has to follow
+     * the daemon rather than remember the last time it was asked.
+     */
+    let res
+    try {
+      res = await this.requestVia<T>(entry, req)
+    } catch (err) {
+      if (err instanceof DaemonUnreachableError) {
+        entry.status = 'error'
+        entry.error = `${err.message}. Start it with 'systemctl start c-backupd'.`
+        entry.repos = []
+        this.emitChange()
+      }
+      throw err
+    }
     if (res.status >= 400) {
       const body = res.body as { error?: string } | undefined
       throw new Error(body?.error ?? `HTTP ${res.status}`)

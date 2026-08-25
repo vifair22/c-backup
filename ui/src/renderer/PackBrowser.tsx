@@ -100,6 +100,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [hover, setHover] = useState<number | null>(null)
   const [showFanout, setShowFanout] = useState(false)
+  const [fanoutLoading, setFanoutLoading] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -137,6 +138,14 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
   const openFanout = async () => {
     setShowFanout(true)
     if (buckets.length > 0) return
+    /*
+     * This is a GROUP BY over every object in the repository, so it is the
+     * one panel here that can take real time on a large store. Without this
+     * flag the chart renders its empty state first and reads as "0 objects"
+     * - a repository reporting itself empty, which is the worst possible
+     * thing for it to say while it is simply still counting.
+     */
+    setFanoutLoading(true)
     try {
       const r = await api.apiCall<{ buckets?: { prefix: string; count: string }[] }>(
         connName, { kind: 'fanout', repoId })
@@ -144,6 +153,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
     } catch (err) {
       setError(String(err))
     }
+    setFanoutLoading(false)
   }
 
   /*
@@ -310,14 +320,16 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
             </div>
 
             <div className="text-xs text-text-secondary mb-2 h-4">
-              {hover !== null
-                ? `0x${hover.toString(16).padStart(2, '0')}: ${fmtNum(counts[hover])} objects`
-                : `${fmtNum(total)} objects, ${avg.toFixed(1)} per prefix on average`}
+              {fanoutLoading
+                ? 'Counting every object in the repository...'
+                : hover !== null
+                  ? `0x${hover.toString(16).padStart(2, '0')}: ${fmtNum(counts[hover])} objects`
+                  : `${fmtNum(total)} objects, ${avg.toFixed(1)} per prefix on average`}
             </div>
 
             <div className="flex items-end gap-px relative" style={{ height: '8rem' }}
                  onMouseLeave={() => setHover(null)}>
-              {maxCount > 0 && (
+              {!fanoutLoading && maxCount > 0 && (
                 <div className="absolute left-0 right-0 border-t border-dashed border-status-warning"
                      style={{ bottom: `${(avg / maxCount) * 100}%` }}>
                   <span className="absolute right-0 -top-4 text-[9px] text-status-warning">
@@ -325,7 +337,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
                   </span>
                 </div>
               )}
-              {counts.map((c, i) => (
+              {!fanoutLoading && counts.map((c, i) => (
                 <div key={i} onMouseEnter={() => setHover(i)}
                   className={`flex-1 ${hover === i ? 'bg-accent' : 'bg-accent/50'}`}
                   style={{ height: maxCount > 0 ? `${Math.max(1, (c / maxCount) * 100)}%` : '1px' }} />

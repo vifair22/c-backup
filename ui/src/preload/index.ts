@@ -35,6 +35,20 @@ export interface CBackupApi {
   credentialDelete(connectionName: string): Promise<{ ok: boolean }>
 }
 
+/*
+ * Electron rewrites an error thrown in the main process into
+ *   Error invoking remote method 'api:call': SomeError: the real message
+ * and every screen printed the whole thing. The useful half is the tail, and
+ * the prefix names an IPC channel that means nothing to the person reading
+ * it - it turned "no daemon at /run/c-backup.sock" into a line about remote
+ * method invocation that reads like the app itself is broken.
+ */
+function unwrap(err: unknown): never {
+  const raw = err instanceof Error ? err.message : String(err)
+  const m = raw.match(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?(.*)$/s)
+  throw new Error(m ? m[1] : raw)
+}
+
 const api: CBackupApi = {
   connectionAdd: (config) => ipcRenderer.invoke(IPC.CONNECTION_ADD, config),
   connectionRemove: (name) => ipcRenderer.invoke(IPC.CONNECTION_REMOVE, name),
@@ -52,7 +66,7 @@ const api: CBackupApi = {
   repoOpen: (conn, path) => ipcRenderer.invoke(IPC.REPO_OPEN, conn, path),
   repoClose: (conn, path) => ipcRenderer.invoke(IPC.REPO_CLOSE, conn, path),
 
-  apiCall: (conn, req) => ipcRenderer.invoke(IPC.API_CALL, conn, req),
+  apiCall: (conn, req) => ipcRenderer.invoke(IPC.API_CALL, conn, req).catch(unwrap),
 
   credentialHas: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_HAS, name),
   credentialDelete: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_DELETE, name),

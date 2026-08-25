@@ -171,7 +171,9 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
           &larr; Dashboard
         </button>
         <h3 className="text-lg font-medium m-0">Snapshots</h3>
-        {!loading && (
+        {/* Not while the fetch is failing: "0 total" beside an error reads
+          * as an empty repository rather than as an unanswered question. */}
+        {!loading && !error && (
           <span className="text-xs text-text-muted">
             {fmtNum(snaps.length)}{more ? '+' : ''} total
           </span>

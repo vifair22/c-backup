@@ -45,6 +45,8 @@ export interface Harness {
   sock: string
   /** Ids of the repositories seeded below, by label. */
   repos: { plain: number; encrypted: number }
+  /** Kill the daemon, to see what the app does without one. */
+  killDaemon(): void
   close(): Promise<void>
 }
 
@@ -139,6 +141,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   return {
     app, page, work, sock,
     repos: { plain, encrypted },
+    killDaemon() { daemon.kill('SIGKILL') },
     async close() {
       await app.close().catch(() => {})
       daemon.kill()
