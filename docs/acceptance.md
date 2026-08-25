@@ -155,3 +155,96 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
   is deliberately disabled.
 - **Auth.** A unix-socket connection needs no password; it matters only for
   the TCP path, which is paused with the rest of the remote work.
+
+---
+
+# Results: first full pass
+
+Run against `~/Documents` (5,722 files, 6.8 GB) and `~/git` (225,240 files,
+46 GB) on the development machine. Every group was driven from the CLI; the
+browse, search and dashboard rows were driven from the app as well, through
+`e2e/90-acceptance.spec.ts` against the same daemon.
+
+## Outcome
+
+All sixty checks pass. Four defects were found and three fixed; the fourth is
+recorded rather than rushed. Two rows in this checklist were wrong and have
+been corrected against what the code actually claims.
+
+## What the numbers were
+
+| Operation | Documents (5.7k files) | ~/git (225k files) |
+|-----------|------------------------|--------------------|
+| First backup | 21.5 s | 443 s |
+| Incremental, nothing changed | 1 s | - |
+| Restore | 20 s | - |
+| Deep verify | 5,639 objects clean | 159,300 objects |
+| Snapshot list | 5 ms | 5 ms |
+| One directory | 5 ms | 5 ms |
+| Name search | 6 ms | 22 ms (200 hits) |
+| Dashboard (3 calls) | - | 142 ms |
+| Backup handoff | 11 ms | 6 ms |
+
+Interactive work does not care how much data is behind it, which is the
+claim the paging and indexing exist to make. The one place it did care was
+the dashboard, and that is fixed below.
+
+In the app, against the same daemon: repository list 9 ms, snapshot list
+11 ms, open a tree 16 ms, expand a directory 72 ms, search 26 ms, dashboard
+of 225k files 182 ms. The app adds roughly 20 ms of IPC and render over the
+CLI, and nothing is near the 400 ms budget.
+
+## Storage
+
+- Documents: 6.8 GB of source became a 2.9 GB repository. 5,722 files became
+  5,054 objects, so 668 were duplicates of content already stored.
+- `~/git`: 46 GB became 26 GB. 225,240 files became 159,300 objects. The
+  corpus is mostly already-compressed - git objects, archives, build output -
+  so almost all of that is dedup rather than compression.
+- **The repository peaked at 53 GB during the run and settled at 26 GB when
+  packing finished.** Loose objects are written uncompressed by design, so
+  transient headroom needs to be roughly twice the final size. Nothing says
+  this anywhere and it is the number that decides whether a backup fits.
+
+## Defects found
+
+1. **Directory mtimes were lost on restore.** 575 of 689 directories came
+   back stamped with the time of the restore. Files, modes and ownership were
+   all correct, which is what made it invisible. Fixed, with a regression
+   test that fails without the fix.
+2. **The dashboard was twice its budget at scale** - 795 ms. `/summary`
+   scanned the objects table four times for what one pass answers, and
+   `/stats` sorted every object row to group four numbers. Fixed: 182 ms.
+3. **A restore never reported completion.** Progress counted from a 0-based
+   index, so the last entry of a restore was announced as 6414 of 6415 and
+   the job then finished. A bar that stops just short and stays there reads
+   as a stall. Fixed.
+4. **Metadata writes fail intermittently during a backup.** `sources set`
+   returned `500 {"error":"cannot begin"}`. Nine `BEGIN` sites across six
+   files and only one takes a lock. **Not fixed** - the correct fix is one
+   lock held by every writer, and it needs the lock ordering proven first,
+   because a deadlock during a backup is worse than a retryable 500. See the
+   trap recorded in CLAUDE.md.
+
+Two smaller ones: `c-backup grep` emits two JSON documents rather than one,
+so piping it to a JSON parser fails; and grep hit paths have no leading
+slash while search result paths do.
+
+## Corrections to this checklist
+
+- **D4** asserted that a restore onto an existing destination is refused
+  without `--overwrite`. It is not, and should not be: existing files are
+  skipped and counted, because an interrupted restore is meant to be
+  re-runnable. An earlier interrupted 45 GB restore flattened 2,262
+  hardlinks before it worked that way.
+- **B8** was recorded as a failure on the first run because the submit
+  response carries `job_id` while job listings carry `id`. The handoff was
+  fine; the harness was reading the wrong key. The inconsistency in the API
+  is real but harmless.
+
+## Not covered by this pass
+
+- Replication, which is paused.
+- Auth, which only matters for the TCP path.
+- G2 (a tag protecting a snapshot from retention) needs backdated snapshots
+  and is covered by `tests/test_gfs.c` instead, where dates can be pinned.
