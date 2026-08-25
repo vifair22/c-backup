@@ -118,6 +118,45 @@ fuzz:
       - timeout-*
       - oom-*
 
+# The desktop app's API contract.
+#
+# Its own job rather than a step inside `test`, because Debian trixie ships
+# Node 20 and the suite needs 22.6 or newer for native type stripping. The
+# `test` job skips it with a message; this is where it actually runs, which
+# matters: a guard that quietly does not run is the failure it exists to
+# prevent. It was skipped in CI for exactly one pipeline before this.
+#
+# No npm install. The suite uses only the standard library and the two
+# TypeScript files it is testing, so there is nothing to fetch and nothing
+# to keep in step with a lockfile.
+ui:
+  stage: analyze
+  # Trixie-based, deliberately. The daemon this suite starts is built in the
+  # test job on debian:trixie, and a node image on an older Debian has an
+  # older glibc - the binary will not load at all, which looks like every
+  # test failing rather than like an image mismatch.
+  image: node:24-trixie-slim
+  tags: [docker]
+  needs:
+    - job: test
+      artifacts: true
+  before_script:
+    # The suite starts a real c-backupd, so the image needs what the binary
+    # links against. Runtime libraries only - nothing here compiles, the
+    # daemon arrives built from the test job.
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends
+        libmicrohttpd12t64 liblz4-1 libssl3t64 libacl1 libsqlite3-0 libcurl4t64
+  script:
+    - node --version
+    - ./build/bins/c-backupd --version || true
+    - cd ui && npm test
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - ui/tests/
+
 coverage:
   stage: coverage
   image: debian:trixie
