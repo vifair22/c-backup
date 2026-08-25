@@ -361,6 +361,45 @@ describe('the flows behind the buttons', () => {
     assert.ok(Array.isArray((found.body as { findings?: unknown[] }).findings))
   })
 
+  test('encryption: an unescrowed key is visible, and acknowledging clears it', async () => {
+    /*
+     * The warning that matters most was reachable only through /metrics: a
+     * system key exists in one file on this host, and if the host is lost
+     * every copy of the repository is unreadable. /repos did not say which
+     * repositories were in that state, so the app could not tell anyone.
+     */
+    const created = await request(toEndpoint({
+      kind: 'repoAdd', path: join(work, 'encrepo'), label: 'enc', encrypt: 'system',
+    }))
+    assert.equal(created.status, 201, `encrypted repo add failed: ${JSON.stringify(created.body)}`)
+    const repoId = (created.body as { id: number }).id
+
+    /* The screen reads its state from the repo record. */
+    let info = await request(toEndpoint({ kind: 'repoShow', repoId }))
+    let body = info.body as { encryption?: string; key_escrowed?: number }
+    assert.equal(body.encryption, 'system')
+    assert.equal(Number(body.key_escrowed), 0, 'a fresh key must not claim to be saved')
+
+    /* Show key returns something an operator can actually write down. */
+    const shown = await request(toEndpoint({ kind: 'keyExport', repoId }))
+    assert.equal(shown.status, 200)
+    const key = (shown.body as { key?: string }).key ?? ''
+    assert.match(key, /^[0-9a-f]{64}$/, 'the exported key is not a 256-bit hex key')
+
+    /* Acknowledging is the operator's claim, and it has to stick. */
+    const acked = await request(toEndpoint({ kind: 'keyAck', repoId }))
+    assert.ok(acked.status < 400, `ack failed: ${JSON.stringify(acked.body)}`)
+
+    info = await request(toEndpoint({ kind: 'repoShow', repoId }))
+    body = info.body as { key_escrowed?: number }
+    assert.equal(Number(body.key_escrowed), 1, 'acknowledging did not record')
+
+    /* And an unencrypted repository says so, rather than showing an empty
+     * key screen. */
+    const plain = await request(toEndpoint({ kind: 'repoShow', repoId: 1 }))
+    assert.equal((plain.body as { encryption?: string }).encryption, 'none')
+  })
+
   test('the maintenance menu starts every operation it offers', async () => {
     const ops = ['verify', 'pack', 'gc', 'gfs', 'reindex'] as const
     for (const kind of ops) {

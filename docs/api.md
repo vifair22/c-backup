@@ -49,7 +49,7 @@ credential cannot report a daemon too unhealthy to authenticate.
 |---|---|---|
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}` |
-| GET | `/repos/<id>` | One repository |
+| GET | `/repos/<id>` | One repository , including `encryption` and `key_escrowed` |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone |
 
 ## Snapshots and browsing

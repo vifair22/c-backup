@@ -32,7 +32,8 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at, last_seen_at"
+            "SELECT id, uuid, path, label, added_at, last_seen_at,"
+            "       encryption, key_escrowed"
             " FROM repos ORDER BY id", NULL, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list repos");
@@ -62,7 +63,21 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
                || json_elem_add_str(&e, "uuid",     r->rows[i][1]) != 0
                || json_elem_add_str(&e, "path",     r->rows[i][2]) != 0
                || json_elem_add_str(&e, "label",    r->rows[i][3] ? r->rows[i][3] : "") != 0
-               || json_elem_add_str(&e, "added_at", r->rows[i][4]) != 0;
+               || json_elem_add_str(&e, "added_at", r->rows[i][4]) != 0
+               /*
+                * Encryption state, which the app could not see at all.
+                *
+                * A system-managed key exists only in a file on this host. If
+                * the host is lost, every offsite copy of the repository is
+                * unreadable - which is precisely the disaster the backups
+                * were for. The daemon has warned about it on /metrics since
+                * the column existed, and Prometheus is not where somebody
+                * finds out their key was never written down.
+                */
+               || json_elem_add_str(&e, "encryption",
+                                    r->rows[i][6] ? r->rows[i][6] : "none") != 0
+               || json_elem_add_str(&e, "key_escrowed",
+                                    r->rows[i][7] ? r->rows[i][7] : "0") != 0;
         /* Committing a partially built element would emit a row missing
          * fields the client requires; drop it and stop instead. */
         if (bad) break;
@@ -229,7 +244,8 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at FROM repos WHERE id = ?",
+            "SELECT id, uuid, path, label, added_at, encryption, key_escrowed"
+            "  FROM repos WHERE id = ?",
             (const char *[]){ tail, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read repo");
@@ -239,11 +255,17 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
         return api_error(404, "no such repo");
     }
 
+    /* encryption and key_escrowed travel with every repo now: without them
+     * a client cannot tell which repositories hold a key that exists on this
+     * host alone. See the note in list_repos. */
     char *body = NULL;
     int n = asprintf(&body,
-        "{\"id\":%s,\"uuid\":\"%s\",\"path\":\"%s\",\"label\":\"%s\",\"added_at\":%s}",
+        "{\"id\":%s,\"uuid\":\"%s\",\"path\":\"%s\",\"label\":\"%s\","
+        "\"added_at\":%s,\"encryption\":\"%s\",\"key_escrowed\":%s}",
         r->rows[0][0], r->rows[0][1], r->rows[0][2],
-        r->rows[0][3] ? r->rows[0][3] : "", r->rows[0][4]);
+        r->rows[0][3] ? r->rows[0][3] : "", r->rows[0][4],
+        (r->rows[0][5] && r->rows[0][5][0]) ? r->rows[0][5] : "none",
+        (r->rows[0][6] && r->rows[0][6][0]) ? r->rows[0][6] : "0");
     db_result_free(r);
     if (n < 0) return api_error(500, "out of memory");
     return api_ok(body);
