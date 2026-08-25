@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/acl.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/xattr.h>
@@ -159,6 +160,51 @@ static void test_restore_preserves_modes(void **state)
     struct stat sb;
     assert_int_equal(stat(path, &sb), 0);
     assert_int_equal(sb.st_mode & 07777, 0640);
+}
+
+/*
+ * A directory's mtime survives its own contents being written into it.
+ *
+ * The kernel moves a directory's mtime forward every time an entry is
+ * created inside it, so setting the timestamp when the directory is made
+ * and then restoring files into it leaves the directory stamped with the
+ * moment of the restore. Nothing fails: modes and ownership are right, the
+ * files are byte-identical, and only the directory timestamps are quietly
+ * today's date. On a real 5722-file tree this hit 575 of 689 directories.
+ */
+static void test_restore_preserves_directory_mtimes(void **state)
+{
+    (void)state;
+
+    /* Backdate a directory that has content in it, so a bumped mtime is
+     * unmistakable rather than a sub-second rounding argument. */
+    const time_t backdated = 1000000000;  /* 2001-09-09 */
+    struct timespec times[2];
+    times[0].tv_sec = backdated; times[0].tv_nsec = 0;
+    times[1] = times[0];
+    assert_int_equal(utimensat(AT_FDCWD, TEST_SRC "/nested", times, 0), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, NULL), OK);
+
+    char path[512];
+    struct stat sb;
+    snprintf(path, sizeof(path), "%s/nested", restored_root());
+    assert_int_equal(stat(path, &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+    assert_int_equal(sb.st_mtime, backdated);
+
+    /* And the directory really did have something restored into it, or the
+     * assertion above would pass for the wrong reason. */
+    snprintf(path, sizeof(path), "%s/nested/deeper", restored_root());
+    assert_int_equal(stat(path, &sb), 0);
 }
 
 static void test_restore_recreates_directory_structure(void **state)
@@ -1069,6 +1115,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_preserves_directory_mtimes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),

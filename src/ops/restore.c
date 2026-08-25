@@ -173,6 +173,22 @@ static int hash_is_zero_hex(const char *hex)
     return 1;
 }
 
+/*
+ * Just the timestamp. Directories need theirs applied twice - once when
+ * created, and again after their contents are written, because writing an
+ * entry into a directory moves its mtime forward. Nothing else about a
+ * directory changes in between, so the second pass reapplies only this.
+ */
+static void apply_mtime(const char *path, uint64_t mtime_ns)
+{
+    struct timespec times[2];
+    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
+    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[1] = times[0];
+    if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
+        log_warn("restore: utimensat %s: %s", path, strerror(errno));
+}
+
 /* Metadata for something the kernel must not follow: a symlink's own
  * ownership and timestamps, never its target's. */
 static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid,
@@ -483,7 +499,12 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
-        report(opts, "restore", (uint64_t)i, (uint64_t)r->nrows);
+        /* i + 1: this is the entry being worked on, not the count already
+         * finished. Reporting the bare index meant the last entry of a
+         * restore was announced as 6414 of 6415 and the job then completed,
+         * so a progress bar stopped just short of full every time and read
+         * as a stall at the worst possible moment. */
+        report(opts, "restore", (uint64_t)i + 1, (uint64_t)r->nrows);
 
         const char *id      = r->rows[i][0];
         uint32_t    mode    = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
@@ -524,6 +545,12 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 st = set_error_errno(ERR_IO, "restore: mkdir %s", full);
                 break;
             }
+            /* Mode and ownership are final here; the mtime is not. Writing
+             * a file into a directory updates that directory's mtime, so
+             * whatever is set now is overwritten by the children that follow
+             * and the restored directory ends up stamped with the time of
+             * the restore. It is reapplied in the pass below, after
+             * everything has been written. */
             apply_metadata(full, mode, uid, gid, mtime);
             apply_xattrs(store, full, xhash);
             apply_acls(store, full, ahash, 1);
@@ -706,6 +733,39 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     hardlink_map_free(&hlinks);
+
+    /*
+     * Directory mtimes, now that nothing else will be written.
+     *
+     * A directory's mtime tracks changes to its entries, so every file
+     * restored into it moved it forward again. Restoring 5722 files left 575
+     * of 689 directories stamped with the moment of the restore rather than
+     * the moment they were backed up - modes and ownership were right, so it
+     * looked like metadata was being preserved, and only the timestamps were
+     * silently today's date.
+     *
+     * The same rows, walked again: directories sort first in this result set
+     * and it is already in memory, so this costs a second scan of a prefix
+     * and no allocation. Order does not matter here - setting a timestamp on
+     * a child does not touch its parent, only creating and removing entries
+     * does, and all of that is finished.
+     */
+    for (int i = 0; i < r->nrows; i++) {
+        if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_DIR) break;
+        if (cancelled(opts)) break;
+
+        char rel[PATH_MAX], full[PATH_MAX];
+        if (node_rel_path(db, repo, snap, r->rows[i][0], rel, sizeof(rel)) != OK) {
+            err_clear();
+            continue;
+        }
+        if (opts->subpath && !path_within(rel, opts->subpath)) continue;
+        if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
+            continue;
+
+        apply_mtime(full, strtoull(r->rows[i][5], NULL, 10));
+    }
+
     db_result_free(r);
     if (st != OK) return st;
 
