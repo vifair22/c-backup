@@ -21,6 +21,7 @@ import { TagsView } from './TagsView'
 import { SchedulesView } from './SchedulesView'
 import { VerifyView } from './VerifyView'
 import { KeyView } from './KeyView'
+import { GrepView } from './GrepView'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -67,7 +68,7 @@ export function App(): React.ReactElement {
        || activeRepo.path.split('/').pop() || activeRepo.path)
     : ''
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -690,6 +691,7 @@ export function App(): React.ReactElement {
                 onViewSchedules={() => navigateTo({ view: 'schedules' })}
                 onViewVerify={() => navigateTo({ view: 'verify' })}
                 onViewEncryption={() => navigateTo({ view: 'encryption' })}
+                onViewGrep={() => navigateTo({ view: 'grep' })}
                 onViewTasks={() => navigateTo({ view: 'tasks' })}
                 onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
                 onLooseObjects={() => navigateTo({ view: 'loose-objects' })}
@@ -738,6 +740,11 @@ export function App(): React.ReactElement {
             )}
             {currentView.view === 'encryption' && (
               <KeyView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                onBack={navBack}
+              />
+            )}
+            {currentView.view === 'grep' && (
+              <GrepView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}

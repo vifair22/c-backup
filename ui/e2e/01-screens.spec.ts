@@ -63,6 +63,25 @@ test('encryption: an unencrypted repository says so', async () => {
   await h.page.getByRole('button', { name: /^back$/i }).first().click()
 })
 
+test('find in files: searches contents and shows hits', async () => {
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /find in files/i }).first().click()
+  await expect(h.page.getByText('Search file contents').first()).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/10-grep-empty.png', fullPage: true })
+
+  /* The fixture writes "the quick brown fox" into notes.txt. */
+  await h.page.getByPlaceholder(/text to look for/i).fill('quick brown')
+  await h.page.getByRole('button', { name: /^search$/i }).click()
+
+  /* A search is a job, so the result appears when the daemon finishes
+   * reading the snapshot rather than when the click returns. */
+  await expect(h.page.getByText('quick brown', { exact: false }).first())
+    .toBeVisible({ timeout: 20_000 })
+  await expect(h.page.getByText('notes.txt', { exact: false }).first()).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/11-grep-hits.png', fullPage: true })
+  await h.page.getByRole('button', { name: /^back$/i }).first().click()
+})
+
 test('encryption: an unsaved key is called out', async () => {
   await openRepo(h.page, 'Photos')
   await h.page.getByRole('button', { name: /encryption/i }).first().click()

@@ -90,6 +90,7 @@ interface Props {
   onViewSchedules?: () => void
   onViewVerify?: () => void
   onViewEncryption?: () => void
+  onViewGrep?: () => void
   onRunBackup?: () => void
   onRunOperation?: (command: MaintenanceOp) => void
   onViewTasks?: () => void
@@ -98,7 +99,7 @@ interface Props {
   onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
+export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onViewGrep, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
@@ -233,6 +234,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
       <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
         {/* Browse */}
         {onSearch && <QBtn onClick={onSearch}>Search</QBtn>}
+        {onViewGrep && <QBtn onClick={onViewGrep}>Find in files</QBtn>}
         {onViewAllSnapshots && <QBtn onClick={onViewAllSnapshots}>Snapshots</QBtn>}
         {onCompareSnapshots && snaps.length >= 2 && <QBtn onClick={() => onCompareSnapshots()}>Compare</QBtn>}
 

@@ -81,6 +81,36 @@ test('starting a backup hands over immediately', async () => {
   expect(ms, 'starting a job must not wait for the job').toBeLessThan(BUDGET_MS.submit)
 })
 
+test('the content search screen opens instantly', async () => {
+  /*
+   * The search itself is slow by nature - it reads every file in a snapshot.
+   * Opening the screen is not, and the two must not be confused: a screen
+   * that waits for a search before it renders would make an honest delay
+   * look like a broken app.
+   */
+  await h.page.getByText('Documents', { exact: true }).first().click()
+  await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+
+  const ms = await timed('open find-in-files', BUDGET_MS.navigation, async () => {
+    await h.page.getByRole('button', { name: /find in files/i }).first().click()
+    await expect(h.page.getByText('Search file contents').first()).toBeVisible()
+  })
+  expect(ms).toBeLessThan(BUDGET_MS.navigation)
+
+  /* Submitting is a handoff too: the daemon accepts the search and reads in
+   * the background, so the click returns before any file is opened. */
+  await h.page.getByPlaceholder(/text to look for/i).fill('quick brown')
+  const submit = await timed('submit search', BUDGET_MS.submit, async () => {
+    await h.page.getByRole('button', { name: /^search$/i }).click()
+    await expect(h.page.getByText('Searching...').first()).toBeVisible()
+  })
+  expect(submit, 'submitting a search must not wait for the search').toBeLessThan(BUDGET_MS.submit)
+
+  await expect(h.page.getByText('notes.txt', { exact: false }).first())
+    .toBeVisible({ timeout: 20_000 })
+  await h.page.getByRole('button', { name: /^back$/i }).first().click()
+})
+
 test('switching between repositories', async () => {
   const ms = await timed('switch repository', BUDGET_MS.navigation, async () => {
     await h.page.getByText('Photos', { exact: true }).first().click()
