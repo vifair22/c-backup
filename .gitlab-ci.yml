@@ -157,6 +157,55 @@ ui:
     paths:
       - ui/tests/
 
+# The screen suites, against a real daemon and a real Electron window.
+#
+# Separate from `ui` above because the cost profile is completely different:
+# that one needs nothing fetched, this one installs the dependency tree,
+# downloads Electron, builds the renderer and runs a browser under Xvfb. It
+# is also the suite that has found the most: every screen that rendered rows
+# of blanks did so while the contract suite was green, because a request that
+# reaches a real route can still be read with the wrong field names.
+#
+# allow_failure is deliberate for now. A windowed test under Xvfb has more
+# ways to be flaky than a unit test, and a suite that blocks a merge for a
+# reason nobody can reproduce gets ignored rather than fixed. Turn it off
+# once it has a few weeks of green behind it.
+ui-e2e:
+  stage: analyze
+  image: node:24-trixie-slim
+  tags: [docker]
+  needs:
+    - job: test
+      artifacts: true
+  allow_failure: true
+  before_script:
+    - apt-get update -qq
+    # What the daemon links against, plus what Electron needs to open a
+    # window at all. Chromium's list is long and every one of them is a
+    # hard requirement: a missing library shows up as the app failing to
+    # start, which reads like the suite is broken.
+    - apt-get install -y -qq --no-install-recommends
+        libmicrohttpd12t64 liblz4-1 libssl3t64 libacl1 libsqlite3-0 libcurl4t64
+        xvfb libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2
+        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
+        libasound2t64 libpango-1.0-0 libcairo2 libgtk-3-0t64
+  script:
+    - cd ui
+    - npm ci
+    - npm run build
+    # Electron refuses to run as root without this, and a CI container is
+    # root. Sandboxing buys nothing here: the thing under test is the app.
+    - export ELECTRON_DISABLE_SANDBOX=1
+    - xvfb-run -a npx playwright test
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      # The screenshots each spec takes on the way through. A layout is
+      # easier to judge from a picture than from a passing assertion, and
+      # these are the pictures a review looks at.
+      - ui/test-results/
+
 coverage:
   stage: coverage
   image: debian:trixie
