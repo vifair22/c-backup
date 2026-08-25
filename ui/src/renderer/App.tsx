@@ -9,6 +9,7 @@ import { RepoView } from './RepoView'
 import { SnapshotList } from './SnapshotList'
 import { SnapshotBrowser } from './SnapshotBrowser'
 import { SnapshotDiff } from './SnapshotDiff'
+import { DaemonStatus } from './DaemonStatus'
 import { FileSearch } from './FileSearch'
 import { PolicyEditor } from './PolicyEditor'
 import { HashLookup } from './HashLookup'
@@ -70,6 +71,13 @@ export function App(): React.ReactElement {
   // Navigation history
   type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' } | { view: 'grep' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
+  /*
+   * The daemon status screen is scoped to a connection, not a repository, so
+   * it sits beside the repo views rather than inside them: the question it
+   * answers is about the daemon, and it has to be reachable when no
+   * repository is open at all.
+   */
+  const [statusConn, setStatusConn] = useState<string | null>(null)
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
 
@@ -348,6 +356,9 @@ export function App(): React.ReactElement {
 
   const handleOpenRepo = async (connName: string, repoPath: string, repoId: number) => {
     setError(null)
+    /* Opening a repository leaves the daemon screen, which otherwise sits
+     * in front of it. */
+    setStatusConn(null)
     setActiveRepo({ conn: connName, id: repoId, path: repoPath })
     setNavHistory([{ view: 'dashboard' }])
     setNavIndex(0)
@@ -518,6 +529,7 @@ export function App(): React.ReactElement {
             await refreshConnections()
           }},
           { label: 'Restart', onClick: () => handleRestartConnection(conn.config.name) },
+          { label: 'Daemon status', onClick: () => setStatusConn(conn.config.name) },
         ] : []),
         { label: 'Delete', danger: true, onClick: () => handleRemoveConnection(conn.config.name) },
       ]
@@ -676,7 +688,9 @@ export function App(): React.ReactElement {
           </div>
         )}
 
-        {activeRepo ? (
+        {statusConn ? (
+          <DaemonStatus connName={statusConn} onBack={() => setStatusConn(null)} />
+        ) : activeRepo ? (
           <>
             {currentView.view === 'dashboard' && (
               <RepoView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
@@ -793,6 +807,12 @@ export function App(): React.ReactElement {
           <div className="text-text-muted text-center mt-16">
             <div className="text-xl mb-2 text-text-secondary">c-backup</div>
             <div className="text-sm">Add a connection and open a repository to get started.</div>
+            {connections.some(c => c.status === 'connected') && (
+              <button onClick={() => setStatusConn(connections.find(c => c.status === 'connected')!.config.name)}
+                className="text-xs mt-4 underline cursor-pointer bg-transparent border-none text-accent p-0">
+                Check the daemon
+              </button>
+            )}
           </div>
         )}
       </div>

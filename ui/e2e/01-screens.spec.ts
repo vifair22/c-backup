@@ -329,6 +329,44 @@ test('diff: what changed between two snapshots', async () => {
   await h.page.screenshot({ path: 'test-results/diff-content.png' })
 })
 
+test('daemon: whether anything is wrong', async () => {
+  /*
+   * `health` and `metrics` were reachable from the CLI and from nothing in
+   * the app, which meant the single most important number in a backup
+   * system - how long since anything was backed up - lived in Prometheus and
+   * in a terminal, and nowhere a person would look.
+   *
+   * /metrics is Prometheus text, so it also could not have worked before:
+   * the transport put any non-JSON body under `error`, so a successful
+   * response arrived looking like a failure.
+   */
+  await h.page.reload()
+  await h.page.getByText('This machine', { exact: false }).first().click({ button: 'right' })
+  await h.page.getByText('Daemon status').click()
+  await expect(h.page.getByRole('heading', { name: 'Daemon' })).toBeVisible()
+
+  /* Ready, not merely up: the process stays alive when its database stops
+   * answering, which is the failure that actually happens. */
+  await expect(h.page.getByText('ready', { exact: true })).toBeVisible()
+
+  /*
+   * Parsed metrics, not an error blob. The fixture registers two
+   * repositories and takes two snapshots, so both are known values rather
+   * than "some number appeared".
+   */
+  await expect(h.page.getByText('Repositories', { exact: true })).toBeVisible()
+  await expect(h.page.getByText('Newest snapshot', { exact: true })).toBeVisible()
+  /* The age of the newest snapshot, which is the number this screen exists
+   * for. Seconds, because the fixture just made it. */
+  await expect(h.page.getByText(/^\d+s ago$/).first()).toBeVisible()
+
+  /* The encrypted fixture repo has never had its key acknowledged, so the
+   * screen should be saying so rather than reporting all clear. */
+  await expect(h.page.getByText(/exists only on this machine/i)).toBeVisible()
+
+  await h.page.screenshot({ path: 'test-results/daemon-status.png', fullPage: true })
+})
+
 test('snapshots: deleting one, which the app could not do at all', async () => {
   /*
    * The CLI has had `snapshot delete` since the rewrite; the app had no way

@@ -85,9 +85,17 @@ export class DaemonClient {
             try {
               parsed = JSON.parse(text)
             } catch {
-              // Non-JSON from an API that always returns JSON means something
-              // is wrong upstream; surface the text rather than hide it.
-              parsed = { error: text }
+              /*
+               * Almost every route returns JSON, so unparseable text
+               * alongside a failure status is an upstream problem and the
+               * text is the most useful thing to surface.
+               *
+               * /metrics is the exception: Prometheus exposition format is
+               * text by definition, and a successful response was being
+               * reported as an error because of where it landed. A 2xx that
+               * is not JSON is a body, not a fault.
+               */
+              parsed = (res.statusCode ?? 0) >= 400 ? { error: text } : { text }
             }
           }
           resolve({ status: res.statusCode ?? 0, body: parsed as T })

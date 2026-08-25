@@ -205,6 +205,24 @@ test('the introspection screens', async () => {
   await h.page.getByRole('button', { name: /back/i }).first().click()
 })
 
+test('the daemon status screen', async () => {
+  /*
+   * Three requests and a text parse, so it should be no slower than a
+   * screen that makes one. It also polls while open, which is the thing to
+   * watch: a poll that cost real time would make the whole app feel heavy
+   * while this screen sits in front.
+   */
+  await h.page.getByText('This machine', { exact: false }).first().click({ button: 'right' })
+  await h.page.getByText('Daemon status').click()
+
+  const ms = await timed('open daemon status', BUDGET_MS.navigation, async () => {
+    await expect(h.page.getByRole('heading', { name: 'Daemon' })).toBeVisible()
+    await expect(h.page.getByText('Newest snapshot', { exact: true })).toBeVisible()
+  })
+  expect(ms).toBeLessThan(BUDGET_MS.navigation)
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+})
+
 test('switching between repositories', async () => {
   const ms = await timed('switch repository', BUDGET_MS.navigation, async () => {
     await h.page.getByText('Photos', { exact: true }).first().click()
