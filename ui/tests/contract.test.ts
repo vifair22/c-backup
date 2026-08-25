@@ -146,6 +146,8 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   keyImport:       { kind: 'keyImport', repoId: 1, key: '00'.repeat(32) },
   keyAck:          { kind: 'keyAck', repoId: 1 },
 
+  sourcesGet:      { kind: 'sourcesGet', repoId: 1 },
+  sourcesSet:      { kind: 'sourcesSet', repoId: 1, sources: ['/nonexistent/contract-probe'] },
   backup:          { kind: 'backup', repoId: 1, paths: ['/nonexistent/contract-probe'] },
   restore:         { kind: 'restore', repoId: 1, snapshotId: 1, dest: '/nonexistent/contract-probe' },
 

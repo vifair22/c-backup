@@ -52,8 +52,14 @@ export type ApiRequest =
   | { kind: 'keyImport'; repoId: number; key: string }
   | { kind: 'keyAck'; repoId: number }
 
-  /* --- the two that matter most, and the two that were broken --- */
-  | { kind: 'backup'; repoId: number; paths: string[]
+  /* --- what a repo backs up, configured once --- */
+  | { kind: 'sourcesGet'; repoId: number }
+  | { kind: 'sourcesSet'; repoId: number; sources: string[]; exclude?: string[] }
+
+  /* --- the two that matter most, and the two that were broken ---
+   * paths is optional: omitted, the daemon uses the repository's own
+   * sources, which is what a button with nothing typed into it means. */
+  | { kind: 'backup'; repoId: number; paths?: string[]
       label?: string; exclude?: string[]; oneFilesystem?: boolean }
   | { kind: 'restore'; repoId: number; snapshotId: number; dest: string
       subpath?: string; overwrite?: boolean }

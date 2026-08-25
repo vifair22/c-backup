@@ -113,6 +113,9 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
      * night at two in the morning, and the log is the only place that says
      * so.
      */
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
     CUTILS_AUTOFREE char *dest = NULL;
     CUTILS_AUTOFREE char *params = NULL;
     if (json_req_get_str_opt(body, "dest", &dest) != 0) dest = NULL;
@@ -140,8 +143,28 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
                 free(sp);
             }
         }
-        if (npaths == 0)
-            return api_error(400, "a backup schedule needs at least one source path");
+        /*
+         * No paths given is fine when the repository has some configured -
+         * that is the ordinary case, since sources belong to the repo. What
+         * is refused is a schedule with nowhere to read from at all, which
+         * would otherwise fail nightly with only a log line to say so.
+         */
+        if (npaths == 0) {
+            db_result_t *cnt = NULL;
+            long have = 0;
+            if (db_execute(g_db,
+                    "SELECT COUNT(*) FROM repo_backup_paths"
+                    " WHERE repo_id = ? AND kind = 'source'",
+                    (const char *[]){ repo, NULL }, &cnt) == 0 && cnt && cnt->nrows == 1)
+                have = strtol(cnt->rows[0][0], NULL, 10);
+            db_result_free(cnt);
+
+            if (have == 0)
+                return api_error(400,
+                                 "this repository has no backup sources configured, "
+                                 "and none were given");
+            params = NULL;   /* the job reads them from the repository */
+        }
 
         char  *pbuf = NULL;
         size_t plen = 0;
@@ -182,8 +205,7 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (trigger_serialise(&t, spec, sizeof(spec)) != OK)
         return api_error(400, err_msg());
 
-    char repo[32], due[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    char due[32];
     time_t now = time(NULL);
     snprintf(due, sizeof(due), "%lld", (long long)trigger_next_fire(&t, now, 0));
 

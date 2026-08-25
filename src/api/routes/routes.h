@@ -93,6 +93,11 @@ api_response_t metadata_note_get(const api_request_t *req, int64_t repo_id,
                                  int64_t snap_id);
 api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
                                  int64_t snap_id);
+/* What a repository backs up, so it is configured once rather than named on
+ * every run. A request that names paths still overrides. */
+api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id);
+api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id);
+
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id);
 api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id);
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id);

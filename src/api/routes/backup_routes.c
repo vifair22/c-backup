@@ -47,6 +47,58 @@ typedef struct {
 
 static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j);
 
+/*
+ * Fall back to what the repository is configured to back up.
+ *
+ * A request that names paths is taken at its word - the CLI saying exactly
+ * what it will read is the behaviour worth keeping. One that names none used
+ * to be refused, which left the desktop button and every schedule with
+ * nowhere to get them and is why neither worked.
+ *
+ * Excludes are only taken from configuration when the request supplied none
+ * either. A request that listed excludes has said what it wants excluded,
+ * and quietly adding more would mean a backup skipping files nobody asked it
+ * to skip.
+ */
+static void backup_fill_from_config(backup_job_t *j)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)j->repo_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(j->db,
+            "SELECT kind, value FROM repo_backup_paths WHERE repo_id = ?"
+            " ORDER BY kind, value",
+            (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return;
+    }
+
+    int want_paths = (j->n_paths == 0);
+    int want_excl  = (j->n_excludes == 0);
+
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        const char *kind = r->rows[i][0];
+        const char *val  = r->rows[i][1];
+        if (!val || !*val) continue;
+
+        int is_excl = (kind && strcmp(kind, "exclude") == 0);
+        if (is_excl && !want_excl) continue;
+        if (!is_excl && !want_paths) continue;
+
+        char *copy = strdup(val);
+        if (!copy) break;
+
+        char ***list = is_excl ? &j->excludes : &j->paths;
+        int    *n    = is_excl ? &j->n_excludes : &j->n_paths;
+        char  **grown = realloc(*list, (size_t)(*n + 1) * sizeof(**list));
+        if (!grown) { free(copy); break; }
+        *list = grown;
+        (*list)[(*n)++] = copy;
+    }
+    db_result_free(r);
+}
+
 static void backup_job_free(void *p)
 {
     backup_job_t *j = p;
@@ -226,9 +278,13 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
         backup_opts_from_json(body, j);
     }
 
+    backup_fill_from_config(j);
+
     if (j->n_paths == 0) {
         backup_job_free(j);
-        return api_error(400, "at least one source path is required");
+        return api_error(400,
+                         "no source paths given and none configured; "
+                         "set them with PUT /repos/<id>/sources");
     }
 
     int64_t job_id = 0;
@@ -335,10 +391,13 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
         backup_opts_from_json(body, j);
     }
 
+    backup_fill_from_config(j);
+
     if (j->n_paths == 0) {
         backup_job_free(j);
         return set_error(ERR_INVALID,
-                         "backup schedule for repo %lld has no source paths",
+                         "backup schedule for repo %lld has no source paths "
+                         "and the repository has none configured",
                          (long long)repo_id);
     }
 

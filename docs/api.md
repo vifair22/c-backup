@@ -154,7 +154,8 @@ lazily on first append, which used to leave an empty result serialising as
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}` |
+| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used |
+| GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
@@ -243,6 +244,20 @@ only happens at pack time: a backup that stopped at the snapshot would have
 written more bytes than it read and left one file per object behind. Set the
 policy key `maintenance.auto_pack` to `false` to turn it off, and use this
 endpoint or a schedule to pack on your own terms instead.
+
+### Sources belong to the repository
+
+A backup used to carry its paths in every request. That is right for the CLI,
+where `backup 1 /home/me` reads exactly what it says, and wrong for
+everything else: a desktop button had nowhere to get them and no way to ask,
+and a schedule had the same problem. Both were broken because of it.
+
+`PUT /repos/<id>/sources` stores them once. After that a backup with no
+`paths` uses them, so the same configuration serves an ad-hoc run, a button
+and a timer. A request that does name paths still overrides, because the
+CLI's explicitness is worth keeping - and excludes are only inherited when
+the request supplies none, since a request that listed some has said what it
+wants excluded.
 
 ### Replication
 

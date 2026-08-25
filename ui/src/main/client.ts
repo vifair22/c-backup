@@ -81,6 +81,16 @@ export function toEndpoint(req: ApiRequest): Endpoint {
     case 'keyAck':
       return { method: 'POST', path: `/repos/${req.repoId}/key/ack` }
 
+    /* --- configured sources --- */
+    case 'sourcesGet':
+      return { method: 'GET', path: `/repos/${req.repoId}/sources` }
+    case 'sourcesSet':
+      return {
+        method: 'PUT',
+        path: `/repos/${req.repoId}/sources`,
+        body: { sources: req.sources, exclude: req.exclude ?? [] },
+      }
+
     /* --- backup and restore --- */
     case 'backup':
       return {

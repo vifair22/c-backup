@@ -413,6 +413,7 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     if (strcmp(rest, "/tags") == 0)      return metadata_tags_get(req, repo_id);
     if (strcmp(rest, "/schedules") == 0) return schedules_get(req, repo_id);
     if (strcmp(rest, "/policy") == 0)  return metadata_policy_get(req, repo_id);
+    if (strcmp(rest, "/sources") == 0) return metadata_sources_get(req, repo_id);
     if (strcmp(rest, "/journal") == 0) return metadata_journal_get(req, repo_id);
 
     /* Introspection: what is actually inside the repository. */
@@ -464,6 +465,7 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
     if (repo_id < 0) return api_error(400, "invalid repo id");
 
     if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
+    if (strcmp(rest, "/sources") == 0) return metadata_sources_put(req, repo_id);
 
     if (strncmp(rest, "/schedules/", 11) == 0) {
         char *end = NULL;

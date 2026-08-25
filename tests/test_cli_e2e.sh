@@ -467,6 +467,41 @@ cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
 
+echo "configured sources"
+
+# Sources belong to the repository, not to each run. The CLI naming them is
+# right for the CLI; a desktop button and a schedule have nowhere to get them
+# from, which is why neither worked. Configure once, then back up with a bare
+# command, a click, or a timer.
+mkdir -p "$WORK/othersrc"
+echo "other content" > "$WORK/othersrc/other.txt"
+
+OUT=$(cb backup 2 2>&1); RC=$?
+check    "a bare backup with nothing configured is refused" 1 "$RC"
+contains "and says how to configure it" "sources" "$OUT"
+
+cb sources set 1 "$WORK/src" --exclude '*.tmp' >/dev/null
+OUT=$(cb sources list 1)
+contains "sources round-trip"  "$WORK/src" "$OUT"
+contains "excludes round-trip" '*.tmp'     "$OUT"
+
+# The point of the whole feature: no paths on the command line.
+BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)
+cb backup 1 >/dev/null
+AFTER=$(cb snapshots 1 | grep -o '"id"' | wc -l)
+check "a bare backup uses the configured sources" "$((BEFORE + 1))" "$AFTER"
+
+# And naming paths still overrides, so the explicit form is unchanged.
+cb backup 1 "$WORK/othersrc" >/dev/null
+# Newest first, so the snapshot just made is the head of the list.
+LAST=$(cb snapshots 1 | tr '}' '\n' | grep -o '"id":"[0-9]*"' | head -1 | tr -dc '0-9')
+cb restore 1 "$LAST" "$WORK/overrideout" >/dev/null 2>&1
+if find "$WORK/overrideout" -name 'other.txt' | grep -q .; then
+    ok "an explicit path still overrides the configured sources"
+else
+    bad "an explicit path still overrides the configured sources" "other.txt" "absent"
+fi
+
 echo "scheduled backups"
 
 # A backup schedule was accepted, listed as enabled, and then failed on every
@@ -479,9 +514,15 @@ check    "an unrunnable action is refused" 1 "$RC"
 contains "and lists what can be scheduled" "cannot be scheduled" "$OUT"
 
 # Backup needs sources. Checked at creation, not at two in the morning.
+OUT=$(cb schedule add 2 backup 3600 2>&1); RC=$?
+check    "a backup schedule for a repo with no sources is refused" 1 "$RC"
+contains "and says what is missing" "sources" "$OUT"
+
+# With sources configured, a schedule needs nothing else.
 OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
-check    "a backup schedule without sources is refused" 1 "$RC"
-contains "and says what is missing" "source path" "$OUT"
+check    "a backup schedule inherits the repo sources" 0 "$RC"
+SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+[ -n "$SID0" ] && cb schedule remove 1 "$SID0" >/dev/null 2>&1
 
 # The one that proves it: a one-second interval must produce real snapshots.
 BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)

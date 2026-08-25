@@ -453,8 +453,10 @@ static int cmd_backup(int argc, char **argv)
         excl[n_excl++] = e;
     }
 
-    if (argc < 2)
-        return fail("usage: backup <repo-id> <path> [path...] "
+    /* Paths are optional now: a repository can hold its own, which is what
+     * a desktop button and a schedule use. */
+    if (argc < 1)
+        return fail("usage: backup <repo-id> [path...] "
                     "[--exclude PATTERN]... [--one-filesystem] [--label TEXT] "
                     "[--no-wait]");
 
@@ -750,6 +752,57 @@ static int cmd_reindex(int argc, char **argv)
  * they are stored in, so an encrypted repository stays encrypted at the far
  * end and the target never needs the key.
  */
+/*
+ * What a repository backs up.
+ *
+ * Configured once and then used by a bare `backup <id>`, by the desktop
+ * button and by a schedule. Naming paths on a backup still overrides, so the
+ * explicit form keeps working exactly as it did.
+ */
+static int cmd_sources(int argc, char **argv)
+{
+    if (argc < 2) return fail("usage: sources <list|set> <repo-id> [path...] "
+                              "[--exclude PAT]...");
+
+    if (strcmp(argv[0], "list") == 0)
+        return get_repo_scoped(argv[1], "/sources", NULL);
+
+    if (strcmp(argv[0], "set") == 0) {
+        int a = argc; char **v = argv;
+        const char *excl[64];
+        int n_excl = 0;
+        for (;;) {
+            const char *e = take_opt_multi(&a, v, "--exclude");
+            if (!e) break;
+            if (n_excl == (int)(sizeof(excl) / sizeof(excl[0])))
+                return fail("too many --exclude patterns");
+            excl[n_excl++] = e;
+        }
+        if (a < 2) return fail("usage: sources set <repo-id> <path>... [--exclude PAT]...");
+
+        sbuf_t b = { 0 };
+        sb_puts(&b, "{\"sources\":[");
+        for (int i = 2; i < a; i++) {
+            if (i > 2) sb_puts(&b, ",");
+            sb_json_str(&b, v[i]);
+        }
+        sb_puts(&b, "],\"exclude\":[");
+        for (int i = 0; i < n_excl; i++) {
+            if (i) sb_puts(&b, ",");
+            sb_json_str(&b, excl[i]);
+        }
+        sb_puts(&b, "]}");
+
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/repos/"); sb_puts(&p, v[1]); sb_puts(&p, "/sources");
+        if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+        int rc = call("PUT", p.buf, b.buf);
+        free(p.buf); free(b.buf);
+        return rc;
+    }
+    return fail("usage: sources <list|set> <repo-id> [path...]");
+}
+
 static int cmd_replicate(int argc, char **argv)
 {
     int no_wait = take_flag(&argc, argv, "--no-wait");
@@ -1107,7 +1160,8 @@ static const struct {
     const char *usage;
 } COMMANDS[] = {
     { "repo",      cmd_repo,      "repo <list|add|show|remove|key> [args]  (add: [--encrypt system|passphrase] [--passphrase TEXT]; key: <export|import|ack> <repo-id>)" },
-    { "backup",    cmd_backup,    "backup <repo-id> <path>... [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
+    { "sources",   cmd_sources,   "sources <list|set> <repo-id> [path...] [--exclude PAT]..." },
+    { "backup",    cmd_backup,    "backup <repo-id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
     { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite] [--no-wait]" },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },

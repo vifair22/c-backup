@@ -210,6 +210,149 @@ int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int de
     return out;
 }
 
+/*
+ * What this repository backs up.
+ *
+ * Sources are a property of the repository rather than of each run, so they
+ * are configured once and then used by the desktop button, by a schedule,
+ * and by a bare `backup <id>`. A request that names paths still overrides
+ * them: the CLI saying exactly what it will read is worth keeping.
+ */
+api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id)
+{
+    (void)req;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(g_db,
+            "SELECT kind, value FROM repo_backup_paths WHERE repo_id = ?"
+            " ORDER BY kind, value",
+            (const char *[]){ repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return api_error(500, "cannot read backup sources");
+    }
+
+    cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
+    /* Both arrays up front, so a repository with no excludes still answers
+     * with the key and a client can iterate unconditionally. */
+    if (json_resp_ensure_array(resp, "sources") != 0) { /* alloc only */ }
+    if (json_resp_ensure_array(resp, "exclude") != 0) { /* alloc only */ }
+
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        const char *kind = r->rows[i][0];
+        const char *val  = r->rows[i][1];
+        const char *key  = (kind && strcmp(kind, "exclude") == 0) ? "exclude" : "sources";
+        if (json_resp_array_append_str(resp, key, val) != 0) break;
+    }
+    db_result_free(r);
+
+    char  *body = NULL;
+    size_t len  = 0;
+    if (json_resp_finalize(resp, &body, &len) != 0) {
+        json_resp_free(resp);
+        return api_error(500, "out of memory");
+    }
+    json_resp_free(resp);
+    return api_ok(body);
+}
+
+/*
+ * Replace them wholesale.
+ *
+ * Not a merge: the caller sends the list it wants, which is what an editor
+ * with an Apply button produces. Merging would leave no way to remove the
+ * last source, and "remove by sending everything except that one" is the
+ * shape a form already has.
+ */
+api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
+{
+    if (!req->body || req->body_len == 0)
+        return api_error(400, "a body with sources is required");
+
+    CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
+    if (json_req_parse(req->body, req->body_len, &body) != 0)
+        return api_error(400, "invalid JSON");
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    /* Collected before anything is written, so a rejected path leaves the
+     * existing configuration alone rather than half-replaced. */
+    char  *paths[256];
+    char  *excl[256];
+    int    n_paths = 0, n_excl = 0;
+    api_response_t bad = { 0 };
+    int failed = 0;
+
+    CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
+    if (json_iter_begin(body, "sources", &it) == 0) {
+        while (json_iter_next(&it) && !failed) {
+            char *sp = NULL;
+            if (json_iter_get_str(&it, "", &sp) != 0 || !sp) continue;
+            if (sp[0] != '/') {
+                free(sp);
+                bad = api_error(400, "backup sources must be absolute paths");
+                failed = 1;
+                break;
+            }
+            if (n_paths == (int)(sizeof(paths) / sizeof(paths[0]))) { free(sp); break; }
+            paths[n_paths++] = sp;
+        }
+    }
+    CUTILS_AUTO_JSON_ITER cutils_json_iter_t ex;
+    if (!failed && json_iter_begin(body, "exclude", &ex) == 0) {
+        while (json_iter_next(&ex)) {
+            char *sp = NULL;
+            if (json_iter_get_str(&ex, "", &sp) != 0 || !sp) continue;
+            if (!*sp) { free(sp); continue; }
+            if (n_excl == (int)(sizeof(excl) / sizeof(excl[0]))) { free(sp); break; }
+            excl[n_excl++] = sp;
+        }
+    }
+
+    if (!failed) {
+        if (db_exec_raw(g_db, "BEGIN") != 0) {
+            failed = 1;
+            bad = api_error(500, "cannot begin");
+        }
+    }
+    if (!failed) {
+        if (db_execute_non_query(g_db,
+                "DELETE FROM repo_backup_paths WHERE repo_id = ?",
+                (const char *[]){ repo, NULL }, NULL) != 0)
+            failed = 1;
+
+        for (int i = 0; i < n_paths && !failed; i++)
+            if (db_execute_non_query(g_db,
+                    "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
+                    " VALUES (?, 'source', ?)",
+                    (const char *[]){ repo, paths[i], NULL }, NULL) != 0)
+                failed = 1;
+
+        for (int i = 0; i < n_excl && !failed; i++)
+            if (db_execute_non_query(g_db,
+                    "INSERT OR REPLACE INTO repo_backup_paths (repo_id, kind, value)"
+                    " VALUES (?, 'exclude', ?)",
+                    (const char *[]){ repo, excl[i], NULL }, NULL) != 0)
+                failed = 1;
+
+        if (failed) {
+            if (db_exec_raw(g_db, "ROLLBACK") != 0) log_error("sources: rollback failed");
+            bad = api_error(500, "cannot store backup sources");
+        } else if (db_exec_raw(g_db, "COMMIT") != 0) {
+            failed = 1;
+            bad = api_error(500, "cannot commit backup sources");
+        }
+    }
+
+    for (int i = 0; i < n_paths; i++) free(paths[i]);
+    for (int i = 0; i < n_excl; i++) free(excl[i]);
+    if (failed) return bad;
+    return api_no_content();
+}
+
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
