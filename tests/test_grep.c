@@ -227,6 +227,94 @@ static void test_path_prefix_scopes_the_search(void **state)
     free(hits);
 }
 
+/*
+ * A prefix decides what gets read, not what gets kept.
+ *
+ * This is the property that was wrong. The prefix used to be tested after
+ * every object in the snapshot had already been enumerated, and each
+ * candidate cost a query plus a parent walk per referencing node before
+ * being discarded - so scoping a search made it slower, and scoping it to
+ * something broad made it much slower. Measured against a real repository:
+ * 29 seconds unscoped became over 110 scoped to the whole tree.
+ *
+ * files_scanned is what proves it. Correctness was never the problem, so a
+ * test that only checks the hits passes either way.
+ */
+static void test_path_prefix_reads_only_the_subtree(void **state)
+{
+    (void)state;
+    int64_t snap = run_backup();
+
+    grep_opts_t all = opts_for("swordfish");
+    grep_result_t ra;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &all, NULL, NULL, NULL, &ra), OK);
+    assert_int_equal(ra.files_scanned, 3);   /* notes.txt, other.txt, conf/app.ini */
+
+    grep_opts_t one = opts_for("swordfish");
+    one.path_prefix = TEST_SRC "/conf";
+    grep_result_t ro;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &one, NULL, NULL, NULL, &ro), OK);
+    assert_int_equal(ro.files_matched, 1);
+    /* The two outside the prefix are never opened. */
+    assert_int_equal(ro.files_scanned, 1);
+}
+
+/*
+ * Both spellings of the same path.
+ *
+ * Search results carry an absolute path and grep hits do not, so somebody
+ * copying a path from one screen into the other would otherwise get silence
+ * rather than results.
+ */
+static void test_path_prefix_accepts_either_slash_form(void **state)
+{
+    (void)state;
+    int64_t snap = run_backup();
+
+    const char *forms[] = { TEST_SRC "/conf", TEST_SRC "/conf/" };
+    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+        grep_opts_t o = opts_for("swordfish");
+        o.path_prefix = forms[i];
+        grep_result_t res;
+        assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+        assert_int_equal(res.files_scanned, 1);
+        assert_int_equal(res.files_matched, 1);
+    }
+}
+
+/* A prefix naming a file searches that file and nothing else. */
+static void test_path_prefix_can_name_a_single_file(void **state)
+{
+    (void)state;
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("swordfish");
+    o.path_prefix = TEST_SRC "/notes.txt";
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_scanned, 1);
+    assert_int_equal(res.files_matched, 1);
+}
+
+/*
+ * A path that is not in the snapshot says so.
+ *
+ * Returning an empty result would be indistinguishable from "the pattern is
+ * not there", which sends somebody looking for the wrong thing - and a typo
+ * in a path is a far more likely explanation than a file having vanished.
+ */
+static void test_unknown_path_prefix_is_an_error(void **state)
+{
+    (void)state;
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("swordfish");
+    o.path_prefix = TEST_SRC "/nope";
+    grep_result_t res;
+    assert_int_not_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    err_clear();
+}
+
 /* A search that has found enough stops reading the repository. */
 static void test_max_files_stops_early(void **state)
 {
@@ -348,6 +436,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_bad_pattern_is_rejected, setup, teardown),
         cmocka_unit_test_setup_teardown(test_ignore_case, setup, teardown),
         cmocka_unit_test_setup_teardown(test_path_prefix_scopes_the_search, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_path_prefix_reads_only_the_subtree, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_path_prefix_accepts_either_slash_form, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_path_prefix_can_name_a_single_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unknown_path_prefix_is_an_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_max_files_stops_early, setup, teardown),
         cmocka_unit_test_setup_teardown(test_searches_packed_content, setup, teardown),
         cmocka_unit_test_setup_teardown(test_binary_file_matches_without_an_excerpt, setup, teardown),
