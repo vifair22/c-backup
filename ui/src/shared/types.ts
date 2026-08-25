@@ -109,7 +109,17 @@ export const IPC = {
   REPO_OPEN: 'repo:open',
   REPO_CLOSE: 'repo:close',
 
-  // RPC passthrough
+  /*
+   * The typed entry point. One channel rather than one per operation,
+   * because the request is a discriminated union and the main process
+   * switches on its `kind` with an exhaustiveness check - forty channels
+   * would buy the same safety for forty times the wiring.
+   */
+  API_CALL: 'api:call',
+
+  /* The old action-string passthrough, on its way out. Every component
+   * still using it is a component that has not been migrated; it goes when
+   * the last one has. */
   RPC_CALL: 'rpc:call',
 
   // Credential management

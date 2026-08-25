@@ -277,6 +277,19 @@ the schedule, since it belongs to the target rather than to the timing:
  "trigger":{"type":"calendar","every":"day","at":"03:00"}}
 ```
 
+A `backup` schedule carries its sources the same way:
+
+```json
+{"action":"backup","paths":["/home/me"],
+ "trigger":{"type":"calendar","every":"day","at":"02:00"}}
+```
+
+Backup was missing from the scheduler's dispatch table until now, and
+schedule creation validated no action at all - so the schedule was accepted,
+listed as enabled, and failed on every tick with nothing an operator could
+see. The action is now checked against the dispatcher's own list, so a
+schedule that cannot run cannot be created.
+
 `dest` is required for a `replicate` schedule and must be absolute, both
 checked when the schedule is created rather than when it first fires - a
 schedule that turns out to have nowhere to send anything otherwise fails

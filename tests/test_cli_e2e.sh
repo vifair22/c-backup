@@ -467,6 +467,36 @@ cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
 
+echo "scheduled backups"
+
+# A backup schedule was accepted, listed as enabled, and then failed on every
+# tick with "no scheduled job for action 'backup'". The single most important
+# thing a backup tool can schedule silently never ran, and nothing an
+# operator could see said so. Two causes: backup was missing from the
+# dispatch table, and schedule creation validated no action at all.
+OUT=$(cb schedule add 1 nonsense 3600 2>&1); RC=$?
+check    "an unrunnable action is refused" 1 "$RC"
+contains "and lists what can be scheduled" "cannot be scheduled" "$OUT"
+
+# Backup needs sources. Checked at creation, not at two in the morning.
+OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
+check    "a backup schedule without sources is refused" 1 "$RC"
+contains "and says what is missing" "source path" "$OUT"
+
+# The one that proves it: a one-second interval must produce real snapshots.
+BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)
+cb schedule add 1 backup 1 --source "$WORK/src" >/dev/null 2>&1
+FIRED=0
+for _ in $(seq 1 60); do
+    AFTER=$(cb snapshots 1 | grep -o '"id"' | wc -l)
+    if [ "$AFTER" -gt "$BEFORE" ]; then FIRED=1; break; fi
+    sleep 0.25
+done
+check "a scheduled backup produces a snapshot" 1 "$FIRED"
+contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
+SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+[ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
+
 echo "listen address"
 
 # http.bind has been a documented setting since the config was written,

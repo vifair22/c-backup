@@ -4,6 +4,7 @@ import { ConnectionManager } from './connection-manager'
 import { loadConfig, loadCredentials, updateWindowBounds } from './config-store'
 import { IPC } from '../shared/types'
 import type { ConnectionConfig } from '../shared/types'
+import type { ApiRequest } from '../shared/api'
 
 let mainWindow: BrowserWindow | null = null
 const connectionManager = new ConnectionManager()
@@ -138,6 +139,10 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(IPC.REPO_CLOSE, async (_e, connectionName: string, repoPath: string) => {
     return connectionManager.closeRepo(connectionName, Number(repoPath))
+  })
+
+  ipcMain.handle(IPC.API_CALL, async (_e, connectionName: string, req: ApiRequest) => {
+    return connectionManager.apiCall(connectionName, req)
   })
 
   ipcMain.handle(IPC.RPC_CALL, async (_e, connectionName: string, repoPath: string, action: string, params?: Record<string, unknown>) => {

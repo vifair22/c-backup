@@ -994,15 +994,35 @@ static int cmd_schedule(int argc, char **argv)
     if (strcmp(argv[0], "add") == 0) {
         int a = argc; char **v = argv;
         const char *cron = take_opt(&a, v, "--cron");
-        /* Replication is the one action that needs somewhere to go. */
+        /* Two actions carry parameters: replication needs somewhere to go,
+         * a backup needs somewhere to read from. Sources repeat, so they
+         * are drained rather than read once. */
         const char *dest = take_opt(&a, v, "--dest");
+        const char *src[32];
+        int n_src = 0;
+        for (;;) {
+            const char *sp = take_opt_multi(&a, v, "--source");
+            if (!sp) break;
+            if (n_src == (int)(sizeof(src) / sizeof(src[0])))
+                return fail("too many --source paths (max %zu)",
+                            sizeof(src) / sizeof(src[0]));
+            src[n_src++] = sp;
+        }
         if (a < 3) return fail("usage: schedule add <repo-id> <action> <seconds> | "
                                "schedule add <repo-id> <action> --cron '<spec>' "
-                               "[--dest PATH]");
+                               "[--dest PATH] [--source PATH]...");
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"action\":");
         sb_json_str(&b, v[2]);
         if (dest) { sb_puts(&b, ",\"dest\":"); sb_json_str(&b, dest); }
+        if (n_src > 0) {
+            sb_puts(&b, ",\"paths\":[");
+            for (int i = 0; i < n_src; i++) {
+                if (i) sb_puts(&b, ",");
+                sb_json_str(&b, src[i]);
+            }
+            sb_puts(&b, "]");
+        }
         if (cron) {
             sb_puts(&b, ",\"trigger\":{\"type\":\"cron\",\"spec\":");
             sb_json_str(&b, cron);
@@ -1110,7 +1130,7 @@ static const struct {
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [args]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args] [--dest PATH]" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args] [--source PATH]... [--dest PATH]" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
     { "auth",      cmd_auth,      "auth <setup|login|logout|password> [args]" },
     { "metrics",   cmd_metrics,   "metrics" },

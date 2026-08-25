@@ -87,6 +87,23 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (json_req_get_str_opt(body, "catchup", &catchup) != 0) catchup = NULL;
 
     /*
+     * Refuse an action the scheduler cannot dispatch.
+     *
+     * Nothing checked this, so any string was accepted: `schedule add 1
+     * backup 3600` returned an id, listed as enabled, and then failed on
+     * every tick with "no scheduled job for action 'backup'" - the most
+     * important thing a backup tool can schedule, silently never running,
+     * while the UI showed a healthy schedule. A typo did the same thing more
+     * quietly.
+     *
+     * The list is the dispatcher's own, so the two cannot disagree.
+     */
+    if (!routes_action_is_schedulable(action))
+        return api_error(400, "that action cannot be scheduled; "
+                              "use backup, verify, grep, gc, gfs, reindex, pack "
+                              "or replicate");
+
+    /*
      * Per-action parameters, stored in the schedules.params column that has
      * existed since the first migration and was never written to.
      *
@@ -99,6 +116,39 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *dest = NULL;
     CUTILS_AUTOFREE char *params = NULL;
     if (json_req_get_str_opt(body, "dest", &dest) != 0) dest = NULL;
+
+    if (strcmp(action, "backup") == 0) {
+        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
+        if (json_resp_new(&pr) != 0 || json_resp_ensure_array(pr, "paths") != 0)
+            return api_error(500, "cannot encode schedule parameters");
+
+        int npaths = 0;
+        CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
+        if (json_iter_begin(body, "paths", &it) == 0) {
+            while (json_iter_next(&it)) {
+                char *sp = NULL;
+                if (json_iter_get_str(&it, "", &sp) != 0 || !sp) continue;
+                if (sp[0] != '/') {
+                    free(sp);
+                    return api_error(400, "backup source paths must be absolute");
+                }
+                /* A bare string, which is what the route's own body holds
+                 * and what the parser on the other side iterates. The
+                 * element builder makes objects, so it is the wrong tool
+                 * here. */
+                if (json_resp_array_append_str(pr, "paths", sp) == 0) npaths++;
+                free(sp);
+            }
+        }
+        if (npaths == 0)
+            return api_error(400, "a backup schedule needs at least one source path");
+
+        char  *pbuf = NULL;
+        size_t plen = 0;
+        if (json_resp_finalize(pr, &pbuf, &plen) != 0)
+            return api_error(500, "cannot encode schedule parameters");
+        params = pbuf;
+    }
 
     if (strcmp(action, "replicate") == 0) {
         if (!dest || !*dest)

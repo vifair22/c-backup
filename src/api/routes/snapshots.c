@@ -935,10 +935,36 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
  * absent on purpose: it needs a destination, which a schedule has no way to
  * supply.
  */
+/*
+ * The actions a schedule may name.
+ *
+ * Kept beside the dispatcher below and derived from the same list, so a
+ * schedule cannot be created for something that will not run. Restore is
+ * absent deliberately: a restore on a timer repeatedly overwrites a tree.
+ */
+int routes_action_is_schedulable(const char *action)
+{
+    static const char *ok[] = {
+        "backup", "verify", "grep", "gc", "gfs", "reindex", "pack", "replicate",
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        if (strcmp(action, ok[i]) == 0) return 1;
+    return 0;
+}
+
 status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                  const char *action, const char *params,
                                  int64_t *out_job_id)
 {
+    /*
+     * Backup is a different job type, owned by backup_routes.c, so it is
+     * dispatched rather than mapped to a kind here. It was absent from this
+     * table entirely, which meant every scheduled backup failed on every
+     * tick while the schedule showed as enabled.
+     */
+    if (strcmp(action, "backup") == 0)
+        return routes_submit_backup(jm, repo_id, params, out_job_id);
+
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
     else if (strcmp(action, "grep") == 0)    kind = SNAP_JOB_GREP;

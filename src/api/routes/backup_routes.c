@@ -45,6 +45,8 @@ typedef struct {
     int          one_filesystem;
 } backup_job_t;
 
+static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j);
+
 static void backup_job_free(void *p)
 {
     backup_job_t *j = p;
@@ -221,6 +223,38 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
             backup_job_free(j);
             return api_error(400, "invalid JSON");
         }
+        backup_opts_from_json(body, j);
+    }
+
+    if (j->n_paths == 0) {
+        backup_job_free(j);
+        return api_error(400, "at least one source path is required");
+    }
+
+    int64_t job_id = 0;
+    status_t st = job_submit(ctx->jm, repo_id, "backup", NULL,
+                             backup_job_run, j, backup_job_free, &job_id);
+    if (st != OK) {
+        return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
+    }
+
+    char *out = NULL;
+    if (asprintf(&out, "{\"job_id\":%lld}", (long long)job_id) < 0)
+        return api_error(500, "out of memory");
+    return api_ok_status(202, out);
+}
+
+/*
+ * Fill a job from a request body.
+ *
+ * Shared with the scheduler, which submits the same job from the same shape
+ * of JSON held in schedules.params. One parser rather than two: a schedule
+ * that took a slightly different body from the route would be a second way
+ * to describe a backup, and the two would drift.
+ */
+static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j)
+{
+    {
         if (json_req_get_str_opt(body, "label", &j->label) != 0) j->label = NULL;
 
         CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
@@ -264,23 +298,52 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
         if (json_req_get_u32(body, "one_filesystem", &onefs, 0, 1) == 0)
             j->one_filesystem = (int)onefs;
     }
+}
+
+/*
+ * Submit a backup the scheduler asked for.
+ *
+ * A scheduled backup was accepted at creation and then failed on every tick
+ * with "no scheduled job for action 'backup'", because the dispatch table
+ * had no entry for it and nothing checked that at creation. The most
+ * important thing a backup tool can schedule silently never ran, and the
+ * schedule showed as enabled the whole time.
+ *
+ * The paths come from schedules.params, which is the same column and the
+ * same shape the route's body uses.
+ */
+status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
+                              const char *params_json, int64_t *out_job_id)
+{
+    backup_ctx_t *ctx = &g_ctx;
+
+    char *repo_path = repo_path_for(ctx->db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+
+    backup_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "backup job: alloc"); }
+    j->db = ctx->db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+
+    if (params_json && *params_json) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
+        if (json_req_parse(params_json, strlen(params_json), &body) != 0) {
+            backup_job_free(j);
+            return set_error(ERR_INVALID, "backup schedule: parameters are not JSON");
+        }
+        backup_opts_from_json(body, j);
+    }
 
     if (j->n_paths == 0) {
         backup_job_free(j);
-        return api_error(400, "at least one source path is required");
+        return set_error(ERR_INVALID,
+                         "backup schedule for repo %lld has no source paths",
+                         (long long)repo_id);
     }
 
-    int64_t job_id = 0;
-    status_t st = job_submit(ctx->jm, repo_id, "backup", NULL,
-                             backup_job_run, j, backup_job_free, &job_id);
-    if (st != OK) {
-        return api_error(st == ERR_BUSY ? 503 : 500, err_msg());
-    }
-
-    char *out = NULL;
-    if (asprintf(&out, "{\"job_id\":%lld}", (long long)job_id) < 0)
-        return api_error(500, "out of memory");
-    return api_ok_status(202, out);
+    return job_submit(jm ? jm : ctx->jm, repo_id, "backup", NULL,
+                      backup_job_run, j, backup_job_free, out_job_id);
 }
 
 /* ---------- jobs ---------- */

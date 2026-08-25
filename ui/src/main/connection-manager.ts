@@ -14,6 +14,8 @@
 import { EventEmitter } from 'node:events'
 import { DaemonClient, DaemonUnreachableError } from './rpc-session'
 import { mapAction } from './api-map'
+import { toEndpoint } from './client'
+import type { ApiRequest } from '../shared/api'
 import type {
   ConnectionConfig,
   ConnectionState,
@@ -191,6 +193,29 @@ export class ConnectionManager extends EventEmitter {
    * all have to change at once. Actions are translated to endpoints in
    * api-map.ts, which also names the ones that no longer exist.
    */
+  /*
+   * The typed entry point.
+   *
+   * Identical plumbing to rpcCall below, with the one difference that
+   * matters: the endpoint comes from client.ts rather than from
+   * interpolating a caller's string, so the set of paths this can produce is
+   * fixed at compile time and checked against a live daemon by
+   * tests/contract.test.ts.
+   */
+  async apiCall<T = unknown>(name: string, req: ApiRequest): Promise<T> {
+    const entry = this.entries.get(name)
+    if (!entry) throw new Error(`no connection '${name}'`)
+    if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
+
+    const ep = toEndpoint(req)
+    const res = await entry.client.request<T>(ep.method, ep.path, ep.body)
+    if (res.status >= 400) {
+      const body = res.body as { error?: string } | undefined
+      throw new Error(body?.error ?? `HTTP ${res.status}`)
+    }
+    return res.body
+  }
+
   async rpcCall<T = unknown>(
     name: string,
     repoId: number,
