@@ -1,28 +1,45 @@
-import React, { useEffect, useState } from 'react'
+/*
+ * Retention: how much history this repository keeps.
+ *
+ * Rewritten rather than migrated. The old editor was built around a policy
+ * struct that no longer exists anywhere: it offered paths, exclude,
+ * auto_pack, auto_gc, auto_prune, verify_after and strict_meta, and read
+ * them out of a response that is a flat list of key/value rows. Nothing in
+ * the daemon reads any of those seven. Sources and excludes moved to the
+ * backup dialog, where they belong, and the five retention counters are the
+ * only policy values anything acts on.
+ *
+ * Offering a switch that changes nothing is worse than not offering it, so
+ * the five that work are here and the rest are gone. Any other key set from
+ * the CLI is listed read-only, because a stored value the app hides is the
+ * same problem in the other direction.
+ */
+
+import React, { useCallback, useEffect, useState } from 'react'
 
 const api = window.cbackup
 
-interface Policy {
-  paths: string[]
-  exclude: string[]
-  keep_snaps: number
-  keep_daily: number
-  keep_weekly: number
-  keep_monthly: number
-  keep_yearly: number
-  auto_pack: boolean
-  auto_gc: boolean
-  auto_prune: boolean
-  verify_after: boolean
-  strict_meta: boolean
-}
+interface RawPolicy { key: string; value: string }
 
-const DEFAULT_POLICY: Policy = {
-  paths: [], exclude: [],
-  keep_snaps: 0, keep_daily: 7, keep_weekly: 4, keep_monthly: 12, keep_yearly: 3,
-  auto_pack: true, auto_gc: true, auto_prune: true,
-  verify_after: false, strict_meta: false,
-}
+/*
+ * The daemon's own fallbacks, from the gfs job. Shown as the value in force
+ * when a repository has set nothing, rather than as a blank field: "7" and
+ * "" mean very different things to somebody deciding whether to change it.
+ */
+const FIELDS = [
+  { key: 'retention.keep_daily',   label: 'Daily',   dflt: 7,
+    hint: 'Days of daily snapshots to keep' },
+  { key: 'retention.keep_weekly',  label: 'Weekly',  dflt: 4,
+    hint: 'Weeks of weekly snapshots' },
+  { key: 'retention.keep_monthly', label: 'Monthly', dflt: 12,
+    hint: 'Months of monthly snapshots' },
+  { key: 'retention.keep_yearly',  label: 'Yearly',  dflt: 3,
+    hint: 'Years of yearly snapshots' },
+  { key: 'retention.keep_snaps',   label: 'Recent',  dflt: 0,
+    hint: 'Most recent snapshots kept regardless of tier. 0 means no extra window' },
+] as const
+
+const KNOWN = new Set<string>(FIELDS.map(f => f.key))
 
 interface Props {
   connName: string
@@ -31,181 +48,151 @@ interface Props {
 }
 
 export function PolicyEditor({ connName, repoPath, onBack }: Props): React.ReactElement {
-  const [policy, setPolicy] = useState<Policy | null>(null)
-  const [original, setOriginal] = useState<string>('') // JSON for dirty check
+  const repoId = Number(repoPath)
+
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [original, setOriginal] = useState<Record<string, string>>({})
+  const [others, setOthers] = useState<RawPolicy[]>([])
+  const [stored, setStored] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
-  const [noPolicy, setNoPolicy] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
+  const load = useCallback(async () => {
     setLoading(true)
     setError(null)
-    api.rpcCall<Policy | null>(connName, repoPath, 'policy')
-      .then(data => {
-        if (cancelled) return
-        if (!data) {
-          setNoPolicy(true)
-          const p = { ...DEFAULT_POLICY }
-          setPolicy(p)
-          setOriginal(JSON.stringify(p))
-        } else {
-          setPolicy(data)
-          setOriginal(JSON.stringify(data))
-        }
-      })
-      .catch(err => { if (!cancelled) setError(String(err)) })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [connName, repoPath])
+    try {
+      const r = await api.apiCall<{ policy?: RawPolicy[] }>(connName, { kind: 'policyGet', repoId })
+      const rows = r.policy ?? []
+      const next: Record<string, string> = {}
+      for (const f of FIELDS) next[f.key] = String(f.dflt)
+      for (const row of rows) if (KNOWN.has(row.key)) next[row.key] = row.value
+      setValues(next)
+      setOriginal(next)
+      setStored(new Set(rows.filter(x => KNOWN.has(x.key)).map(x => x.key)))
+      setOthers(rows.filter(x => !KNOWN.has(x.key)))
+    } catch (err) {
+      setError(String(err))
+    }
+    setLoading(false)
+  }, [connName, repoId])
 
-  const isDirty = policy ? JSON.stringify(policy) !== original : false
+  useEffect(() => { void load() }, [load])
+
+  const changed = FIELDS.filter(f => values[f.key] !== original[f.key])
 
   const handleSave = async () => {
-    if (!policy) return
     setSaving(true)
     setError(null)
     setSuccess(null)
     try {
-      await api.rpcCall(connName, repoPath, 'save_policy', policy as unknown as Record<string, unknown>)
-      setOriginal(JSON.stringify(policy))
-      setNoPolicy(false)
-      setSuccess('Policy saved')
+      /*
+       * The route takes one key per call, so a save is one request per
+       * changed field. Sequential rather than concurrent: they all write the
+       * same table behind one database handle, and a failure part-way
+       * through is easier to reason about when the order is known.
+       */
+      for (const f of changed) {
+        await api.apiCall(connName, {
+          kind: 'policySet', repoId, key: f.key, value: values[f.key],
+        })
+      }
+      setSuccess(changed.length === 1 ? 'Saved' : `Saved ${changed.length} values`)
       setTimeout(() => setSuccess(null), 3000)
+      await load()
     } catch (err) {
+      /* Reload either way: some of the writes may have landed, and leaving
+       * the form showing what was typed would misreport what is stored. */
       setError(String(err))
+      await load()
     }
     setSaving(false)
   }
 
-  const updateNum = (key: keyof Policy, value: string) => {
-    if (!policy) return
-    const n = parseInt(value)
-    if (isNaN(n) || n < 0) return
-    setPolicy({ ...policy, [key]: n })
-  }
-
-  const updateBool = (key: keyof Policy, value: boolean) => {
-    if (!policy) return
-    setPolicy({ ...policy, [key]: value })
-  }
-
-  const updateList = (key: 'paths' | 'exclude', value: string) => {
-    if (!policy) return
-    setPolicy({ ...policy, [key]: value.split('\n').filter(l => l.trim()) })
-  }
-
-  const inputCls = 'px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent w-20 text-right'
-
   return (
     <div>
-      {/* Header */}
       <div className="flex items-center gap-3 mb-4">
         <button onClick={onBack}
           className="text-xs text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-          &larr; Dashboard
+          &larr; Back
         </button>
-        <h3 className="text-lg font-medium m-0">Backup Policy</h3>
-        {isDirty && <span className="text-xs text-status-warning">Unsaved changes</span>}
+        <h3 className="text-lg font-medium m-0">Retention</h3>
+        {changed.length > 0 && (
+          <span className="text-xs text-status-warning">
+            {changed.length} unsaved change{changed.length === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
 
-      {loading && <div className="text-text-muted text-sm">Loading policy...</div>}
+      <div className="text-xs text-text-muted mb-4" style={{ maxWidth: '38rem' }}>
+        Retention is applied when the Apply Retention operation runs, not at
+        backup time, and it only ever considers closed calendar days. A tagged
+        snapshot is kept regardless of any of this.
+      </div>
+
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
       {success && <div className="text-status-connected text-sm mb-3">{success}</div>}
 
-      {noPolicy && !loading && (
-        <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2 mb-4">
-          No policy file found. Showing defaults — save to create one.
-        </div>
-      )}
-
-      {policy && !loading && (
-        <div className="space-y-4">
-          {/* Backup paths */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Backup Paths</div>
-            <textarea
-              value={policy.paths.join('\n')}
-              onChange={e => updateList('paths', e.target.value)}
-              placeholder="One path per line"
-              className="w-full px-2 py-1.5 border border-border-default rounded text-xs bg-surface-primary text-text-primary focus:outline-none focus:border-accent font-mono min-h-[60px] resize-y"
-              rows={Math.max(3, policy.paths.length + 1)}
-            />
+      {loading ? (
+        <div className="text-text-muted text-sm">Loading...</div>
+      ) : (
+        <>
+          <div className="bg-surface-secondary border border-border-default rounded-lg p-4 mb-4"
+               style={{ maxWidth: '38rem' }}>
+            {FIELDS.map(f => (
+              <div key={f.key} className="flex items-baseline gap-3 mb-3 last:mb-0">
+                <label className="text-xs text-text-secondary w-20 shrink-0">{f.label}</label>
+                <input
+                  type="number" min={0} value={values[f.key] ?? ''}
+                  onChange={e => setValues({ ...values, [f.key]: e.target.value })}
+                  className="w-20 px-2 py-1 border border-border-default rounded text-xs
+                             bg-surface-primary text-text-primary focus:outline-none focus:border-accent" />
+                <span className="text-xs text-text-muted">
+                  {f.hint}
+                  {!stored.has(f.key) && values[f.key] === String(f.dflt) && (
+                    <span className="ml-2">(daemon default)</span>
+                  )}
+                </span>
+              </div>
+            ))}
           </div>
 
-          {/* Exclude patterns */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Exclude Patterns</div>
-            <textarea
-              value={policy.exclude.join('\n')}
-              onChange={e => updateList('exclude', e.target.value)}
-              placeholder="One pattern per line"
-              className="w-full px-2 py-1.5 border border-border-default rounded text-xs bg-surface-primary text-text-primary focus:outline-none focus:border-accent font-mono min-h-[60px] resize-y"
-              rows={Math.max(3, policy.exclude.length + 1)}
-            />
-          </div>
-
-          {/* Retention */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-3">Retention (GFS)</div>
-            <div className="grid grid-cols-5 gap-4">
-              {([
-                { key: 'keep_snaps' as const, label: 'Total Snaps', hint: '0 = unlimited' },
-                { key: 'keep_daily' as const, label: 'Daily', hint: '' },
-                { key: 'keep_weekly' as const, label: 'Weekly', hint: '' },
-                { key: 'keep_monthly' as const, label: 'Monthly', hint: '' },
-                { key: 'keep_yearly' as const, label: 'Yearly', hint: '' },
-              ]).map(({ key, label, hint }) => (
-                <div key={key}>
-                  <label className="block text-xs text-text-secondary mb-1">{label}</label>
-                  <input type="number" min={0}
-                    value={policy[key]}
-                    onChange={e => updateNum(key, e.target.value)}
-                    className={inputCls}
-                  />
-                  {hint && <div className="text-[10px] text-text-muted mt-0.5">{hint}</div>}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Automation */}
-          <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-            <div className="text-[11px] text-text-muted uppercase tracking-wide mb-3">Automation</div>
-            <div className="grid grid-cols-2 gap-3">
-              {([
-                { key: 'auto_pack', label: 'Auto pack', desc: 'Pack loose objects after backup' },
-                { key: 'auto_gc', label: 'Auto GC', desc: 'Garbage collect after prune' },
-                { key: 'auto_prune', label: 'Auto prune', desc: 'Prune expired snapshots after backup' },
-                { key: 'verify_after', label: 'Verify after', desc: 'Verify integrity after backup' },
-                { key: 'strict_meta', label: 'Strict metadata', desc: 'Fail on metadata errors (xattr, ACL)' },
-              ] as const).map(({ key, label, desc }) => (
-                <label key={key} className="flex items-start gap-2 cursor-pointer">
-                  <input type="checkbox"
-                    checked={policy[key] as boolean}
-                    onChange={e => updateBool(key, e.target.checked)}
-                    className="mt-0.5"
-                  />
-                  <div>
-                    <div className="text-xs text-text-primary">{label}</div>
-                    <div className="text-[10px] text-text-muted">{desc}</div>
-                  </div>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          {/* Save */}
-          <div className="flex justify-end">
-            <button onClick={handleSave}
-              disabled={!isDirty || saving}
-              className="px-4 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none disabled:opacity-50 disabled:cursor-default">
-              {saving ? 'Saving...' : 'Save Policy'}
+          <div className="flex gap-2 items-center mb-6">
+            <button onClick={handleSave} disabled={saving || changed.length === 0}
+              className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text
+                         hover:bg-accent-hover border-none disabled:opacity-50 disabled:cursor-default">
+              {saving ? 'Saving...' : 'Save'}
             </button>
+            {changed.length > 0 && (
+              <button onClick={() => setValues(original)} disabled={saving}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary
+                           text-text-secondary hover:bg-surface-hover border-none">
+                Discard
+              </button>
+            )}
           </div>
-        </div>
+
+          {others.length > 0 && (
+            <div style={{ maxWidth: '38rem' }}>
+              <div className="text-xs text-text-secondary mb-1">Other stored values</div>
+              <div className="text-xs text-text-muted mb-2">
+                Set from the CLI. Listed so nothing stored here is invisible;
+                nothing in the daemon currently reads these.
+              </div>
+              <table className="w-full text-xs">
+                <tbody>
+                  {others.map(o => (
+                    <tr key={o.key} className="border-t border-border-subtle">
+                      <td className="py-1.5 pr-4 font-mono text-text-secondary">{o.key}</td>
+                      <td className="py-1.5 font-mono">{o.value}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
     </div>
   )

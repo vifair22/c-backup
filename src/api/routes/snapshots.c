@@ -240,6 +240,131 @@ static char *fts_quote(const char *q)
     return out;
 }
 
+/*
+ * Ancestor cache for path building.
+ *
+ * A search result is a name and a node id, which is not something anybody
+ * can act on: the answer to "where is a.txt" is a path. Building one means
+ * walking parent_node_id to the root, and doing that per hit would re-walk
+ * the same directories for every file in them - which, for a search, is most
+ * of the results.
+ *
+ * So each (snap_id, node_id) is resolved once into its name and parent and
+ * kept. A page of a thousand hits from one tree costs the depth of that
+ * tree in lookups, not a thousand times it.
+ */
+typedef struct {
+    int64_t  snap_id;
+    int64_t  node_id;   /* 0 marks an empty slot */
+    int64_t  parent_id;
+    char    *name;
+} anc_slot_t;
+
+typedef struct {
+    anc_slot_t *slots;
+    size_t      mask;
+    cutils_db_t *db;
+    int64_t     repo_id;
+} anc_cache_t;
+
+static size_t anc_hash(int64_t snap_id, int64_t node_id)
+{
+    uint64_t h = (uint64_t)snap_id * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t)node_id + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return (size_t)(h ^ (h >> 29));
+}
+
+static int anc_init(anc_cache_t *c, cutils_db_t *db, int64_t repo_id, int rows)
+{
+    size_t want = 64;
+    /* Four slots per hit, so the table stays sparse enough that linear
+     * probing does not degrade even when every hit has a distinct chain. */
+    while (want < (size_t)rows * 4u && want < (1u << 20)) want <<= 1;
+    c->slots = calloc(want, sizeof(*c->slots));
+    if (!c->slots) return -1;
+    c->mask = want - 1;
+    c->db = db;
+    c->repo_id = repo_id;
+    return 0;
+}
+
+static void anc_free(anc_cache_t *c)
+{
+    if (!c->slots) return;
+    for (size_t i = 0; i <= c->mask; i++) free(c->slots[i].name);
+    free(c->slots);
+    c->slots = NULL;
+}
+
+/* Returns the slot for a node, reading it from the database on a miss.
+ * NULL means the node does not exist, which ends a walk. */
+static const anc_slot_t *anc_get(anc_cache_t *c, int64_t snap_id, int64_t node_id)
+{
+    size_t i = anc_hash(snap_id, node_id) & c->mask;
+    for (size_t probe = 0; probe <= c->mask; probe++, i = (i + 1) & c->mask) {
+        anc_slot_t *sl = &c->slots[i];
+        if (sl->node_id == node_id && sl->snap_id == snap_id) return sl;
+        if (sl->node_id != 0) continue;
+
+        char repo[32], nid[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)c->repo_id);
+        snprintf(nid,  sizeof(nid),  "%lld", (long long)node_id);
+        db_result_t *r = NULL;
+        if (db_execute(c->db,
+                "SELECT name, COALESCE(parent_node_id, 0) FROM nodes"
+                " WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, nid, NULL }, &r) != 0
+            || !r || r->nrows != 1) {
+            db_result_free(r);
+            return NULL;
+        }
+        sl->name = strdup(r->rows[0][0] ? r->rows[0][0] : "");
+        sl->parent_id = strtoll(r->rows[0][1], NULL, 10);
+        db_result_free(r);
+        if (!sl->name) return NULL;
+        sl->snap_id = snap_id;
+        sl->node_id = node_id;
+        return sl;
+    }
+    return NULL;  /* full, which the sizing above makes unreachable */
+}
+
+/*
+ * The absolute path of a node, or NULL if it cannot be resolved. Built from
+ * the root down, so the walk collects names in reverse and then writes them
+ * out forwards.
+ */
+static char *anc_path(anc_cache_t *c, int64_t snap_id, int64_t node_id)
+{
+    /* scan_tree records absolute paths, so a chain is as deep as the source
+     * root plus the tree under it. This is a sanity bound, not a limit
+     * anybody should reach. */
+    enum { MAX_DEPTH = 256 };
+    const char *parts[MAX_DEPTH];
+    size_t n = 0, total = 0;
+
+    for (int64_t id = node_id; id != 0 && n < MAX_DEPTH; ) {
+        const anc_slot_t *sl = anc_get(c, snap_id, id);
+        if (!sl) break;
+        parts[n++] = sl->name;
+        total += strlen(sl->name) + 1;
+        id = sl->parent_id;
+    }
+    if (n == 0) return NULL;
+
+    char *out = malloc(total + 2);
+    if (!out) return NULL;
+    char *w = out;
+    for (size_t i = n; i-- > 0; ) {
+        *w++ = '/';
+        size_t len = strlen(parts[i]);
+        memcpy(w, parts[i], len);
+        w += len;
+    }
+    *w = '\0';
+    return out;
+}
+
 static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
 {
     const char *q = api_query_param(req, "q");
@@ -264,9 +389,12 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
      * the pre-rewrite implementation, while this beats it by ~50x. */
     db_result_t *r = NULL;
     int rc = db_execute(g_ctx.db,
-            "SELECT node_id, snap_id, name FROM node_fts"
-            " WHERE repo_id = ? AND name MATCH ? LIMIT ?",
-            (const char *[]){ repo, mq, lim, NULL }, &r);
+            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+            "       COALESCE(n.content_hash, '')"
+            "  FROM node_fts f"
+            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+            " WHERE f.repo_id = ? AND f.name MATCH ? LIMIT ?",
+            (const char *[]){ repo, repo, mq, lim, NULL }, &r);
     free(mq);
     if (rc != 0) {
         db_result_free(r);
@@ -286,15 +414,30 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
          * there is nothing to unwind and nothing worth failing the
          * request over. */
     }
+    anc_cache_t anc;
+    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, r->nrows) == 0);
+
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+        int64_t nid = strtoll(r->rows[i][0], NULL, 10);
+        int64_t sid = strtoll(r->rows[i][1], NULL, 10);
+        char *path = have_anc ? anc_path(&anc, sid, nid) : NULL;
         int bad = json_elem_add_str(&e, "node_id", r->rows[i][0]) != 0
                || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0;
+               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+               /* Empty when the chain is broken, which a partially faulted-in
+                * snapshot can produce. A hit without a path is still a hit;
+                * it is the navigation that is unavailable, not the result. */
+               || json_elem_add_str(&e, "path",    path ? path : "") != 0
+               || json_elem_add_str(&e, "type",    r->rows[i][3]) != 0
+               || json_elem_add_str(&e, "size",    r->rows[i][4]) != 0
+               || json_elem_add_str(&e, "hash",    r->rows[i][5]) != 0;
+        free(path);
         if (bad) break;
         json_elem_commit(&e);
     }
+    if (have_anc) anc_free(&anc);
     db_result_free(r);
 
     char *body = NULL; size_t blen = 0;

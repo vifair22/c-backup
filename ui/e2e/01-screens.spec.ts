@@ -160,3 +160,96 @@ test('browse: walking into a directory and opening a file', async () => {
   await h.page.screenshot({ path: 'test-results/snapshot-file-detail.png' })
   await h.page.getByRole('button', { name: 'Close' }).click()
 })
+
+test('search: a name, with the path it lives at', async () => {
+  /*
+   * The result rows carried no path, type, size or hash - the route did not
+   * send them and the component read them from a nested `node` object that
+   * does not exist. A path is the whole answer to "where is this file", so
+   * that is what gets asserted.
+   */
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /^search$/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'File Search' })).toBeVisible()
+
+  await h.page.getByPlaceholder(/filename contains/i).fill('notes')
+  await h.page.getByRole('button', { name: /^search$/i }).last().click()
+
+  const row = h.page.locator('tbody tr').first()
+  await expect(row).toBeVisible()
+  await expect(row).toContainText('/src/notes.txt')
+  await expect(row).toContainText('file')
+  await expect(row.locator('td').last()).not.toHaveText('-')
+
+  await h.page.screenshot({ path: 'test-results/file-search.png', fullPage: true })
+
+  /* Under three characters is refused by the daemon, because the name index
+   * is trigram-based and an empty list would read as "no such file". */
+  await h.page.getByPlaceholder(/filename contains/i).fill('no')
+  await h.page.getByRole('button', { name: /^search$/i }).last().click()
+  await expect(h.page.getByText(/at least 3 characters/i)).toBeVisible()
+
+  await h.page.getByRole('button', { name: /dashboard/i }).first().click()
+})
+
+test('activity: operations, results and how long they took', async () => {
+  /*
+   * The journal is one row per finished operation now. The old screen paired
+   * "started" and "completed" rows on an op_id that no longer exists, so
+   * every field it keyed on was undefined.
+   */
+  await h.page.getByRole('button', { name: /journal|activity/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Activity' })).toBeVisible()
+
+  const row = h.page.locator('tbody tr').first()
+  await expect(row).toBeVisible()
+  /* The fixture ran backups, a retention pass and a scrub. */
+  await expect(h.page.locator('tbody')).toContainText('backup')
+  /* duration_ms was selected by the route and never sent; without it every
+   * row's "Took" is a dash. */
+  await expect(row.locator('td').nth(3)).not.toHaveText('-')
+
+  await h.page.screenshot({ path: 'test-results/journal.png', fullPage: true })
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+})
+
+test('tags: naming a snapshot protects it', async () => {
+  await h.page.getByRole('button', { name: /^tags$/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Tags' })).toBeVisible()
+  await expect(h.page.getByText(/never dropped by retention/i)).toBeVisible()
+
+  await h.page.getByRole('button', { name: /add tag/i }).click()
+  await h.page.getByPlaceholder('before-upgrade').fill('keeper')
+  await h.page.getByRole('button', { name: /^add$/i }).click()
+
+  const row = h.page.locator('tbody tr', { hasText: 'keeper' })
+  await expect(row).toBeVisible()
+  /* The Taken column was blank for every tag: the dates came from a
+   * snapshot-list shape the daemon does not send. */
+  await expect(row.locator('td').nth(2)).not.toHaveText('')
+
+  await h.page.screenshot({ path: 'test-results/tags.png', fullPage: true })
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+})
+
+test('retention: the five values the daemon actually reads', async () => {
+  await h.page.getByRole('button', { name: /policy|retention/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Retention' })).toBeVisible()
+
+  /* Defaults are shown as the values in force, not as blanks. */
+  const daily = h.page.locator('input[type="number"]').first()
+  await expect(daily).toHaveValue('7')
+  await expect(h.page.getByText(/daemon default/i).first()).toBeVisible()
+
+  await daily.fill('14')
+  await expect(h.page.getByText(/1 unsaved change/i)).toBeVisible()
+  await h.page.getByRole('button', { name: /^save$/i }).click()
+  await expect(h.page.getByText('Saved', { exact: true })).toBeVisible()
+
+  await h.page.screenshot({ path: 'test-results/retention.png', fullPage: true })
+
+  /* It persisted, and is no longer flagged as a default. */
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+  await h.page.getByRole('button', { name: /policy|retention/i }).first().click()
+  await expect(h.page.locator('input[type="number"]').first()).toHaveValue('14')
+})

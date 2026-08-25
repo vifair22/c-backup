@@ -170,7 +170,16 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
-        time_t began = time(NULL);
+        /*
+         * Monotonic and in milliseconds. This was wall-clock seconds, so
+         * every operation finishing inside a second journalled "0 ms" and
+         * the duration column read as broken rather than as fast. Monotonic
+         * also survives an NTP step, which the subtraction of two time()
+         * calls does not: a clock correction mid-backup could record a
+         * negative duration.
+         */
+        struct timespec began;
+        clock_gettime(CLOCK_MONOTONIC, &began);
 
         progress_ctx_t pc = { jm, slot.job_id };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
@@ -199,8 +208,12 @@ static void *worker_main(void *arg)
 
         if (slot.repo_id > 0) {
             pthread_mutex_lock(&jm->db_mu);
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
+                         + (now.tv_nsec - began.tv_nsec) / 1000000;
             journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
-                           (int64_t)(time(NULL) - began) * 1000, detail);
+                           took, detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
 

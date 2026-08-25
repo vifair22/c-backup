@@ -1,3 +1,24 @@
+/*
+ * Names for snapshots worth keeping.
+ *
+ * Migrated off the action bridge, which is what made most of this screen
+ * inert: 'tag_rename' had no endpoint mapped at all and threw on every use,
+ * and the snapshot dates came from a response shape the daemon does not
+ * send, so the Date column was blank for every row.
+ *
+ * The "preserve" checkbox is gone. It set a flag no table has, and the
+ * behaviour it promised is already unconditional: gfs treats any tag as
+ * protection, because a tag is how somebody says "keep this one" and
+ * dropping a tagged snapshot when a retention window rolled past it would
+ * be the worst kind of surprise. Saying so once is better than offering a
+ * switch for it.
+ *
+ * Renaming is two calls rather than one route: setting the new name and
+ * removing the old. The daemon has no rename verb and neither does the CLI,
+ * and a tag set is an upsert, so this composes out of what exists instead of
+ * asking for a route that only the app would use.
+ */
+
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtNum, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
@@ -5,25 +26,11 @@ import { ConfirmDialog } from './ConfirmDialog'
 
 const api = window.cbackup
 
-interface Tag {
-  name: string
-  snap_id: number
-  preserve?: boolean
-}
+interface RawTag { name: string; snap_id?: string }
+interface RawSnapshot { id: string; ts: string; label?: string }
 
-interface TagsResponse {
-  tags: Tag[]
-}
-
-interface Snapshot {
-  id: number
-  created_sec: number
-}
-
-interface SnapList {
-  head: number
-  snapshots: Snapshot[]
-}
+interface Tag { name: string; snapId: number }
+interface Snapshot { id: number; ts: number; label: string }
 
 interface Props {
   connName: string
@@ -33,36 +40,41 @@ interface Props {
 }
 
 export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props): React.ReactElement {
+  const repoId = Number(repoPath)
+
   const [tags, setTags] = useState<Tag[]>([])
-  const [snapList, setSnapList] = useState<SnapList | null>(null)
+  const [snaps, setSnaps] = useState<Snapshot[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
-  // Dialogs
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; onConfirm: () => void } | null>(null)
-  const [editDialog, setEditDialog] = useState<{ mode: 'create' | 'rename'; oldName?: string; name: string; snapId: number; preserve: boolean } | null>(null)
+  const [editDialog, setEditDialog] = useState<{ mode: 'create' | 'rename'; oldName?: string; name: string; snapId: number } | null>(null)
 
   const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const [tagsResp, snaps] = await Promise.all([
-        api.rpcCall<TagsResponse>(connName, repoPath, 'tags'),
-        api.rpcCall<SnapList>(connName, repoPath, 'list'),
+      const [t, s] = await Promise.all([
+        api.apiCall<{ tags?: RawTag[] }>(connName, { kind: 'tagList', repoId }),
+        api.apiCall<{ snapshots?: RawSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 }),
       ])
-      setTags(tagsResp.tags.sort((a, b) => a.name.localeCompare(b.name)))
-      setSnapList(snaps)
+      setTags((t.tags ?? [])
+        .map(x => ({ name: x.name, snapId: Number(x.snap_id ?? '0') }))
+        .sort((a, b) => a.name.localeCompare(b.name)))
+      setSnaps((s.snapshots ?? []).map(x => ({
+        id: Number(x.id), ts: Number(x.ts), label: x.label ?? '',
+      })))
     } catch (err) {
       setError(String(err))
     }
     setLoading(false)
-  }, [connName, repoPath])
+  }, [connName, repoId])
 
-  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => { void refresh() }, [refresh])
 
-  const snapById = new Map(snapList?.snapshots.map(s => [s.id, s]) ?? [])
+  const snapById = new Map(snaps.map(s => [s.id, s]))
 
   const showSuccess = (msg: string) => {
     setSuccess(msg)
@@ -71,44 +83,36 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
 
   const handleDelete = (name: string) => {
     setConfirmDialog({
-      title: 'Delete Tag',
-      message: `Delete tag "${name}"? This does not affect the snapshot itself.`,
+      title: 'Remove tag',
+      message: `Remove the tag "${name}"? The snapshot itself stays, but it ` +
+               'loses the protection a tag gives it against retention.',
       onConfirm: async () => {
         setConfirmDialog(null)
         try {
-          await api.rpcCall(connName, repoPath, 'tag_delete', { name })
-          showSuccess(`Tag "${name}" deleted`)
+          await api.apiCall(connName, { kind: 'tagRemove', repoId, name })
+          showSuccess(`Removed "${name}"`)
           await refresh()
         } catch (err) { setError(String(err)) }
-      }
+      },
     })
   }
 
   const handleSaveTag = async () => {
     if (!editDialog || !editDialog.name.trim()) return
+    const name = editDialog.name.trim()
     setError(null)
     try {
-      if (editDialog.mode === 'rename' && editDialog.oldName) {
-        if (editDialog.name.trim() !== editDialog.oldName) {
-          await api.rpcCall(connName, repoPath, 'tag_rename', {
-            old_name: editDialog.oldName, new_name: editDialog.name.trim()
-          })
-        }
-        // Update snap_id and preserve if changed
-        await api.rpcCall(connName, repoPath, 'tag_set', {
-          name: editDialog.name.trim(),
-          snap_id: editDialog.snapId,
-          preserve: editDialog.preserve,
-        })
-        showSuccess(`Tag "${editDialog.name.trim()}" updated`)
-      } else {
-        await api.rpcCall(connName, repoPath, 'tag_set', {
-          name: editDialog.name.trim(),
-          snap_id: editDialog.snapId,
-          preserve: editDialog.preserve,
-        })
-        showSuccess(`Tag "${editDialog.name.trim()}" created`)
+      /*
+       * Set first, remove second. A tag set is an upsert, so the new name
+       * exists before the old one goes; the reverse order would leave the
+       * snapshot briefly untagged and unprotected if the second call failed.
+       */
+      await api.apiCall(connName, { kind: 'tagSet', repoId, name, snapshotId: editDialog.snapId })
+      if (editDialog.mode === 'rename' && editDialog.oldName && editDialog.oldName !== name) {
+        await api.apiCall(connName, { kind: 'tagRemove', repoId, name: editDialog.oldName })
       }
+      showSuccess(editDialog.mode === 'create' ? `Tagged #${editDialog.snapId} as "${name}"`
+                                               : `Updated "${name}"`)
       setEditDialog(null)
       await refresh()
     } catch (err) {
@@ -121,30 +125,37 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
     setContextMenu({
       x: e.clientX, y: e.clientY,
       items: [
-        ...(onSelectSnapshot ? [{ label: 'Browse snapshot', onClick: () => onSelectSnapshot(tag.snap_id) }] : []),
-        { label: 'Edit', onClick: () => setEditDialog({ mode: 'rename', oldName: tag.name, name: tag.name, snapId: tag.snap_id, preserve: tag.preserve ?? false }) },
-        { label: 'Delete', danger: true, onClick: () => handleDelete(tag.name) },
-      ]
+        ...(onSelectSnapshot ? [{ label: 'Browse snapshot', onClick: () => onSelectSnapshot(tag.snapId) }] : []),
+        { label: 'Edit', onClick: () => setEditDialog({ mode: 'rename', oldName: tag.name, name: tag.name, snapId: tag.snapId }) },
+        { label: 'Remove', danger: true, onClick: () => handleDelete(tag.name) },
+      ],
     })
   }
 
-  const snaps = snapList?.snapshots ?? []
-  const headId = snaps.length > 0 ? snaps[snaps.length - 1].id : 1
+  /* The list is newest first, so the newest snapshot is the first row. */
+  const newestId = snaps.length > 0 ? snaps[0].id : 1
 
   return (
     <div>
-      {/* Header */}
       <div className="flex items-center gap-3 mb-4">
         <button onClick={onBack}
           className="text-xs text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-          &larr; Dashboard
+          &larr; Back
         </button>
         <h3 className="text-lg font-medium m-0">Tags</h3>
         <span className="text-xs text-text-muted">{fmtNum(tags.length)} tag{tags.length !== 1 ? 's' : ''}</span>
-        <button onClick={() => setEditDialog({ mode: 'create', name: '', snapId: headId, preserve: false })}
-          className="text-xs px-2 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover text-text-secondary cursor-pointer border-none ml-auto">
-          + Create Tag
+        <button onClick={() => setEditDialog({ mode: 'create', name: '', snapId: newestId })}
+          disabled={snaps.length === 0}
+          className="text-xs px-2 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover
+                     text-text-secondary cursor-pointer border-none ml-auto disabled:opacity-50">
+          + Add tag
         </button>
+      </div>
+
+      <div className="text-xs text-text-muted mb-3" style={{ maxWidth: '38rem' }}>
+        A tagged snapshot is never dropped by retention. That is what tagging
+        is for: retention keeps a shape of history, and a tag says this
+        particular one matters regardless.
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
@@ -158,26 +169,25 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
               <tr className="text-text-muted text-left">
                 <th className="font-medium pb-2 pt-4 pl-4">Name</th>
                 <th className="font-medium pb-2 pt-4 w-16">Snap</th>
-                <th className="font-medium pb-2 pt-4 w-40">Date</th>
-                <th className="font-medium pb-2 pt-4 w-20 text-center">Preserve</th>
+                <th className="font-medium pb-2 pt-4 w-44">Taken</th>
+                <th className="font-medium pb-2 pt-4">Label</th>
               </tr>
             </thead>
             <tbody>
               {tags.map(tag => {
-                const snap = snapById.get(tag.snap_id)
+                const snap = snapById.get(tag.snapId)
                 return (
                   <tr key={tag.name}
-                    onClick={() => onSelectSnapshot?.(tag.snap_id)}
+                    onClick={() => onSelectSnapshot?.(tag.snapId)}
                     onContextMenu={e => showRowMenu(e, tag)}
                     className="border-t border-border-default cursor-pointer hover:bg-surface-hover text-text-primary">
                     <td className="py-1.5 pl-4 font-medium">{tag.name}</td>
-                    <td className="py-1.5 font-mono">#{tag.snap_id}</td>
-                    <td className="py-1.5 text-text-muted">{snap ? absoluteTime(snap.created_sec) : ''}</td>
-                    <td className="py-1.5 text-center">
-                      {tag.preserve && (
-                        <span className="inline-block px-1.5 py-0 rounded text-[10px] font-semibold bg-amber-600 text-white">P</span>
-                      )}
-                    </td>
+                    <td className="py-1.5 font-mono">#{tag.snapId}</td>
+                    {/* Blank when the tag outlived the page of snapshots
+                      * fetched, not when the snapshot is gone: removing one
+                      * removes its tags with it. */}
+                    <td className="py-1.5 text-text-muted">{snap ? absoluteTime(snap.ts) : ''}</td>
+                    <td className="py-1.5 text-text-muted truncate">{snap?.label ?? ''}</td>
                   </tr>
                 )
               })}
@@ -187,63 +197,65 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
       )}
 
       {!loading && tags.length === 0 && (
-        <div className="text-text-muted text-xs text-center py-8">No tags. Click "+ Create Tag" to add one.</div>
+        <div className="text-text-muted text-xs py-4">
+          Nothing is tagged.
+        </div>
       )}
 
-      {/* Context menu */}
       {contextMenu && (
         <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextMenu.items}
           onClose={() => setContextMenu(null)} />
       )}
 
-      {/* Confirm dialog */}
       {confirmDialog && (
         <ConfirmDialog
           title={confirmDialog.title}
           message={confirmDialog.message}
+          confirmLabel="Remove"
+          danger
           onConfirm={confirmDialog.onConfirm}
           onCancel={() => setConfirmDialog(null)}
         />
       )}
 
-      {/* Create / Edit dialog */}
       {editDialog && (
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
-          <form onSubmit={e => { e.preventDefault(); handleSaveTag() }}
+          <form onSubmit={e => { e.preventDefault(); void handleSaveTag() }}
             className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
             <h3 className="text-sm font-semibold m-0 mb-3">
-              {editDialog.mode === 'create' ? 'Create Tag' : 'Edit Tag'}
+              {editDialog.mode === 'create' ? 'Add tag' : 'Edit tag'}
             </h3>
             <div className="mb-3">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Tag Name</label>
+              <label className="block text-xs font-medium text-text-secondary mb-1">Name</label>
               <input value={editDialog.name} onChange={e => setEditDialog({ ...editDialog, name: e.target.value })}
-                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
+                placeholder="before-upgrade"
+                className="w-full px-2 py-1 border border-border-default rounded text-sm
+                           bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
                 autoFocus required />
             </div>
-            <div className="mb-3">
+            <div className="mb-4">
               <label className="block text-xs font-medium text-text-secondary mb-1">Snapshot</label>
-              <select value={editDialog.snapId} onChange={e => setEditDialog({ ...editDialog, snapId: Number(e.target.value) })}
-                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent">
+              <select value={editDialog.snapId}
+                onChange={e => setEditDialog({ ...editDialog, snapId: Number(e.target.value) })}
+                className="w-full px-2 py-1 border border-border-default rounded text-sm
+                           bg-surface-primary text-text-primary focus:outline-none focus:border-accent">
                 {snaps.map(s => (
-                  <option key={s.id} value={s.id}>#{s.id} — {absoluteTime(s.created_sec)}</option>
+                  <option key={s.id} value={s.id}>
+                    #{s.id} - {absoluteTime(s.ts)}{s.label ? ` (${s.label})` : ''}
+                  </option>
                 ))}
               </select>
             </div>
-            <div className="mb-4">
-              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
-                <input type="checkbox" checked={editDialog.preserve}
-                  onChange={e => setEditDialog({ ...editDialog, preserve: e.target.checked })} />
-                Preserve (protect from pruning)
-              </label>
-            </div>
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setEditDialog(null)}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary
+                           text-text-secondary hover:bg-surface-hover border-none">
                 Cancel
               </button>
               <button type="submit"
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">
-                {editDialog.mode === 'create' ? 'Create' : 'Save'}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text
+                           hover:bg-accent-hover border-none">
+                {editDialog.mode === 'create' ? 'Add' : 'Save'}
               </button>
             </div>
           </form>

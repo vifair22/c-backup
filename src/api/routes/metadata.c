@@ -461,10 +461,15 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "ts",        r->rows[i][1]) != 0
+        int bad = json_elem_add_str(&e, "id",        r->rows[i][0]) != 0
+               || json_elem_add_str(&e, "ts",        r->rows[i][1]) != 0
                || json_elem_add_str(&e, "source",    r->rows[i][2]) != 0
                || json_elem_add_str(&e, "operation", r->rows[i][3]) != 0
                || json_elem_add_str(&e, "result",    r->rows[i][4]) != 0
+               /* Selected since the journal existed and served to nobody.
+                * How long an operation took is most of what a log of them
+                * is for. */
+               || json_elem_add_str(&e, "duration_ms", r->rows[i][5] ? r->rows[i][5] : "") != 0
                || json_elem_add_str(&e, "message",   r->rows[i][6] ? r->rows[i][6] : "") != 0;
         if (bad) break;
         json_elem_commit(&e);
