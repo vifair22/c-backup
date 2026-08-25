@@ -3116,7 +3116,28 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
             st = ERR_IO; goto cleanup;
         }
         int pfd = open(loose_path, O_RDONLY);
-        if (pfd == -1) continue;  /* deleted between collect and now */
+        if (pfd == -1) {
+            /*
+             * ENOENT is ordinary - the object was deleted between the
+             * collect pass and now. Anything else is not, and used to be
+             * swallowed by the same `continue`.
+             *
+             * That mattered because this loop used to hold a descriptor for
+             * every object it classified. On a repository with more loose
+             * objects than the process has descriptors, open started
+             * failing with EMFILE partway through and every object after
+             * that was dropped from the pack silently: the run reported
+             * success, packed exactly as many objects as the fd limit
+             * allowed, and left the rest loose for ever. Measured on a
+             * 622,000-file source with a 40,960 descriptor limit, it packed
+             * 40,948 of 230,595 objects and said nothing.
+             */
+            if (errno != ENOENT) {
+                st = set_error_errno(ERR_IO, "repo_pack: cannot open %s", loose_path);
+                goto cleanup;
+            }
+            continue;
+        }
         object_header_t ohdr;
         if (read_full_fd(pfd, &ohdr, sizeof(ohdr)) != 0) {
             close(pfd);
@@ -3130,15 +3151,21 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         meta[mi].compressed_size   = ohdr.compressed_size;
         meta[mi].uncompressed_size = ohdr.uncompressed_size;
         meta[mi].skip_ver          = ohdr.pack_skip_ver;
-        meta[mi].fd                = pfd;
+        /*
+         * The header is what this pass wanted; the descriptor is not worth
+         * keeping. Holding one per object made the classification cost a
+         * file descriptor per loose object, which does not scale and failed
+         * silently when it ran out. The writer reopens from the hash when
+         * it finds no cached descriptor, so this costs one extra open per
+         * object actually packed and removes the ceiling entirely.
+         */
+        close(pfd);
+        meta[mi].fd                = -1;
         meta_cnt++;
 
         /* Skip objects already marked as incompressible — they stay loose */
-        if (ohdr.pack_skip_ver == PROBER_VERSION) {
-            close(meta[mi].fd);
-            meta[mi].fd = -1;
+        if (ohdr.pack_skip_ver == PROBER_VERSION)
             continue;
-        }
 
         indices[packable_cnt++] = mi;
         total_bytes_for_pack += ohdr.compressed_size;

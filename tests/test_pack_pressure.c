@@ -26,6 +26,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <sys/resource.h>
+
 #include <cmocka.h>
 
 #include "fake_index.h"
@@ -131,6 +133,57 @@ static int corrupt_pack_byte(long offset)
 }
 
 /* ------------------------------------------------------------------ */
+
+/*
+ * Packing does not stop at the process's file descriptor limit.
+ *
+ * The classification pass used to open every loose object and hold the
+ * descriptor, so a repository with more loose objects than the process had
+ * descriptors ran out partway through - and the failure was invisible.
+ * open() returning EMFILE hit a `continue` commented as "deleted between
+ * collect and now", so every object past the limit was dropped from the
+ * pack, the run reported success, and the rest stayed loose for ever.
+ *
+ * Found on a real 622,000-file source: a 40,960 descriptor limit packed
+ * exactly 40,948 of 230,595 objects and said nothing about the other
+ * 189,647. The arithmetic is what gave it away - packed plus the daemon's
+ * dozen other descriptors is the limit exactly.
+ *
+ * Reproduced here by lowering the limit rather than by making a repository
+ * big enough to hit the real one: the bug is about the ratio, not the size.
+ */
+static void test_pack_is_not_bounded_by_the_fd_limit(void **state)
+{
+    (void)state;
+
+    struct rlimit orig;
+    assert_int_equal(getrlimit(RLIMIT_NOFILE, &orig), 0);
+
+    /* Comfortably fewer descriptors than there are objects to classify. */
+    struct rlimit tight = orig;
+    tight.rlim_cur = 64;
+    if (tight.rlim_max < 64) tight.rlim_cur = tight.rlim_max;
+    assert_int_equal(setrlimit(RLIMIT_NOFILE, &tight), 0);
+
+    uint32_t packed = 0;
+    status_t st = repo_pack(store, &packed, NULL, NULL);
+
+    assert_int_equal(setrlimit(RLIMIT_NOFILE, &orig), 0);
+
+    assert_int_equal(st, OK);
+    /* Every object, not as many as there were descriptors. */
+    assert_int_equal((int)packed, NOBJ);
+    assert_int_equal(count_files(TEST_REPO "/objects"), 0);
+
+    /* And they are all readable, so this is a real pack rather than a
+     * bookkeeping change. */
+    for (int i = 0; i < NOBJ; i++) {
+        void *data = NULL; size_t len = 0; uint8_t type = 0;
+        assert_int_equal(object_load(store, hashes[i], &data, &len, &type), OK);
+        assert_int_equal(len, sizes[i]);
+        free(data);
+    }
+}
 
 static void test_pack_moves_objects(void **state)
 {
@@ -408,6 +461,7 @@ static void test_repack_is_idempotent(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_pack_is_not_bounded_by_the_fd_limit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_moves_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_every_packed_object_reads_back, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_packed_read_requires_a_resolver, setup_packed, teardown),
