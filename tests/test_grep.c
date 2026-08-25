@@ -19,6 +19,9 @@
 #include <limits.h>
 #include <sys/stat.h>
 
+#include <pthread.h>
+#include <time.h>
+
 #include <cmocka.h>
 #include <cutils/db.h>
 
@@ -314,6 +317,26 @@ static void test_unknown_path_prefix_is_an_error(void **state)
     assert_int_not_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
     err_clear();
 }
+
+/*
+ * Not covered here: that a cancel is noticed *while* a file is being read
+ * rather than only between files.
+ *
+ * That was the bug - the flag was tested once per object, so a search that
+ * had reached a large file ignored the cancel until it finished, which
+ * against a real 13.8 GB file was 65 seconds of apparently nothing, and was
+ * reported as cancel being broken. It is fixed in scan_object's streaming
+ * loop, and verified by hand: cancelling mid-file went from up to 65
+ * seconds to 1.
+ *
+ * The attempt to pin it down here is deliberately absent rather than
+ * quietly weakened. Both behaviours end in a cancelled run, so only elapsed
+ * time distinguishes them, and the objects are read in pack order - which
+ * means a fixture cannot reliably arrange for the cancel to land inside the
+ * large file rather than between two small ones. The version tried first
+ * passed with the fix removed, which is worse than having no test at all:
+ * it claims a guarantee it is not making.
+ */
 
 /* A search that has found enough stops reading the repository. */
 static void test_max_files_stops_early(void **state)

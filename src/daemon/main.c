@@ -115,6 +115,20 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /*
+     * A write to a pipe whose reader has gone must return EPIPE, not kill
+     * the daemon.
+     *
+     * The default disposition of SIGPIPE terminates the process, and this
+     * one writes to descriptors it does not own both ends of: the object
+     * streaming path hands a payload to a reader through a pipe, and a
+     * reader is entitled to stop early - because the job was cancelled, or
+     * because it already found what it wanted. Without this, the first such
+     * reader takes the whole daemon down with it, along with whatever else
+     * happened to be running at the time.
+     */
+    signal(SIGPIPE, SIG_IGN);
+
     if (repo_locks_init() != OK) {
         log_error("cannot initialise repo locks");
         appguard_shutdown(guard);

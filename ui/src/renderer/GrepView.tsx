@@ -68,6 +68,10 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
   const [selected, setSelected] = useState<GrepRun | null>(null)
   const [hits, setHits] = useState<Hit[]>([])
   const [searching, setSearching] = useState(false)
+  /* The job behind the current search, so it can be called off from here
+   * rather than from the task list. */
+  const [jobId, setJobId] = useState<number | null>(null)
+  const [cancelling, setCancelling] = useState(false)
   const [loadingHits, setLoadingHits] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -115,10 +119,11 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
     setHits([])
     setSelected(null)
     try {
-      await api.apiCall(connName, {
+      const started = await api.apiCall<{ job_id?: number }>(connName, {
         kind: 'grepStart', repoId, pattern: p, ignoreCase,
         ...(prefix.trim() ? { pathPrefix: prefix.trim() } : {}),
       })
+      setJobId(started.job_id ?? null)
 
       /*
        * Watch for the run to finish rather than blocking on it. The daemon
@@ -130,9 +135,18 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
         try {
           const list = await loadRuns()
           const newest = list[0]
-          if (newest && n(newest.completed) === 1) {
+          /*
+           * finished_at, not completed. A cancelled run sets a finish time
+           * and leaves completed at 0, so waiting for completed meant the
+           * screen said "Searching..." for ever after a cancel - which is
+           * what cancelling from the app looked like from the outside, even
+           * once the job itself had stopped.
+           */
+          if (newest && n(newest.finished_at) > 0) {
             if (poll.current) { clearInterval(poll.current); poll.current = null }
             setSearching(false)
+            setJobId(null)
+            setCancelling(false)
             void openRun(newest)
           }
         } catch {
@@ -205,6 +219,24 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
       </div>
 
       {searching && (
+        <div className="flex items-center gap-3 mb-3">
+          <button
+            onClick={async () => {
+              if (jobId === null) return
+              setCancelling(true)
+              try { await api.apiCall(connName, { kind: 'jobCancel', jobId }) }
+              catch (err) { setError(String(err)); setCancelling(false) }
+            }}
+            disabled={jobId === null || cancelling}
+            className="px-2 py-1 text-xs cursor-pointer rounded bg-surface-tertiary
+                       text-status-error hover:bg-surface-hover border-none
+                       disabled:opacity-50">
+            {cancelling ? 'Stopping...' : 'Stop'}
+          </button>
+        </div>
+      )}
+
+      {searching && (
         <div className="text-xs text-text-muted mb-3">
           {prefix
             ? `Reading every file under ${prefix}. The results appear when it finishes.`
@@ -246,7 +278,12 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                       * the number that shows the scoping worked. */}
                     <td className="py-1.5 pr-3 text-text-muted">{n(r.files_scanned)}</td>
                     <td className="py-1.5 pr-3">{n(r.hits)}</td>
-                    <td className="py-1.5 whitespace-nowrap">{absoluteTime(r.started_at)}</td>
+                    <td className="py-1.5 whitespace-nowrap">
+                      {absoluteTime(r.started_at)}
+                      {n(r.completed) !== 1 && n(r.finished_at) > 0 && (
+                        <span className="text-status-warning ml-1" title="cancelled">*</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -271,7 +308,15 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                 )}
                 {n(selected.truncated) > 0 && (
                   <span className="text-status-warning ml-2">
-                    - stopped early, there may be more
+                    - stopped at the file limit, there may be more
+                  </span>
+                )}
+                {/* A cancelled run has real hits, just not all of them.
+                  * Presenting them as a finished search would be a lie by
+                  * omission. */}
+                {n(selected.completed) !== 1 && n(selected.finished_at) > 0 && (
+                  <span className="text-status-warning ml-2">
+                    - cancelled, these are the files it reached
                   </span>
                 )}
               </div>

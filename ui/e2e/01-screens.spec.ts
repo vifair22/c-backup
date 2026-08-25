@@ -475,3 +475,41 @@ test('browse: "search here" carries the directory into the search', async () => 
   await expect(h.page.getByPlaceholder('the whole snapshot')).toHaveValue(/\/docs$/)
   await h.page.screenshot({ path: 'test-results/grep-search-here.png', fullPage: true })
 })
+
+test('find in files: stopping a search actually stops the screen', async () => {
+  /*
+   * Two separate things had to be wrong for cancelling to look like it did
+   * nothing, and both were.
+   *
+   * The engine checked the cancel flag between files, so a search that had
+   * reached a large file ignored it until that file finished. And this
+   * screen waited for `completed` to become 1 - which a cancelled run never
+   * sets, though it does set finished_at - so even once the job had stopped,
+   * the screen kept saying "Searching..." indefinitely.
+   *
+   * This covers the second: the screen has to come out of its searching
+   * state and say the run was cancelled.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /find in files/i }).first().click()
+  await expect(h.page.getByText('Search file contents').first()).toBeVisible()
+
+  await h.page.getByPlaceholder(/text to look for/i).fill('quick brown')
+  await h.page.getByRole('button', { name: /^search$/i }).click()
+
+  /* Stop is offered here rather than only in the task list: somebody who
+   * started a search on this screen should be able to call it off on it. */
+  const stop = h.page.getByRole('button', { name: /^stop$/i })
+  await expect(stop).toBeVisible()
+  await stop.click()
+
+  /* The screen must leave its searching state. On the fixture the search
+   * may well finish first, which is fine - what must not happen is the
+   * banner staying up for ever. */
+  await expect(h.page.getByText('Reading every file', { exact: false }))
+    .toHaveCount(0, { timeout: 20_000 })
+  await expect(h.page.getByRole('button', { name: /^search$/i })).toBeEnabled()
+
+  await h.page.screenshot({ path: 'test-results/grep-stopped.png', fullPage: true })
+})

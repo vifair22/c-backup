@@ -41,6 +41,8 @@ typedef struct {
     const regex_t *re;
     const grep_opts_t *opts;
     grep_result_t *res;
+    /* Checked while reading a file, not only between files. */
+    volatile int *cancel;
 
     /* Per-file state, reset for each object. */
     uint64_t     line_no;
@@ -346,6 +348,14 @@ static int scan_object(grep_ctx_t *g, store_t *store,
         char *buf = malloc(256 * 1024);
         if (buf) {
             for (;;) {
+                /*
+                 * Between chunks, not between files. A cancel used to be
+                 * noticed only once the current file finished, so cancelling
+                 * a search that had reached a 13.8 GB file did nothing for
+                 * the 65 seconds it took to read it - which from the outside
+                 * is indistinguishable from cancel being broken.
+                 */
+                if (g->cancel && *g->cancel) break;
                 ssize_t n = read(pfd[0], buf, 256 * 1024);
                 if (n <= 0) break;
                 scan_buffer(g, node_id, path, buf, (size_t)n, carry, &carry_len);
@@ -353,6 +363,12 @@ static int scan_object(grep_ctx_t *g, store_t *store,
             }
             free(buf);
         }
+        /*
+         * Closing while the writer still has bytes to push makes its next
+         * write fail with EPIPE, which is how it learns to stop. That is
+         * only survivable because the daemon ignores SIGPIPE; the default
+         * disposition would end the process here.
+         */
         close(pfd[0]);
         pthread_join(tid, NULL);
     }
@@ -485,7 +501,7 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "grep: cannot list snapshot content");
     }
 
-    grep_ctx_t g = { db, repo_id, res.run_id, &re, opts, &res, 0, 0, 0, 0 };
+    grep_ctx_t g = { db, repo_id, res.run_id, &re, opts, &res, cancel, 0, 0, 0, 0 };
     status_t st = OK;
     uint64_t total = (uint64_t)objs->nrows;
 
