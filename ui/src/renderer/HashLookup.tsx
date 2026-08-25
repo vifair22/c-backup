@@ -8,20 +8,26 @@ const OBJECT_TYPES: Record<number, string> = {
   1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE',
 }
 
+/*
+ * As the daemon sends them. Sizes came back as orig_size and phys_size, not
+ * uncompressed_size, and a reference names the node rather than carrying a
+ * "field" - so the size read as 0 B and the name column was blank. Every
+ * integer is a string.
+ */
 interface LocateResult {
-  found: boolean
-  type?: number
-  uncompressed_size?: number
+  found?: boolean
+  type?: string
+  refcount?: string
+  orig_size?: string
+  phys_size?: string
+  location?: string
+  pack_id?: string
 }
 
 interface RefEntry {
-  snap_id: number
-  node_id: number
-  field: string
-}
-
-interface RefsResult {
-  refs: RefEntry[]
+  snap_id: string
+  node_id: string
+  name: string
 }
 
 interface Props {
@@ -32,6 +38,8 @@ interface Props {
 }
 
 export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }: Props): React.ReactElement {
+  const repoId = Number(repoPath)
+
   const [hash, setHash] = useState('')
   const [locate, setLocate] = useState<LocateResult | null>(null)
   const [refs, setRefs] = useState<RefEntry[] | null>(null)
@@ -51,14 +59,16 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
     setRefs(null)
 
     try {
-      const loc = await api.rpcCall<LocateResult>(connName, repoPath, 'object_locate', { hash: h })
+      const loc = await api.apiCall<LocateResult>(connName, { kind: 'objectInfo', repoId, hash: h })
       setLocate(loc)
 
       if (loc.found) {
-        // Start async ref scan
+        /* Which files point at it is the interesting half, and it is a
+         * separate index lookup, so it loads alongside rather than gating
+         * the answer to "does this object exist". */
         setRefsLoading(true)
-        api.rpcCall<RefsResult>(connName, repoPath, 'object_refs', { hash: h })
-          .then(r => setRefs(r.refs))
+        api.apiCall<{ refs?: RefEntry[] }>(connName, { kind: 'objectRefs', repoId, hash: h })
+          .then(r => setRefs(r.refs ?? []))
           .catch(() => setRefs([]))
           .finally(() => setRefsLoading(false))
       }
@@ -103,19 +113,39 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
 
           {locate.found ? (
             <div className="space-y-3">
-              <div className="flex items-center gap-4">
+              <div className="flex items-center gap-6">
                 <div>
                   <div className="text-[10px] text-text-muted uppercase">Type</div>
                   <span className="text-xs font-semibold text-text-primary">
-                    {OBJECT_TYPES[locate.type ?? 0] ?? `Unknown (${locate.type})`}
+                    {OBJECT_TYPES[Number(locate.type ?? 0)] ?? `Unknown (${locate.type})`}
                   </span>
                 </div>
                 <div>
                   <div className="text-[10px] text-text-muted uppercase">Size</div>
                   <span className="text-xs text-text-primary">
-                    {fmtSize(locate.uncompressed_size ?? 0)}
-                    <span className="text-text-muted ml-1">({fmtNum(locate.uncompressed_size ?? 0)} bytes)</span>
+                    {fmtSize(locate.orig_size)}
+                    <span className="text-text-muted ml-1">({fmtNum(locate.orig_size)} bytes)</span>
                   </span>
+                </div>
+                <div>
+                  <div className="text-[10px] text-text-muted uppercase">On disk</div>
+                  <span className="text-xs text-text-primary">{fmtSize(locate.phys_size)}</span>
+                </div>
+                <div>
+                  <div className="text-[10px] text-text-muted uppercase">Stored</div>
+                  <span className="text-xs text-text-primary">
+                    {locate.location ?? '-'}
+                    {locate.pack_id !== undefined && Number(locate.pack_id) >= 0 && (
+                      <span className="text-text-muted ml-1">#{locate.pack_id}</span>
+                    )}
+                  </span>
+                </div>
+                <div>
+                  {/* How many nodes point at it. A refcount above one is
+                    * dedup doing its job, which is the reason to look an
+                    * object up in the first place. */}
+                  <div className="text-[10px] text-text-muted uppercase">Referenced</div>
+                  <span className="text-xs text-text-primary">{locate.refcount ?? '-'}</span>
                 </div>
                 <button onClick={() => setViewerHash(hash.trim().toLowerCase())}
                   className="text-xs px-3 py-1 rounded bg-accent text-accent-text hover:bg-accent-hover border-none cursor-pointer ml-auto">
@@ -133,8 +163,8 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
       {locate?.found && (
         <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
           <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">
-            Snapshot References
-            {refsLoading && <span className="ml-2 animate-pulse">Scanning snapshots...</span>}
+            Referenced by
+            {refsLoading && <span className="ml-2 animate-pulse">Looking up...</span>}
           </div>
 
           {refs && refs.length > 0 && (
@@ -142,18 +172,18 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
               <thead>
                 <tr className="text-text-muted text-left">
                   <th className="font-medium pb-1 w-16">Snap</th>
-                  <th className="font-medium pb-1 w-24">Node ID</th>
-                  <th className="font-medium pb-1">Field</th>
+                  <th className="font-medium pb-1 w-24">Node</th>
+                  <th className="font-medium pb-1">Name</th>
                 </tr>
               </thead>
               <tbody>
                 {refs.map((r, i) => (
                   <tr key={i}
-                    onClick={() => onNavigateToSnapshot?.(r.snap_id)}
+                    onClick={() => onNavigateToSnapshot?.(Number(r.snap_id))}
                     className="border-t border-border-default cursor-pointer hover:bg-surface-hover text-text-primary">
                     <td className="py-1 font-mono">#{r.snap_id}</td>
                     <td className="py-1 font-mono">{r.node_id}</td>
-                    <td className="py-1">{r.field}</td>
+                    <td className="py-1 font-mono">{r.name}</td>
                   </tr>
                 ))}
               </tbody>

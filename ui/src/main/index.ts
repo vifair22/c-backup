@@ -145,7 +145,4 @@ function registerIpcHandlers(): void {
     return connectionManager.apiCall(connectionName, req)
   })
 
-  ipcMain.handle(IPC.RPC_CALL, async (_e, connectionName: string, repoPath: string, action: string, params?: Record<string, unknown>) => {
-    return connectionManager.rpcCall(connectionName, Number(repoPath), action, params)
-  })
 }

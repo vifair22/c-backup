@@ -253,3 +253,85 @@ test('retention: the five values the daemon actually reads', async () => {
   await h.page.getByRole('button', { name: /policy|retention/i }).first().click()
   await expect(h.page.locator('input[type="number"]').first()).toHaveValue('14')
 })
+
+test('objects: the store, by object', async () => {
+  /*
+   * Sizes here came from `uncompressed_size`/`compressed_size` on rows that
+   * carry orig_size and phys_size, so both size columns were empty and the
+   * ratio divided by undefined.
+   */
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /loose|objects/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Objects' })).toBeVisible()
+
+  /* The fixture packs on backup completion, so the interesting rows are
+   * under Packed rather than Loose. */
+  await h.page.getByRole('button', { name: /^packed$/i }).click()
+  const row = h.page.locator('tbody tr').first()
+  await expect(row).toBeVisible()
+  await expect(row.locator('td').nth(3)).not.toHaveText('-')
+  await expect(row.locator('td').nth(4)).not.toHaveText('-')
+
+  await h.page.screenshot({ path: 'test-results/objects.png', fullPage: true })
+
+  /* A row opens the object, and its content can be read back - which is the
+   * whole claim a content-addressed store makes. */
+  await row.click()
+  await expect(h.page.getByText('Referenced by')).toBeVisible()
+  await h.page.getByRole('button', { name: /view content/i }).click()
+  await expect(h.page.getByText('Hash', { exact: true }).first()).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/object-content.png' })
+  await h.page.keyboard.press('Escape')
+})
+
+test('packs: entries, and the hash distribution', async () => {
+  /*
+   * This screen threw on open: it listed packs with a 'scan' action the
+   * bridge had no case for. The fanout chart then read a cumulative table
+   * out of a .idx header that no longer exists - the recorded gap.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /pack/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Packs' })).toBeVisible()
+
+  const pack = h.page.locator('tbody tr').first()
+  await expect(pack).toBeVisible()
+  await pack.click()
+  const entry = h.page.locator('tbody tr').last()
+  await expect(entry).toBeVisible()
+
+  await h.page.screenshot({ path: 'test-results/packs.png', fullPage: true })
+
+  await h.page.getByRole('button', { name: /hash distribution/i }).click()
+  /* Wait for real buckets. "0 objects" is what the panel shows before the
+   * fetch lands, and an assertion loose enough to match that would pass on
+   * an empty chart - which is exactly what it did the first time. */
+  await expect(h.page.getByText(/^(?!0 objects)\d+ objects,/)).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/fanout.png' })
+  await h.page.keyboard.press('Escape')
+})
+
+test('diff: what changed between two snapshots', async () => {
+  /*
+   * The filter buttons matched single-letter change codes against the words
+   * the daemon sends, so every row was filtered out and the table was
+   * always empty. The fixture adds a file between its two snapshots, so
+   * there is exactly one thing to find.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /compare/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Compare Snapshots' })).toBeVisible()
+
+  await expect(h.page.getByText('second.md', { exact: false })).toBeVisible()
+  await expect(h.page.getByRole('button', { name: /Added 1/ })).toBeVisible()
+
+  await h.page.screenshot({ path: 'test-results/diff.png', fullPage: true })
+
+  /* Opening the row shows the file's contents, which needs the hash the
+   * daemon only started sending with this change. */
+  await h.page.getByText('second.md', { exact: false }).click()
+  await expect(h.page.getByText('added later', { exact: false })).toBeVisible({ timeout: 10_000 })
+  await h.page.screenshot({ path: 'test-results/diff-content.png' })
+})

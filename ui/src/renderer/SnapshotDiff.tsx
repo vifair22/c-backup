@@ -1,90 +1,109 @@
+/*
+ * What changed between two snapshots.
+ *
+ * Migrated off the action bridge, which fed it a response of a shape that
+ * has not existed since the rewrite. It expected single-letter change codes
+ * and an old_node/new_node pair carrying mode, uid, gid, mtime and a content
+ * hash; the daemon walks manifest trees and reports a change word, a path
+ * and sizes. Every size column was blank, the filter buttons matched nothing
+ * so the table was always empty, and opening a row to see the content diff
+ * read a hash out of an object that was not there.
+ *
+ * The daemon now sends both hashes and both sizes, which is what makes the
+ * side-by-side view possible at all - and that view is the reason to have
+ * this screen rather than read `c-backup diff`.
+ *
+ * The metadata-only change type is gone. A tree entry is compared by hash,
+ * so a permission change either alters the entry - in which case it is a
+ * modification like any other - or it does not appear. There is no third
+ * category to show.
+ */
+
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { fmtSize, fmtNum, fmtMode, absoluteTime } from './format'
+import { fmtSize, fmtNum, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 
 const api = window.cbackup
 
-const DIFF_ROW_CAP = 5000
+/* The daemon stops emitting rows at 2000 and says so, while still counting
+ * the whole comparison. */
+const DIFF_ROW_CAP = 2000
 const CONTENT_MAX_BYTES = 2 * 1024 * 1024 // 2 MiB
 
-interface Snapshot {
-  id: number
-  created_sec: number
-  node_count: number
+interface RawSnapshot { id: string; ts: string; label?: string }
+interface Snapshot { id: number; ts: number; label: string }
+
+/* Every integer arrives as a string; a hash is empty for the side that does
+ * not exist. */
+interface RawChange {
+  change: string
+  path: string
+  size?: string
+  old_size?: string
+  new_size?: string
+  old_hash?: string
+  new_hash?: string
 }
 
-interface SnapList {
-  head: number
-  snapshots: Snapshot[]
-}
-
-interface DiffNode {
-  mode: number
-  uid: number
-  gid: number
-  size: number
-  mtime_sec: number
-  content_hash: string
-}
+type ChangeType = 'added' | 'removed' | 'modified'
 
 interface DiffChange {
-  change: 'A' | 'D' | 'M' | 'm'
+  change: ChangeType
   path: string
-  old_node?: DiffNode
-  new_node?: DiffNode
+  oldSize: number
+  newSize: number
+  oldHash: string
+  newHash: string
 }
 
-interface DiffResponse {
-  changes: DiffChange[]
-  count: number
+interface RawDiff {
+  changes?: RawChange[]
+  added?: string
+  removed?: string
+  modified?: string
+  truncated?: string
 }
 
 interface ObjectContent {
-  type: number
-  size: number
-  truncated: boolean
-  content_base64: string
+  base64?: string
+  too_large?: boolean
+  size?: number
 }
 
-type ChangeType = 'A' | 'D' | 'M' | 'm'
 type SortKey = 'change' | 'path' | 'old_size' | 'new_size' | 'delta'
 type SortDir = 'asc' | 'desc'
 
 const CHANGE_LABELS: Record<ChangeType, { label: string; badge: string; color: string }> = {
-  A: { label: 'Added', badge: 'A', color: 'bg-green-600 text-white' },
-  D: { label: 'Deleted', badge: 'D', color: 'bg-red-600 text-white' },
-  M: { label: 'Modified', badge: 'M', color: 'bg-amber-600 text-white' },
-  m: { label: 'Metadata', badge: 'm', color: 'bg-blue-600 text-white' },
+  added:    { label: 'Added',    badge: 'A', color: 'bg-green-600 text-white' },
+  removed:  { label: 'Removed',  badge: 'D', color: 'bg-red-600 text-white' },
+  modified: { label: 'Modified', badge: 'M', color: 'bg-amber-600 text-white' },
 }
 
 const ROW_TINT: Record<ChangeType, string> = {
-  A: 'bg-green-500/5',
-  D: 'bg-red-500/5',
-  M: '',
-  m: 'bg-blue-500/5',
+  added: 'bg-green-500/5',
+  removed: 'bg-red-500/5',
+  modified: '',
 }
 
+const parseChange = (c: RawChange): DiffChange => ({
+  change: (c.change as ChangeType),
+  path: c.path,
+  oldSize: Number(c.old_size ?? '0'),
+  newSize: Number(c.new_size ?? '0'),
+  oldHash: c.old_hash ?? '',
+  newHash: c.new_hash ?? '',
+})
+
 function sizeDelta(c: DiffChange): number | null {
-  if (c.change === 'A') return c.new_node?.size ?? null
-  if (c.change === 'D') return c.old_node ? -(c.old_node.size) : null
-  if (c.old_node && c.new_node) return c.new_node.size - c.old_node.size
-  return null
+  if (c.change === 'added') return c.newSize
+  if (c.change === 'removed') return -c.oldSize
+  return c.newSize - c.oldSize
 }
 
 function fmtDelta(delta: number): string {
   if (delta === 0) return '0 B'
   const sign = delta > 0 ? '+' : ''
   return sign + fmtSize(Math.abs(delta))
-}
-
-function metaDiffLines(old_node: DiffNode, new_node: DiffNode): string[] {
-  const lines: string[] = []
-  if (old_node.mode !== new_node.mode) lines.push(`mode: ${fmtMode(old_node.mode)} \u2192 ${fmtMode(new_node.mode)}`)
-  if (old_node.uid !== new_node.uid) lines.push(`uid: ${old_node.uid} \u2192 ${new_node.uid}`)
-  if (old_node.gid !== new_node.gid) lines.push(`gid: ${old_node.gid} \u2192 ${new_node.gid}`)
-  if (old_node.mtime_sec !== new_node.mtime_sec) lines.push(`mtime: ${absoluteTime(old_node.mtime_sec)} \u2192 ${absoluteTime(new_node.mtime_sec)}`)
-  if (old_node.size !== new_node.size) lines.push(`size: ${fmtSize(old_node.size)} \u2192 ${fmtSize(new_node.size)}`)
-  return lines.length > 0 ? lines : ['(no visible metadata differences)']
 }
 
 interface FileDiffData {
@@ -104,14 +123,16 @@ interface Props {
 }
 
 export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, onBack, onNavigateToFile }: Props): React.ReactElement {
-  const [snapList, setSnapList] = useState<SnapList | null>(null)
+  const repoId = Number(repoPath)
+
+  const [snaps, setSnaps] = useState<Snapshot[]>([])
   const [snapA, setSnapA] = useState<number | null>(initialSnapA ?? null)
   const [snapB, setSnapB] = useState<number | null>(initialSnapB ?? null)
   const [changes, setChanges] = useState<DiffChange[] | null>(null)
-  const [totalCount, setTotalCount] = useState(0)
+  const [totals, setTotals] = useState<{ added: number; removed: number; modified: number; truncated: boolean } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [filter, setFilter] = useState<Set<ChangeType>>(new Set(['A', 'D', 'M', 'm']))
+  const [filter, setFilter] = useState<Set<ChangeType>>(new Set(['added', 'removed', 'modified']))
   const [sortKey, setSortKey] = useState<SortKey>('path')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [initLoading, setInitLoading] = useState(true)
@@ -147,20 +168,25 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
 
   useEffect(() => {
     let cancelled = false
-    api.rpcCall<SnapList>(connName, repoPath, 'list')
+    api.apiCall<{ snapshots?: RawSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 })
       .then(data => {
         if (cancelled) return
-        setSnapList(data)
-        const snaps = data.snapshots
-        if (snaps.length >= 2) {
-          if (!snapA) setSnapA(snaps[snaps.length - 2].id)
-          if (!snapB) setSnapB(snaps[snaps.length - 1].id)
+        const list = (data.snapshots ?? []).map(x => ({
+          id: Number(x.id), ts: Number(x.ts), label: x.label ?? '',
+        }))
+        setSnaps(list)
+        /* Newest first, so the default comparison is the previous snapshot
+         * against the newest one - which is what somebody opening this
+         * almost always wants to see. */
+        if (list.length >= 2) {
+          if (!snapA) setSnapA(list[1].id)
+          if (!snapB) setSnapB(list[0].id)
         }
       })
       .catch(err => { if (!cancelled) setError(String(err)) })
       .finally(() => { if (!cancelled) setInitLoading(false) })
     return () => { cancelled = true }
-  }, [connName, repoPath])
+  }, [connName, repoId])
 
   const runDiff = useCallback(async () => {
     if (!snapA || !snapB || snapA === snapB) return
@@ -168,14 +194,21 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
     setError(null)
     setChanges(null)
     try {
-      const resp = await api.rpcCall<DiffResponse>(connName, repoPath, 'diff', { id1: snapA, id2: snapB })
-      setChanges(resp.changes.slice(0, DIFF_ROW_CAP))
-      setTotalCount(resp.count)
+      const resp = await api.apiCall<RawDiff>(connName, {
+        kind: 'diff', repoId, from: snapA, to: snapB,
+      })
+      setChanges((resp.changes ?? []).map(parseChange))
+      setTotals({
+        added: Number(resp.added ?? '0'),
+        removed: Number(resp.removed ?? '0'),
+        modified: Number(resp.modified ?? '0'),
+        truncated: resp.truncated === 'true',
+      })
     } catch (err) {
       setError(String(err))
     }
     setLoading(false)
-  }, [connName, repoPath, snapA, snapB])
+  }, [connName, repoId, snapA, snapB])
 
   useEffect(() => {
     if (snapA && snapB && !changes && !loading && !initLoading) {
@@ -204,17 +237,10 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
 
   // Click row handler
   const handleRowClick = async (change: DiffChange) => {
-    // Metadata-only: in-app modal
-    if (change.change === 'm' && change.old_node && change.new_node) {
-      setMetaModal({ path: change.path, lines: metaDiffLines(change.old_node, change.new_node) })
-      return
-    }
-
-    // Content change: in-app diff modal
-    const oldSize = change.old_node?.size ?? 0
-    const newSize = change.new_node?.size ?? 0
-    if (oldSize > CONTENT_MAX_BYTES || newSize > CONTENT_MAX_BYTES) {
-      setMetaModal({ path: change.path, lines: [`File too large for diff view (${fmtSize(Math.max(oldSize, newSize))})`] })
+    if (change.oldSize > CONTENT_MAX_BYTES || change.newSize > CONTENT_MAX_BYTES) {
+      setMetaModal({ path: change.path, lines: [
+        `Too large to diff in the app (${fmtSize(Math.max(change.oldSize, change.newSize))}).`,
+      ] })
       return
     }
 
@@ -224,18 +250,19 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
 
     try {
       const zeroHash = '0'.repeat(64)
+      const fetchSide = (hash: string) =>
+        hash && hash !== zeroHash
+          ? api.apiCall<ObjectContent>(connName, { kind: 'objectContent', repoId, hash })
+          : Promise.resolve(null)
+
       const [oldContent, newContent] = await Promise.all([
-        change.old_node?.content_hash && change.old_node.content_hash !== zeroHash
-          ? api.rpcCall<ObjectContent>(connName, repoPath, 'object_content', { hash: change.old_node.content_hash, max_bytes: CONTENT_MAX_BYTES })
-          : null,
-        change.new_node?.content_hash && change.new_node.content_hash !== zeroHash
-          ? api.rpcCall<ObjectContent>(connName, repoPath, 'object_content', { hash: change.new_node.content_hash, max_bytes: CONTENT_MAX_BYTES })
-          : null,
+        fetchSide(change.oldHash),
+        fetchSide(change.newHash),
       ])
 
       const decode = (c: ObjectContent | null): string | null => {
-        if (!c) return null
-        try { return atob(c.content_base64) } catch { return null }
+        if (!c || c.too_large || !c.base64) return null
+        try { return atob(c.base64) } catch { return null }
       }
 
       const oldText = decode(oldContent)
@@ -244,7 +271,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       const isBinary = (s: string | null) => s !== null && /[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 4096))
       if (isBinary(oldText) || isBinary(newText)) {
         setFileDiff(null)
-        setMetaModal({ path: change.path, lines: ['Binary file \u2014 cannot display diff'] })
+        setMetaModal({ path: change.path, lines: ['Binary file - nothing readable to compare'] })
       } else {
         setFileDiff({ path: change.path, change: change.change, oldText, newText })
       }
@@ -259,7 +286,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
   // Row right-click
   const showRowMenu = (e: React.MouseEvent, change: DiffChange) => {
     e.preventDefault()
-    const targetSnap = change.change === 'D' ? snapA : snapB
+    const targetSnap = change.change === 'removed' ? snapA : snapB
     const items: ContextMenuItem[] = []
     if (onNavigateToFile && targetSnap) {
       items.push({ label: 'Show in snapshot browser', onClick: () => onNavigateToFile(targetSnap, change.path) })
@@ -274,8 +301,8 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
     switch (sortKey) {
       case 'change': av = a.change; bv = b.change; break
       case 'path': av = a.path; bv = b.path; break
-      case 'old_size': av = a.old_node?.size ?? -1; bv = b.old_node?.size ?? -1; break
-      case 'new_size': av = a.new_node?.size ?? -1; bv = b.new_node?.size ?? -1; break
+      case 'old_size': av = a.oldSize; bv = b.oldSize; break
+      case 'new_size': av = a.newSize; bv = b.newSize; break
       case 'delta': av = sizeDelta(a) ?? 0; bv = sizeDelta(b) ?? 0; break
     }
     if (typeof av === 'string') {
@@ -285,14 +312,16 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
     return sortDir === 'asc' ? (av as number) - (bv as number) : (bv as number) - (av as number)
   })
 
-  const counts = {
-    A: changes?.filter(c => c.change === 'A').length ?? 0,
-    D: changes?.filter(c => c.change === 'D').length ?? 0,
-    M: changes?.filter(c => c.change === 'M').length ?? 0,
-    m: changes?.filter(c => c.change === 'm').length ?? 0,
+  /*
+   * Counts come from the daemon, which counted the whole comparison even
+   * when it stopped emitting rows. Counting the rows here would report 2000
+   * changes for a snapshot that changed a hundred thousand files.
+   */
+  const counts: Record<ChangeType, number> = {
+    added: totals?.added ?? 0,
+    removed: totals?.removed ?? 0,
+    modified: totals?.modified ?? 0,
   }
-
-  const snaps = snapList?.snapshots ?? []
 
   return (
     <div>
@@ -308,7 +337,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       {initLoading && <div className="text-text-muted text-sm">Loading...</div>}
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
 
-      {snapList && (
+      {snaps.length > 0 && (
         <>
           {/* Selectors */}
           <div className="flex flex-wrap items-center gap-3 mb-4 bg-surface-secondary border border-border-default rounded-lg px-4 py-3">
@@ -318,7 +347,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                 className="text-xs px-2 py-1 border border-border-default rounded bg-surface-primary text-text-primary focus:outline-none focus:border-accent min-w-0">
                 <option value="">Select...</option>
                 {snaps.map(s => (
-                  <option key={s.id} value={s.id}>#{s.id} — {absoluteTime(s.created_sec)}</option>
+                  <option key={s.id} value={s.id}>#{s.id} - {absoluteTime(s.ts)}</option>
                 ))}
               </select>
             </div>
@@ -328,7 +357,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                 className="text-xs px-2 py-1 border border-border-default rounded bg-surface-primary text-text-primary focus:outline-none focus:border-accent min-w-0">
                 <option value="">Select...</option>
                 {snaps.map(s => (
-                  <option key={s.id} value={s.id}>#{s.id} — {absoluteTime(s.created_sec)}</option>
+                  <option key={s.id} value={s.id}>#{s.id} - {absoluteTime(s.ts)}</option>
                 ))}
               </select>
             </div>
@@ -345,7 +374,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
           {/* Summary + filters */}
           {changes && (
             <div className="flex flex-wrap items-center gap-2 mb-3">
-              {(['A', 'D', 'M', 'm'] as ChangeType[]).map(type => {
+              {(['added', 'removed', 'modified'] as ChangeType[]).map(type => {
                 const info = CHANGE_LABELS[type]
                 const active = filter.has(type)
                 const count = counts[type]
@@ -359,9 +388,13 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                   </button>
                 )
               })}
-              {totalCount > DIFF_ROW_CAP && (
+              {/* The counts above are the whole comparison; the table is
+                * capped. Saying so is the difference between "a hundred
+                * thousand files changed" and a list that looks complete. */}
+              {totals?.truncated && (
                 <span className="text-xs text-status-warning">
-                  Showing {fmtNum(DIFF_ROW_CAP)} of {fmtNum(totalCount)} changes
+                  Listing the first {fmtNum(DIFF_ROW_CAP)} of{' '}
+                  {fmtNum(counts.added + counts.removed + counts.modified)} changes
                 </span>
               )}
             </div>
@@ -373,7 +406,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
               <table className="w-full text-xs table-fixed">
                 <thead>
                   <tr className="text-text-muted text-left">
-                    <th className="font-medium pb-2 pt-4 pl-4 w-14 cursor-pointer" onClick={() => toggleSort('change')}>
+                    <th className="font-medium pb-2 pt-4 pl-4 pr-4 w-16 cursor-pointer" onClick={() => toggleSort('change')}>
                       Status{sortIndicator('change')}
                     </th>
                     <th className="font-medium pb-2 pt-4 cursor-pointer" onClick={() => toggleSort('path')}>
@@ -400,7 +433,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                         onClick={() => !isFetching && handleRowClick(c)}
                         onContextMenu={e => showRowMenu(e, c)}
                         className={`border-t border-border-default cursor-pointer hover:bg-surface-hover ${ROW_TINT[c.change]}`}>
-                        <td className="py-1.5 pl-4">
+                        <td className="py-1.5 pl-4 pr-4">
                           <span className={`inline-block px-1.5 py-0 rounded text-[10px] font-semibold ${info.color}`}>
                             {info.badge}
                           </span>
@@ -408,17 +441,12 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                         <td className="py-1.5 font-mono truncate" title={c.path}>
                           {c.path}
                           {isFetching && <span className="text-text-muted text-[10px] ml-2">loading...</span>}
-                          {c.change === 'm' && c.old_node && c.new_node && (
-                            <span className="text-text-muted text-[10px] ml-2">
-                              {metaDiffLines(c.old_node, c.new_node).length} field(s)
-                            </span>
-                          )}
                         </td>
                         <td className="py-1.5 text-right text-text-muted">
-                          {c.old_node ? fmtSize(c.old_node.size) : ''}
+                          {c.change === 'added' ? '' : fmtSize(c.oldSize)}
                         </td>
                         <td className="py-1.5 text-right text-text-muted">
-                          {c.new_node ? fmtSize(c.new_node.size) : ''}
+                          {c.change === 'removed' ? '' : fmtSize(c.newSize)}
                         </td>
                         <td className={`py-1.5 text-right pr-4 ${
                           delta !== null && delta > 0 ? 'text-red-400' : delta !== null && delta < 0 ? 'text-green-400' : 'text-text-muted'
@@ -496,7 +524,7 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
             <div className="flex-1 overflow-auto min-h-0">
               {diffLoading ? (
                 <div className="flex items-center justify-center h-full text-text-muted text-sm">Loading diff...</div>
-              ) : fileDiff.change === 'M' && fileDiff.oldText !== null && fileDiff.newText !== null ? (
+              ) : fileDiff.change === 'modified' && fileDiff.oldText !== null && fileDiff.newText !== null ? (
                 /* Side by side */
                 <div className="grid grid-cols-2 h-full">
                   <div ref={leftRef} onScroll={() => syncScroll('left')} className="border-r border-border-default overflow-auto">
@@ -534,8 +562,8 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
                 /* Single side (added or deleted) */
                 <div className="overflow-auto h-full">
                   {(() => {
-                    const text = fileDiff.change === 'D' ? fileDiff.oldText : fileDiff.newText
-                    const isDelete = fileDiff.change === 'D'
+                    const text = fileDiff.change === 'removed' ? fileDiff.oldText : fileDiff.newText
+                    const isDelete = fileDiff.change === 'removed'
                     const lines = text?.split('\n') ?? []
                     const prefix = isDelete ? '-' : '+'
                     const lineClass = isDelete ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'

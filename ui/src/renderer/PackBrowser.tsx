@@ -1,73 +1,82 @@
+/*
+ * What is inside the pack files.
+ *
+ * Rewritten rather than migrated, because the screen was built on a
+ * repository layout that no longer exists. It listed packs from a 'scan'
+ * action the bridge never mapped - so it threw the moment it opened - and
+ * then read each pack's contents from a `.idx` sidecar file paired with the
+ * `.dat`. There are no sidecars: pack contents are rows in pack_objects,
+ * which is what makes an offset lookup an index seek instead of a binary
+ * search through a file.
+ *
+ * The fanout chart is the part worth keeping. The `.idx` header stored a
+ * 256-entry cumulative table because a sorted on-disk index needs somewhere
+ * to start a binary search; the same shape is now a GROUP BY over hash
+ * prefixes, so it is a picture of how evenly the hashes spread rather than a
+ * lookup structure. It reads from /fanout, which had no consumer until now.
+ */
+
 import React, { useCallback, useEffect, useState } from 'react'
-import { fmtSize, fmtNum } from './format'
+import { fmtSize, fmtNum, absoluteTime } from './format'
 import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
 
-const OBJECT_TYPES: Record<number, string> = { 1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE' }
-const COMPRESS_NAMES: Record<number, string> = { 0: 'none', 1: 'lz4-block', 2: 'lz4-frame' }
+const PAGE_SIZE = 200
 
-interface ScanPack {
-  name: string
+/* Every integer arrives as a string. */
+interface RawPack {
+  id: string
+  filename?: string
+  size?: string
+  sealed_at?: string
+  version?: string
+  entries?: string
+}
+
+interface Pack {
+  id: number
+  filename: string
   size: number
-}
-
-interface ScanResponse {
-  packs: ScanPack[]
-}
-
-interface PackEntry {
-  hash: string
-  type: number
-  compression: number
-  uncompressed_size: number
-  compressed_size: number
-  payload_offset: number
-}
-
-interface PackEntriesResponse {
-  entries: PackEntry[]
+  sealedAt: number
   version: number
-  count: number
-  file_size?: number
+  entries: number
 }
 
-interface PackIdxEntry {
+interface RawEntry {
   hash: string
-  dat_offset: number
+  offset?: string
+  comp_size?: string
+  orig_size?: string
+  entry_index?: string
 }
 
-interface PackIndexResponse {
-  entries: PackIdxEntry[]
-  version: number
-  count: number
-}
-
-interface GlobalIndexHeader {
-  magic: number
-  version: number
-  entry_count: number
-  pack_count: number
-}
-
-interface GlobalIndexEntry {
+interface Entry {
   hash: string
-  pack_num: number
-  dat_offset: number
-  pack_version: number
-  entry_index: number
-}
-
-interface GlobalIndexResponse {
-  header: GlobalIndexHeader
-  fanout: number[]
-  entries: GlobalIndexEntry[]
   offset: number
-  limit: number
-  has_more: boolean
+  compSize: number
+  origSize: number
+  entryIndex: number
 }
 
-type PackTab = 'entries' | 'index' | 'global'
+interface Bucket { prefix: string; count: number }
+
+const parsePack = (p: RawPack): Pack => ({
+  id: Number(p.id),
+  filename: p.filename ?? '',
+  size: Number(p.size ?? '0'),
+  sealedAt: Number(p.sealed_at ?? '0'),
+  version: Number(p.version ?? '0'),
+  entries: Number(p.entries ?? '0'),
+})
+
+const parseEntry = (e: RawEntry): Entry => ({
+  hash: e.hash,
+  offset: Number(e.offset ?? '0'),
+  compSize: Number(e.comp_size ?? '0'),
+  origSize: Number(e.orig_size ?? '0'),
+  entryIndex: Number(e.entry_index ?? '0'),
+})
 
 interface Props {
   connName: string
@@ -76,328 +85,259 @@ interface Props {
 }
 
 export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactElement {
-  const [packs, setPacks] = useState<ScanPack[]>([])
-  const [selectedPack, setSelectedPack] = useState<string | null>(null)
-  const [packTab, setPackTab] = useState<PackTab>('entries')
+  const repoId = Number(repoPath)
+
+  const [packs, setPacks] = useState<Pack[]>([])
+  const [selected, setSelected] = useState<Pack | null>(null)
+  const [entries, setEntries] = useState<Entry[]>([])
+  const [offset, setOffset] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [entriesLoading, setEntriesLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  // Pack entries/index
-  const [packEntries, setPackEntries] = useState<PackEntriesResponse | null>(null)
-  const [packIndex, setPackIndex] = useState<PackIndexResponse | null>(null)
-  const [packLoading, setPackLoading] = useState(false)
-
-  // Global index
-  const [globalIndex, setGlobalIndex] = useState<GlobalIndexResponse | null>(null)
-  const [globalOffset, setGlobalOffset] = useState(0)
-  const [globalLoading, setGlobalLoading] = useState(false)
-
-  // Content viewer
   const [viewerHash, setViewerHash] = useState<string | null>(null)
+
+  const [buckets, setBuckets] = useState<Bucket[]>([])
+  const [hover, setHover] = useState<number | null>(null)
+  const [showFanout, setShowFanout] = useState(false)
 
   useEffect(() => {
     let cancelled = false
-    api.rpcCall<ScanResponse>(connName, repoPath, 'scan')
-      .then(r => {
-        if (cancelled) return
-        const sorted = (r.packs ?? []).sort((a, b) => a.name.localeCompare(b.name))
-        setPacks(sorted)
-      })
+    setLoading(true)
+    setError(null)
+    api.apiCall<{ packs?: RawPack[] }>(connName, { kind: 'packList', repoId })
+      .then(r => { if (!cancelled) setPacks((r.packs ?? []).map(parsePack)) })
       .catch(err => { if (!cancelled) setError(String(err)) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [connName, repoPath])
+  }, [connName, repoId])
 
-  const loadPack = useCallback(async (name: string) => {
-    setSelectedPack(name)
-    setPackEntries(null)
-    setPackIndex(null)
-    setPackLoading(true)
+  const loadEntries = useCallback(async (pack: Pack, pageOffset: number) => {
+    setEntriesLoading(true)
     try {
-      const [entries, idx] = await Promise.all([
-        api.rpcCall<PackEntriesResponse>(connName, repoPath, 'pack_entries', { name }),
-        api.rpcCall<PackIndexResponse>(connName, repoPath, 'pack_index', { name: name.replace(/\.dat$/, '.idx') }),
-      ])
-      setPackEntries(entries)
-      setPackIndex(idx)
-    } catch (err) {
-      setError(String(err))
-    }
-    setPackLoading(false)
-  }, [connName, repoPath])
-
-  const loadGlobalIndex = useCallback(async (offset: number) => {
-    setGlobalLoading(true)
-    try {
-      const resp = await api.rpcCall<GlobalIndexResponse>(connName, repoPath, 'global_pack_index', {
-        offset, limit: 500
+      const r = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
+        kind: 'packEntries', repoId, packId: pack.id,
+        limit: PAGE_SIZE, offset: pageOffset,
       })
-      setGlobalIndex(resp)
-      setGlobalOffset(offset)
+      const list = (r.entries ?? []).map(parseEntry)
+      setEntries(list)
+      setHasMore(list.length === PAGE_SIZE)
     } catch (err) {
       setError(String(err))
     }
-    setGlobalLoading(false)
-  }, [connName, repoPath])
+    setEntriesLoading(false)
+  }, [connName, repoId])
 
-  // Fanout distribution
-  const [fanoutHover, setFanoutHover] = useState<number | null>(null)
-  const fanoutCounts = globalIndex ? globalIndex.fanout.map((v, i) => i === 0 ? v : v - globalIndex.fanout[i - 1]) : []
-  const fanoutMax = fanoutCounts.length > 0 ? Math.max(...fanoutCounts) : 0
-  const fanoutAvg = fanoutCounts.length > 0 ? fanoutCounts.reduce((a, b) => a + b, 0) / fanoutCounts.length : 0
+  const openPack = (pack: Pack) => {
+    setSelected(pack)
+    setOffset(0)
+    void loadEntries(pack, 0)
+  }
+
+  const openFanout = async () => {
+    setShowFanout(true)
+    if (buckets.length > 0) return
+    try {
+      const r = await api.apiCall<{ buckets?: { prefix: string; count: string }[] }>(
+        connName, { kind: 'fanout', repoId })
+      setBuckets((r.buckets ?? []).map(b => ({ prefix: b.prefix, count: Number(b.count) })))
+    } catch (err) {
+      setError(String(err))
+    }
+  }
+
+  /*
+   * 256 slots, because a two-character hex prefix has 256 values. The route
+   * only returns prefixes that occur, so the empty ones have to be filled in
+   * here - a chart with the gaps closed up would hide exactly the unevenness
+   * it exists to show.
+   */
+  const counts = new Array<number>(256).fill(0)
+  for (const b of buckets) {
+    const i = parseInt(b.prefix, 16)
+    if (Number.isFinite(i) && i >= 0 && i < 256) counts[i] = b.count
+  }
+  const maxCount = Math.max(0, ...counts)
+  const total = counts.reduce((a, b) => a + b, 0)
+  const avg = total / 256
+
+  const totalSize = packs.reduce((a, p) => a + p.size, 0)
+  const totalEntries = packs.reduce((a, p) => a + p.entries, 0)
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center gap-3 mb-4 shrink-0">
+    <div>
+      <div className="flex items-center gap-3 mb-4">
         <button onClick={onBack}
           className="text-xs text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-          &larr; Dashboard
+          &larr; Back
         </button>
-        <h3 className="text-lg font-medium m-0">Pack Files</h3>
-        <span className="text-xs text-text-muted">{packs.length} pack{packs.length !== 1 ? 's' : ''}</span>
+        <h3 className="text-lg font-medium m-0">Packs</h3>
+        {!loading && packs.length > 0 && (
+          <span className="text-xs text-text-muted">
+            {fmtNum(packs.length)} pack{packs.length === 1 ? '' : 's'},{' '}
+            {fmtNum(totalEntries)} objects, {fmtSize(totalSize)}
+          </span>
+        )}
+        <button onClick={openFanout}
+          className="text-[11px] px-2 py-0.5 rounded bg-surface-tertiary hover:bg-surface-hover
+                     text-text-secondary cursor-pointer border-none ml-auto">
+          Hash distribution
+        </button>
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
       {loading && <div className="text-text-muted text-sm">Loading...</div>}
 
-      <div className="flex gap-4 flex-1 min-h-0">
-        {/* Pack list sidebar */}
-        <div className="w-56 shrink-0 flex flex-col">
-          <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden flex flex-col flex-1">
-            <div className="px-3 py-2 border-b border-border-default text-[11px] text-text-muted uppercase tracking-wide shrink-0">Packs</div>
-            <div className="flex-1 overflow-auto">
-              {packs.map(p => (
-                <div key={p.name}
-                  onClick={() => { loadPack(p.name); setPackTab('entries') }}
-                  className={`px-3 py-1.5 text-xs cursor-pointer hover:bg-surface-hover border-b border-border-default last:border-0 ${
-                    selectedPack === p.name ? 'bg-accent/10 text-accent' : 'text-text-primary'
-                  }`}>
-                  <div className="font-mono truncate">{p.name}</div>
-                  <div className="text-[10px] text-text-muted">{fmtSize(p.size)}</div>
-                </div>
-              ))}
-            </div>
-            {/* Global index button */}
-            <div className="border-t border-border-default">
-              <button onClick={() => { setSelectedPack(null); setPackTab('global'); loadGlobalIndex(0) }}
-                className={`w-full text-left px-3 py-1.5 text-xs cursor-pointer border-none hover:bg-surface-hover ${
-                  packTab === 'global' && !selectedPack ? 'bg-accent/10 text-accent' : 'bg-transparent text-text-secondary'
-                }`}>
-                Global Index
-              </button>
-            </div>
-          </div>
+      {!loading && packs.length === 0 && !error && (
+        <div className="text-text-muted text-sm">
+          Nothing is packed yet. Backup packs on completion, so this fills in
+          after the first one finishes.
         </div>
+      )}
 
-        {/* Main content */}
-        <div className="flex-1 min-w-0 flex flex-col min-h-0">
-          {selectedPack && (
-            <>
-              {/* Tabs */}
-              <div className="flex gap-0 border-b border-border-default mb-3 shrink-0">
-                {(['entries', 'index'] as const).map(tab => (
-                  <button key={tab} onClick={() => setPackTab(tab)}
-                    className={`px-4 py-2 text-xs cursor-pointer border-none bg-transparent ${
-                      packTab === tab ? 'text-accent border-b-2 border-accent font-medium' : 'text-text-muted hover:text-text-primary'
-                    }`}>
-                    {tab === 'entries' ? `Entries (${packEntries?.count ?? '...'})` : `Index (${packIndex?.count ?? '...'})`}
-                  </button>
+      {!loading && packs.length > 0 && (
+        <div className="flex gap-4 items-start">
+          <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden shrink-0">
+            <table className="text-xs">
+              <thead>
+                <tr className="text-text-muted text-left">
+                  <th className="font-medium pb-2 pt-4 pl-4">Pack</th>
+                  <th className="font-medium pb-2 pt-4 text-right">Objects</th>
+                  <th className="font-medium pb-2 pt-4 text-right pr-6">Size</th>
+                  <th className="font-medium pb-2 pt-4 pr-4">Sealed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {packs.map(p => (
+                  <tr key={p.id} onClick={() => openPack(p)}
+                    className={`border-t border-border-default cursor-pointer hover:bg-surface-hover
+                                text-text-primary ${selected?.id === p.id ? 'bg-accent/10' : ''}`}>
+                    <td className="py-1.5 pl-4 pr-4 font-mono">{p.filename || `#${p.id}`}</td>
+                    <td className="py-1.5 pr-4 text-right">{fmtNum(p.entries)}</td>
+                    <td className="py-1.5 pr-6 text-right">{fmtSize(p.size)}</td>
+                    {/* A pack with no sealed_at is still being written to. */}
+                    <td className="py-1.5 pr-4 text-text-muted whitespace-nowrap">
+                      {p.sealedAt > 0 ? absoluteTime(p.sealedAt) : 'open'}
+                    </td>
+                  </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+
+          {selected && (
+            <div className="flex-1 min-w-0">
+              <div className="text-xs text-text-secondary mb-2">
+                {selected.filename || `Pack #${selected.id}`}
+                <span className="text-text-muted ml-2">
+                  format v{selected.version}, {fmtNum(selected.entries)} objects
+                </span>
               </div>
 
-              {packLoading && <div className="text-text-muted text-sm">Loading pack...</div>}
-
-              {/* Pack header info */}
-              {packEntries && packTab === 'entries' && (
-                <>
-                  <div className="flex gap-4 mb-3 text-xs text-text-muted shrink-0">
-                    <span>Version {packEntries.version}</span>
-                    <span>{fmtNum(packEntries.count)} objects</span>
-                    {packEntries.file_size && <span>{fmtSize(packEntries.file_size)} on disk</span>}
-                  </div>
-                  <div className="bg-surface-secondary border border-border-default rounded-lg overflow-auto flex-1 min-h-0">
-                    <table className="w-full text-xs table-fixed">
-                      <thead>
-                        <tr className="text-text-muted text-left">
-                          <th className="font-medium pb-2 pt-3 pl-4">Hash</th>
-                          <th className="font-medium pb-2 pt-3 w-16">Type</th>
-                          <th className="font-medium pb-2 pt-3 w-20 text-right">Size</th>
-                          <th className="font-medium pb-2 pt-3 w-20 text-right">Compressed</th>
-                          <th className="font-medium pb-2 pt-3 w-16 text-right pr-4">Ratio</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {packEntries.entries.slice(0, 500).map((e, i) => {
-                          const ratio = e.uncompressed_size > 0 ? (e.compressed_size / e.uncompressed_size * 100).toFixed(0) : '—'
-                          return (
-                            <tr key={i} onClick={() => setViewerHash(e.hash)}
-                              className="border-t border-border-default cursor-pointer hover:bg-surface-hover">
-                              <td className="py-1 pl-4 font-mono truncate" title={e.hash}>{e.hash}</td>
-                              <td className="py-1">{OBJECT_TYPES[e.type] ?? e.type}</td>
-                              <td className="py-1 text-right">{fmtSize(e.uncompressed_size)}</td>
-                              <td className="py-1 text-right text-text-muted">{fmtSize(e.compressed_size)}</td>
-                              <td className="py-1 text-right pr-4 text-text-muted">{ratio}%</td>
-                            </tr>
-                          )
-                        })}
-                      </tbody>
-                    </table>
-                    {packEntries.count > 500 && (
-                      <div className="text-text-muted text-[10px] text-center py-2">
-                        Showing 500 of {fmtNum(packEntries.count)} entries
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {/* Pack index */}
-              {packIndex && packTab === 'index' && (
-                <div className="bg-surface-secondary border border-border-default rounded-lg overflow-auto flex-1 min-h-0">
+              {entriesLoading ? (
+                <div className="text-text-muted text-xs">Loading entries...</div>
+              ) : (
+                <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
                   <table className="w-full text-xs table-fixed">
                     <thead>
                       <tr className="text-text-muted text-left">
-                        <th className="font-medium pb-2 pt-3 pl-4">Hash</th>
-                        <th className="font-medium pb-2 pt-3 w-28 text-right pr-4">.dat Offset</th>
+                        <th className="font-medium pb-2 pt-4 pl-4">Hash</th>
+                        <th className="font-medium pb-2 pt-4 w-24 text-right">Offset</th>
+                        <th className="font-medium pb-2 pt-4 w-24 text-right">Content</th>
+                        <th className="font-medium pb-2 pt-4 w-24 text-right">Packed</th>
+                        <th className="font-medium pb-2 pt-4 w-16 text-right pr-4">Ratio</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {packIndex.entries.slice(0, 500).map((e, i) => (
-                        <tr key={i} className="border-t border-border-default">
-                          <td className="py-1 pl-4 font-mono truncate" title={e.hash}>{e.hash}</td>
-                          <td className="py-1 text-right pr-4 font-mono text-text-muted">0x{e.dat_offset.toString(16)}</td>
+                      {entries.map(e => (
+                        <tr key={e.hash} onClick={() => setViewerHash(e.hash)}
+                          className="border-t border-border-default cursor-pointer hover:bg-surface-hover text-text-primary">
+                          <td className="py-1.5 pl-4 font-mono truncate" title={e.hash}>{e.hash}</td>
+                          <td className="py-1.5 text-right font-mono text-text-muted">{fmtNum(e.offset)}</td>
+                          <td className="py-1.5 text-right">{fmtSize(e.origSize)}</td>
+                          <td className="py-1.5 text-right text-text-muted">{fmtSize(e.compSize)}</td>
+                          <td className="py-1.5 text-right pr-4 text-text-muted">
+                            {e.origSize > 0 ? `${(e.compSize / e.origSize * 100).toFixed(0)}%` : '-'}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {packIndex.count > 500 && (
-                    <div className="text-text-muted text-[10px] text-center py-2">
-                      Showing 500 of {fmtNum(packIndex.count)} entries
-                    </div>
-                  )}
                 </div>
               )}
-            </>
-          )}
 
-          {/* Global index */}
-          {packTab === 'global' && !selectedPack && (
-            <>
-              {globalLoading && <div className="text-text-muted text-sm">Loading global index...</div>}
-
-              {globalIndex && (
-                <>
-                  {/* Header */}
-                  <div className="flex gap-4 mb-3 text-xs text-text-muted">
-                    <span>Version {globalIndex.header.version}</span>
-                    <span>{fmtNum(globalIndex.header.entry_count)} entries</span>
-                    <span>{globalIndex.header.pack_count} packs</span>
-                  </div>
-
-                  {/* Fanout distribution */}
-                  <div className="bg-surface-secondary border border-border-default rounded-lg p-4 mb-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-[11px] text-text-muted uppercase tracking-wide">Hash Distribution (fanout)</div>
-                      <div className="text-[11px] text-text-primary font-mono">
-                        {fanoutHover !== null
-                          ? `0x${fanoutHover.toString(16).padStart(2, '0')}: ${fmtNum(fanoutCounts[fanoutHover])} objects`
-                          : `${fmtNum(globalIndex.header.entry_count)} total objects`
-                        }
-                      </div>
-                    </div>
-                    {/* Y-axis label */}
-                    <div className="flex gap-1">
-                      <div className="flex flex-col justify-between text-[9px] text-text-muted w-8 shrink-0 text-right pr-1">
-                        <span>{fmtNum(fanoutMax)}</span>
-                        <span>{fmtNum(Math.round(fanoutMax / 2))}</span>
-                        <span>0</span>
-                      </div>
-                      {/* Bars + average line */}
-                      <div className="flex items-end h-20 gap-px flex-1 relative" onMouseLeave={() => setFanoutHover(null)}>
-                        {fanoutMax > 0 && (
-                          <div className="absolute left-0 right-0 border-t border-dashed border-status-warning/60 pointer-events-none"
-                            style={{ bottom: `${(fanoutAvg / fanoutMax) * 100}%` }}>
-                            <span className="absolute right-0 -top-3 text-[8px] text-status-warning">avg {Math.round(fanoutAvg)}</span>
-                          </div>
-                        )}
-                        {fanoutCounts.map((count, i) => {
-                          const height = fanoutMax > 0 ? Math.max(1, (count / fanoutMax) * 100) : 0
-                          const isHovered = fanoutHover === i
-                          return (
-                            <div key={i}
-                              onMouseEnter={() => setFanoutHover(i)}
-                              className={`flex-1 rounded-t-sm cursor-crosshair ${isHovered ? 'bg-accent' : 'bg-accent/50'}`}
-                              style={{ height: `${height}%` }} />
-                          )
-                        })}
-                      </div>
-                    </div>
-                    {/* X-axis labels */}
-                    <div className="flex ml-9 text-[9px] text-text-muted mt-1">
-                      <span className="flex-1">0x00</span>
-                      <span className="flex-1 text-center">0x40</span>
-                      <span className="flex-1 text-center">0x80</span>
-                      <span className="flex-1 text-right">0xFF</span>
-                    </div>
-                  </div>
-
-                  {/* Entries table */}
-                  <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
-                    <table className="w-full text-xs table-fixed">
-                      <thead>
-                        <tr className="text-text-muted text-left">
-                          <th className="font-medium pb-2 pt-3 pl-4">Hash</th>
-                          <th className="font-medium pb-2 pt-3 w-14 text-right">Pack</th>
-                          <th className="font-medium pb-2 pt-3 w-24 text-right">.dat Offset</th>
-                          <th className="font-medium pb-2 pt-3 w-12 text-right pr-4">Ver</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {globalIndex.entries.map((e, i) => (
-                          <tr key={i} className="border-t border-border-default">
-                            <td className="py-1 pl-4 font-mono truncate" title={e.hash}>{e.hash}</td>
-                            <td className="py-1 text-right">{e.pack_num}</td>
-                            <td className="py-1 text-right font-mono text-text-muted">0x{e.dat_offset.toString(16)}</td>
-                            <td className="py-1 text-right pr-4 text-text-muted">v{e.pack_version}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  {/* Pagination */}
-                  {globalIndex.header.entry_count > 500 && (
-                    <div className="flex items-center justify-center gap-2 mt-3">
-                      <button onClick={() => loadGlobalIndex(globalOffset - 500)} disabled={globalOffset === 0}
-                        className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50 disabled:cursor-default">
-                        Prev
-                      </button>
-                      <span className="text-xs text-text-muted">
-                        {fmtNum(globalOffset + 1)}–{fmtNum(Math.min(globalOffset + 500, globalIndex.header.entry_count))} of {fmtNum(globalIndex.header.entry_count)}
-                      </span>
-                      <button onClick={() => loadGlobalIndex(globalOffset + 500)} disabled={!globalIndex.has_more}
-                        className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50 disabled:cursor-default">
-                        Next
-                      </button>
-                    </div>
-                  )}
-                </>
+              {(offset > 0 || hasMore) && (
+                <div className="flex items-center justify-center gap-2 mt-3">
+                  <button onClick={() => { const o = Math.max(0, offset - PAGE_SIZE); setOffset(o); void loadEntries(selected, o) }}
+                    disabled={offset === 0}
+                    className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary
+                               hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50">
+                    Prev
+                  </button>
+                  <span className="text-xs text-text-muted">
+                    {fmtNum(offset + 1)}-{fmtNum(offset + entries.length)} of {fmtNum(selected.entries)}
+                  </span>
+                  <button onClick={() => { const o = offset + PAGE_SIZE; setOffset(o); void loadEntries(selected, o) }}
+                    disabled={!hasMore}
+                    className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary
+                               hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50">
+                    Next
+                  </button>
+                </div>
               )}
-
-              {!globalIndex && !globalLoading && (
-                <div className="text-text-muted text-xs text-center py-8">Click "Global Index" to load.</div>
-              )}
-            </>
-          )}
-
-          {!selectedPack && packTab !== 'global' && (
-            <div className="text-text-muted text-xs text-center py-8">Select a pack file to view its contents.</div>
+            </div>
           )}
         </div>
-      </div>
+      )}
 
-      {/* Content viewer */}
+      {showFanout && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
+             onClick={() => setShowFanout(false)}>
+          <div className="bg-surface-primary rounded-lg p-5 shadow-xl border border-border-default"
+               style={{ width: 'min(90vw, 900px)' }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-start justify-between mb-1">
+              <div className="text-sm font-semibold">Hash distribution</div>
+              <button onClick={() => setShowFanout(false)}
+                className="text-text-muted hover:text-text-primary bg-transparent border-none cursor-pointer text-lg px-1">
+                &times;
+              </button>
+            </div>
+            <div className="text-xs text-text-muted mb-4" style={{ maxWidth: '46rem' }}>
+              How many objects fall under each of the 256 first-byte hash
+              prefixes. A flat chart is a healthy content-addressed store;
+              a spike would mean the hash is not spreading, which is worth
+              knowing because every lookup assumes it does.
+            </div>
+
+            <div className="text-xs text-text-secondary mb-2 h-4">
+              {hover !== null
+                ? `0x${hover.toString(16).padStart(2, '0')}: ${fmtNum(counts[hover])} objects`
+                : `${fmtNum(total)} objects, ${avg.toFixed(1)} per prefix on average`}
+            </div>
+
+            <div className="flex items-end gap-px relative" style={{ height: '8rem' }}
+                 onMouseLeave={() => setHover(null)}>
+              {maxCount > 0 && (
+                <div className="absolute left-0 right-0 border-t border-dashed border-status-warning"
+                     style={{ bottom: `${(avg / maxCount) * 100}%` }}>
+                  <span className="absolute right-0 -top-4 text-[9px] text-status-warning">
+                    avg {avg.toFixed(1)}
+                  </span>
+                </div>
+              )}
+              {counts.map((c, i) => (
+                <div key={i} onMouseEnter={() => setHover(i)}
+                  className={`flex-1 ${hover === i ? 'bg-accent' : 'bg-accent/50'}`}
+                  style={{ height: maxCount > 0 ? `${Math.max(1, (c / maxCount) * 100)}%` : '1px' }} />
+              ))}
+            </div>
+            <div className="flex justify-between text-[10px] text-text-muted mt-1">
+              <span>0x00</span><span>0x7f</span><span>0xff</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {viewerHash && (
         <ContentViewer connName={connName} repoPath={repoPath} hash={viewerHash}
           onClose={() => setViewerHash(null)} />

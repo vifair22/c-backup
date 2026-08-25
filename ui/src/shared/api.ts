@@ -16,13 +16,19 @@
  * runtime surprise. Forty separate IPC channels would give the same safety
  * and forty times the boilerplate.
  *
- * WHAT IT REPLACES
+ * WHAT IT REPLACED
  *
- * rpcCall(conn, repo, action, params) with action a bare string, translated
+ * rpcCall(conn, repo, action, params), with action a bare string translated
  * by a table of cases. That shape let the app post to /repos/<id>/run for
  * four months - a route the daemon has never had - because nothing at build
  * time could object and nothing at run time was watching. `run` was simply a
  * string that stopped naming anything.
+ *
+ * It was worse than that in the end: several screens named actions the table
+ * had no case for and threw on open, and most of the rest read fields out of
+ * responses that carry different names, so they rendered rows of blanks and
+ * failed nothing. That entry point and its table are now deleted, and this
+ * union is the only way the renderer can reach the daemon.
  *
  * WHAT IS DELIBERATELY ABSENT
  *

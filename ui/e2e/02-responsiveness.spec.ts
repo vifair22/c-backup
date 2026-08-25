@@ -148,6 +148,63 @@ test('the snapshot list and the tree', async () => {
   await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
 })
 
+test('the introspection screens', async () => {
+  /*
+   * These read the index rather than the repository, so they are the ones
+   * that should be fastest, and the ones where a regression would be a
+   * missing index rather than a slow disk. The diff is the exception: it
+   * walks manifest trees on the daemon side and is honest work, so it gets
+   * the submit budget rather than the navigation one.
+   */
+  await h.page.getByText('Documents', { exact: true }).first().click()
+  await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+
+  const search = await timed('open file search', BUDGET_MS.navigation, async () => {
+    await h.page.getByRole('button', { name: /^search$/i }).first().click()
+    await expect(h.page.getByRole('heading', { name: 'File Search' })).toBeVisible()
+  })
+  expect(search).toBeLessThan(BUDGET_MS.navigation)
+
+  const query = await timed('run a name search', BUDGET_MS.submit, async () => {
+    await h.page.getByPlaceholder(/filename contains/i).fill('notes')
+    await h.page.getByRole('button', { name: /^search$/i }).last().click()
+    await expect(h.page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(query, 'a name search is an index lookup, not a scan').toBeLessThan(BUDGET_MS.submit)
+  await h.page.getByRole('button', { name: /dashboard/i }).first().click()
+
+  const journal = await timed('open activity', BUDGET_MS.navigation, async () => {
+    await h.page.getByRole('button', { name: /journal|activity/i }).first().click()
+    await expect(h.page.getByRole('heading', { name: 'Activity' })).toBeVisible()
+  })
+  expect(journal).toBeLessThan(BUDGET_MS.navigation)
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+
+  const packs = await timed('open packs', BUDGET_MS.navigation, async () => {
+    await h.page.getByRole('button', { name: /pack/i }).first().click()
+    await expect(h.page.getByRole('heading', { name: 'Packs' })).toBeVisible()
+    await expect(h.page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(packs).toBeLessThan(BUDGET_MS.navigation)
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+
+  await h.page.getByRole('button', { name: /compare/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Compare Snapshots' })).toBeVisible()
+  /*
+   * Against the first snapshot rather than the default pair. An earlier test
+   * here runs a backup, so the two newest snapshots are identical and their
+   * diff prunes at the root hash - the fastest case there is, and a useless
+   * thing to time.
+   */
+  const diff = await timed('compare two snapshots', BUDGET_MS.submit, async () => {
+    await h.page.locator('select').first().selectOption('1')
+    await h.page.getByRole('button', { name: /^compare$/i }).click()
+    await expect(h.page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(diff, 'a diff walks trees, but only the ones whose hashes differ').toBeLessThan(BUDGET_MS.submit)
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+})
+
 test('switching between repositories', async () => {
   const ms = await timed('switch repository', BUDGET_MS.navigation, async () => {
     await h.page.getByText('Photos', { exact: true }).first().click()

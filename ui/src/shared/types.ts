@@ -120,7 +120,6 @@ export const IPC = {
   /* The old action-string passthrough, on its way out. Every component
    * still using it is a component that has not been migrated; it goes when
    * the last one has. */
-  RPC_CALL: 'rpc:call',
 
   // Credential management
   CREDENTIAL_HAS: 'credential:has',

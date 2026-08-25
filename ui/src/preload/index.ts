@@ -29,8 +29,6 @@ export interface CBackupApi {
    */
   apiCall<T = unknown>(connectionName: string, req: ApiRequest): Promise<T>
 
-  /* The old passthrough. Components still on this have not been migrated. */
-  rpcCall<T = unknown>(connectionName: string, repoPath: string, action: string, params?: Record<string, unknown>): Promise<T>
 
   // Credentials
   credentialHas(connectionName: string): Promise<boolean>
@@ -55,7 +53,6 @@ const api: CBackupApi = {
   repoClose: (conn, path) => ipcRenderer.invoke(IPC.REPO_CLOSE, conn, path),
 
   apiCall: (conn, req) => ipcRenderer.invoke(IPC.API_CALL, conn, req),
-  rpcCall: (conn, path, action, params) => ipcRenderer.invoke(IPC.RPC_CALL, conn, path, action, params),
 
   credentialHas: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_HAS, name),
   credentialDelete: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_DELETE, name),

@@ -249,7 +249,11 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
             " WHERE repo_id = ? AND location = 'loose'"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
-    } else if (loc && strcmp(loc, "pack") == 0) {
+    /* Both spellings. The CLI's own help says "packed" and the route only
+     * ever matched "pack", so `objects --location packed` fell through to
+     * the unfiltered branch and listed everything - a filter that silently
+     * did nothing. */
+    } else if (loc && (strcmp(loc, "pack") == 0 || strcmp(loc, "packed") == 0)) {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       location FROM objects"
@@ -680,19 +684,44 @@ typedef struct {
  * still reflect the whole comparison. */
 #define DIFF_MAX_ENTRIES 2000
 
+/*
+ * One changed path.
+ *
+ * Both sides of the change, not just the new one. A diff that reports a file
+ * as modified and gives only its resulting size cannot say whether it grew
+ * or shrank, and without the two content hashes nothing downstream can show
+ * what actually changed inside it - which is the question a diff is asked.
+ * Both hashes are in hand at every call site; they were simply not passed
+ * on. NULL for the side that does not exist.
+ */
 static void diff_emit(diff_ctx_t *ctx, const char *change, const char *path,
-                      uint64_t size)
+                      uint64_t old_size, uint64_t new_size,
+                      const uint8_t *old_hash, const uint8_t *new_hash)
 {
     ctx->emitted++;
     if (ctx->emitted > DIFF_MAX_ENTRIES) { ctx->truncated = 1; return; }
 
     cutils_json_elem_t e;
     if (json_resp_array_append_begin(ctx->resp, "changes", &e) != 0) return;
-    char sz[32];
-    snprintf(sz, sizeof(sz), "%llu", (unsigned long long)size);
+    char osz[32], nsz[32];
+    char ohex[OBJECT_HASH_SIZE * 2 + 1] = { 0 };
+    char nhex[OBJECT_HASH_SIZE * 2 + 1] = { 0 };
+    snprintf(osz, sizeof(osz), "%llu", (unsigned long long)old_size);
+    snprintf(nsz, sizeof(nsz), "%llu", (unsigned long long)new_size);
+    if (old_hash) for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
+        snprintf(ohex + i * 2, 3, "%02x", old_hash[i]);
+    if (new_hash) for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
+        snprintf(nhex + i * 2, 3, "%02x", new_hash[i]);
+
     int bad = json_elem_add_str(&e, "change", change) != 0
            || json_elem_add_str(&e, "path", path) != 0
-           || json_elem_add_str(&e, "size", sz) != 0;
+           /* Kept as the resulting size, which is what it always meant, so
+            * an existing reader is unaffected. */
+           || json_elem_add_str(&e, "size", new_hash ? nsz : osz) != 0
+           || json_elem_add_str(&e, "old_size", osz) != 0
+           || json_elem_add_str(&e, "new_size", nsz) != 0
+           || json_elem_add_str(&e, "old_hash", ohex) != 0
+           || json_elem_add_str(&e, "new_hash", nhex) != 0;
     if (bad) return;
     json_elem_commit(&e);
 }
@@ -721,8 +750,13 @@ static void diff_whole_tree(diff_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE
         if (entries[i].type == NODE_TYPE_DIR) {
             diff_whole_tree(ctx, entries[i].target_hash, path, change, depth + 1);
         } else {
-            if (change[0] == 'a') ctx->added++; else ctx->removed++;
-            diff_emit(ctx, change, path, entries[i].size);
+            int added = change[0] == 'a';
+            if (added) ctx->added++; else ctx->removed++;
+            diff_emit(ctx, change, path,
+                      added ? 0 : entries[i].size,
+                      added ? entries[i].size : 0,
+                      added ? NULL : entries[i].target_hash,
+                      added ? entries[i].target_hash : NULL);
         }
     }
     manifest_free_entries(entries, n);
@@ -757,13 +791,17 @@ static void diff_walk(diff_ctx_t *ctx, const uint8_t from[OBJECT_HASH_SIZE],
             snprintf(path, sizeof(path), "%s/%s", prefix, a[i].name);
             if (a[i].type == NODE_TYPE_DIR)
                 diff_whole_tree(ctx, a[i].target_hash, path, "removed", depth + 1);
-            else { ctx->removed++; diff_emit(ctx, "removed", path, a[i].size); }
+            else { ctx->removed++;
+                   diff_emit(ctx, "removed", path, a[i].size, 0,
+                             a[i].target_hash, NULL); }
             i++;
         } else if (cmp > 0) {
             snprintf(path, sizeof(path), "%s/%s", prefix, b[j].name);
             if (b[j].type == NODE_TYPE_DIR)
                 diff_whole_tree(ctx, b[j].target_hash, path, "added", depth + 1);
-            else { ctx->added++; diff_emit(ctx, "added", path, b[j].size); }
+            else { ctx->added++;
+                   diff_emit(ctx, "added", path, 0, b[j].size,
+                             NULL, b[j].target_hash); }
             j++;
         } else {
             snprintf(path, sizeof(path), "%s/%s", prefix, a[i].name);
@@ -771,7 +809,8 @@ static void diff_walk(diff_ctx_t *ctx, const uint8_t from[OBJECT_HASH_SIZE],
                 diff_walk(ctx, a[i].target_hash, b[j].target_hash, path, depth + 1);
             } else if (!hash_eq(a[i].target_hash, b[j].target_hash)) {
                 ctx->modified++;
-                diff_emit(ctx, "modified", path, b[j].size);
+                diff_emit(ctx, "modified", path, a[i].size, b[j].size,
+                          a[i].target_hash, b[j].target_hash);
             }
             i++; j++;
         }

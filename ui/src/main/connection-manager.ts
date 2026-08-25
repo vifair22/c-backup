@@ -13,7 +13,6 @@
 
 import { EventEmitter } from 'node:events'
 import { DaemonClient, DaemonUnreachableError } from './rpc-session'
-import { mapAction } from './api-map'
 import { toEndpoint } from './client'
 import type { ApiRequest } from '../shared/api'
 import type {
@@ -189,18 +188,14 @@ export class ConnectionManager extends EventEmitter {
   }
 
   /*
-   * The renderer's action-based entry point, preserved so components did not
-   * all have to change at once. Actions are translated to endpoints in
-   * api-map.ts, which also names the ones that no longer exist.
-   */
-  /*
-   * The typed entry point.
+   * The renderer's only way to reach the daemon.
    *
-   * Identical plumbing to rpcCall below, with the one difference that
-   * matters: the endpoint comes from client.ts rather than from
-   * interpolating a caller's string, so the set of paths this can produce is
-   * fixed at compile time and checked against a live daemon by
-   * tests/contract.test.ts.
+   * The endpoint comes from client.ts rather than from interpolating a
+   * caller's string, so the set of paths this can produce is fixed at
+   * compile time and checked against a live daemon by
+   * tests/contract.test.ts. There used to be a second entry point beside
+   * this one that took an action name and looked it up in a table; it is
+   * gone, along with every screen that depended on it.
    */
   async apiCall<T = unknown>(name: string, req: ApiRequest): Promise<T> {
     const entry = this.entries.get(name)
@@ -216,24 +211,6 @@ export class ConnectionManager extends EventEmitter {
     return res.body
   }
 
-  async rpcCall<T = unknown>(
-    name: string,
-    repoId: number,
-    action: string,
-    params?: Record<string, unknown>
-  ): Promise<T> {
-    const entry = this.entries.get(name)
-    if (!entry) throw new Error(`no connection '${name}'`)
-    if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
-
-    const ep = mapAction(repoId, action, params)
-    const res = await entry.client.request<T>(ep.method, ep.path, ep.body)
-    if (res.status >= 400) {
-      const body = res.body as { error?: string } | undefined
-      throw new Error(body?.error ?? `HTTP ${res.status}`)
-    }
-    return res.body
-  }
 
   listConnections(): ConnectionState[] {
     return Array.from(this.entries.values()).map((e) => ({

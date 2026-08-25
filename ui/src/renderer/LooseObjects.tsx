@@ -1,36 +1,72 @@
+/*
+ * The object store, by object.
+ *
+ * Migrated off the action bridge, and widened to match `c-backup objects`,
+ * which takes a location: loose objects are the interesting case but they
+ * are not a different kind of thing, and having no way to look at a packed
+ * one from here meant dropping into the pack browser to answer a question
+ * about a single hash.
+ *
+ * What the bridge fed this was a different response entirely. It read
+ * `uncompressed_size`, `compressed_size`, `compression` and `pack_skip_ver`
+ * from rows that carry `orig_size`, `phys_size` and `location`, so the size
+ * columns were blank and the compression column showed a codec number that
+ * was always undefined. The stats panel read a top-level `count` and a
+ * `skip` block that the route does not send at all.
+ *
+ * Compression codec and skip markers are per-entry facts inside a pack, not
+ * columns on the object row, so they are not shown here rather than shown
+ * as blanks. The ratio between what an object holds and what it occupies is
+ * the part that was actually wanted, and both halves of that are here.
+ */
+
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum } from './format'
 import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
 
-const PAGE_SIZE = 500
-
-const OBJECT_TYPES: Record<number, string> = { 1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE' }
-const COMPRESS_NAMES: Record<number, string> = { 0: 'none', 1: 'lz4-block', 2: 'lz4-frame' }
-
-interface LooseStats {
-  count: number
-  total_uncomp: number
-  per_type: { type: number; count: number; uncomp: number }[]
-  skip: { count: number; uncomp: number }
+const OBJECT_TYPES: Record<number, string> = {
+  1: 'file', 2: 'xattr', 3: 'acl', 4: 'sparse',
 }
 
-interface LooseObject {
+const PAGE_SIZE = 200
+
+type Location = 'loose' | 'packed' | 'all'
+
+/* Every integer arrives as a string. */
+interface RawObject {
+  hash: string
+  type?: string
+  refcount?: string
+  phys_size?: string
+  orig_size?: string
+  location?: string
+}
+
+interface StoreObject {
   hash: string
   type: number
-  compression: number
-  uncompressed_size: number
-  compressed_size: number
-  pack_skip_ver: number
-  file_size?: number
+  refcount: number
+  physSize: number
+  origSize: number
+  location: string
 }
 
-interface LooseListResponse {
-  objects: LooseObject[]
-  count: number
-  offset: number
-  has_more: boolean
+const parse = (o: RawObject): StoreObject => ({
+  hash: o.hash,
+  type: Number(o.type ?? '0'),
+  refcount: Number(o.refcount ?? '0'),
+  physSize: Number(o.phys_size ?? '0'),
+  origSize: Number(o.orig_size ?? '0'),
+  location: o.location ?? '',
+})
+
+interface RawTypeStat {
+  type?: string
+  count?: string
+  phys_size?: string
+  orig_size?: string
 }
 
 interface Props {
@@ -40,82 +76,113 @@ interface Props {
 }
 
 export function LooseObjects({ connName, repoPath, onBack }: Props): React.ReactElement {
-  const [stats, setStats] = useState<LooseStats | null>(null)
-  const [objects, setObjects] = useState<LooseObject[]>([])
+  const repoId = Number(repoPath)
+
+  const [location, setLocation] = useState<Location>('loose')
+  const [perType, setPerType] = useState<RawTypeStat[]>([])
+  const [objects, setObjects] = useState<StoreObject[]>([])
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [selected, setSelected] = useState<LooseObject | null>(null)
+  const [selected, setSelected] = useState<StoreObject | null>(null)
   const [viewerHash, setViewerHash] = useState<string | null>(null)
 
+  /* Totals come from a GROUP BY on the daemon side, so the header can say
+   * how much is there without paging through all of it. */
   useEffect(() => {
-    api.rpcCall<LooseStats>(connName, repoPath, 'loose_stats')
-      .then(setStats)
-      .catch(() => {})
-  }, [connName, repoPath])
+    api.apiCall<{ per_type?: RawTypeStat[] }>(connName, {
+      kind: 'stats', repoId, ...(location === 'loose' ? { scope: 'loose' } : {}),
+    })
+      .then(r => setPerType(r.per_type ?? []))
+      .catch(() => setPerType([]))
+  }, [connName, repoId, location])
 
-  const fetchPage = useCallback(async (pageOffset: number) => {
+  const fetchPage = useCallback(async (pageOffset: number, loc: Location) => {
     setLoading(true)
     setError(null)
     try {
-      const resp = await api.rpcCall<LooseListResponse>(connName, repoPath, 'loose_list', {
-        offset: pageOffset, limit: PAGE_SIZE
+      const resp = await api.apiCall<{ objects?: RawObject[] }>(connName, {
+        kind: 'objectList', repoId,
+        ...(loc === 'all' ? {} : { location: loc }),
+        offset: pageOffset, limit: PAGE_SIZE,
       })
-      setObjects(resp.objects)
-      setHasMore(resp.has_more)
-      setTotalCount(stats?.count ?? resp.count)
+      const list = (resp.objects ?? []).map(parse)
+      setObjects(list)
+      /* The route reports no total and no "more" flag, so a full page is
+       * the only evidence there is another one. */
+      setHasMore(list.length === PAGE_SIZE)
     } catch (err) {
       setError(String(err))
     }
     setLoading(false)
-  }, [connName, repoPath, stats])
+  }, [connName, repoId])
 
-  useEffect(() => { fetchPage(0) }, [fetchPage])
+  useEffect(() => { setOffset(0); void fetchPage(0, location) }, [fetchPage, location])
 
   const goToPage = (newOffset: number) => {
     setOffset(newOffset)
     setSelected(null)
-    fetchPage(newOffset)
+    void fetchPage(newOffset, location)
   }
 
-  const pageCount = Math.ceil((stats?.count ?? totalCount) / PAGE_SIZE)
-  const currentPage = Math.floor(offset / PAGE_SIZE) + 1
+  const totalCount = perType.reduce((a, t) => a + Number(t.count ?? '0'), 0)
+  const totalOrig  = perType.reduce((a, t) => a + Number(t.orig_size ?? '0'), 0)
+  const totalPhys  = perType.reduce((a, t) => a + Number(t.phys_size ?? '0'), 0)
+
+  const LOCATIONS: { key: Location; label: string }[] = [
+    { key: 'loose', label: 'Loose' },
+    { key: 'packed', label: 'Packed' },
+    { key: 'all',   label: 'All' },
+  ]
 
   return (
     <div>
-      {/* Header */}
       <div className="flex items-center gap-3 mb-4">
         <button onClick={onBack}
           className="text-xs text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-          &larr; Dashboard
+          &larr; Back
         </button>
-        <h3 className="text-lg font-medium m-0">Loose Objects</h3>
-        {stats && <span className="text-xs text-text-muted">{fmtNum(stats.count)} objects, {fmtSize(stats.total_uncomp)}</span>}
+        <h3 className="text-lg font-medium m-0">Objects</h3>
+        {totalCount > 0 && (
+          <span className="text-xs text-text-muted">
+            {fmtNum(totalCount)} objects, {fmtSize(totalOrig)} stored as {fmtSize(totalPhys)}
+          </span>
+        )}
+      </div>
+
+      <div className="flex gap-2 mb-4 items-center">
+        {LOCATIONS.map(l => (
+          <button key={l.key} onClick={() => setLocation(l.key)}
+            className={`text-[11px] px-2 py-0.5 rounded cursor-pointer border-none ${
+              location === l.key ? 'bg-accent text-accent-text'
+                                 : 'bg-surface-tertiary text-text-secondary hover:bg-surface-hover'}`}>
+            {l.label}
+          </button>
+        ))}
+        {location === 'loose' && (
+          <span className="text-xs text-text-muted ml-2">
+            Loose objects are stored uncompressed - packing is what compresses
+            them, so an unpacked repository holds more than its source.
+          </span>
+        )}
       </div>
 
       {error && <div className="text-status-error text-sm mb-3">{error}</div>}
 
-      {/* Stats summary */}
-      {stats && (
+      {perType.length > 0 && location === 'loose' && (
         <div className="flex flex-wrap gap-3 mb-4">
-          {stats.per_type.filter(t => t.count > 0).map(t => (
+          {perType.filter(t => Number(t.count ?? '0') > 0).map(t => (
             <div key={t.type} className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
-              <span className="font-semibold">{OBJECT_TYPES[t.type] ?? `type-${t.type}`}</span>
-              <span className="text-text-muted ml-2">{fmtNum(t.count)} ({fmtSize(t.uncomp)})</span>
+              <span className="font-semibold">{OBJECT_TYPES[Number(t.type)] ?? `type-${t.type}`}</span>
+              <span className="text-text-muted ml-2">
+                {fmtNum(t.count)} ({fmtSize(t.orig_size)})
+              </span>
             </div>
           ))}
-          {stats.skip.count > 0 && (
-            <div className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
-              <span className="font-semibold text-status-warning">Skip-marked</span>
-              <span className="text-text-muted ml-2">{fmtNum(stats.skip.count)} ({fmtSize(stats.skip.uncomp)})</span>
-            </div>
-          )}
         </div>
       )}
 
-      {/* Object list */}
       {objects.length > 0 && (
         <div className="bg-surface-secondary border border-border-default rounded-lg overflow-hidden">
           <table className="w-full text-xs table-fixed">
@@ -123,17 +190,20 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
               <tr className="text-text-muted text-left">
                 <th className="font-medium pb-2 pt-4 pl-4">Hash</th>
                 <th className="font-medium pb-2 pt-4 w-16">Type</th>
-                <th className="font-medium pb-2 pt-4 w-20">Compress</th>
-                <th className="font-medium pb-2 pt-4 w-20 text-right">Size</th>
-                <th className="font-medium pb-2 pt-4 w-20 text-right">Compressed</th>
+                <th className="font-medium pb-2 pt-4 w-16 text-right">Refs</th>
+                <th className="font-medium pb-2 pt-4 w-24 text-right">Content</th>
+                <th className="font-medium pb-2 pt-4 w-24 text-right">On disk</th>
                 <th className="font-medium pb-2 pt-4 w-16 text-right pr-4">Ratio</th>
               </tr>
             </thead>
             <tbody>
               {objects.map(obj => {
-                const ratio = obj.uncompressed_size > 0
-                  ? (obj.compressed_size / obj.uncompressed_size * 100).toFixed(0)
-                  : '—'
+                /* Ratio of stored to original. Above 100% means the object
+                 * costs more than it holds, which is what a small file plus
+                 * its parity looks like. */
+                const ratio = obj.origSize > 0
+                  ? `${(obj.physSize / obj.origSize * 100).toFixed(0)}%`
+                  : '-'
                 const isSelected = selected?.hash === obj.hash
                 return (
                   <tr key={obj.hash}
@@ -141,10 +211,10 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
                     className={`border-t border-border-default cursor-pointer hover:bg-surface-hover ${isSelected ? 'bg-accent/10' : ''}`}>
                     <td className="py-1.5 pl-4 font-mono truncate" title={obj.hash}>{obj.hash}</td>
                     <td className="py-1.5">{OBJECT_TYPES[obj.type] ?? obj.type}</td>
-                    <td className="py-1.5 text-text-muted">{COMPRESS_NAMES[obj.compression] ?? obj.compression}</td>
-                    <td className="py-1.5 text-right">{fmtSize(obj.uncompressed_size)}</td>
-                    <td className="py-1.5 text-right text-text-muted">{fmtSize(obj.compressed_size)}</td>
-                    <td className="py-1.5 text-right pr-4 text-text-muted">{ratio}%</td>
+                    <td className="py-1.5 text-right text-text-muted">{obj.refcount}</td>
+                    <td className="py-1.5 text-right">{fmtSize(obj.origSize)}</td>
+                    <td className="py-1.5 text-right text-text-muted">{fmtSize(obj.physSize)}</td>
+                    <td className="py-1.5 text-right pr-4 text-text-muted">{ratio}</td>
                   </tr>
                 )
               })}
@@ -154,15 +224,23 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
       )}
 
       {loading && <div className="text-text-muted text-sm mt-3">Loading...</div>}
+      {!loading && objects.length === 0 && !error && (
+        <div className="text-text-muted text-sm">
+          {location === 'loose'
+            ? 'Nothing is loose. Everything here has been packed.'
+            : 'No objects.'}
+        </div>
+      )}
 
-      {/* Pagination */}
-      {pageCount > 1 && (
+      {(offset > 0 || hasMore) && (
         <div className="flex items-center justify-center gap-2 mt-4">
-          <button onClick={() => goToPage(offset - PAGE_SIZE)} disabled={offset === 0}
+          <button onClick={() => goToPage(Math.max(0, offset - PAGE_SIZE))} disabled={offset === 0}
             className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50 disabled:cursor-default">
             Prev
           </button>
-          <span className="text-xs text-text-muted">Page {currentPage} of {pageCount}</span>
+          <span className="text-xs text-text-muted">
+            {fmtNum(offset + 1)}-{fmtNum(offset + objects.length)}
+          </span>
           <button onClick={() => goToPage(offset + PAGE_SIZE)} disabled={!hasMore}
             className="text-xs px-2 py-1 rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none cursor-pointer disabled:opacity-50 disabled:cursor-default">
             Next
@@ -170,12 +248,11 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
         </div>
       )}
 
-      {/* Selected object detail */}
       {selected && (
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
           <div className="bg-surface-primary rounded-lg p-5 w-[480px] shadow-xl border border-border-default">
             <div className="flex items-start justify-between mb-3">
-              <div className="text-sm font-semibold">Object Detail</div>
+              <div className="text-sm font-semibold">Object</div>
               <button onClick={() => setSelected(null)}
                 className="text-text-muted hover:text-text-primary bg-transparent border-none cursor-pointer text-lg px-1">&times;</button>
             </div>
@@ -186,41 +263,34 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
                 <div className="text-xs">{OBJECT_TYPES[selected.type] ?? selected.type}</div>
               </div>
               <div>
-                <div className="text-[10px] text-text-muted uppercase">Compression</div>
-                <div className="text-xs">{COMPRESS_NAMES[selected.compression] ?? selected.compression}</div>
+                <div className="text-[10px] text-text-muted uppercase">Stored</div>
+                <div className="text-xs">{selected.location || '-'}</div>
               </div>
               <div>
-                <div className="text-[10px] text-text-muted uppercase">Uncompressed</div>
-                <div className="text-xs">{fmtSize(selected.uncompressed_size)} ({fmtNum(selected.uncompressed_size)} B)</div>
+                <div className="text-[10px] text-text-muted uppercase">Content</div>
+                <div className="text-xs">{fmtSize(selected.origSize)} ({fmtNum(selected.origSize)} B)</div>
               </div>
               <div>
-                <div className="text-[10px] text-text-muted uppercase">Compressed</div>
-                <div className="text-xs">{fmtSize(selected.compressed_size)} ({fmtNum(selected.compressed_size)} B)</div>
+                <div className="text-[10px] text-text-muted uppercase">On disk</div>
+                <div className="text-xs">{fmtSize(selected.physSize)} ({fmtNum(selected.physSize)} B)</div>
               </div>
-              {selected.file_size !== undefined && (
-                <div>
-                  <div className="text-[10px] text-text-muted uppercase">File on disk</div>
-                  <div className="text-xs">{fmtSize(selected.file_size)}</div>
-                </div>
-              )}
-              {selected.pack_skip_ver > 0 && (
-                <div>
-                  <div className="text-[10px] text-text-muted uppercase">Skip marked</div>
-                  <div className="text-xs text-status-warning">v{selected.pack_skip_ver}</div>
-                </div>
-              )}
+              <div>
+                {/* Above one is dedup: the same bytes reached from more than
+                  * one file, or from the same file in several snapshots. */}
+                <div className="text-[10px] text-text-muted uppercase">Referenced by</div>
+                <div className="text-xs">{fmtNum(selected.refcount)} node{selected.refcount === 1 ? '' : 's'}</div>
+              </div>
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setSelected(null)}
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Close</button>
               <button onClick={() => { setViewerHash(selected.hash); setSelected(null) }}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">View Content</button>
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">View content</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Content viewer */}
       {viewerHash && (
         <ContentViewer connName={connName} repoPath={repoPath} hash={viewerHash}
           onClose={() => setViewerHash(null)} />

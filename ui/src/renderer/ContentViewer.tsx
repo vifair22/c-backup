@@ -3,7 +3,6 @@ import { fmtSize } from './format'
 
 const api = window.cbackup
 
-const CONTENT_MAX_BYTES = 2 * 1024 * 1024
 const TEXT_DISPLAY_CHARS = 4096
 const HEX_DISPLAY_BYTES = 4096
 
@@ -11,18 +10,30 @@ const OBJECT_TYPES: Record<number, string> = {
   1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE',
 }
 
+/*
+ * As the daemon sends them. Both were wrong here: locate carries orig_size
+ * and phys_size, not uncompressed_size and compressed_size, and content
+ * carries base64 rather than content_base64 - so decoding threw on
+ * undefined and the panel showed an error for every object. There is no
+ * truncation either: an object over the limit comes back as too_large with
+ * no bytes at all, which is a different thing to show.
+ */
 interface ObjectLocateResult {
-  type: number
-  uncompressed_size: number
-  compressed_size?: number
+  found?: boolean
+  type: number | string
+  refcount?: string
+  orig_size?: string
+  phys_size?: string
   location?: string
+  pack_id?: string
 }
 
 interface ObjectContentResult {
-  type: number
-  size: number
-  truncated: boolean
-  content_base64: string
+  type?: number
+  size?: number
+  base64?: string
+  too_large?: boolean
+  limit?: number
 }
 
 function isBinary(data: Uint8Array): boolean {
@@ -70,12 +81,14 @@ interface Props {
 }
 
 export function ContentViewer({ connName, repoPath, hash, filename, onClose }: Props): React.ReactElement {
+  const repoId = Number(repoPath)
+
   const [tab, setTab] = useState<Tab>('info')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [locate, setLocate] = useState<ObjectLocateResult | null>(null)
   const [rawData, setRawData] = useState<Uint8Array | null>(null)
-  const [truncated, setTruncated] = useState(false)
+  const [tooLarge, setTooLarge] = useState<{ size: number; limit: number } | null>(null)
   const [binary, setBinary] = useState(false)
   const [copied, setCopied] = useState(false)
 
@@ -86,17 +99,27 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
 
     ;(async () => {
       try {
-        const loc = await api.rpcCall<ObjectLocateResult>(connName, repoPath, 'object_locate', { hash })
+        const loc = await api.apiCall<ObjectLocateResult>(connName, {
+          kind: 'objectInfo', repoId, hash,
+        })
         if (cancelled) return
         setLocate(loc)
 
-        const content = await api.rpcCall<ObjectContentResult>(connName, repoPath, 'object_content', { hash, max_bytes: CONTENT_MAX_BYTES })
+        const content = await api.apiCall<ObjectContentResult>(connName, {
+          kind: 'objectContent', repoId, hash,
+        })
         if (cancelled) return
 
-        const decoded = Uint8Array.from(atob(content.content_base64), c => c.charCodeAt(0))
-        setRawData(decoded)
-        setTruncated(content.truncated)
-        setBinary(isBinary(decoded))
+        /* The daemon refuses to send an object over its limit rather than
+         * cutting one short, so this is a whole file or none of it. */
+        if (content.too_large) {
+          setTooLarge({ size: Number(content.size ?? 0), limit: Number(content.limit ?? 0) })
+          setRawData(null)
+        } else {
+          const decoded = Uint8Array.from(atob(content.base64 ?? ''), c => c.charCodeAt(0))
+          setRawData(decoded)
+          setBinary(isBinary(decoded))
+        }
       } catch (err) {
         if (!cancelled) setError(String(err))
       }
@@ -104,7 +127,7 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
     })()
 
     return () => { cancelled = true }
-  }, [connName, repoPath, hash])
+  }, [connName, repoId, hash])
 
   const copyHash = () => {
     navigator.clipboard.writeText(hash)
@@ -113,15 +136,15 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
   }
 
   const textContent = (): string => {
-    if (!rawData || binary) return '(binary data \u2014 not valid UTF-8)'
+    if (!rawData || binary) return '(binary data - not valid UTF-8)'
     try {
       const text = new TextDecoder('utf-8', { fatal: true }).decode(rawData)
       if (text.length > TEXT_DISPLAY_CHARS) {
-        return text.slice(0, TEXT_DISPLAY_CHARS) + `\n\n\u2026 ${(text.length - TEXT_DISPLAY_CHARS).toLocaleString()} more chars not shown`
+        return text.slice(0, TEXT_DISPLAY_CHARS) + `\n\n... ${(text.length - TEXT_DISPLAY_CHARS).toLocaleString()} more chars not shown`
       }
       return text
     } catch {
-      return '(binary data \u2014 not valid UTF-8)'
+      return '(binary data - not valid UTF-8)'
     }
   }
 
@@ -187,41 +210,58 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                       </button>
                     </div>
                   </div>
-                  <div className="grid grid-cols-3 gap-4">
+                  <div className="grid grid-cols-4 gap-4">
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Type</div>
-                      <div className="text-sm text-text-primary">{OBJECT_TYPES[locate.type] ?? `Unknown (${locate.type})`}</div>
+                      <div className="text-sm text-text-primary">
+                        {OBJECT_TYPES[Number(locate.type)] ?? `Unknown (${locate.type})`}
+                      </div>
                     </div>
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Size</div>
-                      <div className="text-sm text-text-primary">{fmtSize(locate.uncompressed_size)}</div>
-                      <div className="text-[10px] text-text-muted">{locate.uncompressed_size.toLocaleString()} bytes</div>
-                    </div>
-                    {locate.compressed_size !== undefined && (
-                      <div>
-                        <div className="text-[10px] text-text-muted uppercase tracking-wide">Compressed</div>
-                        <div className="text-sm text-text-primary">{fmtSize(locate.compressed_size)}</div>
+                      <div className="text-sm text-text-primary">{fmtSize(locate.orig_size)}</div>
+                      <div className="text-[10px] text-text-muted">
+                        {Number(locate.orig_size ?? 0).toLocaleString()} bytes
                       </div>
-                    )}
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-text-muted uppercase tracking-wide">On disk</div>
+                      <div className="text-sm text-text-primary">{fmtSize(locate.phys_size)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-text-muted uppercase tracking-wide">Stored</div>
+                      <div className="text-sm text-text-primary">{locate.location ?? '-'}</div>
+                      {locate.pack_id !== undefined && Number(locate.pack_id) >= 0 && (
+                        <div className="text-[10px] text-text-muted">pack #{locate.pack_id}</div>
+                      )}
+                    </div>
                   </div>
                   {binary && (
                     <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2">
                       Binary content detected. Text tab will show hex representation.
                     </div>
                   )}
-                  {truncated && (
+                  {tooLarge && (
                     <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2">
-                      Content truncated to {fmtSize(CONTENT_MAX_BYTES)} (full size: {fmtSize(locate.uncompressed_size)})
+                      {fmtSize(tooLarge.size)} is over the {fmtSize(tooLarge.limit)} the
+                      daemon will send in one response, so none of it was
+                      loaded. Restore the file to read it.
                     </div>
                   )}
+                </div>
+              )}
+
+              {(tab === 'text' || tab === 'hex') && !rawData && tooLarge && (
+                <div className="text-xs text-text-muted">
+                  Nothing was loaded: the object is larger than the daemon
+                  sends in one response.
                 </div>
               )}
 
               {tab === 'text' && rawData && (
                 <div>
                   <div className="text-[10px] text-text-muted mb-2">
-                    {binary ? 'Binary content' : `UTF-8 text \u2014 ${rawData.length.toLocaleString()} bytes loaded`}
-                    {truncated && ' (truncated)'}
+                    {binary ? 'Binary content' : `UTF-8 text - ${rawData.length.toLocaleString()} bytes`}
                   </div>
                   <pre className="text-xs font-mono text-text-primary whitespace-pre-wrap break-all leading-relaxed m-0">
                     {textContent()}
@@ -232,7 +272,10 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
               {tab === 'hex' && rawData && (
                 <div>
                   <div className="text-[10px] text-text-muted mb-2">
-                    Hex dump \u2014 showing {Math.min(rawData.length, HEX_DISPLAY_BYTES).toLocaleString()} of {rawData.length.toLocaleString()} bytes
+                    {/* Bare JSX text is not a string literal, so the \u2014
+                      * that used to be here rendered as those six characters
+                      * on screen rather than as a dash. */}
+                    Hex dump - showing {Math.min(rawData.length, HEX_DISPLAY_BYTES).toLocaleString()} of {rawData.length.toLocaleString()} bytes
                   </div>
                   <pre className="text-[11px] font-mono text-text-primary whitespace-pre leading-relaxed m-0">
                     {hexDump(rawData, HEX_DISPLAY_BYTES)}
