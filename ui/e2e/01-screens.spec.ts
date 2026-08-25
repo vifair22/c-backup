@@ -121,7 +121,7 @@ test('snapshots: the list, with retention and sizes', async () => {
    * which can pin dates; what this checks is that the column renders its
    * placeholder rather than throwing on a snapshot with no flags.
    */
-  await expect(row.locator('td').last()).toHaveText('-')
+  await expect(row.locator('td').nth(5)).toHaveText('-')
 
   await h.page.screenshot({ path: 'test-results/snapshot-list.png', fullPage: true })
 })
@@ -334,4 +334,35 @@ test('diff: what changed between two snapshots', async () => {
   await h.page.getByText('second.md', { exact: false }).click()
   await expect(h.page.getByText('added later', { exact: false })).toBeVisible({ timeout: 10_000 })
   await h.page.screenshot({ path: 'test-results/diff-content.png' })
+})
+
+test('snapshots: deleting one, which the app could not do at all', async () => {
+  /*
+   * The CLI has had `snapshot delete` since the rewrite; the app had no way
+   * to reach it. Deleted last, because every earlier test in this file wants
+   * both fixture snapshots present.
+   */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /^snapshots$/i }).first().click()
+  await expect(h.page.getByText('#1', { exact: true })).toBeVisible()
+
+  const row = h.page.locator('tr', { hasText: '#1' }).first()
+  await row.getByRole('button', { name: /delete/i }).click()
+
+  /* The dialog has to say that space does not come back until a garbage
+   * collection runs, or deleting a snapshot looks like it did nothing. */
+  await expect(h.page.getByText(/garbage collection runs/i)).toBeVisible()
+  await h.page.screenshot({ path: 'test-results/snapshot-delete.png' })
+  await h.page.getByRole('button', { name: /^delete$/i }).last().click()
+
+  await expect(h.page.getByText('#1', { exact: true })).toHaveCount(0)
+  await expect(h.page.getByText('#2', { exact: true })).toBeVisible()
+
+  /* And it is gone from the daemon, not just from this table. */
+  await h.page.reload()
+  await openRepo(h.page, 'Documents')
+  await h.page.getByRole('button', { name: /^snapshots$/i }).first().click()
+  await expect(h.page.getByText('#2', { exact: true })).toBeVisible()
+  await expect(h.page.getByText('#1', { exact: true })).toHaveCount(0)
 })

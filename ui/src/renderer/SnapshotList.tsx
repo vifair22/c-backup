@@ -15,6 +15,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, absoluteTime, gfsBadges, GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY } from './format'
+import { ConfirmDialog } from './ConfirmDialog'
 
 const api = window.cbackup
 
@@ -82,6 +83,8 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
   const [sortKey, setSortKey] = useState<SortKey>('ts')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const [tierFilter, setTierFilter] = useState<number | null>(null) // null = show all
+  const [confirmDelete, setConfirmDelete] = useState<Snapshot | null>(null)
+  const [deleting, setDeleting] = useState(false)
 
   /*
    * One page at a time. The route pages by design and a repository with a
@@ -117,6 +120,25 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
       setError(String(err))
     }
     setLoadingMore(false)
+  }
+
+  /*
+   * Deleting a snapshot is a prune: its nodes go, and any object nothing
+   * else references becomes unreferenced. The space does not come back until
+   * a garbage collection runs, which is worth saying rather than leaving
+   * somebody to wonder why the repository is the same size afterwards.
+   */
+  const handleDelete = async (snap: Snapshot) => {
+    setConfirmDelete(null)
+    setDeleting(true)
+    setError(null)
+    try {
+      await api.apiCall(connName, { kind: 'snapshotDelete', repoId, snapshotId: snap.id })
+      setSnaps(prev => prev.filter(s => s.id !== snap.id))
+    } catch (err) {
+      setError(String(err))
+    }
+    setDeleting(false)
   }
 
   const toggleSort = (key: SortKey) => {
@@ -212,6 +234,7 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
                     Size{sortIndicator('size')}
                   </th>
                   <th className="font-medium pb-2 text-center">Retention</th>
+                  <th className="font-medium pb-2 w-16" />
                 </tr>
               </thead>
               <tbody>
@@ -245,6 +268,15 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
                           <span className="text-text-muted">-</span>
                         )}
                       </td>
+                      <td className="py-1.5 text-right">
+                        <button
+                          onClick={e => { e.stopPropagation(); setConfirmDelete(s) }}
+                          disabled={deleting}
+                          className="text-[11px] underline cursor-pointer bg-transparent
+                                     border-none text-status-error p-0 disabled:opacity-50">
+                          Delete
+                        </button>
+                      </td>
                     </tr>
                   )
                 })}
@@ -264,6 +296,22 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
             )}
           </div>
         </>
+      )}
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title={`Delete snapshot #${confirmDelete.id}`}
+          message={
+            `This removes snapshot #${confirmDelete.id} from ${absoluteTime(confirmDelete.ts)}. ` +
+            'Data shared with other snapshots stays; anything only this one ' +
+            'referenced becomes unreferenced, and the space comes back when a ' +
+            'garbage collection runs. It cannot be undone.'
+          }
+          confirmLabel="Delete"
+          danger
+          onConfirm={() => handleDelete(confirmDelete)}
+          onCancel={() => setConfirmDelete(null)}
+        />
       )}
     </div>
   )

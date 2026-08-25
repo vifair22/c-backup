@@ -131,11 +131,24 @@ export class ConnectionManager extends EventEmitter {
     return { ok: true }
   }
 
+  /*
+   * Through toEndpoint like everything else.
+   *
+   * These three built their paths by hand - 'GET /repos', 'POST /repos',
+   * `DELETE /repos/${id}` - which is the exact hole the union exists to
+   * close, just one process further in. It happened to be correct, but
+   * nothing checked that and nothing would have said so if a route moved.
+   * The contract suite covers repoList, repoAdd and repoRemove against a
+   * live daemon; it could not vouch for these until they went through it.
+   */
+  private async requestVia<T>(entry: Entry, req: ApiRequest) {
+    const ep = toEndpoint(req)
+    return entry.client.request<T>(ep.method, ep.path, ep.body)
+  }
+
   private async loadRepos(entry: Entry): Promise<RepoState[]> {
-    const res = await entry.client.request<{ repos?: Array<Record<string, string>> }>(
-      'GET',
-      '/repos'
-    )
+    const res = await this.requestVia<{ repos?: Array<Record<string, string>> }>(
+      entry, { kind: 'repoList' })
     if (res.status !== 200) throw new Error(`cannot list repos (HTTP ${res.status})`)
     return (res.body?.repos ?? []).map((r) => ({
       id: Number(r.id),
@@ -156,9 +169,8 @@ export class ConnectionManager extends EventEmitter {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
     try {
-      const res = await entry.client.request<{ error?: string }>('POST', '/repos', {
-        path: repoPath,
-        label: label ?? '',
+      const res = await this.requestVia<{ error?: string }>(entry, {
+        kind: 'repoAdd', path: repoPath, label: label ?? '',
       })
       if (res.status !== 200 && res.status !== 201) {
         return { ok: false, error: res.body?.error ?? `HTTP ${res.status}` }
@@ -175,7 +187,7 @@ export class ConnectionManager extends EventEmitter {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
     try {
-      const res = await entry.client.request('DELETE', `/repos/${repoId}`)
+      const res = await this.requestVia(entry, { kind: 'repoRemove', repoId })
       if (res.status !== 204 && res.status !== 200) {
         return { ok: false, error: `HTTP ${res.status}` }
       }
@@ -202,8 +214,7 @@ export class ConnectionManager extends EventEmitter {
     if (!entry) throw new Error(`no connection '${name}'`)
     if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
 
-    const ep = toEndpoint(req)
-    const res = await entry.client.request<T>(ep.method, ep.path, ep.body)
+    const res = await this.requestVia<T>(entry, req)
     if (res.status >= 400) {
       const body = res.body as { error?: string } | undefined
       throw new Error(body?.error ?? `HTTP ${res.status}`)
