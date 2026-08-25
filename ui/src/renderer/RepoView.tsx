@@ -13,28 +13,17 @@ const api = window.cbackup
 /* Types for RPC responses                                             */
 /* ------------------------------------------------------------------ */
 
-interface Stats {
-  snap_count: number
-  snap_total: number
-  head_entries: number
-  head_logical_bytes: number
-  snap_bytes: number
-  loose_objects: number
-  loose_bytes: number
-  pack_files: number
-  pack_bytes: number
-  total_bytes: number
-}
-
+/*
+ * A snapshot as the list route reports it. The old shape had node counts,
+ * byte totals and GFS flags per row; this one has what the daemon actually
+ * sends, and every value is a string for the same reason the sizes are.
+ */
 interface Snapshot {
-  id: number
-  created_sec: number
-  node_count: number
-  dirent_count: number
-  phys_new_bytes: number
-  gfs_flags: number
-  snap_flags: number
-  logical_bytes: number
+  id: string
+  ts: string
+  label?: string
+  files?: string
+  materialized?: string
 }
 
 interface SnapList {
@@ -42,31 +31,41 @@ interface SnapList {
   snapshots: Snapshot[]
 }
 
+/*
+ * The shapes the daemon returns, not the ones this screen was written
+ * against.
+ *
+ * Every number arrives as a string: the daemon renders integers as text so a
+ * 64-bit count cannot be mangled by a JSON number, and reading them as
+ * numbers produced NaN throughout. The old shapes - pack/loose/skip/hiratio
+ * buckets with comp and uncomp - belonged to the one-shot CLI and have no
+ * successor, so the panels that needed them are gone rather than filled with
+ * plausible arithmetic.
+ */
 interface TypeStat {
-  type: number
-  count: number
-  uncomp: number
-  comp: number
-}
-
-interface BucketStat {
-  count: number
-  uncomp: number
-  comp: number
+  type: string
+  count: string
+  phys_size: string
+  orig_size: string
 }
 
 interface RepoStats {
   per_type: TypeStat[]
-  pack: BucketStat
-  loose: BucketStat
-  skip: BucketStat
-  hiratio: BucketStat
 }
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
+interface Summary {
+  snapshots: number
+  objects: number
+  phys_size: number
+  orig_size: number
+  packs: number
+  loose: number
+  tags: number
+  last_snapshot_ts: number
+}
 
+/* A backup from today is fine, from last week is not, and the gap between
+ * says how worried to look. */
 function lastBackupStatus(epochSec: number): 'ok' | 'warn' | 'error' {
   const ageSec = Date.now() / 1000 - epochSec
   if (ageSec < 86400) return 'ok'
@@ -74,15 +73,11 @@ function lastBackupStatus(epochSec: number): 'ok' | 'warn' | 'error' {
   return 'error'
 }
 
-const OBJECT_TYPE_NAMES: Record<number, string> = {
-  1: 'File', 2: 'Xattr', 3: 'ACL', 4: 'Sparse',
-}
-
-/* ------------------------------------------------------------------ */
-/* Component                                                           */
-/* ------------------------------------------------------------------ */
-
 interface Props {
+  /* What to call this repository on screen. repoPath is the repo id the
+   * daemon addresses it by, which is not a name and should never have been
+   * the heading. */
+  title?: string
   connName: string
   repoPath: string
   onSelectSnapshot?: (snapId: number) => void
@@ -103,8 +98,8 @@ interface Props {
   onPackBrowser?: () => void
 }
 
-export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
-  const [stats, setStats] = useState<Stats | null>(null)
+export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAllSnapshots, onCompareSnapshots, onSearch, onEditPolicy, onViewJournal, onViewTags, onViewSchedules, onViewVerify, onViewEncryption, onRunBackup, onRunOperation, onViewTasks, onHashLookup, onLooseObjects, onPackBrowser }: Props): React.ReactElement {
+  const [summary, setSummary] = useState<Summary | null>(null)
   const [opsMenu, setOpsMenu] = useState<{ x: number; y: number } | null>(null)
   const [snapList, setSnapList] = useState<SnapList | null>(null)
   const [repoStats, setRepoStats] = useState<RepoStats | null>(null)
@@ -115,17 +110,18 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
     let cancelled = false
     setLoading(true)
     setError(null)
-    setStats(null)
+    setSummary(null)
     setSnapList(null)
     setRepoStats(null)
 
+    const repoId = Number(repoPath)
     Promise.all([
-      api.rpcCall<Stats>(connName, repoPath, 'stats'),
+      api.apiCall<Summary>(connName, { kind: 'summary', repoId }),
       api.rpcCall<SnapList>(connName, repoPath, 'list'),
-      api.rpcCall<RepoStats>(connName, repoPath, 'repo_stats'),
+      api.apiCall<RepoStats>(connName, { kind: 'stats', repoId }),
     ]).then(([s, l, r]) => {
       if (cancelled) return
-      setStats(s)
+      setSummary(s)
       setSnapList(l)
       setRepoStats(r)
     }).catch(err => {
@@ -140,7 +136,7 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
   if (loading) {
     return (
       <div className="p-4">
-        <h3 className="text-lg font-medium m-0 mb-1">{repoPath}</h3>
+        <h3 className="text-lg font-medium m-0 mb-1">{title ?? repoPath}</h3>
         <div className="text-text-muted text-xs mb-4">via {connName}</div>
         <div className="text-text-muted">Loading dashboard...</div>
       </div>
@@ -150,7 +146,7 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
   if (error) {
     return (
       <div className="p-4">
-        <h3 className="text-lg font-medium m-0 mb-1">{repoPath}</h3>
+        <h3 className="text-lg font-medium m-0 mb-1">{title ?? repoPath}</h3>
         <div className="text-text-muted text-xs mb-4">via {connName}</div>
         <div className="text-status-error text-sm">{error}</div>
       </div>
@@ -158,32 +154,31 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
   }
 
   const snaps = snapList?.snapshots ?? []
-  const latest = snaps.length > 0 ? snaps[snaps.length - 1] : null
-  const recentSnaps = [...snaps].reverse().slice(0, 10)
+  /* Newest first, so the head of the list is the latest backup. */
+  const latest = snaps.length > 0 ? snaps[0] : null
+  const recentSnaps = snaps.slice(0, 10)
 
-  // GFS counts
-  const gfsCounts = {
-    daily: snaps.filter(s => s.gfs_flags & GFS_DAILY).length,
-    weekly: snaps.filter(s => s.gfs_flags & GFS_WEEKLY).length,
-    monthly: snaps.filter(s => s.gfs_flags & GFS_MONTHLY).length,
-    yearly: snaps.filter(s => s.gfs_flags & GFS_YEARLY).length,
-    untagged: snaps.filter(s => !s.gfs_flags).length,
-  }
+  /*
+   * Retention tiers are not on the snapshot list route, so there is nothing
+   * to count. They live in snapshots.gfs_flags and the daemon does not send
+   * them here; showing zeroes would be a panel that says retention is doing
+   * nothing, which is worse than a panel that is absent.
+   */
 
-  // Compression totals
+  /* Compression totals, from the sizes the daemon reports as strings. */
   const totalUncomp = repoStats
-    ? repoStats.per_type.reduce((a, t) => a + t.uncomp, 0)
+    ? repoStats.per_type.reduce((a, t) => a + Number(t.orig_size ?? 0), 0)
     : 0
   const totalComp = repoStats
-    ? repoStats.per_type.reduce((a, t) => a + t.comp, 0)
+    ? repoStats.per_type.reduce((a, t) => a + Number(t.phys_size ?? 0), 0)
     : 0
   const compressionRatio = totalUncomp > 0 ? totalComp / totalUncomp : 1
   const spaceSaved = totalUncomp - totalComp
 
   // Storage bar percentages
-  const looseBytes = stats?.loose_bytes ?? 0
-  const packBytes = stats?.pack_bytes ?? 0
-  const totalBytes = stats?.total_bytes ?? 1
+  const looseBytes = 0 /* the daemon reports loose as a count, not bytes */
+  const packBytes = summary?.phys_size ?? 0
+  const totalBytes = summary?.phys_size ?? 1
   const loosePct = Math.round((looseBytes / totalBytes) * 100)
   const packPct = 100 - loosePct
 
@@ -196,27 +191,27 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
 
   return (
     <div>
-      <h3 className="text-lg font-medium m-0 mb-1">{repoPath}</h3>
+      <h3 className="text-lg font-medium m-0 mb-1">{title ?? repoPath}</h3>
       <div className="text-text-muted text-xs mb-4">via {connName}</div>
 
       {/* Row 1: Summary cards */}
       <div className="grid grid-cols-4 gap-3 mb-4">
         <StatCard
           label="Last Backup"
-          value={latest ? relativeTime(latest.created_sec) : 'Never'}
-          detail={latest ? absoluteTime(latest.created_sec) : undefined}
-          status={latest ? lastBackupStatus(latest.created_sec) : 'error'}
+          value={latest ? relativeTime(latest.ts) : 'Never'}
+          detail={latest ? absoluteTime(latest.ts) : undefined}
+          status={latest ? lastBackupStatus(Number(latest.ts)) : 'error'}
         />
         <div onClick={() => onViewAllSnapshots?.()} className={`${onViewAllSnapshots ? 'cursor-pointer' : ''} h-full`}>
           <StatCard
             label="Snapshots"
-            value={fmtNum(stats?.snap_count ?? 0)}
+            value={fmtNum(summary?.snapshots ?? 0)}
             detail={snapList?.head ? `HEAD: #${snapList.head}` : undefined}
           />
         </div>
         <StatCard
           label="Storage"
-          value={fmtSize(stats?.total_bytes ?? 0)}
+          value={fmtSize(summary?.phys_size ?? 0)}
         >
           <div className="flex h-1.5 rounded-full overflow-hidden mt-2 bg-surface-tertiary">
             {packPct > 0 && <div className="bg-accent" style={{ width: `${packPct}%` }} />}
@@ -229,8 +224,8 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
         </StatCard>
         <StatCard
           label="Files Tracked"
-          value={fmtNum(stats?.head_entries ?? 0)}
-          detail={stats?.head_logical_bytes ? `${fmtSize(stats.head_logical_bytes)} logical` : undefined}
+          value={fmtNum(summary?.objects ?? 0)}
+          detail={summary?.orig_size ? `${fmtSize(summary.orig_size)} logical` : undefined}
         />
       </div>
 
@@ -279,137 +274,101 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
         )}
       </div>
 
-      {/* Row 2: GFS Retention */}
-      {snaps.length > 0 && (
-        <div className="bg-surface-secondary border border-border-default rounded-lg p-4 mb-4">
-          <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Retention Coverage</div>
-          <div className="flex gap-4">
-            {([
-              { label: 'Yearly', count: gfsCounts.yearly, color: 'bg-amber-600' },
-              { label: 'Monthly', count: gfsCounts.monthly, color: 'bg-blue-600' },
-              { label: 'Weekly', count: gfsCounts.weekly, color: 'bg-green-600' },
-              { label: 'Daily', count: gfsCounts.daily, color: 'bg-teal-600' },
-              { label: 'Untagged', count: gfsCounts.untagged, color: 'bg-gray-500' },
-            ] as const).map(tier => (
-              <div key={tier.label} className="flex items-center gap-2">
-                <span className={`inline-block w-2.5 h-2.5 rounded-full ${tier.color}`} />
-                <span className="text-xs text-text-primary">{tier.label}</span>
-                <span className={`text-xs font-semibold ${tier.count === 0 && tier.label !== 'Untagged' ? 'text-status-error' : 'text-text-primary'}`}>
-                  {tier.count}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/*
+          The retention panel lived here. It counted daily / weekly / monthly
+          / yearly snapshots from gfs_flags, which the snapshot list route
+          does not send - so it can be rebuilt when there is an endpoint that
+          reports tiers, rather than rendered as five zeroes that say
+          retention is doing nothing.
+      */}
 
-      {/* Row 3: Storage breakdown */}
-      {repoStats && (() => {
-        const compressibleCount = repoStats.pack.count + repoStats.loose.count - repoStats.skip.count
-        const totalObjCount = repoStats.pack.count + repoStats.loose.count
-        const skipCount = repoStats.skip.count
-        const hiratioCount = repoStats.hiratio.count
-        const compressibleBytes = totalUncomp - repoStats.skip.uncomp
-        const totalTypeBytes = repoStats.per_type.reduce((a, t) => a + t.uncomp, 0)
-        const typeColors: Record<number, string> = { 1: 'bg-blue-500', 2: 'bg-orange-500', 3: 'bg-green-500', 4: 'bg-red-500' }
+      {/* Row 3: what the repository is made of */}
+      {repoStats && summary && (() => {
+        /*
+         * Built from what the daemon reports. The panel here used to show
+         * compressible / skipped / high-ratio object counts, which came from
+         * a stats shape the one-shot CLI produced and this daemon does not:
+         * there is no bucket breakdown to read, so the panel is the parts
+         * that are real rather than the old layout with invented numbers.
+         */
+        const num = (v: string | number | undefined) => Number(v ?? 0)
+        const packedCount = Math.max(0, num(summary.objects) - num(summary.loose))
+        const looseCount = num(summary.loose)
+        const totalObjCount = packedCount + looseCount
+        const typeBytes = repoStats.per_type.reduce((a, t) => a + num(t.orig_size), 0)
+        const typeColors: Record<string, string> = {
+          '1': 'bg-blue-500', '2': 'bg-orange-500', '3': 'bg-green-500',
+          '4': 'bg-red-500', '5': 'bg-purple-500',
+        }
+        const typeNames: Record<string, string> = {
+          '1': 'File', '2': 'Symlink', '3': 'Xattr', '4': 'Sparse', '5': 'Tree',
+        }
         const pct = (n: number, total: number) => total > 0 ? Math.round((n / total) * 100) : 0
 
         return (
         <div className="space-y-3 mb-4">
           <div className="grid grid-cols-2 gap-3">
-            {/* Compression */}
-            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Compression</div>
-              <div className="flex justify-between text-sm mb-2">
-                <span className="text-text-secondary">{fmtSize(totalUncomp)} uncompressed</span>
-                <span className="text-text-primary font-semibold">{fmtSize(totalComp)} on disk</span>
+            <div className="bg-surface-secondary rounded-lg p-3">
+              <div className="text-xs text-text-secondary mb-2">Storage</div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-lg font-semibold text-text-primary">
+                  {fmtSize(num(summary.phys_size))}
+                </span>
+                <span className="text-xs text-text-muted">
+                  from {fmtSize(num(summary.orig_size))} of files
+                </span>
               </div>
-              <div className="flex h-2 rounded-full overflow-hidden bg-surface-tertiary mb-2">
-                <div className="bg-accent" style={{ width: `${Math.round(compressionRatio * 100)}%` }} />
-              </div>
-              <div className="flex justify-between text-[10px] text-text-muted">
-                <span>{(compressionRatio * 100).toFixed(1)}% ratio</span>
-                <span>{fmtSize(spaceSaved)} saved</span>
-              </div>
+              {num(summary.orig_size) > 0 && (
+                <div className="text-xs text-text-muted mt-1">
+                  {pct(num(summary.orig_size) - num(summary.phys_size), num(summary.orig_size))}% saved
+                  by compression and dedup
+                </div>
+              )}
             </div>
 
-            {/* Object types table */}
-            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Object Types</div>
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-text-muted text-left">
-                    <th className="font-medium pb-1">Type</th>
-                    <th className="font-medium pb-1 text-right">Count</th>
-                    <th className="font-medium pb-1 text-right">Size</th>
-                    <th className="font-medium pb-1 text-right">Compressed</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {repoStats.per_type.filter(t => t.count > 0).map(t => (
-                    <tr key={t.type} className="text-text-primary">
-                      <td className="py-0.5 flex items-center gap-1">
-                        <span className={`inline-block w-2 h-2 rounded-full ${typeColors[t.type] ?? 'bg-gray-500'}`} />
-                        {OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`}
-                      </td>
-                      <td className="py-0.5 text-right">{fmtNum(t.count)}</td>
-                      <td className="py-0.5 text-right">{fmtSize(t.uncomp)}</td>
-                      <td className="py-0.5 text-right">{fmtSize(t.comp)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="bg-surface-secondary rounded-lg p-3">
+              <div className="text-xs text-text-secondary mb-2">Objects</div>
+              <div className="h-2 rounded-full bg-surface-tertiary overflow-hidden flex mb-2">
+                {packedCount > 0 && (
+                  <div className="bg-accent" style={{ width: `${pct(packedCount, totalObjCount)}%` }} />
+                )}
+                {looseCount > 0 && (
+                  <div className="bg-status-warning" style={{ width: `${pct(looseCount, totalObjCount)}%` }} />
+                )}
+              </div>
+              <div className="flex gap-3 text-xs text-text-muted">
+                <span>
+                  <span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />
+                  Packed {fmtNum(packedCount)}
+                </span>
+                <span>
+                  <span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />
+                  Loose {fmtNum(looseCount)}
+                </span>
+                <span className="ml-auto">{fmtNum(num(summary.packs))} pack files</span>
+              </div>
             </div>
           </div>
 
-          {/* Distribution bars */}
-          <div className="grid grid-cols-3 gap-3">
-            {/* Compressibility */}
-            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Compressibility</div>
-              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
-                {compressibleCount > 0 && <div className="bg-accent" style={{ width: `${pct(compressibleCount, totalObjCount)}%` }} title={`Compressible: ${fmtNum(compressibleCount)}`} />}
-                {hiratioCount > 0 && <div className="bg-amber-500" style={{ width: `${pct(hiratioCount, totalObjCount)}%` }} title={`High-ratio: ${fmtNum(hiratioCount)}`} />}
-                {skipCount > 0 && <div className="bg-status-error" style={{ width: `${pct(skipCount, totalObjCount)}%` }} title={`Skip-marked: ${fmtNum(skipCount)}`} />}
-              </div>
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
-                <span><span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />Compressible {fmtNum(compressibleCount)}</span>
-                {hiratioCount > 0 && <span><span className="inline-block w-2 h-2 rounded-full bg-amber-500 mr-1" />High-ratio {fmtNum(hiratioCount)}</span>}
-                {skipCount > 0 && <span><span className="inline-block w-2 h-2 rounded-full bg-status-error mr-1" />Skip {fmtNum(skipCount)}</span>}
-              </div>
-            </div>
-
-            {/* Pack vs Loose */}
-            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Pack vs Loose</div>
-              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
-                {repoStats.pack.count > 0 && <div className="bg-accent" style={{ width: `${pct(repoStats.pack.count, totalObjCount)}%` }} />}
-                {repoStats.loose.count > 0 && <div className="bg-status-warning" style={{ width: `${pct(repoStats.loose.count, totalObjCount)}%` }} />}
-              </div>
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
-                <span><span className="inline-block w-2 h-2 rounded-full bg-accent mr-1" />Packed {fmtNum(repoStats.pack.count)} ({fmtSize(repoStats.pack.comp)})</span>
-                <span><span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />Loose {fmtNum(repoStats.loose.count)} ({fmtSize(repoStats.loose.comp)})</span>
-              </div>
-            </div>
-
-            {/* Type distribution by size */}
-            <div className="bg-surface-secondary border border-border-default rounded-lg p-4">
-              <div className="text-[11px] text-text-muted uppercase tracking-wide mb-2">Size by Type</div>
-              <div className="flex h-3 rounded-full overflow-hidden bg-surface-tertiary mb-2">
-                {repoStats.per_type.filter(t => t.uncomp > 0).map(t => (
-                  <div key={t.type} className={typeColors[t.type] ?? 'bg-gray-500'} style={{ width: `${pct(t.uncomp, totalTypeBytes)}%` }} />
+          {repoStats.per_type.length > 0 && (
+            <div className="bg-surface-secondary rounded-lg p-3">
+              <div className="text-xs text-text-secondary mb-2">By object type</div>
+              <div className="h-2 rounded-full bg-surface-tertiary overflow-hidden flex mb-2">
+                {repoStats.per_type.filter(t => num(t.orig_size) > 0).map(t => (
+                  <div key={t.type} className={typeColors[t.type] ?? 'bg-surface-tertiary'}
+                    style={{ width: `${pct(num(t.orig_size), typeBytes)}%` }} />
                 ))}
               </div>
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-text-muted">
-                {repoStats.per_type.filter(t => t.uncomp > 0).map(t => (
+              <div className="flex flex-wrap gap-3 text-xs text-text-muted">
+                {repoStats.per_type.filter(t => num(t.count) > 0).map(t => (
                   <span key={t.type}>
-                    <span className={`inline-block w-2 h-2 rounded-full ${typeColors[t.type] ?? 'bg-gray-500'} mr-1`} />
-                    {OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`} {fmtSize(t.uncomp)}
+                    <span className={`inline-block w-2 h-2 rounded-full mr-1 ${typeColors[t.type] ?? 'bg-surface-tertiary'}`} />
+                    {typeNames[t.type] ?? `Type ${t.type}`} {fmtNum(num(t.count))}
                   </span>
                 ))}
               </div>
             </div>
-          </div>
+          )}
         </div>
         )
       })()}
@@ -439,34 +398,19 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
               <tr className="text-text-muted text-left">
                 <th className="font-medium pb-1 w-16">ID</th>
                 <th className="font-medium pb-1">Date</th>
-                <th className="font-medium pb-1 text-right">Nodes</th>
-                <th className="font-medium pb-1 text-right">New Data</th>
-                <th className="font-medium pb-1 text-center">Retention</th>
+                <th className="font-medium pb-1 text-right pr-6">Files</th>
+                <th className="font-medium pb-1">Label</th>
               </tr>
             </thead>
             <tbody>
               {recentSnaps.map(s => {
-                const badges = gfsBadges(s.gfs_flags)
                 return (
-                  <tr key={s.id} onClick={() => onSelectSnapshot?.(s.id)}
+                  <tr key={s.id} onClick={() => onSelectSnapshot?.(Number(s.id))}
                     className={`text-text-primary border-t border-border-default ${onSelectSnapshot ? 'cursor-pointer hover:bg-surface-hover' : ''}`}>
                     <td className="py-1.5 font-mono">#{s.id}</td>
-                    <td className="py-1.5">{absoluteTime(s.created_sec)}</td>
-                    <td className="py-1.5 text-right">{fmtNum(s.node_count)}</td>
-                    <td className="py-1.5 text-right">{fmtSize(s.phys_new_bytes)}</td>
-                    <td className="py-1.5 text-center">
-                      {badges.length > 0 ? (
-                        <span className="inline-flex gap-1">
-                          {badges.map(b => (
-                            <span key={b.label} className={`inline-block px-1.5 py-0 rounded text-[10px] font-semibold ${b.color}`}>
-                              {b.label}
-                            </span>
-                          ))}
-                        </span>
-                      ) : (
-                        <span className="text-text-muted">-</span>
-                      )}
-                    </td>
+                    <td className="py-1.5">{absoluteTime(s.ts)}</td>
+                    <td className="py-1.5 text-right pr-6">{fmtNum(s.files)}</td>
+                    <td className="py-1.5">{s.label || ''}</td>
                   </tr>
                 )
               })}

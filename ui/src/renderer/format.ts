@@ -5,21 +5,34 @@ export const GFS_WEEKLY = 2
 export const GFS_MONTHLY = 4
 export const GFS_YEARLY = 8
 
-export function fmtSize(bytes: number): string {
-  if (bytes === 0) return '0 B'
+export function fmtSize(bytes: number | string | undefined | null): string {
+  const n = Number(bytes ?? NaN)
+  if (!Number.isFinite(n)) return '-'
+  if (n === 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const val = bytes / Math.pow(1024, i)
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1)
+  const val = n / Math.pow(1024, i)
   return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`
 }
 
-export function fmtNum(n: number): string {
-  return n.toLocaleString()
+/*
+ * Tolerant on purpose.
+ *
+ * These run inside render, so throwing does not produce a bad-looking cell -
+ * it unmounts the tree and leaves a white window. fmtNum(undefined) blanked
+ * the whole dashboard when one field of one row turned out not to exist.
+ * A dash is a worse number and a much better failure.
+ */
+export function fmtNum(n: number | string | undefined | null): string {
+  const v = Number(n ?? NaN)
+  return Number.isFinite(v) ? v.toLocaleString() : '-'
 }
 
-export function relativeTime(epochSec: number): string {
+export function relativeTime(epochSec: number | string | undefined | null): string {
+  const t = Number(epochSec ?? NaN)
+  if (!Number.isFinite(t) || t <= 0) return 'never'
   const now = Date.now() / 1000
-  const diff = now - epochSec
+  const diff = now - t
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
@@ -27,8 +40,10 @@ export function relativeTime(epochSec: number): string {
   return `${Math.floor(diff / 604800)}w ago`
 }
 
-export function absoluteTime(epochSec: number): string {
-  return new Date(epochSec * 1000).toLocaleString()
+export function absoluteTime(epochSec: number | string | undefined | null): string {
+  const t = Number(epochSec ?? NaN)
+  if (!Number.isFinite(t) || t <= 0) return '-'
+  return new Date(t * 1000).toLocaleString()
 }
 
 export function gfsBadges(flags: number): { label: string; color: string }[] {

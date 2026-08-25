@@ -166,3 +166,30 @@ export type ApiResponse = unknown
 export interface JobAccepted {
   job_id: number
 }
+
+/*
+ * A job, as the daemon actually reports it.
+ *
+ * Written down because the app was reading a different shape entirely: it
+ * expected {tasks:[{task_id, command, pid, started, alive, ...}]} from the
+ * one-shot CLI era and the daemon answers {jobs:[{id, action, state}]}. So
+ * the poll set the task list to undefined, and the task bar - which renders
+ * on every repository screen - called .filter on it. Opening any repository
+ * blanked the window.
+ *
+ * Numbers arrive as strings in the list and as numbers in the detail, which
+ * is why the fields are widened rather than picked. Coercing at the edge is
+ * cheaper than being wrong about which one a given route returns.
+ */
+export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface Job {
+  id: string
+  action: string
+  state: JobState
+  /* Present on the detail route, absent from the list. */
+  phase?: string
+  current?: number | string
+  total?: number | string
+  error?: string
+}

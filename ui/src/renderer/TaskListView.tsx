@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { fmtNum, absoluteTime } from './format'
 import { ConfirmDialog } from './ConfirmDialog'
-import type { TaskInfo } from './TaskBar'
+import type { Job } from '../shared/api'
 
 const api = window.cbackup
 
@@ -18,32 +18,34 @@ const STATE_CONFIG: Record<string, { color: string; bg: string; label: string }>
 }
 
 interface Props {
-  tasks: TaskInfo[]
+  jobs: Job[]
   connName: string
   repoPath: string
   onBack: () => void
 }
 
-export function TaskListView({ tasks, connName, repoPath, onBack }: Props): React.ReactElement {
+export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null)
 
   const handleCancel = async (taskId: string) => {
     setConfirmCancel(null)
     try {
-      await api.rpcCall(connName, repoPath, 'task_cancel', { task_id: taskId })
+      await api.apiCall(connName, { kind: 'jobCancel', jobId: Number(taskId) })
     } catch (err) {
       setError(String(err))
     }
   }
 
-  const hasRunning = tasks.some(t => t.state === 'running' && t.alive)
+  const list = jobs ?? []
+  const hasRunning = list.some(j => j.state === 'running')
 
-  // Sort: running first, then by started desc
-  const sorted = [...tasks].sort((a, b) => {
+  /* Running first, then newest. The daemon has no start time on a job, so
+   * the id stands in for one: they are handed out in order. */
+  const sorted = [...list].sort((a, b) => {
     if (a.state === 'running' && b.state !== 'running') return -1
     if (a.state !== 'running' && b.state === 'running') return 1
-    return b.started - a.started
+    return Number(b.id) - Number(a.id)
   })
 
   return (
@@ -64,31 +66,31 @@ export function TaskListView({ tasks, connName, repoPath, onBack }: Props): Reac
         <div className="space-y-2">
           {sorted.map(t => {
             const cfg = STATE_CONFIG[t.state] ?? STATE_CONFIG.running
-            const isRunning = t.state === 'running' && t.alive
-            const pct = t.progress && t.progress.total > 0
-              ? Math.round((t.progress.current / t.progress.total) * 100)
+            const isRunning = t.state === 'running'
+            const pct = Number(t.total ?? 0) > 0
+              ? Math.round((Number(t.current ?? 0) / Number(t.total)) * 100)
               : null
 
             return (
-              <div key={t.task_id}
+              <div key={t.id}
                 className={`border border-border-default rounded-lg p-3 ${cfg.bg}`}>
                 {/* Top row: command, state, time */}
                 <div className="flex items-center gap-3 mb-1">
-                  <span className="text-sm font-semibold text-text-primary capitalize">{t.command}</span>
+                  <span className="text-sm font-semibold text-text-primary capitalize">{t.action}</span>
                   <span className={`text-[10px] font-semibold ${cfg.color}`}>{cfg.label}</span>
+                  {/* The daemon reports no start time on a job, so there is
+                    * nothing honest to render here. Showing absoluteTime of
+                    * undefined printed the epoch. */}
                   <span className="text-[11px] text-text-muted ml-auto">
-                    {absoluteTime(t.started)}
-                    {isRunning && (
-                      <span className="ml-2">{fmtElapsed(Date.now() / 1000 - t.started)}</span>
-                    )}
+                    job {t.id}
                   </span>
                 </div>
 
                 {/* Progress bar for running tasks */}
                 {isRunning && (
                   <div className="flex items-center gap-2 mb-2">
-                    {t.progress?.phase && (
-                      <span className="text-xs text-text-muted w-20 shrink-0">{t.progress.phase}</span>
+                    {t.phase && (
+                      <span className="text-xs text-text-muted w-20 shrink-0">{t.phase}</span>
                     )}
                     {pct !== null ? (
                       <>
@@ -112,13 +114,15 @@ export function TaskListView({ tasks, connName, repoPath, onBack }: Props): Reac
 
                 {/* Bottom row: details + actions */}
                 <div className="flex items-center gap-3 text-[10px] text-text-muted">
-                  <span className="font-mono">{t.task_id.slice(0, 12)}</span>
-                  <span>PID {t.pid}</span>
-                  {t.progress && t.progress.total > 0 && (
-                    <span>{fmtNum(t.progress.current)} / {fmtNum(t.progress.total)}</span>
+                  {/* No pid either: work runs on the daemon's own pool
+                    * rather than as a detached process, which is the whole
+                    * point of the rewrite. */}
+                  {Number(t.total ?? 0) > 0 && (
+                    <span>{fmtNum(Number(t.current ?? 0))} / {fmtNum(Number(t.total))}</span>
                   )}
+                  {t.error && <span className="text-status-error">{t.error}</span>}
                   {isRunning && (
-                    <button onClick={() => setConfirmCancel(t.task_id)}
+                    <button onClick={() => setConfirmCancel(t.id)}
                       className="text-[10px] px-2 py-0.5 rounded bg-surface-tertiary text-status-error hover:bg-surface-hover border-none cursor-pointer ml-auto">
                       Cancel
                     </button>
@@ -130,8 +134,8 @@ export function TaskListView({ tasks, connName, repoPath, onBack }: Props): Reac
         </div>
       )}
 
-      {tasks.length === 0 && (
-        <div className="text-text-muted text-xs text-center py-8">No background tasks.</div>
+      {list.length === 0 && (
+        <div className="text-text-muted text-xs text-center py-8">No background jobs.</div>
       )}
 
       {/* Cancel confirmation */}

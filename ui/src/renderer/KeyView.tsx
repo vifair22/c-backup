@@ -116,15 +116,15 @@ export function KeyView({ connName, repoPath, onBack }: Props): React.ReactEleme
       </div>
 
       {error && (
-        <div className="text-xs mb-3 p-2 rounded bg-danger-subtle text-danger border border-danger">
+        <div className="text-xs mb-3 p-2 rounded bg-error-bg text-error-text border border-error-border">
           {error}
         </div>
       )}
 
       {loading ? (
-        <div className="text-xs text-text-tertiary">Loading...</div>
+        <div className="text-xs text-text-muted">Loading...</div>
       ) : enc === 'none' ? (
-        <div className="text-xs text-text-tertiary" style={{ maxWidth: '34rem' }}>
+        <div className="text-xs text-text-muted" style={{ maxWidth: '34rem' }}>
           This repository is not encrypted. Encryption is chosen when a
           repository is created and cannot be turned on afterwards - every
           object already written would still be in the clear, and a repository
@@ -136,13 +136,13 @@ export function KeyView({ connName, repoPath, onBack }: Props): React.ReactEleme
             <div className="text-text-secondary">Mode</div>
             <div className="font-mono">{enc}</div>
             <div className="text-text-secondary">Key saved elsewhere</div>
-            <div className={escrowed(repo) ? 'text-success' : 'text-danger'}>
+            <div className={escrowed(repo) ? 'text-status-connected' : 'text-status-error'}>
               {escrowed(repo) ? 'yes' : 'not confirmed'}
             </div>
           </div>
 
           {!escrowed(repo) && (
-            <div className="text-xs mb-4 p-2 rounded bg-danger-subtle text-danger border border-danger">
+            <div className="text-xs mb-4 p-2 rounded bg-error-bg text-error-text border border-error-border">
               This key exists in one file, on this machine. If the machine is
               lost, every copy of this repository - including any offsite one -
               is unreadable. Save it somewhere else and confirm below.
@@ -167,7 +167,7 @@ export function KeyView({ connName, repoPath, onBack }: Props): React.ReactEleme
                     {key}
                   </div>
                   {keyId && (
-                    <div className="text-xs text-text-tertiary mt-1">
+                    <div className="text-xs text-text-muted mt-1">
                       Fingerprint {keyId}
                     </div>
                   )}
@@ -189,7 +189,7 @@ export function KeyView({ connName, repoPath, onBack }: Props): React.ReactEleme
           )}
 
           {enc === 'passphrase' && (
-            <div className="text-xs text-text-tertiary mb-4">
+            <div className="text-xs text-text-muted mb-4">
               The key is wrapped by your passphrase and stored in the repository
               itself, so an offsite copy can be opened with the passphrase
               alone. There is nothing here to write down - but the passphrase

@@ -107,10 +107,10 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
    * survived and the medium is telling you something.
    */
   const verdict = (r: VerifyRun): { label: string; cls: string } => {
-    if (n(r.completed) === 0) return { label: 'incomplete', cls: 'text-text-tertiary' }
-    if (n(r.unrecoverable) > 0 || n(r.missing) > 0) return { label: 'damaged', cls: 'text-danger' }
-    if (n(r.repaired) > 0) return { label: 'repaired', cls: 'text-warning' }
-    return { label: 'clean', cls: 'text-success' }
+    if (n(r.completed) === 0) return { label: 'incomplete', cls: 'text-text-muted' }
+    if (n(r.unrecoverable) > 0 || n(r.missing) > 0) return { label: 'damaged', cls: 'text-status-error' }
+    if (n(r.repaired) > 0) return { label: 'repaired', cls: 'text-status-warning' }
+    return { label: 'clean', cls: 'text-status-connected' }
   }
 
   return (
@@ -125,15 +125,15 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
       </div>
 
       {error && (
-        <div className="text-xs mb-3 p-2 rounded bg-danger-subtle text-danger border border-danger">
+        <div className="text-xs mb-3 p-2 rounded bg-error-bg text-error-text border border-error-border">
           {error}
         </div>
       )}
 
       {loading ? (
-        <div className="text-xs text-text-tertiary">Loading...</div>
+        <div className="text-xs text-text-muted">Loading...</div>
       ) : runs.length === 0 ? (
-        <div className="text-xs text-text-tertiary">
+        <div className="text-xs text-text-muted">
           No scrub has run yet. Verify from the operations menu to prove the
           stored objects still read back.
         </div>
@@ -186,8 +186,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
               </div>
 
               {n(selected.repaired) > 0 && (
-                <div className="text-xs mb-3 p-2 rounded bg-warning-subtle text-warning
-                                border border-warning">
+                <div className="text-xs mb-3 p-2 rounded bg-surface-secondary text-status-warning border border-status-warning">
                   Parity corrected {n(selected.repaired)} object(s). The data
                   survived, but a disk returned bytes it was not given - worth
                   looking at the drive.
@@ -195,7 +194,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
               )}
 
               {loadingFindings ? (
-                <div className="text-xs text-text-tertiary">Loading findings...</div>
+                <div className="text-xs text-text-muted">Loading findings...</div>
               ) : findings.length > 0 ? (
                 <>
                   <div className="text-xs text-text-secondary mb-1">Findings</div>
@@ -221,7 +220,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                   </table>
                 </>
               ) : (
-                <div className="text-xs text-text-tertiary">
+                <div className="text-xs text-text-muted">
                   {verdict(selected).label === 'clean'
                     ? 'Every object read back as stored.'
                     : 'No per-object detail was recorded for this run.'}
@@ -238,7 +237,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
 function Stat({ label, value, warn, bad }: {
   label: string; value: number; warn?: boolean; bad?: boolean
 }): React.ReactElement {
-  const cls = bad ? 'text-danger' : warn ? 'text-warning' : 'text-text-primary'
+  const cls = bad ? 'text-status-error' : warn ? 'text-status-warning' : 'text-text-primary'
   return (
     <>
       <div className="text-text-secondary">{label}</div>

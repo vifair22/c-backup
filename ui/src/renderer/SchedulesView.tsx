@@ -189,7 +189,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
       </div>
 
       {error && (
-        <div className="text-xs mb-3 p-2 rounded bg-danger-subtle text-danger border border-danger">
+        <div className="text-xs mb-3 p-2 rounded bg-error-bg text-error-text border border-error-border">
           {error}
         </div>
       )}
@@ -223,7 +223,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
               Cancel
             </button>
           </div>
-          <div className="text-xs text-text-tertiary mt-2">
+          <div className="text-xs text-text-muted mt-2">
             {ACTIONS.find(a => a.value === newAction)?.hint}
             {newAction === 'backup' && ' - set them from the backup dialog first.'}
           </div>
@@ -231,9 +231,9 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
       )}
 
       {loading ? (
-        <div className="text-xs text-text-tertiary">Loading...</div>
+        <div className="text-xs text-text-muted">Loading...</div>
       ) : schedules.length === 0 ? (
-        <div className="text-xs text-text-tertiary">
+        <div className="text-xs text-text-muted">
           Nothing scheduled. A backup that runs only when somebody remembers is
           not a backup strategy.
         </div>
@@ -257,12 +257,12 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
                     <td className="py-1.5 pr-3">{s.action}</td>
                     <td className="py-1.5 pr-3">{describeTrigger(s.trigger)}</td>
                     <td className="py-1.5 pr-3 font-mono truncate max-w-[18rem]">
-                      {target ?? <span className="text-text-tertiary">-</span>}
+                      {target ?? <span className="text-text-muted">-</span>}
                     </td>
                     <td className="py-1.5 pr-3">
                       {s.enabled === '1'
-                        ? <span className="text-success">enabled</span>
-                        : <span className="text-text-tertiary">paused</span>}
+                        ? <span className="text-status-connected">enabled</span>
+                        : <span className="text-text-muted">paused</span>}
                     </td>
                     <td className="py-1.5 text-right whitespace-nowrap">
                       <button onClick={() => handleToggle(s)}
@@ -272,7 +272,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
                       </button>
                       <button onClick={() => setConfirmRemove(s)}
                         className="underline cursor-pointer bg-transparent border-none
-                                   text-danger p-0 text-xs">
+                                   text-status-error p-0 text-xs">
                         Remove
                       </button>
                     </td>

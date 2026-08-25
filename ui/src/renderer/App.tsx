@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react'
+import type { Job } from '../shared/api'
 import type { MaintenanceOp } from '../shared/api'
 import type { ConnectionState, ConnectionConfig } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
@@ -14,7 +15,7 @@ import { HashLookup } from './HashLookup'
 import { LooseObjects } from './LooseObjects'
 import { PackBrowser } from './PackBrowser'
 import { JournalView } from './JournalView'
-import { TaskBar, type TaskInfo } from './TaskBar'
+import { TaskBar } from './TaskBar'
 import { TaskListView } from './TaskListView'
 import { TagsView } from './TagsView'
 import { SchedulesView } from './SchedulesView'
@@ -46,7 +47,25 @@ export function App(): React.ReactElement {
   }
 
   const [connections, setConnections] = useState<ConnectionState[]>([])
-  const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
+  /*
+   * The open repository: which connection, which id, and where it lives.
+   *
+   * `id` is new and is the thing that was missing. Every screen was handed
+   * `path` under a prop called repoPath, and the main process turned it into
+   * a repo id with Number() - so a filesystem path became NaN and every call
+   * from every repository screen came back "invalid repo id". The path stays
+   * because a few things legitimately want it: the header, the context menus,
+   * and matching against a repo being renamed or removed.
+   */
+  const [activeRepo, setActiveRepo] = useState<{ conn: string; id: number; path: string } | null>(null)
+
+  /* The open repository's name, for headings. Falls back to the directory
+   * when it has no label, the way the sidebar does. */
+  const activeRepoLabel = activeRepo
+    ? (connections.find(c => c.config.name === activeRepo.conn)?.repos
+        ?.find(r => r.id === activeRepo.id)?.label
+       || activeRepo.path.split('/').pop() || activeRepo.path)
+    : ''
   // Navigation history
   type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' } | { view: 'verify' } | { view: 'encryption' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
@@ -63,21 +82,24 @@ export function App(): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
 
   // Shared task state — single poll shared by TaskBar + TaskListView
-  const [taskList, setTaskList] = useState<TaskInfo[]>([])
+  const [taskList, setTaskList] = useState<Job[]>([])
 
   useEffect(() => {
     if (!activeRepo) { setTaskList([]); return }
     let cancelled = false
     const poll = async () => {
       try {
-        const resp = await api.rpcCall<{ tasks: TaskInfo[] }>(activeRepo.conn, activeRepo.path, 'task_list')
-        if (!cancelled) setTaskList(resp.tasks)
+        /* `jobs`, not `tasks`. Reading the wrong key set the list to
+         * undefined and TaskBar - which renders on every repository screen -
+         * threw on it, so opening any repository blanked the window. */
+        const resp = await api.apiCall<{ jobs?: Job[] }>(activeRepo.conn, { kind: 'jobList' })
+        if (!cancelled) setTaskList(resp.jobs ?? [])
       } catch { /* ignore */ }
     }
     poll()
     const interval = setInterval(poll, 2000)
     return () => { cancelled = true; clearInterval(interval) }
-  }, [activeRepo?.conn, activeRepo?.path])
+  }, [activeRepo?.conn, activeRepo?.id])
 
   // Restore modal
   const [restoreModal, setRestoreModal] = useState<{ snapId: number; filePath?: string } | null>(null)
@@ -98,7 +120,7 @@ export function App(): React.ReactElement {
   const [showAddConnection, setShowAddConnection] = useState(false)
   const [editingConnection, setEditingConnection] = useState<ConnectionConfig | null>(null)
   const [connectingName, setConnectingName] = useState<string | null>(null)
-  const [pendingRepoOpen, setPendingRepoOpen] = useState<{ conn: string; path: string } | null>(null)
+  const [pendingRepoOpen, setPendingRepoOpen] = useState<{ conn: string; path: string; id: number } | null>(null)
   const [sudoPasswordInput, setSudoPasswordInput] = useState('')
   const [savePassword, setSavePassword] = useState(true)
   const [addRepoConn, setAddRepoConn] = useState<string | null>(null)
@@ -203,7 +225,7 @@ export function App(): React.ReactElement {
         // Was trying to init a repo
         await handleInitRepo()
       } else {
-        await handleOpenRepo(pending.conn, pending.path)
+        await handleOpenRepo(pending.conn, pending.path, pending.id)
       }
     }
   }
@@ -276,7 +298,7 @@ export function App(): React.ReactElement {
     if (!result.ok) {
       if (result.needsCredentials) {
         // Stash the init intent, show credential dialog
-        setPendingRepoOpen({ conn: connName, path: '' }) // empty path signals init, not open
+        setPendingRepoOpen({ conn: connName, path: '', id: 0 }) // empty path signals init, not open
         setConnectingName(connName)
         setSudoPasswordInput('')
         setSavePassword(true)
@@ -297,7 +319,7 @@ export function App(): React.ReactElement {
     const result = await api.repoEdit(editingRepo.connName, editingRepo.oldPath, repoPathInput.trim())
     if (!result.ok) setError(result.error ?? 'Failed to edit repo')
     if (activeRepo?.conn === editingRepo.connName && activeRepo?.path === editingRepo.oldPath) {
-      setActiveRepo({ conn: editingRepo.connName, path: repoPathInput.trim() })
+      setActiveRepo(prev => prev ? { ...prev, path: repoPathInput.trim() } : prev)
     }
     await refreshConnections()
     setEditingRepo(null)
@@ -323,16 +345,16 @@ export function App(): React.ReactElement {
     })
   }
 
-  const handleOpenRepo = async (connName: string, repoPath: string) => {
+  const handleOpenRepo = async (connName: string, repoPath: string, repoId: number) => {
     setError(null)
-    setActiveRepo({ conn: connName, path: repoPath })
+    setActiveRepo({ conn: connName, id: repoId, path: repoPath })
     setNavHistory([{ view: 'dashboard' }])
     setNavIndex(0)
     try {
       const result = await api.repoOpen(connName, repoPath)
       if (!result.ok) {
         if (result.needsCredentials) {
-          setPendingRepoOpen({ conn: connName, path: repoPath })
+          setPendingRepoOpen({ conn: connName, path: repoPath, id: repoId })
           setConnectingName(connName)
           setSudoPasswordInput('')
           setSavePassword(true)
@@ -368,7 +390,7 @@ export function App(): React.ReactElement {
     try {
       await api.apiCall(activeRepo.conn, {
         kind: 'backup',
-        repoId: Number(activeRepo.path),
+        repoId: activeRepo.id,
       })
       setShowBackupModal(false)
       navigateTo({ view: 'tasks' })
@@ -385,7 +407,7 @@ export function App(): React.ReactElement {
     setSourcesLoading(true)
     try {
       const r = await api.apiCall<{ sources?: string[]; exclude?: string[] }>(
-        activeRepo.conn, { kind: 'sourcesGet', repoId: Number(activeRepo.path) })
+        activeRepo.conn, { kind: 'sourcesGet', repoId: activeRepo.id })
       setSources(r.sources ?? [])
       setSourceDraft((r.sources ?? []).join('\n'))
     } catch (err) {
@@ -401,7 +423,7 @@ export function App(): React.ReactElement {
     setError(null)
     try {
       await api.apiCall(activeRepo.conn, {
-        kind: 'sourcesSet', repoId: Number(activeRepo.path), sources: paths,
+        kind: 'sourcesSet', repoId: activeRepo.id, sources: paths,
       })
       setSources(paths)
       setEditingSources(false)
@@ -420,7 +442,7 @@ export function App(): React.ReactElement {
        * which the daemon has never served. */
       await api.apiCall(activeRepo.conn, {
         kind: 'restore',
-        repoId: Number(activeRepo.path),
+        repoId: activeRepo.id,
         snapshotId: restoreModal.snapId,
         dest: restoreDest.trim(),
         subpath: restoreModal.filePath,
@@ -461,7 +483,7 @@ export function App(): React.ReactElement {
         setConfirmDialog(null)
         setError(null)
         try {
-          const repoId = Number(activeRepo.path)
+          const repoId = activeRepo.id
           await api.apiCall(activeRepo.conn, { kind: command, repoId })
           navigateTo({ view: 'tasks' })
         } catch (err) {
@@ -591,13 +613,22 @@ export function App(): React.ReactElement {
                 {conn.repos.map(repo => (
                   <div
                     key={repo.path}
-                    onClick={() => handleOpenRepo(conn.config.name, repo.path)}
+                    onClick={() => handleOpenRepo(conn.config.name, repo.path, repo.id)}
                     onContextMenu={e => showRepoMenu(e, conn.config.name, repo.path)}
                     className={`text-xs py-1 px-1.5 rounded mb-0.5 cursor-pointer hover:bg-surface-hover ${
                       activeRepo?.conn === conn.config.name && activeRepo?.path === repo.path ? 'bg-surface-active' : ''
                     }`}
                   >
-                    <span className="text-text-primary">{repo.path.split('/').pop() || repo.path}</span>
+                    {/*
+                      * The label if there is one, the directory name if not.
+                      * A repository is named when it is added and the name
+                      * was shown nowhere: the sidebar used the last path
+                      * segment, so "Photos" at a path ending in /encrepo
+                      * appeared as encrepo.
+                      */}
+                    <span className="text-text-primary" title={repo.path}>
+                      {repo.label || repo.path.split('/').pop() || repo.path}
+                    </span>
                     {(
                       <span className="text-status-connected text-[10px] ml-1.5">connected</span>
                     )}
@@ -647,7 +678,8 @@ export function App(): React.ReactElement {
         {activeRepo ? (
           <>
             {currentView.view === 'dashboard' && (
-              <RepoView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <RepoView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+                title={activeRepoLabel}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onViewAllSnapshots={() => navigateTo({ view: 'snapshots' })}
                 onCompareSnapshots={(a, b) => navigateTo({ view: 'diff', snapA: a, snapB: b })}
@@ -669,14 +701,14 @@ export function App(): React.ReactElement {
               />
             )}
             {currentView.view === 'snapshots' && (
-              <SnapshotList connName={activeRepo.conn} repoPath={activeRepo.path}
+              <SnapshotList connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onCompareSnapshots={() => navigateTo({ view: 'diff' })}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'snapshot-browser' && (
-              <SnapshotBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
+              <SnapshotBrowser connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 snapId={currentView.snapId}
                 initialPath={currentView.path}
                 onBack={navBack}
@@ -684,65 +716,65 @@ export function App(): React.ReactElement {
               />
             )}
             {currentView.view === 'tasks' && (
-              <TaskListView tasks={taskList} connName={activeRepo.conn} repoPath={activeRepo.path}
+              <TaskListView jobs={taskList} connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'tags' && (
-              <TagsView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <TagsView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'schedules' && (
-              <SchedulesView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <SchedulesView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'verify' && (
-              <VerifyView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <VerifyView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'encryption' && (
-              <KeyView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <KeyView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'journal' && (
-              <JournalView connName={activeRepo.conn} repoPath={activeRepo.path}
+              <JournalView connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'loose-objects' && (
-              <LooseObjects connName={activeRepo.conn} repoPath={activeRepo.path}
+              <LooseObjects connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'pack-browser' && (
-              <PackBrowser connName={activeRepo.conn} repoPath={activeRepo.path}
+              <PackBrowser connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'hash-lookup' && (
-              <HashLookup connName={activeRepo.conn} repoPath={activeRepo.path}
+              <HashLookup connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onNavigateToSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'policy' && (
-              <PolicyEditor connName={activeRepo.conn} repoPath={activeRepo.path}
+              <PolicyEditor connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'search' && (
-              <FileSearch connName={activeRepo.conn} repoPath={activeRepo.path}
+              <FileSearch connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 onNavigateToFile={(snapId, path) => navigateTo({ view: 'snapshot-browser', snapId, path })}
                 onBack={navBack}
               />
             )}
             {currentView.view === 'diff' && (
-              <SnapshotDiff connName={activeRepo.conn} repoPath={activeRepo.path}
+              <SnapshotDiff connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 initialSnapA={currentView.snapA}
                 initialSnapB={currentView.snapB}
                 onBack={navBack}
@@ -759,7 +791,7 @@ export function App(): React.ReactElement {
       </div>
       {/* Task status bar */}
       {activeRepo && (
-        <TaskBar tasks={taskList} connName={activeRepo.conn} repoPath={activeRepo.path}
+        <TaskBar jobs={taskList} connName={activeRepo.conn} repoPath={String(activeRepo.id)}
           onViewTasks={() => navigateTo({ view: 'tasks' })}
         />
       )}
