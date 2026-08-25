@@ -91,6 +91,12 @@ export async function startHarness(): Promise<Harness> {
   cli(sock, ['backup', String(plain)])
   writeFileSync(join(work, 'src', 'docs', 'second.md'), '# added later\n')
   cli(sock, ['backup', String(plain)])
+  /*
+   * Apply retention once. gfs_flags is written by this pass and not by
+   * backup, so without it every snapshot shows an empty retention column
+   * and the tier filters have nothing to filter.
+   */
+  cli(sock, ['gfs', String(plain)])
   /* One scrub, so the integrity screen has a run to open on. */
   cli(sock, ['verify', String(plain), '--level', 'deep'])
 

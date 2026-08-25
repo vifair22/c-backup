@@ -23,12 +23,13 @@ interface Snapshot {
   ts: string
   label?: string
   files?: string
+  size?: string
+  gfs_flags?: string
   materialized?: string
 }
 
 interface SnapList {
-  head: number
-  snapshots: Snapshot[]
+  snapshots?: Snapshot[]
 }
 
 /*
@@ -118,7 +119,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
     const repoId = Number(repoPath)
     Promise.all([
       api.apiCall<Summary>(connName, { kind: 'summary', repoId }),
-      api.rpcCall<SnapList>(connName, repoPath, 'list'),
+      api.apiCall<SnapList>(connName, { kind: 'snapshotList', repoId, limit: 200 }),
       api.apiCall<RepoStats>(connName, { kind: 'stats', repoId }),
     ]).then(([s, l, r]) => {
       if (cancelled) return
@@ -203,11 +204,14 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
           detail={latest ? absoluteTime(latest.ts) : undefined}
           status={latest ? lastBackupStatus(Number(latest.ts)) : 'error'}
         />
+        {/* The response has no "head" field and never had one, so this
+          * line was always blank. The list comes back newest first, which
+          * is the same thing said honestly. */}
         <div onClick={() => onViewAllSnapshots?.()} className={`${onViewAllSnapshots ? 'cursor-pointer' : ''} h-full`}>
           <StatCard
             label="Snapshots"
             value={fmtNum(summary?.snapshots ?? 0)}
-            detail={snapList?.head ? `HEAD: #${snapList.head}` : undefined}
+            detail={latest ? `newest: #${latest.id}` : undefined}
           />
         </div>
         <StatCard
@@ -402,6 +406,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
                 <th className="font-medium pb-1">Date</th>
                 <th className="font-medium pb-1 text-right pr-6">Files</th>
                 <th className="font-medium pb-1">Label</th>
+                <th className="font-medium pb-1 text-center w-20">Retention</th>
               </tr>
             </thead>
             <tbody>
@@ -413,6 +418,14 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
                     <td className="py-1.5">{absoluteTime(s.ts)}</td>
                     <td className="py-1.5 text-right pr-6">{fmtNum(s.files)}</td>
                     <td className="py-1.5">{s.label || ''}</td>
+                    <td className="py-1.5 text-center">
+                      {gfsBadges(Number(s.gfs_flags ?? '0')).map(b => (
+                        <span key={b.label}
+                          className={`inline-block px-1.5 py-0 rounded text-[10px] font-semibold ml-0.5 ${b.color}`}>
+                          {b.label}
+                        </span>
+                      ))}
+                    </td>
                   </tr>
                 )
               })}

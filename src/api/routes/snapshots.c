@@ -87,7 +87,8 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT id, ts, label, file_count, total_size, nodes_materialized"
+            "SELECT id, ts, label, file_count, total_size, nodes_materialized,"
+            "       gfs_flags"
             "  FROM snapshots WHERE repo_id = ?"
             " ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r) != 0) {
@@ -115,6 +116,12 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
                || json_elem_add_str(&e, "ts",    r->rows[i][1]) != 0
                || json_elem_add_str(&e, "label", r->rows[i][2] ? r->rows[i][2] : "") != 0
                || json_elem_add_str(&e, "files", r->rows[i][3] ? r->rows[i][3] : "0") != 0
+               || json_elem_add_str(&e, "size",  r->rows[i][4] ? r->rows[i][4] : "0") != 0
+               /* Which retention tiers hold this snapshot. Stored since the
+                * first schema and served by nothing, so neither the CLI nor
+                * the app could say why a snapshot was being kept - the one
+                * question worth asking of a list of them. */
+               || json_elem_add_str(&e, "gfs_flags", r->rows[i][6]) != 0
                /* Clients need to know a cold snapshot must be faulted in
                 * before it can be browsed. */
                || json_elem_add_str(&e, "materialized", r->rows[i][5]) != 0;
@@ -146,10 +153,20 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns"
-            "  FROM nodes"
-            " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-            " ORDER BY name LIMIT ? OFFSET ?",
+            "SELECT id, name, type, mode, size, mtime_ns, content_hash,"
+            /* Whether this directory has anything in it. A browser needs it
+             * to decide which rows get an expander, and the alternative is a
+             * round trip per directory to find out it is empty. EXISTS and
+             * not COUNT: this runs once per row returned, and counting the
+             * children of a directory holding 10k files to learn that the
+             * answer is "yes" would turn one page into a full scan. It is an
+             * index seek against nodes_by_snap_parent either way. */
+            "       EXISTS (SELECT 1 FROM nodes c"
+            "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id"
+            "                  AND c.parent_node_id = n.id)"
+            "  FROM nodes n"
+            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?"
+            " ORDER BY n.name LIMIT ? OFFSET ?",
             (const char *[]){ repo, snap, parent ? parent : "0", lim, off, NULL },
             &r) != 0) {
         db_result_free(r);
@@ -176,7 +193,12 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
                || json_elem_add_str(&e, "name", r->rows[i][1]) != 0
                || json_elem_add_str(&e, "type", r->rows[i][2]) != 0
                || json_elem_add_str(&e, "mode", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size", r->rows[i][4]) != 0;
+               || json_elem_add_str(&e, "size", r->rows[i][4]) != 0
+               || json_elem_add_str(&e, "mtime_ns", r->rows[i][5]) != 0
+               /* Empty for a directory, and for a file whose content was
+                * never hashed. Both mean "nothing to open". */
+               || json_elem_add_str(&e, "hash", r->rows[i][6] ? r->rows[i][6] : "") != 0
+               || json_elem_add_str(&e, "has_children", r->rows[i][7] ? r->rows[i][7] : "0") != 0;
         if (bad) break;
         json_elem_commit(&e);
     }

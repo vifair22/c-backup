@@ -1,8 +1,26 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+/*
+ * Walking a snapshot's tree.
+ *
+ * Migrated off the action bridge, which is what made this screen work at
+ * all: it asked for `snap_dir_children` and read `resp.children` out of a
+ * response that carries `entries`, so every directory came back empty and
+ * the browser rendered a snapshot with nothing in it. `snap_header` had no
+ * successor route at all and resolved to the snapshot list, whose fields it
+ * then read by the wrong names.
+ *
+ * The tree is fetched one directory at a time, by design rather than by
+ * omission: a directory is an index range scan on the daemon side, and
+ * loading a whole snapshot up front is the exact cost the pagination rule
+ * exists to avoid.
+ */
+
+import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime, gfsBadges, NODE_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
+
+const EMPTY_HASH = '0'.repeat(64)
 
 const NODE_REG = 1
 const NODE_DIR = 2
@@ -17,39 +35,73 @@ function nodeStyle(type: number, size: number): string {
   return ''
 }
 
+/*
+ * What a snapshot is, as far as this screen cares. There is no per-snapshot
+ * route to ask - the daemon serves snapshots as a paged list - so the header
+ * is the row for this id out of that list.
+ */
 interface SnapHeader {
-  snap_id: number
-  version: number
-  created_sec: number
-  phys_new_bytes: number
-  node_count: number
-  dirent_count: number
-  gfs_flags: number
-  snap_flags: number
+  id: number
+  ts: number
+  label: string
+  files: number
+  size: number
+  gfsFlags: number
 }
 
 interface TreeNode {
-  node_id: number
+  nodeId: number
   name: string
   type: number
   size: number
   mode: number
-  has_children: boolean
-  content_hash?: string
+  hasChildren: boolean
+  hash: string
 }
 
-interface DirChildrenResponse {
-  children: TreeNode[]
+/* As the daemon sends it: every integer is a string. */
+interface RawSnapshotRow {
+  id: string
+  ts: string
+  label?: string
+  files?: string
+  size?: string
+  gfs_flags?: string
 }
+
+interface RawEntry {
+  id: string
+  name: string
+  type: string
+  mode: string
+  size: string
+  hash?: string
+  has_children?: string
+}
+
+const parseEntry = (e: RawEntry): TreeNode => ({
+  nodeId: Number(e.id),
+  name: e.name,
+  type: Number(e.type),
+  size: Number(e.size),
+  mode: Number(e.mode),
+  hasChildren: e.has_children === '1',
+  hash: e.hash ?? '',
+})
 
 interface Breadcrumb {
   nodeId: number
   name: string
 }
 
+/*
+ * The daemon already returns a directory in name order, because the index
+ * carries name as its trailing column and serving it sorted costs nothing.
+ * This only lifts directories above files, which is a display choice and
+ * not something worth asking the database to do.
+ */
 function sortChildren(children: TreeNode[]): TreeNode[] {
   return [...children].sort((a, b) => {
-    // Dirs first
     if (a.type === NODE_DIR && b.type !== NODE_DIR) return -1
     if (a.type !== NODE_DIR && b.type === NODE_DIR) return 1
     return a.name.localeCompare(b.name)
@@ -66,6 +118,8 @@ interface Props {
 }
 
 export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBack, onRestore }: Props): React.ReactElement {
+  const repoId = Number(repoPath)
+
   const [header, setHeader] = useState<SnapHeader | null>(null)
   const [tree, setTree] = useState<Map<number, TreeNode[]>>(new Map())
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -81,15 +135,20 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [noteSaving, setNoteSaving] = useState(false)
   const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
 
+  const readDir = useCallback(async (parentNodeId: number): Promise<TreeNode[]> => {
+    const resp = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
+      kind: 'snapshotTree', repoId, snapshotId: snapId, parent: parentNodeId, limit: 500,
+    })
+    return sortChildren((resp.entries ?? []).map(parseEntry))
+  }, [connName, repoId, snapId])
+
   const fetchChildren = useCallback(async (parentNodeId: number) => {
     setLoading(prev => new Set(prev).add(parentNodeId))
     try {
-      const resp = await api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', {
-        id: snapId, parent_node: parentNodeId,
-      })
+      const children = await readDir(parentNodeId)
       setTree(prev => {
         const next = new Map(prev)
-        next.set(parentNodeId, sortChildren(resp.children))
+        next.set(parentNodeId, children)
         return next
       })
     } catch (err) {
@@ -100,7 +159,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       next.delete(parentNodeId)
       return next
     })
-  }, [connName, repoPath, snapId])
+  }, [readDir])
 
   useEffect(() => {
     let cancelled = false
@@ -112,18 +171,30 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     setNote(null)
     setNoteEditing(false)
 
-    // Load note (fire and forget)
-    api.rpcCall<{ text: string }>(connName, repoPath, 'note_get', { id: snapId })
-      .then(r => { if (!cancelled) setNote(r.text) })
+    /*
+     * A snapshot with no note 404s, which is the correct answer and not an
+     * error worth showing: most snapshots have none.
+     */
+    api.apiCall<{ body?: string }>(connName, { kind: 'noteGet', repoId, snapshotId: snapId })
+      .then(r => { if (!cancelled) setNote(r.body || null) })
       .catch(() => { if (!cancelled) setNote(null) })
 
     Promise.all([
-      api.rpcCall<SnapHeader>(connName, repoPath, 'snap_header', { id: snapId }),
-      api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', { id: snapId, parent_node: 0 }),
-    ]).then(async ([h, root]) => {
+      api.apiCall<{ snapshots?: RawSnapshotRow[] }>(connName, {
+        kind: 'snapshotList', repoId, limit: 200,
+      }),
+      readDir(0),
+    ]).then(async ([list, rootChildren]) => {
       if (cancelled) return
-      setHeader(h)
-      const rootChildren = sortChildren(root.children)
+      const row = (list.snapshots ?? []).find(x => Number(x.id) === snapId)
+      setHeader(row ? {
+        id: Number(row.id),
+        ts: Number(row.ts),
+        label: row.label ?? '',
+        files: Number(row.files ?? '0'),
+        size: Number(row.size ?? '0'),
+        gfsFlags: Number(row.gfs_flags ?? '0'),
+      } : null)
       const treeMap = new Map([[0, rootChildren]])
       const expandedSet = new Set<number>()
 
@@ -143,30 +214,21 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
 
           const isLast = i === segments.length - 1
           if (isLast) {
-            // Highlight the target file/dir
-            setHighlightNodeId(match.node_id)
+            setHighlightNodeId(match.nodeId)
             if (match.type === NODE_DIR) {
-              // Expand it too
-              expandedSet.add(match.node_id)
-              crumbs.push({ nodeId: match.node_id, name: match.name })
+              expandedSet.add(match.nodeId)
+              crumbs.push({ nodeId: match.nodeId, name: match.name })
               try {
-                const resp = await api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', {
-                  id: snapId, parent_node: match.node_id,
-                })
-                treeMap.set(match.node_id, sortChildren(resp.children))
-              } catch { /* ignore */ }
+                treeMap.set(match.nodeId, await readDir(match.nodeId))
+              } catch { /* the row is still highlighted; only the expansion is lost */ }
             }
-          } else if (match.type === NODE_DIR && match.has_children) {
-            // Expand intermediate directory
-            expandedSet.add(match.node_id)
-            crumbs.push({ nodeId: match.node_id, name: match.name })
+          } else if (match.type === NODE_DIR && match.hasChildren) {
+            expandedSet.add(match.nodeId)
+            crumbs.push({ nodeId: match.nodeId, name: match.name })
             try {
-              const resp = await api.rpcCall<DirChildrenResponse>(connName, repoPath, 'snap_dir_children', {
-                id: snapId, parent_node: match.node_id,
-              })
-              treeMap.set(match.node_id, sortChildren(resp.children))
+              treeMap.set(match.nodeId, await readDir(match.nodeId))
             } catch { break }
-            parentId = match.node_id
+            parentId = match.nodeId
           } else {
             break
           }
@@ -183,26 +245,26 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     })
 
     return () => { cancelled = true }
-  }, [connName, repoPath, snapId])
+  }, [connName, repoId, snapId, initialPath, readDir])
 
   const toggleDir = async (node: TreeNode, depth: number, parentChain: Breadcrumb[]) => {
     if (node.type !== NODE_DIR) return
 
-    if (expanded.has(node.node_id)) {
+    if (expanded.has(node.nodeId)) {
       // Collapse
       setExpanded(prev => {
         const next = new Set(prev)
-        next.delete(node.node_id)
+        next.delete(node.nodeId)
         return next
       })
       return
     }
 
     // Expand
-    if (!tree.has(node.node_id)) {
-      await fetchChildren(node.node_id)
+    if (!tree.has(node.nodeId)) {
+      await fetchChildren(node.nodeId)
     }
-    setExpanded(prev => new Set(prev).add(node.node_id))
+    setExpanded(prev => new Set(prev).add(node.nodeId))
     setBreadcrumb(parentChain)
   }
 
@@ -217,17 +279,17 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     const rows: React.ReactNode[] = []
     for (const node of children) {
       const isDir = node.type === NODE_DIR
-      const isExpanded = expanded.has(node.node_id)
-      const isLoading = loading.has(node.node_id)
-      const chain = isDir ? [...parentChain, { nodeId: node.node_id, name: node.name }] : parentChain
+      const isExpanded = expanded.has(node.nodeId)
+      const isLoading = loading.has(node.nodeId)
+      const chain = isDir ? [...parentChain, { nodeId: node.nodeId, name: node.name }] : parentChain
 
       const filePath = '/' + [...parentChain.map(b => b.name), node.name].join('/')
-      const isSelected = selectedFile?.node.node_id === node.node_id
+      const isSelected = selectedFile?.node.nodeId === node.nodeId
 
-      const isHighlighted = highlightNodeId === node.node_id
+      const isHighlighted = highlightNodeId === node.nodeId
 
       rows.push(
-        <tr key={`${parentId}-${node.node_id}`}
+        <tr key={`${parentId}-${node.nodeId}`}
           ref={isHighlighted ? (el) => { el?.scrollIntoView({ block: 'center', behavior: 'smooth' }) } : undefined}
           onClick={isDir
             ? () => toggleDir(node, depth, parentChain)
@@ -265,7 +327,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       )
 
       if (isDir && isExpanded) {
-        rows.push(...renderChildren(node.node_id, depth + 1, chain))
+        rows.push(...renderChildren(node.nodeId, depth + 1, chain))
       }
     }
     return rows
@@ -275,15 +337,18 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   /* Render                                                            */
   /* ---------------------------------------------------------------- */
 
-  const badges = header ? gfsBadges(header.gfs_flags) : []
+  const badges = header ? gfsBadges(header.gfsFlags) : []
 
   return (
     <div>
       {/* Navigation */}
       <div className="flex items-center gap-2 mb-3 text-xs">
+        {/* History back, not "go to the dashboard" - reaching this screen
+          * from the snapshot list and being sent past it was the label's
+          * doing, not the navigation's. */}
         <button onClick={onBack}
           className="text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer">
-          &larr; Dashboard
+          &larr; Back
         </button>
         <span className="text-text-muted">/</span>
         <span className="text-text-primary font-medium">Snapshot #{snapId}</span>
@@ -299,14 +364,17 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       {header && (
         <div className="flex items-center gap-4 mb-4 bg-surface-secondary border border-border-default rounded-lg px-4 py-3">
           <div>
-            <span className="text-sm font-semibold">Snapshot #{header.snap_id}</span>
-            <span className="text-xs text-text-muted ml-2">{absoluteTime(header.created_sec)}</span>
+            <span className="text-sm font-semibold">Snapshot #{header.id}</span>
+            <span className="text-xs text-text-muted ml-2">{absoluteTime(header.ts)}</span>
+            {header.label && (
+              <span className="text-xs text-text-secondary ml-2">{header.label}</span>
+            )}
           </div>
           <div className="text-xs text-text-secondary">
-            {fmtNum(header.node_count)} nodes
+            {fmtNum(header.files)} files
           </div>
           <div className="text-xs text-text-secondary">
-            {fmtSize(header.phys_new_bytes)} new data
+            {fmtSize(header.size)}
           </div>
           {badges.length > 0 && (
             <div className="inline-flex gap-1">
@@ -343,8 +411,11 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
                 {note !== null && (
                   <button onClick={async () => {
                     setNoteSaving(true)
-                    try { await api.rpcCall(connName, repoPath, 'note_delete', { id: snapId }); setNote(null); setNoteEditing(false) }
-                    catch { /* ignore */ }
+                    /* The daemon serves GET and PUT on a note and nothing
+                     * else, so clearing one is writing an empty body rather
+                     * than a DELETE that would 404. */
+                    try { await api.apiCall(connName, { kind: 'noteSet', repoId, snapshotId: snapId, note: '' }); setNote(null); setNoteEditing(false) }
+                    catch (err) { setError(String(err)) }
                     setNoteSaving(false)
                   }}
                     className="text-[11px] px-2 py-0.5 rounded bg-surface-tertiary text-status-error hover:bg-surface-hover border-none cursor-pointer"
@@ -355,8 +426,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
                 <button onClick={async () => {
                   if (!noteText.trim()) return
                   setNoteSaving(true)
-                  try { await api.rpcCall(connName, repoPath, 'note_set', { id: snapId, text: noteText.trim() }); setNote(noteText.trim()); setNoteEditing(false) }
-                  catch { /* ignore */ }
+                  try { await api.apiCall(connName, { kind: 'noteSet', repoId, snapshotId: snapId, note: noteText.trim() }); setNote(noteText.trim()); setNoteEditing(false) }
+                  catch (err) { setError(String(err)) }
                   setNoteSaving(false)
                 }}
                   className="text-[11px] px-2 py-0.5 rounded bg-accent text-accent-text hover:bg-accent-hover border-none cursor-pointer"
@@ -431,8 +502,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
               </div>
               <div>
                 <div className="text-[10px] text-text-muted uppercase tracking-wide">Hash</div>
-                <div className="text-xs text-text-muted font-mono truncate" title={selectedFile.node.content_hash}>
-                  {selectedFile.node.content_hash?.slice(0, 16)}...
+                <div className="text-xs text-text-muted font-mono truncate" title={selectedFile.node.hash}>
+                  {selectedFile.node.hash ? `${selectedFile.node.hash.slice(0, 16)}...` : '-'}
                 </div>
               </div>
             </div>
@@ -441,8 +512,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
                 Close
               </button>
-              {selectedFile.node.content_hash && selectedFile.node.content_hash !== '0'.repeat(64) && (
-                <button onClick={() => { setViewerHash({ hash: selectedFile.node.content_hash!, filename: selectedFile.node.name }); setSelectedFile(null) }}
+              {selectedFile.node.hash && selectedFile.node.hash !== EMPTY_HASH && (
+                <button onClick={() => { setViewerHash({ hash: selectedFile.node.hash, filename: selectedFile.node.name }); setSelectedFile(null) }}
                   className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">
                   View Content
                 </button>

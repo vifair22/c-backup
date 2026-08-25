@@ -111,6 +111,43 @@ test('the content search screen opens instantly', async () => {
   await h.page.getByRole('button', { name: /^back$/i }).first().click()
 })
 
+test('the snapshot list and the tree', async () => {
+  /*
+   * Both of these page rather than loading everything: a directory is an
+   * index range scan and a snapshot list is one page of rows. The point of
+   * timing them is that the moment either starts loading a whole snapshot
+   * the number here moves, and nothing else would say so.
+   */
+  await h.page.getByText('Documents', { exact: true }).first().click()
+  await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+
+  const list = await timed('open snapshot list', BUDGET_MS.navigation, async () => {
+    await h.page.getByRole('button', { name: /^snapshots$/i }).first().click()
+    await expect(h.page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
+  })
+  expect(list).toBeLessThan(BUDGET_MS.navigation)
+
+  const browse = await timed('open snapshot tree', BUDGET_MS.navigation, async () => {
+    await h.page.locator('tr', { hasText: '#2' }).first().click()
+    await expect(h.page.getByText('Snapshot #2').first()).toBeVisible()
+    await expect(h.page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(browse).toBeLessThan(BUDGET_MS.navigation)
+
+  /* Expanding a directory is one request for one level. */
+  const expand = await timed('expand a directory', BUDGET_MS.navigation, async () => {
+    await h.page.locator('tbody tr').filter({ hasText: '/' }).last().click()
+    await h.page.waitForTimeout(30)
+  })
+  expect(expand).toBeLessThan(BUDGET_MS.navigation)
+
+  /* Back from the tree lands on the list it was opened from. */
+  await h.page.getByRole('button', { name: /back/i }).first().click()
+  await expect(h.page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
+  await h.page.getByRole('button', { name: /dashboard/i }).first().click()
+  await expect(h.page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+})
+
 test('switching between repositories', async () => {
   const ms = await timed('switch repository', BUDGET_MS.navigation, async () => {
     await h.page.getByText('Photos', { exact: true }).first().click()
