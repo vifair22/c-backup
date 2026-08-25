@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <time.h>
@@ -27,6 +28,7 @@
 
 #include "backup.h"
 #include "manifest.h"
+#include "pack.h"
 #include "object.h"
 #include "repo.h"
 #include "store.h"
@@ -293,6 +295,103 @@ static void test_phys_size_may_exceed_logical_size(void **state)
                             " WHERE repo_id = ? AND phys_size < orig_size", "1"), 0);
 }
 
+
+/*
+ * orig_size is the object's payload length, and packing must not change it.
+ *
+ * The column used to hold two different things. Backup wrote the file's
+ * logical size; the pack commit rewrote it from the object header, which for
+ * a sparse object carries the payload - the region table plus the bytes that
+ * are not holes. So `stats` and `summary` reported one original-size total
+ * before a pack and a smaller one after, on a repository whose contents had
+ * not changed. Found on a 4.5 GB repository where the total moved by 23 MB.
+ *
+ * The logical size is not the object's to hold: two files with the same data
+ * and different trailing holes have the same region table, the same payload
+ * and therefore the same hash. It belongs to the node, and restore reads it
+ * from there.
+ *
+ * The fixture is only meaningful if the filesystem under TEST_SRC reports
+ * holes; where it does not, the file is stored dense and both numbers are the
+ * logical size, so the test would pass without exercising anything. It checks
+ * what the store actually wrote and skips rather than pass for that reason.
+ */
+static void test_pack_does_not_change_orig_size(void **state)
+{
+    (void)state;
+
+    enum { LOGICAL = 64u * 1024 * 1024, DATA = 1024 * 1024 };
+    int fd = open(TEST_SRC "/sparse.bin", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    assert_true(fd >= 0);
+    char *buf = malloc(DATA);
+    assert_non_null(buf);
+    memset(buf, 'S', DATA);
+    assert_int_equal(write(fd, buf, DATA), DATA);
+    free(buf);
+    assert_int_equal(ftruncate(fd, LOGICAL), 0);
+    close(fd);
+
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    db_result_t *r = NULL;
+    const char *params[] = { "1", NULL };
+    assert_int_equal(db_execute(db,
+        "SELECT content_hash FROM nodes"
+        " WHERE repo_id = ? AND name = 'sparse.bin'", params, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        sscanf(hex + i * 2, "%2x", &v);
+        hash[i] = (uint8_t)v;
+    }
+
+    uint64_t header_size = 0;
+    uint8_t  otype = 0;
+    assert_int_equal(object_get_info(store, hash, &header_size, &otype), OK);
+    if (otype != OBJECT_TYPE_SPARSE)
+        skip();   /* no holes here: the fixture is dense and proves nothing */
+
+    /* What backup recorded has to be what the object header says, because the
+     * pack commit will later take it from that header. */
+    const char *hp[] = { "1", hex, NULL };
+    assert_int_equal(db_execute(db,
+        "SELECT orig_size FROM objects WHERE repo_id = ? AND hash = ?",
+        hp, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint64_t before = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+
+    assert_int_equal(before, header_size);
+    assert_true(before < LOGICAL);   /* the holes were never stored */
+
+    uint32_t packed = 0;
+    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
+    assert_true(packed > 0);
+
+    assert_int_equal(db_execute(db,
+        "SELECT orig_size FROM objects WHERE repo_id = ? AND hash = ?",
+        hp, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint64_t after = strtoull(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+
+    assert_int_equal(after, before);
+
+    /* And the logical size is still recorded where it belongs. */
+    assert_int_equal(scalar("SELECT size FROM nodes"
+                            " WHERE repo_id = ? AND name = 'sparse.bin'", "1"),
+                     LOGICAL);
+}
+
 /*
  * Deep and wide trees order correctly and cheaply.
  *
@@ -391,6 +490,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_identical_files_share_one_object, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phys_size_matches_bytes_on_disk, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phys_size_may_exceed_logical_size, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_does_not_change_orig_size, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deep_wide_tree_is_not_quadratic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),

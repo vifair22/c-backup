@@ -653,6 +653,31 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
 
         if (!chash || !chash[0] || hash_is_zero_hex(chash)) {
+            /*
+             * A node the scanner could not classify has no content and never
+             * did, so there is nothing here for the repository to have lost.
+             * In practice this is a unix socket: stat_to_node_type has no case
+             * for one and returns 0, and backup stores no object for it.
+             *
+             * That belongs in skipped rather than failed. Counting it as a
+             * failure made restore_run return ERR_CORRUPT and the job report
+             * "restore incomplete", every time, for any tree containing a live
+             * socket - /run, appdata, anything with a database or a container
+             * runtime in it. Five sockets in one appdata share were enough to
+             * make a restore that wrote every recoverable byte indistinguish-
+             * able from one that had genuinely lost data, which is the more
+             * expensive failure: an operator who sees "incomplete" on every
+             * successful restore stops reading it.
+             *
+             * A regular file with no content hash is a different matter and
+             * stays a failure: that one the repository should have had.
+             */
+            if (ntype == 0) {
+                log_info("restore: %s has no restorable content "
+                         "(unclassified node type, most likely a socket)", rel);
+                res.skipped++;
+                continue;
+            }
             if (ntype != NODE_TYPE_REG)
                 log_warn("restore: %s is an unsupported node type %u, skipping",
                          rel, ntype);

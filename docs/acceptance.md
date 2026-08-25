@@ -304,10 +304,26 @@ unassigned device, or anything outside the array.
    the same shape as the `http.bind` bug: a value accepted and not honoured.
    It also means the ring cannot be the cause of any current problem,
    whatever it did historically.
-2. **A socket gets node type 0.** `stat_to_node_type` returns 0 for
-   anything it does not recognise, and appdata contains five of them.
-   Backup skips them correctly, but a restore has no case for type 0, so
-   they would come back as empty regular files.
+2. **A socket gets node type 0, and that failed the whole restore.**
+   `stat_to_node_type` returns 0 for anything it does not recognise, and
+   appdata contains five of them. Backup records the node with no content
+   object, which is right: a socket has no content.
+
+   The claim first written here - that a restore would recreate them as
+   empty regular files - was wrong, and measuring it rather than reading
+   the code showed why. `restore.c` does guard on a missing content hash
+   and skips the node with a warning. What it then did was count it in
+   `failed`, so `restore_run` returned ERR_CORRUPT and the job reported
+   "restore incomplete: 1 entry could not be restored" on a restore that
+   had written every recoverable byte. Any tree with a live socket in it
+   hits this: /run, appdata, anything with a database or a container
+   runtime. An always-on warning is one nobody reads, and it is the same
+   signal a genuinely lossy restore has to raise.
+
+   Fixed by counting it in `skipped`, which is where `restore.h` already
+   puts what the repository never had content for. Verified against the
+   snapshot that produced the failure, not just a fresh one, since every
+   repository made before the fix has these nodes recorded.
 
 ## Scaling limit worth knowing
 
@@ -323,3 +339,82 @@ entries - about 820 bytes each, the 384-byte struct plus its path string.
 Comfortable on a 125 GB server. Not comfortable on the 2-4 GB NAS that is a
 perfectly ordinary place to run a backup, and it sits against the design
 constraint that says never assume the data fits in memory.
+
+## The pack ceiling, fixed and re-measured
+
+The first Unraid pass left 189,647 of 230,595 objects loose and reported
+success. `repo_pack` held an open descriptor for every object it classified,
+so `open` began failing with EMFILE partway through and every object after
+that was dropped by a `continue` that did not distinguish EMFILE from the
+ordinary ENOENT case. It packed exactly as many objects as the descriptor
+limit allowed, then said it was done.
+
+Re-measured on the same repository, same 40,960 descriptor limit, with the
+classification pass reading each header and closing the descriptor again:
+
+| | before | after |
+|-----------------|---------------|---------------|
+| loose objects | 189,647 | 12 |
+| packs | 4 | 16 |
+| phys_size | 7,870,794,825 | 4,476,889,312 |
+| of orig_size | 98.6% | 56.1% |
+| runs to converge | 5 (40,948/run) | 1 |
+| peak descriptors | at the 40,960 ceiling | 50 |
+| objects | 230,595 | 230,595 |
+
+The 12 that stay loose are skip-marked incompressible, which is correct. One
+run took 3m18s for 189,635 objects; the extra open per packed object is not
+where the time goes.
+
+Descriptor use over the run, sampled every 20s: 10, 10, 50, 45, 36, 29, 25,
+21, 17, 10, 8. It rises with the number of pack workers, not with the number
+of objects, which is the property that was wanted.
+
+## Defect: orig_size changes when an object is packed
+
+Found while checking the numbers above, because `orig_size` moved during a
+pack that by definition changes no content: 7,985,899,320 to 7,962,249,560,
+entirely in blobs, none in trees.
+
+Sparse files are the cause. `backup.c` records `orig_size = node.size`, the
+logical file size. `write_sparse_object_stream` writes a header whose
+`uncompressed_size` is the sparse *payload* size - region table plus data
+bytes, holes excluded - and explicitly discards the logical size. Packing
+then copies that payload size over the correct value in `objects.orig_size`.
+
+Reproduced in isolation with one 64 MiB file holding 1 MiB of data:
+
+| | blobs orig_size |
+|--------|-----------------|
+| loose | 71,303,168 (correct) |
+| packed | 5,242,904 |
+
+The same column means "logical bytes" while loose and "sparse payload bytes"
+once packed, and a `pack` silently switches between them. `snapshots.size`
+keeps the correct figure and restore is unaffected: the restored file is
+byte-identical and still sparse, because restore takes the logical size from
+the manifest tree rather than from the object.
+
+The first read of this was that the pack commit should stop writing the
+column and leave backup's value alone. Testing the premise killed that fix.
+Two files with the same data and different trailing holes produce the same
+region table, the same payload and therefore the same hash: 67,108,864 and
+11,534,336 logical bytes deduplicated to one object, whose `orig_size` was
+whichever file the scan reached first. A logical size cannot be a property of
+an object, because one object legitimately backs files of different lengths.
+Restore is unaffected and both files come back byte-identical, because it
+takes the length from the manifest node.
+
+So the column means the object's payload, the packed path was right, and the
+loose path was the one to fix. Backup now records what the store actually
+wrote, reported back through `object_store_file_info`. All four writers -
+backup, the pack commit, and both of reindex's paths - agree, and the value
+no longer moves under a pack or a rebuild. The logical total is unchanged and
+still correct in `snapshots.size` and `nodes.size`.
+
+One inconsistency in the same family is left alone deliberately: `objects.type`
+says FILE for a sparse object from backup and from reindex's packed path, but
+SPARSE from reindex's loose path, because pack entries do not carry a type.
+Nothing reads it - restore takes the type from the object header - and making
+backup report SPARSE would have created a fresh backup-versus-reindex
+disagreement rather than removing one.

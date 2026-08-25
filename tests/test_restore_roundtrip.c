@@ -23,6 +23,8 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/xattr.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <limits.h>
 
 #include <cmocka.h>
@@ -138,6 +140,62 @@ static void test_roundtrip_is_identical(void **state)
                                  TEST_DST, NULL, &rr), OK);
     assert_int_equal(rr.files, 3);
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+}
+
+/*
+ * A live unix socket in the source must not fail the restore.
+ *
+ * stat_to_node_type has no case for a socket and returns 0, so backup records
+ * the node with no content object - correctly, a socket has no content. The
+ * restore then had no case for type 0 either and counted it in `failed`, which
+ * makes restore_run return ERR_CORRUPT and the job report "restore incomplete".
+ *
+ * That fires for any tree with a socket in it: /run, appdata, anything running
+ * a database or a container runtime. An appdata share with five sockets made
+ * every successful restore report failure, which is worse than it sounds - a
+ * warning that is always on is a warning nobody reads, and it is the same
+ * signal a genuinely lossy restore has to raise.
+ *
+ * `skipped` is where restore.h already puts things the repository never had
+ * content for, alongside the device nodes an unprivileged restore cannot make.
+ */
+static void test_socket_in_source_does_not_fail_the_restore(void **state)
+{
+    (void)state;
+
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert_true(sfd >= 0);
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    /* sun_path is 108 bytes; TEST_SRC is short enough to fit with room over. */
+    assert_true(strlen(TEST_SRC "/live.sock") < sizeof(sa.sun_path));
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", TEST_SRC "/live.sock");
+    assert_int_equal(bind(sfd, (struct sockaddr *)&sa, sizeof(sa)), 0);
+
+    struct stat sb;
+    assert_int_equal(lstat(TEST_SRC "/live.sock", &sb), 0);
+    assert_true(S_ISSOCK(sb.st_mode));
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_result_t rr;
+    /* OK, not ERR_CORRUPT: nothing the repository held was lost. */
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(rr.skipped, 1);
+    /* The files either side of it still came back. */
+    assert_int_equal(rr.files, 3);
+
+    char sockpath[512];
+    snprintf(sockpath, sizeof(sockpath), "%s/live.sock", restored_root());
+    assert_int_not_equal(lstat(sockpath, &sb), 0);   /* and not as an empty file */
+
+    close(sfd);
+    unlink(TEST_SRC "/live.sock");
 }
 
 static void test_restore_preserves_modes(void **state)
@@ -1114,6 +1172,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_directory_mtimes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),

@@ -1193,6 +1193,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
+                                        uint64_t *out_payload_size,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx);
 
@@ -1254,6 +1255,7 @@ static status_t sp_emit(sparse_emit_t *e, const void *data, size_t n)
 static status_t write_sparse_object_stream(store_t *store, int fd,
                                            const char *src_path,
                                            uint64_t file_size,
+                                           uint64_t *out_payload_size,
                                            const sparse_region_t *regions,
                                            uint32_t n_regions,
                                            uint8_t out_hash[OBJECT_HASH_SIZE],
@@ -1280,6 +1282,10 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
     uint64_t payload_sz = (uint64_t)sizeof(sparse_hdr_t)
                         + (uint64_t)n_regions * sizeof(sparse_region_t)
                         + data_bytes;
+    /* Reported before any early return below can fail: the caller records this
+     * against the object, and the object header carries the same number, so the
+     * two must not be able to disagree. */
+    if (out_payload_size) *out_payload_size = payload_sz;
 
     char tmppath[PATH_MAX];
     if (snprintf(tmppath, sizeof(tmppath), "%s/tmp/obj.XXXXXX", store_root(store))
@@ -1536,7 +1542,18 @@ status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, NULL, NULL);
+                                   out_is_new, out_phys_bytes, NULL, NULL, NULL);
+}
+
+status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
+                                uint8_t out_hash[OBJECT_HASH_SIZE],
+                                object_write_t *out_info) {
+    object_write_t scratch;
+    object_write_t *w = out_info ? out_info : &scratch;
+    memset(w, 0, sizeof(*w));
+    return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
+                                   &w->is_new, &w->phys_bytes, &w->payload_size,
+                                   NULL, NULL);
 }
 
 static status_t object_store_file_ex_cb(store_t *store, int fd,
@@ -1544,11 +1561,13 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         uint64_t file_size,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
+                                        uint64_t *out_payload_size,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx) {
     if (file_size == 0) {
         if (src_path) close(fd);
         uint8_t empty = 0;
+        if (out_payload_size) *out_payload_size = 0;
         return write_object(store, OBJECT_TYPE_FILE, &empty, 0, out_hash,
                             out_is_new, out_phys_bytes);
     }
@@ -1615,6 +1634,9 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
      * write_object_file_stream takes ownership of fd (closes it on return). */
     if (!is_sparse || n_regions == 0) {
         free(regions);
+        /* The plain stream writes uncompressed_size = file_size, so for a file
+         * with no holes the payload and the logical size are the same number. */
+        if (out_payload_size) *out_payload_size = file_size;
         return write_object_file_stream(store, fd, src_path, file_size, out_hash,
                                         out_is_new, out_phys_bytes,
                                         progress_cb, progress_ctx);
@@ -1622,6 +1644,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
 
     /* Stream sparse object — bounded RAM regardless of file size. */
     status_t st = write_sparse_object_stream(store, fd, src_path, file_size,
+                                             out_payload_size,
                                              regions, n_regions,
                                              out_hash, out_is_new, out_phys_bytes);
     free(regions);
@@ -1643,7 +1666,7 @@ status_t object_store_file_cb(store_t *store, int fd, const char *src_path,
      * For non-sparse files it falls through to write_object_file_stream.
      * The progress callback is only used on the streaming (non-sparse) path. */
     return object_store_file_ex_cb(store, fd, src_path, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, cb, cb_ctx);
+                                   out_is_new, out_phys_bytes, NULL, cb, cb_ctx);
 }
 
 /* ------------------------------------------------------------------ */

@@ -356,10 +356,10 @@ static status_t store_content(pipeline_t *p)
             continue;
         }
 
-        int is_new = 0;
-        uint64_t phys = 0;
-        status_t st = object_store_file_ex(p->store, fd, e->node.size,
-                                           e->node.content_hash, &is_new, &phys);
+        object_write_t w;
+        status_t st = object_store_file_info(p->store, fd, e->node.size,
+                                             e->node.content_hash, &w);
+        int is_new = w.is_new;
         close(fd);
         if (st != OK) {
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
@@ -371,8 +371,22 @@ static status_t store_content(pipeline_t *p)
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
+        /*
+         * The object's payload length, not the file's logical size.
+         *
+         * They differ only for a sparse file, whose payload is its region
+         * table plus the bytes that are not holes. Recording the logical size
+         * here disagreed with the object header, and a pack rewrites this
+         * column from that header, so stats and summary reported one total
+         * before a pack and a smaller one after - on a repository that had
+         * changed nothing. The logical size is not lost: it is the node's,
+         * in nodes.size and snapshots.size, and restore reads it from there.
+         * It could not live here anyway, because two files with the same data
+         * and different trailing holes share a payload and so share a hash.
+         */
         st = store_index_put_loose(p->db, p->repo_id, e->node.content_hash,
-                                   OBJECT_TYPE_FILE, phys, e->node.size);
+                                   OBJECT_TYPE_FILE, w.phys_bytes,
+                                   w.payload_size);
         if (st != OK) {
             if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
                 log_warn("backup: cache commit failed");

@@ -32,6 +32,30 @@ status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes);
 
+/*
+ * What the store actually wrote, for the index to record.
+ *
+ * payload_size is the object header's uncompressed_size, and it is not always
+ * the file's logical size. A sparse object's payload is its region table plus
+ * the bytes that are not holes, so a 64 MiB file holding 1 MiB of data has a
+ * payload of about 1 MiB. The logical size is a property of the manifest node
+ * rather than of the object, because one object can legitimately back files of
+ * different lengths: two files with the same data and different trailing holes
+ * produce the same region table, the same payload, and therefore the same hash.
+ * Recording the logical size against the object made stats and summary report
+ * different totals before and after a pack, which rewrites the column from the
+ * object header and so disagreed with what backup had put there.
+ */
+typedef struct {
+    int      is_new;
+    uint64_t phys_bytes;    /* bytes on disk: header, payload, parity trailer */
+    uint64_t payload_size;  /* the object header's uncompressed_size */
+} object_write_t;
+
+status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
+                                uint8_t out_hash[OBJECT_HASH_SIZE],
+                                object_write_t *out_info);
+
 /* Per-chunk progress callback invoked from the write path after each ~16 MiB
  * chunk is written.  chunk_bytes is the bytes in that chunk; ctx is caller-
  * supplied.  May be NULL (no callback). */
