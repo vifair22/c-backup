@@ -200,6 +200,11 @@ ui-e2e:
   artifacts:
     when: always
     expire_in: 1 week
+    # Per-case pass/fail in the MR's Tests tab. The config already emits
+    # this file under CI and nothing was collecting it, so a failure would
+    # have meant reading a job log to find out which screen broke.
+    reports:
+      junit: ui/test-results/e2e.xml
     paths:
       # The screenshots each spec takes on the way through. A layout is
       # easier to judge from a picture than from a passing assertion, and
