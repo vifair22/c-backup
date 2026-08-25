@@ -22,6 +22,19 @@ const api = window.cbackup
 
 const EMPTY_HASH = '0'.repeat(64)
 
+/*
+ * How much of one directory is fetched at a time.
+ *
+ * A directory is a paged route and this asked for a page without ever
+ * saying so, which meant a directory of 20,000 files showed the first 500
+ * and looked complete. Silent truncation in a backup browser is the worst
+ * kind: somebody concludes a file was not backed up.
+ *
+ * It is also the right answer for rendering. 500 rows is a table; 20,000 is
+ * a frozen window.
+ */
+const DIR_PAGE = 500
+
 const NODE_REG = 1
 const NODE_DIR = 2
 const NODE_SYMLINK = 3
@@ -124,6 +137,9 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [tree, setTree] = useState<Map<number, TreeNode[]>>(new Map())
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState<Set<number>>(new Set())
+  /* Directories known to be fully loaded, so a short page is not mistaken
+   * for a page that has more behind it. */
+  const [complete, setComplete] = useState<Set<number>>(new Set())
   const [breadcrumb, setBreadcrumb] = useState<Breadcrumb[]>([])
   const [error, setError] = useState<string | null>(null)
   const [highlightNodeId, setHighlightNodeId] = useState<number | null>(null)
@@ -135,12 +151,41 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [noteSaving, setNoteSaving] = useState(false)
   const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
 
-  const readDir = useCallback(async (parentNodeId: number): Promise<TreeNode[]> => {
+  const readDir = useCallback(async (parentNodeId: number, offset = 0): Promise<TreeNode[]> => {
     const resp = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
-      kind: 'snapshotTree', repoId, snapshotId: snapId, parent: parentNodeId, limit: 500,
+      kind: 'snapshotTree', repoId, snapshotId: snapId,
+      parent: parentNodeId, limit: DIR_PAGE, offset,
     })
     return sortChildren((resp.entries ?? []).map(parseEntry))
   }, [connName, repoId, snapId])
+
+  /*
+   * Fetch the next page of a directory already open. The route reports no
+   * total, so a full page is the only evidence there is another one - the
+   * same rule every other paged screen here follows.
+   */
+  const loadMore = useCallback(async (parentNodeId: number) => {
+    const have = tree.get(parentNodeId)?.length ?? 0
+    setLoading(prev => new Set(prev).add(parentNodeId))
+    try {
+      const next = await readDir(parentNodeId, have)
+      setTree(prev => {
+        const map = new Map(prev)
+        map.set(parentNodeId, sortChildren([...(prev.get(parentNodeId) ?? []), ...next]))
+        return map
+      })
+      if (next.length < DIR_PAGE) {
+        setComplete(prev => new Set(prev).add(parentNodeId))
+      }
+    } catch (err) {
+      setError(`Failed to load directory: ${err}`)
+    }
+    setLoading(prev => {
+      const n = new Set(prev)
+      n.delete(parentNodeId)
+      return n
+    })
+  }, [readDir, tree])
 
   const fetchChildren = useCallback(async (parentNodeId: number) => {
     setLoading(prev => new Set(prev).add(parentNodeId))
@@ -151,6 +196,9 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
         next.set(parentNodeId, children)
         return next
       })
+      if (children.length < DIR_PAGE) {
+        setComplete(prev => new Set(prev).add(parentNodeId))
+      }
     } catch (err) {
       setError(`Failed to load directory: ${err}`)
     }
@@ -167,6 +215,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
     setError(null)
     setTree(new Map())
     setExpanded(new Set())
+    setComplete(new Set())
     setBreadcrumb([])
     setNote(null)
     setNoteEditing(false)
@@ -197,6 +246,8 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       } : null)
       const treeMap = new Map([[0, rootChildren]])
       const expandedSet = new Set<number>()
+      const completeSet = new Set<number>()
+      if (rootChildren.length < DIR_PAGE) completeSet.add(0)
 
       // Auto-expand to initialPath if provided
       if (initialPath) {
@@ -219,14 +270,18 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
               expandedSet.add(match.nodeId)
               crumbs.push({ nodeId: match.nodeId, name: match.name })
               try {
-                treeMap.set(match.nodeId, await readDir(match.nodeId))
+                const kids = await readDir(match.nodeId)
+                treeMap.set(match.nodeId, kids)
+                if (kids.length < DIR_PAGE) completeSet.add(match.nodeId)
               } catch { /* the row is still highlighted; only the expansion is lost */ }
             }
           } else if (match.type === NODE_DIR && match.hasChildren) {
             expandedSet.add(match.nodeId)
             crumbs.push({ nodeId: match.nodeId, name: match.name })
             try {
-              treeMap.set(match.nodeId, await readDir(match.nodeId))
+              const kids = await readDir(match.nodeId)
+              treeMap.set(match.nodeId, kids)
+              if (kids.length < DIR_PAGE) completeSet.add(match.nodeId)
             } catch { break }
             parentId = match.nodeId
           } else {
@@ -238,6 +293,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
 
       setTree(treeMap)
       setExpanded(expandedSet)
+      setComplete(completeSet)
     }).catch(err => {
       if (!cancelled) setError(String(err))
     }).finally(() => {
@@ -329,6 +385,26 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       if (isDir && isExpanded) {
         rows.push(...renderChildren(node.nodeId, depth + 1, chain))
       }
+    }
+
+    /*
+     * The tail of a directory that has more behind it. Rendered as a row
+     * rather than a corner control so it sits where the missing entries
+     * would be, at the right indent, in the directory it belongs to.
+     */
+    if (tree.has(parentId) && !complete.has(parentId)) {
+      const busy = loading.has(parentId)
+      rows.push(
+        <tr key={`more-${parentId}`} className="border-t border-border-default">
+          <td colSpan={4} className="py-1.5" style={{ paddingLeft: `${depth * 20 + 28}px` }}>
+            <button onClick={() => void loadMore(parentId)} disabled={busy}
+              className="text-[11px] underline cursor-pointer bg-transparent border-none
+                         text-accent p-0 disabled:opacity-50">
+              {busy ? 'Loading...' : `${fmtNum(children.length)} shown, load more`}
+            </button>
+          </td>
+        </tr>
+      )
     }
     return rows
   }

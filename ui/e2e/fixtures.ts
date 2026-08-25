@@ -13,7 +13,7 @@
  * socket instead of whatever is on the developer's machine.
  */
 
-import { _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
+import { _electron as electron, expect, type ElectronApplication, type Page } from '@playwright/test'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -25,6 +25,18 @@ export const REPO_ROOT = resolve(__dirname, '..', '..')
 const DAEMON = join(REPO_ROOT, 'build', 'bins', 'c-backupd')
 const CLI = join(REPO_ROOT, 'build', 'bins', 'c-backup')
 const APP_MAIN = join(REPO_ROOT, 'ui', 'out', 'main', 'index.js')
+
+export interface HarnessOptions {
+  /*
+   * Files to write into one directory before the first backup.
+   *
+   * The default fixture is three files, which proves a screen renders and
+   * proves nothing about what it does when a directory is bigger than a
+   * page. Passing a number here builds a wide directory instead, so the
+   * paging can be tested rather than assumed.
+   */
+  wideDir?: number
+}
 
 export interface Harness {
   app: ElectronApplication
@@ -48,7 +60,7 @@ function idFrom(out: string): number {
   return m ? Number(m[1]) : 0
 }
 
-export async function startHarness(): Promise<Harness> {
+export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> {
   if (!existsSync(DAEMON)) throw new Error(`build the daemon first: ${DAEMON}`)
   if (!existsSync(APP_MAIN)) throw new Error(`run 'npm run build' first: ${APP_MAIN}`)
 
@@ -62,6 +74,14 @@ export async function startHarness(): Promise<Harness> {
   mkdirSync(join(work, 'src', 'docs'), { recursive: true })
   writeFileSync(join(work, 'src', 'notes.txt'), 'the quick brown fox\n'.repeat(40))
   writeFileSync(join(work, 'src', 'docs', 'readme.md'), '# demo\n\nA fixture file.\n')
+
+  if (opts.wideDir) {
+    mkdirSync(join(work, 'src', 'wide'), { recursive: true })
+    for (let i = 0; i < opts.wideDir; i++) {
+      writeFileSync(join(work, 'src', 'wide', `f${String(i).padStart(5, '0')}.txt`),
+                    `entry ${i}\n`)
+    }
+  }
 
   writeFileSync(join(work, 'config.yaml'),
     `db:\n  path: ${work}/state.db\n` +
@@ -198,4 +218,28 @@ export function reportTimings(): void {
       `    ${t.label.padEnd(width)}  ${String(t.ms).padStart(5)} ms  (budget ${t.budget})${flag}\n`)
   }
   process.stdout.write('\n')
+}
+
+/*
+ * Walk the tree down to the fixture's source directory.
+ *
+ * scan_tree records absolute paths, so a snapshot of /tmp/cbackup-e2e-X/src
+ * has directory entries for /tmp and for the work directory above it. The
+ * first version of this clicked "the last row that looks like a directory"
+ * and slept 100 ms between levels, which passed alone and flaked under a
+ * full run: a slow level meant the next click landed on the wrong row.
+ *
+ * Named segments and a wait on each level's contents instead. Slower to
+ * write, deterministic to run.
+ */
+export async function descendTo(page: Page, work: string, ...rest: string[]): Promise<void> {
+  const segments = ['tmp', work.split('/').pop()!, 'src', ...rest]
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]
+    await page.getByText(seg, { exact: true }).first().click()
+    /* The level is open once the next segment appears, or - for the last
+     * one - once any child row has rendered. */
+    const next = segments[i + 1]
+    if (next) await expect(page.getByText(next, { exact: true }).first()).toBeVisible()
+  }
 }

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { startHarness, openRepo, type Harness } from './fixtures'
+import { startHarness, openRepo, descendTo, type Harness } from './fixtures'
 
 /*
  * The screens added this session, driven the way an operator reaches them.
@@ -140,14 +140,7 @@ test('browse: walking into a directory and opening a file', async () => {
    * directories of the source root, not the source root's contents. */
   await expect(h.page.locator('tbody tr').first()).toBeVisible()
 
-  /* Descend until the fixture directory shows up. */
-  for (let i = 0; i < 8; i++) {
-    if (await h.page.getByText('notes.txt', { exact: true }).count() > 0) break
-    const dir = h.page.locator('tbody tr').filter({ hasText: '/' }).last()
-    if (await dir.count() === 0) break
-    await dir.click()
-    await h.page.waitForTimeout(120)
-  }
+  await descendTo(h.page, h.work)
   await expect(h.page.getByText('notes.txt', { exact: true })).toBeVisible()
   await expect(h.page.getByText('docs', { exact: true }).first()).toBeVisible()
 
