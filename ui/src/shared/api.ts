@@ -37,6 +37,15 @@
 /* ---------------------------------------------------------------- */
 
 export type VerifyLevel = 'index' | 'structure' | 'deep'
+
+/*
+ * The maintenance operations a repository view offers.
+ *
+ * Named here rather than in a component so the menu and the handler cannot
+ * disagree, and so each one is a `kind` the contract suite already proves
+ * reaches a real route.
+ */
+export type MaintenanceOp = 'verify' | 'pack' | 'gc' | 'gfs' | 'reindex'
 export type ObjectLocation = 'loose' | 'packed'
 
 export type ApiRequest =

@@ -228,6 +228,64 @@ describe('every request reaches a route the daemon serves', () => {
   }
 })
 
+/*
+ * The sequence the app actually performs, in order.
+ *
+ * The contract suite above proves each path exists. This proves the ones the
+ * user presses do the thing: the backup button has never worked - it posted
+ * to a route the daemon has never had - so "the endpoint resolves" is not
+ * enough to believe it now does.
+ */
+describe('the flows behind the buttons', () => {
+  test('open the backup modal, set sources, back up, restore', async () => {
+    /* A repository of its own, so the shared fixture is left alone. */
+    const path = join(work, 'flowrepo')
+    const created = await request(toEndpoint({ kind: 'repoAdd', path, label: 'flow' }))
+    assert.equal(created.status, 201)
+    const repoId = (created.body as { id: number }).id
+
+    /* The modal opens and asks what this repository backs up. Nothing yet,
+     * which is what the empty state is for. */
+    let got = await request(toEndpoint({ kind: 'sourcesGet', repoId }))
+    assert.deepEqual((got.body as { sources: string[] }).sources, [])
+
+    /* The user says what to back up, and it comes back. */
+    const src = join(work, 'src')
+    const saved = await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [src] }))
+    assert.equal(saved.status, 204)
+    got = await request(toEndpoint({ kind: 'sourcesGet', repoId }))
+    assert.deepEqual((got.body as { sources: string[] }).sources, [src])
+
+    /* Start Backup sends no paths at all: the repository holds them. */
+    const started = await request(toEndpoint({ kind: 'backup', repoId }))
+    assert.equal(started.status, 202, `backup was refused: ${JSON.stringify(started.body)}`)
+
+    /* And it produces a real snapshot, which is the whole point. */
+    let snaps: unknown[] = []
+    for (let i = 0; i < 60; i++) {
+      const r = await request(toEndpoint({ kind: 'snapshotList', repoId }))
+      snaps = (r.body as { snapshots?: unknown[] }).snapshots ?? []
+      if (snaps.length > 0) break
+      await sleep(250)
+    }
+    assert.ok(snaps.length > 0, 'the backup button produced no snapshot')
+
+    /* Restore goes under the snapshot, which is where the endpoint is. */
+    const restored = await request(toEndpoint({
+      kind: 'restore', repoId, snapshotId: 1, dest: join(work, 'flowout'),
+    }))
+    assert.equal(restored.status, 202, `restore was refused: ${JSON.stringify(restored.body)}`)
+  })
+
+  test('the maintenance menu starts every operation it offers', async () => {
+    const ops = ['verify', 'pack', 'gc', 'gfs', 'reindex'] as const
+    for (const kind of ops) {
+      const r = await request(toEndpoint({ kind, repoId: 1 }))
+      assert.equal(r.status, 202, `${kind} was refused: ${JSON.stringify(r.body)}`)
+    }
+  })
+})
+
 describe('the samples cover the union', () => {
   test('no kind is missing a sample', () => {
     /* Record<ApiKind, ...> makes this a compile-time guarantee; asserting it

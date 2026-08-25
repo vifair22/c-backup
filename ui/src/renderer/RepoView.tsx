@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import type { MaintenanceOp } from '../shared/api'
 import { StatCard } from './StatCard'
 import { ContextMenu } from './ContextMenu'
 import {
@@ -92,7 +93,7 @@ interface Props {
   onViewJournal?: () => void
   onViewTags?: () => void
   onRunBackup?: () => void
-  onRunOperation?: (command: string) => void
+  onRunOperation?: (command: MaintenanceOp) => void
   onViewTasks?: () => void
   onHashLookup?: () => void
   onLooseObjects?: () => void
@@ -474,6 +475,8 @@ export function RepoView({ connName, repoPath, onSelectSnapshot, onViewAllSnapsh
             { label: 'Verify', onClick: () => onRunOperation('verify') },
             { label: 'Pack', onClick: () => onRunOperation('pack') },
             { label: 'Garbage Collect', onClick: () => onRunOperation('gc') },
+            { label: 'Apply Retention', onClick: () => onRunOperation('gfs') },
+            { label: 'Reindex', onClick: () => onRunOperation('reindex') },
           ]}
         />
       )}

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react'
+import type { MaintenanceOp } from '../shared/api'
 import type { ConnectionState, ConnectionConfig } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
@@ -83,7 +84,10 @@ export function App(): React.ReactElement {
 
   // Backup modal
   const [showBackupModal, setShowBackupModal] = useState(false)
-  const [backupUsePolicy, setBackupUsePolicy] = useState(true)
+  const [sources, setSources] = useState<string[]>([])
+  const [sourceDraft, setSourceDraft] = useState('')
+  const [editingSources, setEditingSources] = useState(false)
+  const [sourcesLoading, setSourcesLoading] = useState(false)
   const [backupVerify, setBackupVerify] = useState(false)
   const [backupStarting, setBackupStarting] = useState(false)
 
@@ -344,14 +348,25 @@ export function App(): React.ReactElement {
   /* Task operations                                                   */
   /* ---------------------------------------------------------------- */
 
+  /*
+   * Start a backup of whatever this repository is configured to back up.
+   *
+   * No paths are sent. Sources belong to the repository, so the button means
+   * "back up this repo" and the daemon reads the list - which is also what a
+   * schedule does, so a scheduled run and a clicked one cannot disagree.
+   *
+   * This posted to /repos/<id>/run until now, a route the daemon has never
+   * had, and failed silently every time it was pressed.
+   */
   const handleStartBackup = async () => {
     if (!activeRepo) return
     setBackupStarting(true)
     setError(null)
     try {
-      const params: Record<string, unknown> = { command: 'run' }
-      if (backupVerify) params.verify_after = true
-      await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
+      await api.apiCall(activeRepo.conn, {
+        kind: 'backup',
+        repoId: Number(activeRepo.path),
+      })
       setShowBackupModal(false)
       navigateTo({ view: 'tasks' })
     } catch (err) {
@@ -360,19 +375,53 @@ export function App(): React.ReactElement {
     setBackupStarting(false)
   }
 
+  /* Load what the repository backs up, so the modal can show it rather than
+   * asking for paths that are already recorded. */
+  const loadSources = async () => {
+    if (!activeRepo) return
+    setSourcesLoading(true)
+    try {
+      const r = await api.apiCall<{ sources?: string[]; exclude?: string[] }>(
+        activeRepo.conn, { kind: 'sourcesGet', repoId: Number(activeRepo.path) })
+      setSources(r.sources ?? [])
+      setSourceDraft((r.sources ?? []).join('\n'))
+    } catch (err) {
+      setError(String(err))
+    }
+    setSourcesLoading(false)
+  }
+
+  const handleSaveSources = async () => {
+    if (!activeRepo) return
+    const paths = sourceDraft.split('\n').map(s => s.trim()).filter(Boolean)
+    setSourcesLoading(true)
+    setError(null)
+    try {
+      await api.apiCall(activeRepo.conn, {
+        kind: 'sourcesSet', repoId: Number(activeRepo.path), sources: paths,
+      })
+      setSources(paths)
+      setEditingSources(false)
+    } catch (err) {
+      setError(String(err))
+    }
+    setSourcesLoading(false)
+  }
+
   const handleStartRestore = async () => {
     if (!activeRepo || !restoreModal || !restoreDest.trim()) return
     setRestoreStarting(true)
     setError(null)
     try {
-      const params: Record<string, unknown> = {
-        command: 'restore',
-        snapshot: String(restoreModal.snapId),
+      /* Under the snapshot. The old call posted to /repos/<id>/restore,
+       * which the daemon has never served. */
+      await api.apiCall(activeRepo.conn, {
+        kind: 'restore',
+        repoId: Number(activeRepo.path),
+        snapshotId: restoreModal.snapId,
         dest: restoreDest.trim(),
-      }
-      if (restoreModal.filePath) params.file = restoreModal.filePath
-      if (restoreVerify) params.verify = true
-      await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', params)
+        subpath: restoreModal.filePath,
+      })
       setRestoreModal(null)
       navigateTo({ view: 'tasks' })
     } catch (err) {
@@ -381,19 +430,36 @@ export function App(): React.ReactElement {
     setRestoreStarting(false)
   }
 
-  const handleStartOperation = (command: string) => {
+  /*
+   * The maintenance operations, as a closed set.
+   *
+   * Typed rather than passed through as a command string. These three
+   * happened to name real endpoints, unlike backup, but they were one typo
+   * from the same silent 404 - and a union means a name that stops existing
+   * fails the contract suite instead of a button.
+   */
+  const OP_LABELS: Record<MaintenanceOp, string> = {
+    verify: 'Verify',
+    pack: 'Pack',
+    gc: 'Garbage Collect',
+    gfs: 'Apply Retention',
+    reindex: 'Reindex',
+  }
+
+  const handleStartOperation = (command: MaintenanceOp) => {
     if (!activeRepo) return
-    const labels: Record<string, string> = { verify: 'Verify', pack: 'Pack', gc: 'Garbage Collect' }
+    const label = OP_LABELS[command]
     setConfirmDialog({
-      title: `Run ${labels[command] ?? command}`,
-      message: `Start a background ${labels[command] ?? command} operation on this repository?`,
+      title: `Run ${label}`,
+      message: `Start a background ${label} operation on this repository?`,
       confirmLabel: 'Start',
       danger: false,
       onConfirm: async () => {
         setConfirmDialog(null)
         setError(null)
         try {
-          await api.rpcCall(activeRepo.conn, activeRepo.path, 'task_start', { command })
+          const repoId = Number(activeRepo.path)
+          await api.apiCall(activeRepo.conn, { kind: command, repoId })
           navigateTo({ view: 'tasks' })
         } catch (err) {
           setError(String(err))
@@ -590,7 +656,9 @@ export function App(): React.ReactElement {
                 onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
                 onLooseObjects={() => navigateTo({ view: 'loose-objects' })}
                 onPackBrowser={() => navigateTo({ view: 'pack-browser' })}
-                onRunBackup={() => { setShowBackupModal(true); setBackupUsePolicy(true); setBackupVerify(false) }}
+                /* Read the sources as the modal opens, so it shows what
+                 * will actually be backed up rather than a blank form. */
+                onRunBackup={() => { setShowBackupModal(true); setEditingSources(false); void loadSources() }}
                 onRunOperation={handleStartOperation}
               />
             )}
@@ -854,7 +922,7 @@ export function App(): React.ReactElement {
                 autoFocus required />
             </div>
             <div className="mb-4">
-              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
+              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary hidden">
                 <input type="checkbox" checked={restoreVerify} onChange={e => setRestoreVerify(e.target.checked)} />
                 Verify after restore
               </label>
@@ -876,19 +944,72 @@ export function App(): React.ReactElement {
         <Overlay>
           <div className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
             <h3 className="text-sm font-semibold m-0 mb-3">Run Backup</h3>
+
+            {/*
+              * What this repository backs up, read from the repository
+              * rather than asked for again. The old modal offered a "verify
+              * after" checkbox and no way to say what to back up at all,
+              * which is why the button could never work: it had nothing to
+              * send. The checkbox is gone because no endpoint takes it -
+              * a control that quietly does nothing is worse than its
+              * absence, and verifying on a schedule is the better shape.
+              */}
             <div className="mb-3">
-              <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
-                <input type="checkbox" checked={backupVerify} onChange={e => setBackupVerify(e.target.checked)} />
-                Verify after backup
-              </label>
+              <div className="text-xs text-text-secondary mb-1.5">Sources</div>
+              {sourcesLoading ? (
+                <div className="text-xs text-text-tertiary">Loading...</div>
+              ) : editingSources ? (
+                <>
+                  <textarea
+                    value={sourceDraft}
+                    onChange={e => setSourceDraft(e.target.value)}
+                    rows={4}
+                    placeholder={'/home/me\n/etc'}
+                    className="w-full text-xs font-mono p-2 rounded bg-surface-tertiary
+                               text-text-primary border border-border-default resize-y"
+                  />
+                  <div className="text-xs text-text-tertiary mt-1">One absolute path per line.</div>
+                  <div className="flex gap-2 mt-2">
+                    <button onClick={handleSaveSources}
+                      className="px-2 py-1 text-xs cursor-pointer rounded bg-accent text-accent-text border-none">
+                      Save
+                    </button>
+                    <button onClick={() => { setEditingSources(false); setSourceDraft(sources.join('\n')) }}
+                      className="px-2 py-1 text-xs cursor-pointer rounded bg-surface-tertiary
+                                 text-text-secondary border-none">
+                      Cancel
+                    </button>
+                  </div>
+                </>
+              ) : sources.length === 0 ? (
+                <div className="text-xs text-text-tertiary">
+                  Nothing configured yet.{' '}
+                  <button onClick={() => setEditingSources(true)}
+                    className="underline cursor-pointer bg-transparent border-none text-accent p-0 text-xs">
+                    Choose what to back up
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <ul className="text-xs font-mono m-0 pl-4 text-text-primary">
+                    {sources.map(p => <li key={p} className="truncate">{p}</li>)}
+                  </ul>
+                  <button onClick={() => setEditingSources(true)}
+                    className="underline cursor-pointer bg-transparent border-none text-accent p-0 text-xs mt-1.5">
+                    Edit
+                  </button>
+                </>
+              )}
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setShowBackupModal(false)}
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
                 disabled={backupStarting}>Cancel</button>
               <button onClick={handleStartBackup}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
-                disabled={backupStarting}>{backupStarting ? 'Starting...' : 'Start Backup'}</button>
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text
+                           hover:bg-accent-hover border-none disabled:opacity-50"
+                disabled={backupStarting || sources.length === 0 || editingSources}>
+                {backupStarting ? 'Starting...' : 'Start Backup'}</button>
             </div>
           </div>
         </Overlay>
