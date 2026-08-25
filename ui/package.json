@@ -7,7 +7,9 @@
     "dev": "ELECTRON_DISABLE_SANDBOX=1 electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "test:contract": "node --test --experimental-strip-types tests/contract.test.ts"
   },
   "dependencies": {
     "lz4js": "^0.2.0",

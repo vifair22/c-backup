@@ -241,7 +241,27 @@ test-cli: test-api
 # exits non-zero, the loop swallows it, make reports success, and every gate
 # check downstream believes the tree is green. The shell suites and the
 # analyzers always failed the target properly; the C ones never did.
-test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli
+# The desktop app's API contract.
+#
+# It is the second client of the same daemon and until now was held to
+# nothing, which is how it spent four months posting to a route that has
+# never existed. This asks a running daemon whether every request the app can
+# build names something real, so a path that stops existing fails here rather
+# than in somebody's backup.
+#
+# Skipped rather than failed when node is absent: a C build on a machine
+# without a JS toolchain is a reasonable thing to do, and pretending
+# otherwise would make the C suite depend on it.
+.PHONY: test-ui
+test-ui: all
+	@if command -v node >/dev/null 2>&1 && [ -d ui/tests ]; then \
+	    echo "=== ui contract ==="; \
+	    (cd ui && npm test) || exit 1; \
+	else \
+	    echo "ui contract: skipped (no node)"; \
+	fi
+
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do echo "=== $$t ==="; $$t || exit 1; done
 
 # ---- ASAN tests -------------------------------------------------------

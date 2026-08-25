@@ -123,6 +123,23 @@ desktop app, to run their own backup tool - which is the friction the daemon
 rewrite existed to remove. When an endpoint is added, a command goes with it,
 and `tests/test_cli_e2e.sh` exercises the whole table.
 
+The desktop app is the second client and is held to the same rule. Its
+requests are one closed union in `ui/src/shared/api.ts`, translated to method
+and path in exactly one place (`ui/src/main/client.ts`), and
+`ui/tests/contract.test.ts` starts a real daemon and asks it whether every
+request the app can build names a route that exists.
+
+That suite exists because the app spent four months posting backups to
+`/repos/<id>/run`, which the daemon has never served. The path was built by
+interpolating an action string, so nothing at build time could object, and
+nothing at run time was looking. When an endpoint is added, a variant goes in
+the union and a sample goes in the contract suite - the union is typed as a
+`Record` over every kind, so omitting the sample does not compile.
+
+Replication is deliberately absent from the app. The engine exists and the
+CLI drives it; exposing a capability that writes a repository to an arbitrary
+path is a decision to take on purpose rather than by completing a table.
+
 `c-backup help` lists the commands. Flags may appear anywhere in a command,
 values are JSON-escaped and query parameters percent-encoded, so a path
 containing a quote, a space or a `#` is sent correctly rather than producing
