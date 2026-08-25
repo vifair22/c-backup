@@ -632,6 +632,23 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
     /* Unix socket daemon */
     if (socket_path) {
         /* Remove stale socket */
+        /*
+         * sun_path is 108 bytes and strncpy would silently take the first
+         * 107 of a longer path. Everything downstream then succeeds against
+         * a path nobody asked for: bind and listen work, the log reports the
+         * path from the config, the unlink on the way out removes the
+         * untruncated name and leaves the real socket behind, and every
+         * client refuses the configured path as too long and cannot connect.
+         * The daemon looks healthy and is unreachable.
+         */
+        struct sockaddr_un addr;
+        if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+            log_error("socket path too long (max %zu): %s",
+                      sizeof(addr.sun_path) - 1, socket_path);
+            api_server_stop(srv);
+            return NULL;
+        }
+
         unlink(socket_path);
 
         int sock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -641,11 +658,10 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
             return NULL;
         }
 
-        struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        /* nosemgrep: flawfinder.strncpy-1 -- prior memset zeroed addr; strncpy bound to size-1 leaves the final byte as the NUL from memset */
-        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+        /* Length checked above, so this cannot truncate. */
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
 
         if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             log_error("failed to bind unix socket at %s", socket_path);

@@ -577,6 +577,34 @@ C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind2.log" 2>&1
 check    "an unparseable bind address stops the daemon" 1 "$?"
 contains "and says which value was rejected" "not-an-address" "$(cat "$WORK/bind2.log")"
 
+# sun_path is 108 bytes and the daemon used to strncpy into it, so a longer
+# socket path was silently truncated: bind and listen succeeded against a
+# name nobody configured, the log reported the untruncated one, and every
+# client refused the configured path as too long and could not connect. A
+# healthy-looking daemon that nothing can reach.
+LONGDIR="$WORK/$(printf 'd%.0s' $(seq 1 100))"
+mkdir -p "$LONGDIR"
+cat > "$WORK/longcfg.yaml" <<EOF
+db:
+  path: $WORK/long.db
+http:
+  socket: $LONGDIR/c.sock
+  port: 0
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/keys
+EOF
+C_BACKUP_CONFIG_PATH="$WORK/longcfg.yaml" "$DAEMON" > "$WORK/long.log" 2>&1
+check    "an over-long socket path stops the daemon" 1 "$?"
+contains "and says so rather than truncating" "socket path too long" "$(cat "$WORK/long.log")"
+if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
+    bad "leaves no socket behind" "no socket" "a socket was created"
+else
+    ok "leaves no socket behind"
+fi
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"
