@@ -5,7 +5,8 @@ Two transports, one API.
 - **Unix socket** (`http.socket`) bypasses authentication entirely. Filesystem
   permissions on the socket are the access control: if you can open it, you
   are authorised. This is what the CLI uses.
-- **TCP** (`http.port`) requires `Authorization: Bearer <token>` or an `auth`
+- **TCP** (`http.port`) binds loopback unless `http.bind` says otherwise, and
+  requires `Authorization: Bearer <token>` or an `auth`
   cookie, except for the public routes below.
 
 Until an admin password is set, TCP is open so the daemon can be bootstrapped.

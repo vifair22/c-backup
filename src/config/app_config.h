@@ -22,8 +22,22 @@ static const config_key_t app_file_keys[] = {
     { "http.port",   CFG_INT,    "8765",
       "TCP listen port for remote clients",
       CFG_STORE_FILE, 0 },
-    { "http.bind",   CFG_STRING, "0.0.0.0",
-      "TCP bind address; set 127.0.0.1 to force remote access through a reverse proxy",
+    /*
+     * Loopback by default, because nothing needs otherwise.
+     *
+     * The CLI and the desktop app both use the unix socket, and the one
+     * documented TCP flow is localhost:8765. That leaves no local client
+     * that a public bind serves and no reason for the port to answer a
+     * scanner - so exposure is something an operator turns on, having
+     * decided to, rather than the state the daemon starts in.
+     *
+     * Widening it is a deliberate act: set 0.0.0.0 and put a reverse proxy
+     * or a tunnel in front, because everything this port serves is reachable
+     * with a bearer token and nothing about the transport is encrypted.
+     */
+    { "http.bind",   CFG_STRING, "127.0.0.1",
+      "TCP bind address; 127.0.0.1 confines it to this machine. Widen only "
+      "behind a reverse proxy or a tunnel - the transport is plain HTTP",
       CFG_STORE_FILE, 0 },
 
     /* The database path is c-utils' own immutable `db.path` key, not an
