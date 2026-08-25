@@ -84,7 +84,7 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
 | D1 | Whole snapshot | `restore <id> <snap> <dest>` | Restore | `diff -r` against source is clean |
 | D2 | One subtree | `restore --subpath PATH` | Restore file | Only that subtree appears |
 | D3 | Permissions and mtimes | - | - | `stat` matches for a sample; symlinks are still symlinks |
-| D4 | Overwrite refused by default | `restore` onto existing | Restore | Refuses unless `--overwrite` |
+| D4 | Existing files are left alone | `restore` onto existing | Restore | Skips them and says how many; `--overwrite` replaces. This is resume semantics, not a safety refusal - an interrupted restore is meant to be re-run |
 
 ### E. Integrity
 

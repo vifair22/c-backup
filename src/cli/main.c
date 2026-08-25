@@ -1082,6 +1082,25 @@ static int cmd_schedule(int argc, char **argv)
             sb_puts(&b, "}}");
         } else {
             if (a < 4) { free(b.buf); return fail("usage: schedule add <repo-id> <action> <seconds>"); }
+            /*
+             * Checked here rather than spliced in and left to the daemon.
+             * This value goes into the body as a bare JSON number, so a
+             * non-numeric argument produced malformed JSON and came back as
+             * "invalid JSON" with a 400 - which describes the request the
+             * CLI built, not the mistake the operator made. Typing
+             * `--interval 60` instead of `60` is the obvious way to get
+             * there.
+             */
+            char *endp = NULL;
+            long long secs = strtoll(v[3], &endp, 10);
+            if (!v[3][0] || !endp || *endp || secs <= 0) {
+                free(b.buf);
+                return fail("interval must be a positive number of seconds, "
+                            "not '%s'\n"
+                            "       usage: schedule add <repo-id> <action> <seconds>\n"
+                            "              schedule add <repo-id> <action> --cron '<spec>'",
+                            v[3]);
+            }
             sb_puts(&b, ",\"trigger\":{\"type\":\"interval\",\"seconds\":");
             sb_puts(&b, v[3]);
             sb_puts(&b, "}}");
