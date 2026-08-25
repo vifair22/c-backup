@@ -99,10 +99,16 @@ test('C3/C4 browsing into a real tree', async () => {
     await expect(page.locator('tbody tr').first()).toBeVisible()
   })
 
-  /* Down to the real Documents directory: home > vifair > Documents. */
+  /*
+   * Down to the real Documents directory: home > vifair > Documents.
+   * Scoped to the tree table - "Documents" unqualified also matches the
+   * repository in the sidebar, and clicking that navigates away from the
+   * screen under test rather than descending into it.
+   */
+  const tree = page.locator('tbody')
   for (const seg of ['home', 'vifair', 'Documents']) {
     await timed('C4', `expand ${seg}`, async () => {
-      await page.getByText(seg, { exact: true }).first().click()
+      await tree.getByText(seg, { exact: true }).first().click()
       await page.waitForTimeout(50)
     })
   }
@@ -136,4 +142,58 @@ test('I5 the daemon screen against real repositories', async () => {
   })
   expect(ms).toBeLessThan(1000)
   await page.screenshot({ path: 'test-results/acc-daemon.png', fullPage: true })
+})
+
+test('B7/C5 the 225k-file repository', async () => {
+  /*
+   * The scale case. 225,240 files and 25,509 directories, which is the shape
+   * that never finished before build_trees stopped walking parent chains.
+   * Everything here is a paged or indexed query, so none of these numbers
+   * should differ much from the 5,722-file repository above - and if one
+   * does, that is the finding.
+   */
+  /* Straight to the repository in the sidebar. Clicking a "Dashboard"
+   * button first cost this test a 30 second timeout: the daemon screen it
+   * arrives from has a Back button and no Dashboard one. */
+  await page.getByText('Git', { exact: true }).first().click()
+
+  const dash = await timed('I3g', 'dashboard of 225k files', async () => {
+    await expect(page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
+    await expect(page.getByText('Files Tracked', { exact: false }).first()).toBeVisible()
+  })
+  expect(dash, 'a dashboard is a summary query, not a walk').toBeLessThan(1500)
+  await page.screenshot({ path: 'test-results/acc-git-dashboard.png', fullPage: true })
+
+  const list = await timed('C1g', 'snapshot list at scale', async () => {
+    await page.getByRole('button', { name: /^snapshots$/i }).first().click()
+    await expect(page.getByText('#1', { exact: true })).toBeVisible()
+  })
+  expect(list).toBeLessThan(1000)
+
+  const tree = await timed('C3g', 'open the tree at scale', async () => {
+    await page.locator('tbody tr').first().click()
+    await expect(page.getByText('Snapshot #1').first()).toBeVisible()
+    await expect(page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(tree, 'one directory, not the whole snapshot').toBeLessThan(1000)
+
+  const body = page.locator('tbody')
+  for (const seg of ['home', 'vifair', 'git']) {
+    await timed('C4g', `expand ${seg}`, async () => {
+      await body.getByText(seg, { exact: true }).first().click()
+      await page.waitForTimeout(60)
+    })
+  }
+  await page.screenshot({ path: 'test-results/acc-git-browse.png', fullPage: true })
+
+  await page.getByRole('button', { name: /back/i }).first().click()
+  await page.getByRole('button', { name: /dashboard/i }).first().click()
+  await page.getByRole('button', { name: /^search$/i }).first().click()
+  const search = await timed('C5g', 'search 225k names', async () => {
+    await page.getByPlaceholder(/filename contains/i).fill('CMakeLists')
+    await page.getByRole('button', { name: /^search$/i }).last().click()
+    await expect(page.locator('tbody tr').first()).toBeVisible()
+  })
+  expect(search, 'a trigram index should not care about corpus size').toBeLessThan(1500)
+  await page.screenshot({ path: 'test-results/acc-git-search.png', fullPage: true })
 })
