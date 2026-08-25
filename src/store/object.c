@@ -146,7 +146,8 @@ int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
 
 status_t object_physical_size(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
-                              uint64_t *out_bytes) {
+                              uint64_t *out_bytes,
+                              uint32_t *out_header_bytes) {
     if (!out_bytes) return set_error(ERR_INVALID, "object_physical_size: out_bytes is NULL");
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
@@ -157,12 +158,16 @@ status_t object_physical_size(store_t *store,
     struct stat st;
     if (stat(path, &st) == 0) {
         *out_bytes = (uint64_t)st.st_size;
+        if (out_header_bytes) *out_header_bytes = (uint32_t)sizeof(object_header_t);
         return OK;
     }
     if (errno != ENOENT)
         return set_error_errno(ERR_IO, "stat(%s)", path);
 
-    return pack_object_physical_size(store, hash, out_bytes);
+    status_t st_pack = pack_object_physical_size(store, hash, out_bytes);
+    if (st_pack == OK && out_header_bytes)
+        *out_header_bytes = (uint32_t)sizeof(pack_dat_entry_hdr_t);
+    return st_pack;
 }
 
 /* Write a blob (already in memory) as an object. */

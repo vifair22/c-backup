@@ -108,10 +108,17 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
  * Return on-disk physical bytes used by a single object payload record.
  * For loose objects: object_header_t + compressed payload bytes.
  * For packed objects: pack_dat_entry_hdr_t + compressed payload bytes.
+ *
+ * out_header_bytes, when non-NULL, receives the size of whichever of those
+ * two headers was counted. Callers that report the header separately need it
+ * from here rather than assuming: the two differ (64 against 51), and an
+ * introspection route that showed the loose header beside a packed object's
+ * footprint was describing a layout the object does not have.
  */
 status_t object_physical_size(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
-                              uint64_t *out_bytes);
+                              uint64_t *out_bytes,
+                              uint32_t *out_header_bytes);
 
 /*
  * What an object looks like on disk, without decoding it.

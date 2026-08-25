@@ -273,6 +273,19 @@ test('objects: the store, by object', async () => {
   await expect(h.page.getByText('Referenced by')).toBeVisible()
   await h.page.getByRole('button', { name: /view content/i }).click()
   await expect(h.page.getByText('Hash', { exact: true }).first()).toBeVisible()
+  /*
+   * Size from the index, and size measured off the object itself. Two
+   * different facts, which is the point: when they disagree the index is
+   * stale, and nothing else in the app would say so.
+   */
+  await expect(h.page.getByText('Record on disk')).toBeVisible()
+  await expect(h.page.getByText('Payload', { exact: true })).toBeVisible()
+  /* A manifest tree is object type 5, and every component's own copy of the
+   * type list stopped at 4, so most of a repository read as "Unknown (5)". */
+  await expect(h.page.getByText(/Unknown \(\d+\)/)).toHaveCount(0)
+  await expect(h.page.getByText('Header', { exact: true })).toBeVisible()
+  /* They agree here, so the staleness warning must not be showing. */
+  await expect(h.page.getByText(/index is\s+stale/i)).toHaveCount(0)
   await h.page.screenshot({ path: 'test-results/object-content.png' })
   await h.page.keyboard.press('Escape')
 })

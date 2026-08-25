@@ -1,12 +1,8 @@
 import React, { useState } from 'react'
-import { fmtSize, fmtNum } from './format'
+import { fmtSize, fmtNum, OBJECT_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
-
-const OBJECT_TYPES: Record<number, string> = {
-  1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE',
-}
 
 /*
  * As the daemon sends them. Sizes came back as orig_size and phys_size, not
@@ -117,7 +113,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
                 <div>
                   <div className="text-[10px] text-text-muted uppercase">Type</div>
                   <span className="text-xs font-semibold text-text-primary">
-                    {OBJECT_TYPES[Number(locate.type ?? 0)] ?? `Unknown (${locate.type})`}
+                    {OBJECT_TYPE_NAMES[Number(locate.type ?? 0)] ?? `Unknown (${locate.type})`}
                   </span>
                 </div>
                 <div>

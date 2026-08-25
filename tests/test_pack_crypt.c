@@ -257,7 +257,7 @@ static void test_compressible_object_still_compresses(void **state)
     /* The entry has to be smaller than the plaintext, tag and nonce
      * included, or compression did not happen. */
     uint64_t phys = 0;
-    assert_int_equal(object_physical_size(store, hash, &phys), OK);
+    assert_int_equal(object_physical_size(store, hash, &phys, NULL), OK);
     assert_true(phys < N / 2);
 
     assert_buffered_read_matches(hash, buf, N);
@@ -308,7 +308,7 @@ static void test_frame_codec_object_roundtrips(void **state)
     assert_int_equal(packed, 1);
 
     uint64_t phys = 0;
-    assert_int_equal(object_physical_size(store, hash, &phys), OK);
+    assert_int_equal(object_physical_size(store, hash, &phys, NULL), OK);
     assert_true(phys < FRAME_SIZE / 2);
 
     assert_stream_read_matches(hash, buf, FRAME_SIZE);

@@ -59,6 +59,22 @@ export function fmtMode(mode: number): string {
   return '0' + (mode & 0o7777).toString(8)
 }
 
+/*
+ * Object types, from src/common/types.h.
+ *
+ * Three components each kept their own copy of this and all three stopped at
+ * 4, so every manifest tree object - which is most of what a repository
+ * holds - displayed as "Unknown (5)". One list, in the same file as the node
+ * types it sits next to.
+ */
+export const OBJECT_TYPE_NAMES: Record<number, string> = {
+  1: 'file',
+  2: 'xattr',
+  3: 'acl',
+  4: 'sparse',
+  5: 'tree',
+}
+
 export const NODE_TYPE_NAMES: Record<number, string> = {
   1: 'file',
   2: 'dir',

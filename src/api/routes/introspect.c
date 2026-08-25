@@ -408,23 +408,33 @@ api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_i
     hex_to_hash(hex, hash);
 
     uint64_t size = 0, phys = 0;
+    uint32_t hdr = 0;
     uint8_t type = 0;
     st = object_get_info(store, hash, &size, &type);
     if (st == OK) {
         /* Physical size can legitimately fail for a packed object whose pack
          * is unreadable; report the logical size rather than nothing. */
-        if (object_physical_size(store, hash, &phys) != OK) { phys = 0; err_clear(); }
+        if (object_physical_size(store, hash, &phys, &hdr) != OK) {
+            phys = 0; hdr = 0; err_clear();
+        }
     }
     close_bound_store(store, idx);
 
     if (st != OK) return api_error(404, "no such object");
 
+    /*
+     * The header this object actually has, not the one a loose object would.
+     * physical_size counts whichever header the object sits behind, and this
+     * reported sizeof(object_header_t) unconditionally - so for a packed
+     * object the two described different layouts and their difference was
+     * 13 bytes of nothing.
+     */
     char *body = NULL;
     int n = asprintf(&body,
         "{\"hash\":\"%s\",\"type\":%u,\"uncompressed_size\":%llu,"
-        "\"physical_size\":%llu,\"header_size\":%zu}",
+        "\"physical_size\":%llu,\"header_size\":%u,\"payload_size\":%llu}",
         hex, type, (unsigned long long)size, (unsigned long long)phys,
-        sizeof(object_header_t));
+        hdr, (unsigned long long)(phys > hdr ? phys - hdr : 0));
     if (n < 0) return api_error(500, "out of memory");
     return api_ok(body);
 }

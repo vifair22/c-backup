@@ -547,7 +547,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
 
         uint64_t phys = 0, orig = 0;
         uint8_t  type = 0;
-        if (object_physical_size(store, hash, &phys) != OK ||
+        if (object_physical_size(store, hash, &phys, NULL) != OK ||
             object_get_info(store, hash, &orig, &type) != OK) {
             /* Referenced but absent. Leaving the row unsized rather than
              * inventing a number keeps the gap visible to a verify pass. */

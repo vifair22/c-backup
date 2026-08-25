@@ -262,12 +262,12 @@ static void test_object_physical_size_edge_cases(void **state) {
     uint8_t hash[OBJECT_HASH_SIZE] = {0};
     assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
-    assert_int_equal(object_physical_size(store, hash, NULL), ERR_INVALID);
+    assert_int_equal(object_physical_size(store, hash, NULL, NULL), ERR_INVALID);
 
     uint8_t missing[OBJECT_HASH_SIZE];
     memset(missing, 0xAB, sizeof(missing));
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(store, missing, &bytes), ERR_NOT_FOUND);
+    assert_int_equal(object_physical_size(store, missing, &bytes, NULL), ERR_NOT_FOUND);
 }
 
 static void test_object_physical_size_returns_file_size(void **state) {
@@ -283,7 +283,7 @@ static void test_object_physical_size_returns_file_size(void **state) {
     assert_int_equal(stat(path, &st), 0);
 
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(store, hash, &bytes), OK);
+    assert_int_equal(object_physical_size(store, hash, &bytes, NULL), OK);
     /* physical_size should return the full file size including parity trailer */
     assert_int_equal(bytes, (uint64_t)st.st_size);
 }

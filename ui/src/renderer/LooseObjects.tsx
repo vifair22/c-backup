@@ -21,14 +21,10 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
-import { fmtSize, fmtNum } from './format'
+import { fmtSize, fmtNum, OBJECT_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
 
 const api = window.cbackup
-
-const OBJECT_TYPES: Record<number, string> = {
-  1: 'file', 2: 'xattr', 3: 'acl', 4: 'sparse',
-}
 
 const PAGE_SIZE = 200
 
@@ -174,7 +170,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
         <div className="flex flex-wrap gap-3 mb-4">
           {perType.filter(t => Number(t.count ?? '0') > 0).map(t => (
             <div key={t.type} className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
-              <span className="font-semibold">{OBJECT_TYPES[Number(t.type)] ?? `type-${t.type}`}</span>
+              <span className="font-semibold">{OBJECT_TYPE_NAMES[Number(t.type)] ?? `type-${t.type}`}</span>
               <span className="text-text-muted ml-2">
                 {fmtNum(t.count)} ({fmtSize(t.orig_size)})
               </span>
@@ -210,7 +206,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
                     onClick={() => setSelected(isSelected ? null : obj)}
                     className={`border-t border-border-default cursor-pointer hover:bg-surface-hover ${isSelected ? 'bg-accent/10' : ''}`}>
                     <td className="py-1.5 pl-4 font-mono truncate" title={obj.hash}>{obj.hash}</td>
-                    <td className="py-1.5">{OBJECT_TYPES[obj.type] ?? obj.type}</td>
+                    <td className="py-1.5">{OBJECT_TYPE_NAMES[obj.type] ?? obj.type}</td>
                     <td className="py-1.5 text-right text-text-muted">{obj.refcount}</td>
                     <td className="py-1.5 text-right">{fmtSize(obj.origSize)}</td>
                     <td className="py-1.5 text-right text-text-muted">{fmtSize(obj.physSize)}</td>
@@ -260,7 +256,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
             <div className="grid grid-cols-2 gap-3 mb-3">
               <div>
                 <div className="text-[10px] text-text-muted uppercase">Type</div>
-                <div className="text-xs">{OBJECT_TYPES[selected.type] ?? selected.type}</div>
+                <div className="text-xs">{OBJECT_TYPE_NAMES[selected.type] ?? selected.type}</div>
               </div>
               <div>
                 <div className="text-[10px] text-text-muted uppercase">Stored</div>

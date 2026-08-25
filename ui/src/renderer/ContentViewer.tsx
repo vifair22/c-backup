@@ -1,14 +1,10 @@
 import React, { useEffect, useState } from 'react'
-import { fmtSize } from './format'
+import { fmtSize, OBJECT_TYPE_NAMES } from './format'
 
 const api = window.cbackup
 
 const TEXT_DISPLAY_CHARS = 4096
 const HEX_DISPLAY_BYTES = 4096
-
-const OBJECT_TYPES: Record<number, string> = {
-  1: 'FILE', 2: 'XATTR', 3: 'ACL', 4: 'SPARSE',
-}
 
 /*
  * As the daemon sends them. Both were wrong here: locate carries orig_size
@@ -26,6 +22,20 @@ interface ObjectLocateResult {
   phys_size?: string
   location?: string
   pack_id?: string
+}
+
+/*
+ * The layout route reads the object off disk; locate reads the index. That
+ * makes them two different facts about the same object, and a disagreement
+ * between them means the index is stale - which is exactly the condition
+ * reindex exists to fix and which nothing else in the app would show.
+ */
+interface ObjectLayoutResult {
+  type?: number
+  uncompressed_size?: number
+  physical_size?: number
+  header_size?: number
+  payload_size?: number
 }
 
 interface ObjectContentResult {
@@ -87,6 +97,7 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [locate, setLocate] = useState<ObjectLocateResult | null>(null)
+  const [layout, setLayout] = useState<ObjectLayoutResult | null>(null)
   const [rawData, setRawData] = useState<Uint8Array | null>(null)
   const [tooLarge, setTooLarge] = useState<{ size: number; limit: number } | null>(null)
   const [binary, setBinary] = useState(false)
@@ -99,11 +110,18 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
 
     ;(async () => {
       try {
-        const loc = await api.apiCall<ObjectLocateResult>(connName, {
-          kind: 'objectInfo', repoId, hash,
-        })
+        /* Both, together: they are independent lookups and the panel wants
+         * to show them side by side. A layout read can fail on its own when
+         * a pack is unreadable, which is worth not letting take the rest of
+         * the panel down with it. */
+        const [loc, lay] = await Promise.all([
+          api.apiCall<ObjectLocateResult>(connName, { kind: 'objectInfo', repoId, hash }),
+          api.apiCall<ObjectLayoutResult>(connName, { kind: 'objectLayout', repoId, hash })
+            .catch(() => null),
+        ])
         if (cancelled) return
         setLocate(loc)
+        setLayout(lay)
 
         const content = await api.apiCall<ObjectContentResult>(connName, {
           kind: 'objectContent', repoId, hash,
@@ -214,7 +232,7 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Type</div>
                       <div className="text-sm text-text-primary">
-                        {OBJECT_TYPES[Number(locate.type)] ?? `Unknown (${locate.type})`}
+                        {OBJECT_TYPE_NAMES[Number(locate.type)] ?? `Unknown (${locate.type})`}
                       </div>
                     </div>
                     <div>
@@ -236,6 +254,44 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                       )}
                     </div>
                   </div>
+                  {layout && (
+                    <div className="grid grid-cols-4 gap-4">
+                      <div>
+                        <div className="text-[10px] text-text-muted uppercase tracking-wide">Record on disk</div>
+                        <div className="text-sm text-text-primary">{fmtSize(layout.physical_size)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-text-muted uppercase tracking-wide">Header</div>
+                        <div className="text-sm text-text-primary">{layout.header_size ?? '-'} B</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-text-muted uppercase tracking-wide">Payload</div>
+                        <div className="text-sm text-text-primary">{fmtSize(layout.payload_size)}</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/*
+                    * Payload against payload, which is the only comparison
+                    * that means anything. The index charges a packed
+                    * object's entry header to its pack rather than to the
+                    * entry, so "on disk" from the index and "record on disk"
+                    * read here differ by that header for every packed
+                    * object by design - comparing those two flagged a
+                    * healthy repository as stale.
+                    */}
+                  {layout?.payload_size !== undefined && locate.phys_size !== undefined
+                    && Number(locate.phys_size) > 0
+                    && Number(locate.phys_size) !== layout.payload_size
+                    && Number(locate.phys_size) !== layout.physical_size && (
+                    <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2">
+                      The index records {fmtSize(locate.phys_size)} of payload and
+                      the object holds {fmtSize(layout.payload_size)}. The index is
+                      stale for this object; a reindex rebuilds it from the
+                      repository.
+                    </div>
+                  )}
+
                   {binary && (
                     <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2">
                       Binary content detected. Text tab will show hex representation.

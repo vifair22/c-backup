@@ -200,7 +200,7 @@ static void test_packed_info_and_size(void **state)
     assert_int_equal(type, OBJECT_TYPE_FILE);
 
     uint64_t phys = 0;
-    assert_int_equal(object_physical_size(store, hashes[5], &phys), OK);
+    assert_int_equal(object_physical_size(store, hashes[5], &phys, NULL), OK);
     assert_true(phys > 0);
 }
 

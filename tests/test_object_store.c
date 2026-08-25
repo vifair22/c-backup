@@ -167,7 +167,7 @@ static void test_object_physical_size(void **state) {
     assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
     uint64_t bytes = 0;
-    assert_int_equal(object_physical_size(store, hash, &bytes), OK);
+    assert_int_equal(object_physical_size(store, hash, &bytes, NULL), OK);
     assert_true(bytes > 0);
     assert_true(bytes >= sizeof(object_header_t) + strlen(data));
 }
