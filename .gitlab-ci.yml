@@ -166,10 +166,12 @@ ui:
 # of blanks did so while the contract suite was green, because a request that
 # reaches a real route can still be read with the wrong field names.
 #
-# allow_failure is deliberate for now. A windowed test under Xvfb has more
-# ways to be flaky than a unit test, and a suite that blocks a merge for a
-# reason nobody can reproduce gets ignored rather than fixed. Turn it off
-# once it has a few weeks of green behind it.
+# It gates now. It ran allow_failure while it settled, which was the right
+# call and also a trap: a green pipeline said nothing about whether these
+# tests had run, and it hid a real failure on its first outing - the job died
+# on a missing xauth without ever starting a test, and the pipeline reported
+# success. Two clean runs later there is no reason to keep reading the job
+# list by hand to find out whether the app works.
 ui-e2e:
   stage: analyze
   image: node:24-trixie-slim
@@ -177,7 +179,6 @@ ui-e2e:
   needs:
     - job: test
       artifacts: true
-  allow_failure: true
   before_script:
     - apt-get update -qq
     # What the daemon links against, plus what Electron needs to open a
