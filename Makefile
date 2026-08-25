@@ -585,6 +585,12 @@ COV_OBJS    += $(COV_VENDOR)
 COV_MAIN    := $(COV_DIR)/main.o
 COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
 COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
+# The fault suites too. They were left out because TEST_SRCS filters them -
+# it feeds both TEST_BINS and COV_TESTS, and they need their own link rule
+# for --wrap - so nineteen tests that exercise nothing but error paths in
+# object.c and pack.c ran on every push and counted for nothing. Those are
+# the same error paths this file's ratchet comment calls the gap to 80%.
+COV_FAULT_TESTS := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(FAULT_SRCS))
 
 $(COV_DIR):
 	mkdir -p $(COV_DIR)
@@ -601,6 +607,11 @@ $(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
 $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
 
+# Shorter stem, so make prefers this over the rule above for the fault
+# suites - the same way the release build already resolves them.
+$(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
+
 # Ratchet, not aspiration: the floor is what the current phase actually
 # achieves, raised as each phase lands. src/store/ is gated separately because
 # it is the code that survives. The gap to the 80% standard is in pack.c's
@@ -608,8 +619,8 @@ $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 # reach. See daemonization-spec.md section 14.
 COV_STORE_MIN := 66
 
-coverage: $(COV_TESTS)
-	@for t in $(COV_TESTS); do $$t >/dev/null 2>&1 || true; done
+coverage: $(COV_TESTS) $(COV_FAULT_TESTS)
+	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
 	    --exclude '.*vendor.*' -s
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="

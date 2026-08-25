@@ -448,10 +448,13 @@ static void dat_cache_grow(store_t *st) {
 FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num) {
     if (!st->dat_cache) return NULL;
     uint32_t mask = st->dat_cache_mask;
-    uint32_t idx = dat_cache_hash(pack_num) & mask;
-    for (;;) {
+    uint32_t cap  = mask + 1;
+    uint32_t idx  = dat_cache_hash(pack_num) & mask;
+    /* Bounded for the same reason the return path is: an empty slot ends the
+     * probe, and a table with no empty slot in it never reaches one. */
+    for (uint32_t i = 0; i < cap; i++) {
         dat_cache_slot_t *s = &st->dat_cache[idx];
-        if (!s->fp) return NULL;  /* empty slot → miss */
+        if (!s->fp) return NULL;  /* empty slot means miss */
         if (s->pack_num == pack_num) {
             FILE *fp = s->fp;
             s->fp = NULL;
@@ -460,6 +463,7 @@ FILE *store_dat_cache_checkout(store_t *st, uint32_t pack_num) {
         }
         idx = (idx + 1) & mask;
     }
+    return NULL;
 }
 
 void store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp) {
@@ -467,18 +471,34 @@ void store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp) {
     if (!st->dat_cache) { fclose(fp); return; }
 
     /* Grow at 75% load factor */
-    uint32_t cap = st->dat_cache_mask + 1;
+    uint32_t cap = st->dat_cache_mask + 1, mask;
     if (st->dat_cache_count * 4 >= cap * 3)
         dat_cache_grow(st);
 
-    uint32_t mask = st->dat_cache_mask;
+    /*
+     * Bounded, like the loose set's probe beside it. The grow above
+     * guarantees a free slot - but only when it succeeds, and it returns
+     * silently on an allocation failure by design ("best effort - keep old
+     * table"). With a full table and no room to grow, an unbounded probe
+     * walks a table with no empty slot forever: a hang rather than a fault,
+     * in a cache whose whole purpose is to be optional.
+     *
+     * Nothing is lost by giving up. A returned handle that will not fit is
+     * closed instead of cached, which costs one reopen later.
+     */
+    mask = st->dat_cache_mask;
+    cap  = mask + 1;
     uint32_t idx = dat_cache_hash(pack_num) & mask;
-    while (st->dat_cache[idx].fp)
+    for (uint32_t i = 0; i < cap; i++) {
+        if (!st->dat_cache[idx].fp) {
+            st->dat_cache[idx].fp       = fp;
+            st->dat_cache[idx].pack_num = pack_num;
+            st->dat_cache_count++;
+            return;
+        }
         idx = (idx + 1) & mask;
-
-    st->dat_cache[idx].fp       = fp;
-    st->dat_cache[idx].pack_num = pack_num;
-    st->dat_cache_count++;
+    }
+    fclose(fp);
 }
 
 void store_dat_cache_flush(store_t *st) {

@@ -417,6 +417,269 @@ static void test_fuse_readahead_defaults_off(void **state)
     done(st2);
 }
 
+/* ------------------------------------------------------------------ */
+/* The in-memory loose-object set                                      */
+/*                                                                     */
+/* object_exists consults this before touching the filesystem, so a    */
+/* wrong answer is not a performance problem. A false positive means   */
+/* backup decides an object is already stored and does not write it,   */
+/* and nothing anywhere reports a failure - the snapshot completes and */
+/* the bytes are simply absent. It had no direct tests at all.         */
+/* ------------------------------------------------------------------ */
+
+static void fill_hash(uint8_t h[OBJECT_HASH_SIZE], unsigned seed)
+{
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
+        h[i] = (uint8_t)(seed * 31u + i * 7u + 1u);
+}
+
+static void test_loose_set_finds_what_was_written(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char *body = "loose object body";
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
+
+    /* A fresh store's set is built lazily; nothing is ready until asked. */
+    store_clear_loose_set(st);
+    assert_false(store_loose_set_ready(st));
+    /* Before the build, contains answers no rather than guessing. */
+    assert_false(store_loose_set_contains(st, hash));
+
+    assert_int_equal(store_build_loose_set(st), OK);
+    assert_true(store_loose_set_ready(st));
+    assert_true(store_loose_set_contains(st, hash));
+
+    /* Something never written is absent. The reconstruction reads the first
+     * byte from the bucket directory name and the rest from the filename, so
+     * a hash differing only in its first byte is the case that catches a
+     * prefix that was ignored. */
+    uint8_t other[OBJECT_HASH_SIZE];
+    memcpy(other, hash, sizeof(other));
+    other[0] = (uint8_t)(other[0] ^ 0xff);
+    assert_false(store_loose_set_contains(st, other));
+
+    done(st);
+}
+
+static void test_loose_set_survives_growing(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    assert_int_equal(store_build_loose_set(st), OK);
+
+    /*
+     * The table starts at 256 slots and doubles at 75% load, rehashing as it
+     * goes. A rehash that drops entries is the classic way this breaks, and
+     * it breaks silently: the set simply starts answering no. 5000 crosses
+     * several doublings.
+     */
+    enum { N = 5000 };
+    for (unsigned i = 0; i < N; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        fill_hash(h, i);
+        store_loose_set_insert(st, h);
+    }
+    for (unsigned i = 0; i < N; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        fill_hash(h, i);
+        assert_true(store_loose_set_contains(st, h));
+    }
+
+    /* Re-inserting a member must not grow the set a second time; if it did,
+     * the load factor would be wrong and the table would keep doubling. */
+    for (unsigned i = 0; i < 100; i++) {
+        uint8_t h[OBJECT_HASH_SIZE];
+        fill_hash(h, i);
+        store_loose_set_insert(st, h);
+        assert_true(store_loose_set_contains(st, h));
+    }
+
+    done(st);
+}
+
+static void test_loose_set_refuses_the_empty_sentinel(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    assert_int_equal(store_build_loose_set(st), OK);
+
+    /*
+     * An all-zero slot is how the table spells "empty", so an all-zero hash
+     * cannot be stored in it. Inserting one anyway would write a value
+     * indistinguishable from an empty slot and truncate every probe that
+     * lands on it - turning one bad insert into arbitrary false negatives
+     * elsewhere in the table.
+     */
+    uint8_t zero[OBJECT_HASH_SIZE];
+    memset(zero, 0, sizeof(zero));
+    store_loose_set_insert(st, zero);
+    assert_false(store_loose_set_contains(st, zero));
+
+    uint8_t real[OBJECT_HASH_SIZE];
+    fill_hash(real, 12345);
+    store_loose_set_insert(st, real);
+    assert_true(store_loose_set_contains(st, real));
+
+    done(st);
+}
+
+static void test_loose_set_ignores_junk_in_the_object_tree(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    const char *body = "a real object";
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
+
+    /*
+     * Editors, rsync and interrupted writes all leave files in a directory.
+     * A name of the wrong length or with a non-hex character must be skipped
+     * rather than parsed into a hash that names nothing.
+     */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/objects/ab", TEST_ROOT);
+    (void)mkdir(path, 0755);
+    const char *junk[] = {
+        "short",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", /* 62, not hex */
+        "0123456789012345678901234567890123456789012345678901234567890",  /* 61 */
+    };
+    for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); i++) {
+        char f[768];
+        snprintf(f, sizeof(f), "%s/%s", path, junk[i]);
+        FILE *fp = fopen(f, "w");
+        assert_non_null(fp);
+        fputs("not an object", fp);
+        fclose(fp);
+    }
+
+    store_clear_loose_set(st);
+    assert_int_equal(store_build_loose_set(st), OK);
+    /* The real object is still found, and nothing crashed on the way. */
+    assert_true(store_loose_set_contains(st, hash));
+
+    done(st);
+}
+
+static void test_loose_set_clear_forces_a_rebuild(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    assert_int_equal(store_build_loose_set(st), OK);
+
+    uint8_t h[OBJECT_HASH_SIZE];
+    fill_hash(h, 99);
+    store_loose_set_insert(st, h);
+    assert_true(store_loose_set_contains(st, h));
+
+    /* gc calls this after deleting objects: the set is a cache of what is on
+     * disk, and stale membership after a delete is a false positive. */
+    store_clear_loose_set(st);
+    assert_false(store_loose_set_ready(st));
+    assert_false(store_loose_set_contains(st, h));
+
+    /* Clearing twice is not a double free. */
+    store_clear_loose_set(st);
+
+    /* A build after a clear starts from the filesystem again, so the
+     * hand-inserted hash - which was never written - stays absent. */
+    assert_int_equal(store_build_loose_set(st), OK);
+    assert_false(store_loose_set_contains(st, h));
+
+    done(st);
+}
+
+/* ------------------------------------------------------------------ */
+/* The pack file-handle cache                                          */
+/* ------------------------------------------------------------------ */
+
+static FILE *scratch_file(const char *name)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", TEST_ROOT, name);
+    FILE *fp = fopen(path, "w+");
+    assert_non_null(fp);
+    return fp;
+}
+
+static void test_dat_cache_checkout_is_a_handoff(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    /* Nothing cached yet. */
+    assert_null(store_dat_cache_checkout(st, 7));
+
+    FILE *fp = scratch_file("pack-7");
+    store_dat_cache_return(st, 7, fp);
+
+    /* Checkout hands the handle over: it is the caller's until returned, so
+     * a second checkout of the same pack must not produce the same FILE* a
+     * second time. Two owners of one file position is a torn read. */
+    FILE *got = store_dat_cache_checkout(st, 7);
+    assert_ptr_equal(got, fp);
+    assert_null(store_dat_cache_checkout(st, 7));
+
+    store_dat_cache_return(st, 7, got);
+    assert_ptr_equal(store_dat_cache_checkout(st, 7), fp);
+    store_dat_cache_return(st, 7, fp);
+
+    done(st);
+}
+
+static void test_dat_cache_survives_growing(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    /*
+     * Same shape as the loose set: doubling at 75% load with a rehash. A
+     * dropped entry here leaks a FILE handle rather than losing data, which
+     * on a repository with thousands of packs is a descriptor exhaustion
+     * that looks like an unrelated failure much later.
+     */
+    enum { N = 400 };
+    FILE *handles[N];
+    for (unsigned i = 0; i < N; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "pack-%u", i);
+        handles[i] = scratch_file(name);
+        store_dat_cache_return(st, i, handles[i]);
+    }
+    for (unsigned i = 0; i < N; i++) {
+        FILE *got = store_dat_cache_checkout(st, i);
+        assert_ptr_equal(got, handles[i]);
+        store_dat_cache_return(st, i, got);
+    }
+
+    /* A pack that was never cached is a miss, not a wrong handle. */
+    assert_null(store_dat_cache_checkout(st, N + 1));
+
+    store_dat_cache_flush(st);
+    /* Everything is closed and gone; a checkout after a flush is a miss. */
+    for (unsigned i = 0; i < N; i++)
+        assert_null(store_dat_cache_checkout(st, i));
+    /* Flushing an already-flushed cache is not a double fclose. */
+    store_dat_cache_flush(st);
+
+    done(st);
+}
+
+static void test_dat_cache_return_ignores_null(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+    /* Callers pass through the result of an open that may have failed. */
+    store_dat_cache_return(st, 3, NULL);
+    assert_null(store_dat_cache_checkout(st, 3));
+    done(st);
+}
+
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -435,6 +698,14 @@ int main(void)
         cmocka_unit_test(test_pack_removed_cb_registration),
         cmocka_unit_test(test_pack_removed_without_cb),
         cmocka_unit_test(test_fuse_readahead_defaults_off),
+        cmocka_unit_test(test_loose_set_finds_what_was_written),
+        cmocka_unit_test(test_loose_set_survives_growing),
+        cmocka_unit_test(test_loose_set_refuses_the_empty_sentinel),
+        cmocka_unit_test(test_loose_set_ignores_junk_in_the_object_tree),
+        cmocka_unit_test(test_loose_set_clear_forces_a_rebuild),
+        cmocka_unit_test(test_dat_cache_checkout_is_a_handoff),
+        cmocka_unit_test(test_dat_cache_survives_growing),
+        cmocka_unit_test(test_dat_cache_return_ignores_null),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
