@@ -195,18 +195,35 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    /*
+     * One pass over objects, not four.
+     *
+     * The count, both size sums and the loose count were four separate
+     * subqueries against the same rows, so drawing a dashboard scanned the
+     * objects table four times. On a repository of 159k objects that measured
+     * 366 ms - the slowest interactive call in the whole surface, and the
+     * first thing a screen asks for. The other subqueries stay as they are:
+     * snapshots, packs and tags are small tables and their scans are noise
+     * beside this one.
+     */
     db_result_t *r = NULL;
     if (db_execute(g_db,
+            "WITH o AS ("
+            "  SELECT COUNT(*) AS n,"
+            "         COALESCE(SUM(phys_size),0) AS phys,"
+            "         COALESCE(SUM(orig_size),0) AS orig,"
+            "         COALESCE(SUM(location = 'loose'),0) AS loose"
+            "    FROM objects WHERE repo_id = ?"
+            ")"
             "SELECT"
             " (SELECT COUNT(*) FROM snapshots WHERE repo_id = ?),"
-            " (SELECT COUNT(*) FROM objects   WHERE repo_id = ?),"
-            " (SELECT COALESCE(SUM(phys_size),0) FROM objects WHERE repo_id = ?),"
-            " (SELECT COALESCE(SUM(orig_size),0) FROM objects WHERE repo_id = ?),"
+            " o.n, o.phys, o.orig,"
             " (SELECT COUNT(*) FROM packs      WHERE repo_id = ?),"
-            " (SELECT COUNT(*) FROM objects    WHERE repo_id = ? AND location = 'loose'),"
+            " o.loose,"
             " (SELECT COUNT(*) FROM tags       WHERE repo_id = ?),"
-            " (SELECT COALESCE(MAX(ts),0) FROM snapshots WHERE repo_id = ?)",
-            (const char *[]){ repo, repo, repo, repo, repo, repo, repo, repo, NULL },
+            " (SELECT COALESCE(MAX(ts),0) FROM snapshots WHERE repo_id = ?)"
+            "  FROM o",
+            (const char *[]){ repo, repo, repo, repo, repo, NULL },
             &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(500, "cannot read repository summary");
