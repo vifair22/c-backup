@@ -2163,6 +2163,49 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     if (!w || !w->dat_f) return set_error(ERR_INVALID, "pack_stored_add: no writer");
     if (pack_stored_has(w, hash)) return OK;
 
+    /*
+     * Refuse anything a reader will not open.
+     *
+     * This writer is handed entry headers rather than deriving them, so the
+     * values arrive from wherever the caller got them - today a repository
+     * this machine owns, tomorrow a socket. An entry written here is durable
+     * immediately, and pack_enumerate_dat is deliberately tolerant: it reads
+     * headers with a plain fread so that a damaged pack can still be walked.
+     * So an entry with a codec nobody writes enumerates perfectly, GC and
+     * reindex both count it, and it is unreadable for as long as the
+     * repository exists. Checking at the door is the only place the mistake
+     * is still cheap.
+     *
+     * The checks are the reader's own, not stricter ones: whatever
+     * read_entry_hdr accepts, this accepts.
+     */
+    if (compression != COMPRESS_NONE && compression != COMPRESS_LZ4 &&
+        compression != COMPRESS_LZ4_FRAME)
+        return set_error(ERR_INVALID, "pack_stored_add: unknown compression codec %u",
+                         compression);
+    if (encryption != ENCRYPT_NONE && encryption != ENCRYPT_CHACHA20)
+        return set_error(ERR_INVALID, "pack_stored_add: unknown encryption codec %u",
+                         encryption);
+    if (encryption != ENCRYPT_NONE && len < OBJECT_CRYPT_OVERHEAD)
+        return set_error(ERR_INVALID,
+                         "pack_stored_add: ciphertext shorter than its nonce and tag");
+
+    /*
+     * An uncompressed entry stores exactly its payload, plus the nonce and
+     * tag when encrypted. The reader checks this and calls a mismatch
+     * corruption, so an entry that fails it here would be corrupt the moment
+     * it landed. Nothing equivalent can be checked for the LZ4 codecs
+     * without decompressing, which needs the key this path does not have.
+     */
+    if (compression == COMPRESS_NONE) {
+        uint64_t expect = uncompressed_size +
+                          (encryption != ENCRYPT_NONE ? OBJECT_CRYPT_OVERHEAD : 0u);
+        if ((uint64_t)len != expect)
+            return set_error(ERR_INVALID,
+                             "pack_stored_add: uncompressed entry stores %zu bytes, "
+                             "expected %llu", len, (unsigned long long)expect);
+    }
+
     if (w->count == w->cap) {
         uint32_t ncap = w->cap ? w->cap * 2u : 256u;
         pack_idx_disk_entry_t *ne = realloc(w->entries, (size_t)ncap * sizeof(*ne));

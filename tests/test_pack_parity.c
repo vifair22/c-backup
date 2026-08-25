@@ -446,6 +446,82 @@ static void test_entry_header_beyond_file_is_refused(void **state)
     assert_null(out);
 }
 
+/*
+ * An entry that no reader would open is refused rather than written.
+ *
+ * pack_stored_add is handed entry headers instead of deriving them, so its
+ * values come from wherever the caller got them - a repository this machine
+ * owns today, a peer over a socket once replication has a network sink. An
+ * entry is durable the moment it is written, and pack_enumerate_dat reads
+ * headers with a plain fread so a damaged pack can still be walked: an entry
+ * with a codec nobody writes therefore enumerates perfectly, GC and reindex
+ * both count it, and it never opens again.
+ *
+ * Found by fuzz_pack_stored, whose oracle is that anything the writer
+ * accepts the reader can open.
+ */
+static void test_stored_writer_refuses_what_no_reader_opens(void **state)
+{
+    (void)state;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    memset(hash, 0xA5, sizeof(hash));
+    const char body[] = "payload";
+
+    pack_stored_writer_t *w = NULL;
+    assert_int_equal(pack_stored_open(store, &w), OK);
+
+    /* A compression codec no build has ever emitted. */
+    assert_int_not_equal(pack_stored_add(w, hash, OBJECT_TYPE_FILE, 0x2a,
+                                         ENCRYPT_NONE, sizeof(body) - 1,
+                                         body, sizeof(body) - 1), OK);
+    err_clear();
+
+    /* A cipher codec likewise. */
+    assert_int_not_equal(pack_stored_add(w, hash, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         0x77, sizeof(body) - 1,
+                                         body, sizeof(body) - 1), OK);
+    err_clear();
+
+    /* An uncompressed entry whose stored length disagrees with the size it
+     * claims to hold: the reader calls that corruption, so writing it would
+     * store something corrupt on purpose. */
+    assert_int_not_equal(pack_stored_add(w, hash, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         ENCRYPT_NONE, 999,
+                                         body, sizeof(body) - 1), OK);
+    err_clear();
+
+    /* Ciphertext too short to contain its own nonce and tag. */
+    assert_int_not_equal(pack_stored_add(w, hash, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                         ENCRYPT_CHACHA20, 1, body, 4), OK);
+    err_clear();
+
+    /* Nothing was accepted, so there is nothing to install. */
+    assert_int_equal(pack_stored_count(w), 0);
+
+    /* A well-formed entry still goes through, so the checks reject the
+     * malformed rather than everything. */
+    assert_int_equal(pack_stored_add(w, hash, OBJECT_TYPE_FILE, COMPRESS_NONE,
+                                     ENCRYPT_NONE, sizeof(body) - 1,
+                                     body, sizeof(body) - 1), OK);
+    assert_int_equal(pack_stored_count(w), 1);
+
+    uint32_t packed = 0;
+    assert_int_equal(pack_stored_finish(w, &packed), OK);
+    assert_int_equal(packed, 1);
+
+    /* And it reads back, which is the property the refusals protect. */
+    pack_cache_invalidate(store);
+    uint8_t type = 0, comp = 0, enc = 0;
+    uint64_t usize = 0;
+    void *payload = NULL;
+    size_t len = 0;
+    assert_int_equal(pack_object_read_stored(store, hash, &type, &comp, &enc,
+                                             &usize, &payload, &len), OK);
+    assert_int_equal(len, sizeof(body) - 1);
+    assert_memory_equal(payload, body, len);
+    free(payload);
+}
+
 int main(void)
 {
     rs_init();
@@ -461,6 +537,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_detected_not_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_entry_header_beyond_file_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_stored_writer_refuses_what_no_reader_opens, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
