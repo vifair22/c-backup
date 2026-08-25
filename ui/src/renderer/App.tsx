@@ -17,6 +17,7 @@ import { JournalView } from './JournalView'
 import { TaskBar, type TaskInfo } from './TaskBar'
 import { TaskListView } from './TaskListView'
 import { TagsView } from './TagsView'
+import { SchedulesView } from './SchedulesView'
 import { useTheme, type ThemeMode } from './useTheme'
 
 const api = window.cbackup
@@ -45,7 +46,7 @@ export function App(): React.ReactElement {
   const [connections, setConnections] = useState<ConnectionState[]>([])
   const [activeRepo, setActiveRepo] = useState<{ conn: string; path: string } | null>(null)
   // Navigation history
-  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' }
+  type ViewState = { view: 'dashboard' } | { view: 'snapshots' } | { view: 'snapshot-browser'; snapId: number; path?: string } | { view: 'diff'; snapA?: number; snapB?: number } | { view: 'search' } | { view: 'policy' } | { view: 'journal' } | { view: 'tags' } | { view: 'tasks' } | { view: 'hash-lookup' } | { view: 'loose-objects' } | { view: 'pack-browser' } | { view: 'schedules' }
   const [navHistory, setNavHistory] = useState<ViewState[]>([{ view: 'dashboard' }])
   const [navIndex, setNavIndex] = useState(0)
   const currentView = navHistory[navIndex]
@@ -652,6 +653,7 @@ export function App(): React.ReactElement {
                 onEditPolicy={() => navigateTo({ view: 'policy' })}
                 onViewJournal={() => navigateTo({ view: 'journal' })}
                 onViewTags={() => navigateTo({ view: 'tags' })}
+                onViewSchedules={() => navigateTo({ view: 'schedules' })}
                 onViewTasks={() => navigateTo({ view: 'tasks' })}
                 onHashLookup={() => navigateTo({ view: 'hash-lookup' })}
                 onLooseObjects={() => navigateTo({ view: 'loose-objects' })}
@@ -685,6 +687,11 @@ export function App(): React.ReactElement {
             {currentView.view === 'tags' && (
               <TagsView connName={activeRepo.conn} repoPath={activeRepo.path}
                 onSelectSnapshot={(id) => navigateTo({ view: 'snapshot-browser', snapId: id })}
+                onBack={navBack}
+              />
+            )}
+            {currentView.view === 'schedules' && (
+              <SchedulesView connName={activeRepo.conn} repoPath={activeRepo.path}
                 onBack={navBack}
               />
             )}

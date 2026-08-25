@@ -277,6 +277,58 @@ describe('the flows behind the buttons', () => {
     assert.equal(restored.status, 202, `restore was refused: ${JSON.stringify(restored.body)}`)
   })
 
+  test('schedules: list, add, pause, resume, remove', async () => {
+    const path = join(work, 'schedrepo')
+    const created = await request(toEndpoint({ kind: 'repoAdd', path, label: 'sched' }))
+    assert.equal(created.status, 201)
+    const repoId = (created.body as { id: number }).id
+
+    /* The screen opens on an empty list rather than an error. */
+    let list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
+    assert.equal(list.status, 200)
+    assert.deepEqual((list.body as { schedules?: unknown[] }).schedules ?? [], [])
+
+    /*
+     * A backup schedule for a repository with no sources is refused, and the
+     * screen shows the reason verbatim because it says what to do next.
+     * Being refused here is the fix for schedules that were accepted and
+     * then failed nightly in a log nobody reads.
+     */
+    const premature = await request(toEndpoint({
+      kind: 'scheduleAdd', repoId, action: 'backup',
+      trigger: { type: 'interval', seconds: 86400 },
+    }))
+    assert.equal(premature.status, 400)
+
+    /* With sources set, the same request is accepted. */
+    await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [join(work, 'src')] }))
+    const added = await request(toEndpoint({
+      kind: 'scheduleAdd', repoId, action: 'backup',
+      trigger: { type: 'interval', seconds: 86400 },
+    }))
+    assert.ok(added.status < 400, `schedule add failed: ${JSON.stringify(added.body)}`)
+
+    list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
+    const rows = (list.body as { schedules: { id: string; enabled: string }[] }).schedules
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].enabled, '1')
+
+    /* Pause and resume, which is the toggle in the table. */
+    const sid = Number(rows[0].id)
+    await request(toEndpoint({ kind: 'scheduleSetEnabled', repoId, scheduleId: sid, enabled: false }))
+    list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
+    assert.equal((list.body as { schedules: { enabled: string }[] }).schedules[0].enabled, '0')
+
+    await request(toEndpoint({ kind: 'scheduleSetEnabled', repoId, scheduleId: sid, enabled: true }))
+    list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
+    assert.equal((list.body as { schedules: { enabled: string }[] }).schedules[0].enabled, '1')
+
+    /* And removed, leaving the empty state the screen started from. */
+    await request(toEndpoint({ kind: 'scheduleRemove', repoId, scheduleId: sid }))
+    list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
+    assert.deepEqual((list.body as { schedules?: unknown[] }).schedules ?? [], [])
+  })
+
   test('the maintenance menu starts every operation it offers', async () => {
     const ops = ['verify', 'pack', 'gc', 'gfs', 'reindex'] as const
     for (const kind of ops) {
