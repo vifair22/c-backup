@@ -136,3 +136,60 @@ export async function openRepo(page: Page, label: string): Promise<void> {
   await page.getByText(label, { exact: true }).first().click()
   await page.waitForTimeout(600)
 }
+
+/* ------------------------------------------------------------------ */
+/* Timing                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * How long an interaction takes, from the click to the answer being on
+ * screen.
+ *
+ * Measured rather than judged. Everything here talks to a daemon over a unix
+ * socket on the same machine, so a screen that feels slow is the app's doing:
+ * a request that should have been parallel, a refetch that should have been
+ * cached, or a render waiting on data it did not need. Those are invisible
+ * until somebody puts a number on them.
+ *
+ * The budget is deliberately not per-screen. A user does not know which
+ * endpoint a page uses; they know whether the app answered.
+ */
+export const BUDGET_MS = {
+  /* Moving around inside a repository. Nothing here does real work. */
+  navigation: 400,
+  /* Opening a dialog that has to read something first. */
+  dialog: 500,
+  /* Starting a job. The work is asynchronous by design, so this measures
+   * the handoff, not the backup. */
+  submit: 600,
+}
+
+export interface Timing { label: string; ms: number; budget: number }
+
+export const timings: Timing[] = []
+
+export async function timed(
+  label: string,
+  budget: number,
+  action: () => Promise<void>,
+): Promise<number> {
+  const started = Date.now()
+  await action()
+  const ms = Date.now() - started
+  timings.push({ label, ms, budget })
+  return ms
+}
+
+/* Printed as a table at the end of a run, so a regression is visible as a
+ * number moving rather than as a test that happens to still pass. */
+export function reportTimings(): void {
+  if (timings.length === 0) return
+  const width = Math.max(...timings.map(t => t.label.length))
+  process.stdout.write('\n  interaction timings\n')
+  for (const t of timings) {
+    const flag = t.ms > t.budget ? '  OVER BUDGET' : ''
+    process.stdout.write(
+      `    ${t.label.padEnd(width)}  ${String(t.ms).padStart(5)} ms  (budget ${t.budget})${flag}\n`)
+  }
+  process.stdout.write('\n')
+}
