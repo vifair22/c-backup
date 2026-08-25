@@ -248,3 +248,78 @@ slash while search result paths do.
 - Auth, which only matters for the TCP path.
 - G2 (a tag protecting a snapshot from retention) needs backdated snapshots
   and is covered by `tests/test_gfs.c` instead, where dates can be pinned.
+
+---
+
+# Results: Unraid
+
+A second pass against a live Unraid 7.3.2 server - 125 GB RAM, 27 running
+containers including GitLab, Plex and Immich, load average around 5 before
+any of this started. The daemon ran as the CI-built container image from the
+registry, with the source mounted read-only and the repository written to a
+directory of its own.
+
+This is the machine the app was reported to die on, so the questions were
+what dies and why, not whether the features work.
+
+## Where the repository lives is the biggest single factor
+
+The same source, the same 6,749 files, with only the destination changed:
+
+| Phase | Repo on `/mnt/disk1` (parity array) | Repo on `/mnt/cache` (ZFS SSD) |
+|-------|-------------------------------------|--------------------------------|
+| scan+store | 67.0 s | 18.7 s |
+| trees | 60.9 s | 18.8 s |
+| packing | around 360 s | far less |
+
+A repository is thousands of small loose objects before it is packed, and
+every small write to a parity-protected array costs a parity
+read-modify-write. Reads are unaffected - a deep verify read 2.38 GB back
+off the same array in 18 seconds - so this is a write-amplification story,
+not a slow-disk story.
+
+**A repository does not belong on a parity-protected array disk.** Cache, an
+unassigned device, or anything outside the array.
+
+## What was ruled out
+
+- **`build_trees` is linear.** 341 trees/s at 580 trees and 326 trees/s at
+  25,509 locally - across a 44x range. The counting-sort fix holds and the
+  Unraid slowness is the storage, not the algorithm.
+- **Connections do not accumulate.** The CLI opens a new connection every
+  100 ms while waiting on a job, and MHD's default connection limit is
+  around 1020, which lined up suspiciously well with a failure at roughly
+  1330 polls. Measured instead of assumed: descriptors and threads stayed
+  flat at 8 and 7 under sustained polling. The theory was wrong.
+- **The daemon never died.** Zero restarts across every run. A "lost contact
+  with the daemon" seen once was the test harness tearing down its own ssh
+  session, not the daemon - re-run detached, the same wait returned EXIT=0.
+
+## Defects found
+
+1. **`store.fuse_readahead` is a config key nothing reads.** Every
+   production caller passes NULL for the store config, so
+   `enable_fuse_readahead` is always zero and the FUSE readahead ring is
+   unreachable in any configuration. Setting the key does nothing. This is
+   the same shape as the `http.bind` bug: a value accepted and not honoured.
+   It also means the ring cannot be the cause of any current problem,
+   whatever it did historically.
+2. **A socket gets node type 0.** `stat_to_node_type` returns 0 for
+   anything it does not recognise, and appdata contains five of them.
+   Backup skips them correctly, but a restore has no case for type 0, so
+   they would come back as empty regular files.
+
+## Scaling limit worth knowing
+
+The scan holds every entry in memory. Measured at 487 MB peak for 622,000
+entries - about 820 bytes each, the 384-byte struct plus its path string.
+
+| Files | Scan memory |
+|-------|-------------|
+| 622,000 (measured) | 487 MB |
+| 1.18M (full appdata) | around 925 MB |
+| 10M | around 8 GB |
+
+Comfortable on a 125 GB server. Not comfortable on the 2-4 GB NAS that is a
+perfectly ordinary place to run a backup, and it sits against the design
+constraint that says never assume the data fits in memory.
