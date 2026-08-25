@@ -614,10 +614,23 @@ $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS
 
 # Ratchet, not aspiration: the floor is what the current phase actually
 # achieves, raised as each phase lands. src/store/ is gated separately because
-# it is the code that survives. The gap to the 80% standard is in pack.c's
-# error branches, which need failure injection past what the fault suites
-# reach. See daemonization-spec.md section 14.
-COV_STORE_MIN := 66
+# it is the code that survives.
+#
+# What stands between here and the 80% standard, measured rather than guessed:
+#
+#   - object.c carries ~170 uncovered lines of FUSE readahead ring. It needs
+#     both the opt-in config and an fd whose fstatfs reports FUSE_SUPER_MAGIC,
+#     so reaching it means mounting a real FUSE filesystem in the suite -
+#     /dev/fuse and privileges a CI container does not have.
+#   - pack.c's largest block is the RS repair inside pack_object_load_stream.
+#     A flipped payload byte does not reach it: the block-level parity repairs
+#     the damage before the CRC scan runs, so need_rs_repair never sets. It
+#     needs corruption crafted to survive that earlier layer.
+#   - The rest is error paths behind read(), write() and pwrite(), which the
+#     fault injector does not wrap yet.
+#
+# See daemonization-spec.md section 14.
+COV_STORE_MIN := 74
 
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS)
 	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
