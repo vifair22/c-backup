@@ -1,4 +1,9 @@
-# Direct-to-pack writing: survey before design
+# Direct-to-pack writing
+
+Done. A full backup went from 31.07s to 6.33s on the reference fixture and
+leaves nothing loose; the numbers are journalled in PERF.md. What follows is
+the survey this was designed from, kept because the constraints it records are
+what any future change to the pack path has to respect.
 
 The profiler attributes 41% of a full backup to `rename()`, one per object,
 installing a finished temp file into `objects/xx/`. Reading, hashing,
@@ -156,17 +161,51 @@ process that dies leaves the file behind. Today that is bounded by how often a
 pack run is interrupted. Under direct-to-pack every backup holds an open pack,
 so every interrupted backup leaves one - worth a sweep of `tmp/` at startup.
 
-## Where this leaves the design
+## What was built
 
-Nothing here rules the change out, and the factoring is friendlier than
-expected. The shape it points to is a backup-owned pack writer that borrows
-`open_new_pack` and `finalize_pack` unchanged, accumulates `pack_entry_parity_t`
-per entry the way the `repo_pack` workers do rather than re-reading, carries a
-staged-hash set for in-flight dedup, rolls over at 256 MiB, and draws its pack
-numbers from the same source as everyone else.
+A backup-owned pack writer that borrows `open_new_pack` and `finalize_pack`
+unchanged, accumulates parity per entry the way the `repo_pack` workers do
+rather than re-reading, carries a staged-hash set for in-flight dedup, rolls
+over at 256 MiB, and draws its pack numbers from the same source as everyone
+else. The entry emitter itself is shared with `pw_write_small` rather than
+duplicated: everything upstream of it differs between callers and everything
+from there down must not, because that is where the on-disk format is decided.
 
-Open decisions, in the order they matter:
+There is no flag and no second mode. Objects that the pack format cannot take -
+a file with holes, or one past `PACK_STREAM_THRESHOLD`, since an entry header
+carries its object's hash and cannot be written until the whole object has been
+read - still go loose and are packed afterwards by the ordinary auto-pack. That
+is the format's constraint rather than a configuration, and it lives as a size
+guard inside the store layer, not as a branch in the backup pipeline.
 
-1. Large incompressible objects: pack them, or keep writing them loose?
-2. ~~Pack numbering~~ - done: all writers take `next_pack_num` unmodified.
-3. ~~`tmp/` sweep on startup~~ - done: `store_sweep_tmp`, by age, in `store_open`.
+Three things the wiring had to get right, none of which were visible from
+outside the pack path:
+
+- **Rollover has exactly one safe point.** Sealing a pack emits the commit
+  callback, which begins a transaction, and the write lock is not recursive.
+  `store_content` holds a transaction across each 2,000-entry batch, so the
+  only place a pack may be sealed is the boundary where that batch has just
+  committed. Anywhere else deadlocks the backup against itself.
+- **The writer is sealed before the snapshot record is written.** A packed
+  object does not resolve until its pack installs, so a record naming the root
+  tree first would point at a tree nothing could find.
+- **`phys_size` means the stored payload for a packed object**, not the payload
+  plus its entry header. That is what `db_pack_commit` records, because a
+  pack's own header and trailer are charged to `packs.size`; including the
+  entry header would count it twice. The writer briefly disagreed and the
+  disagreement was invisible, because the commit callback overwrites the value
+  a moment later.
+
+Decisions taken:
+
+1. Large incompressible objects are packed rather than left loose, so the
+   classification matrix no longer has a "stays loose forever" cell for size
+   alone. What stays loose is only what cannot be hashed before its header is
+   written.
+2. Pack numbering: all writers take `next_pack_num` unmodified.
+3. `tmp/` sweep on startup: `store_sweep_tmp`, by age, in `store_open`.
+
+Still open, and unaffected by this: an incremental where nothing changed is
+still 67% `index_nodes` rewriting every node row for a snapshot identical to
+the last. That needs the lazy materialisation the schema was designed for and
+whose fault-in path was never built.

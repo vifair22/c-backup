@@ -10,6 +10,7 @@
 #include "store_index.h"
 #include "db_txn.h"
 #include "phase_timer.h"
+#include "pack.h"
 
 #include <cutils/log.h>
 
@@ -72,6 +73,14 @@ typedef struct {
     hashset_t      meta_seen;
     /* Per-component attribution for the whole run. */
     phase_timers_t *timers;
+    /*
+     * Every object this run produces goes into this pack. There is no second
+     * mode: the loose path is what objects fall back to when the pack format
+     * cannot take them - a file with holes, or one too large to hash before
+     * its entry header is written - and those are packed afterwards by the
+     * ordinary auto-pack, as they always were.
+     */
+    pack_backup_writer_t *pack_w;
 } pipeline_t;
 
 static void hashset_free(hashset_t *s)
@@ -260,8 +269,11 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
 
     int is_new = 0;
     uint64_t phys = 0;
-    status_t st = object_store_ex(p->store, obj_type, data, len, out_hash,
-                                  &is_new, &phys);
+    object_write_t ow;
+    status_t st = object_store_packed(p->store, obj_type, data, len,
+                                      p->pack_w, out_hash, &ow);
+    is_new = ow.is_new;
+    phys   = ow.phys_bytes;
     if (st != OK) return st;
     if (is_new) {
         p->res->objects_new++;
@@ -338,6 +350,24 @@ static status_t store_content(pipeline_t *p)
         }
 
         /*
+         * Seal the open pack here, if it has filled, and nowhere else.
+         *
+         * This is the only point in the loop where no transaction is held.
+         * Sealing emits the commit callback, which begins one of its own, and
+         * the write lock is not recursive - doing it a few lines further down,
+         * inside the batch, deadlocks the backup against itself.
+         *
+         * The headroom is what the next entry might need. Checking after the
+         * fact instead would let one file push the pack past its seal, which
+         * is harmless for a 14 KiB file and is not for a 16 MiB one.
+         */
+        #define PACK_ROLLOVER_HEADROOM PACK_STREAM_THRESHOLD
+        if (!in_txn && pack_backup_full(p->pack_w, PACK_ROLLOVER_HEADROOM)) {
+            status_t rst = pack_backup_rollover(p->pack_w);
+            if (rst != OK) return rst;
+        }
+
+        /*
          * The file is only opened when the cache cannot vouch for it. This is
          * the difference between an incremental costing a full read of the
          * tree and costing a directory walk: content addressing has no way to
@@ -367,8 +397,9 @@ static status_t store_content(pipeline_t *p)
 
         object_write_t w;
         uint64_t _tr = phase_now();
-        status_t st = object_store_file_info(p->store, fd, e->node.size,
-                                             e->node.content_hash, &w);
+        status_t st = object_store_file_packed(p->store, fd, e->node.size,
+                                               p->pack_w,
+                                               e->node.content_hash, &w);
         phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
@@ -416,6 +447,7 @@ static status_t store_content(pipeline_t *p)
         log_warn("backup: cache commit failed");
     return OK;
     #undef CACHE_BATCH
+    #undef PACK_ROLLOVER_HEADROOM
 }
 
 /* ------------------------------------------------------------------ */
@@ -483,8 +515,11 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
     uint8_t *buf = NULL; size_t len = 0;
     status_t st = manifest_serialise(entries, k, &buf, &len);
     if (st == OK) {
-        st = object_store_ex(p->store, OBJECT_TYPE_TREE, buf, len, out_hash,
-                             &is_new, &tree_phys);
+        object_write_t tw;
+        st = object_store_packed(p->store, OBJECT_TYPE_TREE, buf, len,
+                                 p->pack_w, out_hash, &tw);
+        is_new    = tw.is_new;
+        tree_phys = tw.phys_bytes;
         free(buf);
     }
     free(entries);
@@ -938,7 +973,10 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL };
+
+    st = pack_backup_open(store, &p.pack_w);
+    if (st != OK) { free(links); scan_result_free(scan); return st; }
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
@@ -951,6 +989,28 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st == OK) st = build_trees(&p, root_hash);
     phase_add(&timers, PHASE_TREES, _ttr);
     clock_gettime(CLOCK_MONOTONIC, &t2);
+
+    /*
+     * Seal here, and not later.
+     *
+     * The snapshot record about to be written names the root tree, and a
+     * packed object does not resolve until its pack installs and the commit
+     * callback has recorded it. Writing the record first would leave a
+     * snapshot pointing at a tree nothing can find, for as long as the run
+     * takes to finish - and for ever if it does not.
+     *
+     * This is also the last moment at which no transaction is open. Sealing
+     * emits the commit callback, which begins one, and index_nodes below
+     * holds one across each of its batches.
+     */
+    if (st == OK) {
+        uint32_t staged = 0;
+        st = pack_backup_finish(p.pack_w, &staged);
+        p.pack_w = NULL;
+        if (st == OK && staged)
+            log_info("backup: staged %u object(s) directly into pack files", staged);
+    }
+    if (p.pack_w) { pack_backup_abort(p.pack_w); p.pack_w = NULL; }
 
     if (st != OK) {
         hashset_free(&p.meta_seen);

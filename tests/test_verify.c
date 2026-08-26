@@ -79,6 +79,32 @@ static int setup(void **state)
     if (mkdir(TEST_SRC, 0700) != 0) return -1;
     write_file(TEST_SRC "/alpha.txt", "alpha content, long enough to have a payload\n");
     write_file(TEST_SRC "/beta.txt",  "beta content, also with something in it\n");
+
+    /*
+     * One object that stays loose, because several tests here damage a loose
+     * file directly and a backup no longer produces any: it writes into packs
+     * as it goes. What still goes loose is what the pack format cannot take
+     * without reading it twice - anything past PACK_STREAM_THRESHOLD, since an
+     * entry header carries its object's hash and cannot be written until the
+     * whole object has been read.
+     *
+     * Loose verify and loose repair are not legacy paths. They are what those
+     * objects get, and this keeps them covered; the packed equivalents are
+     * covered by test_verify_covers_packed_objects.
+     */
+    {
+        size_t big = (size_t)PACK_STREAM_THRESHOLD + 4096;
+        char *buf = malloc(big);
+        if (!buf) return -1;
+        for (size_t i = 0; i < big; i++) buf[i] = (char)('a' + (i % 23));
+        FILE *f = fopen(TEST_SRC "/loose.bin", "wb");
+        if (!f) { free(buf); return -1; }
+        size_t wrote = fwrite(buf, 1, big, f);
+        fclose(f);
+        free(buf);
+        if (wrote != big) return -1;
+    }
+
     parity_stats_reset();
     return 0;
 }
@@ -162,7 +188,7 @@ static void test_deep_verify_repairs_payload_damage(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("alpha.txt", hex);
+    content_hash_of("loose.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
 
@@ -194,7 +220,7 @@ static void test_verify_without_repair_leaves_disk_untouched(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("alpha.txt", hex);
+    content_hash_of("loose.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
     flip_byte(path, (off_t)sizeof(object_header_t) + 4);
@@ -222,7 +248,7 @@ static void test_unrecoverable_damage_names_the_affected_files(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("alpha.txt", hex);
+    content_hash_of("loose.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
 
@@ -253,7 +279,7 @@ static void test_unrecoverable_damage_names_the_affected_files(void **state)
         " WHERE hash = ?", (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     assert_true(strtoll(r->rows[0][1], NULL, 10) >= 1);
-    assert_non_null(strstr(r->rows[0][2], "alpha.txt"));
+    assert_non_null(strstr(r->rows[0][2], "loose.bin"));
     db_result_free(r);
 }
 
@@ -265,7 +291,7 @@ static void test_index_level_finds_a_deleted_object(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("beta.txt", hex);
+    content_hash_of("loose.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
     assert_int_equal(unlink(path), 0);
@@ -289,7 +315,7 @@ static void test_structure_level_does_not_read_payloads(void **state)
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    content_hash_of("alpha.txt", hex);
+    content_hash_of("loose.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
     flip_byte(path, (off_t)sizeof(object_header_t) + 4);
@@ -313,9 +339,10 @@ static void test_verify_covers_packed_objects(void **state)
 {
     (void)state;
     run_backup();
+    /* Sweeps up the one object the pack format could not take; everything
+     * else was packed by the backup itself. */
     uint32_t packed = 0;
     assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed > 0);
 
     verify_result_t res;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,

@@ -1214,6 +1214,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         uint64_t *out_payload_size,
+                                        pack_backup_writer_t *pack_w,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx);
 
@@ -1562,7 +1563,37 @@ status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, NULL, NULL, NULL);
+                                   out_is_new, out_phys_bytes, NULL, NULL, NULL, NULL);
+}
+
+status_t object_store_packed(store_t *store, uint8_t type,
+                             const void *data, size_t len,
+                             pack_backup_writer_t *pack_w,
+                             uint8_t out_hash[OBJECT_HASH_SIZE],
+                             object_write_t *out_info) {
+    object_write_t scratch;
+    object_write_t *w = out_info ? out_info : &scratch;
+    memset(w, 0, sizeof(*w));
+    w->payload_size = len;
+
+    if (pack_w && (uint64_t)len <= PACK_STREAM_THRESHOLD)
+        return pack_backup_add(pack_w, type, data, len, out_hash,
+                               &w->is_new, &w->phys_bytes, &w->payload_size);
+
+    return object_store_ex(store, type, data, len, out_hash,
+                           &w->is_new, &w->phys_bytes);
+}
+
+status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
+                                  pack_backup_writer_t *pack_w,
+                                  uint8_t out_hash[OBJECT_HASH_SIZE],
+                                  object_write_t *out_info) {
+    object_write_t scratch;
+    object_write_t *w = out_info ? out_info : &scratch;
+    memset(w, 0, sizeof(*w));
+    return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
+                                   &w->is_new, &w->phys_bytes, &w->payload_size,
+                                   pack_w, NULL, NULL);
 }
 
 status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
@@ -1573,7 +1604,7 @@ status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
     memset(w, 0, sizeof(*w));
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
                                    &w->is_new, &w->phys_bytes, &w->payload_size,
-                                   NULL, NULL);
+                                   NULL, NULL, NULL);
 }
 
 static status_t object_store_file_ex_cb(store_t *store, int fd,
@@ -1582,6 +1613,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         uint8_t out_hash[OBJECT_HASH_SIZE],
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         uint64_t *out_payload_size,
+                                        pack_backup_writer_t *pack_w,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx) {
     if (file_size == 0) {
@@ -1657,6 +1689,39 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
         /* The plain stream writes uncompressed_size = file_size, so for a file
          * with no holes the payload and the logical size are the same number. */
         if (out_payload_size) *out_payload_size = file_size;
+
+        /*
+         * Straight into the open pack, when there is one and the file is small
+         * enough to hash before its entry header is written.
+         *
+         * The decision sits here rather than in the caller because it depends
+         * on whether the file has holes, and that is what the code above has
+         * just worked out. A sparse object hashes over its region table rather
+         * than its contents, so routing one down this path would give it a
+         * different hash from the same file stored loose and quietly split the
+         * repository's deduplication in two.
+         */
+        if (pack_w && file_size <= PACK_STREAM_THRESHOLD) {
+            uint8_t *buf = malloc((size_t)file_size);
+            if (!buf) {
+                if (src_path) close(fd);
+                return set_error(ERR_NOMEM, "store: pack staging buffer");
+            }
+            if (lseek(fd, 0, SEEK_SET) == (off_t)-1 ||
+                io_read_full(fd, buf, (size_t)file_size) != 0) {
+                free(buf);
+                if (src_path) close(fd);
+                return set_error_errno(ERR_IO, "store: read for pack staging");
+            }
+            if (src_path) close(fd);
+            status_t pst = pack_backup_add(pack_w, OBJECT_TYPE_FILE, buf,
+                                           (size_t)file_size, out_hash,
+                                           out_is_new, out_phys_bytes,
+                                           out_payload_size);
+            free(buf);
+            return pst;
+        }
+
         return write_object_file_stream(store, fd, src_path, file_size, out_hash,
                                         out_is_new, out_phys_bytes,
                                         progress_cb, progress_ctx);
@@ -1686,7 +1751,7 @@ status_t object_store_file_cb(store_t *store, int fd, const char *src_path,
      * For non-sparse files it falls through to write_object_file_stream.
      * The progress callback is only used on the streaming (non-sparse) path. */
     return object_store_file_ex_cb(store, fd, src_path, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, NULL, cb, cb_ctx);
+                                   out_is_new, out_phys_bytes, NULL, NULL, cb, cb_ctx);
 }
 
 /* ------------------------------------------------------------------ */

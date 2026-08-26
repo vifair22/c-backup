@@ -102,10 +102,6 @@ typedef struct {
 
 #define PACK_WORKER_THREADS_MAX 32
 
-/* Objects above this threshold are streamed chunk-by-chunk rather than
- * loaded entirely into memory.  Matches STREAM_CHUNK in object.c. */
-#define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
-
 /* Maximum body size for multi-object packs.  When adding the next object
  * would exceed this limit, the current pack is finalized and a new one is
  * started.  Both large (streamed) and small (worker-compressed) objects
@@ -3204,9 +3200,23 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
     }
     staged_set_insert(&w->seen, out_hash, slot);
 
-    if (out_is_new)     *out_is_new = 1;
-    if (out_phys_bytes) *out_phys_bytes = w->pw.idx_entries[slot].compressed_size
-                                        + sizeof(pack_dat_entry_hdr_t);
+    if (out_is_new) *out_is_new = 1;
+    /*
+     * The stored payload, without the entry header.
+     *
+     * That is what db_pack_commit records for a packed object, deliberately:
+     * a pack's own header and parity trailer are charged to packs.size rather
+     * than split across its entries, so total bytes on disk is sum(packs.size)
+     * plus the phys_size of whatever is still loose. Including the entry header
+     * here would count it twice, and would disagree with the value the commit
+     * callback overwrites this one with a moment later - which is the sort of
+     * difference that shows up as a statistic contradicting itself long after
+     * anyone remembers why.
+     *
+     * Note this is not the convention pack_object_physical_size uses; that one
+     * answers "how many bytes does this entry occupy" and includes the header.
+     */
+    if (out_phys_bytes) *out_phys_bytes = w->pw.idx_entries[slot].compressed_size;
     return OK;
 }
 

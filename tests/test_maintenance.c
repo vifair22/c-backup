@@ -252,14 +252,21 @@ static void test_gc_clears_pack_locations_for_swept_objects(void **state)
     backup_result_t first;
     assert_int_equal(backup_run(store, db, repo_id, &o, &first), OK);
 
-    /* Move everything into a pack, which populates pack_objects. */
+    /* The backup packs as it goes, so pack_objects is already populated;
+     * repo_pack is here to sweep up anything the pack format could not take. */
     assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
-    int packed_rows = count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?");
-    assert_true(packed_rows > 0);
+    assert_true(count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?") > 0);
 
     write_file(TEST_SRC "/keep.txt", "content that displaces the first\n");
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
     assert_int_equal(prune_snapshot(store, db, repo_id, first.snapshot_id), OK);
+
+    /*
+     * Counted here rather than before the second backup, which packs objects
+     * of its own and would otherwise be credited to the sweep.
+     */
+    int packed_rows = count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?");
+    assert_true(packed_rows > 0);
 
     gc_result_t g;
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);

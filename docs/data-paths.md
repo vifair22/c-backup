@@ -328,6 +328,32 @@ loose; packing is retried by the next backup or an explicit pack job.
 
 ---
 
+## Part 1b: objects go into packs as the backup produces them
+
+A backup does not write loose objects. Each one - file content, manifest tree,
+xattr or ACL blob - is staged into an open pack as it is produced, and the pack
+is sealed once every object for the snapshot exists and before the snapshot
+record that names them is written.
+
+The loose path is what objects fall back to when the pack format cannot take
+them, which is two cases and only two: a file with holes, whose object hashes
+over its region table rather than its contents, and an object past
+`PACK_STREAM_THRESHOLD`, which cannot be hashed before its entry header is
+written because that header carries the hash. Those are packed afterwards by
+the auto-pack described below, exactly as everything used to be.
+
+Two consequences worth knowing:
+
+- **`repo_pack` after a backup normally finds nothing to do.** It is no longer
+  the thing that gets objects into packs; it is the sweep for the two cases
+  above, plus anything a previous interrupted run left behind.
+- **A pack is sealed only where no transaction is open.** Sealing emits the
+  commit callback, which begins one, and the write lock is not recursive. In
+  `store_content` that is the batch boundary and nowhere else.
+
+Measured on 60,000 files: 31.07s before, 6.33s after, with the per-object
+`rename` that was 41% of the run gone entirely. See PERF.md.
+
 ## Part 2: the packing path (`repo_pack` in `src/store/pack.c`)
 
 Packing converts many loose files into few pack files, and it is the only

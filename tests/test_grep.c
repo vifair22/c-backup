@@ -351,14 +351,22 @@ static void test_max_files_stops_early(void **state)
     assert_true(res.truncated);
 }
 
-/* Packed content is the normal case, since a backup packs on completion. */
+/*
+ * Packed content is not a special case, it is the only case: a backup writes
+ * its objects into packs as it produces them.
+ *
+ * This used to back up, then call repo_pack and assert it had work to do. It
+ * has none now, and that is the assertion worth making instead - a repo_pack
+ * immediately after a backup should find nothing loose to collect, because
+ * nothing was written loose.
+ */
 static void test_searches_packed_content(void **state)
 {
     (void)state;
     int64_t snap = run_backup();
     uint32_t packed = 0;
     assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed > 0);
+    assert_int_equal(packed, 0);
 
     grep_opts_t o = opts_for("swordfish");
     grep_result_t res;

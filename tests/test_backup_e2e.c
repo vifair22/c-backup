@@ -258,41 +258,90 @@ static void test_phys_size_matches_bytes_on_disk(void **state)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT hash, phys_size FROM objects WHERE repo_id = ?",
+        "SELECT hash, phys_size, location FROM objects WHERE repo_id = ?",
         (const char *[]){ "1", NULL }, &r), 0);
     assert_non_null(r);
     assert_true(r->nrows > 0);
 
-    int checked = 0;
+    /*
+     * phys_size has to be the bytes the object really occupies, whichever way
+     * it was stored. A backup now writes into a pack, so most of these have no
+     * loose file at all; the ones that do are what the pack format cannot take
+     * without reading them twice.
+     *
+     * The two storage forms count differently, and deliberately. A loose
+     * object's phys_size is its whole file, header and parity trailer
+     * included. A packed one's is the stored payload alone, because the pack's
+     * own header and trailer are charged to packs.size - so total bytes on
+     * disk is sum(packs.size) plus the phys_size of everything still loose,
+     * and folding entry headers in here would count them twice.
+     *
+     * Checking the packed case against pack_object_physical_size, which
+     * answers the other question - what the entry occupies, header included -
+     * ties the two conventions together. They disagreed silently before this
+     * test asked them to agree.
+     */
+    int loose = 0, packed = 0;
     for (int i = 0; i < r->nrows; i++) {
         const char *hex = r->rows[i][0];
+        uint64_t phys = strtoull(r->rows[i][1], NULL, 10);
+
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
 
         struct stat sb;
-        assert_int_equal(stat(path, &sb), 0);
-        assert_int_equal((unsigned long long)sb.st_size,
-                         strtoull(r->rows[i][1], NULL, 10));
-        checked++;
+        if (stat(path, &sb) == 0) {
+            assert_int_equal((unsigned long long)sb.st_size, phys);
+            loose++;
+            continue;
+        }
+
+        uint8_t hash[OBJECT_HASH_SIZE];
+        for (size_t k = 0; k < OBJECT_HASH_SIZE; k++) {
+            unsigned v = 0;
+            sscanf(hex + k * 2, "%2x", &v);
+            hash[k] = (uint8_t)v;
+        }
+        uint64_t entry_bytes = 0;
+        assert_int_equal(pack_object_physical_size(store, hash, &entry_bytes), OK);
+        assert_int_equal(entry_bytes, phys + sizeof(pack_dat_entry_hdr_t));
+        packed++;
     }
     db_result_free(r);
-    assert_true(checked > 0);
+
+    /* And the point of the change: this run packed rather than wrote loose. */
+    assert_true(packed > 0);
+    (void)loose;
 }
 
-/* Incompressible content is stored raw, so phys_size exceeds orig_size by the
- * header and parity trailer. That is the designed cost, but it means no
- * caller may treat these two fields as a compression ratio. */
-static void test_phys_size_may_exceed_logical_size(void **state)
+/*
+ * A packed object never claims more than the payload it stores.
+ *
+ * This used to assert the opposite, and correctly: a loose object carries a
+ * header and a parity trailer, so its phys_size exceeded its orig_size and no
+ * caller could read the pair as a compression ratio. Writing into packs moves
+ * that overhead to packs.size, and phys_size becomes the stored payload - equal
+ * to orig_size for content that did not compress, smaller for content that did.
+ *
+ * So the pair now is a compression ratio for packed objects, which is what
+ * makes the figure stats and summary report meaningful. The bound worth
+ * holding is the other direction: nothing may claim to store more payload than
+ * it was given, because that is what a miscounted entry header looks like.
+ */
+static void test_packed_phys_size_never_exceeds_the_payload(void **state)
 {
     (void)state;
     backup_opts_t o = basic_opts();
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
 
-    assert_true(scalar("SELECT COUNT(*) FROM objects"
-                       " WHERE repo_id = ? AND phys_size > orig_size", "1") > 0);
-    /* And never smaller than the payload it describes. */
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects"
-                            " WHERE repo_id = ? AND phys_size < orig_size", "1"), 0);
+                            " WHERE repo_id = ? AND location != 'loose'"
+                            "   AND phys_size > orig_size", "1"), 0);
+    /* The fixture is small text, under the floor below which compression is
+     * not attempted, so the two are equal rather than merely ordered. */
+    assert_true(scalar("SELECT COUNT(*) FROM objects"
+                       " WHERE repo_id = ? AND location != 'loose'"
+                       "   AND phys_size = orig_size", "1") > 0);
 }
 
 
@@ -489,7 +538,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_search_finds_backed_up_files, setup, teardown),
         cmocka_unit_test_setup_teardown(test_identical_files_share_one_object, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phys_size_matches_bytes_on_disk, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_phys_size_may_exceed_logical_size, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_packed_phys_size_never_exceeds_the_payload, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_does_not_change_orig_size, setup, teardown),
         cmocka_unit_test_setup_teardown(test_deep_wide_tree_is_not_quadratic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),

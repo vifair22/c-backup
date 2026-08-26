@@ -27,6 +27,17 @@
 #define PACK_VERSION     5u
 
 /*
+ * Objects above this threshold are streamed chunk-by-chunk rather than loaded
+ * entirely into memory. Matches STREAM_CHUNK in object.c.
+ *
+ * In the header because it is part of pack_backup_add's contract as well as an
+ * internal size choice: an entry header carries its object's hash, so an object
+ * that cannot be held in memory cannot be hashed before its header is written,
+ * and the writer refuses it rather than guessing.
+ */
+#define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
+
+/*
  * Pack all loose objects into a new pack file.
  * *out_packed (may be NULL) receives the number of objects packed.
  */

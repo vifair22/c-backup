@@ -20,6 +20,7 @@ status_t object_store_ex(store_t *store, uint8_t type,
                          uint8_t out_hash[OBJECT_HASH_SIZE],
                          int *out_is_new, uint64_t *out_phys_bytes);
 
+
 /*
  * Store a regular file, automatically detecting sparse regions.
  * Stores as OBJECT_TYPE_SPARSE if the file has holes, OBJECT_TYPE_FILE
@@ -55,6 +56,40 @@ typedef struct {
 status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
                                 uint8_t out_hash[OBJECT_HASH_SIZE],
                                 object_write_t *out_info);
+
+/*
+ * Like object_store_file_info, but stages the object into an open pack instead
+ * of writing it loose - when it can.
+ *
+ * A file with holes, or one too large to hash before its entry header is
+ * written, still goes loose and is packed later as it always was. That choice
+ * cannot be made by the caller: it depends on whether the file is sparse, which
+ * is decided by probing it, and a sparse object hashes over its region table
+ * rather than its contents. Routing one the wrong way would give it a different
+ * hash from the same file stored loose and split deduplication in two.
+ *
+ * pack_w may be NULL, which makes this exactly object_store_file_info.
+ */
+struct pack_backup_writer;
+status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
+                                  struct pack_backup_writer *pack_w,
+                                  uint8_t out_hash[OBJECT_HASH_SIZE],
+                                  object_write_t *out_info);
+/*
+ * The buffer counterpart to object_store_file_packed: stage into an open pack
+ * when there is one, otherwise write loose exactly as object_store_ex does.
+ *
+ * This is the path manifest trees and metadata blobs take, and on a real tree
+ * it is the majority of objects by count - 130,726 of 230,595 on the corpus
+ * this was measured against were trees. An object already in memory has none of
+ * the sparseness or size problems a file has, so the only reason to fall back
+ * is a buffer too large to hash before its entry header is written.
+ */
+status_t object_store_packed(store_t *store, uint8_t type,
+                             const void *data, size_t len,
+                             struct pack_backup_writer *pack_w,
+                             uint8_t out_hash[OBJECT_HASH_SIZE],
+                             object_write_t *out_info);
 
 /* Per-chunk progress callback invoked from the write path after each ~16 MiB
  * chunk is written.  chunk_bytes is the bytes in that chunk; ctx is caller-

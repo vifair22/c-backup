@@ -6,6 +6,49 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-08-25 - Objects go straight into packs
+
+The rename that was 41% of a full backup is gone, because the file it renamed
+is never created. Same fixture as the attribution run: 60,000 files, 917 MB,
+average 14 KB, 21,929 of them distinct, on NVMe-backed xfs.
+
+| | before | after |
+|--------------------|---------|---------|
+| full backup | 31.07s | **6.33s** |
+| read+hash+write | 18.25s | 1.34s |
+| per object | 304 us | 22 us |
+| inst:rename | 9.70s | - |
+| trees | 1.64s | 1.57s |
+| index-nodes | 1.15s | 1.25s |
+| loose objects left | 21,929 | 0 |
+
+4.9x, and the object write path is 13.6x faster per call. `repo_pack` after the
+run reports nothing to do.
+
+Write volume roughly halves as well. The old path wrote every object loose and
+uncompressed, then read it back, compressed it and wrote it again: about 358 MB
+followed by 311 MB, for 316 MB of logical content. Now it writes 311 MB once,
+because compression happens on the only write there is.
+
+Correctness held: a restore of all 60,000 files diffs clean against the source,
+and a deep verify returns no findings.
+
+### What it does not help
+
+The incremental case is unchanged at 2.28s, and should be: nothing new is
+written, so there was no rename to remove. It is still 67% `index_nodes`
+rewriting every node row and FTS row for a snapshot in which nothing changed,
+and that remains the next thing worth attacking. Direct-to-pack was the fix for
+the full-backup profile, not for that one.
+
+### Where the time goes now
+
+Trees at 28% and index_nodes at 22% are what a full backup is made of once the
+object writes stop dominating. Both are database work, and the gap between what
+c-utils costs per call and what SQLite costs is a separate finding recorded
+above: raw SQLite does an insert in 1.0-2.9 us where the measured phases sit at
+5-9 us.
+
 ## 2026-08-25 - The whole backup path, attributed
 
 `backup_run` reported one number for "scan+store", which was both the bucket

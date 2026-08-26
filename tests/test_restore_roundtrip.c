@@ -706,9 +706,11 @@ static void test_gc_compacts_packs(void **state)
     backup_result_t dead_br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &dead_br), OK);
 
+    /* The backup packed as it went, so this finds nothing left loose. What
+     * matters to compaction is that the packs exist, not who wrote them. */
     uint32_t packed = 0;
     assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed > 0);
+    assert_int_equal(packed, 0);
     uint64_t bytes_before = pack_bytes_on_disk();
     assert_true(bytes_before > 0);
 
