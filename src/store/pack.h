@@ -130,6 +130,58 @@ uint32_t pack_stored_count(const pack_stored_writer_t *w);
 status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed);
 void     pack_stored_abort(pack_stored_writer_t *w);
 
+/*
+ * Write objects into a pack as a backup produces them.
+ *
+ * The loose path costs an inode create, a rename, a second full read at pack
+ * time, an unlink, and double the write volume per object - measured at 41% of
+ * a full backup in one rename() alone. A pack amortises one rename across
+ * thousands of objects.
+ *
+ * This is the plaintext counterpart to pack_stored_writer_t. That one is handed
+ * bytes that have already been through the pipeline and copies them verbatim;
+ * this one is handed content and does the whole thing - hash, deduplicate,
+ * probe, compress, encrypt - so that what lands is byte-for-byte what repo_pack
+ * would have produced from the same object.
+ *
+ * Objects large enough to stream (PACK_STREAM_THRESHOLD) are not accepted: an
+ * entry header carries its object's hash and therefore cannot be written until
+ * the whole object has been read. They keep the loose path, where the hash is
+ * computed as the bytes go by, and are packed afterwards as they always were.
+ */
+typedef struct pack_backup_writer pack_backup_writer_t;
+
+status_t pack_backup_open(store_t *store, pack_backup_writer_t **out);
+
+/*
+ * Stage one object. out_is_new is 0 when the hash was already present, in the
+ * repository or in the pack this writer has open, in which case nothing is
+ * written. out_phys_bytes is what the entry occupies, out_payload_size the
+ * object header's uncompressed_size - the two numbers the index records.
+ */
+status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
+                         const void *data, size_t len,
+                         uint8_t out_hash[OBJECT_HASH_SIZE],
+                         int *out_is_new, uint64_t *out_phys_bytes,
+                         uint64_t *out_payload_size);
+
+/* Would staging an object of this size push the open pack past its seal? */
+int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
+
+/*
+ * Seal the open pack and start another.
+ *
+ * Must not be called while the caller holds a database transaction. Sealing
+ * emits the commit callback, which begins one of its own, and the write lock
+ * is not recursive - a caller that has one open deadlocks against itself.
+ */
+status_t pack_backup_rollover(pack_backup_writer_t *w);
+
+/* Seal whatever is open. Same transaction rule as rollover. Frees the writer
+ * either way; on failure the staging file is removed. */
+status_t pack_backup_finish(pack_backup_writer_t *w, uint32_t *out_packed);
+void     pack_backup_abort(pack_backup_writer_t *w);
+
 /* Returns 1 if hash lives in any pack file, 0 otherwise. */
 int pack_object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 

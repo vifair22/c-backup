@@ -2121,33 +2121,69 @@ static uint32_t hash_slot(const uint8_t h[OBJECT_HASH_SIZE], uint32_t cap)
     return v & (cap - 1u);
 }
 
-static int staged_set_grow(pack_stored_writer_t *w)
+/*
+ * Both incremental writers need the same question answered: has this hash
+ * already been staged into the pack I have open? An object that has been
+ * written but not yet finalised is invisible to every lookup that reads the
+ * repository, because its index row does not exist until the pack installs.
+ *
+ * The set indexes into the caller's entry array rather than copying hashes,
+ * so it stays correct as that array is reallocated and costs one word an
+ * entry.
+ */
+static int staged_set_rebuild(staged_set_t *set,
+                              const pack_idx_disk_entry_t *entries,
+                              uint32_t count)
 {
-    uint32_t ncap = w->seen.cap ? w->seen.cap * 2u : 1024u;
+    uint32_t ncap = set->cap ? set->cap * 2u : 1024u;
     uint32_t *ns = calloc(ncap, sizeof(*ns));
     if (!ns) return -1;
-    for (uint32_t i = 0; i < w->count; i++) {
-        uint32_t k = hash_slot(w->entries[i].hash, ncap);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t k = hash_slot(entries[i].hash, ncap);
         while (ns[k]) k = (k + 1u) & (ncap - 1u);
         ns[k] = i + 1u;
     }
-    free(w->seen.slots);
-    w->seen.slots = ns;
-    w->seen.cap = ncap;
+    free(set->slots);
+    set->slots = ns;
+    set->cap = ncap;
     return 0;
+}
+
+static int staged_set_contains(const staged_set_t *set,
+                               const pack_idx_disk_entry_t *entries,
+                               const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!set->cap) return 0;
+    uint32_t k = hash_slot(hash, set->cap);
+    while (set->slots[k]) {
+        uint32_t idx = set->slots[k] - 1u;
+        if (memcmp(entries[idx].hash, hash, OBJECT_HASH_SIZE) == 0) return 1;
+        k = (k + 1u) & (set->cap - 1u);
+    }
+    return 0;
+}
+
+static void staged_set_insert(staged_set_t *set,
+                              const uint8_t hash[OBJECT_HASH_SIZE],
+                              uint32_t idx)
+{
+    uint32_t k = hash_slot(hash, set->cap);
+    while (set->slots[k]) k = (k + 1u) & (set->cap - 1u);
+    set->slots[k] = idx + 1u;
+}
+
+static void staged_set_free(staged_set_t *set)
+{
+    free(set->slots);
+    set->slots = NULL;
+    set->cap = 0;
 }
 
 int pack_stored_has(const pack_stored_writer_t *w,
                     const uint8_t hash[OBJECT_HASH_SIZE])
 {
-    if (!w || !w->seen.cap) return 0;
-    uint32_t k = hash_slot(hash, w->seen.cap);
-    while (w->seen.slots[k]) {
-        uint32_t idx = w->seen.slots[k] - 1u;
-        if (memcmp(w->entries[idx].hash, hash, OBJECT_HASH_SIZE) == 0) return 1;
-        k = (k + 1u) & (w->seen.cap - 1u);
-    }
-    return 0;
+    if (!w) return 0;
+    return staged_set_contains(&w->seen, w->entries, hash);
 }
 
 uint32_t pack_stored_count(const pack_stored_writer_t *w)
@@ -2232,7 +2268,7 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     }
     /* Keep the set no more than half full, so probing stays short. */
     if (w->seen.cap == 0 || (w->count + 1u) * 2u >= w->seen.cap) {
-        if (staged_set_grow(w) != 0)
+        if (staged_set_rebuild(&w->seen, w->entries, w->count) != 0)
             return set_error(ERR_NOMEM, "pack_stored_add: staged set");
     }
 
@@ -2268,9 +2304,7 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     e->uncompressed_size = uncompressed_size;
     e->compressed_size   = len;
 
-    uint32_t k = hash_slot(hash, w->seen.cap);
-    while (w->seen.slots[k]) k = (k + 1u) & (w->seen.cap - 1u);
-    w->seen.slots[k] = w->count + 1u;
+    staged_set_insert(&w->seen, hash, w->count);
 
     w->count++;
     return OK;
@@ -2280,7 +2314,7 @@ static void pack_stored_free(pack_stored_writer_t *w)
 {
     if (!w) return;
     free(w->entries);
-    free(w->seen.slots);
+    staged_set_free(&w->seen);
     free(w);
 }
 
@@ -2496,6 +2530,121 @@ static void pw_destroy(pack_writer_t *pw) {
     memset(pw, 0, sizeof(*pw));
 }
 
+/*
+ * Append one entry: encrypt, write, compute its parity, record its index slot.
+ *
+ * Split out of pw_write_small so a second writer can share it. Everything
+ * upstream of here differs between callers - one reads a loose object and has
+ * to decrypt it first, another is handed plaintext that was never on disk -
+ * and everything from here down must not, because this is where the on-disk
+ * format is decided.
+ *
+ * payload is plaintext-or-compressed and stays the caller's to free; any
+ * ciphertext buffer is owned and released here.
+ */
+static status_t pw_emit(pack_writer_t *pw, progress_t *prog,
+                        const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                        uint64_t uncompressed_size,
+                        const uint8_t *payload, uint64_t compressed_size,
+                        uint8_t compression)
+{
+    const repo_key_t *key = store_key(pw->store);
+
+    /*
+     * Re-encrypt last, so parity and the CRC below cover ciphertext and a
+     * scrub of an offsite copy needs no key. Compressing first and encrypting
+     * after is the only order that works: ciphertext does not compress.
+     *
+     * A fresh nonce, never one reused from elsewhere. The same plaintext can
+     * be stored twice in an encrypted repository, and reusing a nonce across
+     * two different plaintexts under one key is the one mistake a stream
+     * cipher does not survive.
+     */
+    uint8_t  encryption = ENCRYPT_NONE;
+    uint8_t *cipher     = NULL;
+    if (key) {
+        cipher = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
+        if (!cipher) return ERR_NOMEM;
+        if (object_encrypt(key, payload, (size_t)compressed_size, cipher) != OK) {
+            free(cipher);
+            return ERR_IO;
+        }
+        payload          = cipher;
+        compressed_size += OBJECT_CRYPT_OVERHEAD;
+        encryption       = ENCRYPT_CHACHA20;
+    }
+
+    pack_dat_entry_hdr_t ehdr;
+    memcpy(ehdr.hash, hash, OBJECT_HASH_SIZE);
+    ehdr.type              = type;
+    ehdr.compression       = compression;
+    ehdr.encryption        = encryption;
+    ehdr.uncompressed_size = uncompressed_size;
+    ehdr.compressed_size   = compressed_size;
+
+    if (pw_ensure_capacity(pw, pw->packed + 1) != 0) { free(cipher); return ERR_NOMEM; }
+
+    uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
+
+    if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
+        fwrite_full(payload, (size_t)compressed_size, pw->dat_f) != 0) {
+        free(cipher);
+        return ERR_IO;
+    }
+
+    size_t csize = (size_t)compressed_size;
+    parity_record_t hdr_par;
+    parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
+
+    uint32_t payload_crc = 0;
+    uint8_t *rs_buf = NULL;
+    size_t rs_par_sz = 0;
+    if (csize > 0) {
+        payload_crc = crc32c(payload, csize);
+        rs_par_sz = rs_parity_size(csize);
+        if (rs_par_sz > 0) {
+            rs_buf = malloc(rs_par_sz);
+            if (rs_buf)
+                rs_parity_encode(payload, csize, rs_buf);
+            else
+                rs_par_sz = 0;
+        }
+    }
+
+    /*
+     * entry_index is the on-disk entry position, not the position this entry
+     * will occupy after finalize_pack sorts the array by hash. The parity
+     * trailer is indexed by the former; recording the latter makes every
+     * parity lookup read the wrong offsets, which disables repair without
+     * failing anything.
+     */
+    memcpy(pw->idx_entries[pw->packed].hash, hash, OBJECT_HASH_SIZE);
+    pw->idx_entries[pw->packed].dat_offset        = dat_off;
+    pw->idx_entries[pw->packed].entry_index       = pw->packed;
+    pw->idx_entries[pw->packed].type              = ehdr.type;
+    pw->idx_entries[pw->packed].compression       = ehdr.compression;
+    pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
+    pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
+    pw->idx_entries[pw->packed].compressed_size   = compressed_size;
+
+    pw->entry_parity[pw->packed].hdr_par     = hdr_par;
+    pw->entry_parity[pw->packed].payload_crc = payload_crc;
+    pw->entry_parity[pw->packed].rs_parity   = rs_buf;
+    pw->entry_parity[pw->packed].rs_ps       = NULL;
+    pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
+
+    pw->body_offset += sizeof(ehdr) + compressed_size;
+    pw->packed++;
+
+    if (prog) {
+        atomic_fetch_add(&prog->bytes, compressed_size);
+        atomic_fetch_add(&prog->items, 1);
+    }
+
+    free(cipher);
+    return OK;
+}
+
 /* Write a small object (payload fits in RAM). */
 static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                                 pack_obj_meta_t *m, int fd)
@@ -2590,96 +2739,10 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         }
     }
 
-    /*
-     * Re-encrypt last, so parity and the CRC below cover ciphertext and a
-     * scrub of an offsite copy needs no key. Compressing first and encrypting
-     * after is the only order that works: ciphertext does not compress.
-     *
-     * A fresh nonce, not the loose object's. The same plaintext is stored
-     * twice in an encrypted repository - raw while loose, compressed once
-     * packed - and reusing a nonce across two different plaintexts under one
-     * key is the one mistake a stream cipher does not survive.
-     */
-    uint8_t encryption = ENCRYPT_NONE;
-    if (key) {
-        uint8_t *enc = malloc((size_t)compressed_size + OBJECT_CRYPT_OVERHEAD);
-        if (!enc) { free(owned_payload); return ERR_NOMEM; }
-        if (object_encrypt(key, payload, (size_t)compressed_size, enc) != OK) {
-            free(enc); free(owned_payload); return ERR_IO;
-        }
-        free(owned_payload);
-        owned_payload   = enc;
-        payload         = enc;
-        compressed_size += OBJECT_CRYPT_OVERHEAD;
-        encryption      = ENCRYPT_CHACHA20;
-    }
-
-    /* Write entry header + payload to dat */
-    pack_dat_entry_hdr_t ehdr;
-    memcpy(ehdr.hash, m->hash, OBJECT_HASH_SIZE);
-    ehdr.type              = m->type;
-    ehdr.compression       = compression;
-    ehdr.encryption        = encryption;
-    ehdr.uncompressed_size = uncompressed_size;
-    ehdr.compressed_size   = compressed_size;
-
-    if (pw_ensure_capacity(pw, pw->packed + 1) != 0) {
-        free(owned_payload);
-        return ERR_NOMEM;
-    }
-
-    uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
-
-    if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
-        fwrite_full(payload, (size_t)compressed_size, pw->dat_f) != 0) {
-        free(owned_payload);
-        return ERR_IO;
-    }
-
-    /* Compute parity */
-    size_t csize = (size_t)compressed_size;
-    parity_record_t hdr_par;
-    parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
-
-    uint32_t payload_crc = 0;
-    uint8_t *rs_buf = NULL;
-    size_t rs_par_sz = 0;
-    if (csize > 0) {
-        payload_crc = crc32c(payload, csize);
-        rs_par_sz = rs_parity_size(csize);
-        if (rs_par_sz > 0) {
-            rs_buf = malloc(rs_par_sz);
-            if (rs_buf)
-                rs_parity_encode(payload, csize, rs_buf);
-            else
-                rs_par_sz = 0;
-        }
-    }
-
-    /* Store idx + parity */
-    memcpy(pw->idx_entries[pw->packed].hash, m->hash, OBJECT_HASH_SIZE);
-    pw->idx_entries[pw->packed].dat_offset        = dat_off;
-    pw->idx_entries[pw->packed].entry_index       = pw->packed;
-    pw->idx_entries[pw->packed].type              = ehdr.type;
-    pw->idx_entries[pw->packed].compression       = ehdr.compression;
-    pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
-    pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
-    pw->idx_entries[pw->packed].compressed_size   = compressed_size;
-
-    pw->entry_parity[pw->packed].hdr_par     = hdr_par;
-    pw->entry_parity[pw->packed].payload_crc = payload_crc;
-    pw->entry_parity[pw->packed].rs_parity   = rs_buf;
-    pw->entry_parity[pw->packed].rs_ps       = NULL;
-    pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
-
-    pw->body_offset += sizeof(ehdr) + compressed_size;
-    pw->packed++;
-
-    atomic_fetch_add(&ctx->prog->bytes, compressed_size);
-    atomic_fetch_add(&ctx->prog->items, 1);
-
+    status_t est = pw_emit(pw, ctx->prog, m->hash, m->type, uncompressed_size,
+                           payload, compressed_size, compression);
     free(owned_payload);
-    return OK;
+    return est;
 }
 
 /* Write a large object (streamed from fd). */
@@ -2976,6 +3039,213 @@ done:
 
     atomic_fetch_add(&ctx->prog->items, 1);
     return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Backup-side pack writer                                             */
+/* ------------------------------------------------------------------ */
+
+struct pack_backup_writer {
+    pack_writer_t pw;
+    staged_set_t  seen;      /* over pw.idx_entries[0 .. pw.packed) */
+    uint32_t      sealed;    /* objects in packs already installed */
+};
+
+/*
+ * Decide compression for a plaintext buffer, mirroring what pw_write_small
+ * does to a loose object once it has decrypted it.
+ *
+ * The skip-marking branch there has no counterpart here and needs none. That
+ * marker exists so a later pack run does not re-probe an incompressible loose
+ * object, and an object written straight into a pack is never offered to a
+ * pack run at all - repo_pack only ever considers loose objects, and neither
+ * pack_gc nor maybe_coalesce_packs re-probes. The verdict is durable by
+ * construction rather than by a byte in a header.
+ *
+ * On return *out points at either the caller's buffer or *owned, which the
+ * caller frees.
+ */
+static void pb_compress(pack_writer_t *pw, const uint8_t *in, uint64_t len,
+                        const uint8_t **out, uint64_t *out_len,
+                        uint8_t *out_compression, uint8_t **owned)
+{
+    *out             = in;
+    *out_len         = len;
+    *out_compression = COMPRESS_NONE;
+    *owned           = NULL;
+
+    /* Under 4 KiB the entry header costs more than the codec saves. */
+    if (len < 4096 || len > (uint64_t)INT_MAX) return;
+
+    int sample_len = (len > 65536) ? 65536 : (int)len;
+    int sc = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
+                                  sample_len, pw->comp_buf_size);
+    if (sc <= 0 || (double)sc / (double)sample_len > 0.98) return;
+
+    int csz = LZ4_compress_default((const char *)in, (char *)pw->comp_buf,
+                                   (int)len, pw->comp_buf_size);
+    if (csz <= 0 || (uint64_t)csz >= len) return;
+
+    uint8_t *copy = malloc((size_t)csz);
+    if (!copy) return;
+    memcpy(copy, pw->comp_buf, (size_t)csz);
+    *owned           = copy;
+    *out             = copy;
+    *out_len         = (uint64_t)csz;
+    *out_compression = COMPRESS_LZ4;
+}
+
+status_t pack_backup_open(store_t *store, pack_backup_writer_t **out)
+{
+    if (!store || !out) return set_error(ERR_INVALID, "pack_backup_open: null argument");
+
+    /* Packing rewrites what it touches, so without the key it would turn an
+     * encrypted repository into a plaintext one an entry at a time. */
+    if (store_needs_key(store))
+        return set_error(ERR_INVALID,
+                         "repository is encrypted and no key is loaded: "
+                         "refusing to pack");
+
+    pack_backup_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) return set_error(ERR_NOMEM, "pack_backup_open: alloc");
+
+    w->pw.store = store;
+    w->pw.comp_buf_size = LZ4_compressBound((int)PACK_STREAM_THRESHOLD);
+    w->pw.comp_buf = malloc((size_t)w->pw.comp_buf_size);
+    if (!w->pw.comp_buf) {
+        free(w);
+        return set_error(ERR_NOMEM, "pack_backup_open: compression buffer");
+    }
+
+    rs_init();
+    *out = w;
+    return OK;
+}
+
+/* Open a pack on demand, so a backup that stages nothing creates no file. */
+static status_t pb_ensure_open(pack_backup_writer_t *w)
+{
+    if (w->pw.dat_f) return OK;
+    w->pw.pack_num = next_pack_num(w->pw.store);
+    w->pw.packed = 0;
+    w->pw.body_offset = 0;
+    return open_new_pack(w->pw.store, w->pw.pack_num, &w->pw.dat_f,
+                         w->pw.dat_tmp, &w->pw.dat_hdr);
+}
+
+int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes)
+{
+    if (!w || !w->pw.dat_f || w->pw.packed == 0) return 0;
+    return w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) + bytes
+           > PACK_MAX_MULTI_BYTES;
+}
+
+status_t pack_backup_rollover(pack_backup_writer_t *w)
+{
+    if (!w || !w->pw.dat_f || w->pw.packed == 0) return OK;
+
+    uint32_t n = w->pw.packed;
+    status_t st = pw_finalize(&w->pw);
+    if (st != OK) return st;
+
+    w->sealed += n;
+    staged_set_free(&w->seen);   /* sealed objects resolve through the index now */
+    return OK;
+}
+
+status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
+                         const void *data, size_t len,
+                         uint8_t out_hash[OBJECT_HASH_SIZE],
+                         int *out_is_new, uint64_t *out_phys_bytes,
+                         uint64_t *out_payload_size)
+{
+    if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
+    if (len > PACK_STREAM_THRESHOLD)
+        return set_error(ERR_TOO_LARGE,
+                         "pack_backup_add: %zu bytes exceeds the streaming threshold", len);
+
+    /* The same digest object.c takes, over the same bytes: the raw payload,
+     * with no type prefix. Dedup only works across the two write paths if
+     * this stays identical to what the loose writer would have produced. */
+    SHA256((const unsigned char *)data, len, out_hash);
+    if (out_is_new)        *out_is_new = 0;
+    if (out_payload_size)  *out_payload_size = len;
+    if (out_phys_bytes)    *out_phys_bytes = 0;
+
+    /*
+     * Staged first, then the repository. An object written into the pack this
+     * writer has open is invisible to object_exists until the pack installs,
+     * so asking the repository alone would write it a second time and produce
+     * a pack holding the same hash twice.
+     */
+    if (staged_set_contains(&w->seen, w->pw.idx_entries, out_hash)) return OK;
+    if (object_exists(w->pw.store, out_hash)) return OK;
+
+    status_t st = pb_ensure_open(w);
+    if (st != OK) return st;
+
+    const uint8_t *payload = NULL;
+    uint64_t payload_len = 0;
+    uint8_t compression = COMPRESS_NONE;
+    uint8_t *owned = NULL;
+    pb_compress(&w->pw, data, (uint64_t)len, &payload, &payload_len,
+                &compression, &owned);
+
+    uint32_t slot = w->pw.packed;
+    st = pw_emit(&w->pw, NULL, out_hash, type, (uint64_t)len,
+                 payload, payload_len, compression);
+    free(owned);
+    if (st != OK) return st;
+
+    /* Keep the set no more than half full, so probing stays short. */
+    if (w->seen.cap == 0 || (w->pw.packed + 1u) * 2u >= w->seen.cap) {
+        if (staged_set_rebuild(&w->seen, w->pw.idx_entries, w->pw.packed) != 0)
+            return set_error(ERR_NOMEM, "pack_backup_add: staged set");
+    }
+    staged_set_insert(&w->seen, out_hash, slot);
+
+    if (out_is_new)     *out_is_new = 1;
+    if (out_phys_bytes) *out_phys_bytes = w->pw.idx_entries[slot].compressed_size
+                                        + sizeof(pack_dat_entry_hdr_t);
+    return OK;
+}
+
+static void pack_backup_free(pack_backup_writer_t *w)
+{
+    staged_set_free(&w->seen);
+    pw_destroy(&w->pw);
+    free(w);
+}
+
+status_t pack_backup_finish(pack_backup_writer_t *w, uint32_t *out_packed)
+{
+    if (!w) return set_error(ERR_INVALID, "pack_backup_finish: no writer");
+
+    status_t st = OK;
+    if (w->pw.dat_f && w->pw.packed > 0) {
+        uint32_t n = w->pw.packed;
+        st = pw_finalize(&w->pw);
+        if (st == OK) w->sealed += n;
+    } else if (w->pw.dat_f) {
+        /* Opened and nothing arrived. An empty pack is a file every later
+         * enumeration has to open to learn it holds nothing. */
+        fclose(w->pw.dat_f);
+        w->pw.dat_f = NULL;
+        unlink(w->pw.dat_tmp);
+        w->pw.dat_tmp[0] = '\0';
+    }
+
+    if (out_packed) *out_packed = w->sealed;
+    pack_backup_free(w);
+    return st;
+}
+
+void pack_backup_abort(pack_backup_writer_t *w)
+{
+    if (!w) return;
+    if (w->pw.dat_f) { fclose(w->pw.dat_f); w->pw.dat_f = NULL; }
+    if (w->pw.dat_tmp[0]) { unlink(w->pw.dat_tmp); w->pw.dat_tmp[0] = '\0'; }
+    pack_backup_free(w);
 }
 
 static void *pack_unified_worker(void *arg) {
