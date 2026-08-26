@@ -67,6 +67,20 @@ static void fill_text(char *buf, size_t len, int seed)
         buf[i] = (char)('a' + ((i / 17 + (size_t)seed) % 23));
 }
 
+/* How many packs the repository holds. */
+static int count_packs(void)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "find '%s/packs' -name 'pack-*.dat' 2>/dev/null | wc -l", TEST_ROOT);
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
+    int n = -1;
+    if (fscanf(f, "%d", &n) != 1) n = -1;
+    pclose(f);
+    return n;
+}
+
 /* ------------------------------------------------------------------ */
 
 /*
@@ -354,6 +368,147 @@ static void test_matches_what_repo_pack_would_have_written(void **state)
     for (int i = 0; i < N; i++) { free(ref_payload[i]); free(bufs[i]); }
 }
 
+/*
+ * Rollover: the pack seals mid-run and another opens behind it.
+ *
+ * This is the most dangerous path in the writer and the one a synthetic
+ * fixture barely reaches - 60,000 small files produce two packs, so it fires
+ * once. Driving it directly exercises the same mechanics without writing a
+ * gigabyte: objects staged before the seal have to survive it, the writer has
+ * to keep counting across packs, and the staged set has to reset - a hash from
+ * the sealed pack is no longer "in flight", it is committed, and must now
+ * deduplicate through the index instead.
+ */
+static void test_rollover_seals_and_keeps_going(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    enum { BEFORE = 5, AFTER = 4 };
+    char   *bufs[BEFORE + AFTER];
+    size_t  lens[BEFORE + AFTER];
+    uint8_t hashes[BEFORE + AFTER][OBJECT_HASH_SIZE];
+
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(st, &w), OK);
+
+    for (int i = 0; i < BEFORE; i++) {
+        lens[i] = (size_t)(6000 + i * 1500);
+        bufs[i] = malloc(lens[i]);
+        assert_non_null(bufs[i]);
+        fill_text(bufs[i], lens[i], i + 70);
+        assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, bufs[i], lens[i],
+                                         hashes[i], NULL, NULL, NULL), OK);
+    }
+
+    assert_int_equal(pack_backup_rollover(w), OK);
+
+    /*
+     * The same content again, immediately after the seal. It is in the pack
+     * that just installed, so it must deduplicate - through the index now,
+     * not through the staged set, which the rollover cleared.
+     */
+    int is_new = -1;
+    uint8_t again[OBJECT_HASH_SIZE];
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, bufs[0], lens[0],
+                                     again, &is_new, NULL, NULL), OK);
+    assert_memory_equal(again, hashes[0], OBJECT_HASH_SIZE);
+    assert_int_equal(is_new, 0);
+
+    for (int i = BEFORE; i < BEFORE + AFTER; i++) {
+        lens[i] = (size_t)(7000 + i * 1300);
+        bufs[i] = malloc(lens[i]);
+        assert_non_null(bufs[i]);
+        fill_text(bufs[i], lens[i], i + 70);
+        assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, bufs[i], lens[i],
+                                         hashes[i], NULL, NULL, NULL), OK);
+    }
+
+    uint32_t packed = 0;
+    assert_int_equal(pack_backup_finish(w, &packed), OK);
+    /* Counted across both packs, not just the last one. */
+    assert_int_equal(packed, BEFORE + AFTER);
+
+    /* Two packs, and everything readable regardless of which it landed in. */
+    assert_int_equal(count_packs(), 2);
+    for (int i = 0; i < BEFORE + AFTER; i++) {
+        void *out = NULL; size_t out_len = 0; uint8_t type = 0;
+        assert_int_equal(pack_object_load(st, hashes[i], &out, &out_len, &type), OK);
+        assert_int_equal(out_len, lens[i]);
+        assert_memory_equal(out, bufs[i], lens[i]);
+        free(out);
+        free(bufs[i]);
+    }
+
+    done(st);
+}
+
+/*
+ * And the seal arithmetic itself trips where it should.
+ *
+ * The test above drives rollover by hand, which proves the mechanics but not
+ * that anything would ever call it. This fills a pack with incompressible
+ * content until the writer says it is full, and checks that happened somewhere
+ * near the 256 MiB seal rather than immediately or never. Bounded deliberately:
+ * one crossing is enough to know the comparison is the right way round.
+ */
+static void test_reports_full_near_the_seal(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(st, &w), OK);
+
+    const size_t chunk = 4u * 1024u * 1024u;
+    uint8_t *buf = malloc(chunk);
+    assert_non_null(buf);
+
+    /*
+     * Incompressible, so the pack grows by roughly what is staged into it.
+     * A plain LCG is not: its output compressed by a quarter, 320 MiB of it
+     * fitted inside a 256 MiB pack, and the seal never tripped. xorshift64*
+     * mixes well enough that LZ4 gives up, which is the property this needs.
+     */
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    uint64_t staged_bytes = 0;
+    int rounds = 0;
+    const uint64_t headroom = PACK_STREAM_THRESHOLD;
+
+    while (!pack_backup_full(w, headroom) && rounds < 80) {
+        for (size_t i = 0; i < chunk; i += 8) {
+            rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+            uint64_t v = rng * 0x2545F4914F6CDD1Dull;
+            memcpy(buf + i, &v, sizeof(v));
+        }
+        uint8_t h[OBJECT_HASH_SIZE];
+        assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, buf, chunk,
+                                         h, NULL, NULL, NULL), OK);
+        staged_bytes += chunk;
+        rounds++;
+    }
+    free(buf);
+
+    /* It filled, rather than running out of rounds. */
+    assert_true(pack_backup_full(w, headroom));
+
+    /*
+     * The seal is 256 MiB and the caller reserves 16 MiB of headroom for the
+     * next entry, so this should report full somewhere under 256 MiB and well
+     * above nothing. Loose bounds on purpose: the point is that the comparison
+     * is the right way round, not that a constant has a particular value.
+     */
+    assert_true(staged_bytes > 128u * 1024u * 1024u);
+    assert_true(staged_bytes <= 256u * 1024u * 1024u);
+
+    assert_int_equal(pack_backup_rollover(w), OK);
+    assert_int_equal(count_packs(), 1);
+
+    uint32_t packed = 0;
+    assert_int_equal(pack_backup_finish(w, &packed), OK);
+    done(st);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -364,6 +519,8 @@ int main(void)
         cmocka_unit_test(test_writing_nothing_leaves_no_pack),
         cmocka_unit_test(test_refuses_objects_it_cannot_hash_first),
         cmocka_unit_test(test_abort_removes_the_staging_file),
+        cmocka_unit_test(test_rollover_seals_and_keeps_going),
+        cmocka_unit_test(test_reports_full_near_the_seal),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
