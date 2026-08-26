@@ -418,3 +418,62 @@ SPARSE from reindex's loose path, because pack entries do not carry a type.
 Nothing reads it - restore takes the type from the object header - and making
 backup report SPARSE would have created a fresh backup-versus-reindex
 disagreement rather than removing one.
+
+# Results: the shfs FUSE path
+
+The first Unraid pass never touched FUSE, which was the thing it was meant to
+test. Every read came from `/mnt/cache/appdata/gitlab-runner`, the ZFS dataset
+directly.
+
+Pointing the container at `/mnt/user/appdata/gitlab-runner` does not fix that.
+Unraid exposes a cache-only share through shfs as the backing dataset, so the
+container's mount table showed `cache/appdata ... zfs` for both paths and the
+FUSE layer was still absent. `stat -f` reporting `zfs` for `/mnt/user/appdata`
+on the host says the same thing. Checking which shares are genuinely FUSE:
+
+| Share | Real type |
+|-----------|-----------|
+| appdata | zfs |
+| Documents | fuse |
+| Media | fuse |
+| domains | zfs |
+
+`Documents` is 4.3 TB over eight array disks, so every read is proxied by the
+shfs process. `Documents/Andi` is a bounded slice of it: 22 GB, 4,424 files,
+spanning disk5 and disk8, mostly `.mov` files of a few hundred MB. Large and
+incompressible over a real union, which is the opposite profile to the 622,000
+small files of the first pass and the one the throughput reports came from.
+
+## FUSE is not the problem
+
+Mounted so the container really does see `shfs ... fuse.shfs`:
+
+| | shfs union | direct off disk8 | ratio |
+|-----------------------|--------------|------------------|-------|
+| raw read, 686 MB file | 221 MB/s | 217 MB/s | 1.02 |
+| walk 774,582 entries | 4.7 s | 4.5 s | 1.05 |
+| backup, 22 GB | 332 s | 310 s | 1.07 |
+
+Same binary, same repository storage, same data, caches dropped before each.
+Both runs produced the same objects, the same 40 packs, and the same 101 loose
+skip-marked objects. No ENXIO, no stall, no error or warning in the log.
+Descriptors stayed at 12 through the copy and peaked at 109 during packing.
+RSS oscillated between 9 MB and 170 MB as streaming buffers came and went.
+
+So shfs costs about 7% and does not kill anything. The recorded ENXIO failure
+does not reproduce against this code.
+
+## The throughput ceiling is real but is not FUSE's
+
+Both runs move 22 GB in a little over five minutes, about 66 MB/s, against a
+raw read of roughly 220 MB/s. That is not idle time: the run reads 22 GB and
+writes 22.5 GB, hashes all of it with SHA-256 and computes Reed-Solomon parity
+over it, so 44.5 GB of I/O in 310 s is 143 MB/s of combined traffic. The
+ceiling is the pipeline, and it is identical on xfs and on FUSE.
+
+The first pass looks nothing like this and the difference is the file size, not
+the filesystem. 622,000 files in 3,552 s is 175 files per second, 5.7 ms each,
+while moving only 8 GB - 2.3 MB/s. That is per-file overhead, not bandwidth,
+and it is where the time on a small-file tree goes. Worth measuring properly
+before optimising anything: this pass says the large-file path is healthy and
+says nothing about the small-file one beyond the wall clock.

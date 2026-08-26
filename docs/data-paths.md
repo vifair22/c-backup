@@ -607,3 +607,33 @@ Memory ceiling worth knowing: each pack worker holds a 16 MiB read buffer
 plus an LZ4 bound-sized compress buffer, so a full 32-worker pack run can
 reach roughly a gigabyte of buffer space. Deliberate; this targets modern
 systems, and the per-object streaming paths stay bounded regardless.
+
+## Part 7: where the index lives, and why it matters
+
+The repository is the source of truth and the database is a derived index, so
+it is tempting to treat the index as unimportant and put it anywhere. It is on
+the hot path of every backup instead.
+
+A backup runs at least one `file_cache` SELECT and one INSERT per file, plus a
+second SELECT on `objects` for every cache hit. That is roughly 1.2M queries
+for a 622,000-file tree, and they are small random accesses, which is the
+access pattern parity-protected storage is worst at: every write becomes a
+read-modify-write across the data disk and the parity disk.
+
+Measured on `gitlab-runner/builds`, 60,875 files, with the source and the
+repository both on the ZFS cache and only the index moving:
+
+| `state.db` on | wall | ms/file |
+|-----------------------------------|------------|--------:|
+| Unraid array disk, xfs on `md1p1` | 204,165 ms | 3.35 |
+| ZFS SSD cache | 64,056 ms | 1.05 |
+
+Both runs wrote byte-identical repositories. The index placement was worth 3.2x
+on its own.
+
+**Put `state.db` on the fastest storage available, and never on a
+parity-protected array.** On Unraid that means an appdata share backed by a
+cache pool, which is where the shipped deploy puts it. The repository itself is
+written in large sequential pieces and cares much less; array storage is a
+reasonable place for it.
+

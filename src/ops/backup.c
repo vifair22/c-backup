@@ -9,6 +9,7 @@
 #include "scan.h"
 #include "store_index.h"
 #include "db_txn.h"
+#include "phase_timer.h"
 
 #include <cutils/log.h>
 
@@ -69,6 +70,8 @@ typedef struct {
     struct timespec last_report;
     /* Metadata blobs (xattr sets, ACL texts) already stored this run. */
     hashset_t      meta_seen;
+    /* Per-component attribution for the whole run. */
+    phase_timers_t *timers;
 } pipeline_t;
 
 static void hashset_free(hashset_t *s)
@@ -294,6 +297,7 @@ static status_t store_content(pipeline_t *p)
         /* Every node type can carry xattrs and ACLs, so their blobs are
          * stored before the type branches below skip non-regular entries.
          * The hashes land in the node and travel into the manifest. */
+        uint64_t _tm = phase_now();
         status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR,
                                        e->xattr_data, e->xattr_len,
                                        e->node.xattr_hash);
@@ -301,6 +305,7 @@ static status_t store_content(pipeline_t *p)
             mst = store_meta_blob(p, OBJECT_TYPE_ACL,
                                   e->acl_data, e->acl_len,
                                   e->node.acl_hash);
+        phase_add(p->timers, PHASE_META_BLOB, _tm);
         if (mst != OK) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
@@ -339,8 +344,11 @@ static status_t store_content(pipeline_t *p)
          * know a file is unchanged without hashing it, so the metadata has to
          * answer instead.
          */
-        if (file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
-                              e->node.content_hash)) {
+        uint64_t _tc = phase_now();
+        int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                                          e->node.content_hash);
+        phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
+        if (cache_hit) {
             /* Nothing is written here on purpose. A hit has to be free, or
              * the cache costs more than the reading it avoids. */
             p->res->files++;
@@ -358,8 +366,10 @@ static status_t store_content(pipeline_t *p)
         }
 
         object_write_t w;
+        uint64_t _tr = phase_now();
         status_t st = object_store_file_info(p->store, fd, e->node.size,
                                              e->node.content_hash, &w);
+        phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
         if (st != OK) {
@@ -385,17 +395,21 @@ static status_t store_content(pipeline_t *p)
          * It could not live here anyway, because two files with the same data
          * and different trailing holes share a payload and so share a hash.
          */
+        uint64_t _ti = phase_now();
         st = store_index_put_loose(p->db, p->repo_id, e->node.content_hash,
                                    OBJECT_TYPE_FILE, w.phys_bytes,
                                    w.payload_size);
+        phase_add(p->timers, PHASE_INDEX_PUT, _ti);
         if (st != OK) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
             return st;
         }
 
+        uint64_t _tp = phase_now();
         file_cache_put(p->db, p->repo_id, e->path, &e->st,
                        e->node.content_hash, p->cache_stamp);
+        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
     }
 
     if (in_txn && db_txn_commit(p->db) != OK)
@@ -880,6 +894,10 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * roots are detected once, which is why the inode map is shared. */
     scan_result_t *scan = NULL;
     status_t st = OK;
+    phase_timers_t timers;
+    memset(&timers, 0, sizeof(timers));
+
+    uint64_t _tscan = phase_now();
     for (int i = 0; i < opts->n_paths; i++) {
         scan_result_t *part = NULL;
         st = scan_tree(opts->paths[i], imap, &sopts, &part);
@@ -909,6 +927,8 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_INVALID, "backup_run: nothing to back up");
     }
 
+    phase_add(&timers, PHASE_SCAN, _tscan);
+
     node_link_t *links = calloc(scan->count, sizeof(*links));
     if (!links) { scan_result_free(scan); return set_error(ERR_NOMEM, "backup_run: links"); }
     for (uint32_t i = 0; i < scan->count; i++) {
@@ -918,14 +938,18 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 } };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers };
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* Layers below here attribute through the thread-local; see phase_timer.h. */
+    phase_current = &timers;
     st = store_content(&p);
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t _ttr = phase_now();
     if (st == OK) st = build_trees(&p, root_hash);
+    phase_add(&timers, PHASE_TREES, _ttr);
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     if (st != OK) {
@@ -947,7 +971,9 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     time_t now = time(NULL);
     st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
+    uint64_t _tin = phase_now();
     if (st == OK) st = index_nodes(&p, snap_id);
+    phase_add(&timers, PHASE_INDEX_NODES, _tin);
     clock_gettime(CLOCK_MONOTONIC, &t3);
 
     if (st == OK) {
@@ -977,11 +1003,14 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 if (scan->entries[i].node.type == NODE_TYPE_REG)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
+            uint64_t _tsw = phase_now();
             file_cache_sweep(db, repo_id, seen, n_seen);
+            phase_add(&timers, PHASE_CACHE_SWEEP, _tsw);
             free(seen);
         }
     }
 
+    phase_current = NULL;
     res.snapshot_id = snap_id;
     hashset_free(&p.meta_seen);
     free(links);
@@ -989,10 +1018,16 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     if (st == OK && out) *out = res;
     if (st == OK) {
-        log_info("backup phases: scan+store %.1fs, trees %.1fs, index %.1fs",
+        /*
+         * t0 is taken after the scan has already run, so the old label on
+         * this line - "scan+store" - named a phase it did not contain. The
+         * scan is measured properly now and appears in the profile below.
+         */
+        log_info("backup phases: store %.1fs, trees %.1fs, index %.1fs",
                  (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
                  (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) / 1e9,
                  (double)(t3.tv_sec - t2.tv_sec) + (double)(t3.tv_nsec - t2.tv_nsec) / 1e9);
+        phase_report(&timers, "backup", phase_now() - _tscan);
         log_info("backup: snapshot %lld, %llu files (%llu unchanged, not read), "
                  "%llu new objects, %llu new trees, %llu reused",
                  (long long)snap_id, (unsigned long long)res.files,

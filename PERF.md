@@ -6,6 +6,155 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-08-25 - The whole backup path, attributed
+
+`backup_run` reported one number for "scan+store", which was both the bucket
+holding everything interesting and mislabelled - its clock started after the
+scan had already finished. `src/common/phase_timer.h` now measures every
+component and logs them sorted by cost, at about a tenth of a second of
+overhead across 622,000 files, so it stays on in production. The profile that
+matters only exists on the deployment.
+
+Fixture: 60,000 files, 917 MB, average 14 KB, three levels deep. 21,929 of them
+are distinct objects; the rest deduplicate.
+
+### Two different problems, which one number was hiding
+
+Full backup on NVMe-backed xfs, 31s:
+
+| phase | time | share | per call |
+|--------------------|--------|-------|---------|
+| read+hash+write | 18.25s | 77.3% | 304 us |
+| trees | 1.64s | 7.0% | |
+| index-nodes | 1.15s | 4.9% | |
+| index-put | 1.09s | 4.6% | 18.2 us |
+| cache-put | 0.79s | 3.3% | 13.2 us |
+| cache-lookup | 0.54s | 2.3% | 9.0 us |
+| scan | 0.12s | 0.5% | |
+
+Incremental, nothing changed, 2.26s:
+
+| phase | time | share |
+|--------------|--------|-------|
+| index-nodes | 1.50s | 67.0% |
+| cache-lookup | 0.55s | 24.4% |
+| scan | 0.12s | 5.2% |
+| trees | 0.06s | 2.7% |
+
+**91% of an incremental is SQLite**, and two thirds of it is `index_nodes`
+rewriting all 60,000 node rows and 60,000 FTS rows for a snapshot in which
+nothing changed - while the manifest trees it derives from deduplicate at 3.3%.
+The schema already carries `nodes_materialized` and a fault-in path for evicted
+snapshots, so the machinery for not doing this eagerly exists.
+
+### The full-backup cost is one syscall
+
+Breaking the 77% bucket apart:
+
+| | time | share | per call |
+|-------------------|--------|-------|----------|
+| obj:install | 9.86s | 41.7% | 449 us |
+| **inst:rename** | 9.70s | 41.1% | **442 us** |
+| obj:io-loop | 4.59s | 19.4% | 76.5 us |
+| obj:setup | 1.45s | 6.1% | 24.2 us |
+| obj:finish | 0.20s | 0.9% | 3.4 us |
+| obj:sync | 0.04s | 0.2% | 2.0 us |
+| inst:mkdir+open | 0.09s | 0.4% | 4.0 us |
+| inst:close | 0.03s | 0.1% | 1.5 us |
+| inst:loose-set | 0.00s | 0.0% | 0.1 us |
+
+Renaming each finished temp file into `objects/xx/` is 41% of the run. Reading,
+hashing, encrypting and writing the actual bytes is 19%.
+
+`obj:sync` at 2.0 us also settles a standing suspicion: `async_writeback` is
+genuinely asynchronous here, so the `sync_file_range` fallback to `fdatasync`
+in `object.c` is not firing on this filesystem and is not a cost.
+
+### What was ruled out, and what is still unexplained
+
+A microbenchmark on the same filesystem does create+write+rename in 13 us, and
+59 us with the same `sync_file_range` call. Ours costs 442 us for the rename
+alone, so this is not simply what xfs charges.
+
+Four explanations were measured and killed: a 256 MiB `malloc` per object in
+`rs_parity_stream_init` (free - glibc caches it, 0 us), the `sync_file_range`
+fallback (2 us, above), CPU cost (`perf` finds under 5% in `rs_encode_batch32`
+and about 10% scattered in SQLite, so the time is blocked rather than spent),
+and journal contention with `state.db` sharing the filesystem - moving the
+database to tmpfs made rename *worse*, 825 us.
+
+The last of those matters more as variance than as a result: the same operation
+measured 442 us and 825 us on consecutive runs of an identical fixture. A
+per-object filesystem metadata operation whose cost swings 2x with ambient
+system state is not something to tune. It is something to stop doing.
+
+### Where this points
+
+Not at making rename faster. Objects are written loose and uncompressed, then
+read back, compressed, written again into a pack, and unlinked - so each one
+costs an inode create, a rename, a second full read, an unlink, and double the
+write volume. On the Unraid runner tree that was 7.87 GB written loose before
+4.48 GB written packed, for 8 GB of source, across 230,595 objects.
+
+Writing into packs during the backup removes the rename entirely rather than
+optimising it, compresses once instead of twice, and deletes the 41%. The
+incremental path is a separate fix and a cheaper one: stop materialising node
+rows eagerly, which the schema is already built for.
+
+## 2026-08-25 - Where a small-file backup actually spends its time
+
+`bench_phases` reports `backup_1k_4K` at 51,033 files/s, 0.0196 ms a file. The
+first Unraid pass took 3,552 s for 622,000 files, 5.7 ms a file. A 290x gap
+between the benchmark and the machine is worth explaining before optimising
+anything, because one of the two is measuring the wrong thing.
+
+It was the machine, and the cause was the test rig rather than the code.
+
+### Same work, only the state database moves
+
+60,875 files, 842 MB, `gitlab-runner/builds`. Source on ZFS cache both times,
+repository on ZFS cache both times, same image, caches dropped before each.
+
+| state.db on | wall | ms/file |
+|--------------------------------|-----------|--------:|
+| `/mnt/disk1` - xfs on `md1p1` | 204,165 ms | 3.35 |
+| `/mnt/cache` - ZFS SSD | 64,056 ms | 1.05 |
+
+3.2x, and the two runs produced byte-identical repositories: 35,855 objects,
+phys 636,180,560, orig 1,198,057,486, 4 packs, 0 loose. The only difference was
+which device the index lived on.
+
+`md1p1` is an Unraid parity-protected array disk, so every write is a
+read-modify-write across the data disk and the parity disk on spinning rust.
+A backup does at least one `file_cache` SELECT and one INSERT per file, plus a
+second SELECT on `objects` for every cache hit - roughly 1.2M queries for
+622,000 files. Paying parity RMW on those costs about 2.3 ms a file, which was
+68% of that run.
+
+### The floor, for comparison
+
+60,000 files, 917 MB, same shape, on tmpfs:
+
+| Run | wall | ms/file |
+|------------------------|--------|--------:|
+| first backup | 6.2 s | 0.103 |
+| incremental, warm cache | 1.7 s | 0.029 |
+
+So the code path is about 0.1 ms a file and the rest is storage. The benchmark
+was not wrong, it was just measuring the path with the index in RAM.
+
+### What this does and does not say
+
+The shipped deploy is already correct: `.gitlab-ci.yml` mounts
+`/mnt/user/appdata/c-backupd`, and on this box `/mnt/user/appdata` resolves to
+the ZFS cache dataset, not the array. Only the acceptance rig had the index on
+`/mnt/disk1`, and the 59-minute figure recorded for the first Unraid pass is an
+artifact of that. It would have been roughly three times faster as deployed.
+
+What remains genuinely open is the 1.05 ms against a 0.103 ms floor - a factor
+of ten between ZFS and RAM for the same work. That is the number to attack if
+small-file throughput matters, and it has not been broken down yet.
+
 ## 2026-08-22 - Streaming parity repair
 
 A/B against the commit before the fix (04b16ca), measured with a driver

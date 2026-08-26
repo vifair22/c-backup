@@ -6,6 +6,7 @@
 #include "parity.h"
 #include "parity_stream.h"
 #include "util.h"
+#include "phase_timer.h"
 #include <cutils/log.h>
 
 #include <errno.h>
@@ -585,6 +586,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
                                          void *progress_ctx) {
+    uint64_t _pt_setup = phase_now();
     if (store_needs_key(store)) {
         if (src_path) close(src_fd);
         return set_error(ERR_INVALID,
@@ -712,9 +714,12 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         return set_error(ERR_NOMEM, "stream: rs parity stream init");
     }
 
+    phase_add(phase_current, PHASE_OBJ_SETUP, _pt_setup);
+
     /* ----------------------------------------------------------------
      * Main loop: read → hash → write → accumulate CRC & RS parity
      * ---------------------------------------------------------------- */
+    uint64_t _pt_io = phase_now();
     status_t st     = OK;
     uint32_t stream_crc = 0;
     uint64_t offset = 0;
@@ -1036,12 +1041,15 @@ done:
     }
     object_crypt_stream_free(cs);
     cs = NULL;
+    phase_add(phase_current, PHASE_OBJ_IO, _pt_io);
 
     /* Flush final partial RS group */
+    uint64_t _pt_fin = phase_now();
     if (st == OK) {
         if (rs_parity_stream_finish(&ps) != 0)
             st = set_error_errno(ERR_IO, "stream: RS parity finish failed");
     }
+    phase_add(phase_current, PHASE_OBJ_FINISH, _pt_fin);
 
     if (st != OK) {
         rs_parity_stream_destroy(&ps);
@@ -1125,12 +1133,18 @@ done:
     /* Evict payload pages — no parity re-read needed */
     posix_fadvise(tfd, (off_t)sizeof(hdr), (off_t)total_written, POSIX_FADV_DONTNEED);
 
+    uint64_t _pt_sync = phase_now();
     if (async_writeback(tfd) == -1) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: fdatasync"); }
+    phase_add(phase_current, PHASE_OBJ_SYNC, _pt_sync);
+    uint64_t _pt_inst = phase_now();
+    uint64_t _pt_cl = phase_now();
     close(tfd);
+    phase_add(phase_current, PHASE_OBJ_CLOSE, _pt_cl);
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(out_hash, subdir, fname);
 
+    uint64_t _pt_md = phase_now();
     int objfd = store_objects_fd(store);
     if (objfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "stream: openat(objects)"); }
     if (mkdirat(objfd, subdir, 0755) == -1 && errno != EEXIST) {
@@ -1139,21 +1153,26 @@ done:
     if (errno == EEXIST) errno = 0;
     int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
     if (subfd == -1) { unlink(tmppath); return set_error_errno(ERR_IO, "stream: openat(%s)", subdir); }
+    phase_add(phase_current, PHASE_OBJ_MKDIR, _pt_md);
 
     char dstpath[PATH_MAX];
     if (snprintf(dstpath, sizeof(dstpath), "%s/objects/%s/%s",
                  store_root(store), subdir, fname) >= (int)sizeof(dstpath)) {
         close(subfd); unlink(tmppath); return set_error(ERR_IO, "stream: dstpath too long");
     }
+    uint64_t _pt_rn = phase_now();
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             close(subfd); unlink(tmppath); return OK;
         }
         close(subfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: rename(%s, %s)", tmppath, dstpath);
     }
+    phase_add(phase_current, PHASE_OBJ_RENAME, _pt_rn);
 
     close(subfd);
+    uint64_t _pt_ls = phase_now();
     store_loose_set_insert(store, out_hash);
+    phase_add(phase_current, PHASE_OBJ_LOOSESET, _pt_ls);
     if (out_is_new) *out_is_new = 1;
     /* The parity trailer is on disk whether or not the caller asked about it,
      * so it belongs in the physical size. Leaving it out here while the
@@ -1163,6 +1182,7 @@ done:
     if (out_phys_bytes)
         *out_phys_bytes = (uint64_t)sizeof(object_header_t) + total_written
                         + stream_trailer_sz;
+    phase_add(phase_current, PHASE_OBJ_INSTALL, _pt_inst);
     return OK;
 }
 
