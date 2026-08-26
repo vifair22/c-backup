@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "prune.h"
+#include "db_txn.h"
 
 #include <cutils/log.h>
 
@@ -32,7 +33,7 @@ status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
             (const char *[]){ repo, marker, snap, NULL }, NULL) != 0)
         return set_error(ERR_IO, "prune: cannot record intent");
 
-    if (db_exec_raw(db, "BEGIN") != 0)
+    if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "prune: begin");
 
     int failed = db_execute_non_query(db,
@@ -56,11 +57,11 @@ status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
             (const char *[]){ repo, snap, NULL }, NULL) != 0;
 
     if (failed) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("prune: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "prune: cannot remove snapshot %lld rows",
                          (long long)snap_id);
     }
-    if (db_exec_raw(db, "COMMIT") != 0)
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "prune: commit");
 
     char path[PATH_MAX];

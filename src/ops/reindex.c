@@ -6,6 +6,7 @@
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
+#include "db_txn.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -277,7 +278,7 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
-    if (db_exec_raw(db, "BEGIN") != 0) {
+    if (db_txn_begin(db) != OK) {
         free(label);
         return set_error(ERR_IO, "reindex: begin");
     }
@@ -325,11 +326,11 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
     free(label);
 
     if (failed) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return st != OK ? st : set_error(ERR_IO, "reindex: snapshot %lld failed",
                                          (long long)snap_id);
     }
-    if (db_exec_raw(db, "COMMIT") != 0)
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: commit");
 
     /* Standalone callers fault a single cold snapshot back in and get a
@@ -455,14 +456,14 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
      * its time in SQLite's per-statement bookkeeping rather than in the work.
      * It is also the correct scope: a half-rebuilt pack index should never be
      * observable. */
-    if (db_exec_raw(db, "BEGIN") != 0)
+    if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin pack index rebuild");
 
     if (db_execute_non_query(db, "DELETE FROM pack_objects WHERE repo_id = ?",
                              (const char *[]){ repo, NULL }, NULL) != 0 ||
         db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ?",
                              (const char *[]){ repo, NULL }, NULL) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "reindex: cannot clear pack index");
     }
 
@@ -474,11 +475,11 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
 
     status_t st = pack_list(store, pack_num_seen, &c);
     if (st != OK || c.failed) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return st != OK ? st
                         : set_error(ERR_IO, "reindex: cannot rebuild pack index");
     }
-    if (db_exec_raw(db, "COMMIT") != 0)
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: cannot commit pack index");
 
     res->packs         = c.packs;
@@ -509,7 +510,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
      * pack_objects was just rebuilt from those same headers and already holds
      * the sizes, so the answer is a join rather than a file read.
      */
-    if (db_exec_raw(db, "BEGIN") != 0)
+    if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin object sizing");
 
     if (db_execute_non_query(db,
@@ -524,7 +525,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
             "   AND EXISTS (SELECT 1 FROM pack_objects po"
             "                WHERE po.repo_id = objects.repo_id AND po.hash = objects.hash)",
             (const char *[]){ repo, NULL }, NULL) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "reindex: cannot size packed objects");
     }
 
@@ -535,7 +536,7 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
             "SELECT hash FROM objects WHERE repo_id = ? AND phys_size IS NULL",
             (const char *[]){ repo, NULL }, &r) != 0) {
         db_result_free(r);
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "reindex: cannot list unsized objects");
     }
 
@@ -573,10 +574,10 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
     db_result_free(r);
 
     if (st != OK) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("reindex: rollback failed");
+        db_txn_rollback(db);
         return st;
     }
-    if (db_exec_raw(db, "COMMIT") != 0)
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: cannot commit object sizes");
     return OK;
 }

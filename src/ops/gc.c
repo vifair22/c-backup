@@ -7,6 +7,7 @@
 #include "manifest.h"
 #include "object.h"
 #include "pack.h"
+#include "db_txn.h"
 
 #include <cutils/log.h>
 
@@ -116,21 +117,21 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     gc_result_t res;
     memset(&res, 0, sizeof(res));
 
-    if (db_exec_raw(db, "BEGIN") != 0)
+    if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "gc: begin");
 
     /* Clear every mark first. Anything still at zero after the walk is
      * unreachable from any snapshot. */
     if (db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
                              (const char *[]){ repo, NULL }, NULL) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot clear marks");
     }
 
     db_result_t *snaps = NULL;
     if (db_execute(db, "SELECT id, root_tree_hash FROM snapshots WHERE repo_id = ?",
                    (const char *[]){ repo, NULL }, &snaps) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot list snapshots");
     }
 
@@ -144,7 +145,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_free(snaps);
 
     if (st != OK) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return st;
     }
 
@@ -154,7 +155,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             "SELECT hash, COALESCE(phys_size, 0), location FROM objects"
             " WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, &dead) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot list unreachable objects");
     }
 
@@ -166,7 +167,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (dry_run) {
         db_result_free(dead);
         /* Marks are real work, but a dry run must leave nothing changed. */
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         if (out) *out = res;
         return OK;
     }
@@ -195,18 +196,18 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             "DELETE FROM pack_objects WHERE repo_id = ? AND hash IN"
             " (SELECT hash FROM objects WHERE repo_id = ? AND refcount = 0)",
             (const char *[]){ repo, repo, NULL }, NULL) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot clear pack locations");
     }
 
     if (db_execute_non_query(db,
             "DELETE FROM objects WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, NULL) != 0) {
-        if (db_exec_raw(db, "ROLLBACK") != 0) log_error("gc: rollback failed");
+        db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot delete unreachable objects");
     }
 
-    if (db_exec_raw(db, "COMMIT") != 0)
+    if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "gc: commit");
 
     /* The in-memory loose set predates the sweep and now lists files that are

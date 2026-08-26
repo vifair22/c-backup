@@ -3,6 +3,7 @@
 #include "store_index.h"
 
 #include "pack.h"   /* PACK_VERSION: the format new packs are written in */
+#include "db_txn.h"
 
 #include <cutils/log.h>
 
@@ -82,7 +83,16 @@ static status_t db_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
  * disk and unreachable. Serialising the commits is enough, and they are rare
  * and short compared to the packing itself.
  */
-static pthread_mutex_t g_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * The pack commit mutex is gone: db_txn_begin serialises every writer in the
+ * daemon, which is a superset of what this guarded. It existed because two
+ * pack workers issuing BEGIN on the shared handle collided, the second one's
+ * rows were never written, and its objects sat on disk unreachable.
+ *
+ * Lock ordering note, since this is the site that used to hold two: whatever
+ * replaces it must still be taken before the transaction, never after. See
+ * db_txn.h.
+ */
 
 static void db_pack_commit(void *user, const pack_commit_info_t *info)
 {
@@ -101,10 +111,8 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
      * The pack file is already installed by the time this runs; that ordering
      * is deliberate and explained in daemonization-spec.md section 12.
      */
-    pthread_mutex_lock(&g_commit_lock);
-    if (db_exec_raw(idx->db, "BEGIN") != 0) {
+    if (db_txn_begin(idx->db) != OK) {
         log_error("pack commit: cannot begin transaction for pack %s", pack);
-        pthread_mutex_unlock(&g_commit_lock);
         return;
     }
 
@@ -149,15 +157,12 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
     }
 
     if (failed) {
-        if (db_exec_raw(idx->db, "ROLLBACK") != 0)
-            log_error("pack commit: rollback failed for pack %s", pack);
+        db_txn_rollback(idx->db);
         log_error("pack commit: rolled back pack %s (%u objects)", pack, info->entry_count);
-        pthread_mutex_unlock(&g_commit_lock);
         return;
     }
-    if (db_exec_raw(idx->db, "COMMIT") != 0)
+    if (db_txn_commit(idx->db) != OK)
         log_error("pack commit: commit failed for pack %s", pack);
-    pthread_mutex_unlock(&g_commit_lock);
 }
 
 /*
@@ -171,24 +176,44 @@ static void pack_removed(void *user, uint64_t pack_id)
     store_index_t *idx = user;
     if (!idx) return;
 
-    /* Same shared handle as the commit callback, and GC emits removals from
-     * the same worker threads that emit commits. */
-    pthread_mutex_lock(&g_commit_lock);
-
+    /*
+     * Its own transaction, where it used to run two bare DELETEs under the
+     * pack commit mutex and join whatever transaction happened to be open.
+     * They belong together: a pack_objects row outliving its packs row
+     * resolves to bytes that now belong to something else.
+     */
     char repo[32], pack[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
     snprintf(pack, sizeof(pack), "%llu", (unsigned long long)pack_id);
 
+    if (db_txn_begin(idx->db) != OK) {
+        log_error("pack removed: cannot begin transaction for pack %s", pack);
+        return;
+    }
+
+    /*
+     * Either both rows go or neither does. Committing half of this is the
+     * stale-row bug in a new shape: a pack_objects row whose packs row is
+     * gone still resolves, to bytes that now belong to something else.
+     */
     if (db_execute_non_query(idx->db,
             "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
-            (const char *[]){ repo, pack, NULL }, NULL) != 0)
+            (const char *[]){ repo, pack, NULL }, NULL) != 0) {
         log_error("pack removed: cannot clear pack_objects for pack %s", pack);
+        db_txn_rollback(idx->db);
+        return;
+    }
 
     if (db_execute_non_query(idx->db,
             "DELETE FROM packs WHERE repo_id = ? AND id = ?",
-            (const char *[]){ repo, pack, NULL }, NULL) != 0)
+            (const char *[]){ repo, pack, NULL }, NULL) != 0) {
         log_error("pack removed: cannot delete packs row %s", pack);
-    pthread_mutex_unlock(&g_commit_lock);
+        db_txn_rollback(idx->db);
+        return;
+    }
+
+    if (db_txn_commit(idx->db) != OK)
+        log_error("pack removed: commit failed for pack %s", pack);
 }
 
 /* ------------------------------------------------------------------ */

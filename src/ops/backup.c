@@ -8,6 +8,7 @@
 #include "object.h"
 #include "scan.h"
 #include "store_index.h"
+#include "db_txn.h"
 
 #include <cutils/log.h>
 
@@ -282,7 +283,7 @@ static status_t store_content(pipeline_t *p)
 
     for (uint32_t i = 0; i < p->count; i++) {
         if (cancelled(p)) {
-            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+            if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed on cancel");
             return set_error(ERR_BUSY, "backup cancelled");
         }
@@ -301,7 +302,7 @@ static status_t store_content(pipeline_t *p)
                                   e->acl_data, e->acl_len,
                                   e->node.acl_hash);
         if (mst != OK) {
-            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+            if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
             return mst;
         }
@@ -321,12 +322,12 @@ static status_t store_content(pipeline_t *p)
          * is the middle.
          */
         if (!in_txn) {
-            if (db_exec_raw(p->db, "BEGIN") == 0) in_txn = 1;
+            if (db_txn_begin(p->db) == OK) in_txn = 1;
             else err_clear();
             since_commit = 0;
         }
         if (++since_commit >= CACHE_BATCH) {
-            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+            if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
             in_txn = 0;
         }
@@ -388,7 +389,7 @@ static status_t store_content(pipeline_t *p)
                                    OBJECT_TYPE_FILE, w.phys_bytes,
                                    w.payload_size);
         if (st != OK) {
-            if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+            if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
             return st;
         }
@@ -397,7 +398,7 @@ static status_t store_content(pipeline_t *p)
                        e->node.content_hash, p->cache_stamp);
     }
 
-    if (in_txn && db_exec_raw(p->db, "COMMIT") != 0)
+    if (in_txn && db_txn_commit(p->db) != OK)
         log_warn("backup: cache commit failed");
     return OK;
     #undef CACHE_BATCH
@@ -721,8 +722,27 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         db_result_free(r);
     }
 
-    if (db_exec_raw(p->db, "BEGIN") != 0)
-        return set_error(ERR_IO, "index_nodes: begin");
+    /*
+     * Committed in batches, for the same reason store_content is.
+     *
+     * This used to be one transaction spanning every node and its FTS row -
+     * 1.2M inserts on a 622,000-file tree, minutes of wall clock. That was
+     * survivable while writers raced, because a writer that could not begin
+     * failed instead of waiting. Now they queue behind the write lock, and a
+     * lock held for minutes would block every tag, note, policy and sources
+     * write for the length of a backup: a worse bug than the one it replaced.
+     *
+     * Splitting it is safe here. The authoritative snapshot record is already
+     * in the repository, written by write_snapshot_record before this runs,
+     * and the snapshots row that marks nodes_materialized is not inserted
+     * until every batch has landed. An interrupted run therefore leaves node
+     * rows that no snapshot claims - index garbage a reindex rebuilds, which
+     * is the state eviction already produces deliberately.
+     */
+    #define NODE_BATCH 2000
+    uint32_t since_commit = 0;
+    status_t bst = db_txn_begin(p->db);
+    if (bst != OK) return bst;
 
     for (uint32_t i = 0; i < p->count; i++) {
         scan_entry_t *e = &p->scan->entries[i];
@@ -810,8 +830,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                                   hash_is_zero(e->node.acl_hash)   ? "" : ahex,
                                   dmaj, dmin, NULL }, NULL);
         if (rc != 0) {
-            if (db_exec_raw(p->db, "ROLLBACK") != 0)
-                log_error("index_nodes: rollback failed");
+            db_txn_rollback(p->db);
             return set_error(ERR_IO, "index_nodes: insert failed");
         }
 
@@ -819,15 +838,21 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
                 "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
                 " VALUES (?, ?, ?, ?)",
                 (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
-            if (db_exec_raw(p->db, "ROLLBACK") != 0)
-                log_error("index_nodes: rollback failed");
+            db_txn_rollback(p->db);
             return set_error(ERR_IO, "index_nodes: fts insert failed");
+        }
+
+        if (++since_commit >= NODE_BATCH) {
+            status_t cst = db_txn_commit(p->db);
+            if (cst != OK) return cst;
+            since_commit = 0;
+            cst = db_txn_begin(p->db);
+            if (cst != OK) return cst;
         }
     }
 
-    if (db_exec_raw(p->db, "COMMIT") != 0)
-        return set_error(ERR_IO, "index_nodes: commit");
-    return OK;
+    #undef NODE_BATCH
+    return db_txn_commit(p->db);
 }
 
 /* ------------------------------------------------------------------ */

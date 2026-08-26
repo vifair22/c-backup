@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "db_txn.h"
 
 #include <strings.h>
 
@@ -313,7 +314,7 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
     }
 
     if (!failed) {
-        if (db_exec_raw(g_db, "BEGIN") != 0) {
+        if (db_txn_begin(g_db) != OK) {
             failed = 1;
             bad = api_error(500, "cannot begin");
         }
@@ -339,9 +340,9 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
                 failed = 1;
 
         if (failed) {
-            if (db_exec_raw(g_db, "ROLLBACK") != 0) log_error("sources: rollback failed");
+            db_txn_rollback(g_db);
             bad = api_error(500, "cannot store backup sources");
-        } else if (db_exec_raw(g_db, "COMMIT") != 0) {
+        } else if (db_txn_commit(g_db) != OK) {
             failed = 1;
             bad = api_error(500, "cannot commit backup sources");
         }
