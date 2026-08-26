@@ -67,6 +67,25 @@ static void reset_repo(void)
     fake_index_attach(g_store);
 }
 
+/*
+ * Which pack got written, rather than which pack we assume got written.
+ *
+ * This used to enumerate "pack-00000001.dat" by name, which passed only
+ * because pack_stored_open took next_pack_num() + 1 and so skipped pack 0 on
+ * a fresh repository. When that off-by-one was removed - every writer now
+ * takes the number unmodified - the pack became 00000000 and this fuzzer
+ * aborted on a file that was there and correct.
+ *
+ * Asking the repository what it holds keeps the oracle about the round trip
+ * instead of about the numbering.
+ */
+static void note_pack_num(uint32_t pack_num, void *ctx)
+{
+    uint32_t *out = ctx;
+    (*out)++;
+    if (*out == 1u) out[1] = pack_num;
+}
+
 static void check_entry(const pack_entry_info_t *info, void *ctx)
 {
     size_t *seen = ctx;
@@ -147,9 +166,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
      * a pack it cannot get through is a repository that cannot be
      * maintained - and the entries it yields must be the ones written.
      */
+    uint32_t found[2] = { 0u, 0u };
+    if (pack_list(g_store, note_pack_num, found) != OK) abort();
+    if (found[0] != 1u) abort();   /* one writer, one pack */
+
+    char dat_name[64];
+    snprintf(dat_name, sizeof(dat_name), "pack-%08u.dat", found[1]);
+
     uint32_t version = 0, count = 0;
     size_t seen = 0;
-    if (pack_enumerate_dat(g_store, "pack-00000001.dat", &version, &count,
+    if (pack_enumerate_dat(g_store, dat_name, &version, &count,
                            check_entry, &seen) != OK) {
         /* A pack this writer produced must be readable by the enumerator
          * that every maintenance path depends on. */
