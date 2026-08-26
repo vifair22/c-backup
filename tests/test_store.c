@@ -22,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -680,6 +681,58 @@ static void test_dat_cache_return_ignores_null(void **state)
 }
 
 
+/*
+ * Staging files a dead process left behind are dropped on open.
+ *
+ * tmp/ is write-only by design: every durable write is mkstemp, write, fsync,
+ * rename, and nothing ever reads the directory back. A file there is therefore
+ * either in flight or garbage, and only the process that created it can tell
+ * the difference - unless it died, which is the case this exists for. Under
+ * direct-to-pack every interrupted backup leaves a pack-sized one.
+ */
+static void test_open_sweeps_stale_staging_files(void **state)
+{
+    (void)state;
+    rmrf(TEST_ROOT);
+    assert_int_equal(store_init_dirs(TEST_ROOT), OK);
+
+    char stale[512], fresh[512];
+    snprintf(stale, sizeof(stale), "%s/tmp/pack-dat.ABC123", TEST_ROOT);
+    snprintf(fresh, sizeof(fresh), "%s/tmp/obj.XYZ789",      TEST_ROOT);
+
+    for (int i = 0; i < 2; i++) {
+        const char *p = i ? fresh : stale;
+        FILE *f = fopen(p, "wb");
+        assert_non_null(f);
+        fputs("staging", f);
+        fclose(f);
+    }
+
+    /* Backdate one well past the threshold; leave the other at now. */
+    struct timespec times[2];
+    times[0].tv_sec = time(NULL) - 6 * 60 * 60;
+    times[0].tv_nsec = 0;
+    times[1] = times[0];
+    assert_int_equal(utimensat(AT_FDCWD, stale, times, 0), 0);
+
+    store_t *st = NULL;
+    store_config_t cfg = { 0 };
+    assert_int_equal(store_open(TEST_ROOT, &cfg, &st), OK);
+
+    struct stat sb;
+    /* The orphan is gone... */
+    assert_int_not_equal(stat(stale, &sb), 0);
+    /*
+     * ...and the recent one is not. This is the half that matters: a sweep
+     * that cannot tell an orphan from an in-flight write would delete a pack
+     * out from under the worker filling it, and the failure would surface
+     * later as a missing object rather than as an error here.
+     */
+    assert_int_equal(stat(fresh, &sb), 0);
+
+    done(st);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -706,6 +759,7 @@ int main(void)
         cmocka_unit_test(test_dat_cache_checkout_is_a_handoff),
         cmocka_unit_test(test_dat_cache_survives_growing),
         cmocka_unit_test(test_dat_cache_return_ignores_null),
+        cmocka_unit_test(test_open_sweeps_stale_staging_files),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

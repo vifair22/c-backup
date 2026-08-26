@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -169,6 +170,68 @@ done:
     return st;
 }
 
+/*
+ * Drop staging files left behind by a process that died mid-write.
+ *
+ * Every durable write in the repository is mkstemp, write, fsync, rename, and
+ * the loser of that race is a file in tmp/ that nothing will ever read - the
+ * directory is write-only by design. The success and error paths both unlink
+ * their own temp file, so these only accumulate when the process does not get
+ * to run either: a kill, an OOM, a power cut.
+ *
+ * Today that is bounded by how rarely a pack run is interrupted. It stops
+ * being bounded the moment a backup holds an open pack for its whole run,
+ * because then every interrupted backup leaves one behind, and they are pack
+ * sized.
+ *
+ * Age is the discriminator rather than a lock, because tmp/ is shared by
+ * whatever else is running against this repository and a sweep must never
+ * delete a file that is still being written. A live write touches its file
+ * continuously - the pack writer flushes an 8 MiB stdio buffer, the object
+ * writer streams in 256 KiB chunks - so an hour of no modification is several
+ * orders of magnitude past anything an in-flight operation produces, however
+ * slow its source. A file younger than that is left alone even if it is in
+ * fact an orphan; it will be swept on a later open.
+ */
+static void store_sweep_tmp(const char *root)
+{
+    char tmp_dir[PATH_MAX];
+    if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
+        return;
+
+    DIR *d = opendir(tmp_dir);
+    if (!d) return;
+
+    const time_t now = time(NULL);
+    const time_t stale_after = 60 * 60;   /* one hour, see above */
+    unsigned swept = 0;
+    uint64_t bytes = 0;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name)
+            >= (int)sizeof(path))
+            continue;
+
+        struct stat sb;
+        if (lstat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
+        if (now - sb.st_mtime < stale_after) continue;
+
+        if (unlink(path) == 0) {
+            swept++;
+            bytes += (uint64_t)sb.st_size;
+        }
+    }
+    closedir(d);
+
+    if (swept)
+        log_info("store: swept %u stale staging file(s) from tmp (%llu bytes)",
+                 swept, (unsigned long long)bytes);
+}
+
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd == -1)
@@ -209,6 +272,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
+
+    store_sweep_tmp(r->path);
 
     *out = r;
     return OK;

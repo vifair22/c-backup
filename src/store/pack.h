@@ -34,8 +34,9 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx);
 
 /*
- * Complete any interrupted pack installs from a previous crash.
- * Call before repo_pack() to recover staging directories.
+ * The function this used to document is gone. Packs install with a single
+ * rename now, so there is no interrupted two-file move to replay; what does
+ * survive a crash is an orphaned staging file, which store_open sweeps by age.
  */
 
 /* --- used by object.c -------------------------------------------- */

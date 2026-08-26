@@ -272,6 +272,23 @@ static void max_pack_num_cb(uint32_t pack_num, void *ctx) {
     if (pack_num >= *max) *max = pack_num + 1;
 }
 
+/*
+ * The number the next pack written to this repository should take.
+ *
+ * Returns max + 1: max_pack_num_cb increments as it scans, so the result is
+ * already the free slot rather than the highest used one. Every writer takes
+ * it the same way and none of them adds to it - pack_stored_open used to,
+ * which left a gap in the numbering for no reason.
+ *
+ * Concurrency is handled outside this function and has to stay that way.
+ * Within one repo_pack run the workers share an atomic seeded from here, so
+ * they do not collide with each other. Across runs, every writer - backup,
+ * pack, replicate - is a repo-scoped job holding the repo write lock, and that
+ * lock rejects rather than queues, so two of them cannot be open on one
+ * repository at the same time. A writer that ever runs outside that lock needs
+ * a reservation scheme, not a second scan: this one cannot see a pack that is
+ * still staging in tmp/, because it is not named until it is installed.
+ */
 static uint32_t next_pack_num(store_t *store) {
     uint32_t pack_num = 0;
     char packs_dir[PATH_MAX];
@@ -2145,7 +2162,7 @@ status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
     pack_stored_writer_t *w = calloc(1, sizeof(*w));
     if (!w) return set_error(ERR_NOMEM, "pack_stored_open: alloc");
     w->store = store;
-    w->pack_num = next_pack_num(store) + 1u;
+    w->pack_num = next_pack_num(store);
 
     status_t st = open_new_pack(store, w->pack_num, &w->dat_f, w->dat_tmp, &w->dat_hdr);
     if (st != OK) { free(w); return st; }
