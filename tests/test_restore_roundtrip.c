@@ -198,6 +198,65 @@ static void test_socket_in_source_does_not_fail_the_restore(void **state)
     unlink(TEST_SRC "/live.sock");
 }
 
+/*
+ * A whiteout is device 0:0, and 0:0 is a device.
+ *
+ * Restore used to read a zero major/minor pair as "this came from a version 1
+ * tree that never recorded the numbers" and skip the node. The case it guarded
+ * cannot happen - manifest_parse refuses any tree version but 2 - and the value
+ * it keyed on is exactly what an overlayfs whiteout is, so every whiteout in a
+ * Docker overlay2 tree was dropped and the restore reported nothing lost.
+ *
+ * It is not nothing. A whiteout records that a file was deleted in an upper
+ * layer; restore the layers without them and the deleted files come back.
+ * Found by restoring 561,132 files of a real runner cache, where 60 were
+ * whiteouts and only a diff against the source said so.
+ */
+static void test_restores_a_zero_zero_device_node(void **state)
+{
+    (void)state;
+
+    /*
+     * No privilege check, deliberately. Linux refuses an unprivileged mknod of
+     * a real device but allows 0:0, because it points at no driver - which is
+     * the whole reason a whiteout uses it. The one device value the old code
+     * discarded is the one every user can create.
+     */
+    assert_int_equal(mknod(TEST_SRC "/whiteout", S_IFCHR | 0000, makedev(0, 0)), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    /* Stored as a character device with both numbers zero, not as nothing. */
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT type, dev_major, dev_minor FROM nodes WHERE name = 'whiteout'",
+        NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "6");   /* NODE_TYPE_CHR */
+    assert_string_equal(r->rows[0][1], "0");
+    assert_string_equal(r->rows[0][2], "0");
+    db_result_free(r);
+
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/whiteout", restored_root());
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_true(S_ISCHR(sb.st_mode));
+    assert_int_equal(major(sb.st_rdev), 0);
+    assert_int_equal(minor(sb.st_rdev), 0);
+
+    /* Counted as created, not quietly skipped. */
+    assert_true(rr.specials >= 1);
+
+    unlink(TEST_SRC "/whiteout");
+}
+
 static void test_restore_preserves_modes(void **state)
 {
     (void)state;
@@ -608,16 +667,26 @@ static void insert_device_node(int64_t snap_id, const char *name,
         NULL), 0);
 }
 
-static void test_device_without_numbers_is_skipped_not_created(void **state)
+static void test_device_the_kernel_refuses_is_skipped_not_created(void **state)
 {
     (void)state;
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
-    /* 0:0 is how a device indexed from a version 1 tree reads: the numbers
-     * were never recorded and cannot be invented. */
-    insert_device_node(br.snapshot_id, "olddev", 0, 0);
+    /*
+     * A device the kernel will not let this process create - 1:3 is /dev/null,
+     * and an unprivileged mknod of it fails EPERM. That is the case this test
+     * is about: the node is skipped with a warning and the rest of the tree
+     * still restores.
+     *
+     * It used to use 0:0 and call that "a device from a version 1 tree, whose
+     * numbers were never recorded". Both halves were wrong. A v1 tree cannot
+     * be read at all, and 0:0 is a real device - an overlayfs whiteout - which
+     * restore now creates. See test_restores_a_zero_zero_device_node.
+     */
+    if (geteuid() == 0) skip();   /* as root the mknod succeeds; nothing to skip */
+    insert_device_node(br.snapshot_id, "realdev", 1, 3);
 
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
@@ -626,7 +695,7 @@ static void test_device_without_numbers_is_skipped_not_created(void **state)
     assert_int_equal(rr.specials, 0);
 
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/olddev", restored_root());
+    snprintf(path, sizeof(path), "%s/realdev", restored_root());
     struct stat sb;
     assert_int_not_equal(lstat(path, &sb), 0);   /* nothing was created */
 
@@ -1175,6 +1244,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_directory_mtimes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
@@ -1186,7 +1256,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_fifos_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fifos_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_device_numbers_reach_the_index, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_device_without_numbers_is_skipped_not_created, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_device_the_kernel_refuses_is_skipped_not_created, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unprivileged_device_failure_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),

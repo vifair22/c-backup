@@ -607,15 +607,26 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             int made;
             if (ntype == NODE_TYPE_FIFO) {
                 made = mkfifo(full, (mode_t)(mode & 07777));
-            } else if (dmajor == 0 && dminor == 0) {
-                /* Version 1 trees never recorded the pair, so it cannot be
-                 * recovered. A device pointing at the wrong driver is worse
-                 * than an absent one. */
-                log_warn("restore: %s has no recorded device numbers "
-                         "(pre-v2 snapshot), skipping", rel);
-                res.skipped++;
-                continue;
             } else {
+                /*
+                 * Device 0:0 is a device, not a missing one.
+                 *
+                 * This used to treat a zero pair as "version 1 tree, the
+                 * numbers were never recorded" and skip the node. Two things
+                 * were wrong with that. A v1 tree cannot be read at all -
+                 * manifest_parse refuses any version but 2, so the case it
+                 * guarded cannot occur - and 0:0 is exactly what an overlayfs
+                 * whiteout is. Every whiteout in a Docker overlay2 tree was
+                 * therefore dropped, counted as skipped, and reported as a
+                 * restore with nothing lost.
+                 *
+                 * It is not nothing: a whiteout records that a file was
+                 * deleted in an upper layer. Restore the layers without them
+                 * and the deleted files come back. Found by restoring 561,132
+                 * files of a real runner cache, where 60 of them were
+                 * whiteouts and the diff against the source was the only thing
+                 * that said so.
+                 */
                 mode_t kind = (ntype == NODE_TYPE_CHR) ? S_IFCHR : S_IFBLK;
                 made = mknod(full, kind | (mode_t)(mode & 07777),
                              makedev(dmajor, dminor));
