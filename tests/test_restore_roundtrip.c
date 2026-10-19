@@ -10,6 +10,7 @@
  * than authoritative is demonstrated rather than asserted.
  */
 
+#include <errno.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -221,8 +222,19 @@ static void test_restores_a_zero_zero_device_node(void **state)
      * a real device but allows 0:0, because it points at no driver - which is
      * the whole reason a whiteout uses it. The one device value the old code
      * discarded is the one every user can create.
+     *
+     * Except on overlayfs, which refuses it even to root: a 0:0 node in the
+     * merged view would be indistinguishable from its own whiteouts. CI runs
+     * in a container whose /tmp is overlayfs, so there this test can only
+     * skip. Both the fixture and the restore target live under TEST_DIR, so
+     * moving the source alone would not help.
      */
-    assert_int_equal(mknod(TEST_SRC "/whiteout", S_IFCHR | 0000, makedev(0, 0)), 0);
+    if (mknod(TEST_SRC "/whiteout", S_IFCHR | 0000, makedev(0, 0)) != 0) {
+        assert_int_equal(errno, EPERM);
+        print_message("%s refuses a 0:0 device (overlayfs?), skipping\n",
+                      TEST_DIR);
+        skip();
+    }
 
     backup_opts_t o = basic_opts();
     backup_result_t br;
