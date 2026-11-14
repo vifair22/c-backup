@@ -24,15 +24,21 @@
 #define SALT_BYTES         16
 #define KEY_BYTES          32
 
-/* Endpoints callable without authentication. Kept as an explicit allowlist
- * (not a prefix match) so adding a new public route is a deliberate edit
- * to this table rather than an accident of URL shape. */
+/* Endpoints callable over TCP without a token, configured or not. Kept as an
+ * explicit allowlist (not a prefix match) so adding a public route is a
+ * deliberate edit to this table rather than an accident of URL shape.
+ *
+ * The probes are here because a monitor or a client has to be able to ask
+ * "is it up" without holding a credential; /metrics because a scraper should
+ * not need one either, and it carries counts and ages, never paths or
+ * content. /api/auth/setup is here so a client can learn whether setup is
+ * pending: its GET reports that, and its POST refuses any TCP request in the
+ * handler, because the first password is set on the host, over the socket. */
 static const char *const PUBLIC_ENDPOINTS[] = {
+    "/healthz",
+    "/readyz",
+    "/metrics",
     "/api/auth/setup",
-    "/api/auth/login",
-    "/api/setup/status",
-    "/api/setup/ports",
-    "/api/setup/test",
     NULL,
 };
 
@@ -163,8 +169,6 @@ int auth_is_setup(cutils_db_t *db)
     if (rc != 0 || !result) return 1;
     return result->nrows > 0;
 }
-
-#define AUTH_MIN_PASSWORD_LEN 4
 
 int auth_set_password(cutils_db_t *db, const char *password)
 {
@@ -329,20 +333,30 @@ int auth_check(const api_request_t *req, const char *url, void *userdata)
 
     /* Unix socket (CLI) - trusted, no auth required */
     if (req->is_local)
-        return 1;
+        return API_AUTH_ALLOW;
 
     /* Public endpoints - exact-match allowlist */
     for (const char *const *p = PUBLIC_ENDPOINTS; *p; p++) {
         if (strcmp(url, *p) == 0)
-            return 1;
+            return API_AUTH_ALLOW;
     }
 
-    /* Setup mode: allow everything only when we can affirmatively confirm
-     * the admin password has not been set. auth_is_setup fails closed on
-     * DB error, so a transient query failure cannot silently unlock the
-     * API. */
+    /*
+     * Before setup, TCP serves nothing else.
+     *
+     * The lifted airies-ups behaviour was the opposite: with no password set,
+     * every request passed, so whoever reached the port first could use the
+     * whole API and claim the daemon by setting the password. The first
+     * password is now set on the host over the socket, and until it is the
+     * network gets the probes and a 403 saying so. auth_is_setup fails closed
+     * on a DB error, so a transient failure reads as configured and falls
+     * through to the token check rather than opening anything.
+     */
     if (!auth_is_setup(db))
-        return 1;
+        return API_AUTH_NOT_CONFIGURED;
+
+    if (strcmp(url, "/api/auth/login") == 0)
+        return API_AUTH_ALLOW;
 
     /* Token comes from either the Authorization header (CLI / API
      * tokens / curl) or the "auth" cookie (browser SSE + regular
@@ -351,5 +365,5 @@ int auth_check(const api_request_t *req, const char *url, void *userdata)
     const char *token = req->auth_token;
     if (!token || !token[0])
         token = api_cookie(req, "auth");
-    return auth_validate_token(db, token);
+    return auth_validate_token(db, token) == 1 ? API_AUTH_ALLOW : API_AUTH_DENY;
 }

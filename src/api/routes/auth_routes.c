@@ -56,6 +56,11 @@ static api_response_t handle_setup_get(const api_request_t *req, void *ud)
 static api_response_t handle_setup_post(const api_request_t *req, void *ud)
 {
     auth_ctx_t *ctx = ud;
+    /* The first password is set on the host. Accepting it over TCP meant
+     * whoever reached the port first owned the daemon. */
+    if (!req->is_local)
+        return api_error(403, "setup is only accepted over the local socket: "
+                              "run 'c-backup auth setup' on the daemon's host");
     if (auth_is_setup(ctx->db))
         return api_error(409, "already configured; use /api/auth/password");
     if (!req->body) return api_error(400, "request body required");
@@ -67,7 +72,7 @@ static api_response_t handle_setup_post(const api_request_t *req, void *ud)
     CUTILS_AUTOFREE char *password = NULL;
     if (json_req_get_str(body, "password", &password) != 0 || !password)
         return api_error(400, "password is required");
-    if (strlen(password) < 8)
+    if (strlen(password) < AUTH_MIN_PASSWORD_LEN)
         return api_error(400, "password must be at least 8 characters");
 
     if (auth_set_password(ctx->db, password) != 0)
@@ -149,7 +154,7 @@ static api_response_t handle_password(const api_request_t *req, void *ud)
         return api_error(400, "current password is required");
     if (json_req_get_str(body, "new", &next) != 0 || !next)
         return api_error(400, "new password is required");
-    if (strlen(next) < 8)
+    if (strlen(next) < AUTH_MIN_PASSWORD_LEN)
         return api_error(400, "password must be at least 8 characters");
 
     if (!auth_verify_password(ctx->db, current))

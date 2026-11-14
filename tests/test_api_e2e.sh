@@ -53,7 +53,10 @@ well_formed() {  # well_formed <name> <body>
 
 sock_code() { curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" "http://localhost$1"; }
 sock_body() { curl -s --unix-socket "$SOCK" "http://localhost$1"; }
-tcp_code()  { curl -s -o /dev/null -w '%{http_code}' "$@" "http://127.0.0.1:$PORT$1" 2>/dev/null; }
+tcp_code() {  # tcp_code <path> [curl args...]
+    local path="$1"; shift
+    curl -s -o /dev/null -w '%{http_code}' "$@" "http://127.0.0.1:$PORT$path" 2>/dev/null
+}
 
 # Job ids come from the submit response, never from counting submissions.
 # Anything that fires a schedule consumes an id too, so a hardcoded id ends up
@@ -109,21 +112,56 @@ check "healthz"            200 "$(sock_code /healthz)"
 check "readyz"             200 "$(sock_code /readyz)"
 
 echo "auth"
-contains "setup unconfigured" '"configured":false' "$(sock_body /api/auth/setup)"
-# First-run mode leaves TCP open so the operator can bootstrap.
-check "tcp open before setup" 200 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/repos")"
-curl -s -X POST -d '{"password":"correcthorsebattery"}' \
-     "http://127.0.0.1:$PORT/api/auth/setup" > /dev/null
-check "tcp locked after setup" 401 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/repos")"
-check "wrong password" 401 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-     -d '{"password":"wrong"}' "http://127.0.0.1:$PORT/api/auth/login")"
+# Remote clients: the desktop app on another machine. Everything below the
+# setup checks goes over TCP unless it says socket.
+tcp_body() { curl -s "$@" 2>/dev/null; }
+URL="http://127.0.0.1:$PORT"
 
-TOKEN=$(curl -s -X POST -d '{"password":"correcthorsebattery"}' \
-        "http://127.0.0.1:$PORT/api/auth/login" \
+contains "setup unconfigured" '"configured":false' "$(sock_body /api/auth/setup)"
+# Before setup the network gets the probes and a 403 that says what to do -
+# not the whole API, which is what the lifted airies-ups behaviour gave it.
+check "tcp healthz before setup"   200 "$(tcp_code /healthz)"
+check "tcp readyz before setup"    200 "$(tcp_code /readyz)"
+check "tcp metrics before setup"   200 "$(tcp_code /metrics)"
+contains "tcp setup state readable" '"configured":false' "$(tcp_body "$URL/api/auth/setup")"
+check "tcp api refused before setup" 403 "$(tcp_code /repos)"
+contains "refusal names the fix" "c-backup auth setup" "$(tcp_body "$URL/repos")"
+check "tcp login refused before setup" 403 "$(tcp_code /api/auth/login -X POST \
+     -d '{"password":"correcthorsebattery"}')"
+# The first password is set on the host. Over TCP that would hand the daemon
+# to whoever reached the port first.
+check "tcp setup refused" 403 "$(tcp_code /api/auth/setup -X POST \
+     -d '{"password":"correcthorsebattery"}')"
+contains "still unconfigured" '"configured":false' "$(sock_body /api/auth/setup)"
+
+check "short password refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"password":"short"}' http://localhost/api/auth/setup)"
+check "socket setup" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"password":"correcthorsebattery"}' http://localhost/api/auth/setup)"
+check "setup twice refused" 409 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"password":"anotherpassword"}' http://localhost/api/auth/setup)"
+
+check "tcp locked after setup" 401 "$(tcp_code /repos)"
+# The probes stay public once a password exists. The desktop app asks /readyz
+# before it logs in, so a 401 here made every remote connection fail.
+check "tcp healthz after setup"  200 "$(tcp_code /healthz)"
+check "tcp readyz after setup"   200 "$(tcp_code /readyz)"
+check "tcp metrics after setup"  200 "$(tcp_code /metrics)"
+check "wrong password" 401 "$(tcp_code /api/auth/login -X POST -d '{"password":"wrong"}')"
+
+TOKEN=$(tcp_body -X POST -d '{"password":"correcthorsebattery"}' "$URL/api/auth/login" \
         | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 if [ -n "$TOKEN" ]; then ok "login returns a token"; else bad "login returns a token" "non-empty" "empty"; fi
-check "bearer accepted" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
-     -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/repos")"
+check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN")"
+check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
+check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
+check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
+# No CORS: nothing here is a browser client, and a wildcard origin let any
+# page in a browser on the host read the API.
+contains "no CORS header" "no-cors" \
+    "$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$URL/repos" \
+       | grep -qi '^access-control-allow-origin' && echo cors || echo no-cors)"
+check "preflight is not an auth bypass" 401 "$(tcp_code /repos -X OPTIONS)"
 # The socket is gated by filesystem permissions, not tokens.
 check "socket bypasses auth" 200 "$(sock_code /repos)"
 
@@ -365,6 +403,38 @@ contains "empty search keeps its key" '"results"' \
     "$(sock_body '/repos/1/search?q=zzzznotathing')"
 contains "empty object refs keep their key" '"refs"' \
     "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
+
+echo "remote"
+# The same operations the desktop app drives, over TCP with a token, after
+# the socket did the setup.
+AUTH=(-H "Authorization: Bearer $TOKEN")
+RB=$(tcp_body "${AUTH[@]}" -X POST -d "{\"paths\":[\"$WORK/src\"]}" "$URL/repos/1/backup")
+contains "tcp backup submits" '"job_id"' "$RB"
+RJOB=$(job_id "$RB")
+wait_job "$RJOB"
+contains "tcp job readable" '"state":"completed"' "$(tcp_body "${AUTH[@]}" "$URL/jobs/$RJOB")"
+contains "tcp snapshots" '"snapshots"' "$(tcp_body "${AUTH[@]}" "$URL/repos/1/snapshots")"
+# Progress streams over TCP too. A finished job gets one frame with its final
+# state and the stream ends, so this cannot hang the suite.
+contains "tcp job stream" '"state":"completed"' \
+    "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/$RJOB")"
+contains "tcp stream unknown job" 'no such job' \
+    "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/999999")"
+check "tcp stream needs a token" 401 "$(tcp_code /jobs/stream/$RJOB --max-time 5)"
+
+check "password change needs current" 401 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
+     -d '{"current":"wrong","new":"brandnewpassword"}')"
+check "password change too short" 400 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
+     -d '{"current":"correcthorsebattery","new":"short"}')"
+check "password change" 200 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
+     -d '{"current":"correcthorsebattery","new":"brandnewpassword"}')"
+check "old password refused" 401 "$(tcp_code /api/auth/login -X POST \
+     -d '{"password":"correcthorsebattery"}')"
+check "new password accepted" 200 "$(tcp_code /api/auth/login -X POST \
+     -d '{"password":"brandnewpassword"}')"
+
+check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
+check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"
 
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null

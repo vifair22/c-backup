@@ -141,8 +141,8 @@ int main(int argc, char *argv[])
         return 1;
     }
     if (!auth_is_setup(db))
-        log_warn("no admin password set: TCP requests are unauthenticated "
-                 "until POST /api/auth/setup");
+        log_warn("no admin password set: TCP serves only the health probes "
+                 "until one is, with 'c-backup auth setup' on this host");
 
     job_manager_t *jm = NULL;
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);

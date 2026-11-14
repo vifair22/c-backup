@@ -15,6 +15,11 @@
  * never has to re-login. 90 days here matches the home-user UX target. */
 #define AUTH_SESSION_TTL_HOURS (90 * 24)
 
+/* One minimum for every path that sets a password. The library accepted 4
+ * while both routes demanded 8, so the effective rule depended on who
+ * called it. */
+#define AUTH_MIN_PASSWORD_LEN 8
+
 /* Initialize auth system. */
 int auth_init(cutils_db_t *db);
 

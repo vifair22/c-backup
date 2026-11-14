@@ -195,8 +195,6 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
 
     if (content_type)
         MHD_add_response_header(resp, "Content-Type", content_type);
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
     /* set_cookie is built by api_cookie_set/api_cookie_clear, both of
      * which reject control characters in name/value - so any string
      * reaching here is safe to pass through without further validation. */
@@ -271,9 +269,6 @@ static enum MHD_Result send_streaming_response(
         free(w);
         return MHD_NO;
     }
-
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
 
     if (sresp->headers) {
         for (const api_header_t *h = sresp->headers; h->name; h++) {
@@ -454,20 +449,14 @@ static enum MHD_Result request_handler(void *cls,
 
     /* Body complete - dispatch */
 
-    /* CORS preflight: respond to OPTIONS immediately without auth */
-    if (strcmp(method, "OPTIONS") == 0) {
-        free(pb->data);
-        free(pb);
-        *req_cls = NULL;
-        struct MHD_Response *resp = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
-        MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-        MHD_add_response_header(resp, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
-        MHD_add_response_header(resp, "Access-Control-Max-Age", "86400");
-        enum MHD_Result ret = MHD_queue_response(conn, 204, resp);
-        MHD_destroy_response(resp);
-        return ret;
-    }
+    /*
+     * No CORS. Every response used to carry Access-Control-Allow-Origin: *
+     * and OPTIONS skipped auth, which let any web page open in a browser on
+     * the daemon's host read the API - and, before setup, drive all of it.
+     * Nothing here is a browser client: the CLI uses the socket and the
+     * desktop app's requests come from its main process, which CORS does
+     * not apply to.
+     */
 
     api_method_t api_method = method_from_string(method);
 
@@ -485,10 +474,18 @@ static enum MHD_Result request_handler(void *cls,
         };
 
         /* Auth check */
-        if (srv->auth_fn && !srv->auth_fn(&req, url, srv->auth_ud)) {
+        int verdict = srv->auth_fn ? srv->auth_fn(&req, url, srv->auth_ud)
+                                   : API_AUTH_ALLOW;
+        if (verdict != API_AUTH_ALLOW) {
             free(pb->data);
             free(pb);
             *req_cls = NULL;
+            /* A 401 invites the client to try a credential. Before setup
+             * there is no credential to try, so say what to do instead. */
+            if (verdict == API_AUTH_NOT_CONFIGURED)
+                return send_response(conn, 403, "application/json",
+                    "{\"error\":\"not configured: set the admin password "
+                    "with 'c-backup auth setup' on the daemon's host\"}", NULL);
             return send_response(conn, 401, "application/json",
                 "{\"error\":\"unauthorized\"}", NULL);
         }
