@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <time.h>
+#include <unistd.h>
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -1135,36 +1137,109 @@ static int cmd_schedule(int argc, char **argv)
 }
 
 /*
+ * Read a password without putting it on the command line.
+ *
+ * An argument lands in shell history and, while the command runs, in
+ * /proc/<pid>/cmdline for every local user to read. On a terminal this
+ * prompts with echo off; otherwise it takes one line from stdin, so a script
+ * can pipe the password in. Returns 0 with buf filled, or -1.
+ */
+static int read_password(const char *prompt, char *buf, size_t sz)
+{
+    int tty = isatty(STDIN_FILENO);
+    struct termios old, quiet;
+
+    if (tty) {
+        fputs(prompt, stderr);
+        fflush(stderr);
+        if (tcgetattr(STDIN_FILENO, &old) != 0) return -1;
+        quiet = old;
+        quiet.c_lflag &= ~(tcflag_t)ECHO;
+        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet) != 0) return -1;
+    }
+    char *got = fgets(buf, (int)sz, stdin);
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+        fputc('\n', stderr);
+    }
+    if (!got) return -1;
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return 0;
+}
+
+/* A new password, read twice on a terminal so a typo is not what gets set. */
+static int read_new_password(const char *prompt, char *buf, size_t sz)
+{
+    if (read_password(prompt, buf, sz) != 0) return -1;
+    if (!isatty(STDIN_FILENO)) return 0;
+    char again[256];
+    if (read_password("Repeat it: ", again, sizeof(again)) != 0) return -1;
+    int same = strcmp(buf, again) == 0;
+    memset(again, 0, sizeof(again));
+    if (!same) {
+        memset(buf, 0, sz);
+        fputs("c-backup: the passwords do not match\n", stderr);
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Authentication configures the daemon's TCP listener. Over the unix socket
- * these calls are still accepted, which is how a local operator sets or
- * changes the password that remote clients will use.
+ * these calls are always accepted, and setup is accepted nowhere else: the
+ * first admin password is set on the host, by whoever can reach the socket.
+ *
+ * Passwords may still be given as arguments for scripts that already do,
+ * but the default is to prompt (or read stdin), which keeps them off the
+ * command line.
  */
 static int cmd_auth(int argc, char **argv)
 {
     if (argc < 1) return fail("usage: auth <setup|login|logout|password> [args]");
 
+    char pw[256], pw2[256];
+
     if (strcmp(argv[0], "setup") == 0 || strcmp(argv[0], "login") == 0) {
-        if (argc < 2) return fail("usage: auth %s <password>", argv[0]);
+        int setup = strcmp(argv[0], "setup") == 0;
+        const char *pass = (argc >= 2) ? argv[1] : NULL;
+        if (!pass) {
+            int r = setup ? read_new_password("New admin password: ", pw, sizeof(pw))
+                          : read_password("Admin password: ", pw, sizeof(pw));
+            if (r != 0) return fail("no password read");
+            pass = pw;
+        }
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"password\":");
-        sb_json_str(&b, argv[1]);
+        sb_json_str(&b, pass);
         sb_puts(&b, "}");
-        const char *path = (strcmp(argv[0], "setup") == 0)
-                           ? "/api/auth/setup" : "/api/auth/login";
-        return call_sb("POST", path, &b);
+        memset(pw, 0, sizeof(pw));
+        return call_sb("POST", setup ? "/api/auth/setup" : "/api/auth/login", &b);
     }
 
     if (strcmp(argv[0], "logout") == 0)
         return call("POST", "/api/auth/logout", NULL);
 
     if (strcmp(argv[0], "password") == 0) {
-        if (argc < 3) return fail("usage: auth password <current> <new>");
+        const char *cur  = (argc >= 2) ? argv[1] : NULL;
+        const char *next = (argc >= 3) ? argv[2] : NULL;
+        if (!cur) {
+            if (read_password("Current admin password: ", pw, sizeof(pw)) != 0)
+                return fail("no password read");
+            cur = pw;
+        }
+        if (!next) {
+            if (read_new_password("New admin password: ", pw2, sizeof(pw2)) != 0)
+                return fail("no password read");
+            next = pw2;
+        }
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"current\":");
-        sb_json_str(&b, argv[1]);
+        sb_json_str(&b, cur);
         sb_puts(&b, ",\"new\":");
-        sb_json_str(&b, argv[2]);
+        sb_json_str(&b, next);
         sb_puts(&b, "}");
+        memset(pw, 0, sizeof(pw));
+        memset(pw2, 0, sizeof(pw2));
         return call_sb("POST", "/api/auth/password", &b);
     }
 
@@ -1205,7 +1280,7 @@ static const struct {
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
     { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args] [--source PATH]... [--dest PATH]" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
-    { "auth",      cmd_auth,      "auth <setup|login|logout|password> [args]" },
+    { "auth",      cmd_auth,      "auth <setup|login|logout|password> (prompts for passwords)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },

@@ -143,9 +143,14 @@ int api_server_route_streaming(api_server_t *srv, const char *pattern,
                                void *userdata);
 
 /* Set an auth check callback. Called before every API route handler.
- * Return 1 if the request is authorized, 0 to reject with 401.
+ * Return API_AUTH_ALLOW to serve the request, API_AUTH_DENY to reject it
+ * with 401, or API_AUTH_NOT_CONFIGURED to reject it with 403 because no
+ * admin password exists yet and there is nothing a client could send.
  * The callback receives the request (with auth_token) and the route URL.
  * If not set, all requests are allowed. */
+#define API_AUTH_ALLOW            1
+#define API_AUTH_DENY             0
+#define API_AUTH_NOT_CONFIGURED (-1)
 typedef int (*api_auth_fn)(const api_request_t *req, const char *url, void *userdata);
 void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata);
 

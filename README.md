@@ -59,13 +59,19 @@ sudo cp packaging/systemd/c-backupd.service /etc/systemd/system/
 sudo systemctl enable --now c-backupd
 ```
 
-Then set an admin password. Until you do, the TCP listener is open so the
-daemon can be bootstrapped; the unix socket is always gated by filesystem
-permissions instead.
+Then set an admin password on the host. It prompts, and it is the only way to
+set the first one: until it is set the TCP listener serves nothing but the
+health probes. The unix socket is always gated by filesystem permissions
+instead.
 
 ```sh
-curl -X POST -d '{"password":"..."}' http://localhost:8765/api/auth/setup
+c-backup auth setup
 ```
+
+The TCP listener binds loopback by default. To connect the desktop app from
+another machine, set `http.bind` in `/etc/c-backupd/config.yaml` to `0.0.0.0`
+(or one interface's address) and restart. The transport is plain HTTP, so put
+a reverse proxy or a tunnel in front on any network you do not trust.
 
 ## Using it
 
