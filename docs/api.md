@@ -5,12 +5,20 @@ Two transports, one API.
 - **Unix socket** (`http.socket`) bypasses authentication entirely. Filesystem
   permissions on the socket are the access control: if you can open it, you
   are authorised. This is what the CLI uses.
-- **TCP** (`http.port`) binds loopback unless `http.bind` says otherwise, and
-  requires `Authorization: Bearer <token>` or an `auth`
-  cookie, except for the public routes below.
+- **TCP** (`http.port`) is for remote clients, chiefly the desktop app on
+  another machine. It binds loopback unless `http.bind` says otherwise, and
+  requires `Authorization: Bearer <token>` (the `Bearer ` prefix is optional)
+  or an `auth` cookie, except for the public routes below. The transport is
+  plain HTTP; put a reverse proxy or a tunnel in front on an untrusted network.
 
-Until an admin password is set, TCP is open so the daemon can be bootstrapped.
-It locks down the moment `POST /api/auth/setup` succeeds.
+The first admin password is set over the socket, on the daemon's host:
+`c-backup auth setup`. Until one exists, TCP serves only the public routes
+and answers everything else with `403` and a message saying so. Setting it
+over TCP is refused outright: a port that accepted it would belong to
+whoever reached it first.
+
+There are no CORS headers. No client of this API is a browser page, and a
+wildcard origin would let any page open in a browser on the host read it.
 
 ## Conventions
 
@@ -37,11 +45,23 @@ client and daemon.
 | GET | `/readyz` | Readiness: the database is open |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/api/auth/setup` | Is an admin password configured? |
-| POST | `/api/auth/setup` | Set it, first run only |
-| POST | `/api/auth/login` | `{password}` returns `{token}` |
 
 Health and metrics are public deliberately: an endpoint that needs a
-credential cannot report a daemon too unhealthy to authenticate.
+credential cannot report a daemon too unhealthy to authenticate, and a client
+asks `/readyz` before it has logged in. Metrics carry counts and ages, never
+paths or file content.
+
+## Auth
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/auth/setup` | `{password}`: set the first one. Socket only (`403` over TCP), `409` once set |
+| POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. `403` before setup |
+| POST | `/api/auth/logout` | Revoke the presented token; `204` |
+| POST | `/api/auth/password` | `{current, new}`: always needs the current password |
+
+Passwords are at least 8 characters. Sessions last 90 days and slide forward
+on every authenticated request.
 
 ## Repositories
 
