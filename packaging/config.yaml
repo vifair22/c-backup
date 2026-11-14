@@ -17,10 +17,14 @@ http:
   # on it are the access control. RuntimeDirectory=c-backupd creates the
   # parent and removes it on stop, so a stale socket never survives a crash.
   socket: /run/c-backupd/c-backupd.sock
-  # TCP requires a bearer token or session cookie. Set bind to 127.0.0.1 to
-  # force remote access through a reverse proxy.
+  # TCP is for the desktop app on another machine. It requires a bearer token
+  # or session cookie, and until the admin password is set (with
+  # 'c-backup auth setup' on this host) it serves only the health probes.
+  # Loopback by default: set bind to 0.0.0.0, or one interface's address, to
+  # allow remote connections. The transport is plain HTTP, so put a reverse
+  # proxy or a tunnel in front on any network you do not trust.
   port: 8765
-  bind: 0.0.0.0
+  bind: 127.0.0.1
 
 log:
   level: info

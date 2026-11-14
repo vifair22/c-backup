@@ -538,6 +538,25 @@ contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
 SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
 
+echo "auth"
+# Setup is socket-only, so this is the one way the first admin password gets
+# set. It reads the password rather than taking it as an argument, which
+# would put it in shell history and /proc/<pid>/cmdline.
+OUT=$(printf 'correcthorsebattery\n' | cb auth setup 2>&1); RC=$?
+check "setup reads the password from stdin" 0 "$RC"
+contains "and reports it configured" '"configured":true' "$OUT"
+OUT=$(printf 'anotherpassword\n' | cb auth setup 2>&1); RC=$?
+check "a second setup fails" 1 "$RC"
+contains "and says to change it instead" "already configured" "$OUT"
+contains "login reads stdin too" '"token"' "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1); RC=$?
+check "password change reads both from stdin" 0 "$RC"
+contains "old password no longer logs in" "invalid password" \
+    "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
+check "no password on stdin fails" 1 "$RC"
+contains "and says so" "no password read" "$OUT"
+
 echo "listen address"
 
 # http.bind has been a documented setting since the config was written,

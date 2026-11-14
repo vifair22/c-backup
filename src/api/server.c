@@ -59,6 +59,9 @@ struct api_server {
     /* Held for the daemon's lifetime: MHD keeps the pointer it is given
      * rather than copying the address. */
     struct sockaddr_in bind_addr;
+    int                tcp_port;   /* 0 = no TCP listener */
+    int                unix_bound; /* this process created socket_path */
+    char               bind_str[INET_ADDRSTRLEN];
 };
 
 /* Wrapper passed as cls to MHD - carries the server + transport flag */
@@ -192,8 +195,6 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
 
     if (content_type)
         MHD_add_response_header(resp, "Content-Type", content_type);
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
     /* set_cookie is built by api_cookie_set/api_cookie_clear, both of
      * which reject control characters in name/value - so any string
      * reaching here is safe to pass through without further validation. */
@@ -268,9 +269,6 @@ static enum MHD_Result send_streaming_response(
         free(w);
         return MHD_NO;
     }
-
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
 
     if (sresp->headers) {
         for (const api_header_t *h = sresp->headers; h->name; h++) {
@@ -451,20 +449,14 @@ static enum MHD_Result request_handler(void *cls,
 
     /* Body complete - dispatch */
 
-    /* CORS preflight: respond to OPTIONS immediately without auth */
-    if (strcmp(method, "OPTIONS") == 0) {
-        free(pb->data);
-        free(pb);
-        *req_cls = NULL;
-        struct MHD_Response *resp = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
-        MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-        MHD_add_response_header(resp, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        MHD_add_response_header(resp, "Access-Control-Allow-Headers", "Authorization, Content-Type");
-        MHD_add_response_header(resp, "Access-Control-Max-Age", "86400");
-        enum MHD_Result ret = MHD_queue_response(conn, 204, resp);
-        MHD_destroy_response(resp);
-        return ret;
-    }
+    /*
+     * No CORS. Every response used to carry Access-Control-Allow-Origin: *
+     * and OPTIONS skipped auth, which let any web page open in a browser on
+     * the daemon's host read the API - and, before setup, drive all of it.
+     * Nothing here is a browser client: the CLI uses the socket and the
+     * desktop app's requests come from its main process, which CORS does
+     * not apply to.
+     */
 
     api_method_t api_method = method_from_string(method);
 
@@ -482,10 +474,18 @@ static enum MHD_Result request_handler(void *cls,
         };
 
         /* Auth check */
-        if (srv->auth_fn && !srv->auth_fn(&req, url, srv->auth_ud)) {
+        int verdict = srv->auth_fn ? srv->auth_fn(&req, url, srv->auth_ud)
+                                   : API_AUTH_ALLOW;
+        if (verdict != API_AUTH_ALLOW) {
             free(pb->data);
             free(pb);
             *req_cls = NULL;
+            /* A 401 invites the client to try a credential. Before setup
+             * there is no credential to try, so say what to do instead. */
+            if (verdict == API_AUTH_NOT_CONFIGURED)
+                return send_response(conn, 403, "application/json",
+                    "{\"error\":\"not configured: set the admin password "
+                    "with 'c-backup auth setup' on the daemon's host\"}", NULL);
             return send_response(conn, 401, "application/json",
                 "{\"error\":\"unauthorized\"}", NULL);
         }
@@ -568,10 +568,6 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
     srv->_tcp_cls = tcp_cls;
     srv->_unix_cls = unix_cls;
 
-    /* TCP daemon. MHD_OPTION_LISTENING_ADDRESS_REUSE sets SO_REUSEADDR on the
-     * listen socket so a restart can rebind while the previous instance's
-     * socket is still in TIME_WAIT - without it, systemctl restart races
-     * the kernel's socket cleanup and the new daemon refuses to start. */
     if (tcp_port > 0) {
         /*
          * Bind where the operator said, not everywhere.
@@ -586,125 +582,37 @@ api_server_t *api_server_create(int tcp_port, const char *bind_addr,
          * An address that will not parse stops the daemon rather than
          * falling back. Falling back means opening the port to the network
          * because a config line had a typo in it, which is the one outcome
-         * worth refusing to reach by accident.
+         * worth refusing to reach by accident. For the same reason an empty
+         * value means loopback, the documented default, not every interface.
          */
         struct sockaddr_in addr4;
         memset(&addr4, 0, sizeof(addr4));
         addr4.sin_family = AF_INET;
         addr4.sin_port   = htons((uint16_t)tcp_port);
 
-        const char *want = (bind_addr && *bind_addr) ? bind_addr : "0.0.0.0";
+        const char *want = (bind_addr && *bind_addr) ? bind_addr : "127.0.0.1";
         if (inet_pton(AF_INET, want, &addr4.sin_addr) != 1) {
             log_error("http.bind: '%s' is not an IPv4 address", want);
             api_server_stop(srv);
             return NULL;
         }
         srv->bind_addr = addr4;
-
-        srv->tcp_daemon = MHD_start_daemon(
-            /* Thread-per-connection because the SSE streaming-route
-             * handler blocks in pthread_cond_timedwait while waiting for
-             * the next frame. With a single-threaded polling model
-             * (formerly MHD_USE_EPOLL) that block parked the entire MHD
-             * daemon thread for up to one heartbeat interval, making
-             * the whole daemon feel unresponsive on an idle UPS. Each
-             * connection now has its own worker thread; the SSE block
-             * is local to that thread, other HTTP requests continue
-             * uninterrupted. Loses epoll efficiency but the workload
-             * (single-admin dashboard, ~10 concurrent conns max) makes
-             * that irrelevant. */
-            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
-            (uint16_t)tcp_port,
-            NULL, NULL,
-            request_handler, tcp_cls,
-            MHD_OPTION_LISTENING_ADDRESS_REUSE, (unsigned int)1,
-            MHD_OPTION_SOCK_ADDR, (struct sockaddr *)&srv->bind_addr,
-            MHD_OPTION_END);
-
-        if (!srv->tcp_daemon) {
-            log_error("failed to start HTTP server on port %d", tcp_port);
-            api_server_stop(srv);
-            return NULL;
-        }
-        log_info("HTTP server listening on %s:%d", want, tcp_port);
+        srv->tcp_port  = tcp_port;
+        snprintf(srv->bind_str, sizeof(srv->bind_str), "%s", want);
     }
 
-    /* Unix socket daemon */
-    if (socket_path) {
-        /* Remove stale socket */
-        /*
-         * sun_path is 108 bytes and strncpy would silently take the first
-         * 107 of a longer path. Everything downstream then succeeds against
-         * a path nobody asked for: bind and listen work, the log reports the
-         * path from the config, the unlink on the way out removes the
-         * untruncated name and leaves the real socket behind, and every
-         * client refuses the configured path as too long and cannot connect.
-         * The daemon looks healthy and is unreachable.
-         */
-        struct sockaddr_un addr;
-        if (strlen(socket_path) >= sizeof(addr.sun_path)) {
-            log_error("socket path too long (max %zu): %s",
-                      sizeof(addr.sun_path) - 1, socket_path);
-            api_server_stop(srv);
-            return NULL;
-        }
-
-        unlink(socket_path);
-
-        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sock < 0) {
-            log_error("failed to create unix socket");
-            api_server_stop(srv);
-            return NULL;
-        }
-
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        /* Length checked above, so this cannot truncate. */
-        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
-
-        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            log_error("failed to bind unix socket at %s", socket_path);
-            close(sock);
-            api_server_stop(srv);
-            return NULL;
-        }
-
-        if (listen(sock, 8) < 0) {
-            log_error("failed to listen on unix socket");
-            close(sock);
-            unlink(socket_path);
-            api_server_stop(srv);
-            return NULL;
-        }
-
-        srv->unix_daemon = MHD_start_daemon(
-            /* Thread-per-connection because the SSE streaming-route
-             * handler blocks in pthread_cond_timedwait while waiting for
-             * the next frame. With a single-threaded polling model
-             * (formerly MHD_USE_EPOLL) that block parked the entire MHD
-             * daemon thread for up to one heartbeat interval, making
-             * the whole daemon feel unresponsive on an idle UPS. Each
-             * connection now has its own worker thread; the SSE block
-             * is local to that thread, other HTTP requests continue
-             * uninterrupted. Loses epoll efficiency but the workload
-             * (single-admin dashboard, ~10 concurrent conns max) makes
-             * that irrelevant. */
-            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
-            0,  /* port ignored for pre-bound socket */
-            NULL, NULL,
-            request_handler, unix_cls,
-            MHD_OPTION_LISTEN_SOCKET, sock,
-            MHD_OPTION_END);
-
-        if (!srv->unix_daemon) {
-            log_error("failed to start HTTP server on unix socket %s", socket_path);
-            close(sock);
-            unlink(socket_path);
-            api_server_stop(srv);
-            return NULL;
-        }
-        log_info("API socket listening at %s", socket_path);
+    /*
+     * sun_path is 108 bytes, and a longer path would be silently truncated:
+     * bind and listen succeed against a path nobody asked for, and every
+     * client refuses the configured one. Checked here, before anything
+     * binds, so it stops the daemon at the same point a bad address does.
+     */
+    struct sockaddr_un probe;
+    if (socket_path && strlen(socket_path) >= sizeof(probe.sun_path)) {
+        log_error("socket path too long (max %zu): %s",
+                  sizeof(probe.sun_path) - 1, socket_path);
+        api_server_stop(srv);
+        return NULL;
     }
 
     return srv;
@@ -751,10 +659,108 @@ void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata)
     srv->auth_ud = userdata;
 }
 
+/*
+ * Listening starts here, not in api_server_create.
+ *
+ * It used to start in create, which main() calls before it registers a single
+ * route or attaches auth_check. For that window the TCP port accepted
+ * requests with no auth function set - every one of them passed - and the
+ * route table was being appended to while connection threads could already be
+ * walking it. Starting the listeners only once the caller says the server is
+ * fully configured closes both.
+ */
 int api_server_start(api_server_t *srv)
 {
-    /* libmicrohttpd daemons are already running from create */
-    (void)srv;
+    mhd_cls_t *tcp_cls  = srv->_tcp_cls;
+    mhd_cls_t *unix_cls = srv->_unix_cls;
+
+    if (srv->tcp_port > 0) {
+        if (!tcp_cls)
+            return set_error(CUTILS_ERR, "out of memory");
+        srv->tcp_daemon = MHD_start_daemon(
+            /* Thread-per-connection because the SSE streaming-route
+             * handler blocks in pthread_cond_timedwait while waiting for
+             * the next frame. With a single-threaded polling model that
+             * block parked the entire MHD daemon thread for up to one
+             * heartbeat interval. Each connection now has its own worker
+             * thread, so the SSE block is local to that thread. */
+            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
+            (uint16_t)srv->tcp_port,
+            NULL, NULL,
+            request_handler, tcp_cls,
+            /*
+             * No MHD_OPTION_LISTENING_ADDRESS_REUSE. Left unset, MHD sets
+             * SO_REUSEADDR, which is what lets a restart rebind while the old
+             * instance's connections sit in TIME_WAIT. Set to 1 - as it was,
+             * with a comment asking for exactly that - it adds SO_REUSEPORT,
+             * which lets a second daemon bind the same port and have the
+             * kernel split connections between the two.
+             */
+            MHD_OPTION_SOCK_ADDR, (struct sockaddr *)&srv->bind_addr,
+            MHD_OPTION_END);
+        if (!srv->tcp_daemon)
+            return set_error(CUTILS_ERR, "failed to start HTTP server on %s:%d",
+                             srv->bind_str, srv->tcp_port);
+        log_info("HTTP server listening on %s:%d", srv->bind_str, srv->tcp_port);
+    }
+
+    if (srv->socket_path) {
+        if (!unix_cls)
+            return set_error(CUTILS_ERR, "out of memory");
+        const char *path = srv->socket_path;
+        struct sockaddr_un addr;
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        /* Length checked in create, so this cannot truncate. */
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+        /*
+         * A socket file left by an unclean exit is removed so bind can
+         * succeed - but only if nothing answers on it. Unlinking a live one
+         * hands its path to this process and leaves the running daemon
+         * serving a socket nobody can reach.
+         */
+        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (probe >= 0) {
+            int live = connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+            close(probe);
+            if (live)
+                return set_error(CUTILS_ERR, "another daemon is serving %s", path);
+        }
+        unlink(path);
+
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0)
+            return set_error(CUTILS_ERR, "failed to create unix socket");
+
+        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(sock);
+            return set_error(CUTILS_ERR, "failed to bind unix socket at %s", path);
+        }
+        srv->unix_bound = 1;
+        if (listen(sock, 8) < 0) {
+            close(sock);
+            unlink(path);
+            return set_error(CUTILS_ERR, "failed to listen on unix socket");
+        }
+
+        srv->unix_daemon = MHD_start_daemon(
+            MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
+            0,  /* port ignored for pre-bound socket */
+            NULL, NULL,
+            request_handler, unix_cls,
+            MHD_OPTION_LISTEN_SOCKET, sock,
+            MHD_OPTION_END);
+        if (!srv->unix_daemon) {
+            close(sock);
+            unlink(path);
+            return set_error(CUTILS_ERR, "failed to start HTTP server on unix socket %s",
+                             path);
+        }
+        log_info("API socket listening at %s", path);
+    }
+
     return CUTILS_OK;
 }
 
@@ -772,8 +778,11 @@ void api_server_stop(api_server_t *srv)
         srv->unix_daemon = NULL;
     }
 
+    /* Only a socket this process bound. A daemon that fails to start -
+     * its TCP port taken by an instance already running, say - must not
+     * delete that instance's socket on the way out. */
     if (srv->socket_path) {
-        unlink(srv->socket_path);
+        if (srv->unix_bound) unlink(srv->socket_path);
         free(srv->socket_path);
     }
 

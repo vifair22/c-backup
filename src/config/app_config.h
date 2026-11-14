@@ -23,17 +23,16 @@ static const config_key_t app_file_keys[] = {
       "TCP listen port for remote clients",
       CFG_STORE_FILE, 0 },
     /*
-     * Loopback by default, because nothing needs otherwise.
+     * Loopback by default: remote access is something an operator turns on.
      *
-     * The CLI and the desktop app both use the unix socket, and the one
-     * documented TCP flow is localhost:8765. That leaves no local client
-     * that a public bind serves and no reason for the port to answer a
-     * scanner - so exposure is something an operator turns on, having
-     * decided to, rather than the state the daemon starts in.
+     * Local clients - the CLI and the desktop app on the same machine - use
+     * the unix socket, so a public bind serves only remote ones, and the
+     * port has no reason to answer a scanner until someone wants that.
      *
-     * Widening it is a deliberate act: set 0.0.0.0 and put a reverse proxy
-     * or a tunnel in front, because everything this port serves is reachable
-     * with a bearer token and nothing about the transport is encrypted.
+     * Widening it is a deliberate act: set 0.0.0.0 (or one interface's
+     * address) for the desktop app on another machine to connect. Put a
+     * reverse proxy or a tunnel in front where the network is not trusted,
+     * because the transport is plain HTTP and carries the bearer token.
      */
     { "http.bind",   CFG_STRING, "127.0.0.1",
       "TCP bind address; 127.0.0.1 confines it to this machine. Widen only "
