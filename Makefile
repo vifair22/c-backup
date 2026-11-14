@@ -652,15 +652,21 @@ $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS
 # See daemonization-spec.md section 14.
 COV_STORE_MIN := 74
 
+# The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
+# the last "lines:" in the log, and printing the store gate second made every
+# pipeline report src/store as the project figure. The HTML report is still
+# written first, so a failing store gate leaves it behind for the artifact.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
 	@./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 || true
 	@./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 || true
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
-	    --exclude '.*vendor.*' -s
+	    --exclude '.*vendor.*'
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
 	    --fail-under-line $(COV_STORE_MIN) -s
+	@echo "=== whole repo ==="
+	@gcovr -r $(SRC) $(COV_DIR) --exclude '.*vendor.*' --txt $(COV_DIR)/coverage.txt -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 
 .PHONY: coverage
