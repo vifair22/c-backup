@@ -591,6 +591,14 @@ COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
 # object.c and pack.c ran on every push and counted for nothing. Those are
 # the same error paths this file's ratchet comment calls the gap to 80%.
 COV_FAULT_TESTS := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(FAULT_SRCS))
+# The daemon and CLI themselves, instrumented, so the shell suites count. They
+# are the only tests that reach the routes, the auth middleware, the job
+# manager and both main()s, and without them every line those cover reported
+# as untested: the whole-repo figure read 60% while the code was exercised on
+# every push. gcov writes its counters at exit, which works because both
+# suites stop the daemon with SIGTERM and wait for it.
+COV_DAEMON := $(COV_DIR)/bins/c-backupd
+COV_CLI    := $(COV_DIR)/bins/c-backup
 
 $(COV_DIR):
 	mkdir -p $(COV_DIR)
@@ -606,6 +614,18 @@ $(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
 
 $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
+
+$(COV_DIR)/daemon_main.o: $(DAEMON_MAIN) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) -c $< -o $@
+$(COV_DIR)/cli_main.o: $(CLI_MAIN) | $(COV_DIR)
+	$(CC) $(COV_CFLAGS) -c $< -o $@
+
+$(COV_DAEMON): $(COV_DIR)/daemon_main.o $(COV_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS)
+$(COV_CLI): $(COV_DIR)/cli_main.o $(COV_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS)
 
 # Shorter stem, so make prefers this over the rule above for the fault
 # suites - the same way the release build already resolves them.
@@ -632,13 +652,21 @@ $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS
 # See daemonization-spec.md section 14.
 COV_STORE_MIN := 74
 
-coverage: $(COV_TESTS) $(COV_FAULT_TESTS)
+# The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
+# the last "lines:" in the log, and printing the store gate second made every
+# pipeline report src/store as the project figure. The HTML report is still
+# written first, so a failing store gate leaves it behind for the artifact.
+coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
+	@./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 || true
+	@./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 || true
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
-	    --exclude '.*vendor.*' -s
+	    --exclude '.*vendor.*'
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
 	    --fail-under-line $(COV_STORE_MIN) -s
+	@echo "=== whole repo ==="
+	@gcovr -r $(SRC) $(COV_DIR) --exclude '.*vendor.*' --txt $(COV_DIR)/coverage.txt -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 
 .PHONY: coverage
