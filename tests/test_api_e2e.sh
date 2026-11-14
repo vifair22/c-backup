@@ -385,6 +385,10 @@ wait_job "$VERIFY_JOB"
 contains "verify job completed" '"state":"completed"' "$(sock_body "/jobs/$VERIFY_JOB")"
 DEEP_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
             "http://localhost/repos/1/verify?level=deep")
+# Asserted, not just parsed: this failed once in CI with no job id and the
+# log said only "no such job", because the response that explained it was
+# thrown away.
+contains "deep verify submit" '"job_id"' "$DEEP_RESP"
 DEEP_JOB=$(job_id "$DEEP_RESP")
 wait_job "$DEEP_JOB"
 contains "deep verify completed" '"state":"completed"' "$(sock_body "/jobs/$DEEP_JOB")"
