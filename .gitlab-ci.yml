@@ -232,14 +232,20 @@ coverage:
     paths:
       - build/coverage/coverage.html
 
+# The runner binds the host's Docker socket into the job, so builds and pushes
+# run on the host daemon. The dind service this job used to declare was never
+# reached: nothing set DOCKER_HOST to point at it.
 build:image:
   stage: build
-  image: docker:latest
+  image: docker:cli
   tags: [docker, unraid]
-  services:
-    - docker:dind
   script:
-    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    # --provenance=false --sbom=false: a plain single manifest. Docker 29
+    # attaches attestations by default, which makes the image an index, and
+    # this registry rejects that push with "blob unknown" partway through,
+    # naming a different blob each time. gitlab-infra's image job hit the same
+    # thing and carries the same flags.
+    - docker build --provenance=false --sbom=false -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
     # An image that builds but dies on startup is the failure this catches:
     # run it, wait, and confirm it is still up before pushing.
     - docker run -d --name smoke "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
@@ -247,7 +253,7 @@ build:image:
     - docker ps --filter name=smoke --filter status=running | grep -q smoke
     - docker logs smoke
     - docker rm -f smoke
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   only:
     - master
