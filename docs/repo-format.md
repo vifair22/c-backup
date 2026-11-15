@@ -62,10 +62,22 @@ packed. Inside a pack each entry has a 51-byte entry header
 (`pack_dat_entry_hdr_t`: hash, type, compression, encryption, both sizes)
 before its possibly LZ4-compressed payload.
 
+The parity trailer is Reed-Solomon RS(255,239) over the stored payload, 16
+parity bytes per 239 data bytes, interleaved 64 codewords deep (groups of
+15,296 data bytes, 1,024 parity bytes each, the last group paid in full), so
+each codeword corrects 8 bytes and a contiguous burst of up to 512 bytes is
+repairable. That is 16/239 = **6.7% of the stored payload**, the figure
+measured on large incompressible objects, plus about 280 fixed bytes per
+object: a 260-byte XOR parity record over the header, the payload CRC32C, a
+reserved word and the 12-byte footer.
+
 Compression bails out early. A 64 KiB probe decides whether the payload is
 worth compressing, and an incompressible object is marked so later passes do
 not retry: there is no point spending CPU on video, audio or database files
-that will not shrink.
+that will not shrink. Objects up to 16 MiB are written straight into packs
+by the backup; an object over 16 MiB is written loose, and one that fails the
+probe is marked in its header (`pack_skip_ver`) and stays loose for good,
+never packed (see `docs/data-paths.md`).
 
 Sparse files are stored as a region table plus data, so a 1 TiB sparse file
 does not become 1 TiB of zeroes. Restoring one linearly would inflate it to

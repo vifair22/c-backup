@@ -873,6 +873,17 @@ Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
 per-repository journal (`c-backup journal 1`) is the permanent record of what
 ran and how it ended.
 
+**Large incompressible objects stay loose.** A backup writes objects up to
+16 MiB straight into packs. Anything larger is written as one loose file,
+and the pack step then reads its first 64 KiB: if that does not compress
+(video, audio, disk images, encrypted or already-compressed archives) the
+object is marked and is never packed, by this or any later `pack` run. It is
+stored raw with its parity trailer, so `stats` and `summary` keep counting
+it as loose and `phys_size` exceeds `orig_size` by the parity overhead
+(section 18.1). That is deliberate: rewriting gigabytes into a pack would
+save nothing but an inode. Large files that do compress are packed
+normally. Details are in `docs/data-paths.md`.
+
 ---
 
 ## 13. Encryption
@@ -1146,7 +1157,20 @@ running). `docs/acceptance.md` has the full results.
 - Deduplication is per repository, across every snapshot.
 - Already-compressed data (media, archives, git objects) gains nothing from
   compression and is detected quickly; expect source size, less duplicates,
-  plus parity overhead of a few percent.
+  **plus 6.7% for parity**.
+- **Parity costs 6.7% of every stored payload, measured and by design.**
+  Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
+  data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
+  damaged bytes per codeword, and codewords are interleaved 64 deep so a
+  contiguous burst of up to 512 bytes is repairable. Parity is computed in
+  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
+  so the last group is paid in full: a tiny file still costs 1 KiB of
+  parity. On top of that every object carries about 280 fixed bytes (a
+  260-byte parity record for its header, a CRC32C, a reserved word and a
+  12-byte footer). For compressible data the 6.7% applies to the compressed
+  size; for a large incompressible file it is essentially the whole
+  difference between `phys_size` and `orig_size`, which is where the
+  measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
 
