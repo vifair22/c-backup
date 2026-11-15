@@ -43,9 +43,9 @@ typedef enum {
     /* Inside PHASE_READ_HASH, which on real storage is 82% of a full backup
      * and far too coarse to act on. These break that bucket apart. */
     PHASE_OBJ_SETUP,     /* mkstemp, header write, parity stream init */
-    PHASE_OBJ_IO,        /* the read -> hash -> write -> parity-feed loop */
+    PHASE_OBJ_IO,        /* the read -> hash -> write -> parity pipeline, to its join */
     PHASE_OBJ_FINISH,    /* parity finish and trailer write */
-    PHASE_OBJ_SYNC,      /* async_writeback */
+    PHASE_OBJ_SYNC,      /* payload fadvise and async_writeback: both start writeback */
     PHASE_OBJ_INSTALL,   /* rename into objects/, and the existence check */
     /* Inside obj:install, which turned out to be 59% of a full backup. */
     PHASE_OBJ_CLOSE,     /* close of the written temp file */

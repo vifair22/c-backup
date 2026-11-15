@@ -512,9 +512,15 @@ could take over the removed one's schedules and history.
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
 the repository must be atomic, so `tmp/` lives inside it. Local disks, ZFS,
-XFS, ext4 and NFS mounts all work. On Unraid, measured, a repository on a
-parity-protected array disk is several times slower than on the cache pool
-or an unassigned device; see section 18.
+XFS, ext4 and NFS mounts all work.
+
+Which disk is fastest for a repository depends on the hardware, not on the
+kind of storage, so measure before assuming. On one Unraid server a
+repository on the parity array (an 18 TB HDD with parity) was faster than on
+a SATA SSD cache pool: a first backup took 295 s against 391 s, and a backup
+with nothing changed 2.0 s against 6.6 s, with `state.db` on the cache both
+times. What does matter is where `state.db` lives: it belongs on fast
+storage and never on a parity array. See section 18.2.
 
 ---
 
@@ -1349,9 +1355,14 @@ a parity-protected array.** Measured on the same 60,875 files, with only the
 index moving: 3.35 ms/file on an Unraid array disk against 1.05 ms/file on
 the SSD cache, a 3.2x difference for byte-identical repositories.
 
-A repository is written in large sequential pieces and is less sensitive, but
-on Unraid it too belongs on cache, an unassigned device, or anything outside
-the array.
+That 3.2x was the index, not the repository. A repository is written in
+large sequential pieces and is far less sensitive, and where it is fastest
+depends on the hardware. Measured on one Unraid server with `state.db` on
+the SSD cache both times, a repository on the parity array (18 TB HDD plus
+parity) beat the same repository on a SATA SSD cache pool: first backup
+295 s against 391 s, an unchanged backup 2.0 s against 6.6 s. Put the
+repository wherever capacity and your own measurements say; keep `state.db`
+on fast storage.
 
 ### 18.3 Memory
 
@@ -1361,8 +1372,10 @@ the array.
   several repositories or several sources backed up separately. Section 20.
 - File content is streamed in bounded chunks whatever its size. Parity for a
   large object spills to `<repo>/tmp` beyond 256 MiB.
-- Storing a large file holds a 128 MiB read buffer, and the Reed-Solomon
-  parity for it is kept in memory up to 256 MiB before spilling to disk.
+- Storing a large file holds 8 MiB of pipeline buffers (eight 1 MiB chunks
+  shared by a reading, a hashing and a writing thread), and the
+  Reed-Solomon parity for it is kept in memory up to 256 MiB before
+  spilling to disk.
 - A large pack run uses up to about 1 GB of buffers at its widest (32
   workers, each with a 16 MiB read buffer and a compression buffer). The
   worker count is capped at one per 256 MiB of data to pack, so small runs
@@ -1418,7 +1431,7 @@ the underlying disk.
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |
-| Backups slow on Unraid | `state.db` or the repository on the parity array | Section 18.2 |
+| Backups slow on Unraid | `state.db` on the parity array | Section 18.2 |
 
 `journalctl -u c-backupd` has the daemon's log; `log.level: debug` for more.
 `c-backup journal <id>` shows every operation on a repository and its outcome.
