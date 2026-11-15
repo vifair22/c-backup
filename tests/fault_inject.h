@@ -70,3 +70,18 @@ static inline void fault_reset_all(void) {
 extern const char *volatile fault_tmp_root;
 extern volatile int fault_tmp_refused;
 extern int __real_mkstemp(char *);
+
+/*
+ * Fail a rename into one place.
+ *
+ * When fault_rename_dst is set, a rename whose destination starts with it
+ * fails with EIO, after the first fault_rename_skip such renames have been
+ * let through. Every refusal is counted. Installing a file is a rename, so
+ * this is how a test makes one particular install fail - a pack into a
+ * replica's packs/, say - without disturbing the staging writes before it.
+ * Process-wide, like fault_tmp_root. NULL disables it.
+ */
+extern const char *volatile fault_rename_dst;
+extern volatile int fault_rename_skip;
+extern volatile int fault_rename_refused;
+extern int __real_rename(const char *, const char *);

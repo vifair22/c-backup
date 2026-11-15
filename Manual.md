@@ -1182,6 +1182,15 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
+- **Whole snapshots only.** Each snapshot's new objects are written as one
+  pack and synced to disk before the snapshot's record is written, so a
+  snapshot the replica lists is one it can restore. If writing a pack
+  fails, the job fails naming the snapshot, and that snapshot and the ones
+  after it are not recorded. A run that is cancelled, fails or is killed
+  part-way leaves the replica openable and verify-clean with the snapshots
+  it finished; the next run skips those and carries on. Objects it had
+  staged for an unfinished snapshot are either kept (reused by the next
+  run) or left in the replica's `tmp/`, where a later open sweeps them.
 - A destination already holding a different repository is refused, unless
   `--reencrypt` says that is the point (below).
 - So is the source repository's own directory, anything inside it, and any

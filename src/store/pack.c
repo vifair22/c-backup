@@ -192,6 +192,18 @@ static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
         (void)mkdir(shard, 0755);  /* EEXIST is fine */
 }
 
+/* fsync a directory, so the entries renamed into it survive a power cut.
+ * Returns 0 or -1 with errno set. */
+static int fsync_dir_path(const char *path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    int rc = fsync(fd);
+    int err = errno;
+    close(fd);
+    errno = err;
+    return rc;
+}
+
 int parse_pack_dat_name(const char *name, uint32_t *out_num) {
     int end = 0;
     uint32_t n;
@@ -2345,9 +2357,34 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
      * which keeps peak memory independent of how large the objects were. */
     status_t st = finalize_pack(w->store, &w->dat_f, w->dat_tmp, &w->dat_hdr,
                                 w->entries, w->count, w->pack_num, NULL);
+
+    /*
+     * Make the rename itself durable before saying the pack is installed.
+     * finalize_pack fsyncs the file but not the directory entry, and the
+     * caller of this writer - replication - goes on to write a snapshot
+     * record naming these objects. Without the directory syncs a power cut
+     * could keep the record and lose the pack, which is the dangling
+     * snapshot this ordering exists to rule out. The shard directory may
+     * have been created just now, so its parent is synced too.
+     */
+    if (st == OK) {
+        char dir[PATH_MAX];
+        if (path_fmt(dir, sizeof(dir), "%s/packs/%04x", store_root(w->store),
+                     w->pack_num / 256) != 0 ||
+            fsync_dir_path(dir) != 0)
+            st = set_error_errno(ERR_IO, "pack_stored_finish: sync %s", dir);
+        else if (path_fmt(dir, sizeof(dir), "%s/packs", store_root(w->store)) != 0 ||
+                 fsync_dir_path(dir) != 0)
+            st = set_error_errno(ERR_IO, "pack_stored_finish: sync %s", dir);
+    }
     if (st == OK && out_packed) *out_packed = w->count;
     pack_stored_free(w);
     return st;
+}
+
+uint32_t pack_stored_pack_num(const pack_stored_writer_t *w)
+{
+    return w ? w->pack_num : 0;
 }
 
 void pack_stored_abort(pack_stored_writer_t *w)

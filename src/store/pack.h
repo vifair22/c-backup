@@ -159,8 +159,14 @@ int pack_stored_has(const pack_stored_writer_t *w,
 
 uint32_t pack_stored_count(const pack_stored_writer_t *w);
 
+/* The number the pack will be installed under. Read it before finish, which
+ * frees the writer. */
+uint32_t pack_stored_pack_num(const pack_stored_writer_t *w);
+
 /* Install the pack and emit the commit callback. The writer is freed either
- * way; on failure the staging file is removed. */
+ * way; on failure the staging file is removed. OK means durably installed:
+ * the file and the directory entries naming it have been synced, so a
+ * caller may write records that depend on these objects. */
 status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed);
 void     pack_stored_abort(pack_stored_writer_t *w);
 
