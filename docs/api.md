@@ -215,7 +215,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
-| POST | `/repos/<id>/reindex` | Rebuild the index from the repository |
+| POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
 | GET | `/repos/<id>/grep` | Recent searches, newest first |

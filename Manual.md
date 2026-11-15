@@ -1060,6 +1060,11 @@ sudo c-backup reindex 1
 ```
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
+It fails, rather than completing, if any snapshot or pack cannot be read: the
+readable snapshots are indexed, and anything unreadable keeps whatever index
+rows it already had, so a reindex never replaces a populated index with an
+empty or partial one. An encrypted repository is refused outright until its
+key is on the host (section 13).
 Lost for good: schedules, sources, policy, tags, notes, the journal, job
 history and sessions. Re-create the schedules and sources. Remote clients sign
 in again; set the admin password again first with `auth setup`.

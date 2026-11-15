@@ -350,46 +350,54 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
 /* Pack index rebuild                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A pack's entries are collected in memory and written only once the whole
+ * pack has been read. Writing them as they were enumerated meant a pack that
+ * failed halfway had already replaced part of its rows, and the rebuild used
+ * to begin by deleting every row for the repository - so one unreadable pack
+ * lost its index entirely, while the job carried on and reported success.
+ */
 typedef struct {
-    cutils_db_t *db;
-    const char  *repo;
-    char         pack[32];
-    int          failed;
-    uint64_t     entries;
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t offset, comp, orig;
+    uint32_t eidx;
+} pack_row_t;
+
+typedef struct {
+    pack_row_t *rows;
+    size_t      n, cap;
+    int         oom;
 } pack_entry_ctx_t;
 
 static void pack_entry_seen(const pack_entry_info_t *info, void *vctx)
 {
     pack_entry_ctx_t *c = vctx;
-    if (c->failed) return;
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_hex(info->hash, hex);
-    char off[32], comp[32], orig[32], eidx[16];
-    snprintf(off,  sizeof(off),  "%llu", (unsigned long long)info->entry_offset);
-    snprintf(comp, sizeof(comp), "%llu", (unsigned long long)info->compressed_size);
-    snprintf(orig, sizeof(orig), "%llu", (unsigned long long)info->uncompressed_size);
-    snprintf(eidx, sizeof(eidx), "%u",   info->entry_index);
-
-    if (db_execute_non_query(c->db,
-            "INSERT OR REPLACE INTO pack_objects"
-            " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (const char *[]){ c->repo, hex, c->pack, off, comp, orig, eidx, NULL },
-            NULL) != 0) {
-        c->failed = 1;
-        return;
+    if (c->oom) return;
+    if (c->n == c->cap) {
+        size_t ncap = c->cap ? c->cap * 2 : 1024;
+        pack_row_t *nr = realloc(c->rows, ncap * sizeof(*nr));
+        if (!nr) { c->oom = 1; return; }
+        c->rows = nr;
+        c->cap = ncap;
     }
-    c->entries++;
+    pack_row_t *r = &c->rows[c->n++];
+    memcpy(r->hash, info->hash, OBJECT_HASH_SIZE);
+    r->offset = info->entry_offset;
+    r->comp   = info->compressed_size;
+    r->orig   = info->uncompressed_size;
+    r->eidx   = info->entry_index;
 }
 
 typedef struct {
     store_t     *store;
     cutils_db_t *db;
     const char  *repo;
-    int          failed;
+    int          failed;      /* a database write failed: abandon the rebuild */
     uint64_t     packs;
     uint64_t     entries;
+    uint64_t     unreadable;  /* packs on disk that could not be read */
+    uint32_t    *seen;        /* every pack number on disk, readable or not */
+    size_t       nseen, capseen;
 } pack_scan_ctx_t;
 
 static void pack_num_seen(uint32_t pack_num, void *vctx)
@@ -397,25 +405,65 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     pack_scan_ctx_t *c = vctx;
     if (c->failed) return;
 
+    if (c->nseen == c->capseen) {
+        size_t ncap = c->capseen ? c->capseen * 2 : 64;
+        uint32_t *ns = realloc(c->seen, ncap * sizeof(*ns));
+        if (!ns) { c->failed = 1; return; }
+        c->seen = ns;
+        c->capseen = ncap;
+    }
+    c->seen[c->nseen++] = pack_num;
+
     char name[64];
     snprintf(name, sizeof(name), "pack-%08u.dat", pack_num);
 
     uint32_t version = 0, count = 0;
     pack_entry_ctx_t ec;
     memset(&ec, 0, sizeof(ec));
-    ec.db = c->db;
-    ec.repo = c->repo;
-    snprintf(ec.pack, sizeof(ec.pack), "%u", pack_num);
-
     if (pack_enumerate_dat(c->store, name, &version, &count,
-                           pack_entry_seen, &ec) != OK) {
-        /* One unreadable pack must not abandon the rest, for the same reason
-         * one unreadable snapshot does not. */
-        log_warn("reindex: cannot read %s: %s", name, err_msg());
+                           pack_entry_seen, &ec) != OK || ec.oom) {
+        /* One unreadable pack must not abandon the rest, and must not lose
+         * the rows the index already has for it either: they are left as
+         * they were, and the reindex reports the pack as a failure. */
+        log_warn("reindex: cannot read %s: %s", name,
+                 ec.oom ? "out of memory" : err_msg());
         err_clear();
+        free(ec.rows);
+        c->unreadable++;
         return;
     }
-    if (ec.failed) { c->failed = 1; return; }
+
+    char pid[32];
+    snprintf(pid, sizeof(pid), "%u", pack_num);
+    if (db_execute_non_query(c->db,
+            "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+            (const char *[]){ c->repo, pid, NULL }, NULL) != 0) {
+        free(ec.rows);
+        c->failed = 1;
+        return;
+    }
+    for (size_t i = 0; i < ec.n; i++) {
+        const pack_row_t *r = &ec.rows[i];
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(r->hash, hex);
+        char off[32], comp[32], orig[32], eidx[16];
+        snprintf(off,  sizeof(off),  "%llu", (unsigned long long)r->offset);
+        snprintf(comp, sizeof(comp), "%llu", (unsigned long long)r->comp);
+        snprintf(orig, sizeof(orig), "%llu", (unsigned long long)r->orig);
+        snprintf(eidx, sizeof(eidx), "%u",   r->eidx);
+        if (db_execute_non_query(c->db,
+                "INSERT OR REPLACE INTO pack_objects"
+                " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (const char *[]){ c->repo, hex, pid, off, comp, orig, eidx, NULL },
+                NULL) != 0) {
+            free(ec.rows);
+            c->failed = 1;
+            return;
+        }
+    }
+    size_t nentries = ec.n;
+    free(ec.rows);
 
     char path[PATH_MAX];
     uint64_t size = 0;
@@ -424,8 +472,7 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
         if (stat(path, &sb) == 0) size = (uint64_t)sb.st_size;
     }
 
-    char pid[32], szbuf[32], ver[16];
-    snprintf(pid,   sizeof(pid),   "%u", pack_num);
+    char szbuf[32], ver[16];
     snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)size);
     snprintf(ver,   sizeof(ver),   "%u", version);
     if (db_execute_non_query(c->db,
@@ -436,7 +483,37 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
         return;
     }
     c->packs++;
-    c->entries += ec.entries;
+    c->entries += nentries;
+}
+
+/* Drop the rows of packs that are no longer on disk at all. Rows of a pack
+ * that is present but unreadable stay, for the reason in pack_num_seen. */
+static int drop_vanished_packs(pack_scan_ctx_t *c)
+{
+    db_result_t *r = NULL;
+    if (db_execute(c->db, "SELECT id FROM packs WHERE repo_id = ?",
+                   (const char *[]){ c->repo, NULL }, &r) != 0) {
+        db_result_free(r);
+        return -1;
+    }
+    int rc = 0;
+    for (int i = 0; r && i < r->nrows && rc == 0; i++) {
+        uint32_t id = (uint32_t)strtoul(r->rows[i][0], NULL, 10);
+        int present = 0;
+        for (size_t k = 0; k < c->nseen && !present; k++)
+            present = (c->seen[k] == id);
+        if (present) continue;
+        const char *pid = r->rows[i][0];
+        if (db_execute_non_query(c->db,
+                "DELETE FROM pack_objects WHERE repo_id = ? AND pack_id = ?",
+                (const char *[]){ c->repo, pid, NULL }, NULL) != 0 ||
+            db_execute_non_query(c->db,
+                "DELETE FROM packs WHERE repo_id = ? AND id = ?",
+                (const char *[]){ c->repo, pid, NULL }, NULL) != 0)
+            rc = -1;
+    }
+    db_result_free(r);
+    return rc;
 }
 
 /*
@@ -461,14 +538,6 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "reindex: cannot begin pack index rebuild");
 
-    if (db_execute_non_query(db, "DELETE FROM pack_objects WHERE repo_id = ?",
-                             (const char *[]){ repo, NULL }, NULL) != 0 ||
-        db_execute_non_query(db, "DELETE FROM packs WHERE repo_id = ?",
-                             (const char *[]){ repo, NULL }, NULL) != 0) {
-        db_txn_rollback(db);
-        return set_error(ERR_IO, "reindex: cannot clear pack index");
-    }
-
     pack_scan_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.store = store;
@@ -476,6 +545,8 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
     c.repo  = repo;
 
     status_t st = pack_list(store, pack_num_seen, &c);
+    if (st == OK && !c.failed && drop_vanished_packs(&c) != 0) c.failed = 1;
+    free(c.seen);
     if (st != OK || c.failed) {
         db_txn_rollback(db);
         return st != OK ? st
@@ -484,8 +555,9 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: cannot commit pack index");
 
-    res->packs         = c.packs;
-    res->pack_entries  = c.entries;
+    res->packs            = c.packs;
+    res->pack_entries     = c.entries;
+    res->packs_unreadable = c.unreadable;
     return OK;
 }
 
@@ -591,12 +663,24 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (snprintf(dir, sizeof(dir), "%s/snapshots", store_root(store)) >= (int)sizeof(dir))
         return set_error(ERR_IO, "reindex: path too long");
 
+    /*
+     * Without the key no tree can be read, so every snapshot would fail and
+     * the reindex would rebuild nothing. Refused before anything is touched;
+     * the job layer says which repository and how to supply the key.
+     */
+    if (store_needs_key(store))
+        return set_error(ERR_INVALID,
+                         "reindex: repository is encrypted and no key is loaded; "
+                         "nothing was changed");
+
     DIR *d = opendir(dir);
     if (!d) return set_error_errno(ERR_IO, "reindex: cannot open %s", dir);
 
     reindex_result_t total;
     memset(&total, 0, sizeof(total));
     status_t st = OK;
+    long long first_failed = 0;
+    char first_err[256] = "";
 
     /* Packs first: the tree walk resolves packed objects through these rows,
      * so rebuilding them afterwards would be too late. */
@@ -618,8 +702,16 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         status_t one_st = reindex_snapshot(store, db, repo_id, id, &one);
         if (one_st != OK) {
             /* One unreadable snapshot must not abandon the rest: partial
-             * recovery of a damaged repository is the whole point. */
+             * recovery of a damaged repository is the whole point. Its old
+             * rows survive, since reindex_snapshot replaces a snapshot only
+             * in a transaction that commits on success. But it is a failure,
+             * and the run reports it as one below. */
             log_warn("reindex: snapshot %lld failed: %s", id, err_msg());
+            if (total.snapshots_failed == 0) {
+                first_failed = id;
+                snprintf(first_err, sizeof(first_err), "%s", err_msg());
+            }
+            total.snapshots_failed++;
             err_clear();
             continue;
         }
@@ -643,5 +735,26 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
              (unsigned long long)total.trees_read, (unsigned long long)total.objects,
              (unsigned long long)total.packs, (unsigned long long)total.pack_entries);
     if (out) *out = total;
+
+    /*
+     * A reindex that could not read everything has failed, whatever it did
+     * manage. It used to report completed after failing every snapshot, so
+     * the job list said the index was rebuilt while it held nothing; an
+     * operator recovering from a lost database had no reason to look
+     * further until a restore found no snapshot.
+     */
+    if (total.snapshots_failed > 0)
+        return set_error(ERR_CORRUPT,
+                         "reindex: %llu of %llu snapshot(s) could not be read "
+                         "(snapshot %lld: %s); the readable ones were indexed, "
+                         "the rest keep their previous index rows",
+                         (unsigned long long)total.snapshots_failed,
+                         (unsigned long long)(total.snapshots + total.snapshots_failed),
+                         first_failed, first_err);
+    if (total.packs_unreadable > 0)
+        return set_error(ERR_CORRUPT,
+                         "reindex: %llu pack(s) could not be read and keep their "
+                         "previous index rows; run verify",
+                         (unsigned long long)total.packs_unreadable);
     return OK;
 }

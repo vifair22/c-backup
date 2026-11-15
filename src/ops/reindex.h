@@ -33,9 +33,20 @@ typedef struct {
     uint64_t objects;
     uint64_t packs;
     uint64_t pack_entries;
+    /* What could not be read. Either being non-zero fails the run, and what
+     * could not be read keeps whatever index rows it had before. */
+    uint64_t snapshots_failed;
+    uint64_t packs_unreadable;
 } reindex_result_t;
 
-/* Rebuild every snapshot found under the repo's snapshots/ directory. */
+/*
+ * Rebuild every snapshot found under the repo's snapshots/ directory.
+ *
+ * Refuses outright, changing nothing, when the repository is encrypted and
+ * no key is loaded. Otherwise indexes everything it can read and returns
+ * ERR_CORRUPT if any snapshot or pack could not be: the readable ones are
+ * rebuilt, and nothing that failed loses the index rows it had.
+ */
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       volatile int *cancel, reindex_result_t *out);
 
