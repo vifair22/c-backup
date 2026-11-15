@@ -31,10 +31,10 @@ const PASSWORD = process.env.CBACKUP_ACCEPTANCE_PASSWORD ?? ''
  * backed up, which the tree walk follows segment by segment, and a filename
  * fragment known to be in it. The defaults are the first pass's.
  */
-const D_PATH = process.env.CBACKUP_ACCEPTANCE_D_PATH ?? '/home/vifair/Documents'
-const D_TERM = process.env.CBACKUP_ACCEPTANCE_D_TERM ?? 'Scan2025'
-const G_PATH = process.env.CBACKUP_ACCEPTANCE_G_PATH ?? '/home/vifair/git'
-const G_TERM = process.env.CBACKUP_ACCEPTANCE_G_TERM ?? 'CMakeLists'
+const D_PATH = process.env.CBACKUP_ACCEPTANCE_D_PATH || '/home/vifair/Documents'
+const D_TERM = process.env.CBACKUP_ACCEPTANCE_D_TERM || 'Scan2025'
+const G_PATH = process.env.CBACKUP_ACCEPTANCE_G_PATH || '/home/vifair/git'
+const G_TERM = process.env.CBACKUP_ACCEPTANCE_G_TERM || 'CMakeLists'
 const segments = (p: string) => p.split('/').filter(Boolean)
 const APP_MAIN = resolve(__dirname, '..', 'out', 'main', 'index.js')
 
@@ -117,19 +117,20 @@ test('C1/C2 the snapshot list', async () => {
   const ms = await timed('C1', 'open snapshot list', async () => {
     await page.getByRole('button', { name: /^snapshots$/i }).first().click()
     await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
-    await expect(page.getByText('#1', { exact: true })).toBeVisible()
+    await expect(page.locator('tbody tr').first()).toBeVisible()
   })
   expect(ms).toBeLessThan(1000)
-  /* The sizes and file counts are the real ones, not blanks. */
-  const row = page.locator('tr', { hasText: '#3' }).first()
+  /* The sizes and file counts are the real ones, not blanks. Whichever
+   * snapshot is newest: the CLI half deletes and prunes some on purpose. */
+  const row = page.locator('tbody tr').first()
   await expect(row.locator('td').nth(3)).not.toHaveText('-')
   await page.screenshot({ path: 'test-results/acc-snapshots.png', fullPage: true })
 })
 
 test('C3/C4 browsing into a real tree', async () => {
   await timed('C3', 'open a snapshot tree', async () => {
-    await page.locator('tr', { hasText: '#3' }).first().click()
-    await expect(page.getByText('Snapshot #3').first()).toBeVisible()
+    await page.locator('tbody tr').first().click()
+    await expect(page.getByText(/^Snapshot #\d+/).first()).toBeVisible()
     await expect(page.locator('tbody tr').first()).toBeVisible()
   })
 
@@ -200,13 +201,13 @@ test('B7/C5 the 225k-file repository', async () => {
 
   const list = await timed('C1g', 'snapshot list at scale', async () => {
     await page.getByRole('button', { name: /^snapshots$/i }).first().click()
-    await expect(page.getByText('#1', { exact: true })).toBeVisible()
+    await expect(page.locator('tbody tr').first()).toBeVisible()
   })
   expect(list).toBeLessThan(1000)
 
   const tree = await timed('C3g', 'open the tree at scale', async () => {
     await page.locator('tbody tr').first().click()
-    await expect(page.getByText('Snapshot #1').first()).toBeVisible()
+    await expect(page.getByText(/^Snapshot #\d+/).first()).toBeVisible()
     await expect(page.locator('tbody tr').first()).toBeVisible()
   })
   expect(tree, 'one directory, not the whole snapshot').toBeLessThan(1000)
