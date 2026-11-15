@@ -12,6 +12,9 @@ set -u
 DAEMON="${1:-build/bins/c-backupd}"
 CLI="${2:-build/bins/c-backup}"
 WORK="$(mktemp -d /tmp/c_backup_cli_e2e.XXXXXX)"
+# Ports per run, so concurrent suites (CI jobs on one runner, parallel
+# worktrees) never reach each other's daemons.
+PORTBASE=$((20000 + ($$ % 15000) * 3))
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
@@ -32,6 +35,16 @@ check()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 contains() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "contains '$2'" "$3" ;; esac; }
 
 cb() { "$CLI" --socket "$SOCK" "$@"; }
+# Does FILE contain the first 32 bytes of SAMPLE, verbatim? Compared as hex
+# with a fixed-string search: the bytes are random, and handed to grep as a
+# pattern they were a random regular expression - metacharacters, or a
+# newline that split it into several patterns, one of which could be empty
+# and match anything. That made the plaintext checks fail at random.
+contains_bytes() {  # contains_bytes <sample> <file>
+    [ -f "$1" ] && [ -f "$2" ] || return 1
+    local pat; pat=$(head -c 32 "$1" | od -An -tx1 -v | tr -d ' \n')
+    od -An -tx1 -v "$2" | tr -d ' \n' | grep -qF "$pat"
+}
 
 echo "no daemon"
 # The most important case: a clear message, a non-zero exit, and no hang.
@@ -59,7 +72,7 @@ db:
   path: $WORK/state.db
 http:
   socket: $SOCK
-  port: 18801
+  port: $PORTBASE
   bind: 127.0.0.1
 log:
   level: warn
@@ -287,7 +300,7 @@ fi
 # A file that is stored raw would appear verbatim in the pack if the repo
 # were not encrypted; grep is useless for compressed text, so use the
 # incompressible fixture.
-if grep -qa "$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)" "$ENC_DAT" 2>/dev/null; then
+if contains_bytes "$WORK/src/random.bin" "$ENC_DAT" 2>/dev/null; then
     bad "no plaintext in the encrypted pack" "absent" "present"
 else
     ok "no plaintext in the encrypted pack"
@@ -365,8 +378,11 @@ fi
 # And it is still ciphertext. The same fixture the pack test uses, for the
 # same reason: compressed text is unsearchable either way, so look for the
 # incompressible one.
-NEEDLE=$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)
-if grep -qra "$NEEDLE" "$REPL" 2>/dev/null; then
+REPL_HIT=0
+while IFS= read -r -d '' f; do
+    contains_bytes "$WORK/src/random.bin" "$f" && { REPL_HIT=1; break; }
+done < <(find "$REPL" -type f -print0)
+if [ "$REPL_HIT" = 1 ]; then
     bad "replica holds no plaintext" "absent" "present"
 else
     ok "replica holds no plaintext"
@@ -439,7 +455,7 @@ db:
   path: $WORK/state2.db
 http:
   socket: $SOCK2
-  port: 18802
+  port: $((PORTBASE + 1))
   bind: 127.0.0.1
 log:
   level: warn
@@ -588,7 +604,7 @@ echo "listen address"
 # proxy", and it was never read: MHD was started without a socket address,
 # which binds every interface. Setting it to 127.0.0.1 produced a port
 # answering on the LAN and a config file saying it did not.
-BINDPORT=18809
+BINDPORT=$((PORTBASE + 2))
 cat > "$WORK/bindcfg.yaml" <<EOF
 db:
   path: $WORK/bind.db
