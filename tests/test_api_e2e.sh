@@ -729,8 +729,51 @@ check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapsho
 check "an overflowing limit is clamped too" 200 "$(sock_code '/jobs?limit=99999999999')"
 check "an overflowing offset is an empty page" 200 "$(sock_code '/jobs?offset=99999999999')"
 check "a bad limit names the range" \
-    '{"error":"limit must be a whole number from 1 to 1000 (a larger one is reduced to 1000)"}' \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one is reduced to 1000)"}' \
     "$(sock_body '/jobs?limit=0')"
+# B112: every numeric query parameter reads numbers the same way and words
+# a refusal the way a body field does. An overflowing id used to be clamped
+# by strtoll and answered 404, as though it were merely unknown.
+check "a non-numeric limit says whole number" '{"error":"limit must be a whole number"} 400' \
+    "$(sock_send GET '/jobs?limit=lots')"
+check "a fractional limit says whole number" '{"error":"limit must be a whole number"} 400' \
+    "$(sock_send GET '/jobs?limit=1.5')"
+check "a negative offset is out of range" \
+    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one is past every row)"} 400' \
+    "$(sock_send GET '/jobs?offset=-5')"
+check "a huge limit in exponent form is clamped too" 200 "$(sock_code '/jobs?limit=1e999')"
+check "a leading zero still reads" 200 "$(sock_code '/jobs?limit=010')"
+SRANGE='snapshot is out of range; it must be from 1 to 4294967295'
+for v in 1e999 -1 0 99999999999999999999; do
+    check "search ?snapshot=$v is out of range" "{\"error\":\"$SRANGE\"} 400" \
+        "$(sock_send GET "/repos/1/search?q=txt&snapshot=$v")"
+done
+for v in abc 1.5 +5; do
+    check "search ?snapshot=$v is not a whole number" \
+        '{"error":"snapshot must be a whole number"} 400' \
+        "$(sock_send GET "/repos/1/search?q=txt&snapshot=$v")"
+done
+check "search ?snapshot= of an unknown id is still 404" '{"error":"no such snapshot"} 404' \
+    "$(sock_send GET '/repos/1/search?q=txt&snapshot=4000000000')"
+PRANGE='parent is out of range; it must be from 0 to 9007199254740992'
+for v in 1e999 -1 99999999999999999999; do
+    check "tree ?parent=$v is out of range" "{\"error\":\"$PRANGE\"} 400" \
+        "$(sock_send GET "/repos/1/snapshots/1/tree?parent=$v")"
+done
+check "tree ?parent=x is not a whole number" '{"error":"parent must be a whole number"} 400' \
+    "$(sock_send GET '/repos/1/snapshots/1/tree?parent=x')"
+check "tree ?parent= of an unknown node is still 404" \
+    '{"error":"no such directory in this snapshot"} 404' \
+    "$(sock_send GET '/repos/1/snapshots/1/tree?parent=9000000000')"
+check "tree ?parent=0 is the root" 200 "$(sock_code '/repos/1/snapshots/1/tree?parent=0')"
+check "diff ?from=1e999 is out of range" \
+    '{"error":"from is out of range; it must be from 1 to 4294967295"} 400' \
+    "$(sock_send GET '/repos/1/diff?from=1e999&to=1')"
+check "diff ?to=x is not a whole number" '{"error":"to must be a whole number"} 400' \
+    "$(sock_send GET '/repos/1/diff?from=1&to=x')"
+check "diff of an unknown snapshot is still 404" \
+    "{\"error\":\"no such snapshot in 'to'\"} 404" \
+    "$(sock_send GET '/repos/1/diff?from=1&to=4000000000')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than

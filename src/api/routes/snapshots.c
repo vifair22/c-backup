@@ -395,17 +395,24 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
      */
     if (!snapshot_exists(repo_id, snap_id)) return api_error(404, "no such snapshot");
     if (parent && !*parent) parent = NULL;
-    if (parent && strcmp(parent, "0") != 0) {
-        char *end = NULL;
-        long long pid = strtoll(parent, &end, 10);
-        if (pid <= 0 || !end || *end) return api_error(400, "parent must be a node id");
+    /* 0 is the root. An id too large to be one used to be clamped by strtoll
+     * and answered as a directory that does not exist (B112). */
+    int64_t pid = 0;
+    jreq_err_t je;
+    if (parent && jquery_i64(parent, "parent", 0, INT64_MAX, &pid, &je) != JREQ_OK)
+        return api_error(400, je.msg);
+    /* Bound as the id read, not the text sent: "1e2" is node 100. */
+    char pidbuf[32];
+    snprintf(pidbuf, sizeof(pidbuf), "%lld", (long long)pid);
+    parent = pidbuf;
+    if (pid > 0) {
         char rb[32], sb[32];
         snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
         snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
         db_result_t *pr = NULL;
         int found = db_execute(g_ctx.db,
                 "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
-                (const char *[]){ rb, sb, parent, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+                (const char *[]){ rb, sb, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
         db_result_free(pr);
         if (!found) return api_error(404, "no such directory in this snapshot");
     }
@@ -662,11 +669,9 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     int64_t only_snap = 0;
     const char *sq = api_query_param(req, "snapshot");
     if (sq) {
-        char *end = NULL;
-        long long v = strtoll(sq, &end, 10);
-        if (!*sq || !end || *end || v <= 0)
-            return api_error(400, "snapshot must be a snapshot id");
-        only_snap = (int64_t)v;
+        jreq_err_t je;
+        if (jquery_i64(sq, "snapshot", 1, UINT32_MAX, &only_snap, &je) != JREQ_OK)
+            return api_error(400, je.msg);
         if (!snapshot_exists(repo_id, only_snap))
             return api_error(404, "no such snapshot");
     }

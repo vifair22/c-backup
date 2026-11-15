@@ -380,6 +380,55 @@ static void test_request_string_lists(void **state)
     json_req_free(req);
 }
 
+/*
+ * Query-string numbers go through the same verdict as a body field, so the
+ * two word a mistake the same way.
+ */
+static void test_query_numbers(void **state)
+{
+    (void)state;
+    double d = 0.0;
+    static const char *const nums[] = { "0", "7", "-1", "1.5", "1e3", "1E+2",
+                                        "-0.0", "1e999", "99999999999999999999" };
+    for (size_t i = 0; i < sizeof(nums) / sizeof(nums[0]); i++)
+        if (jquery_number(nums[i], &d) != 0) fail_msg("%s", nums[i]);
+    static const char *const junk[] = { "", "-", "+5", " 3", "3 ", "lots", "0x10",
+                                        "010", "1.", ".5", "1e", "inf", "nan", "1,2" };
+    for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); i++)
+        if (jquery_number(junk[i], &d) != -1) fail_msg("'%s'", junk[i]);
+
+    int64_t v = 9;
+    jreq_err_t e;
+    assert_int_equal(jquery_i64(NULL, "snapshot", 1, UINT32_MAX, &v, &e), JREQ_ABSENT);
+    assert_int_equal(jquery_i64("12", "snapshot", 1, UINT32_MAX, &v, &e), JREQ_OK);
+    assert_true(v == 12);
+    assert_int_equal(jquery_i64("1e2", "snapshot", 1, UINT32_MAX, &v, &e), JREQ_OK);
+    assert_true(v == 100);
+
+    static const struct { const char *text; const char *msg; } bad[] = {
+        { "1e999", "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "-1",    "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "0",     "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "99999999999999999999",
+                   "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "1.5",   "snapshot must be a whole number" },
+        { "abc",   "snapshot must be a whole number" },
+        { "",      "snapshot must be a whole number" },
+        { "+5",    "snapshot must be a whole number" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        v = 9;
+        if (jquery_i64(bad[i].text, "snapshot", 1, UINT32_MAX, &v, &e) != JREQ_BAD)
+            fail_msg("'%s'", bad[i].text);
+        assert_string_equal(e.msg, bad[i].msg);
+        assert_true(v == 9);
+    }
+    /* Wider than a double holds exactly: narrowed, and the message says so. */
+    assert_int_equal(jquery_i64("9007199254740994", "parent", 0, INT64_MAX, &v, &e),
+                     JREQ_BAD);
+    assert_string_equal(e.msg, "parent is out of range; it must be from 0 to 9007199254740992");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -398,6 +447,7 @@ int main(void)
         cmocka_unit_test(test_request_u32),
         cmocka_unit_test(test_request_wide_ints),
         cmocka_unit_test(test_request_string_lists),
+        cmocka_unit_test(test_query_numbers),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

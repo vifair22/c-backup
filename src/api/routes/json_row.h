@@ -145,4 +145,22 @@ int jreq_strv(const cutils_json_req_t *req, const char *key, size_t max,
               char ***out, size_t *n, jreq_err_t *err);
 void jreq_strv_free(char **v, size_t n);
 
+/*
+ * Query-string numbers, by the same rules and in the same words as a body.
+ *
+ * jquery_number reads text in JSON's number grammar into *out (which may
+ * be infinite for 1e999) and returns 0, or -1 for anything else - "lots",
+ * "+5", " 3", "0x10".
+ *
+ * jquery_i64 is the query counterpart of jreq_i64: JREQ_ABSENT for a NULL
+ * text, JREQ_BAD with "<name> must be a whole number" for something that
+ * is not a number or not whole, and "<name> is out of range; it must be
+ * from <min> to <max>" for a negative, oversized or unrepresentable one.
+ * An id each route parsed its own way used to clamp an overflowing value
+ * to LLONG_MAX and answer 404, as though the id were merely unknown.
+ */
+int jquery_number(const char *text, double *out);
+int jquery_i64(const char *text, const char *name, int64_t min, int64_t max,
+               int64_t *out, jreq_err_t *err);
+
 #endif

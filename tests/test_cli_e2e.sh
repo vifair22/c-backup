@@ -157,7 +157,7 @@ contains "search"        'one.txt'             "$(cb search 1 txt)"
 # B074: these were silently replaced by the defaults.
 OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
 check    "snapshots --limit -1 fails" 1 "$RC"
-contains "and says why" "limit must be a whole number" "$OUT"
+contains "and says why" "limit is out of range; it must be from 1 to" "$OUT"
 OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
 check    "objects --location nowhere fails" 1 "$RC"
 

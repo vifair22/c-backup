@@ -203,6 +203,32 @@ int jreq_bool(const cutils_json_req_t *req, const char *key, bool *out,
 #define JREQ_EXACT 9007199254740992.0 /* 2^53 */
 
 /*
+ * The verdict on a number already read, shared by the body and the query
+ * string so the two cannot word the same mistake differently. d may be
+ * infinite, which is simply out of range.
+ */
+static int jreq_whole_verdict(const char *name, double d, double lo, double hi,
+                              const char *range, double *out, jreq_err_t *err)
+{
+    if (isfinite(d) && d != floor(d))
+        return jreq_bad(err, "%s must be a whole number", name);
+    if (!(d >= lo && d <= hi))
+        return jreq_bad(err, "%s is out of range; it must be %s", name, range);
+    *out = d;
+    return JREQ_OK;
+}
+
+/* Signed bounds narrowed to what a double holds exactly, and their text. */
+static void jreq_i64_bounds(int64_t *min, int64_t *max, char *range, size_t rsz)
+{
+    const int64_t exact = (int64_t)1 << 53;
+    if (*max > exact)  *max = exact;
+    if (*min < -exact) *min = -exact;
+    if (*min > *max) *min = *max;
+    snprintf(range, rsz, "from %" PRId64 " to %" PRId64, *min, *max);
+}
+
+/*
  * The shared half of the integer getters. lo and hi are already exact
  * doubles (narrowed to 2^53 by the caller), and range is their text for the
  * message, printed from the integers so it never reads 4.29497e+09.
@@ -227,11 +253,7 @@ static int jreq_whole(const cutils_json_req_t *req, const char *key,
     double d = 0.0;
     if (json_req_get_f64(req, key, &d, -DBL_MAX, DBL_MAX) != 0)
         return jreq_bad(err, "%s must be a number", key);
-    if (d != floor(d)) return jreq_bad(err, "%s must be a whole number", key);
-    if (d < lo || d > hi)
-        return jreq_bad(err, "%s is out of range; it must be %s", key, range);
-    *out = d;
-    return JREQ_OK;
+    return jreq_whole_verdict(key, d, lo, hi, range, out, err);
 }
 
 int jreq_u32(const cutils_json_req_t *req, const char *key, uint32_t *out,
@@ -262,14 +284,53 @@ int jreq_u64(const cutils_json_req_t *req, const char *key, uint64_t *out,
 int jreq_i64(const cutils_json_req_t *req, const char *key, int64_t *out,
              int64_t min, int64_t max, jreq_err_t *err)
 {
-    const int64_t exact = (int64_t)1 << 53;
-    if (max > exact)  max = exact;
-    if (min < -exact) min = -exact;
-    if (min > max) min = max;
     char range[64];
-    snprintf(range, sizeof(range), "from %" PRId64 " to %" PRId64, min, max);
+    jreq_i64_bounds(&min, &max, range, sizeof(range));
     double d = 0.0;
     int rc = jreq_whole(req, key, (double)min, (double)max, range, &d, err);
+    if (rc == JREQ_OK) *out = (int64_t)d;
+    return rc;
+}
+
+int jquery_number(const char *text, double *out)
+{
+    if (!text) return -1;
+    /* JSON's number grammar, so a query string and a body agree on what a
+     * number is: no sign but '-', no leading zeros, no hex, inf or nan,
+     * no surrounding space - all of which strtod alone would accept. */
+    const char *p = text;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else if (*p >= '1' && *p <= '9') while (*p >= '0' && *p <= '9') p++;
+    else return -1;
+    if (*p == '.') {
+        p++;
+        if (!(*p >= '0' && *p <= '9')) return -1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!(*p >= '0' && *p <= '9')) return -1;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p) return -1;
+    /* ERANGE is fine: overflow gives +-HUGE_VAL, which is out of range for
+     * every field, and underflow a value that is not whole. */
+    *out = strtod(text, NULL);
+    return 0;
+}
+
+int jquery_i64(const char *text, const char *name, int64_t min, int64_t max,
+               int64_t *out, jreq_err_t *err)
+{
+    if (!text) return JREQ_ABSENT;
+    double d = 0.0;
+    if (jquery_number(text, &d) != 0)
+        return jreq_bad(err, "%s must be a whole number", name);
+    char range[64];
+    jreq_i64_bounds(&min, &max, range, sizeof(range));
+    int rc = jreq_whole_verdict(name, d, (double)min, (double)max, range, &d, err);
     if (rc == JREQ_OK) *out = (int64_t)d;
     return rc;
 }

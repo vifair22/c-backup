@@ -929,11 +929,21 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     const char *from = api_query_param(req, "from");
     const char *to   = api_query_param(req, "to");
     if (!from || !to) return api_error(400, "from and to are required");
+    /* Snapshot ids, read like every other numeric parameter: "abc" or
+     * 1e999 used to be looked up as text and answered 404 (B112). */
+    int64_t fid = 0, tid = 0;
+    jreq_err_t je;
+    if (jquery_i64(from, "from", 1, UINT32_MAX, &fid, &je) != JREQ_OK ||
+        jquery_i64(to, "to", 1, UINT32_MAX, &tid, &je) != JREQ_OK)
+        return api_error(400, je.msg);
+    char fbuf[32], tbuf[32];
+    snprintf(fbuf, sizeof(fbuf), "%lld", (long long)fid);
+    snprintf(tbuf, sizeof(tbuf), "%lld", (long long)tid);
 
     uint8_t hfrom[OBJECT_HASH_SIZE], hto[OBJECT_HASH_SIZE];
-    if (root_hash_of(repo_id, from, hfrom) != 0)
+    if (root_hash_of(repo_id, fbuf, hfrom) != 0)
         return api_error(404, "no such snapshot in 'from'");
-    if (root_hash_of(repo_id, to, hto) != 0)
+    if (root_hash_of(repo_id, tbuf, hto) != 0)
         return api_error(404, "no such snapshot in 'to'");
 
     store_t *store = NULL;

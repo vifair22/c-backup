@@ -29,10 +29,12 @@ while the first page through the index costs 93 us and beats it. The
 regression only exists if the API offers a way to ask for everything at once,
 so it does not. **No route returns a whole snapshot.**
 
-`limit` and `offset` must be plain decimal counts: `limit` 1 or more,
-`offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
-400 naming the parameter, and for `limit` the route's range: `limit must be
-a whole number from 1 to 1000 (a larger one is reduced to 1000)`. They used
+`limit` and `offset` must be whole numbers: `limit` 1 or more, `offset` 0
+or more. Something that is not a whole number (`+5`, `lots`, `1.5`) is a
+400 `<param> must be a whole number`; one below the minimum (`-1`, `0` for
+a limit) is a 400 naming the range, which for `limit` is the route's:
+`limit is out of range; it must be from 1 to 1000 (a larger one is reduced
+to 1000)`. They used
 to be replaced by the defaults, which answered a request the server had not
 understood as if it had. A `limit` above a route's maximum is clamped to it,
 however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
@@ -90,6 +92,15 @@ Requests take the same types. Where a field used to be sent as text or as
 accepted.
 
 ### Request errors
+
+Numeric query parameters (`limit`, `offset`, `snapshot` on search,
+`parent` on a tree listing, `from` and `to` on a diff) read numbers the
+same way and answer in the same words: something that is not a whole
+number is `<param> must be a whole number`, and a negative, oversized or
+unrepresentable one (`1e999`) is `<param> is out of range; it must be from
+<min> to <max>`. A valid id that names nothing is still a 404. An
+overflowing id used to be clamped and answered 404, as though it were
+merely unknown.
 
 A request body field is either absent or of its documented type. A field
 that is present with the wrong type is a 400 naming it and the type it
