@@ -20,6 +20,15 @@
 #include <openssl/params.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/opensslv.h>
+
+/* Argon2 arrived in OpenSSL 3.2. Against 3.0 or 3.1 the build otherwise dies
+ * on an undeclared OSSL_KDF_PARAM_ARGON2_MEMCOST, which says nothing about
+ * why (B104). The Makefile checks first when pkg-config knows OpenSSL; this
+ * is the backstop for a build that bypasses it. */
+#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER < 0x30200000L
+#error "c-backup needs OpenSSL 3.2 or newer (Argon2id key derivation). This OpenSSL is older: see Manual.md section 2.1 for distributions that ship it."
+#endif
 
 /*
  * Argon2id defaults: 64 MiB, three passes, one lane.

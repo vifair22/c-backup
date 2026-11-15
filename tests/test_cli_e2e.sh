@@ -62,7 +62,16 @@ contains "explains the daemon is not running" "daemon not running" "$OUT"
 # B080: the advice fits where the CLI runs. It said systemctl inside the
 # Docker image, which has no systemd. CI itself may be a container, so the
 # expectation follows the same signals the CLI reads.
-if [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
+# B103: systemd with the unit installed wins even inside a container, and a
+# container booting systemd without the unit gets both commands.
+UNIT=0
+for u in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system \
+         /usr/lib/systemd/system /lib/systemd/system; do
+    [ -e "$u/c-backupd.service" ] && UNIT=1
+done
+if [ -d /run/systemd/system ] && [ "$UNIT" = 1 ]; then
+    contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+elif [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
     contains "suggests how to start it" "start that container" "$OUT"
 elif [ -d /run/systemd/system ]; then
     contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
@@ -72,11 +81,24 @@ fi
 contains "names the socket options" "--socket PATH" "$OUT"
 contains "and the variable" "C_BACKUP_SOCKET" "$OUT"
 OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" repo list 2>&1)
-contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
-case "$OUT" in
-    *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
-    *)           ok  "and not systemctl" ;;
-esac
+if [ -d /run/systemd/system ] && [ "$UNIT" = 1 ]; then
+    contains "a container with the unit installed says systemctl" "systemctl start c-backupd" "$OUT"
+elif [ -d /run/systemd/system ]; then
+    # The marker alone cannot be faked on a host booted with systemd; the
+    # decision table itself is covered by test_start_advice.
+    contains "a container running systemd gives both: docker" "docker start c-backupd" "$OUT"
+    contains "and systemctl" "systemctl start c-backupd" "$OUT"
+else
+    contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
+    case "$OUT" in
+        *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
+        *)           ok  "and not systemctl" ;;
+    esac
+fi
+# jobs watch had its own copy of the advice, which always said systemctl.
+OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" jobs watch 1 2>&1); RC=$?
+check    "watch without a daemon exits non-zero" 1 "$RC"
+contains "watch gives the same advice" "--socket PATH" "$OUT"
 
 echo "offline commands"
 contains "version" "c-backup" "$("$CLI" --version)"
@@ -788,6 +810,37 @@ if [ -n "$LOSS_DAT" ]; then
     else bad "the loss gauge sees it" "> 0" "${GAUGE:-absent}"; fi
 else
     bad "loss repo produced a pack" "a pack file" "none"
+fi
+
+# B106: verify --dry-run is a check that writes nothing to the repository,
+# whatever else was asked for. One byte of damage inside a 1 MiB
+# incompressible payload is within parity: the dry run has to report it
+# recoverable and leave the byte where it is, and a repairing run fixes it.
+mkdir -p "$WORK/drysrc"
+head -c 1048576 /dev/urandom > "$WORK/drysrc/blob.bin"
+DRY_ID=$(cb repo add "$WORK/dryrepo" dry | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$DRY_ID" "$WORK/drysrc" > /dev/null
+DRY_OBJ=$(find "$WORK/dryrepo/objects" "$WORK/dryrepo/packs" -type f -size +1000k 2>/dev/null | head -1)
+if [ -n "$DRY_OBJ" ]; then
+    DRY_GOOD=$(sha256sum < "$DRY_OBJ")
+    DRY_OFF=$(( $(stat -c %s "$DRY_OBJ") / 2 ))
+    DRY_BYTE=$(od -An -tu1 -j "$DRY_OFF" -N1 "$DRY_OBJ" | tr -d ' ')
+    if [ "$DRY_BYTE" = 0 ]; then printf '\377'; else printf '\000'; fi | \
+        dd of="$DRY_OBJ" bs=1 seek="$DRY_OFF" conv=notrunc status=none
+    DRY_BAD=$(sha256sum < "$DRY_OBJ")
+    OUT=$(cb verify "$DRY_ID" --dry-run 2>&1); RC=$?
+    check    "a dry run over recoverable damage succeeds" 0 "$RC"
+    contains "and reports nothing repaired" '"repaired":0,' "$OUT"
+    contains "but the damage recoverable"   '"recoverable":1,' "$OUT"
+    check    "and leaves the repository untouched" "$DRY_BAD" "$(sha256sum < "$DRY_OBJ")"
+    # --dry-run wins over a request that would otherwise repair.
+    OUT=$(cb verify "$DRY_ID" --level deep --dry-run 2>&1)
+    contains "even with the level named" '"repaired":0,' "$OUT"
+    OUT=$(cb verify "$DRY_ID" 2>&1)
+    contains "a repairing run fixes it" '"repaired":1,' "$OUT"
+    check    "and writes the right bytes back" "$DRY_GOOD" "$(sha256sum < "$DRY_OBJ")"
+else
+    bad "dry-run repo stored the blob" "a file over 1000k" "$(find "$WORK/dryrepo" -type f | head)"
 fi
 
 # Job commands wait by default and exit non-zero when the job fails.

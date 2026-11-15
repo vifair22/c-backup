@@ -392,7 +392,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
 | GET | `/repos/<id>/grep` | Recent searches, newest first; `limit` and `offset` |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
-| POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
+| POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing, `?dry_run=1` (or `true`) the same and overriding any `repair` |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
 | POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |

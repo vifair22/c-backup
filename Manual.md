@@ -113,6 +113,23 @@ hosts: the scan's memory.
 
 ### 2.1 From source
 
+**OpenSSL 3.2 or newer is required.** Repository encryption derives keys with
+Argon2id through OpenSSL's KDF interface, which first shipped in 3.2. An older
+OpenSSL stops the build at once with a message naming the version it found.
+
+| Distribution | OpenSSL | Builds as is |
+|---|---|---|
+| Debian 13 (trixie), the Docker image's base | 3.5 | yes |
+| Arch Linux | current 3.x | yes |
+| Ubuntu 24.04 LTS | 3.0 | no: build against a newer OpenSSL, or use the Docker image |
+| Debian 12 (bookworm) | 3.0 | no, as Ubuntu 24.04 |
+
+On a distribution that ships an older OpenSSL, the Docker image (section 2.3)
+is the supported install; a newer release of the distribution (Ubuntu 25.04
+ships 3.4) also builds. Replacing the system OpenSSL on an LTS host is not
+something to do for one program, and building against a private copy is not
+a configuration the Makefile or CI supports.
+
 Build dependencies on Debian/Ubuntu:
 
 ```sh
@@ -151,6 +168,15 @@ The unit runs the daemon as root, because reading arbitrary source paths and
 restoring ownership both need it. systemd creates `/run/c-backupd` (the
 socket directory) and `/var/lib/c-backupd` (the database directory, mode
 0700) on start.
+
+The unit is `Type=notify`: the daemon tells systemd it is ready only once its
+unix socket and TCP listener are bound, so `systemctl start` (and
+`enable --now`) returns when the CLI can connect, and a unit ordered
+`After=c-backupd.service` starts no earlier. Startup applies any schema
+migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+On stop it reports `deactivating` while running jobs are cancelled. The
+daemon implements the notification protocol itself and does not link
+libsystemd; run outside systemd it simply skips it.
 
 Check it:
 
@@ -272,7 +298,10 @@ daemon logs the location at start (`sqlite temporary files: ...`).
 
 ### 2.4 The desktop app
 
-The app lives in `ui/`. To build and run it from a checkout:
+The app lives in `ui/`. It needs Node.js 22.12 or newer, as `engines` in
+`ui/package.json` says: Vite 7 needs that to build, and `npm test` runs the
+TypeScript tests directly with `node --experimental-strip-types`. CI uses
+Node 24. To build and run it from a checkout:
 
 ```sh
 cd ui
@@ -988,6 +1017,7 @@ sudo c-backup verify 1                     # deep, repairing
 sudo c-backup verify 1 --level index       # fast: every object still resolves
 sudo c-backup verify 1 --level structure   # also parses every header
 sudo c-backup verify 1 --no-repair         # check only, write nothing
+sudo c-backup verify 1 --dry-run           # the same, and wins over everything
 sudo c-backup verify list 1                # past runs
 ```
 
@@ -1002,11 +1032,22 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
+`--dry-run` is a check that cannot write: it turns repair off whatever else
+the command says, so it behaves exactly as `--no-repair` and takes the read
+lock. It is there for the habit `gc --dry-run` and `gfs --dry-run` teach,
+and it means "show me, change nothing". Nothing in the repository is
+written. The daemon still records the run and its findings (`verify list`,
+`verify show`, the verify metrics), because that is the report. Objects
+up to 16 MiB are read with parity applied in memory, so damage there is
+reported `recoverable`; a larger object is streamed, cannot be checked that
+way without writing, and is reported as damaged with a note to run a
+repairing verify. A dry run that finds loss fails like any other verify.
+
 What a run counts:
 
 | Count | Meaning |
 |---|---|
-| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` |
+| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
@@ -1614,7 +1655,7 @@ the underlying disk.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies |
+| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies: systemctl wherever systemd runs with the unit installed, a container included, and both commands in a container running systemd without it |
 | `permission denied` on the socket | Not root, and the socket is root-only | `sudo`, or section 4.1 |
 | `another daemon is serving <socket>` at start | A second instance | Stop the other one; only one daemon owns a host |
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |

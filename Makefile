@@ -26,6 +26,22 @@ endif
 endif
 endif
 
+# ---- OpenSSL floor ----------------------------------------------------
+# Argon2id key derivation needs OpenSSL 3.2. Older (Ubuntu 24.04 ships 3.0)
+# fails deep in repo_key.c on an undeclared constant that does not say why,
+# so a build checks up front. Only when building: clean and the analysers
+# need no OpenSSL. Skipped when pkg-config cannot see OpenSSL at all, in which
+# case repo_key.c's own #error is the backstop.
+OPENSSL_MIN := 3.2
+ifneq ($(filter _build,$(MAKECMDGOALS)),)
+OPENSSL_PC_VERSION := $(shell pkg-config --modversion openssl 2>/dev/null)
+ifneq ($(OPENSSL_PC_VERSION),)
+ifneq ($(shell pkg-config --atleast-version=$(OPENSSL_MIN) openssl && echo ok),ok)
+$(error OpenSSL $(OPENSSL_PC_VERSION) found; c-backup needs OpenSSL $(OPENSSL_MIN) or newer for Argon2id key derivation. See Manual.md section 2.1)
+endif
+endif
+endif
+
 # ---- Directory layout -------------------------------------------------
 BUILD      := build
 BINS       := $(BUILD)/bins
