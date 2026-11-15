@@ -145,21 +145,41 @@ static int q_search(int64_t snap, const char *needle)
     snprintf(lim, sizeof(lim), "%d", snap ? PAGE : PAGE * SEARCH_SCAN_FACTOR);
     snprintf(snap_s, sizeof(snap_s), "%lld", (long long)snap);
     const char *repo = g_e.repo_id_s;
+    /* snapshot_in_older_half, as the route decides it. */
+    int oldest_first = 0;
+    if (snap) {
+        db_result_t *h = NULL;
+        if (db_execute(g_e.db,
+                "SELECT (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id > ?)"
+                "     > (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id < ?)",
+                (const char *[]){ repo, snap_s, repo, snap_s, NULL }, &h) == 0 &&
+            h && h->nrows == 1)
+            oldest_first = strcmp(h->rows[0][0], "1") == 0;
+        db_result_free(h);
+    }
     db_result_t *r = NULL;
     int rc = snap
-        ? db_execute(g_e.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ? LIMIT ?",
+        ? db_execute(g_e.db, oldest_first
+            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+              "       COALESCE(n.content_hash, '')"
+              "  FROM node_fts f"
+              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
+              " ORDER BY f.rowid ASC LIMIT ?"
+            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+              "       COALESCE(n.content_hash, '')"
+              "  FROM node_fts f"
+              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
+              " ORDER BY f.rowid DESC LIMIT ?",
             (const char *[]){ repo, repo, mq, snap_s, lim, NULL }, &r)
         : db_execute(g_e.db,
             "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
             "       COALESCE(n.content_hash, '')"
             "  FROM node_fts f"
             "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ? LIMIT ?",
+            " WHERE f.repo_id = ? AND f.name MATCH ?"
+            " ORDER BY f.rowid DESC LIMIT ?",
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
     if (rc != 0) { db_result_free(r); return -1; }
     int n = r ? r->nrows : 0;

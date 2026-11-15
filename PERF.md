@@ -6,6 +6,32 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - One-snapshot search reads the index newest first
+
+Machine: i7-1265U laptop, `/tmp` on tmpfs. `make bench-browse` defaults
+(100k files, 4 snapshots).
+
+A search restricted to one snapshot applied the snapshot filter after the
+trigram match, and read matches in index rowid order, which is the order
+snapshots were indexed: oldest first. A page from the newest snapshot - the
+one people search - walked every older snapshot's matches first, so its cost
+grew with retention. The route now reads newest first unless the snapshot is
+in the older half of the repository's snapshots. All-snapshot search reads
+newest first too, which is also the copy a collapsed result keeps.
+
+| Query | Before | After |
+|---|---:|---:|
+| search_one_snap_common (newest) | 210,873 us | 364 us |
+| search_one_snap_common_oldest | 251 us | 257 us |
+| search_one_snap_rare | 188 us | 345 us |
+| search_all_snaps_common | 1,624 us | 1,944 us |
+| search_all_snaps_rare | 188 us | 338 us |
+
+The rare-term and all-snapshot rows cost about 0.15-0.3 ms more reading
+descending; the common case they trade against was 580x slower. A snapshot
+reindexed after later ones is written at the high end of the index, so it is
+found more slowly by this rule, never wrongly.
+
 ## 2026-11-15 - Benchmarks rebuilt on the daemon engine
 
 `make bench` had not built since the daemon rewrite. `BENCH_CFLAGS` kept its
