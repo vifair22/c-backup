@@ -14,6 +14,7 @@
 #include "repo_key.h"
 #include "store.h"
 #include <cutils/db.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define CBACKUP_MARKER      ".cbackup"
@@ -71,6 +72,16 @@ typedef struct {
 status_t repo_store_open(const char *path, const store_config_t *cfg,
                          store_t **out);
 
+/*
+ * repo_store_open for work that reads or writes content: backup, restore,
+ * reindex, grep, pack, gc, replicate. An encrypted repository whose key is
+ * not on this host fails here with the REPO_NO_KEY_FMT message, instead of
+ * opening and failing deep inside the work with "pack entry is encrypted
+ * and no key is loaded", or worse, "1 entry could not be restored".
+ */
+status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
+                               store_t **out);
+
 /* Read the marker from a repo directory. ERR_NOT_FOUND if absent,
  * ERR_CORRUPT if present but malformed or of an unknown format. */
 status_t repo_marker_read(const char *path, repo_marker_t *out);
@@ -86,6 +97,22 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
  * naming a keyfile before the repository exists requires. */
 status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
                                  repo_marker_t *out);
+
+/*
+ * Decide the encryption mode from what a caller sent. mode may be NULL or
+ * empty (not given). A non-empty passphrase with no mode means passphrase
+ * mode; with none or system it is ERR_INVALID, as is passphrase mode without
+ * one.
+ */
+status_t repo_enc_resolve(const char *mode, const char *passphrase,
+                          repo_enc_mode_t *out);
+
+/*
+ * Normalise an absolute path lexically: no "//", no "." or ".." components,
+ * no trailing slash. Symlinks are left alone. ERR_INVALID for a relative or
+ * over-long path. Registration stores paths in this form.
+ */
+status_t repo_path_normalize(const char *in, char *out, size_t outsz);
 
 /*
  * Register a repo directory, per section 5.2:
@@ -108,10 +135,61 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id);
 
+/* What a registration did, for a caller that has to tell the cases apart. */
+typedef struct {
+    int64_t         id;
+    int             created;            /* a new repository was made on disk */
+    int             inserted;           /* a new row: created, or adopted */
+    int             already_registered; /* the row existed: same path or moved */
+    int             label_updated;      /* already registered, label changed */
+    repo_enc_mode_t enc_mode;           /* as the marker records it */
+    /* An existing passphrase repository whose passphrase was given and
+     * verified: its key is now cached in the key directory. */
+    int             key_unlocked;
+    /* An existing encrypted repository registered without its key being
+     * available on this host. Registration succeeds, because verifying an
+     * offsite copy needs no key, but reading it will not work until the key
+     * is imported or the passphrase supplied. */
+    int             key_missing;
+} repo_register_out_t;
+
+/*
+ * repo_register_ex, reporting which case happened. Registering a repository
+ * that is already registered succeeds (that is the moved-repository path),
+ * applies a non-empty label that differs from the stored one, and leaves
+ * already_registered set. Asking for an encryption mode an existing
+ * repository does not have is ERR_INVALID.
+ */
+status_t repo_register_detail(cutils_db_t *db, const char *path, const char *label,
+                              repo_enc_request_t *enc, repo_register_out_t *out);
+
 status_t repo_register(cutils_db_t *db, const char *path, const char *label,
                        int64_t *out_repo_id);
 
-/* Remove the registration and its index rows. The repository directory is
- * never touched: deleting backup data is the operator's act, not a side
- * effect of an API call. */
+/*
+ * The one message for "this repository is encrypted and its key is not on
+ * this host", so a refused request, a failed job and a registration warning
+ * all say the same plain thing. The second %s is the hint for the mode.
+ */
+#define REPO_NO_KEY_FMT "no key loaded for repository %s; %s"
+#define REPO_NO_KEY_HINT_SYSTEM \
+    "import it with c-backup repo key import <repo-id> <key-hex>"
+#define REPO_NO_KEY_HINT_PASS \
+    "import it with c-backup repo key import <repo-id> <key-hex>, or unlock it " \
+    "with c-backup repo add <path> --passphrase <passphrase>"
+
+/* Encrypted per the marker and no keyfile for it in the key directory. */
+int repo_key_is_missing(const char *path);
+
+/*
+ * OK for an unencrypted repository or one whose key is on this host;
+ * otherwise ERR_INVALID with the REPO_NO_KEY_FMT message. For anything that
+ * has to read or write content: refusing up front says what is wrong, where
+ * the work itself fails later with a message about a pack entry.
+ */
+status_t repo_require_key(const char *path);
+
+/* Remove the registration and queue its index rows for repo_purge, which
+ * the caller kicks. The repository directory is never touched: deleting
+ * backup data is the operator's act, not a side effect of an API call. */
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id);

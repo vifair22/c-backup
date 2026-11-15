@@ -120,7 +120,7 @@ export type ApiRequest =
   | { kind: 'policyGet'; repoId: number }
   | { kind: 'policySet'; repoId: number; key: string; value: string }
   | { kind: 'tagList'; repoId: number }
-  | { kind: 'tagSet'; repoId: number; name: string; snapshotId: number }
+  | { kind: 'tagSet'; repoId: number; name: string; snapshotId: number; move?: boolean }
   | { kind: 'tagRemove'; repoId: number; name: string }
   | { kind: 'journal'; repoId: number; limit?: number; result?: string }
 
@@ -183,19 +183,26 @@ export interface JobAccepted {
  * on every repository screen - called .filter on it. Opening any repository
  * blanked the window.
  *
- * Numbers arrive as strings in the list and as numbers in the detail, which
- * is why the fields are widened rather than picked. Coercing at the edge is
- * cheaper than being wrong about which one a given route returns.
+ * The list and the detail now carry the same object, with JSON numbers.
+ * "started"/"ended" are epoch seconds or null; "result" is what the job
+ * reported about itself when it finished, or null.
  */
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface Job {
-  id: string
+  id: number
+  repo_id?: number
   action: string
   state: JobState
-  /* Present on the detail route, absent from the list. */
+  started?: number | null
+  ended?: number | null
+  elapsed_s?: number
   phase?: string
-  current?: number | string
-  total?: number | string
+  current?: number
+  total?: number
+  bytes_done?: number
+  bytes_total?: number
+  rate_bytes_per_s?: number
   error?: string
+  result?: Record<string, unknown> | null
 }

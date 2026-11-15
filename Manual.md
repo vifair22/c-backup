@@ -163,15 +163,25 @@ sudo c-backup version
 
 `systemctl stop c-backupd` (SIGTERM) shuts the daemon down in order: it stops
 accepting requests, stops firing schedules, then cancels running jobs, which
-stop between files and are recorded as `cancelled` in `c-backup jobs` and the
-journal. This takes about a second. A second SIGTERM or SIGINT forces an
-immediate exit. Run the cancelled job again after the restart; a backup skips
-what it already stored, a restore skips what it already wrote.
+are recorded as `cancelled` in `c-backup jobs` and the journal. A job checks
+for cancellation between files and between chunks inside one: storing,
+packing and restoring a file all stop within one read of at most 8 MiB, so a
+multi-gigabyte file in progress does not hold up the shutdown. This takes
+about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
+or SIGINT forces an immediate exit. Run the cancelled job again after the
+restart; a backup skips what it already stored, a restore skips what it
+already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
+job, and prints the job record with `"cancel_requested":true`.
 
-A daemon that dies without stopping (a crash, `kill -9`, power loss) marks
-whatever was running as `failed: interrupted by daemon restart` on its next
-start. Either way the repository is consistent: a backup's partial pack is
-discarded and the next backup stores those files again.
+A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
+loss) marks whatever was running as `failed: interrupted by daemon restart` on
+its next start, and journals each such job then, since the killed process
+could not. Either way the repository is consistent: a backup's partial pack
+and the index rows staged into it are discarded, and the next backup stores
+those files again. Staging files a killed writer left in the repository's
+`tmp/` are removed by the next backup or gc, which hold the repository's write
+lock and so know nothing else is writing there; opening a repository also
+removes any an hour old.
 
 ### 2.3 Docker
 
@@ -184,19 +194,68 @@ docker run -d --name c-backupd \
   -v /srv/backup:/srv/backup \
   -v /home:/source/home:ro \
   -p 127.0.0.1:8765:8765 \
+  -e TZ=America/Chicago \
   <registry>/vifair22/c-backup:<tag>
 ```
 
-- `/var/lib/c-backupd` holds `state.db`. Put it on fast storage (section 18).
+- `/var/lib/c-backupd` holds `state.db` and, in `keys/`, the encryption key
+  of every encrypted repository. Put it on fast storage (section 18).
+- **The keys are the one thing on that volume a reindex cannot rebuild.**
+  The image sets `C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys`, so they
+  survive replacing the container, but lose the volume and every `system`
+  repository is unreadable. Back up `/var/lib/c-backupd/keys` somewhere other
+  than this host, or keep each key from `repo key export` (section 13). The
+  environment variable overrides `security.key_dir` in any config file you
+  mount; to move the keys, pass `-e C_BACKUP_SECURITY_KEY_DIR=...` and keep
+  the directory on a volume.
 - Mount the repositories and the sources at whatever paths you will register
   and back up. Paths are always the container's view.
 - The image binds TCP on every interface inside the container, because a
   published port cannot reach the container's loopback. What is exposed is
   decided by `-p`. TCP serves only the health probes until an admin password
   is set.
+- **Set the time zone.** The image runs in UTC unless told otherwise, and
+  calendar schedules (section 10) fire in the daemon's local time, so on a
+  host in US Central `--at 03:00` would fire at 03:00 UTC, 21:00 the evening
+  before. Pass `-e TZ=America/Chicago` (any zone name from the tz database;
+  the image carries `tzdata`), or mount the host's zone read-only with
+  `-v /etc/localtime:/etc/localtime:ro`; `TZ` wins if both are given.
+  `c-backup schedule list` reports the zone in use (`timezone`) and each
+  schedule's next fire with its offset (`next_due_iso`), so a wrong zone is
+  visible before anything fires at the wrong hour. Changing the zone takes
+  effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
-  `/etc/c-backupd/config.yaml`.
+  `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
+  file 0600: the daemon warns at start if it is not and cannot fix it.
+
+**Privileges.** The daemon runs as root inside the container, because it
+has to read every source file whatever its owner and restore ownership,
+modes and device nodes. It does not need root's full capability set. This
+set covers backup and restore:
+
+```sh
+docker run -d --name c-backupd \
+  --cap-drop ALL \
+  --cap-add DAC_READ_SEARCH --cap-add DAC_OVERRIDE \
+  --cap-add CHOWN --cap-add FOWNER --cap-add FSETID --cap-add MKNOD \
+  --read-only --tmpfs /run/c-backupd \
+  -v cbackup-state:/var/lib/c-backupd ... \
+  <image>
+```
+
+| Capability | Needed for |
+|---|---|
+| `DAC_READ_SEARCH` | reading source files and directories regardless of their permissions |
+| `DAC_OVERRIDE` | writing restored files into directories owned by others |
+| `CHOWN` | restoring ownership |
+| `FOWNER` | restoring modes and times on files owned by others |
+| `FSETID` | keeping setuid and setgid bits on restored files |
+| `MKNOD` | restoring device nodes (without it they are skipped and counted) |
+
+With `--read-only`, the root filesystem is not written: state goes to the
+`/var/lib/c-backupd` volume, the socket to the `/run/c-backupd` tmpfs, and
+staging files into each repository's own `tmp/`.
 
 ### 2.4 The desktop app
 
@@ -236,12 +295,13 @@ are different: they live in the database and change through the policy API
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
-| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each |
+| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
 | `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
 | `log.level` | `info` | `debug`, `info`, `warn`, `error` |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories |
+| `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -250,6 +310,11 @@ are different: they live in the database and change through the policy API
 
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9).
+
+Every key can also be set from the environment: `C_BACKUP_` followed by the
+key in capitals with dots as underscores, so `security.key_dir` is
+`C_BACKUP_SECURITY_KEY_DIR`. The environment wins over the file. The
+container image uses this for the key directory (section 2.3).
 
 Logs go to stdout, which systemd sends to the journal
 (`journalctl -u c-backupd`). The daemon also keeps 30 days of log lines in its
@@ -322,8 +387,26 @@ HTTPS.
 - A login returns a token valid for 90 days. Every authenticated request
   slides the expiry forward, so a connection in regular use does not expire.
 - `c-backup auth password` changes the password; it always asks for the
-  current one.
+  current one. A change revokes every other session at once: a client that
+  signed in with the old password is signed out, not left holding a token
+  that works for another 90 days. Over TCP the session that made the change
+  survives; from the CLI, which has no session, every session goes.
 - Sign out in the app, or `POST /api/auth/logout` with the token, revokes it.
+- `sudo c-backup auth logout --all` (or `POST /api/auth/logout-all` with a
+  token) revokes every session any client holds, including the caller's.
+  Use it when a machine that was signed in is lost or no longer trusted and
+  the password itself is not in doubt.
+- Failed logins over TCP are throttled. Each client address gets 5 free
+  failures; after that every failure locks it out for twice as long as the
+  last (1 s, 2 s, 4 s, ... up to 5 minutes), and the lockout refuses the
+  correct password too, with `429` and a `Retry-After` header. An address is
+  forgotten after 15 minutes without a failure, or at once when it logs in.
+  Across all addresses, a burst of 60 failures, or a sustained rate above
+  one every 2 seconds, refuses every TCP login until the rate falls; that caps an attacker who
+  rotates addresses - and can lock you out while one is trying. The socket is
+  never throttled: `sudo c-backup ...` on the host always works. Behind a
+  reverse proxy every client is the proxy's address and shares one budget.
+  Details are in `docs/api.md`.
 - The CLI never needs a password: it uses the socket.
 - The app stores the session token, never the password (section 15.2).
 
@@ -356,6 +439,7 @@ A repository is a directory the daemon registers and then owns.
 <repo>/
   .cbackup          identity marker: format, version, UUID, encryption
   snapshots/<id>    snapshot records: root tree hash and metadata
+  tags              the tag list, kept so a reindex can restore it
   objects/aa/bb...  loose objects, including manifest trees
   packs/<id>.dat    packs
   tmp/              staging for atomic writes
@@ -371,13 +455,30 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
 ```
 
 - A path that does not exist, or an empty directory, becomes a new
-  repository.
+  repository. Missing parent directories are created as `mkdir -p` would,
+  mode 0755; the repository directory itself is mode 0700. A path that
+  cannot be created (a parent is a regular file, a read-only filesystem, no
+  permission) is refused with HTTP 400 and the reason; only a failure of the
+  host itself, such as a full disk, is a 500.
 - A directory with a `.cbackup` marker is an existing repository and is
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links
   back to its snapshots.
+- Adding a repository that is already registered succeeds and says so
+  (`"already_registered":true`, HTTP 200 rather than 201). A label given
+  that differs from the stored one replaces it; leaving the label out keeps
+  the old one. Asking for an encryption mode the repository does not have is
+  refused: encryption is fixed when a repository is created.
+- Paths are stored normalised: `/srv/backup/main/` and
+  `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
   somebody else's data is the failure this prevents.
+- A path inside a registered repository, or one containing a registered
+  repository, is refused with HTTP 400 naming that repository. One
+  repository's objects would otherwise sit in a directory the other owns, so
+  its garbage collection and verify would see them as strays, and deleting
+  either directory would take data from both. The comparison is on resolved
+  paths, so a symlink or `..` does not get around it.
 
 ### 5.2 Removing
 
@@ -389,6 +490,21 @@ This deregisters the repository and drops its index rows. **The repository
 directory is never touched.** Deleting backup data is the operator's act:
 remove the directory yourself once you are sure. Registering it again later
 restores everything, with a reindex.
+
+The registration goes at once; the index rows (snapshots, nodes, objects,
+schedules, jobs, journal, search and verify results) are deleted afterwards
+by a background thread in short batches, so a large repository does not hold
+the database while it goes. The log says `removed repo <id>: index rows
+deleted` when it is done, and a purge cut short by a restart resumes at the
+next start. Rows earlier builds left behind for removed repositories are
+deleted the same way on the first start of this one.
+
+Removal is refused with `409` while a job is running against the
+repository; cancel it or wait for it first.
+
+A removed repository's id is never handed out again; registering it again
+gives it a new one. Ids used to be reused, so the next repository added
+could take over the removed one's schedules and history.
 
 ### 5.3 Where to put a repository
 
@@ -412,7 +528,19 @@ sudo c-backup backup 1 /home/me/projects   # or name paths for this run
 
 A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
-`c-backup jobs watch <id>` follow it.
+`c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
+state as soon as it connects, then one per change and at least every 5
+seconds, and exits when the job ends:
+
+```
+data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
+```
+
+`sources set` replaces the whole list. Each source must be an absolute path
+(empty or relative ones are refused, and nothing is changed). A path that
+does not exist on the daemon's host is stored with a warning in the reply,
+not refused, since it may be a share or disk that is mounted only at backup
+time; a backup skips it until it exists.
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
@@ -466,6 +594,21 @@ flowchart TD
    is reused without opening the file. Otherwise the file is read, hashed and
    stored. A file whose content already exists in the repository costs one
    read and no write.
+
+   "Exactly the metadata" is size, mtime, ctime, and the device and inode
+   numbers, on a local filesystem. On a network or FUSE filesystem (NFS,
+   SMB/CIFS, an Unraid user share, mergerfs, sshfs, 9p, Ceph) device and
+   inode numbers are not stable: shfs hands out new inode numbers, and a
+   container volume can remount on another device. There the cache compares
+   size, mtime and ctime only, and the daemon logs once per device that it
+   is doing so. Without this every incremental over such a share re-read
+   every file. `backup.file_cache_match` overrides the choice: `strict`
+   compares every field everywhere, `relaxed` compares only size and mtime
+   everywhere (for a filesystem whose ctime is not stable either). At
+   `log.level: debug` each miss on a known path is logged with the fields
+   that differed, which is the place to look when an incremental takes as
+   long as the first backup did and `files_unchanged` in the job result is
+   near zero.
 3. **Trees.** One manifest tree per directory, bottom up.
 4. **Snapshot.** The snapshot record goes into the repository first, then
    the index rows go into the database. An interrupted backup leaves at most
@@ -480,8 +623,20 @@ hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
 extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
 
-Files that cannot be read are logged and skipped; the backup continues. A
-source that is unreadable as a whole fails the job.
+A file inside a source that cannot be read is logged and skipped; the backup
+continues. A source itself - a path named on the command line or configured
+with `sources set` - that does not exist or cannot be opened fails the job
+before anything is written, with an error naming it, even when the other
+sources are fine:
+
+```
+c-backup: source /data/no-such-dir cannot be read (No such file or directory); no snapshot written
+```
+
+The difference is deliberate. A file vanishing between the scan and the read
+is normal on a live filesystem; a whole source missing is a mount that did
+not come up or a typo, and a snapshot without it would look like a backup of
+everything that was asked for.
 
 ### 6.4 Concurrency
 
@@ -508,13 +663,20 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
 - **Name search** uses a trigram index: substring matches in milliseconds.
+  Across all snapshots, a file kept unchanged is one result with a count of
+  the snapshots holding it and the newest one's id; a file that changed
+  appears once per distinct content. `--snapshot N` searches one snapshot.
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. Binary files are reported without an excerpt.
-  `--snapshot N` picks the snapshot (newest by default), `--path-prefix`
+  names is read once. A binary file that matches is one hit, `(binary file
+  matches)`, however often it matches. `--snapshot N` picks the snapshot
+  (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
-  matching files. The hits are kept and `GET /repos/<id>/grep` lists past
+  matching files. A file stops being read after `--max-hits-per-file`
+  matches (default 100) and the whole search after `--max-hits` (default
+  10,000); when either cut it short the output says `truncated` or counts
+  `files_capped`. The hits are kept and `GET /repos/<id>/grep` lists past
   searches.
 - **Diff** walks manifest trees and skips any subtree whose hash did not
   change, so comparing two large snapshots costs what changed between them.
@@ -524,7 +686,25 @@ Snapshots carry notes and tags:
 ```sh
 sudo c-backup snapshot note 1 12 "before the migration"
 sudo c-backup tag set 1 pre-migration 12
+sudo c-backup tag set 1 pre-migration 14 --move   # it is on 12; move it
+sudo c-backup tag remove 1 pre-migration
 ```
+
+- A note or tag needs a snapshot that exists; naming one that does not is
+  an error, not a record attached to nothing.
+- **A tag names one snapshot, and moving it must be asked for.** Setting a
+  name that is already on another snapshot fails and says where the tag is.
+  A tag is retention protection (section 9.1), so moving it unprotects the
+  snapshot it was on; `--move` says that is intended. Setting a tag on the
+  snapshot it is already on succeeds.
+- Tag names are 1 to 64 letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit. A name is part of a URL path when it is removed, and one
+  with a space or a slash could be set but never removed.
+- Removing a tag that does not exist fails with "no such tag".
+- Every tag change is also written into the repository's `tags` file, so
+  tags survive losing the database (section 17.1). If that file cannot be
+  written the change is refused, rather than leaving a tag that a recovery
+  would silently drop.
 
 ---
 
@@ -591,7 +771,20 @@ sudo c-backup policy set 1 retention.keep_daily 14
 sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
-`policy list` shows the repository's own values and the defaults in force.
+`policy list` shows the repository's own values and the defaults in force,
+`maintenance.auto_pack` (on) included.
+
+Only these keys are accepted; any other key, and any value of the wrong
+kind, is refused with a message listing what is valid:
+
+| Key | Accepts |
+|---|---|
+| `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
+| `maintenance.auto_pack` | `true` or `false` (`yes`/`no`, `on`/`off`, `1`/`0` also accepted, and stored as `true`/`false`) |
+
+A database from before this check may hold a value that would now be
+refused. A retention pass ignores it, logs a warning naming it, and uses the
+default; `policy set` with a valid value replaces it.
 
 ### 9.3 Running it
 
@@ -603,6 +796,18 @@ sudo c-backup gfs 1 --dry-run              # what would go
 sudo c-backup gfs 1
 sudo c-backup schedule add 1 gfs --every day --at 04:00
 ```
+
+The finished job says what the pass did. A dry run lists the snapshots it
+would remove, a real run the ones it removed, and both give the retention
+values the pass applied (the repository's policy over the defaults):
+
+```json
+"result":{"dry_run":true,"would_remove":[3,4,9],"count":3,
+          "retention":{"keep_snaps":1,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+```
+
+The journal entry for the pass says the same in one line, for example
+`removed 3 snapshots: 3, 4, 9`, naming up to 20 ids and counting the rest.
 
 Pruning a snapshot removes its record and index rows. The space its objects
 held is reclaimed by garbage collection (section 12), which a schedule should
@@ -632,22 +837,33 @@ when it first fires.
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
-**Calendar** triggers use the host's local time. `every` is `day`, `week`
+**Calendar** triggers use the daemon's local time: the host's under systemd,
+UTC in the Docker image unless `TZ` is set (section 2.3). `schedule list`
+names the zone (`timezone`) and gives each next fire with its offset
+(`next_due_iso`). `every` is `day`, `week`
 (with `--on <weekday>`), `month` (with `--on-day 1-31`) or `year` (with
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice
 on a fall-back day fires once, the 31st clamps to the last day of shorter
-months, and 29 February fires every year.
+months, and 29 February fires every year (on the 28th in common years). A day
+no year has, such as 30 February, is refused when the schedule is created.
 
 Two policies per schedule:
 
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now. Applies to a schedule's first window too |
+
+Any other value is refused when the schedule is created.
 
 A `backup` schedule uses the repository's sources unless it names
-`--source` paths. A `replicate` schedule needs `--dest`, an absolute path.
+`--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
+`grep` schedule needs `--pattern` (an extended regular expression, checked
+when the schedule is created) and takes `--path-prefix` and `-i`; it searches
+the newest snapshot each time it fires. An option that belongs to a
+different action, such as `--dest` on a `gc` schedule, is refused rather than
+stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
 
@@ -678,7 +894,7 @@ sudo c-backup verify list 1                # past runs
 
 | Level | Reads | Proves |
 |---|---|---|
-| `index` | no payloads | every registered object resolves to a location |
+| `index` | no payloads | every registered object resolves to a location, and every pack file it names exists |
 | `structure` | headers | every object's header is well formed |
 | `deep` | everything | every payload's SHA-256 matches its name |
 
@@ -687,9 +903,31 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
-Findings name files, not hashes: each damaged object is reported with how
-many files reference it, a sample of their paths, and which snapshots contain
-them. The CLI prints the run and its findings as one JSON document.
+What a run counts:
+
+| Count | Meaning |
+|---|---|
+| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` |
+| `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
+| `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
+| `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
+
+**Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
+job `failed`, with an error naming the run and the counts, and
+`c-backup verify` exits 1, so a scheduler or script that checks the exit
+status sees it. The run and its findings are still recorded and still
+printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
+reads them back later. A missing pack is reported as missing, never as
+damage to repair: its parity went with it.
+
+Findings name files, not hashes: each object that is not intact is reported
+with its status, how many distinct paths reference it (`affected_files`),
+how many versions of them across snapshots (`affected_versions`), up to
+three full paths, and up to ten snapshot ids beside the exact count
+(`affected_snapshot_count`, with `snapshots_truncated` set when the list is
+short). The run's `affected_files` and `affected_snapshots` are distinct
+paths and snapshots across every lost object. The CLI prints the run and its
+findings as one JSON document.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
 
@@ -707,19 +945,57 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 
 Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
 per-repository journal (`c-backup journal 1`) is the permanent record of what
-ran and how it ended.
+ran and how it ended. A journal entry's `source` says who asked: `api` for a
+job run by hand (the CLI and the app both go through the API), `schedule` for
+one a schedule fired, with the message starting `schedule <id>`.
+
+`gc` reports what it did in the job's `result`, and `gc --dry-run` what it
+would do:
+
+```json
+{"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
+ "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
+ "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+```
+
+`objects_swept` and `bytes_freed` are what was swept, or on a dry run what
+would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
+does not do; `tmp_files_removed` counts staging files an interrupted run left
+behind (section 2.2). The journal entry carries the same in a line.
+
+**Large incompressible objects stay loose.** A backup writes objects up to
+16 MiB straight into packs. Anything larger is written as one loose file,
+and the pack step then reads its first 64 KiB: if that does not compress
+(video, audio, disk images, encrypted or already-compressed archives) the
+object is marked and is never packed, by this or any later `pack` run. It is
+stored raw with its parity trailer, so `stats` and `summary` keep counting
+it as loose and `phys_size` exceeds `orig_size` by the parity overhead
+(section 18.1). That is deliberate: rewriting gigabytes into a pack would
+save nothing but an inode. Large files that do compress are packed
+normally. Details are in `docs/data-paths.md`.
 
 ---
 
 ## 13. Encryption
 
 A repository is encrypted or not, decided when it is created. To change it,
-create a new repository and replicate into it.
+create a new repository with the encryption you want and replicate into it
+with `--reencrypt` (section 14.1).
 
 ```sh
 sudo c-backup repo add /srv/backup/main "Main" --encrypt system
 sudo c-backup repo add /srv/backup/main "Main" --encrypt passphrase --passphrase '...'
 ```
+
+`--passphrase` on its own implies `--encrypt passphrase`. Giving one with
+`--encrypt none` or `--encrypt system` is refused, because neither mode can
+use it and silently dropping it would leave you believing a passphrase
+protects the repository.
+
+A new repository's passphrase must be at least 8 characters, the same floor
+as the admin password. Argon2id makes each guess slow, but a one-character
+passphrase is a handful of guesses, and a passphrase repository is meant to
+be safe to carry offsite.
 
 Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
 over AES-GCM because it does not depend on AES-NI. Hashes are of the
@@ -759,6 +1035,16 @@ sudo c-backup repo key import <id> <key-hex>
 The import is refused unless the key matches the fingerprint in the
 repository's marker. The marker never contains the key.
 
+An encrypted repository whose key is not on this host can be registered and
+verified, but not read: backup, restore, reindex, grep, pack, gc and
+replicate are refused with 409 `no key loaded for repository <uuid>`, which
+names the command that fixes it. A scheduled job fails with the same message.
+
+A `passphrase` repository needs no import: registering it with its
+passphrase (`repo add <path> --passphrase '...'`) unwraps the key and caches
+it on this host, whether or not it is already registered. A wrong passphrase
+is refused with `wrong passphrase`.
+
 ---
 
 ## 14. Replication
@@ -780,7 +1066,48 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
-- A destination already holding a different repository is refused.
+- A destination already holding a different repository is refused, unless
+  `--reencrypt` says that is the point (below).
+- So is the source repository's own directory, anything inside it, and any
+  directory containing it, even through a symlink: a replica there is not a
+  second copy of anything.
+
+### 14.1 Changing a repository's encryption
+
+Encryption is fixed when a repository is created, so changing it - adding
+it, removing it, or moving to a new key or passphrase - means copying into a
+new repository with `--reencrypt`:
+
+```sh
+sudo c-backup repo add /srv/backup/main2 "Main" --encrypt passphrase --passphrase '...'
+sudo c-backup replicate 1 /srv/backup/main2 --reencrypt
+sudo c-backup reindex 2
+```
+
+The destination must already be a repository, created with the encryption
+you want; `--reencrypt` will not create one, so its mode is always chosen on
+purpose. It keeps its own UUID and key. Each object is decrypted with the
+source key and encrypted under the destination's (or written plaintext into
+an unencrypted destination) as it crosses; compression is untouched, and
+hashes are of the plaintext, so they, the trees and deduplication carry over
+unchanged. Snapshot ids carry over too, so the destination must hold no
+backups of its own: a snapshot number it already uses for a different tree
+fails the run rather than being overwritten.
+
+Unlike a plain replica, this is not for an untrusted target: the daemon
+doing it holds both keys, and so must the host the destination is used on.
+Refused when the destination is not a repository, is a replica of the source
+(replicate without `--reencrypt`), or is encrypted and its key is not on this
+host. If the destination is registered here, its write lock is held for the
+run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+again after more backups and only the new snapshots are sent.
+
+The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
+(already complete at the target), `objects_asked`, `objects_sent`,
+`bytes_sent` (as stored, so what crossed to the target) and
+`subtrees_skipped`. A run with nothing to send reports zeros and journals
+`target already up to date`, so a no-op and a full copy are told apart at a
+glance.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
@@ -876,9 +1203,10 @@ per-repository labels).
 | `cbackup_repos_key_unescrowed` | gauge | Encrypted repositories whose key is not acknowledged as stored elsewhere |
 | `cbackup_repos_encrypted` | gauge | Encrypted repositories |
 | `cbackup_last_verify_age_seconds` | gauge | Age of the newest verify run |
-| `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify could not repair |
-| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired |
-| `cbackup_verify_affected_files` | gauge | Files referencing damaged objects |
+| `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
+| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
+| `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
+| `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
 
 Alerts worth having:
 
@@ -888,6 +1216,8 @@ Alerts worth having:
   checking what was written.
 - `cbackup_verify_unrecoverable_objects > 0`: data is lost; the findings say
   which files.
+- `cbackup_verify_recoverable_objects > 0`: damage parity still covers, left
+  on disk by a checking-only verify; run a repairing one.
 - `increase(cbackup_jobs_failed_total[1d]) > 0`.
 - `cbackup_repos_key_unescrowed > 0`.
 
@@ -916,8 +1246,16 @@ sudo c-backup reindex 1
 ```
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
-Lost for good: schedules, sources, policy, tags, notes, the journal, job
-history and sessions. Re-create the schedules and sources. Remote clients sign
+It fails, rather than completing, if any snapshot or pack cannot be read: the
+readable snapshots are indexed, and anything unreadable keeps whatever index
+rows it already had, so a reindex never replaces a populated index with an
+empty or partial one. An encrypted repository is refused outright until its
+key is on the host (section 13).
+Tags come back: the repository keeps its own copy of the tag list (a `tags`
+file beside `snapshots/`), and the reindex job's result reports
+`tags_restored`. A reindex that cannot read that file fails rather than
+leaving tagged snapshots silently unprotected. Lost for good: schedules,
+sources, policy, notes, the journal, job history and sessions. Re-create the schedules and sources. Remote clients sign
 in again; set the admin password again first with `auth setup`.
 
 Keep a copy of `config.yaml` and a note of your schedules somewhere else, and
@@ -936,7 +1274,16 @@ On a new host with the daemon installed:
    sudo c-backup repo key import 1 <key-hex>
    ```
 
-   For a `passphrase` repository, register it and supply the passphrase.
+   For a `passphrase` repository, register it with its passphrase, which
+   unwraps the key from the marker and caches it in `security.key_dir`:
+
+   ```sh
+   sudo c-backup repo add /srv/backup/main "Main" --passphrase '...'
+   ```
+
+   A wrong passphrase is refused and registers nothing. Registering without
+   one succeeds but answers `"key_loaded":false` with a warning; run the
+   same command again with the passphrase to unlock it.
 3. `sudo c-backup reindex 1`, then restore.
 
 Without the key, a `system`-encrypted repository cannot be read by anyone.
@@ -971,7 +1318,20 @@ running). `docs/acceptance.md` has the full results.
 - Deduplication is per repository, across every snapshot.
 - Already-compressed data (media, archives, git objects) gains nothing from
   compression and is detected quickly; expect source size, less duplicates,
-  plus parity overhead of a few percent.
+  **plus 6.7% for parity**.
+- **Parity costs 6.7% of every stored payload, measured and by design.**
+  Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
+  data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
+  damaged bytes per codeword, and codewords are interleaved 64 deep so a
+  contiguous burst of up to 512 bytes is repairable. Parity is computed in
+  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
+  so the last group is paid in full: a tiny file still costs 1 KiB of
+  parity. On top of that every object carries about 280 fixed bytes (a
+  260-byte parity record for its header, a CRC32C, a reserved word and a
+  12-byte footer). For compressible data the 6.7% applies to the compressed
+  size; for a large incompressible file it is essentially the whole
+  difference between `phys_size` and `orig_size`, which is where the
+  measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
 
@@ -993,8 +1353,19 @@ the array.
   several repositories or several sources backed up separately. Section 20.
 - File content is streamed in bounded chunks whatever its size. Parity for a
   large object spills to `<repo>/tmp` beyond 256 MiB.
+- Storing a large file holds a 128 MiB read buffer, and the Reed-Solomon
+  parity for it is kept in memory up to 256 MiB before spilling to disk.
 - A large pack run uses up to about 1 GB of buffers at its widest (32
-  workers). Smaller runs use proportionally less.
+  workers, each with a 16 MiB read buffer and a compression buffer). The
+  worker count is capped at one per 256 MiB of data to pack, so small runs
+  use far less.
+
+So peak memory is the scan's share plus whichever of these is running. As a
+measured reference, a first backup of 66,218 entries and 417 GB of mostly
+large media files peaked at 723 MiB resident (VmHWM) on a 12-core host:
+about 50 MiB of scan, the store buffers, and packing at the end. Plan on
+about 1 GB for a large first backup on a many-core machine, and more only
+for trees of several million files (the scan's 820 bytes each).
 
 ### 18.4 What to expect
 
@@ -1023,12 +1394,13 @@ the underlying disk.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`; `--socket PATH` or `C_BACKUP_SOCKET` |
+| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies |
 | `permission denied` on the socket | Not root, and the socket is root-only | `sudo`, or section 4.1 |
 | `another daemon is serving <socket>` at start | A second instance | Stop the other one; only one daemon owns a host |
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |
 | App or API: 403 `not configured` | No admin password yet | `sudo c-backup auth setup` on the daemon's host |
 | App: `login failed: check the admin password` | Wrong password | Retry; `c-backup auth password` on the host to change it |
+| `429 too many failed logins` | The login throttle (section 4.3) locked out this address, or every address during an attack | Wait the `Retry-After` seconds; the socket is never throttled |
 | App: `sign in again` mid-use | Session revoked or expired | Sign in |
 | `repo is busy` | Another job holds the repository | Wait, or `c-backup jobs` to see what |
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
@@ -1097,20 +1469,20 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `snapshot delete <id> <snapshot>` | Prune one |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--limit N]` | File names |
-| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i]` | File contents |
+| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
+| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `diff <id> <from> <to>` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest>` | Copy into another directory |
+| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
-| `tag list <id>`, `tag set <id> <name> <snapshot>`, `tag remove <id> <name>` | Tags |
+| `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |

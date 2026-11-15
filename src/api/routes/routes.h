@@ -25,6 +25,10 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db);
 
 /* Where per-repository keys are stored. Set from config at startup. */
 void routes_repos_set_key_dir(const char *dir);
+
+/* How strictly backups recognise an unchanged file (file_cache_match_t,
+ * from backup.file_cache_match). Set from config at startup. */
+void routes_backup_set_file_cache_match(int mode);
 void routes_auth_set_config(cutils_config_t *cfg);
 
 /* Backup submission and job inspection. Needs the job manager because a
@@ -78,6 +82,31 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
  */
 int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def);
 
+/*
+ * Parse a retention count as the policy route accepts it: decimal digits
+ * only, 0 to INT_MAX. Returns 0 and sets *out, or -1. Readers use it too,
+ * so a value stored before the route validated is ignored rather than read
+ * through atoi as 0.
+ */
+int routes_policy_count(const char *text, int *out);
+
+/*
+ * Read ?limit= and (when offset is non-NULL) ?offset= for a collection
+ * route. Absent means def_limit and 0; a limit above max_limit is clamped.
+ * Anything that is not a plain decimal count - negative, signed, zero for a
+ * limit, trailing junk - returns -1 with *bad set to a 400.
+ */
+int routes_paging(const api_request_t *req, int def_limit, int max_limit,
+                  int *limit, int *offset, api_response_t *bad);
+
+/*
+ * Can repository repo_id replicate to dest? Refuses a relative dest, and one
+ * that is the source repository, lies inside it, or contains it (compared
+ * canonically). Returns 0, or -1 with the reason written to why.
+ */
+int routes_replicate_dest_check(int64_t repo_id, const char *dest,
+                                char *why, size_t whysz);
+
 /* Is this an action a schedule may name? The list lives with the dispatcher
  * so a schedule cannot be created for something that will not run. */
 int routes_action_is_schedulable(const char *action);
@@ -85,13 +114,15 @@ int routes_action_is_schedulable(const char *action);
 /* Submit a backup from a schedule's params, which carry the same shape the
  * route's request body does. */
 status_t routes_submit_backup(struct job_manager *jm, int64_t repo_id,
-                              const char *params_json, int64_t *out_job_id);
+                              const char *params_json, int64_t schedule_id,
+                              int64_t *out_job_id);
 
 /* params is the schedules.params column, action-specific and possibly empty.
- * Backup reads its source paths out of it, replication its destination. */
+ * Backup reads its source paths out of it, replication its destination.
+ * schedule_id names the schedule on the job and in its journal entry. */
 status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
                                  const char *action, const char *params,
-                                 int64_t *out_job_id);
+                                 int64_t schedule_id, int64_t *out_job_id);
 
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */

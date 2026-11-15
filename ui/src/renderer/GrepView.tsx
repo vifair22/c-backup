@@ -14,30 +14,15 @@
  * that it started.
  */
 
+import type { Job } from '../shared/api'
+import type { WireGrepHit, WireGrepRun } from '../shared/wire'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { absoluteTime } from './format'
 
 const api = window.cbackup
 
-interface GrepRun {
-  id: string
-  snapshot: string
-  pattern: string
-  started_at: string
-  finished_at: string
-  completed: string
-  files_scanned: string
-  files_matched: string
-  hits: string
-  truncated: string
-}
-
-interface Hit {
-  path: string
-  line: string
-  excerpt: string
-  node_id: string
-}
+type GrepRun = WireGrepRun
+type Hit = WireGrepHit
 
 interface Props {
   connName: string
@@ -47,7 +32,8 @@ interface Props {
   onBack: () => void
 }
 
-const n = (v?: string): number => Number(v ?? '0')
+/* A run that has finished without completing was cancelled partway. */
+const cancelled = (r: GrepRun): boolean => !r.completed && (r.finished_at ?? 0) > 0
 
 export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)
@@ -98,11 +84,11 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
   const openRun = async (run: GrepRun) => {
     setSelected(run)
     setHits([])
-    if (n(run.hits) === 0) return
+    if (run.hits === 0) return
     setLoadingHits(true)
     try {
       const r = await api.apiCall<{ hits?: Hit[] }>(connName, {
-        kind: 'grepHits', repoId, runId: Number(run.id), limit: 200,
+        kind: 'grepHits', repoId, runId: run.id, limit: 200,
       })
       setHits(r.hits ?? [])
     } catch (err) {
@@ -131,27 +117,33 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
        * so and fill in when there is something to show.
        */
       if (poll.current) clearInterval(poll.current)
+      const jobIdNow = started.job_id
+      /*
+       * Follow the job, then open the run it reports.
+       *
+       * This polled the run list and took the newest finished run. Until
+       * this job's own run existed, that was an older search - so the screen
+       * showed a previous result, or stayed on "Searching..." after a cancel,
+       * depending on timing. The job knows which run is its own.
+       */
       poll.current = setInterval(async () => {
         try {
-          const list = await loadRuns()
-          const newest = list[0]
-          /*
-           * finished_at, not completed. A cancelled run sets a finish time
-           * and leaves completed at 0, so waiting for completed meant the
-           * screen said "Searching..." for ever after a cancel - which is
-           * what cancelling from the app looked like from the outside, even
-           * once the job itself had stopped.
-           */
-          if (newest && n(newest.finished_at) > 0) {
-            if (poll.current) { clearInterval(poll.current); poll.current = null }
-            setSearching(false)
-            setJobId(null)
-            setCancelling(false)
-            void openRun(newest)
-          }
-        } catch {
+          if (!jobIdNow) throw new Error('the daemon did not return a job id')
+          const job = await api.apiCall<Job>(connName, { kind: 'jobGet', jobId: jobIdNow })
+          if (job.state === 'queued' || job.state === 'running') return
           if (poll.current) { clearInterval(poll.current); poll.current = null }
           setSearching(false)
+          setJobId(null)
+          setCancelling(false)
+          const list = await loadRuns()
+          const runId = (job.result as { run_id?: number } | null | undefined)?.run_id ?? 0
+          const run = runId > 0 ? list.find(r => r.id === runId) : undefined
+          if (run) void openRun(run)
+          if (job.state === 'failed' && job.error) setError(job.error)
+        } catch (err) {
+          if (poll.current) { clearInterval(poll.current); poll.current = null }
+          setSearching(false)
+          setError(String(err))
         }
       }, 400)
     } catch (err) {
@@ -276,11 +268,11 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                     <td className="py-1.5 pr-3 font-mono truncate max-w-[9rem]">{r.pattern}</td>
                     {/* How many files the run opened. With a path set this is
                       * the number that shows the scoping worked. */}
-                    <td className="py-1.5 pr-3 text-text-muted">{n(r.files_scanned)}</td>
-                    <td className="py-1.5 pr-3">{n(r.hits)}</td>
+                    <td className="py-1.5 pr-3 text-text-muted">{r.files_scanned}</td>
+                    <td className="py-1.5 pr-3">{r.hits}</td>
                     <td className="py-1.5 whitespace-nowrap">
                       {absoluteTime(r.started_at)}
-                      {n(r.completed) !== 1 && n(r.finished_at) > 0 && (
+                      {cancelled(r) && (
                         <span className="text-status-warning ml-1" title="cancelled">*</span>
                       )}
                     </td>
@@ -299,14 +291,14 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                 * thirty of them.
                 */}
               <div className="text-xs text-text-secondary mb-2">
-                {n(selected.hits)} hit{n(selected.hits) === 1 ? '' : 's'} in{' '}
-                {n(selected.files_matched)} of {n(selected.files_scanned)} files
-                {!loadingHits && hits.length > 0 && hits.length < n(selected.hits) && (
+                {selected.hits} hit{selected.hits === 1 ? '' : 's'} in{' '}
+                {selected.files_matched} of {selected.files_scanned} files
+                {!loadingHits && hits.length > 0 && hits.length < selected.hits && (
                   <span className="text-text-muted">
                     {' '}- showing {hits.length}, at most ten per file
                   </span>
                 )}
-                {n(selected.truncated) > 0 && (
+                {selected.truncated && (
                   <span className="text-status-warning ml-2">
                     - stopped at the file limit, there may be more
                   </span>
@@ -314,7 +306,7 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                 {/* A cancelled run has real hits, just not all of them.
                   * Presenting them as a finished search would be a lie by
                   * omission. */}
-                {n(selected.completed) !== 1 && n(selected.finished_at) > 0 && (
+                {cancelled(selected) && (
                   <span className="text-status-warning ml-2">
                     - cancelled, these are the files it reached
                   </span>

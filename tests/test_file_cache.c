@@ -25,6 +25,7 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "file_cache.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -92,6 +93,16 @@ static backup_opts_t basic_opts(void)
     o.paths = paths;
     o.n_paths = 1;
     return o;
+}
+
+static backup_result_t run_backup_mode(int mode)
+{
+    backup_opts_t o = basic_opts();
+    o.file_cache_match = mode;
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    return r;
 }
 
 static backup_result_t run_backup(void)
@@ -238,6 +249,110 @@ static void test_sweep_drops_entries_for_removed_paths(void **state)
     assert_true((int)second.files < (int)first.files);
 }
 
+/*
+ * B087: what an Unraid share over NFS looks like to the cache. shfs hands
+ * out inode numbers that change between lookups, and a container volume can
+ * remount on another device number, so every recorded dev and inode is
+ * wrong the next time while size, mtime and the bytes are not. Simulated by
+ * moving the recorded numbers, which is what the next stat reports there.
+ */
+static void shift_recorded_dev_and_inode(void)
+{
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE file_cache SET dev = dev + 1, inode = inode + 7", NULL, NULL), 0);
+}
+
+/* On a local filesystem, auto keeps comparing them: a changed inode there
+ * means another file now sits at the path. */
+static void test_auto_compares_inode_on_a_local_filesystem(void **state)
+{
+    (void)state;
+    run_backup();
+    shift_recorded_dev_and_inode();
+    backup_result_t r = run_backup_mode(FILE_CACHE_MATCH_AUTO);
+    assert_int_equal(r.files_unchanged, 0);
+}
+
+static void test_strict_compares_every_field(void **state)
+{
+    (void)state;
+    run_backup();
+    shift_recorded_dev_and_inode();
+    backup_result_t r = run_backup_mode(FILE_CACHE_MATCH_STRICT);
+    assert_int_equal(r.files_unchanged, 0);
+}
+
+/* relaxed is the escape hatch for a filesystem auto does not recognise:
+ * unstable numbers no longer cost a full re-read. */
+static void test_relaxed_ignores_dev_inode_and_ctime(void **state)
+{
+    (void)state;
+    run_backup();
+    shift_recorded_dev_and_inode();
+    /* And a ctime change: chmod moves it without touching the content. */
+    sleep(1);
+    assert_int_equal(chmod(TEST_SRC "/alpha.txt", 0640), 0);
+    backup_result_t r = run_backup_mode(FILE_CACHE_MATCH_RELAXED);
+    assert_int_equal(r.files_unchanged, r.files);
+    assert_int_equal(r.objects_new, 0);
+}
+
+/* Even relaxed reads a file whose size or mtime moved. */
+static void test_relaxed_still_reads_a_modified_file(void **state)
+{
+    (void)state;
+    run_backup();
+    sleep(1);
+    write_file(TEST_SRC "/alpha.txt", "alpha content, now different");
+    backup_result_t r = run_backup_mode(FILE_CACHE_MATCH_RELAXED);
+    assert_int_equal(r.files_unchanged, r.files - 1);
+    assert_true(r.objects_new > 0);
+}
+
+/* The lookup itself honours the mask auto uses on a network filesystem,
+ * and only that mask. */
+static void test_lookup_ignores_only_what_it_is_told(void **state)
+{
+    (void)state;
+    run_backup();
+    shift_recorded_dev_and_inode();
+    struct stat st;
+    assert_int_equal(stat(TEST_SRC "/beta.txt", &st), 0);
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(file_cache_lookup(db, repo_id, TEST_SRC "/beta.txt", &st, 0, h), 0);
+    assert_int_equal(file_cache_lookup(db, repo_id, TEST_SRC "/beta.txt", &st,
+                                       FILE_CACHE_IGNORE_DEV, h), 0);
+    assert_int_equal(file_cache_lookup(db, repo_id, TEST_SRC "/beta.txt", &st,
+                                       FILE_CACHE_IGNORE_INODE, h), 0);
+    assert_int_equal(file_cache_lookup(db, repo_id, TEST_SRC "/beta.txt", &st,
+                                       FILE_CACHE_IGNORE_DEV | FILE_CACHE_IGNORE_INODE, h), 1);
+}
+
+static void test_match_modes_parse(void **state)
+{
+    (void)state;
+    assert_int_equal(file_cache_match_parse("auto"), FILE_CACHE_MATCH_AUTO);
+    assert_int_equal(file_cache_match_parse(""), FILE_CACHE_MATCH_AUTO);
+    assert_int_equal(file_cache_match_parse(NULL), FILE_CACHE_MATCH_AUTO);
+    assert_int_equal(file_cache_match_parse("strict"), FILE_CACHE_MATCH_STRICT);
+    assert_int_equal(file_cache_match_parse("relaxed"), FILE_CACHE_MATCH_RELAXED);
+    assert_int_equal(file_cache_match_parse("Relaxed"), -1);
+    assert_int_equal(file_cache_match_parse("ignore-inode"), -1);
+}
+
+static void test_remote_filesystems_are_recognised(void **state)
+{
+    (void)state;
+    assert_true(file_cache_fs_is_remote(0x6969));        /* NFS */
+    assert_true(file_cache_fs_is_remote(0x65735546));    /* FUSE (shfs) */
+    assert_true(file_cache_fs_is_remote((long)0xFF534D42u)); /* CIFS */
+    assert_true(file_cache_fs_is_remote((long)0xFE534D42u)); /* SMB2 */
+    assert_false(file_cache_fs_is_remote(0xEF53));       /* ext4 */
+    assert_false(file_cache_fs_is_remote((long)0x9123683Eu)); /* btrfs */
+    assert_false(file_cache_fs_is_remote(0x58465342));   /* xfs */
+    assert_false(file_cache_fs_is_remote(0x01021994));   /* tmpfs */
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -248,6 +363,13 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_content_change_with_restored_mtime_is_caught, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cache_is_not_trusted_when_the_object_is_gone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_drops_entries_for_removed_paths, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_auto_compares_inode_on_a_local_filesystem, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_strict_compares_every_field, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_relaxed_ignores_dev_inode_and_ctime, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_relaxed_still_reads_a_modified_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_lookup_ignores_only_what_it_is_told, setup, teardown),
+        cmocka_unit_test(test_match_modes_parse),
+        cmocka_unit_test(test_remote_filesystems_are_recognised),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

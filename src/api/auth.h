@@ -48,6 +48,12 @@ int auth_validate_token(cutils_db_t *db, const char *token);
  * with NULL or unknown tokens - both no-op. */
 void auth_revoke_token(cutils_db_t *db, const char *token);
 
+/* Revoke every session and token except keep_token, when that is non-NULL
+ * and non-empty (a "Bearer " prefix is accepted). Returns the number of rows
+ * removed, or -1 on a database error. Password change and logout-all use
+ * it. */
+int auth_revoke_all(cutils_db_t *db, const char *keep_token);
+
 /* Clean up expired sessions. */
 void auth_cleanup_sessions(cutils_db_t *db);
 

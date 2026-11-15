@@ -23,22 +23,13 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, OBJECT_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
+import type { WireObject, WireTypeStat } from '../shared/wire'
 
 const api = window.cbackup
 
 const PAGE_SIZE = 200
 
 type Location = 'loose' | 'packed' | 'all'
-
-/* Every integer arrives as a string. */
-interface RawObject {
-  hash: string
-  type?: string
-  refcount?: string
-  phys_size?: string
-  orig_size?: string
-  location?: string
-}
 
 interface StoreObject {
   hash: string
@@ -49,21 +40,15 @@ interface StoreObject {
   location: string
 }
 
-const parse = (o: RawObject): StoreObject => ({
+/* A packed object's location is "packed", with the pack in pack_id. */
+const parse = (o: WireObject): StoreObject => ({
   hash: o.hash,
-  type: Number(o.type ?? '0'),
-  refcount: Number(o.refcount ?? '0'),
-  physSize: Number(o.phys_size ?? '0'),
-  origSize: Number(o.orig_size ?? '0'),
-  location: o.location ?? '',
+  type: o.type,
+  refcount: o.refcount,
+  physSize: o.phys_size,
+  origSize: o.orig_size,
+  location: o.pack_id != null ? `${o.location} #${o.pack_id}` : o.location,
 })
-
-interface RawTypeStat {
-  type?: string
-  count?: string
-  phys_size?: string
-  orig_size?: string
-}
 
 interface Props {
   connName: string
@@ -75,7 +60,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
   const repoId = Number(repoPath)
 
   const [location, setLocation] = useState<Location>('loose')
-  const [perType, setPerType] = useState<RawTypeStat[]>([])
+  const [perType, setPerType] = useState<WireTypeStat[]>([])
   const [objects, setObjects] = useState<StoreObject[]>([])
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
@@ -87,7 +72,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
   /* Totals come from a GROUP BY on the daemon side, so the header can say
    * how much is there without paging through all of it. */
   useEffect(() => {
-    api.apiCall<{ per_type?: RawTypeStat[] }>(connName, {
+    api.apiCall<{ per_type?: WireTypeStat[] }>(connName, {
       kind: 'stats', repoId, ...(location === 'loose' ? { scope: 'loose' } : {}),
     })
       .then(r => setPerType(r.per_type ?? []))
@@ -98,7 +83,7 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
     setLoading(true)
     setError(null)
     try {
-      const resp = await api.apiCall<{ objects?: RawObject[] }>(connName, {
+      const resp = await api.apiCall<{ objects?: WireObject[] }>(connName, {
         kind: 'objectList', repoId,
         ...(loc === 'all' ? {} : { location: loc }),
         offset: pageOffset, limit: PAGE_SIZE,
@@ -122,9 +107,9 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
     void fetchPage(newOffset, location)
   }
 
-  const totalCount = perType.reduce((a, t) => a + Number(t.count ?? '0'), 0)
-  const totalOrig  = perType.reduce((a, t) => a + Number(t.orig_size ?? '0'), 0)
-  const totalPhys  = perType.reduce((a, t) => a + Number(t.phys_size ?? '0'), 0)
+  const totalCount = perType.reduce((a, t) => a + t.count, 0)
+  const totalOrig  = perType.reduce((a, t) => a + t.orig_size, 0)
+  const totalPhys  = perType.reduce((a, t) => a + t.phys_size, 0)
 
   const LOCATIONS: { key: Location; label: string }[] = [
     { key: 'loose', label: 'Loose' },
@@ -168,9 +153,9 @@ export function LooseObjects({ connName, repoPath, onBack }: Props): React.React
 
       {perType.length > 0 && location === 'loose' && (
         <div className="flex flex-wrap gap-3 mb-4">
-          {perType.filter(t => Number(t.count ?? '0') > 0).map(t => (
+          {perType.filter(t => t.count > 0).map(t => (
             <div key={t.type} className="bg-surface-secondary border border-border-default rounded-lg px-3 py-2 text-xs">
-              <span className="font-semibold">{OBJECT_TYPE_NAMES[Number(t.type)] ?? `type-${t.type}`}</span>
+              <span className="font-semibold">{OBJECT_TYPE_NAMES[t.type] ?? `type-${t.type}`}</span>
               <span className="text-text-muted ml-2">
                 {fmtNum(t.count)} ({fmtSize(t.orig_size)})
               </span>

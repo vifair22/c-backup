@@ -308,7 +308,7 @@ static void test_backup_after_a_crash_restores_what_the_crash_lost(void **state)
 
     /* A staged row is not an object, so the cache does not trust it. */
     uint8_t cached[OBJECT_HASH_SIZE];
-    assert_int_equal(file_cache_lookup(db, repo_id, victim, &lst, cached), 0);
+    assert_int_equal(file_cache_lookup(db, repo_id, victim, &lst, 0, cached), 0);
     assert_false(object_exists(store, hash));
 
     backup_opts_t o = basic_opts();

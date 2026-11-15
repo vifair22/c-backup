@@ -127,6 +127,20 @@ static void sb_query_val(sbuf_t *b, const char *s)
     }
 }
 
+/*
+ * Percent-encode one path segment, such as a tag name.
+ *
+ * The same unreserved set as a query value, so this is the same encoding;
+ * it has its own name because the reason differs. A name went into the path
+ * raw, so "a b" produced a request line the server rejected with an HTML
+ * page and a 301, and "x?y" addressed tag "x". Tag names are restricted
+ * now, but one stored before that must still be removable.
+ */
+static void sb_path_seg(sbuf_t *b, const char *s)
+{
+    sb_query_val(b, s);
+}
+
 /* ------------------------------------------------------------------ */
 /* Options                                                             */
 /* ------------------------------------------------------------------ */
@@ -187,6 +201,39 @@ static const char *take_opt_multi(int *argc, char **argv, const char *name)
  * Callers that want fields pipe through jq; what matters is that the exit
  * code reflects the HTTP status.
  */
+/*
+ * What to say when nothing answers on the socket.
+ *
+ * It used to say "systemctl start c-backupd" everywhere, including inside
+ * the Docker image, where there is no systemd and the daemon is the
+ * container's own process: if it is not answering, the container is not
+ * running it, or this is a different container. A container is recognised
+ * by Docker's /.dockerenv, podman's /run/.containerenv, or the `container`
+ * variable podman and systemd-nspawn set. A wrong socket path is the other
+ * common cause, so the way to name one is always given.
+ */
+static void daemon_down(void)
+{
+    fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+    const char *cv = getenv("container");
+    int in_container = access("/.dockerenv", F_OK) == 0 ||
+                       access("/run/.containerenv", F_OK) == 0 ||
+                       (cv && *cv);
+    if (in_container)
+        fprintf(stderr,
+                "          This looks like a container: the daemon runs as the\n"
+                "          c-backupd container's own process, so start that container\n"
+                "          (docker start c-backupd), or run this command in it\n"
+                "          (docker exec c-backupd c-backup ...).\n");
+    else if (access("/run/systemd/system", F_OK) == 0)
+        fprintf(stderr, "          Start it with 'systemctl start c-backupd'.\n");
+    else
+        fprintf(stderr, "          Start c-backupd.\n");
+    fprintf(stderr,
+            "          If it runs with another socket, name it with --socket PATH\n"
+            "          or C_BACKUP_SOCKET.\n");
+}
+
 static int call(const char *method, const char *path, const char *body)
 {
     http_response_t resp;
@@ -194,18 +241,19 @@ static int call(const char *method, const char *path, const char *body)
 
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr,
-                "c-backup: daemon not running at %s.\n"
-                "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+        daemon_down();
         return 1;
     }
     if (st != OK) return fail("%s", err_msg());
 
-    if (resp.body && resp.body[0]) {
-        fputs(resp.body, stdout);
-        if (resp.body[resp.body_len - 1] != '\n') fputc('\n', stdout);
-    }
     int rc = (resp.status >= 200 && resp.status < 300) ? 0 : 1;
+    /* A failure's body is the daemon's error, and errors go to stderr: a
+     * script piping stdout to a JSON reader must never parse one as data. */
+    FILE *outf = rc ? stderr : stdout;
+    if (resp.body && resp.body[0]) {
+        fputs(resp.body, outf);
+        if (resp.body[resp.body_len - 1] != '\n') fputc('\n', outf);
+    }
     if (rc) fprintf(stderr, "c-backup: request failed with HTTP %d\n", resp.status);
     http_response_free(&resp);
     return rc;
@@ -290,7 +338,7 @@ static long job_submit(const char *method, const char *path, const char *body)
     memset(&resp, 0, sizeof(resp));
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+        daemon_down();
         return -1;
     }
     if (st != OK) { fail("%s", err_msg()); return -1; }
@@ -641,7 +689,15 @@ static int cmd_search(int argc, char **argv)
 {
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
-    if (argc < 2) { free(q.buf); return fail("usage: search <repo-id> <query> [--limit N]"); }
+    const char *snap = take_opt(&argc, argv, "--snapshot");
+    if (snap) {
+        sb_puts(&q, q.len ? "&snapshot=" : "snapshot=");
+        sb_query_val(&q, snap);
+    }
+    if (argc < 2) {
+        free(q.buf);
+        return fail("usage: search <repo-id> <query> [--snapshot N] [--limit N]");
+    }
     sb_puts(&q, q.len ? "&q=" : "q=");
     sb_query_val(&q, argv[1]);
 
@@ -680,12 +736,25 @@ static int cmd_grep(int argc, char **argv)
     const char *prefix = take_opt(&argc, argv, "--path-prefix");
     const char *snap   = take_opt(&argc, argv, "--snapshot");
     const char *maxf   = take_opt(&argc, argv, "--limit");
+    const char *hpf    = take_opt(&argc, argv, "--max-hits-per-file");
+    const char *maxh   = take_opt(&argc, argv, "--max-hits");
     int icase   = take_flag(&argc, argv, "-i") | take_flag(&argc, argv, "--ignore-case");
     int no_wait = take_flag(&argc, argv, "--no-wait");
 
     if (argc < 2)
         return fail("usage: grep <repo-id> <pattern> [--snapshot N] "
-                    "[--path-prefix PATH] [--limit N] [-i] [--no-wait]");
+                    "[--path-prefix PATH] [--limit N] [--max-hits-per-file N] "
+                    "[--max-hits N] [-i] [--no-wait]");
+    /* These go into the body as bare numbers, where anything else is
+     * malformed JSON and comes back as "invalid JSON". */
+    const char *nums[] = { snap, maxf, hpf, maxh };
+    for (size_t k = 0; k < sizeof(nums) / sizeof(nums[0]); k++) {
+        if (!nums[k]) continue;
+        size_t n = strlen(nums[k]);
+        if (n == 0 || n > 10 || strspn(nums[k], "0123456789") != n)
+            return fail("--snapshot, --limit, --max-hits-per-file and --max-hits "
+                        "take a whole number, not '%s'", nums[k]);
+    }
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"pattern\":");
@@ -693,6 +762,8 @@ static int cmd_grep(int argc, char **argv)
     if (prefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, prefix); }
     if (snap)   { sb_puts(&b, ",\"snapshot\":");    sb_puts(&b, snap); }
     if (maxf)   { sb_puts(&b, ",\"max_files\":");   sb_puts(&b, maxf); }
+    if (hpf)    { sb_puts(&b, ",\"max_hits_per_file\":"); sb_puts(&b, hpf); }
+    if (maxh)   { sb_puts(&b, ",\"max_hits\":");    sb_puts(&b, maxh); }
     if (icase)  sb_puts(&b, ",\"ignore_case\":1");
     sb_puts(&b, "}");
 
@@ -715,8 +786,8 @@ static int cmd_grep(int argc, char **argv)
     free(rp.buf);
     if (rst != OK) return fail("%s", err_msg());
     long run = -1;
-    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
-    if (ip) run = strtol(ip + 6, NULL, 10);
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
     if (run < 0) {
         if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
         http_response_free(&rr);
@@ -746,7 +817,22 @@ static int cmd_jobs(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[0], "watch") == 0) {
         sbuf_t p = { 0 };
         sb_puts(&p, "/jobs/stream/"); sb_puts(&p, argv[1]);
-        return call_path_sb("GET", &p, NULL);
+        if (p.oom) { free(p.buf); return fail("request path too large"); }
+        int status = 0;
+        status_t st = http_stream(g_socket, p.buf, stdout, stderr, &status);
+        free(p.buf);
+        if (st == ERR_NOT_FOUND) {
+            fprintf(stderr,
+                    "c-backup: daemon not running at %s.\n"
+                    "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+            return 1;
+        }
+        if (st != OK) return fail("%s", err_msg());
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "c-backup: request failed with HTTP %d\n", status);
+            return 1;
+        }
+        return 0;
     }
     if (argc >= 1) {
         sbuf_t p = { 0 };
@@ -858,13 +944,17 @@ static int cmd_sources(int argc, char **argv)
 
 static int cmd_replicate(int argc, char **argv)
 {
-    int no_wait = take_flag(&argc, argv, "--no-wait");
+    int no_wait   = take_flag(&argc, argv, "--no-wait");
+    /* Into a different repository, under its own encryption: the way to
+     * change a repository's encryption, which is fixed at creation. */
+    int reencrypt = take_flag(&argc, argv, "--reencrypt");
     if (argc < 2)
-        return fail("usage: replicate <repo-id> <dest-path> [--no-wait]");
+        return fail("usage: replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]");
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"dest\":");
     sb_json_str(&b, argv[1]);
+    if (reencrypt) sb_puts(&b, ",\"reencrypt\":true");
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -893,6 +983,24 @@ static int cmd_pack(int argc, char **argv)
  * verify list / verify show read past runs, in the same shape as repo list
  * and policy list.
  */
+/* Id of a repository's newest verify run, or -1 if it has none or the
+ * daemon cannot say. */
+static long newest_verify_run(const char *repo)
+{
+    sbuf_t rp = { 0 };
+    sb_puts(&rp, "/repos/"); sb_puts(&rp, repo); sb_puts(&rp, "/verify?limit=1");
+    if (rp.oom) { free(rp.buf); return -1; }
+    http_response_t rr;
+    memset(&rr, 0, sizeof(rr));
+    status_t st = http_request(g_socket, "GET", rp.buf, NULL, &rr);
+    free(rp.buf);
+    long run = -1;
+    const char *ip = (st == OK && rr.body) ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
+    http_response_free(&rr);
+    return run;
+}
+
 static int cmd_verify(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[0], "list") == 0) {
@@ -921,12 +1029,21 @@ static int cmd_verify(int argc, char **argv)
     if (level) { sb_puts(&q, "level="); sb_query_val(&q, level); }
     if (no_repair) sb_puts(&q, q.len ? "&repair=0" : "repair=0");
     if (dry) sb_puts(&q, q.len ? "&dry_run=1" : "dry_run=1");
+    /*
+     * A verify that finds loss fails its job, and the findings are then the
+     * part an operator most needs. So a failed job still prints the run it
+     * produced - but only one newer than any run that existed before, since
+     * a job that failed before opening a run (a busy repository, a missing
+     * key) must not print an older run as if it were this one's.
+     */
+    long before = (!no_wait && argc >= 1) ? newest_verify_run(argv[0]) : -1;
+
     long job = -1;
     /* Quiet: the run record below says everything the job record does, and
-     * more. A failed run still prints the job, which carries the reason. */
+     * more. A failed run still prints the job, on stderr, with the reason. */
     int rc = maintenance_ex("verify", argc, argv, q.buf, no_wait, 1, &job);
     free(q.buf);
-    if (rc != 0 || no_wait) return rc;
+    if (no_wait || (rc != 0 && job < 0)) return rc;
 
     /* Newest run for this repo is the one just finished. */
     http_response_t rr;
@@ -938,12 +1055,13 @@ static int cmd_verify(int argc, char **argv)
     free(rp.buf);
     if (st != OK) return fail("%s", err_msg());
     long run = -1;
-    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
-    if (ip) run = strtol(ip + 6, NULL, 10);
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
+    if (rc != 0 && run <= before) { http_response_free(&rr); return rc; }
     if (run < 0) {
         if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
         http_response_free(&rr);
-        return 0;
+        return rc;
     }
 
     sbuf_t fp = { 0 };
@@ -953,7 +1071,7 @@ static int cmd_verify(int argc, char **argv)
     sb_puts(&fp, runbuf);
     int out = print_with_result(&rr, &fp);
     http_response_free(&rr);
-    return out;
+    return rc != 0 ? rc : out;
 }
 
 static int cmd_stats(int argc, char **argv)
@@ -1054,12 +1172,17 @@ static int cmd_tag(int argc, char **argv)
         return get_repo_scoped(argv[1], "/tags", NULL);
 
     if (strcmp(argv[0], "set") == 0) {
-        if (argc < 4) return fail("usage: tag set <repo-id> <name> <snapshot-id>");
+        /* Moving a tag that is already on another snapshot takes its
+         * retention protection from that snapshot, so it has to be asked
+         * for; without --move the daemon refuses and says where it is. */
+        int move = take_flag(&argc, argv, "--move");
+        if (argc < 4) return fail("usage: tag set <repo-id> <name> <snapshot-id> [--move]");
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"name\":");
         sb_json_str(&b, argv[2]);
         sb_puts(&b, ",\"snap_id\":");
         sb_puts(&b, argv[3]);
+        if (move) sb_puts(&b, ",\"move\":true");
         sb_puts(&b, "}");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]); sb_puts(&p, "/tags");
@@ -1073,7 +1196,7 @@ static int cmd_tag(int argc, char **argv)
         if (argc < 3) return fail("usage: tag remove <repo-id> <name>");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]);
-        sb_puts(&p, "/tags/"); sb_puts(&p, argv[2]);
+        sb_puts(&p, "/tags/"); sb_path_seg(&p, argv[2]);
         return call_path_sb("DELETE", &p, NULL);
     }
     return fail("unknown tag subcommand '%s'", argv[0]);
@@ -1121,6 +1244,11 @@ static int cmd_schedule(int argc, char **argv)
          * a backup needs somewhere to read from. Sources repeat, so they
          * are drained rather than read once. */
         const char *dest = take_opt(&a, v, "--dest");
+        /* A grep schedule needs its pattern; there was no way to give one,
+         * so every grep schedule searched for nothing. */
+        const char *pattern = take_opt(&a, v, "--pattern");
+        const char *gprefix = take_opt(&a, v, "--path-prefix");
+        int gicase = take_flag(&a, v, "-i") | take_flag(&a, v, "--ignore-case");
         const char *src[32];
         int n_src = 0;
         for (;;) {
@@ -1135,7 +1263,8 @@ static int cmd_schedule(int argc, char **argv)
                                "schedule add <repo-id> <action> --every day|week|month|year "
                                "--at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N] "
                                "[--on-overlap skip|queue|cancel_running] [--catchup skip|run_once] "
-                               "[--dest PATH] [--source PATH]...");
+                               "[--dest PATH] [--source PATH]... "
+                               "[--pattern REGEX [--path-prefix PATH] [-i]]");
         /* Numbers go into the body bare, so a non-number would be malformed
          * JSON and come back as "invalid JSON", describing the request
          * rather than the mistake. */
@@ -1151,6 +1280,9 @@ static int cmd_schedule(int argc, char **argv)
         sb_puts(&b, "{\"action\":");
         sb_json_str(&b, v[2]);
         if (dest) { sb_puts(&b, ",\"dest\":"); sb_json_str(&b, dest); }
+        if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
+        if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
+        if (gicase)  sb_puts(&b, ",\"ignore_case\":1");
         if (n_src > 0) {
             sb_puts(&b, ",\"paths\":[");
             for (int i = 0; i < n_src; i++) {
@@ -1284,7 +1416,7 @@ static int read_new_password(const char *prompt, char *buf, size_t sz)
  */
 static int cmd_auth(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: auth <setup|login|logout|password> [args]");
+    if (argc < 1) return fail("usage: auth <setup|login|logout [--all]|password> [args]");
 
     char pw[256], pw2[256];
 
@@ -1305,8 +1437,14 @@ static int cmd_auth(int argc, char **argv)
         return call_sb("POST", setup ? "/api/auth/setup" : "/api/auth/login", &b);
     }
 
-    if (strcmp(argv[0], "logout") == 0)
+    if (strcmp(argv[0], "logout") == 0) {
+        /* The socket carries no session of its own, so a plain logout here
+         * revokes nothing; --all is the one that does something from the
+         * host: every session any client holds. */
+        if (take_flag(&argc, argv, "--all"))
+            return call("POST", "/api/auth/logout-all", NULL);
         return call("POST", "/api/auth/logout", NULL);
+    }
 
     if (strcmp(argv[0], "password") == 0) {
         const char *cur  = (argc >= 2) ? argv[1] : NULL;
@@ -1349,14 +1487,14 @@ static const struct {
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
-    { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
-    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i] [--no-wait]" },
+    { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
+    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
-    { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--no-wait]" },
+    { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]" },
     { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
     { "stats",     cmd_stats,     "stats <repo-id>" },
     { "summary",   cmd_summary,   "summary <repo-id>" },
@@ -1365,11 +1503,11 @@ static const struct {
     { "packs",     cmd_packs,     "packs <repo-id> [pack-id]" },
     { "fanout",    cmd_fanout,    "fanout <repo-id>" },
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
-    { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [args]" },
+    { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
-    { "auth",      cmd_auth,      "auth <setup|login|logout|password> (prompts for passwords)" },
+    { "auth",      cmd_auth,      "auth <setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },
@@ -1377,9 +1515,24 @@ static const struct {
     { NULL, NULL, NULL },
 };
 
+/* One command's usage line, for `c-backup <command> --help` and
+ * `c-backup help <command>`. Returns -1 for an unknown command. */
+static int command_usage(const char *name)
+{
+    for (int i = 0; COMMANDS[i].name; i++) {
+        if (strcmp(COMMANDS[i].name, name) != 0) continue;
+        printf("usage: c-backup %s\n", COMMANDS[i].usage);
+        return 0;
+    }
+    return -1;
+}
+
 static int cmd_help(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    if (argc >= 1) {
+        if (command_usage(argv[0]) == 0) return 0;
+        return fail("unknown command '%s' (try 'c-backup help')", argv[0]);
+    }
     printf("c-backup %s\n\n", VERSION_STRING);
     printf("usage: c-backup [--socket PATH] <command> [args]\n\n");
     printf("commands:\n");
@@ -1414,6 +1567,15 @@ int main(int argc, char **argv)
     const char *name = argv[i++];
     for (int c = 0; COMMANDS[c].name; c++) {
         if (strcmp(COMMANDS[c].name, name) != 0) continue;
+        /*
+         * Help anywhere after the command answers here, before the command
+         * validates anything or sends a request. It used to reach the
+         * handler as an argument: `repo add --help` asked the daemon to
+         * register a repository at "--help".
+         */
+        for (int a = i; a < argc; a++)
+            if (strcmp(argv[a], "--help") == 0 || strcmp(argv[a], "-h") == 0)
+                return command_usage(name) == 0 ? 0 : 1;
         return COMMANDS[c].fn(argc - i, argv + i);
     }
     return fail("unknown command '%s' (try 'c-backup help')", name);

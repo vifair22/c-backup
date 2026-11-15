@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { startHarness, openRepo, descendTo, type Harness } from './fixtures'
+import { startHarness, openRepo, descendTo, cli, type Harness } from './fixtures'
 
 /*
  * The screens added this session, driven the way an operator reaches them.
@@ -29,6 +29,31 @@ test('backup dialog: shows the configured sources', async () => {
   await expect(h.page.getByText('Sources', { exact: false }).first()).toBeVisible()
   await expect(h.page.getByText('/tmp/cbackup-e2e-', { exact: false }).first()).toBeVisible()
   await h.page.screenshot({ path: 'test-results/02-backup-dialog.png', fullPage: true })
+  await h.page.getByRole('button', { name: /^cancel$/i }).first().click()
+})
+
+/*
+ * Saving sources from the dialog kept them and cleared the excludes: the
+ * daemon replaces both lists on every save and the app sent an empty one.
+ */
+test('backup dialog: saving sources keeps the excludes', async () => {
+  const listed = JSON.parse(cli(h.sock, ['sources', 'list', String(h.repos.plain)]))
+  cli(h.sock, ['sources', 'set', String(h.repos.plain), ...listed.sources,
+               '--exclude', '*.never-e2e'])
+
+  await h.page.getByRole('button', { name: /backup/i }).first().click()
+  await expect(h.page.getByText('*.never-e2e').first()).toBeVisible({ timeout: 10_000 })
+  await h.page.getByRole('button', { name: /^edit$/i }).first().click()
+  await expect(h.page.getByLabel('Exclude patterns')).toHaveValue('*.never-e2e')
+  await h.page.getByRole('button', { name: /^save$/i }).first().click()
+  await expect(h.page.getByRole('button', { name: /^edit$/i }).first()).toBeVisible({ timeout: 10_000 })
+
+  const after = JSON.parse(cli(h.sock, ['sources', 'list', String(h.repos.plain)]))
+  expect(after.sources).toEqual(listed.sources)
+  expect(after.exclude).toEqual(['*.never-e2e'])
+
+  /* Back as the fixture had it, for the screens after this one. */
+  cli(h.sock, ['sources', 'set', String(h.repos.plain), ...listed.sources])
   await h.page.getByRole('button', { name: /^cancel$/i }).first().click()
 })
 

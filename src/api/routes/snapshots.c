@@ -17,10 +17,14 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "util.h"
+#include "json_row.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,21 +78,8 @@ int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max
 #define PAGE_DEFAULT 200
 #define PAGE_MAX     1000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
+/* Run records are small and a client usually wants the last few. */
+#define RUNS_DEFAULT 20
 
 static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
 {
@@ -105,14 +96,208 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     return path;
 }
 
+/* The newest snapshot's id, or 0 when the repository has none. */
+static int64_t newest_snapshot(int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int64_t id = 0;
+    if (db_execute(g_ctx.db,
+            "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
+/* Does this repository have a snapshot with this id? */
+static int snapshot_exists(int64_t repo_id, int64_t snap_id)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db,
+            "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
+/* ---------- restore request validation ---------- */
+
+/*
+ * Where an absolute path really lands, for a path that may not exist yet.
+ * The longest prefix that exists goes through realpath, so a symlink or a
+ * ".." cannot smuggle a destination into a repository; the part below it
+ * does not exist, so it cannot contain a symlink and is normalised
+ * lexically. Returns 0, or -1 when nothing resolves.
+ */
+static int canonical_path(const char *in, char out[PATH_MAX])
+{
+    char head[PATH_MAX];
+    if (snprintf(head, sizeof(head), "%s", in) >= (int)sizeof(head)) return -1;
+    const char *tail = "";
+    char resolved[PATH_MAX];
+
+    for (;;) {
+        if (realpath(head, resolved)) break;
+        if (errno != ENOENT && errno != ENOTDIR) return -1;
+        char *slash = strrchr(head, '/');
+        if (!slash) return -1;
+        if (slash == head) {        /* "/" always resolves; this cannot loop */
+            snprintf(resolved, sizeof(resolved), "/");
+            tail = in + 1;
+            break;
+        }
+        *slash = '\0';
+        tail = in + (slash - head) + 1;
+    }
+
+    char joined[PATH_MAX * 2];
+    snprintf(joined, sizeof(joined), "%s/%s", resolved, tail);
+    return path_normalize(joined, out, PATH_MAX);
+}
+
+/* Is `path` the directory `dir` or somewhere beneath it? Both canonical. */
+static int path_is_under(const char *path, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (n == 1 && dir[0] == '/') return 1;
+    return strncmp(path, dir, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+int routes_replicate_dest_check(int64_t repo_id, const char *dest,
+                                char *why, size_t whysz)
+{
+    if (!dest || dest[0] != '/') {
+        snprintf(why, whysz, "dest must be an absolute path");
+        return -1;
+    }
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) { snprintf(why, whysz, "no such repo"); return -1; }
+
+    /*
+     * Into its own directory, the replica is the source: the sink opened
+     * the existing marker, found its own uuid, saw every object already
+     * present and reported success having copied nothing - the "offsite
+     * copy" was the original. Inside the source, it writes a repository
+     * into a tree GC cannot account for; above it, the source ends up
+     * inside its own replica. All three are refused, compared as canonical
+     * paths so a symlink or ".." cannot route around it.
+     */
+    char cdest[PATH_MAX], crepo[PATH_MAX];
+    int rc = 0;
+    if (canonical_path(dest, cdest) != 0 || canonical_path(repo_path, crepo) != 0) {
+        snprintf(why, whysz, "dest cannot be resolved");
+        rc = -1;
+    } else if (strcmp(cdest, crepo) == 0) {
+        snprintf(why, whysz, "dest is the source repository itself (%s)", repo_path);
+        rc = -1;
+    } else if (path_is_under(cdest, crepo)) {
+        snprintf(why, whysz, "dest is inside the source repository at %s", repo_path);
+        rc = -1;
+    } else if (path_is_under(crepo, cdest)) {
+        snprintf(why, whysz, "dest contains the source repository at %s", repo_path);
+        rc = -1;
+    }
+    free(repo_path);
+    return rc;
+}
+
+/*
+ * A restore must not write into any registered repository. Restored files
+ * landing beside objects/ and packs/ are at best clutter a GC cannot account
+ * for and at worst a name that collides with something the repository owns.
+ * Every repository counts, not only the one being restored from: it is the
+ * same damage whichever one it is. Returns the offending repository's path,
+ * which the caller frees, or NULL when the destination is clear.
+ */
+static char *dest_inside_repo(const char *dest)
+{
+    char cdest[PATH_MAX];
+    if (canonical_path(dest, cdest) != 0) return NULL;
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db, "SELECT path FROM repos", NULL, &r) != 0 || !r) {
+        db_result_free(r);
+        return NULL;
+    }
+    char *hit = NULL;
+    for (int i = 0; i < r->nrows && !hit; i++) {
+        char crepo[PATH_MAX];
+        if (!r->rows[i][0][0] || canonical_path(r->rows[i][0], crepo) != 0)
+            continue;
+        if (path_is_under(cdest, crepo)) hit = strdup(r->rows[i][0]);
+    }
+    db_result_free(r);
+    return hit;
+}
+
+/*
+ * Does `subpath` (normalised, absolute, not "/") name anything in the
+ * snapshot? One indexed lookup per component against nodes_by_snap_parent,
+ * so asking costs the depth of the path, not the size of the snapshot.
+ *
+ * Returns 1 when it does, 0 when it does not, and -1 when the index cannot
+ * say: a snapshot whose nodes are not resident (evicted, or never
+ * materialised) has no rows to walk, and the restore job reports that case
+ * with its own message rather than this one guessing.
+ */
+static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+
+    db_result_t *r = NULL;
+    int resident = db_execute(g_ctx.db,
+            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    if (!resident) return -1;
+
+    char parent[32] = "0";
+    const char *p = subpath;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        char name[NAME_MAX + 1];
+        size_t n = (size_t)(p - s);
+        if (n > NAME_MAX) return 0;
+        memcpy(name, s, n);
+        name[n] = '\0';
+
+        r = NULL;
+        if (db_execute(g_ctx.db,
+                "SELECT id FROM nodes"
+                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
+                "   AND name = ?",
+                (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
+            !r || r->nrows < 1) {
+            db_result_free(r);
+            return 0;
+        }
+        snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
+        db_result_free(r);
+    }
+    return 1;
+}
+
 /* ---------- listing ---------- */
 
 static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -141,19 +326,25 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "snapshots", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "ts",    r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "label", r->rows[i][2] ? r->rows[i][2] : "") != 0
-               || json_elem_add_str(&e, "files", r->rows[i][3] ? r->rows[i][3] : "0") != 0
-               || json_elem_add_str(&e, "size",  r->rows[i][4] ? r->rows[i][4] : "0") != 0
-               /* Which retention tiers hold this snapshot. Stored since the
-                * first schema and served by nothing, so neither the CLI nor
-                * the app could say why a snapshot was being kept - the one
-                * question worth asking of a list of them. */
-               || json_elem_add_str(&e, "gfs_flags", r->rows[i][6]) != 0
-               /* Clients need to know a cold snapshot must be faulted in
-                * before it can be browsed. */
-               || json_elem_add_str(&e, "materialized", r->rows[i][5]) != 0;
+        /*
+         * gfs_flags: which retention tiers hold this snapshot, a bitfield
+         * (1 daily, 2 weekly, 4 monthly, 8 yearly). Stored since the first
+         * schema and served by nothing, so neither the CLI nor the app
+         * could say why a snapshot was being kept - the one question worth
+         * asking of a list of them.
+         *
+         * materialized: clients need to know a cold snapshot must be
+         * faulted in before it can be browsed.
+         *
+         * files and size are null for a snapshot that never recorded them.
+         */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "ts", 1, JCOL_INT },
+            { "label", 2, JCOL_STR_NULL }, { "files", 3, JCOL_INT },
+            { "size", 4, JCOL_INT }, { "gfs_flags", 6, JCOL_INT },
+            { "materialized", 5, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -174,15 +365,41 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
                                 int64_t snap_id)
 {
     const char *parent = api_query_param(req, "parent");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
+    /*
+     * A snapshot or directory that is not there is a 404. Both answered an
+     * empty listing, which is what an empty directory looks like, so a
+     * mistyped id read as "nothing in here".
+     */
+    if (!snapshot_exists(repo_id, snap_id)) return api_error(404, "no such snapshot");
+    if (parent && !*parent) parent = NULL;
+    if (parent && strcmp(parent, "0") != 0) {
+        char *end = NULL;
+        long long pid = strtoll(parent, &end, 10);
+        if (pid <= 0 || !end || *end) return api_error(400, "parent must be a node id");
+        char rb[32], sb[32];
+        snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
+        snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
+        db_result_t *pr = NULL;
+        int found = db_execute(g_ctx.db,
+                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
+                (const char *[]){ rb, sb, parent, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+        db_result_free(pr);
+        if (!found) return api_error(404, "no such directory in this snapshot");
+    }
+
     char repo[32], snap[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns, content_hash,"
+            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
+            "       mtime_ns % 1000000000, content_hash,"
             /* Whether this directory has anything in it. A browser needs it
              * to decide which rows get an expander, and the alternative is a
              * round trip per directory to find out it is empty. EXISTS and
@@ -218,16 +435,26 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",   r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "name", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "type", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "mode", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size", r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "mtime_ns", r->rows[i][5]) != 0
-               /* Empty for a directory, and for a file whose content was
-                * never hashed. Both mean "nothing to open". */
-               || json_elem_add_str(&e, "hash", r->rows[i][6] ? r->rows[i][6] : "") != 0
-               || json_elem_add_str(&e, "has_children", r->rows[i][7] ? r->rows[i][7] : "0") != 0;
+        /*
+         * type is NODE_TYPE_* and mode the full st_mode, both integers;
+         * docs/api.md lists the codes.
+         *
+         * The modification time is split into whole seconds and the
+         * nanoseconds within them. As one nanosecond count it is about
+         * 1.7e18, past the 2^53 a JSON number holds exactly, so a client
+         * would have read back a different time than was stored.
+         *
+         * hash is null for a directory, and for a file whose content was
+         * never hashed. Both mean "nothing to open".
+         */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "name", 1, JCOL_STR },
+            { "type", 2, JCOL_INT }, { "mode", 3, JCOL_INT },
+            { "size", 4, JCOL_INT }, { "mtime", 5, JCOL_INT },
+            { "mtime_nsec", 6, JCOL_INT }, { "hash", 7, JCOL_STR_NULL },
+            { "has_children", 8, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -407,17 +634,61 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
         return api_error(400, "search needs at least 3 characters "
                               "(the name index is built from trigrams)");
 
+    /*
+     * An optional snapshot. Without one every snapshot is searched, and a
+     * file unchanged across thirty snapshots used to come back thirty
+     * times; with one, only that snapshot is.
+     */
+    int64_t only_snap = 0;
+    const char *sq = api_query_param(req, "snapshot");
+    if (sq) {
+        char *end = NULL;
+        long long v = strtoll(sq, &end, 10);
+        if (!*sq || !end || *end || v <= 0)
+            return api_error(400, "snapshot must be a snapshot id");
+        only_snap = (int64_t)v;
+        if (!snapshot_exists(repo_id, only_snap))
+            return api_error(404, "no such snapshot");
+    }
+
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
+
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
+    /*
+     * Without a snapshot, identical (path, content) rows across snapshots
+     * collapse into one result, so more rows are read than results returned.
+     * Bounded, because the alternative is reading every match in the
+     * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
+     * result stops and says the counts are partial.
+     */
+    enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
+    int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
+    if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
+    if (scan < limit) scan = limit;
 
-    char repo[32], lim[16];
+    char repo[32], lim[16], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", scan);
+    snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
     /* Through the trigram index, not LIKE: a scan of the nodes table loses to
-     * the pre-rewrite implementation, while this beats it by ~50x. */
+     * the pre-rewrite implementation, while this beats it by ~50x. No ORDER
+     * BY: sorting would read every match to return the first page, which is
+     * the cost the index exists to avoid. A collapsed result keeps the
+     * newest copy among the rows read instead. */
     db_result_t *r = NULL;
-    int rc = db_execute(g_ctx.db,
+    int rc = only_snap
+        ? db_execute(g_ctx.db,
+            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+            "       COALESCE(n.content_hash, '')"
+            "  FROM node_fts f"
+            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+            " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ? LIMIT ?",
+            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r)
+        : db_execute(g_ctx.db,
             "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
             "       COALESCE(n.content_hash, '')"
             "  FROM node_fts f"
@@ -443,29 +714,77 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
          * there is nothing to unwind and nothing worth failing the
          * request over. */
     }
+    int nrows = r ? r->nrows : 0;
     anc_cache_t anc;
-    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, r->nrows) == 0);
+    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, nrows) == 0);
 
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        cutils_json_elem_t e;
-        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+    /*
+     * One result per (path, content). Each keeps the row of the newest
+     * snapshot it was seen in and counts the snapshots, so "in 30 snapshots,
+     * newest 41" replaces thirty identical lines. A changed file is a new
+     * hash and stays a separate result, which is the version history a
+     * search is often after. Results stay in first-seen order.
+     */
+    typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
+    hit_t *hits = calloc((size_t)limit, sizeof(*hits));
+    char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
+    int nhits = 0;
+    if (!hits || !paths) {
+        free(hits); free(paths);
+        if (have_anc) anc_free(&anc);
+        db_result_free(r);
+        return api_error(500, "out of memory");
+    }
+
+    for (int i = 0; i < nrows; i++) {
         int64_t nid = strtoll(r->rows[i][0], NULL, 10);
         int64_t sid = strtoll(r->rows[i][1], NULL, 10);
-        char *path = have_anc ? anc_path(&anc, sid, nid) : NULL;
-        int bad = json_elem_add_str(&e, "node_id", r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+        paths[i] = have_anc ? anc_path(&anc, sid, nid) : NULL;
+        /* A row with no path cannot be compared, so it stands alone. */
+        char *key = NULL;
+        if (paths[i] && asprintf(&key, "%s%c%s", paths[i], '\x01', r->rows[i][5]) < 0)
+            key = NULL;
+        int found = -1;
+        for (int k = 0; key && k < nhits; k++)
+            if (hits[k].key && strcmp(hits[k].key, key) == 0) { found = k; break; }
+        if (found >= 0) {
+            hits[found].count++;
+            if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
+            free(key);
+        } else if (nhits < limit) {
+            hits[nhits++] = (hit_t){ key, i, sid, 1 };
+        } else {
+            free(key);
+        }
+    }
+    int partial = !only_snap && nrows == scan;
+
+    for (int k = 0; k < nhits; k++) {
+        char **row = r->rows[hits[k].row];
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+        int bad = jrow_elem_add(&e, "node_id", JCOL_INT, row[0]) != 0
+               || jrow_elem_add(&e, "snap_id", JCOL_INT, row[1]) != 0
+               || json_elem_add_u32(&e, "snapshots", hits[k].count) != 0
+               || json_elem_add_str(&e, "name",    row[2]) != 0
                /* Empty when the chain is broken, which a partially faulted-in
                 * snapshot can produce. A hit without a path is still a hit;
                 * it is the navigation that is unavailable, not the result. */
-               || json_elem_add_str(&e, "path",    path ? path : "") != 0
-               || json_elem_add_str(&e, "type",    r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size",    r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "hash",    r->rows[i][5]) != 0;
-        free(path);
+               || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
+               || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
+               || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
+               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
+    /* More matches exist than were read: the results and their snapshot
+     * counts cover the rows read, not necessarily the whole repository. */
+    if (json_resp_add_bool(resp, "partial", partial) != 0) { /* alloc only */ }
+
+    for (int k = 0; k < nhits; k++) free(hits[k].key);
+    for (int i = 0; i < nrows; i++) free(paths[i]);
+    free(hits);
+    free(paths);
     if (have_anc) anc_free(&anc);
     db_result_free(r);
 
@@ -504,6 +823,9 @@ typedef struct {
     char           *path_prefix;
     int             ignore_case;
     uint32_t        max_files;
+    int             reencrypt;   /* replicate into another repository's key */
+    uint32_t        max_hits_per_file;   /* 0: the grep default */
+    uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -541,7 +863,9 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
-    (void)cancel;   /* repo_pack has no cancellation hook of its own yet */
+    /* repo_pack takes no flag of its own; it reads the store's, which is
+     * how a cancel reaches the middle of packing one large object. */
+    if (cancel) store_set_cancel((store_t *)store, cancel);
     pack_progress_bridge_t bridge = { progress, progress_ctx };
     uint32_t packed = 0;
     status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
@@ -549,6 +873,158 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
         log_info("pack: %u object(s) packed in repo %lld",
                  packed, (long long)repo_id);
     return st;
+}
+
+/* How many ids a gfs journal message names before it summarises the rest.
+ * The job result carries all of them; the journal is a one-line log. */
+#define GFS_SUMMARY_IDS 20
+
+/*
+ * What a retention pass did, on the job and in the journal.
+ *
+ * A dry run's whole answer - which snapshots would go - reached only the
+ * daemon log, so "gfs --dry-run" printed a job record saying "completed"
+ * and nothing else, and the journal entry for a real pass had an empty
+ * message. The retention values are reported too, since the defaults and
+ * the per-repo policy combine here and nowhere else shows the result.
+ */
+static void gfs_report(void *progress_ctx, int dry_run,
+                       const gfs_retention_t *ret, const gfs_result_t *gr)
+{
+    /* 11 bytes per id covers ten digits and a comma. */
+    size_t cap = 320 + (size_t)gr->pruned * 11;
+    char *js = malloc(cap);
+    if (js) {
+        size_t off = (size_t)snprintf(js, cap, "{\"dry_run\":%s,\"%s\":[",
+                                      dry_run ? "true" : "false",
+                                      dry_run ? "would_remove" : "removed");
+        for (uint32_t i = 0; i < gr->pruned && off < cap; i++)
+            off += (size_t)snprintf(js + off, cap - off, "%s%u", i ? "," : "", gr->ids[i]);
+        if (off < cap)
+            snprintf(js + off, cap - off,
+                     "],\"count\":%u,\"retention\":{\"keep_snaps\":%d,"
+                     "\"keep_daily\":%d,\"keep_weekly\":%d,"
+                     "\"keep_monthly\":%d,\"keep_yearly\":%d}}",
+                     gr->pruned, ret->keep_snaps, ret->keep_daily,
+                     ret->keep_weekly, ret->keep_monthly, ret->keep_yearly);
+        job_set_result(progress_ctx, js);
+        free(js);
+    }
+
+    char msg[384];
+    size_t off = (size_t)snprintf(msg, sizeof(msg), "%s",
+                                  dry_run ? "dry run: would remove " : "removed ");
+    if (gr->pruned == 0) {
+        snprintf(msg + off, sizeof(msg) - off, "no snapshots");
+    } else {
+        off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%u snapshot%s:",
+                                gr->pruned, gr->pruned == 1 ? "" : "s");
+        uint32_t shown = gr->pruned < GFS_SUMMARY_IDS ? gr->pruned : GFS_SUMMARY_IDS;
+        for (uint32_t i = 0; i < shown && off < sizeof(msg); i++)
+            off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%s %u",
+                                    i ? "," : "", gr->ids[i]);
+        if (gr->pruned > shown && off < sizeof(msg))
+            snprintf(msg + off, sizeof(msg) - off, " and %u more", gr->pruned - shown);
+    }
+    job_set_summary(progress_ctx, msg);
+}
+
+/*
+ * Which jobs read or write content and so cannot run without the key.
+ * Verify works on ciphertext - parity covers it so an offsite copy can be
+ * scrubbed by whoever holds it - and retention only deletes records, so
+ * those two run keyless; everything else would fail partway with a message
+ * about a pack entry rather than about the missing key.
+ */
+static int snap_job_needs_key(snap_job_kind_t kind)
+{
+    return kind != SNAP_JOB_VERIFY && kind != SNAP_JOB_GFS;
+}
+
+/*
+ * What a gc did, or would do, on the job and in the journal.
+ *
+ * gc and gc --dry-run both printed a bare job record: the counts reached the
+ * daemon log and nowhere a client could read them, so a dry run - whose
+ * whole purpose is the answer - answered nothing. Recorded on failure and
+ * cancellation too, because the sweep commits before compaction starts and
+ * what it removed is still true.
+ */
+static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
+{
+    char js[512];
+    snprintf(js, sizeof(js),
+             "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
+             "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
+             "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
+             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"tmp_bytes_removed\":%llu}",
+             dry_run ? "true" : "false",
+             (unsigned long long)gr->reachable,
+             (unsigned long long)gr->swept,
+             (unsigned long long)gr->bytes_freed,
+             (unsigned long long)gr->pack_entries_kept,
+             (unsigned long long)gr->pack_entries_dropped,
+             gr->packs_rewritten, gr->packs_deleted,
+             gr->tmp_files_removed,
+             (unsigned long long)gr->tmp_bytes_removed);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (dry_run)
+        snprintf(msg, sizeof(msg),
+                 "dry run: would sweep %llu object%s (%llu bytes)",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed);
+    else
+        snprintf(msg, sizeof(msg),
+                 "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
+                 "%u deleted; %u stale temp file%s removed",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed,
+                 gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
+                 gr->packs_deleted,
+                 gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
+}
+
+/*
+ * What a replication sent. A full copy, an incremental and a no-op all
+ * printed the same bare job before this; the counts were only in the log.
+ */
+static void replicate_report(void *progress_ctx, const replicate_result_t *rr)
+{
+    char js[384];
+    snprintf(js, sizeof(js),
+             "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+             "\"objects_asked\":%llu,\"objects_sent\":%llu,"
+             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu}",
+             (unsigned long long)rr->snapshots_sent,
+             (unsigned long long)rr->snapshots_skipped,
+             (unsigned long long)rr->objects_asked,
+             (unsigned long long)rr->objects_sent,
+             (unsigned long long)rr->bytes_sent,
+             (unsigned long long)rr->subtrees_skipped);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (rr->snapshots_sent == 0 && rr->objects_sent == 0)
+        snprintf(msg, sizeof(msg),
+                 "target already up to date (%llu snapshot%s present)",
+                 (unsigned long long)rr->snapshots_skipped,
+                 rr->snapshots_skipped == 1 ? "" : "s");
+    else
+        snprintf(msg, sizeof(msg),
+                 "sent %llu snapshot%s, %llu object%s, %llu bytes; "
+                 "%llu subtree%s skipped",
+                 (unsigned long long)rr->snapshots_sent,
+                 rr->snapshots_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->objects_sent,
+                 rr->objects_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->bytes_sent,
+                 (unsigned long long)rr->subtrees_skipped,
+                 rr->subtrees_skipped == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
 }
 
 static status_t snap_job_run(void *arg, volatile int *cancel,
@@ -578,13 +1054,33 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = repo_store_open(j->repo_path, NULL, &store);
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    /* Every loop below the engine boundary that can run for a whole large
+     * object checks this; see store_set_cancel. */
+    store_set_cancel(store, cancel);
 
     if (j->kind == SNAP_JOB_REINDEX) {
-        st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
+        reindex_result_t rx;
+        memset(&rx, 0, sizeof(rx));
+        st = reindex_repo(store, j->db, j->repo_id, cancel, &rx);
+        /* What came back, on the job, failed or not: an operator recovering
+         * from a lost database needs to see that the tags returned, and a
+         * failed run says how much it still managed. */
+        char rj[320];
+        snprintf(rj, sizeof(rj),
+                 "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
+                 "\"objects\":%llu,\"packs_unreadable\":%llu,"
+                 "\"tags_restored\":%llu,\"tags_skipped\":%llu}",
+                 (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
+                 (unsigned long long)rx.files, (unsigned long long)rx.objects,
+                 (unsigned long long)rx.packs_unreadable,
+                 (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped);
+        job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_PACK) {
         /* Loose objects are one file each, and compression only happens at
          * pack time, so an unpacked repository stores more than its source
@@ -597,9 +1093,30 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         go.path_prefix       = j->path_prefix;
         go.ignore_case       = j->ignore_case;
         go.max_files         = j->max_files;
-        go.max_hits_per_file = 10;
+        go.max_hits_per_file = j->max_hits_per_file;
+        go.max_hits          = j->max_hits;
+        grep_result_t gr;
+        memset(&gr, 0, sizeof(gr));
         st = grep_run(store, j->db, j->repo_id, j->snap_id, &go, cancel,
-                      progress, progress_ctx, NULL);
+                      progress, progress_ctx, &gr);
+        /* What the search did, on the job, including what it stopped short
+         * of: files_capped and truncated say the hit list is not the whole
+         * answer. The run record carries the rest. Recorded whenever a
+         * run exists, cancelled or not, so a client following the job
+         * opens this job's run and never an older one. */
+        if (gr.run_id > 0) {
+            char rj[320];
+            snprintf(rj, sizeof(rj),
+                     "{\"run_id\":%lld,\"snapshot\":%lld,\"files_scanned\":%llu,"
+                     "\"files_matched\":%llu,\"files_capped\":%llu,\"hits\":%llu,"
+                     "\"truncated\":%s}",
+                     (long long)gr.run_id, (long long)j->snap_id,
+                     (unsigned long long)gr.files_scanned,
+                     (unsigned long long)gr.files_matched,
+                     (unsigned long long)gr.files_capped,
+                     (unsigned long long)gr.hits, gr.truncated ? "true" : "false");
+            job_set_result(progress_ctx, rj);
+        }
     } else if (j->kind == SNAP_JOB_VERIFY) {
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, NULL);
@@ -611,15 +1128,46 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          */
         repo_marker_t m;
         st = repo_marker_read(j->repo_path, &m);
+        /*
+         * A re-encrypting target is a repository in its own right, and may
+         * be registered here: hold its write lock too, so a backup into it
+         * cannot allocate a snapshot id this run is about to write. Try,
+         * never wait - the source lock is already held, and waiting for a
+         * second lock while holding one is how two jobs deadlock.
+         */
+        int64_t dest_locked = 0;
+        if (st == OK && j->reencrypt) {
+            repo_marker_t dm;
+            if (repo_marker_read(j->dest, &dm) == OK) {
+                db_result_t *r = NULL;
+                if (db_execute(j->db, "SELECT id FROM repos WHERE uuid = ?",
+                               (const char *[]){ dm.uuid, NULL }, &r) == 0 &&
+                    r && r->nrows == 1)
+                    dest_locked = strtoll(r->rows[0][0], NULL, 10);
+                db_result_free(r);
+            } else {
+                err_clear();
+            }
+            if (dest_locked > 0 && dest_locked != j->repo_id) {
+                st = repo_trylock_write(dest_locked);
+                if (st != OK) dest_locked = 0;
+            } else {
+                dest_locked = 0;
+            }
+        }
         if (st == OK) {
             replica_sink_t sink;
-            st = replica_sink_local_open(j->dest, &m, &sink);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+                              : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
                 memset(&rr, 0, sizeof(rr));
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                /* A cancelled run keeps what it committed, so its counts
+                 * are true either way. */
+                replicate_report(progress_ctx, &rr);
                 if (st == OK)
                     log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
                              "%llu object(s), %llu byte(s), %llu subtree(s) skipped",
@@ -628,10 +1176,24 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                              (unsigned long long)rr.objects_sent,
                              (unsigned long long)rr.bytes_sent,
                              (unsigned long long)rr.subtrees_skipped);
+                char rj[256];
+                snprintf(rj, sizeof(rj),
+                         "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+                         "\"objects_sent\":%llu,\"bytes_sent\":%llu,\"reencrypted\":%s}",
+                         (unsigned long long)rr.snapshots_sent,
+                         (unsigned long long)rr.snapshots_skipped,
+                         (unsigned long long)rr.objects_sent,
+                         (unsigned long long)rr.bytes_sent,
+                         j->reencrypt ? "true" : "false");
+                job_set_result(progress_ctx, rj);
             }
         }
+        if (dest_locked > 0) repo_unlock(dest_locked);
     } else if (j->kind == SNAP_JOB_GC) {
-        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
+        gc_result_t gr;
+        memset(&gr, 0, sizeof(gr));
+        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, &gr);
+        gc_report(progress_ctx, j->dry_run, &gr);
     } else if (j->kind == SNAP_JOB_GFS) {
         /* Retention comes from policy_values, falling back to the daemon
          * defaults when a repo has not set its own. Those were hard-coded
@@ -646,7 +1208,17 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 (const char *[]){ repo, NULL }, &r) == 0 && r) {
             for (int i = 0; i < r->nrows; i++) {
                 const char *k = r->rows[i][0];
-                int v = atoi(r->rows[i][1]);
+                /* The policy route validates now, but a database written
+                 * before it did can hold "banana" or "-3". atoi read those
+                 * as 0 and -3, and 0 for a tier means unlimited: a typo
+                 * silently turned a tier's pruning off. Skip and keep the
+                 * default instead, and say so. */
+                int v = 0;
+                if (routes_policy_count(r->rows[i][1], &v) != 0) {
+                    log_warn("gfs: repo %lld: ignoring invalid %s = '%s'",
+                             (long long)j->repo_id, k, r->rows[i][1]);
+                    continue;
+                }
                 if      (strcmp(k, "retention.keep_daily") == 0)   ret.keep_daily = v;
                 else if (strcmp(k, "retention.keep_weekly") == 0)  ret.keep_weekly = v;
                 else if (strcmp(k, "retention.keep_monthly") == 0) ret.keep_monthly = v;
@@ -666,9 +1238,12 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         /* Manual runs are full scans: an operator asking for GFS explicitly
          * wants the whole history reconsidered, not the incremental pass the
          * backup pipeline does. */
+        gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, NULL)
+                            j->dry_run, 1, 1, &gr)
                   : OK;
+        if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
+        gfs_result_free(&gr);
     } else {
         restore_opts_t o;
         memset(&o, 0, sizeof(o));
@@ -677,7 +1252,23 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         o.cancel       = cancel;
         o.progress_cb  = progress;
         o.progress_ctx = progress_ctx;
-        st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, NULL);
+        o.bytes_cb     = job_progress_bytes;
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, &rr);
+        /* What was restored, on the job: the counts the Manual promises and
+         * the log had, where the job showed only the snapshot's entry count.
+         * Recorded on failure too, since that is when "failed" matters. */
+        char rj[384];
+        snprintf(rj, sizeof(rj),
+                 "{\"files\":%llu,\"dirs\":%llu,\"symlinks\":%llu,"
+                 "\"hardlinks\":%llu,\"specials\":%llu,\"bytes\":%llu,"
+                 "\"skipped\":%llu,\"failed\":%llu}",
+                 (unsigned long long)rr.files, (unsigned long long)rr.dirs,
+                 (unsigned long long)rr.symlinks, (unsigned long long)rr.hardlinks,
+                 (unsigned long long)rr.specials, (unsigned long long)rr.bytes,
+                 (unsigned long long)rr.skipped, (unsigned long long)rr.failed);
+        job_set_result(progress_ctx, rj);
     }
 
     store_index_free(idx);
@@ -693,6 +1284,13 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
+    /* Refused while the caller is listening. Queued, a restore without the
+     * key ran and reported "1 entry could not be restored". */
+    if (snap_job_needs_key(kind) && repo_require_key(repo_path) != OK) {
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
+
     /*
      * A restore names a snapshot, and one that does not exist is the
      * caller's mistake to hear about now. It used to be queued, and the job
@@ -700,19 +1298,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
      * sends an operator to rebuild an index that is fine, for a snapshot
      * that retention or a delete had already removed.
      */
-    if (snap_id > 0) {
-        char repo[32], snap[32];
-        snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-        snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-        db_result_t *r = NULL;
-        int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
-                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
-        db_result_free(r);
-        if (!found) {
-            free(repo_path);
-            return api_error(404, "no such snapshot");
-        }
+    if (snap_id > 0 && !snapshot_exists(repo_id, snap_id)) {
+        free(repo_path);
+        return api_error(404, "no such snapshot");
     }
 
     snap_job_t *j = calloc(1, sizeof(*j));
@@ -773,21 +1361,46 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         uint32_t mf = 0;
         if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
             j->max_files = mf;
+        /* Out of range is refused rather than clamped, so a caller asking
+         * for a million hits per file learns the ceiling instead of getting
+         * quietly fewer. */
+        uint32_t hpf = 0;
+        if (json_req_has(body, "max_hits_per_file") &&
+            json_req_get_u32(body, "max_hits_per_file", &hpf, 1, 10000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits_per_file must be 1 to 10000");
+        }
+        j->max_hits_per_file = hpf;
+        uint32_t mh = 0;
+        if (json_req_has(body, "max_hits") &&
+            json_req_get_u32(body, "max_hits", &mh, 1, 1000000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits must be 1 to 1000000");
+        }
+        j->max_hits = mh;
 
         /* Which snapshot: the newest unless one was named. Searching "the
          * backup" almost always means the current one. */
         uint32_t sid = 0;
-        if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) == 0) {
+        if (json_req_has(body, "snapshot")) {
+            /*
+             * A named snapshot is checked now. One that did not exist was
+             * searched anyway: the job found no files, completed, and
+             * reported zero matches - an answer to a question nobody asked,
+             * indistinguishable from "not in this backup". A malformed one
+             * fell back to the newest snapshot, which is worse.
+             */
+            if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) != 0) {
+                snap_job_free(j);
+                return api_error(400, "snapshot must be a snapshot id");
+            }
             j->snap_id = (int64_t)sid;
+            if (!snapshot_exists(repo_id, j->snap_id)) {
+                snap_job_free(j);
+                return api_error(404, "no such snapshot");
+            }
         } else {
-            char repo[32];
-            snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-            db_result_t *r = NULL;
-            if (db_execute(g_ctx.db,
-                    "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
-                    (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-                j->snap_id = strtoll(r->rows[0][0], NULL, 10);
-            db_result_free(r);
+            j->snap_id = newest_snapshot(repo_id);
             if (j->snap_id <= 0) {
                 snap_job_free(j);
                 return api_error(404, "repo has no snapshots to search");
@@ -809,6 +1422,18 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        bool reenc = false;
+        if (json_req_has(body, "reencrypt") &&
+            json_req_get_bool(body, "reencrypt", &reenc) != 0) {
+            snap_job_free(j);
+            return api_error(400, "reencrypt must be true or false");
+        }
+        j->reencrypt = reenc ? 1 : 0;
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return api_error(400, why);
+        }
     }
 
     if (kind == SNAP_JOB_RESTORE) {
@@ -825,12 +1450,61 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        /* Checked here rather than left to the job: a relative destination
+         * would resolve against the daemon's working directory, which is
+         * nobody's intent, and a job that fails on it says so long after
+         * the caller could have been told. */
+        if (j->dest[0] != '/') {
+            snap_job_free(j);
+            return api_error(400, "dest must be an absolute path");
+        }
+        char *repo_hit = dest_inside_repo(j->dest);
+        if (repo_hit) {
+            char msg[PATH_MAX + 96];
+            snprintf(msg, sizeof(msg),
+                     "dest is inside the repository at %s; restore somewhere else",
+                     repo_hit);
+            free(repo_hit);
+            snap_job_free(j);
+            return api_error(400, msg);
+        }
         uint32_t ow = 0;
         if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
         /* Optional: restore one path out of the snapshot rather than all of
          * it. Pulling a single file out of a large backup should not cost a
          * full restore. */
         if (json_req_get_str(body, "subpath", &j->subpath) != 0) j->subpath = NULL;
+        if (j->subpath) {
+            /* Snapshot paths are absolute, so a subpath is read as one
+             * whether or not it starts with a slash, and normalised so
+             * "/a//b/" and "/a/./b" name the same thing "/a/b" does. */
+            char raw[PATH_MAX], norm[PATH_MAX];
+            if (snprintf(raw, sizeof(raw), "%s%s", j->subpath[0] == '/' ? "" : "/",
+                         j->subpath) >= (int)sizeof(raw) ||
+                path_normalize(raw, norm, sizeof(norm)) != 0) {
+                snap_job_free(j);
+                return api_error(400, "subpath is too long");
+            }
+            free(j->subpath);
+            j->subpath = NULL;
+            if (strcmp(norm, "/") != 0) {
+                /* A subpath that matches nothing used to run a restore that
+                 * wrote nothing and reported success. */
+                if (subpath_exists(repo_id, snap_id, norm) == 0) {
+                    char msg[PATH_MAX + 64];
+                    snprintf(msg, sizeof(msg),
+                             "subpath %s matches nothing in snapshot %lld",
+                             norm, (long long)snap_id);
+                    snap_job_free(j);
+                    return api_error(404, msg);
+                }
+                j->subpath = strdup(norm);
+                if (!j->subpath) {
+                    snap_job_free(j);
+                    return api_error(500, "out of memory");
+                }
+            }
+        }
     }
 
     int64_t job_id = 0;
@@ -864,9 +1538,11 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -884,16 +1560,15 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",            r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snapshot",      r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "pattern",       r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "started_at",    r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "finished_at",   r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "completed",     r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "files_scanned", r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "files_matched", r->rows[i][7]) != 0
-               || json_elem_add_str(&e, "hits",          r->rows[i][8]) != 0
-               || json_elem_add_str(&e, "truncated",     r->rows[i][9]) != 0;
+        /* finished_at is null while the search is still running. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "snapshot", 1, JCOL_INT },
+            { "pattern", 2, JCOL_STR }, { "started_at", 3, JCOL_INT },
+            { "finished_at", 4, JCOL_INT }, { "completed", 5, JCOL_BOOL },
+            { "files_scanned", 6, JCOL_INT }, { "files_matched", 7, JCOL_INT },
+            { "hits", 8, JCOL_INT }, { "truncated", 9, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -905,17 +1580,38 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     return api_ok(body);
 }
 
+/*
+ * Is run_id one of this repository's runs in `table`? A run that is not
+ * there answered with an empty list, which is also what a clean scrub or a
+ * search with no matches looks like - so `verify show 1 999` read as
+ * "nothing wrong". The table name is one of two literals, never input.
+ */
+static int run_exists(const char *table, int64_t repo_id, int64_t run_id)
+{
+    char repo[32], run[32], sql[96];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    snprintf(sql, sizeof(sql), "SELECT 1 FROM %s WHERE repo_id = ? AND id = ?", table);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db, sql, (const char *[]){ repo, run, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
                                     int64_t run_id)
 {
+    if (!run_exists("grep_runs", repo_id, run_id)) return api_error(404, "no such search run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -932,10 +1628,11 @@ static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "hits", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "path",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "line",    r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "excerpt", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "node_id", r->rows[i][3]) != 0;
+        static const jcol_t cols[] = {
+            { "path", 0, JCOL_STR }, { "line", 1, JCOL_INT },
+            { "excerpt", 2, JCOL_STR }, { "node_id", 3, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -965,15 +1662,17 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, started_at, finished_at, level, completed, checked, ok,"
             "       repaired, unrecoverable, missing, bytes_read,"
-            "       affected_files, affected_snapshots"
+            "       affected_files, affected_snapshots, recoverable"
             "  FROM verify_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
             (const char *[]){ repo, limit, NULL }, &r) != 0) {
         db_result_free(r);
@@ -986,19 +1685,18 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",                 r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "started_at",         r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "finished_at",        r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "level",              r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "completed",          r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "checked",            r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "ok",                 r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "repaired",           r->rows[i][7]) != 0
-               || json_elem_add_str(&e, "unrecoverable",      r->rows[i][8]) != 0
-               || json_elem_add_str(&e, "missing",            r->rows[i][9]) != 0
-               || json_elem_add_str(&e, "bytes_read",         r->rows[i][10]) != 0
-               || json_elem_add_str(&e, "affected_files",     r->rows[i][11]) != 0
-               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][12]) != 0;
+        /* finished_at is null while the scrub is still running. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "started_at", 1, JCOL_INT },
+            { "finished_at", 2, JCOL_INT }, { "level", 3, JCOL_STR },
+            { "completed", 4, JCOL_BOOL }, { "checked", 5, JCOL_INT },
+            { "ok", 6, JCOL_INT }, { "repaired", 7, JCOL_INT },
+            { "recoverable", 13, JCOL_INT }, { "unrecoverable", 8, JCOL_INT },
+            { "missing", 9, JCOL_INT }, { "bytes_read", 10, JCOL_INT },
+            { "affected_files", 11, JCOL_INT },
+            { "affected_snapshots", 12, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -1014,18 +1712,21 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 static api_response_t verify_findings_get(const api_request_t *req, int64_t repo_id,
                                           int64_t run_id)
 {
+    if (!run_exists("verify_runs", repo_id, run_id)) return api_error(404, "no such verify run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT hash, status, affected_files, sample_paths, affected_snapshots"
+            "SELECT hash, status, affected_files, sample_paths, affected_snapshots,"
+            "       affected_versions, affected_snapshot_count, snapshots_truncated"
             "  FROM verify_findings WHERE repo_id = ? AND run_id = ?"
             " ORDER BY id LIMIT ? OFFSET ?",
             (const char *[]){ repo, run, limit, offset, NULL }, &r) != 0) {
@@ -1039,11 +1740,18 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "findings", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "hash",               r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "status",             r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "affected_files",     r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "sample_paths",       r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][4]) != 0;
+        /* sample_paths and affected_snapshots are text lists the scrub
+         * wrote, not numbers; null when it recorded none. */
+        static const jcol_t cols[] = {
+            { "hash", 0, JCOL_STR }, { "status", 1, JCOL_STR },
+            { "affected_files", 2, JCOL_INT },
+            { "sample_paths", 3, JCOL_STR_NULL },
+            { "affected_snapshots", 4, JCOL_STR_NULL },
+            { "affected_versions", 5, JCOL_INT },
+            { "affected_snapshot_count", 6, JCOL_INT },
+            { "snapshots_truncated", 7, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -1171,7 +1879,7 @@ int routes_action_is_schedulable(const char *action)
 
 status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                  const char *action, const char *params,
-                                 int64_t *out_job_id)
+                                 int64_t schedule_id, int64_t *out_job_id)
 {
     /*
      * Backup is a different job type, owned by backup_routes.c, so it is
@@ -1180,7 +1888,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
      * tick while the schedule showed as enabled.
      */
     if (strcmp(action, "backup") == 0)
-        return routes_submit_backup(jm, repo_id, params, out_job_id);
+        return routes_submit_backup(jm, repo_id, params, schedule_id, out_job_id);
 
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
@@ -1218,10 +1926,48 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                              "replicate schedule for repo %lld has no destination",
                              (long long)repo_id);
         }
+        /* Checked again at fire time: the repository may have moved since
+         * the schedule was made. */
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID, "replicate schedule for repo %lld: %s",
+                             (long long)repo_id, why);
+        }
     }
 
-    return job_submit(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                      snap_job_run, j, snap_job_free, out_job_id);
+    /*
+     * A scheduled grep searches the newest snapshot as of when it fires,
+     * which is what a recurring "is this still in the backup" means. It ran
+     * with no pattern and no snapshot at all, because neither reached here.
+     */
+    if (kind == SNAP_JOB_GREP) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *p = NULL;
+        if (!params || !*params ||
+            json_req_parse(params, strlen(params), &p) != 0 ||
+            json_req_get_str(p, "pattern", &j->pattern) != 0 ||
+            !j->pattern || !*j->pattern) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID,
+                             "grep schedule for repo %lld has no pattern",
+                             (long long)repo_id);
+        }
+        if (json_req_get_str_opt(p, "path_prefix", &j->path_prefix) != 0)
+            j->path_prefix = NULL;
+        uint32_t v = 0;
+        if (json_req_get_u32(p, "ignore_case", &v, 0, 1) == 0) j->ignore_case = (int)v;
+        if (json_req_get_u32(p, "max_files", &v, 0, 1000000) == 0) j->max_files = v;
+        j->snap_id = newest_snapshot(repo_id);
+        if (j->snap_id <= 0) {
+            snap_job_free(j);
+            return set_error(ERR_NOT_FOUND, "repo %lld has no snapshots to search",
+                             (long long)repo_id);
+        }
+    }
+
+    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
+                                schedule_id, snap_job_run, j, snap_job_free,
+                                out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import type { MaintenanceOp } from '../shared/api'
+import type { WireSnapshot, WireSummary, WireTypeStat } from '../shared/wire'
 import { StatCard } from './StatCard'
 import { ContextMenu } from './ContextMenu'
 import {
-  fmtSize, fmtNum, relativeTime, absoluteTime, gfsBadges,
+  fmtSize, fmtNum, relativeTime, absoluteTime, gfsBadges, OBJECT_TYPE_NAMES,
   GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY,
 } from './format'
 
@@ -14,56 +15,20 @@ const api = window.cbackup
 /* ------------------------------------------------------------------ */
 
 /*
- * A snapshot as the list route reports it. The old shape had node counts,
- * byte totals and GFS flags per row; this one has what the daemon actually
- * sends, and every value is a string for the same reason the sizes are.
- */
-interface Snapshot {
-  id: string
-  ts: string
-  label?: string
-  files?: string
-  size?: string
-  gfs_flags?: string
-  materialized?: string
-}
-
-interface SnapList {
-  snapshots?: Snapshot[]
-}
-
-/*
  * The shapes the daemon returns, not the ones this screen was written
- * against.
- *
- * Every number arrives as a string: the daemon renders integers as text so a
- * 64-bit count cannot be mangled by a JSON number, and reading them as
- * numbers produced NaN throughout. The old shapes - pack/loose/skip/hiratio
- * buckets with comp and uncomp - belonged to the one-shot CLI and have no
- * successor, so the panels that needed them are gone rather than filled with
- * plausible arithmetic.
+ * against. The old shapes - pack/loose/skip/hiratio buckets with comp and
+ * uncomp - belonged to the one-shot CLI and have no successor, so the panels
+ * that needed them are gone rather than filled with plausible arithmetic.
  */
-interface TypeStat {
-  type: string
-  count: string
-  phys_size: string
-  orig_size: string
+interface SnapList {
+  snapshots?: WireSnapshot[]
 }
 
 interface RepoStats {
-  per_type: TypeStat[]
+  per_type: WireTypeStat[]
 }
 
-interface Summary {
-  snapshots: number
-  objects: number
-  phys_size: number
-  orig_size: number
-  packs: number
-  loose: number
-  tags: number
-  last_snapshot_ts: number
-}
+type Summary = WireSummary
 
 /* A backup from today is fine, from last week is not, and the gap between
  * says how worried to look. */
@@ -167,12 +132,12 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
    * nothing, which is worse than a panel that is absent.
    */
 
-  /* Compression totals, from the sizes the daemon reports as strings. */
+  /* Compression totals, from the per-type sizes. */
   const totalUncomp = repoStats
-    ? repoStats.per_type.reduce((a, t) => a + Number(t.orig_size ?? 0), 0)
+    ? repoStats.per_type.reduce((a, t) => a + t.orig_size, 0)
     : 0
   const totalComp = repoStats
-    ? repoStats.per_type.reduce((a, t) => a + Number(t.phys_size ?? 0), 0)
+    ? repoStats.per_type.reduce((a, t) => a + t.phys_size, 0)
     : 0
   const compressionRatio = totalUncomp > 0 ? totalComp / totalUncomp : 1
   const spaceSaved = totalUncomp - totalComp
@@ -202,7 +167,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
           label="Last Backup"
           value={latest ? relativeTime(latest.ts) : 'Never'}
           detail={latest ? absoluteTime(latest.ts) : undefined}
-          status={latest ? lastBackupStatus(Number(latest.ts)) : 'error'}
+          status={latest ? lastBackupStatus(latest.ts) : 'error'}
         />
         {/* The response has no "head" field and never had one, so this
           * line was always blank. The list comes back newest first, which
@@ -297,18 +262,18 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
          * there is no bucket breakdown to read, so the panel is the parts
          * that are real rather than the old layout with invented numbers.
          */
-        const num = (v: string | number | undefined) => Number(v ?? 0)
-        const packedCount = Math.max(0, num(summary.objects) - num(summary.loose))
-        const looseCount = num(summary.loose)
+        const packedCount = Math.max(0, summary.objects - summary.loose)
+        const looseCount = summary.loose
         const totalObjCount = packedCount + looseCount
-        const typeBytes = repoStats.per_type.reduce((a, t) => a + num(t.orig_size), 0)
-        const typeColors: Record<string, string> = {
-          '1': 'bg-blue-500', '2': 'bg-orange-500', '3': 'bg-green-500',
-          '4': 'bg-red-500', '5': 'bg-purple-500',
+        const typeBytes = repoStats.per_type.reduce((a, t) => a + t.orig_size, 0)
+        const typeColors: Record<number, string> = {
+          1: 'bg-blue-500', 2: 'bg-orange-500', 3: 'bg-green-500',
+          4: 'bg-red-500', 5: 'bg-purple-500',
         }
-        const typeNames: Record<string, string> = {
-          '1': 'File', '2': 'Symlink', '3': 'Xattr', '4': 'Sparse', '5': 'Tree',
-        }
+        /* The shared object type names. This screen kept its own list,
+         * keyed by strings, and it had 2 as "Symlink" and 3 as "Xattr":
+         * object type 2 is extended attributes and 3 an ACL. */
+        const typeNames = OBJECT_TYPE_NAMES
         const pct = (n: number, total: number) => total > 0 ? Math.round((n / total) * 100) : 0
 
         return (
@@ -318,15 +283,15 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
               <div className="text-xs text-text-secondary mb-2">Storage</div>
               <div className="flex items-baseline gap-2">
                 <span className="text-lg font-semibold text-text-primary">
-                  {fmtSize(num(summary.phys_size))}
+                  {fmtSize(summary.phys_size)}
                 </span>
                 <span className="text-xs text-text-muted">
-                  from {fmtSize(num(summary.orig_size))} of files
+                  from {fmtSize(summary.orig_size)} of files
                 </span>
               </div>
-              {num(summary.orig_size) > 0 && (
+              {summary.orig_size > 0 && (
                 <div className="text-xs text-text-muted mt-1">
-                  {pct(num(summary.orig_size) - num(summary.phys_size), num(summary.orig_size))}% saved
+                  {pct(summary.orig_size - summary.phys_size, summary.orig_size)}% saved
                   by compression and dedup
                 </div>
               )}
@@ -351,7 +316,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
                   <span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />
                   Loose {fmtNum(looseCount)}
                 </span>
-                <span className="ml-auto">{fmtNum(num(summary.packs))} pack files</span>
+                <span className="ml-auto">{fmtNum(summary.packs)} pack files</span>
               </div>
             </div>
           </div>
@@ -360,16 +325,16 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
             <div className="bg-surface-secondary rounded-lg p-3">
               <div className="text-xs text-text-secondary mb-2">By object type</div>
               <div className="h-2 rounded-full bg-surface-tertiary overflow-hidden flex mb-2">
-                {repoStats.per_type.filter(t => num(t.orig_size) > 0).map(t => (
+                {repoStats.per_type.filter(t => t.orig_size > 0).map(t => (
                   <div key={t.type} className={typeColors[t.type] ?? 'bg-surface-tertiary'}
-                    style={{ width: `${pct(num(t.orig_size), typeBytes)}%` }} />
+                    style={{ width: `${pct(t.orig_size, typeBytes)}%` }} />
                 ))}
               </div>
               <div className="flex flex-wrap gap-3 text-xs text-text-muted">
-                {repoStats.per_type.filter(t => num(t.count) > 0).map(t => (
+                {repoStats.per_type.filter(t => t.count > 0).map(t => (
                   <span key={t.type}>
                     <span className={`inline-block w-2 h-2 rounded-full mr-1 ${typeColors[t.type] ?? 'bg-surface-tertiary'}`} />
-                    {typeNames[t.type] ?? `Type ${t.type}`} {fmtNum(num(t.count))}
+                    {typeNames[t.type] ?? `Type ${t.type}`} {fmtNum(t.count)}
                   </span>
                 ))}
               </div>
@@ -412,14 +377,14 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
             <tbody>
               {recentSnaps.map(s => {
                 return (
-                  <tr key={s.id} onClick={() => onSelectSnapshot?.(Number(s.id))}
+                  <tr key={s.id} onClick={() => onSelectSnapshot?.(s.id)}
                     className={`text-text-primary border-t border-border-default ${onSelectSnapshot ? 'cursor-pointer hover:bg-surface-hover' : ''}`}>
                     <td className="py-1.5 font-mono">#{s.id}</td>
                     <td className="py-1.5">{absoluteTime(s.ts)}</td>
                     <td className="py-1.5 text-right pr-6">{fmtNum(s.files)}</td>
                     <td className="py-1.5">{s.label || ''}</td>
                     <td className="py-1.5 text-center">
-                      {gfsBadges(Number(s.gfs_flags ?? '0')).map(b => (
+                      {gfsBadges(s.gfs_flags ?? 0).map(b => (
                         <span key={b.label}
                           className={`inline-block px-1.5 py-0 rounded text-[10px] font-semibold ml-0.5 ${b.color}`}>
                           {b.label}

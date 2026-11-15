@@ -16,20 +16,9 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { absoluteTime, relativeTime } from './format'
+import type { WireJournalEntry } from '../shared/wire'
 
 const api = window.cbackup
-
-/* Every integer arrives as a string; duration_ms is empty when the daemon
- * recorded none, which is not the same as zero. */
-interface RawEntry {
-  id?: string
-  ts?: string
-  source?: string
-  operation?: string
-  result?: string
-  duration_ms?: string
-  message?: string
-}
 
 interface Entry {
   id: number
@@ -41,13 +30,15 @@ interface Entry {
   message: string
 }
 
-const parse = (r: RawEntry, i: number): Entry => ({
-  id: Number(r.id ?? i),
-  ts: Number(r.ts ?? '0'),
+/* duration_ms is null when the daemon recorded none, which is not the same
+ * as zero. */
+const parse = (r: Partial<WireJournalEntry>, i: number): Entry => ({
+  id: r.id ?? i,
+  ts: r.ts ?? 0,
   source: r.source ?? '',
   operation: r.operation ?? '',
   result: r.result ?? '',
-  durationMs: r.duration_ms ? Number(r.duration_ms) : null,
+  durationMs: r.duration_ms ?? null,
   message: r.message ?? '',
 })
 
@@ -97,7 +88,7 @@ export function JournalView({ connName, repoPath, onBack }: Props): React.ReactE
     setLoading(true)
     setError(null)
     try {
-      const r = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
+      const r = await api.apiCall<{ entries?: Partial<WireJournalEntry>[] }>(connName, {
         kind: 'journal', repoId, limit: PAGE,
         ...(result ? { result } : {}),
       })

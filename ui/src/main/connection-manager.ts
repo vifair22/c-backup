@@ -22,6 +22,7 @@ import { EventEmitter } from 'node:events'
 import { DaemonClient, DaemonUnreachableError, notConfiguredMessage } from './rpc-session.ts'
 import { toEndpoint } from './client.ts'
 import type { ApiRequest } from '../shared/api'
+import type { WireRepo } from '../shared/wire'
 import type {
   ConnectionConfig,
   ConnectionState,
@@ -282,14 +283,14 @@ export class ConnectionManager extends EventEmitter {
   }
 
   private async loadRepos(entry: Entry): Promise<RepoState[] | 'unauthorized'> {
-    const res = await this.requestVia<{ repos?: Array<Record<string, string>> }>(
+    const res = await this.requestVia<{ repos?: WireRepo[] }>(
       entry, { kind: 'repoList' })
     if (res.status === 401) return 'unauthorized'
     if (res.status !== 200) throw new Error(`cannot list repos (HTTP ${res.status})`)
     return (res.body?.repos ?? []).map((r) => ({
-      id: Number(r.id),
+      id: r.id,
       path: r.path,
-      label: r.label,
+      label: r.label ?? undefined,
       uuid: r.uuid,
     }))
   }

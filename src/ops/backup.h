@@ -22,14 +22,23 @@ typedef struct {
     int          n_exclude;
     int          one_filesystem;
     const char  *label;
+    /* A file_cache_match_t: how strictly an unchanged file is recognised.
+     * Zero is auto, which is right everywhere it can tell. */
+    int          file_cache_match;
 
     /* Cooperative cancellation. The job manager sets this; the pipeline
-     * checks it between entries so a cancelled backup stops within one file
-     * rather than at the end of the run. */
+     * checks it between entries, and backup_run lends it to the store for
+     * the run so the object writers check it between chunks of one file.
+     * A cancel lands within one read, not at the end of a large file. */
     volatile int *cancel;
 
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
     void  *progress_ctx;
+    /* Optional: bytes of regular-file content handled so far, and expected
+     * in total, called alongside progress_cb with the same context. Entry
+     * counts crawl through large files and say little about how far a
+     * backup has to go; bytes do. */
+    void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
 } backup_opts_t;
 
 typedef struct {
@@ -44,6 +53,9 @@ typedef struct {
     uint64_t files_unchanged;
     uint64_t trees_new;
     uint64_t trees_reused;
+    /* Bytes this run added to the repository for new file content, before
+     * packing compresses them. Everything else was already there. */
+    uint64_t bytes_stored;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,

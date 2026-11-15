@@ -44,9 +44,13 @@ RUN if [ "$VARIANT" = asan ]; then \
 
 FROM debian:trixie-slim
 
+# tzdata because calendar schedules fire in local time, and without the zone
+# database TZ=America/Chicago silently means UTC: "--at 03:00" fired at 03:00
+# UTC, 21:00 the previous evening on the host. The container still defaults
+# to UTC; run it with -e TZ=<zone> to change that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 liblz4-1 libacl1 libsqlite3-0 \
-        libmicrohttpd12 libcurl4 \
+        libmicrohttpd12 libcurl4 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/build/bins/c-backupd /usr/local/bin/c-backupd
@@ -65,9 +69,18 @@ RUN sed -i 's/^  bind: 127.0.0.1$/  bind: 0.0.0.0/' /etc/c-backupd/config.yaml \
 
 # The socket directory has to exist before the daemon binds. systemd creates
 # it outside a container; here it is the image's job.
-RUN mkdir -p /run/c-backupd /var/lib/c-backupd && chmod 0700 /var/lib/c-backupd
+RUN mkdir -p /run/c-backupd /var/lib/c-backupd/keys \
+    && chmod 0700 /var/lib/c-backupd /var/lib/c-backupd/keys
 
 ENV C_BACKUP_CONFIG_PATH=/etc/c-backupd/config.yaml
+# Repository keys live on the state volume, not at the systemd default of
+# /etc/c-backupd/keys. That path is in the image's own filesystem, so
+# replacing the container - an image upgrade, a recreate - threw away every
+# key, and every encrypted repository behind it stopped backing up and
+# restoring. An environment variable rather than a line in config.yaml
+# because the environment wins over the file: an operator who mounts their
+# own config.yaml without a security section still keeps keys on the volume.
+ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys
 # Read only by an asan build; harmless otherwise. Leak checks run at exit,
 # which a SIGTERM stop now reaches through the daemon's own shutdown.
 ENV ASAN_OPTIONS=detect_leaks=1:print_summary=1

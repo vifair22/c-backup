@@ -8,6 +8,7 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "json_row.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -31,21 +32,6 @@ static cutils_db_t *g_db;
 #define PAGE_DEFAULT 500
 #define PAGE_MAX     5000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
 
 static api_response_t finalise(cutils_json_resp_t *resp)
 {
@@ -173,10 +159,11 @@ api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "per_type", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "type",      r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "count",     r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "phys_size", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "orig_size", r->rows[i][3]) != 0;
+        static const jcol_t cols[] = {
+            { "type", 0, JCOL_INT }, { "count", 1, JCOL_INT },
+            { "phys_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -221,7 +208,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
             " (SELECT COUNT(*) FROM packs      WHERE repo_id = ?),"
             " o.loose,"
             " (SELECT COUNT(*) FROM tags       WHERE repo_id = ?),"
-            " (SELECT COALESCE(MAX(ts),0) FROM snapshots WHERE repo_id = ?)"
+            " (SELECT MAX(ts) FROM snapshots WHERE repo_id = ?)"
             "  FROM o",
             (const char *[]){ repo, repo, repo, repo, repo, NULL },
             &r) != 0 || !r || r->nrows != 1) {
@@ -229,18 +216,39 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot read repository summary");
     }
 
-    char *body = NULL;
-    int n = asprintf(&body,
-        "{\"snapshots\":%s,\"objects\":%s,\"phys_size\":%s,\"orig_size\":%s,"
-        "\"packs\":%s,\"loose\":%s,\"tags\":%s,\"last_snapshot_ts\":%s}",
-        r->rows[0][0], r->rows[0][1], r->rows[0][2], r->rows[0][3],
-        r->rows[0][4], r->rows[0][5], r->rows[0][6], r->rows[0][7]);
+    /* last_snapshot_ts is MAX() over no rows for an empty repository, which
+     * reads back as "" and is served as null: there is no last snapshot. */
+    static const jcol_t cols[] = {
+        { "snapshots", 0, JCOL_INT }, { "objects", 1, JCOL_INT },
+        { "phys_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
+        { "packs", 4, JCOL_INT }, { "loose", 5, JCOL_INT },
+        { "tags", 6, JCOL_INT }, { "last_snapshot_ts", 7, JCOL_INT },
+    };
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    int bad = json_resp_new(&resp) != 0
+           || jrow_resp_add_row(resp, cols, JROW_N(cols), r->rows[0]) != 0;
     db_result_free(r);
-    if (n < 0) return api_error(500, "out of memory");
-    return api_ok(body);
+    if (bad) return api_error(500, "out of memory");
+    return finalise(resp);
 }
 
 /* ---------- objects ---------- */
+
+/*
+ * Where an object is, as a client sees it: "loose", "staged" or "packed",
+ * with the pack's number in pack_id (null otherwise).
+ *
+ * The column holds the pack number itself for a packed object, so serving
+ * it as it is made location a string that was sometimes a word and
+ * sometimes a number ("location":"3"), and a client that wanted the pack
+ * had to know to parse it.
+ */
+#define OBJ_LOCATION_EXPR \
+    "CASE WHEN location IN ('loose', 'staged') THEN location ELSE 'packed' END"
+#define OBJ_LOCATION_COLS \
+    OBJ_LOCATION_EXPR "," \
+    " CASE WHEN location IN ('loose', 'staged') THEN NULL" \
+    "      ELSE CAST(location AS INTEGER) END"
 
 /*
  * Paginated object listing. `?location=loose` or `?location=pack` narrows it.
@@ -252,17 +260,26 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
 {
     const char *loc = api_query_param(req, "location");
+    /* Anything else used to fall through to the unfiltered listing, so
+     * `--location nowhere` answered with every object: a filter that
+     * silently filtered nothing. */
+    if (loc && strcmp(loc, "loose") != 0 && strcmp(loc, "pack") != 0 &&
+        strcmp(loc, "packed") != 0 && strcmp(loc, "all") != 0)
+        return api_error(400, "location must be loose, pack (or packed), or all");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     int rc;
     if (loc && strcmp(loc, "loose") == 0) {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
-            "       location FROM objects"
+            "       " OBJ_LOCATION_COLS " FROM objects"
             " WHERE repo_id = ? AND location = 'loose'"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
@@ -273,14 +290,14 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     } else if (loc && (strcmp(loc, "pack") == 0 || strcmp(loc, "packed") == 0)) {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
-            "       location FROM objects"
+            "       " OBJ_LOCATION_COLS " FROM objects"
             " WHERE repo_id = ? AND location NOT IN ('loose', 'staged')"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
-            "       location FROM objects WHERE repo_id = ?"
+            "       " OBJ_LOCATION_COLS " FROM objects WHERE repo_id = ?"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     }
@@ -305,12 +322,13 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "objects", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "hash",      r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "type",      r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "refcount",  r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "phys_size", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "orig_size", r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "location",  r->rows[i][5]) != 0;
+        static const jcol_t cols[] = {
+            { "hash", 0, JCOL_STR }, { "type", 1, JCOL_INT },
+            { "refcount", 2, JCOL_INT }, { "phys_size", 3, JCOL_INT },
+            { "orig_size", 4, JCOL_INT }, { "location", 5, JCOL_STR },
+            { "pack_id", 6, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -331,8 +349,7 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT o.type, o.refcount, COALESCE(o.phys_size,0), COALESCE(o.orig_size,0),"
-            "       o.location, COALESCE(po.pack_id,-1), COALESCE(po.offset,-1),"
-            "       COALESCE(po.entry_index,-1)"
+            "       " OBJ_LOCATION_EXPR ", po.pack_id, po.offset, po.entry_index"
             "  FROM objects o"
             "  LEFT JOIN pack_objects po"
             "    ON po.repo_id = o.repo_id AND po.hash = o.hash"
@@ -342,16 +359,21 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
         return api_error(404, "no such object");
     }
 
-    char *body = NULL;
-    int n = asprintf(&body,
-        "{\"found\":true,\"type\":%s,\"refcount\":%s,\"phys_size\":%s,"
-        "\"orig_size\":%s,\"location\":\"%s\",\"pack_id\":%s,\"offset\":%s,"
-        "\"entry_index\":%s}",
-        r->rows[0][0], r->rows[0][1], r->rows[0][2], r->rows[0][3],
-        r->rows[0][4], r->rows[0][5], r->rows[0][6], r->rows[0][7]);
+    /* The pack fields are null for an object that is not in a pack. They
+     * were -1, a sentinel every client had to know was not an offset. */
+    static const jcol_t cols[] = {
+        { "type", 0, JCOL_INT }, { "refcount", 1, JCOL_INT },
+        { "phys_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
+        { "location", 4, JCOL_STR }, { "pack_id", 5, JCOL_INT },
+        { "offset", 6, JCOL_INT }, { "entry_index", 7, JCOL_INT },
+    };
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    int bad = json_resp_new(&resp) != 0
+           || json_resp_add_bool(resp, "found", true) != 0
+           || jrow_resp_add_row(resp, cols, JROW_N(cols), r->rows[0]) != 0;
     db_result_free(r);
-    if (n < 0) return api_error(500, "out of memory");
-    return api_ok(body);
+    if (bad) return api_error(500, "out of memory");
+    return finalise(resp);
 }
 
 /*
@@ -365,16 +387,41 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
 {
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
     char repo[32], lim[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
 
+    /*
+     * The full path of each referencing node, climbed in SQL one primary-key
+     * lookup per level. A bare name ("config.yaml") does not say which of
+     * the many files of that name holds the object, which was the question.
+     * A chain that breaks before the root (a partly faulted-in snapshot)
+     * leaves the path empty rather than dropping the reference.
+     */
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT snap_id, id, name FROM nodes"
-            " WHERE repo_id = ? AND content_hash = ?"
-            " ORDER BY snap_id, id LIMIT ?",
-            (const char *[]){ repo, hex, lim, NULL }, &r) != 0) {
+            "WITH RECURSIVE"
+            " refs(snap_id, nid) AS ("
+            "   SELECT snap_id, id FROM nodes"
+            "    WHERE repo_id = ? AND content_hash = ?"
+            "    ORDER BY snap_id, id LIMIT ?),"
+            " up(nid, parent, path, depth) AS ("
+            "   SELECT n.id, n.parent_node_id, n.name, 0"
+            "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   UNION ALL"
+            "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
+            "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
+            "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
+            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, '')"
+            "   FROM refs"
+            "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   LEFT JOIN up ON up.nid = refs.nid"
+            "             AND (up.parent IS NULL OR up.parent = 0)"
+            "  ORDER BY refs.snap_id, refs.nid",
+            (const char *[]){ repo, hex, lim, repo, repo, repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");
     }
@@ -395,9 +442,11 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "refs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "snap_id", r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "node_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0;
+        static const jcol_t cols[] = {
+            { "snap_id", 0, JCOL_INT }, { "node_id", 1, JCOL_INT },
+            { "name", 2, JCOL_STR }, { "path", 3, JCOL_STR },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -544,7 +593,7 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT p.id, p.filename, COALESCE(p.size,0), COALESCE(p.sealed_at,0),"
+            "SELECT p.id, p.filename, COALESCE(p.size,0), p.sealed_at,"
             "       p.version, (SELECT COUNT(*) FROM pack_objects po"
             "                    WHERE po.repo_id = p.repo_id AND po.pack_id = p.id)"
             "  FROM packs p WHERE p.repo_id = ? ORDER BY p.id",
@@ -569,12 +618,13 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "packs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",       r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "filename", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "size",     r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "sealed_at",r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "version",  r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "entries",  r->rows[i][5]) != 0;
+        /* sealed_at is null for a pack that has no seal time recorded. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "filename", 1, JCOL_STR },
+            { "size", 2, JCOL_INT }, { "sealed_at", 3, JCOL_INT },
+            { "version", 4, JCOL_INT }, { "entries", 5, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -585,13 +635,24 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id,
                                        int64_t pack_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], pid[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(pid,  sizeof(pid),  "%lld", (long long)pack_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
+    /* A pack that is not there is a 404, not an empty pack. */
     db_result_t *r = NULL;
+    int found = db_execute(g_db, "SELECT 1 FROM packs WHERE repo_id = ? AND id = ?",
+                           (const char *[]){ repo, pid, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    if (!found) return api_error(404, "no such pack");
+
+    r = NULL;
     if (db_execute(g_db,
             "SELECT hash, offset, comp_size, orig_size, entry_index"
             "  FROM pack_objects WHERE repo_id = ? AND pack_id = ?"
@@ -617,11 +678,12 @@ api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "hash",        r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "offset",      r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "comp_size",   r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "orig_size",   r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "entry_index", r->rows[i][4]) != 0;
+        static const jcol_t cols[] = {
+            { "hash", 0, JCOL_STR }, { "offset", 1, JCOL_INT },
+            { "comp_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
+            { "entry_index", 4, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -669,8 +731,8 @@ api_response_t introspect_fanout(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "buckets", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "prefix", r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "count",  r->rows[i][1]) != 0;
+        int bad = jrow_elem_add(&e, "prefix", JCOL_STR, r->rows[i][0]) != 0
+               || jrow_elem_add(&e, "count",  JCOL_INT, r->rows[i][1]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -730,25 +792,23 @@ static void diff_emit(diff_ctx_t *ctx, const char *change, const char *path,
 
     cutils_json_elem_t e;
     if (json_resp_array_append_begin(ctx->resp, "changes", &e) != 0) return;
-    char osz[32], nsz[32];
     char ohex[OBJECT_HASH_SIZE * 2 + 1] = { 0 };
     char nhex[OBJECT_HASH_SIZE * 2 + 1] = { 0 };
-    snprintf(osz, sizeof(osz), "%llu", (unsigned long long)old_size);
-    snprintf(nsz, sizeof(nsz), "%llu", (unsigned long long)new_size);
     if (old_hash) for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
         snprintf(ohex + i * 2, 3, "%02x", old_hash[i]);
     if (new_hash) for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
         snprintf(nhex + i * 2, 3, "%02x", new_hash[i]);
 
+    /* The side that does not exist has a size of 0 and a null hash. */
     int bad = json_elem_add_str(&e, "change", change) != 0
            || json_elem_add_str(&e, "path", path) != 0
            /* Kept as the resulting size, which is what it always meant, so
             * an existing reader is unaffected. */
-           || json_elem_add_str(&e, "size", new_hash ? nsz : osz) != 0
-           || json_elem_add_str(&e, "old_size", osz) != 0
-           || json_elem_add_str(&e, "new_size", nsz) != 0
-           || json_elem_add_str(&e, "old_hash", ohex) != 0
-           || json_elem_add_str(&e, "new_hash", nhex) != 0;
+           || json_elem_add_u64(&e, "size", new_hash ? new_size : old_size) != 0
+           || json_elem_add_u64(&e, "old_size", old_size) != 0
+           || json_elem_add_u64(&e, "new_size", new_size) != 0
+           || jrow_elem_add(&e, "old_hash", JCOL_STR_NULL, ohex) != 0
+           || jrow_elem_add(&e, "new_hash", JCOL_STR_NULL, nhex) != 0;
     if (bad) return;
     json_elem_commit(&e);
 }
@@ -895,14 +955,10 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     diff_walk(&ctx, hfrom, hto, "", 0);
     close_bound_store(store, idx);
 
-    char n[32];
-    snprintf(n, sizeof(n), "%u", ctx.added);
-    if (json_resp_add_str(resp, "added", n) != 0) return api_error(500, "out of memory");
-    snprintf(n, sizeof(n), "%u", ctx.removed);
-    if (json_resp_add_str(resp, "removed", n) != 0) return api_error(500, "out of memory");
-    snprintf(n, sizeof(n), "%u", ctx.modified);
-    if (json_resp_add_str(resp, "modified", n) != 0) return api_error(500, "out of memory");
-    if (json_resp_add_str(resp, "truncated", ctx.truncated ? "true" : "false") != 0)
+    if (json_resp_add_u32(resp, "added", ctx.added) != 0 ||
+        json_resp_add_u32(resp, "removed", ctx.removed) != 0 ||
+        json_resp_add_u32(resp, "modified", ctx.modified) != 0 ||
+        json_resp_add_bool(resp, "truncated", ctx.truncated != 0) != 0)
         return api_error(500, "out of memory");
 
     return finalise(resp);

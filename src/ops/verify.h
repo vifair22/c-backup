@@ -37,16 +37,20 @@ typedef enum {
 typedef struct {
     uint64_t checked;
     uint64_t ok;
-    /* Damaged on disk and corrected from parity. With repair enabled the
-     * correction was written back; without it, the object was readable but
-     * the disk copy is still wrong. */
+    /* Damaged on disk, corrected from parity, and the correction written
+     * back. Only a repairing run can count anything here. */
     uint64_t repaired;
+    /* Damaged on disk and readable only through parity, with the disk copy
+     * still wrong: repair was off, or the write-back failed. Not loss yet,
+     * but one more bad byte away from it. */
+    uint64_t recoverable;
     /* Damaged beyond what parity can reconstruct. These are data loss. */
     uint64_t unrecoverable;
     /* Registered but absent: no loose file, no pack entry. */
     uint64_t missing;
     uint64_t bytes_read;
-    /* Blast radius of everything unrecoverable or missing. */
+    /* Blast radius of everything unrecoverable or missing: distinct file
+     * paths, and distinct snapshots holding any of them. */
     uint64_t affected_files;
     uint64_t affected_snapshots;
     int64_t  run_id;
@@ -55,6 +59,10 @@ typedef struct {
 /*
  * repair writes corrections back to disk. The caller must hold the repo
  * write lock when it does, and may hold only the read lock when it does not.
+ *
+ * Returns ERR_CORRUPT when the walk finished but found unrecoverable or
+ * missing objects. The run record and findings are written first, and *out
+ * is filled, exactly as for a clean run.
  */
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     verify_level_t level, int repair, volatile int *cancel,

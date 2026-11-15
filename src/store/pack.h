@@ -246,6 +246,20 @@ status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted);
 
+/* Packs pack_gc_stats touched: rewritten without their dead entries, and
+ * deleted outright because every entry was dead. Coalescing is not counted. */
+typedef struct {
+    uint32_t packs_rewritten;
+    uint32_t packs_deleted;
+} pack_gc_stats_t;
+
+/* pack_gc, also reporting which packs it rewrote or deleted. stats may be
+ * NULL, which is what pack_gc passes. */
+status_t pack_gc_stats(store_t *store,
+                       const uint8_t *refs, size_t refs_cnt,
+                       uint32_t *out_kept, uint32_t *out_deleted,
+                       pack_gc_stats_t *stats);
+
 /* ------------------------------------------------------------------ */
 /* On-disk pack structures (shared between pack.c and json_api.c)      */
 /* ------------------------------------------------------------------ */
@@ -272,6 +286,8 @@ typedef struct {
     uint64_t uncompressed_size;        /*  8 */
     uint64_t compressed_size;          /*  8 */
 } __attribute__((packed)) pack_dat_entry_hdr_t;  /* 51 bytes */
+/* On-disk format; /layout reports it as header_size for a packed object. */
+_Static_assert(sizeof(pack_dat_entry_hdr_t) == 51, "pack entry header is 51 bytes on disk");
 
 /* Pack index file header (12 bytes) */
 typedef struct {

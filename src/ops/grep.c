@@ -44,11 +44,18 @@ typedef struct {
     /* Checked while reading a file, not only between files. */
     volatile int *cancel;
 
+    /* Effective limits: the options with their defaults applied. */
+    uint32_t     per_file_cap;
+    uint64_t     total_cap;
+    int          stop_all;     /* total_cap reached: end the search */
+
     /* Per-file state, reset for each object. */
     uint64_t     line_no;
     uint32_t     file_hits;
     int          is_binary;
     int          binary_decided;
+    int          file_done;    /* nothing more worth reading in this file */
+    int          file_capped;  /* file_done because of per_file_cap */
 } grep_ctx_t;
 
 /*
@@ -216,16 +223,32 @@ static int line_matches(const regex_t *re, char *s, size_t len)
     return 0;
 }
 
+/*
+ * Record one hit and decide whether the file, or the search, is finished.
+ *
+ * Hits used to be counted without limit and only the recording capped, so a
+ * 10 MiB binary produced 40,776 "(binary file)" hits and a 20 MiB log
+ * 806,597, every one of them read and matched to no purpose. Now a binary
+ * file gives one hit and stops being read, as grep(1) says "binary file
+ * matches" once; a text file stops at the per-file cap; and the search
+ * stops at the total cap, reporting itself truncated.
+ */
 static void record_hit(grep_ctx_t *g, const char *node_id, const char *path,
                        uint64_t line_no, const char *line, size_t len)
 {
+    if (g->file_done || g->stop_all) return;
     g->res->hits++;
     g->file_hits++;
-    if (g->file_hits > g->opts->max_hits_per_file) return;
 
     char excerpt[GREP_EXCERPT_MAX + 1];
-    if (g->is_binary) snprintf(excerpt, sizeof(excerpt), "(binary file)");
-    else excerpt_of(line, len, excerpt, sizeof(excerpt));
+    if (g->is_binary) {
+        snprintf(excerpt, sizeof(excerpt), "(binary file matches)");
+        g->file_done = 1;
+    } else {
+        excerpt_of(line, len, excerpt, sizeof(excerpt));
+        if (g->file_hits >= g->per_file_cap) { g->file_done = 1; g->file_capped = 1; }
+    }
+    if (g->res->hits >= g->total_cap) { g->stop_all = 1; g->file_done = 1; }
 
     char repo[32], run[32], ln[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)g->repo_id);
@@ -260,7 +283,7 @@ static void scan_buffer(grep_ctx_t *g, const char *node_id, const char *path,
     }
 
     size_t i = 0;
-    while (i < len) {
+    while (i < len && !g->file_done) {
         const char *nl = memchr(buf + i, '\n', len - i);
         size_t seg = nl ? (size_t)(nl - (buf + i)) : len - i;
 
@@ -316,6 +339,8 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     g->file_hits = 0;
     g->is_binary = 0;
     g->binary_decided = 0;
+    g->file_done = 0;
+    g->file_capped = 0;
 
     char *carry = malloc(GREP_LINE_MAX + 1);
     if (!carry) return 0;
@@ -359,6 +384,7 @@ static int scan_object(grep_ctx_t *g, store_t *store,
                  * is indistinguishable from cancel being broken.
                  */
                 if (g->cancel && *g->cancel) break;
+                if (g->file_done) break;   /* closing the pipe stops the writer */
                 ssize_t n = read(pfd[0], buf, 256 * 1024);
                 if (n <= 0) break;
                 scan_buffer(g, node_id, path, buf, (size_t)n, carry, &carry_len);
@@ -504,7 +530,20 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "grep: cannot list snapshot content");
     }
 
-    grep_ctx_t g = { db, repo_id, res.run_id, &re, opts, &res, cancel, 0, 0, 0, 0 };
+    grep_ctx_t g;
+    memset(&g, 0, sizeof(g));
+    g.db = db;
+    g.repo_id = repo_id;
+    g.run_id = res.run_id;
+    g.re = &re;
+    g.opts = opts;
+    g.res = &res;
+    g.cancel = cancel;
+    /* 0 is the default, never "unlimited": unlimited is exactly how one
+     * log file turned into 806,597 rows. */
+    g.per_file_cap = opts->max_hits_per_file ? opts->max_hits_per_file
+                                             : GREP_DEFAULT_HITS_PER_FILE;
+    g.total_cap = opts->max_hits ? opts->max_hits : GREP_DEFAULT_MAX_HITS;
     status_t st = OK;
     uint64_t total = (uint64_t)objs->nrows;
 
@@ -540,6 +579,11 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.files_scanned++;
         if (scan_object(&g, store, hash, size, node_id, rel))
             res.files_matched++;
+        if (g.file_capped) res.files_capped++;
+        if (g.stop_all) {
+            res.truncated = 1;
+            break;
+        }
     }
 
     db_result_free(objs);
@@ -563,6 +607,9 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                               run, NULL }, NULL) != 0)
         log_warn("grep: cannot close run record %s", run);
 
+    /* Filled on a cancel too: the run record exists and is closed, and a
+     * caller needs its id to show what was found before it stopped. */
+    if (out) *out = res;
     if (st != OK) return st;
 
     log_info("grep: %llu file(s) scanned, %llu matched, %llu hit(s), %llu bytes%s",
@@ -570,7 +617,9 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
              (unsigned long long)res.files_matched,
              (unsigned long long)res.hits,
              (unsigned long long)res.bytes_scanned,
-             res.truncated ? " (stopped at the file limit)" : "");
+             !res.truncated ? ""
+             : g.stop_all   ? " (stopped at the hit limit)"
+                            : " (stopped at the file limit)");
 
     if (out) *out = res;
     return OK;

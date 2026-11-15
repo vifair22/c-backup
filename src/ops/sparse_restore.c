@@ -36,8 +36,10 @@
  *
  * The rules, and why each one:
  *   - the magic must match, or this is not a region table at all
- *   - a zero region count means a sparse object with no data, which the
- *     writer never produces
+ *   - a zero region count is allowed: it is an all-hole file, which the
+ *     writer stores as a header and an empty table, and a restore turns it
+ *     into nothing but an ftruncate. It cannot write anywhere, so there is
+ *     nothing to bound
  *   - region_count is bounded by what the table could physically describe,
  *     so a corrupt count cannot ask for a multi-gigabyte allocation
  *   - regions ascend and do not overlap, so the file is written once
@@ -54,8 +56,6 @@ status_t sparse_header_check(const sparse_hdr_t *h, uint64_t file_size)
     if (!h) return set_error(ERR_INVALID, "sparse: null header");
     if (h->magic != SPARSE_MAGIC)
         return set_error(ERR_CORRUPT, "sparse: bad magic");
-    if (h->region_count == 0)
-        return set_error(ERR_CORRUPT, "sparse: no regions");
     if (h->region_count > SPARSE_MAX_REGIONS)
         return set_error(ERR_CORRUPT, "sparse: %u regions is not plausible",
                          h->region_count);
@@ -98,12 +98,17 @@ struct sparse_stream_arg {
     const uint8_t *hash;
     int pipe_wfd;
     status_t rc;
+    /* The error buffer is thread-local, so the reason the load failed dies
+     * with this thread unless it is carried back by hand. */
+    char msg[ERR_MSG_MAX];
 };
 
 static void *sparse_stream_worker(void *a) {
     struct sparse_stream_arg *arg = a;
     uint64_t sz = 0; uint8_t type = 0;
+    err_clear();
     arg->rc = object_load_stream(arg->store, arg->hash, arg->pipe_wfd, &sz, &type);
+    if (arg->rc != OK) snprintf(arg->msg, sizeof(arg->msg), "%s", err_msg());
     close(arg->pipe_wfd);
     return NULL;
 }
@@ -146,7 +151,8 @@ status_t restore_sparse_streaming(store_t *store,
     if (st != OK) goto done;
 
     size_t rt_sz = (size_t)shdr.region_count * sizeof(sparse_region_t);
-    rgns = malloc(rt_sz);
+    /* An all-hole file has an empty table, and malloc(0) may return NULL. */
+    rgns = malloc(rt_sz ? rt_sz : 1);
     if (!rgns) { st = set_error(ERR_NOMEM, "restore sparse: regions"); goto done; }
     if (read_pipe_full(pfd[0], rgns, rt_sz) != OK) {
         st = set_error(ERR_CORRUPT, "restore sparse: short regions for %s", full);
@@ -187,6 +193,11 @@ done:
     while (read(pfd[0], drain, sizeof(drain)) > 0) {}
     close(pfd[0]);
     pthread_join(tid, NULL);
-    if (st == OK && arg.rc != OK) st = arg.rc;
+    /* The loader's failure explains any short read above better than the
+     * short read does, so it wins whenever there is one. */
+    if (arg.rc != OK && arg.msg[0])
+        st = set_error(arg.rc, "%s", arg.msg);
+    else if (st == OK && arg.rc != OK)
+        st = arg.rc;
     return st;
 }

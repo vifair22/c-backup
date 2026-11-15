@@ -12,6 +12,17 @@ set -u
 DAEMON="${1:-build/bins/c-backupd}"
 CLI="${2:-build/bins/c-backup}"
 WORK="$(mktemp -d /tmp/c_backup_cli_e2e.XXXXXX)"
+# Ports per run, so concurrent suites (CI jobs on one runner, parallel
+# worktrees) never reach each other's daemons.
+PORTBASE=$((20000 + ($$ % 15000) * 3))
+# Skip past ports something already holds: the base is derived from the pid,
+# and anything bound there (a listener, or an outgoing connection that drew
+# it from the ephemeral range) made the daemon exit with "cannot start API
+# server" about once in a few dozen runs.
+port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
+while port_busy "$PORTBASE" || port_busy $((PORTBASE + 1)) || port_busy $((PORTBASE + 2)); do
+    PORTBASE=$((PORTBASE + 3)); [ "$PORTBASE" -gt 64990 ] && PORTBASE=20000
+done
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
@@ -32,13 +43,40 @@ check()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
 contains() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "contains '$2'" "$3" ;; esac; }
 
 cb() { "$CLI" --socket "$SOCK" "$@"; }
+# Does FILE contain the first 32 bytes of SAMPLE, verbatim? Compared as hex
+# with a fixed-string search: the bytes are random, and handed to grep as a
+# pattern they were a random regular expression - metacharacters, or a
+# newline that split it into several patterns, one of which could be empty
+# and match anything. That made the plaintext checks fail at random.
+contains_bytes() {  # contains_bytes <sample> <file>
+    [ -f "$1" ] && [ -f "$2" ] || return 1
+    local pat; pat=$(head -c 32 "$1" | od -An -tx1 -v | tr -d ' \n')
+    od -An -tx1 -v "$2" | tr -d ' \n' | grep -qF "$pat"
+}
 
 echo "no daemon"
 # The most important case: a clear message, a non-zero exit, and no hang.
 OUT=$("$CLI" --socket "$WORK/absent.sock" repo list 2>&1); RC=$?
 check    "exits non-zero without a daemon" 1 "$RC"
 contains "explains the daemon is not running" "daemon not running" "$OUT"
-contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+# B080: the advice fits where the CLI runs. It said systemctl inside the
+# Docker image, which has no systemd. CI itself may be a container, so the
+# expectation follows the same signals the CLI reads.
+if [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
+    contains "suggests how to start it" "start that container" "$OUT"
+elif [ -d /run/systemd/system ]; then
+    contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+else
+    contains "suggests how to start it" "Start c-backupd." "$OUT"
+fi
+contains "names the socket options" "--socket PATH" "$OUT"
+contains "and the variable" "C_BACKUP_SOCKET" "$OUT"
+OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" repo list 2>&1)
+contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
+case "$OUT" in
+    *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
+    *)           ok  "and not systemctl" ;;
+esac
 
 echo "offline commands"
 contains "version" "c-backup" "$("$CLI" --version)"
@@ -59,7 +97,7 @@ db:
   path: $WORK/state.db
 http:
   socket: $SOCK
-  port: 18801
+  port: $PORTBASE
   bind: 127.0.0.1
 log:
   level: warn
@@ -75,6 +113,14 @@ if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; e
 echo "with daemon"
 contains "health" "ready" "$(cb health)"
 contains "repo add" '"id":1' "$(cb repo add "$WORK/repo" main)"
+check "an unknown repo id is an error" 1 "$(cb summary 99 >/dev/null 2>&1; echo $?)"
+# Errors go to stderr, so stdout piped to a JSON reader never holds one.
+check "an error body stays off stdout" "" "$(cb summary 99 2>/dev/null)"
+contains "and is on stderr" '"error"' "$(cb summary 99 2>&1 >/dev/null)"
+# --help after a command answers locally, before any validation or request.
+contains "command --help shows its usage" "usage: c-backup repo" "$(cb repo add --help)"
+check    "command --help exits 0" 0 "$(cb backup --help >/dev/null; echo $?)"
+contains "help <command>" "usage: c-backup restore" "$(cb help restore)"
 contains "repo list" '"path"' "$(cb repo list)"
 contains "repo show" '"uuid"' "$(cb repo show 1)"
 
@@ -83,13 +129,34 @@ contains "repo show" '"uuid"' "$(cb repo show 1)"
 # daemon having accepted the request.
 contains "backup waits and completes" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "jobs list"     '"action"'            "$(cb jobs)"
-contains "snapshots"     '"id":"1"'            "$(cb snapshots 1)"
+contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
+# B074: these were silently replaced by the defaults.
+OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
+check    "snapshots --limit -1 fails" 1 "$RC"
+contains "and says why" "limit must be a whole number" "$OUT"
+OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
+check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
 check    "tag remove" 0           "$(cb tag remove 1 keeper > /dev/null; echo $?)"
+
+# B038: removing a tag that is not there exited 0 with no output.
+OUT=$(cb tag remove 1 keeper 2>&1); RC=$?
+check    "tag remove of a missing tag fails" 1 "$RC"
+contains "and says so" 'no such tag' "$OUT"
+# B037: a nonexistent snapshot, or no name at all, was accepted.
+check "tag set on a missing snapshot fails" 1 "$(cb tag set 1 ghost 999 > /dev/null 2>&1; echo $?)"
+check "note on a missing snapshot fails" 1 "$(cb snapshot note 1 999 x > /dev/null 2>&1; echo $?)"
+check "tag set with an empty name fails" 1 "$(cb tag set 1 '' 1 > /dev/null 2>&1; echo $?)"
+# B036: the name went into the path unencoded, so "a b" made a request line
+# the server answered with an HTML page and a 301. Encoded, the daemon sees
+# the name and answers in JSON. And a name like that cannot be set now.
+contains "tag remove encodes the name" '{"error":"no such tag"}' "$(cb tag remove 1 'a b' 2>&1)"
+contains "a name that is not a path segment is refused" 'invalid tag name' \
+    "$(cb tag set 1 'a/b' 1 2>&1)"
 
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
@@ -98,6 +165,11 @@ check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
 contains "reindex" '"state":"completed"' "$(cb reindex 1)"
 contains "gfs"     '"state":"completed"' "$(cb gfs 1)"
+# B035: a dry run printed the job record and nothing about what it would
+# remove. One snapshot, so the answer is nothing, but it is an answer.
+GFS_OUT=$(cb gfs 1 --dry-run)
+contains "gfs dry run says what it would remove" '"would_remove":[],"count":0' "$GFS_OUT"
+contains "and the retention it used" '"retention":{"keep_snaps":' "$GFS_OUT"
 contains "journal" 'entries'  "$(cb journal 1)"
 
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
@@ -120,6 +192,10 @@ contains "objects filtered by location" '"objects"' "$(cb objects 1 --location p
 contains "empty location filter keeps its key" '"objects"' \
     "$(cb objects 1 --location loose --limit 5)"
 contains "packs"    '"'          "$(cb packs 1)"
+# B075: these printed an empty listing and exited 0 for ids that do not exist.
+check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1; echo $?)"
+check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
+check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
 contains "fanout"   '"'          "$(cb fanout 1)"
 contains "metrics"  'cbackup_'   "$(cb metrics)"
 contains "health live" 'ok'      "$(cb health live)"
@@ -138,6 +214,11 @@ fi
 
 contains "policy set"  '"ok"'         "$(cb policy set 1 retention.keep_daily 14)"
 contains "policy list" 'keep_daily'   "$(cb policy list 1)"
+# B034: any key and any value were stored.
+OUT=$(cb policy set 1 retention.keep_hourly 5 2>&1); RC=$?
+check    "an unknown policy key fails" 1 "$RC"
+contains "and lists the valid keys" 'retention.keep_daily' "$OUT"
+check "a non-numeric count fails" 1 "$(cb policy set 1 retention.keep_daily banana > /dev/null 2>&1; echo $?)"
 
 contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')"
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
@@ -151,11 +232,95 @@ contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
 contains "gc dry run" '"state":"completed"' "$(cb gc 1 --dry-run)"
 contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
 
+echo "job reporting"
+# B062: gc and its dry run printed a bare job; the counts were only logged.
+GC_OUT=$(cb gc 1)
+contains "gc reports what it swept" '"objects_swept":' "$GC_OUT"
+contains "and what compaction did" '"packs_rewritten":' "$GC_OUT"
+contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
+contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
+contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
+
+# B072: every entry said "daemon", so a manual run and a scheduled one could
+# not be told apart.
+contains "journal says a manual job came over the api" '"source":"api"' "$(cb journal 1)"
+check    "and no entry claims the daemon asked" "" \
+    "$(cb journal 1 | grep -o '"source":"daemon"')"
+contains "the job record says so too" '"origin":"api"' "$(cb jobs)"
+
+# B077: a source that does not exist failed nothing; the backup completed
+# with the other source's files and a log line.
+OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
+check    "a missing source fails the backup" 1 "$RC"
+contains "naming the source" "no-such-dir" "$OUT"
+
+# B058: `jobs watch` on a running job printed nothing until the job ended,
+# because the CLI read the whole response before printing any of it. A job
+# row nothing will finish holds the stream open for as long as the test
+# needs, so the assertion is on what arrived, not on a race with real work.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+        progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
+        'store')"
+    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2>&1 &
+    WPID=$!
+    sleep 1
+    contains "jobs watch prints a running job at once" '"state":"running"' \
+        "$(cat "$WORK/watch.out")"
+    sqlite3 "$WORK/state.db" "UPDATE jobs SET state = 'completed',
+        ended = strftime('%s','now') WHERE id = 9999"
+    for _ in $(seq 1 50); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$WPID" 2>/dev/null; then
+        bad "jobs watch ends with the job" "exited" "still running"
+        kill "$WPID" 2>/dev/null
+    else
+        ok "jobs watch ends with the job"
+    fi
+    wait "$WPID" 2>/dev/null
+    contains "and prints how it ended" '"state":"completed"' "$(cat "$WORK/watch.out")"
+else
+    ok "jobs watch prints a running job at once (skipped: no sqlite3)"
+fi
+
+# B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
+# file is still cancellable when the request lands, whatever the machine.
+mkdir -p "$WORK/big"
+dd if=/dev/zero of="$WORK/big/big.bin" bs=1M count=512 status=none
+BJ=$(cb backup 1 "$WORK/big" --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+OUT=$(cb jobs cancel "$GJ")
+contains "jobs cancel prints the job" "\"id\":$GJ" "$OUT"
+contains "and that the cancel landed" '"cancel_requested":true' "$OUT"
+cb jobs cancel "$BJ" > /dev/null 2>&1
+for _ in $(seq 1 100); do
+    cb jobs "$GJ" | grep -q '"state":"cancelled"' && break
+    sleep 0.1
+done
+contains "the cancelled gc ends cancelled" '"state":"cancelled"' "$(cb jobs "$GJ")"
+contains "and the journal says so" '"operation":"gc","result":"cancelled"' "$(cb journal 1)"
+for _ in $(seq 1 100); do
+    cb jobs "$BJ" | grep -Eq '"state":"(cancelled|completed)"' && break
+    sleep 0.1
+done
+check "a cancelled backup leaves no staging files" "" \
+    "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
+rm -f "$WORK/big/big.bin"
+
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"
 contains "second backup completed" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "diff" '"added"' "$(cb diff 1 1 2)"
+
+# B033: a tag set on a name already in use moved it silently, taking the
+# retention protection off the snapshot it was on. --move says it is meant.
+contains "tag set" '"ok"' "$(cb tag set 1 pinned 1)"
+OUT=$(cb tag set 1 pinned 2 2>&1); RC=$?
+check    "a tag in use elsewhere is not moved" 1 "$RC"
+contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
+contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
+contains "to the new snapshot" '"snap_id":2' "$(cb tag list 1)"
+cb tag remove 1 pinned > /dev/null
 
 # Exclusions have to work from the CLI too, which is where anyone would
 # actually type them.
@@ -176,8 +341,10 @@ case "$(cb search 1 big)" in
 esac
 
 check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
-contains "schedule enable/disable" '"ok"' \
-    "$(cb schedule add 1 verify 7200 > /dev/null; cb schedule list 1 | grep -q verify && cb schedule disable 1 2 || echo miss)"
+# The id comes from the add. This disabled a hardcoded id 2 that did not
+# exist, which passed only because a missing schedule answered success.
+VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "schedule enable/disable" '"ok"' "$(cb schedule disable 1 "$VSID" || echo miss)"
 
 # Calendar schedules. The CLI offered --cron, which built a trigger type the
 # daemon rejects by design, and had no way to ask for the calendar triggers
@@ -218,6 +385,67 @@ esac
 OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
 check "grep rejects a bad pattern" 1 "$RC"
 contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
+# B066: a snapshot that does not exist completed with zero files, which
+# reads as "not in that backup".
+OUT=$(cb grep 1 hunter2 --snapshot 999 2>&1); RC=$?
+check    "grep on a missing snapshot fails" 1 "$RC"
+contains "and says so at submission" "no such snapshot" "$OUT"
+check    "a malformed snapshot is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" -d '{"pattern":"x","snapshot":"latest"}' http://localhost/repos/1/grep)"
+# B068: an unchanged file came back once per snapshot. Now one result per
+# path and content, counting the snapshots, and --snapshot narrows to one.
+SR=$(cb search 1 one.txt)
+check "search collapses identical copies" 1 \
+    "$(printf '%s' "$SR" | grep -o "\"path\":\"$WORK/src/one.txt\"" | wc -l | tr -d ' ')"
+NSNAP=$(printf '%s' "$SR" | sed -n 's/.*"snapshots":\([0-9]*\).*/\1/p' | head -1)
+if [ "${NSNAP:-0}" -ge 2 ]; then ok "and counts the snapshots it is in"; else bad "and counts the snapshots it is in" ">= 2" "${NSNAP:-none}"; fi
+NEWEST=$(cb snapshots 1 --limit 1 | sed -n 's/.*"id":\([0-9]*\),.*/\1/p')
+contains "--snapshot narrows the search" "\"snap_id\":$NEWEST," "$(cb search 1 one.txt --snapshot "$NEWEST")"
+OUT=$(cb search 1 one.txt --snapshot 999 2>&1); RC=$?
+check    "search in a missing snapshot fails" 1 "$RC"
+# B067: the hit caps are request options, refused out of range rather than
+# clamped, and the job result says whether anything was cut short.
+contains "grep takes a per-file cap" 'secrets.txt' "$(cb grep 1 hunter2 --max-hits-per-file 1 --max-hits 5)"
+OUT=$(cb grep 1 hunter2 --max-hits 0 2>&1); RC=$?
+check    "a zero hit cap is refused" 1 "$RC"
+contains "and names the range" "max_hits must be 1 to 1000000" "$OUT"
+GJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"hunter2"}' http://localhost/repos/1/grep \
+     | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+
+# B064: schedule options are validated per action. Values outside the
+# documented sets were stored and read back as something else; parameters an
+# action never reads were stored as if they configured something; a grep
+# schedule could not be given a pattern at all.
+OUT=$(cb schedule add 1 gc 3600 --on-overlap bogus 2>&1); RC=$?
+check    "an unknown on_overlap is refused" 1 "$RC"
+contains "and the valid ones are named" "skip, queue or cancel_running" "$OUT"
+OUT=$(cb schedule add 1 gc 3600 --catchup nope 2>&1); RC=$?
+check    "an unknown catchup is refused" 1 "$RC"
+OUT=$(cb schedule add 1 gc 3600 --dest /mnt/x 2>&1); RC=$?
+check    "a parameter the action ignores is refused" 1 "$RC"
+contains "and says whose it is" "dest applies only to a replicate" "$OUT"
+OUT=$(cb schedule add 1 grep 3600 2>&1); RC=$?
+check    "a grep schedule needs a pattern" 1 "$RC"
+OUT=$(cb schedule add 1 grep 3600 --pattern 'unclosed[' 2>&1); RC=$?
+check    "a grep schedule with a bad pattern is refused" 1 "$RC"
+check    "--on-overlap queue is accepted" 0 \
+    "$(cb schedule add 1 gc 3600 --on-overlap queue --catchup run_once >/dev/null 2>&1; echo $?)"
+GSID=$(cb schedule add 1 grep 1 --pattern 'passphrase is' | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores its pattern" '"params":{"pattern":"passphrase is"' "$(cb schedule list 1)"
+FIRED=0
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" 'http://localhost/repos/1/grep?limit=1')" in
+        *'"pattern":"passphrase is"'*'"completed":true'*) FIRED=1; break ;;
+    esac
+    sleep 0.2
+done
+check "a scheduled grep runs with its pattern" 1 "$FIRED"
+cb schedule remove 1 "$GSID" >/dev/null 2>&1
 
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.
@@ -255,6 +483,16 @@ contains "key readable again" "$ENC_KEY" "$(cb repo key export "$ENC_ID")"
 OUT=$(cb repo key import "$ENC_ID" "$(printf '0%.0s' $(seq 1 64))" 2>&1); RC=$?
 check "wrong key refused" 1 "$RC"
 
+# B048, B050: the key commands on an unencrypted repository. Export sent the
+# operator looking for a keyfile that never existed; ack answered ok.
+OUT=$(cb repo key export 1 2>&1); RC=$?
+check    "key export of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+contains "as a 400" "HTTP 400" "$OUT"
+OUT=$(cb repo key ack 1 2>&1); RC=$?
+check    "key ack of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+
 # Passphrase mode needs nothing escrowed: the wrapped key travels with the
 # repository, so the passphrase alone recovers it.
 PASS_OUT=$(cb repo add "$WORK/passrepo" pass --encrypt passphrase --passphrase 'correct horse')
@@ -263,12 +501,38 @@ contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
 contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
+# B044: a one-character passphrase was accepted.
+OUT=$(cb repo add "$WORK/shortpass" sp --passphrase 'a' 2>&1); RC=$?
+check    "a short passphrase is refused" 1 "$RC"
+contains "and says how long it must be" "at least 8" "$OUT"
+check    "and creates nothing" 1 "$([ -e "$WORK/shortpass" ]; echo $?)"
+# B011: a passphrase without --encrypt made an unencrypted repository and
+# exited 0. It implies passphrase mode now, and a mode that cannot use one
+# refuses it instead of dropping it.
+IMPLIED=$(cb repo add "$WORK/implied" imp --passphrase 'correct horse')
+contains "a passphrase alone implies passphrase mode" '"encryption":"passphrase"' "$IMPLIED"
+contains "and the marker says so" '"mode":"passphrase"' "$(cat "$WORK/implied/.cbackup")"
+OUT=$(cb repo add "$WORK/nonepass" np --encrypt none --passphrase 'x' 2>&1); RC=$?
+check    "encrypt none with a passphrase is refused" 1 "$RC"
+contains "and says why" "encrypt none" "$OUT"
+OUT=$(cb repo add "$WORK/syspass" sp --encrypt system --passphrase 'x' 2>&1); RC=$?
+check    "encrypt system with a passphrase is refused" 1 "$RC"
+check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
 check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
 contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
+# B046: the newest id was handed out again, and with it the removed
+# repository's schedules and history.
+NEXT_ID=$(cb repo add "$WORK/after-gone" after | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+if [ -n "$NEXT_ID" ] && [ "$NEXT_ID" -gt "$RM_ID" ]; then
+    ok "a removed repository's id is not reused"
+else
+    bad "a removed repository's id is not reused" "greater than $RM_ID" "${NEXT_ID:-none}"
+fi
+cb repo remove "$NEXT_ID" >/dev/null 2>&1
 
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the
@@ -287,7 +551,7 @@ fi
 # A file that is stored raw would appear verbatim in the pack if the repo
 # were not encrypted; grep is useless for compressed text, so use the
 # incompressible fixture.
-if grep -qa "$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)" "$ENC_DAT" 2>/dev/null; then
+if contains_bytes "$WORK/src/random.bin" "$ENC_DAT" 2>/dev/null; then
     bad "no plaintext in the encrypted pack" "absent" "present"
 else
     ok "no plaintext in the encrypted pack"
@@ -301,6 +565,71 @@ else
     bad "encrypted round trip is byte-identical" "identical" "differs"
 fi
 
+# B041: with the key gone, backup and restore of an encrypted repository
+# failed deep inside the job ("refusing to pack", "1 entry could not be
+# restored"). They are refused up front now, naming the repository and the
+# command that fixes it.
+ENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/encrepo/.cbackup" | head -1)
+mv "$WORK/keys/$ENC_UUID.key" "$WORK/enc.key.aside"
+OUT=$(cb backup "$ENC_ID" "$WORK/src" 2>&1); RC=$?
+check    "backup without the key is refused" 1 "$RC"
+contains "and names the repository" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the fix" "c-backup repo key import" "$OUT"
+contains "as a 409" "HTTP 409" "$OUT"
+OUT=$(cb restore "$ENC_ID" 1 "$WORK/nokeyout" 2>&1); RC=$?
+check    "restore without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+check    "and writes nothing" 1 "$([ -e "$WORK/nokeyout" ]; echo $?)"
+OUT=$(cb reindex "$ENC_ID" 2>&1); RC=$?
+check    "reindex without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the index is untouched" '"id":1,' "$(cb snapshots "$ENC_ID")"
+mv "$WORK/enc.key.aside" "$WORK/keys/$ENC_UUID.key"
+
+# B042: a passphrase repository recovered with nothing but its passphrase.
+# The host loses its key cache and its registration; a wrong passphrase was
+# accepted, and the right one wrote no key, so reindex found nothing and the
+# restore after it found no snapshot.
+PASS_ID=$(printf '%s' "$PASS_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+PASS_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/passrepo/.cbackup" | head -1)
+cb backup "$PASS_ID" "$WORK/src" >/dev/null
+# B052: tags lived only in state.db, so this recovery came back with every
+# snapshot unprotected. The repository carries them now.
+cb tag set "$PASS_ID" guard 1 >/dev/null
+contains "a tag is written into the repository" '"name":"guard"' "$(cat "$WORK/passrepo/tags" 2>&1)"
+rm -f "$WORK/keys/$PASS_UUID.key"
+cb repo remove "$PASS_ID" >/dev/null
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'wrong horse' 2>&1); RC=$?
+check    "a wrong passphrase is refused" 1 "$RC"
+contains "and says so" "wrong passphrase" "$OUT"
+check    "and registers nothing" 0 "$(cb repo list | grep -c passrepo)"
+OUT=$(cb repo add "$WORK/passrepo" pass2 2>&1); RC=$?
+check    "no passphrase still registers" 0 "$RC"
+contains "but says the key is missing" "no key loaded for repository $PASS_UUID" "$OUT"
+PASS_ID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+# B045: registering it again with the passphrase unlocks it.
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=$?
+check    "the right passphrase unlocks a registered repo" 0 "$RC"
+contains "and says it did" '"key_unlocked":true' "$OUT"
+check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
+REINDEX_OUT=$(cb reindex "$PASS_ID")
+contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
+contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
+contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
+contains "and lists its snapshot" '"id":1,' "$(cb snapshots "$PASS_ID")"
+# B047: a reindexed snapshot listed "size":"", which is null now that a
+# missing value is served as one.
+case "$(cb snapshots "$PASS_ID")" in
+    *'"size":""'*|*'"size":null'*) bad "a reindexed snapshot keeps its size" "a size" "no size" ;;
+    *)             ok  "a reindexed snapshot keeps its size" ;;
+esac
+cb restore "$PASS_ID" 1 "$WORK/passout" >/dev/null
+if diff -r "$WORK/src" "$WORK/passout$WORK/src" >/dev/null 2>&1; then
+    ok "a passphrase-recovered repo restores byte-identical"
+else
+    bad "a passphrase-recovered repo restores byte-identical" "identical" "differs"
+fi
+
 # Verify records runs and findings, and both were unreachable until now: the
 # counters reached an operator only through /metrics and the findings not at
 # all. A scrub whose answer you cannot read is a scrub you did not run.
@@ -311,6 +640,48 @@ check "verify prints one document"         "1"              "$(printf '%s\n' "$V
 contains "verify reports findings"          '"findings"'     "$VOUT"
 contains "clean repo has no findings"       '"findings":[]'  "$VOUT"
 contains "verify list shows past runs"      '"runs"'         "$(cb verify list "$ENC_ID" --limit 2)"
+
+# Loss is a failure. A deep verify that found a pack overwritten with random
+# bytes exited 0 and its job read "completed", so anything judging the run by
+# its exit status was told the repository was fine. The run and findings
+# still have to come out, on stdout, because they say what was lost.
+mkdir -p "$WORK/losssrc"
+for i in 1 2 3; do echo "loss fixture $i" > "$WORK/losssrc/f$i.txt"; done
+LOSS_ID=$(cb repo add "$WORK/lossrepo" loss | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$LOSS_ID" "$WORK/losssrc" > /dev/null
+LOSS_DAT=$(find "$WORK/lossrepo/packs" -name '*.dat' | head -1)
+if [ -n "$LOSS_DAT" ]; then
+    # Everything past the first 64 bytes: payloads and the parity that would
+    # rebuild them, so nothing is left to recover from.
+    LOSS_LEN=$(stat -c %s "$LOSS_DAT")
+    head -c $((LOSS_LEN - 64)) /dev/urandom | \
+        dd of="$LOSS_DAT" bs=1 seek=64 conv=notrunc status=none
+    OUT=$(cb verify "$LOSS_ID" --level deep 2>"$WORK/loss.err"); RC=$?
+    check    "verify that finds loss exits non-zero" 1 "$RC"
+    contains "the failed job says why"  "data loss"              "$(cat "$WORK/loss.err")"
+    contains "the failed job is failed" '"state":"failed"'       "$(cat "$WORK/loss.err")"
+    contains "the run still prints"     '"level":"deep"'         "$OUT"
+    contains "its findings still print" '"status":"unrecoverable"' "$OUT"
+    check    "and as one document"      "1" "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
+
+    # The index level never opens a pack, and reported a deleted one as ok.
+    rm -f "$LOSS_DAT"
+    OUT=$(cb verify "$LOSS_ID" --level index 2>/dev/null); RC=$?
+    check    "index verify of a deleted pack exits non-zero" 1 "$RC"
+    contains "a deleted pack's objects are missing" '"status":"missing"' "$OUT"
+    case "$OUT" in
+        *'"missing":0,'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
+        *)                 ok  "index verify counts them missing" ;;
+    esac
+    contains "verify show reads the failed run back" '"findings"' \
+        "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"
+    # A failed run is still a completed walk, and the gauge reads those.
+    GAUGE=$(cb metrics | sed -n 's/^cbackup_verify_unrecoverable_objects \([0-9]*\)$/\1/p')
+    if [ "${GAUGE:-0}" -gt 0 ]; then ok "the loss gauge sees it"
+    else bad "the loss gauge sees it" "> 0" "${GAUGE:-absent}"; fi
+else
+    bad "loss repo produced a pack" "a pack file" "none"
+fi
 
 # Job commands wait by default and exit non-zero when the job fails.
 OUT=$(cb pack "$ENC_ID"); RC=$?
@@ -335,6 +706,14 @@ REPL="$WORK/replica"
 OUT=$(cb replicate "$ENC_ID" "$REPL"); RC=$?
 check    "replicate waits for its job"  0             "$RC"
 contains "replicate reports completion" '"completed"' "$OUT"
+# B070: a full copy, an incremental and a no-op all printed the same bare
+# job; what was sent was only in the log.
+contains "replicate reports what it sent" '"objects_sent":' "$OUT"
+contains "including the snapshots" '"snapshots_sent":' "$OUT"
+case "$OUT" in
+    *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
+    *) ok "a first replicate sends objects" ;;
+esac
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.
@@ -365,8 +744,11 @@ fi
 # And it is still ciphertext. The same fixture the pack test uses, for the
 # same reason: compressed text is unsearchable either way, so look for the
 # incompressible one.
-NEEDLE=$(head -c 32 "$WORK/src/random.bin" 2>/dev/null || echo __nofixture__)
-if grep -qra "$NEEDLE" "$REPL" 2>/dev/null; then
+REPL_HIT=0
+while IFS= read -r -d '' f; do
+    contains_bytes "$WORK/src/random.bin" "$f" && { REPL_HIT=1; break; }
+done < <(find "$REPL" -type f -print0)
+if [ "$REPL_HIT" = 1 ]; then
     bad "replica holds no plaintext" "absent" "present"
 else
     ok "replica holds no plaintext"
@@ -375,9 +757,27 @@ fi
 # Running it again moves nothing: the target already has the root tree, so
 # one question ends the walk.
 BEFORE=$(find "$REPL" -type f | wc -l)
-cb replicate "$ENC_ID" "$REPL" >/dev/null
+OUT=$(cb replicate "$ENC_ID" "$REPL")
 AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
+contains "and says it sent nothing" '"snapshots_sent":0' "$OUT"
+contains "no objects either" '"objects_sent":0,' "$OUT"
+contains "the journal says the target was current" 'target already up to date' \
+    "$(cb journal "$ENC_ID")"
+
+# B071: into the source's own directory it "completed" having copied
+# nothing, since the target was the source. Inside or above it is refused
+# too, and the comparison sees through a symlink.
+OUT=$(cb replicate "$ENC_ID" "$WORK/encrepo" 2>&1); RC=$?
+check    "replicate into itself fails" 1 "$RC"
+contains "and says why" "the source repository itself" "$OUT"
+check    "replicate inside itself fails" 1 "$(cb replicate "$ENC_ID" "$WORK/encrepo/sub" >/dev/null 2>&1; echo $?)"
+check    "replicate above itself fails"  1 "$(cb replicate "$ENC_ID" "$WORK" >/dev/null 2>&1; echo $?)"
+ln -s "$WORK/encrepo" "$WORK/enclink"
+check    "replicate through a symlink to itself fails" 1 \
+    "$(cb replicate "$ENC_ID" "$WORK/enclink" >/dev/null 2>&1; echo $?)"
+check    "a schedule into itself is refused" 1 \
+    "$(cb schedule add "$ENC_ID" replicate 3600 --dest "$WORK/encrepo" >/dev/null 2>&1; echo $?)"
 
 # Replication can be scheduled, which is the point of an offsite copy: one
 # that only runs when somebody remembers is not a backup strategy. The
@@ -410,8 +810,16 @@ for _ in $(seq 1 60); do
 done
 check "a scheduled replicate fires and writes its pack" 1 "$FIRED"
 contains "the fired job ran as a replicate job" '"action":"replicate"' "$(cb jobs)"
+# B072: and its journal entry says a schedule asked, and which.
+SCHED_J=""
+for _ in $(seq 1 40); do
+    SCHED_J=$(cb journal "$ENC_ID" | grep -o '"source":"schedule"[^}]*' | head -1)
+    [ -n "$SCHED_J" ] && break
+    sleep 0.25
+done
+contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
 # Stop it before it fires again under the rest of the suite.
-SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true
 
 # A relative path would be resolved against the daemon's working directory,
@@ -439,7 +847,7 @@ db:
   path: $WORK/state2.db
 http:
   socket: $SOCK2
-  port: 18802
+  port: $((PORTBASE + 1))
   bind: 127.0.0.1
 log:
   level: warn
@@ -481,7 +889,7 @@ check    "the source keeps its path" "$BEFORE_PATH" "$AFTER_PATH"
 # The case that rule is guarding must still work: a repository that actually
 # moved re-links to its new path, because the old one is gone.
 cb repo add "$WORK/driftrepo" drift >/dev/null
-DRIFT_ID=$(cb repo list | tr '}' '\n' | grep driftrepo | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+DRIFT_ID=$(cb repo list | tr '}' '\n' | grep driftrepo | sed -n 's/.*"id":\([0-9]*\),.*/\1/p')
 mv "$WORK/driftrepo" "$WORK/driftmoved"
 contains "a moved repository re-links" '"id"' "$(cb repo add "$WORK/driftmoved" drift 2>&1)"
 contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID")"
@@ -490,6 +898,42 @@ contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID"
 cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
+contains "and points at --reencrypt" "--reencrypt" "$OUT"
+
+# B069: the Manual said to change encryption by replicating into a fresh
+# repository, and replication refused every repository but a replica of
+# the source. --reencrypt copies into a repository of its own, under its
+# own key, which then reindexes and restores like any other.
+REENC_OUT=$(cb repo add "$WORK/reenc" reenc --encrypt system)
+REENC_ID=$(printf '%s' "$REENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+REENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc" --reencrypt 2>&1); RC=$?
+check    "re-encrypting replication succeeds" 0 "$RC"
+contains "and says it re-encrypted" '"reencrypted":true' "$OUT"
+check    "the destination keeps its own identity" "$REENC_UUID" \
+    "$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)"
+if [ "$REENC_UUID" != "$SRC_UUID" ]; then ok "which is not the source's"
+else bad "which is not the source's" "a different uuid" "$REENC_UUID"; fi
+REENC_HIT=0
+while IFS= read -r -d '' f; do
+    contains_bytes "$WORK/src/random.bin" "$f" && { REENC_HIT=1; break; }
+done < <(find "$WORK/reenc/packs" -type f -print0)
+if [ "$REENC_HIT" = 1 ]; then
+    bad "the re-encrypted copy holds no plaintext" "absent" "present"
+else
+    ok "the re-encrypted copy holds no plaintext"
+fi
+contains "the destination reindexes" '"completed"' "$(cb reindex "$REENC_ID")"
+contains "and lists the snapshot" '"id":1,' "$(cb snapshots "$REENC_ID")"
+cb restore "$REENC_ID" 1 "$WORK/reencout" >/dev/null
+if diff -r "$WORK/encout" "$WORK/reencout" >/dev/null 2>&1; then
+    ok "a re-encrypted copy restores what the source does"
+else
+    bad "a re-encrypted copy restores what the source does" "identical" "differs"
+fi
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-missing" --reencrypt 2>&1); RC=$?
+check    "re-encrypting into no repository is refused" 1 "$RC"
+contains "and says to create it first" "repo add" "$OUT"
 
 echo "configured sources"
 
@@ -518,7 +962,7 @@ check "a bare backup uses the configured sources" "$((BEFORE + 1))" "$AFTER"
 # And naming paths still overrides, so the explicit form is unchanged.
 cb backup 1 "$WORK/othersrc" >/dev/null
 # Newest first, so the snapshot just made is the head of the list.
-LAST=$(cb snapshots 1 | tr '}' '\n' | grep -o '"id":"[0-9]*"' | head -1 | tr -dc '0-9')
+LAST=$(cb snapshots 1 | tr '}' '\n' | grep -o '"id":[0-9]*' | head -1 | tr -dc '0-9')
 cb restore 1 "$LAST" "$WORK/overrideout" >/dev/null 2>&1
 if find "$WORK/overrideout" -name 'other.txt' | grep -q .; then
     ok "an explicit path still overrides the configured sources"
@@ -545,8 +989,18 @@ contains "and says what is missing" "sources" "$OUT"
 # With sources configured, a schedule needs nothing else.
 OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
 check    "a backup schedule inherits the repo sources" 0 "$RC"
-SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
+# B065: another repository's schedule, or one that does not exist, is not
+# this repository's to remove or disable; both reported success.
+OUT=$(cb schedule remove 2 "$SID0" 2>&1); RC=$?
+check    "removing another repo's schedule fails" 1 "$RC"
+contains "and says there is no such schedule" "no such schedule" "$OUT"
+OUT=$(cb schedule disable 2 "$SID0" 2>&1); RC=$?
+check    "disabling another repo's schedule fails" 1 "$RC"
+contains "the schedule survives" "\"id\":$SID0," "$(cb schedule list 1)"
 [ -n "$SID0" ] && cb schedule remove 1 "$SID0" >/dev/null 2>&1
+OUT=$(cb schedule remove 1 "$SID0" 2>&1); RC=$?
+check    "removing it twice fails" 1 "$RC"
 
 # The one that proves it: a one-second interval must produce real snapshots.
 BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)
@@ -559,7 +1013,7 @@ for _ in $(seq 1 60); do
 done
 check "a scheduled backup produces a snapshot" 1 "$FIRED"
 contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
-SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
 
 echo "auth"
@@ -577,6 +1031,14 @@ OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1);
 check "password change reads both from stdin" 0 "$RC"
 contains "old password no longer logs in" "invalid password" \
     "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+# B053: from the host, logout --all ends every session a client holds. A
+# token from a login is checked over TCP, since the socket needs none.
+LTOK=$(printf 'brandnewpassword\n' | cb auth login 2>&1 | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"
+check "and the token is dead" 401 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
 OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
 check "no password on stdin fails" 1 "$RC"
 contains "and says so" "no password read" "$OUT"
@@ -588,7 +1050,7 @@ echo "listen address"
 # proxy", and it was never read: MHD was started without a socket address,
 # which binds every interface. Setting it to 127.0.0.1 produced a port
 # answering on the LAN and a config file saying it did not.
-BINDPORT=18809
+BINDPORT=$((PORTBASE + 2))
 cat > "$WORK/bindcfg.yaml" <<EOF
 db:
   path: $WORK/bind.db
@@ -647,6 +1109,38 @@ if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
 else
     ok "leaves no socket behind"
 fi
+
+echo "key directory"
+
+# B041: the container image kept keys at /etc/c-backupd/keys, inside the
+# container's own filesystem, so replacing the container lost every key. It
+# sets the key directory through the environment, which has to win over the
+# config file for an operator's own mounted config not to undo it.
+grep -q '^ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys$' "$(dirname "$0")/../Dockerfile" \
+    && ok "the image keeps keys on the state volume" \
+    || bad "the image keeps keys on the state volume" "ENV C_BACKUP_SECURITY_KEY_DIR" "absent"
+cat > "$WORK/envcfg.yaml" <<EOF
+db:
+  path: $WORK/env.db
+http:
+  socket: $WORK/env.sock
+  port: 0
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/filekeys
+EOF
+C_BACKUP_SECURITY_KEY_DIR="$WORK/envkeys" C_BACKUP_CONFIG_PATH="$WORK/envcfg.yaml" \
+    "$DAEMON" > "$WORK/env.log" 2>&1 &
+ENV_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/env.sock" ] && break; sleep 0.1; done
+"$CLI" --socket "$WORK/env.sock" repo add "$WORK/envrepo" e --encrypt system >/dev/null 2>&1
+check "the environment's key directory wins over the file's" 1 \
+    "$(find "$WORK/envkeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+check "and the file's is not used" 0 \
+    "$(find "$WORK/filekeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+kill $ENV_PID 2>/dev/null; wait $ENV_PID 2>/dev/null
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?

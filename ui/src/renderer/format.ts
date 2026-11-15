@@ -5,7 +5,7 @@ export const GFS_WEEKLY = 2
 export const GFS_MONTHLY = 4
 export const GFS_YEARLY = 8
 
-export function fmtSize(bytes: number | string | undefined | null): string {
+export function fmtSize(bytes: number | undefined | null): string {
   const n = Number(bytes ?? NaN)
   if (!Number.isFinite(n)) return '-'
   if (n === 0) return '0 B'
@@ -23,12 +23,12 @@ export function fmtSize(bytes: number | string | undefined | null): string {
  * the whole dashboard when one field of one row turned out not to exist.
  * A dash is a worse number and a much better failure.
  */
-export function fmtNum(n: number | string | undefined | null): string {
+export function fmtNum(n: number | undefined | null): string {
   const v = Number(n ?? NaN)
   return Number.isFinite(v) ? v.toLocaleString() : '-'
 }
 
-export function relativeTime(epochSec: number | string | undefined | null): string {
+export function relativeTime(epochSec: number | undefined | null): string {
   const t = Number(epochSec ?? NaN)
   if (!Number.isFinite(t) || t <= 0) return 'never'
   const now = Date.now() / 1000
@@ -40,7 +40,7 @@ export function relativeTime(epochSec: number | string | undefined | null): stri
   return `${Math.floor(diff / 604800)}w ago`
 }
 
-export function absoluteTime(epochSec: number | string | undefined | null): string {
+export function absoluteTime(epochSec: number | undefined | null): string {
   const t = Number(epochSec ?? NaN)
   if (!Number.isFinite(t) || t <= 0) return '-'
   return new Date(t * 1000).toLocaleString()

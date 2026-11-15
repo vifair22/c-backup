@@ -222,11 +222,12 @@ static void test_dry_run_prunes_nothing(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    uint32_t pruned = 0;
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, &pruned), OK);
+    gfs_result_t gr = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, &gr), OK);
 
-    assert_true(pruned > 0);
+    assert_true(gr.pruned > 0);
     assert_int_equal(snapshot_count(), before);
+    gfs_result_free(&gr);
 }
 
 static void test_prune_removes_expired_snapshots(void **state)
@@ -237,13 +238,14 @@ static void test_prune_removes_expired_snapshots(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    uint32_t pruned = 0;
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, &pruned), OK);
+    gfs_result_t gr = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, &gr), OK);
 
-    assert_true(pruned > 0);
+    assert_true(gr.pruned > 0);
     assert_true(snapshot_count() < before);
     /* The newest is never pruned: it is the one just taken. */
     assert_int_not_equal(flags_of(20), 0xFFFFFFFFu);
+    gfs_result_free(&gr);
 }
 
 /*
@@ -279,11 +281,12 @@ static void test_zero_retention_keeps_everything(void **state)
     int before = snapshot_count();
 
     gfs_retention_t ret = { 0, 0, 0, 0, 0 };
-    uint32_t pruned = 0;
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 15, 0, 1, 1, &pruned), OK);
+    gfs_result_t gr = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 15, 0, 1, 1, &gr), OK);
 
-    assert_int_equal(pruned, 0);
+    assert_int_equal(gr.pruned, 0);
     assert_int_equal(snapshot_count(), before);
+    gfs_result_free(&gr);
 }
 
 /*
@@ -302,14 +305,55 @@ static void test_shipped_defaults_prune(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 7, 4, 12, 3 };
-    uint32_t pruned = 0;
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, 1, &pruned), OK);
+    gfs_result_t gr = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, 1, &gr), OK);
 
-    assert_true(pruned > 45);
-    assert_int_equal(snapshot_count(), 90 - (int)pruned);
+    assert_true(gr.pruned > 45);
+    assert_int_equal(snapshot_count(), 90 - (int)gr.pruned);
     /* The newest stays, and so does the most recent closed day's daily. */
     assert_int_not_equal(flags_of(90), 0xFFFFFFFFu);
     assert_true(flags_of(89) & GFS_DAILY);
+    gfs_result_free(&gr);
+}
+
+/*
+ * The ids a pass reports are exactly the ones a real pass removes.
+ *
+ * A dry run's answer reached only the daemon log, so the caller who asked
+ * for it got "completed" and nothing else. Now it comes back as ids, and
+ * they have to be the right ids: the dry run's list must name precisely the
+ * snapshots the real run then deletes, in ascending order, and none that
+ * survive.
+ */
+static void test_result_names_the_pruned_snapshots(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 20; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
+
+    gfs_retention_t ret = { 3, 2, 1, 1, 1 };
+    gfs_result_t dry = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, &dry), OK);
+    assert_true(dry.pruned > 0);
+    assert_non_null(dry.ids);
+    for (uint32_t i = 0; i < dry.pruned; i++) {
+        /* Still present: a dry run names, it does not delete. */
+        assert_int_not_equal(flags_of((int)dry.ids[i]), 0xFFFFFFFFu);
+        if (i) assert_true(dry.ids[i] > dry.ids[i - 1]);
+    }
+
+    gfs_result_t real = { 0, NULL };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, &real), OK);
+    assert_int_equal(real.pruned, dry.pruned);
+    for (uint32_t i = 0; i < real.pruned; i++) {
+        assert_int_equal(real.ids[i], dry.ids[i]);
+        assert_int_equal(flags_of((int)real.ids[i]), 0xFFFFFFFFu);
+    }
+    assert_int_equal(snapshot_count(), 20 - (int)real.pruned);
+
+    gfs_result_free(&dry);
+    gfs_result_free(&real);
+    assert_null(dry.ids);
 }
 
 /* keep_snaps protects the newest N whatever their tier, and 0 is not a
@@ -373,6 +417,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_zero_retention_keeps_everything, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shipped_defaults_prune, setup, teardown),
         cmocka_unit_test_setup_teardown(test_keep_snaps_is_a_minimum, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_result_names_the_pruned_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_repo_is_not_an_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gfs_is_idempotent, setup, teardown),
     };
