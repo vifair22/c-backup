@@ -824,6 +824,20 @@ Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
 per-repository journal (`c-backup journal 1`) is the permanent record of what
 ran and how it ended.
 
+`gc` reports what it did in the job's `result`, and `gc --dry-run` what it
+would do:
+
+```json
+{"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
+ "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
+ "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+```
+
+`objects_swept` and `bytes_freed` are what was swept, or on a dry run what
+would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
+does not do; `tmp_files_removed` counts staging files an interrupted run left
+behind (section 2.2). The journal entry carries the same in a line.
+
 ---
 
 ## 13. Encryption

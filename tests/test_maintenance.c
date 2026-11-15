@@ -273,6 +273,9 @@ static void test_gc_clears_pack_locations_for_swept_objects(void **state)
     gc_result_t g;
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
     assert_true(g.swept > 0);
+    /* B062: what compaction did is reported, not only logged. */
+    assert_true(g.packs_rewritten + g.packs_deleted > 0);
+    assert_true(g.pack_entries_dropped > 0);
 
     /* No pack_objects row may survive its objects row. */
     assert_int_equal(count(

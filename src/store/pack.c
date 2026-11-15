@@ -4244,6 +4244,16 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
 status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
+    return pack_gc_stats(store, refs, refs_cnt, out_kept, out_deleted, NULL);
+}
+
+status_t pack_gc_stats(store_t *store,
+                       const uint8_t *refs, size_t refs_cnt,
+                       uint32_t *out_kept, uint32_t *out_deleted,
+                       pack_gc_stats_t *stats) {
+    pack_gc_stats_t scratch_stats;
+    if (!stats) stats = &scratch_stats;
+    memset(stats, 0, sizeof(*stats));
     pack_resume_deleting(store);
     uint32_t total_kept = 0, total_deleted = 0;
     char gc_packs_dir[PATH_MAX];
@@ -4323,6 +4333,7 @@ status_t pack_gc(store_t *store,
             unlink(dat_path);
             store_emit_pack_removed(store, pnum);
             total_deleted += count;
+            stats->packs_deleted++;
             free(disk_idx);
             continue;
         }
@@ -4468,6 +4479,8 @@ status_t pack_gc(store_t *store,
             int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
             if (pfd >= 0) { fsync(pfd); close(pfd); }
         }
+
+        stats->packs_rewritten++;
 
         /* Re-announce the rewritten pack. GC drops dead objects, so the
          * daemon's pack_objects rows for this pack are now wrong; the commit

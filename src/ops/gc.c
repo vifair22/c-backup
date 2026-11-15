@@ -258,11 +258,17 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_free(live);
 
     uint32_t kept = 0, dropped = 0;
-    status_t pst = pack_gc(store, refs, refs_cnt, &kept, &dropped);
+    pack_gc_stats_t pstats;
+    status_t pst = pack_gc_stats(store, refs, refs_cnt, &kept, &dropped, &pstats);
     free(refs);
-    if (pst != OK) return pst;
     res.pack_entries_kept    = kept;
     res.pack_entries_dropped = dropped;
+    res.packs_rewritten      = pstats.packs_rewritten;
+    res.packs_deleted        = pstats.packs_deleted;
+    /* The sweep is committed whatever compaction did, so a caller reporting
+     * a failed or cancelled gc can still say what it removed. */
+    if (out) *out = res;
+    if (pst != OK) return pst;
 
     log_info("gc: %llu reachable references, %llu objects swept, %llu bytes, "
              "%u pack entr%s dropped",

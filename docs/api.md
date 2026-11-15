@@ -441,6 +441,18 @@ permanent record of what ran is each repository's journal
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it.
 
+What some jobs report in `result`, beyond the backup and restore counts:
+
+| Job | `result` |
+|---|---|
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
+
+It also puts a one-line summary in its journal entry, such as `swept 12
+objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
+removed`. A dry-run gc
+removes nothing, temp files included; its pack figures are zero because
+compaction does not run.
+
 ## Introspection
 
 What is actually inside a repository, as opposed to what it can do.

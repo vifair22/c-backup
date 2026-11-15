@@ -187,6 +187,15 @@ contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
 contains "gc dry run" '"state":"completed"' "$(cb gc 1 --dry-run)"
 contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
 
+echo "job reporting"
+# B062: gc and its dry run printed a bare job; the counts were only logged.
+GC_OUT=$(cb gc 1)
+contains "gc reports what it swept" '"objects_swept":' "$GC_OUT"
+contains "and what compaction did" '"packs_rewritten":' "$GC_OUT"
+contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
+contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
+contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
+
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"

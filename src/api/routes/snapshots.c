@@ -734,6 +734,53 @@ static void gfs_report(void *progress_ctx, int dry_run,
     job_set_summary(progress_ctx, msg);
 }
 
+/*
+ * What a gc did, or would do, on the job and in the journal.
+ *
+ * gc and gc --dry-run both printed a bare job record: the counts reached the
+ * daemon log and nowhere a client could read them, so a dry run - whose
+ * whole purpose is the answer - answered nothing. Recorded on failure and
+ * cancellation too, because the sweep commits before compaction starts and
+ * what it removed is still true.
+ */
+static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
+{
+    char js[512];
+    snprintf(js, sizeof(js),
+             "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
+             "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
+             "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
+             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"tmp_bytes_removed\":%llu}",
+             dry_run ? "true" : "false",
+             (unsigned long long)gr->reachable,
+             (unsigned long long)gr->swept,
+             (unsigned long long)gr->bytes_freed,
+             (unsigned long long)gr->pack_entries_kept,
+             (unsigned long long)gr->pack_entries_dropped,
+             gr->packs_rewritten, gr->packs_deleted,
+             gr->tmp_files_removed,
+             (unsigned long long)gr->tmp_bytes_removed);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (dry_run)
+        snprintf(msg, sizeof(msg),
+                 "dry run: would sweep %llu object%s (%llu bytes)",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed);
+    else
+        snprintf(msg, sizeof(msg),
+                 "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
+                 "%u deleted; %u stale temp file%s removed",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed,
+                 gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
+                 gr->packs_deleted,
+                 gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -817,7 +864,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
             }
         }
     } else if (j->kind == SNAP_JOB_GC) {
-        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
+        gc_result_t gr;
+        memset(&gr, 0, sizeof(gr));
+        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, &gr);
+        gc_report(progress_ctx, j->dry_run, &gr);
     } else if (j->kind == SNAP_JOB_GFS) {
         /* Retention comes from policy_values, falling back to the daemon
          * defaults when a repo has not set its own. Those were hard-coded
