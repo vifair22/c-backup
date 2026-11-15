@@ -1094,6 +1094,70 @@ static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZ
  * Written atomically, because a half-written record would make a snapshot
  * unreadable during reindex even though all of its data is present.
  */
+/*
+ * The next snapshot id for a repository, recorded as issued before it is
+ * used.
+ *
+ * Ids are per repository and never handed out twice. MAX(id) + 1 over the
+ * snapshots present did hand them out twice: deleting the newest snapshot
+ * gave its id to the next backup, and a tag, note, search run or client
+ * still naming the old one silently moved to a different tree. The
+ * high-water mark in snapshot_id_seq (migration 023) remembers ids whose
+ * rows are gone; MAX(id) still counts, for snapshots a reindex inserted.
+ *
+ * A record file already at the candidate is skipped too. A backup that
+ * stopped between writing its record and inserting its row leaves exactly
+ * that, and the rename in write_snapshot_record would replace it.
+ */
+static status_t allocate_snapshot_id(cutils_db_t *db, store_t *store,
+                                     int64_t repo_id, int64_t *out)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    if (db_txn_begin(db) != OK) return set_error(ERR_IO, "snapshot id: begin");
+
+    db_result_t *r = NULL;
+    int64_t next = 0;
+    if (db_execute(db,
+            "SELECT MAX(COALESCE((SELECT last_id FROM snapshot_id_seq WHERE repo_id = ?), 0),"
+            "           COALESCE((SELECT MAX(id) FROM snapshots WHERE repo_id = ?), 0)) + 1",
+            (const char *[]){ repo, repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        next = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    if (next < 1) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "snapshot id: cannot read the high-water mark");
+    }
+
+    for (;;) {
+        char path[PATH_MAX];
+        struct stat sb;
+        if (snprintf(path, sizeof(path), "%s/snapshots/%lld",
+                     store_root(store), (long long)next) >= (int)sizeof(path)) {
+            db_txn_rollback(db);
+            return set_error(ERR_IO, "snapshot id: path too long");
+        }
+        if (lstat(path, &sb) != 0) break;
+        log_warn("backup: snapshot record %lld exists with no index row; skipping that id",
+                 (long long)next);
+        next++;
+    }
+
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)next);
+    if (db_execute_non_query(db,
+            "INSERT INTO snapshot_id_seq (repo_id, last_id) VALUES (?, ?)"
+            " ON CONFLICT(repo_id) DO UPDATE SET last_id = excluded.last_id",
+            (const char *[]){ repo, id, NULL }, NULL) != 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "snapshot id: cannot record %s", id);
+    }
+    if (db_txn_commit(db) != OK) return set_error(ERR_IO, "snapshot id: commit");
+    *out = next;
+    return OK;
+}
+
 static status_t write_snapshot_record(store_t *store, int64_t snap_id,
                                       const uint8_t root[OBJECT_HASH_SIZE],
                                       time_t ts, const char *label)
@@ -1532,18 +1596,13 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         return st;
     }
 
-    /* Snapshot ids are per repo and monotonic. */
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    db_result_t *r = NULL;
-    int64_t snap_id = 1;
-    if (db_execute(db, "SELECT COALESCE(MAX(id), 0) + 1 FROM snapshots WHERE repo_id = ?",
-                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-        snap_id = strtoll(r->rows[0][0], NULL, 10);
-    db_result_free(r);
+    int64_t snap_id = 0;
+    st = allocate_snapshot_id(db, store, repo_id, &snap_id);
 
     time_t now = time(NULL);
-    st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
+    if (st == OK) st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
     uint64_t _tin = phase_now();
     if (st == OK) st = index_nodes(&p, snap_id);
     phase_add(&timers, PHASE_INDEX_NODES, _tin);

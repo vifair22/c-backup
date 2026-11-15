@@ -32,6 +32,7 @@
 #include "db_txn.h"
 #include "manifest.h"
 #include "pack.h"
+#include "prune.h"
 #include "object.h"
 #include "repo.h"
 #include "restore.h"
@@ -1166,10 +1167,62 @@ static void test_metadata_write_is_not_held_by_a_slow_batch(void **state)
     assert_true(pr.waited_ms < 1500);
 }
 
+/*
+ * Snapshot ids are never handed out twice. They were MAX(id) + 1 over the
+ * snapshots present, so deleting the newest one gave its id to the next
+ * backup, and anything still naming it (a tag, a note, a search run, a
+ * client) silently pointed at a different tree.
+ */
+static void test_deleted_newest_snapshot_id_is_not_reused(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 1);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 2);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, 2), OK);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 3);
+
+    /* Every snapshot pruned: still above the highest ever issued. */
+    assert_int_equal(prune_snapshot(store, db, repo_id, 3), OK);
+    assert_int_equal(prune_snapshot(store, db, repo_id, 1), OK);
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 4);
+}
+
+/* A record with no index row, as a backup stopped between writing the
+ * record and inserting its row leaves, keeps its id: the next backup must
+ * not rename its own record over it. */
+static void test_orphaned_snapshot_record_keeps_its_id(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 1);
+
+    write_file(TEST_REPO "/snapshots/2", "orphan\n");
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.snapshot_id, 3);
+
+    char buf[16] = { 0 };
+    FILE *f = fopen(TEST_REPO "/snapshots/2", "r");
+    assert_non_null(f);
+    assert_non_null(fgets(buf, sizeof(buf), f));
+    fclose(f);
+    assert_string_equal(buf, "orphan\n");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_deleted_newest_snapshot_id_is_not_reused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_orphaned_snapshot_record_keeps_its_id, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_phases_end_at_their_totals, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_sparse_file, setup, teardown),
