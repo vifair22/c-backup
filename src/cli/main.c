@@ -896,6 +896,24 @@ static int cmd_pack(int argc, char **argv)
  * verify list / verify show read past runs, in the same shape as repo list
  * and policy list.
  */
+/* Id of a repository's newest verify run, or -1 if it has none or the
+ * daemon cannot say. */
+static long newest_verify_run(const char *repo)
+{
+    sbuf_t rp = { 0 };
+    sb_puts(&rp, "/repos/"); sb_puts(&rp, repo); sb_puts(&rp, "/verify?limit=1");
+    if (rp.oom) { free(rp.buf); return -1; }
+    http_response_t rr;
+    memset(&rr, 0, sizeof(rr));
+    status_t st = http_request(g_socket, "GET", rp.buf, NULL, &rr);
+    free(rp.buf);
+    long run = -1;
+    const char *ip = (st == OK && rr.body) ? strstr(rr.body, "\"id\":\"") : NULL;
+    if (ip) run = strtol(ip + 6, NULL, 10);
+    http_response_free(&rr);
+    return run;
+}
+
 static int cmd_verify(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[0], "list") == 0) {
@@ -924,12 +942,21 @@ static int cmd_verify(int argc, char **argv)
     if (level) { sb_puts(&q, "level="); sb_query_val(&q, level); }
     if (no_repair) sb_puts(&q, q.len ? "&repair=0" : "repair=0");
     if (dry) sb_puts(&q, q.len ? "&dry_run=1" : "dry_run=1");
+    /*
+     * A verify that finds loss fails its job, and the findings are then the
+     * part an operator most needs. So a failed job still prints the run it
+     * produced - but only one newer than any run that existed before, since
+     * a job that failed before opening a run (a busy repository, a missing
+     * key) must not print an older run as if it were this one's.
+     */
+    long before = (!no_wait && argc >= 1) ? newest_verify_run(argv[0]) : -1;
+
     long job = -1;
     /* Quiet: the run record below says everything the job record does, and
-     * more. A failed run still prints the job, which carries the reason. */
+     * more. A failed run still prints the job, on stderr, with the reason. */
     int rc = maintenance_ex("verify", argc, argv, q.buf, no_wait, 1, &job);
     free(q.buf);
-    if (rc != 0 || no_wait) return rc;
+    if (no_wait || (rc != 0 && job < 0)) return rc;
 
     /* Newest run for this repo is the one just finished. */
     http_response_t rr;
@@ -943,10 +970,11 @@ static int cmd_verify(int argc, char **argv)
     long run = -1;
     const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
     if (ip) run = strtol(ip + 6, NULL, 10);
+    if (rc != 0 && run <= before) { http_response_free(&rr); return rc; }
     if (run < 0) {
         if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
         http_response_free(&rr);
-        return 0;
+        return rc;
     }
 
     sbuf_t fp = { 0 };
@@ -956,7 +984,7 @@ static int cmd_verify(int argc, char **argv)
     sb_puts(&fp, runbuf);
     int out = print_with_result(&rr, &fp);
     http_response_free(&rr);
-    return out;
+    return rc != 0 ? rc : out;
 }
 
 static int cmd_stats(int argc, char **argv)

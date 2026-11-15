@@ -59,6 +59,10 @@ typedef struct {
 /*
  * repair writes corrections back to disk. The caller must hold the repo
  * write lock when it does, and may hold only the read lock when it does not.
+ *
+ * Returns ERR_CORRUPT when the walk finished but found unrecoverable or
+ * missing objects. The run record and findings are written first, and *out
+ * is filled, exactly as for a clean run.
  */
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     verify_level_t level, int repair, volatile int *cancel,

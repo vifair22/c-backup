@@ -583,5 +583,27 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  (unsigned long long)res.bytes_read);
 
     if (out) *out = res;
+
+    /*
+     * Loss is a failure, reported after the run record and its findings are
+     * written so they stay readable. This returned OK, so a scrub that found
+     * 4 MiB of a pack overwritten finished as a completed job and the CLI
+     * exited 0: anything that judged the run by its exit status, which is
+     * every scheduler and script, was told the repository was fine.
+     *
+     * Recoverable and repaired damage is not loss and does not fail the run.
+     * The walk itself did finish, so the record stays completed = 1 and the
+     * metrics that read completed runs still see the damage.
+     */
+    if (res.unrecoverable || res.missing)
+        return set_error(ERR_CORRUPT,
+                         "verify run %lld found data loss: %llu unrecoverable and "
+                         "%llu missing object(s), affecting %llu file(s) in %llu "
+                         "snapshot(s)",
+                         (long long)res.run_id,
+                         (unsigned long long)res.unrecoverable,
+                         (unsigned long long)res.missing,
+                         (unsigned long long)res.affected_files,
+                         (unsigned long long)res.affected_snapshots);
     return OK;
 }

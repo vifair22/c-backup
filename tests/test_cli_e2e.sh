@@ -320,6 +320,48 @@ contains "verify reports findings"          '"findings"'     "$VOUT"
 contains "clean repo has no findings"       '"findings":[]'  "$VOUT"
 contains "verify list shows past runs"      '"runs"'         "$(cb verify list "$ENC_ID" --limit 2)"
 
+# Loss is a failure. A deep verify that found a pack overwritten with random
+# bytes exited 0 and its job read "completed", so anything judging the run by
+# its exit status was told the repository was fine. The run and findings
+# still have to come out, on stdout, because they say what was lost.
+mkdir -p "$WORK/losssrc"
+for i in 1 2 3; do echo "loss fixture $i" > "$WORK/losssrc/f$i.txt"; done
+LOSS_ID=$(cb repo add "$WORK/lossrepo" loss | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$LOSS_ID" "$WORK/losssrc" > /dev/null
+LOSS_DAT=$(find "$WORK/lossrepo/packs" -name '*.dat' | head -1)
+if [ -n "$LOSS_DAT" ]; then
+    # Everything past the first 64 bytes: payloads and the parity that would
+    # rebuild them, so nothing is left to recover from.
+    LOSS_LEN=$(stat -c %s "$LOSS_DAT")
+    head -c $((LOSS_LEN - 64)) /dev/urandom | \
+        dd of="$LOSS_DAT" bs=1 seek=64 conv=notrunc status=none
+    OUT=$(cb verify "$LOSS_ID" --level deep 2>"$WORK/loss.err"); RC=$?
+    check    "verify that finds loss exits non-zero" 1 "$RC"
+    contains "the failed job says why"  "data loss"              "$(cat "$WORK/loss.err")"
+    contains "the failed job is failed" '"state":"failed"'       "$(cat "$WORK/loss.err")"
+    contains "the run still prints"     '"level":"deep"'         "$OUT"
+    contains "its findings still print" '"status":"unrecoverable"' "$OUT"
+    check    "and as one document"      "1" "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
+
+    # The index level never opens a pack, and reported a deleted one as ok.
+    rm -f "$LOSS_DAT"
+    OUT=$(cb verify "$LOSS_ID" --level index 2>/dev/null); RC=$?
+    check    "index verify of a deleted pack exits non-zero" 1 "$RC"
+    contains "a deleted pack's objects are missing" '"status":"missing"' "$OUT"
+    case "$OUT" in
+        *'"missing":"0"'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
+        *)                 ok  "index verify counts them missing" ;;
+    esac
+    contains "verify show reads the failed run back" '"findings"' \
+        "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":"\([0-9]*\)".*/\1/p')")"
+    # A failed run is still a completed walk, and the gauge reads those.
+    GAUGE=$(cb metrics | sed -n 's/^cbackup_verify_unrecoverable_objects \([0-9]*\)$/\1/p')
+    if [ "${GAUGE:-0}" -gt 0 ]; then ok "the loss gauge sees it"
+    else bad "the loss gauge sees it" "> 0" "${GAUGE:-absent}"; fi
+else
+    bad "loss repo produced a pack" "a pack file" "none"
+fi
+
 # Job commands wait by default and exit non-zero when the job fails.
 OUT=$(cb pack "$ENC_ID"); RC=$?
 check    "pack waits for its job"  0            "$RC"
