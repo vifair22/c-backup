@@ -17,10 +17,12 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "util.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +105,60 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     char *path = strdup(r->rows[0][0]);
     db_result_free(r);
     return path;
+}
+
+/* ---------- restore request validation ---------- */
+
+/*
+ * Does `subpath` (normalised, absolute, not "/") name anything in the
+ * snapshot? One indexed lookup per component against nodes_by_snap_parent,
+ * so asking costs the depth of the path, not the size of the snapshot.
+ *
+ * Returns 1 when it does, 0 when it does not, and -1 when the index cannot
+ * say: a snapshot whose nodes are not resident (evicted, or never
+ * materialised) has no rows to walk, and the restore job reports that case
+ * with its own message rather than this one guessing.
+ */
+static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+
+    db_result_t *r = NULL;
+    int resident = db_execute(g_ctx.db,
+            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    if (!resident) return -1;
+
+    char parent[32] = "0";
+    const char *p = subpath;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        char name[NAME_MAX + 1];
+        size_t n = (size_t)(p - s);
+        if (n > NAME_MAX) return 0;
+        memcpy(name, s, n);
+        name[n] = '\0';
+
+        r = NULL;
+        if (db_execute(g_ctx.db,
+                "SELECT id FROM nodes"
+                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
+                "   AND name = ?",
+                (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
+            !r || r->nrows < 1) {
+            db_result_free(r);
+            return 0;
+        }
+        snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
+        db_result_free(r);
+    }
+    return 1;
 }
 
 /* ---------- listing ---------- */
@@ -831,6 +887,37 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
          * it. Pulling a single file out of a large backup should not cost a
          * full restore. */
         if (json_req_get_str(body, "subpath", &j->subpath) != 0) j->subpath = NULL;
+        if (j->subpath) {
+            /* Snapshot paths are absolute, so a subpath is read as one
+             * whether or not it starts with a slash, and normalised so
+             * "/a//b/" and "/a/./b" name the same thing "/a/b" does. */
+            char raw[PATH_MAX], norm[PATH_MAX];
+            if (snprintf(raw, sizeof(raw), "%s%s", j->subpath[0] == '/' ? "" : "/",
+                         j->subpath) >= (int)sizeof(raw) ||
+                path_normalize(raw, norm, sizeof(norm)) != 0) {
+                snap_job_free(j);
+                return api_error(400, "subpath is too long");
+            }
+            free(j->subpath);
+            j->subpath = NULL;
+            if (strcmp(norm, "/") != 0) {
+                /* A subpath that matches nothing used to run a restore that
+                 * wrote nothing and reported success. */
+                if (subpath_exists(repo_id, snap_id, norm) == 0) {
+                    char msg[PATH_MAX + 64];
+                    snprintf(msg, sizeof(msg),
+                             "subpath %s matches nothing in snapshot %lld",
+                             norm, (long long)snap_id);
+                    snap_job_free(j);
+                    return api_error(404, msg);
+                }
+                j->subpath = strdup(norm);
+                if (!j->subpath) {
+                    snap_job_free(j);
+                    return api_error(500, "out of memory");
+                }
+            }
+        }
     }
 
     int64_t job_id = 0;

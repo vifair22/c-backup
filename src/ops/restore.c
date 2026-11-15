@@ -524,6 +524,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     restore_result_t res;
+    uint64_t matched = 0;     /* nodes inside the subpath, when there is one */
     memset(&res, 0, sizeof(res));
     status_t st = OK;
 
@@ -622,6 +623,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (opts->subpath && !path_within(rel, opts->subpath))
             continue;
+        matched++;
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
@@ -903,6 +905,14 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     pt_free(&paths);
     db_result_free(r);
     if (st != OK) return st;
+
+    /* The route refuses this up front when the index can answer; this is
+     * the backstop for every other caller. A restore that wrote nothing
+     * because nothing matched is not a success. */
+    if (opts->subpath && matched == 0 && res.failed == 0)
+        return set_error(ERR_NOT_FOUND,
+                         "subpath %s matches nothing in snapshot %lld",
+                         opts->subpath, (long long)snap_id);
 
     log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
              "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped, "

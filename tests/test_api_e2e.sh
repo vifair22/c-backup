@@ -333,6 +333,28 @@ if [ -f "$WORK/sub$WORK/src/a.txt" ]; then
     bad "subpath excluded the rest" "no a.txt outside the subpath" "a.txt restored"
 else ok "subpath excluded the rest"; fi
 
+# A subpath is normalised before it is matched, so the doubled and trailing
+# slashes here name the same directory as the plain spelling.
+NORM_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+           -d "{\"dest\":\"$WORK/subnorm\",\"subpath\":\"$WORK//src/./docs/\"}" \
+           http://localhost/repos/1/snapshots/1/restore)")
+wait_job "$NORM_JOB"
+contains "normalised subpath restore completed" '"state":"completed"' "$(sock_body "/jobs/$NORM_JOB")"
+if [ -f "$WORK/subnorm$WORK/src/docs/c.txt" ]; then ok "normalised subpath restored its file"
+else bad "normalised subpath restored its file" "c.txt restored" "missing"; fi
+
+echo "restore request validation"
+restore_req() {  # restore_req <json> -> "<code> <body>"
+    curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" -d "$1" \
+         http://localhost/repos/1/snapshots/1/restore
+}
+# A subpath that matches nothing used to run, restore nothing, and report
+# success. The index can answer the question before a job exists.
+R=$(restore_req "{\"dest\":\"$WORK/nothing\",\"subpath\":\"/no/such/path\"}")
+contains "missing subpath is 404"        ' 404'                                   "$R"
+contains "missing subpath says so"       'subpath /no/such/path matches nothing in snapshot 1' "$R"
+check    "missing subpath wrote nothing" "absent" "$([ -e "$WORK/nothing" ] && echo present || echo absent)"
+
 echo "maintenance"
 GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")
 check "gc submitted" "1" "$([ -n "$GC_JOB" ] && echo 1 || echo 0)"

@@ -114,6 +114,55 @@ static inline int path_is_rotational(const char *path) { (void)path; return -1; 
 #endif
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Path helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Lexical normalisation of an absolute path: repeated slashes collapse, "."
+ * components vanish, ".." removes the component before it and stops at the
+ * root, and no trailing slash survives except on "/" itself.
+ *
+ * Lexical on purpose. It touches no filesystem, so it works on paths that do
+ * not exist here - a snapshot's contents, an exclude pattern, a restore
+ * destination not yet created - at the price of not resolving symlinks.
+ * Callers that need to know where a path really lands use realpath on the
+ * part that exists.
+ *
+ * Returns 0, or -1 when the input is not absolute or the result does not fit.
+ */
+static inline int path_normalize(const char *in, char *out, size_t outsz) {
+    if (!in || in[0] != '/' || !out || outsz < 2) return -1;
+    size_t len = 0;
+    out[len++] = '/';
+    out[len] = '\0';
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        size_t n = (size_t)(p - s);
+        if (n == 1 && s[0] == '.') continue;
+        if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (len > 1 && out[len - 1] != '/') len--;
+            if (len > 1) len--;
+            out[len] = '\0';
+            continue;
+        }
+        if (len > 1) {
+            if (len + 1 >= outsz) return -1;
+            out[len++] = '/';
+        }
+        if (len + n >= outsz) return -1;
+        memcpy(out + len, s, n);
+        len += n;
+        out[len] = '\0';
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Time helpers                                                       */
 /* ------------------------------------------------------------------ */
 

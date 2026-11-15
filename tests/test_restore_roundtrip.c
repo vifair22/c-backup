@@ -668,6 +668,36 @@ static void test_restore_of_unknown_snapshot_fails(void **state)
 }
 
 /*
+ * A subpath that names nothing fails rather than restoring nothing.
+ *
+ * It returned OK with zero files written, so `restore --subpath /typo`
+ * looked exactly like a restore that worked. The route refuses it before a
+ * job exists; this is the backstop for callers that reach restore_run some
+ * other way, or a snapshot the index could not check up front. A subpath
+ * that does match still restores, so the check is not simply failing every
+ * subpath restore.
+ */
+static void test_subpath_matching_nothing_fails(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.subpath = "/no/such/path";
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), ERR_NOT_FOUND);
+
+    ro.subpath = TEST_SRC "/nested";
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(rr.files, 2);
+}
+
+/*
  * Symlinks and hardlinks survive a round trip.
  *
  * Nothing in this suite had a link in it until a 223,000-file tree was backed
@@ -1551,6 +1581,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_subpath_matching_nothing_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resumed_restore_relinks_hardlinks, setup, teardown),
