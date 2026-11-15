@@ -107,6 +107,12 @@ contains "and says so" 'no such tag' "$OUT"
 check "tag set on a missing snapshot fails" 1 "$(cb tag set 1 ghost 999 > /dev/null 2>&1; echo $?)"
 check "note on a missing snapshot fails" 1 "$(cb snapshot note 1 999 x > /dev/null 2>&1; echo $?)"
 check "tag set with an empty name fails" 1 "$(cb tag set 1 '' 1 > /dev/null 2>&1; echo $?)"
+# B036: the name went into the path unencoded, so "a b" made a request line
+# the server answered with an HTML page and a 301. Encoded, the daemon sees
+# the name and answers in JSON. And a name like that cannot be set now.
+contains "tag remove encodes the name" '{"error":"no such tag"}' "$(cb tag remove 1 'a b' 2>&1)"
+contains "a name that is not a path segment is refused" 'invalid tag name' \
+    "$(cb tag set 1 'a/b' 1 2>&1)"
 
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"

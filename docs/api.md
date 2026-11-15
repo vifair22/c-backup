@@ -422,6 +422,13 @@ asked for; it used to happen silently, and the next retention pass could
 then delete a snapshot the operator believed was protected. Setting a name on
 the snapshot it is already on succeeds, so a retried request is harmless.
 
+Tag names are 1 to 64 characters of `A-Z a-z 0-9 . _ -`, starting with a
+letter or digit; anything else is a 400 at set time. A name is the last
+segment of the `DELETE` path, and one that cannot be a path segment (a space,
+a slash, a `?`) could be set and then never removed. Clients should still
+percent-encode the segment, as the CLI and the app do, so that a tag stored
+before this rule can be removed: the server decodes the path before routing.
+
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
 `defaults`, the daemon's configured `retention.*` values from `config.yaml`
 that apply wherever the repository has set nothing. A client cannot read the

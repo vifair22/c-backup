@@ -25,6 +25,10 @@
  * a tag under a name already in use does not, and shows the refusal.
  */
 
+/* What the daemon accepts as a tag name. Mirrored here so the dialog can say
+ * so before a round trip; the daemon is the authority. */
+const TAG_NAME_PATTERN = '[A-Za-z0-9][A-Za-z0-9._\\-]{0,63}'
+
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtNum, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
@@ -238,6 +242,8 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
               <label className="block text-xs font-medium text-text-secondary mb-1">Name</label>
               <input value={editDialog.name} onChange={e => setEditDialog({ ...editDialog, name: e.target.value })}
                 placeholder="before-upgrade"
+                pattern={TAG_NAME_PATTERN} maxLength={64}
+                title="Letters, digits, '.', '_' and '-', starting with a letter or digit"
                 className="w-full px-2 py-1 border border-border-default rounded text-sm
                            bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
                 autoFocus required />

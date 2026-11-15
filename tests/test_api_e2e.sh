@@ -241,6 +241,20 @@ contains "removing a missing tag is a 404" '{"error":"no such tag"} 404' \
     "$(sock_send DELETE /repos/1/tags/milestone)"
 check "nothing was stored for the missing snapshot" '{"tags":[]}' "$(sock_body /repos/1/tags)"
 
+# B036: a tag name is a path segment in DELETE, so one that cannot be a
+# segment ("a b", "a/b", "x?y") could be set and then never removed.
+for n in 'a/b' 'a b' 'x?y' '.hidden' '..'; do
+    check "tag name '$n' is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+         --unix-socket "$SOCK" -d "{\"name\":\"$n\",\"snap_id\":1}" http://localhost/repos/1/tags)"
+done
+check "a 65-character tag name is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d "{\"name\":\"$(printf 'a%.0s' $(seq 1 65))\",\"snap_id\":1}" \
+     http://localhost/repos/1/tags)"
+check "a dotted, dashed name is fine" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"v1.2_pre-upgrade","snap_id":1}' http://localhost/repos/1/tags)"
+check "and removable" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" http://localhost/repos/1/tags/v1.2_pre-upgrade)"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.

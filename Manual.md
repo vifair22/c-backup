@@ -535,6 +535,9 @@ sudo c-backup tag remove 1 pre-migration
   A tag is retention protection (section 9.1), so moving it unprotects the
   snapshot it was on; `--move` says that is intended. Setting a tag on the
   snapshot it is already on succeeds.
+- Tag names are 1 to 64 letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit. A name is part of a URL path when it is removed, and one
+  with a space or a slash could be set but never removed.
 - Removing a tag that does not exist fails with "no such tag".
 
 ---

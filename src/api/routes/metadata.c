@@ -4,6 +4,7 @@
 #include "routes.h"
 #include "db_txn.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <strings.h>
 
@@ -79,6 +80,38 @@ api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
     return finalise(resp);
 }
 
+/*
+ * What a tag may be called: [A-Za-z0-9][A-Za-z0-9._-]{0,63}.
+ *
+ * A tag name is the last segment of DELETE /repos/<id>/tags/<name>, so it
+ * has to survive being a path segment. Restricting the name is what makes
+ * that hold for every client, rather than trusting each one to
+ * percent-encode: "a b" was accepted at set time and could then never be
+ * removed from the CLI, because the unencoded space made the request line
+ * invalid and the server answered with an HTML error page. A slash cannot
+ * round-trip either, since the server decodes %2F before routing, and a '?'
+ * truncated the name to whatever preceded it. The leading alphanumeric
+ * rules out "." and "..", which clients and proxies may collapse before a
+ * request leaves them.
+ *
+ * Only set validates. Remove accepts any non-empty name, so a tag stored
+ * before this rule existed can still be addressed (percent-encoded) and
+ * deleted.
+ */
+#define TAG_NAME_MAX 64
+
+static int tag_name_valid(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n > TAG_NAME_MAX) return 0;
+    if (!isalnum((unsigned char)s[0])) return 0;
+    for (size_t i = 1; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return 0;
+    }
+    return 1;
+}
+
 /* Tags and notes hang off a snapshot id with no foreign key behind it, so
  * routes that accepted any number stored metadata for snapshots that never
  * existed: a tag on 999 protected nothing and listed as if it did. */
@@ -104,6 +137,9 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     bool move = false;
     if (json_req_get_str(body, "name", &name) != 0 || !name || !name[0])
         return api_error(400, "name is required");
+    if (!tag_name_valid(name))
+        return api_error(400, "invalid tag name: use 1-64 of A-Z a-z 0-9 . _ -,"
+                              " starting with a letter or digit");
     if (json_req_get_u32(body, "snap_id", &snap, 1, UINT32_MAX) != 0)
         return api_error(400, "snap_id is required");
     if (json_req_has(body, "move") && json_req_get_bool(body, "move", &move) != 0)

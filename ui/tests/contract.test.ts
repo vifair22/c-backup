@@ -362,7 +362,9 @@ describe('the flows behind the buttons', () => {
     assert.deepEqual((list.body as { tags: { name: string; snap_id: string }[] }).tags,
       [{ name: 'keep', snap_id: '2' }])
 
-    /* A removal of nothing says so. */
+    /* A name the daemon would refuse, and a removal of nothing, both say so. */
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'a/b', snapshotId: 1 }))
+    assert.equal(r.status, 400)
     r = await request(toEndpoint({ kind: 'tagRemove', repoId, name: 'absent' }))
     assert.equal(r.status, 404)
   })

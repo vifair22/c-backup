@@ -127,6 +127,20 @@ static void sb_query_val(sbuf_t *b, const char *s)
     }
 }
 
+/*
+ * Percent-encode one path segment, such as a tag name.
+ *
+ * The same unreserved set as a query value, so this is the same encoding;
+ * it has its own name because the reason differs. A name went into the path
+ * raw, so "a b" produced a request line the server rejected with an HTML
+ * page and a 301, and "x?y" addressed tag "x". Tag names are restricted
+ * now, but one stored before that must still be removable.
+ */
+static void sb_path_seg(sbuf_t *b, const char *s)
+{
+    sb_query_val(b, s);
+}
+
 /* ------------------------------------------------------------------ */
 /* Options                                                             */
 /* ------------------------------------------------------------------ */
@@ -1081,7 +1095,7 @@ static int cmd_tag(int argc, char **argv)
         if (argc < 3) return fail("usage: tag remove <repo-id> <name>");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]);
-        sb_puts(&p, "/tags/"); sb_puts(&p, argv[2]);
+        sb_puts(&p, "/tags/"); sb_path_seg(&p, argv[2]);
         return call_path_sb("DELETE", &p, NULL);
     }
     return fail("unknown tag subcommand '%s'", argv[0]);
