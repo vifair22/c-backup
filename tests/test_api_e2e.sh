@@ -454,5 +454,46 @@ else
 fi
 DAEMON_PID=""
 
+# Retention defaults come from config.yaml. They were database keys nothing
+# could set and the GFS job never read, so every pass used compiled-in
+# numbers whatever the operator configured. A second daemon with keep_snaps
+# at 2: four same-day backups hold no tier yet, so only the recency window
+# keeps any, and the default of 1 would leave one.
+echo "retention config"
+R="$WORK/ret"
+mkdir -p "$R/src"
+echo one > "$R/src/f"
+cat > "$R/config.yaml" <<EOF
+db:
+  path: $R/state.db
+http:
+  socket: $R/sock
+  port: 0
+log:
+  level: warn
+security:
+  key_dir: $R/keys
+retention:
+  keep_snaps: 2
+EOF
+C_BACKUP_CONFIG_PATH="$R/config.yaml" "$BIN" > "$R/daemon.log" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 50); do [ -S "$R/sock" ] && break; sleep 0.1; done
+MAIN_SOCK="$SOCK"
+SOCK="$R/sock"
+sock_post() { curl -s -X POST --unix-socket "$SOCK" "http://localhost$1" ${2:+-d "$2"}; }
+sock_post /repos "{\"path\":\"$R/repo\",\"label\":\"r\"}" > /dev/null
+for i in 1 2 3 4; do
+    echo "$i" >> "$R/src/f"
+    wait_job "$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")"
+done
+wait_job "$(job_id "$(sock_post /repos/1/gfs)")"
+check "retention reads keep_snaps from config" 2 \
+    "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+kill -TERM "$DAEMON_PID" 2>/dev/null
+wait "$DAEMON_PID" 2>/dev/null
+DAEMON_PID=""
+SOCK="$MAIN_SOCK"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -37,6 +37,11 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, struct job_manager 
  * here by suffix; these do not register routes of their own.
  */
 void routes_snapshots_init(cutils_db_t *db, struct job_manager *jm);
+
+/* What a retention pass keeps when a repository has set no retention.*
+ * policy of its own: the daemon's configured defaults. */
+void routes_snapshots_set_retention(int keep_snaps, int keep_daily, int keep_weekly,
+                                    int keep_monthly, int keep_yearly);
 api_response_t snapshots_route_get(const api_request_t *req, int64_t repo_id,
                                    const char *rest);
 api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,

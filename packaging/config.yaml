@@ -36,3 +36,24 @@ auth:
 pushover:
   token: ""
   user: ""
+
+scheduler:
+  # 0 stops schedules firing; manual jobs still run.
+  enabled: 1
+
+jobs:
+  # Jobs running at once across all repositories. Jobs for one repository
+  # always run one at a time.
+  max_parallel: 2
+
+retention:
+  # What a retention pass (c-backup gfs, or a gfs schedule) keeps for a
+  # repository that has not set its own with 'c-backup policy set'. A
+  # snapshot survives if it is among the newest keep_snaps, holds a tier
+  # whose count it is within, or is tagged. 0 for a tier keeps all of it.
+  # Retention does not run on its own: schedule it.
+  keep_snaps: 1
+  keep_daily: 7
+  keep_weekly: 4
+  keep_monthly: 12
+  keep_yearly: 3
