@@ -66,6 +66,14 @@ typedef struct {
     uint64_t bytes_stored;
     /* Threads that stored large files: 1 when they were stored serially. */
     unsigned store_workers;
+    /*
+     * Index transactions committed, by the phase that held them: the store
+     * phase's batches, the trees batch, index_nodes' batches, and the pack
+     * commit each seal runs. Every one is a WAL sync, which on slow storage
+     * is the cost to watch (OWN-16). With nobody else writing, the store
+     * phase commits once per 2,000 files plus once per pack seal.
+     */
+    uint32_t commits_store, commits_trees, commits_index, commits_pack;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,

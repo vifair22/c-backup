@@ -213,6 +213,7 @@ typedef struct {
     char  **line;      /* path|type|mode|...|subtree, one per node */
     char  **path;
     char  **mtime;
+    char  **nsize;     /* node size, compared apart like mtime */
     char  **subtree;
     int     n;
     char    root[80];
@@ -248,6 +249,7 @@ static void snap_rows_load(env_t *e, int64_t snap, snap_rows_t *out)
     out->line    = calloc((size_t)n, sizeof(char *));
     out->path    = calloc((size_t)n, sizeof(char *));
     out->mtime   = calloc((size_t)n, sizeof(char *));
+    out->nsize   = calloc((size_t)n, sizeof(char *));
     out->subtree = calloc((size_t)n, sizeof(char *));
     for (int i = 0; i < n; i++) {
         /* Walk to the root; trees here are a handful of levels deep. */
@@ -264,16 +266,19 @@ static void snap_rows_load(env_t *e, int64_t snap, snap_rows_t *out)
         }
         char line[PATH_MAX + 1024];
         int off = snprintf(line, sizeof(line), "%s", path);
-        /* Every column but the ids, which are the database's own. mtime and
-         * subtree are compared separately, since an ancestor outside the
-         * test's control may differ in exactly those. */
+        /* Every column but the ids, which are the database's own. mtime,
+         * size and subtree are compared separately, since an ancestor
+         * outside the test's control may differ in exactly those: other
+         * processes add and remove entries in /tmp while the test runs,
+         * which moves its directory size as well as its mtime. */
         for (int c = 3; c < 17; c++) {
-            if (c == 7 || c == 10) continue;
+            if (c == 7 || c == 8 || c == 10) continue;
             off += snprintf(line + off, sizeof(line) - (size_t)off, "|%s", r->rows[i][c]);
         }
         out->line[i]    = strdup(line);
         out->path[i]    = strdup(path);
         out->mtime[i]   = strdup(r->rows[i][7]);
+        out->nsize[i]   = strdup(r->rows[i][8]);
         out->subtree[i] = strdup(r->rows[i][10]);
     }
     db_result_free(r);
@@ -283,8 +288,9 @@ static void snap_rows_free(snap_rows_t *s)
 {
     for (int i = 0; i < s->n; i++) {
         free(s->line[i]); free(s->path[i]); free(s->mtime[i]); free(s->subtree[i]);
+        free(s->nsize[i]);
     }
-    free(s->line); free(s->path); free(s->mtime); free(s->subtree);
+    free(s->line); free(s->path); free(s->mtime); free(s->subtree); free(s->nsize);
 }
 
 static int find_path(const snap_rows_t *s, const char *path)
@@ -330,9 +336,11 @@ static void assert_same_snapshot(env_t *a, int64_t sa, env_t *b, int64_t sb,
         if (j < 0) fail_msg("node %s missing from the second snapshot", x.path[i]);
         assert_string_equal(x.line[i], y.line[j]);
         if (is_ancestor(x.path[i], owned)) {
-            if (strcmp(x.mtime[i], y.mtime[j]) != 0) outside_moved = 1;
+            if (strcmp(x.mtime[i], y.mtime[j]) != 0 ||
+                strcmp(x.nsize[i], y.nsize[j]) != 0) outside_moved = 1;
         } else {
             assert_string_equal(x.mtime[i], y.mtime[j]);
+            assert_string_equal(x.nsize[i], y.nsize[j]);
             assert_string_equal(x.subtree[i], y.subtree[j]);
         }
     }

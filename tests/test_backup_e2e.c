@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -1166,6 +1167,224 @@ static void test_metadata_write_is_not_held_by_a_slow_batch(void **state)
     assert_true(pr.waited_ms < 1500);
 }
 
+/*
+ * OWN-16: with nobody waiting, a batch is ended by its size and nothing else.
+ *
+ * B107 committed every 200 ms and around every file of 4 MiB or more whether
+ * or not another writer wanted the lock, and on the UAT host's storage that
+ * cost a WAL sync per large file: 60 s of a 400 s backup. Here the batch is
+ * kept open well past 200 ms by a slow progress callback, and three files sit
+ * over the old 4 MiB line (two packed, one loose and read on this thread),
+ * and the store phase must still commit exactly once per 2,000 files.
+ */
+static void slow_store_progress(const char *phase, uint64_t done, uint64_t total,
+                                void *ctx)
+{
+    (void)done; (void)total;
+    int *calls = ctx;
+    if (!phase || strcmp(phase, "store") != 0 || *calls >= 3) return;
+    (*calls)++;
+    struct timespec ts = { 0, 300L * 1000000L };   /* past the 250 ms throttle */
+    nanosleep(&ts, NULL);
+}
+
+static void test_no_waiter_means_no_extra_commits(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int i = 0; i < 4500; i++) {
+        char path[128], body[64];
+        snprintf(path, sizeof(path), TEST_SRC "/many/f%04d.txt", i);
+        snprintf(body, sizeof(body), "file %d", i);
+        write_file(path, body);
+    }
+    write_big(TEST_SRC "/six.bin", 6);
+    write_big(TEST_SRC "/seven.bin", 7);
+    write_big(TEST_SRC "/twenty.bin", 20);
+
+    backup_opts_t o = basic_opts();
+    o.store_workers = 1;           /* the 20 MiB file is read on this thread */
+    int calls = 0;
+    o.progress_cb  = slow_store_progress;
+    o.progress_ctx = &calls;
+
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(calls, 3);
+    assert_int_equal(res.files, 4506);
+    /* Batches end at files 2,000 and 4,000, and the last at the end. B107
+     * added one per large file and one per 200 ms on top. */
+    assert_int_equal(res.commits_store, 3);
+    assert_int_equal(res.commits_trees, 1);
+    /* 13 MiB packed: no seal in the loop, one at the end. */
+    assert_int_equal(res.commits_pack, 1);
+}
+
+/*
+ * OWN-16: the batch is held across a large file now, so a writer that queues
+ * mid-file has to be noticed mid-file. It must get in within the B107 bound,
+ * and cost the backup exactly one commit beyond what it would have made
+ * alone: the commits a backup adds are bounded by the writers it meets.
+ */
+static void test_a_waiter_mid_file_costs_one_commit(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 48);
+    static const char *paths[] = { TEST_DIR "/big.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    o.store_workers = 1;
+    txn_probe_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.want_mid = 1;
+    pr.slow_ms  = 100;
+    pr.slow_max = 30;
+    o.progress_cb  = probe_progress;
+    o.bytes_cb     = probe_bytes;
+    o.progress_ctx = &pr;
+
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(pr.started);
+    pthread_join(pr.thr, NULL);
+    assert_int_equal(pr.begin_st, OK);
+    assert_true(pr.waited_ms < 1000);
+    /* Alone: one batch, committed at the end. The waiter adds one. */
+    assert_int_equal(res.commits_store, 2);
+}
+
+/*
+ * The trees phase holds a batch too (OWN-16), where it used to commit every
+ * new tree on its own. A writer that queues while trees are being built gets
+ * in between two trees, not after the last.
+ */
+static void trees_probe_progress(const char *phase, uint64_t done, uint64_t total,
+                                 void *ctx)
+{
+    (void)total;
+    txn_probe_t *pr = ctx;
+    if (!phase || strcmp(phase, "trees") != 0) return;
+    /* From the second tree on, when the first has opened the batch. */
+    if (!pr->started && done > 0) {
+        pr->started = 1;
+        clock_gettime(CLOCK_MONOTONIC, &pr->t0);
+        assert_int_equal(pthread_create(&pr->thr, NULL, txn_probe_run, pr), 0);
+    }
+    if (pr->slow_calls < pr->slow_max) {
+        pr->slow_calls++;
+        struct timespec ts = { 0, (long)pr->slow_ms * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void test_a_waiter_gets_in_between_trees(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/dirs", 0700), 0);
+    for (int i = 0; i < 300; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), TEST_SRC "/dirs/d%03d", i);
+        assert_int_equal(mkdir(path, 0700), 0);
+        snprintf(path, sizeof(path), TEST_SRC "/dirs/d%03d/f.txt", i);
+        char body[32];
+        snprintf(body, sizeof(body), "dir %d", i);
+        write_file(path, body);
+    }
+    backup_opts_t o = basic_opts();
+    txn_probe_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.slow_ms  = 300;          /* past the throttle: every tree reports */
+    pr.slow_max = 2;            /* the first tree, and the one that queues */
+    o.progress_cb  = trees_probe_progress;
+    o.progress_ctx = &pr;
+
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(pr.started);
+    pthread_join(pr.thr, NULL);
+    assert_int_equal(pr.begin_st, OK);
+    /* The old code had no batch to wait on; the new one must let go at the
+     * first tree after the waiter queued, not at the 2,000th. */
+    assert_true(pr.waited_ms < 1000);
+    assert_true(res.trees_new >= 300);
+    /* One for the waiter and one at the end, and perhaps one more from the
+     * contended second that follows (batch_t) if the remaining trees take
+     * longer than 200 ms on a slow machine. */
+    assert_true(res.commits_trees >= 2);
+    assert_true(res.commits_trees <= 4);
+}
+
+/*
+ * A writer that keeps coming back must not turn every check into a commit.
+ *
+ * The case that matters is a second backup, of another repository, sharing
+ * the lock: if each yielded at every check to the other, the two would hand
+ * it back and forth once per entry, a sync each. A raw writer that queues
+ * about once a millisecond stands in for it. Once contended, the backup
+ * holds for 200 ms at a time (B107's rule), so over a run of a second or
+ * two it commits a few dozen times at most, not once per handful of files.
+ */
+static atomic_int hammer_stop;
+
+static void *hammer_run(void *arg)
+{
+    int *n = arg;
+    while (!atomic_load(&hammer_stop)) {
+        if (db_txn_begin(db) == OK) {
+            int rc = db_execute_non_query(db,
+                "INSERT INTO config (key, value) VALUES ('hammer', '1')"
+                " ON CONFLICT(key) DO UPDATE SET value = value + 1", NULL, NULL);
+            (void)rc;
+            (void)db_txn_commit(db);
+            (*n)++;
+        }
+        struct timespec ts = { 0, 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void test_a_persistent_writer_does_not_cost_a_commit_per_file(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int i = 0; i < 6000; i++) {
+        char path[128], body[64];
+        snprintf(path, sizeof(path), TEST_SRC "/many/f%04d.txt", i);
+        snprintf(body, sizeof(body), "file %d", i);
+        write_file(path, body);
+    }
+    backup_opts_t o = basic_opts();
+    atomic_store(&hammer_stop, 0);
+    int hammered = 0;
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, hammer_run, &hammered), 0);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    atomic_store(&hammer_stop, 1);
+    pthread_join(t, NULL);
+    assert_int_equal(st, OK);
+    assert_true(hammered > 0);
+
+    int64_t ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000
+               + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000;
+    /* One per 200 ms held, plus the 2,000-entry batches and the first
+     * yield, with room for a loaded machine's scheduling. */
+    uint32_t bound = (uint32_t)(ms / 200) + 3 + 6000 / 2000 + 8;
+    print_message("persistent writer: %d writes, %u store commits in %lld ms"
+                  " (bound %u)\n", hammered, res.commits_store,
+                  (long long)ms, bound);
+    assert_true(res.commits_store <= bound);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1189,6 +1408,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_no_waiter_means_no_extra_commits, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_waiter_mid_file_costs_one_commit, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_waiter_gets_in_between_trees, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_persistent_writer_does_not_cost_a_commit_per_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_left_by_an_interrupted_run_keeps_its_size, setup, teardown),

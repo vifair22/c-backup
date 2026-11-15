@@ -20,7 +20,16 @@ static const char *const phase_names[PHASE__COUNT] = {
     [PHASE_INDEX_NODES]  = "index-nodes",
     [PHASE_CACHE_SWEEP]  = "cache-sweep",
     [PHASE_STORE_WAIT]   = "large-file-wait",
-    [PHASE_STORE_COMMIT] = "store-commit",
+    [PHASE_SETUP]        = "setup",
+    [PHASE_PACK_SEAL]    = "pack-seal",
+    [PHASE_SNAPSHOT]     = "snapshot-record",
+    [PHASE_TXN_WAIT]     = "txn-wait",
+    [PHASE_TXN_COMMIT]   = "txn-commit",
+    [PHASE_PROGRESS]     = "progress-cb",
+    [PHASE_COMMIT_STORE] = "  commit:store",
+    [PHASE_COMMIT_TREES] = "  commit:trees",
+    [PHASE_COMMIT_INDEX] = "  commit:index",
+    [PHASE_COMMIT_PACK]  = "  commit:pack",
     [PHASE_OBJ_SETUP]    = "  obj:setup",
     [PHASE_OBJ_IO]       = "  obj:io-loop",
     [PHASE_OBJ_FINISH]   = "  obj:finish",
@@ -45,6 +54,15 @@ void phase_merge(phase_timers_t *dst, const phase_timers_t *src)
         dst->ns[i]    += src->ns[i];
         dst->count[i] += src->count[i];
     }
+    /* nested_ns is not merged: it is this thread's running total for its
+     * own open spans, and a worker's spans were never inside them. */
+}
+
+/* The disjoint rows that sum to the wall clock. Everything else breaks one
+ * of them down further, or recounts it from another angle. */
+static int phase_accounted(int i)
+{
+    return i < PHASE_COMMIT_STORE;
 }
 
 struct row {
@@ -74,9 +92,10 @@ void phase_report(const phase_timers_t *t, const char *what, uint64_t total_ns)
         rows[n].name  = phase_names[i] ? phase_names[i] : "?";
         rows[n].ns    = t->ns[i];
         rows[n].count = t->count[i];
-        /* Sub-phases of read+hash+write, already counted in their parent.
-         * Adding them again would double-count and make the percentages lie. */
-        if (i < PHASE_OBJ_SETUP) accounted += t->ns[i];
+        /* Sub-phases of read+hash+write, and the commit:* recount of
+         * txn-commit, are already counted in their parent. Adding them
+         * again would double-count and make the percentages lie. */
+        if (phase_accounted(i)) accounted += t->ns[i];
         n++;
     }
     if (n == 0) return;
