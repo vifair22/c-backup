@@ -535,8 +535,12 @@ state as soon as it connects, then one per change and at least every 5
 seconds, and exits when the job ends:
 
 ```
-data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
+data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
 ```
+
+`current` counts entries, so it sits still while one large file is stored;
+`bytes_done` moves through the file as it is read, a few times a second, and
+each move is a new line.
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that

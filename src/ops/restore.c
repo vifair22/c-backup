@@ -336,6 +336,31 @@ static void report(const restore_opts_t *o, const char *phase,
 }
 
 /*
+ * Bytes written so far into the file being restored, from inside the store.
+ *
+ * Without it a restore's byte count moved only between files, and one large
+ * file held the job at a single value for as long as it took (B089). Capped
+ * at the file's size: a sparse object is streamed once as its payload before
+ * being laid out with its holes, and that second pass must not count again.
+ */
+typedef struct {
+    const restore_opts_t *opts;
+    uint64_t base, total;     /* bytes finished before this file, and all */
+    uint64_t size, written;   /* this file */
+    uint64_t index, count;    /* entry being restored, for the count */
+} restore_io_t;
+
+static void restore_bytes(uint64_t bytes, void *ctx)
+{
+    restore_io_t *io = ctx;
+    io->written += bytes;
+    if (io->written > io->size) io->written = io->size;
+    if (io->opts->bytes_cb)
+        io->opts->bytes_cb(io->opts->progress_ctx, io->base + io->written, io->total);
+    report(io->opts, "restore", io->index, io->count);
+}
+
+/*
  * Every node's path, built from the rows the restore has already read.
  *
  * This walked parents with one query per path component, per node, and the
@@ -860,7 +885,16 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         uint64_t sz = 0;
         uint8_t  otype = 0;
         err_clear();    /* so a reason below cannot be left over from before */
+        restore_io_t io = { opts, bytes_done, bytes_total,
+                            strtoull(r->rows[i][6], NULL, 10), 0,
+                            (uint64_t)i + 1, (uint64_t)r->nrows };
+        store_io_fn prev_io;
+        void *prev_io_ctx;
+        store_get_io_progress(store, &prev_io, &prev_io_ctx);
+        if (opts->bytes_cb || opts->progress_cb)
+            store_set_io_progress(store, restore_bytes, &io);
         status_t lst = object_load_stream(store, hash, fd, &sz, &otype);
+        store_set_io_progress(store, prev_io, prev_io_ctx);
         if (lst == OK && otype == OBJECT_TYPE_SPARSE) {
             /* Sparse objects arrive as a region table plus data; writing them
              * linearly would turn holes into zeros and inflate the file to

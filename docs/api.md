@@ -654,6 +654,9 @@ is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
 stream ends after the frame with a terminal state. A frame is
 `{"id","state","phase","current","total","bytes_done","bytes_total","error"}`.
+`bytes_done` advances inside a file as backup and restore read and write it,
+not only between files, so a job spending minutes on one large file still
+sends a changed frame a few times a second.
 
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered

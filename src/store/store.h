@@ -121,6 +121,25 @@ volatile int *store_get_cancel(const store_t *st);
 int  store_cancelled(const store_t *st);
 
 /*
+ * Byte progress inside one object, reported as it is read or written.
+ *
+ * A job's progress used to move only between files, so a backup or restore
+ * of a 2 GiB file sat at one count for as long as the file took - half a
+ * minute and more - and every client watching it, the event stream included,
+ * reported a job that looked hung. The hook sits on the handle for the same
+ * reason the cancel flag does: the loops that see the bytes are several
+ * layers below anything that knows about jobs.
+ *
+ * The streaming store paths call it with each read's byte count, and the
+ * streaming load paths with each block of plaintext written out. It runs on
+ * the calling thread and must be cheap. NULL, the default, reports nothing.
+ */
+typedef void (*store_io_fn)(uint64_t bytes, void *ctx);
+void store_set_io_progress(store_t *st, store_io_fn fn, void *ctx);
+void store_get_io_progress(const store_t *st, store_io_fn *fn, void **ctx);
+void store_io_progress(const store_t *st, uint64_t bytes);
+
+/*
  * Remove staging files in tmp/ last modified before `before`, limited to the
  * names the engine itself creates (obj.*, pack-dat.*, pack-idx.*, snap.*,
  * par.*). Returns how many were removed and adds their size to *bytes when

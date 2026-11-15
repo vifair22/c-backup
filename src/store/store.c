@@ -83,6 +83,10 @@ struct store {
 
     /* The owning job's cancel flag, or NULL. See store_set_cancel. */
     volatile int         *cancel;
+
+    /* Byte progress inside one object, or NULL. See store_set_io_progress. */
+    store_io_fn           io_fn;
+    void                 *io_ctx;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -279,6 +283,24 @@ int store_cancelled(const store_t *st)
     return st && st->cancel && *st->cancel;
 }
 
+void store_set_io_progress(store_t *st, store_io_fn fn, void *ctx)
+{
+    if (!st) return;
+    st->io_fn  = fn;
+    st->io_ctx = ctx;
+}
+
+void store_get_io_progress(const store_t *st, store_io_fn *fn, void **ctx)
+{
+    *fn  = st ? st->io_fn : NULL;
+    *ctx = st ? st->io_ctx : NULL;
+}
+
+void store_io_progress(const store_t *st, uint64_t bytes)
+{
+    if (st && st->io_fn && bytes) st->io_fn(bytes, st->io_ctx);
+}
+
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd == -1)
@@ -319,6 +341,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
+    r->io_fn           = NULL;
+    r->io_ctx          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     store_sweep_tmp(r->path);
