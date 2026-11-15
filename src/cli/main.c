@@ -201,11 +201,14 @@ static int call(const char *method, const char *path, const char *body)
     }
     if (st != OK) return fail("%s", err_msg());
 
-    if (resp.body && resp.body[0]) {
-        fputs(resp.body, stdout);
-        if (resp.body[resp.body_len - 1] != '\n') fputc('\n', stdout);
-    }
     int rc = (resp.status >= 200 && resp.status < 300) ? 0 : 1;
+    /* A failure's body is the daemon's error, and errors go to stderr: a
+     * script piping stdout to a JSON reader must never parse one as data. */
+    FILE *outf = rc ? stderr : stdout;
+    if (resp.body && resp.body[0]) {
+        fputs(resp.body, outf);
+        if (resp.body[resp.body_len - 1] != '\n') fputc('\n', outf);
+    }
     if (rc) fprintf(stderr, "c-backup: request failed with HTTP %d\n", resp.status);
     http_response_free(&resp);
     return rc;
@@ -1377,9 +1380,24 @@ static const struct {
     { NULL, NULL, NULL },
 };
 
+/* One command's usage line, for `c-backup <command> --help` and
+ * `c-backup help <command>`. Returns -1 for an unknown command. */
+static int command_usage(const char *name)
+{
+    for (int i = 0; COMMANDS[i].name; i++) {
+        if (strcmp(COMMANDS[i].name, name) != 0) continue;
+        printf("usage: c-backup %s\n", COMMANDS[i].usage);
+        return 0;
+    }
+    return -1;
+}
+
 static int cmd_help(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    if (argc >= 1) {
+        if (command_usage(argv[0]) == 0) return 0;
+        return fail("unknown command '%s' (try 'c-backup help')", argv[0]);
+    }
     printf("c-backup %s\n\n", VERSION_STRING);
     printf("usage: c-backup [--socket PATH] <command> [args]\n\n");
     printf("commands:\n");
@@ -1414,6 +1432,15 @@ int main(int argc, char **argv)
     const char *name = argv[i++];
     for (int c = 0; COMMANDS[c].name; c++) {
         if (strcmp(COMMANDS[c].name, name) != 0) continue;
+        /*
+         * Help anywhere after the command answers here, before the command
+         * validates anything or sends a request. It used to reach the
+         * handler as an argument: `repo add --help` asked the daemon to
+         * register a repository at "--help".
+         */
+        for (int a = i; a < argc; a++)
+            if (strcmp(argv[a], "--help") == 0 || strcmp(argv[a], "-h") == 0)
+                return command_usage(name) == 0 ? 0 : 1;
         return COMMANDS[c].fn(argc - i, argv + i);
     }
     return fail("unknown command '%s' (try 'c-backup help')", name);
