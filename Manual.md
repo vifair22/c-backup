@@ -1160,6 +1160,19 @@ printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
 reads them back later. A missing pack is reported as missing, never as
 damage to repair: its parity went with it.
 
+**Repair is disabled past about 59.75 GiB.** The parity trailer records its
+own size in 32-bit fields, and RS parity costs 1024 bytes per 15296 stored,
+so an object stored in more than 64,156,058,688 bytes, or any object in a
+pack whose trailer outgrew those fields (an old unsealed pack can be any
+size), has a trailer size that has wrapped. Reads are unaffected, because
+they find parity from the object's header, but repair finds it from that
+size and would write a wrong correction into the data. Until the format
+carries wider fields, repair refuses these and writes nothing; the finding
+says `unrecoverable: too large for 32-bit parity fields; repair disabled
+pending format fix` when the object could not be read, or `recoverable, not
+written back: ...` with the same reason when the read corrected it in
+memory. The daemon logs a warning when it writes such an object or pack.
+
 Findings name files, not hashes: each object that is not intact is reported
 with its status, how many distinct paths reference it (`affected_files`),
 how many versions of them across snapshots (`affected_versions`), up to

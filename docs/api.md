@@ -576,7 +576,11 @@ report says what was lost and what is still clean. Every object that is not
 `ok` gets one, with `status` one of `missing`, `unrecoverable`, `unreadable
 header`, `uncorrectable parity`, `damaged (run with repair to attempt
 recovery)` (a large streamed object with repair off, whose recoverability
-cannot be known without writing), `recoverable` or `repaired`:
+cannot be known without writing), `recoverable` or `repaired`. Two more
+carry the reason repair declined to write: `unrecoverable: too large for
+32-bit parity fields; repair disabled pending format fix` and `recoverable,
+not written back: ` followed by the same reason, for an object or pack past
+the parity format's size limit (Manual section 11):
 
 | Field | Meaning |
 |---|---|
