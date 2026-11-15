@@ -155,7 +155,10 @@ static status_t grep_node_path(cutils_db_t *db, const char *repo, const char *sn
     size_t off = 0;
     out[0] = '\0';
     for (int i = n - 1; i >= 0; i--) {
-        int w = snprintf(out + off, outsz - off, "%s%s", off ? "/" : "", parts[i]);
+        /* Absolute, as name search and the browser give it: a hit is
+         * something to look up there, and a path that differed by its
+         * leading slash had to be fixed up by whoever read it. */
+        int w = snprintf(out + off, outsz - off, "/%s", parts[i]);
         if (w < 0 || (size_t)w >= outsz - off) { off = 0; break; }
         off += (size_t)w;
     }

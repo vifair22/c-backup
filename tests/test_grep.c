@@ -157,6 +157,9 @@ static void test_finds_a_string_in_two_files(void **state)
      * useful rather than a list of filenames. */
     assert_non_null(strstr(hits, ":2:"));
     assert_non_null(strstr(hits, "the secret token is swordfish"));
+    /* Absolute, like name search, so a hit can be looked up as given. */
+    assert_non_null(strstr(hits, TEST_SRC "/notes.txt:"));
+    assert_int_equal(hits[0], '/');
     free(hits);
 }
 

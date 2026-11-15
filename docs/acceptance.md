@@ -228,7 +228,9 @@ CLI, and nothing is near the 400 ms budget.
 
 Two smaller ones: `c-backup grep` emits two JSON documents rather than one,
 so piping it to a JSON parser fails; and grep hit paths have no leading
-slash while search result paths do.
+slash while search result paths do. Both fixed before 1.0: grep and verify
+each print one object holding the run and its result, and grep hit paths
+are absolute like every other path the daemon returns.
 
 ## Corrections to this checklist
 

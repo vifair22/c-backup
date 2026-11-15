@@ -188,6 +188,10 @@ GREP_OUT=$(cb grep 1 'passphrase is hunter2')
 contains "grep finds the line"    'secrets.txt' "$GREP_OUT"
 contains "grep reports the text"  'hunter2'     "$GREP_OUT"
 contains "grep reports a line no" '"line"'      "$GREP_OUT"
+# The hits alone: printing the run record first made two JSON documents,
+# and nothing that reads JSON accepts that.
+check "grep prints one document" "1" "$(printf '%s\n' "$GREP_OUT" | wc -l | tr -d ' ')"
+contains "grep paths are absolute" "\"path\":\"$WORK/src/" "$GREP_OUT"
 contains "grep regex syntax"      'secrets.txt' "$(cb grep 1 '^the pass[a-z]+ is')"
 case "$(cb grep 1 'zzznotinanyfile')" in
     *'"hits"'*) ok "grep with no match still answers" ;;
@@ -284,6 +288,7 @@ fi
 VOUT=$(cb verify "$ENC_ID" --level deep)
 contains "verify waits and reports its run" '"level":"deep"' "$VOUT"
 contains "verify reports what it checked"   '"checked"'      "$VOUT"
+check "verify prints one document"         "1"              "$(printf '%s\n' "$VOUT" | wc -l | tr -d ' ')"
 contains "verify reports findings"          '"findings"'     "$VOUT"
 contains "clean repo has no findings"       '"findings":[]'  "$VOUT"
 contains "verify list shows past runs"      '"runs"'         "$(cb verify list "$ENC_ID" --limit 2)"
