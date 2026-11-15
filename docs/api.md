@@ -192,6 +192,20 @@ old one's schedules, history and index rows, which deregistering does not
 delete. Migration 019 rebuilt `repos` with `AUTOINCREMENT`, starting above
 every id any table still refers to.
 
+No other id the API hands out is reused either: job ids, schedule ids,
+search and verify run ids, and snapshot ids within a repository. Job,
+schedule and run ids came round again when the newest rows were deleted
+(by the purge after `DELETE /repos/<id>`, the 30-day job cleanup, or
+deleting a schedule), so job 312 of a removed repository was followed by a
+job 312 on another one, and a client still holding the old id read an
+unrelated job (B113). Migration 023 rebuilt those tables with
+`AUTOINCREMENT`. Snapshot ids were one more than the highest present, so
+deleting the newest snapshot gave its id to the next backup; the daemon
+now keeps a per-repository high-water mark. Ids reused before 023 stay
+reused. The snapshot mark lives in the database, so after a database loss
+a reindex resumes above the highest snapshot record left in the repository
+(see `docs/repo-format.md`).
+
 A repository is `{id, uuid, path, label, added_at, encryption,
 key_escrowed}`: `label` is `null` when none was given, `encryption` is
 `none`, `system` or `passphrase`, and `key_escrowed` is a boolean that is
