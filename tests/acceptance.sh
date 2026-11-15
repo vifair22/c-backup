@@ -195,7 +195,9 @@ timed cb search "$D_ID" "$D_TERM"
 check C5 "name search '$D_TERM' ($MS ms)" grep -q '"path"' <<<"$OUT"
 timed cb search "$G_ID" "$G_TERM"
 check C5g "name search over the scale set ($MS ms)" test "$MS" -lt 1000 -a "$RC" -eq 0
-timed cb grep "$D_ID" "$GREP_TEXT" --limit 5
+# Snapshot 1, the first full backup: the newest one by now is B6's, which
+# backed up only the specials directory.
+timed cb grep "$D_ID" "$GREP_TEXT" --snapshot 1 --limit 5
 check C6 "content search finds '$GREP_TEXT'" grep -q '"line"' <<<"$OUT"
 timed cb diff "$D_ID" 2 3
 check C7 "diff two snapshots" grep -q '"added"' <<<"$OUT"
