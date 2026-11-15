@@ -18,6 +18,12 @@ SOCK="$WORK/c.sock"
 # worktrees) cannot answer each other's requests. A fixed port made a second
 # daemon fail to bind, or worse, sent a request to the other run's daemon.
 PORT=$((20000 + ($$ % 20000)))
+# Skip past ports something already holds: the base is derived from the pid,
+# and anything bound there (a listener, or an outgoing connection that drew
+# it from the ephemeral range) made the daemon exit with "cannot start API
+# server" about once in a few dozen runs.
+port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
+while port_busy "$PORT"; do PORT=$((PORT + 1)); [ "$PORT" -gt 64990 ] && PORT=20000; done
 PASS=0
 FAIL=0
 

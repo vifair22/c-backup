@@ -15,6 +15,14 @@ WORK="$(mktemp -d /tmp/c_backup_cli_e2e.XXXXXX)"
 # Ports per run, so concurrent suites (CI jobs on one runner, parallel
 # worktrees) never reach each other's daemons.
 PORTBASE=$((20000 + ($$ % 15000) * 3))
+# Skip past ports something already holds: the base is derived from the pid,
+# and anything bound there (a listener, or an outgoing connection that drew
+# it from the ephemeral range) made the daemon exit with "cannot start API
+# server" about once in a few dozen runs.
+port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
+while port_busy "$PORTBASE" || port_busy $((PORTBASE + 1)) || port_busy $((PORTBASE + 2)); do
+    PORTBASE=$((PORTBASE + 3)); [ "$PORTBASE" -gt 64990 ] && PORTBASE=20000
+done
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
