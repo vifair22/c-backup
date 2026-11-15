@@ -520,6 +520,18 @@ writing the correction while already there costs almost nothing extra. Pass
 damage, and for small objects it still distinguishes recoverable damage from
 loss, because it can apply parity in memory without writing.
 
+`dry_run=1` is `repair=0` and nothing else: it overrides `repair`, and it
+does not lower the level, so with no `level` it is a full deep read like a
+plain verify, with the same counts on a healthy repository. The job's
+`result` says which kind of run it was, since the run record does not:
+
+```json
+{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+```
+
+`run_id` is null when the walk did not finish (cancelled or aborted); the
+partial run is still in `GET /repos/<id>/verify`, with `completed` false.
+
 A checking-only verify takes the repository read lock, so a backup can run
 underneath it. With repair on it takes the write lock like any other writer.
 

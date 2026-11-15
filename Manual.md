@@ -1045,7 +1045,7 @@ sudo c-backup verify 1                     # deep, repairing
 sudo c-backup verify 1 --level index       # fast: every object still resolves
 sudo c-backup verify 1 --level structure   # also parses every header
 sudo c-backup verify 1 --no-repair         # check only, write nothing
-sudo c-backup verify 1 --dry-run           # the same, and wins over everything
+sudo c-backup verify 1 --dry-run           # the same: still deep, repair off
 sudo c-backup verify list 1                # past runs
 ```
 
@@ -1060,16 +1060,28 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
-`--dry-run` is a check that cannot write: it turns repair off whatever else
-the command says, so it behaves exactly as `--no-repair` and takes the read
-lock. It is there for the habit `gc --dry-run` and `gfs --dry-run` teach,
-and it means "show me, change nothing". Nothing in the repository is
-written. The daemon still records the run and its findings (`verify list`,
-`verify show`, the verify metrics), because that is the report. Objects
-up to 16 MiB are read with parity applied in memory, so damage there is
-reported `recoverable`; a larger object is streamed, cannot be checked that
-way without writing, and is reported as damaged with a note to run a
-repairing verify. A dry run that finds loss fails like any other verify.
+`--dry-run` is exactly `--no-repair`, and wins over anything else on the
+command line. It changes one thing: repair is off, so nothing in the
+repository is written. It does **not** change the level. With no `--level`
+a dry run is a deep verify, reads every payload, and takes as long as a
+plain one; on a healthy repository the two print the same counts, because
+the only count repair can change is `repaired`, and that is 0 when there is
+nothing to repair. The differences show only when there is damage:
+
+| | `verify` (default) | `verify --dry-run` or `--no-repair` |
+|---|---|---|
+| Level | deep | deep (or what `--level` says) |
+| Reads | every payload | every payload |
+| Damage within parity, object up to 16 MiB | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
+| Damage within parity, larger object | corrected on disk, counted `repaired` | reported damaged, with a note to run a repairing verify: streaming it through parity would mean writing |
+| Lock | write | read |
+| Job `result` | `"repair":true,"dry_run":false` | `"repair":false`, and `"dry_run":true` for `--dry-run` |
+
+For a quick look rather than a full read, combine it with a level:
+`verify 1 --level index --dry-run`. The daemon records a dry run like any
+other (`verify list`, `verify show`, the verify metrics), because the run
+and its findings are the report. A dry run that finds loss fails like any
+other verify.
 
 What a run counts:
 

@@ -829,6 +829,16 @@ contains "deep verify submit" '"job_id"' "$DEEP_RESP"
 DEEP_JOB=$(job_id "$DEEP_RESP")
 wait_job "$DEEP_JOB"
 contains "deep verify completed" '"state":"completed"' "$(sock_body "/jobs/$DEEP_JOB")"
+# B106: the job says what kind of run it was. A dry run's counts on a healthy
+# repository are identical to a repairing run's, so nothing else does.
+contains "a plain verify is deep and repairing" \
+    '"level":"deep","repair":true,"dry_run":false}' "$(sock_body "/jobs/$DEEP_JOB")"
+DRY_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
+           "http://localhost/repos/1/verify?dry_run=1")
+DRY_JOB=$(job_id "$DRY_RESP")
+wait_job "$DRY_JOB"
+contains "a dry run is the same level, with repair off" \
+    '"level":"deep","repair":false,"dry_run":true}' "$(sock_body "/jobs/$DRY_JOB")"
 check "unknown verify level rejected" 400 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
        "http://localhost/repos/1/verify?level=sideways")"
