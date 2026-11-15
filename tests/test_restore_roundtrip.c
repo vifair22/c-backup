@@ -144,6 +144,95 @@ static void test_roundtrip_is_identical(void **state)
 }
 
 /*
+ * A sparse file comes back with its holes.
+ *
+ * Every file goes through SEEK_DATA/SEEK_HOLE at backup, and one with holes
+ * is stored as a region table plus its data. Restore has a separate reader
+ * for that, restore_sparse_streaming, and nothing exercised it: a file with
+ * holes is common (VM images, databases, core dumps) and this is the only
+ * path that writes one back. Reading it linearly would produce a file with
+ * the right bytes and every hole filled in, which diff would not notice, so
+ * the allocation is checked too.
+ *
+ * Holes at the start, in the middle and at the end, because each one is a
+ * different branch of the region walk. Restored once from the loose object
+ * and once after packing, since the two load through different readers.
+ */
+#define SPARSE_SIZE  (4u * 1024 * 1024)
+#define SPARSE_CHUNK (64u * 1024)
+
+static int make_sparse(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(fd >= 0);
+    char *buf = malloc(SPARSE_CHUNK);
+    assert_non_null(buf);
+    for (size_t i = 0; i < SPARSE_CHUNK; i++) buf[i] = (char)('a' + i % 26);
+    assert_int_equal(pwrite(fd, buf, SPARSE_CHUNK, 1024 * 1024), (ssize_t)SPARSE_CHUNK);
+    memset(buf, 'Z', SPARSE_CHUNK);
+    assert_int_equal(pwrite(fd, buf, SPARSE_CHUNK, 3 * 1024 * 1024), (ssize_t)SPARSE_CHUNK);
+    assert_int_equal(ftruncate(fd, SPARSE_SIZE), 0);
+    free(buf);
+    close(fd);
+
+    /* A filesystem that does not report holes stores the file whole, and
+     * then there is nothing sparse to restore. */
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    return (uint64_t)sb.st_blocks * 512 < SPARSE_SIZE;
+}
+
+static void check_sparse_restore(int64_t snap)
+{
+    rmrf(TEST_DST);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/sparse.img", restored_root());
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal((uint64_t)sb.st_size, SPARSE_SIZE);
+    assert_true((uint64_t)sb.st_blocks * 512 < SPARSE_SIZE / 2);
+}
+
+static void test_sparse_file_round_trips_with_its_holes(void **state)
+{
+    (void)state;
+    if (!make_sparse(TEST_SRC "/sparse.img")) skip();
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    check_sparse_restore(br.snapshot_id);
+
+    uint32_t packed = 0;
+    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
+    check_sparse_restore(br.snapshot_id);
+}
+
+/* A file that is nothing but a hole has no data region at all, and SEEK_DATA
+ * answers ENXIO for it, the same answer a filesystem without hole support
+ * gives. It is stored whole; what matters is that it comes back. */
+static void test_file_that_is_all_hole_round_trips(void **state)
+{
+    (void)state;
+    int fd = open(TEST_SRC "/empty.img", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_true(fd >= 0);
+    assert_int_equal(ftruncate(fd, 256 * 1024), 0);
+    close(fd);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+}
+
+/*
  * A live unix socket in the source must not fail the restore.
  *
  * stat_to_node_type has no case for a socket and returns 0, so backup records
@@ -1255,6 +1344,8 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_sparse_file_round_trips_with_its_holes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_is_all_hole_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
