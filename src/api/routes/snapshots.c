@@ -112,6 +112,25 @@ static int64_t newest_snapshot(int64_t repo_id)
 }
 
 /* Does this repository have a snapshot with this id? */
+/* Are more of this repository's snapshots newer than snap_id than older?
+ * A count over the snapshots table, which holds one row per snapshot. */
+static int snapshot_in_older_half(int64_t repo_id, int64_t snap_id)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    int older = 0;
+    if (db_execute(g_ctx.db,
+            "SELECT (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id > ?)"
+            "     > (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id < ?)",
+            (const char *[]){ repo, snap, repo, snap, NULL }, &r) == 0 &&
+        r && r->nrows == 1)
+        older = strcmp(r->rows[0][0], "1") == 0;
+    db_result_free(r);
+    return older;
+}
+
 static int snapshot_exists(int64_t repo_id, int64_t snap_id)
 {
     char repo[32], snap[32];
@@ -674,26 +693,48 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     snprintf(lim,  sizeof(lim),  "%d", scan);
     snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
-    /* Through the trigram index, not LIKE: a scan of the nodes table loses to
-     * the pre-rewrite implementation, while this beats it by ~50x. No ORDER
-     * BY: sorting would read every match to return the first page, which is
-     * the cost the index exists to avoid. A collapsed result keeps the
-     * newest copy among the rows read instead. */
+    /*
+     * Through the trigram index, not LIKE: a scan of the nodes table loses to
+     * the pre-rewrite implementation, while this beats it by ~50x. Ordered by
+     * the index's own rowid only, which costs nothing: any other ORDER BY
+     * would read every match to return the first page.
+     *
+     * The direction is what makes a one-snapshot search fast. Index rows are
+     * written as each snapshot is indexed, so rowid order is snapshot order,
+     * and the snapshot filter applies after the match: a page from the newest
+     * snapshot, read oldest first, walked every older snapshot's matches
+     * before reaching its own (231 ms against 0.27 ms for the oldest, growing
+     * with retention). Newest first by default, which is also the copy a
+     * collapsed result should keep; oldest first only for a snapshot in the
+     * older half. A reindexed snapshot is rewritten at the high end, which
+     * makes it slower to find this way, never wrong.
+     */
+    int oldest_first = only_snap && snapshot_in_older_half(repo_id, only_snap);
     db_result_t *r = NULL;
-    int rc = only_snap
-        ? db_execute(g_ctx.db,
+    int rc;
+    if (only_snap)
+        rc = db_execute(g_ctx.db, oldest_first
+            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+              "       COALESCE(n.content_hash, '')"
+              "  FROM node_fts f"
+              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
+              " ORDER BY f.rowid ASC LIMIT ?"
+            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+              "       COALESCE(n.content_hash, '')"
+              "  FROM node_fts f"
+              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
+              " ORDER BY f.rowid DESC LIMIT ?",
+            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
+    else
+        rc = db_execute(g_ctx.db,
             "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
             "       COALESCE(n.content_hash, '')"
             "  FROM node_fts f"
             "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ? LIMIT ?",
-            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r)
-        : db_execute(g_ctx.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ? LIMIT ?",
+            " WHERE f.repo_id = ? AND f.name MATCH ?"
+            " ORDER BY f.rowid DESC LIMIT ?",
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
     free(mq);
     if (rc != 0) {

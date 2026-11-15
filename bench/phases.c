@@ -1,1290 +1,430 @@
 /*
- * Phase-level benchmarks for c-backup.
+ * End-to-end backup, incremental and restore timings on the daemon's engine.
  *
- * Exercises real pipeline operations against temporary repositories with
- * synthetic data.  Each benchmark creates and tears down its own repo.
+ * Generates a source tree of many small files and a few large ones, then
+ * times, in order:
+ *
+ *   1. a first backup into an empty repository, and the pack that follows it
+ *   2. a second backup with nothing changed, and its pack (normally a no-op)
+ *   3. a restore of the latest snapshot into an empty directory
+ *
+ * The backup job packs on completion (backup_routes.c), so the pack is part
+ * of what a user waits for; it is timed separately because it is a separate
+ * cost to attack. backup_run logs its own per-phase profile (phase_timer.h)
+ * at info level, and that log is left on here: it is the same breakdown the
+ * daemon writes on a deployment, which is the point of printing it.
+ *
+ * The large files are what the B086 first-backup work needs: random ones are
+ * incompressible and exercise the object writer's read -> hash -> write ->
+ * parity pipeline and the LZ4 bailout; the text copies are compressible and
+ * identical, so the second dedups and the first is re-copied by the pack.
  *
  * Usage:
- *   build/bench_phases              — run all benchmarks
- *   build/bench_phases scan         — run only benchmarks matching "scan"
- *   build/bench_phases -l           — list available benchmarks
+ *   bench_phases [options]
+ *     -d, --dir DIR        parent of the working directory      (BENCH_DIR, /tmp)
+ *     -n, --small N        small files                          (BENCH_SMALL_FILES, 10000)
+ *     -s, --small-bytes B  mean small-file size in bytes        (BENCH_SMALL_BYTES, 4096)
+ *     -l, --large N        incompressible large files           (BENCH_LARGE_FILES, 3)
+ *     -t, --text N         identical compressible large files   (BENCH_TEXT_FILES, 2)
+ *     -m, --large-mib M    size of each large file, MiB         (BENCH_LARGE_MIB, 64)
+ *     -c, --cold           sync and evict the source from the page cache before
+ *                          each backup, and include a trailing sync in every
+ *                          timing; only meaningful on a real filesystem
+ *     -k, --keep           leave the working directory behind
+ *
+ * The working directory is DIR/c_backup_bench_phases and is removed at the
+ * end unless --keep. On tmpfs (the default /tmp here) every number is a CPU
+ * number; put DIR on the target filesystem to measure storage.
  */
 
-#define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <time.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <errno.h>
+#include <getopt.h>
 #include <inttypes.h>
 
-#include "repo.h"
+#include "bench_common.h"
+
 #include "backup.h"
-#include "scan.h"
-#include "object.h"
-#include "snapshot.h"
-#include "restore.h"
 #include "pack.h"
-#include "gc.h"
+#include "restore.h"
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
+#define FILES_PER_DIR 100
+#define WRITE_CHUNK   (1u << 20)
 
-#define BENCH_REPO "/tmp/c_backup_bench_repo"
-#define BENCH_SRC  "/tmp/c_backup_bench_src"
-#define BENCH_DST  "/tmp/c_backup_bench_dst"
+typedef struct {
+    char     parent[3072];
+    char     work[3200];
+    uint64_t small_files;
+    uint64_t small_bytes;
+    uint64_t large_files;
+    uint64_t text_files;
+    uint64_t large_mib;
+    int      cold;
+    int      keep;
+} opts_t;
 
-static double now_sec(void)
+typedef struct {
+    uint64_t files;
+    uint64_t bytes;
+} tree_stats_t;
+
+/* ---------- source generation ---------- */
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+
+static uint64_t xorshift(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return g_rng;
 }
 
-static void rmrf(const char *path)
+static int write_all(int fd, const uint8_t *buf, size_t n)
 {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    int rc = system(cmd);
-    (void)rc;
-}
-
-static void bench_cleanup(void)
-{
-    rmrf(BENCH_REPO);
-    rmrf(BENCH_SRC);
-    rmrf(BENCH_DST);
-}
-
-static uint64_t g_file_seed;
-
-/* Create a file with compressible but unique content (unique per call).
- * Every 8th byte comes from the PRNG; the other 7 repeat it.  This gives
- * ~50 % LZ4 compression — well under the 90 % skip threshold — while still
- * producing distinct hashes so dedup doesn't collapse multiple files. */
-static void create_file(const char *path, size_t size)
-{
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-    uint64_t s = 0xdeadbeefcafebabeULL ^ (uint64_t)size ^ (++g_file_seed * 2654435761ULL);
-    uint8_t buf[8192];
-    size_t remaining = size;
-    while (remaining > 0) {
-        size_t chunk = remaining < sizeof(buf) ? remaining : sizeof(buf);
-        for (size_t i = 0; i < chunk; i++) {
-            if ((i & 7) == 0) {
-                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            }
-            buf[i] = (uint8_t)(s >> 32);
+    while (n > 0) {
+        ssize_t w = write(fd, buf, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
         }
-        fwrite(buf, 1, chunk, f);
-        remaining -= chunk;
+        buf += w;
+        n -= (size_t)w;
     }
-    fclose(f);
+    return 0;
 }
 
-/* Create a directory tree with N files of given size */
-static uint64_t create_tree(const char *root, int nfiles, size_t file_size)
+typedef enum { FILL_SMALL, FILL_RANDOM, FILL_TEXT } fill_t;
+
+/*
+ * Fill one chunk.
+ *
+ * FILL_SMALL repeats each random byte eight times: unique per file, so
+ * nothing dedups, and about half-compressible, so it is packed compressed
+ * rather than bailing out. FILL_RANDOM is incompressible. FILL_TEXT is
+ * deterministic from its offset alone, so every copy is byte-identical.
+ */
+static void fill(uint8_t *buf, size_t n, fill_t kind, uint64_t offset)
 {
-    rmrf(root);
-    mkdir(root, 0755);
-
-    /* Create subdirectories: root/00/ through root/ff/ */
-    for (int d = 0; d < 256; d++) {
-        char dir[512];
-        snprintf(dir, sizeof(dir), "%s/%02x", root, d);
-        mkdir(dir, 0755);
+    switch (kind) {
+    case FILL_SMALL: {
+        uint64_t r = 0;
+        for (size_t i = 0; i < n; i++) {
+            if ((i & 7) == 0) r = xorshift();
+            buf[i] = (uint8_t)(r >> 24);
+        }
+        break;
     }
-
-    uint64_t total_bytes = 0;
-    for (int i = 0; i < nfiles; i++) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%02x/file_%06d.dat",
-                 root, i % 256, i);
-        create_file(path, file_size);
-        total_bytes += (uint64_t)file_size;
+    case FILL_RANDOM:
+        for (size_t i = 0; i + 8 <= n; i += 8) {
+            uint64_t r = xorshift();
+            memcpy(buf + i, &r, 8);
+        }
+        for (size_t i = n & ~(size_t)7; i < n; i++) buf[i] = (uint8_t)xorshift();
+        break;
+    case FILL_TEXT: {
+        static const char words[] =
+            "the quick brown fox jumps over the lazy dog while a backup runs ";
+        for (size_t i = 0; i < n; i++) {
+            uint64_t pos = offset + i;
+            buf[i] = (pos % 81 == 80) ? '\n'
+                                      : (uint8_t)words[(pos / 7 + pos) % (sizeof(words) - 1)];
+        }
+        break;
     }
-    return total_bytes;
+    }
 }
+
+static int make_file(const char *path, uint64_t size, fill_t kind, uint8_t *buf)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "bench: create %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    uint64_t done = 0;
+    while (done < size) {
+        size_t n = (size - done) < WRITE_CHUNK ? (size_t)(size - done) : WRITE_CHUNK;
+        fill(buf, n, kind, done);
+        if (write_all(fd, buf, n) != 0) {
+            fprintf(stderr, "bench: write %s: %s\n", path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        done += n;
+    }
+    return close(fd);
+}
+
+static int generate(const opts_t *o, const char *src, tree_stats_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    uint8_t *buf = malloc(WRITE_CHUNK);
+    if (!buf) return -1;
+    char path[4096];
+    int rc = -1;
+
+    if (bench_mkdir(src) != 0) goto out;
+
+    snprintf(path, sizeof(path), "%s/small", src);
+    if (bench_mkdir(path) != 0) goto out;
+    for (uint64_t i = 0; i < o->small_files; i++) {
+        if (i % FILES_PER_DIR == 0) {
+            snprintf(path, sizeof(path), "%s/small/%05" PRIu64, src, i / FILES_PER_DIR);
+            if (bench_mkdir(path) != 0) goto out;
+        }
+        /* Uniform in [mean/2, 3*mean/2), so the mean is what was asked for. */
+        uint64_t size = o->small_bytes / 2 + (o->small_bytes ? xorshift() % o->small_bytes : 0);
+        snprintf(path, sizeof(path), "%s/small/%05" PRIu64 "/f%07" PRIu64 ".dat",
+                 src, i / FILES_PER_DIR, i);
+        if (make_file(path, size, FILL_SMALL, buf) != 0) goto out;
+        st->files++;
+        st->bytes += size;
+    }
+
+    uint64_t lsize = o->large_mib << 20;
+    if (o->large_files + o->text_files > 0) {
+        snprintf(path, sizeof(path), "%s/large", src);
+        if (bench_mkdir(path) != 0) goto out;
+    }
+    for (uint64_t i = 0; i < o->large_files; i++) {
+        snprintf(path, sizeof(path), "%s/large/random_%02" PRIu64 ".bin", src, i);
+        if (make_file(path, lsize, FILL_RANDOM, buf) != 0) goto out;
+        st->files++;
+        st->bytes += lsize;
+    }
+    for (uint64_t i = 0; i < o->text_files; i++) {
+        snprintf(path, sizeof(path), "%s/large/text_%02" PRIu64 ".txt", src, i);
+        if (make_file(path, lsize, FILL_TEXT, buf) != 0) goto out;
+        st->files++;
+        st->bytes += lsize;
+    }
+    rc = 0;
+out:
+    free(buf);
+    return rc;
+}
+
+/* ---------- cold cache ---------- */
+
+static int evict_one(const char *path, const struct stat *sb, int type, struct FTW *ftw)
+{
+    (void)sb; (void)ftw;
+    if (type != FTW_F) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    return 0;
+}
+
+/* Clean pages only go, so sync first. Not as thorough as drop_caches, and
+ * needs no root; it covers the source, which is what a first backup reads. */
+static void evict(const char *src)
+{
+    sync();
+    (void)nftw(src, evict_one, 32, FTW_PHYS | FTW_MOUNT);
+}
+
+/* ---------- reporting ---------- */
 
 static void report(const char *name, double value, const char *unit, double elapsed)
 {
-    printf("  %-40s %10.1f %-10s (%.2fs)\n", name, value, unit, elapsed);
+    printf("  %-34s %12.3f %-10s (%.2fs)\n", name, value, unit, elapsed);
 }
 
-/* ------------------------------------------------------------------ */
-/* Benchmark registry                                                  */
-/* ------------------------------------------------------------------ */
+static void section(const char *what)
+{
+    printf("\n--- %s ---\n", what);
+    fflush(stdout);
+}
 
-typedef void (*bench_fn_t)(void);
+static double finish_timing(const opts_t *o, double t0)
+{
+    if (o->cold) sync();
+    return bench_now() - t0;
+}
 
-typedef struct {
-    const char *name;
-    bench_fn_t fn;
-} phase_bench_t;
+/* ---------- the run ---------- */
 
-static phase_bench_t g_benches[64];
-static int g_nbench;
+static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
+                        const char *label, backup_result_t *res)
+{
+    static const char *paths[1];
+    paths[0] = src;
+    backup_opts_t bo;
+    memset(&bo, 0, sizeof(bo));
+    bo.paths = paths;
+    bo.n_paths = 1;
 
-#define REGISTER(nm, func) \
-    __attribute__((constructor)) static void reg_##func(void) { \
-        g_benches[g_nbench].name = nm; \
-        g_benches[g_nbench].fn   = func; \
-        g_nbench++; \
+    if (o->cold) evict(src);
+    section(label);
+    memset(res, 0, sizeof(*res));
+    double t0 = bench_now();
+    if (backup_run(e->store, e->db, e->repo_id, &bo, res) != OK) {
+        fprintf(stderr, "bench: %s failed: %s\n", label, err_msg());
+        return -1;
     }
+    double tb = finish_timing(o, t0);
 
-/* ------------------------------------------------------------------ */
-/* Phase 1: Scan                                                       */
-/* ------------------------------------------------------------------ */
-
-static void bench_scan_1k_small(void)
-{
-    int nfiles = 1000;
-    create_tree(BENCH_SRC, nfiles, 64);
-
-    /* Warm the dcache with a dummy scan */
-    scan_imap_t *imap = scan_imap_new();
-    scan_result_t *res = NULL;
-    scan_tree(BENCH_SRC, imap, NULL, &res);
-    scan_result_free(res); res = NULL;
-    scan_imap_free(imap);
-
-    double t0 = now_sec();
-    imap = scan_imap_new();
-    scan_tree(BENCH_SRC, imap, NULL, &res);
-    double elapsed = now_sec() - t0;
-    uint32_t entries = res ? res->count : 0;
-    scan_result_free(res);
-    scan_imap_free(imap);
-
-    report("scan_1k_64B", (double)entries / elapsed, "entries/s", elapsed);
-    rmrf(BENCH_SRC);
-}
-REGISTER("scan_1k_64B", bench_scan_1k_small);
-
-static void bench_scan_10k_small(void)
-{
-    int nfiles = 10000;
-    create_tree(BENCH_SRC, nfiles, 64);
-
-    scan_imap_t *imap = scan_imap_new();
-    scan_result_t *res = NULL;
-    scan_tree(BENCH_SRC, imap, NULL, &res);
-    scan_result_free(res); res = NULL;
-    scan_imap_free(imap);
-
-    double t0 = now_sec();
-    imap = scan_imap_new();
-    scan_tree(BENCH_SRC, imap, NULL, &res);
-    double elapsed = now_sec() - t0;
-    uint32_t entries = res ? res->count : 0;
-    scan_result_free(res);
-    scan_imap_free(imap);
-
-    report("scan_10k_64B", (double)entries / elapsed, "entries/s", elapsed);
-    rmrf(BENCH_SRC);
-}
-REGISTER("scan_10k_64B", bench_scan_10k_small);
-
-/* ------------------------------------------------------------------ */
-/* Phase 3: Object store (single-threaded loose)                       */
-/* ------------------------------------------------------------------ */
-
-static void bench_store_small_objects(void)
-{
-    bench_cleanup();
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    int count = 1000;
-    size_t obj_sz = 4096;
-    uint8_t *data = malloc(obj_sz);
-    uint64_t s = 0x1234567890abcdefULL;
-    uint64_t total = 0;
-
-    double t0 = now_sec();
-    for (int i = 0; i < count; i++) {
-        /* Vary content so each object is unique */
-        for (size_t j = 0; j < obj_sz; j++) {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            data[j] = (uint8_t)(s >> 32);
-        }
-        uint8_t hash[OBJECT_HASH_SIZE];
-        int is_new = 0;
-        uint64_t phys = 0;
-        object_store_ex(repo, 1, data, obj_sz, hash, &is_new, &phys);
-        total += obj_sz;
-    }
-    double elapsed = now_sec() - t0;
-
-    double mib = (double)total / (1024.0 * 1024.0) / elapsed;
-    double ops = (double)count / elapsed;
-
-    report("store_1k_4K_loose", mib, "MiB/s", elapsed);
-    report("store_1k_4K_loose", ops, "objects/s", elapsed);
-
-    free(data);
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("store_1k_4K_loose", bench_store_small_objects);
-
-static void bench_store_file_16m(void)
-{
-    bench_cleanup();
-    mkdir(BENCH_SRC, 0755);
-    create_file(BENCH_SRC "/bigfile.dat", 16u * 1024 * 1024);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    int fd = open(BENCH_SRC "/bigfile.dat", O_RDONLY);
-    uint8_t hash[OBJECT_HASH_SIZE];
-    int is_new = 0;
-    uint64_t phys = 0;
-
-    double t0 = now_sec();
-    object_store_file_ex(repo, fd, 16u * 1024 * 1024, hash, &is_new, &phys);
-    double elapsed = now_sec() - t0;
-
-    close(fd);
-
-    double mib = 16.0 / elapsed;
-    report("store_file_16M_loose", mib, "MiB/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("store_file_16M_loose", bench_store_file_16m);
-
-/* ------------------------------------------------------------------ */
-/* Full backup cycle                                                   */
-/* ------------------------------------------------------------------ */
-
-static void bench_backup_1k_4k(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-
-    const char *paths[] = { BENCH_SRC };
-
-    double t0 = now_sec();
-    backup_run_opts(repo, paths, 1, &opts);
-    double elapsed = now_sec() - t0;
-
-    double mib = (1000.0 * 4096.0) / (1024.0 * 1024.0) / elapsed;
-    report("backup_1k_4K (full)", mib, "MiB/s", elapsed);
-    report("backup_1k_4K (full)", 1000.0 / elapsed, "files/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("backup_1k_4K", bench_backup_1k_4k);
-
-static void bench_backup_incremental_1k_4k(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-
-    const char *paths[] = { BENCH_SRC };
-
-    /* First backup (full) */
-    backup_run_opts(repo, paths, 1, &opts);
-
-    /* Modify 10 files */
-    for (int i = 0; i < 10; i++) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%02x/file_%06d.dat",
-                 BENCH_SRC, i % 256, i);
-        create_file(path, 4096);
-    }
-
-    /* Incremental backup */
-    double t0 = now_sec();
-    backup_run_opts(repo, paths, 1, &opts);
-    double elapsed = now_sec() - t0;
-
-    report("backup_1k_4K (incr, 10 changed)", 1000.0 / elapsed, "entries/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("backup_1k_4K_incr", bench_backup_incremental_1k_4k);
-
-/* ------------------------------------------------------------------ */
-/* Pack                                                                */
-/* ------------------------------------------------------------------ */
-
-/* Helper: backup source tree into repo, then time repo_pack(). */
-static void pack_bench_run(const char *label, int nfiles, size_t file_size)
-{
-    bench_cleanup();
-    uint64_t total_bytes = create_tree(BENCH_SRC, nfiles, file_size);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-
+    double t1 = bench_now();
     uint32_t packed = 0;
-    double t0 = now_sec();
-    repo_pack(repo, &packed);
-    double elapsed = now_sec() - t0;
-
-    char name_ops[64], name_mib[64];
-    snprintf(name_ops, sizeof(name_ops), "%s", label);
-    snprintf(name_mib, sizeof(name_mib), "%s", label);
-    report(name_ops, (double)packed / elapsed, "objects/s", elapsed);
-    double mib = (double)total_bytes / (1024.0 * 1024.0) / elapsed;
-    report(name_mib, mib, "MiB/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-
-/* Small objects: per-object overhead (index, RS per-entry, fsync) */
-static void bench_pack_small(void)
-{
-    pack_bench_run("pack_1k_4K", 1000, 4096);
-}
-REGISTER("pack_1k_4K", bench_pack_small);
-
-/* Medium objects: 64K, typical source code / configs */
-static void bench_pack_medium(void)
-{
-    pack_bench_run("pack_200_64K", 200, 64 * 1024);
-}
-REGISTER("pack_200_64K", bench_pack_medium);
-
-/* Large objects: 32M, exercises streaming pack path (>16M threshold) */
-static void bench_pack_large(void)
-{
-    pack_bench_run("pack_8_32M", 8, 32u * 1024 * 1024);
-}
-REGISTER("pack_8_32M", bench_pack_large);
-
-/* Mixed: small + large together, realistic workload */
-static void bench_pack_mixed(void)
-{
-    bench_cleanup();
-
-    /* Create a mix: 500 × 4K + 4 × 32M */
-    mkdir(BENCH_SRC, 0755);
-    for (int d = 0; d < 256; d++) {
-        char dir[512];
-        snprintf(dir, sizeof(dir), "%s/%02x", BENCH_SRC, d);
-        mkdir(dir, 0755);
+    if (repo_pack(e->store, &packed, NULL, NULL) != OK) {
+        fprintf(stderr, "bench: %s pack failed: %s\n", label, err_msg());
+        return -1;
     }
-
-    uint64_t total_bytes = 0;
-    for (int i = 0; i < 500; i++) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%02x/small_%06d.dat",
-                 BENCH_SRC, i % 256, i);
-        create_file(path, 4096);
-        total_bytes += 4096;
-    }
-    for (int i = 0; i < 4; i++) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%02x/large_%06d.dat",
-                 BENCH_SRC, i % 256, i);
-        create_file(path, 32u * 1024 * 1024);
-        total_bytes += 32u * 1024 * 1024;
-    }
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-
-    uint32_t packed = 0;
-    double t0 = now_sec();
-    repo_pack(repo, &packed);
-    double elapsed = now_sec() - t0;
-
-    report("pack_mixed (500×4K + 4×32M)", (double)packed / elapsed, "objects/s", elapsed);
-    double mib = (double)total_bytes / (1024.0 * 1024.0) / elapsed;
-    report("pack_mixed (500×4K + 4×32M)", mib, "MiB/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pack_mixed", bench_pack_mixed);
-
-/* ------------------------------------------------------------------ */
-/* Verify (read-back + integrity check)                                */
-/* ------------------------------------------------------------------ */
-
-static void bench_verify(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 500, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-
-    /* Pack first so verify exercises packed read path */
-    uint32_t packed;
-    repo_pack(repo, &packed);
-
-    verify_opts_t vopts = {0};
-    double t0 = now_sec();
-    repo_verify(repo, &vopts);
-    double elapsed = now_sec() - t0;
-
-    report("verify_500_4K_packed", (double)vopts.objects_checked / elapsed, "objects/s", elapsed);
-    double mib = (double)vopts.bytes_checked / (1024.0 * 1024.0) / elapsed;
-    report("verify_500_4K_packed", mib, "MiB/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("verify_500_4K", bench_verify);
-
-/* ------------------------------------------------------------------ */
-/* GC                                                                  */
-/* ------------------------------------------------------------------ */
-
-static void bench_gc(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 500, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-
-    uint32_t kept = 0, deleted = 0;
-    double t0 = now_sec();
-    repo_gc(repo, &kept, &deleted);
-    double elapsed = now_sec() - t0;
-
-    report("gc_500_4K", (double)(kept + deleted) / elapsed, "objects/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("gc_500_4K", bench_gc);
-
-/* ------------------------------------------------------------------ */
-/* Snapshot read hot paths                                             */
-/* ------------------------------------------------------------------ */
-
-#include "diff.h"
-#include "ls.h"
-
-/*
- * Helper: create a repo with N snapshots, each containing `nfiles` files.
- * Between snapshots, modifies `n_changed` files so diffs are non-trivial.
- * Returns the repo (caller must close + cleanup).
- */
-static repo_t *create_multi_snap_repo(int nfiles, size_t file_size,
-                                       int n_snaps, int n_changed)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, nfiles, file_size);
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-
-    for (int s = 0; s < n_snaps; s++) {
-        backup_run_opts(repo, paths, 1, &opts);
-        /* Modify some files for next snapshot */
-        if (s < n_snaps - 1 && n_changed > 0) {
-            for (int i = 0; i < n_changed; i++) {
-                char path[512];
-                snprintf(path, sizeof(path), "%s/%02x/file_%06d.dat",
-                         BENCH_SRC, (s * n_changed + i) % 256, (s * n_changed + i) % nfiles);
-                create_file(path, file_size);
-            }
-        }
-    }
-    return repo;
-}
-
-/* --- snapshot_load (full) --- */
-
-static void bench_snap_load_1k(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
-
-    snapshot_t *snap = NULL;
-    /* warmup */
-    snapshot_load(repo, 1, &snap);
-    snapshot_free(snap); snap = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_load(repo, 1, &snap);
-        snapshot_free(snap); snap = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("snap_load_1k_files", (double)iters / elapsed, "loads/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("snap_load_1k", bench_snap_load_1k);
-
-static void bench_snap_load_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    snapshot_t *snap = NULL;
-    snapshot_load(repo, 1, &snap);
-    snapshot_free(snap); snap = NULL;
-
-    int iters = 20;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_load(repo, 1, &snap);
-        snapshot_free(snap); snap = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("snap_load_10k_files", (double)iters / elapsed, "loads/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("snap_load_10k", bench_snap_load_10k);
-
-/* --- snapshot_load_nodes_only --- */
-
-static void bench_snap_load_nodes_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    snapshot_t *snap = NULL;
-    snapshot_load_nodes_only(repo, 1, &snap);
-    snapshot_free(snap); snap = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_load_nodes_only(repo, 1, &snap);
-        snapshot_free(snap); snap = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("snap_load_nodes_only_10k", (double)iters / elapsed, "loads/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("snap_load_nodes_only_10k", bench_snap_load_nodes_10k);
-
-/* --- snapshot_list_all --- */
-
-static void bench_snap_list_all(void)
-{
-    repo_t *repo = create_multi_snap_repo(500, 4096, 10, 5);
-
-    snap_list_t *sl = NULL;
-    snapshot_list_all(repo, &sl);
-    snap_list_free(sl); sl = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_list_all(repo, &sl);
-        snap_list_free(sl); sl = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("snap_list_all (10 snaps)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("snap_list_all", bench_snap_list_all);
-
-/* --- pathmap_build --- */
-
-static void bench_pathmap_1k(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
-
-    snapshot_t *snap = NULL;
-    snapshot_load(repo, 1, &snap);
-
-    pathmap_t *pm = NULL;
-    /* warmup */
-    pathmap_build(snap, &pm);
-    pathmap_free(pm); pm = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        pathmap_build(snap, &pm);
-        pathmap_free(pm); pm = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("pathmap_build_1k", (double)iters / elapsed, "builds/s", elapsed);
-    report("pathmap_build_1k", (double)iters * 1000.0 / elapsed / 1e6, "M entries/s", elapsed);
-
-    snapshot_free(snap);
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pathmap_1k", bench_pathmap_1k);
-
-static void bench_pathmap_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    snapshot_t *snap = NULL;
-    snapshot_load(repo, 1, &snap);
-
-    pathmap_t *pm = NULL;
-    pathmap_build(snap, &pm);
-    pathmap_free(pm); pm = NULL;
-
-    int iters = 20;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        pathmap_build(snap, &pm);
-        pathmap_free(pm); pm = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("pathmap_build_10k", (double)iters / elapsed, "builds/s", elapsed);
-    report("pathmap_build_10k", (double)iters * 10000.0 / elapsed / 1e6, "M entries/s", elapsed);
-
-    snapshot_free(snap);
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pathmap_10k", bench_pathmap_10k);
-
-/* --- snapshot_ls_collect --- */
-
-static void bench_ls_collect_1k(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
-
-    ls_result_t *r = NULL;
-    /* warmup */
-    snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
-    ls_result_free(r); r = NULL;
-
-    int iters = 30;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
-        ls_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("ls_collect_1k (recursive)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("ls_collect_1k", bench_ls_collect_1k);
-
-static void bench_ls_collect_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    ls_result_t *r = NULL;
-    snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
-    ls_result_free(r); r = NULL;
-
-    int iters = 10;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_ls_collect(repo, 1, "", 1, 0, NULL, &r);
-        ls_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("ls_collect_10k (recursive)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("ls_collect_10k", bench_ls_collect_10k);
-
-static void bench_ls_collect_10k_nonrec(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    ls_result_t *r = NULL;
-    snapshot_ls_collect(repo, 1, "", 0, 0, NULL, &r);
-    ls_result_free(r); r = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_ls_collect(repo, 1, "", 0, 0, NULL, &r);
-        ls_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("ls_collect_10k (non-recursive)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("ls_collect_10k_nonrec", bench_ls_collect_10k_nonrec);
-
-static void bench_ls_collect_10k_subdir(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    /* List a single subdirectory (e.g. "00") */
-    ls_result_t *r = NULL;
-    snapshot_ls_collect(repo, 1, "00", 0, 0, NULL, &r);
-    ls_result_free(r); r = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_ls_collect(repo, 1, "00", 0, 0, NULL, &r);
-        ls_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("ls_collect_10k (subdir non-rec)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("ls_collect_10k_subdir", bench_ls_collect_10k_subdir);
-
-/* --- snapshot_search --- */
-
-static void bench_search_1k(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 1, 0);
-
-    search_result_t *r = NULL;
-    snapshot_search(repo, 1, "file_0001", 5000, &r);
-    search_result_free(r); r = NULL;
-
-    int iters = 50;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_search(repo, 1, "file_0001", 5000, &r);
-        search_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("search_1k (substring)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("search_1k", bench_search_1k);
-
-static void bench_search_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 1, 0);
-
-    search_result_t *r = NULL;
-    snapshot_search(repo, 1, "file_0001", 5000, &r);
-    search_result_free(r); r = NULL;
-
-    int iters = 20;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_search(repo, 1, "file_0001", 5000, &r);
-        search_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("search_10k (substring)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("search_10k", bench_search_10k);
-
-static void bench_search_multi_snap(void)
-{
-    /* 5 snapshots with 1K files each, search across all */
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 5, 10);
-
-    search_result_t *r = NULL;
-    int iters = 30;
-    double t0 = now_sec();
-    for (int it = 0; it < iters; it++) {
-        for (uint32_t sid = 1; sid <= 5; sid++) {
-            snapshot_search(repo, sid, "file_0001", 5000, &r);
-            search_result_free(r); r = NULL;
-        }
-    }
-    double elapsed = now_sec() - t0;
-
-    report("search_multi (5×1k snaps)", (double)iters / elapsed, "full-scans/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("search_multi", bench_search_multi_snap);
-
-/* --- snapshot_diff_collect --- */
-
-static void bench_diff_1k(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 2, 50);
-
-    diff_result_t *r = NULL;
-    /* warmup */
-    snapshot_diff_collect(repo, 1, 2, &r);
-    diff_result_free(r); r = NULL;
-
-    int iters = 30;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_diff_collect(repo, 1, 2, &r);
-        diff_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("diff_collect_1k (50 changes)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("diff_1k", bench_diff_1k);
-
-static void bench_diff_10k(void)
-{
-    repo_t *repo = create_multi_snap_repo(10000, 256, 2, 200);
-
-    diff_result_t *r = NULL;
-    snapshot_diff_collect(repo, 1, 2, &r);
-    diff_result_free(r); r = NULL;
-
-    int iters = 10;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        snapshot_diff_collect(repo, 1, 2, &r);
-        diff_result_free(r); r = NULL;
-    }
-    double elapsed = now_sec() - t0;
-
-    report("diff_collect_10k (200 changes)", (double)iters / elapsed, "calls/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("diff_10k", bench_diff_10k);
-
-/* ------------------------------------------------------------------ */
-/* Restore                                                             */
-/* ------------------------------------------------------------------ */
-
-static void bench_restore(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 500, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-
-    uint32_t packed;
-    repo_pack(repo, &packed);
-
-    mkdir(BENCH_DST, 0755);
-
-    double t0 = now_sec();
-    restore_snapshot(repo, 1, BENCH_DST);
-    double elapsed = now_sec() - t0;
-
-    double mib = (500.0 * 4096.0) / (1024.0 * 1024.0) / elapsed;
-    report("restore_500_4K_packed", mib, "MiB/s", elapsed);
-    report("restore_500_4K_packed", 500.0 / elapsed, "files/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("restore_500_4K", bench_restore);
-
-/* ------------------------------------------------------------------ */
-/* Pack Index (Opt 1)                                                  */
-/* ------------------------------------------------------------------ */
-
-#include "pack_index.h"
-
-static void bench_pack_index_rebuild(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-    repo_pack(repo, NULL);
-
-    /* Delete index, then time rebuild */
-    char idx_path[PATH_MAX];
-    snprintf(idx_path, sizeof(idx_path), "%s/packs/pack-index.pidx", BENCH_REPO);
-    unlink(idx_path);
-
-    int iters = 20;
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        unlink(idx_path);
-        pack_index_rebuild(repo);
-    }
-    double elapsed = now_sec() - t0;
-
-    report("pack_index_rebuild (1k objs)", (double)iters / elapsed, "rebuilds/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pack_index_rebuild", bench_pack_index_rebuild);
-
-static void bench_pack_index_lookup(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-    repo_pack(repo, NULL);
-
-    /* Collect content hashes from snapshot */
-    snapshot_t *snap = NULL;
-    uint32_t head = 0;
-    snapshot_read_head(repo, &head);
-    snapshot_load(repo, head, &snap);
-
-    uint8_t zero[OBJECT_HASH_SIZE] = {0};
-    uint8_t hashes[2048][OBJECT_HASH_SIZE];
-    int nhashes = 0;
-    for (uint32_t i = 0; i < snap->node_count && nhashes < 2048; i++) {
-        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0)
-            memcpy(hashes[nhashes++], snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
-    }
-    snapshot_free(snap);
-
-    pack_index_t *idx = pack_index_open(repo);
-    if (!idx || nhashes == 0) {
-        repo_close(repo);
-        bench_cleanup();
-        return;
-    }
-
-    /* Warmup */
-    for (int i = 0; i < nhashes; i++)
-        pack_index_lookup(idx, hashes[i]);
-
-    uint64_t iters = 0;
-    double t0 = now_sec(), elapsed;
-    do {
-        for (int i = 0; i < nhashes; i++)
-            pack_index_lookup(idx, hashes[i]);
-        iters++;
-        elapsed = now_sec() - t0;
-    } while (elapsed < 1.0);
-
-    double lookups = (double)iters * (double)nhashes;
-    report("pack_index_lookup", lookups / elapsed / 1e6, "Mlookups/s", elapsed);
-
-    pack_index_close(idx);
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pack_index_lookup", bench_pack_index_lookup);
-
-/* ------------------------------------------------------------------ */
-/* Restore packed (Opt 4: pack-ordered reads)                          */
-/* ------------------------------------------------------------------ */
-
-static void bench_restore_packed_1k(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-    repo_pack(repo, NULL);
-
-    mkdir(BENCH_DST, 0755);
-    double t0 = now_sec();
-    restore_snapshot(repo, 1, BENCH_DST);
-    double elapsed = now_sec() - t0;
-
-    double mib = (1000.0 * 4096.0) / (1024.0 * 1024.0) / elapsed;
-    report("restore_1k_4K_packed", mib, "MiB/s", elapsed);
-    report("restore_1k_4K_packed", 1000.0 / elapsed, "files/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("restore_1k_4K_packed", bench_restore_packed_1k);
-
-/* ------------------------------------------------------------------ */
-/* Verify packed multi-snap (Opt 5: dedup + pack-ordered)              */
-/* ------------------------------------------------------------------ */
-
-static void bench_verify_multi_snap(void)
-{
-    repo_t *repo = create_multi_snap_repo(1000, 4096, 5, 10);
-    repo_pack(repo, NULL);
-
-    verify_opts_t vopts = {0};
-    double t0 = now_sec();
-    repo_verify(repo, &vopts);
-    double elapsed = now_sec() - t0;
-
-    report("verify_5snap_1k_packed", (double)vopts.objects_checked / elapsed, "objects/s", elapsed);
-    double mib = (double)vopts.bytes_checked / (1024.0 * 1024.0) / elapsed;
-    report("verify_5snap_1k_packed", mib, "MiB/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("verify_5snap_1k_packed", bench_verify_multi_snap);
-
-/* ------------------------------------------------------------------ */
-/* Object load with parity (Opt 6: sequential trailer read)            */
-/* ------------------------------------------------------------------ */
-
-static void bench_object_load_parity(void)
-{
-    bench_cleanup();
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    /* Store 500 loose objects (4K each, with v2 parity trailers) */
-    int count = 500;
-    size_t obj_sz = 4096;
-    uint8_t *data = malloc(obj_sz);
-    uint8_t stored_hashes[500][OBJECT_HASH_SIZE];
-    uint64_t s = 0xfeedface12345678ULL;
-
-    for (int i = 0; i < count; i++) {
-        for (size_t j = 0; j < obj_sz; j++) {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            data[j] = (uint8_t)(s >> 32);
-        }
-        int is_new = 0;
-        uint64_t phys = 0;
-        object_store_ex(repo, 1, data, obj_sz, stored_hashes[i], &is_new, &phys);
-    }
-    free(data);
-
-    /* Warm cache */
-    for (int i = 0; i < count; i++) {
-        void *d = NULL; size_t sz = 0;
-        object_load(repo, stored_hashes[i], &d, &sz, NULL);
-        free(d);
-    }
-
-    /* Time object_load (exercises parity trailer read) */
-    uint64_t total_bytes = 0;
-    double t0 = now_sec();
-    for (int i = 0; i < count; i++) {
-        void *d = NULL; size_t sz = 0;
-        object_load(repo, stored_hashes[i], &d, &sz, NULL);
-        total_bytes += sz;
-        free(d);
-    }
-    double elapsed = now_sec() - t0;
-
-    double mib = (double)total_bytes / (1024.0 * 1024.0) / elapsed;
-    report("object_load_loose_parity_500", mib, "MiB/s", elapsed);
-    report("object_load_loose_parity_500", (double)count / elapsed, "objects/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("object_load_parity", bench_object_load_parity);
-
-/* ------------------------------------------------------------------ */
-/* pack_resolve_location (Opt 4/5 foundation)                          */
-/* ------------------------------------------------------------------ */
-
-static void bench_pack_resolve(void)
-{
-    bench_cleanup();
-    create_tree(BENCH_SRC, 1000, 4096);
-
-    repo_init(BENCH_REPO);
-    repo_t *repo;
-    repo_open(BENCH_REPO, &repo);
-    repo_lock(repo);
-
-    backup_opts_t opts = {0};
-    opts.quiet = 1;
-    const char *paths[] = { BENCH_SRC };
-    backup_run_opts(repo, paths, 1, &opts);
-    repo_pack(repo, NULL);
-
-    /* Collect hashes */
-    snapshot_t *snap = NULL;
-    uint32_t head = 0;
-    snapshot_read_head(repo, &head);
-    snapshot_load(repo, head, &snap);
-
-    uint8_t zero[OBJECT_HASH_SIZE] = {0};
-    uint8_t hashes[2048][OBJECT_HASH_SIZE];
-    int nhashes = 0;
-    for (uint32_t i = 0; i < snap->node_count && nhashes < 2048; i++) {
-        if (memcmp(snap->nodes[i].content_hash, zero, OBJECT_HASH_SIZE) != 0)
-            memcpy(hashes[nhashes++], snap->nodes[i].content_hash, OBJECT_HASH_SIZE);
-    }
-    snapshot_free(snap);
-
-    /* Warmup */
-    for (int i = 0; i < nhashes; i++) {
-        uint32_t pn; uint64_t off;
-        pack_resolve_location(repo, hashes[i], &pn, &off);
-    }
-
-    uint64_t iters = 0;
-    double t0 = now_sec(), elapsed;
-    do {
-        for (int i = 0; i < nhashes; i++) {
-            uint32_t pn; uint64_t off;
-            pack_resolve_location(repo, hashes[i], &pn, &off);
-        }
-        iters++;
-        elapsed = now_sec() - t0;
-    } while (elapsed < 1.0);
-
-    double resolves = (double)iters * (double)nhashes;
-    report("pack_resolve_location", resolves / elapsed / 1e6, "Mresolves/s", elapsed);
-
-    repo_close(repo);
-    bench_cleanup();
-}
-REGISTER("pack_resolve", bench_pack_resolve);
-
-/* ------------------------------------------------------------------ */
-/* Main                                                                */
-/* ------------------------------------------------------------------ */
-
-static int matches_filter(const char *name, int argc, char **argv)
-{
-    if (argc <= 1) return 1;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-l") == 0) continue;
-        if (strstr(name, argv[i]) != NULL) return 1;
-    }
+    double tp = finish_timing(o, t1);
+
+    double mib = (double)res->bytes_logical / (1024.0 * 1024.0);
+    char name[96];
+    printf("\n");
+    snprintf(name, sizeof(name), "%s", label);
+    report(name, tb, "s", tb);
+    snprintf(name, sizeof(name), "%s files/s", label);
+    report(name, (double)res->files / tb, "files/s", tb);
+    snprintf(name, sizeof(name), "%s MiB/s", label);
+    report(name, mib / tb, "MiB/s", tb);
+    snprintf(name, sizeof(name), "%s pack", label);
+    report(name, tp, "s", tp);
+    snprintf(name, sizeof(name), "%s + pack MiB/s", label);
+    report(name, mib / (tb + tp), "MiB/s", tb + tp);
+    printf("      (%" PRIu64 " files, %" PRIu64 " dirs, %" PRIu64 " unchanged, "
+           "%" PRIu64 " new objects, %" PRIu64 " new trees, %" PRIu64 " reused, "
+           "%u packed)\n",
+           res->files, res->dirs, res->files_unchanged, res->objects_new,
+           res->trees_new, res->trees_reused, packed);
     return 0;
+}
+
+static int timed_restore(const opts_t *o, bench_env_t *e, int64_t snap_id,
+                         const char *dst, const tree_stats_t *want)
+{
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+
+    section("restore");
+    double t0 = bench_now();
+    status_t st = restore_run(e->store, e->db, e->repo_id, snap_id, dst, &ro, &rr);
+    double t = finish_timing(o, t0);
+    if (st != OK || rr.failed != 0 || rr.files != want->files) {
+        fprintf(stderr, "bench: restore wrong: status %d, %" PRIu64 " of %" PRIu64
+                " files, %" PRIu64 " failed: %s\n",
+                (int)st, rr.files, want->files, rr.failed, err_msg());
+        return -1;
+    }
+    double mib = (double)rr.bytes / (1024.0 * 1024.0);
+    report("restore", t, "s", t);
+    report("restore files/s", (double)rr.files / t, "files/s", t);
+    report("restore MiB/s", mib / t, "MiB/s", t);
+    printf("      (%" PRIu64 " files, %" PRIu64 " dirs, %.1f MiB)\n", rr.files, rr.dirs, mib);
+    return 0;
+}
+
+static void usage(FILE *f)
+{
+    fprintf(f,
+        "usage: bench_phases [-d DIR] [-n SMALL] [-s BYTES] [-l LARGE] [-t TEXT]\n"
+        "                    [-m MIB] [-c] [-k]\n"
+        "  -d, --dir DIR        parent of the working directory (BENCH_DIR, /tmp)\n"
+        "  -n, --small N        small files (BENCH_SMALL_FILES, 10000)\n"
+        "  -s, --small-bytes B  mean small-file size (BENCH_SMALL_BYTES, 4096)\n"
+        "  -l, --large N        incompressible large files (BENCH_LARGE_FILES, 3)\n"
+        "  -t, --text N         identical compressible large files (BENCH_TEXT_FILES, 2)\n"
+        "  -m, --large-mib M    MiB per large file (BENCH_LARGE_MIB, 64)\n"
+        "  -c, --cold           evict the source before each backup, sync in timings\n"
+        "  -k, --keep           keep the working directory\n");
+}
+
+static void parse(int argc, char **argv, opts_t *o)
+{
+    const char *dir = getenv("BENCH_DIR");
+    snprintf(o->parent, sizeof(o->parent), "%s", (dir && *dir) ? dir : "/tmp");
+    o->small_files = bench_env_u64("BENCH_SMALL_FILES", 10000);
+    o->small_bytes = bench_env_u64("BENCH_SMALL_BYTES", 4096);
+    o->large_files = bench_env_u64("BENCH_LARGE_FILES", 3);
+    o->text_files  = bench_env_u64("BENCH_TEXT_FILES", 2);
+    o->large_mib   = bench_env_u64("BENCH_LARGE_MIB", 64);
+
+    static const struct option lo[] = {
+        { "dir",         required_argument, NULL, 'd' },
+        { "small",       required_argument, NULL, 'n' },
+        { "small-bytes", required_argument, NULL, 's' },
+        { "large",       required_argument, NULL, 'l' },
+        { "text",        required_argument, NULL, 't' },
+        { "large-mib",   required_argument, NULL, 'm' },
+        { "cold",        no_argument,       NULL, 'c' },
+        { "keep",        no_argument,       NULL, 'k' },
+        { "help",        no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 },
+    };
+    int c;
+    while ((c = getopt_long(argc, argv, "d:n:s:l:t:m:ckh", lo, NULL)) != -1) {
+        switch (c) {
+        case 'd': snprintf(o->parent, sizeof(o->parent), "%s", optarg); break;
+        case 'n': o->small_files = bench_parse_u64("--small", optarg); break;
+        case 's': o->small_bytes = bench_parse_u64("--small-bytes", optarg); break;
+        case 'l': o->large_files = bench_parse_u64("--large", optarg); break;
+        case 't': o->text_files  = bench_parse_u64("--text", optarg); break;
+        case 'm': o->large_mib   = bench_parse_u64("--large-mib", optarg); break;
+        case 'c': o->cold = 1; break;
+        case 'k': o->keep = 1; break;
+        case 'h': usage(stdout); exit(0);
+        default:  usage(stderr); exit(2);
+        }
+    }
+    if (optind != argc) { usage(stderr); exit(2); }
+    if (o->large_mib > (UINT64_MAX >> 21)) {
+        fprintf(stderr, "bench: --large-mib too large\n");
+        exit(2);
+    }
+    if (o->small_files + o->large_files + o->text_files == 0) {
+        fprintf(stderr, "bench: nothing to back up\n");
+        exit(2);
+    }
+    snprintf(o->work, sizeof(o->work), "%s/c_backup_bench_phases", o->parent);
 }
 
 int main(int argc, char **argv)
 {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-l") == 0) {
-            printf("Available benchmarks:\n");
-            for (int b = 0; b < g_nbench; b++)
-                printf("  %s\n", g_benches[b].name);
-            return 0;
-        }
-    }
+    opts_t o;
+    memset(&o, 0, sizeof(o));
+    parse(argc, argv, &o);
 
-    printf("bench_phases: %d benchmark(s) registered\n", g_nbench);
-    printf("  %-40s %10s %-10s\n", "NAME", "RESULT", "UNIT");
-    printf("  %-40s %10s %-10s\n",
-           "----------------------------------------",
-           "----------", "----------");
+    char src[3300], dst[3300];
+    snprintf(src, sizeof(src), "%s/src", o.work);
+    snprintf(dst, sizeof(dst), "%s/restore", o.work);
 
-    int ran = 0;
-    for (int b = 0; b < g_nbench; b++) {
-        if (!matches_filter(g_benches[b].name, argc, argv))
-            continue;
-        g_benches[b].fn();
-        ran++;
-    }
+    if (bench_rm_tree(o.work) != 0 || bench_mkdir(o.work) != 0) return 1;
 
-    if (ran == 0)
-        printf("  (no benchmarks matched filter)\n");
+    printf("bench_phases: %s\n", o.work);
+    printf("  %" PRIu64 " small files of ~%" PRIu64 " B, %" PRIu64 " random + %" PRIu64
+           " identical text files of %" PRIu64 " MiB%s\n",
+           o.small_files, o.small_bytes, o.large_files, o.text_files, o.large_mib,
+           o.cold ? ", cold" : "");
 
-    bench_cleanup();
-    return 0;
+    tree_stats_t ts;
+    double t0 = bench_now();
+    if (generate(&o, src, &ts) != 0) { bench_rm_tree(o.work); return 1; }
+    printf("  generated %" PRIu64 " files, %.1f MiB in %.2fs\n",
+           ts.files, (double)ts.bytes / (1024.0 * 1024.0), bench_now() - t0);
+
+    int rc = 1;
+    bench_env_t e;
+    if (bench_env_open(&e, o.work) != 0) goto out;
+
+    backup_result_t first, incr;
+    if (timed_backup(&o, &e, src, "first backup", &first) != 0) goto out;
+    if (timed_backup(&o, &e, src, "incremental, no change", &incr) != 0) goto out;
+    if (incr.files_unchanged != incr.files)
+        printf("  warning: %" PRIu64 " of %" PRIu64 " files were re-read by the incremental\n",
+               incr.files - incr.files_unchanged, incr.files);
+    if (timed_restore(&o, &e, incr.snapshot_id, dst, &ts) != 0) goto out;
+    rc = 0;
+
+out:
+    bench_env_close(&e);
+    if (o.keep) printf("\nkept %s\n", o.work);
+    else if (bench_rm_tree(o.work) != 0) rc = 1;
+    return rc;
 }
