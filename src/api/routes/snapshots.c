@@ -779,7 +779,22 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
 
     if (j->kind == SNAP_JOB_REINDEX) {
-        st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
+        reindex_result_t rx;
+        memset(&rx, 0, sizeof(rx));
+        st = reindex_repo(store, j->db, j->repo_id, cancel, &rx);
+        /* What came back, on the job, failed or not: an operator recovering
+         * from a lost database needs to see that the tags returned, and a
+         * failed run says how much it still managed. */
+        char rj[320];
+        snprintf(rj, sizeof(rj),
+                 "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
+                 "\"objects\":%llu,\"packs_unreadable\":%llu,"
+                 "\"tags_restored\":%llu,\"tags_skipped\":%llu}",
+                 (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
+                 (unsigned long long)rx.files, (unsigned long long)rx.objects,
+                 (unsigned long long)rx.packs_unreadable,
+                 (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped);
+        job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_PACK) {
         /* Loose objects are one file each, and compression only happens at
          * pack time, so an unpacked repository stores more than its source

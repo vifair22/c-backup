@@ -8,6 +8,7 @@
 #include "object.h"
 #include "pack.h"
 #include "db_txn.h"
+#include "repo_tags.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -791,11 +792,21 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     st = recompute_refcounts(db, repo_id);
     if (st != OK) return st;
 
+    /* Tags last: they attach to snapshot rows, which now exist. */
+    status_t tst = repo_tags_restore(db, repo_id, store_root(store),
+                                     &total.tags_restored, &total.tags_skipped);
+    char tags_err[256] = "";
+    if (tst != OK) {
+        snprintf(tags_err, sizeof(tags_err), "%s", err_msg());
+        err_clear();
+    }
+
     log_info("reindex: %llu snapshot(s), %llu nodes, %llu trees read, "
-             "%llu object(s), %llu pack(s) with %llu entries",
+             "%llu object(s), %llu pack(s) with %llu entries, %llu tag(s) restored",
              (unsigned long long)total.snapshots, (unsigned long long)total.nodes,
              (unsigned long long)total.trees_read, (unsigned long long)total.objects,
-             (unsigned long long)total.packs, (unsigned long long)total.pack_entries);
+             (unsigned long long)total.packs, (unsigned long long)total.pack_entries,
+             (unsigned long long)total.tags_restored);
     if (out) *out = total;
 
     /*
@@ -818,5 +829,12 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "reindex: %llu pack(s) could not be read and keep their "
                          "previous index rows; run verify",
                          (unsigned long long)total.packs_unreadable);
+    /* Loud, because tags are the retention guard: an index rebuilt without
+     * them leaves every tagged snapshot open to the next gfs pass. */
+    if (tags_err[0])
+        return set_error(ERR_CORRUPT,
+                         "reindex: the index was rebuilt but the repository's tag "
+                         "list could not be read (%s); tagged snapshots are not "
+                         "protected until they are tagged again", tags_err);
     return OK;
 }

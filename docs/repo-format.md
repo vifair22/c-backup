@@ -8,6 +8,7 @@ daemon's database is an index over this, not the only copy.
 <repo>/
   .cbackup            identity marker
   snapshots/<id>      snapshot records: root tree hash plus metadata
+  tags                the tag list, which reindex restores (absent until a tag is set)
   objects/aa/bb...    loose objects, including manifest trees
   packs/NNNN/pack-XXXXXXXX.dat   packs, 256 per directory
   tmp/                staging for atomic writes; never read back
@@ -52,6 +53,29 @@ Registering a non-empty directory without a marker is refused. The marker is
 the only thing distinguishing "our repository" from "a directory that happens
 to be here", and the cost of guessing wrong is writing objects into somebody
 else's data.
+
+## `tags`
+
+```json
+{"version":1,"tags":[{"name":"keep","snapshot":3,"ts":1731600000,"created_at":1731600100}]}
+```
+
+Tags are the retention guard: a retention pass keeps a tagged snapshot
+whatever its tier. They are user-authored, so unlike the rest of the index
+they cannot be derived from the trees, and while they lived only in the
+database a recovery from a lost database came back with every snapshot
+unprotected. The daemon rewrites this file whole (temp file, `fsync`,
+`rename`) inside the same transaction as every tag change, and reindex
+inserts its tags back, a tag already in the database winning.
+
+`ts` is the tagged snapshot's timestamp. Snapshot ids are allocated as one
+more than the highest, so pruning the newest snapshot frees its id; a tag is
+restored only onto the snapshot with the same id *and* timestamp, never onto
+a later backup that reused the number.
+
+The file is optional. A repository written before it existed has none and
+reindexes exactly as it did, restoring no tags. A build that predates it
+ignores it. Replication does not copy it.
 
 ## Objects
 
@@ -125,5 +149,6 @@ This walks each snapshot record's root tree and repopulates the index.
 Measured at roughly 764k rows per second, so a million-file snapshot takes
 about a second and a half.
 
-What reindexing cannot recover is daemon-only state: job history, sessions,
-schedules. None of that describes your backups.
+Tags come back from the `tags` file. What reindexing cannot recover is
+daemon-only state: job history, sessions, schedules, notes. None of that
+describes your backups.

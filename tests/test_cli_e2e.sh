@@ -402,6 +402,10 @@ mv "$WORK/enc.key.aside" "$WORK/keys/$ENC_UUID.key"
 PASS_ID=$(printf '%s' "$PASS_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 PASS_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/passrepo/.cbackup" | head -1)
 cb backup "$PASS_ID" "$WORK/src" >/dev/null
+# B052: tags lived only in state.db, so this recovery came back with every
+# snapshot unprotected. The repository carries them now.
+cb tag set "$PASS_ID" guard 1 >/dev/null
+contains "a tag is written into the repository" '"name":"guard"' "$(cat "$WORK/passrepo/tags" 2>&1)"
 rm -f "$WORK/keys/$PASS_UUID.key"
 cb repo remove "$PASS_ID" >/dev/null
 OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'wrong horse' 2>&1); RC=$?
@@ -417,7 +421,10 @@ OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=
 check    "the right passphrase unlocks a registered repo" 0 "$RC"
 contains "and says it did" '"key_unlocked":true' "$OUT"
 check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
-contains "the unlocked repo reindexes" '"completed"' "$(cb reindex "$PASS_ID")"
+REINDEX_OUT=$(cb reindex "$PASS_ID")
+contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
+contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
+contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
 contains "and lists its snapshot" '"id":"1"' "$(cb snapshots "$PASS_ID")"
 # B047: a reindexed snapshot listed "size":"".
 case "$(cb snapshots "$PASS_ID")" in

@@ -39,6 +39,10 @@ typedef struct {
      * could not be read keeps whatever index rows it had before. */
     uint64_t snapshots_failed;
     uint64_t packs_unreadable;
+    /* Tags brought back from the repository's own tag list, and those whose
+     * snapshot no longer exists there. */
+    uint64_t tags_restored;
+    uint64_t tags_skipped;
 } reindex_result_t;
 
 /*

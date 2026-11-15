@@ -32,6 +32,7 @@
 #include "reindex.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "repo_tags.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -345,6 +346,112 @@ static void test_reindex_counts_refs_and_gc_after_it_keeps_live_objects(void **s
     }
 }
 
+/* ---------- B052 ---------- */
+
+static void tag(const char *name, const char *sid)
+{
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, ?, ?, 1)",
+        (const char *[]){ repo, name, sid, NULL }, NULL), 0);
+    assert_int_equal(repo_tags_save(db, repo_id, TEST_REPO), OK);
+}
+
+/*
+ * Tags are the retention guard and lived only in state.db, so recovering
+ * from a lost database left every tagged snapshot unprotected. The
+ * repository's copy brings them back on reindex.
+ */
+static void test_reindex_restores_tags_from_the_repository(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_SRC "/top.txt", "second\n");
+    backup_once();
+    tag("keep-first", "1");
+    tag("keep-second", "2");
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM tags", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.tags_restored, 2);
+    assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep-first'"), 1);
+    assert_int_equal(scalar("SELECT snap_id FROM tags WHERE repo_id = ? AND name = 'keep-second'"), 2);
+
+    /* A second reindex finds them present and changes nothing. */
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.tags_restored, 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 2);
+}
+
+/*
+ * Pruning the newest snapshot frees its id for the next backup. A tag in
+ * the file for the pruned snapshot must not land on its successor.
+ */
+static void test_a_tag_does_not_follow_a_reused_snapshot_id(void **state)
+{
+    (void)state;
+    backup_once();
+    tag("old", "1");
+    long long ts1 = scalar("SELECT ts FROM snapshots WHERE repo_id = ? AND id = 1");
+
+    /* The record is rewritten with another timestamp, as a later backup
+     * reusing id 1 would write it. */
+    char rec[512];
+    snprintf(rec, sizeof(rec), "%s/snapshots/1", TEST_REPO);
+    FILE *f = fopen(rec, "r");
+    assert_non_null(f);
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    char *root = strstr(buf, "\"root\":\"");
+    assert_non_null(root);
+    char hex[65];
+    memcpy(hex, root + 8, 64);
+    hex[64] = '\0';
+    char body[256];
+    snprintf(body, sizeof(body), "{\"id\":1,\"ts\":%lld,\"root\":\"%s\",\"label\":\"\"}\n",
+             ts1 + 1000, hex);
+    write_file(rec, body);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM tags", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.tags_restored, 0);
+    assert_int_equal(rx.tags_skipped, 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+}
+
+/* A repository written before the tag file existed reindexes as before. */
+static void test_reindex_without_a_tag_file_restores_none(void **state)
+{
+    (void)state;
+    backup_once();
+    unlink(TEST_REPO "/tags");
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.tags_restored, 0);
+}
+
+/* An unreadable tag list fails the run loudly: tagged snapshots would
+ * otherwise come back silently unprotected. */
+static void test_corrupt_tag_file_fails_the_reindex(void **state)
+{
+    (void)state;
+    backup_once();
+    write_file(TEST_REPO "/tags", "{not json");
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "tag list could not be read"));
+    err_clear();
+    /* The index itself was still rebuilt. */
+    assert_int_equal(rx.snapshots, 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -357,6 +464,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_reindex_restores_size_and_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_counts_refs_and_gc_after_it_keeps_live_objects,
                                         setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_restores_tags_from_the_repository, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_tag_does_not_follow_a_reused_snapshot_id, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_without_a_tag_file_restores_none, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_corrupt_tag_file_fails_the_reindex, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

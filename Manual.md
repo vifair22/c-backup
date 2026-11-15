@@ -399,6 +399,7 @@ A repository is a directory the daemon registers and then owns.
 <repo>/
   .cbackup          identity marker: format, version, UUID, encryption
   snapshots/<id>    snapshot records: root tree hash and metadata
+  tags              the tag list, kept so a reindex can restore it
   objects/aa/bb...  loose objects, including manifest trees
   packs/<id>.dat    packs
   tmp/              staging for atomic writes
@@ -599,6 +600,10 @@ sudo c-backup tag remove 1 pre-migration
   letter or digit. A name is part of a URL path when it is removed, and one
   with a space or a slash could be set but never removed.
 - Removing a tag that does not exist fails with "no such tag".
+- Every tag change is also written into the repository's `tags` file, so
+  tags survive losing the database (section 17.1). If that file cannot be
+  written the change is refused, rather than leaving a tag that a recovery
+  would silently drop.
 
 ---
 
@@ -1065,8 +1070,11 @@ readable snapshots are indexed, and anything unreadable keeps whatever index
 rows it already had, so a reindex never replaces a populated index with an
 empty or partial one. An encrypted repository is refused outright until its
 key is on the host (section 13).
-Lost for good: schedules, sources, policy, tags, notes, the journal, job
-history and sessions. Re-create the schedules and sources. Remote clients sign
+Tags come back: the repository keeps its own copy of the tag list (a `tags`
+file beside `snapshots/`), and the reindex job's result reports
+`tags_restored`. A reindex that cannot read that file fails rather than
+leaving tagged snapshots silently unprotected. Lost for good: schedules,
+sources, policy, notes, the journal, job history and sessions. Re-create the schedules and sources. Remote clients sign
 in again; set the admin password again first with `auth setup`.
 
 Keep a copy of `config.yaml` and a note of your schedules somewhere else, and
