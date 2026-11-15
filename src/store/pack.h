@@ -301,6 +301,19 @@ status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted);
 
+/*
+ * Finish pack removals a crash interrupted: delete every pack a
+ * .deleting-NNNNNNNN marker names, emit its removal callback, and remove
+ * the marker. A marker is written only once the packs replacing the ones
+ * it names are installed, synced and announced, so this never deletes the
+ * only copy of anything. pack_gc runs it first; reindex must too, before it
+ * reads the packs, or it would index the doomed copies.
+ *
+ * Must not be called with a database transaction open: the removal
+ * callback begins one.
+ */
+void pack_resume_removals(store_t *store);
+
 /* Packs pack_gc_stats touched: rewritten without their dead entries, and
  * deleted outright because every entry was dead. Coalescing is not counted. */
 typedef struct {

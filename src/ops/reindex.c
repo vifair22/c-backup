@@ -551,6 +551,21 @@ static status_t rebuild_pack_index(store_t *store, cutils_db_t *db, int64_t repo
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    /*
+     * Finish any pack removal a crash interrupted before reading the packs.
+     *
+     * A .deleting marker means the packs it names have been replaced by
+     * packs already installed and announced (gc's rewrite, coalescing), and
+     * only the unlinks are outstanding. Rebuilding rows from both sets would
+     * point some objects at the doomed copies, by whatever order the
+     * directory walk hands packs back, and the next gc's replay of the
+     * marker would then delete those rows with the files: objects present
+     * on disk and missing from the index. Replayed first, there is only one
+     * copy to index. Before the transaction below, because the removal
+     * callback begins its own.
+     */
+    pack_resume_removals(store);
+
     /* One transaction for the whole rebuild. Without it every row is its own
      * committed transaction, and a pack of a few thousand entries spends all
      * its time in SQLite's per-statement bookkeeping rather than in the work.

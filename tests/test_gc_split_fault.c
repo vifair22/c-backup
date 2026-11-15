@@ -450,8 +450,10 @@ static void test_killed_before_the_marker(void **state)
 
 /*
  * Killed just after the marker went in, before the old pack was unlinked.
- * The next gc replays the marker - unlinks the old pack and drops its rows
- * - and there is nothing left to rewrite.
+ * A reindex then replays the marker before reading the packs - it used not
+ * to, indexed the doomed copy by directory order, and the next gc's replay
+ * deleted those rows with the file (OWN-20) - and the next gc finds
+ * nothing left to rewrite.
  */
 static void test_killed_after_the_marker(void **state)
 {
@@ -460,6 +462,10 @@ static void test_killed_after_the_marker(void **state)
     gc_killed_at(2, 1);
 
     assert_true(big_pack_on_disk());
+    verify_clean();
+    restore_exact();
+    reindex_clean();
+    assert_false(big_pack_on_disk());
     verify_clean();
     restore_exact();
 

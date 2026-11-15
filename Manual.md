@@ -1231,7 +1231,8 @@ only staging files in `tmp/`; killed after installing the new packs but
 before deleting the old one, it leaves the old pack beside copies of its
 live entries, which wastes that space until the snapshots naming them are
 pruned and loses nothing; killed while deleting, it is finished by the next
-gc.
+gc or reindex. Merging small packs (coalescing, which gc also does) follows
+the same steps and leaves the same states.
 
 **Large incompressible objects stay loose.** A backup writes objects up to
 16 MiB straight into packs. Anything larger is written as one loose file,
