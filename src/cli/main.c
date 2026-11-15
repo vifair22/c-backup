@@ -18,6 +18,7 @@
 
 #include "http.h"
 #include "sse.h"
+#include "start_advice.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -207,29 +208,17 @@ static const char *take_opt_multi(int *argc, char **argv, const char *name)
  *
  * It used to say "systemctl start c-backupd" everywhere, including inside
  * the Docker image, where there is no systemd and the daemon is the
- * container's own process: if it is not answering, the container is not
- * running it, or this is a different container. A container is recognised
- * by Docker's /.dockerenv, podman's /run/.containerenv, or the `container`
- * variable podman and systemd-nspawn set. A wrong socket path is the other
- * common cause, so the way to name one is always given.
+ * container's own process; then "docker start" in every container, including
+ * one booting systemd with the unit installed. start_advice.h has the rules.
+ * A wrong socket path is the other common cause, so the way to name one is
+ * always given.
  */
 static void daemon_down(void)
 {
+    host_facts_t f;
+    host_facts_probe("", &f);
     fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
-    const char *cv = getenv("container");
-    int in_container = access("/.dockerenv", F_OK) == 0 ||
-                       access("/run/.containerenv", F_OK) == 0 ||
-                       (cv && *cv);
-    if (in_container)
-        fprintf(stderr,
-                "          This looks like a container: the daemon runs as the\n"
-                "          c-backupd container's own process, so start that container\n"
-                "          (docker start c-backupd), or run this command in it\n"
-                "          (docker exec c-backupd c-backup ...).\n");
-    else if (access("/run/systemd/system", F_OK) == 0)
-        fprintf(stderr, "          Start it with 'systemctl start c-backupd'.\n");
-    else
-        fprintf(stderr, "          Start c-backupd.\n");
+    fputs(start_advice(&f), stderr);
     fprintf(stderr,
             "          If it runs with another socket, name it with --socket PATH\n"
             "          or C_BACKUP_SOCKET.\n");
@@ -904,9 +893,7 @@ static int cmd_jobs(int argc, char **argv)
         sse_free(&sp);
         free(p.buf);
         if (st == ERR_NOT_FOUND) {
-            fprintf(stderr,
-                    "c-backup: daemon not running at %s.\n"
-                    "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+            daemon_down();
             return 1;
         }
         if (st != OK) return fail("%s", err_msg());
@@ -1610,7 +1597,7 @@ static const struct {
     { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
     { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]  |  grep runs <repo-id> [--limit N] [--offset N]  |  grep show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
-    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
+    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  (deep and repairing by default; --dry-run is --no-repair: check only, the repository is not written)  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
