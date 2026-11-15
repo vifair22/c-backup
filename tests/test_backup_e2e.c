@@ -528,6 +528,52 @@ static void test_rejects_empty_path_list(void **state)
     assert_int_not_equal(backup_run(store, db, repo_id, &o, NULL), OK);
 }
 
+/*
+ * A backup whose every source is excluded fails and writes no snapshot.
+ *
+ * The scan records each root's ancestors (/tmp and /tmp/c_backup_test_e2e
+ * for this source) so a restore can recreate the layout. Exclude the root
+ * and those ancestors were all that was left, so `--exclude '*'` used to
+ * complete with a snapshot holding no files at all. Three ways in: a glob
+ * matching everything, an exclude naming the root, and a source that does
+ * not exist. A second source that does contribute must still back up, so
+ * the check is on the sources as a whole, not each one.
+ */
+static void test_backup_of_nothing_fails_without_a_snapshot(void **state)
+{
+    (void)state;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    const char *star[] = { "*" };
+    const char *root[] = { TEST_SRC };
+    const char **excl[] = { star, root };
+    for (size_t i = 0; i < sizeof(excl) / sizeof(excl[0]); i++) {
+        backup_opts_t o = basic_opts();
+        o.exclude = excl[i];
+        o.n_exclude = 1;
+        err_clear();
+        assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_INVALID);
+        assert_non_null(strstr(err_msg(), "nothing to back up"));
+    }
+
+    static const char *missing[] = { TEST_DIR "/no-such-source" };
+    backup_opts_t o = basic_opts();
+    o.paths = missing;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_INVALID);
+
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", repo), 0);
+
+    /* One empty source beside a real one is a normal backup. */
+    static const char *mixed[] = { TEST_DIR "/no-such-source", TEST_SRC };
+    o = basic_opts();
+    o.paths = mixed;
+    o.n_paths = 2;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.files, 3);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -543,6 +589,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deep_wide_tree_is_not_quadratic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_of_nothing_fails_without_a_snapshot, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

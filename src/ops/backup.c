@@ -945,10 +945,12 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&timers, 0, sizeof(timers));
 
     uint64_t _tscan = phase_now();
+    uint64_t from_sources = 0;
     for (int i = 0; i < opts->n_paths; i++) {
         scan_result_t *part = NULL;
         st = scan_tree(opts->paths[i], imap, &sopts, &part);
         if (st != OK) { scan_result_free(part); break; }
+        from_sources += part->root_entries;
         if (!scan) {
             scan = part;
         } else {
@@ -969,9 +971,19 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     scan_imap_free(imap);
     if (st != OK) { scan_result_free(scan); return st; }
-    if (!scan || scan->count == 0) {
+    /*
+     * Count what the sources gave, not what the scan holds. The scan also
+     * carries the ancestors of each root (/a and /a/b for a source of
+     * /a/b/c), so `--exclude '*'` or an exclude naming the root used to
+     * leave a few synthesised directories behind and write a snapshot of
+     * nothing that reported success. Nothing is written before this.
+     */
+    if (!scan || scan->count == 0 || from_sources == 0) {
         scan_result_free(scan);
-        return set_error(ERR_INVALID, "backup_run: nothing to back up");
+        return set_error(ERR_INVALID,
+                         "nothing to back up: every source was excluded or "
+                         "could not be read (%d source%s); no snapshot written",
+                         opts->n_paths, opts->n_paths == 1 ? "" : "s");
     }
 
     phase_add(&timers, PHASE_SCAN, _tscan);

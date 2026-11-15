@@ -818,9 +818,11 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
         return OK;
     }
 
+    uint32_t before = res->count;
     status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts,
                                 root_dev, res);
     if (st != OK) { scan_result_free(res); return st; }
+    res->root_entries = res->count - before;
     *out = res;
     return OK;
 }

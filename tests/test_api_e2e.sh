@@ -429,6 +429,18 @@ case "$(sock_body '/repos/2/search?q=out')" in
     *out.o*) bad "build dir excluded" "absent" "present" ;;
     *)       ok  "build dir excluded" ;;
 esac
+# Excluding everything used to complete with a snapshot of nothing but the
+# source's ancestor directories. It fails instead, and writes no snapshot.
+SNAPS_BEFORE=$(sock_body /repos/2/snapshots | grep -o '"id"' | wc -l)
+ALL_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"paths\":[\"$WORK/exsrc\"],\"exclude\":[\"*\"]}" \
+          http://localhost/repos/2/backup)")
+wait_job "$ALL_JOB"
+ALL_BODY=$(sock_body "/jobs/$ALL_JOB")
+contains "exclude-everything backup fails"  '"state":"failed"'     "$ALL_BODY"
+contains "exclude-everything says why"      'nothing to back up'   "$ALL_BODY"
+check    "exclude-everything wrote no snapshot" "$SNAPS_BEFORE" \
+         "$(sock_body /repos/2/snapshots | grep -o '"id"' | wc -l)"
 
 # Verify had unit coverage and no end-to-end coverage: the route, the job
 # wiring and the level parameter were never exercised through the daemon.

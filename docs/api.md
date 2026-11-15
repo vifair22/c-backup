@@ -226,6 +226,11 @@ on the text, not the filesystem, so it does not follow symlinks. Directories are
 descends, so excluding one prunes its subtree rather than filtering entries
 on the way out.
 
+A backup in which every source is excluded, or none could be read, fails
+with "nothing to back up" and writes no snapshot. It used to succeed with a
+snapshot holding only the directories above each source, which looks like a
+backup and restores nothing.
+
 Before this, the matcher accepted absolute prefixes only and silently
 skipped everything else, and the route did not read the field at all: a
 request could carry any exclusions it liked and back up the whole tree
