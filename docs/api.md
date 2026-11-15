@@ -430,9 +430,10 @@ percent-encode the segment, as the CLI and the app do, so that a tag stored
 before this rule can be removed: the server decodes the path before routing.
 
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
-`defaults`, the daemon's configured `retention.*` values from `config.yaml`
-that apply wherever the repository has set nothing. A client cannot read the
-daemon's config file, so without them it could only guess at what is in force.
+`defaults`, what applies wherever the repository has set nothing: the
+daemon's configured `retention.*` values from `config.yaml`, and
+`maintenance.auto_pack` (`true`). A client cannot read the daemon's config
+file, so without them it could only guess at what is in force.
 
 `PUT /repos/<id>/policy` accepts only the keys something in the daemon reads,
 and refuses anything else with a 400 that lists them:

@@ -273,6 +273,11 @@ case "$POL" in *keep_hourly*) bad "an unknown key is not stored" "absent" "$POL"
                *) ok "an unknown key is not stored" ;; esac
 put_policy maintenance.auto_pack true > /dev/null
 
+# B040: the defaults listed every retention key but not auto_pack, which is
+# in force everywhere a repository has not set it.
+contains "policy defaults include auto_pack, on" \
+    '{"key":"maintenance.auto_pack","value":"true"}]}' "$(sock_body /repos/1/policy)"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.

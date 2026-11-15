@@ -605,7 +605,8 @@ sudo c-backup policy set 1 retention.keep_daily 14
 sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
-`policy list` shows the repository's own values and the defaults in force.
+`policy list` shows the repository's own values and the defaults in force,
+`maintenance.auto_pack` (on) included.
 
 Only these keys are accepted; any other key, and any value of the wrong
 kind, is refused with a message listing what is valid:

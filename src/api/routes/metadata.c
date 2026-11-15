@@ -553,6 +553,19 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
             json_elem_commit(&e);
             if (bad) break;
         }
+        /* Not a config key, so not in the retention list, but it is in
+         * force everywhere a repository has not set it, and leaving it out
+         * read as "auto_pack has no value". Must match the default
+         * backup_routes.c passes to routes_policy_flag. */
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "defaults", &e) == 0) {
+            /* Committed either way, like the rows above: an uncommitted
+             * element is never freed, and the adds fail only on allocation. */
+            int bad = json_elem_add_str(&e, "key",   "maintenance.auto_pack") != 0
+                   || json_elem_add_str(&e, "value", "true") != 0;
+            (void)bad;
+            json_elem_commit(&e);
+        }
     }
     return finalise(resp);
 }
