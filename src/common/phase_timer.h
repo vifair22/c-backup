@@ -40,6 +40,7 @@ typedef enum {
     PHASE_TREES,         /* build_trees: manifest serialisation and dedup */
     PHASE_INDEX_NODES,   /* nodes and node_fts inserts */
     PHASE_CACHE_SWEEP,   /* dropping cache rows for paths the scan no longer sees */
+    PHASE_STORE_WAIT,    /* the backup thread blocked on the large-file workers */
     /* Inside PHASE_READ_HASH, which on real storage is 82% of a full backup
      * and far too coarse to act on. These break that bucket apart. */
     PHASE_OBJ_SETUP,     /* mkstemp, header write, parity stream init */
@@ -52,12 +53,35 @@ typedef enum {
     PHASE_OBJ_MKDIR,     /* mkdirat + openat of the fanout directory */
     PHASE_OBJ_RENAME,    /* rename into place */
     PHASE_OBJ_LOOSESET,  /* store_loose_set_insert */
+    /*
+     * The large-file workers (B086): wall time per file, summed over every
+     * worker, so with N of them it can approach N times the wall clock. On a
+     * single-threaded store this bucket is empty and those files are in
+     * read+hash+write as before.
+     */
+    PHASE_STORE_WORKERS,
+    /*
+     * Inside obj:io-loop, by pipeline stage. These are thread CPU time
+     * (CLOCK_THREAD_CPUTIME_ID), not wall, summed over every thread that ran
+     * the stage: the reader, the hasher and the writer of each object, on
+     * every worker. A stage that waits on I/O or on its neighbour shows the
+     * work it did, not how long it took. There is no compression probe here:
+     * loose objects are always stored uncompressed and probed at pack time.
+     */
+    PHASE_IO_READ,       /* read(2) of the source, page-cache copy included */
+    PHASE_IO_HASH,       /* SHA-256 over the plaintext */
+    PHASE_IO_ENCRYPT,    /* ChaCha20 in place, encrypted repositories only */
+    PHASE_IO_WRITE,      /* write(2) of the payload into the temp file */
+    PHASE_IO_PARITY,     /* CRC-32C and the Reed-Solomon stream */
     PHASE__COUNT
 } phase_id_t;
 
 typedef struct {
     uint64_t ns[PHASE__COUNT];
     uint64_t count[PHASE__COUNT];
+    /* How many threads stored large files concurrently; 0 or 1 means the
+     * obj:* figures are this thread's wall time and nothing was summed. */
+    unsigned store_threads;
 } phase_timers_t;
 
 /*
@@ -86,6 +110,35 @@ static inline void phase_add(phase_timers_t *t, phase_id_t id, uint64_t start)
     t->ns[id]    += phase_now() - start;
     t->count[id] += 1;
 }
+
+/*
+ * This thread's CPU clock, for the io:* stages.
+ *
+ * Not a vDSO read: it is a system call, a few hundred nanoseconds. The stages
+ * take it twice per 1 MiB chunk, which is under a millisecond per gigabyte,
+ * so the rule in the header comment still holds - but only because the spans
+ * are per chunk. Per block would not be free.
+ */
+static inline uint64_t phase_cpu_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Adds a duration measured elsewhere: a stage thread keeps its own sums and
+ * hands them over once joined, so no counter is ever shared between threads. */
+static inline void phase_add_ns(phase_timers_t *t, phase_id_t id,
+                                uint64_t ns, uint64_t count)
+{
+    if (!t) return;
+    t->ns[id]    += ns;
+    t->count[id] += count;
+}
+
+/* Folds a joined worker's timers into the backup's. The caller owns both: the
+ * worker has exited, so nothing else is writing src. */
+void phase_merge(phase_timers_t *dst, const phase_timers_t *src);
 
 /*
  * Log one line per phase, widest first, with a per-call figure.

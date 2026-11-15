@@ -84,9 +84,6 @@ struct store {
     /* The owning job's cancel flag, or NULL. See store_set_cancel. */
     volatile int         *cancel;
 
-    /* Byte progress inside one object, or NULL. See store_set_io_progress. */
-    store_io_fn           io_fn;
-    void                 *io_ctx;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -278,27 +275,53 @@ volatile int *store_get_cancel(const store_t *st)
     return st ? st->cancel : NULL;
 }
 
+/* A second flag for this thread alone; see store_set_thread_cancel. */
+static _Thread_local volatile int *tls_cancel;
+
+void store_set_thread_cancel(volatile int *cancel)
+{
+    tls_cancel = cancel;
+}
+
 int store_cancelled(const store_t *st)
 {
+    if (tls_cancel && *tls_cancel) return 1;
     return st && st->cancel && *st->cancel;
 }
+
+/*
+ * The hook is per thread, and names the handle it was set for.
+ *
+ * It sat on the handle while one thread did all the storing. Once a backup
+ * stores several large files at once (B086), every worker's reads would have
+ * landed in whichever callback the last thread installed, and the backup's
+ * own counter would have been bumped from several threads at once. Each
+ * thread now reports to the callback it set itself.
+ */
+static _Thread_local struct {
+    const store_t *st;
+    store_io_fn    fn;
+    void          *ctx;
+} tls_io;
 
 void store_set_io_progress(store_t *st, store_io_fn fn, void *ctx)
 {
     if (!st) return;
-    st->io_fn  = fn;
-    st->io_ctx = ctx;
+    tls_io.st  = fn ? st : NULL;
+    tls_io.fn  = fn;
+    tls_io.ctx = ctx;
 }
 
 void store_get_io_progress(const store_t *st, store_io_fn *fn, void **ctx)
 {
-    *fn  = st ? st->io_fn : NULL;
-    *ctx = st ? st->io_ctx : NULL;
+    int mine = st && tls_io.st == st;
+    *fn  = mine ? tls_io.fn : NULL;
+    *ctx = mine ? tls_io.ctx : NULL;
 }
 
 void store_io_progress(const store_t *st, uint64_t bytes)
 {
-    if (st && st->io_fn && bytes) st->io_fn(bytes, st->io_ctx);
+    if (st && bytes && tls_io.st == st && tls_io.fn) tls_io.fn(bytes, tls_io.ctx);
 }
 
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
@@ -341,8 +364,6 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
-    r->io_fn           = NULL;
-    r->io_ctx          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     store_sweep_tmp(r->path);
@@ -377,10 +398,19 @@ const char *store_root(const store_t *st) {
     return st->path;
 }
 
+/* Several object writers may ask at once, so the first open wins and a loser
+ * closes its own rather than leaking it or overwriting the winner. */
 int store_objects_fd(store_t *st) {
-    if (st->obj_dirfd >= 0) return st->obj_dirfd;
-    st->obj_dirfd = openat(st->dirfd, "objects", O_RDONLY | O_DIRECTORY);
-    return st->obj_dirfd;
+    int cur = __atomic_load_n(&st->obj_dirfd, __ATOMIC_ACQUIRE);
+    if (cur >= 0) return cur;
+    int fd = openat(st->dirfd, "objects", O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return -1;
+    int expected = cur;
+    if (__atomic_compare_exchange_n(&st->obj_dirfd, &expected, fd, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return fd;
+    close(fd);
+    return expected;
 }
 
 /* ------------------------------------------------------------------ */
@@ -478,20 +508,27 @@ status_t store_build_loose_set(store_t *st) {
     return OK;
 }
 
+/* Under the same lock as inserts: an insert that grows the table frees the
+ * one a lock-free reader would still be probing, and parallel large-file
+ * stores (B086) insert while other workers look up. */
 int store_loose_set_contains(store_t *st, const uint8_t *hash) {
-    if (!st->loose_set_ready || !st->loose_set) return 0;
-    uint32_t mask = st->loose_set_mask;
-    uint32_t cap = mask + 1;
-    uint32_t idx = loose_set_slot(hash, mask);
-    /* Bounded probe: if every slot is non-empty and none match, the table
-     * is full — treat as miss rather than spinning forever. */
-    for (uint32_t i = 0; i < cap; i++) {
-        const uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
-        if (loose_set_is_empty(slot)) return 0;
-        if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) return 1;
-        idx = (idx + 1) & mask;
+    pthread_mutex_lock(&st->loose_set_mu);
+    int found = 0;
+    if (st->loose_set_ready && st->loose_set) {
+        uint32_t mask = st->loose_set_mask;
+        uint32_t cap = mask + 1;
+        uint32_t idx = loose_set_slot(hash, mask);
+        /* Bounded probe: if every slot is non-empty and none match, the table
+         * is full, so treat it as a miss rather than spinning forever. */
+        for (uint32_t i = 0; i < cap; i++) {
+            const uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
+            if (loose_set_is_empty(slot)) break;
+            if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) { found = 1; break; }
+            idx = (idx + 1) & mask;
+        }
     }
-    return 0;
+    pthread_mutex_unlock(&st->loose_set_mu);
+    return found;
 }
 
 /* Grow the loose-set table to 2x capacity and rehash. Caller must hold
@@ -516,11 +553,11 @@ static void loose_set_grow_locked(store_t *st) {
 }
 
 void store_loose_set_insert(store_t *st, const uint8_t *hash) {
-    if (!st->loose_set) return;
     /* All-zero hash is our empty sentinel — never insert it */
     if (loose_set_is_empty(hash)) return;
 
     pthread_mutex_lock(&st->loose_set_mu);
+    if (!st->loose_set) { pthread_mutex_unlock(&st->loose_set_mu); return; }
     /* Grow at 75% load to keep open addressing efficient and to guarantee a
      * free slot exists. */
     uint32_t cap = st->loose_set_mask + 1;

@@ -410,6 +410,14 @@ typedef struct {
     int                     fail_stage;
     int                     fail_errno;
 
+    /* Stage CPU time, for the io:* phases. Each sum has one writer - the
+     * hasher, or the writer - and is read by the caller only after the join,
+     * so none of it needs to be atomic. Zero `timed` skips the clock reads
+     * when nobody is profiling. */
+    int                     timed;
+    uint64_t                ns_hash, ns_encrypt, ns_write, ns_parity;
+    uint64_t                n_hash, n_consume;
+
     /* The ring. Chunk i lives in slot i % DEPTH and moves read -> hashed ->
      * written; each count only grows. The reader may fill a slot once the
      * writer has released it, so at most DEPTH chunks are in flight. */
@@ -428,25 +436,47 @@ typedef struct {
 static void sink_hash(stream_sink_t *s, const uint8_t *b, size_t n)
 {
     if (s->hash_fail) return;
+    uint64_t t0 = s->timed ? phase_cpu_now() : 0;
     if (EVP_DigestUpdate(s->md, b, n) != 1) s->hash_fail = 1;
+    if (s->timed) { s->ns_hash += phase_cpu_now() - t0; s->n_hash++; }
 }
 
 static void sink_consume(stream_sink_t *s, uint8_t *b, size_t n)
 {
     if (s->fail_stage) return;
+    uint64_t t0 = s->timed ? phase_cpu_now() : 0, t1 = t0;
     /* Hashed as plaintext, stored as ciphertext, encrypted in place: the
      * chunk is the writer's until it is released. */
-    if (s->cs && object_crypt_stream_update(s->cs, b, n, b) != OK) {
-        s->fail_stage = SINK_ENCRYPT; s->fail_errno = EIO; return;
+    if (s->cs) {
+        if (object_crypt_stream_update(s->cs, b, n, b) != OK) {
+            s->fail_stage = SINK_ENCRYPT; s->fail_errno = EIO; return;
+        }
+        if (s->timed) { t1 = phase_cpu_now(); s->ns_encrypt += t1 - t0; }
     }
     if (io_write_full(s->tfd, b, n) != 0) {
         s->fail_stage = SINK_WRITE; s->fail_errno = errno ? errno : EIO; return;
     }
+    uint64_t t2 = s->timed ? phase_cpu_now() : 0;
+    if (s->timed) s->ns_write += t2 - t1;
     s->crc = crc32c_update(s->crc, b, n);
     if (rs_parity_stream_feed(s->ps, b, n) != 0) {
         s->fail_stage = SINK_PARITY; s->fail_errno = errno ? errno : EIO; return;
     }
+    if (s->timed) { s->ns_parity += phase_cpu_now() - t2; s->n_consume++; }
     s->written += n;
+}
+
+/* Hand the stage sums to whoever is profiling this thread, once the stages
+ * have been joined. */
+static void sink_account(const stream_sink_t *s, uint64_t ns_read, uint64_t n_read)
+{
+    if (!s->timed || !phase_current) return;
+    phase_add_ns(phase_current, PHASE_IO_READ,  ns_read, n_read);
+    phase_add_ns(phase_current, PHASE_IO_HASH,  s->ns_hash, s->n_hash);
+    if (s->ns_encrypt)
+        phase_add_ns(phase_current, PHASE_IO_ENCRYPT, s->ns_encrypt, s->n_consume);
+    phase_add_ns(phase_current, PHASE_IO_WRITE,  s->ns_write,  s->n_consume);
+    phase_add_ns(phase_current, PHASE_IO_PARITY, s->ns_parity, s->n_consume);
 }
 
 static void *sink_hasher(void *arg)
@@ -507,6 +537,7 @@ static int sink_init(stream_sink_t *s, EVP_MD_CTX *md, int tfd,
     memset(s, 0, sizeof(*s));
     s->md = md; s->tfd = tfd; s->cs = cs; s->ps = ps;
     s->crc = crc; s->written = written;
+    s->timed = phase_current != NULL;
     unsigned n = file_size > STREAM_PIPE_MIN ? STREAM_PIPE_DEPTH : 1u;
     for (unsigned i = 0; i < n; i++) {
         s->buf[i] = malloc(STREAM_PIPE_CHUNK);
@@ -608,6 +639,7 @@ static status_t sink_error(const stream_sink_t *s)
 static status_t write_object_file_stream(store_t *store, int src_fd,
                                          const char *src_path,
                                          uint64_t file_size,
+                                         size_t parity_cap,
                                          uint8_t out_hash[OBJECT_HASH_SIZE],
                                          int *out_is_new, uint64_t *out_phys_bytes,
                                          xfer_progress_fn progress_cb,
@@ -708,7 +740,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     char ps_tmp_dir[PATH_MAX];
     snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", store_root(store));
     rs_parity_stream_t ps;
-    int ps_ok = rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir);
+    int ps_ok = rs_parity_stream_init(&ps, parity_cap, ps_tmp_dir);
     if (ps_ok != 0) {
         EVP_MD_CTX_free(mdctx);
         if (src_path) close(src_fd);
@@ -752,6 +784,10 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
 
     #define STREAM_LOG(logfn, msg) logfn("%s", (msg))
 
+    /* The reader's share of the io:* phases; the other stages keep theirs in
+     * the sink. */
+    uint64_t io_read_ns = 0, io_reads = 0;
+
     {
         /* Direct read, with recovery for sources that fail transiently. */
         int recoveries = 0;
@@ -781,7 +817,9 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                 }
                 size_t ask = want - got;
                 if (ask > CANCEL_READ_MAX) ask = CANCEL_READ_MAX;
+                uint64_t _rc = sink.timed ? phase_cpu_now() : 0;
                 ssize_t r = read(src_fd, buf + got, ask);
+                if (sink.timed) { io_read_ns += phase_cpu_now() - _rc; io_reads++; }
                 if (r > 0) {
                     got += (size_t)r; retries = 0; last_was_seek = 0;
                     store_io_progress(store, (uint64_t)r);
@@ -935,6 +973,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
 
 done:
     sink_close(&sink, st != OK);
+    sink_account(&sink, io_read_ns, io_reads);
     if (st == OK && sink_failed(&sink)) st = sink_error(&sink);
     stream_crc    = sink.crc;
     total_written = sink.written;
@@ -1143,6 +1182,10 @@ status_t object_store_file(store_t *store, int fd, uint64_t file_size,
     return object_store_file_ex(store, fd, file_size, out_hash, NULL, NULL);
 }
 
+/* How much RS parity one streamed object keeps in memory before spilling it
+ * to tmp/. 256 MiB covers the parity of a file of about 3.8 GiB. */
+#define STREAM_PARITY_CAP_DEFAULT ((size_t)256 * 1024 * 1024)
+
 static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         const char *src_path,
                                         uint64_t file_size,
@@ -1150,6 +1193,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         uint64_t *out_payload_size,
                                         pack_backup_writer_t *pack_w,
+                                        size_t parity_cap,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx);
 
@@ -1211,6 +1255,7 @@ static status_t sp_emit(sparse_emit_t *e, const void *data, size_t n)
 static status_t write_sparse_object_stream(store_t *store, int fd,
                                            const char *src_path,
                                            uint64_t file_size,
+                                           size_t parity_cap,
                                            uint64_t *out_payload_size,
                                            const sparse_region_t *regions,
                                            uint32_t n_regions,
@@ -1281,7 +1326,7 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
     char ps_tmp_dir[PATH_MAX];
     snprintf(ps_tmp_dir, sizeof(ps_tmp_dir), "%s/tmp", store_root(store));
     rs_parity_stream_t ps;
-    if (rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir) != 0) {
+    if (rs_parity_stream_init(&ps, parity_cap, ps_tmp_dir) != 0) {
         EVP_MD_CTX_free(mdctx);
         if (src_path) close(fd);
         close(tfd); unlink(tmppath);
@@ -1507,7 +1552,8 @@ status_t object_store_file_ex(store_t *store, int fd, uint64_t file_size,
                               uint8_t out_hash[OBJECT_HASH_SIZE],
                               int *out_is_new, uint64_t *out_phys_bytes) {
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, NULL, NULL, NULL, NULL);
+                                   out_is_new, out_phys_bytes, NULL, NULL, 0,
+                                   NULL, NULL);
 }
 
 status_t object_store_packed(store_t *store, uint8_t type,
@@ -1537,7 +1583,19 @@ status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
     memset(w, 0, sizeof(*w));
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
                                    &w->is_new, &w->phys_bytes, &w->payload_size,
-                                   pack_w, NULL, NULL);
+                                   pack_w, 0, NULL, NULL);
+}
+
+status_t object_store_file_loose(store_t *store, int fd, uint64_t file_size,
+                                 size_t parity_cap,
+                                 uint8_t out_hash[OBJECT_HASH_SIZE],
+                                 object_write_t *out_info) {
+    object_write_t scratch;
+    object_write_t *w = out_info ? out_info : &scratch;
+    memset(w, 0, sizeof(*w));
+    return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
+                                   &w->is_new, &w->phys_bytes, &w->payload_size,
+                                   NULL, parity_cap, NULL, NULL);
 }
 
 status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
@@ -1548,7 +1606,7 @@ status_t object_store_file_info(store_t *store, int fd, uint64_t file_size,
     memset(w, 0, sizeof(*w));
     return object_store_file_ex_cb(store, fd, NULL, file_size, out_hash,
                                    &w->is_new, &w->phys_bytes, &w->payload_size,
-                                   NULL, NULL, NULL);
+                                   NULL, 0, NULL, NULL);
 }
 
 static status_t object_store_file_ex_cb(store_t *store, int fd,
@@ -1558,8 +1616,10 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                                         int *out_is_new, uint64_t *out_phys_bytes,
                                         uint64_t *out_payload_size,
                                         pack_backup_writer_t *pack_w,
+                                        size_t parity_cap,
                                         xfer_progress_fn progress_cb,
                                         void *progress_ctx) {
+    if (parity_cap == 0) parity_cap = STREAM_PARITY_CAP_DEFAULT;
     if (file_size == 0) {
         if (src_path) close(fd);
         uint8_t empty = 0;
@@ -1675,14 +1735,15 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
             return pst;
         }
 
-        return write_object_file_stream(store, fd, src_path, file_size, out_hash,
+        return write_object_file_stream(store, fd, src_path, file_size,
+                                        parity_cap, out_hash,
                                         out_is_new, out_phys_bytes,
                                         progress_cb, progress_ctx);
     }
 
     /* Stream sparse object — bounded RAM regardless of file size. */
     status_t st = write_sparse_object_stream(store, fd, src_path, file_size,
-                                             out_payload_size,
+                                             parity_cap, out_payload_size,
                                              regions, n_regions,
                                              out_hash, out_is_new, out_phys_bytes);
     free(regions);
@@ -1704,7 +1765,8 @@ status_t object_store_file_cb(store_t *store, int fd, const char *src_path,
      * For non-sparse files it falls through to write_object_file_stream.
      * The progress callback is only used on the streaming (non-sparse) path. */
     return object_store_file_ex_cb(store, fd, src_path, file_size, out_hash,
-                                   out_is_new, out_phys_bytes, NULL, NULL, cb, cb_ctx);
+                                   out_is_new, out_phys_bytes, NULL, NULL, 0,
+                                   cb, cb_ctx);
 }
 
 /* ------------------------------------------------------------------ */

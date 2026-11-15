@@ -117,6 +117,18 @@ const struct repo_key *store_key(const store_t *st);
  * already removed, exactly as any other failed write does.
  */
 void store_set_cancel(store_t *st, volatile int *cancel);
+
+/*
+ * A further cancel flag, for the calling thread only, consulted by
+ * store_cancelled alongside the handle's.
+ *
+ * The parallel large-file store (B086) needs to stop its workers when the
+ * backup fails for a reason of its own - a database write on the main thread,
+ * say - and the job's flag is not set. Setting the job's flag would be a lie
+ * about who cancelled; this lets the pool stop its own threads without
+ * touching it. NULL clears it.
+ */
+void store_set_thread_cancel(volatile int *cancel);
 volatile int *store_get_cancel(const store_t *st);
 int  store_cancelled(const store_t *st);
 
@@ -133,6 +145,10 @@ int  store_cancelled(const store_t *st);
  * The streaming store paths call it with each read's byte count, and the
  * streaming load paths with each block of plaintext written out. It runs on
  * the calling thread and must be cheap. NULL, the default, reports nothing.
+ *
+ * The hook belongs to the thread that sets it, for the handle it names: a
+ * backup storing several files at once gives each worker its own, and a
+ * thread that set none reports nothing.
  */
 typedef void (*store_io_fn)(uint64_t bytes, void *ctx);
 void store_set_io_progress(store_t *st, store_io_fn fn, void *ctx);
