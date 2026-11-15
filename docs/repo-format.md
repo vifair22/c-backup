@@ -68,10 +68,16 @@ unprotected. The daemon rewrites this file whole (temp file, `fsync`,
 `rename`) inside the same transaction as every tag change, and reindex
 inserts its tags back, a tag already in the database winning.
 
-`ts` is the tagged snapshot's timestamp. Snapshot ids are allocated as one
-more than the highest, so pruning the newest snapshot frees its id; a tag is
-restored only onto the snapshot with the same id *and* timestamp, never onto
-a later backup that reused the number.
+`ts` is the tagged snapshot's timestamp. A tag is restored only onto the
+snapshot with the same id *and* timestamp, never onto a later backup that
+reused the number. While the database lives, no backup does: the daemon
+keeps a high-water mark per repository (migration 023), so a deleted
+snapshot's id, the newest included, is never handed out again, and an id
+whose record file exists without an index row is skipped. The mark is not
+in the repository, though. After the database is lost or the repository is
+registered again, a reindex starts the ids above the highest record that
+still exists, so an id pruned from the top before then can come back, and
+the timestamp check is what keeps a tag off it.
 
 The file is optional. A repository written before it existed has none and
 reindexes exactly as it did, restoring no tags. A build that predates it

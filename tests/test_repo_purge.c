@@ -18,11 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "job_manager.h"
 #include "repo.h"
 #include "repo_purge.h"
 #include "store.h"
@@ -207,12 +209,99 @@ static void test_the_thread_purges_in_the_background(void **state)
     assert_int_equal(rows_for(second), 0);
 }
 
+static status_t noop_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    return OK;
+}
+
+static int64_t scalar(const char *sql, const char *p1)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ p1, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    int64_t v = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return v;
+}
+
+/* Submit a job and wait for it to finish, so the next one can start. */
+static int64_t run_job(job_manager_t *jm, int64_t repo)
+{
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, repo, "gc", NULL, noop_job, NULL, NULL, &id), OK);
+    assert_true(id > 0);
+    char jid[32];
+    snprintf(jid, sizeof(jid), "%lld", (long long)id);
+    for (int i = 0; i < 400; i++) {
+        if (scalar("SELECT COUNT(*) FROM jobs WHERE id = ?"
+                   " AND state IN ('completed','failed','cancelled')", jid) == 1)
+            return id;
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    fail_msg("job %lld never finished", (long long)id);
+    return 0;
+}
+
+/*
+ * B113: the purge deletes a removed repository's job rows, and when those
+ * were the newest, the next job anywhere took the same id: job 312 ran on
+ * the removed repository and the next backup on another one was 312 too.
+ * Schedules, search runs and verify runs are purged the same way and had
+ * the same flaw. Every id handed out after the purge must be above every id
+ * handed out before it.
+ */
+static void test_ids_are_not_reused_after_a_purge(void **state)
+{
+    (void)state;
+    int64_t kept = repo_with_history("kept");
+    int64_t gone = repo_with_history("gone");   /* its run rows are the newest */
+    char kid[32], gid[32];
+    snprintf(kid, sizeof(kid), "%lld", (long long)kept);
+    snprintf(gid, sizeof(gid), "%lld", (long long)gone);
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    (void)run_job(jm, kept);
+    int64_t last_job = 0;
+    for (int i = 0; i < 3; i++) last_job = run_job(jm, gone);
+
+    static const char *const sched_sql =
+        "INSERT INTO schedules (repo_id, action, trigger_type, trigger_spec, next_due_at)"
+        " VALUES (?, 'gc', 'interval', '{}', 0) RETURNING id";
+    (void)scalar(sched_sql, kid);
+    int64_t last_sched = scalar(sched_sql, gid);
+    int64_t last_grep = scalar("SELECT MAX(id) FROM grep_runs WHERE repo_id = ?", gid);
+    int64_t last_verify = scalar("SELECT MAX(id) FROM verify_runs WHERE repo_id = ?", gid);
+    assert_true(last_grep > 0);
+    assert_true(last_verify > 0);
+
+    assert_int_equal(repo_deregister(db, gone), OK);
+    assert_int_equal(repo_purge_run(db, NULL), OK);
+    assert_int_equal(rows_for(gone), 0);
+
+    int64_t next_job = run_job(jm, kept);
+    job_manager_stop(jm);
+    assert_true(next_job > last_job);
+
+    assert_true(scalar(sched_sql, kid) > last_sched);
+    assert_true(scalar("INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
+                       " VALUES (?, 1, 'a', 0) RETURNING id", kid) > last_grep);
+    assert_true(scalar("INSERT INTO verify_runs (repo_id, started_at, level)"
+                       " VALUES (?, 0, 'index') RETURNING id", kid) > last_verify);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_remove_deletes_every_row_and_spares_the_rest, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_stopped_purge_resumes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_the_thread_purges_in_the_background, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_ids_are_not_reused_after_a_purge, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

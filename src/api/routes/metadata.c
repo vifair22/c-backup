@@ -838,27 +838,29 @@ void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
                     const char *operation, const char *result,
                     int64_t duration_ms, const char *message)
 {
-    char repo[32], dur[32], id[32];
+    char repo[32], dur[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(dur,  sizeof(dur),  "%lld", (long long)duration_ms);
 
-    /* Journal ids are per repo, so the sequence is derived rather than a
-     * global rowid. */
-    db_result_t *r = NULL;
-    long long next = 1;
-    if (db_execute(db, "SELECT COALESCE(MAX(id), 0) + 1 FROM journal WHERE repo_id = ?",
-                   (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-        next = strtoll(r->rows[0][0], NULL, 10);
-    db_result_free(r);
-    snprintf(id, sizeof(id), "%lld", next);
-
+    /*
+     * Journal ids are per repo, so the sequence is derived rather than a
+     * global rowid. Derived inside the INSERT itself: it used to be a
+     * SELECT MAX and then a separate INSERT, and two threads journalling
+     * for one repository between them took the same id, so the second
+     * insert hit the primary key and that entry was lost with a warning
+     * (OWN-18). One statement runs whole under the handle's lock, and needs
+     * no db_txn, which matters because some callers may already hold one
+     * and db_txn_begin is not reentrant.
+     */
     /* Best effort: failing to journal must never fail the operation being
      * journalled. */
     if (db_execute_non_query(db,
             "INSERT INTO journal (repo_id, id, ts, source, operation, result,"
             " duration_ms, message)"
-            " VALUES (?, ?, strftime('%s','now'), ?, ?, ?, ?, ?)",
-            (const char *[]){ repo, id, source, operation, result, dur,
+            " SELECT ?1, COALESCE(MAX(id), 0) + 1, strftime('%s','now'),"
+            "        ?2, ?3, ?4, ?5, ?6"
+            "   FROM journal WHERE repo_id = ?1",
+            (const char *[]){ repo, source, operation, result, dur,
                               message ? message : "", NULL }, NULL) != 0)
         log_warn("journal: cannot record %s/%s", operation, result);
 }
