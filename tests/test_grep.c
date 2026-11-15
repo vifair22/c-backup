@@ -538,7 +538,7 @@ static void test_cancel_marks_the_run_incomplete(void **state)
 {
     (void)state;
     int64_t snap = run_backup();
-    volatile int cancel = 1;
+    atomic_int cancel = 1;
     grep_opts_t o = opts_for("swordfish");
     grep_result_t res;
     assert_int_not_equal(grep_run(store, db, repo_id, snap, &o, &cancel, NULL, NULL, &res), OK);

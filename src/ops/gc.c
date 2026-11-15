@@ -73,9 +73,9 @@ static status_t mark_object(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_SIZE
  * pruning one snapshot must not collect a tree the other nine still use.
  */
 static status_t mark_tree(mark_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
-                          volatile int *cancel, int depth)
+                          atomic_int *cancel, int depth)
 {
-    if (cancel && *cancel) return set_error(ERR_BUSY, "gc cancelled");
+    if (cancel_requested(cancel)) return set_error(ERR_BUSY, "gc cancelled");
     if (depth > 512) return set_error(ERR_CORRUPT, "gc: tree nesting too deep");
 
     status_t st = mark_object(ctx, tree_hash);
@@ -108,7 +108,7 @@ static status_t mark_tree(mark_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_S
 }
 
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                int dry_run, volatile int *cancel, gc_result_t *out)
+                int dry_run, atomic_int *cancel, gc_result_t *out)
 {
     if (!store || !db) return set_error(ERR_INVALID, "gc_run: null argument");
 
@@ -239,7 +239,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * order as the raw bytes, so ORDER BY hash hands pack_gc the sorted
      * array its bsearch needs without a second sort here.
      */
-    if (cancel && *cancel)
+    if (cancel_requested(cancel))
         return set_error(ERR_BUSY, "gc cancelled");
 
     db_result_t *live = NULL;

@@ -303,7 +303,7 @@ static int pack_file_missing(store_t *store, int64_t pack_id)
 }
 
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                    verify_level_t level, int repair, volatile int *cancel,
+                    verify_level_t level, int repair, atomic_int *cancel,
                     void (*progress)(const char *phase, uint64_t done,
                                      uint64_t total, void *ctx),
                     void *progress_ctx,
@@ -402,7 +402,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     int     cur_pack_missing = 0;
 
     for (int i = 0; i < objs->nrows; i++) {
-        if (cancel && *cancel) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
+        if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
         if (progress && (i % 256 == 0 || i + 1 == objs->nrows))
             progress(level_name(level), (uint64_t)i, total, progress_ctx);
 

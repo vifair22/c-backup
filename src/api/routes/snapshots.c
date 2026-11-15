@@ -901,7 +901,7 @@ static void pack_progress_adapter(uint64_t current, uint64_t total,
 }
 
 status_t routes_run_pack(struct store *store, int64_t repo_id,
-                         volatile int *cancel,
+                         atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx, struct pack_report *out)
 {
@@ -1113,7 +1113,7 @@ static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
     job_set_summary(progress_ctx, msg);
 }
 
-static status_t snap_job_run(void *arg, volatile int *cancel,
+static status_t snap_job_run(void *arg, atomic_int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
 {

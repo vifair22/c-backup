@@ -26,6 +26,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -86,7 +88,7 @@ static int teardown(void **state)
 
 /* Sleeps long enough that an overlap, if the dispatcher allows one, is
  * observed rather than missed by luck of scheduling. */
-static status_t probe_job(void *arg, volatile int *cancel,
+static status_t probe_job(void *arg, atomic_int *cancel,
                           void (*progress)(const char *, uint64_t, uint64_t, void *),
                           void *progress_ctx)
 {
@@ -256,7 +258,7 @@ static void test_old_finished_jobs_are_pruned_as_jobs_finish(void **state)
  * Progress is throttled to a few writes a second, and that must not cost the
  * final tick: a job record that stops at 4,999 of 5,000 reads as a stall.
  */
-static status_t chatty_job(void *arg, volatile int *cancel,
+static status_t chatty_job(void *arg, atomic_int *cancel,
                            void (*progress)(const char *, uint64_t, uint64_t, void *),
                            void *progress_ctx)
 {
@@ -284,7 +286,7 @@ static void test_throttled_progress_keeps_the_last_tick(void **state)
  * said 170/171. The last report is what the job record must end on, whether
  * or not it reached the total.
  */
-static status_t short_phase_job(void *arg, volatile int *cancel,
+static status_t short_phase_job(void *arg, atomic_int *cancel,
                                 void (*progress)(const char *, uint64_t, uint64_t, void *),
                                 void *progress_ctx)
 {
@@ -394,24 +396,40 @@ static void test_journal_source_says_who_asked(void **state)
  * shares the one connection: a grep or verify inserting its run row in
  * between gave the submitter that row's id. The CLI then waited on, and
  * reported, some other job. Here a thread inserts rows into another table
- * as fast as it can while jobs are submitted, and every id handed back has
- * to be the job that was submitted.
+ * while each job is submitted, and every id handed back has to be the job
+ * that was submitted.
+ *
+ * The noise runs on a budget per submission rather than flat out (FLAKE-5).
+ * A thread re-taking the database mutex in a tight loop can hold it for as
+ * long as the scheduler lets it, and this test sometimes took a minute
+ * waiting for its turn. Each submission now races a burst of up to
+ * NOISE_PER_SUBMIT inserts, released just before it starts, which is the
+ * same window the old code lost ids in, and the database is quiet while the
+ * returned id is checked.
  */
-static volatile int g_noise_stop;
+#define NOISE_PER_SUBMIT 32
+
+static atomic_int  g_noise_stop;
+static atomic_int  g_noise_budget;
+static atomic_long g_noise_rows;
 
 static void *noise_inserts(void *arg)
 {
     (void)arg;
-    while (!g_noise_stop) {
-        int rc = db_execute_non_query(db,
-            "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
-            " VALUES (1, 1, 'noise', 0)", NULL, NULL);
-        (void)rc;
+    while (!atomic_load(&g_noise_stop)) {
+        int left = atomic_load(&g_noise_budget);
+        if (left <= 0) { sched_yield(); continue; }
+        if (!atomic_compare_exchange_weak(&g_noise_budget, &left, left - 1))
+            continue;
+        if (db_execute_non_query(db,
+                "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
+                " VALUES (1, 1, 'noise', 0)", NULL, NULL) == 0)
+            atomic_fetch_add(&g_noise_rows, 1);
     }
     return NULL;
 }
 
-static status_t noop_job(void *arg, volatile int *cancel,
+static status_t noop_job(void *arg, atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
@@ -428,7 +446,9 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         "INSERT INTO grep_runs (id, repo_id, snap_id, pattern, started_at)"
         " VALUES (1000000, 1, 1, 'seed', 0)", NULL, NULL), 0);
 
-    g_noise_stop = 0;
+    atomic_store(&g_noise_stop, 0);
+    atomic_store(&g_noise_budget, 0);
+    atomic_store(&g_noise_rows, 0);
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, noise_inserts, NULL), 0);
 
@@ -437,8 +457,10 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         char action[32];
         snprintf(action, sizeof(action), "probe-%d", i);
         int64_t id = 0;
+        atomic_store(&g_noise_budget, NOISE_PER_SUBMIT);
         assert_int_equal(job_submit(jm, 1 + (i % 4), action, NULL, noop_job,
                                     NULL, NULL, &id), OK);
+        atomic_store(&g_noise_budget, 0);
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
         db_result_t *r = NULL;
@@ -448,9 +470,11 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         db_result_free(r);
         if (i % 16 == 15) usleep(20000);   /* let the workers drain the queue */
     }
-    g_noise_stop = 1;
+    atomic_store(&g_noise_stop, 1);
     pthread_join(th, NULL);
     assert_int_equal(wrong, 0);
+    /* The noise has to have happened for the ids to prove anything. */
+    assert_true(atomic_load(&g_noise_rows) > 0);
 }
 
 /*
@@ -458,10 +482,10 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
  * read "queued" until a worker reached it, and only then "cancelled". It
  * must be cancelled at once, journalled, and never run.
  */
-static volatile int g_gate_open;
+static atomic_int g_gate_open;
 static int g_gated_runs;
 
-static status_t gated_job(void *arg, volatile int *cancel,
+static status_t gated_job(void *arg, atomic_int *cancel,
                           void (*progress)(const char *, uint64_t, uint64_t, void *),
                           void *progress_ctx)
 {
@@ -476,7 +500,7 @@ static status_t gated_job(void *arg, volatile int *cancel,
     return OK;
 }
 
-static int g_arg_freed;
+static atomic_int g_arg_freed;
 static void count_free(void *arg) { (void)arg; g_arg_freed++; }
 
 static void test_cancelling_a_queued_job_is_immediate(void **state)
@@ -524,9 +548,9 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
  * and journalled "cancelled before it started", and only the running job is
  * asked to stop. Queued jobs on another repository are no different.
  */
-static int g_polling_runs;
+static atomic_int g_polling_runs;
 
-static status_t polling_job(void *arg, volatile int *cancel,
+static status_t polling_job(void *arg, atomic_int *cancel,
                             void (*progress)(const char *, uint64_t, uint64_t, void *),
                             void *progress_ctx)
 {
@@ -535,7 +559,7 @@ static status_t polling_job(void *arg, volatile int *cancel,
     g_polling_runs++;
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < 2000; i++) {
-        if (*cancel) return set_error(ERR_IO, "cancelled");
+        if (atomic_load(cancel)) return set_error(ERR_IO, "cancelled");
         usleep(5000);
     }
     return set_error(ERR_IO, "polling_job: never cancelled");
@@ -572,6 +596,101 @@ static void test_shutdown_never_starts_a_queued_job(void **state)
     snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
     assert_int_equal(db_text(q, st, sizeof(st)), 0);
     assert_string_equal(st, "cancelled");
+}
+
+/*
+ * OWN-15: a claimed job stayed in its ring slot behind the head while the
+ * full check counted only queued jobs, so with every worker busy the tail
+ * wrapped onto a running job's slot after JOB_QUEUE_MAX - workers queued
+ * jobs. The next submits overwrote it, cancel flag included: `jobs cancel`
+ * on the running job then answered "not running" and it ran on.
+ *
+ * Here both workers are busy, the queue takes exactly JOB_QUEUE_MAX more,
+ * the one after is refused cleanly, and the running jobs are untouched:
+ * still running, never flagged, and still stopped by a cancel.
+ */
+static int g_never_runs_calls;
+
+static status_t never_runs_job(void *arg, atomic_int *cancel,
+                               void (*progress)(const char *, uint64_t, uint64_t, void *),
+                               void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    g_never_runs_calls++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void test_full_queue_refuses_and_spares_running_jobs(void **state)
+{
+    (void)state;
+    g_polling_runs = 0;
+    g_arg_freed = 0;
+    g_never_runs_calls = 0;
+    int64_t a = 0, b = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, polling_job, NULL, NULL, &a), OK);
+    assert_int_equal(job_submit(jm, 2, "backup", NULL, polling_job, NULL, NULL, &b), OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 2; i++)
+        usleep(5000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 2);
+
+    /* Every slot the ring has, all on the busy repositories so none can
+     * start: a running job's slot would be overwritten from the
+     * (JOB_QUEUE_MAX - 1)th of these on. */
+    for (int i = 0; i < JOB_QUEUE_MAX; i++) {
+        int64_t id = 0;
+        assert_int_equal(job_submit(jm, 1 + (i % 2), "verify", NULL, never_runs_job,
+                                    NULL, count_free, &id), OK);
+        assert_true(id > b);
+    }
+
+    /* One more is refused, cleanly: busy (503 at the route), a message
+     * that says why, its argument released, its row marked failed. */
+    int64_t over = -1;
+    assert_int_equal(job_submit(jm, 3, "gc", NULL, never_runs_job, NULL, count_free, &over),
+                     ERR_BUSY);
+    assert_int_equal(over, -1);
+    assert_non_null(strstr(err_msg(), "job queue full"));
+    err_clear();
+    assert_int_equal(g_arg_freed, 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"
+                              " AND error = 'job queue full'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'queued'"),
+                     JOB_QUEUE_MAX);
+
+    /* The running jobs: same ids, still running, never flagged (a polling
+     * job returns as soon as it sees the flag), and nothing queued ran. */
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "running");
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)b);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "running");
+    assert_int_equal(g_never_runs_calls, 0);
+
+    /* Cancelling each still reaches that job and stops it. */
+    assert_int_equal(job_cancel(jm, a), OK);
+    assert_int_equal(job_cancel(jm, b), OK);
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id IN (%lld, %lld)"
+             " AND state = 'cancelled'", (long long)a, (long long)b);
+    for (int i = 0; i < 400 && db_count(q) != 2; i++) usleep(5000);
+    assert_int_equal(db_count(q), 2);
+    assert_int_equal(g_polling_runs, 2);
+
+    /* And the queue behind them drains in full, every job intact. */
+    for (int i = 0; i < 1000; i++) {
+        if (db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'") == JOB_QUEUE_MAX)
+            break;
+        usleep(5000);
+    }
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'"
+                              " AND action = 'verify'"), JOB_QUEUE_MAX);
+    pthread_mutex_lock(&g_mu);
+    int calls = g_never_runs_calls;
+    pthread_mutex_unlock(&g_mu);
+    assert_int_equal(calls, JOB_QUEUE_MAX);
 }
 
 /*
@@ -628,6 +747,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

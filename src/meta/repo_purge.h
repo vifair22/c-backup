@@ -16,13 +16,14 @@
  */
 
 #include <cutils/db.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "error.h"
 
 /* Purge every queued repository now, on the calling thread. Returns OK when
  * the queue is empty; stops early with ERR_BUSY, the queue intact, when *stop is set. */
-status_t repo_purge_run(cutils_db_t *db, volatile int *stop);
+status_t repo_purge_run(cutils_db_t *db, atomic_int *stop);
 
 /* Start the purge thread; it drains the queue at once (resuming a purge an
  * earlier run did not finish) and again on every repo_purge_kick. */

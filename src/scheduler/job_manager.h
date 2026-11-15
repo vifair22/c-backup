@@ -17,14 +17,19 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
 typedef struct job_manager job_manager_t;
 
+/* How many jobs may wait for a worker. Running jobs do not count against it;
+ * a submit beyond it is refused with ERR_BUSY, which the routes answer 503. */
+#define JOB_QUEUE_MAX 256
+
 /* What a job does. Returns OK on success; the message from err_msg() is
  * recorded against the job on failure. */
-typedef status_t (*job_fn)(void *arg, volatile int *cancel,
+typedef status_t (*job_fn)(void *arg, atomic_int *cancel,
                            void (*progress)(const char *phase, uint64_t done,
                                             uint64_t total, void *ctx),
                            void *progress_ctx);

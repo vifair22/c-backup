@@ -390,7 +390,7 @@ static atomic_int g_started;
 static atomic_int g_release;
 static atomic_int g_deaf;
 
-static status_t slow_job(void *arg, volatile int *cancel,
+static status_t slow_job(void *arg, atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
@@ -398,7 +398,7 @@ static status_t slow_job(void *arg, volatile int *cancel,
     atomic_fetch_add(&g_started, 1);
     /* Bounded so a broken test fails instead of hanging: 20 s. */
     for (int i = 0; i < 4000; i++) {
-        if (!atomic_load(&g_deaf) && *cancel)
+        if (!atomic_load(&g_deaf) && atomic_load(cancel))
             return set_error(ERR_IO, "cancelled");
         if (atomic_load(&g_release)) return OK;
         usleep(5000);
@@ -547,11 +547,18 @@ static void test_queue_coalesces_against_the_job_manager(void **state)
     for (int k = 1; k <= 4; k++)
         assert_int_equal(scheduler_tick(s, now + k * 3600), OK);
     assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+    /* The one extra run is waiting, not a second one running alongside. */
+    char st[32];
+    job_state(ids[1], st, sizeof(st));
+    assert_string_equal(st, "queued");
+    assert_int_equal(atomic_load(&g_started), 1);
 
     atomic_store(&g_release, 1);
     assert_true(wait_state(ids[0], "completed"));
     assert_true(wait_state(ids[1], "completed"));
     assert_int_equal(atomic_load(&g_started), 2);
+    /* And nothing else was left queued behind it to run later. */
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
 
     scheduler_stop(s);
     job_manager_stop(jm);

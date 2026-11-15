@@ -190,7 +190,7 @@ static void hashset_add(hashset_t *s, const uint8_t key[OBJECT_HASH_SIZE])
 
 static int cancelled(const pipeline_t *p)
 {
-    return p->opts->cancel && *p->opts->cancel;
+    return cancel_requested(p->opts->cancel);
 }
 
 /*
@@ -1151,7 +1151,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The job's flag reaches the object writers through the store, so a
      * cancel lands inside a large file rather than after it. Restored on the
      * way out: the handle may outlive this call. */
-    volatile int *prev_cancel = store_get_cancel(store);
+    atomic_int *prev_cancel = store_get_cancel(store);
     if (opts->cancel) store_set_cancel(store, opts->cancel);
     st = backup_run_inner(store, db, repo_id, opts, out);
     store_set_cancel(store, prev_cancel);
