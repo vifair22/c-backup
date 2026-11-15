@@ -10,7 +10,9 @@ export interface CBackupApi {
   /* A password is only for a remote daemon; remember keeps the session
    * token it is exchanged for, never the password. */
   connectionConnect(name: string, credentials?: { password?: string; remember?: boolean }): Promise<ConnectResult>
-  connectionEdit(name: string, config: ConnectionConfig): Promise<{ ok: boolean; error?: string }>
+  /* A rename keeps the connection as it is; a new address reconnects a live
+   * one, which may need the new daemon's password. */
+  connectionEdit(name: string, config: ConnectionConfig): Promise<ConnectResult>
   connectionRestart(name: string): Promise<ConnectResult>
   connectionDisconnect(name: string): Promise<{ ok: boolean }>
   /* Revoke the session on the daemon and forget the stored token. */

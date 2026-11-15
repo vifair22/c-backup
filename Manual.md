@@ -1414,6 +1414,14 @@ Sign out, Edit and Delete.
 Connections are saved and restored when the app starts. Local connections,
 and remote ones with a stored session, reconnect on their own.
 
+**Edit** changes a connection's name, its address, or both. A rename alone
+leaves the connection as it was: a connected one stays connected, signed in,
+with the same repository open, and only the name in the sidebar changes. A
+new address (socket path, host or port) is a different daemon, so the old
+session is dropped and a connection that was connected reconnects to the new
+address at once; for a remote daemon that means the sign-in dialog. A
+connection that was not connected stays that way until you connect it.
+
 ### 15.2 Signing in
 
 The sign-in dialog takes the admin password and exchanges it for a session
@@ -1430,8 +1438,9 @@ daemon ends a session (a sign-out elsewhere, or expiry), the
 app says so and asks again. **Sign out** revokes the token on the daemon and
 forgets it locally.
 
-Renaming a connection keeps its session; changing its address drops it,
-because a token belongs to the daemon that issued it.
+Renaming a connection keeps its session, stored or not, and does not
+disconnect it; changing its address drops the session, because a token
+belongs to the daemon that issued it (section 15.1).
 
 ### 15.3 Paths are the daemon's
 

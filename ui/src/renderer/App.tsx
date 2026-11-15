@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import type { Job } from '../shared/api'
 import type { MaintenanceOp } from '../shared/api'
 import type { ConnectionState, ConnectionConfig, CredentialInfo } from '../shared/types'
+import { sameDaemon } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -218,10 +219,34 @@ export function App(): React.ReactElement {
     // No-op if nothing changed
     if (JSON.stringify(config) === JSON.stringify(editingConnection)) { setEditingConnection(null); return }
     setError(null)
-    const result = await api.connectionEdit(originalName, config)
-    if (!result.ok) setError(result.error ?? 'Failed to edit connection')
-    await refreshConnections()
     setEditingConnection(null)
+    const result = await api.connectionEdit(originalName, config)
+    if (result.ok || result.needsCredentials) {
+      /* The view follows the connection. A rename is the same daemon, so the
+       * open repository stays open under the new name; a new address is
+       * another daemon, whose repository ids mean nothing here. */
+      if (activeRepo?.conn === originalName) {
+        if (sameDaemon(editingConnection, config)) {
+          setActiveRepo({ ...activeRepo, conn: config.name })
+        } else {
+          setActiveRepo(null)
+          setNavHistory([{ view: 'dashboard' }])
+          setNavIndex(0)
+          setTaskList([])
+        }
+      }
+      if (config.name !== originalName && collapsed.has(originalName)) {
+        setCollapsed(prev => {
+          const next = new Set(prev)
+          next.delete(originalName)
+          next.add(config.name)
+          return next
+        })
+      }
+    }
+    await refreshConnections()
+    if (result.needsCredentials) { openSignIn(config.name); return }
+    if (!result.ok) setError(result.error ?? 'Failed to edit connection')
   }
 
   /* The password prompt, for a remote daemon that needs one. */
