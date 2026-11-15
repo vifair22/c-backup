@@ -218,7 +218,15 @@ int main(int argc, char *argv[])
         const char *m = config_get_str(cfg, "backup.file_cache_match");
         int mode = file_cache_match_parse(m);
         if (mode < 0) {
-            log_error("backup.file_cache_match: '%s' is not auto, strict or relaxed", m);
+            /* Pointing at the line, like c-utils' own config errors; a value
+             * from the environment has none. */
+            int line = config_key_line(cfg, "backup.file_cache_match");
+            if (line > 0)
+                log_error("%s:%d: backup.file_cache_match: '%s' is not auto, "
+                          "strict or relaxed", config_get_path(cfg), line, m);
+            else
+                log_error("backup.file_cache_match: '%s' is not auto, strict or "
+                          "relaxed", m);
             api_server_stop(srv);
             repo_purge_stop();
             appguard_shutdown(guard);

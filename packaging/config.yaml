@@ -8,6 +8,11 @@
 # the container image both use /etc/c-backupd/config.yaml. Keep it 0600: it
 # holds Pushover credentials. In a container, mounting your own copy over it
 # read-only is fine.
+#
+# The daemon refuses to start on a line, key or value it cannot honour - an
+# unknown or misspelt key, a number that is not one, a list or nested key -
+# and names the file and line. The format is the simple one below: sections
+# at the left margin, "key: value" lines indented under them.
 
 db:
   # Under the systemd unit, StateDirectory= creates /var/lib/c-backupd; the

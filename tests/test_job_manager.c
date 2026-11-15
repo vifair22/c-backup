@@ -488,6 +488,44 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE operation = 'verify'"), 1);
 }
 
+/*
+ * B083: a failed job's alert said "repo 3: <error>" under the title
+ * "c-backup: backup failed", and the title is all c-utils logs when a send
+ * is rejected, so neither the line in the journal nor the notification named
+ * the repository. Manual 16.3 promises the action, the repository and the
+ * error.
+ */
+static void test_alert_names_repository_and_error(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (7, 'u-7', '/srv/repos/photos', 'photos', 0)", NULL, NULL), 0);
+
+    char title[250], body[1024];
+    job_alert_compose(db, 7, 41, "backup", "cannot read /data: Permission denied",
+                      title, sizeof(title), body, sizeof(body));
+    assert_string_equal(title, "c-backup: backup of photos failed");
+    assert_non_null(strstr(body, "Repository photos (id 7) at /srv/repos/photos"));
+    assert_non_null(strstr(body, "Job 41 (backup) failed: cannot read /data: Permission denied"));
+
+    /* A repository removed while its job ran is still named, by id. */
+    job_alert_compose(db, 99, 42, "verify", NULL,
+                      title, sizeof(title), body, sizeof(body));
+    assert_string_equal(title, "c-backup: verify of repo 99 failed");
+    assert_non_null(strstr(body, "Repository 99 (no longer registered)"));
+    assert_non_null(strstr(body, "failed: no detail recorded"));
+
+    /* An unlabelled one is named by id in the title and by path below. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, added_at)"
+        " VALUES (8, 'u-8', '/srv/repos/misc', 0)", NULL, NULL), 0);
+    job_alert_compose(db, 8, 43, "gc", "disk full",
+                      title, sizeof(title), body, sizeof(body));
+    assert_string_equal(title, "c-backup: gc of repo 8 failed");
+    assert_non_null(strstr(body, "(no label) (id 8) at /srv/repos/misc"));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -502,6 +540,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

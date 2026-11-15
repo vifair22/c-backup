@@ -299,7 +299,7 @@ are different: they live in the database and change through the policy API
 | `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
 | `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
 | `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
-| `log.level` | `info` | `debug`, `info`, `warn`, `error` |
+| `log.level` | `info` | `debug`, `info`, `warn` (or `warning`), `error`. Anything else stops the daemon at start |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories |
@@ -313,10 +313,38 @@ are different: they live in the database and change through the policy API
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9).
 
+The daemon refuses to start on a file it cannot honour, rather than running
+on defaults nobody chose. Each problem is printed with the file and line,
+all of them in one run, and the daemon exits with status 1 before it opens
+the database or binds a socket:
+
+```
+/etc/c-backupd/config.yaml:12: error: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+appguard: config init failed: /etc/c-backupd/config.yaml:12: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+```
+
+What stops it:
+
+| Problem | Example |
+|---|---|
+| A line the parser does not understand | `log: [debug]`, a nested key, a top-level `verbose: true`, an unclosed `"`, a single-quoted value, a key indented differently from the rest of its section |
+| An unknown key, or one in an unknown section | `security.key_dri`, `mystery.thing` |
+| A key set twice | |
+| A number that is not one | `jobs.max_parallel: eighty`, or a value out of range |
+| A `log.level` that is not a level | `log.level: chatty` |
+| A `backup.file_cache_match` that is not a mode | `fast` |
+
+The file format is a small subset of YAML: sections at the left margin, each
+holding `key: value` lines indented the same way, `#` comments, and double
+quotes around a value that contains ` #`. Nothing else: no lists, no nesting,
+no single quotes, no anchors. The c-utils Manual (section 5) lists the subset
+exactly.
+
 Every key can also be set from the environment: `C_BACKUP_` followed by the
 key in capitals with dots as underscores, so `security.key_dir` is
 `C_BACKUP_SECURITY_KEY_DIR`. The environment wins over the file. The
-container image uses this for the key directory (section 2.3).
+container image uses this for the key directory (section 2.3). A number set
+this way is checked like one in the file, and the error names the variable.
 
 Logs go to stdout, which systemd sends to the journal
 (`journalctl -u c-backupd`). The daemon also keeps 30 days of log lines in its
@@ -1221,6 +1249,12 @@ per-repository labels).
 | `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
 | `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
 | `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
+| `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
+| `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
+| `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
+
+The `cbackup_alerts_*` series count from zero each time the daemon starts, and
+read zero when Pushover is not configured.
 
 Alerts worth having:
 
@@ -1234,12 +1268,34 @@ Alerts worth having:
   on disk by a checking-only verify; run a repairing one.
 - `increase(cbackup_jobs_failed_total[1d]) > 0`.
 - `cbackup_repos_key_unescrowed > 0`.
+- `increase(cbackup_alerts_failed_total[1d]) > 0`: failure notifications are
+  not arriving, so the alert above is the only one you will get.
 
 ### 16.3 Push notifications
 
 With `pushover.token` and `pushover.user` set, every failed job sends a
 notification naming the action, the repository and the error. A cancelled
-job does not.
+job does not. The title names the action and the repository's label; the
+body gives the label, id and path, the job id and the error:
+
+```
+c-backup: backup of photos failed
+
+Repository photos (id 3) at /mnt/backup/photos
+Job 118 (backup) failed: cannot read /data/photos/2024: Permission denied
+```
+
+A notification that cannot be delivered is retried for 24 hours unless
+Pushover rejects it outright (a wrong token or user key), in which case it is
+dropped at once. Either way the journal has a line naming the notification,
+with Pushover's reason for a rejection:
+
+```
+push permanently failed (HTTP 400, {"user":"invalid",...}): c-backup: backup of photos failed
+```
+
+and `cbackup_alerts_failed_total` counts it (section 16.2). Watch that
+counter: an alert path that has stopped working is otherwise silent.
 
 ---
 
@@ -1432,6 +1488,8 @@ the underlying disk.
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |
 | Backups slow on Unraid | `state.db` on the parity array | Section 18.2 |
+| Daemon exits at start with `config.yaml:N: error: ...` | The config file has a line, key or value the daemon cannot honour | Fix the line it names; every problem is listed (section 3) |
+| No failure notifications arrive | Pushover credentials wrong, or Pushover unreachable for 24 hours | `cbackup_alerts_failed_total`; the journal's `push permanently failed` line says why (section 16.3) |
 
 `journalctl -u c-backupd` has the daemon's log; `log.level: debug` for more.
 `c-backup journal <id>` shows every operation on a repository and its outcome.
