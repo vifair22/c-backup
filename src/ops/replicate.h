@@ -34,6 +34,20 @@
  * reconciled - the alternative is a repository holding two kinds of
  * ciphertext with no way to tell which key opens which object.
  *
+ * RE-ENCRYPTING, WHICH IS THE ONE EXCEPTION
+ *
+ * Encryption is fixed when a repository is created, so changing it - adding
+ * it, dropping it, moving to a new key - means copying into a new
+ * repository. A sink opened for re-encryption is that path: the target is
+ * an existing repository with an identity and key of its own, and each
+ * object is decrypted with the source key and encrypted under the target's
+ * (or left plaintext, for an unencrypted target) on its way across.
+ * Compression is untouched, and so are hashes: they are of the plaintext,
+ * so the object graph, the tree hashes and every dedup decision carry over
+ * unchanged. This is deliberately not the untrusted-target mode: the
+ * process doing it holds both keys, which is why it is a separate opening
+ * rather than a flag a replica could be talked into.
+ *
  * WHAT IS ASKED FOR
  *
  * The transfer is a walk of the snapshot's manifest tree, asking the target
@@ -156,6 +170,11 @@ typedef struct {
      * end up holding ciphertext under two different keys. Empty for an
      * unencrypted repository. */
     char                       key_id[64];
+    /* Set only by replica_sink_local_open_reencrypt: objects are decrypted
+     * with the source key and re-encrypted under dst_key, or written as
+     * plaintext when dst_key is NULL. The key belongs to the sink. */
+    int                        reencrypt;
+    const repo_key_t          *dst_key;
 } replica_sink_t;
 
 typedef struct {
@@ -233,3 +252,21 @@ void      replica_reader_close(replica_reader_t *r);
 status_t replica_sink_local_open(const char *path,
                                  const repo_marker_t *source_marker,
                                  replica_sink_t *out);
+
+/*
+ * A sink that copies into a different, existing repository, re-encrypting
+ * every object under that repository's key. The supported way to change a
+ * repository's encryption: create the new one with `repo add --encrypt`,
+ * replicate into it with this, register and reindex it.
+ *
+ * Refused when the path holds no repository (create it first, so its
+ * encryption is chosen on purpose), when it holds this same repository (that
+ * is a replica; use replica_sink_local_open), or when the target is
+ * encrypted and its key is not on this host. A snapshot is never written
+ * over one the target already has under the same number with a different
+ * tree, so a target holding backups of its own fails rather than losing
+ * them.
+ */
+status_t replica_sink_local_open_reencrypt(const char *path,
+                                           const repo_marker_t *source_marker,
+                                           replica_sink_t *out);

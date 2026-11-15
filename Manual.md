@@ -840,7 +840,8 @@ ran and how it ended.
 ## 13. Encryption
 
 A repository is encrypted or not, decided when it is created. To change it,
-create a new repository and replicate into it.
+create a new repository with the encryption you want and replicate into it
+with `--reencrypt` (section 14.1).
 
 ```sh
 sudo c-backup repo add /srv/backup/main "Main" --encrypt system
@@ -926,7 +927,38 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
-- A destination already holding a different repository is refused.
+- A destination already holding a different repository is refused, unless
+  `--reencrypt` says that is the point (below).
+
+### 14.1 Changing a repository's encryption
+
+Encryption is fixed when a repository is created, so changing it - adding
+it, removing it, or moving to a new key or passphrase - means copying into a
+new repository with `--reencrypt`:
+
+```sh
+sudo c-backup repo add /srv/backup/main2 "Main" --encrypt passphrase --passphrase '...'
+sudo c-backup replicate 1 /srv/backup/main2 --reencrypt
+sudo c-backup reindex 2
+```
+
+The destination must already be a repository, created with the encryption
+you want; `--reencrypt` will not create one, so its mode is always chosen on
+purpose. It keeps its own UUID and key. Each object is decrypted with the
+source key and encrypted under the destination's (or written plaintext into
+an unencrypted destination) as it crosses; compression is untouched, and
+hashes are of the plaintext, so they, the trees and deduplication carry over
+unchanged. Snapshot ids carry over too, so the destination must hold no
+backups of its own: a snapshot number it already uses for a different tree
+fails the run rather than being overwritten.
+
+Unlike a plain replica, this is not for an untrusted target: the daemon
+doing it holds both keys, and so must the host the destination is used on.
+Refused when the destination is not a repository, is a replica of the source
+(replicate without `--reencrypt`), or is encrypted and its key is not on this
+host. If the destination is registered here, its write lock is held for the
+run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+again after more backups and only the new snapshots are sent.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
@@ -1282,7 +1314,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest>` | Copy into another directory |
+| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |

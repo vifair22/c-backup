@@ -631,6 +631,7 @@ typedef struct {
     char           *path_prefix;
     int             ignore_case;
     uint32_t        max_files;
+    int             reencrypt;   /* replicate into another repository's key */
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -821,9 +822,37 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          */
         repo_marker_t m;
         st = repo_marker_read(j->repo_path, &m);
+        /*
+         * A re-encrypting target is a repository in its own right, and may
+         * be registered here: hold its write lock too, so a backup into it
+         * cannot allocate a snapshot id this run is about to write. Try,
+         * never wait - the source lock is already held, and waiting for a
+         * second lock while holding one is how two jobs deadlock.
+         */
+        int64_t dest_locked = 0;
+        if (st == OK && j->reencrypt) {
+            repo_marker_t dm;
+            if (repo_marker_read(j->dest, &dm) == OK) {
+                db_result_t *r = NULL;
+                if (db_execute(j->db, "SELECT id FROM repos WHERE uuid = ?",
+                               (const char *[]){ dm.uuid, NULL }, &r) == 0 &&
+                    r && r->nrows == 1)
+                    dest_locked = strtoll(r->rows[0][0], NULL, 10);
+                db_result_free(r);
+            } else {
+                err_clear();
+            }
+            if (dest_locked > 0 && dest_locked != j->repo_id) {
+                st = repo_trylock_write(dest_locked);
+                if (st != OK) dest_locked = 0;
+            } else {
+                dest_locked = 0;
+            }
+        }
         if (st == OK) {
             replica_sink_t sink;
-            st = replica_sink_local_open(j->dest, &m, &sink);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+                              : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
                 memset(&rr, 0, sizeof(rr));
@@ -838,8 +867,19 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                              (unsigned long long)rr.objects_sent,
                              (unsigned long long)rr.bytes_sent,
                              (unsigned long long)rr.subtrees_skipped);
+                char rj[256];
+                snprintf(rj, sizeof(rj),
+                         "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+                         "\"objects_sent\":%llu,\"bytes_sent\":%llu,\"reencrypted\":%s}",
+                         (unsigned long long)rr.snapshots_sent,
+                         (unsigned long long)rr.snapshots_skipped,
+                         (unsigned long long)rr.objects_sent,
+                         (unsigned long long)rr.bytes_sent,
+                         j->reencrypt ? "true" : "false");
+                job_set_result(progress_ctx, rj);
             }
         }
+        if (dest_locked > 0) repo_unlock(dest_locked);
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
@@ -1055,6 +1095,13 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        bool reenc = false;
+        if (json_req_has(body, "reencrypt") &&
+            json_req_get_bool(body, "reencrypt", &reenc) != 0) {
+            snap_job_free(j);
+            return api_error(400, "reencrypt must be true or false");
+        }
+        j->reencrypt = reenc ? 1 : 0;
     }
 
     if (kind == SNAP_JOB_RESTORE) {

@@ -340,6 +340,7 @@ static void test_reindex_counts_refs_and_gc_after_it_keeps_live_objects(void **s
         char dst[PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/dst%lld", TEST_DIR, (long long)sid);
         restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
         assert_int_equal(restore_run(store, db, repo_id, sid, dst, NULL, &rr), OK);
         assert_int_equal(rr.failed, 0);
         assert_int_equal(rr.files, 3);

@@ -109,7 +109,8 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 
 A repository is encrypted or not, decided at creation and never afterwards.
 Converting in place would mean rewriting every object with both forms live;
-replicating into a fresh repository is the supported path instead.
+replicating into a fresh repository with `reencrypt` (see Replication) is the
+supported path instead.
 
 `POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
 last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
@@ -223,7 +224,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
-| POST | `/repos/<id>/replicate` | Copy this repository into another one: `{dest}` |
+| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -402,6 +403,19 @@ different repository is refused rather than merged.
 Only what is missing is sent. A directory's tree hash covers everything
 beneath it, so a subtree the target already holds is dismissed by a single
 comparison and an unchanged repository replicates in one question.
+
+`"reencrypt": true` is the exception, and the way to change a repository's
+encryption. `dest` must already be a repository with an identity of its
+own (create it with `POST /repos` and the encryption wanted); each object is
+decrypted with the source key and encrypted under the destination's, or
+written plaintext into an unencrypted destination. Hashes are of the
+plaintext, so they and the trees carry over unchanged, as do snapshot ids;
+a snapshot id the destination already uses for another tree fails the run
+instead of being overwritten. The job fails, saying which, when `dest` is
+not a repository, is a replica of the source, or is encrypted and its key is
+not on this host. The job's result reports `snapshots_sent`, `objects_sent`,
+`bytes_sent` and `reencrypted`. Re-encrypting is a manual operation: the
+schedule route does not store `reencrypt`.
 
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.

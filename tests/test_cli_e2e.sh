@@ -669,6 +669,38 @@ contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID"
 cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
+contains "and points at --reencrypt" "--reencrypt" "$OUT"
+
+# B069: the Manual said to change encryption by replicating into a fresh
+# repository, and replication refused every repository but a replica of
+# the source. --reencrypt copies into a repository of its own, under its
+# own key, which then reindexes and restores like any other.
+REENC_OUT=$(cb repo add "$WORK/reenc" reenc --encrypt system)
+REENC_ID=$(printf '%s' "$REENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+REENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc" --reencrypt 2>&1); RC=$?
+check    "re-encrypting replication succeeds" 0 "$RC"
+contains "and says it re-encrypted" '"reencrypted":true' "$OUT"
+check    "the destination keeps its own identity" "$REENC_UUID" \
+    "$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)"
+if [ "$REENC_UUID" != "$SRC_UUID" ]; then ok "which is not the source's"
+else bad "which is not the source's" "a different uuid" "$REENC_UUID"; fi
+if grep -qra "$NEEDLE" "$WORK/reenc/packs" 2>/dev/null; then
+    bad "the re-encrypted copy holds no plaintext" "absent" "present"
+else
+    ok "the re-encrypted copy holds no plaintext"
+fi
+contains "the destination reindexes" '"completed"' "$(cb reindex "$REENC_ID")"
+contains "and lists the snapshot" '"id":"1"' "$(cb snapshots "$REENC_ID")"
+cb restore "$REENC_ID" 1 "$WORK/reencout" >/dev/null
+if diff -r "$WORK/encout" "$WORK/reencout" >/dev/null 2>&1; then
+    ok "a re-encrypted copy restores what the source does"
+else
+    bad "a re-encrypted copy restores what the source does" "identical" "differs"
+fi
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-missing" --reencrypt 2>&1); RC=$?
+check    "re-encrypting into no repository is refused" 1 "$RC"
+contains "and says to create it first" "repo add" "$OUT"
 
 echo "configured sources"
 
