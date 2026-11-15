@@ -256,10 +256,15 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
     snprintf(sid,  sizeof(sid),  "%lld", (long long)schedule_id);
     snprintf(en,   sizeof(en),   "%u", enabled);
 
+    /* A schedule that is not there, or belongs to another repository, is a
+     * 404. Both used to answer {"ok":true}, so a typo in the id read as
+     * success while the schedule meant went on firing. */
+    int changed = 0;
     if (db_execute_non_query(g_db,
             "UPDATE schedules SET enabled = ? WHERE repo_id = ? AND id = ?",
-            (const char *[]){ en, repo, sid, NULL }, NULL) != 0)
+            (const char *[]){ en, repo, sid, NULL }, &changed) != 0)
         return api_error(500, "cannot update schedule");
+    if (changed == 0) return api_error(404, "no such schedule in this repository");
 
     if (enabled && scheduler_recompute(g_db, schedule_id, time(NULL)) != OK)
         err_clear();
@@ -277,10 +282,12 @@ api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(sid,  sizeof(sid),  "%lld", (long long)schedule_id);
 
+    int removed = 0;
     if (db_execute_non_query(g_db,
             "DELETE FROM schedules WHERE repo_id = ? AND id = ?",
-            (const char *[]){ repo, sid, NULL }, NULL) != 0)
+            (const char *[]){ repo, sid, NULL }, &removed) != 0)
         return api_error(500, "cannot delete schedule");
+    if (removed == 0) return api_error(404, "no such schedule in this repository");
 
     scheduler_notify(g_sched);
     return api_no_content();

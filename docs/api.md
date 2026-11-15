@@ -600,8 +600,12 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}` |
-| DELETE | `/repos/<id>/schedules/<sid>` | Remove |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`; 404 if this repository has no such schedule |
+| DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
+
+Both used to answer success for an id that did not exist, or that belonged
+to another repository, so a typo read as done while the schedule meant kept
+firing.
 
 The trigger is a nested object, validated at creation rather than at fire
 time:
@@ -615,8 +619,9 @@ time:
 ```
 
 `every` is `day`, `week` (with `on`, a weekday name), `month` (with
-`on_day`, 1-31) or `year` (with `on_month` and `on_day`). There is no cron
-syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
+`on_day`, 1-31) or `year` (with `on_month` and `on_day`, a day that month
+has: 30 February and 31 April are refused, 29 February is accepted). There
+is no cron syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
 and `--on-month`, or takes a number of seconds for an interval.
 
 Interval triggers anchor to the last successful fire, not to wall-clock

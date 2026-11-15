@@ -326,6 +326,15 @@ else
 fi
 check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
+# B065: these answered success for a schedule that does not exist.
+check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" http://localhost/repos/1/schedules/1)"
+check "disable a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+     --unix-socket "$SOCK" -d '{"enabled":0}' http://localhost/repos/1/schedules/999)"
+check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" \
+     -d '{"action":"gc","trigger":{"type":"calendar","every":"year","on_month":2,"on_day":30,"at":"05:00"}}' \
+     http://localhost/repos/1/schedules)"
 
 echo "introspection"
 contains "summary"      '"snapshots"'  "$(sock_body /repos/1/summary)"

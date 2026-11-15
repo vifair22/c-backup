@@ -222,8 +222,10 @@ case "$(cb search 1 big)" in
 esac
 
 check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
-contains "schedule enable/disable" '"ok"' \
-    "$(cb schedule add 1 verify 7200 > /dev/null; cb schedule list 1 | grep -q verify && cb schedule disable 1 2 || echo miss)"
+# The id comes from the add. This disabled a hardcoded id 2 that did not
+# exist, which passed only because a missing schedule answered success.
+VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "schedule enable/disable" '"ok"' "$(cb schedule disable 1 "$VSID" || echo miss)"
 
 # Calendar schedules. The CLI offered --cron, which built a trigger type the
 # daemon rejects by design, and had no way to ask for the calendar triggers
@@ -646,7 +648,17 @@ contains "and says what is missing" "sources" "$OUT"
 OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
 check    "a backup schedule inherits the repo sources" 0 "$RC"
 SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+# B065: another repository's schedule, or one that does not exist, is not
+# this repository's to remove or disable; both reported success.
+OUT=$(cb schedule remove 2 "$SID0" 2>&1); RC=$?
+check    "removing another repo's schedule fails" 1 "$RC"
+contains "and says there is no such schedule" "no such schedule" "$OUT"
+OUT=$(cb schedule disable 2 "$SID0" 2>&1); RC=$?
+check    "disabling another repo's schedule fails" 1 "$RC"
+contains "the schedule survives" "\"id\":\"$SID0\"" "$(cb schedule list 1)"
 [ -n "$SID0" ] && cb schedule remove 1 "$SID0" >/dev/null 2>&1
+OUT=$(cb schedule remove 1 "$SID0" 2>&1); RC=$?
+check    "removing it twice fails" 1 "$RC"
 
 # The one that proves it: a one-second interval must produce real snapshots.
 BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)

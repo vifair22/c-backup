@@ -740,7 +740,8 @@ multiples: a long backup does not make the next one due the moment it ends.
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice
 on a fall-back day fires once, the 31st clamps to the last day of shorter
-months, and 29 February fires every year.
+months, and 29 February fires every year (on the 28th in common years). A day
+no year has, such as 30 February, is refused when the schedule is created.
 
 Two policies per schedule:
 
