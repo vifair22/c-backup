@@ -241,6 +241,33 @@ static void test_clean_reindex_reports_no_failures(void **state)
     assert_int_equal(rx.packs_unreadable, 0);
 }
 
+/* ---------- B047 ---------- */
+
+/*
+ * A rebuilt snapshot listed "size":"" because reindex never wrote
+ * total_size. Both counts must come back exactly as the backup wrote them.
+ */
+static void test_reindex_restores_size_and_file_count(void **state)
+{
+    (void)state;
+    backup_once();
+    long long size = scalar("SELECT total_size FROM snapshots WHERE repo_id = ?");
+    long long files = scalar("SELECT file_count FROM snapshots WHERE repo_id = ?");
+    assert_int_equal(size, (long long)(strlen("top level content\n") +
+                                       strlen("middle content\n")));
+    assert_int_equal(files, 2);
+
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+
+    assert_int_equal(scalar("SELECT total_size FROM snapshots WHERE repo_id = ?"), size);
+    assert_int_equal(scalar("SELECT file_count FROM snapshots WHERE repo_id = ?"), files);
+    /* Not NULL: the listing shows NULL as an empty string. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"
+                            " AND total_size IS NULL"), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -250,6 +277,7 @@ int main(void)
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_pack_keeps_its_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_reindex_reports_no_failures, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_restores_size_and_file_count, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

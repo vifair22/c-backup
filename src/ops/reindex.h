@@ -26,6 +26,8 @@ typedef struct {
      * snapshot was written by a backup or rebuilt here, so counting nodes
      * would make a rebuilt snapshot claim more files than it has. */
     uint64_t files;
+    /* Logical bytes in those files, which is snapshots.total_size. */
+    uint64_t bytes;
     uint64_t trees_read;
     /* Registry rebuilt alongside the nodes. Without these the recovered
      * database can browse and restore but cannot account for its own disk

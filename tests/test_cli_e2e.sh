@@ -419,6 +419,11 @@ contains "and says it did" '"key_unlocked":true' "$OUT"
 check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
 contains "the unlocked repo reindexes" '"completed"' "$(cb reindex "$PASS_ID")"
 contains "and lists its snapshot" '"id":"1"' "$(cb snapshots "$PASS_ID")"
+# B047: a reindexed snapshot listed "size":"".
+case "$(cb snapshots "$PASS_ID")" in
+    *'"size":""'*) bad "a reindexed snapshot keeps its size" "a size" '"size":""' ;;
+    *)             ok  "a reindexed snapshot keeps its size" ;;
+esac
 cb restore "$PASS_ID" 1 "$WORK/passout" >/dev/null
 if diff -r "$WORK/src" "$WORK/passout$WORK/src" >/dev/null 2>&1; then
     ok "a passphrase-recovered repo restores byte-identical"
