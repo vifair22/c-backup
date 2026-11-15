@@ -547,11 +547,18 @@ static void test_queue_coalesces_against_the_job_manager(void **state)
     for (int k = 1; k <= 4; k++)
         assert_int_equal(scheduler_tick(s, now + k * 3600), OK);
     assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+    /* The one extra run is waiting, not a second one running alongside. */
+    char st[32];
+    job_state(ids[1], st, sizeof(st));
+    assert_string_equal(st, "queued");
+    assert_int_equal(atomic_load(&g_started), 1);
 
     atomic_store(&g_release, 1);
     assert_true(wait_state(ids[0], "completed"));
     assert_true(wait_state(ids[1], "completed"));
     assert_int_equal(atomic_load(&g_started), 2);
+    /* And nothing else was left queued behind it to run later. */
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
 
     scheduler_stop(s);
     job_manager_stop(jm);
