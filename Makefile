@@ -165,7 +165,11 @@ $(OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(OBJ_DIR)
 # cannot half-migrate against a stale migrations/ directory on disk.
 MIGRATE_SRC := $(BUILD)/app_migrations.c
 
-$(MIGRATE_SRC): $(wildcard migrations/*.sql) | $(BUILD)
+#
+# The directory is a prerequisite as well as its files. A migration removed
+# by switching branches changes no remaining file, only the directory, and
+# without it a stale embed carried migrations the checkout no longer has.
+$(MIGRATE_SRC): migrations $(wildcard migrations/*.sql) | $(BUILD)
 	$(CUTILS_DIR)/tools/embed_sql.sh migrations/ app_migrations > $@
 
 $(OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(OBJ_DIR)
