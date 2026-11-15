@@ -7,6 +7,7 @@
 #include "repo_purge.h"
 #include "lock.h"
 #include "json_row.h"
+#include "cJSON.h"
 
 #include <openssl/crypto.h>
 
@@ -197,10 +198,16 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
      * operator heard was a reindex finding nothing and a restore finding no
      * snapshot.
      */
-    char keywarn[384] = "";
+    char keywarn[1024] = "";
     if (st == OK && reg.key_missing && repo_require_key(path) != OK) {
-        snprintf(keywarn, sizeof(keywarn), ",\"key_loaded\":false,\"warning\":\"%s\"",
-                 err_msg());
+        /* Escaped: the message names the repository's UUID today, but it is
+         * error text, and a quote or backslash in it made the body invalid. */
+        cJSON *w = cJSON_CreateString(err_msg());
+        char *wq = w ? cJSON_PrintUnformatted(w) : NULL;
+        cJSON_Delete(w);
+        snprintf(keywarn, sizeof(keywarn), ",\"key_loaded\":false,\"warning\":%s",
+                 wq ? wq : "\"key not loaded\"");
+        free(wq);
         err_clear();
     }
     const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
