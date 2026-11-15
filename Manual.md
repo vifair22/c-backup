@@ -344,6 +344,7 @@ are different: they live in the database and change through the policy API
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
+| `backup.store_workers` | `0` | Threads one backup stores large files (over 16 MiB) on at once, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM cannot give each 40 MiB, and never more than there are large files; `1` stores them one after another. The snapshot is identical either way |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -371,7 +372,7 @@ What stops it:
 | An unknown key, or one in an unknown section | `security.key_dri`, `mystery.thing` |
 | A key set twice | |
 | A number that is not one | `jobs.max_parallel: eighty`, or one too large for an integer |
-| A number outside the range in the table above | `http.port: 99999`, `jobs.max_parallel: 0`, `retention.keep_daily: -1`, `auth.cookie_secure: 2` |
+| A number outside the range in the table above | `http.port: 99999`, `jobs.max_parallel: 0`, `retention.keep_daily: -1`, `auth.cookie_secure: 2`, `backup.store_workers: 65` |
 | An `http.bind` that is not an IPv4 address | `localhost`, `not-an-ip` |
 | A missing `db.path` | `<file>: error: required config key 'db.path' is missing or empty; it has no default` |
 | A tab in the indentation | YAML indents with spaces |

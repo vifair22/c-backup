@@ -31,6 +31,7 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     config_check_int_range(chk, "auth.cookie_secure", 0, 1);
     config_check_int_range(chk, "scheduler.enabled", 0, 1);
     config_check_int_range(chk, "jobs.max_parallel", 1, APP_MAX_PARALLEL_JOBS);
+    config_check_int_range(chk, "backup.store_workers", 0, APP_MAX_STORE_WORKERS);
 
     static const char *const retention[] = {
         "retention.keep_snaps", "retention.keep_daily", "retention.keep_weekly",

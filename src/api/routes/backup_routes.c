@@ -43,6 +43,19 @@ void routes_backup_set_file_cache_match(int mode)
     g_file_cache_match = mode;
 }
 
+/* backup.store_workers, read once at start. */
+static unsigned g_store_workers;
+
+void routes_backup_set_store_workers(unsigned n)
+{
+    g_store_workers = n;
+}
+
+unsigned routes_backup_store_workers(void)
+{
+    return g_store_workers;
+}
+
 /* Everything one backup job needs, owned by the job manager for its lifetime. */
 typedef struct {
     cutils_db_t *db;
@@ -183,6 +196,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     o.n_exclude      = j->n_excludes;
     o.one_filesystem = j->one_filesystem;
     o.file_cache_match = g_file_cache_match;
+    o.store_workers    = g_store_workers;
     o.label        = j->label;
     o.cancel       = cancel;
     o.progress_cb  = progress;
@@ -255,7 +269,8 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
                  "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
                  "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
                  "\"objects_new\":%llu,\"bytes_stored\":%llu,"
-                 "\"trees_new\":%llu,\"trees_reused\":%llu}",
+                 "\"trees_new\":%llu,\"trees_reused\":%llu,"
+                 "\"store_workers\":%u}",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -263,7 +278,8 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
                  (unsigned long long)res.objects_new,
                  (unsigned long long)res.bytes_stored,
                  (unsigned long long)res.trees_new,
-                 (unsigned long long)res.trees_reused);
+                 (unsigned long long)res.trees_reused,
+                 res.store_workers);
         job_set_result(progress_ctx, rj);
     }
 

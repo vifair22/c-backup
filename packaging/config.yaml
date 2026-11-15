@@ -64,6 +64,10 @@ backup:
   # where they are not stable. strict compares every field everywhere;
   # relaxed compares only size and mtime.
   file_cache_match: auto
+  # Threads one backup stores large files (over 16 MiB) on at once. 0 picks
+  # two thirds of the CPUs, fewer if memory is short; 1 stores them one
+  # after another. A single file is hashed on one core either way.
+  store_workers: 0
 
 retention:
   # What a retention pass (c-backup gfs, or a gfs schedule) keeps for a

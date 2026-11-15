@@ -259,6 +259,12 @@ int main(int argc, char *argv[])
         routes_backup_set_file_cache_match(mode);
         if (mode != FILE_CACHE_MATCH_AUTO)
             log_info("backup.file_cache_match: %s", m);
+
+        /* Range-checked to 0..APP_MAX_STORE_WORKERS during config init. */
+        int sw = config_get_int(cfg, "backup.store_workers", 0);
+        routes_backup_set_store_workers(sw > 0 ? (unsigned)sw : 0u);
+        if (sw > 0)
+            log_info("backup.store_workers: %d", sw);
     }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);

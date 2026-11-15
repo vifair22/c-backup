@@ -144,6 +144,8 @@ refuses "bind not an address" "bad.yaml:6: error: http.bind: 'not-an-ip' is not 
     '  bind: not-an-ip'
 refuses "file cache mode" "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed" \
     'backup:' '  file_cache_match: fast'
+refuses "store workers out of range" "backup.store_workers: '65' is not between 0 and 64" \
+    'backup:' '  store_workers: 65'
 refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
     "$(printf '\tbind: 127.0.0.1')"
 # log.level among other problems: it was dropped from the list.
@@ -380,6 +382,7 @@ contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")
 JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
 contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
 contains "backup result counts files" '"files":3,' "$JOB_BODY"
+contains "no large files, no store pool" '"store_workers":1}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1089,6 +1092,8 @@ security:
   key_dir: $R/keys
 retention:
   keep_snaps: 2
+backup:
+  store_workers: 2
 EOF
 C_BACKUP_CONFIG_PATH="$R/config.yaml" "$BIN" > "$R/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -1201,6 +1206,20 @@ fi
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \
     '"key":"retention.keep_snaps","value":2' "$(sock_body /repos/1/policy)"
+
+# B086: backup.store_workers reaches the backup. Three files over 16 MiB,
+# and the configured 2 caps the pool where automatic would have used 3 on
+# any machine with five CPUs or more; the main daemon, on automatic, stored
+# its three small files serially.
+mkdir -p "$R/big"
+for i in 1 2 3; do head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/f$i"; done
+SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
+wait_job "$SW"
+SW_BODY=$(sock_body "/jobs/$SW")
+contains "store_workers from config sizes the pool" '"store_workers":2}' "$SW_BODY"
+contains "and the backup stores all three" '"objects_new":3,' "$SW_BODY"
+rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
+rmdir "$R/big"
 
 # B101: deleting a snapshot. A tag protects it unless force says otherwise,
 # the 409 names the tags, a missing snapshot is a 404, and each delete is

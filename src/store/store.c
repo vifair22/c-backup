@@ -285,10 +285,12 @@ void store_set_thread_cancel(volatile int *cancel)
     tls_cancel = cancel;
 }
 
+/* Atomic loads: the flags are set from other threads (the job manager, the
+ * pool), and since B086 several object writers poll them at once. */
 int store_cancelled(const store_t *st)
 {
-    if (tls_cancel && *tls_cancel) return 1;
-    return st && st->cancel && *st->cancel;
+    if (tls_cancel && __atomic_load_n(tls_cancel, __ATOMIC_ACQUIRE)) return 1;
+    return st && st->cancel && __atomic_load_n(st->cancel, __ATOMIC_ACQUIRE);
 }
 
 /*

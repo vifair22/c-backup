@@ -12,6 +12,7 @@
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
+#include "store_pool.h"
 
 #include <cutils/log.h>
 
@@ -97,6 +98,13 @@ typedef struct {
      * time, which is slower and still right. */
     struct { dev_t dev; unsigned ignore; } fs_seen[16];
     unsigned       n_fs_seen;
+    /* Large files go to this pool when there is one (B086); NULL stores
+     * every file on this thread. See store_pool.h. */
+    store_pool_t  *pool;
+    /* Hashes the pool reported as newly written this run. Two identical
+     * large files stored at once both find the object absent and both
+     * install it; the second one to be taken back is not new. */
+    hashset_t      pool_new;
 } pipeline_t;
 
 /*
@@ -218,7 +226,8 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
     }
 
     if (p->opts->bytes_cb)
-        p->opts->bytes_cb(p->opts->progress_ctx, p->bytes_done + p->file_bytes,
+        p->opts->bytes_cb(p->opts->progress_ctx,
+                          p->bytes_done + p->file_bytes + store_pool_bytes(p->pool),
                           p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
 }
@@ -377,7 +386,129 @@ static void scan_progress(uint32_t scanned, void *ctx)
     b->cb("scan", scanned, 0, b->ctx);
 }
 
+/*
+ * Record a large file a pool worker has finished, exactly as the serial path
+ * below records one it stored itself: the same warning and skip for a file
+ * that could not be stored, the same counters, index row and cache row. Runs
+ * on the backup thread, inside whatever transaction it holds.
+ */
+static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
+{
+    scan_entry_t *e = &p->scan->entries[j->index];
+    /* Counted whole here rather than as the loop moved past it, since the
+     * loop moved past it long before the file was read. */
+    p->bytes_done += e->node.size;
+
+    if (j->st != OK) {
+        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        log_warn("backup: cannot store %s: %s", e->path, j->err);
+        return OK;
+    }
+
+    memcpy(e->node.content_hash, j->hash, OBJECT_HASH_SIZE);
+    int is_new = j->w.is_new;
+    if (is_new) {
+        if (hashset_contains(&p->pool_new, j->hash)) is_new = 0;
+        else hashset_add(&p->pool_new, j->hash);
+    }
+    if (is_new) {
+        p->res->objects_new++;
+        p->res->bytes_stored += j->w.phys_bytes;
+    }
+    p->res->files++;
+    p->res->bytes_logical += e->node.size;
+
+    uint64_t _ti = phase_now();
+    status_t st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
+                                j->w.phys_bytes, j->w.payload_size);
+    phase_add(p->timers, PHASE_INDEX_PUT, _ti);
+    if (st != OK) return st;
+
+    uint64_t _tp = phase_now();
+    file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                   e->node.content_hash, p->cache_stamp);
+    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    return OK;
+}
+
+/* Take back and record every finished large file, waiting up to wait_ms for
+ * one first when asked. The wait is the backup thread idle on the workers,
+ * which is what large-file-wait reports. */
+static status_t pool_drain(pipeline_t *p, unsigned wait_ms)
+{
+    if (!p->pool) return OK;
+    if (wait_ms) {
+        uint64_t _tw = phase_now();
+        store_pool_wait(p->pool, wait_ms);
+        phase_add(p->timers, PHASE_STORE_WAIT, _tw);
+    }
+    store_pool_job_t *j;
+    while ((j = store_pool_take(p->pool)) != NULL) {
+        status_t st = pool_record(p, j);
+        store_pool_job_free(j);
+        if (st != OK) return st;
+    }
+    return OK;
+}
+
+/* How long the backup thread waits on the pool between progress reports. */
+#define POOL_WAIT_MS 250
+
+static status_t store_content_loop(pipeline_t *p);
+
+/*
+ * Content, with large files on a pool when it pays (B086).
+ *
+ * The pool only exists for the length of this phase, and whatever way the
+ * loop ends it is stopped and joined here before anything else runs: on
+ * success every result has already been taken; on failure or cancel the
+ * workers abandon their files, which removes their temp files, and the
+ * backup fails exactly as it would have serially.
+ */
 static status_t store_content(pipeline_t *p)
+{
+    uint64_t n_large = 0;
+    for (uint32_t i = 0; i < p->count; i++) {
+        const scan_entry_t *e = &p->scan->entries[i];
+        if (e->node.type == NODE_TYPE_REG && e->node.size > PACK_STREAM_THRESHOLD)
+            n_large++;
+    }
+
+    unsigned workers = 1;
+    size_t parity_cap = 0;
+    store_pool_plan(p->opts->store_workers, n_large, &workers, &parity_cap);
+    if (workers > 1) {
+        if (store_pool_start(p->store, workers, parity_cap, 1, &p->pool) == OK) {
+            log_info("backup: %llu file(s) over %llu MiB, stored on up to %u "
+                     "threads (RS parity held in memory: %zu MiB each)",
+                     (unsigned long long)n_large,
+                     (unsigned long long)(PACK_STREAM_THRESHOLD >> 20),
+                     workers, parity_cap >> 20);
+        } else {
+            /* Slower, not wrong: every file can still be stored here. */
+            log_warn("backup: cannot start large-file workers, storing "
+                     "serially: %s", err_msg());
+            err_clear();
+            workers = 1;
+        }
+    }
+    p->res->store_workers = workers;
+
+    status_t st = store_content_loop(p);
+
+    char why[ERR_MSG_MAX];
+    snprintf(why, sizeof(why), "%s", err_msg());
+    store_pool_finish(p->pool, st != OK, p->timers);
+    p->pool = NULL;
+    hashset_free(&p->pool_new);
+    /* Joining can run a worker's error path on this thread's buffer only in
+     * principle - each thread has its own - but the backup's message is the
+     * one the caller must see, so it is put back regardless. */
+    if (st != OK) set_error(st, "%s", why);
+    return st;
+}
+
+static status_t store_content_loop(pipeline_t *p)
 {
     /*
      * Cache writes are batched. One transaction per file would put an fsync
@@ -394,15 +525,28 @@ static status_t store_content(pipeline_t *p)
         if (S_ISREG(p->scan->entries[i].st.st_mode))
             p->bytes_total += p->scan->entries[i].node.size;
 
+    /* The entry before this one went to the pool, which counts its bytes
+     * when the result comes back. */
+    int prev_pooled = 0;
+
     for (uint32_t i = 0; i < p->count; i++) {
         /* The previous entry is finished, whichever way it went: stored,
          * vouched for by the cache, or skipped as unreadable. */
-        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode))
+        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode) && !prev_pooled)
             p->bytes_done += p->scan->entries[i - 1].node.size;
+        prev_pooled = 0;
         if (cancelled(p)) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed on cancel");
             return set_error(ERR_BUSY, "backup cancelled");
+        }
+
+        /* Results come back between entries, inside the open batch. */
+        status_t dst = pool_drain(p, 0);
+        if (dst != OK) {
+            if (in_txn && db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed");
+            return dst;
         }
 
         scan_entry_t *e = &p->scan->entries[i];
@@ -490,11 +634,37 @@ static status_t store_content(pipeline_t *p)
             continue;
         }
 
+        /* A large file goes to the pool once there is room for it; the
+         * backup thread carries on with the entries after it. */
+        int to_pool = p->pool && e->node.size > PACK_STREAM_THRESHOLD;
+        while (to_pool &&
+               store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
+            status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
+                                        : pool_drain(p, POOL_WAIT_MS);
+            if (wst != OK) {
+                if (in_txn && db_txn_commit(p->db) != OK)
+                    log_warn("backup: cache commit failed");
+                return wst;
+            }
+            report(p, "store", i, p->count);
+        }
+
         int fd = open(e->path, O_RDONLY);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
              * filesystem; it is a warning, not a failed backup. */
             log_warn("backup: cannot open %s, skipping", e->path);
+            continue;
+        }
+
+        if (to_pool) {
+            status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
+            if (sst != OK) {
+                if (in_txn && db_txn_commit(p->db) != OK)
+                    log_warn("backup: cache commit failed");
+                return sst;
+            }
+            prev_pooled = 1;
             continue;
         }
 
@@ -563,6 +733,21 @@ static status_t store_content(pipeline_t *p)
         file_cache_put(p->db, p->repo_id, e->path, &e->st,
                        e->node.content_hash, p->cache_stamp);
         phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    }
+
+    /* The large files still out. Progress keeps moving while they finish:
+     * their bytes through the pool's counter, the entry count by how many
+     * are left. */
+    while (p->pool && store_pool_outstanding(p->pool) > 0) {
+        status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
+                                    : pool_drain(p, POOL_WAIT_MS);
+        if (wst != OK) {
+            if (in_txn && db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed");
+            return wst;
+        }
+        unsigned left = store_pool_outstanding(p->pool);
+        report(p, "store", p->count > left ? p->count - left : 0, p->count);
     }
 
     if (in_txn && db_txn_commit(p->db) != OK)
@@ -1109,7 +1294,16 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * way out: the handle may outlive this call. */
     volatile int *prev_cancel = store_get_cancel(store);
     if (opts->cancel) store_set_cancel(store, opts->cancel);
+    /*
+     * The inner run points phase_current at timers on its own stack, and
+     * not every way out of it put the pointer back: a failed run left it
+     * aimed at a dead frame, and the next object written on this thread
+     * added its phases there (OWN-12, an ASan stack-use-after-return).
+     * Restoring it here covers every return at once.
+     */
+    phase_timers_t *prev_timers = phase_current;
     st = backup_run_inner(store, db, repo_id, opts, out);
+    phase_current = prev_timers;
     store_set_cancel(store, prev_cancel);
     return st;
 }
@@ -1197,9 +1391,18 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         links[i].scan_index = i;
     }
 
-    pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0,
-                     0, 0, 0, { { 0, 0 } }, 0 };
+    pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    p.store       = store;
+    p.db          = db;
+    p.repo_id     = repo_id;
+    p.scan        = scan;
+    p.links       = links;
+    p.count       = scan->count;
+    p.res         = &res;
+    p.opts        = opts;
+    p.cache_stamp = (int64_t)time(NULL);
+    p.timers      = &timers;
 
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else

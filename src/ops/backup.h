@@ -39,6 +39,14 @@ typedef struct {
      * counts crawl through large files and say little about how far a
      * backup has to go; bytes do. */
     void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
+
+    /*
+     * Threads storing large files (over PACK_STREAM_THRESHOLD) concurrently,
+     * B086. 0 picks a number from the CPUs and memory available
+     * (store_pool_plan); 1 stores every file on the backup thread, one after
+     * another, as before. The snapshot is byte-identical either way.
+     */
+    unsigned     store_workers;
 } backup_opts_t;
 
 typedef struct {
@@ -56,6 +64,8 @@ typedef struct {
     /* Bytes this run added to the repository for new file content, before
      * packing compresses them. Everything else was already there. */
     uint64_t bytes_stored;
+    /* Threads that stored large files: 1 when they were stored serially. */
+    unsigned store_workers;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
