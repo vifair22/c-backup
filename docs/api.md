@@ -586,7 +586,7 @@ plus missing), `cbackup_verify_repaired_objects`,
 A backup writes every object of 16 MiB or less straight into a pack, and
 ends with a pack sweep for what it could not: a sparse file's object and an
 object over 16 MiB are written loose and uncompressed, and the sweep packs
-them and coalesces small packs, as this endpoint does. The policy key
+them, as this endpoint does. Neither merges small packs; gc does that. The policy key
 `maintenance.auto_pack` set to `false` skips that sweep and nothing else;
 small objects are packed during the backup either way, so a backup of small
 files leaves nothing loose and a pack after it reports `loose` 0. With the

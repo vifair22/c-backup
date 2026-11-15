@@ -689,7 +689,7 @@ flowchart TD
   E --> F[write snapshot record<br/>into the repository]
   F --> G[index nodes in state.db]
   G --> H{maintenance.auto_pack}
-  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects, coalesce]
+  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects]
   H -- false --> J[done]
   I --> J
 ```
@@ -727,9 +727,10 @@ flowchart TD
    index rows a reindex cleans up.
 5. **Pack sweep.** Loose objects are always stored uncompressed, so by
    default every backup ends with a pack run, as `pack` would do: it packs
-   the loose objects of step 2 (and anything an interrupted run left) and
-   coalesces small packs. Setting the policy key `maintenance.auto_pack` to
-   `false` skips this sweep and nothing else. Small objects still go into
+   the loose objects of step 2 (and anything an interrupted run left). It
+   does not merge small packs; only gc does that (section 12). Setting the
+   policy key `maintenance.auto_pack` to `false` skips this sweep and
+   nothing else. Small objects still go into
    packs during the backup, because that is how they are written; what
    stays loose until a `pack` is only sparse files' objects and objects
    over 16 MiB. A backup of small files therefore leaves no loose objects
@@ -1169,7 +1170,7 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 |---|---|---|
 | `gc 1` | Mark from every live snapshot, sweep unreferenced objects, compact packs | After retention prunes |
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
-| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
+| `pack 1` | Pack and compress loose objects | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
 | `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 
@@ -1231,8 +1232,9 @@ only staging files in `tmp/`; killed after installing the new packs but
 before deleting the old one, it leaves the old pack beside copies of its
 live entries, which wastes that space until the snapshots naming them are
 pruned and loses nothing; killed while deleting, it is finished by the next
-gc or reindex. Merging small packs (coalescing, which gc also does) follows
-the same steps and leaves the same states.
+gc or reindex. Merging small packs (coalescing), which gc does after
+compaction and nothing else does, follows the same steps and leaves the same
+states.
 
 **Large incompressible objects stay loose.** A backup writes objects up to
 16 MiB straight into packs. Anything larger is written as one loose file,
