@@ -388,12 +388,46 @@ static int64_t snap_suffix(const char *rest, const char *suffix)
  * is exactly as sensitive as reading the repository, which the same caller
  * can already do.
  */
+/*
+ * Whether a repository is unencrypted, by its marker, which is the
+ * authority; the database column is the fallback for a repository whose
+ * directory cannot be read right now.
+ *
+ * The key routes asked neither. Exporting the key of a plaintext repository
+ * answered "no key for repository ... in /etc/c-backupd/keys", which sends
+ * an operator looking for a keyfile that never existed, and acknowledging
+ * one answered ok for a key that was never there to escrow.
+ */
+static int repo_is_unencrypted(int64_t repo_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db_for_keys, "SELECT path, encryption FROM repos WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    repo_marker_t m;
+    int plain;
+    if (repo_marker_read(r->rows[0][0], &m) == OK) {
+        plain = (m.enc_mode == REPO_ENC_NONE);
+    } else {
+        err_clear();
+        plain = !r->rows[0][1][0] || strcmp(r->rows[0][1], "none") == 0;
+    }
+    db_result_free(r);
+    return plain;
+}
+
 static api_response_t key_export(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
     char uuid[64];
     if (repo_uuid_of(g_db_for_keys, repo_id, uuid, sizeof(uuid)) != 0)
         return api_error(404, "no such repo");
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; it has no key");
 
     repo_key_t k;
     status_t st = repo_key_load(repo_key_dir(), uuid, &k);
@@ -473,6 +507,8 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
 static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; there is no key to escrow");
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
     if (db_execute_non_query(g_db_for_keys,

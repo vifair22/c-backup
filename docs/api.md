@@ -142,6 +142,9 @@ is deliberately a persistent nag rather than a message shown once.
 | POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. Refused unless it matches the fingerprint in the marker |
 | POST | `/repos/<id>/key/ack` | Confirm the key is stored elsewhere; clears the warning |
 
+All three answer 400 `repository is not encrypted` for an unencrypted
+repository, which has no key to export, import or escrow.
+
 The marker records the mode, cipher and a one-way fingerprint of the key, and
 for passphrase mode the Argon2id parameters and wrapped key. It never contains
 the key itself. Markers are version 2 for every repository, encrypted or

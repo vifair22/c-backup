@@ -301,6 +301,16 @@ contains "key readable again" "$ENC_KEY" "$(cb repo key export "$ENC_ID")"
 OUT=$(cb repo key import "$ENC_ID" "$(printf '0%.0s' $(seq 1 64))" 2>&1); RC=$?
 check "wrong key refused" 1 "$RC"
 
+# B048, B050: the key commands on an unencrypted repository. Export sent the
+# operator looking for a keyfile that never existed; ack answered ok.
+OUT=$(cb repo key export 1 2>&1); RC=$?
+check    "key export of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+contains "as a 400" "HTTP 400" "$OUT"
+OUT=$(cb repo key ack 1 2>&1); RC=$?
+check    "key ack of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+
 # Passphrase mode needs nothing escrowed: the wrapped key travels with the
 # repository, so the passphrase alone recovers it.
 PASS_OUT=$(cb repo add "$WORK/passrepo" pass --encrypt passphrase --passphrase 'correct horse')
