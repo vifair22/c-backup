@@ -167,24 +167,36 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "Repositories with no completed verify.", "gauge",
                 "SELECT COUNT(*) FROM repos r WHERE NOT EXISTS"
                 " (SELECT 1 FROM verify_runs v WHERE v.repo_id = r.id AND v.completed = 1)");
+    /*
+     * Damage gauges: each repository's latest completed verify, summed.
+     *
+     * They read the latest completed verify anywhere, so a clean scrub of one
+     * repository - or one finishing in the same second - hid unrecoverable
+     * loss in another. Summing every repository's latest run means loss
+     * stays visible until that repository's own next verify clears it.
+     */
+#define LATEST_RUNS \
+    " FROM verify_runs v WHERE v.completed = 1 AND v.id = (" \
+    "  SELECT v2.id FROM verify_runs v2 WHERE v2.repo_id = v.repo_id" \
+    "   AND v2.completed = 1 ORDER BY v2.finished_at DESC, v2.id DESC LIMIT 1)"
     emit_scalar(&m, "cbackup_verify_unrecoverable_objects",
-                "Objects the most recent completed verify could not reconstruct.", "gauge",
-                "SELECT COALESCE((SELECT unrecoverable + missing FROM verify_runs"
-                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+                "Objects each repository's latest completed verify could not reconstruct "
+                "or found missing, summed over repositories.", "gauge",
+                "SELECT COALESCE(SUM(v.unrecoverable + v.missing), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_repaired_objects",
-                "Objects repaired from parity by the most recent completed verify.", "gauge",
-                "SELECT COALESCE((SELECT repaired FROM verify_runs"
-                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+                "Objects repaired from parity by each repository's latest completed verify, "
+                "summed.", "gauge",
+                "SELECT COALESCE(SUM(v.repaired), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_recoverable_objects",
-                "Objects the most recent completed verify found damaged on disk and readable "
-                "only through parity (repair off, or the write-back failed).", "gauge",
-                "SELECT COALESCE((SELECT recoverable FROM verify_runs"
-                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+                "Objects each repository's latest completed verify found damaged on disk "
+                "and readable only through parity (repair off, or the write-back failed), "
+                "summed.", "gauge",
+                "SELECT COALESCE(SUM(v.recoverable), 0)" LATEST_RUNS);
     emit_scalar(&m, "cbackup_verify_affected_files",
-                "Files affected by damage the most recent completed verify could not repair.",
-                "gauge",
-                "SELECT COALESCE((SELECT affected_files FROM verify_runs"
-                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+                "Files affected by damage each repository's latest completed verify could "
+                "not repair, summed.", "gauge",
+                "SELECT COALESCE(SUM(v.affected_files), 0)" LATEST_RUNS);
+#undef LATEST_RUNS
 
     if (!m.buf) return api_error(500, "cannot build metrics");
 
