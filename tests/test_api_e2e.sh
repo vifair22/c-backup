@@ -359,6 +359,25 @@ check    "missing subpath wrote nothing" "absent" "$([ -e "$WORK/nothing" ] && e
 R=$(restore_req '{"dest":"relative/out"}')
 contains "relative dest is 400"          ' 400'                       "$R"
 contains "relative dest says why"        'dest must be an absolute path' "$R"
+# Restoring into a repository writes beside objects/ and packs/. Refused,
+# however the path is spelled: directly, through "..", and through a symlink,
+# which is why the comparison is on canonical paths.
+R=$(restore_req "{\"dest\":\"$WORK/repo/restored\"}")
+contains "dest inside the repo is 400"   ' 400'                       "$R"
+contains "dest inside the repo says so"  'inside the repository'      "$R"
+R=$(restore_req "{\"dest\":\"$WORK/src/../repo/x\"}")
+contains "dotdot into the repo is 400"   ' 400'                       "$R"
+ln -s "$WORK/repo" "$WORK/repolink"
+R=$(restore_req "{\"dest\":\"$WORK/repolink/x\"}")
+contains "symlink into the repo is 400"  ' 400'                       "$R"
+R=$(restore_req "{\"dest\":\"$WORK/repo\"}")
+contains "the repo itself is 400"        ' 400'                       "$R"
+check    "repo untouched by refusals"    "absent" \
+         "$([ -e "$WORK/repo/restored" ] || [ -e "$WORK/repo/x" ] && echo present || echo absent)"
+# A sibling whose name merely starts with the repo's is not inside it.
+R=$(restore_req "{\"dest\":\"$WORK/repo-sibling\"}")
+contains "repo-prefixed sibling accepted" '"job_id"'                  "$R"
+wait_job "$(job_id "$R")"
 
 echo "maintenance"
 GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")

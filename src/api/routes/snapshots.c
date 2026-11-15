@@ -22,6 +22,7 @@
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,76 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
 }
 
 /* ---------- restore request validation ---------- */
+
+/*
+ * Where an absolute path really lands, for a path that may not exist yet.
+ * The longest prefix that exists goes through realpath, so a symlink or a
+ * ".." cannot smuggle a destination into a repository; the part below it
+ * does not exist, so it cannot contain a symlink and is normalised
+ * lexically. Returns 0, or -1 when nothing resolves.
+ */
+static int canonical_path(const char *in, char out[PATH_MAX])
+{
+    char head[PATH_MAX];
+    if (snprintf(head, sizeof(head), "%s", in) >= (int)sizeof(head)) return -1;
+    const char *tail = "";
+    char resolved[PATH_MAX];
+
+    for (;;) {
+        if (realpath(head, resolved)) break;
+        if (errno != ENOENT && errno != ENOTDIR) return -1;
+        char *slash = strrchr(head, '/');
+        if (!slash) return -1;
+        if (slash == head) {        /* "/" always resolves; this cannot loop */
+            snprintf(resolved, sizeof(resolved), "/");
+            tail = in + 1;
+            break;
+        }
+        *slash = '\0';
+        tail = in + (slash - head) + 1;
+    }
+
+    char joined[PATH_MAX * 2];
+    snprintf(joined, sizeof(joined), "%s/%s", resolved, tail);
+    return path_normalize(joined, out, PATH_MAX);
+}
+
+/* Is `path` the directory `dir` or somewhere beneath it? Both canonical. */
+static int path_is_under(const char *path, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (n == 1 && dir[0] == '/') return 1;
+    return strncmp(path, dir, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+/*
+ * A restore must not write into any registered repository. Restored files
+ * landing beside objects/ and packs/ are at best clutter a GC cannot account
+ * for and at worst a name that collides with something the repository owns.
+ * Every repository counts, not only the one being restored from: it is the
+ * same damage whichever one it is. Returns the offending repository's path,
+ * which the caller frees, or NULL when the destination is clear.
+ */
+static char *dest_inside_repo(const char *dest)
+{
+    char cdest[PATH_MAX];
+    if (canonical_path(dest, cdest) != 0) return NULL;
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db, "SELECT path FROM repos", NULL, &r) != 0 || !r) {
+        db_result_free(r);
+        return NULL;
+    }
+    char *hit = NULL;
+    for (int i = 0; i < r->nrows && !hit; i++) {
+        char crepo[PATH_MAX];
+        if (!r->rows[i][0][0] || canonical_path(r->rows[i][0], crepo) != 0)
+            continue;
+        if (path_is_under(cdest, crepo)) hit = strdup(r->rows[i][0]);
+    }
+    db_result_free(r);
+    return hit;
+}
 
 /*
  * Does `subpath` (normalised, absolute, not "/") name anything in the
@@ -888,6 +959,16 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         if (j->dest[0] != '/') {
             snap_job_free(j);
             return api_error(400, "dest must be an absolute path");
+        }
+        char *repo_hit = dest_inside_repo(j->dest);
+        if (repo_hit) {
+            char msg[PATH_MAX + 96];
+            snprintf(msg, sizeof(msg),
+                     "dest is inside the repository at %s; restore somewhere else",
+                     repo_hit);
+            free(repo_hit);
+            snap_job_free(j);
+            return api_error(400, msg);
         }
         uint32_t ow = 0;
         if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
