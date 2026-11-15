@@ -278,6 +278,51 @@ static void test_throttled_progress_keeps_the_last_tick(void **state)
     assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 5000);
 }
 
+static int db_text(const char *sql, char *out, size_t cap)
+{
+    db_result_t *r = NULL;
+    out[0] = '\0';
+    if (db_execute(db, sql, NULL, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return -1;
+    }
+    snprintf(out, cap, "%s", r->rows[0][0]);
+    db_result_free(r);
+    return 0;
+}
+
+/*
+ * B059: a job the daemon never finished - SIGKILL, docker kill, a power cut -
+ * is marked failed at the next start, and must also reach the journal. The
+ * journal is written by the worker when a job ends, and a killed process has
+ * no worker left to write it, so the permanent record simply lacked every
+ * interrupted backup.
+ */
+static void test_journal_source_says_who_asked(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit_scheduled(jm, 1, "gc", NULL, 42, probe_job,
+                                          (void *)(intptr_t)1, NULL, &id), OK);
+    wait_for(1);
+    submit(1, "gc");
+    wait_for(2);
+    usleep(200000);
+
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'daemon'"), 0);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'schedule'"
+                              " AND message LIKE 'schedule 42%'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'api'"), 1);
+
+    char origin[32];
+    assert_int_equal(db_text("SELECT origin || ':' || COALESCE(schedule_id, 0)"
+                             "  FROM jobs ORDER BY id LIMIT 1", origin, sizeof(origin)), 0);
+    assert_string_equal(origin, "schedule:42");
+    assert_int_equal(db_text("SELECT origin || ':' || COALESCE(schedule_id, 0)"
+                             "  FROM jobs ORDER BY id DESC LIMIT 1", origin, sizeof(origin)), 0);
+    assert_string_equal(origin, "api:0");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -288,6 +333,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_as_jobs_finish, setup, teardown),
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

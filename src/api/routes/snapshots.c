@@ -1532,7 +1532,7 @@ int routes_action_is_schedulable(const char *action)
 
 status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                  const char *action, const char *params,
-                                 int64_t *out_job_id)
+                                 int64_t schedule_id, int64_t *out_job_id)
 {
     /*
      * Backup is a different job type, owned by backup_routes.c, so it is
@@ -1541,7 +1541,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
      * tick while the schedule showed as enabled.
      */
     if (strcmp(action, "backup") == 0)
-        return routes_submit_backup(jm, repo_id, params, out_job_id);
+        return routes_submit_backup(jm, repo_id, params, schedule_id, out_job_id);
 
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
@@ -1581,8 +1581,9 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         }
     }
 
-    return job_submit(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                      snap_job_run, j, snap_job_free, out_job_id);
+    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
+                                schedule_id, snap_job_run, j, snap_job_free,
+                                out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

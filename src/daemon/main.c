@@ -72,15 +72,16 @@ static void on_signal(int sig, void *ctx)
 static status_t schedule_dispatch(void *user, int64_t schedule_id, int64_t repo_id,
                                   const char *action, const char *params)
 {
-    (void)schedule_id;
     job_manager_t *jm = user;
 
     int64_t job_id = 0;
-    status_t st = routes_submit_scheduled(jm, repo_id, action, params, &job_id);
+    status_t st = routes_submit_scheduled(jm, repo_id, action, params,
+                                          schedule_id, &job_id);
     if (st != OK) return st;
 
-    log_info("scheduler: submitted %s for repo %lld as job %lld",
-             action, (long long)repo_id, (long long)job_id);
+    log_info("scheduler: submitted %s for repo %lld as job %lld (schedule %lld)",
+             action, (long long)repo_id, (long long)job_id,
+             (long long)schedule_id);
     return OK;
 }
 

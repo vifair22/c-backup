@@ -841,7 +841,9 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 
 Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
 per-repository journal (`c-backup journal 1`) is the permanent record of what
-ran and how it ended.
+ran and how it ended. A journal entry's `source` says who asked: `api` for a
+job run by hand (the CLI and the app both go through the API), `schedule` for
+one a schedule fired, with the message starting `schedule <id>`.
 
 `gc` reports what it did in the job's `result`, and `gc --dry-run` what it
 would do:

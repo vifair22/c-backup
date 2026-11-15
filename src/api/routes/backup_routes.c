@@ -395,7 +395,8 @@ static void backup_opts_from_json(cutils_json_req_t *body, backup_job_t *j)
  * same shape the route's body uses.
  */
 status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
-                              const char *params_json, int64_t *out_job_id)
+                              const char *params_json, int64_t schedule_id,
+                              int64_t *out_job_id)
 {
     backup_ctx_t *ctx = &g_ctx;
 
@@ -427,8 +428,9 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
                          (long long)repo_id);
     }
 
-    return job_submit(jm ? jm : ctx->jm, repo_id, "backup", NULL,
-                      backup_job_run, j, backup_job_free, out_job_id);
+    return job_submit_scheduled(jm ? jm : ctx->jm, repo_id, "backup", NULL,
+                                schedule_id, backup_job_run, j, backup_job_free,
+                                out_job_id);
 }
 
 /* ---------- jobs ---------- */
@@ -455,7 +457,8 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
     "       CAST(COALESCE(NULLIF(bytes_done,''),0) AS INTEGER)," \
     "       CAST(COALESCE(NULLIF(bytes_total,''),0) AS INTEGER)," \
     "       COALESCE(NULLIF(error,''),'')," \
-    "       COALESCE(result,'')" \
+    "       COALESCE(result,'')," \
+    "       COALESCE(origin,'api'), COALESCE(schedule_id, 0)" \
     "  FROM jobs"
 
 static cJSON *job_json(char **row)
@@ -489,6 +492,11 @@ static cJSON *job_json(char **row)
     cJSON *res = row[12][0] ? cJSON_Parse(row[12]) : NULL;
     if (res) cJSON_AddItemToObject(o, "result", res);
     else     cJSON_AddNullToObject(o, "result");
+    /* Who asked: "api" or "schedule", and which schedule. */
+    cJSON_AddStringToObject(o, "origin", row[13]);
+    long long sched = strtoll(row[14], NULL, 10);
+    if (sched > 0) cJSON_AddNumberToObject(o, "schedule_id", (double)sched);
+    else           cJSON_AddNullToObject(o, "schedule_id");
     return o;
 }
 

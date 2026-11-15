@@ -47,6 +47,16 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     void (*arg_free)(void *), int64_t *out_job_id);
 
 /*
+ * job_submit for a job a schedule asked for. The job row and its journal
+ * entry carry the schedule as their origin ("schedule", and its id), where
+ * job_submit records "api". schedule_id <= 0 is the same as job_submit.
+ */
+status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
+                              const char *params_json, int64_t schedule_id,
+                              job_fn fn, void *arg, void (*arg_free)(void *),
+                              int64_t *out_job_id);
+
+/*
  * What a job reports beyond its phase and item count, through the progress
  * context the job function was given. Both are optional: a job that never
  * calls them has no bytes and no result. NULL is ignored.

@@ -196,6 +196,13 @@ contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
 contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
 contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
 
+# B072: every entry said "daemon", so a manual run and a scheduled one could
+# not be told apart.
+contains "journal says a manual job came over the api" '"source":"api"' "$(cb journal 1)"
+check    "and no entry claims the daemon asked" "" \
+    "$(cb journal 1 | grep -o '"source":"daemon"')"
+contains "the job record says so too" '"origin":"api"' "$(cb jobs)"
+
 # B077: a source that does not exist failed nothing; the backup completed
 # with the other source's files and a log line.
 OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
@@ -589,6 +596,14 @@ for _ in $(seq 1 60); do
 done
 check "a scheduled replicate fires and writes its pack" 1 "$FIRED"
 contains "the fired job ran as a replicate job" '"action":"replicate"' "$(cb jobs)"
+# B072: and its journal entry says a schedule asked, and which.
+SCHED_J=""
+for _ in $(seq 1 40); do
+    SCHED_J=$(cb journal "$ENC_ID" | grep -o '"source":"schedule"[^}]*' | head -1)
+    [ -n "$SCHED_J" ] && break
+    sleep 0.25
+done
+contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
 # Stop it before it fires again under the rest of the suite.
 SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true

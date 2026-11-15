@@ -443,6 +443,10 @@ returns it, plus `"cancel_requested":true`. Its `state` is usually still
 `running` (or `queued`): the job reports `cancelled` once it has stopped. A
 job that is not queued or running is a 404.
 
+A job record carries `origin`, who asked for it: `api` for anything submitted
+over the API (the CLI and the app both are), `schedule` for the scheduler, with
+`schedule_id` naming the schedule (null otherwise).
+
 `/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
 is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
@@ -459,6 +463,9 @@ permanent record of what ran is each repository's journal
 (`GET /repos/<id>/journal`). A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
 one starts, since nothing resumes it.
+
+A journal entry's `source` is the job's origin: `api`, or `schedule` with the
+message starting `schedule <id>`.
 
 What some jobs report in `result`, beyond the backup and restore counts:
 
