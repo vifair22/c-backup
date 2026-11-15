@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { fmtNum, absoluteTime } from './format'
+import { fmtNum, fmtSize, absoluteTime } from './format'
 import { ConfirmDialog } from './ConfirmDialog'
 import type { Job } from '../shared/api'
 
@@ -26,9 +26,9 @@ interface Props {
 
 export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
-  const [confirmCancel, setConfirmCancel] = useState<string | null>(null)
+  const [confirmCancel, setConfirmCancel] = useState<number | null>(null)
 
-  const handleCancel = async (taskId: string) => {
+  const handleCancel = async (taskId: number) => {
     setConfirmCancel(null)
     try {
       await api.apiCall(connName, { kind: 'jobCancel', jobId: Number(taskId) })
@@ -40,8 +40,7 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
   const list = jobs ?? []
   const hasRunning = list.some(j => j.state === 'running')
 
-  /* Running first, then newest. The daemon has no start time on a job, so
-   * the id stands in for one: they are handed out in order. */
+  /* Running first, then newest; ids are handed out in order. */
   const sorted = [...list].sort((a, b) => {
     if (a.state === 'running' && b.state !== 'running') return -1
     if (a.state !== 'running' && b.state === 'running') return 1
@@ -67,9 +66,13 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
           {sorted.map(t => {
             const cfg = STATE_CONFIG[t.state] ?? STATE_CONFIG.running
             const isRunning = t.state === 'running'
-            const pct = Number(t.total ?? 0) > 0
-              ? Math.round((Number(t.current ?? 0) / Number(t.total)) * 100)
-              : null
+            /* Bytes when the job reports them: entry counts crawl through
+             * large files and say little about how far along it is. */
+            const pct = (t.bytes_total ?? 0) > 0
+              ? Math.round(((t.bytes_done ?? 0) / (t.bytes_total ?? 1)) * 100)
+              : (t.total ?? 0) > 0
+                ? Math.round(((t.current ?? 0) / (t.total ?? 1)) * 100)
+                : null
 
             return (
               <div key={t.id}
@@ -78,11 +81,10 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                 <div className="flex items-center gap-3 mb-1">
                   <span className="text-sm font-semibold text-text-primary capitalize">{t.action}</span>
                   <span className={`text-[10px] font-semibold ${cfg.color}`}>{cfg.label}</span>
-                  {/* The daemon reports no start time on a job, so there is
-                    * nothing honest to render here. Showing absoluteTime of
-                    * undefined printed the epoch. */}
                   <span className="text-[11px] text-text-muted ml-auto">
                     job {t.id}
+                    {t.started ? `, started ${absoluteTime(t.started)}` : ''}
+                    {t.elapsed_s ? `, ${fmtElapsed(t.elapsed_s)}` : ''}
                   </span>
                 </div>
 
@@ -117,8 +119,14 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
                   {/* No pid either: work runs on the daemon's own pool
                     * rather than as a detached process, which is the whole
                     * point of the rewrite. */}
-                  {Number(t.total ?? 0) > 0 && (
-                    <span>{fmtNum(Number(t.current ?? 0))} / {fmtNum(Number(t.total))}</span>
+                  {(t.total ?? 0) > 0 && (
+                    <span>{fmtNum(t.current ?? 0)} / {fmtNum(t.total)}</span>
+                  )}
+                  {(t.bytes_total ?? 0) > 0 && (
+                    <span>{fmtSize(t.bytes_done ?? 0)} / {fmtSize(t.bytes_total)}</span>
+                  )}
+                  {isRunning && (t.rate_bytes_per_s ?? 0) > 0 && (
+                    <span>{fmtSize(t.rate_bytes_per_s)}/s</span>
                   )}
                   {t.error && <span className="text-status-error">{t.error}</span>}
                   {isRunning && (
