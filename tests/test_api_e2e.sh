@@ -490,6 +490,10 @@ done
 wait_job "$(job_id "$(sock_post /repos/1/gfs)")"
 check "retention reads keep_snaps from config" 2 \
     "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+# And a client can see them: the app shows the value in force, and these
+# live in a file on this host that it cannot read.
+contains "policy reports the configured defaults" \
+    '"key":"retention.keep_snaps","value":"2"' "$(sock_body /repos/1/policy)"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""

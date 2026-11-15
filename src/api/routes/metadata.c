@@ -390,6 +390,28 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
         json_elem_commit(&e);
     }
     db_result_free(r);
+
+    /*
+     * What applies where the repository has set nothing: the daemon's
+     * configured defaults. A client showing the policy needs them to say
+     * what is in force, and they live in config.yaml on the daemon's host,
+     * where a client cannot read them. The app used to hard-code its own
+     * copy, which was wrong the moment an operator changed one.
+     */
+    if (json_resp_ensure_array(resp, "defaults") == 0) {
+        routes_retention_default_t d[8];
+        int n = routes_snapshots_retention_defaults(d, 8);
+        for (int i = 0; i < n; i++) {
+            cutils_json_elem_t e;
+            char v[16];
+            snprintf(v, sizeof(v), "%d", d[i].value);
+            if (json_resp_array_append_begin(resp, "defaults", &e) != 0) break;
+            int bad = json_elem_add_str(&e, "key",   d[i].key) != 0
+                   || json_elem_add_str(&e, "value", v) != 0;
+            json_elem_commit(&e);
+            if (bad) break;
+        }
+    }
     return finalise(resp);
 }
 

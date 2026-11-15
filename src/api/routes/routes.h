@@ -42,6 +42,12 @@ void routes_snapshots_init(cutils_db_t *db, struct job_manager *jm);
  * policy of its own: the daemon's configured defaults. */
 void routes_snapshots_set_retention(int keep_snaps, int keep_daily, int keep_weekly,
                                     int keep_monthly, int keep_yearly);
+
+/* The configured defaults back again, as policy keys and values, for the
+ * policy route to report what is in force where a repository sets nothing.
+ * Fills up to `max` entries and returns how many. */
+typedef struct { const char *key; int value; } routes_retention_default_t;
+int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max);
 api_response_t snapshots_route_get(const api_request_t *req, int64_t repo_id,
                                    const char *rest);
 api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,

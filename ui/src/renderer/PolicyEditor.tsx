@@ -22,9 +22,11 @@ const api = window.cbackup
 interface RawPolicy { key: string; value: string }
 
 /*
- * The daemon's own fallbacks, from the gfs job. Shown as the value in force
- * when a repository has set nothing, rather than as a blank field: "7" and
- * "" mean very different things to somebody deciding whether to change it.
+ * The fallbacks, shown as the value in force when a repository has set
+ * nothing, rather than as a blank field: "7" and "" mean very different
+ * things to somebody deciding whether to change it. The daemon reports its
+ * configured defaults with the policy and those win; these are only for a
+ * daemon too old to send them.
  */
 const FIELDS = [
   { key: 'retention.keep_daily',   label: 'Daily',   dflt: 7,
@@ -35,7 +37,7 @@ const FIELDS = [
     hint: 'Months of monthly snapshots' },
   { key: 'retention.keep_yearly',  label: 'Yearly',  dflt: 3,
     hint: 'Years of yearly snapshots' },
-  { key: 'retention.keep_snaps',   label: 'Recent',  dflt: 0,
+  { key: 'retention.keep_snaps',   label: 'Recent',  dflt: 1,
     hint: 'Most recent snapshots kept regardless of tier. 0 means no extra window' },
 ] as const
 
@@ -63,10 +65,12 @@ export function PolicyEditor({ connName, repoPath, onBack }: Props): React.React
     setLoading(true)
     setError(null)
     try {
-      const r = await api.apiCall<{ policy?: RawPolicy[] }>(connName, { kind: 'policyGet', repoId })
+      const r = await api.apiCall<{ policy?: RawPolicy[]; defaults?: RawPolicy[] }>(
+        connName, { kind: 'policyGet', repoId })
       const rows = r.policy ?? []
       const next: Record<string, string> = {}
       for (const f of FIELDS) next[f.key] = String(f.dflt)
+      for (const d of r.defaults ?? []) if (KNOWN.has(d.key)) next[d.key] = d.value
       for (const row of rows) if (KNOWN.has(row.key)) next[row.key] = row.value
       setValues(next)
       setOriginal(next)

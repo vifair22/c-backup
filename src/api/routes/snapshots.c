@@ -56,6 +56,21 @@ void routes_snapshots_set_retention(int keep_snaps, int keep_daily, int keep_wee
     g_retention.keep_yearly  = keep_yearly;
 }
 
+int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max)
+{
+    const routes_retention_default_t all[] = {
+        { "retention.keep_snaps",   g_retention.keep_snaps   },
+        { "retention.keep_daily",   g_retention.keep_daily   },
+        { "retention.keep_weekly",  g_retention.keep_weekly  },
+        { "retention.keep_monthly", g_retention.keep_monthly },
+        { "retention.keep_yearly",  g_retention.keep_yearly  },
+    };
+    int n = (int)(sizeof(all) / sizeof(all[0]));
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = all[i];
+    return n;
+}
+
 #define PAGE_DEFAULT 200
 #define PAGE_MAX     1000
 
