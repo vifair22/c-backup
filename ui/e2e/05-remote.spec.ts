@@ -122,6 +122,10 @@ test('a backup started from the app runs on the remote daemon', async () => {
 test('a restore started from the app writes on the remote daemon', async () => {
   const { page } = h
   const dest = join(h.work, 'restored')
+  /* Starting the backup left the app on its task list; back to the
+   * repository, the way a person would get there. */
+  await page.getByText('Documents', { exact: true }).first().click()
+  await expect(page.getByText('Last Backup', { exact: false }).first()).toBeVisible()
   await page.getByRole('button', { name: /^snapshots$/i }).first().click()
   await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible()
   await page.locator('tr', { hasText: '#1' }).first().click()
