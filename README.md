@@ -4,10 +4,13 @@ A content-addressed backup daemon. One `c-backupd` per machine owns every
 repository on it and is the only writer; `c-backup` is a thin HTTP client, and
 the Electron app talks to the same API.
 
-**Status: mid-rewrite.** The daemon backs up, restores, prunes and schedules.
-Several UI panels are still blocked on introspection endpoints that are
-designed but not built. See `daemonization-spec.md` for the plan and the
-per-phase record of what changed and why.
+Version 1.0. The operator's reference is [`Manual.md`](Manual.md): installing,
+configuring, remote access, every operation, disaster recovery, capacity
+planning and the known limits.
+
+Repositories written before the daemon rewrite are not readable by this
+version and there is no migration; the `pre-daemon-rewrite` tag builds a
+binary that reads them.
 
 ## What it does
 
@@ -37,7 +40,7 @@ make debug      # -Og -g
 make asan       # -fsanitize=address
 make analyze    # stack-usage (64 KiB limit), gcc -fanalyzer, cppcheck
 make test       # unit suites, then the HTTP and CLI end-to-end suites
-make coverage   # gcovr report with the src/store ratchet
+make coverage   # gcovr; fails under 80% whole-repo, or the src/store floor
 make bench      # microbenchmarks and browse-path benchmarks
 ```
 
@@ -89,7 +92,8 @@ Every command is an HTTP request over the daemon's socket. If the daemon is
 not running the CLI says so and exits; there is no standalone mode, because
 having exactly one writer is the point.
 
-Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
+Output is the daemon's JSON, one document per command, so it pipes straight
+into `jq`.
 
 ## Layout
 
@@ -107,6 +111,7 @@ Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
 
 ## Documentation
 
+- `Manual.md`: the operator's manual. Start here to run it.
 - `docs/repo-format.md`: on-disk layout, manifest trees, and why determinism
   matters more than it looks.
 - `docs/api.md`: every endpoint, with the reasoning behind pagination, auth
@@ -115,8 +120,10 @@ Output is the daemon's JSON, unmodified. Pipe through `jq` for fields.
   pipelines, every per-file-type branch, packing and compression decisions,
   and the maintenance paths that rewrite data.
 - `PERF.md`: benchmark journal. New numbers are added, not substituted.
+- `docs/acceptance.md`: the acceptance checklist and the results of each full
+  pass, including what was measured on a real Unraid server.
 - `diagrams/`: Mermaid diagrams for individual mechanisms (parity layout,
-  pack dispatch, GFS promotion, dedup cascade, FUSE ring).
+  pack dispatch, GFS promotion, dedup cascade).
 
 ## License
 

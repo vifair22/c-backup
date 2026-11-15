@@ -410,6 +410,18 @@ same property that makes incremental backups cheap, applied to reading.
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
 | GET | `/repos/<id>/journal` | Operation history |
 
+`GET /repos/<id>/policy` returns `policy`, what the repository has set, and
+`defaults`, the daemon's configured `retention.*` values from `config.yaml`
+that apply wherever the repository has set nothing. A client cannot read the
+daemon's config file, so without them it could only guess at what is in force.
+
+Retention keeps a snapshot that is among the newest `retention.keep_snaps`, or
+holds a tier (daily, weekly, monthly, yearly) and is within that tier's count,
+or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
+`keep_snaps` below 1 still keeps the newest snapshot. Retention runs when
+`/repos/<id>/gfs` is called or a `gfs` schedule fires, never as a side effect
+of a backup.
+
 Any tag protects a snapshot from retention pruning. Tags are how a user says
 "keep this one", and deleting a tagged snapshot because a window rolled past
 would be the worst kind of surprise.
@@ -429,7 +441,14 @@ time:
 {"action":"backup","trigger":{"type":"interval","seconds":14400}}
 {"action":"gc","trigger":{"type":"calendar","every":"day","at":"02:00"}}
 {"action":"gfs","trigger":{"type":"calendar","every":"week","on":"sunday","at":"03:00"}}
+{"action":"verify","trigger":{"type":"calendar","every":"month","on_day":1,"at":"04:00"}}
+{"action":"gc","trigger":{"type":"calendar","every":"year","on_month":1,"on_day":1,"at":"05:00"}}
 ```
+
+`every` is `day`, `week` (with `on`, a weekday name), `month` (with
+`on_day`, 1-31) or `year` (with `on_month` and `on_day`). There is no cron
+syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
+and `--on-month`, or takes a number of seconds for an interval.
 
 Interval triggers anchor to the last successful fire, not to wall-clock
 multiples: a four-hour backup that runs long should not be due the moment it
