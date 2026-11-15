@@ -14,6 +14,7 @@
 #include "repo_key.h"
 #include "store.h"
 #include <cutils/db.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define CBACKUP_MARKER      ".cbackup"
@@ -86,6 +87,13 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
  * naming a keyfile before the repository exists requires. */
 status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
                                  repo_marker_t *out);
+
+/*
+ * Normalise an absolute path lexically: no "//", no "." or ".." components,
+ * no trailing slash. Symlinks are left alone. ERR_INVALID for a relative or
+ * over-long path. Registration stores paths in this form.
+ */
+status_t repo_path_normalize(const char *in, char *out, size_t outsz);
 
 /*
  * Register a repo directory, per section 5.2:

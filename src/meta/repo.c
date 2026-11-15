@@ -303,6 +303,62 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Lexical normalisation: collapse repeated slashes, drop "." components,
+ * resolve ".." against the components before it, strip a trailing slash.
+ *
+ * The path was stored exactly as typed, so "/srv/backup/r/" and
+ * "/srv/backup/r" were two different strings for one directory. Every
+ * comparison against a stored path - the re-link check, the nesting check,
+ * an operator reading `repo list` - then had to know that, and none did.
+ *
+ * Deliberately lexical, not realpath: a symlink the operator chose is part
+ * of how they named the repository, and resolving it here would store a
+ * path they never typed. ".." above the root stays at the root, as the
+ * kernel treats it.
+ */
+status_t repo_path_normalize(const char *in, char *out, size_t outsz)
+{
+    if (!in || !in[0])
+        return set_error(ERR_INVALID, "repo path is empty");
+    if (in[0] != '/')
+        return set_error(ERR_INVALID, "repo path must be absolute: %s", in);
+    if (outsz < 2)
+        return set_error(ERR_INVALID, "repo path buffer too small");
+
+    size_t len = 0;
+    out[len++] = '/';
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t clen = (size_t)(p - start);
+
+        if (clen == 1 && start[0] == '.') continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.') {
+            /* Back up to the slash before the last component. */
+            while (len > 1 && out[len - 1] != '/') len--;
+            if (len > 1) len--;
+            continue;
+        }
+        if (len > 1) {
+            if (len + 1 >= outsz) goto too_long;
+            out[len++] = '/';
+        }
+        if (len + clen >= outsz) goto too_long;
+        memcpy(out + len, start, clen);
+        len += clen;
+    }
+    out[len] = '\0';
+    return OK;
+
+too_long:
+    out[0] = '\0';
+    return set_error(ERR_INVALID, "repo path too long: %s", in);
+}
+
 /* "Empty" ignores . and .. only. A directory holding anything else is
  * someone's data until a marker says otherwise. */
 static int dir_is_empty(const char *path)
@@ -393,8 +449,12 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
 {
     if (!db || !path || !path[0])
         return set_error(ERR_INVALID, "repo_register: missing db or path");
-    if (path[0] != '/')
-        return set_error(ERR_INVALID, "repo path must be absolute: %s", path);
+
+    /* Everything below works on, and stores, the normalised form. */
+    char npath[PATH_MAX];
+    status_t nst = repo_path_normalize(path, npath, sizeof(npath));
+    if (nst != OK) return nst;
+    path = npath;
 
     struct stat sb;
     int exists = (stat(path, &sb) == 0);
@@ -477,7 +537,16 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
         int64_t id = strtoll(r->rows[0][0], NULL, 10);
         const char *known = r->rows[0][1];
 
-        if (known && *known && strcmp(known, path) != 0) {
+        /* Rows written before paths were normalised may carry a trailing
+         * slash or a doubled one; compare in normal form so the same
+         * directory is never mistaken for a second copy of itself. */
+        char known_norm[PATH_MAX];
+        if (known && *known &&
+            repo_path_normalize(known, known_norm, sizeof(known_norm)) != OK) {
+            err_clear();
+            snprintf(known_norm, sizeof(known_norm), "%s", known);
+        }
+        if (known && *known && strcmp(known_norm, path) != 0) {
             repo_marker_t other;
             if (repo_marker_read(known, &other) == OK &&
                 strcmp(other.uuid, marker.uuid) == 0) {

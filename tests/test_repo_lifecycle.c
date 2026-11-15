@@ -11,6 +11,7 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,6 +165,57 @@ static void test_register_requires_absolute_path(void **state)
     (void)state;
     int64_t id = 0;
     assert_int_not_equal(repo_register(db, "relative/path", NULL, &id), OK);
+}
+
+/*
+ * B014: the path was stored exactly as typed, so a trailing slash made
+ * "/srv/backup/r/" and "/srv/backup/r" two strings for one directory.
+ */
+static void test_path_normalize(void **state)
+{
+    (void)state;
+    static const struct { const char *in, *want; } cases[] = {
+        { "/",                    "/" },
+        { "//",                   "/" },
+        { "/a",                   "/a" },
+        { "/a/",                  "/a" },
+        { "/a///b//",             "/a/b" },
+        { "/a/./b/.",             "/a/b" },
+        { "/a/b/../c",            "/a/c" },
+        { "/a/b/../../..",        "/" },
+        { "/../a",                "/a" },
+        { "/a/..b/.c",            "/a/..b/.c" },
+        { "/srv/backup/r-slash/", "/srv/backup/r-slash" },
+    };
+    char out[PATH_MAX];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        assert_int_equal(repo_path_normalize(cases[i].in, out, sizeof(out)), OK);
+        assert_string_equal(out, cases[i].want);
+    }
+    assert_int_equal(repo_path_normalize("rel/a", out, sizeof(out)), ERR_INVALID);
+    assert_int_equal(repo_path_normalize("", out, sizeof(out)), ERR_INVALID);
+    char tiny[4];
+    assert_int_equal(repo_path_normalize("/abcdef", tiny, sizeof(tiny)), ERR_INVALID);
+    err_clear();
+}
+
+static void test_register_stores_normalised_path(void **state)
+{
+    (void)state;
+    int64_t id = 0, again = 0;
+    assert_int_equal(mkdir(TEST_ROOT "/norm", 0700), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "//norm/./x/../r/", NULL, &id), OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT path FROM repos", NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], TEST_ROOT "/norm/r");
+    db_result_free(r);
+
+    /* Another spelling of the same directory is the same registration. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/norm/r//", NULL, &again), OK);
+    assert_int_equal(again, id);
+    assert_int_equal(count_repos(), 1);
 }
 
 /* A marker is written once. Overwriting one would silently sever a repo
@@ -498,6 +550,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_adopts_unknown_uuid, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_refuses_foreign_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_requires_absolute_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_path_normalize, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_stores_normalised_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),
