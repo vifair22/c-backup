@@ -654,6 +654,14 @@ $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS
 COV_MIN       := 80
 COV_STORE_MIN := 78
 
+# The suites run with their output discarded, since `make test` is where they
+# are read. A hang there was invisible: a CI coverage job sat for 42 minutes
+# with nothing in its log after the build. Each suite gets a deadline, and
+# one that fails or overruns is named, without failing the target - the
+# coverage gates decide that.
+COV_TEST_TIMEOUT := 300
+COV_E2E_TIMEOUT  := 900
+
 # The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
 # the last "lines:" in the log, and printing the store gate second made every
 # pipeline report src/store as the project figure. The HTML report is still
@@ -664,9 +672,13 @@ COV_STORE_MIN := 78
 # the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	@find $(COV_DIR) -name '*.gcda' -delete
-	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
-	@./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 || true
-	@./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 || true
+	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do \
+	    timeout $(COV_TEST_TIMEOUT) $$t >/dev/null 2>&1 || echo "coverage: $$t failed or timed out"; \
+	done
+	@timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 \
+	    || echo "coverage: test_api_e2e.sh failed or timed out"
+	@timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 \
+	    || echo "coverage: test_cli_e2e.sh failed or timed out"
 	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
 	    --exclude '.*vendor.*'
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
