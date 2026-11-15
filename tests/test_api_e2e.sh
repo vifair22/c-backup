@@ -14,7 +14,10 @@ set -u
 BIN="${1:-build/bins/c-backupd}"
 WORK="$(mktemp -d /tmp/c_backup_api_e2e.XXXXXX)"
 SOCK="$WORK/c.sock"
-PORT=18799
+# Per run, so two suites running at once (CI jobs on one runner, parallel
+# worktrees) cannot answer each other's requests. A fixed port made a second
+# daemon fail to bind, or worse, sent a request to the other run's daemon.
+PORT=$((20000 + ($$ % 20000)))
 PASS=0
 FAIL=0
 
