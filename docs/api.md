@@ -593,6 +593,11 @@ than refused, because it may be a share that is not mounted yet, and the
 warning says that a backup fails while it is missing: a backup does not skip
 a missing source, it fails the job (see above).
 
+A `PUT` during a running backup returns promptly; it does not wait for the
+backup (it did, for the whole run, before B107). The new list applies to
+backups submitted after it: a backup reads the sources when it is submitted,
+so one already running or queued keeps the list it was submitted with.
+
 Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
 and a timer. A request that does name paths still overrides, because the

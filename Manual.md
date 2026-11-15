@@ -747,7 +747,16 @@ second job for a repository that has one running, and queues it instead. Jobs
 for different repositories run in parallel, up to `jobs.max_parallel`.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
-briefly for the database rather than failing.
+briefly for the database rather than failing: a backup holds the database's
+write lock for at most about 200 ms at a time, never while it reads a file of
+4 MiB or more, and a write that is waiting goes before the backup's next
+batch. Such a write returns in well under a second however long the backup
+runs.
+
+A change to a repository's sources applies to backups submitted after it. A
+backup takes its sources from the configuration when it is submitted, so a
+backup already running, or already queued, keeps the sources it was
+submitted with.
 
 ---
 

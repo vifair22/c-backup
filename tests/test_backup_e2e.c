@@ -23,11 +23,13 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "db_txn.h"
 #include "manifest.h"
 #include "pack.h"
 #include "object.h"
@@ -1034,6 +1036,136 @@ static void test_bytes_move_inside_one_sparse_file(void **state)
     assert_int_equal(seen.backwards, 0);
 }
 
+/*
+ * B107: a metadata write is not held for the length of a backup.
+ *
+ * Every tag and sources write takes the same write lock as the backup's
+ * cache batches (db_txn.h). The batch was bounded only by entry count, so a
+ * backup of fewer than 2,000 files read and hashed every byte inside one
+ * transaction, and a PUT /repos/<id>/sources waited until the backup ended.
+ *
+ * A probe thread plays the metadata write: it is started from the backup's
+ * own progress callback, at a point where the old code held the lock, and
+ * the callback then slows the backup down the way slow storage would. The
+ * probe has to get its transaction while the backup is still going, not
+ * when it finishes.
+ */
+typedef struct {
+    pthread_t       thr;
+    int             started;
+    struct timespec t0;
+    int64_t         waited_ms;
+    status_t        begin_st;
+    int             slow_ms;      /* per callback, once the probe is out */
+    int             slow_calls;   /* callbacks slowed so far */
+    int             slow_max;     /* and at most this many */
+    int             want_mid;     /* trigger mid-file rather than per entry */
+    uint64_t        bytes_done, bytes_total;
+} txn_probe_t;
+
+static void *txn_probe_run(void *arg)
+{
+    txn_probe_t *pr = arg;
+    pr->begin_st = db_txn_begin(db);
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pr->waited_ms = (int64_t)(t1.tv_sec - pr->t0.tv_sec) * 1000
+                  + (int64_t)(t1.tv_nsec - pr->t0.tv_nsec) / 1000000;
+    if (pr->begin_st == OK) {
+        int rc = db_execute_non_query(db,
+                "INSERT INTO repo_backup_paths (repo_id, kind, value)"
+                " VALUES (1, 'source', '/probe')", NULL, NULL);
+        (void)rc;
+        (void)db_txn_commit(db);
+    }
+    return NULL;
+}
+
+static void probe_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    txn_probe_t *pr = ctx;
+    pr->bytes_done  = done;
+    pr->bytes_total = total;
+}
+
+static void probe_progress(const char *phase, uint64_t done, uint64_t total,
+                           void *ctx)
+{
+    (void)done; (void)total;
+    txn_probe_t *pr = ctx;
+    if (!phase || strcmp(phase, "store") != 0) return;
+    if (!pr->started) {
+        /* Mid-file, or once several entries in: the slowing starts with the
+         * phase, so by then the batch has been open across regular files. */
+        int ready = pr->want_mid
+            ? (pr->bytes_done > 0 && pr->bytes_done < pr->bytes_total)
+            : (pr->slow_calls >= 8);
+        if (ready) {
+            pr->started = 1;
+            clock_gettime(CLOCK_MONOTONIC, &pr->t0);
+            assert_int_equal(pthread_create(&pr->thr, NULL, txn_probe_run, pr), 0);
+        }
+    }
+    if ((pr->started || !pr->want_mid) && pr->slow_calls < pr->slow_max) {
+        pr->slow_calls++;
+        struct timespec ts = { 0, (long)pr->slow_ms * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* One large file: the read is outside any transaction. */
+static void test_metadata_write_is_not_held_by_a_large_file(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 48);
+    static const char *paths[] = { TEST_DIR "/big.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    txn_probe_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.want_mid = 1;
+    pr.slow_ms  = 100;
+    pr.slow_max = 30;          /* 3 s of slow reading after the probe */
+    o.progress_cb  = probe_progress;
+    o.bytes_cb     = probe_bytes;
+    o.progress_ctx = &pr;
+
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_true(pr.started);
+    pthread_join(pr.thr, NULL);
+    assert_int_equal(pr.begin_st, OK);
+    /* The old code: until the whole file was read, about 3 s here. */
+    assert_true(pr.waited_ms < 1000);
+}
+
+/* Many small slow files: the batch is cut by time, not only by count. */
+static void test_metadata_write_is_not_held_by_a_slow_batch(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC "/many", 0700), 0);
+    for (int i = 0; i < 40; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), TEST_SRC "/many/f%02d.txt", i);
+        char body[64];
+        snprintf(body, sizeof(body), "small file %d", i);
+        write_file(path, body);
+    }
+    backup_opts_t o = basic_opts();
+    txn_probe_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.slow_ms  = 270;         /* past the progress throttle: every entry */
+    pr.slow_max = 16;
+    o.progress_cb  = probe_progress;
+    o.progress_ctx = &pr;
+
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_true(pr.started);
+    pthread_join(pr.thr, NULL);
+    assert_int_equal(pr.begin_st, OK);
+    /* The old code: until the store phase ended, about 2.2 s here. */
+    assert_true(pr.waited_ms < 1500);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1055,6 +1187,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_backup_of_nothing_fails_without_a_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_source_fails_but_unreadable_file_does_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_large_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_left_by_an_interrupted_run_keeps_its_size, setup, teardown),

@@ -1135,6 +1135,46 @@ else
     bad "an explicit path still overrides the configured sources" "other.txt" "absent"
 fi
 
+# B107: a sources write during a running backup waited for the backup to
+# end, 179-200 seconds, because the store phase of a backup of fewer than
+# 2,000 files ran inside one transaction. It returns at once now, and the
+# job already running keeps the sources it was submitted with.
+mkdir -p "$WORK/slowsrc" "$WORK/nextsrc"
+dd if=/dev/zero of="$WORK/slowsrc/slow.bin" bs=1M count=512 status=none
+echo "next content" > "$WORK/nextsrc/next.txt"
+SR=$(cb repo add "$WORK/srcrepo" sr | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb sources set "$SR" "$WORK/slowsrc" >/dev/null
+SJ=$(cb backup "$SR" --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    cb jobs "$SJ" | grep -q '"phase":"store"' && break
+    sleep 0.05
+done
+T0=$(date +%s%N)
+cb sources set "$SR" "$WORK/nextsrc" >/dev/null; RC=$?
+T1=$(date +%s%N)
+STILL=$(cb jobs "$SJ")
+check "a sources write during a backup succeeds" 0 "$RC"
+case "$STILL" in
+    *'"state":"running"'*)
+        if [ $(( (T1 - T0) / 1000000 )) -lt 2000 ]; then
+            ok "and returns while the backup is still running"
+        else
+            bad "and returns while the backup is still running" "< 2000 ms" \
+                "$(( (T1 - T0) / 1000000 )) ms"
+        fi ;;
+    *) ok "and returns while the backup is still running (skipped: backup already done)" ;;
+esac
+for _ in $(seq 1 600); do
+    cb jobs "$SJ" | grep -Eq '"state":"(completed|failed|cancelled)"' && break
+    sleep 0.1
+done
+contains "the running backup kept the sources it started with" "slow.bin" \
+    "$(cb search "$SR" slow.bin --snapshot 1)"
+cb backup "$SR" >/dev/null
+contains "and the next backup uses the new ones" "next.txt" \
+    "$(cb search "$SR" next.txt --snapshot 2)"
+rm -f "$WORK/slowsrc/slow.bin"
+
 echo "scheduled backups"
 
 # A backup schedule was accepted, listed as enabled, and then failed on every
