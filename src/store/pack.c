@@ -337,14 +337,12 @@ static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
 /* write_full_fd: uses io_write_full from util.h */
 #define write_full_fd io_write_full
 
-static size_t g_pack_line_len = 0;
-
-#define pack_progress_enabled() progress_enabled()
-#define pack_line_set(msg)      progress_line_set(&g_pack_line_len, (msg))
-#define pack_line_clear()       progress_line_clear(&g_pack_line_len)
-
-#define pack_tick_due(t)     tick_due(t)
-/* pack progress uses progress_t from progress.h */
+/* What the pack workers have written so far. The count is the number of
+ * objects packed, which repo_pack reports. */
+typedef struct {
+    _Atomic uint64_t items;
+    _Atomic uint64_t bytes;
+} pack_counts_t;
 
 /* Accumulated parity data for one entry in the current pack. */
 typedef struct {
@@ -1597,10 +1595,6 @@ static status_t collect_loose(store_t *store,
     DIR *top = fdopendir(obj_fd);
     if (!top) { close(obj_fd); free(hashes); return set_error_errno(ERR_IO, "collect_loose: fdopendir(objects)"); }
 
-    int show_progress = pack_progress_enabled();
-    struct timespec next_tick = {0};
-    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
-
     status_t st = OK;
     struct dirent *de;
     while ((de = readdir(top)) != NULL) {
@@ -1627,17 +1621,9 @@ static status_t collect_loose(store_t *store,
             if (hex_decode(hexhash, (size_t)hlen,
                            hashes + cnt * OBJECT_HASH_SIZE) == 0)
                 cnt++;
-
-            if (show_progress && pack_tick_due(&next_tick)) {
-                char msg[80];
-                snprintf(msg, sizeof(msg),
-                         "pack: collecting loose objects (%zu found)", cnt);
-                pack_line_set(msg);
-            }
         }
         closedir(sub);
     }
-    if (show_progress) pack_line_clear();
 
 done:
     closedir(top);
@@ -2455,7 +2441,7 @@ typedef struct {
     _Atomic uint32_t  next_pack_num;
     _Atomic int       stop;
     _Atomic int       error;         /* first non-OK status from any worker */
-    progress_t       *prog;
+    pack_counts_t    *prog;
 } pack_unified_ctx_t;
 
 static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
@@ -2538,7 +2524,7 @@ static void pw_destroy(pack_writer_t *pw) {
  * payload is plaintext-or-compressed and stays the caller's to free; any
  * ciphertext buffer is owned and released here.
  */
-static status_t pw_emit(pack_writer_t *pw, progress_t *prog,
+static status_t pw_emit(pack_writer_t *pw, pack_counts_t *prog,
                         const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
                         uint64_t uncompressed_size,
                         const uint8_t *payload, uint64_t compressed_size,
@@ -3355,7 +3341,6 @@ out:
 
 status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
-    int show_progress = pack_progress_enabled();
 
     /* Packing rewrites every object it touches, so without the key it would
      * turn an encrypted repository into a plaintext one, one pack at a time. */
@@ -3399,9 +3384,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         return set_error(ERR_NOMEM, "repo_pack: partition alloc failed");
     }
     uint64_t total_bytes_for_pack = 0;
-
-    struct timespec part_tick = {0};
-    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &part_tick);
 
     for (size_t i = 0; i < loose_cnt; i++) {
         const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
@@ -3466,15 +3448,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
 
         indices[packable_cnt++] = mi;
         total_bytes_for_pack += ohdr.compressed_size;
-
-        if (show_progress && pack_tick_due(&part_tick)) {
-            char msg[80];
-            snprintf(msg, sizeof(msg),
-                     "pack: classifying objects (%zu/%zu)", i + 1, loose_cnt);
-            pack_line_set(msg);
-        }
     }
-    if (show_progress) pack_line_clear();
 
     if (packable_cnt == 0) {
         for (size_t mi2 = 0; mi2 < meta_cnt; mi2++)
@@ -3605,12 +3579,9 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     }
     if (n_workers < 1) n_workers = 1;
 
-    progress_t prog = {
-        .label = "pack:", .unit = "objects",
-        .total_items = (uint64_t)packable_cnt,
-        .total_bytes = total_bytes_for_pack,
-    };
-    if (show_progress) progress_start(&prog);
+    pack_counts_t prog;
+    atomic_init(&prog.items, 0);
+    atomic_init(&prog.bytes, 0);
 
     pack_unified_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3649,8 +3620,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     for (uint32_t i = 0; i < launched; i++)
         pthread_join(tids[i], NULL);
 
-    progress_end(&prog);
-
     packed = (uint32_t)atomic_load(&prog.items);
 
     /* Check for worker errors */
@@ -3661,8 +3630,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
             goto cleanup;
         }
     }
-
-    /* progress already cleared by progress_end() */
 
     /* Single packs/ dir fsync after all packs are written */
     {
@@ -3691,7 +3658,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     return OK;
 
 cleanup:
-    progress_end(&prog);
     if (meta) {
         for (size_t mi2 = 0; mi2 < meta_cnt; mi2++) {
             if (meta[mi2].fd >= 0) { close(meta[mi2].fd); meta[mi2].fd = -1; }
@@ -4229,10 +4195,6 @@ status_t pack_gc(store_t *store,
                  uint32_t *out_kept, uint32_t *out_deleted) {
     pack_resume_deleting(store);
     uint32_t total_kept = 0, total_deleted = 0;
-    int show_progress = pack_progress_enabled();
-    struct timespec next_tick = {0};
-    if (show_progress) clock_gettime(CLOCK_MONOTONIC, &next_tick);
-
     char gc_packs_dir[PATH_MAX];
     if (path_fmt(gc_packs_dir, sizeof(gc_packs_dir), "%s/packs", store_root(store)) != 0) {
         if (out_kept)    *out_kept    = 0;
@@ -4260,12 +4222,6 @@ status_t pack_gc(store_t *store,
     if (!gc_chunk) { free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: gc_chunk alloc failed"); }
 
     for (size_t pi = 0; pi < npack; pi++) {
-        if (show_progress && pack_tick_due(&next_tick)) {
-            char line[128];
-            snprintf(line, sizeof(line),
-                     "pack-gc: processing packs %zu/%zu", pi, npack);
-            pack_line_set(line);
-        }
         uint32_t pnum = pack_nums[pi];
 
         char dat_path[PATH_MAX];
@@ -4504,13 +4460,6 @@ pack_fail:
             return st;
     }
     free(gc_chunk);
-
-    if (show_progress) {
-        char line[128];
-        snprintf(line, sizeof(line), "pack-gc: processing packs %zu/%zu", npack, npack);
-        pack_line_set(line);
-        pack_line_clear();
-    }
 
     status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
     if (coalesce_st != OK)
