@@ -185,10 +185,16 @@ $(CLI_OBJ): $(CLI_MAIN) | $(OBJ_DIR)
 
 -include $(wildcard $(OBJ_DIR)/*.d)
 
-$(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) | $(BINS)
+# The c-utils archive is a prerequisite so a rebuilt c-utils relinks the
+# binaries; without it they kept the old library and a c-utils fix looked
+# like it had not worked. Wildcard, so a missing archive still reaches the
+# linker's own error.
+CUTILS_ARCHIVE := $(wildcard $(CUTILS_DIR)/build/libc-utils.a)
+
+$(DAEMON_TARGET): $(LIB_OBJS) $(DAEMON_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
-$(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) | $(BINS)
+$(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 	$(CC) $(TYPE_CFLAGS) $^ -o $@ $(TYPE_LDFLAGS)
 
 # ---- Tests (link against release lib objects) -------------------------
