@@ -395,6 +395,21 @@ esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
 contains "schedule disabled" '"enabled":false' "$(sock_body /repos/1/schedules)"
+# B091: {"enabled":false} was refused with "enabled must be 0 or 1". JSON
+# booleans and 0/1 both work, both ways, and anything else is a 400.
+sched_put() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+                   -d "$1" http://localhost/repos/1/schedules/1; }
+check "enable with true"   200 "$(sched_put '{"enabled":true}')"
+contains "enabled by true"  '"enabled":true'  "$(sock_body /repos/1/schedules)"
+check "disable with false" 200 "$(sched_put '{"enabled":false}')"
+contains "disabled by false" '"enabled":false' "$(sock_body /repos/1/schedules)"
+check "enable with 1"      200 "$(sched_put '{"enabled":1}')"
+contains "enabled by 1"     '"enabled":true'  "$(sock_body /repos/1/schedules)"
+check "disable with 0"     200 "$(sched_put '{"enabled":0}')"
+contains "disabled by 0"    '"enabled":false' "$(sock_body /repos/1/schedules)"
+check "enabled 2 refused"  400 "$(sched_put '{"enabled":2}')"
+check "enabled string refused" 400 "$(sched_put '{"enabled":"yes"}')"
+contains "a refusal changes nothing" '"enabled":false' "$(sock_body /repos/1/schedules)"
 
 # A schedule already due must fire on the next tick and produce a real job.
 curl -s -X POST --unix-socket "$SOCK" \
