@@ -627,6 +627,9 @@ values the pass applied (the repository's policy over the defaults):
           "retention":{"keep_snaps":1,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
 ```
 
+The journal entry for the pass says the same in one line, for example
+`removed 3 snapshots: 3, 4, 9`, naming up to 20 ids and counting the rest.
+
 Pruning a snapshot removes its record and index rows. The space its objects
 held is reclaimed by garbage collection (section 12), which a schedule should
 follow.

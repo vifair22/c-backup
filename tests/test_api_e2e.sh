@@ -585,6 +585,17 @@ contains "a real pass names what it removed" \
     '"result":{"dry_run":false,"removed":[1,2],"count":2,' "$(sock_body "/jobs/$GFS")"
 check "retention reads keep_snaps from config" 2 \
     "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+
+# B039: the journal entry for a retention pass had an empty message.
+JOURNAL=$(sock_body '/repos/1/journal?limit=2')
+contains "the journal says what a pass removed" \
+    '"operation":"gfs","result":"success","duration_ms":' "$JOURNAL"
+contains "with its ids" '"message":"removed 2 snapshots: 1, 2"' "$JOURNAL"
+contains "and a dry run says it was one" '"message":"dry run: would remove 2 snapshots: 1, 2"' "$JOURNAL"
+check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10' \
+    | grep -o '"operation":"backup","result":"success","duration_ms":"[0-9]*","message":""' \
+    | wc -l | tr -d ' ')"
+
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \

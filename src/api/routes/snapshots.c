@@ -551,14 +551,18 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
     return st;
 }
 
+/* How many ids a gfs journal message names before it summarises the rest.
+ * The job result carries all of them; the journal is a one-line log. */
+#define GFS_SUMMARY_IDS 20
+
 /*
- * What a retention pass did, reported on the job.
+ * What a retention pass did, on the job and in the journal.
  *
  * A dry run's whole answer - which snapshots would go - reached only the
  * daemon log, so "gfs --dry-run" printed a job record saying "completed"
- * and nothing else. The retention values are reported too, since the
- * defaults and the per-repo policy combine here and nowhere else shows the
- * result.
+ * and nothing else, and the journal entry for a real pass had an empty
+ * message. The retention values are reported too, since the defaults and
+ * the per-repo policy combine here and nowhere else shows the result.
  */
 static void gfs_report(void *progress_ctx, int dry_run,
                        const gfs_retention_t *ret, const gfs_result_t *gr)
@@ -582,6 +586,23 @@ static void gfs_report(void *progress_ctx, int dry_run,
         job_set_result(progress_ctx, js);
         free(js);
     }
+
+    char msg[384];
+    size_t off = (size_t)snprintf(msg, sizeof(msg), "%s",
+                                  dry_run ? "dry run: would remove " : "removed ");
+    if (gr->pruned == 0) {
+        snprintf(msg + off, sizeof(msg) - off, "no snapshots");
+    } else {
+        off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%u snapshot%s:",
+                                gr->pruned, gr->pruned == 1 ? "" : "s");
+        uint32_t shown = gr->pruned < GFS_SUMMARY_IDS ? gr->pruned : GFS_SUMMARY_IDS;
+        for (uint32_t i = 0; i < shown && off < sizeof(msg); i++)
+            off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%s %u",
+                                    i ? "," : "", gr->ids[i]);
+        if (gr->pruned > shown && off < sizeof(msg))
+            snprintf(msg + off, sizeof(msg) - off, " and %u more", gr->pruned - shown);
+    }
+    job_set_summary(progress_ctx, msg);
 }
 
 static status_t snap_job_run(void *arg, volatile int *cancel,

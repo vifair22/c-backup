@@ -60,5 +60,13 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
 void job_progress_bytes(void *progress_ctx, uint64_t done, uint64_t total);
 void job_set_result(void *progress_ctx, const char *json_object);
 
+/*
+ * job_set_summary: one line of plain text saying what a successful job did,
+ * which becomes its journal entry's message. A failed job's message is its
+ * error, whatever was set here. Jobs that never call it journal an empty
+ * message, as every job did before. The text is copied.
+ */
+void job_set_summary(void *progress_ctx, const char *text);
+
 /* Request cancellation. Returns OK if the job exists and is not finished. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);

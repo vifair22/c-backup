@@ -451,7 +451,9 @@ A retention job's `result` says what it did, and on a dry run
 
 A real pass names `removed` instead of `would_remove`, listing only the
 snapshots it actually deleted. `retention` is what the pass applied: the
-repository's policy where it has one, the daemon defaults elsewhere.
+repository's policy where it has one, the daemon defaults elsewhere. The
+journal entry for the job carries the same in a line, such as `removed 2
+snapshots: 1, 2`, naming at most 20 ids and counting the rest.
 
 Any tag protects a snapshot from retention pruning. Tags are how a user says
 "keep this one", and deleting a tagged snapshot because a window rolled past
