@@ -125,6 +125,26 @@ status_t repo_path_normalize(const char *in, char *out, size_t outsz);
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id);
 
+/* What a registration did, for a caller that has to tell the cases apart. */
+typedef struct {
+    int64_t         id;
+    int             created;            /* a new repository was made on disk */
+    int             inserted;           /* a new row: created, or adopted */
+    int             already_registered; /* the row existed: same path or moved */
+    int             label_updated;      /* already registered, label changed */
+    repo_enc_mode_t enc_mode;           /* as the marker records it */
+} repo_register_out_t;
+
+/*
+ * repo_register_ex, reporting which case happened. Registering a repository
+ * that is already registered succeeds (that is the moved-repository path),
+ * applies a non-empty label that differs from the stored one, and leaves
+ * already_registered set. Asking for an encryption mode an existing
+ * repository does not have is ERR_INVALID.
+ */
+status_t repo_register_detail(cutils_db_t *db, const char *path, const char *label,
+                              repo_enc_request_t *enc, repo_register_out_t *out);
+
 status_t repo_register(cutils_db_t *db, const char *path, const char *label,
                        int64_t *out_repo_id);
 

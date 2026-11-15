@@ -72,6 +72,19 @@ on every authenticated request.
 | GET | `/repos/<id>` | One repository , including `encryption` and `key_escrowed` |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone |
 
+`POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
+stores that form. It answers:
+
+| Status | Body | When |
+|---|---|---|
+| 201 | `{id}`, plus `encryption` and key fields for an encrypted repository | a new registration: a repository created, or an existing one adopted |
+| 200 | `{id, already_registered: true, label_updated, encryption}` | the repository was already registered, at this path or, if it moved, at its old one |
+| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, or asks for an encryption mode the existing repository does not have |
+
+Re-registering is a success rather than a 409 because it is how a moved
+repository re-links. A non-empty `label` that differs from the stored one is
+applied (`label_updated: true`); an absent or empty one leaves it alone.
+
 ## Snapshots and browsing
 
 | Method | Path | Purpose |

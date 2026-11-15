@@ -380,6 +380,13 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links
   back to its snapshots.
+- Adding a repository that is already registered succeeds and says so
+  (`"already_registered":true`, HTTP 200 rather than 201). A label given
+  that differs from the stored one replaces it; leaving the label out keeps
+  the old one. Asking for an encryption mode the repository does not have is
+  refused: encryption is fixed when a repository is created.
+- Paths are stored normalised: `/srv/backup/main/` and
+  `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
   somebody else's data is the failure this prevents.
 - A path inside a registered repository, or one containing a registered

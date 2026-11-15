@@ -442,6 +442,58 @@ static repo_enc_request_t enc_request(repo_enc_mode_t mode, const char *pass)
 }
 
 /*
+ * B015: registering an already-registered path answered with the id alone
+ * and dropped the label it was given.
+ */
+static void test_reregister_reports_and_relabels(void **state)
+{
+    (void)state;
+    repo_register_out_t o;
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "old", NULL, &o), OK);
+    assert_true(o.created);
+    assert_true(o.inserted);
+    assert_false(o.already_registered);
+    int64_t id = o.id;
+
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "new", NULL, &o), OK);
+    assert_int_equal(o.id, id);
+    assert_true(o.already_registered);
+    assert_true(o.label_updated);
+    assert_false(o.inserted);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT label FROM repos", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "new");
+    db_result_free(r);
+
+    /* No label, or the same one, changes nothing. */
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "", NULL, &o), OK);
+    assert_true(o.already_registered);
+    assert_false(o.label_updated);
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "new", NULL, &o), OK);
+    assert_false(o.label_updated);
+    assert_int_equal(db_execute(db, "SELECT label FROM repos", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "new");
+    db_result_free(r);
+    assert_int_equal(count_repos(), 1);
+}
+
+/* An existing repository's encryption is fixed. Asking for another mode
+ * was accepted and recorded against a repository written otherwise. */
+static void test_reregister_refuses_a_different_encryption(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/plainrepo", NULL, &id), OK);
+    repo_enc_request_t e = enc_request(REPO_ENC_SYSTEM, NULL);
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/plainrepo", NULL, &e, &id),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "encryption none"));
+    assert_int_equal(e.key_hex[0], '\0');
+    err_clear();
+}
+
+/*
  * System mode: the key exists on the host and nowhere else, so registration
  * has to hand it back. If it did not, the only copy would be a file on the
  * machine being backed up, and losing that machine would take every offsite
@@ -679,6 +731,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_refuses_containing_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_allows_prefix_siblings, setup, teardown),
         cmocka_unit_test(test_enc_resolve),
+        cmocka_unit_test_setup_teardown(test_reregister_reports_and_relabels, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reregister_refuses_a_different_encryption, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),

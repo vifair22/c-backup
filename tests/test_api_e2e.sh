@@ -451,6 +451,19 @@ check "and creates nothing" 1 "$([ -e "$WORK/repo/nested" ]; echo $?)"
 contains "a repo around a repo is refused" "contains repository" \
     "$(repo_post_body "{\"path\":\"$WORK/deep/a\"}")"
 
+# B015: re-registering answered {"id":1} and dropped the new label. It is
+# still a success, because that is how a moved repository re-links, but it
+# says so and applies the label.
+RE=$(curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" \
+     -d "{\"path\":\"$WORK/repo\",\"label\":\"renamed\"}" http://localhost/repos)
+contains "re-register answers 200" ' 200' "$RE"
+contains "and says it was already registered" '"already_registered":true' "$RE"
+contains "and that the label changed" '"label_updated":true' "$RE"
+contains "the new label is stored" '"label":"renamed"' "$(sock_body /repos/1)"
+contains "a trailing slash is the same repository" '"id":1,"already_registered":true' \
+    "$(repo_post_body "{\"path\":\"$WORK/repo/\"}")"
+contains "and the label survives an empty one" '"label":"renamed"' "$(sock_body /repos/1)"
+
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
 # the socket did the setup.

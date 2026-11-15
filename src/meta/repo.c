@@ -626,6 +626,18 @@ static status_t provision_key(const char *uuid, repo_enc_request_t *enc,
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id)
 {
+    repo_register_out_t out;
+    status_t st = repo_register_detail(db, path, label, enc, &out);
+    if (st == OK && out_repo_id) *out_repo_id = out.id;
+    return st;
+}
+
+status_t repo_register_detail(cutils_db_t *db, const char *path, const char *label,
+                              repo_enc_request_t *enc, repo_register_out_t *out)
+{
+    repo_register_out_t discard;
+    if (!out) out = &discard;
+    memset(out, 0, sizeof(*out));
     if (!db || !path || !path[0])
         return set_error(ERR_INVALID, "repo_register: missing db or path");
 
@@ -687,7 +699,10 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
             st = repo_marker_write(path, &marker);
             if (st != OK) return st;
         }
-        return insert_repo_row(db, marker.uuid, path, label, out_repo_id);
+        out->created  = 1;
+        out->inserted = 1;
+        out->enc_mode = marker.enc_mode;
+        return insert_repo_row(db, marker.uuid, path, label, &out->id);
     }
 
     /* Non-empty. Only a valid marker makes this ours. */
@@ -706,6 +721,20 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                          path, marker.version);
 
     /*
+     * Encryption is the marker's to say, not the request's. Asking for a
+     * mode an existing repository does not have used to be accepted, and
+     * the route then recorded the requested mode against a repository whose
+     * objects were written otherwise - a plaintext repository listed as
+     * encrypted is the worst way round for that to be wrong.
+     */
+    if (enc && enc->mode != REPO_ENC_NONE && enc->mode != marker.enc_mode)
+        return set_error(ERR_INVALID,
+                         "%s is already a repository with encryption %s; "
+                         "encryption is decided when a repository is created",
+                         path, repo_enc_mode_name(marker.enc_mode));
+    out->enc_mode = marker.enc_mode;
+
+    /*
      * Known UUID: re-link, updating the path in case the repo moved.
      *
      * Moved is the case this exists for - a mount point that changed, a
@@ -722,7 +751,7 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
      * is meant is not something to guess.
      */
     db_result_t *r = NULL;
-    if (db_execute(db, "SELECT id, path FROM repos WHERE uuid = ?",
+    if (db_execute(db, "SELECT id, path, label FROM repos WHERE uuid = ?",
                    (const char *[]){ marker.uuid, NULL }, &r) == 0 &&
         r && r->nrows == 1) {
         int64_t id = strtoll(r->rows[0][0], NULL, 10);
@@ -756,13 +785,29 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
             err_clear();
         }
 
+        /*
+         * Registering an already-registered repository answered with its
+         * id and nothing else, and dropped the label it was given. That
+         * made `repo add` with a new label look like it had worked. A label
+         * that differs is applied; an absent or empty one leaves the stored
+         * label alone, because the CLI sends "" when none was typed.
+         */
+        int relabel = label && *label && strcmp(label, r->rows[0][2]) != 0;
         db_result_free(r);
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
         if (db_execute_non_query(db, "UPDATE repos SET path = ? WHERE id = ?",
                                  (const char *[]){ path, idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: path update to %s failed", (long long)id, path);
-        if (out_repo_id) *out_repo_id = id;
+        if (relabel) {
+            if (db_execute_non_query(db, "UPDATE repos SET label = ? WHERE id = ?",
+                                     (const char *[]){ label, idbuf, NULL }, NULL) != 0)
+                return set_error(ERR_IO, "cannot update label of repo %lld",
+                                 (long long)id);
+            out->label_updated = 1;
+        }
+        out->already_registered = 1;
+        out->id = id;
         return OK;
     }
     db_result_free(r);
@@ -771,7 +816,8 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
      * Adopt the existing UUID rather than minting a new one, so the repo
      * keeps its identity and a later reindex can repopulate its rows. */
     log_info("registering repo %s with pre-existing uuid %s", path, marker.uuid);
-    return insert_repo_row(db, marker.uuid, path, label, out_repo_id);
+    out->inserted = 1;
+    return insert_repo_row(db, marker.uuid, path, label, &out->id);
 }
 
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id)

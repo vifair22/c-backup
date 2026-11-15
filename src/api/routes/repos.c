@@ -160,8 +160,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     }
     if (enc.mode == REPO_ENC_PASSPHRASE) enc.passphrase = passphrase;
 
-    int64_t id = 0;
-    status_t st = repo_register_ex(db, path, label, &enc, &id);
+    repo_register_out_t reg;
+    status_t st = repo_register_detail(db, path, label, &enc, &reg);
+    int64_t id = reg.id;
 
     api_response_t out;
     if (st != OK) {
@@ -170,18 +171,36 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
          * problem to fix, not a server fault. */
         int code = (st == ERR_INVALID) ? 400 : 500;
         out = api_error(code, err_msg());
+    } else if (reg.already_registered) {
+        /*
+         * Success, not a 409: registering a repository that is already
+         * registered is how a moved repository is re-linked, so it has to
+         * keep working. What changes is that the answer says so, instead
+         * of a bare id indistinguishable from a fresh registration.
+         */
+        char *body = NULL;
+        int n = asprintf(&body,
+            "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
+            "\"encryption\":\"%s\"}",
+            (long long)id, reg.label_updated ? "true" : "false",
+            repo_enc_mode_name(reg.enc_mode));
+        out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
+        log_info("repo %lld at %s was already registered%s", (long long)id, path,
+                 reg.label_updated ? "; label updated" : "");
     } else {
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-        if (enc.mode != REPO_ENC_NONE &&
+        /* From the marker, not the request: an adopted repository brings
+         * its own mode, and recording what was asked for would be wrong. */
+        if (reg.enc_mode != REPO_ENC_NONE &&
             db_execute_non_query(db, "UPDATE repos SET encryption = ? WHERE id = ?",
-                                 (const char *[]){ repo_enc_mode_name(enc.mode),
+                                 (const char *[]){ repo_enc_mode_name(reg.enc_mode),
                                                    idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record encryption mode", (long long)id);
 
         char *body = NULL;
         int n;
-        if (enc.mode == REPO_ENC_SYSTEM) {
+        if (reg.created && reg.enc_mode == REPO_ENC_SYSTEM) {
             /*
              * The key is returned exactly once, because it exists in exactly
              * one other place: a file on this machine. Whoever is going to
@@ -195,10 +214,11 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 "It is not shown again, and without it every copy of this "
                 "repository is unreadable. Confirm with: c-backup repo key ack %lld\"}",
                 (long long)id, enc.key_hex, (long long)id);
-        } else if (enc.mode == REPO_ENC_PASSPHRASE) {
+        } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"passphrase\",\"key_escrowed\":true}",
-                (long long)id);
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s}",
+                (long long)id, repo_enc_mode_name(reg.enc_mode),
+                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false");
         } else {
             n = asprintf(&body, "{\"id\":%lld}", (long long)id);
         }
@@ -209,14 +229,14 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
 
         /* A passphrase repository is recoverable from the repository itself,
          * so there is nothing for the operator to file away. */
-        if (enc.mode == REPO_ENC_PASSPHRASE &&
+        if (reg.enc_mode == REPO_ENC_PASSPHRASE &&
             db_execute_non_query(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
                                  (const char *[]){ idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record escrow state", (long long)id);
 
         log_info("registered repo %lld at %s (%s)", (long long)id, path,
-                 repo_enc_mode_name(enc.mode));
-        if (enc.mode == REPO_ENC_SYSTEM)
+                 repo_enc_mode_name(reg.enc_mode));
+        if (reg.enc_mode == REPO_ENC_SYSTEM)
             log_warn("repo %lld holds a system-managed key that exists only in %s; "
                      "copy it elsewhere or a lost host means lost backups",
                      (long long)id, repo_key_dir());
