@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trigger.h"
+#include "json_row.h"
 
 #include <cutils/json.h>
 
@@ -207,18 +208,42 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
     status_t st = OK;
     char *type = NULL, *every = NULL, *at = NULL, *on = NULL;
     char path[128];
+    jreq_err_t je;
+    int rc;
+
+    /*
+     * Each field is told apart as missing, the wrong type, or out of range.
+     * They were all "is required", so "seconds":1e999 or "seconds":"3600"
+     * was told to send the field it had just sent (B112).
+     */
+    if (prefix && prefix[0]) {
+        jreq_type_t t = jreq_type(req, prefix);
+        if (t == JREQ_T_ABSENT) {
+            st = set_error(ERR_INVALID, "%s is required", prefix);
+            goto done;
+        }
+        if (t != JREQ_T_OBJECT) {
+            st = set_error(ERR_INVALID, "%s must be an object", prefix);
+            goto done;
+        }
+    }
 
     path_of(path, sizeof(path), prefix, "type");
-    if (json_req_get_str(req, path, &type) != 0 || !type) {
-        st = set_error(ERR_INVALID, "trigger: type is required");
+    rc = jreq_str(req, path, &type, &je);
+    if (rc != JREQ_OK) {
+        st = rc == JREQ_ABSENT ? set_error(ERR_INVALID, "trigger: type is required")
+                               : set_error(ERR_INVALID, "trigger: %s", je.msg);
         goto done;
     }
 
     if (strcmp(type, "interval") == 0) {
         uint64_t secs = 0;
         path_of(path, sizeof(path), prefix, "seconds");
-        if (json_req_get_u64(req, path, &secs, 1, UINT64_MAX) != 0) {
-            st = set_error(ERR_INVALID, "interval trigger: seconds is required");
+        rc = jreq_u64(req, path, &secs, 1, (uint64_t)INT64_MAX, &je);
+        if (rc != JREQ_OK) {
+            st = rc == JREQ_ABSENT
+                     ? set_error(ERR_INVALID, "interval trigger: seconds is required")
+                     : set_error(ERR_INVALID, "interval trigger: %s", je.msg);
             goto done;
         }
         out->type = TRIGGER_INTERVAL;
@@ -233,12 +258,15 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
 
     out->type = TRIGGER_CALENDAR;
     path_of(path, sizeof(path), prefix, "every");
-    if (json_req_get_str(req, path, &every) != 0 || !every) {
-        st = set_error(ERR_INVALID, "calendar trigger: every is required");
+    rc = jreq_str(req, path, &every, &je);
+    if (rc != JREQ_OK) {
+        st = rc == JREQ_ABSENT
+                 ? set_error(ERR_INVALID, "calendar trigger: every is required")
+                 : set_error(ERR_INVALID, "calendar trigger: %s", je.msg);
         goto done;
     }
     path_of(path, sizeof(path), prefix, "at");
-    if (json_req_get_str(req, path, &at) != 0 ||
+    if (jreq_str(req, path, &at, &je) != JREQ_OK ||
         parse_at(at, &out->at_hour, &out->at_min) != 0) {
         st = set_error(ERR_INVALID, "calendar trigger: at must be HH:MM");
         goto done;
@@ -258,8 +286,11 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
         uint32_t d = 0;
         out->every = CAL_MONTH;
         path_of(path, sizeof(path), prefix, "on_day");
-        if (json_req_get_u32(req, path, &d, 1, 31) != 0) {
-            st = set_error(ERR_INVALID, "monthly trigger: on_day must be 1-31");
+        rc = jreq_u32(req, path, &d, 1, 31, &je);
+        if (rc != JREQ_OK) {
+            st = rc == JREQ_ABSENT
+                     ? set_error(ERR_INVALID, "monthly trigger: on_day must be 1-31")
+                     : set_error(ERR_INVALID, "monthly trigger: %s", je.msg);
             goto done;
         }
         out->on_day = (int)d;
@@ -267,13 +298,19 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
         uint32_t d = 0, m = 0;
         out->every = CAL_YEAR;
         path_of(path, sizeof(path), prefix, "on_month");
-        if (json_req_get_u32(req, path, &m, 1, 12) != 0) {
-            st = set_error(ERR_INVALID, "yearly trigger: on_month is required");
+        rc = jreq_u32(req, path, &m, 1, 12, &je);
+        if (rc != JREQ_OK) {
+            st = rc == JREQ_ABSENT
+                     ? set_error(ERR_INVALID, "yearly trigger: on_month is required")
+                     : set_error(ERR_INVALID, "yearly trigger: %s", je.msg);
             goto done;
         }
         path_of(path, sizeof(path), prefix, "on_day");
-        if (json_req_get_u32(req, path, &d, 1, 31) != 0) {
-            st = set_error(ERR_INVALID, "yearly trigger: on_day is required");
+        rc = jreq_u32(req, path, &d, 1, 31, &je);
+        if (rc != JREQ_OK) {
+            st = rc == JREQ_ABSENT
+                     ? set_error(ERR_INVALID, "yearly trigger: on_day is required")
+                     : set_error(ERR_INVALID, "yearly trigger: %s", je.msg);
             goto done;
         }
         /*

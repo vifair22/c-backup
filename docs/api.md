@@ -29,10 +29,12 @@ while the first page through the index costs 93 us and beats it. The
 regression only exists if the API offers a way to ask for everything at once,
 so it does not. **No route returns a whole snapshot.**
 
-`limit` and `offset` must be plain decimal counts: `limit` 1 or more,
-`offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
-400 naming the parameter, and for `limit` the route's range: `limit must be
-a whole number from 1 to 1000 (a larger one is reduced to 1000)`. They used
+`limit` and `offset` must be whole numbers: `limit` 1 or more, `offset` 0
+or more. Something that is not a whole number (`+5`, `lots`, `1.5`) is a
+400 `<param> must be a whole number`; one below the minimum (`-1`, `0` for
+a limit) is a 400 naming the range, which for `limit` is the route's:
+`limit is out of range; it must be from 1 to 1000 (a larger one is reduced
+to 1000)`. They used
 to be replaced by the defaults, which answered a request the server had not
 understood as if it had. A `limit` above a route's maximum is clamped to it,
 however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
@@ -88,6 +90,50 @@ seconds and `mtime_nsec` within the second.
 Requests take the same types. Where a field used to be sent as text or as
 0/1 - a policy `value`, a schedule's `enabled` - the old form is still
 accepted.
+
+### Request errors
+
+Numeric query parameters (`limit`, `offset`, `snapshot` on search,
+`parent` on a tree listing, `from` and `to` on a diff) read numbers the
+same way and answer in the same words: something that is not a whole
+number is `<param> must be a whole number`, and a negative, oversized or
+unrepresentable one (`1e999`) is `<param> is out of range; it must be from
+<min> to <max>`. A valid id that names nothing is still a 404. An
+overflowing id used to be clamped and answered 404, as though it were
+merely unknown.
+
+A request body field is either absent or of its documented type. A field
+that is present with the wrong type is a 400 naming it and the type it
+must be, and nothing is changed:
+
+| Problem | Error |
+|---|---|
+| A required field is absent | `<field> is required` |
+| A string field holds anything else | `<field> must be a string` |
+| A boolean field holds anything else | `<field> must be true or false` |
+| A number field holds anything else | `<field> must be a number` |
+| A whole-number field holds a fraction | `<field> must be a whole number` |
+| A number outside the field's range, negative where it cannot be, or too large to represent (`1e999`) | `<field> is out of range; it must be from <min> to <max>` |
+| A list of strings is not a list, or an entry is not a string | `<field> must be a list of strings` (with the entry's position) |
+
+`null` is a value of the wrong type, not a way of leaving a field out: omit
+a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
+`one_filesystem`, `overwrite`, a schedule's `enabled`) still do. A nested
+field is named by its path, as in `interval trigger: trigger.seconds must
+be a number`. Integers are exact only up to 2^53, so a field whose type
+allows more is limited to that, and the range in the message says so.
+
+Each of these used to read as absent: an array `label` registered a
+repository with no label and answered 201, `"one_filesystem":true` was
+ignored because only `1` was read, and `"snap_id":1e999` was told
+`snap_id is required`.
+
+The request is checked before the state it acts on. A body that is wrong
+in itself is reported first, and only a sound one goes on to errors about
+the repository: missing configured sources (400), a key that is not loaded
+(409), a busy repository (503). A malformed schedule trigger on a
+repository with no sources is reported as the trigger error. A path or id
+in the URL that names nothing is still a 404 before the body is read.
 
 ## Public
 

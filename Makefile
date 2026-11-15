@@ -80,7 +80,7 @@ DEBUG_CFLAGS   := $(COMMON_CFLAGS) -Og -g $(ARCH_CFLAGS)
 ASAN_CFLAGS    := $(COMMON_CFLAGS) -O1 -g -fsanitize=address -fno-omit-frame-pointer $(ARCH_CFLAGS)
 
 CUTILS_LIB     := -L$(CUTILS_DIR)/build -lc-utils
-LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+LDFLAGS        := $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
 
 # Per-type CFLAGS/LDFLAGS selection
 ifeq ($(BUILD_TYPE),release)
@@ -97,7 +97,7 @@ else ifeq ($(BUILD_TYPE),debug)
   BIN_SUFFIX   := -debug
 else ifeq ($(BUILD_TYPE),asan)
   TYPE_CFLAGS  := $(ASAN_CFLAGS)
-  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+  TYPE_LDFLAGS := -static-libasan $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
   BIN_SUFFIX   := -asan
 endif
 
@@ -303,7 +303,7 @@ ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) | $(BINS)
 	$(CC) $(ASAN_TEST_CFLAGS) $^ -o $@ -static-libasan \
-	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lcmocka
+	    $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm -lcmocka
 
 test-asan: asan $(ASAN_TEST_BINS)
 	@for t in $(ASAN_TEST_BINS); do echo "=== $$t ==="; $$t || exit 1; done
@@ -344,7 +344,7 @@ FUZZ_SAN    := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-point
 FUZZ_CFLAGS := -std=c11 -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
                $(SRC_INCLUDES) -I $(TESTS) $(CUTILS_VERSION_DEF)
 FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
-                $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
+                $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm
 
 $(FUZZ_OBJ_DIR) $(FUZZ_BIN_DIR):
 	mkdir -p $@
@@ -459,7 +459,7 @@ fuzz-cov: $(MIGRATE_SRC)
 	    n=$$(basename $${t%.c}); \
 	    $(FUZZ_CC) $(FUZZCOV_CF) $$t $(FUZZCOV_OBJ)/*.o -o $(FUZZCOV_BIN)/$$n \
 	        -fsanitize=fuzzer -fprofile-instr-generate -fcoverage-mapping \
-	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread || exit 1; \
+	        $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread -lm || exit 1; \
 	done
 	@rm -rf $(FUZZCOV_DIR)/prof && mkdir -p $(FUZZCOV_DIR)/prof
 	@for t in $(FUZZCOV_BIN)/*; do \

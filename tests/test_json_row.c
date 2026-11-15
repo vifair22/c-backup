@@ -11,6 +11,7 @@
 
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -185,6 +186,249 @@ static void test_request_flags(void **state)
     assert_int_equal(v, 7);
 }
 
+/*
+ * B112: typed request fields. A present field of the wrong type used to read
+ * as absent, so the route said "is required" (or quietly used a default)
+ * about something the client had sent. Each case here pins the verdict and
+ * the message, since the message is what the client acts on.
+ */
+static cutils_json_req_t *req_of(const char *body)
+{
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(json_req_parse(body, strlen(body), &req), 0);
+    return req;
+}
+
+static void test_request_types(void **state)
+{
+    (void)state;
+    static const struct { const char *body; jreq_type_t t; } cases[] = {
+        { "{}",               JREQ_T_ABSENT },
+        { "{\"f\":null}",     JREQ_T_NULL   },
+        { "{\"f\":true}",     JREQ_T_BOOL   },
+        { "{\"f\":3}",        JREQ_T_NUMBER },
+        { "{\"f\":-1.5}",     JREQ_T_NUMBER },
+        { "{\"f\":1e999}",    JREQ_T_HUGE   },
+        { "{\"f\":-1e999}",   JREQ_T_HUGE   },
+        { "{\"f\":\"x\"}",    JREQ_T_STRING },
+        { "{\"f\":\"\"}",     JREQ_T_STRING },
+        { "{\"f\":[]}",       JREQ_T_ARRAY  },
+        { "{\"f\":[1]}",      JREQ_T_ARRAY  },
+        { "{\"f\":{}}",       JREQ_T_OBJECT },
+        { "{\"f\":{\"a\":1}}", JREQ_T_OBJECT },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cutils_json_req_t *req = req_of(cases[i].body);
+        if (jreq_type(req, "f") != cases[i].t) fail_msg("%s", cases[i].body);
+        json_req_free(req);
+    }
+}
+
+static void test_request_strings(void **state)
+{
+    (void)state;
+    static const char *const wrong[] = {
+        "{\"label\":[\"a\"]}", "{\"label\":{}}", "{\"label\":5}",
+        "{\"label\":true}", "{\"label\":null}",
+    };
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); i++) {
+        cutils_json_req_t *req = req_of(wrong[i]);
+        char *v = NULL;
+        jreq_err_t e;
+        assert_int_equal(jreq_str(req, "label", &v, &e), JREQ_BAD);
+        assert_null(v);
+        assert_string_equal(e.msg, "label must be a string");
+        json_req_free(req);
+    }
+
+    cutils_json_req_t *req = req_of("{\"label\":\"nightly\"}");
+    char *v = NULL;
+    jreq_err_t e;
+    assert_int_equal(jreq_str(req, "label", &v, &e), JREQ_OK);
+    assert_string_equal(v, "nightly");
+    free(v);
+    v = NULL;
+    assert_int_equal(jreq_str(req, "other", &v, &e), JREQ_ABSENT);
+    assert_null(v);
+    json_req_free(req);
+}
+
+static void test_request_bools(void **state)
+{
+    (void)state;
+    cutils_json_req_t *req = req_of("{\"t\":true,\"f\":false,\"n\":1,\"s\":\"true\"}");
+    bool b = false;
+    jreq_err_t e;
+    assert_int_equal(jreq_bool(req, "t", &b, &e), JREQ_OK); assert_true(b);
+    assert_int_equal(jreq_bool(req, "f", &b, &e), JREQ_OK); assert_false(b);
+    assert_int_equal(jreq_bool(req, "x", &b, &e), JREQ_ABSENT);
+    assert_int_equal(jreq_bool(req, "n", &b, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "n must be true or false");
+    assert_int_equal(jreq_bool(req, "s", &b, &e), JREQ_BAD);
+    json_req_free(req);
+}
+
+static int u32_of(const char *body, uint32_t *out, jreq_err_t *e)
+{
+    cutils_json_req_t *req = req_of(body);
+    int rc = jreq_u32(req, "snap_id", out, 1, UINT32_MAX, e);
+    json_req_free(req);
+    return rc;
+}
+
+static void test_request_u32(void **state)
+{
+    (void)state;
+    uint32_t v = 7;
+    jreq_err_t e;
+    assert_int_equal(u32_of("{\"snap_id\":3}", &v, &e), JREQ_OK);
+    assert_int_equal(v, 3);
+    assert_int_equal(u32_of("{\"snap_id\":4294967295}", &v, &e), JREQ_OK);
+    assert_int_equal(v, UINT32_MAX);
+    v = 7;
+    assert_int_equal(u32_of("{}", &v, &e), JREQ_ABSENT);
+    assert_int_equal(v, 7);
+
+    static const struct { const char *body; const char *msg; } bad[] = {
+        { "{\"snap_id\":1e999}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":-1e999}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":-1}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":0}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":4294967296}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":99999999999999999999}",
+          "snap_id is out of range; it must be from 1 to 4294967295" },
+        { "{\"snap_id\":1.5}",  "snap_id must be a whole number" },
+        { "{\"snap_id\":-0.5}", "snap_id must be a whole number" },
+        { "{\"snap_id\":\"3\"}", "snap_id must be a number" },
+        { "{\"snap_id\":true}",  "snap_id must be a number" },
+        { "{\"snap_id\":null}",  "snap_id must be a number" },
+        { "{\"snap_id\":[3]}",   "snap_id must be a number" },
+        { "{\"snap_id\":{}}",    "snap_id must be a number" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        v = 7;
+        if (u32_of(bad[i].body, &v, &e) != JREQ_BAD) fail_msg("%s", bad[i].body);
+        assert_string_equal(e.msg, bad[i].msg);
+        assert_int_equal(v, 7);
+    }
+}
+
+static void test_request_wide_ints(void **state)
+{
+    (void)state;
+    jreq_err_t e;
+    cutils_json_req_t *req = req_of(
+        "{\"a\":9007199254740992,\"b\":9007199254740994,\"c\":-12,"
+        "\"d\":-9007199254740994,\"t\":{\"seconds\":1e999}}");
+
+    uint64_t u = 0;
+    assert_int_equal(jreq_u64(req, "a", &u, 0, UINT64_MAX, &e), JREQ_OK);
+    assert_true(u == 9007199254740992ULL);
+    /* Past 2^53 the value read is not the value sent, so it is refused and
+     * the message gives the bound that actually applies. */
+    assert_int_equal(jreq_u64(req, "b", &u, 0, UINT64_MAX, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "b is out of range; it must be from 0 to 9007199254740992");
+    assert_int_equal(jreq_u64(req, "c", &u, 0, UINT64_MAX, &e), JREQ_BAD);
+
+    int64_t s = 0;
+    assert_int_equal(jreq_i64(req, "c", &s, INT64_MIN, INT64_MAX, &e), JREQ_OK);
+    assert_true(s == -12);
+    assert_int_equal(jreq_i64(req, "d", &s, INT64_MIN, INT64_MAX, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "d is out of range; it must be from "
+                               "-9007199254740992 to 9007199254740992");
+
+    /* A dot path is named as given, so a nested field says where it is. */
+    assert_int_equal(jreq_u64(req, "t.seconds", &u, 1, UINT64_MAX, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "t.seconds is out of range; it must be from 1 "
+                               "to 9007199254740992");
+    json_req_free(req);
+}
+
+static void test_request_string_lists(void **state)
+{
+    (void)state;
+    jreq_err_t e;
+    char **v = NULL;
+    size_t n = 0;
+
+    cutils_json_req_t *req = req_of("{\"p\":[\"/a\",\"/b\"],\"e\":[]}");
+    assert_int_equal(jreq_strv(req, "p", 8, &v, &n, &e), JREQ_OK);
+    assert_int_equal(n, 2);
+    assert_string_equal(v[0], "/a");
+    assert_string_equal(v[1], "/b");
+    jreq_strv_free(v, n);
+    v = NULL;
+    assert_int_equal(jreq_strv(req, "e", 8, &v, &n, &e), JREQ_OK);
+    assert_int_equal(n, 0);
+    assert_null(v);
+    assert_int_equal(jreq_strv(req, "x", 8, &v, &n, &e), JREQ_ABSENT);
+    assert_int_equal(jreq_strv(req, "p", 1, &v, &n, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "p takes at most 1 entries");
+    json_req_free(req);
+
+    req = req_of("{\"p\":[\"/a\",5],\"q\":\"/a\",\"r\":[null]}");
+    assert_int_equal(jreq_strv(req, "p", 8, &v, &n, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "p must be a list of strings; entry 2 is not one");
+    assert_int_equal(jreq_strv(req, "q", 8, &v, &n, &e), JREQ_BAD);
+    assert_string_equal(e.msg, "q must be a list of strings");
+    assert_int_equal(jreq_strv(req, "r", 8, &v, &n, &e), JREQ_BAD);
+    json_req_free(req);
+}
+
+/*
+ * Query-string numbers go through the same verdict as a body field, so the
+ * two word a mistake the same way.
+ */
+static void test_query_numbers(void **state)
+{
+    (void)state;
+    double d = 0.0;
+    static const char *const nums[] = { "0", "7", "-1", "1.5", "1e3", "1E+2",
+                                        "-0.0", "1e999", "99999999999999999999" };
+    for (size_t i = 0; i < sizeof(nums) / sizeof(nums[0]); i++)
+        if (jquery_number(nums[i], &d) != 0) fail_msg("%s", nums[i]);
+    static const char *const junk[] = { "", "-", "+5", " 3", "3 ", "lots", "0x10",
+                                        "010", "1.", ".5", "1e", "inf", "nan", "1,2" };
+    for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); i++)
+        if (jquery_number(junk[i], &d) != -1) fail_msg("'%s'", junk[i]);
+
+    int64_t v = 9;
+    jreq_err_t e;
+    assert_int_equal(jquery_i64(NULL, "snapshot", 1, UINT32_MAX, &v, &e), JREQ_ABSENT);
+    assert_int_equal(jquery_i64("12", "snapshot", 1, UINT32_MAX, &v, &e), JREQ_OK);
+    assert_true(v == 12);
+    assert_int_equal(jquery_i64("1e2", "snapshot", 1, UINT32_MAX, &v, &e), JREQ_OK);
+    assert_true(v == 100);
+
+    static const struct { const char *text; const char *msg; } bad[] = {
+        { "1e999", "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "-1",    "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "0",     "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "99999999999999999999",
+                   "snapshot is out of range; it must be from 1 to 4294967295" },
+        { "1.5",   "snapshot must be a whole number" },
+        { "abc",   "snapshot must be a whole number" },
+        { "",      "snapshot must be a whole number" },
+        { "+5",    "snapshot must be a whole number" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        v = 9;
+        if (jquery_i64(bad[i].text, "snapshot", 1, UINT32_MAX, &v, &e) != JREQ_BAD)
+            fail_msg("'%s'", bad[i].text);
+        assert_string_equal(e.msg, bad[i].msg);
+        assert_true(v == 9);
+    }
+    /* Wider than a double holds exactly: narrowed, and the message says so. */
+    assert_int_equal(jquery_i64("9007199254740994", "parent", 0, INT64_MAX, &v, &e),
+                     JREQ_BAD);
+    assert_string_equal(e.msg, "parent is out of range; it must be from 0 to 9007199254740992");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -197,6 +441,13 @@ int main(void)
         cmocka_unit_test(test_row),
         cmocka_unit_test(test_resp_row),
         cmocka_unit_test(test_request_flags),
+        cmocka_unit_test(test_request_types),
+        cmocka_unit_test(test_request_strings),
+        cmocka_unit_test(test_request_bools),
+        cmocka_unit_test(test_request_u32),
+        cmocka_unit_test(test_request_wide_ints),
+        cmocka_unit_test(test_request_string_lists),
+        cmocka_unit_test(test_query_numbers),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
