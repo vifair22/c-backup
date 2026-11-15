@@ -6,6 +6,130 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - Benchmarks rebuilt on the daemon engine
+
+`make bench` had not built since the daemon rewrite. `BENCH_CFLAGS` kept its
+own `-I` list, which lacked `src/meta`, `src/scheduler`, `src/config`,
+`src/daemon`, `src/api/routes` and the c-utils headers, and four harnesses
+included headers the rewrite removed (`snapshot.h`, `ls.h`). `BENCH_CFLAGS`
+now uses `$(SRC_INCLUDES)` and the daemon's warning set, and every harness
+compiles clean under it.
+
+| Harness | Fate |
+|---------|------|
+| `bench_micro` | Unchanged apart from `-Wpedantic` fixes |
+| `bench_phases` | Rewritten: first backup, no-change incremental and restore through `backup_run`, `repo_pack` and `restore_run`, with the daemon's own phase profile |
+| `bench_browse` | Rewritten: the routes' SQL against the `nodes` table and `node_fts`, on a snapshot made by `backup_run` |
+| `bench_browse_sqlite` | Retired |
+| `bench_manifest` | Retired |
+| `bench_fuse_xfer` | Unchanged; built on demand, not part of `make bench` |
+
+**Why two were retired rather than ported.** `bench_browse_sqlite` raced the
+pre-rewrite `.snap` browse path against a prototype SQLite node table, and
+`bench_manifest` measured manifest-tree dedup and node-table size before
+either existed. Both questions were decided and are now the shipped design:
+the pre-rewrite format they compared against no longer exists in this tree,
+and the SQLite side of the comparison is what `bench_browse` now measures
+directly. Their results stay where they were recorded, in
+"2026-08-19 - Browse-path baseline and SQLite evaluation" and
+"2026-08-19 - Manifest trees and derived-index sizing" below. The manifest
+determinism they checked is asserted by `tests/test_manifest_tree.c` and
+`tests/test_backup_incremental.c`, and `bench_phases` prints new and reused
+tree counts for every backup.
+
+### Results, default settings
+
+Machine: i7-1265U laptop (2P+8E cores, 12 threads), 16 GB RAM, GCC 16.2.1,
+Linux 7.2.15, built with the Makefile default `-O3 -flto -march=znver3`.
+Working directories on `/tmp`, which is tmpfs here, so every figure below is
+CPU and memory, not storage. Not comparable with the 2026-04-02 baseline: a
+different machine, and different harnesses measuring a different engine.
+
+#### `bench_micro`
+
+| Benchmark | Result | Unit |
+|-----------|-------:|------|
+| lz4_decompress_16M | 19,677 | MiB/s |
+| lz4_compress_16M | 15,498 | MiB/s |
+| rs_parity_decode_clean_16M | 2,687 | MiB/s |
+| rs_parity_encode_16M | 3,709 | MiB/s |
+| rs_encode_single | 65.2 | Mops/s |
+| sha256_evp_small_256B | 4.6 | Mops/s |
+| sha256_evp_stream_16M | 2,191 | MiB/s |
+| sha256_oneshot_16M | 2,203 | MiB/s |
+| sha256_oneshot_1M | 2,211 | MiB/s |
+| sha256_oneshot_64K | 2,202 | MiB/s |
+| sha256_oneshot_4K | 2,071 | MiB/s |
+
+The two `crc32c` rows (1.09e9 and 266,307 MiB/s) are omitted: the compiler
+hoists the loop-invariant call out of the timing loop, as it did in the
+2026-04-02 run, so they measure nothing.
+
+#### `bench_phases`
+
+10,000 small files (mean 4 KiB, half-compressible, all distinct), 3 x 64 MiB
+random, 2 x 64 MiB identical text: 10,005 files, 359 MiB.
+
+| Step | Time | Rate |
+|------|-----:|-----:|
+| first backup | 0.789 s | 12,676 files/s, 455 MiB/s |
+| its pack | 0.014 s | 1 object (the text) |
+| incremental, nothing changed | 0.198 s | 50,572 files/s |
+| restore | 0.509 s | 19,647 files/s, 705 MiB/s |
+
+The daemon's profile of the first backup: read+hash+write 0.44 s (62%, of
+which `obj:io-loop` 0.22 s for the five large files), index-nodes 0.10 s,
+index-put 0.06 s, cache-put 0.05 s, cache-lookup 0.03 s, scan 0.02 s, trees
+0.01 s. The incremental is still half `index_nodes` (0.10 s of 0.20 s)
+rewriting every node row for a snapshot in which nothing changed, as recorded
+on 2026-08-25.
+
+Options (`-n -s -l -t -m`, or `BENCH_*` variables) size the tree, `-d` puts
+it on a real filesystem, and `-c` evicts the source from the page cache
+before each backup and includes a trailing `sync` in every timing, which is
+the shape the B086 measurements above used.
+
+#### `bench_browse`
+
+100,000 files in directories of 40, a 40-entry probe directory, a
+10,000-entry directory, a 24-level chain; 4 snapshots (one backup and three
+unchanged). 450,288 node rows, 112,572 per snapshot, `state.db` 226.8 MiB.
+Building it took 15.8 s.
+
+| Benchmark | Result | Unit |
+|-----------|-------:|------|
+| cold_open_first_listing | 226.9 | us/op |
+| list_snapshot_root | 21.5 | us/op |
+| expand_40child_dir | 51.1 | us/op |
+| expand_wide_first_page (200 of 10k) | 166.0 | us/op |
+| expand_wide_last_page (offset 9,800) | 376.2 | us/op |
+| expand_wide_all_pages (50 pages) | 13,852.7 | us/op |
+| resolve_path_deep (29 components) | 111.9 | us/op |
+| resolve_path_bulk_file (6 components) | 23.4 | us/op |
+| snapshot_switch (resolve+list) | 66.6 | us/op |
+| search_one_snap_rare | 204.3 | us/op |
+| search_one_snap_common | 230,868.0 | us/op |
+| search_one_snap_common_oldest | 274.0 | us/op |
+| search_all_snaps_rare | 204.9 | us/op |
+| search_all_snaps_common | 1,783.4 | us/op |
+
+Browsing is what the 2026-08-19 evaluation predicted: a 40-entry directory
+in 51 us against 107 us under the old format at the same snapshot size, and a
+snapshot switch in 67 us against 2,078 us. The old figures came from the
+desktop in the header, so if anything the comparison flatters the old code.
+
+**Search scoped to the newest snapshot is the outlier, at 231 ms.** The
+snapshot filter sits on the joined `nodes` row, not in `node_fts`, so the
+trigram index yields every snapshot's matches in insertion order and the
+query rejects the older snapshots' rows before it reaches the current one.
+The same search against the oldest snapshot takes 274 us. The cost grows
+with matches times retained snapshots, and the newest snapshot is the one a
+user searches. Not addressed here; recorded so it is not rediscovered.
+
+`OFFSET` paging costs 2.3x more on the last page of a 10k directory than on
+the first, which is acceptable at this size and grows linearly with the
+offset.
+
 ## 2026-11-15 - Large-file first backup, pipelined (B086)
 
 UAT reported a first backup of 16 GiB (6 x 2 GiB random, 2 x 2 GiB identical
