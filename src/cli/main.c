@@ -473,13 +473,11 @@ static int cmd_repo(int argc, char **argv)
     }
 
     if (strcmp(argv[0], "remove") == 0) {
-        int a = argc; char **v = argv;
-        int purge = take_flag(&a, v, "--purge");
-        if (a < 2) return fail("usage: repo remove <id> [--purge]");
+        /* Deregisters. The repository directory stays where it is. */
+        if (argc < 2) return fail("usage: repo remove <id>");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/");
-        sb_puts(&p, v[1]);
-        if (purge) sb_puts(&p, "?purge=1");
+        sb_puts(&p, argv[1]);
         return call_path_sb("DELETE", &p, NULL);
     }
 

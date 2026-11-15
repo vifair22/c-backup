@@ -176,6 +176,11 @@ check "refuses foreign dir" 400 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
        -d "{\"path\":\"$WORK/foreign\"}" http://localhost/repos)"
 check "foreign dir untouched" "data.txt" "$(ls "$WORK/foreign")"
+# purge was accepted and deleted nothing. Refused now, and refused before
+# anything happens: the repository is still registered afterwards.
+check "purge is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" 'http://localhost/repos/1?purge=1')"
+check "a refused purge deregisters nothing" 200 "$(sock_code /repos/1)"
 
 echo "backup"
 BACKUP_RESP=$(curl -s -X POST --unix-socket "$SOCK" -d "{\"paths\":[\"$WORK/src\"]}" \

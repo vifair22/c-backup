@@ -279,13 +279,22 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
     const char *tail = url_tail(req->url, "/repos/");
     if (!tail) return api_error(400, "repo id required");
 
+    /*
+     * Deregistering never deletes backup data, and purge used to say it
+     * would: it was accepted, logged a warning, and left everything in
+     * place while the response said the request had succeeded. Refused
+     * instead, so nobody believes a repository is gone when it is not.
+     */
     const char *purge = api_query_param(req, "purge");
-    int do_purge = purge && (strcmp(purge, "1") == 0 || strcmp(purge, "true") == 0);
+    if (purge && (strcmp(purge, "1") == 0 || strcmp(purge, "true") == 0))
+        return api_error(400, "purge is not supported: deregistering leaves the "
+                              "repository directory alone; delete it yourself "
+                              "once you are sure");
 
     int64_t id = strtoll(tail, NULL, 10);
     if (id <= 0) return api_error(400, "invalid repo id");
 
-    status_t st = repo_deregister(db, id, do_purge);
+    status_t st = repo_deregister(db, id);
     if (st != OK) return api_error(500, err_msg());
 
     log_info("deregistered repo %lld", (long long)id);

@@ -60,7 +60,7 @@ export type ApiRequest =
   | { kind: 'repoShow'; repoId: number }
   | { kind: 'repoAdd'; path: string; label?: string
       encrypt?: 'system' | 'passphrase'; passphrase?: string }
-  | { kind: 'repoRemove'; repoId: number; purge?: boolean }
+  | { kind: 'repoRemove'; repoId: number }
 
   /* --- encryption --- */
   | { kind: 'keyExport'; repoId: number }

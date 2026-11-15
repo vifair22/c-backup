@@ -264,6 +264,12 @@ contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
 
+# Removing a repository deregisters it and leaves its data where it was.
+RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
+check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
+contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
+
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the
 # key was never handed to the store and every byte went to disk in the clear.

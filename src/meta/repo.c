@@ -514,32 +514,12 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
     return insert_repo_row(db, marker.uuid, path, label, out_repo_id);
 }
 
-status_t repo_deregister(cutils_db_t *db, int64_t repo_id, int purge)
+status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
 {
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", (long long)repo_id);
-
-    char path[PATH_MAX] = { 0 };
-    if (purge) {
-        db_result_t *r = NULL;
-        if (db_execute(db, "SELECT path FROM repos WHERE id = ?",
-                       (const char *[]){ idbuf, NULL }, &r) == 0 &&
-            r && r->nrows == 1)
-            snprintf(path, sizeof(path), "%s", r->rows[0][0]);
-        db_result_free(r);
-    }
-
     if (db_execute_non_query(db, "DELETE FROM repos WHERE id = ?",
                              (const char *[]){ idbuf, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot delete repo %lld", (long long)repo_id);
-
-    if (purge && path[0]) {
-        /* Deliberately not recursive here: removing a user's backup data on
-         * a deregister is destructive enough that it belongs behind an
-         * explicit job with its own confirmation, not a DELETE handler. */
-        log_warn("purge requested for repo %lld at %s: data removal is not "
-                 "performed by deregister; delete the directory manually",
-                 (long long)repo_id, path);
-    }
     return OK;
 }
