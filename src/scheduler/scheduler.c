@@ -101,6 +101,20 @@ status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
     return recompute(db, schedule_id, now, 0);
 }
 
+/* Off, with the reason recorded where the schedule list shows it. The log
+ * line alone left a schedule reading "enabled": false with nothing to say
+ * whether a person or the daemon did that. */
+static void disable_schedule(cutils_db_t *db, int64_t schedule_id, const char *why)
+{
+    log_warn("scheduler: disabling schedule %lld: %s", (long long)schedule_id, why);
+    char idb[32];
+    snprintf(idb, sizeof(idb), "%lld", (long long)schedule_id);
+    if (db_execute_non_query(db,
+            "UPDATE schedules SET enabled = 0, disabled_reason = ? WHERE id = ?",
+            (const char *[]){ why, idb, NULL }, NULL) != 0)
+        log_warn("scheduler: cannot disable schedule %s", idb);
+}
+
 /*
  * on_overlap decides what happens when a schedule comes due while its own
  * previous run is still going.
@@ -179,15 +193,10 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
          */
         trigger_t parsed;
         if (trigger_parse(r->rows[i][5], &parsed) != OK) {
-            log_warn("scheduler: disabling schedule %lld with unparseable trigger: %s",
-                     (long long)sid, err_msg());
+            char why[320];
+            snprintf(why, sizeof(why), "invalid trigger: %s", err_msg());
             err_clear();
-            char idb[32];
-            snprintf(idb, sizeof(idb), "%lld", (long long)sid);
-            if (db_execute_non_query(sched->db,
-                    "UPDATE schedules SET enabled = 0 WHERE id = ?",
-                    (const char *[]){ idb, NULL }, NULL) != 0)
-                log_warn("scheduler: cannot disable schedule %s", idb);
+            disable_schedule(sched->db, sid, why);
             continue;
         }
 
@@ -214,15 +223,10 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
          * kept its old due time would fire again on the next tick, and every
          * tick after that. */
         if (scheduler_recompute(sched->db, sid, now) != OK) {
-            log_warn("scheduler: disabling schedule %lld: %s",
-                     (long long)sid, err_msg());
+            char why[320];
+            snprintf(why, sizeof(why), "%s", err_msg());
             err_clear();
-            char idb[32];
-            snprintf(idb, sizeof(idb), "%lld", (long long)sid);
-            if (db_execute_non_query(sched->db,
-                    "UPDATE schedules SET enabled = 0 WHERE id = ?",
-                    (const char *[]){ idb, NULL }, NULL) != 0)
-                log_warn("scheduler: cannot disable schedule %s", idb);
+            disable_schedule(sched->db, sid, why);
         }
     }
     db_result_free(r);

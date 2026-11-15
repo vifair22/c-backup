@@ -154,7 +154,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
           pattern: req.pattern,
           snapshot: req.snapshot,
           path_prefix: req.pathPrefix,
-          ignore_case: req.ignoreCase ? 1 : undefined,
+          ignore_case: req.ignoreCase ? true : undefined,
           max_files: req.maxFiles,
         },
       }

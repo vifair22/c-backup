@@ -35,15 +35,23 @@ status_t http_request(const char *socket_path, const char *method,
 void http_response_free(http_response_t *r);
 
 /*
- * GET a streaming response and copy its body to `out` as it arrives,
- * flushing after every read.
+ * Receives a streamed body as it arrives. A non-OK return stops the stream
+ * and is returned from http_stream, with the sink's error message intact.
+ */
+typedef status_t (*http_sink_fn)(void *ud, const char *buf, size_t n);
+
+/*
+ * GET a streaming response and hand its body to `sink` as it arrives, one
+ * call per read.
  *
  * http_request reads to EOF before returning anything, which is right for a
  * JSON reply and wrong for server-sent events: `jobs watch` sat silent until
  * the job ended, however many progress frames the daemon had sent. Chunked
  * transfer encoding is decoded if the server uses it. *out_status receives
- * the HTTP status; a non-2xx body is copied all the same, and the caller
- * decides which stream it belongs on by passing `out`.
+ * the HTTP status. Only a 2xx body goes to the sink: anything else is an
+ * error document, not a stream, and is copied to `err_out` (dropped when it
+ * is NULL).
  */
 status_t http_stream(const char *socket_path, const char *path,
-                     FILE *out, FILE *err_out, int *out_status);
+                     http_sink_fn sink, void *ud, FILE *err_out,
+                     int *out_status);

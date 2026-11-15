@@ -71,10 +71,11 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
  * callback with the counters first.
  */
 struct store;
+struct pack_report;
 status_t routes_run_pack(struct store *store, int64_t repo_id,
                          volatile int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx);
+                         void *progress_ctx, struct pack_report *out);
 
 /*
  * Read a boolean policy flag, falling back to def when the repo has not set
@@ -152,6 +153,14 @@ void journal_record(cutils_db_t *db, int64_t repo_id, const char *source,
 /* Schedule CRUD. Repo-scoped sub-handlers, dispatched from repos.c. */
 struct scheduler;
 void routes_schedules_init(cutils_db_t *db, struct scheduler *sched);
+/*
+ * Hold every enabled schedule to the rules the route applies to a new one,
+ * and disable each that fails, logging which and why and recording the
+ * reason for the list to show. Rows written before a rule existed survive an
+ * upgrade otherwise. Run at startup before the scheduler first reads them.
+ * Returns how many were disabled, or -1 when the table cannot be read.
+ */
+int routes_schedules_audit(cutils_db_t *db);
 api_response_t schedules_get(const api_request_t *req, int64_t repo_id);
 api_response_t schedules_post(const api_request_t *req, int64_t repo_id);
 api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,

@@ -33,26 +33,83 @@ typedef struct {
     size_t len, cap;
 } mbuf_t;
 
+/* Formats straight into the buffer. It went through a 512-byte line and
+ * copied the truncated result, which was fine for fixed text and is not for
+ * a line carrying a repository label of any length: a cut-off line is an
+ * unterminated label value, and that fails the whole scrape. */
 static void mb_addf(mbuf_t *m, const char *fmt, ...)
 {
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
-    char line[512];
-    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    if (n < 0) return;
+    if (n < 0) { va_end(ap2); return; }
 
     if (m->len + (size_t)n + 1 > m->cap) {
         size_t cap = m->cap ? m->cap * 2 : 4096;
         while (cap < m->len + (size_t)n + 1) cap *= 2;
         char *grown = realloc(m->buf, cap);
-        if (!grown) return;
+        if (!grown) { va_end(ap2); return; }
         m->buf = grown;
         m->cap = cap;
     }
-    memcpy(m->buf + m->len, line, (size_t)n);
+    vsnprintf(m->buf + m->len, m->cap - m->len, fmt, ap2);
+    va_end(ap2);
     m->len += (size_t)n;
-    m->buf[m->len] = '\0';
+}
+
+/*
+ * A label value per the text exposition format: backslash, double quote and
+ * line feed are escaped, everything else is literal. A repository label is
+ * free text, so a quote in one would otherwise end the value early and make
+ * the scrape unparseable. NULL on allocation failure.
+ */
+static char *label_escape(const char *s)
+{
+    size_t n = strlen(s);
+    char *out = malloc(n * 2 + 1);
+    if (!out) return NULL;
+    char *o = out;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\')      { *o++ = '\\'; *o++ = '\\'; }
+        else if (*p == '"')  { *o++ = '\\'; *o++ = '"'; }
+        else if (*p == '\n') { *o++ = '\\'; *o++ = 'n'; }
+        else                 *o++ = *p;
+    }
+    *o = '\0';
+    return out;
+}
+
+/*
+ * Which repository an age gauge is about, as an info series: one series,
+ * value 1, naming the repository in its labels.
+ *
+ * The ages are the stalest repository's, so an alert on them knew something
+ * was stale and not what. Per-repository series would answer that and are
+ * ruled out: a label per repository multiplies every series by the
+ * repository count, and these are daemon-wide aggregates by decision. One
+ * series whose labels change when a different repository becomes the
+ * stalest costs one series, and an alert can join on it or template its
+ * labels into the message. The query must order repositories by exactly the
+ * age the gauge takes the maximum of, ties to the lowest id, so the two
+ * never disagree. Absent with no repositories, like the gauge.
+ */
+static void emit_stalest_info(mbuf_t *m, const char *name, const char *help,
+                              const char *sql)
+{
+    db_result_t *r = NULL;
+    if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return;
+    }
+    char *label = label_escape(r->rows[0][1] ? r->rows[0][1] : "");
+    if (label) {
+        mb_addf(m, "# HELP %s %s\n# TYPE %s gauge\n%s{repo_id=\"%lld\",label=\"%s\"} 1\n",
+                name, help, name, name, strtoll(r->rows[0][0], NULL, 10), label);
+        free(label);
+    }
+    db_result_free(r);
 }
 
 /* Single-value query; -1 when it cannot be answered, including a NULL
@@ -131,6 +188,12 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - COALESCE("
                 "(SELECT MAX(s.ts) FROM snapshots s WHERE s.repo_id = r.id), r.added_at))"
                 " FROM repos r");
+    emit_stalest_info(&m, "cbackup_stalest_snapshot_repo_info",
+                "The repository cbackup_last_snapshot_age_seconds measures: the one whose "
+                "newest snapshot (or registration, if it has none) is oldest. Always 1.",
+                "SELECT r.id, r.label FROM repos r ORDER BY COALESCE("
+                "(SELECT MAX(s.ts) FROM snapshots s WHERE s.repo_id = r.id), r.added_at) ASC,"
+                " r.id ASC LIMIT 1");
     emit_scalar(&m, "cbackup_repos_never_backed_up",
                 "Repositories with no snapshot.", "gauge",
                 "SELECT COUNT(*) FROM repos r WHERE NOT EXISTS"
@@ -164,6 +227,13 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "(SELECT MAX(v.finished_at) FROM verify_runs v"
                 "  WHERE v.repo_id = r.id AND v.completed = 1), r.added_at))"
                 " FROM repos r");
+    emit_stalest_info(&m, "cbackup_stalest_verify_repo_info",
+                "The repository cbackup_last_verify_age_seconds measures: the one whose "
+                "last completed verify (or registration, if it has none) is oldest. Always 1.",
+                "SELECT r.id, r.label FROM repos r ORDER BY COALESCE("
+                "(SELECT MAX(v.finished_at) FROM verify_runs v"
+                "  WHERE v.repo_id = r.id AND v.completed = 1), r.added_at) ASC,"
+                " r.id ASC LIMIT 1");
     emit_scalar(&m, "cbackup_repos_never_verified",
                 "Repositories with no completed verify.", "gauge",
                 "SELECT COUNT(*) FROM repos r WHERE NOT EXISTS"
