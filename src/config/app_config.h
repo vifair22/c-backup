@@ -119,6 +119,15 @@ static const config_section_t app_sections[] = {
     { NULL, NULL }
 };
 
+/* Upper bound on jobs.max_parallel. One worker thread each, and jobs for
+ * one repository serialise anyway, so more than this buys nothing. */
+#define APP_MAX_PARALLEL_JOBS 256
+
+/* Ranges, enumerations and the bind address, checked during config init
+ * alongside c-utils' own checks (app_config.c). */
+void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
+                      void *ctx);
+
 /* Generated from migrations/ by c-utils' embed_sql.sh at build time. */
 extern const db_migration_t app_migrations[];
 
@@ -150,12 +159,14 @@ static inline appguard_config_t app_appguard_config(void)
         /*
          * Refuse to start on a config file the daemon cannot honour: a line
          * outside c-utils' YAML subset, an unknown or misspelt key, a value
-         * of the wrong type, a log.level that is not a level. Each of those
+         * of the wrong type or out of range, a log.level that is not a level, an
+         * http.bind that is not an address (app_config_check). Each of those
          * used to start the daemon normally and run it on defaults the
          * operator never chose, with nothing in the log to say so. Every
          * problem is printed with its file and line before the exit.
          */
         .config_validate        = CFG_VALIDATE_STRICT,
+        .config_check           = app_config_check,
     };
     return cfg;
 }

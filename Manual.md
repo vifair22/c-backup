@@ -293,16 +293,16 @@ are different: they live in the database and change through the policy API
 
 | Key | Default | Meaning |
 |---|---|---|
-| `db.path` | `state.db` in the working directory | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db` |
+| `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
-| `http.port` | `8765` | TCP port for remote clients. `0` disables TCP |
-| `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
+| `http.port` | `8765` | TCP port for remote clients, 0 to 65535. `0` disables TCP |
+| `http.bind` | `127.0.0.1` | TCP bind address, an IPv4 address (not a hostname). `0.0.0.0` for every interface |
 | `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
-| `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
+| `auth.cookie_secure` | `0` | `1` sets `Secure` on session cookies. Only behind HTTPS |
 | `log.level` | `info` | `debug`, `info`, `warn` (or `warning`), `error`. Anything else stops the daemon at start |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
-| `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run |
-| `jobs.max_parallel` | `2` | Jobs running at once, across all repositories |
+| `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
+| `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
@@ -311,7 +311,7 @@ are different: they live in the database and change through the policy API
 | `retention.keep_yearly` | `3` | Yearly snapshots kept |
 
 The `retention.*` keys are defaults for repositories that have not set their
-own (section 9).
+own (section 9). Each is a whole number, 0 or more.
 
 The daemon refuses to start on a file it cannot honour, rather than running
 on defaults nobody chose. Each problem is printed with the file and line,
@@ -330,14 +330,19 @@ What stops it:
 | A line the parser does not understand | `log: [debug]`, a nested key, a top-level `verbose: true`, an unclosed `"`, a single-quoted value, a key indented differently from the rest of its section |
 | An unknown key, or one in an unknown section | `security.key_dri`, `mystery.thing` |
 | A key set twice | |
-| A number that is not one | `jobs.max_parallel: eighty`, or a value out of range |
+| A number that is not one | `jobs.max_parallel: eighty`, or one too large for an integer |
+| A number outside the range in the table above | `http.port: 99999`, `jobs.max_parallel: 0`, `retention.keep_daily: -1`, `auth.cookie_secure: 2` |
+| An `http.bind` that is not an IPv4 address | `localhost`, `not-an-ip` |
+| A missing `db.path` | `<file>: error: required config key 'db.path' is missing or empty; it has no default` |
+| A tab in the indentation | YAML indents with spaces |
 | A `log.level` that is not a level | `log.level: chatty` |
 | A `backup.file_cache_match` that is not a mode | `fast` |
 
 The file format is a small subset of YAML: sections at the left margin, each
-holding `key: value` lines indented the same way, `#` comments, and double
-quotes around a value that contains ` #`. Nothing else: no lists, no nesting,
-no single quotes, no anchors. The c-utils Manual (section 5) lists the subset
+holding `key: value` lines indented the same way with spaces, `#` comments,
+and double quotes around a value that contains ` #`. Nothing else: no lists,
+no nesting, no single quotes, no anchors. Windows line endings (CRLF) and a
+UTF-8 byte order mark are accepted. The c-utils Manual (section 5) lists the subset
 exactly.
 
 Every key can also be set from the environment: `C_BACKUP_` followed by the
