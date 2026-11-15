@@ -441,6 +441,18 @@ or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
 `/repos/<id>/gfs` is called or a `gfs` schedule fires, never as a side effect
 of a backup.
 
+A retention job's `result` says what it did, and on a dry run
+(`?dry_run=1`) what it would do:
+
+```json
+{"dry_run":true,"would_remove":[1,2],"count":2,
+ "retention":{"keep_snaps":2,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+```
+
+A real pass names `removed` instead of `would_remove`, listing only the
+snapshots it actually deleted. `retention` is what the pass applied: the
+repository's policy where it has one, the daemon defaults elsewhere.
+
 Any tag protects a snapshot from retention pruning. Tags are how a user says
 "keep this one", and deleting a tagged snapshot because a window rolled past
 would be the worst kind of surprise.

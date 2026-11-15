@@ -551,6 +551,39 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
     return st;
 }
 
+/*
+ * What a retention pass did, reported on the job.
+ *
+ * A dry run's whole answer - which snapshots would go - reached only the
+ * daemon log, so "gfs --dry-run" printed a job record saying "completed"
+ * and nothing else. The retention values are reported too, since the
+ * defaults and the per-repo policy combine here and nowhere else shows the
+ * result.
+ */
+static void gfs_report(void *progress_ctx, int dry_run,
+                       const gfs_retention_t *ret, const gfs_result_t *gr)
+{
+    /* 11 bytes per id covers ten digits and a comma. */
+    size_t cap = 320 + (size_t)gr->pruned * 11;
+    char *js = malloc(cap);
+    if (js) {
+        size_t off = (size_t)snprintf(js, cap, "{\"dry_run\":%s,\"%s\":[",
+                                      dry_run ? "true" : "false",
+                                      dry_run ? "would_remove" : "removed");
+        for (uint32_t i = 0; i < gr->pruned && off < cap; i++)
+            off += (size_t)snprintf(js + off, cap - off, "%s%u", i ? "," : "", gr->ids[i]);
+        if (off < cap)
+            snprintf(js + off, cap - off,
+                     "],\"count\":%u,\"retention\":{\"keep_snaps\":%d,"
+                     "\"keep_daily\":%d,\"keep_weekly\":%d,"
+                     "\"keep_monthly\":%d,\"keep_yearly\":%d}}",
+                     gr->pruned, ret->keep_snaps, ret->keep_daily,
+                     ret->keep_weekly, ret->keep_monthly, ret->keep_yearly);
+        job_set_result(progress_ctx, js);
+        free(js);
+    }
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -666,9 +699,12 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         /* Manual runs are full scans: an operator asking for GFS explicitly
          * wants the whole history reconsidered, not the incremental pass the
          * backup pipeline does. */
+        gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, NULL)
+                            j->dry_run, 1, 1, &gr)
                   : OK;
+        if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
+        gfs_result_free(&gr);
     } else {
         restore_opts_t o;
         memset(&o, 0, sizeof(o));

@@ -121,6 +121,11 @@ check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
 contains "reindex" '"state":"completed"' "$(cb reindex 1)"
 contains "gfs"     '"state":"completed"' "$(cb gfs 1)"
+# B035: a dry run printed the job record and nothing about what it would
+# remove. One snapshot, so the answer is nothing, but it is an answer.
+GFS_OUT=$(cb gfs 1 --dry-run)
+contains "gfs dry run says what it would remove" '"would_remove":[],"count":0' "$GFS_OUT"
+contains "and the retention it used" '"retention":{"keep_snaps":' "$GFS_OUT"
 contains "journal" 'entries'  "$(cb journal 1)"
 
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")

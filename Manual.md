@@ -618,6 +618,15 @@ sudo c-backup gfs 1
 sudo c-backup schedule add 1 gfs --every day --at 04:00
 ```
 
+The finished job says what the pass did. A dry run lists the snapshots it
+would remove, a real run the ones it removed, and both give the retention
+values the pass applied (the repository's policy over the defaults):
+
+```json
+"result":{"dry_run":true,"would_remove":[3,4,9],"count":3,
+          "retention":{"keep_snaps":1,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+```
+
 Pruning a snapshot removes its record and index rows. The space its objects
 held is reclaimed by garbage collection (section 12), which a schedule should
 follow.

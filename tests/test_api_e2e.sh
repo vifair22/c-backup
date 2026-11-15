@@ -567,7 +567,22 @@ contains "and the tag did not move" '"snap_id":"3"' "$(sock_body /repos/1/tags)"
 check "move moves it" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":4,"move":true}')"
 contains "to the new snapshot" '"snap_id":"4"' "$(sock_body /repos/1/tags)"
 curl -s -o /dev/null -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/keep
-wait_job "$(job_id "$(sock_post /repos/1/gfs)")"
+
+# B035: a dry run's answer was in the daemon log only. The job reports the
+# ids it would remove and the retention it used, and removes nothing.
+DRY=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
+wait_job "$DRY"
+DRY_BODY=$(sock_body "/jobs/$DRY")
+contains "gfs dry run names what it would remove" \
+    '"result":{"dry_run":true,"would_remove":[1,2],"count":2,' "$DRY_BODY"
+contains "and the retention it applied" '"retention":{"keep_snaps":2,' "$DRY_BODY"
+check "and removes nothing" 4 \
+    "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+
+GFS=$(job_id "$(sock_post /repos/1/gfs)")
+wait_job "$GFS"
+contains "a real pass names what it removed" \
+    '"result":{"dry_run":false,"removed":[1,2],"count":2,' "$(sock_body "/jobs/$GFS")"
 check "retention reads keep_snaps from config" 2 \
     "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
 # And a client can see them: the app shows the value in force, and these
