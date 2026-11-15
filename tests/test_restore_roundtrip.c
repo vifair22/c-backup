@@ -30,6 +30,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
 
 #include "backup.h"
 #include "gc.h"
@@ -213,23 +214,137 @@ static void test_sparse_file_round_trips_with_its_holes(void **state)
     check_sparse_restore(br.snapshot_id);
 }
 
-/* A file that is nothing but a hole has no data region at all, and SEEK_DATA
- * answers ENXIO for it, the same answer a filesystem without hole support
- * gives. It is stored whole; what matters is that it comes back. */
+/*
+ * A file that is nothing but a hole restores with nothing allocated.
+ *
+ * SEEK_DATA on such a file fails with ENXIO, which the store used to read as
+ * "this filesystem does not report holes" and so stored the file whole. The
+ * restore then wrote every zero: `truncate -s 100M` came back as 204,800
+ * allocated blocks. Comparing contents cannot catch that, since the bytes
+ * are identical; only the block count says the restore inflated the file.
+ */
 static void test_file_that_is_all_hole_round_trips(void **state)
 {
     (void)state;
-    int fd = open(TEST_SRC "/empty.img", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const char *src = TEST_SRC "/hole.bin";
+    const off_t size = 8 * 1024 * 1024;
+    int fd = open(src, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     assert_true(fd >= 0);
-    assert_int_equal(ftruncate(fd, 256 * 1024), 0);
+    assert_int_equal(ftruncate(fd, size), 0);
     close(fd);
+
+    struct stat sb;
+    assert_int_equal(stat(src, &sb), 0);
+    if (sb.st_blocks != 0) {
+        /* The fixture is already dense here, so there is nothing to keep. */
+        skip();
+    }
 
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
     restore_result_t rr;
-    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+
+    char dst[512];
+    snprintf(dst, sizeof(dst), "%s/hole.bin", restored_root());
+    assert_int_equal(stat(dst, &sb), 0);
+    assert_int_equal(sb.st_size, size);
+    assert_int_equal(sb.st_blocks, 0);
+}
+
+/* Warnings the restore logs, collected so a test can read what an operator
+ * would. */
+static char captured_log[8192];
+
+static void capture_log(const char *ts, const char *level, const char *func,
+                        const char *message, void *ud)
+{
+    (void)ts; (void)level; (void)func; (void)ud;
+    size_t have = strlen(captured_log);
+    snprintf(captured_log + have, sizeof(captured_log) - have, "%s\n", message);
+}
+
+/* Overwrite everything in every pack but its first and last 128 bytes: far
+ * more damage than parity can correct, so objects are found, or looked
+ * for, and cannot be produced. A fixed fill keeps the outcome repeatable. */
+static void wreck_packs(void)
+{
+    FILE *p = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(p);
+    char path[512];
+    int hit = 0;
+    while (fgets(path, sizeof(path), p)) {
+        path[strcspn(path, "\n")] = '\0';
+        int fd = open(path, O_RDWR);
+        assert_true(fd >= 0);
+        struct stat sb;
+        assert_int_equal(fstat(fd, &sb), 0);
+        if (sb.st_size > 256) {
+            size_t n = (size_t)sb.st_size - 256;
+            char *junk = malloc(n);
+            assert_non_null(junk);
+            memset(junk, 0x5A, n);
+            assert_int_equal(pwrite(fd, junk, n, 128), (ssize_t)n);
+            free(junk);
+            hit = 1;
+        }
+        close(fd);
+    }
+    pclose(p);
+    assert_true(hit);
+}
+
+/*
+ * An object that cannot be read says so, by hash, with the reason.
+ *
+ * The warning used to read "cannot write <path>: " and stop, which pointed
+ * the operator at the destination - a full disk, a permission - when the
+ * fault was in the repository. Whatever the store layer did or did not
+ * record, the line has to name the object and say it could not be read or
+ * repaired, and must not end on an empty reason.
+ */
+static void test_unreadable_object_is_named_in_the_warning(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    wreck_packs();
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = 'top.txt'",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, br.snapshot_id,
+                              TEST_DST, NULL, &rr);
+    log_stream_unregister(h);
+
+    assert_int_not_equal(st, OK);
+    assert_true(rr.failed >= 1);
+    assert_non_null(strstr(captured_log, hex));
+    assert_non_null(strstr(captured_log, "could not be read or repaired"));
+    /* No line may end on an empty reason. Nor fall back to the placeholder:
+     * the hash check after a failed repair returned a bare status, and
+     * clearing the buffer first is what showed the reason the log used to
+     * print for it ("object not in any pack") was left over from an
+     * earlier lookup. */
+    assert_null(strstr(captured_log, ": \n"));
+    assert_null(strstr(captured_log, "no detail recorded"));
 }
 
 /*
@@ -425,6 +540,87 @@ static void test_restore_preserves_directory_mtimes(void **state)
     assert_int_equal(stat(path, &sb), 0);
 }
 
+/* What the index holds for one node's mtime, and the type SQLite gave it. */
+static void node_mtime(const char *name, char *val, size_t vlen,
+                       char *type, size_t tlen)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT mtime_ns, typeof(mtime_ns) FROM nodes WHERE name = ?",
+        (const char *[]){ name, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    snprintf(val, vlen, "%s", r->rows[0][0]);
+    snprintf(type, tlen, "%s", r->rows[0][1]);
+    db_result_free(r);
+}
+
+static void assert_mtime(const char *path, time_t sec, long nsec)
+{
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_int_equal((long long)sb.st_mtim.tv_sec, (long long)sec);
+    assert_int_equal(sb.st_mtim.tv_nsec, nsec);
+}
+
+/*
+ * Times before 1970 survive, to the nanosecond.
+ *
+ * The time was unsigned end to end: 1960-01-01 became 1.8e19 nanoseconds,
+ * SQLite stored that as a REAL ("1.81311464737096e+19"), and the restore
+ * parsed it as an integer and set the file's times to 0. Two shapes are
+ * checked: a plain pre-epoch time with a sub-second part, and half a second
+ * before the epoch, where the seconds and nanoseconds have to be floored
+ * apart ({-1, 500000000}) rather than truncated, or utimensat refuses the
+ * negative tv_nsec. The restore is repeated from a reindexed database, so
+ * the manifest tree's encoding of the time is checked as well as the row
+ * the backup wrote.
+ */
+static void test_pre_epoch_mtimes_round_trip(void **state)
+{
+    (void)state;
+    const time_t s1960 = -315619200;            /* 1960-01-01T00:00:00Z */
+    struct timespec t[2];
+    t[0].tv_sec = s1960; t[0].tv_nsec = 123456789;
+    t[1] = t[0];
+    assert_int_equal(utimensat(AT_FDCWD, TEST_SRC "/top.txt", t, 0), 0);
+    t[0].tv_sec = -1; t[0].tv_nsec = 500000000;
+    t[1] = t[0];
+    assert_int_equal(utimensat(AT_FDCWD, TEST_SRC "/nested/mid.txt", t, 0), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char val[64], type[16];
+    node_mtime("top.txt", val, sizeof(val), type, sizeof(type));
+    assert_string_equal(type, "integer");
+    assert_string_equal(val, "-315619199876543211");
+    node_mtime("mid.txt", val, sizeof(val), type, sizeof(type));
+    assert_string_equal(type, "integer");
+    assert_string_equal(val, "-500000000");
+
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            rmrf(TEST_DST);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+            reindex_result_t rx;
+            assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+            node_mtime("top.txt", val, sizeof(val), type, sizeof(type));
+            assert_string_equal(val, "-315619199876543211");
+        }
+        assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                     TEST_DST, NULL, NULL), OK);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+        assert_mtime(path, s1960, 123456789);
+        snprintf(path, sizeof(path), "%s/nested/mid.txt", restored_root());
+        assert_mtime(path, -1, 500000000);
+    }
+}
+
 static void test_restore_recreates_directory_structure(void **state)
 {
     (void)state;
@@ -469,6 +665,36 @@ static void test_restore_of_unknown_snapshot_fails(void **state)
 {
     (void)state;
     assert_int_not_equal(restore_run(store, db, repo_id, 999, TEST_DST, NULL, NULL), OK);
+}
+
+/*
+ * A subpath that names nothing fails rather than restoring nothing.
+ *
+ * It returned OK with zero files written, so `restore --subpath /typo`
+ * looked exactly like a restore that worked. The route refuses it before a
+ * job exists; this is the backstop for callers that reach restore_run some
+ * other way, or a snapshot the index could not check up front. A subpath
+ * that does match still restores, so the check is not simply failing every
+ * subpath restore.
+ */
+static void test_subpath_matching_nothing_fails(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.subpath = "/no/such/path";
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), ERR_NOT_FOUND);
+
+    ro.subpath = TEST_SRC "/nested";
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(rr.files, 2);
 }
 
 /*
@@ -1346,13 +1572,16 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sparse_file_round_trips_with_its_holes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_is_all_hole_round_trips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unreadable_object_is_named_in_the_warning, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_directory_mtimes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pre_epoch_mtimes_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_subpath_matching_nothing_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resumed_restore_relinks_hardlinks, setup, teardown),

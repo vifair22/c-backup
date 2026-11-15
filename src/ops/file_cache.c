@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "file_cache.h"
+#include "util.h"
 
 #include <cutils/log.h>
 
@@ -27,14 +28,14 @@ static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
     }
 }
 
-static uint64_t mtime_ns_of(const struct stat *st)
+static int64_t mtime_ns_of(const struct stat *st)
 {
-    return (uint64_t)st->st_mtim.tv_sec * 1000000000ULL + (uint64_t)st->st_mtim.tv_nsec;
+    return time_to_ns((int64_t)st->st_mtim.tv_sec, (int64_t)st->st_mtim.tv_nsec);
 }
 
-static uint64_t ctime_ns_of(const struct stat *st)
+static int64_t ctime_ns_of(const struct stat *st)
 {
-    return (uint64_t)st->st_ctim.tv_sec * 1000000000ULL + (uint64_t)st->st_ctim.tv_nsec;
+    return time_to_ns((int64_t)st->st_ctim.tv_sec, (int64_t)st->st_ctim.tv_nsec);
 }
 
 int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
@@ -58,8 +59,8 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
     int same = strtoull(r->rows[0][0], NULL, 10) == (unsigned long long)st->st_dev
             && strtoull(r->rows[0][1], NULL, 10) == (unsigned long long)st->st_ino
             && strtoull(r->rows[0][2], NULL, 10) == (unsigned long long)st->st_size
-            && strtoull(r->rows[0][3], NULL, 10) == mtime_ns_of(st)
-            && strtoull(r->rows[0][4], NULL, 10) == ctime_ns_of(st);
+            && strtoll(r->rows[0][3], NULL, 10) == mtime_ns_of(st)
+            && strtoll(r->rows[0][4], NULL, 10) == ctime_ns_of(st);
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     snprintf(hex, sizeof(hex), "%s", r->rows[0][5] ? r->rows[0][5] : "");
@@ -99,8 +100,8 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
     snprintf(dev,  sizeof(dev),  "%llu", (unsigned long long)st->st_dev);
     snprintf(ino,  sizeof(ino),  "%llu", (unsigned long long)st->st_ino);
     snprintf(size, sizeof(size), "%llu", (unsigned long long)st->st_size);
-    snprintf(mt,   sizeof(mt),   "%llu", (unsigned long long)mtime_ns_of(st));
-    snprintf(ct,   sizeof(ct),   "%llu", (unsigned long long)ctime_ns_of(st));
+    snprintf(mt,   sizeof(mt),   "%lld", (long long)mtime_ns_of(st));
+    snprintf(ct,   sizeof(ct),   "%lld", (long long)ctime_ns_of(st));
     snprintf(seen, sizeof(seen), "%lld", (long long)seen_at);
 
     if (db_execute_non_query(db,

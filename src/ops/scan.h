@@ -31,6 +31,10 @@ typedef struct {
     scan_entry_t *entries;
     uint32_t      count;
     uint32_t      capacity;
+    /* Entries the walk of the root itself produced, leaving out the
+     * ancestor directories synthesised above it. Zero means the source
+     * contributed nothing: excluded, or gone before it could be read. */
+    uint32_t      root_entries;
     /* Non-fatal warnings accumulated during scan (skipped entries, etc.) */
     char        **warnings;
     uint32_t      warn_count;

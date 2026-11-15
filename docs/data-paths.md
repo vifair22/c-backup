@@ -267,7 +267,9 @@ counting sort on depth, and an open-addressed `node_id -> index` map keeps
 the whole pass linear in entries. (This pass was quadratic once; at 25,000
 directories it did not finish. Anything added here has to stay linear.)
 
-Each manifest entry carries: name, type, mode, uid, gid, size, mtime,
+Each manifest entry carries: name, type, mode, uid, gid, size, mtime (seconds
+are signed, stored as the two's complement pattern in a u64 slot, so a file
+from before 1970 round-trips and a later one encodes exactly as it always did),
 `inode_identity`, the device major/minor pair (devices only), the target
 hash (child tree hash for directories, content hash for files, zero
 otherwise), the symlink target string, and the xattr/ACL blob hashes. The wire format is versioned (currently 2; version 1 trees stay readable so

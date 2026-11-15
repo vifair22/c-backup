@@ -112,6 +112,47 @@ static void test_serialisation_is_stable(void **state)
     free(ba); free(bb);
 }
 
+/*
+ * mtime_sec is signed in memory and the same u64 slot on disk.
+ *
+ * Before 1970 is a real timestamp, and an unsigned field turned it into
+ * 1.8e19 on the way to the index. Making the field signed must not move a
+ * single byte of any tree already written, or every directory gets a fresh
+ * hash and dedup quietly resets: so the slot holds the two's complement
+ * pattern, a positive time encodes exactly as it did, and a negative one
+ * reads back as itself.
+ */
+static void test_mtime_is_signed_without_changing_the_bytes(void **state)
+{
+    (void)state;
+    /* header (4 + 2 + 4), then name_len, link_len, type, mode, uid, gid,
+     * size before the mtime. */
+    const size_t at = 10 + 2 + 2 + 1 + 4 + 4 + 4 + 8;
+    const int64_t times[] = { 1700000000, -315619200, -1 };
+
+    for (size_t t = 0; t < sizeof(times) / sizeof(times[0]); t++) {
+        manifest_entry_t e = mk("f", NODE_TYPE_REG, 1);
+        e.mtime_sec = times[t];
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        assert_int_equal(manifest_serialise(&e, 1, &buf, &len), OK);
+        assert_true(len >= at + 8);
+
+        uint64_t want = (uint64_t)times[t];
+        for (int i = 0; i < 8; i++)
+            assert_int_equal(buf[at + (size_t)i], (uint8_t)(want >> (8 * i)));
+
+        manifest_entry_t *out = NULL;
+        uint32_t n = 0;
+        assert_int_equal(manifest_parse(buf, len, &out, &n), OK);
+        assert_int_equal(n, 1);
+        assert_true(out[0].mtime_sec == times[t]);
+        assert_int_equal(out[0].mtime_nsec, 123456789);
+        manifest_free_entries(out, n);
+        free(buf);
+    }
+}
+
 /* Input order must not matter: the writer sorts, so a scan that yields
  * entries in readdir order produces the same tree as a sorted one. */
 static void test_input_order_does_not_matter(void **state)
@@ -349,6 +390,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_serialisation_is_stable, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_mtime_is_signed_without_changing_the_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_input_order_does_not_matter, setup, teardown),
         cmocka_unit_test_setup_teardown(test_duplicate_names_still_order_deterministically, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sort_is_byte_order, setup, teardown),

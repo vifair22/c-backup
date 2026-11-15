@@ -17,10 +17,13 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "util.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +106,130 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     char *path = strdup(r->rows[0][0]);
     db_result_free(r);
     return path;
+}
+
+/* ---------- restore request validation ---------- */
+
+/*
+ * Where an absolute path really lands, for a path that may not exist yet.
+ * The longest prefix that exists goes through realpath, so a symlink or a
+ * ".." cannot smuggle a destination into a repository; the part below it
+ * does not exist, so it cannot contain a symlink and is normalised
+ * lexically. Returns 0, or -1 when nothing resolves.
+ */
+static int canonical_path(const char *in, char out[PATH_MAX])
+{
+    char head[PATH_MAX];
+    if (snprintf(head, sizeof(head), "%s", in) >= (int)sizeof(head)) return -1;
+    const char *tail = "";
+    char resolved[PATH_MAX];
+
+    for (;;) {
+        if (realpath(head, resolved)) break;
+        if (errno != ENOENT && errno != ENOTDIR) return -1;
+        char *slash = strrchr(head, '/');
+        if (!slash) return -1;
+        if (slash == head) {        /* "/" always resolves; this cannot loop */
+            snprintf(resolved, sizeof(resolved), "/");
+            tail = in + 1;
+            break;
+        }
+        *slash = '\0';
+        tail = in + (slash - head) + 1;
+    }
+
+    char joined[PATH_MAX * 2];
+    snprintf(joined, sizeof(joined), "%s/%s", resolved, tail);
+    return path_normalize(joined, out, PATH_MAX);
+}
+
+/* Is `path` the directory `dir` or somewhere beneath it? Both canonical. */
+static int path_is_under(const char *path, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (n == 1 && dir[0] == '/') return 1;
+    return strncmp(path, dir, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+/*
+ * A restore must not write into any registered repository. Restored files
+ * landing beside objects/ and packs/ are at best clutter a GC cannot account
+ * for and at worst a name that collides with something the repository owns.
+ * Every repository counts, not only the one being restored from: it is the
+ * same damage whichever one it is. Returns the offending repository's path,
+ * which the caller frees, or NULL when the destination is clear.
+ */
+static char *dest_inside_repo(const char *dest)
+{
+    char cdest[PATH_MAX];
+    if (canonical_path(dest, cdest) != 0) return NULL;
+
+    db_result_t *r = NULL;
+    if (db_execute(g_ctx.db, "SELECT path FROM repos", NULL, &r) != 0 || !r) {
+        db_result_free(r);
+        return NULL;
+    }
+    char *hit = NULL;
+    for (int i = 0; i < r->nrows && !hit; i++) {
+        char crepo[PATH_MAX];
+        if (!r->rows[i][0][0] || canonical_path(r->rows[i][0], crepo) != 0)
+            continue;
+        if (path_is_under(cdest, crepo)) hit = strdup(r->rows[i][0]);
+    }
+    db_result_free(r);
+    return hit;
+}
+
+/*
+ * Does `subpath` (normalised, absolute, not "/") name anything in the
+ * snapshot? One indexed lookup per component against nodes_by_snap_parent,
+ * so asking costs the depth of the path, not the size of the snapshot.
+ *
+ * Returns 1 when it does, 0 when it does not, and -1 when the index cannot
+ * say: a snapshot whose nodes are not resident (evicted, or never
+ * materialised) has no rows to walk, and the restore job reports that case
+ * with its own message rather than this one guessing.
+ */
+static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+
+    db_result_t *r = NULL;
+    int resident = db_execute(g_ctx.db,
+            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    if (!resident) return -1;
+
+    char parent[32] = "0";
+    const char *p = subpath;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        char name[NAME_MAX + 1];
+        size_t n = (size_t)(p - s);
+        if (n > NAME_MAX) return 0;
+        memcpy(name, s, n);
+        name[n] = '\0';
+
+        r = NULL;
+        if (db_execute(g_ctx.db,
+                "SELECT id FROM nodes"
+                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
+                "   AND name = ?",
+                (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
+            !r || r->nrows < 1) {
+            db_result_free(r);
+            return 0;
+        }
+        snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
+        db_result_free(r);
+    }
+    return 1;
 }
 
 /* ---------- listing ---------- */
@@ -841,12 +968,61 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        /* Checked here rather than left to the job: a relative destination
+         * would resolve against the daemon's working directory, which is
+         * nobody's intent, and a job that fails on it says so long after
+         * the caller could have been told. */
+        if (j->dest[0] != '/') {
+            snap_job_free(j);
+            return api_error(400, "dest must be an absolute path");
+        }
+        char *repo_hit = dest_inside_repo(j->dest);
+        if (repo_hit) {
+            char msg[PATH_MAX + 96];
+            snprintf(msg, sizeof(msg),
+                     "dest is inside the repository at %s; restore somewhere else",
+                     repo_hit);
+            free(repo_hit);
+            snap_job_free(j);
+            return api_error(400, msg);
+        }
         uint32_t ow = 0;
         if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
         /* Optional: restore one path out of the snapshot rather than all of
          * it. Pulling a single file out of a large backup should not cost a
          * full restore. */
         if (json_req_get_str(body, "subpath", &j->subpath) != 0) j->subpath = NULL;
+        if (j->subpath) {
+            /* Snapshot paths are absolute, so a subpath is read as one
+             * whether or not it starts with a slash, and normalised so
+             * "/a//b/" and "/a/./b" name the same thing "/a/b" does. */
+            char raw[PATH_MAX], norm[PATH_MAX];
+            if (snprintf(raw, sizeof(raw), "%s%s", j->subpath[0] == '/' ? "" : "/",
+                         j->subpath) >= (int)sizeof(raw) ||
+                path_normalize(raw, norm, sizeof(norm)) != 0) {
+                snap_job_free(j);
+                return api_error(400, "subpath is too long");
+            }
+            free(j->subpath);
+            j->subpath = NULL;
+            if (strcmp(norm, "/") != 0) {
+                /* A subpath that matches nothing used to run a restore that
+                 * wrote nothing and reported success. */
+                if (subpath_exists(repo_id, snap_id, norm) == 0) {
+                    char msg[PATH_MAX + 64];
+                    snprintf(msg, sizeof(msg),
+                             "subpath %s matches nothing in snapshot %lld",
+                             norm, (long long)snap_id);
+                    snap_job_free(j);
+                    return api_error(404, msg);
+                }
+                j->subpath = strdup(norm);
+                if (!j->subpath) {
+                    snap_job_free(j);
+                    return api_error(500, "out of memory");
+                }
+            }
+        }
     }
 
     int64_t job_id = 0;

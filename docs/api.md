@@ -210,6 +210,21 @@ lazily on first append, which used to leave an empty result serialising as
 pulling a single file back does not cost a full restore. It accepts the path
 either as it appears in the browser or without its leading slash, and matches
 on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
+It is normalised first: repeated slashes collapse and `.` and `..` resolve,
+so `/src//doc/./` names the same directory as `/src/doc`.
+
+A restore request is refused before any job is created when it cannot do
+what was asked:
+
+| Response | When |
+|---|---|
+| `400 dest must be an absolute path` | `dest` is relative; it would resolve against the daemon's working directory |
+| `400 dest is inside the repository at <path>` | `dest`, compared as a canonical path so a symlink or `..` cannot route around it, is a registered repository or lies beneath one |
+| `404 subpath <p> matches nothing in snapshot <n>` | `subpath` names nothing in the snapshot; the index answers this with one lookup per path component |
+
+A snapshot whose nodes are not resident cannot be checked up front, so for
+that one a subpath that matches nothing fails the job with the same message
+instead of reporting a restore that wrote nothing.
 
 `exclude` takes patterns, and how one is matched follows from what it
 contains rather than from a flag:
@@ -223,9 +238,17 @@ contains rather than from a flag:
 | anything containing `**` | as above, but wildcards may cross `/` |
 
 A trailing slash is accepted and ignored, so `node_modules/` and
-`node_modules` mean the same thing. Directories are tested before the walk
+`node_modules` mean the same thing. An absolute pattern is normalised
+lexically before matching: repeated slashes collapse and `.` and `..`
+resolve, so `/a/../a/b` and `/a//b` exclude what `/a/b` does. This is done
+on the text, not the filesystem, so it does not follow symlinks. Directories are tested before the walk
 descends, so excluding one prunes its subtree rather than filtering entries
 on the way out.
+
+A backup in which every source is excluded, or none could be read, fails
+with "nothing to back up" and writes no snapshot. It used to succeed with a
+snapshot holding only the directories above each source, which looks like a
+backup and restores nothing.
 
 Before this, the matcher accepted absolute prefixes only and silently
 skipped everything else, and the route did not read the field at all: a

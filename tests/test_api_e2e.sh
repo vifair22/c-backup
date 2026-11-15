@@ -354,6 +354,52 @@ if [ -f "$WORK/sub$WORK/src/a.txt" ]; then
     bad "subpath excluded the rest" "no a.txt outside the subpath" "a.txt restored"
 else ok "subpath excluded the rest"; fi
 
+# A subpath is normalised before it is matched, so the doubled and trailing
+# slashes here name the same directory as the plain spelling.
+NORM_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+           -d "{\"dest\":\"$WORK/subnorm\",\"subpath\":\"$WORK//src/./docs/\"}" \
+           http://localhost/repos/1/snapshots/1/restore)")
+wait_job "$NORM_JOB"
+contains "normalised subpath restore completed" '"state":"completed"' "$(sock_body "/jobs/$NORM_JOB")"
+if [ -f "$WORK/subnorm$WORK/src/docs/c.txt" ]; then ok "normalised subpath restored its file"
+else bad "normalised subpath restored its file" "c.txt restored" "missing"; fi
+
+echo "restore request validation"
+restore_req() {  # restore_req <json> -> "<code> <body>"
+    curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" -d "$1" \
+         http://localhost/repos/1/snapshots/1/restore
+}
+# A subpath that matches nothing used to run, restore nothing, and report
+# success. The index can answer the question before a job exists.
+R=$(restore_req "{\"dest\":\"$WORK/nothing\",\"subpath\":\"/no/such/path\"}")
+contains "missing subpath is 404"        ' 404'                                   "$R"
+contains "missing subpath says so"       'subpath /no/such/path matches nothing in snapshot 1' "$R"
+check    "missing subpath wrote nothing" "absent" "$([ -e "$WORK/nothing" ] && echo present || echo absent)"
+# A relative dest resolves against the daemon's cwd. It used to become a job
+# that then failed; it is refused at the request instead.
+R=$(restore_req '{"dest":"relative/out"}')
+contains "relative dest is 400"          ' 400'                       "$R"
+contains "relative dest says why"        'dest must be an absolute path' "$R"
+# Restoring into a repository writes beside objects/ and packs/. Refused,
+# however the path is spelled: directly, through "..", and through a symlink,
+# which is why the comparison is on canonical paths.
+R=$(restore_req "{\"dest\":\"$WORK/repo/restored\"}")
+contains "dest inside the repo is 400"   ' 400'                       "$R"
+contains "dest inside the repo says so"  'inside the repository'      "$R"
+R=$(restore_req "{\"dest\":\"$WORK/src/../repo/x\"}")
+contains "dotdot into the repo is 400"   ' 400'                       "$R"
+ln -s "$WORK/repo" "$WORK/repolink"
+R=$(restore_req "{\"dest\":\"$WORK/repolink/x\"}")
+contains "symlink into the repo is 400"  ' 400'                       "$R"
+R=$(restore_req "{\"dest\":\"$WORK/repo\"}")
+contains "the repo itself is 400"        ' 400'                       "$R"
+check    "repo untouched by refusals"    "absent" \
+         "$([ -e "$WORK/repo/restored" ] || [ -e "$WORK/repo/x" ] && echo present || echo absent)"
+# A sibling whose name merely starts with the repo's is not inside it.
+R=$(restore_req "{\"dest\":\"$WORK/repo-sibling\"}")
+contains "repo-prefixed sibling accepted" '"job_id"'                  "$R"
+wait_job "$(job_id "$R")"
+
 echo "maintenance"
 GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")
 check "gc submitted" "1" "$([ -n "$GC_JOB" ] && echo 1 || echo 0)"
@@ -404,6 +450,18 @@ case "$(sock_body '/repos/2/search?q=out')" in
     *out.o*) bad "build dir excluded" "absent" "present" ;;
     *)       ok  "build dir excluded" ;;
 esac
+# Excluding everything used to complete with a snapshot of nothing but the
+# source's ancestor directories. It fails instead, and writes no snapshot.
+SNAPS_BEFORE=$(sock_body /repos/2/snapshots | grep -o '"id"' | wc -l)
+ALL_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
+          -d "{\"paths\":[\"$WORK/exsrc\"],\"exclude\":[\"*\"]}" \
+          http://localhost/repos/2/backup)")
+wait_job "$ALL_JOB"
+ALL_BODY=$(sock_body "/jobs/$ALL_JOB")
+contains "exclude-everything backup fails"  '"state":"failed"'     "$ALL_BODY"
+contains "exclude-everything says why"      'nothing to back up'   "$ALL_BODY"
+check    "exclude-everything wrote no snapshot" "$SNAPS_BEFORE" \
+         "$(sock_body /repos/2/snapshots | grep -o '"id"' | wc -l)"
 
 # Verify had unit coverage and no end-to-end coverage: the route, the job
 # wiring and the level parameter were never exercised through the daemon.
