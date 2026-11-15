@@ -574,7 +574,10 @@ data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_don
 
 `current` counts entries, so it sits still while one large file is stored;
 `bytes_done` moves through the file as it is read, a few times a second, and
-each move is a new line.
+each move is a new line. A finished job keeps its last report, and each
+phase ends with `current` equal to `total`. A restore counts the entries it
+restores: with `--subpath` that is the subtree, so restoring one file ends
+at 1 of 1 rather than at the size of the snapshot.
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that
@@ -715,8 +718,10 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
-  10,000); when either cut it short the output says `truncated` or counts
-  `files_capped`. The hits are kept: `c-backup grep runs <id>` lists past
+  10,000). `truncated` says the search itself stopped early (`--limit` or
+  `--max-hits`); `files_capped` counts files read only as far as their cap,
+  which may hold more matches than were recorded. Both are on the job's
+  result and on the run in `grep runs`. The hits are kept: `c-backup grep runs <id>` lists past
   searches, newest first, and `c-backup grep show <id> <run>` prints one
   search's hits again, which is how a `--no-wait` search is read once it
   has finished.
@@ -1016,6 +1021,23 @@ it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 save nothing but an inode. Large files that do compress are packed
 normally. Details are in `docs/data-paths.md`.
 
+`pack` reports what it did in the job's `result`, including why it did
+nothing when it did nothing:
+
+```json
+{"loose":3,"packed":0,"skip_marked":3,"incompressible":0,
+ "reason":"all loose objects are skip-marked as incompressible"}
+```
+
+`loose` is what it found, `packed` what it moved into packs, `skip_marked`
+objects an earlier run already marked incompressible, and `incompressible`
+those this run's probe marked. `reason` is `null` when something was packed,
+and otherwise one of `no loose objects`, `all loose objects are skip-marked
+as incompressible`, `every remaining loose object is incompressible` or `no
+loose object could be packed`. The journal entry says the same in a line
+(`nothing packed: no loose objects`). Backups pack on completion, so a `pack`
+run by hand afterwards usually finds nothing loose.
+
 ---
 
 ## 13. Encryption
@@ -1146,10 +1168,10 @@ again after more backups and only the new snapshots are sent.
 
 The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
 (already complete at the target), `objects_asked`, `objects_sent`,
-`bytes_sent` (as stored, so what crossed to the target) and
-`subtrees_skipped`. A run with nothing to send reports zeros and journals
-`target already up to date`, so a no-op and a full copy are told apart at a
-glance.
+`bytes_sent` (as stored, so what crossed to the target),
+`subtrees_skipped` and `reencrypted`. A run with nothing to send reports
+zeros and journals `target already up to date`, so a no-op and a full copy
+are told apart at a glance.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
