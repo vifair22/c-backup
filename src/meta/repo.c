@@ -359,6 +359,52 @@ too_long:
     return set_error(ERR_INVALID, "repo path too long: %s", in);
 }
 
+/*
+ * A failure the caller can fix by choosing another path is ERR_INVALID, so
+ * the API answers 4xx; anything else is the host's fault and stays ERR_IO.
+ * Before this every mkdir failure was ERR_IO, and a typo in a parent
+ * directory came back as a 500 that read like a daemon bug.
+ */
+static status_t mkdir_error(const char *what)
+{
+    switch (errno) {
+    case EACCES: case EPERM: case EROFS: case ENOTDIR: case EEXIST:
+    case ENAMETOOLONG: case ELOOP:
+        return set_error_errno(ERR_INVALID, "cannot create %s", what);
+    default:
+        return set_error_errno(ERR_IO, "cannot create %s", what);
+    }
+}
+
+/*
+ * mkdir -p for a normalised absolute path. Missing parents get 0755, the
+ * repository itself 0700: the parents are ordinary directories the operator
+ * named, and only the repository holds backup data. A repository at
+ * /srv/backup/main on a fresh disk used to fail with ENOENT until somebody
+ * created /srv/backup by hand, which nothing told them to do.
+ */
+static status_t mkdir_parents(const char *path)
+{
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1; ; p++) {
+        int leaf = (*p == '\0');
+        if (*p != '/' && !leaf) continue;
+        *p = '\0';
+        if (mkdir(buf, leaf ? 0700 : 0755) != 0) {
+            struct stat sb;
+            if (errno != EEXIST) return mkdir_error(buf);
+            if (stat(buf, &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+                errno = ENOTDIR;
+                return mkdir_error(buf);
+            }
+        }
+        if (leaf) break;
+        *p = '/';
+    }
+    return OK;
+}
+
 /* "Empty" ignores . and .. only. A directory holding anything else is
  * someone's data until a marker says otherwise. */
 static int dir_is_empty(const char *path)
@@ -465,8 +511,10 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
     status_t st;
 
     if (!exists || dir_is_empty(path)) {
-        if (!exists && mkdir(path, 0700) != 0)
-            return set_error_errno(ERR_IO, "cannot create %s", path);
+        if (!exists) {
+            st = mkdir_parents(path);
+            if (st != OK) return st;
+        }
         st = store_init_dirs(path);
         if (st != OK) return st;
 

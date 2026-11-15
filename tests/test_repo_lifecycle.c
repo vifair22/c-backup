@@ -218,6 +218,40 @@ static void test_register_stores_normalised_path(void **state)
     assert_int_equal(count_repos(), 1);
 }
 
+/*
+ * B013: a repository whose parents did not exist failed with ENOENT, which
+ * the API returned as a 500.
+ */
+static void test_register_creates_missing_parents(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/p/q/r/repo", NULL, &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/p/q/r/repo", &m), OK);
+
+    struct stat sb;
+    assert_int_equal(stat(TEST_ROOT "/p/q/r/repo", &sb), 0);
+    assert_int_equal(sb.st_mode & 0777, 0700);
+    assert_int_equal(stat(TEST_ROOT "/p/q", &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+}
+
+/* A path that cannot be created is the caller's to fix: ERR_INVALID, which
+ * the route answers with a 400 rather than a 500. */
+static void test_register_under_a_file_is_invalid(void **state)
+{
+    (void)state;
+    FILE *f = fopen(TEST_ROOT "/plain", "w");
+    assert_non_null(f);
+    fclose(f);
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/plain/repo", NULL, &id), ERR_INVALID);
+    assert_int_equal(repo_register(db, TEST_ROOT "/plain/x/repo", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 0);
+    err_clear();
+}
+
 /* A marker is written once. Overwriting one would silently sever a repo
  * from every row that references its uuid. */
 static void test_marker_write_refuses_overwrite(void **state)
@@ -552,6 +586,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_requires_absolute_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_path_normalize, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_stores_normalised_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_creates_missing_parents, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_under_a_file_is_invalid, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),

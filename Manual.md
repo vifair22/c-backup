@@ -371,7 +371,11 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
 ```
 
 - A path that does not exist, or an empty directory, becomes a new
-  repository.
+  repository. Missing parent directories are created as `mkdir -p` would,
+  mode 0755; the repository directory itself is mode 0700. A path that
+  cannot be created (a parent is a regular file, a read-only filesystem, no
+  permission) is refused with HTTP 400 and the reason; only a failure of the
+  host itself, such as a full disk, is a 500.
 - A directory with a `.cbackup` marker is an existing repository and is
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links

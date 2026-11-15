@@ -429,6 +429,20 @@ contains "empty search keeps its key" '"results"' \
 contains "empty object refs keep their key" '"refs"' \
     "$(sock_body '/repos/1/objects/0000000000000000000000000000000000000000000000000000000000000000/refs')"
 
+# Registration edge cases from UAT. Kept after every hardcoded /repos/<id>
+# above, because each one registers a repository and takes an id.
+echo "repo lifecycle"
+repo_post_code() { curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+                   -d "$1" http://localhost/repos; }
+repo_post_body() { curl -s -X POST --unix-socket "$SOCK" -d "$1" http://localhost/repos; }
+
+# B013: missing parents are created, and a path that cannot exist is the
+# caller's mistake, not a 500.
+check "missing parents are created" 201 "$(repo_post_code "{\"path\":\"$WORK/deep/a/b/r\"}")"
+check "the repository is private" 700 "$(stat -c %a "$WORK/deep/a/b/r")"
+echo "a file" > "$WORK/plainfile"
+check "a file as a parent is a 400" 400 "$(repo_post_code "{\"path\":\"$WORK/plainfile/r\"}")"
+
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
 # the socket did the setup.
