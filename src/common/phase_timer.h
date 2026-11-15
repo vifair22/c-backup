@@ -45,6 +45,14 @@ typedef enum {
     PHASE_PACK_SEAL,     /* sealing a full backup pack, and the last one */
     PHASE_SNAPSHOT,      /* snapshot id, the record file and its row */
     /*
+     * The pack run a backup job ends with (maintenance.auto_pack): what is
+     * loose after the store phase - files over PACK_STREAM_THRESHOLD and
+     * sparse files - probed, and the compressible ones rewritten into packs.
+     * It ran after the profile was reported, so on UAT FS2 70-100 s of a
+     * first backup was in no row at all (B086).
+     */
+    PHASE_PACK_SWEEP,
+    /*
      * Nested spans: recorded from inside whichever phase is running, and
      * subtracted from it by phase_add_excl, so the top-level rows stay
      * disjoint and still sum to the wall clock.
@@ -64,6 +72,9 @@ typedef enum {
     PHASE_COMMIT_TREES,
     PHASE_COMMIT_INDEX,
     PHASE_COMMIT_PACK,
+    /* Inside pack-sweep. */
+    PHASE_SWEEP_SCAN,    /* listing loose objects, reading headers, the 64 KiB probes */
+    PHASE_SWEEP_PACK,    /* the pack workers: read, compress, write, parity, seal */
     /* Inside PHASE_READ_HASH, which on real storage is 82% of a full backup
      * and far too coarse to act on. These break that bucket apart. */
     PHASE_OBJ_SETUP,     /* mkstemp, header write, parity stream init */

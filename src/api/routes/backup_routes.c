@@ -234,10 +234,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         db_result_free(kr);
     }
 
-    backup_result_t res;
-    memset(&res, 0, sizeof(res));
-    st = backup_run(store, j->db, j->repo_id, &o, &res);
-
     /*
      * Packing finishes the backup rather than waiting for someone to ask.
      *
@@ -250,36 +246,42 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
      * consolidated.
      *
      * A pack failure does not fail the backup: the snapshot is committed and
-     * its objects are readable loose. It is logged and left for the next run
-     * or an explicit pack.
+     * its objects are readable loose. backup_run logs it and carries on.
      *
-     * This sweep is all maintenance.auto_pack controls (B111). Objects up to
+     * This pass is all maintenance.auto_pack controls (B111). Objects up to
      * PACK_STREAM_THRESHOLD went into a pack as backup_run wrote them, key or
-     * no key, so what the sweep finds is a sparse file's object, anything
-     * larger, and pack coalescing. Writing small objects loose when the key
-     * is off would honour the old wording at the cost of an inode and an
-     * uncompressed copy per object, which is what direct-to-pack removed.
+     * no key, so what the pass finds is a sparse file's object and anything
+     * larger. Writing small objects loose when the key is off would honour
+     * the old wording at the cost of an inode and an uncompressed copy per
+     * object, which is what direct-to-pack removed.
+     *
+     * backup_run runs it, rather than this function after it returns, so
+     * its time is in the backup's profile and its writes in bytes_written
+     * (B086): on UAT FS2 it was 70-100 s that neither accounted for.
      */
-    if (st == OK && routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1)) {
-        status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx,
-                                       NULL);
-        if (pst != OK) {
-            log_warn("backup: snapshot %lld committed but packing failed: %s",
-                     (long long)res.snapshot_id, err_msg());
-            err_clear();
-        }
-    }
+    o.pack_after = routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1);
+
+    backup_result_t res;
+    memset(&res, 0, sizeof(res));
+    st = backup_run(store, j->db, j->repo_id, &o, &res);
 
     /* What the backup did, on the job record: the log line had it, the job
      * did not, so a client saw only "completed". Every field is numeric. */
     if (res.snapshot_id > 0) {
-        char rj[512];
+        const uint64_t *w = res.written.bytes;
+        char rj[1024];
         snprintf(rj, sizeof(rj),
                  "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
                  "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
                  "\"objects_new\":%llu,\"bytes_stored\":%llu,"
                  "\"trees_new\":%llu,\"trees_reused\":%llu,"
-                 "\"store_workers\":%u}",
+                 "\"store_workers\":%u,"
+                 "\"bytes_written\":%llu,\"bytes_written_loose\":%llu,"
+                 "\"bytes_written_loose_parity\":%llu,"
+                 "\"bytes_written_loose_discarded\":%llu,"
+                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
+                 "\"bytes_written_parity_spill\":%llu,"
+                 "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu}",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -288,7 +290,16 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)res.bytes_stored,
                  (unsigned long long)res.trees_new,
                  (unsigned long long)res.trees_reused,
-                 res.store_workers);
+                 res.store_workers,
+                 (unsigned long long)res.written_total,
+                 (unsigned long long)w[STORE_WR_LOOSE],
+                 (unsigned long long)w[STORE_WR_LOOSE_PARITY],
+                 (unsigned long long)w[STORE_WR_LOOSE_DISCARD],
+                 (unsigned long long)w[STORE_WR_PACK],
+                 (unsigned long long)w[STORE_WR_PACK_PARITY],
+                 (unsigned long long)w[STORE_WR_PARITY_SPILL],
+                 (unsigned long long)res.written_sweep,
+                 (unsigned long long)res.sweep_packed);
         job_set_result(progress_ctx, rj);
     }
 

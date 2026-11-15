@@ -328,6 +328,7 @@ static status_t write_object(store_t *store, uint8_t type,
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             unlink(tmppath);
             close(subfd); free(compressed); free(ciphertext);
+            store_count_write(store, STORE_WR_LOOSE_DISCARD, total_phys);
             if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
             return OK;
         }
@@ -335,6 +336,8 @@ static status_t write_object(store_t *store, uint8_t type,
         goto fail;
     }
     close(subfd); free(compressed); free(ciphertext);
+    store_count_write(store, STORE_WR_LOOSE, (uint64_t)sizeof(hdr) + (uint64_t)payload_size);
+    store_count_write(store, STORE_WR_LOOSE_PARITY, (uint64_t)pfooter.trailer_size);
     store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     if (out_phys_bytes) *out_phys_bytes = total_phys;
@@ -747,6 +750,7 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         close(tfd); unlink(tmppath);
         return set_error(ERR_NOMEM, "stream: rs parity stream init");
     }
+    ps.spill_counter = store_write_counter(store, STORE_WR_PARITY_SPILL);
 
     phase_add(phase_current, PHASE_OBJ_SETUP, _pt_setup);
 
@@ -1027,7 +1031,11 @@ done:
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(store, out_hash)) {
+        /* The whole payload is already in tmp/ by now: a duplicate large
+         * file costs its full size in writes, and this is where it shows. */
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        store_count_write(store, STORE_WR_LOOSE_DISCARD,
+                          (uint64_t)sizeof(hdr) + total_written);
         if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
         return OK;
     }
@@ -1136,6 +1144,8 @@ done:
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             close(subfd); unlink(tmppath);
+            store_count_write(store, STORE_WR_LOOSE_DISCARD,
+                              (uint64_t)sizeof(hdr) + total_written + stream_trailer_sz);
             if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
             return OK;
         }
@@ -1144,6 +1154,8 @@ done:
     phase_add(phase_current, PHASE_OBJ_RENAME, _pt_rn);
 
     close(subfd);
+    store_count_write(store, STORE_WR_LOOSE, (uint64_t)sizeof(hdr) + total_written);
+    store_count_write(store, STORE_WR_LOOSE_PARITY, stream_trailer_sz);
     uint64_t _pt_ls = phase_now();
     store_loose_set_insert(store, out_hash);
     phase_add(phase_current, PHASE_OBJ_LOOSESET, _pt_ls);
@@ -1332,6 +1344,7 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
         close(tfd); unlink(tmppath);
         return set_error(ERR_NOMEM, "sparse_stream: rs init");
     }
+    ps.spill_counter = store_write_counter(store, STORE_WR_PARITY_SPILL);
 
     status_t st = OK;
     sparse_emit_t em = { .tfd = tfd, .mdctx = mdctx, .ps = &ps };
@@ -1458,6 +1471,8 @@ sp_done:
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(store, out_hash)) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        store_count_write(store, STORE_WR_LOOSE_DISCARD,
+                          (uint64_t)sizeof(object_header_t) + total_written);
         if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
         return OK;
     }
@@ -1532,6 +1547,9 @@ sp_done:
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             close(subfd); unlink(tmppath);
+            store_count_write(store, STORE_WR_LOOSE_DISCARD,
+                              (uint64_t)sizeof(object_header_t) + total_written
+                              + pftr.trailer_size);
             if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
             return OK;
         }
@@ -1539,6 +1557,8 @@ sp_done:
         return set_error_errno(ERR_IO, "sparse_stream: rename(%s, %s)", tmppath, dstpath);
     }
     close(subfd);
+    store_count_write(store, STORE_WR_LOOSE, (uint64_t)sizeof(object_header_t) + total_written);
+    store_count_write(store, STORE_WR_LOOSE_PARITY, pftr.trailer_size);
     store_loose_set_insert(store, out_hash);
     if (out_is_new) *out_is_new = 1;
     /* Trailer included, same reasoning as the streaming path above. */

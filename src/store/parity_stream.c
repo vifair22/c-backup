@@ -63,6 +63,8 @@ static int spill_flush(rs_parity_stream_t *ps)
         return -1;
 
     ps->spill_size += ps->par_off;
+    if (ps->spill_counter)
+        __atomic_fetch_add(ps->spill_counter, (uint64_t)ps->par_off, __ATOMIC_RELAXED);
     ps->par_off = 0;
     return 0;
 }

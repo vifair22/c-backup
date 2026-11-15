@@ -40,6 +40,7 @@
 
 #include "backup.h"
 #include "object.h"
+#include "parity.h"
 #include "phase_timer.h"
 #include "repo.h"
 #include "store.h"
@@ -793,6 +794,116 @@ static void test_cancel_stops_the_workers(void **state)
     env_close(&e);
 }
 
+/* Compressible content of a given size, distinct per seed. */
+static void write_compressible(const char *path, unsigned mib, unsigned seed)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    char line[80];
+    for (unsigned long i = 0; i < (unsigned long)mib * MIB / 64; i++) {
+        snprintf(line, sizeof(line), "line %010lu of a compressible file, seed %05u", i, seed);
+        fprintf(f, "%-63.63s\n", line);   /* 64 bytes a line, so mib MiB */
+    }
+    fclose(f);
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal((uint64_t)sb.st_size, (uint64_t)mib * MIB);
+}
+
+static uint64_t g_tree_bytes;
+static int sum_one(const char *path, const struct stat *sb, int type, struct FTW *ftw)
+{
+    (void)path; (void)ftw;
+    if (type == FTW_F) g_tree_bytes += (uint64_t)sb->st_size;
+    return 0;
+}
+
+static uint64_t tree_bytes(const env_t *e, const char *sub)
+{
+    char p[PATH_MAX + 32];
+    snprintf(p, sizeof(p), "%s/repo/%s", e->dir, sub);
+    g_tree_bytes = 0;
+    (void)nftw(p, sum_one, 16, FTW_PHYS);
+    return g_tree_bytes;
+}
+
+/* A loose object of P payload bytes, unencrypted: header, payload, and a
+ * trailer of header parity, RS parity, CRC, the deprecated length and the
+ * footer. */
+static uint64_t loose_size(uint64_t p)
+{
+    return 64 + p + 260 + (uint64_t)rs_parity_size((size_t)p) + 4 + 4 + 12;
+}
+
+/*
+ * The write counters (B086) account for every byte the backup put in the
+ * repository, by what it was: checked against the files on disk, not
+ * against the counters' own arithmetic.
+ *
+ * The source has small files (packed during the backup), an incompressible
+ * large file (left loose, the pack pass probes it and moves on), a
+ * compressible one (loose, then rewritten into a pack by the pack pass and
+ * its loose copy deleted) and two identical large files (the second staged
+ * in full and then dropped).
+ */
+static void test_write_counters_match_the_disk(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(TEST_SRC, 0700), 0);
+    char p[PATH_MAX];
+    for (int i = 0; i < 20; i++) {
+        char body[64];
+        snprintf(p, sizeof(p), TEST_SRC "/small%02d.txt", i);
+        snprintf(body, sizeof(body), "small file %d\n", i);
+        write_text(p, body);
+    }
+    write_random(TEST_SRC "/random.bin", 20, 11);
+    write_compressible(TEST_SRC "/text.txt", 20, 1);
+    write_random(TEST_SRC "/twin1.bin", 18, 12);
+    write_random(TEST_SRC "/twin2.bin", 18, 12);
+
+    env_t e;
+    env_open(&e, "counters");
+    backup_opts_t o = opts_for(1);
+    o.pack_after = 1;
+    backup_result_t r;
+    assert_int_equal(backup_run(e.store, e.db, e.repo_id, &o, &r), OK);
+
+    const uint64_t *w = r.written.bytes;
+    uint64_t sum = 0;
+    for (int i = 0; i < STORE_WR__COUNT; i++) sum += w[i];
+    assert_int_equal(r.written_total, sum);
+
+    /* Three large objects written loose: random, text and one twin. */
+    uint64_t p20 = 20ull * MIB, p18 = 18ull * MIB;
+    assert_int_equal(w[STORE_WR_LOOSE], (64 + p20) * 2 + 64 + p18);
+    assert_int_equal(w[STORE_WR_LOOSE] + w[STORE_WR_LOOSE_PARITY],
+                     loose_size(p20) * 2 + loose_size(p18));
+    /* The second twin was staged in full, then found present. */
+    assert_int_equal(w[STORE_WR_LOOSE_DISCARD], 64 + p18);
+    assert_int_equal(w[STORE_WR_PARITY_SPILL], 0);
+
+    /* What is left loose is the random file and the twin; the text file's
+     * loose copy went when the pack pass packed it. */
+    assert_int_equal(r.sweep_packed, 1);
+    assert_int_equal(tree_bytes(&e, "objects"), loose_size(p20) + loose_size(p18));
+
+    /* Every pack is still on disk after a first backup, so the pack
+     * counters are exactly the size of packs/. */
+    assert_int_equal(w[STORE_WR_PACK] + w[STORE_WR_PACK_PARITY], tree_bytes(&e, "packs"));
+    /* The pack pass wrote one pack, and the text compressed in it. */
+    assert_true(r.written_sweep > 0);
+    assert_true(r.written_sweep < p20 / 4);
+
+    /* A second backup of the same tree writes nothing at all. */
+    backup_result_t r2;
+    assert_int_equal(backup_run(e.store, e.db, e.repo_id, &o, &r2), OK);
+    assert_int_equal(r2.files_unchanged, r2.files);
+    assert_int_equal(r2.written_total, 0);
+    assert_int_equal(r2.written_sweep, 0);
+    env_close(&e);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -801,6 +912,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_same_repository_on_one_or_many_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_file_is_skipped_as_it_is_serially, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_stops_the_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_write_counters_match_the_disk, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -84,6 +84,10 @@ struct store {
     /* The owning job's cancel flag, or NULL. See store_set_cancel. */
     atomic_int         *cancel;
 
+    /* Bytes written, by category; see store_count_write. Starts zeroed
+     * with the calloc in store_open. Updated with __atomic builtins from
+     * the backup thread, the large-file workers and the pack workers. */
+    uint64_t            written[STORE_WR__COUNT];
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -324,6 +328,39 @@ void store_get_io_progress(const store_t *st, store_io_fn *fn, void **ctx)
 void store_io_progress(const store_t *st, uint64_t bytes)
 {
     if (st && bytes && tls_io.st == st && tls_io.fn) tls_io.fn(bytes, tls_io.ctx);
+}
+
+void store_count_write(store_t *st, store_write_cat_t cat, uint64_t bytes)
+{
+    if (!st || !bytes || (unsigned)cat >= STORE_WR__COUNT) return;
+    __atomic_fetch_add(&st->written[cat], bytes, __ATOMIC_RELAXED);
+}
+
+uint64_t *store_write_counter(store_t *st, store_write_cat_t cat)
+{
+    if (!st || (unsigned)cat >= STORE_WR__COUNT) return NULL;
+    return &st->written[cat];
+}
+
+void store_write_stats(const store_t *st, store_write_stats_t *out)
+{
+    if (!out) return;
+    for (int i = 0; i < STORE_WR__COUNT; i++)
+        out->bytes[i] = st ? __atomic_load_n(&st->written[i], __ATOMIC_RELAXED) : 0;
+}
+
+uint64_t store_write_stats_diff(const store_write_stats_t *after,
+                                const store_write_stats_t *before,
+                                store_write_stats_t *out)
+{
+    uint64_t total = 0;
+    for (int i = 0; i < STORE_WR__COUNT; i++) {
+        uint64_t a = after ? after->bytes[i] : 0, b = before ? before->bytes[i] : 0;
+        uint64_t d = a > b ? a - b : 0;
+        if (out) out->bytes[i] = d;
+        total += d;
+    }
+    return total;
 }
 
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
