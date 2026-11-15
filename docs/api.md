@@ -574,9 +574,11 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 Findings (`GET /repos/<id>/verify/<run-id>`) name files, not hashes, so the
 report says what was lost and what is still clean. Every object that is not
 `ok` gets one, with `status` one of `missing`, `unrecoverable`, `unreadable
-header`, `uncorrectable parity`, `damaged (run with repair to attempt
-recovery)` (a large streamed object with repair off, whose recoverability
-cannot be known without writing), `recoverable` or `repaired`:
+header`, `uncorrectable parity`, `recoverable` or `repaired`. Parity is
+applied in memory at every object size, so `unrecoverable` means the same
+with repair off as with it on. (Before 1.0 a large streamed object with
+repair off was reported `damaged (run with repair to attempt recovery)`;
+that status is gone.) Each finding also carries:
 
 | Field | Meaning |
 |---|---|
