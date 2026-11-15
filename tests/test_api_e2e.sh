@@ -101,6 +101,8 @@ http:
   bind: 127.0.0.1
 log:
   level: warn
+auth:
+  cookie_secure: 1
 EOF
 
 C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$BIN" > "$WORK/daemon.log" 2>&1 &
@@ -165,6 +167,12 @@ check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN"
 check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
 check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
 check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
+# B082: the key was read into the route context and then cleared when the
+# routes registered, so the flag was parsed and never honoured.
+LOGIN_HDRS=$(curl -s -D - -o /dev/null -X POST -d '{"password":"correcthorsebattery"}' \
+             "http://127.0.0.1:$PORT/api/auth/login")
+contains "cookie_secure sets Secure on the session cookie" "; Secure" \
+    "$(printf '%s' "$LOGIN_HDRS" | grep -i '^set-cookie:')"
 # No CORS: nothing here is a browser client, and a wildcard origin let any
 # page in a browser on the host read the API.
 contains "no CORS header" "no-cors" \
