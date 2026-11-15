@@ -202,11 +202,13 @@ done:
  */
 /* The prefixes mkstemp is given under tmp/, by every writer in the engine.
  * A targeted sweep removes only these, so a file somebody put in tmp/ by
- * hand is never the engine's to delete. */
+ * hand is never the engine's to delete. "tags." is the tag mirror's staging
+ * file (repo_tags.c): written by the daemon rather than the store, but a
+ * crash between its mkstemp and rename orphans it all the same. */
 static int is_engine_tmp_name(const char *name)
 {
     static const char *const prefixes[] = {
-        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.",
+        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.", "tags.",
     };
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
         if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
@@ -344,6 +346,14 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->io_fn           = NULL;
     r->io_ctx          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
+
+    /* tmp/ is where every staging and spill file goes, and nothing outside
+     * the repository is used for either, so a repository whose tmp/ was
+     * removed by hand would fail every write. Recreate it. A failure is not
+     * an error here: a repository on a read-only mount can still be read,
+     * and a write would report the real cause at its mkstemp. */
+    if (mkdirat(fd, "tmp", 0755) == -1 && errno != EEXIST && errno != EROFS)
+        log_warn("store: cannot create '%s/tmp': %s", path, strerror(errno));
 
     store_sweep_tmp(r->path);
 

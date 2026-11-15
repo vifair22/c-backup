@@ -192,6 +192,18 @@ static void pack_ensure_shard_dir(const char *store, uint32_t pack_num) {
         (void)mkdir(shard, 0755);  /* EEXIST is fine */
 }
 
+/* fsync a directory, so the entries renamed into it survive a power cut.
+ * Returns 0 or -1 with errno set. */
+static int fsync_dir_path(const char *path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    int rc = fsync(fd);
+    int err = errno;
+    close(fd);
+    errno = err;
+    return rc;
+}
+
 int parse_pack_dat_name(const char *name, uint32_t *out_num) {
     int end = 0;
     uint32_t n;
@@ -1716,7 +1728,8 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
  * seekable; the current position is at the end of data entries.  Reads
  * entries back from the file (still in page cache) to compute parity.
  * idx_by_offset is idx_entries sorted by dat_offset (entry write order). */
-static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
+static status_t write_dat_parity(store_t *store, FILE *dat_f,
+                                 const pack_dat_hdr_t *dat_hdr,
                                  const pack_idx_disk_entry_t *idx_by_offset,
                                  uint32_t packed) {
     rs_init();
@@ -1742,8 +1755,17 @@ static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
         return set_error(ERR_NOMEM, "write_dat_parity: chunk_buf alloc failed");
     }
 
-    /* Spill dir for parity stream temp files (unlinked immediately) */
-    const char *spill_dir = "/tmp";
+    /* Parity for an entry past about 3.7 MiB outgrows the 256 KiB buffer and
+     * spills to a file, unlinked as soon as it is created. It goes in the
+     * repository's own tmp/ like every other staging file: the daemon must
+     * run on a read-only root, where /tmp may not be writable at all, and a
+     * spill there failed gc, coalescing and replication on exactly the
+     * large entries they exist to move. */
+    char spill_dir[PATH_MAX];
+    if (path_fmt(spill_dir, sizeof(spill_dir), "%s/tmp", store_root(store)) != 0) {
+        free(entry_offsets); free(chunk_buf);
+        return set_error(ERR_IO, "write_dat_parity: tmp path too long");
+    }
 
     size_t cur_trailer_pos = sizeof(fhdr_crc);  /* relative to trailer_start */
 
@@ -1991,7 +2013,7 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
         if (!by_offset) { st = ERR_NOMEM; goto fail; }
         memcpy(by_offset, idx_entries, (size_t)packed * sizeof(*by_offset));
         qsort(by_offset, packed, sizeof(*by_offset), idx_offset_cmp);
-        st = write_dat_parity(*dat_f, dat_hdr, by_offset, packed);
+        st = write_dat_parity(store, *dat_f, dat_hdr, by_offset, packed);
         free(by_offset);
     }
     if (st != OK) goto fail;
@@ -2335,9 +2357,34 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
      * which keeps peak memory independent of how large the objects were. */
     status_t st = finalize_pack(w->store, &w->dat_f, w->dat_tmp, &w->dat_hdr,
                                 w->entries, w->count, w->pack_num, NULL);
+
+    /*
+     * Make the rename itself durable before saying the pack is installed.
+     * finalize_pack fsyncs the file but not the directory entry, and the
+     * caller of this writer - replication - goes on to write a snapshot
+     * record naming these objects. Without the directory syncs a power cut
+     * could keep the record and lose the pack, which is the dangling
+     * snapshot this ordering exists to rule out. The shard directory may
+     * have been created just now, so its parent is synced too.
+     */
+    if (st == OK) {
+        char dir[PATH_MAX];
+        if (path_fmt(dir, sizeof(dir), "%s/packs/%04x", store_root(w->store),
+                     w->pack_num / 256) != 0 ||
+            fsync_dir_path(dir) != 0)
+            st = set_error_errno(ERR_IO, "pack_stored_finish: sync %s", dir);
+        else if (path_fmt(dir, sizeof(dir), "%s/packs", store_root(w->store)) != 0 ||
+                 fsync_dir_path(dir) != 0)
+            st = set_error_errno(ERR_IO, "pack_stored_finish: sync %s", dir);
+    }
     if (st == OK && out_packed) *out_packed = w->count;
     pack_stored_free(w);
     return st;
+}
+
+uint32_t pack_stored_pack_num(const pack_stored_writer_t *w)
+{
+    return w ? w->pack_num : 0;
 }
 
 void pack_stored_abort(pack_stored_writer_t *w)
@@ -4338,10 +4385,10 @@ status_t pack_gc_stats(store_t *store,
         }
         uint32_t count = ghdr.count;
         if (count > 10000000u) {
-            fclose(gcidxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
+            fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
         }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
-        if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
+        if (!disk_idx) { fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
         if (build_disk_idx_from_dat(gcidxf, count, disk_idx) != 0) {
             free(disk_idx); fclose(gcidxf); continue;
         }
@@ -4378,27 +4425,35 @@ status_t pack_gc_stats(store_t *store,
                      store_root(store)) != 0 ||
             path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
                      store_root(store)) != 0) {
-            free(disk_idx);
+            free(disk_idx); free(gc_chunk); free(pack_nums);
             return set_error(ERR_IO, "pack_gc: tmp path too long for pack %u", pnum);
         }
 
         int new_dat_fd = mkstemp(dat_tmp);
         int new_idx_fd = mkstemp(idx_tmp);
         if (new_dat_fd == -1 || new_idx_fd == -1) {
+            int err = errno;
             if (new_dat_fd >= 0) { close(new_dat_fd); unlink(dat_tmp); }
             if (new_idx_fd >= 0) { close(new_idx_fd); unlink(idx_tmp); }
             free(disk_idx);
+            free(gc_chunk);
             free(pack_nums);
+            errno = err;
             return set_error_errno(ERR_IO, "pack_gc: mkstemp failed for pack %u", pnum);
         }
 
         FILE *new_dat = fdopen(new_dat_fd, "w+b");
         FILE *new_idx = fdopen(new_idx_fd, "wb");
         if (!new_dat || !new_idx) {
-            if (new_dat) fclose(new_dat); else { close(new_dat_fd); unlink(dat_tmp); }
-            if (new_idx) fclose(new_idx); else { close(new_idx_fd); unlink(idx_tmp); }
+            int err = errno;
+            if (new_dat) fclose(new_dat); else close(new_dat_fd);
+            if (new_idx) fclose(new_idx); else close(new_idx_fd);
+            unlink(dat_tmp);
+            unlink(idx_tmp);
             free(disk_idx);
+            free(gc_chunk);
             free(pack_nums);
+            errno = err;
             return set_error_errno(ERR_IO, "pack_gc: fdopen failed for pack %u", pnum);
         }
 
@@ -4487,7 +4542,7 @@ status_t pack_gc_stats(store_t *store,
             }
             memcpy(gc_by_offset, new_disk_idx, (size_t)live_count * sizeof(*gc_by_offset));
             qsort(gc_by_offset, live_count, sizeof(*gc_by_offset), idx_offset_cmp);
-            st = write_dat_parity(new_dat, &dhdr, gc_by_offset, live_count);
+            st = write_dat_parity(store, new_dat, &dhdr, gc_by_offset, live_count);
             free(gc_by_offset);
             if (st != OK) { free(new_disk_idx); goto pack_fail; }
         }
