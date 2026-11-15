@@ -910,25 +910,41 @@ echo "login throttle"
 # afterwards. Now the first few failures are free and then the address is
 # locked out, for longer each time, and the lockout holds even for the right
 # password - otherwise it would not slow guessing at all.
+#
+# The waits come from the 429's own Retry-After, not fixed sleeps. The
+# throttle counts in whole seconds, so a failure just before a second
+# boundary can find the previous lockout already over, count once more and
+# double it; a fixed 1.2 s sleep then lands inside a 2 s lockout. That
+# flaked on CI.
+login_hdrs() {  # login_hdrs <password>: status line and headers, lowercased
+    curl -s -D - -o /dev/null -X POST -d "{\"password\":\"$1\"}" \
+         "$URL/api/auth/login" | tr -d '\r' | tr 'A-Z' 'a-z'
+}
+status_of()      { printf '%s\n' "$1" | sed -n '1s/^http\/[0-9.]* \([0-9]*\).*/\1/p'; }
+wait_retry_after() {  # sleep what a 429 asked for, plus a second for rounding
+    local ra
+    ra=$(printf '%s\n' "$1" | sed -n 's/^retry-after: *\([0-9]*\).*/\1/p')
+    sleep $(( ${ra:-1} + 1 ))
+}
 CODES=""
+LAST=""
 for _ in $(seq 1 12); do
-    c=$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')
+    LAST=$(login_hdrs guessing)
+    c=$(status_of "$LAST")
     CODES="$CODES $c"
     [ "$c" = 429 ] && break
 done
 contains "wrong logins end in 429" "429" "$CODES"
 contains "after the free attempts" "401 401 401 401 401 401" "$CODES"
-sleep 1.2
+wait_retry_after "$LAST"
 check "another failure once the lockout lapses" 401 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')"
-check "the right password is refused while locked out" 429 \
-    "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
-contains "429 carries Retry-After" "retry-after:" \
-    "$(curl -s -D - -o /dev/null -X POST -d '{"password":"brandnewpassword"}' \
-       "$URL/api/auth/login" | tr 'A-Z' 'a-z')"
+LAST=$(login_hdrs brandnewpassword)
+check "the right password is refused while locked out" 429 "$(status_of "$LAST")"
+contains "429 carries Retry-After" "retry-after:" "$LAST"
 check "the socket is never throttled" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"password":"brandnewpassword"}' http://localhost/api/auth/login)"
-sleep 2.2
+wait_retry_after "$LAST"
 check "the right password works once it lapses" 200 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
 
