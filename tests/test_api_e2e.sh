@@ -260,6 +260,10 @@ contains "still unconfigured" '"configured":false' "$(sock_body /api/auth/setup)
 
 check "short password refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"password":"short"}' http://localhost/api/auth/setup)"
+# B112: a password of the wrong type was told it was required.
+check "a non-string password is named" '{"error":"password must be a string"} 400' \
+    "$(curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" \
+       -d '{"password":["correcthorsebattery"]}' http://localhost/api/auth/setup)"
 check "socket setup" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"password":"correcthorsebattery"}' http://localhost/api/auth/setup)"
 check "setup twice refused" 409 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
@@ -492,6 +496,123 @@ check "and a flag as a boolean" '{"ok":true} 200' \
     "$(sock_send PUT /repos/1/policy '{"key":"maintenance.auto_pack","value":true}')"
 contains "and both read back typed" '"key":"retention.keep_monthly","value":6' \
     "$(sock_body /repos/1/policy)"
+
+echo "request field types"
+# B112: a field present with the wrong JSON type read as absent. An array
+# label registered a repository with no label and answered 201, and a
+# snap_id of 1e999 was told it was required. Each is a 400 naming the field
+# and what it must be, and nothing is created.
+for lbl in '["a"]' '{"a":1}' '5' 'true' 'null'; do
+    R=$(sock_send POST /repos "{\"path\":\"$WORK/typedrepo\",\"label\":$lbl}")
+    check "label $lbl is refused" '{"error":"label must be a string"} 400' "$R"
+done
+check "and no repository was made" "absent" \
+    "$([ -e "$WORK/typedrepo" ] && echo present || echo absent)"
+case "$(sock_body /repos)" in *typedrepo*) bad "and none was registered" "absent" "listed" ;;
+                              *) ok "and none was registered" ;; esac
+check "a non-string path is refused" '{"error":"path must be a string"} 400' \
+    "$(sock_send POST /repos '{"path":["/x"]}')"
+check "a missing path is still required" '{"error":"path is required"} 400' \
+    "$(sock_send POST /repos '{"label":"x"}')"
+check "a non-string encrypt is refused" '{"error":"encrypt must be a string"} 400' \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/typedrepo\",\"encrypt\":1}")"
+
+tag_snap() { sock_send POST /repos/1/tags "{\"name\":\"typed\",\"snap_id\":$1}"; }
+RANGE='snap_id is out of range; it must be from 1 to 4294967295'
+check "snap_id 1e999 is out of range"   "{\"error\":\"$RANGE\"} 400" "$(tag_snap 1e999)"
+check "snap_id -1 is out of range"      "{\"error\":\"$RANGE\"} 400" "$(tag_snap -1)"
+check "snap_id 0 is out of range"       "{\"error\":\"$RANGE\"} 400" "$(tag_snap 0)"
+check "snap_id past uint32 is out of range" "{\"error\":\"$RANGE\"} 400" "$(tag_snap 4294967296)"
+check "snap_id 99999999999999999999 is out of range" "{\"error\":\"$RANGE\"} 400" \
+    "$(tag_snap 99999999999999999999)"
+check "snap_id 1.5 is not whole" '{"error":"snap_id must be a whole number"} 400' "$(tag_snap 1.5)"
+check "snap_id as a string" '{"error":"snap_id must be a number"} 400' "$(tag_snap '"1"')"
+check "snap_id as a list"   '{"error":"snap_id must be a number"} 400' "$(tag_snap '[1]')"
+check "a missing snap_id is still required" '{"error":"snap_id is required"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"typed"}')"
+check "move must be a boolean" '{"error":"move must be true or false"} 400' \
+    "$(sock_send POST /repos/1/tags '{"name":"typed","snap_id":1,"move":1}')"
+check "no typed tag was stored" '{"tags":[]}' "$(sock_body /repos/1/tags)"
+
+check "a note body must be a string" '{"error":"body must be a string"} 400' \
+    "$(sock_send PUT /repos/1/snapshots/1/note '{"body":["x"]}')"
+check "a fractional policy value" '{"error":"value must be a whole number"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":1.5}')"
+check "a policy value of 1e999" \
+    '{"error":"value is out of range; it must be from -9007199254740992 to 9007199254740992"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":1e999}')"
+check "a policy value that is a list" \
+    '{"error":"value must be a string, a whole number, or true or false"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_daily","value":[1]}')"
+check "a non-string policy key" '{"error":"key must be a string"} 400' \
+    "$(sock_send PUT /repos/1/policy '{"key":7,"value":1}')"
+contains "and the stored value is untouched" '"key":"retention.keep_daily","value":14' \
+    "$(sock_body /repos/1/policy)"
+
+# The backup body: each of these used to be dropped and the backup run
+# anyway, from the configured sources or with the wrong options.
+check "a backup label must be a string" '{"error":"label must be a string"} 400' \
+    "$(sock_send POST /repos/1/backup '{"label":["x"]}')"
+check "backup paths must be a list" '{"error":"paths must be a list of strings"} 400' \
+    "$(sock_send POST /repos/1/backup '{"paths":"/x"}')"
+check "a non-string backup path" \
+    '{"error":"paths must be a list of strings; entry 2 is not one"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\",5]}")"
+check "one_filesystem must be a flag" '{"error":"one_filesystem must be true or false"} 400' \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"one_filesystem\":\"yes\"}")"
+check "restore overwrite must be a flag" '{"error":"overwrite must be true or false"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore "{\"dest\":\"$WORK/typed\",\"overwrite\":\"yes\"}")"
+check "restore subpath must be a string" '{"error":"subpath must be a string"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore "{\"dest\":\"$WORK/typed\",\"subpath\":[\"/a\"]}")"
+check "restore dest must be a string" '{"error":"dest must be a string"} 400' \
+    "$(sock_send POST /repos/1/snapshots/1/restore '{"dest":5}')"
+check "grep max_files must be a number" '{"error":"max_files must be a number"} 400' \
+    "$(sock_send POST /repos/1/grep '{"pattern":"x","max_files":"10"}')"
+check "grep snapshot of 1e999" \
+    '{"error":"snapshot is out of range; it must be from 1 to 4294967295"} 400' \
+    "$(sock_send POST /repos/1/grep '{"pattern":"x","snapshot":1e999}')"
+check "nothing was restored by a refusal" "absent" \
+    "$([ -e "$WORK/typed" ] && echo present || echo absent)"
+
+# B112: the body is checked before the repository. Repository 1 has no
+# sources configured (cleared above), and a backup schedule naming none
+# was refused for that even when its trigger was malformed, so the client
+# fixed the sources and then learned about the trigger.
+contains "repository 1 has no sources here" '"sources":[]' "$(sock_body /repos/1/sources)"
+sched() { sock_send POST /repos/1/schedules "$1"; }
+check "a malformed trigger is reported before missing sources" \
+    "{\"error\":\"trigger: unknown type 'cron'\"} 400" \
+    "$(sched '{"action":"backup","trigger":{"type":"cron"}}')"
+check "a trigger of the wrong type" '{"error":"trigger must be an object"} 400' \
+    "$(sched '{"action":"backup","trigger":"daily"}')"
+check "a missing trigger" '{"error":"trigger is required"} 400' \
+    "$(sched '{"action":"backup"}')"
+check "trigger seconds of the wrong type" \
+    '{"error":"interval trigger: trigger.seconds must be a number"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":"3600"}}')"
+check "trigger seconds of 1e999" \
+    '{"error":"interval trigger: trigger.seconds is out of range; it must be from 1 to 9007199254740992"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":1e999}}')"
+check "a bad on_overlap is reported before missing sources" \
+    '{"error":"on_overlap must be skip, queue or cancel_running"} 400' \
+    "$(sched '{"action":"backup","on_overlap":"x","trigger":{"type":"interval","seconds":60}}')"
+check "a bad catchup is reported before missing sources" \
+    '{"error":"catchup must be skip or run_once"} 400' \
+    "$(sched '{"action":"backup","catchup":["skip"],"trigger":{"type":"interval","seconds":60}}')"
+check "non-string schedule paths are reported before missing sources" \
+    '{"error":"paths must be a list of strings; entry 1 is not one"} 400' \
+    "$(sched '{"action":"backup","paths":[1],"trigger":{"type":"interval","seconds":60}}')"
+check "a sound body then hears about the sources" \
+    '{"error":"this repository has no backup sources configured, and none were given"} 400' \
+    "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":60}}')"
+check "a non-string action" '{"error":"action must be a string"} 400' \
+    "$(sched '{"action":1,"trigger":{"type":"interval","seconds":60}}')"
+check "a non-string grep pattern" '{"error":"pattern must be a string"} 400' \
+    "$(sched '{"action":"grep","pattern":5,"trigger":{"type":"interval","seconds":60}}')"
+case "$(sock_body /repos/1/schedules)" in
+    *'"action"'*) bad "no schedule was created by any of them" "none" "$(sock_body /repos/1/schedules)" ;;
+    *) ok "no schedule was created by any of them" ;;
+esac
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job

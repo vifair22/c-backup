@@ -1382,13 +1382,6 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
-    /* Refused while the caller is listening. Queued, a restore without the
-     * key ran and reported "1 entry could not be restored". */
-    if (snap_job_needs_key(kind) && repo_require_key(repo_path) != OK) {
-        free(repo_path);
-        return api_error(409, err_msg());
-    }
-
     /*
      * A restore names a snapshot, and one that does not exist is the
      * caller's mistake to hear about now. It used to be queued, and the job
@@ -1447,35 +1440,35 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "invalid JSON");
         }
-        if (json_req_get_str(body, "pattern", &j->pattern) != 0 || !j->pattern) {
+        /* A field of the wrong type is refused by name. path_prefix and
+         * max_files used to be dropped when they were, so the search ran
+         * over everything with the default budget. */
+        jreq_err_t je;
+        int rc = jreq_str(body, "pattern", &j->pattern, &je);
+        if (rc != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "pattern is required");
+            return api_error(400, rc == JREQ_ABSENT ? "pattern is required" : je.msg);
         }
-        if (json_req_get_str(body, "path_prefix", &j->path_prefix) != 0)
-            j->path_prefix = NULL;
+        if (jreq_str(body, "path_prefix", &j->path_prefix, &je) == JREQ_BAD) {
+            snap_job_free(j);
+            return api_error(400, je.msg);
+        }
         if (jreq_flag(body, "ignore_case", &j->ignore_case) != 0) {
             snap_job_free(j);
             return api_error(400, "ignore_case must be true or false");
         }
-        uint32_t mf = 0;
-        if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
-            j->max_files = mf;
         /* Out of range is refused rather than clamped, so a caller asking
          * for a million hits per file learns the ceiling instead of getting
          * quietly fewer. */
-        uint32_t hpf = 0;
-        if (json_req_has(body, "max_hits_per_file") &&
-            json_req_get_u32(body, "max_hits_per_file", &hpf, 1, 10000) != 0) {
+        uint32_t mf = 0, hpf = 0, mh = 0;
+        if (jreq_u32(body, "max_files", &mf, 0, 1000000, &je) == JREQ_BAD ||
+            jreq_u32(body, "max_hits_per_file", &hpf, 1, 10000, &je) == JREQ_BAD ||
+            jreq_u32(body, "max_hits", &mh, 1, 1000000, &je) == JREQ_BAD) {
             snap_job_free(j);
-            return api_error(400, "max_hits_per_file must be 1 to 10000");
+            return api_error(400, je.msg);
         }
+        j->max_files = mf;
         j->max_hits_per_file = hpf;
-        uint32_t mh = 0;
-        if (json_req_has(body, "max_hits") &&
-            json_req_get_u32(body, "max_hits", &mh, 1, 1000000) != 0) {
-            snap_job_free(j);
-            return api_error(400, "max_hits must be 1 to 1000000");
-        }
         j->max_hits = mh;
 
         /* Which snapshot: the newest unless one was named. Searching "the
@@ -1489,9 +1482,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
              * indistinguishable from "not in this backup". A malformed one
              * fell back to the newest snapshot, which is worse.
              */
-            if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) != 0) {
+            if (jreq_u32(body, "snapshot", &sid, 1, UINT32_MAX, &je) != JREQ_OK) {
                 snap_job_free(j);
-                return api_error(400, "snapshot must be a snapshot id");
+                return api_error(400, je.msg);
             }
             j->snap_id = (int64_t)sid;
             if (!snapshot_exists(repo_id, j->snap_id)) {
@@ -1517,15 +1510,16 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "invalid JSON");
         }
-        if (json_req_get_str(body, "dest", &j->dest) != 0 || !j->dest) {
+        jreq_err_t je;
+        int rc = jreq_str(body, "dest", &j->dest, &je);
+        if (rc != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "dest is required");
+            return api_error(400, rc == JREQ_ABSENT ? "dest is required" : je.msg);
         }
         bool reenc = false;
-        if (json_req_has(body, "reencrypt") &&
-            json_req_get_bool(body, "reencrypt", &reenc) != 0) {
+        if (jreq_bool(body, "reencrypt", &reenc, &je) == JREQ_BAD) {
             snap_job_free(j);
-            return api_error(400, "reencrypt must be true or false");
+            return api_error(400, je.msg);
         }
         j->reencrypt = reenc ? 1 : 0;
         char why[PATH_MAX + 128];
@@ -1545,9 +1539,25 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "invalid JSON");
         }
-        if (json_req_get_str(body, "dest", &j->dest) != 0 || !j->dest) {
+        /*
+         * Every field is read for its type before any is acted on.
+         * "overwrite":true - the spelling the other flags take - was not 0
+         * or 1 and so meant "do not overwrite", and a subpath that was not
+         * a string restored the whole snapshot (B112).
+         */
+        jreq_err_t je;
+        int rc = jreq_str(body, "dest", &j->dest, &je);
+        if (rc != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "dest is required");
+            return api_error(400, rc == JREQ_ABSENT ? "dest is required" : je.msg);
+        }
+        if (jreq_flag(body, "overwrite", &j->overwrite) != 0) {
+            snap_job_free(j);
+            return api_error(400, "overwrite must be true or false");
+        }
+        if (jreq_str(body, "subpath", &j->subpath, &je) == JREQ_BAD) {
+            snap_job_free(j);
+            return api_error(400, je.msg);
         }
         /* Checked here rather than left to the job: a relative destination
          * would resolve against the daemon's working directory, which is
@@ -1567,12 +1577,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, msg);
         }
-        uint32_t ow = 0;
-        if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
         /* Optional: restore one path out of the snapshot rather than all of
          * it. Pulling a single file out of a large backup should not cost a
          * full restore. */
-        if (json_req_get_str(body, "subpath", &j->subpath) != 0) j->subpath = NULL;
         if (j->subpath) {
             /* Snapshot paths are absolute, so a subpath is read as one
              * whether or not it starts with a slash, and normalised so
@@ -1604,6 +1611,18 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                 }
             }
         }
+    }
+
+    /*
+     * Refused while the caller is listening. Queued, a restore without the
+     * key ran and reported "1 entry could not be restored". Checked after
+     * the body, so a request that is wrong in itself says so first rather
+     * than sending the operator off to load a key it would still fail
+     * without (B112).
+     */
+    if (snap_job_needs_key(kind) && repo_require_key(j->repo_path) != OK) {
+        snap_job_free(j);
+        return api_error(409, err_msg());
     }
 
     int64_t job_id = 0;

@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "routes.h"
+#include "json_row.h"
 #include "auth.h"
 #include "login_throttle.h"
 #include "app_config.h"
@@ -88,8 +89,10 @@ static api_response_t handle_setup_post(const api_request_t *req, void *ud)
         return api_error(400, "invalid JSON");
 
     CUTILS_AUTOFREE char *password = NULL;
-    if (json_req_get_str(body, "password", &password) != 0 || !password)
-        return api_error(400, "password is required");
+    jreq_err_t je;
+    int rc = jreq_str(body, "password", &password, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "password is required");
+    if (rc != JREQ_OK) return api_error(400, je.msg);
     if (strlen(password) < AUTH_MIN_PASSWORD_LEN)
         return api_error(400, "password must be at least 8 characters");
 
@@ -115,8 +118,10 @@ static api_response_t handle_login(const api_request_t *req, void *ud)
         return api_error(400, "invalid JSON");
 
     CUTILS_AUTOFREE char *password = NULL;
-    if (json_req_get_str(body, "password", &password) != 0 || !password)
-        return api_error(400, "password is required");
+    jreq_err_t je;
+    int rc = jreq_str(body, "password", &password, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "password is required");
+    if (rc != JREQ_OK) return api_error(400, je.msg);
 
     /*
      * Throttled before the password is even hashed: a client that is locked
@@ -209,10 +214,13 @@ static api_response_t handle_password(const api_request_t *req, void *ud)
 
     CUTILS_AUTOFREE char *current = NULL;
     CUTILS_AUTOFREE char *next = NULL;
-    if (json_req_get_str(body, "current", &current) != 0 || !current)
-        return api_error(400, "current password is required");
-    if (json_req_get_str(body, "new", &next) != 0 || !next)
-        return api_error(400, "new password is required");
+    jreq_err_t je;
+    int rc = jreq_str(body, "current", &current, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "current password is required");
+    if (rc != JREQ_OK) return api_error(400, je.msg);
+    rc = jreq_str(body, "new", &next, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "new password is required");
+    if (rc != JREQ_OK) return api_error(400, je.msg);
     if (strlen(next) < AUTH_MIN_PASSWORD_LEN)
         return api_error(400, "password must be at least 8 characters");
 

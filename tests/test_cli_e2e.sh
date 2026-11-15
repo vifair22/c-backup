@@ -487,7 +487,7 @@ check    "search in a missing snapshot fails" 1 "$RC"
 contains "grep takes a per-file cap" 'secrets.txt' "$(cb grep 1 hunter2 --max-hits-per-file 1 --max-hits 5)"
 OUT=$(cb grep 1 hunter2 --max-hits 0 2>&1); RC=$?
 check    "a zero hit cap is refused" 1 "$RC"
-contains "and names the range" "max_hits must be 1 to 1000000" "$OUT"
+contains "and names the range" "max_hits is out of range; it must be from 1 to 1000000" "$OUT"
 GJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"hunter2"}' http://localhost/repos/1/grep \
      | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
 for _ in $(seq 1 50); do

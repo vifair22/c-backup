@@ -89,6 +89,41 @@ Requests take the same types. Where a field used to be sent as text or as
 0/1 - a policy `value`, a schedule's `enabled` - the old form is still
 accepted.
 
+### Request errors
+
+A request body field is either absent or of its documented type. A field
+that is present with the wrong type is a 400 naming it and the type it
+must be, and nothing is changed:
+
+| Problem | Error |
+|---|---|
+| A required field is absent | `<field> is required` |
+| A string field holds anything else | `<field> must be a string` |
+| A boolean field holds anything else | `<field> must be true or false` |
+| A number field holds anything else | `<field> must be a number` |
+| A whole-number field holds a fraction | `<field> must be a whole number` |
+| A number outside the field's range, negative where it cannot be, or too large to represent (`1e999`) | `<field> is out of range; it must be from <min> to <max>` |
+| A list of strings is not a list, or an entry is not a string | `<field> must be a list of strings` (with the entry's position) |
+
+`null` is a value of the wrong type, not a way of leaving a field out: omit
+a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
+`one_filesystem`, `overwrite`, a schedule's `enabled`) still do. A nested
+field is named by its path, as in `interval trigger: trigger.seconds must
+be a number`. Integers are exact only up to 2^53, so a field whose type
+allows more is limited to that, and the range in the message says so.
+
+Each of these used to read as absent: an array `label` registered a
+repository with no label and answered 201, `"one_filesystem":true` was
+ignored because only `1` was read, and `"snap_id":1e999` was told
+`snap_id is required`.
+
+The request is checked before the state it acts on. A body that is wrong
+in itself is reported first, and only a sound one goes on to errors about
+the repository: missing configured sources (400), a key that is not loaded
+(409), a busy repository (503). A malformed schedule trigger on a
+repository with no sources is reported as the trigger error. A path or id
+in the URL that names nothing is still a 404 before the body is read.
+
 ## Public
 
 | Method | Path | Purpose |

@@ -167,15 +167,20 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *name = NULL;
     uint32_t snap = 0;
     bool move = false;
-    if (json_req_get_str(body, "name", &name) != 0 || !name || !name[0])
-        return api_error(400, "name is required");
+    /* "is required" only when it is missing: a snap_id of 1e999 or 1.5 was
+     * told it was required, about a field it had sent (B112). */
+    jreq_err_t je;
+    int rc = jreq_str(body, "name", &name, &je);
+    if (rc == JREQ_BAD) return api_error(400, je.msg);
+    if (rc == JREQ_ABSENT || !name[0]) return api_error(400, "name is required");
     if (!tag_name_valid(name))
         return api_error(400, "invalid tag name: use 1-64 of A-Z a-z 0-9 . _ -,"
                               " starting with a letter or digit");
-    if (json_req_get_u32(body, "snap_id", &snap, 1, UINT32_MAX) != 0)
-        return api_error(400, "snap_id is required");
-    if (json_req_has(body, "move") && json_req_get_bool(body, "move", &move) != 0)
-        return api_error(400, "move must be true or false");
+    rc = jreq_u32(body, "snap_id", &snap, 1, UINT32_MAX, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "snap_id is required");
+    if (rc == JREQ_BAD) return api_error(400, je.msg);
+    if (jreq_bool(body, "move", &move, &je) == JREQ_BAD)
+        return api_error(400, je.msg);
 
     char repo[32], sid[32], now[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -309,8 +314,10 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
         return api_error(400, "invalid JSON");
 
     CUTILS_AUTOFREE char *text = NULL;
-    if (json_req_get_str(body, "body", &text) != 0 || !text)
-        return api_error(400, "body is required");
+    jreq_err_t je;
+    int rc = jreq_str(body, "body", &text, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "body is required");
+    if (rc == JREQ_BAD) return api_error(400, je.msg);
 
     char repo[32], sid[32], now[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -708,20 +715,45 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
     CUTILS_AUTOFREE char *key = NULL;
     CUTILS_AUTOFREE char *value = NULL;
-    if (json_req_get_str(body, "key", &key) != 0 || !key)
-        return api_error(400, "key is required");
-    /* The value as the policy GET serves it - a number or a boolean - or as
-     * text, which is how every client sent it before values were typed. */
-    if (json_req_get_str(body, "value", &value) != 0 || !value) {
-        free(value);
-        value = NULL;
-        int64_t num = 0;
+    jreq_err_t je;
+    int rc = jreq_str(body, "key", &key, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "key is required");
+    if (rc == JREQ_BAD) return api_error(400, je.msg);
+    /*
+     * The value as the policy GET serves it - a number or a boolean - or as
+     * text, which is how every client sent it before values were typed.
+     * Anything else is named for what it is: a fraction, 1e999 or a list
+     * all used to be told "value is required" (B112).
+     */
+    switch (jreq_type(body, "value")) {
+    case JREQ_T_ABSENT:
+        return api_error(400, "value is required");
+    case JREQ_T_STRING:
+        if (jreq_str(body, "value", &value, &je) != JREQ_OK) return api_error(400, je.msg);
+        break;
+    case JREQ_T_BOOL: {
         bool flag = false;
-        if (json_req_get_i64(body, "value", &num, INT64_MIN, INT64_MAX) == 0) {
-            if (asprintf(&value, "%lld", (long long)num) < 0) value = NULL;
-        } else if (json_req_get_bool(body, "value", &flag) == 0)
-            value = strdup(flag ? "true" : "false");
-        if (!value) return api_error(400, "value is required");
+        if (jreq_bool(body, "value", &flag, &je) != JREQ_OK) return api_error(400, je.msg);
+        value = strdup(flag ? "true" : "false");
+        if (!value) return api_error(500, "out of memory");
+        break;
+    }
+    case JREQ_T_NUMBER:
+    case JREQ_T_HUGE: {
+        int64_t num = 0;
+        if (jreq_i64(body, "value", &num, INT64_MIN, INT64_MAX, &je) != JREQ_OK)
+            return api_error(400, je.msg);
+        if (asprintf(&value, "%lld", (long long)num) < 0) {
+            value = NULL;
+            return api_error(500, "out of memory");
+        }
+        break;
+    }
+    case JREQ_T_NULL:
+    case JREQ_T_ARRAY:
+    case JREQ_T_OBJECT:
+    default:
+        return api_error(400, "value must be a string, a whole number, or true or false");
     }
 
     int k = 0;
