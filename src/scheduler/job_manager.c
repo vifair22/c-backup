@@ -547,28 +547,34 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
      * job's schedule_id: a NULL there is a terminator, and would leave the
      * columns after it unbound without an error.
      */
+    /*
+     * The id comes back from the INSERT itself. last_insert_rowid() is per
+     * connection, and every thread shares one; db_mu only orders this
+     * module's own writes, so a grep or verify inserting its run row in
+     * between handed the submitter that row's id as its job id.
+     *
+     * A daemon-wide job has no repository: bound as "" and stored as NULL,
+     * because a NULL in the list would end it there.
+     */
     pthread_mutex_lock(&jm->db_mu);
+    db_result_t *r = NULL;
     int rc;
     if (schedule_id > 0)
-        rc = db_execute_non_query(jm->db,
+        rc = db_execute(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id)"
-            " VALUES (?, ?, ?, 'queued', 'schedule', ?)",
-            (const char *[]){ repo_id > 0 ? repo : NULL, action,
-                              params_json ? params_json : "", sched, NULL }, NULL);
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'schedule', ?) RETURNING id",
+            (const char *[]){ repo_id > 0 ? repo : "", action,
+                              params_json ? params_json : "", sched, NULL }, &r);
     else
-        rc = db_execute_non_query(jm->db,
+        rc = db_execute(jm->db,
             "INSERT INTO jobs (repo_id, action, params, state, origin)"
-            " VALUES (?, ?, ?, 'queued', 'api')",
-            (const char *[]){ repo_id > 0 ? repo : NULL, action,
-                              params_json ? params_json : "", NULL }, NULL);
+            " VALUES (NULLIF(?, ''), ?, ?, 'queued', 'api') RETURNING id",
+            (const char *[]){ repo_id > 0 ? repo : "", action,
+                              params_json ? params_json : "", NULL }, &r);
     int64_t job_id = 0;
-    if (rc == 0) {
-        db_result_t *r = NULL;
-        if (db_execute(jm->db, "SELECT last_insert_rowid()", NULL, &r) == 0 &&
-            r && r->nrows == 1)
-            job_id = strtoll(r->rows[0][0], NULL, 10);
-        db_result_free(r);
-    }
+    if (rc == 0 && r && r->nrows == 1)
+        job_id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
     pthread_mutex_unlock(&jm->db_mu);
 
     if (rc != 0 || job_id == 0)
