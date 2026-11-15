@@ -1256,6 +1256,7 @@ status_t pack_object_load_stream(store_t *store,
                                  uint64_t *out_size,
                                  uint8_t *out_type) {
     pack_cache_entry_t found;
+    memset(&found, 0, sizeof(found));   /* set via a resolver callback LTO cannot see through */
     status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
