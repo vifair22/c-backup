@@ -489,6 +489,12 @@ A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
 `c-backup jobs watch <id>` follow it.
 
+`sources set` replaces the whole list. Each source must be an absolute path
+(empty or relative ones are refused, and nothing is changed). A path that
+does not exist on the daemon's host is stored with a warning in the reply,
+not refused, since it may be a share or disk that is mounted only at backup
+time; a backup skips it until it exists.
+
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
 overrides them for that run. Exclusions are inherited only when the request

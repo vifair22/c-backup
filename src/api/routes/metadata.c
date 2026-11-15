@@ -3,11 +3,13 @@
 
 #include "routes.h"
 #include "db_txn.h"
+#include "util.h"
 
 #include <ctype.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -420,34 +422,83 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
 
     /* Collected before anything is written, so a rejected path leaves the
      * existing configuration alone rather than half-replaced. */
-    char  *paths[256];
-    char  *excl[256];
+    enum { SOURCES_MAX = 256 };
+    char  *paths[SOURCES_MAX];
+    char  *excl[SOURCES_MAX];
     int    n_paths = 0, n_excl = 0;
     api_response_t bad = { 0 };
     int failed = 0;
+
+    /*
+     * Every element is checked, and anything unusable refuses the whole
+     * request. The loop used to skip what it could not read: a number, a
+     * null, a "sources" that was a string rather than a list, or no
+     * "sources" at all each produced an empty list - and since this
+     * replaces wholesale, a 204 that had just deleted the repository's
+     * configuration. Past 256 entries the rest were dropped the same way.
+     */
+    size_t n_src_in = 0, n_ex_in = 0;
+    if (json_req_array_len(body, "sources", &n_src_in) != 0)
+        return api_error(400, "sources must be a list of absolute paths");
+    if (json_req_has(body, "exclude") &&
+        json_req_array_len(body, "exclude", &n_ex_in) != 0)
+        return api_error(400, "exclude must be a list of patterns");
+    if (n_src_in > SOURCES_MAX || n_ex_in > SOURCES_MAX)
+        return api_error(400, "at most 256 sources and 256 exclude patterns");
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *out = NULL;
+    if (json_resp_new(&out) != 0 || json_resp_ensure_array(out, "warnings") != 0)
+        return api_error(500, "out of memory");
 
     CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
     if (json_iter_begin(body, "sources", &it) == 0) {
         while (json_iter_next(&it) && !failed) {
             char *sp = NULL;
-            if (json_iter_get_str(&it, "", &sp) != 0 || !sp) continue;
-            if (sp[0] != '/') {
+            if (json_iter_get_str(&it, "", &sp) != 0 || !sp) {
                 free(sp);
-                bad = api_error(400, "backup sources must be absolute paths");
+                bad = api_error(400, "every source must be a string");
                 failed = 1;
                 break;
             }
-            if (n_paths == (int)(sizeof(paths) / sizeof(paths[0]))) { free(sp); break; }
-            paths[n_paths++] = sp;
+            char norm[PATH_MAX];
+            if (!*sp || sp[0] != '/' || path_normalize(sp, norm, sizeof(norm)) != 0) {
+                bad = api_error(400, *sp ? "backup sources must be absolute paths"
+                                         : "a backup source cannot be empty");
+                free(sp);
+                failed = 1;
+                break;
+            }
+            free(sp);
+            /*
+             * A source that does not exist is accepted with a warning, not
+             * refused: it may be a share that is not mounted yet, or a disk
+             * that is attached only when the backup runs. Until it exists a
+             * backup skips it, and a backup whose every source is missing
+             * fails with "nothing to back up".
+             */
+            struct stat stt;
+            if (stat(norm, &stt) != 0) {
+                char msg[PATH_MAX + 96];
+                snprintf(msg, sizeof(msg),
+                         "%s does not exist on the daemon's host; backups will "
+                         "skip it until it does", norm);
+                if (json_resp_array_append_str(out, "warnings", msg) != 0) { /* alloc only */ }
+            }
+            paths[n_paths] = strdup(norm);
+            if (!paths[n_paths]) { bad = api_error(500, "out of memory"); failed = 1; break; }
+            n_paths++;
         }
     }
     CUTILS_AUTO_JSON_ITER cutils_json_iter_t ex;
     if (!failed && json_iter_begin(body, "exclude", &ex) == 0) {
         while (json_iter_next(&ex)) {
             char *sp = NULL;
-            if (json_iter_get_str(&ex, "", &sp) != 0 || !sp) continue;
-            if (!*sp) { free(sp); continue; }
-            if (n_excl == (int)(sizeof(excl) / sizeof(excl[0]))) { free(sp); break; }
+            if (json_iter_get_str(&ex, "", &sp) != 0 || !sp || !*sp) {
+                free(sp);
+                bad = api_error(400, "every exclude pattern must be a non-empty string");
+                failed = 1;
+                break;
+            }
             excl[n_excl++] = sp;
         }
     }
@@ -490,7 +541,12 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < n_paths; i++) free(paths[i]);
     for (int i = 0; i < n_excl; i++) free(excl[i]);
     if (failed) return bad;
-    return api_no_content();
+
+    /* 200 with a body rather than 204, so a warning has somewhere to go. */
+    if (json_resp_add_u32(out, "sources", (uint32_t)n_paths) != 0 ||
+        json_resp_add_u32(out, "exclude", (uint32_t)n_excl) != 0)
+        return api_error(500, "out of memory");
+    return finalise(out);
 }
 
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)

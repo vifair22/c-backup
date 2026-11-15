@@ -216,6 +216,27 @@ contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
 
+echo "sources"
+# B078: anything the loop could not read was skipped, and the route replaces
+# wholesale - so a malformed request answered 204 having deleted the
+# configuration. Every element is checked now and a refusal changes nothing.
+put_sources() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+                     -d "$1" http://localhost/repos/1/sources; }
+check "sources set" 200 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"*.tmp\"]}")"
+check "sources as a string refused"   400 "$(put_sources '{"sources":"/x"}')"
+check "missing sources refused"       400 "$(put_sources '{}')"
+check "a non-string source refused"   400 "$(put_sources '{"sources":[123]}')"
+check "an empty source refused"       400 "$(put_sources '{"sources":[""]}')"
+check "a relative source refused"     400 "$(put_sources '{"sources":["rel/path"]}')"
+check "an empty exclude refused"      400 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"\"]}")"
+contains "a refusal leaves the configuration alone" "$WORK/src" "$(sock_body /repos/1/sources)"
+contains "an absent source is accepted with a warning" "does not exist on the daemon's host" \
+    "$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
+       http://localhost/repos/1/sources)"
+contains "sources are stored normalised" '"sources":["/a/b"]' \
+    "$(put_sources '{"sources":["/a//b/./"]}' >/dev/null; sock_body /repos/1/sources)"
+check "sources cleared" 200 "$(put_sources '{"sources":[]}')"
+
 echo "metadata"
 check "set tag" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      -d '{"name":"milestone","snap_id":1}' http://localhost/repos/1/tags)"

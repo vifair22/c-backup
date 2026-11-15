@@ -439,7 +439,19 @@ where `backup 1 /home/me` reads exactly what it says, and wrong for
 everything else: a desktop button had nowhere to get them and no way to ask,
 and a schedule had the same problem. Both were broken because of it.
 
-`PUT /repos/<id>/sources` stores them once. After that a backup with no
+`PUT /repos/<id>/sources` replaces the list and answers `200
+{"sources":N,"exclude":M,"warnings":[...]}`. `sources` is required and must
+be a list of at most 256 absolute paths; `exclude`, if present, a list of at
+most 256 non-empty patterns. Anything else - a missing or non-list
+`sources`, a non-string, an empty or relative path - is a 400 that leaves the
+stored configuration untouched. It used to skip what it could not read, and
+since the route replaces wholesale, a malformed request answered 204 having
+emptied the list. Paths are stored normalised (`/a//b/./` is `/a/b`). A path
+that does not exist on the daemon's host is accepted with a warning rather
+than refused, because it may be a share that is not mounted yet; a backup
+skips it until it exists.
+
+Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
 and a timer. A request that does name paths still overrides, because the
 CLI's explicitness is worth keeping - and excludes are only inherited when
