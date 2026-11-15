@@ -141,7 +141,11 @@ check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
-check    "tag remove" 0           "$(cb tag remove 1 keeper > /dev/null; echo $?)"
+# B095: the removes printed nothing on success, against the contract of one
+# JSON document per command.
+OUT=$(cb tag remove 1 keeper); RC=$?
+check    "tag remove" 0           "$RC"
+check    "tag remove prints what it removed" '{"removed":true,"name":"keeper"}' "$OUT"
 
 # B038: removing a tag that is not there exited 0 with no output.
 OUT=$(cb tag remove 1 keeper 2>&1); RC=$?
@@ -160,7 +164,9 @@ contains "a name that is not a path segment is refused" 'invalid tag name' \
 
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
-check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?)"
+OUT=$(cb schedule remove 1 1); RC=$?
+check    "schedule remove" 0      "$RC"
+check    "schedule remove prints what it removed" '{"removed":true,"id":1}' "$OUT"
 
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
 contains "reindex" '"state":"completed"' "$(cb reindex 1)"
@@ -272,7 +278,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
         progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
         'store')"
-    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2>&1 &
+    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
     WPID=$!
     sleep 1
     contains "jobs watch prints a running job at once" '"state":"running"' \
@@ -286,11 +292,23 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         ok "jobs watch ends with the job"
     fi
-    wait "$WPID" 2>/dev/null
+    wait "$WPID"; WRC=$?
+    check    "and exits 0" 0 "$WRC"
     contains "and prints how it ended" '"state":"completed"' "$(cat "$WORK/watch.out")"
+    # B096: it printed the SSE framing, "data: " before each document and a
+    # blank line after it. Every line is now one JSON document.
+    check "jobs watch prints no SSE framing" "" "$(grep -n '^data:\|^event:\|^$' "$WORK/watch.out")"
+    check "every line is a JSON document" "" "$(grep -v '^{.*}$' "$WORK/watch.out")"
+    check "and nothing on stderr" "" "$(cat "$WORK/watch.err")"
 else
     ok "jobs watch prints a running job at once (skipped: no sqlite3)"
 fi
+# The daemon ends the stream with a named error event for a job it does not
+# have. That is a failure, its document an error: stderr, not stdout.
+"$CLI" --socket "$SOCK" jobs watch 987654 > "$WORK/watch.out" 2> "$WORK/watch.err"; RC=$?
+check    "jobs watch of a missing job fails" 1 "$RC"
+check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
+check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
 
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
 # file is still cancellable when the request lands, whatever the machine.
@@ -350,7 +368,9 @@ case "$(cb search 1 big)" in
     *)         ok  "cli --exclude glob drops the file" ;;
 esac
 
-check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
+OUT=$(cb snapshot delete 1 1 2>/dev/null); RC=$?
+check "snapshot delete" 0 "$RC"
+check "snapshot delete prints what it removed" '{"removed":true,"id":1}' "$OUT"
 # The id comes from the add. This disabled a hardcoded id 2 that did not
 # exist, which passed only because a missing schedule answered success.
 VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -549,7 +569,9 @@ check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
+OUT=$(cb repo remove "$RM_ID"); RC=$?
+check    "repo remove" 0 "$RC"
+check    "repo remove prints what it removed" "{\"removed\":true,\"id\":$RM_ID}" "$OUT"
 check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
 contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
 # B046: the newest id was handed out again, and with it the removed
@@ -1055,14 +1077,25 @@ contains "and reports it configured" '"configured":true' "$OUT"
 OUT=$(printf 'anotherpassword\n' | cb auth setup 2>&1); RC=$?
 check "a second setup fails" 1 "$RC"
 contains "and says to change it instead" "already configured" "$OUT"
-contains "login reads stdin too" '"token"' "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+# B055: the CLI only talks to the socket, which needs no credential, and
+# `auth login` minted a 90-day token there that nothing stored. It refuses
+# now, before asking for a password, and prints no token.
+OUT=$(printf 'correcthorsebattery\n' | cb auth login 2>&1); RC=$?
+check    "auth login fails" 1 "$RC"
+contains "and says the socket needs no login" "needs no credential" "$OUT"
+check    "and mints no token" "" "$(printf '%s' "$OUT" | grep -o '"token"')"
+# A plain logout exited 0, printed nothing and revoked nothing.
+OUT=$(cb auth logout 2>&1); RC=$?
+check    "auth logout without --all fails" 1 "$RC"
+contains "and points at --all" "auth logout --all" "$OUT"
+tcp_login() {  # tcp_login <password>: the response body of a TCP login
+    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$PORTBASE/api/auth/login"
+}
 OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1); RC=$?
 check "password change reads both from stdin" 0 "$RC"
-contains "old password no longer logs in" "invalid password" \
-    "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
-# B053: from the host, logout --all ends every session a client holds. A
-# token from a login is checked over TCP, since the socket needs none.
-LTOK=$(printf 'brandnewpassword\n' | cb auth login 2>&1 | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+contains "old password no longer logs in" "invalid password" "$(tcp_login correcthorsebattery)"
+# B053: from the host, logout --all ends every session a client holds.
+LTOK=$(tcp_login brandnewpassword | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
 contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"

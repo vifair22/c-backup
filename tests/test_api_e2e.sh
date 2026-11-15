@@ -396,9 +396,14 @@ check "an empty source refused"       400 "$(put_sources '{"sources":[""]}')"
 check "a relative source refused"     400 "$(put_sources '{"sources":["rel/path"]}')"
 check "an empty exclude refused"      400 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"\"]}")"
 contains "a refusal leaves the configuration alone" "$WORK/src" "$(sock_body /repos/1/sources)"
+ABSENT=$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
+       http://localhost/repos/1/sources)
 contains "an absent source is accepted with a warning" "does not exist on the daemon's host" \
-    "$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
-       http://localhost/repos/1/sources)"
+    "$ABSENT"
+# B097: the warning promised the source would be skipped, but a backup with
+# a missing source fails (B077). It has to say what actually happens.
+contains "and the warning says a backup fails" "a backup fails while it is missing" "$ABSENT"
+check "and does not promise a skip" "" "$(printf '%s' "$ABSENT" | grep -o 'skip')"
 contains "sources are stored normalised" '"sources":["/a/b"]' \
     "$(put_sources '{"sources":["/a//b/./"]}' >/dev/null; sock_body /repos/1/sources)"
 check "sources cleared" 200 "$(put_sources '{"sources":[]}')"
@@ -413,7 +418,7 @@ contains "note readable" 'first backup' "$(sock_body /repos/1/snapshots/1/note)"
 check "set policy" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"key":"retention.keep_daily","value":"14"}' http://localhost/repos/1/policy)"
 contains "policy readable" 'keep_daily' "$(sock_body /repos/1/policy)"
-check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
+check "delete tag" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/tags/milestone)"
 
 # B037, B038: metadata for a snapshot that does not exist, a tag with no
@@ -442,7 +447,7 @@ check "a 65-character tag name is refused" 400 "$(curl -s -o /dev/null -w '%{htt
      http://localhost/repos/1/tags)"
 check "a dotted, dashed name is fine" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"name":"v1.2_pre-upgrade","snap_id":1}' http://localhost/repos/1/tags)"
-check "and removable" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+check "and removable" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
      --unix-socket "$SOCK" http://localhost/repos/1/tags/v1.2_pre-upgrade)"
 
 # B034: policy stored any key and any value and said ok. Each of these was
@@ -546,7 +551,7 @@ if [ "$JOBS_AFTER" -gt "$JOBS_BEFORE" ]; then
 else
     bad "due schedule submitted a job" "more than $JOBS_BEFORE jobs" "$JOBS_AFTER"
 fi
-check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
+check "delete schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
 # B065: these answered success for a schedule that does not exist.
 check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
@@ -945,6 +950,29 @@ TOKEN=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/log
         | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
+# B055: sessions are a TCP concept. Over the socket a login minted a token
+# nothing used, and a logout with nothing to revoke answered 204.
+sock_auth() {  # sock_auth <path> [curl args]: status and body over the socket
+    local p=$1; shift
+    curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" "$@" "http://localhost$p"
+}
+OUT=$(sock_auth /api/auth/login -d '{"password":"brandnewpassword"}')
+contains "socket login refused" " 400" "$OUT"
+contains "and says the socket needs no credential" "needs no credential" "$OUT"
+check "and mints no token" "" "$(printf '%s' "$OUT" | grep -o '"token"')"
+OUT=$(sock_auth /api/auth/logout)
+contains "socket logout with no token refused" " 400" "$OUT"
+contains "and points at logout-all" "logout-all" "$OUT"
+# A token named over the socket is revoked: the host's way to end one
+# session without ending all of them.
+SOCKREV=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+          | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "socket logout revokes a named token" 204 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" -H "Authorization: Bearer $SOCKREV" \
+     http://localhost/api/auth/logout)"
+check "and that token is dead" 401 "$(tcp_code /repos -H "Authorization: Bearer $SOCKREV")"
+check "while the caller's own is not" 200 "$(tcp_code /repos "${AUTH[@]}")"
+
 check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
 check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"
 
@@ -985,8 +1013,8 @@ check "another failure once the lockout lapses" 401 \
 LAST=$(login_hdrs brandnewpassword)
 check "the right password is refused while locked out" 429 "$(status_of "$LAST")"
 contains "429 carries Retry-After" "retry-after:" "$LAST"
-check "the socket is never throttled" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-     --unix-socket "$SOCK" -d '{"password":"brandnewpassword"}' http://localhost/api/auth/login)"
+check "the socket is never locked out" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
+     --unix-socket "$SOCK" http://localhost/repos)"
 wait_retry_after "$LAST"
 check "the right password works once it lapses" 200 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"

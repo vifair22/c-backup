@@ -430,7 +430,9 @@ HTTPS.
 - `sudo c-backup auth logout --all` (or `POST /api/auth/logout-all` with a
   token) revokes every session any client holds, including the caller's.
   Use it when a machine that was signed in is lost or no longer trusted and
-  the password itself is not in doubt.
+  the password itself is not in doubt. `--all` is required: the CLI has no
+  session of its own to sign out, so `auth logout` without it fails and
+  says so rather than succeeding at nothing.
 - Failed logins over TCP are throttled. Each client address gets 5 free
   failures; after that every failure locks it out for twice as long as the
   last (1 s, 2 s, 4 s, ... up to 5 minutes), and the lockout refuses the
@@ -442,7 +444,11 @@ HTTPS.
   never throttled: `sudo c-backup ...` on the host always works. Behind a
   reverse proxy every client is the proxy's address and shares one budget.
   Details are in `docs/api.md`.
-- The CLI never needs a password: it uses the socket.
+- The CLI never needs a password: it uses the socket. Sessions exist only
+  for TCP clients, so there is no `auth login`: it fails with an
+  explanation, and the daemon refuses a login over the socket with `400`.
+  A token minted there would be a live 90-day credential nothing uses. To
+  get a token for a script, log in over TCP (`POST /api/auth/login`).
 - The app stores the session token, never the password (section 15.2).
 
 ### 4.4 Public routes
@@ -571,21 +577,28 @@ A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
 `c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
 state as soon as it connects, then one per change and at least every 5
-seconds, and exits when the job ends:
+seconds, and exits when the job ends. Each line is one JSON document and
+nothing else (NDJSON), so `jq` reads the output as it arrives:
 
 ```
-data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
+{"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
 ```
 
 `current` counts entries, so it sits still while one large file is stored;
 `bytes_done` moves through the file as it is read, a few times a second, and
 each move is a new line.
 
+`watch` exits 0 once it has printed the job's final state, whatever that
+state is: read `state` for the outcome. It exits 1 with a message on stderr
+when there is no such job, and when the daemon stops following a job that is
+still running after an hour; watch it again to go on following.
+
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that
 does not exist on the daemon's host is stored with a warning in the reply,
 not refused, since it may be a share or disk that is mounted only at backup
-time; a backup skips it until it exists.
+time. A backup does not skip it: while it is missing every backup of the
+repository fails, naming it (below).
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
@@ -1535,7 +1548,9 @@ Not in 1.0, by decision:
 
 Every command talks to the daemon over its socket: `--socket PATH` before the
 command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
-JSON, one document per command, on stdout; errors go to stderr. The exit
+JSON, one document per command, on stdout (a remove prints what it removed,
+`{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
+that prints several: one document per line until the job ends. The exit
 status is 0 on success and 1 otherwise. Flags may appear anywhere after the
 command. Commands that start a job wait for it unless given `--no-wait`.
 
@@ -1572,7 +1587,8 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
 | `auth status` | Whether an admin password is set |
-| `auth setup\|login\|logout\|password` | Admin password and sessions (prompts) |
+| `auth setup\|password` | Set or change the admin password (prompts) |
+| `auth logout --all` | Revoke every remote session (section 4.3) |
 | `health [live]`, `metrics`, `version` | The daemon |
 | `help` | This list, from the binary |
 

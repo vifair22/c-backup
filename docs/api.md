@@ -50,6 +50,11 @@ A path that names nothing, under any method, is a `404`, and so is anything
 under `/repos/<id>` for a repository that is not registered. The 405 comes
 after authentication, so over TCP it needs a token like everything else.
 
+Every success carries a JSON body, removes included: a `DELETE` answers
+`200` with `{"removed":true,"id":N}` (or `"name"` for a tag) naming what went.
+They used to answer `204` with no body, and `c-backup repo remove` printed
+nothing on success. `POST /api/auth/logout` over TCP is the one `204` left.
+
 Long operations return `202` with a job id rather than blocking. A backup can
 run for hours, and a request that lives that long dies to any timeout between
 client and daemon.
@@ -101,8 +106,8 @@ paths or file content.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/auth/setup` | `{password}`: set the first one. Socket only (`403` over TCP), `409` once set |
-| POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. `403` before setup |
-| POST | `/api/auth/logout` | Revoke the presented token; `204` |
+| POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. TCP only (`400` over the socket), `403` before setup |
+| POST | `/api/auth/logout` | Revoke the presented token; `204`. Over the socket, `400` unless a token is presented |
 | POST | `/api/auth/logout-all` | Revoke every session, the caller's included; `{revoked}` |
 | POST | `/api/auth/password` | `{current, new}`: always needs the current password; returns `{changed, sessions_revoked}` |
 
@@ -115,6 +120,14 @@ left whoever the change was meant to shut out holding a token that kept
 working - and kept sliding forward - for 90 days. `logout-all` is the same
 revocation without a password change, for a lost or untrusted client; from
 the host it is `c-backup auth logout --all`.
+
+Sessions are for TCP clients. The socket is authorised by its file
+permissions and carries no session, so over it a login is a `400` (it used to
+mint a 90-day token that nothing held, and `c-backup auth login` printed it),
+and a logout is a `400` unless the request names a token in `Authorization:
+Bearer`, which revokes that one session: the host's way to end a single known
+token without ending the rest. It used to answer `204` having revoked
+nothing. The CLI has no `auth login`, and its `auth logout` needs `--all`.
 
 ### Login throttle
 
@@ -149,7 +162,7 @@ host always has a way in.
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}` |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list |
-| DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it |
+| DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
 stores that form. It answers:
@@ -189,7 +202,7 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
-| DELETE | `/repos/<id>/snapshots/<sid>` | Prune |
+| DELETE | `/repos/<id>/snapshots/<sid>` | Prune; `{"removed":true,"id"}` |
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
@@ -554,8 +567,9 @@ stored configuration untouched. It used to skip what it could not read, and
 since the route replaces wholesale, a malformed request answered 204 having
 emptied the list. Paths are stored normalised (`/a//b/./` is `/a/b`). A path
 that does not exist on the daemon's host is accepted with a warning rather
-than refused, because it may be a share that is not mounted yet; a backup
-skips it until it exists.
+than refused, because it may be a share that is not mounted yet, and the
+warning says that a backup fails while it is missing: a backup does not skip
+a missing source, it fails the job (see above).
 
 Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
@@ -762,7 +776,7 @@ same property that makes incremental backups cheap, applied to reading.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id, move}` |
-| DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
+| DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
 | GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
@@ -843,7 +857,7 @@ would be the worst kind of surprise.
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
 | PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule |
-| DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
+| DELETE | `/repos/<id>/schedules/<sid>` | Remove; `{"removed":true,"id"}`, 404 if this repository has no such schedule |
 
 Both used to answer success for an id that did not exist, or that belonged
 to another repository, so a typo read as done while the schedule meant kept

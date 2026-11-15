@@ -370,7 +370,13 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
     repo_purge_kick();
 
     log_info("deregistered repo %lld", (long long)id);
-    return api_no_content();
+
+    /* A body, not a 204: the CLI's contract is one JSON document per
+     * command, and `repo remove` printed nothing on success (B095). */
+    char *out = NULL;
+    if (asprintf(&out, "{\"removed\":true,\"id\":%lld}", (long long)id) < 0)
+        return api_error(500, "out of memory");
+    return api_ok(out);
 }
 
 /*

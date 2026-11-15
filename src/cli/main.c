@@ -17,6 +17,7 @@
  */
 
 #include "http.h"
+#include "sse.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -253,6 +254,12 @@ static int call(const char *method, const char *path, const char *body)
     if (resp.body && resp.body[0]) {
         fputs(resp.body, outf);
         if (resp.body[resp.body_len - 1] != '\n') fputc('\n', outf);
+    } else if (!rc) {
+        /* Every command prints one JSON document. The daemon's removes used
+         * to answer 204 and `repo remove` printed nothing (B095); they carry
+         * a body now, and this keeps any empty success from breaking a
+         * script that parses stdout. */
+        puts("{\"ok\":true}");
     }
     if (rc) fprintf(stderr, "c-backup: request failed with HTTP %d\n", resp.status);
     http_response_free(&resp);
@@ -834,6 +841,47 @@ static int cmd_grep(int argc, char **argv)
     return out;
 }
 
+/*
+ * `jobs watch` output: one JSON document per line, nothing else (B096).
+ *
+ * The stream's bytes used to be copied straight through, so the output was
+ * SSE framing - "data: " before every document and a blank line after it -
+ * that every reader had to strip. An unnamed event is a progress document
+ * and goes to stdout. The daemon's named events end the stream without a
+ * job outcome: "error" (no such job) carries an error document, which goes
+ * to stderr like every other error, and "timeout" means the daemon stopped
+ * following a job that is still running. Both make the command fail.
+ */
+typedef struct {
+    int failed;
+} watch_ctx_t;
+
+static status_t watch_event(void *ud, const char *event, const char *data)
+{
+    watch_ctx_t *w = ud;
+    if (event[0] == '\0' || strcmp(event, "message") == 0) {
+        if (!data[0]) return OK;
+        if (fputs(data, stdout) == EOF || fputc('\n', stdout) == EOF)
+            return set_error(ERR_IO, "cannot write to stdout");
+        fflush(stdout);
+        return OK;
+    }
+    if (strcmp(event, "error") == 0) {
+        fprintf(stderr, "%s\n", data[0] ? data : "{\"error\":\"stream error\"}");
+        w->failed = 1;
+    } else if (strcmp(event, "timeout") == 0) {
+        fprintf(stderr, "c-backup: the daemon stopped following the job, which "
+                        "is still running; watch it again to keep following\n");
+        w->failed = 1;
+    }
+    return OK;
+}
+
+static status_t watch_sink(void *ud, const char *buf, size_t n)
+{
+    return sse_feed(ud, buf, n);
+}
+
 static int cmd_jobs(int argc, char **argv)
 {
     if (argc >= 1 && strcmp(argv[0], "cancel") == 0) {
@@ -849,7 +897,11 @@ static int cmd_jobs(int argc, char **argv)
         sb_puts(&p, "/jobs/stream/"); sb_puts(&p, argv[1]);
         if (p.oom) { free(p.buf); return fail("request path too large"); }
         int status = 0;
-        status_t st = http_stream(g_socket, p.buf, stdout, stderr, &status);
+        watch_ctx_t w = { 0 };
+        sse_parser_t sp;
+        sse_init(&sp, watch_event, &w);
+        status_t st = http_stream(g_socket, p.buf, watch_sink, &sp, stderr, &status);
+        sse_free(&sp);
         free(p.buf);
         if (st == ERR_NOT_FOUND) {
             fprintf(stderr,
@@ -862,7 +914,7 @@ static int cmd_jobs(int argc, char **argv)
             fprintf(stderr, "c-backup: request failed with HTTP %d\n", status);
             return 1;
         }
-        return 0;
+        return w.failed;
     }
     /* The list pages like every other collection; the CLI could only ever
      * read its first 50 (B084 audit). */
@@ -1463,13 +1515,21 @@ static int read_new_password(const char *prompt, char *buf, size_t sz)
  * these calls are always accepted, and setup is accepted nowhere else: the
  * first admin password is set on the host, by whoever can reach the socket.
  *
+ * There is no `auth login`, and `auth logout` needs --all (B055). The CLI
+ * only ever talks to the socket, which needs no credential and holds no
+ * session: a login minted a 90-day token that nothing stored and printed it
+ * to the terminal, and a plain logout exited 0 having revoked nothing. Both
+ * now refuse here, before a password prompt, and say what to do instead;
+ * the daemon refuses them over the socket too. Remote clients sign in over
+ * TCP.
+ *
  * Passwords may still be given as arguments for scripts that already do,
  * but the default is to prompt (or read stdin), which keeps them off the
  * command line.
  */
 static int cmd_auth(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: auth <status|setup|login|logout [--all]|password> [args]");
+    if (argc < 1) return fail("usage: auth <status|setup|password|logout --all> [args]");
 
     /* Whether an admin password is set: GET /api/auth/setup, which had no
      * command (B084 audit). */
@@ -1477,13 +1537,17 @@ static int cmd_auth(int argc, char **argv)
 
     char pw[256], pw2[256];
 
-    if (strcmp(argv[0], "setup") == 0 || strcmp(argv[0], "login") == 0) {
-        int setup = strcmp(argv[0], "setup") == 0;
+    if (strcmp(argv[0], "login") == 0)
+        return fail("auth login is not needed: this CLI talks to the daemon's "
+                    "local socket, which needs no credential. Sessions are for "
+                    "remote clients, which sign in over TCP (the desktop app, "
+                    "or POST /api/auth/login)");
+
+    if (strcmp(argv[0], "setup") == 0) {
         const char *pass = (argc >= 2) ? argv[1] : NULL;
         if (!pass) {
-            int r = setup ? read_new_password("New admin password: ", pw, sizeof(pw))
-                          : read_password("Admin password: ", pw, sizeof(pw));
-            if (r != 0) return fail("no password read");
+            if (read_new_password("New admin password: ", pw, sizeof(pw)) != 0)
+                return fail("no password read");
             pass = pw;
         }
         sbuf_t b = { 0 };
@@ -1491,16 +1555,15 @@ static int cmd_auth(int argc, char **argv)
         sb_json_str(&b, pass);
         sb_puts(&b, "}");
         memset(pw, 0, sizeof(pw));
-        return call_sb("POST", setup ? "/api/auth/setup" : "/api/auth/login", &b);
+        return call_sb("POST", "/api/auth/setup", &b);
     }
 
     if (strcmp(argv[0], "logout") == 0) {
-        /* The socket carries no session of its own, so a plain logout here
-         * revokes nothing; --all is the one that does something from the
-         * host: every session any client holds. */
         if (take_flag(&argc, argv, "--all"))
             return call("POST", "/api/auth/logout-all", NULL);
-        return call("POST", "/api/auth/logout", NULL);
+        return fail("usage: auth logout --all. The local socket holds no session "
+                    "of its own to sign out; --all revokes every session any "
+                    "remote client holds");
     }
 
     if (strcmp(argv[0], "password") == 0) {
@@ -1564,7 +1627,7 @@ static const struct {
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
     { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
     { "jobs",      cmd_jobs,      "jobs [--limit N] [--offset N] | jobs <job-id> | jobs cancel <job-id> | jobs watch <job-id>" },
-    { "auth",      cmd_auth,      "auth <status|setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
+    { "auth",      cmd_auth,      "auth <status|setup|password|logout --all> (prompts for passwords; logout --all revokes every remote session)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },
