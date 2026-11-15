@@ -702,3 +702,22 @@ trigger_deploy:
     strategy: depend
   rules:
     - if: '$CI_COMMIT_BRANCH == "master" && $CBACKUP_DEPLOY_TARGETS'
+
+# UAT only: this branch exists to be deployed for acceptance testing and is
+# never merged. The image is built straight away rather than after fuzz and
+# coverage, and tagged so it cannot be mistaken for a release build.
+build:image:uat:
+  extends: build:image
+  needs: []
+  script:
+    - docker build --provenance=false --sbom=false -t "$CI_REGISTRY_IMAGE:uat-$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE:uat" .
+    - docker run -d --name smoke-uat "$CI_REGISTRY_IMAGE:uat-$CI_COMMIT_SHORT_SHA"
+    - sleep 5
+    - docker ps --filter name=smoke-uat --filter status=running | grep -q smoke-uat
+    - docker logs smoke-uat
+    - docker rm -f smoke-uat
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker push "$CI_REGISTRY_IMAGE:uat-$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:uat"
+  only:
+    - /^uat\//
