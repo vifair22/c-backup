@@ -16,10 +16,20 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
+import type { WirePolicyEntry } from '../shared/wire'
 
 const api = window.cbackup
 
-interface RawPolicy { key: string; value: string }
+type RawPolicy = WirePolicyEntry
+
+/*
+ * A policy value as the form edits it. The daemon types each value by its
+ * key - a count is a number, auto_pack a boolean - and null is a value
+ * stored before validation that the daemon ignores, which has nothing to
+ * show. The inputs are text, so everything becomes the string the PUT
+ * accepts as readily as the typed value.
+ */
+const asText = (v: RawPolicy['value']): string | null => v === null ? null : String(v)
 
 /*
  * The fallbacks, shown as the value in force when a repository has set
@@ -70,8 +80,14 @@ export function PolicyEditor({ connName, repoPath, onBack }: Props): React.React
       const rows = r.policy ?? []
       const next: Record<string, string> = {}
       for (const f of FIELDS) next[f.key] = String(f.dflt)
-      for (const d of r.defaults ?? []) if (KNOWN.has(d.key)) next[d.key] = d.value
-      for (const row of rows) if (KNOWN.has(row.key)) next[row.key] = row.value
+      for (const d of r.defaults ?? []) {
+        const v = asText(d.value)
+        if (KNOWN.has(d.key) && v !== null) next[d.key] = v
+      }
+      for (const row of rows) {
+        const v = asText(row.value)
+        if (KNOWN.has(row.key) && v !== null) next[row.key] = v
+      }
       setValues(next)
       setOriginal(next)
       setStored(new Set(rows.filter(x => KNOWN.has(x.key)).map(x => x.key)))
@@ -189,7 +205,7 @@ export function PolicyEditor({ connName, repoPath, onBack }: Props): React.React
                   {others.map(o => (
                     <tr key={o.key} className="border-t border-border-subtle">
                       <td className="py-1.5 pr-4 font-mono text-text-secondary">{o.key}</td>
-                      <td className="py-1.5 font-mono">{o.value}</td>
+                      <td className="py-1.5 font-mono">{asText(o.value) ?? '(ignored: not a valid value)'}</td>
                     </tr>
                   ))}
                 </tbody>

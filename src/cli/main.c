@@ -786,8 +786,8 @@ static int cmd_grep(int argc, char **argv)
     free(rp.buf);
     if (rst != OK) return fail("%s", err_msg());
     long run = -1;
-    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
-    if (ip) run = strtol(ip + 6, NULL, 10);
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
     if (run < 0) {
         if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
         http_response_free(&rr);
@@ -995,8 +995,8 @@ static long newest_verify_run(const char *repo)
     status_t st = http_request(g_socket, "GET", rp.buf, NULL, &rr);
     free(rp.buf);
     long run = -1;
-    const char *ip = (st == OK && rr.body) ? strstr(rr.body, "\"id\":\"") : NULL;
-    if (ip) run = strtol(ip + 6, NULL, 10);
+    const char *ip = (st == OK && rr.body) ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
     http_response_free(&rr);
     return run;
 }
@@ -1055,8 +1055,8 @@ static int cmd_verify(int argc, char **argv)
     free(rp.buf);
     if (st != OK) return fail("%s", err_msg());
     long run = -1;
-    const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
-    if (ip) run = strtol(ip + 6, NULL, 10);
+    const char *ip = rr.body ? strstr(rr.body, "\"id\":") : NULL;
+    if (ip) run = strtol(ip + 5, NULL, 10);
     if (rc != 0 && run <= before) { http_response_free(&rr); return rc; }
     if (run < 0) {
         if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }

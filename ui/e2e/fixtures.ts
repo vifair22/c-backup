@@ -96,7 +96,7 @@ function freePort(): Promise<number> {
 }
 
 function idFrom(out: string): number {
-  const m = out.match(/"id":"?(\d+)"?/)
+  const m = out.match(/"id":(\d+)/)
   return m ? Number(m[1]) : 0
 }
 

@@ -8,27 +8,16 @@
  * nothing else. Every column rendered as a dash and the sort comparator
  * subtracted undefined from undefined. It looked like an empty repository.
  *
- * The daemon renders every integer as a string so a 64-bit count cannot be
- * mangled by a JSON number, so everything numeric is converted on the way in
- * rather than trusted.
+ * The daemon sends typed values (B008): numbers, booleans, and null where a
+ * snapshot never recorded a count.
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, absoluteTime, gfsBadges, GFS_DAILY, GFS_WEEKLY, GFS_MONTHLY, GFS_YEARLY } from './format'
 import { ConfirmDialog } from './ConfirmDialog'
+import type { WireSnapshot } from '../shared/wire'
 
 const api = window.cbackup
-
-/* As the daemon sends it. */
-interface RawSnapshot {
-  id: string
-  ts: string
-  label?: string
-  files?: string
-  size?: string
-  gfs_flags?: string
-  materialized?: string
-}
 
 interface Snapshot {
   id: number
@@ -40,15 +29,15 @@ interface Snapshot {
   materialized: boolean
 }
 
-const parse = (r: RawSnapshot): Snapshot => ({
-  id: Number(r.id),
-  ts: Number(r.ts),
+const parse = (r: WireSnapshot): Snapshot => ({
+  id: r.id,
+  ts: r.ts,
   label: r.label ?? '',
-  files: Number(r.files ?? '0'),
-  size: Number(r.size ?? '0'),
-  gfsFlags: Number(r.gfs_flags ?? '0'),
+  files: r.files ?? 0,
+  size: r.size ?? 0,
+  gfsFlags: r.gfs_flags ?? 0,
   /* Absent means resident: the column postdates the first repositories. */
-  materialized: r.materialized === undefined || r.materialized !== '0',
+  materialized: r.materialized !== false,
 })
 
 type SortKey = 'id' | 'ts' | 'files' | 'size'
@@ -92,7 +81,7 @@ export function SnapshotList({ connName, repoPath, onSelectSnapshot, onCompareSn
    * them would trade a fast first screen for a slow one nobody scrolls.
    */
   const fetchPage = useCallback(async (offset: number): Promise<Snapshot[]> => {
-    const r = await api.apiCall<{ snapshots?: RawSnapshot[] }>(connName, {
+    const r = await api.apiCall<{ snapshots?: WireSnapshot[] }>(connName, {
       kind: 'snapshotList', repoId, limit: PAGE, offset,
     })
     const list = (r.snapshots ?? []).map(parse)

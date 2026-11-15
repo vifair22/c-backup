@@ -36,15 +36,16 @@ interface ScheduleParams {
 
 /* trigger and params arrive as objects. They were strings of JSON until
  * the daemon stopped double-encoding them; a string is still accepted so
- * an older daemon renders too. */
+ * an older daemon renders too. id and next_due are numbers and enabled a
+ * boolean (B008); this compared enabled with '1'. */
 interface Schedule {
-  id: string
+  id: number
   action: string
   trigger: Trigger | string
   overlap: string
   catchup: string
-  enabled: string
-  next_due: string
+  enabled: boolean
+  next_due: number
   next_due_iso?: string
   params?: ScheduleParams | string
 }
@@ -175,8 +176,8 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
       await api.apiCall(connName, {
         kind: 'scheduleSetEnabled',
         repoId,
-        scheduleId: Number(s.id),
-        enabled: s.enabled !== '1',
+        scheduleId: s.id,
+        enabled: !s.enabled,
       })
       await load()
     } catch (err) {
@@ -189,7 +190,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
     setError(null)
     try {
       await api.apiCall(connName, {
-        kind: 'scheduleRemove', repoId, scheduleId: Number(s.id),
+        kind: 'scheduleRemove', repoId, scheduleId: s.id,
       })
       await load()
     } catch (err) {
@@ -287,7 +288,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
                       {target ?? <span className="text-text-muted">-</span>}
                     </td>
                     <td className="py-1.5 pr-3">
-                      {s.enabled === '1'
+                      {s.enabled
                         ? <span className="text-status-connected">enabled</span>
                         : <span className="text-text-muted">paused</span>}
                     </td>
@@ -295,7 +296,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
                       <button onClick={() => handleToggle(s)}
                         className="underline cursor-pointer bg-transparent border-none
                                    text-accent p-0 text-xs mr-3">
-                        {s.enabled === '1' ? 'Pause' : 'Resume'}
+                        {s.enabled ? 'Pause' : 'Resume'}
                       </button>
                       <button onClick={() => setConfirmRemove(s)}
                         className="underline cursor-pointer bg-transparent border-none

@@ -18,6 +18,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "util.h"
+#include "json_row.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -325,19 +326,25 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "snapshots", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "ts",    r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "label", r->rows[i][2] ? r->rows[i][2] : "") != 0
-               || json_elem_add_str(&e, "files", r->rows[i][3] ? r->rows[i][3] : "0") != 0
-               || json_elem_add_str(&e, "size",  r->rows[i][4] ? r->rows[i][4] : "0") != 0
-               /* Which retention tiers hold this snapshot. Stored since the
-                * first schema and served by nothing, so neither the CLI nor
-                * the app could say why a snapshot was being kept - the one
-                * question worth asking of a list of them. */
-               || json_elem_add_str(&e, "gfs_flags", r->rows[i][6]) != 0
-               /* Clients need to know a cold snapshot must be faulted in
-                * before it can be browsed. */
-               || json_elem_add_str(&e, "materialized", r->rows[i][5]) != 0;
+        /*
+         * gfs_flags: which retention tiers hold this snapshot, a bitfield
+         * (1 daily, 2 weekly, 4 monthly, 8 yearly). Stored since the first
+         * schema and served by nothing, so neither the CLI nor the app
+         * could say why a snapshot was being kept - the one question worth
+         * asking of a list of them.
+         *
+         * materialized: clients need to know a cold snapshot must be
+         * faulted in before it can be browsed.
+         *
+         * files and size are null for a snapshot that never recorded them.
+         */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "ts", 1, JCOL_INT },
+            { "label", 2, JCOL_STR_NULL }, { "files", 3, JCOL_INT },
+            { "size", 4, JCOL_INT }, { "gfs_flags", 6, JCOL_INT },
+            { "materialized", 5, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -391,7 +398,8 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns, content_hash,"
+            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
+            "       mtime_ns % 1000000000, content_hash,"
             /* Whether this directory has anything in it. A browser needs it
              * to decide which rows get an expander, and the alternative is a
              * round trip per directory to find out it is empty. EXISTS and
@@ -427,16 +435,26 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",   r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "name", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "type", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "mode", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size", r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "mtime_ns", r->rows[i][5]) != 0
-               /* Empty for a directory, and for a file whose content was
-                * never hashed. Both mean "nothing to open". */
-               || json_elem_add_str(&e, "hash", r->rows[i][6] ? r->rows[i][6] : "") != 0
-               || json_elem_add_str(&e, "has_children", r->rows[i][7] ? r->rows[i][7] : "0") != 0;
+        /*
+         * type is NODE_TYPE_* and mode the full st_mode, both integers;
+         * docs/api.md lists the codes.
+         *
+         * The modification time is split into whole seconds and the
+         * nanoseconds within them. As one nanosecond count it is about
+         * 1.7e18, past the 2^53 a JSON number holds exactly, so a client
+         * would have read back a different time than was stored.
+         *
+         * hash is null for a directory, and for a file whose content was
+         * never hashed. Both mean "nothing to open".
+         */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "name", 1, JCOL_STR },
+            { "type", 2, JCOL_INT }, { "mode", 3, JCOL_INT },
+            { "size", 4, JCOL_INT }, { "mtime", 5, JCOL_INT },
+            { "mtime_nsec", 6, JCOL_INT }, { "hash", 7, JCOL_STR_NULL },
+            { "has_children", 8, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -745,17 +763,17 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
         char **row = r->rows[hits[k].row];
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "node_id", row[0]) != 0
-               || json_elem_add_str(&e, "snap_id", row[1]) != 0
+        int bad = jrow_elem_add(&e, "node_id", JCOL_INT, row[0]) != 0
+               || jrow_elem_add(&e, "snap_id", JCOL_INT, row[1]) != 0
                || json_elem_add_u32(&e, "snapshots", hits[k].count) != 0
                || json_elem_add_str(&e, "name",    row[2]) != 0
                /* Empty when the chain is broken, which a partially faulted-in
                 * snapshot can produce. A hit without a path is still a hit;
                 * it is the navigation that is unavailable, not the result. */
                || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
-               || json_elem_add_str(&e, "type",    row[3]) != 0
-               || json_elem_add_str(&e, "size",    row[4]) != 0
-               || json_elem_add_str(&e, "hash",    row[5]) != 0;
+               || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
+               || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
+               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -1542,16 +1560,15 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",            r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snapshot",      r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "pattern",       r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "started_at",    r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "finished_at",   r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "completed",     r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "files_scanned", r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "files_matched", r->rows[i][7]) != 0
-               || json_elem_add_str(&e, "hits",          r->rows[i][8]) != 0
-               || json_elem_add_str(&e, "truncated",     r->rows[i][9]) != 0;
+        /* finished_at is null while the search is still running. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "snapshot", 1, JCOL_INT },
+            { "pattern", 2, JCOL_STR }, { "started_at", 3, JCOL_INT },
+            { "finished_at", 4, JCOL_INT }, { "completed", 5, JCOL_BOOL },
+            { "files_scanned", 6, JCOL_INT }, { "files_matched", 7, JCOL_INT },
+            { "hits", 8, JCOL_INT }, { "truncated", 9, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -1611,10 +1628,11 @@ static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "hits", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "path",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "line",    r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "excerpt", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "node_id", r->rows[i][3]) != 0;
+        static const jcol_t cols[] = {
+            { "path", 0, JCOL_STR }, { "line", 1, JCOL_INT },
+            { "excerpt", 2, JCOL_STR }, { "node_id", 3, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -1667,20 +1685,18 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "runs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",                 r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "started_at",         r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "finished_at",        r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "level",              r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "completed",          r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "checked",            r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "ok",                 r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "repaired",           r->rows[i][7]) != 0
-               || json_elem_add_str(&e, "recoverable",        r->rows[i][13]) != 0
-               || json_elem_add_str(&e, "unrecoverable",      r->rows[i][8]) != 0
-               || json_elem_add_str(&e, "missing",            r->rows[i][9]) != 0
-               || json_elem_add_str(&e, "bytes_read",         r->rows[i][10]) != 0
-               || json_elem_add_str(&e, "affected_files",     r->rows[i][11]) != 0
-               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][12]) != 0;
+        /* finished_at is null while the scrub is still running. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "started_at", 1, JCOL_INT },
+            { "finished_at", 2, JCOL_INT }, { "level", 3, JCOL_STR },
+            { "completed", 4, JCOL_BOOL }, { "checked", 5, JCOL_INT },
+            { "ok", 6, JCOL_INT }, { "repaired", 7, JCOL_INT },
+            { "recoverable", 13, JCOL_INT }, { "unrecoverable", 8, JCOL_INT },
+            { "missing", 9, JCOL_INT }, { "bytes_read", 10, JCOL_INT },
+            { "affected_files", 11, JCOL_INT },
+            { "affected_snapshots", 12, JCOL_INT },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }
@@ -1724,14 +1740,18 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "findings", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "hash",               r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "status",             r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "affected_files",     r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "sample_paths",       r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "affected_versions",  r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "affected_snapshot_count", r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "snapshots_truncated", r->rows[i][7]) != 0;
+        /* sample_paths and affected_snapshots are text lists the scrub
+         * wrote, not numbers; null when it recorded none. */
+        static const jcol_t cols[] = {
+            { "hash", 0, JCOL_STR }, { "status", 1, JCOL_STR },
+            { "affected_files", 2, JCOL_INT },
+            { "sample_paths", 3, JCOL_STR_NULL },
+            { "affected_snapshots", 4, JCOL_STR_NULL },
+            { "affected_versions", 5, JCOL_INT },
+            { "affected_snapshot_count", 6, JCOL_INT },
+            { "snapshots_truncated", 7, JCOL_BOOL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }

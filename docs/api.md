@@ -46,6 +46,34 @@ Long operations return `202` with a job id rather than blocking. A backup can
 run for hours, and a request that lives that long dies to any timeout between
 client and daemon.
 
+### Value types
+
+Every response is typed. Until 1.0 most routes copied database rows out as
+text, so ids, counts and sizes arrived as strings (`"id":"3"`) and every
+client had to know which strings were numbers; they no longer do.
+
+| Kind | JSON type | Examples |
+|---|---|---|
+| Ids, counts, byte sizes, offsets | number | `id`, `snap_id`, `files`, `size`, `phys_size`, `refcount`, `offset` |
+| Times | number, epoch seconds | `ts`, `added_at`, `started_at`, `finished_at`, `next_due`, `mtime` |
+| Type codes, modes, bitfields | number | `type`, `mode`, `gfs_flags`, pack `version` |
+| Flags | `true`/`false` | `enabled`, `completed`, `truncated`, `materialized`, `has_children`, `key_escrowed` |
+| Paths, names, labels, hashes, enums | string | `path`, `name`, `label`, `hash` (hex), `state`, `location`, `level` |
+| A value the row does not have | `null` | `label` never set, `finished_at` of a running scrub, `hash` of a directory |
+
+`null` replaces the empty string or `0` that stood in for "no value": a
+NULL in the index is `null` in the response, whatever the field's type.
+
+Integers are exact up to 10^15 (the serialiser prints 15 significant
+digits). Every id, count, epoch second and byte size stays far below that;
+10^15 bytes is a petabyte. The one value that would not, a file's
+modification time in nanoseconds, is served as two numbers: `mtime` in
+seconds and `mtime_nsec` within the second.
+
+Requests take the same types. Where a field used to be sent as text or as
+0/1 - a policy `value`, a schedule's `enabled` - the old form is still
+accepted.
+
 ## Public
 
 | Method | Path | Purpose |
@@ -112,7 +140,7 @@ host always has a way in.
 |---|---|---|
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}` |
-| GET | `/repos/<id>` | One repository , including `encryption` and `key_escrowed` |
+| GET | `/repos/<id>` | One repository, the same object as each entry of the list |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
@@ -137,6 +165,11 @@ old one's schedules, history and index rows, which deregistering does not
 delete. Migration 019 rebuilt `repos` with `AUTOINCREMENT`, starting above
 every id any table still refers to.
 
+A repository is `{id, uuid, path, label, added_at, encryption,
+key_escrowed}`: `label` is `null` when none was given, `encryption` is
+`none`, `system` or `passphrase`, and `key_escrowed` is a boolean that is
+`false` while a system-managed key exists only on this host.
+
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is
 applied (`label_updated: true`); an absent or empty one leaves it alone.
@@ -149,6 +182,33 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
 | DELETE | `/repos/<id>/snapshots/<sid>` | Prune |
+
+A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
+`gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
+weekly, 4 monthly, 8 yearly. `materialized` is `false` for a cold snapshot
+whose rows must be faulted back in before it can be browsed.
+
+A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
+has_children}`. `id` is the node id to pass back as `parent`. `hash` is
+the content's hex hash, `null` for a directory or a file with no content
+object. `mode` is the file's full `st_mode` as a decimal integer, file type
+bits included: `33188` is `0100644`, a regular file with `rw-r--r--`, and
+`mode & 0o7777` is the permission bits. `type` is the node type:
+
+| `type` | Node |
+|---|---|
+| 1 | Regular file |
+| 2 | Directory |
+| 3 | Symbolic link |
+| 4 | Reserved for hard links; none is written, and a hard-linked file is type 1 |
+| 5 | FIFO |
+| 6 | Character device |
+| 7 | Block device |
+
+The same codes are `type` in search results. Object `type` (in `stats`,
+`objects` and an object's locate, layout and content) is a different set:
+1 file content, 2 extended attributes, 3 ACL, 4 sparse file, 5 manifest
+tree.
 
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
@@ -418,7 +478,7 @@ underneath it. With repair on it takes the write lock like any other writer.
 `unrecoverable` or `missing` object, the job ends `failed` with an error
 naming the run and the counts, and `c-backup verify` exits 1. The run record
 and its findings are written first and read back exactly as for a clean run;
-the run is still `completed: 1`, since the walk did finish. Repaired and
+the run is still `completed: true`, since the walk did finish. Repaired and
 recoverable damage is not loss and does not fail the job.
 
 A run (`GET /repos/<id>/verify`) carries these counts:
@@ -445,10 +505,10 @@ cannot be known without writing), `recoverable` or `repaired`:
 |---|---|
 | `affected_files` | Distinct paths referencing the object |
 | `affected_versions` | Node rows referencing it: one per path per snapshot |
-| `sample_paths` | Up to three full paths, `, `-separated, sorted, as restore would recreate them |
-| `affected_snapshots` | Up to ten snapshot ids, comma-separated, ascending |
+| `sample_paths` | Up to three full paths, `, `-separated, sorted, as restore would recreate them; `null` if none |
+| `affected_snapshots` | Up to ten snapshot ids as a comma-separated string, ascending; `null` if none |
 | `affected_snapshot_count` | Every snapshot referencing it |
-| `snapshots_truncated` | `1` when `affected_snapshots` lists fewer than `affected_snapshot_count` |
+| `snapshots_truncated` | `true` when `affected_snapshots` lists fewer than `affected_snapshot_count` |
 
 An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
@@ -652,6 +712,16 @@ genuinely the compressed entry payload.
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
 | GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
 
+An object's `location` is `loose`, `staged` or `packed`, and `pack_id` is
+the pack's number or `null`. The index stores the pack number in place of
+the location, and serving it as stored made `location` a word for some
+objects and `"3"` for others. `/objects/<hash>` also gives `offset` and
+`entry_index` within the pack, `null` for an object not in one. In
+`/summary`, `last_snapshot_ts` is `null` for a repository with no snapshots.
+In `/diff`, the counts are numbers and `truncated` a boolean; a change's
+`old_hash` or `new_hash` is `null` for the side that does not exist, whose
+size is 0.
+
 `/objects` replaces three separate actions that each read a different part of
 the old `.idx` sidecar. Pack membership is a column now, so one query serves
 all of them.
@@ -678,7 +748,7 @@ same property that makes incremental backups cheap, applied to reading.
 | DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
-| GET | `/repos/<id>/journal` | Operation history |
+| GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
 
 Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
 with no name is a 400. Removing a tag that is not there is a 404 `no such
@@ -702,7 +772,9 @@ before this rule can be removed: the server decodes the path before routing.
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
 `defaults`, what applies wherever the repository has set nothing: the
 daemon's configured `retention.*` values from `config.yaml`, and
-`maintenance.auto_pack` (`true`). A client cannot read the daemon's config
+`maintenance.auto_pack` (`true`). Each is `{key, value}` with the value
+typed by its key: a number for a count, a boolean for `auto_pack`. A value
+stored before the route validated, which the readers ignore, is `null`. A client cannot read the daemon's config
 file, so without them it could only guess at what is in force.
 
 `PUT /repos/<id>/policy` accepts only the keys something in the daemon reads,
@@ -717,7 +789,8 @@ and refuses anything else with a 400 that lists them:
 | `retention.keep_yearly` | whole number, 0 or more |
 | `maintenance.auto_pack` | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, any case); stored as `true` or `false` |
 
-A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
+The value may be sent as the GET serves it (`6`, `true`) or as text (`"6"`,
+`"true"`). A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
 were all stored once, and a retention pass read `banana` as 0, which for a
 tier means "keep all". A value stored before the route validated is ignored
 when read, with a warning in the daemon log, and the default applies.
@@ -752,7 +825,7 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`; 404 if this repository has no such schedule |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule |
 | DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
 
 Both used to answer success for an id that did not exist, or that belonged
@@ -764,10 +837,10 @@ parameters as objects:
 
 ```json
 {"timezone":"America/Chicago",
- "schedules":[{"id":"2","action":"replicate",
+ "schedules":[{"id":2,"action":"replicate",
    "trigger":{"type":"calendar","every":"day","at":"03:00"},
-   "overlap":"skip","catchup":"skip","enabled":"1",
-   "next_due":"1794733200","next_due_iso":"2026-11-16T03:00:00-06:00",
+   "overlap":"skip","catchup":"skip","enabled":true,
+   "next_due":1794733200,"next_due_iso":"2026-11-16T03:00:00-06:00",
    "params":{"dest":"/mnt/nas/replica"}}]}
 ```
 

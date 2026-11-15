@@ -16,15 +16,11 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { ConfirmDialog } from './ConfirmDialog'
+import type { WireRepo } from '../shared/wire'
 
 const api = window.cbackup
 
-interface RepoInfo {
-  id: number
-  label?: string
-  encryption?: string
-  key_escrowed?: number | string
-}
+type RepoInfo = Partial<WireRepo>
 
 interface Props {
   connName: string
@@ -32,8 +28,9 @@ interface Props {
   onBack: () => void
 }
 
-const escrowed = (r: RepoInfo | null): boolean =>
-  !!r && (r.key_escrowed === 1 || r.key_escrowed === '1')
+/* A boolean since B008. It was 0/1 from this route and "0"/"1" from the
+ * list, which is why this used to accept both. */
+const escrowed = (r: RepoInfo | null): boolean => r?.key_escrowed === true
 
 export function KeyView({ connName, repoPath, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)

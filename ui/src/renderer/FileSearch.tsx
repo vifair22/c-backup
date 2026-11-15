@@ -15,22 +15,12 @@
 import React, { useCallback, useState } from 'react'
 import { fmtSize, fmtNum, NODE_TYPE_NAMES } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
+import type { WireSearchResult } from '../shared/wire'
 
 const api = window.cbackup
 
 /* The route caps a page at 1000, so asking for more silently gets 1000. */
 const RESULT_CAP = 1000
-
-/* Every integer arrives as a string. */
-interface RawResult {
-  node_id: string
-  snap_id: string
-  name: string
-  path?: string
-  type?: string
-  size?: string
-  hash?: string
-}
 
 interface SearchResult {
   nodeId: number
@@ -42,13 +32,13 @@ interface SearchResult {
   hash: string
 }
 
-const parse = (r: RawResult): SearchResult => ({
-  nodeId: Number(r.node_id),
-  snapId: Number(r.snap_id),
+const parse = (r: WireSearchResult): SearchResult => ({
+  nodeId: r.node_id,
+  snapId: r.snap_id,
   name: r.name,
   path: r.path ?? '',
-  type: Number(r.type ?? '0'),
-  size: Number(r.size ?? '0'),
+  type: r.type ?? 0,
+  size: r.size ?? 0,
   hash: r.hash ?? '',
 })
 
@@ -75,7 +65,7 @@ export function FileSearch({ connName, repoPath, onNavigateToFile, onBack }: Pro
     setError(null)
     setResults(null)
     try {
-      const resp = await api.apiCall<{ results?: RawResult[] }>(connName, {
+      const resp = await api.apiCall<{ results?: WireSearchResult[] }>(connName, {
         kind: 'search', repoId, query: q, limit: RESULT_CAP,
       })
       setResults((resp.results ?? []).map(parse))
