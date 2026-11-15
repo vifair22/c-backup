@@ -1,10 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * Fault injection wrapper implementations.
  * Linked with --wrap=malloc,--wrap=calloc,... so these intercept libc calls.
  */
 
 #include "fault_inject.h"
+#include <pthread.h>
 #include <string.h>
+#include <time.h>
 
 _Thread_local int fault_malloc_at  = -1;
 _Thread_local int fault_fread_at   = -1;
@@ -100,7 +104,44 @@ const char *volatile fault_rename_dst = NULL;
 volatile int fault_rename_skip = 0;
 volatile int fault_rename_refused = 0;
 
+static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gate_cv = PTHREAD_COND_INITIALIZER;
+static char            gate_dst[4096];
+static int             gate_on, gate_n, gate_arrived;
+
+void fault_rename_gate_set(const char *dst, int n) {
+    pthread_mutex_lock(&gate_mu);
+    gate_on = dst != NULL;
+    if (dst) snprintf(gate_dst, sizeof(gate_dst), "%s", dst);
+    gate_n = n;
+    gate_arrived = 0;
+    pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_mu);
+}
+
+int fault_rename_gate_arrivals(void) {
+    pthread_mutex_lock(&gate_mu);
+    int n = gate_arrived;
+    pthread_mutex_unlock(&gate_mu);
+    return n;
+}
+
+static void gate_wait(const char *to) {
+    pthread_mutex_lock(&gate_mu);
+    if (gate_on && strcmp(to, gate_dst) == 0) {
+        gate_arrived++;
+        pthread_cond_broadcast(&gate_cv);
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += FAULT_GATE_TIMEOUT_S;
+        while (gate_on && gate_arrived < gate_n)
+            if (pthread_cond_timedwait(&gate_cv, &gate_mu, &until) != 0) break;
+    }
+    pthread_mutex_unlock(&gate_mu);
+}
+
 int __wrap_rename(const char *from, const char *to) {
+    gate_wait(to);
     const char *match = fault_rename_dst;
     if (match && strncmp(to, match, strlen(match)) == 0) {
         if (__atomic_load_n(&fault_rename_skip, __ATOMIC_SEQ_CST) > 0) {

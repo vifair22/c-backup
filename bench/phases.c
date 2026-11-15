@@ -27,6 +27,11 @@
  *     -l, --large N        incompressible large files           (BENCH_LARGE_FILES, 3)
  *     -t, --text N         identical compressible large files   (BENCH_TEXT_FILES, 2)
  *     -m, --large-mib M    size of each large file, MiB         (BENCH_LARGE_MIB, 64)
+ *     -w, --workers N      large-file store workers, 0 automatic, 1 serial
+ *                                                          (BENCH_STORE_WORKERS, 0)
+ *     -p, --preset NAME    many-large: 8 incompressible files of 2 GiB and
+ *                          nothing else, the B086 case; later options still
+ *                          override it
  *     -c, --cold           sync and evict the source from the page cache before
  *                          each backup, and include a trailing sync in every
  *                          timing; only meaningful on a real filesystem
@@ -58,6 +63,7 @@ typedef struct {
     uint64_t large_files;
     uint64_t text_files;
     uint64_t large_mib;
+    unsigned workers;
     int      cold;
     int      keep;
 } opts_t;
@@ -255,6 +261,7 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     memset(&bo, 0, sizeof(bo));
     bo.paths = paths;
     bo.n_paths = 1;
+    bo.store_workers = o->workers;
 
     if (o->cold) evict(src);
     section(label);
@@ -289,9 +296,9 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     report(name, mib / (tb + tp), "MiB/s", tb + tp);
     printf("      (%" PRIu64 " files, %" PRIu64 " dirs, %" PRIu64 " unchanged, "
            "%" PRIu64 " new objects, %" PRIu64 " new trees, %" PRIu64 " reused, "
-           "%u packed)\n",
+           "%u packed, %u store workers)\n",
            res->files, res->dirs, res->files_unchanged, res->objects_new,
-           res->trees_new, res->trees_reused, packed);
+           res->trees_new, res->trees_reused, packed, res->store_workers);
     return 0;
 }
 
@@ -325,13 +332,15 @@ static void usage(FILE *f)
 {
     fprintf(f,
         "usage: bench_phases [-d DIR] [-n SMALL] [-s BYTES] [-l LARGE] [-t TEXT]\n"
-        "                    [-m MIB] [-c] [-k]\n"
+        "                    [-m MIB] [-w N] [-p PRESET] [-c] [-k]\n"
         "  -d, --dir DIR        parent of the working directory (BENCH_DIR, /tmp)\n"
         "  -n, --small N        small files (BENCH_SMALL_FILES, 10000)\n"
         "  -s, --small-bytes B  mean small-file size (BENCH_SMALL_BYTES, 4096)\n"
         "  -l, --large N        incompressible large files (BENCH_LARGE_FILES, 3)\n"
         "  -t, --text N         identical compressible large files (BENCH_TEXT_FILES, 2)\n"
         "  -m, --large-mib M    MiB per large file (BENCH_LARGE_MIB, 64)\n"
+        "  -w, --workers N      large-file store workers, 0 auto, 1 serial (BENCH_STORE_WORKERS, 0)\n"
+        "  -p, --preset NAME    many-large: 8 x 2 GiB incompressible, no small files\n"
         "  -c, --cold           evict the source before each backup, sync in timings\n"
         "  -k, --keep           keep the working directory\n");
 }
@@ -345,6 +354,8 @@ static void parse(int argc, char **argv, opts_t *o)
     o->large_files = bench_env_u64("BENCH_LARGE_FILES", 3);
     o->text_files  = bench_env_u64("BENCH_TEXT_FILES", 2);
     o->large_mib   = bench_env_u64("BENCH_LARGE_MIB", 64);
+    uint64_t w     = bench_env_u64("BENCH_STORE_WORKERS", 0);
+    o->workers     = w > 64 ? 64u : (unsigned)w;
 
     static const struct option lo[] = {
         { "dir",         required_argument, NULL, 'd' },
@@ -353,13 +364,15 @@ static void parse(int argc, char **argv, opts_t *o)
         { "large",       required_argument, NULL, 'l' },
         { "text",        required_argument, NULL, 't' },
         { "large-mib",   required_argument, NULL, 'm' },
+        { "workers",     required_argument, NULL, 'w' },
+        { "preset",      required_argument, NULL, 'p' },
         { "cold",        no_argument,       NULL, 'c' },
         { "keep",        no_argument,       NULL, 'k' },
         { "help",        no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "d:n:s:l:t:m:ckh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:n:s:l:t:m:w:p:ckh", lo, NULL)) != -1) {
         switch (c) {
         case 'd': snprintf(o->parent, sizeof(o->parent), "%s", optarg); break;
         case 'n': o->small_files = bench_parse_u64("--small", optarg); break;
@@ -367,6 +380,22 @@ static void parse(int argc, char **argv, opts_t *o)
         case 'l': o->large_files = bench_parse_u64("--large", optarg); break;
         case 't': o->text_files  = bench_parse_u64("--text", optarg); break;
         case 'm': o->large_mib   = bench_parse_u64("--large-mib", optarg); break;
+        case 'w': {
+            uint64_t n = bench_parse_u64("--workers", optarg);
+            if (n > 64) { fprintf(stderr, "bench: --workers is 0 to 64\n"); exit(2); }
+            o->workers = (unsigned)n;
+            break;
+        }
+        case 'p':
+            if (strcmp(optarg, "many-large") != 0) {
+                fprintf(stderr, "bench: unknown preset '%s'\n", optarg);
+                exit(2);
+            }
+            o->small_files = 0;
+            o->large_files = 8;
+            o->text_files  = 0;
+            o->large_mib   = 2048;
+            break;
         case 'c': o->cold = 1; break;
         case 'k': o->keep = 1; break;
         case 'h': usage(stdout); exit(0);
@@ -399,9 +428,9 @@ int main(int argc, char **argv)
 
     printf("bench_phases: %s\n", o.work);
     printf("  %" PRIu64 " small files of ~%" PRIu64 " B, %" PRIu64 " random + %" PRIu64
-           " identical text files of %" PRIu64 " MiB%s\n",
+           " identical text files of %" PRIu64 " MiB, store workers %u%s%s\n",
            o.small_files, o.small_bytes, o.large_files, o.text_files, o.large_mib,
-           o.cold ? ", cold" : "");
+           o.workers, o.workers ? "" : " (auto)", o.cold ? ", cold" : "");
 
     tree_stats_t ts;
     double t0 = bench_now();

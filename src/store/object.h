@@ -75,6 +75,22 @@ status_t object_store_file_packed(store_t *store, int fd, uint64_t file_size,
                                   struct pack_backup_writer *pack_w,
                                   uint8_t out_hash[OBJECT_HASH_SIZE],
                                   object_write_t *out_info);
+
+/*
+ * object_store_file_info with a bound on the RS parity the stream holds in
+ * memory, past which it spills to tmp/; 0 means the default of 256 MiB.
+ *
+ * For a file over PACK_STREAM_THRESHOLD this stores exactly what
+ * object_store_file_packed would, since such a file never goes into a pack:
+ * same bytes, same hash. The parallel large-file store (B086) runs several of
+ * these at once on one handle, which is safe - each has its own temp file,
+ * the loose set is locked, and the existence check is a read - and divides a
+ * memory budget between them through parity_cap. fd is not closed.
+ */
+status_t object_store_file_loose(store_t *store, int fd, uint64_t file_size,
+                                 size_t parity_cap,
+                                 uint8_t out_hash[OBJECT_HASH_SIZE],
+                                 object_write_t *out_info);
 /*
  * The buffer counterpart to object_store_file_packed: stage into an open pack
  * when there is one, otherwise write loose exactly as object_store_ex does.

@@ -49,18 +49,22 @@ void parity_stats_add_uncorrectable(uint64_t n)
 
 #if !CRC32C_HW
 static uint32_t crc32c_table[256];
-static int crc32c_table_ready;
+static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
 
-static void crc32c_init_table(void)
+static void crc32c_build_table(void)
 {
-    if (crc32c_table_ready) return;
     for (unsigned i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int j = 0; j < 8; j++)
             c = (c >> 1) ^ ((c & 1) ? 0x82F63B78u : 0);
         crc32c_table[i] = c;
     }
-    crc32c_table_ready = 1;
+}
+
+/* Once, because object writers run on several threads at a time. */
+static void crc32c_init_table(void)
+{
+    pthread_once(&crc32c_once, crc32c_build_table);
 }
 #endif
 
