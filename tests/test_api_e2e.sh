@@ -614,6 +614,35 @@ case "$(sock_body /repos/1/schedules)" in
     *) ok "no schedule was created by any of them" ;;
 esac
 
+# B112 (1), (2): the parser stopped at the end of the first value, so data
+# after it was never read, and a repeated key silently took one of its
+# values. c-utils 1.6.0 refuses both, at any depth, before a route sees
+# the body.
+code_of() { printf '%s' "$1" | awk '{print $NF}'; }
+check "trailing junk after a repo body is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"label\":\"x\"} junk")")"
+check "a second object after a repo body is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\"}{}")")"
+check "a bare {}{} is a 400" 400 "$(code_of "$(sock_send POST /repos '{}{}')")"
+check "a duplicate top-level key is a 400" 400 \
+    "$(code_of "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"path\":\"$WORK/junkrepo2\"}")")"
+check "trailing whitespace is still fine to send" '{"error":"path is required"} 400' \
+    "$(sock_send POST /repos "{\"label\":\"x\"}"$' \t\n')"
+check "and no repository was made by any of them" "absent absent" \
+    "$([ -e "$WORK/junkrepo" ] && echo present || echo absent) $([ -e "$WORK/junkrepo2" ] && echo present || echo absent)"
+case "$(sock_body /repos)" in *junkrepo*) bad "and none was registered" "absent" "listed" ;;
+                              *) ok "and none was registered" ;; esac
+check "a duplicate key inside a trigger is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60,"seconds":3600}}')")"
+check "trailing data after a schedule is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60}} x')")"
+check "a duplicate top-level schedule key is a 400" 400 \
+    "$(code_of "$(sched '{"action":"gc","action":"pack","trigger":{"type":"interval","seconds":60}}')")"
+case "$(sock_body /repos/1/schedules)" in
+    *'"action"'*) bad "and no schedule was created" "none" "$(sock_body /repos/1/schedules)" ;;
+    *) ok "and no schedule was created" ;;
+esac
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.
