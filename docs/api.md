@@ -94,7 +94,11 @@ accepted.
 Health and metrics are public deliberately: an endpoint that needs a
 credential cannot report a daemon too unhealthy to authenticate, and a client
 asks `/readyz` before it has logged in. Metrics carry counts and ages, never
-paths or file content.
+paths or file content. The only repository they name is the stalest one, by id
+and label, in `cbackup_stalest_snapshot_repo_info` and
+`cbackup_stalest_verify_repo_info`: one series each, value 1, so an alert on
+the matching age can say which repository it means without a series per
+repository. Label values are escaped per the text exposition format.
 
 ## Auth
 

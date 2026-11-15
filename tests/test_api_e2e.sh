@@ -261,6 +261,12 @@ contains "alerts sent metric"    "cbackup_alerts_sent_total 0" "$METRICS"
 contains "alerts failed metric"  "cbackup_alerts_failed_total 0" "$METRICS"
 contains "alerts failed is a counter" "# TYPE cbackup_alerts_failed_total counter" "$METRICS"
 contains "alerts pending metric" "cbackup_alerts_pending 0" "$METRICS"
+# B092: the ages are the stalest repository's, and an info series says which
+# one, so an alert can name it without a series per repository.
+contains "stalest backup is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label=""} 1' "$METRICS"
+contains "stalest verify is named" \
+    'cbackup_stalest_verify_repo_info{repo_id="1",label=""} 1' "$METRICS"
 check "unknown repo" 404 "$(sock_code /repos/99)"
 
 echo "methods"
@@ -1077,6 +1083,24 @@ if command -v sqlite3 > /dev/null 2>&1; then
         "$(printf '%s' "$LIST" | grep -o '{"id":3,[^}]*}')"
 else
     ok "tier flags reach the listing (skipped: no sqlite3)"
+fi
+
+# B092: the info series follows the stalest repository, and a label is
+# free text, so its value is escaped as the exposition format requires.
+# Repository 1's newest snapshot is now from 2024; a second one registered
+# at the epoch is staler still.
+sock_post /repos "{\"path\":\"$R/repo2\",\"label\":\"q\\\"u\\\\o\"}" > /dev/null
+contains "the staler of two is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label="r"} 1' "$(sock_body /metrics)"
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
+    METRICS=$(sock_body /metrics)
+    contains "and it moves when another becomes staler, label escaped" \
+        'cbackup_stalest_snapshot_repo_info{repo_id="2",label="q\"u\\o"} 1' "$METRICS"
+    check "one series, not one per repository" 1 \
+        "$(printf '%s\n' "$METRICS" | grep -c '^cbackup_stalest_snapshot_repo_info{')"
+else
+    ok "the info series follows the stalest repository (skipped: no sqlite3)"
 fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.

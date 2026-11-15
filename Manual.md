@@ -445,7 +445,8 @@ HTTPS.
 `/healthz`, `/readyz`, `/metrics` and `GET /api/auth/setup` answer without a
 credential, on both transports. A health probe that needs a login cannot
 report a daemon too unhealthy to authenticate. Metrics carry counts and ages,
-never paths or file content.
+and name at most the stalest repository by id and label; never paths or file
+content.
 
 ### 4.5 What is protected, and what is not
 
@@ -1231,7 +1232,8 @@ Both are public, on the socket and on TCP.
 ### 16.2 Metrics
 
 `/metrics` is Prometheus text exposition, public, daemon-wide aggregates (no
-per-repository labels).
+per-repository series; see below for why, and for how an alert still names
+the repository).
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -1245,10 +1247,14 @@ per-repository labels).
 | `cbackup_jobs_failed_total` | counter | Jobs that failed |
 | `cbackup_jobs_completed_total` | counter | Jobs that completed |
 | `cbackup_schedules_enabled` | gauge | Enabled schedules |
-| `cbackup_last_snapshot_age_seconds` | gauge | Age of the newest snapshot |
+| `cbackup_last_snapshot_age_seconds` | gauge | Seconds since the stalest repository's newest snapshot, or since it was registered if it has none |
+| `cbackup_stalest_snapshot_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the age above measures |
+| `cbackup_repos_never_backed_up` | gauge | Repositories with no snapshot |
 | `cbackup_repos_key_unescrowed` | gauge | Encrypted repositories whose key is not acknowledged as stored elsewhere |
 | `cbackup_repos_encrypted` | gauge | Encrypted repositories |
-| `cbackup_last_verify_age_seconds` | gauge | Age of the newest verify run |
+| `cbackup_last_verify_age_seconds` | gauge | Seconds since the stalest repository's last completed verify, or since it was registered if it has none |
+| `cbackup_stalest_verify_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the verify age measures |
+| `cbackup_repos_never_verified` | gauge | Repositories with no completed verify |
 | `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
 | `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
 | `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
@@ -1259,6 +1265,34 @@ per-repository labels).
 
 The `cbackup_alerts_*` series count from zero each time the daemon starts, and
 read zero when Pushover is not configured.
+
+There are no per-repository series, by decision. A `repo` label on every
+series multiplies the series count by the number of repositories, and the
+gauges here are what an alert needs daemon-wide: the worst age, the summed
+damage. The ages are the *stalest* repository's, so an alert on them fires
+when any repository falls behind. To say which one, each age has an info
+series: a single series, value 1, whose labels name that repository and
+change when a different one becomes the stalest:
+
+```
+cbackup_last_snapshot_age_seconds 93784
+cbackup_stalest_snapshot_repo_info{repo_id="3",label="nas"} 1
+```
+
+Ties go to the lowest repository id. The label is the repository's label
+(empty when it has none), escaped as the exposition format requires; a
+repository's path never appears. An alert rule templates the labels into its
+message by joining the two; multiplying by the info series' 1 keeps the age
+as the value and adds its labels:
+
+```
+(cbackup_last_snapshot_age_seconds > 90000)
+  * on(instance) group_left(repo_id, label) cbackup_stalest_snapshot_repo_info
+```
+
+Only the stalest repository is named. When two have stopped, the alert names
+the worse, and the other surfaces once that one is fixed; `c-backup repo list`
+and each repository's summary give the full picture.
 
 Alerts worth having:
 
