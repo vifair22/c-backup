@@ -169,6 +169,9 @@ echo "repos"
 contains "register" '"id":1' \
     "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"path\":\"$WORK/repo\"}" http://localhost/repos)"
 contains "get repo" '"uuid"' "$(sock_body /repos/1)"
+# A repository with no snapshot is counted. Its age runs from registration,
+# so it trips an age alert like any stale repository instead of reading 0.
+contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
 check "unknown repo" 404 "$(sock_code /repos/99)"
 # And every route under it: these answered 200 with empty results, which a
 # script cannot tell from an empty repository that exists.
