@@ -153,10 +153,10 @@ check B3 "unchanged incremental adds $((BYTES2-BYTES1)) bytes, $MS ms" \
 echo "changed $(date)" > "$S/changed.txt"
 timed cb backup "$D_ID"
 DIFF=$(cb diff "$D_ID" 2 3)
-check B4 "one-file change shows in diff: $DIFF" grep -q '"added":"1"' <<<"$DIFF"
+check B4 "one-file change shows in diff: $DIFF" grep -q '"added":1,' <<<"$DIFF"
 timed cb backup "$D_ID" "$S" --exclude '*.bin'
 LAST=$(cb snapshots "$D_ID" --limit 1 | jget 'd["snapshots"][0]["id"]')
-check B5 "exclude keeps data.bin out" bash -c "! '$CLI' --socket '$SOCK' search $D_ID data.bin | grep -q '\"id\"' || true; ! '$CLI' --socket '$SOCK' diff $D_ID 3 $LAST | grep -q '\"removed\":\"0\"'"
+check B5 "exclude keeps data.bin out" bash -c "! '$CLI' --socket '$SOCK' search $D_ID data.bin | grep -q '\"id\"' || true; ! '$CLI' --socket '$SOCK' diff $D_ID 3 $LAST | grep -q '\"removed\":0,'"
 timed cb backup "$D_ID" "$S" --label acceptance-label
 check B6 "label recorded" bash -c "'$CLI' --socket '$SOCK' snapshots $D_ID --limit 1 | grep -q acceptance-label"
 
@@ -224,9 +224,9 @@ check D4 "restoring again skips what exists" grep -q '"state":"completed"' <<<"$
 
 # ---- E. Integrity --------------------------------------------------------------
 timed cb verify "$D_ID" --level index
-check E1 "index verify clean" grep -q '"missing":"0"' <<<"$OUT"
+check E1 "index verify clean" grep -q '"missing":0,' <<<"$OUT"
 timed cb verify "$D_ID" --level deep
-check E2 "deep verify clean ($((MS/1000)) s)" grep -q '"unrecoverable":"0"' <<<"$OUT"
+check E2 "deep verify clean ($((MS/1000)) s)" grep -q '"unrecoverable":0,' <<<"$OUT"
 timed cb verify list "$D_ID"
 check E3 "verify history" grep -q '"runs"' <<<"$OUT"
 PACK=$(find "$WORK/repo-d/packs" -name '*.dat' | head -1)
@@ -235,9 +235,9 @@ OFF=$((SIZE / 2))
 printf '\xff' | dd of="$PACK" bs=1 seek="$OFF" conv=notrunc status=none
 timed cb verify "$D_ID" --level deep
 check E4 "damage found and repaired: $(echo "$OUT" | jget 'd["runs"][0]["repaired"]') repaired" \
-    bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if int(r[\"repaired\"])>0 and r[\"unrecoverable\"]==\"0\" else 1)'" "$OUT"
+    bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if int(r[\"repaired\"])>0 and r[\"unrecoverable\"]==0 else 1)'" "$OUT"
 timed cb verify "$D_ID" --level deep
-check E5 "second deep verify clean" bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"repaired\"]==\"0\" and r[\"unrecoverable\"]==\"0\" else 1)'" "$OUT"
+check E5 "second deep verify clean" bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"repaired\"]==0 and r[\"unrecoverable\"]==0 else 1)'" "$OUT"
 
 # ---- F. Maintenance -------------------------------------------------------------
 timed cb pack "$D_ID"
@@ -260,7 +260,7 @@ timed cb tag set "$D_ID" keep 2
 check G1 "tag" bash -c "'$CLI' --socket '$SOCK' tag list $D_ID | grep -q keep"
 cb policy set "$D_ID" retention.keep_snaps 1 >/dev/null
 timed cb gfs "$D_ID"
-check G2 "tagged snapshot survives retention" bash -c "'$CLI' --socket '$SOCK' snapshots $D_ID | grep -q '\"id\":\"2\"'"
+check G2 "tagged snapshot survives retention" bash -c "'$CLI' --socket '$SOCK' snapshots $D_ID | grep -q '\"id\":2,'"
 timed cb tag remove "$D_ID" keep
 check G3 "remove tag" bash -c "! '$CLI' --socket '$SOCK' tag list $D_ID | grep -q keep"
 LAST=$(cb snapshots "$D_ID" --limit 1 | jget 'd["snapshots"][0]["id"]')
@@ -269,7 +269,7 @@ check G4 "note" bash -c "'$CLI' --socket '$SOCK' snapshot note $D_ID $LAST | gre
 timed cb snapshot note "$D_ID" "$LAST" ""
 check G5 "clear note" bash -c "! '$CLI' --socket '$SOCK' snapshot note $D_ID $LAST | grep -q 'acceptance note'"
 timed cb policy set "$D_ID" retention.keep_daily 14
-check G6 "policy persists" bash -c "'$CLI' --socket '$SOCK' policy list $D_ID | grep -q '\"retention.keep_daily\",\"value\":\"14\"'"
+check G6 "policy persists" bash -c "'$CLI' --socket '$SOCK' policy list $D_ID | grep -q '\"retention.keep_daily\",\"value\":14'"
 timed cb journal "$D_ID"
 check G7 "journal records operations with durations" grep -q '"duration_ms"' <<<"$OUT"
 
@@ -285,7 +285,7 @@ done
 MS=$(( $(now_ms) - T0 ))
 check H2 "it fires on its own" bash -c "[ \"\$('$CLI' --socket '$SOCK' snapshots $G_ID | python3 -c 'import sys,json; print(len(json.load(sys.stdin)[\"snapshots\"]))')\" -gt $BEFORE ]"
 timed cb schedule disable "$G_ID" "$SCHED"
-check H3 "pause" bash -c "'$CLI' --socket '$SOCK' schedule list $G_ID | grep -q '\"enabled\":\"0\"'"
+check H3 "pause" bash -c "'$CLI' --socket '$SOCK' schedule list $G_ID | grep -q '\"enabled\":false'"
 timed cb schedule add "$G_ID" gfs --every day --at 04:00
 check H3c "calendar schedule" grep -q '"id"' <<<"$OUT"
 timed cb schedule remove "$G_ID" "$SCHED"
@@ -374,7 +374,7 @@ start_daemon
 timed cb backup "$CR_ID" "$G_PATH"
 timed cb verify "$CR_ID" --level index --no-repair
 check M3 "after kill -9 mid-backup, the next backup is complete" \
-    bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"missing\"]==\"0\" else 1)'" "$OUT"
+    bash -c "echo \"\$0\" | python3 -c 'import sys,json; r=json.load(sys.stdin)[\"runs\"][0]; sys.exit(0 if r[\"missing\"]==0 else 1)'" "$OUT"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL" | tee -a "$RESULTS"
 if [ "$KEEP" = 1 ]; then

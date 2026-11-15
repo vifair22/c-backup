@@ -129,7 +129,7 @@ contains "repo show" '"uuid"' "$(cb repo show 1)"
 # daemon having accepted the request.
 contains "backup waits and completes" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "jobs list"     '"action"'            "$(cb jobs)"
-contains "snapshots"     '"id":"1"'            "$(cb snapshots 1)"
+contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
 # B074: these were silently replaced by the defaults.
@@ -319,7 +319,7 @@ OUT=$(cb tag set 1 pinned 2 2>&1); RC=$?
 check    "a tag in use elsewhere is not moved" 1 "$RC"
 contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
 contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
-contains "to the new snapshot" '"snap_id":"2"' "$(cb tag list 1)"
+contains "to the new snapshot" '"snap_id":2' "$(cb tag list 1)"
 cb tag remove 1 pinned > /dev/null
 
 # Exclusions have to work from the CLI too, which is where anyone would
@@ -399,8 +399,8 @@ check "search collapses identical copies" 1 \
     "$(printf '%s' "$SR" | grep -o "\"path\":\"$WORK/src/one.txt\"" | wc -l | tr -d ' ')"
 NSNAP=$(printf '%s' "$SR" | sed -n 's/.*"snapshots":\([0-9]*\).*/\1/p' | head -1)
 if [ "${NSNAP:-0}" -ge 2 ]; then ok "and counts the snapshots it is in"; else bad "and counts the snapshots it is in" ">= 2" "${NSNAP:-none}"; fi
-NEWEST=$(cb snapshots 1 --limit 1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
-contains "--snapshot narrows the search" "\"snap_id\":\"$NEWEST\"" "$(cb search 1 one.txt --snapshot "$NEWEST")"
+NEWEST=$(cb snapshots 1 --limit 1 | sed -n 's/.*"id":\([0-9]*\),.*/\1/p')
+contains "--snapshot narrows the search" "\"snap_id\":$NEWEST," "$(cb search 1 one.txt --snapshot "$NEWEST")"
 OUT=$(cb search 1 one.txt --snapshot 999 2>&1); RC=$?
 check    "search in a missing snapshot fails" 1 "$RC"
 # B067: the hit caps are request options, refused out of range rather than
@@ -440,7 +440,7 @@ contains "a grep schedule stores its pattern" '"params":{"pattern":"passphrase i
 FIRED=0
 for _ in $(seq 1 50); do
     case "$(curl -s --unix-socket "$SOCK" 'http://localhost/repos/1/grep?limit=1')" in
-        *'"pattern":"passphrase is"'*'"completed":"1"'*) FIRED=1; break ;;
+        *'"pattern":"passphrase is"'*'"completed":true'*) FIRED=1; break ;;
     esac
     sleep 0.2
 done
@@ -583,7 +583,7 @@ check    "and writes nothing" 1 "$([ -e "$WORK/nokeyout" ]; echo $?)"
 OUT=$(cb reindex "$ENC_ID" 2>&1); RC=$?
 check    "reindex without the key is refused" 1 "$RC"
 contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
-contains "and the index is untouched" '"id":"1"' "$(cb snapshots "$ENC_ID")"
+contains "and the index is untouched" '"id":1,' "$(cb snapshots "$ENC_ID")"
 mv "$WORK/enc.key.aside" "$WORK/keys/$ENC_UUID.key"
 
 # B042: a passphrase repository recovered with nothing but its passphrase.
@@ -616,10 +616,11 @@ REINDEX_OUT=$(cb reindex "$PASS_ID")
 contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
 contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
 contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
-contains "and lists its snapshot" '"id":"1"' "$(cb snapshots "$PASS_ID")"
-# B047: a reindexed snapshot listed "size":"".
+contains "and lists its snapshot" '"id":1,' "$(cb snapshots "$PASS_ID")"
+# B047: a reindexed snapshot listed "size":"", which is null now that a
+# missing value is served as one.
 case "$(cb snapshots "$PASS_ID")" in
-    *'"size":""'*) bad "a reindexed snapshot keeps its size" "a size" '"size":""' ;;
+    *'"size":""'*|*'"size":null'*) bad "a reindexed snapshot keeps its size" "a size" "no size" ;;
     *)             ok  "a reindexed snapshot keeps its size" ;;
 esac
 cb restore "$PASS_ID" 1 "$WORK/passout" >/dev/null
@@ -669,11 +670,11 @@ if [ -n "$LOSS_DAT" ]; then
     check    "index verify of a deleted pack exits non-zero" 1 "$RC"
     contains "a deleted pack's objects are missing" '"status":"missing"' "$OUT"
     case "$OUT" in
-        *'"missing":"0"'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
+        *'"missing":0,'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
         *)                 ok  "index verify counts them missing" ;;
     esac
     contains "verify show reads the failed run back" '"findings"' \
-        "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":"\([0-9]*\)".*/\1/p')")"
+        "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"
     # A failed run is still a completed walk, and the gauge reads those.
     GAUGE=$(cb metrics | sed -n 's/^cbackup_verify_unrecoverable_objects \([0-9]*\)$/\1/p')
     if [ "${GAUGE:-0}" -gt 0 ]; then ok "the loss gauge sees it"
@@ -818,7 +819,7 @@ for _ in $(seq 1 40); do
 done
 contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
 # Stop it before it fires again under the rest of the suite.
-SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true
 
 # A relative path would be resolved against the daemon's working directory,
@@ -888,7 +889,7 @@ check    "the source keeps its path" "$BEFORE_PATH" "$AFTER_PATH"
 # The case that rule is guarding must still work: a repository that actually
 # moved re-links to its new path, because the old one is gone.
 cb repo add "$WORK/driftrepo" drift >/dev/null
-DRIFT_ID=$(cb repo list | tr '}' '\n' | grep driftrepo | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+DRIFT_ID=$(cb repo list | tr '}' '\n' | grep driftrepo | sed -n 's/.*"id":\([0-9]*\),.*/\1/p')
 mv "$WORK/driftrepo" "$WORK/driftmoved"
 contains "a moved repository re-links" '"id"' "$(cb repo add "$WORK/driftmoved" drift 2>&1)"
 contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID")"
@@ -923,7 +924,7 @@ else
     ok "the re-encrypted copy holds no plaintext"
 fi
 contains "the destination reindexes" '"completed"' "$(cb reindex "$REENC_ID")"
-contains "and lists the snapshot" '"id":"1"' "$(cb snapshots "$REENC_ID")"
+contains "and lists the snapshot" '"id":1,' "$(cb snapshots "$REENC_ID")"
 cb restore "$REENC_ID" 1 "$WORK/reencout" >/dev/null
 if diff -r "$WORK/encout" "$WORK/reencout" >/dev/null 2>&1; then
     ok "a re-encrypted copy restores what the source does"
@@ -961,7 +962,7 @@ check "a bare backup uses the configured sources" "$((BEFORE + 1))" "$AFTER"
 # And naming paths still overrides, so the explicit form is unchanged.
 cb backup 1 "$WORK/othersrc" >/dev/null
 # Newest first, so the snapshot just made is the head of the list.
-LAST=$(cb snapshots 1 | tr '}' '\n' | grep -o '"id":"[0-9]*"' | head -1 | tr -dc '0-9')
+LAST=$(cb snapshots 1 | tr '}' '\n' | grep -o '"id":[0-9]*' | head -1 | tr -dc '0-9')
 cb restore 1 "$LAST" "$WORK/overrideout" >/dev/null 2>&1
 if find "$WORK/overrideout" -name 'other.txt' | grep -q .; then
     ok "an explicit path still overrides the configured sources"
@@ -988,7 +989,7 @@ contains "and says what is missing" "sources" "$OUT"
 # With sources configured, a schedule needs nothing else.
 OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
 check    "a backup schedule inherits the repo sources" 0 "$RC"
-SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
 # B065: another repository's schedule, or one that does not exist, is not
 # this repository's to remove or disable; both reported success.
 OUT=$(cb schedule remove 2 "$SID0" 2>&1); RC=$?
@@ -996,7 +997,7 @@ check    "removing another repo's schedule fails" 1 "$RC"
 contains "and says there is no such schedule" "no such schedule" "$OUT"
 OUT=$(cb schedule disable 2 "$SID0" 2>&1); RC=$?
 check    "disabling another repo's schedule fails" 1 "$RC"
-contains "the schedule survives" "\"id\":\"$SID0\"" "$(cb schedule list 1)"
+contains "the schedule survives" "\"id\":$SID0," "$(cb schedule list 1)"
 [ -n "$SID0" ] && cb schedule remove 1 "$SID0" >/dev/null 2>&1
 OUT=$(cb schedule remove 1 "$SID0" 2>&1); RC=$?
 check    "removing it twice fails" 1 "$RC"
@@ -1012,7 +1013,7 @@ for _ in $(seq 1 60); do
 done
 check "a scheduled backup produces a snapshot" 1 "$FIRED"
 contains "and ran as a backup job" '"action":"backup"' "$(cb jobs)"
-SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":\([0-9]*\),.*/\1/p' | head -1)
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
 
 echo "auth"

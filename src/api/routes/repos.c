@@ -4,6 +4,7 @@
 #include "routes.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "json_row.h"
 
 #include <openssl/crypto.h>
 
@@ -25,6 +26,38 @@ static const char *url_tail(const char *url, const char *prefix)
     return tail;
 }
 
+/*
+ * One repository, as both the list and the single-repo route serve it, from
+ * a row of REPO_COLUMNS. Exactly one of e and r is set.
+ *
+ * key_escrowed is a flag and encryption a mode name; a row from before
+ * either column existed reads them as unset, which means "none" and "not
+ * escrowed".
+ */
+#define REPO_COLUMNS \
+    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed FROM repos"
+
+static const jcol_t k_repo_cols[] = {
+    { "id",       0, JCOL_INT },
+    { "uuid",     1, JCOL_STR },
+    { "path",     2, JCOL_STR },
+    { "label",    3, JCOL_STR_NULL },
+    { "added_at", 4, JCOL_INT },
+};
+
+static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row)
+{
+    const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
+    const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
+    if (e)
+        return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
+            || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
+            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0;
+    return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
+        || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
+        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0;
+}
+
 static api_response_t list_repos(const api_request_t *req, void *userdata)
 {
     (void)req;
@@ -32,9 +65,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at, last_seen_at,"
-            "       encryption, key_escrowed"
-            " FROM repos ORDER BY id", NULL, &r) != 0) {
+            REPO_COLUMNS " ORDER BY id", NULL, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list repos");
     }
@@ -59,25 +90,18 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "repos", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",       r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "uuid",     r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "path",     r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "label",    r->rows[i][3] ? r->rows[i][3] : "") != 0
-               || json_elem_add_str(&e, "added_at", r->rows[i][4]) != 0
-               /*
-                * Encryption state, which the app could not see at all.
-                *
-                * A system-managed key exists only in a file on this host. If
-                * the host is lost, every offsite copy of the repository is
-                * unreadable - which is precisely the disaster the backups
-                * were for. The daemon has warned about it on /metrics since
-                * the column existed, and Prometheus is not where somebody
-                * finds out their key was never written down.
-                */
-               || json_elem_add_str(&e, "encryption",
-                                    r->rows[i][6] ? r->rows[i][6] : "none") != 0
-               || json_elem_add_str(&e, "key_escrowed",
-                                    r->rows[i][7] ? r->rows[i][7] : "0") != 0;
+        /*
+         * Encryption state travels with every repo, which the app could
+         * not see at all.
+         *
+         * A system-managed key exists only in a file on this host. If the
+         * host is lost, every offsite copy of the repository is unreadable -
+         * which is precisely the disaster the backups were for. The daemon
+         * has warned about it on /metrics since the column existed, and
+         * Prometheus is not where somebody finds out their key was never
+         * written down.
+         */
+        int bad = repo_row_add(&e, NULL, r->rows[i]) != 0;
         /* Committing a partially built element would emit a row missing
          * fields the client requires; drop it and stop instead. */
         if (bad) break;
@@ -275,8 +299,7 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at, encryption, key_escrowed"
-            "  FROM repos WHERE id = ?",
+            REPO_COLUMNS " WHERE id = ?",
             (const char *[]){ tail, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read repo");
@@ -286,19 +309,16 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
         return api_error(404, "no such repo");
     }
 
-    /* encryption and key_escrowed travel with every repo now: without them
-     * a client cannot tell which repositories hold a key that exists on this
-     * host alone. See the note in list_repos. */
-    char *body = NULL;
-    int n = asprintf(&body,
-        "{\"id\":%s,\"uuid\":\"%s\",\"path\":\"%s\",\"label\":\"%s\","
-        "\"added_at\":%s,\"encryption\":\"%s\",\"key_escrowed\":%s}",
-        r->rows[0][0], r->rows[0][1], r->rows[0][2],
-        r->rows[0][3] ? r->rows[0][3] : "", r->rows[0][4],
-        (r->rows[0][5] && r->rows[0][5][0]) ? r->rows[0][5] : "none",
-        (r->rows[0][6] && r->rows[0][6][0]) ? r->rows[0][6] : "0");
+    /* The same object the list carries. This was a format string that
+     * spliced path and label in unescaped, so a path holding a quote or a
+     * backslash produced a body no client could parse. */
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    int bad = json_resp_new(&resp) != 0 || repo_row_add(NULL, resp, r->rows[0]) != 0;
     db_result_free(r);
-    if (n < 0) return api_error(500, "out of memory");
+    if (bad) return api_error(500, "out of memory");
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
     return api_ok(body);
 }
 

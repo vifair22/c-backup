@@ -5,6 +5,7 @@
 #include "db_txn.h"
 #include "repo_tags.h"
 #include "util.h"
+#include "json_row.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -102,8 +103,8 @@ api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "tags", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "name",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0;
+        int bad = jrow_elem_add(&e, "name",    JCOL_STR, r->rows[i][0]) != 0
+               || jrow_elem_add(&e, "snap_id", JCOL_INT, r->rows[i][1]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -594,6 +595,29 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
     return finalise(out);
 }
 
+/*
+ * A stored policy value, typed by its key: a count as a number, a flag as a
+ * boolean. They are text in policy_values because one column holds both.
+ * A value stored before the PUT route validated is null, which is also how
+ * the readers treat it: ignored, with the default in force.
+ */
+static int policy_value_add(cutils_json_elem_t *e, const char *key, const char *text)
+{
+    for (int k = 0; k < N_POLICY_KEYS; k++) {
+        if (strcmp(k_policy_keys[k].key, key) != 0) continue;
+        if (k_policy_keys[k].kind == POLICY_COUNT) {
+            int n = 0;
+            return routes_policy_count(text, &n) == 0
+                ? json_elem_add_i32(e, "value", n) : json_elem_add_null(e, "value");
+        }
+        int b = policy_bool(text);
+        return b >= 0 ? json_elem_add_bool(e, "value", b != 0)
+                      : json_elem_add_null(e, "value");
+    }
+    /* A key nothing reads any more: shown as it was stored. */
+    return json_elem_add_str(e, "value", text);
+}
+
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
@@ -624,8 +648,8 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "policy", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "key",   r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "value", r->rows[i][1]) != 0;
+        int bad = json_elem_add_str(&e, "key", r->rows[i][0]) != 0
+               || policy_value_add(&e, r->rows[i][0], r->rows[i][1]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -643,11 +667,9 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
         int n = routes_snapshots_retention_defaults(d, 8);
         for (int i = 0; i < n; i++) {
             cutils_json_elem_t e;
-            char v[16];
-            snprintf(v, sizeof(v), "%d", d[i].value);
             if (json_resp_array_append_begin(resp, "defaults", &e) != 0) break;
             int bad = json_elem_add_str(&e, "key",   d[i].key) != 0
-                   || json_elem_add_str(&e, "value", v) != 0;
+                   || json_elem_add_i32(&e, "value", d[i].value) != 0;
             json_elem_commit(&e);
             if (bad) break;
         }
@@ -660,7 +682,7 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
             /* Committed either way, like the rows above: an uncommitted
              * element is never freed, and the adds fail only on allocation. */
             int bad = json_elem_add_str(&e, "key",   "maintenance.auto_pack") != 0
-                   || json_elem_add_str(&e, "value", "true") != 0;
+                   || json_elem_add_bool(&e, "value", true) != 0;
             (void)bad;
             json_elem_commit(&e);
         }
@@ -679,8 +701,19 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *value = NULL;
     if (json_req_get_str(body, "key", &key) != 0 || !key)
         return api_error(400, "key is required");
-    if (json_req_get_str(body, "value", &value) != 0 || !value)
-        return api_error(400, "value is required");
+    /* The value as the policy GET serves it - a number or a boolean - or as
+     * text, which is how every client sent it before values were typed. */
+    if (json_req_get_str(body, "value", &value) != 0 || !value) {
+        free(value);
+        value = NULL;
+        int64_t num = 0;
+        bool flag = false;
+        if (json_req_get_i64(body, "value", &num, INT64_MIN, INT64_MAX) == 0) {
+            if (asprintf(&value, "%lld", (long long)num) < 0) value = NULL;
+        } else if (json_req_get_bool(body, "value", &flag) == 0)
+            value = strdup(flag ? "true" : "false");
+        if (!value) return api_error(400, "value is required");
+    }
 
     int k = 0;
     while (k < N_POLICY_KEYS && strcmp(k_policy_keys[k].key, key) != 0) k++;
@@ -775,16 +808,16 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",        r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "ts",        r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "source",    r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "operation", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "result",    r->rows[i][4]) != 0
-               /* Selected since the journal existed and served to nobody.
-                * How long an operation took is most of what a log of them
-                * is for. */
-               || json_elem_add_str(&e, "duration_ms", r->rows[i][5] ? r->rows[i][5] : "") != 0
-               || json_elem_add_str(&e, "message",   r->rows[i][6] ? r->rows[i][6] : "") != 0;
+        /* duration_ms was selected since the journal existed and served to
+         * nobody; how long an operation took is most of what a log of them
+         * is for. It and message are null where nothing was recorded. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "ts", 1, JCOL_INT },
+            { "source", 2, JCOL_STR }, { "operation", 3, JCOL_STR },
+            { "result", 4, JCOL_STR }, { "duration_ms", 5, JCOL_INT },
+            { "message", 6, JCOL_STR_NULL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }

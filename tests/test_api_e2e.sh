@@ -218,7 +218,7 @@ contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
 contains "the job list carries the same detail" '"elapsed_s":' "$(sock_body /jobs)"
-contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
+contains "snapshot listed" '"id":1,' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
 
@@ -297,8 +297,8 @@ contains "a signed count is a 400" ' 400' "$(put_policy retention.keep_weekly +3
 contains "a non-boolean flag is a 400" ' 400' "$(put_policy maintenance.auto_pack maybe)"
 contains "a boolean in another spelling is accepted" ' 200' "$(put_policy maintenance.auto_pack OFF)"
 POL=$(sock_body /repos/1/policy)
-contains "and stored in one spelling" '"key":"maintenance.auto_pack","value":"false"' "$POL"
-contains "a refused value leaves the stored one" '"key":"retention.keep_daily","value":"14"' "$POL"
+contains "and stored in one spelling" '"key":"maintenance.auto_pack","value":false' "$POL"
+contains "a refused value leaves the stored one" '"key":"retention.keep_daily","value":14' "$POL"
 case "$POL" in *keep_hourly*) bad "an unknown key is not stored" "absent" "$POL" ;;
                *) ok "an unknown key is not stored" ;; esac
 put_policy maintenance.auto_pack true > /dev/null
@@ -306,7 +306,15 @@ put_policy maintenance.auto_pack true > /dev/null
 # B040: the defaults listed every retention key but not auto_pack, which is
 # in force everywhere a repository has not set it.
 contains "policy defaults include auto_pack, on" \
-    '{"key":"maintenance.auto_pack","value":"true"}]}' "$(sock_body /repos/1/policy)"
+    '{"key":"maintenance.auto_pack","value":true}]}' "$(sock_body /repos/1/policy)"
+
+# B008: values are typed, so the PUT takes them as the GET serves them.
+check "a count may be sent as a number" '{"ok":true} 200' \
+    "$(sock_send PUT /repos/1/policy '{"key":"retention.keep_monthly","value":6}')"
+check "and a flag as a boolean" '{"ok":true} 200' \
+    "$(sock_send PUT /repos/1/policy '{"key":"maintenance.auto_pack","value":true}')"
+contains "and both read back typed" '"key":"retention.keep_monthly","value":6' \
+    "$(sock_body /repos/1/policy)"
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
@@ -349,7 +357,7 @@ case "$SL" in
 esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
-contains "schedule disabled" '"enabled":"0"' "$(sock_body /repos/1/schedules)"
+contains "schedule disabled" '"enabled":false' "$(sock_body /repos/1/schedules)"
 
 # A schedule already due must fire on the next tick and produce a real job.
 curl -s -X POST --unix-socket "$SOCK" \
@@ -401,7 +409,7 @@ contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 # location filter: a backup packs on completion, so which side of the loose
 # and packed split an object lands on is not this test's business.
 OBJ=$(sock_body '/repos/1/objects?limit=200' \
-      | tr '}' '\n' | grep '"type":"1"' | head -1 \
+      | tr '}' '\n' | grep '"type":1,' | head -1 \
       | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "object locate"  '"found":true' "$(sock_body "/repos/1/objects/$OBJ")"
 contains "object refs"    '"refs"'       "$(sock_body "/repos/1/objects/$OBJ/refs")"
@@ -421,8 +429,9 @@ wait_job "$DIFF_JOB"
 contains "second backup completed" '"state":"completed"' "$(sock_body "/jobs/$DIFF_JOB")"
 DIFF=$(sock_body '/repos/1/diff?from=1&to=2')
 contains "diff reports the modification" '"change":"modified"' "$DIFF"
-contains "diff counts one change"        '"modified":"1"'      "$DIFF"
-contains "diff adds nothing"             '"added":"0"'         "$DIFF"
+contains "diff counts one change"        '"modified":1'        "$DIFF"
+contains "diff adds nothing"             '"added":0'           "$DIFF"
+contains "diff truncation is a boolean"  '"truncated":false'   "$DIFF"
 
 
 echo "packing"
@@ -611,6 +620,51 @@ check "unknown verify level rejected" 400 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
        "http://localhost/repos/1/verify?level=sideways")"
 contains "verify age metric present" 'cbackup_last_verify_age_seconds' "$(sock_body /metrics)"
+
+# B008: every number the API serves is a JSON number. Rows used to be
+# copied out of the database as text, so ids, counts, sizes, timestamps,
+# modes and flags all arrived quoted and every client had to know which
+# strings were numbers. Swept across the repository-scoped reads, after
+# backup, pack, tag, policy, schedule and verify have all left rows behind.
+# A string of nothing but digits is what the bug looked like; none of the
+# names, paths, labels or hashes in this fixture is one. The fanout's
+# "prefix" is the exception that proves it: two hex digits, which can be
+# all decimal ones.
+echo "typed values"
+NEWEST=$(sock_body '/repos/1/snapshots?limit=1' | grep -oE '"id":[0-9]+' | head -1 | tr -dc '0-9')
+for path in /repos /repos/1 /repos/1/snapshots "/repos/1/snapshots/$NEWEST/tree?parent=0" \
+            '/repos/1/search?q=txt' /repos/1/summary /repos/1/stats \
+            '/repos/1/objects?limit=5' "/repos/1/objects/$OBJ" "/repos/1/objects/$OBJ/refs" \
+            /repos/1/packs '/repos/1/packs/0/entries?limit=5' /repos/1/fanout \
+            '/repos/1/diff?from=1&to=2' /repos/1/tags /repos/1/policy /repos/1/journal \
+            /repos/1/schedules /repos/1/verify /repos/1/grep; do
+    BODY=$(sock_body "$path")
+    if printf '%s' "$BODY" | grep -oE '"[a-z_]+":"-?[0-9]+"' | grep -qv '^"prefix":'; then
+        bad "no quoted numbers in $path" "numbers unquoted" \
+            "$(printf '%s' "$BODY" | grep -oE '"[a-z_]+":"-?[0-9]+"' | head -3 | tr '\n' ' ')"
+    else
+        ok "no quoted numbers in $path"
+    fi
+done
+REPO1=$(sock_body /repos/1)
+contains "a repo id is a number"          '"id":1,'               "$REPO1"
+contains "key_escrowed is a boolean"      '"key_escrowed":false'  "$REPO1"
+contains "an unset label is null"         '"label":null'          "$(sock_body /repos/2)"
+TREE=$(sock_body "/repos/1/snapshots/$NEWEST/tree?parent=0")
+contains "a tree type is a number"        '"type":2,'             "$TREE"
+contains "a tree mode is the st_mode"     '"type":2,"mode":1'      "$TREE"  # S_IFDIR 040000 is 16384, so 16384-16895
+contains "mtime is whole seconds"         '"mtime":1'             "$TREE"
+contains "with the nanoseconds apart"     '"mtime_nsec":'         "$TREE"
+contains "has_children is a boolean"      '"has_children":true'   "$TREE"
+contains "a directory has a null hash"    '"hash":null'           "$TREE"
+contains "materialized is a boolean"      '"materialized":true'   "$(sock_body /repos/1/snapshots)"
+contains "the last snapshot time is a number" '"last_snapshot_ts":1' "$(sock_body /repos/1/summary)"
+LOC=$(sock_body "/repos/1/objects/$OBJ")
+contains "a packed object says so"        '"location":"packed","pack_id":' "$LOC"
+contains "and the listing names its pack" '"location":"packed","pack_id":' \
+    "$(sock_body '/repos/1/objects?limit=5')"
+contains "verify completion is a boolean" '"completed":true'      "$(sock_body /repos/1/verify)"
+contains "an object type is a number"     '"type":1,'             "$LOC"
 
 # An empty collection must still carry its key. The array is created lazily
 # on first append, so a query with no rows used to serialise as {} and every
@@ -802,9 +856,9 @@ check "the same snapshot again is fine" '{"ok":true} 200' "$(sock_tag '{"name":"
 OUT=$(sock_tag '{"name":"keep","snap_id":4}')
 contains "an existing tag on another snapshot is a 409" ' 409' "$OUT"
 contains "naming where the tag is" 'already on snapshot 3' "$OUT"
-contains "and the tag did not move" '"snap_id":"3"' "$(sock_body /repos/1/tags)"
+contains "and the tag did not move" '"snap_id":3' "$(sock_body /repos/1/tags)"
 check "move moves it" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":4,"move":true}')"
-contains "to the new snapshot" '"snap_id":"4"' "$(sock_body /repos/1/tags)"
+contains "to the new snapshot" '"snap_id":4' "$(sock_body /repos/1/tags)"
 curl -s -o /dev/null -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/keep
 
 # B035: a dry run's answer was in the daemon log only. The job reports the
@@ -816,14 +870,14 @@ contains "gfs dry run names what it would remove" \
     '"result":{"dry_run":true,"would_remove":[1,2],"count":2,' "$DRY_BODY"
 contains "and the retention it applied" '"retention":{"keep_snaps":2,' "$DRY_BODY"
 check "and removes nothing" 4 \
-    "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+    "$(sock_body /repos/1/snapshots | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')"
 
 GFS=$(job_id "$(sock_post /repos/1/gfs)")
 wait_job "$GFS"
 contains "a real pass names what it removed" \
     '"result":{"dry_run":false,"removed":[1,2],"count":2,' "$(sock_body "/jobs/$GFS")"
 check "retention reads keep_snaps from config" 2 \
-    "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+    "$(sock_body /repos/1/snapshots | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')"
 
 # B039: the journal entry for a retention pass had an empty message.
 JOURNAL=$(sock_body '/repos/1/journal?limit=2')
@@ -832,7 +886,7 @@ contains "the journal says what a pass removed" \
 contains "with its ids" '"message":"removed 2 snapshots: 1, 2"' "$JOURNAL"
 contains "and a dry run says it was one" '"message":"dry run: would remove 2 snapshots: 1, 2"' "$JOURNAL"
 check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10' \
-    | grep -o '"operation":"backup","result":"success","duration_ms":"[0-9]*","message":""' \
+    | grep -o '"operation":"backup","result":"success","duration_ms":[0-9]*,"message":null' \
     | wc -l | tr -d ' ')"
 
 # B034, read side: a value stored before the route validated must not be
@@ -851,7 +905,7 @@ fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \
-    '"key":"retention.keep_snaps","value":"2"' "$(sock_body /repos/1/policy)"
+    '"key":"retention.keep_snaps","value":2' "$(sock_body /repos/1/policy)"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""

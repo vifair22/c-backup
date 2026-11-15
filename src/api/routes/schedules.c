@@ -130,15 +130,15 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
         char **row = r->rows[i];
         cJSON *o = cJSON_CreateObject();
         if (!o) break;
-        cJSON_AddStringToObject(o, "id",      row[0]);
+        cJSON_AddNumberToObject(o, "id", (double)strtoll(row[0], NULL, 10));
         cJSON_AddStringToObject(o, "action",  row[1]);
         add_stored_json(o, "trigger", row[3]);
         cJSON_AddStringToObject(o, "overlap", row[4]);
         cJSON_AddStringToObject(o, "catchup", row[5]);
-        cJSON_AddStringToObject(o, "enabled", row[6]);
+        cJSON_AddBoolToObject(o, "enabled", strtoll(row[6], NULL, 10) != 0);
         /* The epoch stays for scripts that compute with it; the ISO form,
          * with the zone's offset, is what a person can read. */
-        cJSON_AddStringToObject(o, "next_due", row[8]);
+        cJSON_AddNumberToObject(o, "next_due", (double)strtoll(row[8], NULL, 10));
         char iso[48];
         iso_local((time_t)strtoll(row[8], NULL, 10), iso, sizeof(iso));
         cJSON_AddStringToObject(o, "next_due_iso", iso);
@@ -442,9 +442,13 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
     if (json_req_parse(req->body, req->body_len, &body) != 0)
         return api_error(400, "invalid JSON");
 
+    /* A boolean, as the list serves it, or 0/1 as it was always sent. */
     uint32_t enabled = 1;
-    if (json_req_get_u32(body, "enabled", &enabled, 0, 1) != 0)
-        return api_error(400, "enabled must be 0 or 1");
+    bool flag = true;
+    if (json_req_get_bool(body, "enabled", &flag) == 0)
+        enabled = flag ? 1u : 0u;
+    else if (json_req_get_u32(body, "enabled", &enabled, 0, 1) != 0)
+        return api_error(400, "enabled must be true or false (or 1 or 0)");
 
     char repo[32], sid[32], en[8];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
