@@ -3,6 +3,7 @@
 
 #include "routes.h"
 #include "auth.h"
+#include "login_throttle.h"
 #include "app_config.h"
 
 #include <cutils/config.h>
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Authentication endpoints.
@@ -106,12 +108,36 @@ static api_response_t handle_login(const api_request_t *req, void *ud)
     if (json_req_get_str(body, "password", &password) != 0 || !password)
         return api_error(400, "password is required");
 
+    /*
+     * Throttled before the password is even hashed: a client that is locked
+     * out learns nothing from trying, and does not get to spend the
+     * daemon's CPU on PBKDF2 either. The socket is exempt - it needs no
+     * password at all, and it is the way back in if an attack has filled
+     * the global bucket.
+     */
+    const char *peer = req->is_local ? NULL : req->client_addr;
+    time_t now = time(NULL);
+    if (!req->is_local) {
+        long wait = login_throttle_check(peer, now);
+        if (wait > 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "too many failed logins; retry in %ld second%s",
+                     wait, wait == 1 ? "" : "s");
+            api_response_t resp = api_error(429, msg);
+            resp.retry_after = (int)wait;
+            return resp;
+        }
+    }
+
     if (!auth_verify_password(ctx->db, password)) {
         /* No detail on why: distinguishing "no password set" from "wrong
          * password" tells an unauthenticated caller about daemon state. */
-        log_warn("failed login attempt");
+        log_warn("failed login attempt from %s", peer && *peer ? peer : "the socket");
+        if (!req->is_local) login_throttle_fail(peer, now);
         return api_error(401, "invalid password");
     }
+    if (!req->is_local) login_throttle_success(peer);
 
     CUTILS_AUTOFREE char *token = auth_create_token(ctx->db, AUTH_SESSION_TTL_HOURS);
     if (!token) return api_error(500, "cannot create session");

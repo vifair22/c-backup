@@ -641,6 +641,33 @@ AUTH=(-H "Authorization: Bearer $TOKEN")
 check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
 check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"
 
+echo "login throttle"
+# B054: 100 wrong passwords took 2.66 s and the right one still worked
+# afterwards. Now the first few failures are free and then the address is
+# locked out, for longer each time, and the lockout holds even for the right
+# password - otherwise it would not slow guessing at all.
+CODES=""
+for _ in $(seq 1 12); do
+    c=$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')
+    CODES="$CODES $c"
+    [ "$c" = 429 ] && break
+done
+contains "wrong logins end in 429" "429" "$CODES"
+contains "after the free attempts" "401 401 401 401 401 401" "$CODES"
+sleep 1.2
+check "another failure once the lockout lapses" 401 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')"
+check "the right password is refused while locked out" 429 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
+contains "429 carries Retry-After" "retry-after:" \
+    "$(curl -s -D - -o /dev/null -X POST -d '{"password":"brandnewpassword"}' \
+       "$URL/api/auth/login" | tr 'A-Z' 'a-z')"
+check "the socket is never throttled" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"password":"brandnewpassword"}' http://localhost/api/auth/login)"
+sleep 2.2
+check "the right password works once it lapses" 200 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
+
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 for _ in $(seq 1 50); do

@@ -360,6 +360,17 @@ HTTPS.
   token) revokes every session any client holds, including the caller's.
   Use it when a machine that was signed in is lost or no longer trusted and
   the password itself is not in doubt.
+- Failed logins over TCP are throttled. Each client address gets 5 free
+  failures; after that every failure locks it out for twice as long as the
+  last (1 s, 2 s, 4 s, ... up to 5 minutes), and the lockout refuses the
+  correct password too, with `429` and a `Retry-After` header. An address is
+  forgotten after 15 minutes without a failure, or at once when it logs in.
+  Across all addresses, a burst of 60 failures, or a sustained rate above
+  one every 2 seconds, refuses every TCP login until the rate falls; that caps an attacker who
+  rotates addresses - and can lock you out while one is trying. The socket is
+  never throttled: `sudo c-backup ...` on the host always works. Behind a
+  reverse proxy every client is the proxy's address and shares one budget.
+  Details are in `docs/api.md`.
 - The CLI never needs a password: it uses the socket.
 - The app stores the session token, never the password (section 15.2).
 
@@ -1162,6 +1173,7 @@ the underlying disk.
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |
 | App or API: 403 `not configured` | No admin password yet | `sudo c-backup auth setup` on the daemon's host |
 | App: `login failed: check the admin password` | Wrong password | Retry; `c-backup auth password` on the host to change it |
+| `429 too many failed logins` | The login throttle (section 4.3) locked out this address, or every address during an attack | Wait the `Retry-After` seconds; the socket is never throttled |
 | App: `sign in again` mid-use | Session revoked or expired | Sign in |
 | `repo is busy` | Another job holds the repository | Wait, or `c-backup jobs` to see what |
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |

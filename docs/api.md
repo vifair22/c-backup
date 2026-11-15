@@ -71,6 +71,32 @@ working - and kept sliding forward - for 90 days. `logout-all` is the same
 revocation without a password change, for a lost or untrusted client; from
 the host it is `c-backup auth logout --all`.
 
+### Login throttle
+
+Failed logins over TCP are throttled; before this, 100 wrong passwords took
+2.66 s and the right one still worked straight afterwards.
+
+| Rule | Value |
+|---|---|
+| Free failures per client address | 5 |
+| Lockout after each further failure | 1 s, doubling each time (1, 2, 4, ...), at most 300 s |
+| Address forgotten after | 900 s without a failure, or at once on a successful login |
+| Global cap, all addresses together | a bucket of 60 failures draining one every 2 s; while full, every TCP login is refused |
+| Addresses remembered | 256; when full, the one that failed longest ago is dropped |
+
+A refused attempt is `429 {"error":"too many failed logins; retry in N
+seconds"}` with a `Retry-After` header. It is refused before the password is
+hashed, so it reveals nothing and costs nothing, and the correct password is
+refused too while the lockout lasts - a throttle that let the right answer
+through would not slow guessing at all. A refused attempt does not extend
+the lockout.
+
+The address is the TCP peer. Behind a reverse proxy every client shares the
+proxy's address and so one budget; `X-Forwarded-For` is not trusted, because
+it is whatever the client sent. The global cap can lock the owner out during
+an attack as well as the attacker. The unix socket is never throttled, so the
+host always has a way in.
+
 ## Repositories
 
 | Method | Path | Purpose |
