@@ -184,6 +184,10 @@ int main(int argc, char *argv[])
      * keeping them apart means a slow job cannot delay the next tick.
      */
     scheduler_t *sched = NULL;
+    /* Before the scheduler computes due times from rows the route would no
+     * longer accept, and with the scheduler off as well, so the list is
+     * right whichever way it is configured. */
+    (void)routes_schedules_audit(db);
     if (config_get_int(cfg, "scheduler.enabled", 1)) {
         if (scheduler_open(db, schedule_dispatch, jm, &sched) != OK) {
             log_error("cannot create scheduler");

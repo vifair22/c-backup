@@ -914,6 +914,24 @@ stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
 
+**Schedules from older builds.** Each rule above was added at some point, and
+a schedule stored before its rule existed is still in the database after an
+upgrade: an impossible day such as 30 February, an overlap or catchup value
+outside the table, an action nothing runs. At every start the daemon holds
+each enabled schedule to the rules a new one must pass and disables any that
+fails, with a warning naming it:
+
+```
+schedules: disabled schedule 4 (repo 1, gc): catchup 'always' is not skip or run_once; delete it and create it again
+```
+
+It disables rather than repairs. Each of these has a nearest valid reading,
+and running that under the old schedule's name would be a schedule nobody
+chose. `schedule list` shows the schedule as `"enabled": false` with
+`disabled_reason` saying why, and `schedule enable` refuses it with the same
+reason until it is deleted and created again. The scheduler records a reason
+the same way when it disables a schedule it cannot compute a next fire for.
+
 A suggested set for one repository:
 
 | What | When |

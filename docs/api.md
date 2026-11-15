@@ -848,7 +848,7 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule; 409 enabling one that breaks a creation rule |
 | DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
 
 Both used to answer success for an id that did not exist, or that belonged
@@ -911,6 +911,24 @@ schedule that has never fired: if its first due time passed while the daemon
 was down, `run_once` fires it when the daemon starts. Any other value of
 either is a 400; both used to be stored as sent and then read as something
 else.
+
+A schedule stored before one of these rules existed survives an upgrade, so
+at every start the daemon checks each enabled schedule's action, trigger,
+`on_overlap` and `catchup` against them, and disables one that fails rather
+than reinterpreting it. The list then carries `"enabled":false` and a
+`disabled_reason`, present only when the daemon turned the schedule off:
+
+```json
+{"id":4,"action":"gc","trigger":{"type":"interval","seconds":3600},
+ "overlap":"skip","catchup":"always","enabled":false,
+ "disabled_reason":"catchup 'always' is not skip or run_once", ...}
+```
+
+Enabling such a schedule is a 409 naming the same problem; delete it and
+create it again. Any `PUT` that succeeds clears the reason. Parameters that
+depend on the host, such as a replication destination, are not part of the
+check: they can be right again tomorrow, and fail at fire time with the job
+saying why.
 
 Parameters belong to one action each, and naming one on a schedule for a
 different action is a 400 rather than a value stored and never read:
