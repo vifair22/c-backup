@@ -30,6 +30,7 @@
 #include "gc.h"
 #include "pack.h"
 #include "prune.h"
+#include "repo_tags.h"
 #include "reindex.h"
 #include "repo.h"
 #include "restore.h"
@@ -425,9 +426,76 @@ static void test_gc_removes_stale_staging_files(void **state)
     assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
 }
 
+static int64_t count_rows(const char *sql)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ repo, NULL }, &r), 0);
+    int64_t n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * B101: an operator's delete refuses a tagged snapshot unless forced,
+ * reports a missing one as missing, and a forced delete takes the tags out
+ * of the repository's own copy too. A refusal changes nothing, including
+ * the recovery marker the prune writes.
+ */
+static void test_checked_delete(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)br.snapshot_id);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (?, 'zeta', ?, 1),"
+        " (?, 'alpha', ?, 1)",
+        (const char *[]){ repo, snap, repo, snap, NULL }, NULL), 0);
+    assert_int_equal(repo_tags_save(db, repo_id, TEST_REPO), OK);
+
+    prune_info_t info;
+    assert_int_equal(prune_snapshot_checked(store, db, repo_id, br.snapshot_id, 0, &info),
+                     ERR_INVALID);
+    assert_int_equal(info.ntags, 2);
+    assert_string_equal(info.tags, "alpha, zeta");
+    assert_non_null(strstr(err_msg(), "alpha, zeta"));
+    err_clear();
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 1);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 2);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM recovery_state WHERE repo_id = ?"), 0);
+    char rec[256];
+    snprintf(rec, sizeof(rec), TEST_REPO "/snapshots/%lld", (long long)br.snapshot_id);
+    struct stat sb;
+    assert_int_equal(stat(rec, &sb), 0);
+
+    assert_int_equal(prune_snapshot_checked(store, db, repo_id, br.snapshot_id, 1, &info), OK);
+    assert_int_equal(info.ntags, 2);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    assert_int_equal(count_rows("SELECT COUNT(*) FROM tags WHERE repo_id = ?"), 0);
+    assert_int_equal(stat(rec, &sb), -1);
+    FILE *f = fopen(TEST_REPO "/" REPO_TAGS_FILE, "r");
+    assert_non_null(f);
+    char body[256] = { 0 };
+    size_t n = fread(body, 1, sizeof(body) - 1, f);
+    fclose(f);
+    assert_true(n > 0);
+    assert_null(strstr(body, "alpha"));
+
+    assert_int_equal(prune_snapshot_checked(store, db, repo_id, br.snapshot_id, 1, &info),
+                     ERR_NOT_FOUND);
+    assert_int_equal(prune_snapshot_checked(store, db, repo_id, 999, 0, NULL), ERR_NOT_FOUND);
+    err_clear();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_checked_delete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_everything_reachable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_dry_run_changes_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_sweeps_after_prune, setup, teardown),

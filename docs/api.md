@@ -206,7 +206,20 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
-| DELETE | `/repos/<id>/snapshots/<sid>` | Prune; `{"removed":true,"id"}` |
+| DELETE | `/repos/<id>/snapshots/<sid>[?force=1]` | Delete one snapshot, synchronously; `{"removed":true,"id","tags_removed"}` |
+
+Deleting a snapshot is not a job: it is a few row deletes and one unlink,
+answered in the response. GC reclaims the space later. A tagged snapshot is
+refused with `409` and an error naming its tags (`snapshot 3 is tagged
+(guard)...`) unless `force=1`, which deletes it and its tags, from the
+database and from the repository's own tag file. `tags_removed` counts
+them. A snapshot that does not exist, including one already deleted, is
+`404 {"error":"no such snapshot"}`; `force` other than `1`/`true`/`0`/`false`
+is `400`; `503` while a job holds the repository. Each delete that runs is
+journalled with `source` `api` and `operation` `snapshot-delete`, its
+message naming the snapshot and any tags a forced delete took with it
+(`removed snapshot 3 and its tag guard (forced)`); a refusal or 404 changes
+nothing and is not journalled.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2

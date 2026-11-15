@@ -1040,13 +1040,32 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
 | `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
-| `snapshot delete 1 12` | Prune one snapshot | By hand; GC reclaims its space |
+| `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 
-Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
-per-repository journal (`c-backup journal 1`) is the permanent record of what
-ran and how it ended. A journal entry's `source` says who asked: `api` for a
-job run by hand (the CLI and the app both go through the API), `schedule` for
-one a schedule fired, with the message starting `schedule <id>`.
+`gc`, `pack` and `reindex` are jobs. Finished jobs stay visible for 30 days
+(`c-backup jobs`); the per-repository journal (`c-backup journal 1`) is the
+permanent record of what ran and how it ended. A journal entry's `source`
+says who asked: `api` for a job run by hand (the CLI and the app both go
+through the API), `schedule` for one a schedule fired, with the message
+starting `schedule <id>`.
+
+**Deleting a snapshot** is not a job: it removes a few rows and one file and
+answers at once, `{"removed":true,"id":12,"tags_removed":0}`. It is
+journalled all the same, as operation `snapshot-delete`. A snapshot
+carrying a tag is refused, and the error names the tags:
+
+```
+$ c-backup snapshot delete 1 12
+{"error":"snapshot 12 is tagged (guard); a tag protects a snapshot from deletion. ..."}
+c-backup: request failed with HTTP 409
+```
+
+Remove the tag first (`tag remove 1 guard`), or pass `--force` to delete the
+snapshot and its tags together; the journal entry then names the tags it
+took (`removed snapshot 12 and its tag guard (forced)`). A snapshot that
+does not exist, or was already deleted, is an error (HTTP 404, exit 1)
+rather than a silent success. Retention never deletes a tagged snapshot
+(section 9.1).
 
 `gc` reports what it did in the job's `result`, and `gc --dry-run` what it
 would do:
@@ -1663,7 +1682,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
-| `snapshot delete <id> <snapshot>` | Prune one |
+| `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
 | `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
