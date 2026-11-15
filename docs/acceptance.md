@@ -304,6 +304,11 @@ unassigned device, or anything outside the array.
    the same shape as the `http.bind` bug: a value accepted and not honoured.
    It also means the ring cannot be the cause of any current problem,
    whatever it did historically.
+
+   Resolved for 1.0 by removing the ring and the key rather than wiring
+   them up. The ENXIO it was blamed for was a short write on RS parity,
+   since fixed, and the shfs pass below shows the plain read path within
+   7% of a direct disk read, so there was nothing left for it to win.
 2. **A socket gets node type 0, and that failed the whole restore.**
    `stat_to_node_type` returns 0 for anything it does not recognise, and
    appdata contains five of them. Backup records the node with no content

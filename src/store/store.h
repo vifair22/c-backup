@@ -29,11 +29,10 @@
 typedef struct store store_t;
 struct repo_key;
 
+/* Per-store tuning. Empty since the FUSE readahead ring went; kept because
+ * store_open and repo_store_open take one and a NULL means defaults. */
 typedef struct {
-    /* Off by default pending the FUSE ENXIO fix. The readahead ring speeds
-     * up reads from FUSE-backed sources but is implicated in short-read
-     * failures under load. */
-    int enable_fuse_readahead;
+    int reserved;
 } store_config_t;
 
 /* ---------- lifecycle ---------- */

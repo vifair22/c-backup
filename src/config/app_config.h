@@ -90,11 +90,6 @@ static const config_key_t app_db_keys[] = {
     { "retention.keep_monthly", CFG_INT, "12", "Default monthly snapshots to keep", CFG_STORE_DB, 0 },
     { "retention.keep_yearly",  CFG_INT, "3",  "Default yearly snapshots to keep",  CFG_STORE_DB, 0 },
 
-    /* Off by default pending the FUSE ENXIO fix; see project notes. */
-    { "store.fuse_readahead", CFG_INT, "0",
-      "Enable the FUSE readahead ring in the storage engine",
-      CFG_STORE_DB, 0 },
-
     { NULL, 0, NULL, NULL, 0, 0 }
 };
 

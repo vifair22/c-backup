@@ -399,22 +399,20 @@ static void test_pack_removed_without_cb(void **state)
     done(st);
 }
 
-/* The readahead ring stays off unless asked for; see the FUSE ENXIO issue. */
-static void test_fuse_readahead_defaults_off(void **state)
+/* A config is optional: NULL gets defaults, and one passed in is kept. */
+static void test_store_config_is_kept(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
-    const store_config_t *cfg = store_config(st);
-    assert_non_null(cfg);
-    assert_int_equal(cfg->enable_fuse_readahead, 0);
+    assert_non_null(store_config(st));
     done(st);
 
     rmrf(TEST_ROOT);
     assert_int_equal(store_init_dirs(TEST_ROOT), OK);
-    store_config_t on = { .enable_fuse_readahead = 1 };
+    store_config_t cfg = { .reserved = 7 };
     store_t *st2 = NULL;
-    assert_int_equal(store_open(TEST_ROOT, &on, &st2), OK);
-    assert_int_equal(store_config(st2)->enable_fuse_readahead, 1);
+    assert_int_equal(store_open(TEST_ROOT, &cfg, &st2), OK);
+    assert_int_equal(store_config(st2)->reserved, 7);
     done(st2);
 }
 
@@ -750,7 +748,7 @@ int main(void)
         cmocka_unit_test(test_pack_commit_without_cb),
         cmocka_unit_test(test_pack_removed_cb_registration),
         cmocka_unit_test(test_pack_removed_without_cb),
-        cmocka_unit_test(test_fuse_readahead_defaults_off),
+        cmocka_unit_test(test_store_config_is_kept),
         cmocka_unit_test(test_loose_set_finds_what_was_written),
         cmocka_unit_test(test_loose_set_survives_growing),
         cmocka_unit_test(test_loose_set_refuses_the_empty_sentinel),
