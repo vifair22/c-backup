@@ -657,6 +657,15 @@ contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/
 # entry header (a loose one behind the 64-byte object header).
 contains "packed header is the 51-byte entry header" '"header_size":51' \
     "$(sock_body "/repos/1/objects/$PACKED/layout")"
+# B102: a packed object's phys_size is its stored payload, the entry header
+# and parity being charged to the pack, so it equals layout's payload_size
+# and is exactly 51 less than layout's physical_size (docs/api.md).
+P_PHYS=$(sock_body "/repos/1/objects/$PACKED" | sed -n 's/.*"phys_size":\([0-9]*\).*/\1/p')
+P_LAY=$(sock_body "/repos/1/objects/$PACKED/layout")
+P_REC=$(printf '%s' "$P_LAY" | sed -n 's/.*"physical_size":\([0-9]*\).*/\1/p')
+P_PAY=$(printf '%s' "$P_LAY" | sed -n 's/.*"payload_size":\([0-9]*\).*/\1/p')
+check "packed phys_size is layout's payload_size" "$P_PAY" "$P_PHYS"
+check "and the record is that plus the entry header" "$P_REC" "$((P_PHYS + 51))"
 contains "packed object content" '"base64"'      "$(sock_body "/repos/1/objects/$PACKED/content")"
 contains "diff over packs"       '"modified"'    "$(sock_body '/repos/1/diff?from=1&to=2')"
 
@@ -1192,6 +1201,31 @@ fi
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \
     '"key":"retention.keep_snaps","value":2' "$(sock_body /repos/1/policy)"
+
+# B101: deleting a snapshot. A tag protects it unless force says otherwise,
+# the 409 names the tags, a missing snapshot is a 404, and each delete is
+# journalled. Snapshots 3 and 4 are what retention left.
+sock_tag '{"name":"guard","snap_id":3}' > /dev/null
+sock_tag '{"name":"also","snap_id":3}' > /dev/null
+OUT=$(sock_send DELETE /repos/1/snapshots/3)
+contains "a tagged snapshot is a 409" ' 409' "$OUT"
+contains "naming its tags" 'tagged (also, guard)' "$OUT"
+contains "and it is still listed" '"id":3,' "$(sock_body /repos/1/snapshots)"
+contains "a bad force is a 400" ' 400' "$(sock_send DELETE '/repos/1/snapshots/3?force=maybe')"
+check "force deletes it" '{"removed":true,"id":3,"tags_removed":2} 200' \
+    "$(sock_send DELETE '/repos/1/snapshots/3?force=1')"
+check "and its tags with it" '{"tags":[]}' "$(sock_body /repos/1/tags)"
+contains "the repository's tag file loses them too" '"tags":[]' "$(cat "$R/repo/tags")"
+contains "journalled" \
+    '"operation":"snapshot-delete","result":"success"' "$(sock_body '/repos/1/journal?limit=1')"
+contains "with what it removed" 'removed snapshot 3 and its tags also, guard (forced)' \
+    "$(sock_body '/repos/1/journal?limit=1')"
+check "deleting it again is a 404" '{"error":"no such snapshot"} 404' \
+    "$(sock_send DELETE /repos/1/snapshots/3)"
+check "so is one that never existed" '{"error":"no such snapshot"} 404' \
+    "$(sock_send DELETE /repos/1/snapshots/999)"
+check "an untagged snapshot needs no force" '{"removed":true,"id":4,"tags_removed":0} 200' \
+    "$(sock_send DELETE /repos/1/snapshots/4)"
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""
