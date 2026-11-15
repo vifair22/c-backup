@@ -213,25 +213,10 @@ int main(int argc, char *argv[])
 
     routes_auth_set_config(cfg);
     {
-        /* Refused rather than defaulted: a typo here would otherwise run
-         * every backup in a mode nobody chose, silently. */
+        /* app_config_check refused anything else during config init. */
         const char *m = config_get_str(cfg, "backup.file_cache_match");
         int mode = file_cache_match_parse(m);
-        if (mode < 0) {
-            /* Pointing at the line, like c-utils' own config errors; a value
-             * from the environment has none. */
-            int line = config_key_line(cfg, "backup.file_cache_match");
-            if (line > 0)
-                log_error("%s:%d: backup.file_cache_match: '%s' is not auto, "
-                          "strict or relaxed", config_get_path(cfg), line, m);
-            else
-                log_error("backup.file_cache_match: '%s' is not auto, strict or "
-                          "relaxed", m);
-            api_server_stop(srv);
-            repo_purge_stop();
-            appguard_shutdown(guard);
-            return 1;
-        }
+        if (mode < 0) mode = FILE_CACHE_MATCH_AUTO;
         routes_backup_set_file_cache_match(mode);
         if (mode != FILE_CACHE_MATCH_AUTO)
             log_info("backup.file_cache_match: %s", m);

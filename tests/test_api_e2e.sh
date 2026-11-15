@@ -130,6 +130,49 @@ refuses "nested mapping" "bad.yaml:8: error: indented deeper" \
     'jobs:' '  max_parallel: 2' '    extra: 1'
 refuses "every problem reported" "(and 1 more, printed above)" \
     'jobs:' '  max_parallel: x' '  max_paralel: 2'
+# Values of the right type the daemon cannot honour (B081 reopened): each
+# used to start, port 99999 logging "listening on 0.0.0.0:99999".
+refuses "port out of range" "bad.yaml:6: error: http.port: '99999' is not between 0 and 65535" \
+    '  port: 99999'
+refuses "zero workers" "bad.yaml:7: error: jobs.max_parallel: '0' is not between 1 and 256" \
+    'jobs:' '  max_parallel: 0'
+refuses "negative retention" "retention.keep_daily: '-1' is not between 0 and" \
+    'retention:' '  keep_daily: -1'
+refuses "switch not 0 or 1" "auth.cookie_secure: '2' is not between 0 and 1" \
+    'auth:' '  cookie_secure: 2'
+refuses "bind not an address" "bad.yaml:6: error: http.bind: 'not-an-ip' is not an IPv4 address" \
+    '  bind: not-an-ip'
+refuses "file cache mode" "backup.file_cache_match: 'fast' is not one of auto, strict, relaxed" \
+    'backup:' '  file_cache_match: fast'
+refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
+    "$(printf '\tbind: 127.0.0.1')"
+# log.level among other problems: it was dropped from the list.
+out=$(printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: abc\nlog:\n  level: verbose\njobs:\n  max_parallel: -1\n' \
+      "$WORK" "$WORK" > "$WORK/bad.yaml"; chmod 600 "$WORK/bad.yaml"
+      C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 10 "$BIN" 2>&1)
+contains "every problem: port" "bad.yaml:5: error: http.port: 'abc'" "$out"
+contains "every problem: log.level" "bad.yaml:7: error: log.level: 'verbose'" "$out"
+contains "every problem: max_parallel" "bad.yaml:9: error: jobs.max_parallel: '-1'" "$out"
+# db.path is required: there is no default to fall back on.
+printf 'http:\n  socket: %s/bad.sock\n  port: 0\n' "$WORK" > "$WORK/bad.yaml"
+out=$(C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 10 "$BIN" 2>&1)
+contains "missing db.path refused, naming the file" \
+    "bad.yaml: error: required config key 'db.path' is missing or empty" "$out"
+# CRLF line endings and a UTF-8 byte order mark are legal YAML and start.
+for kind in crlf bom; do
+    body=$(printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n\nlog:\n  level: info\n' "$WORK" "$WORK")
+    if [ "$kind" = crlf ]; then printf '%s\n' "$body" | sed 's/$/\r/' > "$WORK/bad.yaml"
+    else { printf '\xEF\xBB\xBF'; printf '%s\n' "$body"; } > "$WORK/bad.yaml"; fi
+    chmod 600 "$WORK/bad.yaml"
+    C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 3 "$BIN" > "$WORK/$kind.log" 2>&1
+    rc=$?
+    check "$kind config starts" "124" "$rc"
+    case "$(cat "$WORK/$kind.log")" in
+        *error:*) bad "$kind config: no errors" "none" "$(grep error: "$WORK/$kind.log")" ;;
+        *) ok "$kind config: no errors" ;;
+    esac
+    rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock" "$WORK/$kind.log"
+done
 # An environment override has no line, so it is named instead.
 printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' \
     "$WORK" "$WORK" > "$WORK/bad.yaml"
