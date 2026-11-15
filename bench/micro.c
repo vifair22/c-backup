@@ -71,6 +71,8 @@ typedef struct {
 static bench_entry_t g_benches[64];
 static int g_nbench;
 
+/* Used without a trailing semicolon: the expansion is a function definition,
+ * and a stray ';' at file scope is not ISO C, which -Wpedantic reports. */
 #define REGISTER_BENCH(nm, un, func) \
     __attribute__((constructor)) static void reg_##func(void) { \
         g_benches[g_nbench].name = nm; \
@@ -105,7 +107,7 @@ static void bench_sha256_4k(double *tp)
     *tp = ((double)iters * 4096.0) / (1024.0 * 1024.0) / elapsed;
     report("sha256_oneshot_4K", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_oneshot_4K", "MiB/s", bench_sha256_4k);
+REGISTER_BENCH("sha256_oneshot_4K", "MiB/s", bench_sha256_4k)
 
 static void bench_sha256_64k(double *tp)
 {
@@ -119,7 +121,7 @@ static void bench_sha256_64k(double *tp)
     *tp = ((double)iters * (double)sz) / (1024.0 * 1024.0) / elapsed;
     report("sha256_oneshot_64K", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_oneshot_64K", "MiB/s", bench_sha256_64k);
+REGISTER_BENCH("sha256_oneshot_64K", "MiB/s", bench_sha256_64k)
 
 static void bench_sha256_1m(double *tp)
 {
@@ -133,7 +135,7 @@ static void bench_sha256_1m(double *tp)
     *tp = ((double)iters * (double)sz) / (1024.0 * 1024.0) / elapsed;
     report("sha256_oneshot_1M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_oneshot_1M", "MiB/s", bench_sha256_1m);
+REGISTER_BENCH("sha256_oneshot_1M", "MiB/s", bench_sha256_1m)
 
 static void bench_sha256_16m(double *tp)
 {
@@ -146,7 +148,7 @@ static void bench_sha256_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("sha256_oneshot_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_oneshot_16M", "MiB/s", bench_sha256_16m);
+REGISTER_BENCH("sha256_oneshot_16M", "MiB/s", bench_sha256_16m)
 
 /* EVP streaming: N x Update calls of chunk_sz, then Final */
 static void bench_sha256_evp_stream(double *tp)
@@ -176,7 +178,7 @@ static void bench_sha256_evp_stream(double *tp)
     *tp = ((double)iters * (double)chunk) / (1024.0 * 1024.0) / elapsed;
     report("sha256_evp_stream_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_evp_stream_16M", "MiB/s", bench_sha256_evp_stream);
+REGISTER_BENCH("sha256_evp_stream_16M", "MiB/s", bench_sha256_evp_stream)
 
 /* EVP per-object overhead: many tiny objects (256 bytes) */
 static void bench_sha256_evp_small(double *tp)
@@ -204,7 +206,7 @@ static void bench_sha256_evp_small(double *tp)
     *tp = (double)iters / 1e6 / elapsed;
     report("sha256_evp_small_256B", "Mops/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("sha256_evp_small_256B", "Mops/s", bench_sha256_evp_small);
+REGISTER_BENCH("sha256_evp_small_256B", "Mops/s", bench_sha256_evp_small)
 
 /* ------------------------------------------------------------------ */
 /* CRC-32C benchmarks                                                  */
@@ -220,7 +222,7 @@ static void bench_crc32c_4k(double *tp)
     *tp = ((double)iters * 4096.0) / (1024.0 * 1024.0) / elapsed;
     report("crc32c_4K", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("crc32c_4K", "MiB/s", bench_crc32c_4k);
+REGISTER_BENCH("crc32c_4K", "MiB/s", bench_crc32c_4k)
 
 static void bench_crc32c_16m(double *tp)
 {
@@ -232,7 +234,7 @@ static void bench_crc32c_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("crc32c_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("crc32c_16M", "MiB/s", bench_crc32c_16m);
+REGISTER_BENCH("crc32c_16M", "MiB/s", bench_crc32c_16m)
 
 /* ------------------------------------------------------------------ */
 /* RS parity benchmarks                                                */
@@ -251,7 +253,7 @@ static void bench_rs_encode_single(double *tp)
     *tp = (double)iters / 1e6 / elapsed;
     report("rs_encode_single", "Mops/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("rs_encode_single", "Mops/s", bench_rs_encode_single);
+REGISTER_BENCH("rs_encode_single", "Mops/s", bench_rs_encode_single)
 
 static void bench_rs_parity_encode_16m(double *tp)
 {
@@ -268,7 +270,7 @@ static void bench_rs_parity_encode_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("rs_parity_encode_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("rs_parity_encode_16M", "MiB/s", bench_rs_parity_encode_16m);
+REGISTER_BENCH("rs_parity_encode_16M", "MiB/s", bench_rs_parity_encode_16m)
 
 static void bench_rs_parity_decode_clean_16m(double *tp)
 {
@@ -288,7 +290,7 @@ static void bench_rs_parity_decode_clean_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("rs_parity_decode_clean_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("rs_parity_decode_clean_16M", "MiB/s", bench_rs_parity_decode_clean_16m);
+REGISTER_BENCH("rs_parity_decode_clean_16M", "MiB/s", bench_rs_parity_decode_clean_16m)
 
 /* ------------------------------------------------------------------ */
 /* LZ4 benchmarks                                                      */
@@ -315,7 +317,7 @@ static void bench_lz4_compress_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("lz4_compress_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("lz4_compress_16M", "MiB/s", bench_lz4_compress_16m);
+REGISTER_BENCH("lz4_compress_16M", "MiB/s", bench_lz4_compress_16m)
 
 static void bench_lz4_decompress_16m(double *tp)
 {
@@ -338,7 +340,7 @@ static void bench_lz4_decompress_16m(double *tp)
     *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
     report("lz4_decompress_16M", "MiB/s", *tp, iters, elapsed);
 }
-REGISTER_BENCH("lz4_decompress_16M", "MiB/s", bench_lz4_decompress_16m);
+REGISTER_BENCH("lz4_decompress_16M", "MiB/s", bench_lz4_decompress_16m)
 
 /* ------------------------------------------------------------------ */
 /* Main: filter by name, run matching benchmarks                       */
