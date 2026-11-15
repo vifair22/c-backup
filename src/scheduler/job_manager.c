@@ -528,6 +528,11 @@ static void *worker_main(void *arg)
             job_alert_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
                               detail, title, sizeof(title), body, sizeof(body));
             pthread_mutex_unlock(&jm->db_mu);
+            /* c-utils logs a send only when it is rejected, and then only
+             * the title, so the log never said an alert went out or what
+             * it said. */
+            log_info("sending failure notification for job %lld: %s: %s",
+                     (long long)slot.job_id, title, body);
             if (push_send(title, body) != 0)
                 log_warn("cannot queue failure notification for job %lld",
                          (long long)slot.job_id);
