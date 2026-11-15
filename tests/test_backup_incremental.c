@@ -22,12 +22,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "file_cache.h"
+#include "object.h"
+#include "pack.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -263,6 +267,85 @@ static void test_snapshots_are_independent(void **state)
     db_result_free(r);
 }
 
+/*
+ * A backup that dies mid-run must not poison the next one.
+ *
+ * Small files go straight into a pack the backup holds open, and the index
+ * rows and file-cache entries for them are committed in batches while that
+ * pack is still a temporary file. A crash loses the pack and keeps the rows.
+ * When those rows said "loose", the next backup's file cache saw the path
+ * unchanged, found the object "present", and wrote a snapshot referencing
+ * bytes that were never on disk: 23,674 such files in one measured run, with
+ * the backup reporting success.
+ *
+ * This builds that state exactly - an object staged into a pack that is then
+ * abandoned, with its index row and its cache entry written - and requires
+ * the next backup to store the file again.
+ */
+static void test_backup_after_a_crash_restores_what_the_crash_lost(void **state)
+{
+    (void)state;
+    const char *victim = TEST_SRC "/dir03/file02.txt";
+
+    pack_backup_writer_t *pw = NULL;
+    assert_int_equal(pack_backup_open(store, &pw), OK);
+    int fd = open(victim, O_RDONLY);
+    assert_true(fd >= 0);
+    struct stat st;
+    assert_int_equal(fstat(fd, &st), 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_packed(store, fd, (uint64_t)st.st_size,
+                                              pw, hash, &w), OK);
+    close(fd);
+    assert_true(pack_backup_holds(pw, hash));
+    assert_int_equal(store_index_put_staged(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                            w.phys_bytes, w.payload_size), OK);
+    struct stat lst;
+    assert_int_equal(lstat(victim, &lst), 0);
+    file_cache_put(db, repo_id, victim, &lst, hash, 1);
+    pack_backup_abort(pw);   /* the process died: the pack never landed */
+
+    /* A staged row is not an object, so the cache does not trust it. */
+    uint8_t cached[OBJECT_HASH_SIZE];
+    assert_int_equal(file_cache_lookup(db, repo_id, victim, &lst, cached), 0);
+    assert_false(object_exists(store, hash));
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    /* Stored for real this time, and indexed where it actually is. */
+    assert_true(object_exists(store, hash));
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT location FROM objects WHERE repo_id = ? AND hash = ?",
+        (const char *[]){ repo, hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_not_equal(r->rows[0][0], "staged");
+    assert_string_not_equal(r->rows[0][0], "loose");   /* it went into a pack */
+    db_result_free(r);
+}
+
+/* What the daemon does at start: staged rows belong to a dead backup. */
+static void test_staged_rows_are_dropped(void **state)
+{
+    (void)state;
+    uint8_t h[OBJECT_HASH_SIZE];
+    memset(h, 0xab, sizeof(h));
+    assert_int_equal(store_index_put_staged(db, repo_id, h, OBJECT_TYPE_FILE, 1, 1), OK);
+    assert_int_equal(store_index_drop_staged(db, 0), OK);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT COUNT(*) FROM objects WHERE location = 'staged'",
+                                NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -272,6 +355,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deleted_file_is_localised, setup, teardown),
         cmocka_unit_test_setup_teardown(test_new_tree_fraction_stays_low, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshots_are_independent, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_after_a_crash_restores_what_the_crash_lost, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_staged_rows_are_dropped, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

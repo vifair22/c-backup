@@ -241,9 +241,42 @@ void store_index_free(store_index_t *idx)
     free(idx);
 }
 
+static status_t put_object(cutils_db_t *db, int64_t repo_id,
+                           const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                           uint64_t phys_size, uint64_t orig_size,
+                           const char *location);
+
 status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                uint8_t type, uint64_t phys_size, uint64_t orig_size)
+{
+    return put_object(db, repo_id, hash, type, phys_size, orig_size, "loose");
+}
+
+status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint8_t type, uint64_t phys_size, uint64_t orig_size)
+{
+    return put_object(db, repo_id, hash, type, phys_size, orig_size, "staged");
+}
+
+status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int rc = repo_id > 0
+        ? db_execute_non_query(db,
+              "DELETE FROM objects WHERE repo_id = ? AND location = 'staged'",
+              (const char *[]){ repo, NULL }, NULL)
+        : db_execute_non_query(db,
+              "DELETE FROM objects WHERE location = 'staged'", NULL, NULL);
+    return rc == 0 ? OK : set_error(ERR_IO, "cannot drop staged objects");
+}
+
+static status_t put_object(cutils_db_t *db, int64_t repo_id,
+                           const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
+                           uint64_t phys_size, uint64_t orig_size,
+                           const char *location)
 {
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_to_hex(hash, hex);
@@ -258,9 +291,9 @@ status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
     if (db_execute_non_query(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
-            " VALUES (?, ?, 0, ?, ?, 'loose', ?)"
+            " VALUES (?, ?, 0, ?, ?, ?, ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
-            (const char *[]){ repo, hex, phys, orig, t, NULL }, NULL) != 0)
+            (const char *[]){ repo, hex, phys, orig, location, t, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record object");
     return OK;
 }

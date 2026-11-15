@@ -188,6 +188,10 @@ int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
  */
 status_t pack_backup_rollover(pack_backup_writer_t *w);
 
+/* Is this object staged in the writer's open pack, which is not on disk as a
+ * pack until it is sealed? The index records such objects as staged. */
+int pack_backup_holds(const pack_backup_writer_t *w, const uint8_t hash[OBJECT_HASH_SIZE]);
+
 /* Seal whatever is open. Same transaction rule as rollover. Frees the writer
  * either way; on failure the staging file is removed. */
 status_t pack_backup_finish(pack_backup_writer_t *w, uint32_t *out_packed);

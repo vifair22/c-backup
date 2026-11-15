@@ -3115,6 +3115,12 @@ static status_t pb_ensure_open(pack_backup_writer_t *w)
                          w->pw.dat_tmp, &w->pw.dat_hdr);
 }
 
+int pack_backup_holds(const pack_backup_writer_t *w, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!w) return 0;
+    return staged_set_contains(&w->seen, w->pw.idx_entries, hash);
+}
+
 int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes)
 {
     if (!w || !w->pw.dat_f || w->pw.packed == 0) return 0;
