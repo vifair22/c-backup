@@ -791,6 +791,37 @@ else
     bad "loss repo produced a pack" "a pack file" "none"
 fi
 
+# B106: verify --dry-run is a check that writes nothing to the repository,
+# whatever else was asked for. One byte of damage inside a 1 MiB
+# incompressible payload is within parity: the dry run has to report it
+# recoverable and leave the byte where it is, and a repairing run fixes it.
+mkdir -p "$WORK/drysrc"
+head -c 1048576 /dev/urandom > "$WORK/drysrc/blob.bin"
+DRY_ID=$(cb repo add "$WORK/dryrepo" dry | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$DRY_ID" "$WORK/drysrc" > /dev/null
+DRY_OBJ=$(find "$WORK/dryrepo/objects" "$WORK/dryrepo/packs" -type f -size +1000k 2>/dev/null | head -1)
+if [ -n "$DRY_OBJ" ]; then
+    DRY_GOOD=$(sha256sum < "$DRY_OBJ")
+    DRY_OFF=$(( $(stat -c %s "$DRY_OBJ") / 2 ))
+    DRY_BYTE=$(od -An -tu1 -j "$DRY_OFF" -N1 "$DRY_OBJ" | tr -d ' ')
+    if [ "$DRY_BYTE" = 0 ]; then printf '\377'; else printf '\000'; fi | \
+        dd of="$DRY_OBJ" bs=1 seek="$DRY_OFF" conv=notrunc status=none
+    DRY_BAD=$(sha256sum < "$DRY_OBJ")
+    OUT=$(cb verify "$DRY_ID" --dry-run 2>&1); RC=$?
+    check    "a dry run over recoverable damage succeeds" 0 "$RC"
+    contains "and reports nothing repaired" '"repaired":0,' "$OUT"
+    contains "but the damage recoverable"   '"recoverable":1,' "$OUT"
+    check    "and leaves the repository untouched" "$DRY_BAD" "$(sha256sum < "$DRY_OBJ")"
+    # --dry-run wins over a request that would otherwise repair.
+    OUT=$(cb verify "$DRY_ID" --level deep --dry-run 2>&1)
+    contains "even with the level named" '"repaired":0,' "$OUT"
+    OUT=$(cb verify "$DRY_ID" 2>&1)
+    contains "a repairing run fixes it" '"repaired":1,' "$OUT"
+    check    "and writes the right bytes back" "$DRY_GOOD" "$(sha256sum < "$DRY_OBJ")"
+else
+    bad "dry-run repo stored the blob" "a file over 1000k" "$(find "$WORK/dryrepo" -type f | head)"
+fi
+
 # Job commands wait by default and exit non-zero when the job fails.
 OUT=$(cb pack "$ENC_ID"); RC=$?
 check    "pack waits for its job"  0            "$RC"

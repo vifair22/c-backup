@@ -1006,6 +1006,7 @@ sudo c-backup verify 1                     # deep, repairing
 sudo c-backup verify 1 --level index       # fast: every object still resolves
 sudo c-backup verify 1 --level structure   # also parses every header
 sudo c-backup verify 1 --no-repair         # check only, write nothing
+sudo c-backup verify 1 --dry-run           # the same, and wins over everything
 sudo c-backup verify list 1                # past runs
 ```
 
@@ -1020,11 +1021,22 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
+`--dry-run` is a check that cannot write: it turns repair off whatever else
+the command says, so it behaves exactly as `--no-repair` and takes the read
+lock. It is there for the habit `gc --dry-run` and `gfs --dry-run` teach,
+and it means "show me, change nothing". Nothing in the repository is
+written. The daemon still records the run and its findings (`verify list`,
+`verify show`, the verify metrics), because that is the report. Objects
+up to 16 MiB are read with parity applied in memory, so damage there is
+reported `recoverable`; a larger object is streamed, cannot be checked that
+way without writing, and is reported as damaged with a note to run a
+repairing verify. A dry run that finds loss fails like any other verify.
+
 What a run counts:
 
 | Count | Meaning |
 |---|---|
-| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` |
+| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
