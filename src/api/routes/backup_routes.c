@@ -5,6 +5,7 @@
 
 #include "backup.h"
 #include "job_manager.h"
+#include "cJSON.h"
 #include "lock.h"
 #include "repo.h"
 #include "store.h"
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Backup and job routes.
@@ -172,6 +174,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     o.cancel       = cancel;
     o.progress_cb  = progress;
     o.progress_ctx = progress_ctx;
+    o.bytes_cb     = job_progress_bytes;
 
     /*
      * Say it again, every backup, until someone acts on it.
@@ -228,6 +231,26 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
                      (long long)res.snapshot_id, err_msg());
             err_clear();
         }
+    }
+
+    /* What the backup did, on the job record: the log line had it, the job
+     * did not, so a client saw only "completed". Every field is numeric. */
+    if (res.snapshot_id > 0) {
+        char rj[512];
+        snprintf(rj, sizeof(rj),
+                 "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
+                 "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
+                 "\"objects_new\":%llu,\"bytes_stored\":%llu,"
+                 "\"trees_new\":%llu,\"trees_reused\":%llu}",
+                 (long long)res.snapshot_id,
+                 (unsigned long long)res.files, (unsigned long long)res.dirs,
+                 (unsigned long long)res.files_unchanged,
+                 (unsigned long long)res.bytes_logical,
+                 (unsigned long long)res.objects_new,
+                 (unsigned long long)res.bytes_stored,
+                 (unsigned long long)res.trees_new,
+                 (unsigned long long)res.trees_reused);
+        job_set_result(progress_ctx, rj);
     }
 
     free(cpaths);
@@ -407,6 +430,75 @@ status_t routes_submit_backup(job_manager_t *jm, int64_t repo_id,
 
 /* ---------- jobs ---------- */
 
+/*
+ * One job, as clients see it. Both /jobs and /jobs/<id> use this, so the
+ * list carries the same detail as a single job rather than three fields.
+ *
+ * Numbers are JSON numbers. Times are epoch seconds; "started" and "ended"
+ * are null until they happen. "elapsed_s" runs to now for a running job.
+ * "rate_bytes_per_s" is the average over the job so far. "result" is what
+ * the job reported about itself when it ended (a backup's snapshot and
+ * counts, a restore's files and skips), or null.
+ *
+ * Built with cJSON rather than c-utils' builder because "result" is stored
+ * JSON and has to be embedded as an object, not escaped into a string.
+ */
+#define JOB_COLUMNS \
+    "SELECT id, COALESCE(repo_id, 0), action, state," \
+    "       COALESCE(started, 0), COALESCE(ended, 0)," \
+    "       COALESCE(NULLIF(progress_phase,''),'')," \
+    "       CAST(COALESCE(NULLIF(progress_current,''),0) AS INTEGER)," \
+    "       CAST(COALESCE(NULLIF(progress_total,''),0) AS INTEGER)," \
+    "       CAST(COALESCE(NULLIF(bytes_done,''),0) AS INTEGER)," \
+    "       CAST(COALESCE(NULLIF(bytes_total,''),0) AS INTEGER)," \
+    "       COALESCE(NULLIF(error,''),'')," \
+    "       COALESCE(result,'')" \
+    "  FROM jobs"
+
+static cJSON *job_json(char **row)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return NULL;
+    long long started = strtoll(row[4], NULL, 10);
+    long long ended   = strtoll(row[5], NULL, 10);
+    unsigned long long bdone = strtoull(row[9], NULL, 10);
+    long long now = (long long)time(NULL);
+    long long elapsed = started > 0 ? ((ended > 0 ? ended : now) - started) : 0;
+    if (elapsed < 0) elapsed = 0;
+
+    cJSON_AddNumberToObject(o, "id",      (double)strtoll(row[0], NULL, 10));
+    cJSON_AddNumberToObject(o, "repo_id", (double)strtoll(row[1], NULL, 10));
+    cJSON_AddStringToObject(o, "action",  row[2]);
+    cJSON_AddStringToObject(o, "state",   row[3]);
+    if (started > 0) cJSON_AddNumberToObject(o, "started", (double)started);
+    else             cJSON_AddNullToObject(o, "started");
+    if (ended > 0)   cJSON_AddNumberToObject(o, "ended", (double)ended);
+    else             cJSON_AddNullToObject(o, "ended");
+    cJSON_AddNumberToObject(o, "elapsed_s", (double)elapsed);
+    cJSON_AddStringToObject(o, "phase",   row[6]);
+    cJSON_AddNumberToObject(o, "current", (double)strtoull(row[7], NULL, 10));
+    cJSON_AddNumberToObject(o, "total",   (double)strtoull(row[8], NULL, 10));
+    cJSON_AddNumberToObject(o, "bytes_done",  (double)bdone);
+    cJSON_AddNumberToObject(o, "bytes_total", (double)strtoull(row[10], NULL, 10));
+    cJSON_AddNumberToObject(o, "rate_bytes_per_s",
+                            elapsed > 0 ? (double)(bdone / (unsigned long long)elapsed) : 0.0);
+    cJSON_AddStringToObject(o, "error",   row[11]);
+    cJSON *res = row[12][0] ? cJSON_Parse(row[12]) : NULL;
+    if (res) cJSON_AddItemToObject(o, "result", res);
+    else     cJSON_AddNullToObject(o, "result");
+    return o;
+}
+
+static api_response_t json_out(cJSON *root)
+{
+    char *txt = root ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    if (!txt) return api_error(500, "cannot serialise response");
+    /* api_ok takes a malloc'd body and frees it; cJSON allocates with the
+     * default hooks, which are malloc and free. */
+    return api_ok(txt);
+}
+
 static api_response_t list_jobs(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
@@ -414,44 +506,19 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     const char *lim = (limit && atoi(limit) > 0) ? limit : "50";
 
     db_result_t *r = NULL;
-    if (db_execute(ctx->db,
-            "SELECT id, repo_id, action, state, started, ended,"
-            "       progress_phase, progress_current, progress_total, error"
-            "  FROM jobs ORDER BY id DESC LIMIT ?",
-            (const char *[]){ lim, NULL }, &r) != 0) {
+    if (db_execute(ctx->db, JOB_COLUMNS " ORDER BY id DESC LIMIT ?",
+                   (const char *[]){ lim, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list jobs");
     }
-
-    cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
-
-    /* Create the array up front. json_resp_array_append_begin makes it
-     * lazily on first append, so a query with no rows omitted the key
-     * entirely and the response came back as {} - a second shape every
-     * client had to handle, and only when a collection happened to be
-     * empty. */
-    if (json_resp_ensure_array(resp, "jobs") != 0) {
-        /* Only fails on allocation trouble. Carrying on leaves the
-         * key absent, which is what every response did before, so
-         * there is nothing to unwind and nothing worth failing the
-         * request over. */
-    }
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        cutils_json_elem_t e;
-        if (json_resp_array_append_begin(resp, "jobs", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",     r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "action", r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "state",  r->rows[i][3]) != 0;
-        if (bad) break;
-        json_elem_commit(&e);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = root ? cJSON_AddArrayToObject(root, "jobs") : NULL;
+    for (int i = 0; arr && i < (r ? r->nrows : 0); i++) {
+        cJSON *j = job_json(r->rows[i]);
+        if (j) cJSON_AddItemToArray(arr, j);
     }
     db_result_free(r);
-
-    char *body = NULL; size_t blen = 0;
-    if (json_resp_finalize(resp, &body, &blen) != 0)
-        return api_error(500, "cannot serialise response");
-    return api_ok(body);
+    return json_out(root);
 }
 
 static api_response_t get_job(const api_request_t *req, void *ud)
@@ -468,44 +535,14 @@ static api_response_t get_job(const api_request_t *req, void *ud)
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", id);
     db_result_t *r = NULL;
-    /*
-     * COALESCE rather than a NULL check in C: this db layer hands back an
-     * empty string for a NULL column, not NULL, so the guard never fired and
-     * a job that had not reported progress serialised as "current":, which is
-     * not JSON at all. Every gc, gfs and reindex job hit it, because those
-     * report no progress.
-     */
-    if (db_execute(ctx->db,
-            "SELECT id, action, state,"
-            "       COALESCE(NULLIF(progress_phase,''),''),"
-            "       CAST(COALESCE(NULLIF(progress_current,''),0) AS INTEGER),"
-            "       CAST(COALESCE(NULLIF(progress_total,''),0) AS INTEGER),"
-            "       COALESCE(NULLIF(error,''),'')"
-            "  FROM jobs WHERE id = ?",
-            (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
+    if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
+                   (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(404, "no such job");
     }
-
-    /* Built rather than printed: phase and error carry paths and strerror
-     * text, and one quote or backslash in either would produce a body no
-     * client can parse. */
-    cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
-    int bad = json_resp_add_str(resp, "id",      r->rows[0][0]) != 0
-           || json_resp_add_str(resp, "action",  r->rows[0][1]) != 0
-           || json_resp_add_str(resp, "state",   r->rows[0][2]) != 0
-           || json_resp_add_str(resp, "phase",   r->rows[0][3]) != 0
-           || json_resp_add_u64(resp, "current", strtoull(r->rows[0][4], NULL, 10)) != 0
-           || json_resp_add_u64(resp, "total",   strtoull(r->rows[0][5], NULL, 10)) != 0
-           || json_resp_add_str(resp, "error",   r->rows[0][6]) != 0;
+    cJSON *j = job_json(r->rows[0]);
     db_result_free(r);
-    if (bad) return api_error(500, "cannot serialise response");
-
-    char *body = NULL; size_t blen = 0;
-    if (json_resp_finalize(resp, &body, &blen) != 0)
-        return api_error(500, "cannot serialise response");
-    return api_ok(body);
+    return json_out(j);
 }
 
 static api_response_t cancel_job(const api_request_t *req, void *ud)

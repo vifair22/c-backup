@@ -677,7 +677,23 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         o.cancel       = cancel;
         o.progress_cb  = progress;
         o.progress_ctx = progress_ctx;
-        st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, NULL);
+        o.bytes_cb     = job_progress_bytes;
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        st = restore_run(store, j->db, j->repo_id, j->snap_id, j->dest, &o, &rr);
+        /* What was restored, on the job: the counts the Manual promises and
+         * the log had, where the job showed only the snapshot's entry count.
+         * Recorded on failure too, since that is when "failed" matters. */
+        char rj[384];
+        snprintf(rj, sizeof(rj),
+                 "{\"files\":%llu,\"dirs\":%llu,\"symlinks\":%llu,"
+                 "\"hardlinks\":%llu,\"specials\":%llu,\"bytes\":%llu,"
+                 "\"skipped\":%llu,\"failed\":%llu}",
+                 (unsigned long long)rr.files, (unsigned long long)rr.dirs,
+                 (unsigned long long)rr.symlinks, (unsigned long long)rr.hardlinks,
+                 (unsigned long long)rr.specials, (unsigned long long)rr.bytes,
+                 (unsigned long long)rr.skipped, (unsigned long long)rr.failed);
+        job_set_result(progress_ctx, rj);
     }
 
     store_index_free(idx);

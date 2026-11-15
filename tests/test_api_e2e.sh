@@ -169,7 +169,18 @@ echo "repos"
 contains "register" '"id":1' \
     "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"path\":\"$WORK/repo\"}" http://localhost/repos)"
 contains "get repo" '"uuid"' "$(sock_body /repos/1)"
+# A repository with no snapshot is counted. Its age runs from registration,
+# so it trips an age alert like any stale repository instead of reading 0.
+contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
 check "unknown repo" 404 "$(sock_code /repos/99)"
+# And every route under it: these answered 200 with empty results, which a
+# script cannot tell from an empty repository that exists.
+check "unknown repo: summary" 404 "$(sock_code /repos/99/summary)"
+check "unknown repo: snapshots" 404 "$(sock_code /repos/99/snapshots)"
+check "unknown repo: backup" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+     -d '{"paths":["/tmp"]}' http://localhost/repos/99/backup)"
+check "unknown repo: policy" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+     -d '{"key":"retention.keep_daily","value":"1"}' http://localhost/repos/99/policy)"
 
 mkdir -p "$WORK/foreign" && echo "not ours" > "$WORK/foreign/data.txt"
 check "refuses foreign dir" 400 \
@@ -189,6 +200,15 @@ contains "submit" '"job_id"' "$BACKUP_RESP"
 BACKUP_JOB=$(job_id "$BACKUP_RESP")
 wait_job "$BACKUP_JOB"
 contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")"
+# A finished job says what it did, and how big and how long. It said only
+# "completed" with the last phase's entry count.
+JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
+contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
+contains "backup result counts files" '"files":3,' "$JOB_BODY"
+contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
+contains "job reports when it started" '"started":1' "$JOB_BODY"
+contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
+contains "the job list carries the same detail" '"elapsed_s":' "$(sock_body /jobs)"
 contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
@@ -216,6 +236,7 @@ RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$W
                         http://localhost/repos/1/snapshots/1/restore)")
 wait_job "$RESTORE_JOB"
 contains "restore completed" '"state":"completed"' "$(sock_body "/jobs/$RESTORE_JOB")"
+contains "restore result counts what it wrote" '"result":{"files":3,' "$(sock_body "/jobs/$RESTORE_JOB")"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else

@@ -320,48 +320,107 @@ static void report(const restore_opts_t *o, const char *phase,
     if (o && o->progress_cb) o->progress_cb(phase, done, total, o->progress_ctx);
 }
 
-/* Build a node's path relative to the snapshot root by walking parents. */
-static status_t node_rel_path(cutils_db_t *db, const char *repo, const char *snap,
-                              const char *node_id, char *out, size_t outsz)
+/*
+ * Every node's path, built from the rows the restore has already read.
+ *
+ * This walked parents with one query per path component, per node, and the
+ * restore asked up to three times per node. Through the one database handle
+ * every thread shares, that made a restore cost entries times depth queries
+ * whatever it restored: a one-file --subpath restore of an 82,604-entry
+ * snapshot took 5 minutes 41 seconds, almost all of it rebuilding paths of
+ * files it then skipped. The rows already carry each node's name and parent,
+ * so the table maps node id to row once and memoises directory paths; a
+ * file's path is its directory's plus its name. Linear in entries, and the
+ * memory is one string per directory beside a result set already in memory.
+ */
+#define COL_PARENT 15
+
+typedef struct {
+    const db_result_t *r;
+    int64_t  *keys;      /* node id, 0 = empty slot */
+    int32_t  *rows;
+    uint32_t  mask;
+    char    **dir_path;  /* per row, set once computed */
+} path_table_t;
+
+static uint32_t pt_slot(int64_t id, uint32_t mask)
 {
-    const char *parts[MAX_PATH_DEPTH];
-    char       *owned[MAX_PATH_DEPTH];
-    int         n = 0;
+    uint64_t h = (uint64_t)id * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(h >> 32) & mask;
+}
 
-    char cur[32];
-    snprintf(cur, sizeof(cur), "%s", node_id);
-
-    while (n < MAX_PATH_DEPTH) {
-        db_result_t *r = NULL;
-        if (db_execute(db,
-                "SELECT name, parent_node_id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND id = ?",
-                (const char *[]){ repo, snap, cur, NULL }, &r) != 0 ||
-            !r || r->nrows != 1) {
-            db_result_free(r);
-            break;
-        }
-        owned[n] = strdup(r->rows[0][0]);
-        parts[n] = owned[n];
-        char parent[32];
-        snprintf(parent, sizeof(parent), "%s", r->rows[0][1] ? r->rows[0][1] : "0");
-        db_result_free(r);
-        if (!owned[n]) break;
-        n++;
-        if (strcmp(parent, "0") == 0) break;
-        snprintf(cur, sizeof(cur), "%s", parent);
+static int pt_init(path_table_t *pt, const db_result_t *r)
+{
+    memset(pt, 0, sizeof(*pt));
+    pt->r = r;
+    uint32_t cap = 16;
+    while (cap < (uint32_t)r->nrows * 2u) cap <<= 1;
+    pt->mask = cap - 1;
+    pt->keys = calloc(cap, sizeof(*pt->keys));
+    pt->rows = calloc(cap, sizeof(*pt->rows));
+    pt->dir_path = calloc((size_t)r->nrows + 1, sizeof(*pt->dir_path));
+    if (!pt->keys || !pt->rows || !pt->dir_path) return -1;
+    for (int i = 0; i < r->nrows; i++) {
+        int64_t id = strtoll(r->rows[i][0], NULL, 10);
+        uint32_t k = pt_slot(id, pt->mask);
+        while (pt->keys[k] != 0) k = (k + 1) & pt->mask;
+        pt->keys[k] = id;
+        pt->rows[k] = i;
     }
+    return 0;
+}
 
-    size_t off = 0;
-    out[0] = '\0';
-    for (int i = n - 1; i >= 0; i--) {
-        int w = snprintf(out + off, outsz - off, "%s%s",
-                         off ? "/" : "", parts[i]);
-        if (w < 0 || (size_t)w >= outsz - off) { off = 0; break; }
-        off += (size_t)w;
+static void pt_free(path_table_t *pt)
+{
+    if (pt->dir_path)
+        for (int i = 0; i < (pt->r ? pt->r->nrows : 0); i++) free(pt->dir_path[i]);
+    free(pt->dir_path);
+    free(pt->keys);
+    free(pt->rows);
+    memset(pt, 0, sizeof(*pt));
+}
+
+static int pt_find(const path_table_t *pt, int64_t id)
+{
+    uint32_t k = pt_slot(id, pt->mask);
+    while (pt->keys[k] != 0) {
+        if (pt->keys[k] == id) return pt->rows[k];
+        k = (k + 1) & pt->mask;
     }
-    for (int i = 0; i < n; i++) free(owned[i]);
-    return off ? OK : set_error(ERR_IO, "restore: cannot rebuild path");
+    return -1;
+}
+
+static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int depth);
+
+/* A directory's path, computed once. */
+static const char *pt_dir(path_table_t *pt, int i, int depth)
+{
+    if (pt->dir_path[i]) return pt->dir_path[i];
+    char buf[PATH_MAX];
+    if (pt_rel(pt, i, buf, sizeof(buf), depth) != OK) return NULL;
+    pt->dir_path[i] = strdup(buf);
+    return pt->dir_path[i];
+}
+
+static status_t pt_rel(path_table_t *pt, int i, char *out, size_t outsz, int depth)
+{
+    if (depth > MAX_PATH_DEPTH)
+        return set_error(ERR_CORRUPT, "restore: path deeper than %d", MAX_PATH_DEPTH);
+    const char *name = pt->r->rows[i][1];
+    int64_t parent = strtoll(pt->r->rows[i][COL_PARENT], NULL, 10);
+    int w;
+    if (parent == 0) {
+        w = snprintf(out, outsz, "%s", name);
+    } else {
+        int p = pt_find(pt, parent);
+        if (p < 0) return set_error(ERR_CORRUPT, "restore: node %s has no parent row",
+                                    pt->r->rows[i][0]);
+        const char *dir = pt_dir(pt, p, depth + 1);
+        if (!dir) return set_error(ERR_IO, "restore: cannot rebuild path");
+        w = snprintf(out, outsz, "%s/%s", dir, name);
+    }
+    if (w < 0 || (size_t)w >= outsz) return set_error(ERR_IO, "restore: path too long");
+    return OK;
 }
 
 /* mkdir -p for the destination side. */
@@ -425,7 +484,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type,"
             "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
             "       COALESCE(xattr_hash,''), COALESCE(acl_hash,''),"
-            "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0)"
+            "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0),"
+            "       COALESCE(parent_node_id, 0)"
             "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
             " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
@@ -458,6 +518,13 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         db_result_free(r);
         return set_error(ERR_NOMEM, "restore: hardlink map");
     }
+    path_table_t paths;
+    if (pt_init(&paths, r) != 0) {
+        pt_free(&paths);
+        hardlink_map_free(&hlinks);
+        db_result_free(r);
+        return set_error(ERR_NOMEM, "restore: path table");
+    }
 
     /*
      * Resume pre-pass. A restore into a partially-populated destination
@@ -475,6 +542,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (!opts->overwrite) {
         groupcount_t gcount;
         if (groupcount_init(&gcount, (uint32_t)r->nrows) != 0) {
+            pt_free(&paths);
             hardlink_map_free(&hlinks);
             db_result_free(r);
             return set_error(ERR_NOMEM, "restore: group counts");
@@ -492,7 +560,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             if (hardlink_lookup(&hlinks, hgroup)) continue;
 
             char rel[PATH_MAX];
-            if (node_rel_path(db, repo, snap, r->rows[i][0], rel, sizeof(rel)) != OK) {
+            if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
                 err_clear();
                 continue;
             }
@@ -507,8 +575,27 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         groupcount_free(&gcount);
     }
 
+    /* Bytes to restore: regular files inside the subpath, if there is one.
+     * A file's size is counted once the loop has moved past it, written or
+     * skipped alike, since both are progress through the snapshot. */
+    uint64_t bytes_total = 0, bytes_done = 0, bytes_pending = 0;
+    if (opts->bytes_cb) {
+        for (int i = 0; i < r->nrows; i++) {
+            if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+            if (opts->subpath) {
+                char rel[PATH_MAX];
+                if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) { err_clear(); continue; }
+                if (!path_within(rel, opts->subpath)) continue;
+            }
+            bytes_total += strtoull(r->rows[i][6], NULL, 10);
+        }
+    }
+
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
+        bytes_done += bytes_pending;
+        bytes_pending = 0;
+        if (opts->bytes_cb) opts->bytes_cb(opts->progress_ctx, bytes_done, bytes_total);
         /* i + 1: this is the entry being worked on, not the count already
          * finished. Reporting the bare index meant the last entry of a
          * restore was announced as 6414 of 6415 and the job then completed,
@@ -516,7 +603,6 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
          * as a stall at the worst possible moment. */
         report(opts, "restore", (uint64_t)i + 1, (uint64_t)r->nrows);
 
-        const char *id      = r->rows[i][0];
         uint32_t    mode    = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
         uint32_t    uid     = (uint32_t)strtoul(r->rows[i][3], NULL, 10);
         uint32_t    gid     = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
@@ -532,7 +618,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         uint32_t    dminor  = (uint32_t)strtoul(r->rows[i][14], NULL, 10);
 
         char rel[PATH_MAX];
-        if (node_rel_path(db, repo, snap, id, rel, sizeof(rel)) != OK) {
+        if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
             log_warn("restore: cannot reconstruct the path of node %s", r->rows[i][0]);
             res.failed++;
             err_clear();
@@ -541,6 +627,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (opts->subpath && !path_within(rel, opts->subpath))
             continue;
+        if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
@@ -801,7 +888,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (cancelled(opts)) break;
 
         char rel[PATH_MAX], full[PATH_MAX];
-        if (node_rel_path(db, repo, snap, r->rows[i][0], rel, sizeof(rel)) != OK) {
+        if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
             err_clear();
             continue;
         }
@@ -812,6 +899,9 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         apply_mtime(full, strtoull(r->rows[i][5], NULL, 10));
     }
 
+    if (opts->bytes_cb && st == OK)
+        opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);
+    pt_free(&paths);
     db_result_free(r);
     if (st != OK) return st;
 

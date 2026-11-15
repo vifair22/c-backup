@@ -21,6 +21,9 @@ typedef struct {
     volatile int *cancel;
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
     void  *progress_ctx;
+    /* Optional: bytes of file content restored or skipped so far, and in
+     * total, called alongside progress_cb with the same context. */
+    void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
 } restore_opts_t;
 
 typedef struct {

@@ -108,23 +108,84 @@ static void prune_finished_jobs(job_manager_t *jm)
 typedef struct {
     job_manager_t *jm;
     int64_t        job_id;
+    /* Throttle state: see on_progress. Touched only by the job's own
+     * worker thread, which is the only caller. */
+    int64_t        last_ms;
+    char           last_phase[32];
+    /* The latest report, written or not, for the job's closing log line. */
+    uint64_t       seen_done, seen_total;
+    /* job_progress_bytes and job_set_result. */
+    uint64_t       bytes_done, bytes_total;
+    char          *result;
 } progress_ctx_t;
 
+/* How often a running job's progress reaches the database. */
+#define PROGRESS_INTERVAL_MS 250
+
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Progress reaches the database at most every PROGRESS_INTERVAL_MS, plus on
+ * every phase change and at completion.
+ *
+ * Pipelines report per item - every restored entry, every stored file,
+ * every packed object - and each report was a committed UPDATE through the
+ * one database handle every thread shares. A restore of one file out of an
+ * 82,604-entry snapshot took 5 minutes 46 seconds, nearly all of it writing
+ * a progress row per skipped entry. Nobody reads progress faster than a few
+ * times a second; the CLI polls every 100 ms and the app less often.
+ */
 static void on_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
 {
     progress_ctx_t *pc = ctx;
-    char id[32], d[32], t[32];
+    const char *ph = phase ? phase : "";
+    pc->seen_done = done;
+    pc->seen_total = total;
+    int64_t now = mono_ms();
+    int phase_changed = strncmp(pc->last_phase, ph, sizeof(pc->last_phase) - 1) != 0;
+    int finished = total > 0 && done >= total;
+    if (!phase_changed && !finished && now - pc->last_ms < PROGRESS_INTERVAL_MS)
+        return;
+    pc->last_ms = now;
+    snprintf(pc->last_phase, sizeof(pc->last_phase), "%s", ph);
+
+    char id[32], d[32], t[32], bd[32], bt[32];
     snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
     snprintf(d,  sizeof(d),  "%llu", (unsigned long long)done);
     snprintf(t,  sizeof(t),  "%llu", (unsigned long long)total);
+    snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc->bytes_done);
+    snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc->bytes_total);
     pthread_mutex_lock(&pc->jm->db_mu);
     /* Best effort: losing a progress tick must never fail the job. */
     if (db_execute_non_query(pc->jm->db,
             "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
-            " progress_total = ? WHERE id = ?",
-            (const char *[]){ phase, d, t, id, NULL }, NULL) != 0)
+            " progress_total = ?, bytes_done = ?, bytes_total = ? WHERE id = ?",
+            (const char *[]){ ph, d, t, bd, bt, id, NULL }, NULL) != 0)
         { /* ignored deliberately */ }
     pthread_mutex_unlock(&pc->jm->db_mu);
+}
+
+void job_progress_bytes(void *progress_ctx, uint64_t done, uint64_t total)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc) return;
+    pc->bytes_done  = done;
+    pc->bytes_total = total;
+}
+
+void job_set_result(void *progress_ctx, const char *json_object)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc || !json_object) return;
+    char *copy = strdup(json_object);
+    if (!copy) return;   /* a result is a report, not the job's outcome */
+    free(pc->result);
+    pc->result = copy;
 }
 
 /* Caller holds jm->mu. repo_id 0 means "not repo scoped", never busy. */
@@ -197,6 +258,11 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
+        /* A start and an end line per job. The log had neither: a backup
+         * that ran for two hours left nothing in the journal until it
+         * succeeded or failed, and no line at all saying when it began. */
+        log_info("job %lld started: %s, repo %lld",
+                 (long long)slot.job_id, slot.action, (long long)slot.repo_id);
         /*
          * Monotonic and in milliseconds. This was wall-clock seconds, so
          * every operation finishing inside a second journalled "0 ms" and
@@ -208,9 +274,31 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
+
+        /* The job's own account of what it did, and the final byte count,
+         * which the throttle may not have written. Before the final state,
+         * so a client that sees the job finished also sees its result. */
+        {
+            char id[32], bd[32], bt[32];
+            snprintf(id, sizeof(id), "%lld", (long long)slot.job_id);
+            snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc.bytes_done);
+            snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc.bytes_total);
+            pthread_mutex_lock(&jm->db_mu);
+            if (db_execute_non_query(jm->db,
+                    "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
+                    (const char *[]){ bd, bt, id, NULL }, NULL) != 0)
+                log_warn("job %s: cannot record its byte count", id);
+            if (pc.result && db_execute_non_query(jm->db,
+                    "UPDATE jobs SET result = ? WHERE id = ?",
+                    (const char *[]){ pc.result, id, NULL }, NULL) != 0)
+                log_warn("job %s: cannot record its result", id);
+            pthread_mutex_unlock(&jm->db_mu);
+            free(pc.result);
+            pc.result = NULL;
+        }
 
         /*
          * Journalling happens here rather than in each route because this is
@@ -231,6 +319,18 @@ static void *worker_main(void *arg)
             set_job_state(jm, slot.job_id, "failed", detail);
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
+        }
+        {
+            struct timespec fin;
+            clock_gettime(CLOCK_MONOTONIC, &fin);
+            double secs = (double)(fin.tv_sec - began.tv_sec)
+                        + (double)(fin.tv_nsec - began.tv_nsec) / 1e9;
+            log_info("job %lld %s: %s, repo %lld, %.1f s, %s %llu/%llu",
+                     (long long)slot.job_id, outcome, slot.action,
+                     (long long)slot.repo_id, secs,
+                     pc.last_phase[0] ? pc.last_phase : "no progress",
+                     (unsigned long long)pc.seen_done,
+                     (unsigned long long)pc.seen_total);
         }
 
         if (slot.repo_id > 0) {

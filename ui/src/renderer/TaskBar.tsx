@@ -33,7 +33,7 @@ export function TaskBar({ jobs, connName, repoPath, onViewTasks }: Props): React
   const tot = Number(active?.total ?? 0)
   const pct = tot > 0 ? Math.round((cur / tot) * 100) : null
 
-  const handleCancel = async (taskId: string, e: React.MouseEvent) => {
+  const handleCancel = async (taskId: number, e: React.MouseEvent) => {
     e.stopPropagation()
     try {
       await api.apiCall(connName, { kind: 'jobCancel', jobId: Number(taskId) })
