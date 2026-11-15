@@ -201,6 +201,39 @@ static const char *take_opt_multi(int *argc, char **argv, const char *name)
  * Callers that want fields pipe through jq; what matters is that the exit
  * code reflects the HTTP status.
  */
+/*
+ * What to say when nothing answers on the socket.
+ *
+ * It used to say "systemctl start c-backupd" everywhere, including inside
+ * the Docker image, where there is no systemd and the daemon is the
+ * container's own process: if it is not answering, the container is not
+ * running it, or this is a different container. A container is recognised
+ * by Docker's /.dockerenv, podman's /run/.containerenv, or the `container`
+ * variable podman and systemd-nspawn set. A wrong socket path is the other
+ * common cause, so the way to name one is always given.
+ */
+static void daemon_down(void)
+{
+    fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+    const char *cv = getenv("container");
+    int in_container = access("/.dockerenv", F_OK) == 0 ||
+                       access("/run/.containerenv", F_OK) == 0 ||
+                       (cv && *cv);
+    if (in_container)
+        fprintf(stderr,
+                "          This looks like a container: the daemon runs as the\n"
+                "          c-backupd container's own process, so start that container\n"
+                "          (docker start c-backupd), or run this command in it\n"
+                "          (docker exec c-backupd c-backup ...).\n");
+    else if (access("/run/systemd/system", F_OK) == 0)
+        fprintf(stderr, "          Start it with 'systemctl start c-backupd'.\n");
+    else
+        fprintf(stderr, "          Start c-backupd.\n");
+    fprintf(stderr,
+            "          If it runs with another socket, name it with --socket PATH\n"
+            "          or C_BACKUP_SOCKET.\n");
+}
+
 static int call(const char *method, const char *path, const char *body)
 {
     http_response_t resp;
@@ -208,9 +241,7 @@ static int call(const char *method, const char *path, const char *body)
 
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr,
-                "c-backup: daemon not running at %s.\n"
-                "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+        daemon_down();
         return 1;
     }
     if (st != OK) return fail("%s", err_msg());
@@ -307,7 +338,7 @@ static long job_submit(const char *method, const char *path, const char *body)
     memset(&resp, 0, sizeof(resp));
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+        daemon_down();
         return -1;
     }
     if (st != OK) { fail("%s", err_msg()); return -1; }

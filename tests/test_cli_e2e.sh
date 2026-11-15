@@ -41,7 +41,24 @@ echo "no daemon"
 OUT=$("$CLI" --socket "$WORK/absent.sock" repo list 2>&1); RC=$?
 check    "exits non-zero without a daemon" 1 "$RC"
 contains "explains the daemon is not running" "daemon not running" "$OUT"
-contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+# B080: the advice fits where the CLI runs. It said systemctl inside the
+# Docker image, which has no systemd. CI itself may be a container, so the
+# expectation follows the same signals the CLI reads.
+if [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
+    contains "suggests how to start it" "start that container" "$OUT"
+elif [ -d /run/systemd/system ]; then
+    contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+else
+    contains "suggests how to start it" "Start c-backupd." "$OUT"
+fi
+contains "names the socket options" "--socket PATH" "$OUT"
+contains "and the variable" "C_BACKUP_SOCKET" "$OUT"
+OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" repo list 2>&1)
+contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
+case "$OUT" in
+    *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
+    *)           ok  "and not systemctl" ;;
+esac
 
 echo "offline commands"
 contains "version" "c-backup" "$("$CLI" --version)"

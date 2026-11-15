@@ -1233,7 +1233,7 @@ the underlying disk.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`; `--socket PATH` or `C_BACKUP_SOCKET` |
+| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies |
 | `permission denied` on the socket | Not root, and the socket is root-only | `sudo`, or section 4.1 |
 | `another daemon is serving <socket>` at start | A second instance | Stop the other one; only one daemon owns a host |
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |
