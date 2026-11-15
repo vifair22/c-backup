@@ -98,6 +98,27 @@ int  store_needs_key(const store_t *st);
 
 /* NULL when the repository is not encrypted. */
 const struct repo_key *store_key(const store_t *st);
+
+/* ---------- cancellation ---------- */
+
+/*
+ * The job's cancel flag, consulted between chunks inside one object.
+ *
+ * Checking only between files made a cancel wait for the file in hand to
+ * finish: 17 seconds for a 2 GiB file, longer than the 10 second grace a
+ * `docker stop` gives, so a shutdown during a large backup ended in SIGKILL
+ * and a job recorded as interrupted. The flag lives on the handle rather
+ * than in every signature because each job opens its own store, and the
+ * loops that need it sit several layers below anything that knows about
+ * jobs. NULL, the default, means nothing can cancel.
+ *
+ * A write that stops on this flag returns ERR_BUSY with its temporary file
+ * already removed, exactly as any other failed write does.
+ */
+void store_set_cancel(store_t *st, volatile int *cancel);
+volatile int *store_get_cancel(const store_t *st);
+int  store_cancelled(const store_t *st);
+
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 

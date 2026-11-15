@@ -335,6 +335,10 @@ fail:
 
 #define STREAM_CHUNK      ((size_t)(128 * 1024 * 1024)) /* 128 MiB write buffer */
 #define STREAM_LOAD_MAX   ((size_t)( 16 * 1024 * 1024)) /*  16 MiB load threshold */
+/* The most one read may take between cancellation checks. 8 MiB is tens of
+ * milliseconds on a disk and a few on an SSD; small enough that a cancel is
+ * prompt, large enough that the check costs nothing. */
+#define CANCEL_READ_MAX   ((size_t)(  8 * 1024 * 1024))
 
 /* Probe size and compression threshold for LZ4 frame decision */
 #define PROBE_SIZE        (64  * 1024)          /* 64 KiB sample          */
@@ -505,7 +509,19 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
             size_t got = 0;
             int    retries = 0;
             while (got < want) {
-                ssize_t r = read(src_fd, buf + got, want - got);
+                /*
+                 * Cancellation is checked per read, and a read is capped, so
+                 * a cancel lands within one CANCEL_READ_MAX of I/O rather
+                 * than at the end of the file. The chunk stays large for the
+                 * writes and parity groups; only the read is split.
+                 */
+                if (store_cancelled(store)) {
+                    st = set_error(ERR_BUSY, "cancelled while storing an object");
+                    goto done;
+                }
+                size_t ask = want - got;
+                if (ask > CANCEL_READ_MAX) ask = CANCEL_READ_MAX;
+                ssize_t r = read(src_fd, buf + got, ask);
                 if (r > 0) { got += (size_t)r; retries = 0; last_was_seek = 0; continue; }
                 if (r == -1 && errno == EINTR) continue;
                 if (r == -1 && retries < 3 &&
@@ -1061,7 +1077,12 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
         }
         uint64_t remaining = regions[r].length;
         while (remaining > 0) {
-            size_t want = (remaining > STREAM_CHUNK) ? STREAM_CHUNK : (size_t)remaining;
+            /* Same bound as the plain stream: see CANCEL_READ_MAX. */
+            if (store_cancelled(store)) {
+                st = set_error(ERR_BUSY, "cancelled while storing an object");
+                break;
+            }
+            size_t want = (remaining > CANCEL_READ_MAX) ? CANCEL_READ_MAX : (size_t)remaining;
             ssize_t got = read(fd, buf, want);
             if (got <= 0) {
                 if (got == -1 && errno == EINTR) continue;
@@ -1847,6 +1868,10 @@ status_t object_load_stream(store_t *store,
         }
 
         while (remaining > 0 && st == OK) {
+            /* A restore of one large file is cancellable inside it. */
+            if (store_cancelled(store)) {
+                st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+            }
             size_t want = (remaining > STREAM_LOAD_MAX) ? STREAM_LOAD_MAX : (size_t)remaining;
             if (io_read_full(fd, buf, want) != 0)           { st = set_error(ERR_CORRUPT, "load_stream: truncated payload"); break; }
             /* Decrypt in place, then hash and emit the plaintext. */

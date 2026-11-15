@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <limits.h>
@@ -574,6 +575,177 @@ static void test_backup_of_nothing_fails_without_a_snapshot(void **state)
     assert_int_equal(res.files, 3);
 }
 
+/* A non-sparse file of `mib` MiB, filled with a pattern rather than zeroes
+ * so nothing along the way can mistake it for a hole. */
+static void write_big(const char *path, int mib)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    char *buf = malloc(1 << 20);
+    assert_non_null(buf);
+    for (int i = 0; i < mib; i++) {
+        memset(buf, 'a' + (i % 26), 1 << 20);
+        snprintf(buf, 32, "block %d", i);
+        assert_int_equal(write(fd, buf, 1 << 20), 1 << 20);
+    }
+    free(buf);
+    close(fd);
+}
+
+static int dir_entries(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (de->d_name[0] != '.') n++;
+    closedir(d);
+    return n;
+}
+
+/* Cancels the moment the store phase reaches the last entry, which the
+ * test arranges to be the large file. */
+static void cancel_at_last_entry(const char *phase, uint64_t done, uint64_t total,
+                                 void *ctx)
+{
+    volatile int *cancel = ctx;
+    if (phase && strcmp(phase, "store") == 0 && total > 0 && done + 1 == total)
+        *cancel = 1;
+}
+
+/*
+ * B056/B057: a cancel lands inside a large file, not after it.
+ *
+ * The flag was checked between files only, so a cancel during a 2 GiB file
+ * waited for the whole file - 17 seconds, past docker's 10 second grace, so
+ * a shutdown ended in SIGKILL. Here the cancel arrives as the large file is
+ * the entry in hand and it is the last entry: the old loop stored the whole
+ * file, found no further entry to check the flag at, and completed the
+ * backup. Now it stops within one read, and the run leaves nothing behind:
+ * no snapshot, no index rows (the small files' staged rows go with the pack
+ * they were staged into), and no staging files.
+ */
+static void test_cancel_lands_inside_a_large_file(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 64);
+    static const char *paths[] = { TEST_SRC, TEST_DIR "/big.bin" };
+    volatile int cancel = 0;
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    o.n_paths = 2;
+    o.cancel = &cancel;
+    o.progress_cb = cancel_at_last_entry;
+    o.progress_ctx = (void *)&cancel;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_BUSY);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    assert_int_equal(cancel, 1);
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", repo), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE location = 'staged'", NULL), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects", NULL), 0);
+    assert_int_equal(dir_entries(TEST_REPO "/tmp"), 0);
+    assert_int_equal(dir_entries(TEST_REPO "/packs"), 0);
+
+    /* Prompt, with plenty of slack for a loaded machine: storing the file
+     * whole is what the old code did, and that is not what took this long. */
+    double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    assert_true(secs < 5.0);
+
+    /* And the store's flag is put back: the handle outlives the call. */
+    assert_null(store_get_cancel(store));
+}
+
+/*
+ * The object writers stop on the store's flag directly, with their staging
+ * file removed. Restore and pack read the same flag through the same
+ * handle, which is how one flag reaches every loop below a job.
+ */
+static void test_object_writer_stops_on_the_store_flag(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 24);
+    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
+    assert_true(fd >= 0);
+    volatile int cancel = 1;
+    store_set_cancel(store, &cancel);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    status_t st = object_store_file_info(store, fd, 24u << 20, hash, &w);
+    store_set_cancel(store, NULL);
+    close(fd);
+    assert_int_equal(st, ERR_BUSY);
+    assert_int_equal(dir_entries(TEST_REPO "/tmp"), 0);
+}
+
+/*
+ * The readers and the packer stop on the same flag: a restore of one large
+ * file, and the auto-pack that ends every backup, were each as long as the
+ * file and as uncancellable. Loose first, then packed, and a cancelled pack
+ * leaves the object loose and no new pack behind.
+ */
+static void test_readers_and_packer_stop_on_the_store_flag(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 24);
+    static const char *paths[] = { TEST_DIR "/big.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    db_result_t *r = NULL;
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT hash FROM objects WHERE orig_size = %u", 24u << 20);
+    assert_int_equal(db_execute(db, sql, NULL, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(r->rows[0][0] + i * 2, "%2x", &v), 1);
+        hash[i] = (uint8_t)v;
+    }
+    db_result_free(r);
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1], loose[PATH_MAX];
+    object_hash_to_hex(hash, hex);
+    snprintf(loose, sizeof(loose), TEST_REPO "/objects/%.2s/%s", hex, hex + 2);
+    struct stat sb;
+
+    int out = open("/dev/null", O_WRONLY);
+    assert_true(out >= 0);
+    volatile int cancel = 1;
+    uint64_t sz = 0;
+
+    store_set_cancel(store, &cancel);
+    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), ERR_BUSY);
+
+    int packs_before = dir_entries(TEST_REPO "/packs");
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), ERR_BUSY);
+    assert_int_equal(dir_entries(TEST_REPO "/packs"), packs_before);
+    assert_int_equal(dir_entries(TEST_REPO "/tmp"), 0);
+    assert_int_equal(stat(loose, &sb), 0);   /* still loose */
+
+    store_set_cancel(store, NULL);
+    uint32_t packed = 0;
+    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
+    assert_true(packed >= 1);
+    assert_int_equal(stat(loose, &sb), -1);  /* packed now */
+
+    store_set_cancel(store, &cancel);
+    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), ERR_BUSY);
+    store_set_cancel(store, NULL);
+    assert_int_equal(object_load_stream(store, hash, out, &sz, NULL), OK);
+    assert_int_equal(sz, 24u << 20);
+    close(out);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -590,6 +762,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_of_nothing_fails_without_a_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

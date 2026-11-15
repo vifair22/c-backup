@@ -668,7 +668,9 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
-    (void)cancel;   /* repo_pack has no cancellation hook of its own yet */
+    /* repo_pack takes no flag of its own; it reads the store's, which is
+     * how a cancel reaches the middle of packing one large object. */
+    if (cancel) store_set_cancel((store_t *)store, cancel);
     pack_progress_bridge_t bridge = { progress, progress_ctx };
     uint32_t packed = 0;
     status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
@@ -763,6 +765,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    /* Every loop below the engine boundary that can run for a whole large
+     * object checks this; see store_set_cancel. */
+    store_set_cancel(store, cancel);
 
     if (j->kind == SNAP_JOB_REINDEX) {
         st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);

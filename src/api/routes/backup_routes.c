@@ -136,6 +136,9 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
         repo_unlock(j->repo_id);
         return st;
     }
+    /* For the auto-pack below as much as the backup: packing a 2 GiB loose
+     * object is as long as storing it was. */
+    store_set_cancel(store, cancel);
 
     /* backup_opts_t takes const char **, and casting char ** straight to it
      * is the classic unsafe-intermediate-pointer conversion -Wcast-qual

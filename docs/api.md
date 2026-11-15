@@ -424,9 +424,11 @@ and returned by `GET /repos/<id>/schedules`.
 | GET | `/jobs/stream/<id>` | Server-sent progress events |
 | POST | `/jobs/<id>/cancel` | Request cancellation |
 
-Cancellation is cooperative: the flag is set and the pipeline checks it
-between files, so a cancelled backup stops within one file rather than at the
-end of the run.
+Cancellation is cooperative: the flag is set and the job stops at its next
+check. Those sit between files and also between chunks inside one file -
+storing it, packing it, restoring it - so a cancel lands within one read
+(at most 8 MiB of I/O), not at the end of a large file. A cancelled backup
+discards its open pack, the index rows staged into it and its staging files.
 
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered

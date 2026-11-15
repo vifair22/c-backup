@@ -80,6 +80,9 @@ struct store {
     /* The marker said encrypted. Independent of has_key: a scrub of an
      * offsite copy is encrypted with no key, and must still work. */
     int                   encrypted;
+
+    /* The owning job's cancel flag, or NULL. See store_set_cancel. */
+    volatile int         *cancel;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -232,6 +235,21 @@ static void store_sweep_tmp(const char *root)
                  swept, (unsigned long long)bytes);
 }
 
+void store_set_cancel(store_t *st, volatile int *cancel)
+{
+    if (st) st->cancel = cancel;
+}
+
+volatile int *store_get_cancel(const store_t *st)
+{
+    return st ? st->cancel : NULL;
+}
+
+int store_cancelled(const store_t *st)
+{
+    return st && st->cancel && *st->cancel;
+}
+
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd == -1)
@@ -271,6 +289,7 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->commit_user     = NULL;
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
+    r->cancel          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     store_sweep_tmp(r->path);

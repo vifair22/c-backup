@@ -442,6 +442,13 @@ static status_t store_content(pipeline_t *p)
         phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
+        if (st != OK && cancelled(p)) {
+            /* Stopped inside the file, not unreadable: no warning, and no
+             * moving on to the next one. */
+            if (in_txn && db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed on cancel");
+            return set_error(ERR_BUSY, "backup cancelled");
+        }
         if (st != OK) {
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
@@ -947,12 +954,28 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
 /* ------------------------------------------------------------------ */
 
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out);
+
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out)
 {
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
 
+    /* The job's flag reaches the object writers through the store, so a
+     * cancel lands inside a large file rather than after it. Restored on the
+     * way out: the handle may outlive this call. */
+    volatile int *prev_cancel = store_get_cancel(store);
+    if (opts->cancel) store_set_cancel(store, opts->cancel);
+    status_t st = backup_run_inner(store, db, repo_id, opts, out);
+    store_set_cancel(store, prev_cancel);
+    return st;
+}
+
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out)
+{
     backup_result_t res;
     memset(&res, 0, sizeof(res));
 
@@ -1078,6 +1101,18 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (p.pack_w) { pack_backup_abort(p.pack_w); p.pack_w = NULL; }
 
     if (st != OK) {
+        /*
+         * The open pack was just discarded, so rows staged into it name
+         * bytes that no longer exist. The next backup would drop them, but
+         * until then they claim objects the repository does not hold, and a
+         * cancelled backup should leave the index as it found it. The error
+         * is the backup's; a failure here is only logged.
+         */
+        char why[256];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        if (store_index_drop_staged(db, repo_id) != OK)
+            log_warn("backup: cannot drop staged rows after: %s", why);
+        set_error(st, "%s", why);
         hashset_free(&p.meta_seen);
         free(links);
         scan_result_free(scan);

@@ -6,7 +6,8 @@
  * Replaces the fork-detach-and-write-a-status-file pattern the one-shot CLI
  * used for long operations. Jobs run on a small worker pool inside the daemon,
  * their state lives in the jobs table, and cancellation is cooperative: the
- * flag is set here and the pipeline checks it between files.
+ * flag is set here and the pipeline checks it between files, and through the
+ * store (store_set_cancel) between chunks inside one.
  *
  * Jobs that were running when the daemon died are marked failed on the next
  * start rather than left claiming to be in progress, since nothing is
