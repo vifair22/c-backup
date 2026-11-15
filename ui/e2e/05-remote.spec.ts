@@ -40,6 +40,10 @@ function credentials(): string {
   return existsSync(p) ? readFileSync(p, 'utf-8') : ''
 }
 
+/* The sign-in dialog. Its submit button shares a name with the sidebar's
+ * "Sign in" link, which appears as soon as the connection needs a password. */
+const signInDialog = () => h.page.locator('form', { hasText: 'Sign in: nas' })
+
 /* The connection row in the sidebar, by its name. */
 const connRow = () => h.page.locator('strong', { hasText: /^nas$/ }).first()
 
@@ -61,7 +65,7 @@ test('a remote connection added in the dialog asks for the password', async () =
 test('a wrong password is refused and the dialog stays open', async () => {
   const { page } = h
   await page.locator('input[type="password"]').fill('not the password')
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await signInDialog().getByRole('button', { name: 'Sign in', exact: true }).click()
   await expect(page.getByText(/login failed/)).toBeVisible({ timeout: 15_000 })
   await expect(page.getByText('Sign in: nas')).toBeVisible()
   expect(credentials()).not.toContain('nas')
@@ -70,7 +74,7 @@ test('a wrong password is refused and the dialog stays open', async () => {
 test('signing in connects and lists the repositories', async () => {
   const { page } = h
   await page.locator('input[type="password"]').fill(PASSWORD)
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await signInDialog().getByRole('button', { name: 'Sign in', exact: true }).click()
 
   await expect(page.getByText('Sign in: nas')).toHaveCount(0, { timeout: 15_000 })
   await expect(page.getByText('(remote, connected)')).toBeVisible()
