@@ -98,12 +98,17 @@ struct sparse_stream_arg {
     const uint8_t *hash;
     int pipe_wfd;
     status_t rc;
+    /* The error buffer is thread-local, so the reason the load failed dies
+     * with this thread unless it is carried back by hand. */
+    char msg[ERR_MSG_MAX];
 };
 
 static void *sparse_stream_worker(void *a) {
     struct sparse_stream_arg *arg = a;
     uint64_t sz = 0; uint8_t type = 0;
+    err_clear();
     arg->rc = object_load_stream(arg->store, arg->hash, arg->pipe_wfd, &sz, &type);
+    if (arg->rc != OK) snprintf(arg->msg, sizeof(arg->msg), "%s", err_msg());
     close(arg->pipe_wfd);
     return NULL;
 }
@@ -188,6 +193,11 @@ done:
     while (read(pfd[0], drain, sizeof(drain)) > 0) {}
     close(pfd[0]);
     pthread_join(tid, NULL);
-    if (st == OK && arg.rc != OK) st = arg.rc;
+    /* The loader's failure explains any short read above better than the
+     * short read does, so it wins whenever there is one. */
+    if (arg.rc != OK && arg.msg[0])
+        st = set_error(arg.rc, "%s", arg.msg);
+    else if (st == OK && arg.rc != OK)
+        st = arg.rc;
     return st;
 }

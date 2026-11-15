@@ -30,6 +30,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
 
 #include "backup.h"
 #include "gc.h"
@@ -253,6 +254,97 @@ static void test_file_that_is_all_hole_round_trips(void **state)
     assert_int_equal(stat(dst, &sb), 0);
     assert_int_equal(sb.st_size, size);
     assert_int_equal(sb.st_blocks, 0);
+}
+
+/* Warnings the restore logs, collected so a test can read what an operator
+ * would. */
+static char captured_log[8192];
+
+static void capture_log(const char *ts, const char *level, const char *func,
+                        const char *message, void *ud)
+{
+    (void)ts; (void)level; (void)func; (void)ud;
+    size_t have = strlen(captured_log);
+    snprintf(captured_log + have, sizeof(captured_log) - have, "%s\n", message);
+}
+
+/* Overwrite everything in every pack but its first and last 128 bytes: far
+ * more damage than parity can correct, so objects are found, or looked
+ * for, and cannot be produced. A fixed fill keeps the outcome repeatable. */
+static void wreck_packs(void)
+{
+    FILE *p = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(p);
+    char path[512];
+    int hit = 0;
+    while (fgets(path, sizeof(path), p)) {
+        path[strcspn(path, "\n")] = '\0';
+        int fd = open(path, O_RDWR);
+        assert_true(fd >= 0);
+        struct stat sb;
+        assert_int_equal(fstat(fd, &sb), 0);
+        if (sb.st_size > 256) {
+            size_t n = (size_t)sb.st_size - 256;
+            char *junk = malloc(n);
+            assert_non_null(junk);
+            memset(junk, 0x5A, n);
+            assert_int_equal(pwrite(fd, junk, n, 128), (ssize_t)n);
+            free(junk);
+            hit = 1;
+        }
+        close(fd);
+    }
+    pclose(p);
+    assert_true(hit);
+}
+
+/*
+ * An object that cannot be read says so, by hash, with the reason.
+ *
+ * The warning used to read "cannot write <path>: " and stop, which pointed
+ * the operator at the destination - a full disk, a permission - when the
+ * fault was in the repository. Whatever the store layer did or did not
+ * record, the line has to name the object and say it could not be read or
+ * repaired, and must not end on an empty reason.
+ */
+static void test_unreadable_object_is_named_in_the_warning(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    wreck_packs();
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = 'top.txt'",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, br.snapshot_id,
+                              TEST_DST, NULL, &rr);
+    log_stream_unregister(h);
+
+    assert_int_not_equal(st, OK);
+    assert_true(rr.failed >= 1);
+    assert_non_null(strstr(captured_log, hex));
+    assert_non_null(strstr(captured_log, "could not be read or repaired"));
+    /* No line may end on an empty reason. Nor fall back to the placeholder:
+     * the hash check after a failed repair returned a bare status, and
+     * clearing the buffer first is what showed the reason the log used to
+     * print for it ("object not in any pack") was left over from an
+     * earlier lookup. */
+    assert_null(strstr(captured_log, ": \n"));
+    assert_null(strstr(captured_log, "no detail recorded"));
 }
 
 /*
@@ -1450,6 +1542,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_roundtrip_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sparse_file_round_trips_with_its_holes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_is_all_hole_round_trips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unreadable_object_is_named_in_the_warning, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),

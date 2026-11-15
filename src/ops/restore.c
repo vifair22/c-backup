@@ -308,6 +308,22 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
     free(data);
 }
 
+/* Something to say when a failure arrives with no message attached. */
+static const char *status_reason(status_t st)
+{
+    switch (st) {
+    case OK:            return "no error";
+    case ERR_IO:        return "I/O error (no detail recorded)";
+    case ERR_CORRUPT:   return "corrupt beyond repair (no detail recorded)";
+    case ERR_NOMEM:     return "out of memory";
+    case ERR_INVALID:   return "invalid object (no detail recorded)";
+    case ERR_NOT_FOUND: return "not found in the repository";
+    case ERR_TOO_LARGE: return "too large to load";
+    case ERR_BUSY:      return "busy";
+    }
+    return "unknown error";
+}
+
 static int cancelled(const restore_opts_t *o)
 {
     return o && o->cancel && *o->cancel;
@@ -800,6 +816,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         uint64_t sz = 0;
         uint8_t  otype = 0;
+        err_clear();    /* so a reason below cannot be left over from before */
         status_t lst = object_load_stream(store, hash, fd, &sz, &otype);
         if (lst == OK && otype == OBJECT_TYPE_SPARSE) {
             /* Sparse objects arrive as a region table plus data; writing them
@@ -815,7 +832,13 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (fd != -1) close(fd);
 
         if (lst != OK) {
-            log_warn("restore: cannot write %s: %s", full, err_msg());
+            /* The fault is the repository's, not the destination's: name
+             * the object, and never end on an empty reason. Several store
+             * paths return a bare status, and this line used to read
+             * "cannot write <path>: " - pointing an operator at a disk that
+             * was fine. */
+            log_warn("restore: %s: object %s could not be read or repaired: %s",
+                     full, chash, err_msg()[0] ? err_msg() : status_reason(lst));
             err_clear();
             /*
              * Remove what was written before the failure. The streaming read

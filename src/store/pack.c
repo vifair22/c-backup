@@ -1336,7 +1336,7 @@ status_t pack_object_load_stream(store_t *store,
         if (memcmp(got, hash, OBJECT_HASH_SIZE) != 0) { free(out); return set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch (LZ4) in %s", dat_path); }
         int wr = write_full_fd(out_fd, out, (size_t)ehdr.uncompressed_size);
         free(out);
-        return wr == 0 ? OK : ERR_IO;
+        return wr == 0 ? OK : set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed");
     }
 
     if (ehdr.compression == COMPRESS_LZ4_FRAME) {
@@ -1371,7 +1371,7 @@ status_t pack_object_load_stream(store_t *store,
         while (remaining > 0 && fst == OK) {
             size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                           (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
-            if (fread(src, 1, want, f) != want) { fst = ERR_CORRUPT; break; }
+            if (fread(src, 1, want, f) != want) { fst = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 frame in %s", dat_path); break; }
             /* CRC covers the stored bytes, so it runs before decryption. */
             if (have_parity)
                 running_crc = crc32c_update(running_crc, src, want);
@@ -1384,11 +1384,11 @@ status_t pack_object_load_stream(store_t *store,
                 size_t dst_sz = PACK_STREAM_THRESHOLD;
                 size_t src_sz = src_left;
                 size_t ret = LZ4F_decompress(dctx, dst, &dst_sz, srcp, &src_sz, NULL);
-                if (LZ4F_isError(ret)) { fst = ERR_CORRUPT; break; }
+                if (LZ4F_isError(ret)) { fst = set_error(ERR_CORRUPT, "pack_object_load_stream: LZ4 frame decode failed in %s: %s", dat_path, LZ4F_getErrorName(ret)); break; }
                 if (dst_sz > 0) {
                     if (EVP_DigestUpdate(mdctx, dst, dst_sz) != 1 ||
                         write_full_fd(out_fd, dst, dst_sz) != 0)
-                        fst = ERR_IO;
+                        fst = set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed");
                 }
                 srcp     += src_sz;
                 src_left -= src_sz;
@@ -1417,7 +1417,7 @@ status_t pack_object_load_stream(store_t *store,
             if (EVP_DigestFinal_ex(mdctx, got, &dl) != 1 ||
                 dl != OBJECT_HASH_SIZE ||
                 memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-                fst = ERR_CORRUPT;
+                fst = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch (LZ4 frame) in %s", dat_path);
         }
         EVP_MD_CTX_free(mdctx);
         return fst;
@@ -1491,7 +1491,7 @@ status_t pack_object_load_stream(store_t *store,
 
         while (remaining > 0 && stream_st == OK) {
             size_t want = (remaining < grp_data) ? (size_t)remaining : grp_data;
-            if (fread(gbuf, 1, want, f) != want) { stream_st = ERR_CORRUPT; break; }
+            if (fread(gbuf, 1, want, f) != want) { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
 
             /* Repair the stored bytes, then decrypt what was repaired. The
              * parity groups know nothing about where the nonce and tag fall. */
@@ -1508,8 +1508,8 @@ status_t pack_object_load_stream(store_t *store,
             stream_st = sink_push(&sink, gbuf, want, &pp, &pn);
             if (stream_st != OK) break;
             if (pn) {
-                if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = ERR_IO; break; }
-                if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = ERR_IO; break; }
+                if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
+                if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
             }
             par_ptr += grp_par;
             par_left = par_left > grp_par ? par_left - grp_par : 0;
@@ -1533,7 +1533,7 @@ status_t pack_object_load_stream(store_t *store,
             if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
                 dlen != OBJECT_HASH_SIZE ||
                 memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-                stream_st = ERR_CORRUPT;
+                stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch after parity repair in %s", dat_path);
         }
         EVP_MD_CTX_free(mdctx);
         return stream_st;
@@ -1551,13 +1551,13 @@ status_t pack_object_load_stream(store_t *store,
     while (remaining > 0 && stream_st == OK) {
         size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                       (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
-        if (fread(buf, 1, want, f) != want)           { stream_st = ERR_CORRUPT; break; }
+        if (fread(buf, 1, want, f) != want)           { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
         uint8_t *pp = NULL; size_t pn = 0;
         stream_st = sink_push(&sink, buf, want, &pp, &pn);
         if (stream_st != OK) break;
         if (pn) {
-            if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = ERR_IO; break; }
-            if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = ERR_IO; break; }
+            if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
+            if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
         }
         remaining -= want;
     }
@@ -1572,7 +1572,7 @@ status_t pack_object_load_stream(store_t *store,
         if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
             dlen != OBJECT_HASH_SIZE ||
             memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-            stream_st = ERR_CORRUPT;
+            stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch in %s", dat_path);
     }
     EVP_MD_CTX_free(mdctx);
     return stream_st;
