@@ -623,6 +623,57 @@ static status_t provision_key(const char *uuid, repo_enc_request_t *enc,
     return OK;
 }
 
+/*
+ * Turn a passphrase back into an existing repository's key, without side
+ * effects: nothing is written until every other check on the registration
+ * has passed, so a refused registration leaves no keyfile behind.
+ *
+ * This is the recovery path the passphrase mode exists for - an offsite copy
+ * plus the passphrase, no surviving host - and it used to be missing. A
+ * passphrase given while registering an existing repository was checked
+ * only for being non-empty: a wrong one was accepted, and a right one wrote
+ * no key, so the reindex that followed could read nothing and the restore
+ * after it found no snapshots.
+ */
+static status_t unlock_existing(const char *path, const repo_marker_t *m,
+                                const char *passphrase, repo_key_t *out)
+{
+    status_t st = repo_key_unwrap(m->wrapped, &m->kdf, passphrase, out);
+    if (st == ERR_INVALID)
+        return set_error(ERR_INVALID,
+                         "wrong passphrase: it does not unlock the repository at %s",
+                         path);
+    if (st != OK) return st;
+    /* The tag already proved the passphrase, so a fingerprint mismatch means
+     * the marker's own fields disagree with each other. Refuse rather than
+     * cache a key the marker says is not this repository's. */
+    if (strcmp(out->id, m->key_id) != 0) {
+        repo_key_wipe(out);
+        return set_error(ERR_CORRUPT,
+                         "%s: the wrapped key does not match the marker's key id",
+                         path);
+    }
+    return OK;
+}
+
+/* Write an unlocked key to the host cache. Done at the last moment before
+ * the registration commits to the database, for the reason above. */
+static status_t cache_unlocked(const repo_enc_request_t *enc, const char *uuid,
+                               repo_key_t *k, repo_register_out_t *out)
+{
+    if (!enc->key_dir || !*enc->key_dir) {
+        repo_key_wipe(k);
+        return set_error(ERR_INVALID, "no key directory configured");
+    }
+    status_t st = repo_key_save(enc->key_dir, uuid, k);
+    repo_key_wipe(k);
+    if (st != OK) return st;
+    out->key_unlocked = 1;
+    log_info("repo %s: key unlocked with its passphrase and cached in %s",
+             uuid, enc->key_dir);
+    return OK;
+}
+
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id)
 {
@@ -742,6 +793,16 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
                          path, repo_enc_mode_name(marker.enc_mode));
     out->enc_mode = marker.enc_mode;
 
+    /* Verified now, cached only once nothing below can refuse. */
+    repo_key_t unlocked;
+    int have_unlocked = 0;
+    if (enc && enc->mode == REPO_ENC_PASSPHRASE && marker.enc_mode == REPO_ENC_PASSPHRASE &&
+        enc->passphrase && *enc->passphrase) {
+        st = unlock_existing(path, &marker, enc->passphrase, &unlocked);
+        if (st != OK) return st;
+        have_unlocked = 1;
+    }
+
     /*
      * Known UUID: re-link, updating the path in case the repo moved.
      *
@@ -781,6 +842,7 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
                 char known_copy[PATH_MAX];
                 snprintf(known_copy, sizeof(known_copy), "%s", known);
                 db_result_free(r);
+                if (have_unlocked) repo_key_wipe(&unlocked);
                 return set_error(ERR_INVALID,
                                  "%s holds the same repository as %s, which is still "
                                  "registered as repo %lld. Registering it would repoint "
@@ -802,6 +864,10 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
          */
         int relabel = label && *label && strcmp(label, r->rows[0][2]) != 0;
         db_result_free(r);
+        if (have_unlocked) {
+            st = cache_unlocked(enc, marker.uuid, &unlocked, out);
+            if (st != OK) return st;
+        }
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
         if (db_execute_non_query(db, "UPDATE repos SET path = ? WHERE id = ?",
@@ -816,16 +882,42 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
         }
         out->already_registered = 1;
         out->id = id;
+        out->key_missing = repo_key_is_missing(path);
         return OK;
     }
     db_result_free(r);
+
+    if (have_unlocked) {
+        st = cache_unlocked(enc, marker.uuid, &unlocked, out);
+        if (st != OK) return st;
+    }
 
     /* Marker we have never seen: the DB was restored or rebuilt behind us.
      * Adopt the existing UUID rather than minting a new one, so the repo
      * keeps its identity and a later reindex can repopulate its rows. */
     log_info("registering repo %s with pre-existing uuid %s", path, marker.uuid);
     out->inserted = 1;
+    out->key_missing = repo_key_is_missing(path);
     return insert_repo_row(db, marker.uuid, path, label, &out->id);
+}
+
+int repo_key_is_missing(const char *path)
+{
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) { err_clear(); return 0; }
+    if (m.enc_mode == REPO_ENC_NONE) return 0;
+    return !repo_key_exists(repo_key_dir(), m.uuid);
+}
+
+status_t repo_require_key(const char *path)
+{
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) { err_clear(); return OK; }
+    if (m.enc_mode == REPO_ENC_NONE || repo_key_exists(repo_key_dir(), m.uuid))
+        return OK;
+    return set_error(ERR_INVALID, REPO_NO_KEY_FMT, m.uuid,
+                     m.enc_mode == REPO_ENC_PASSPHRASE ? REPO_NO_KEY_HINT_PASS
+                                                       : REPO_NO_KEY_HINT_SYSTEM);
 }
 
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id)

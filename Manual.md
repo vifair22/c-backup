@@ -876,6 +876,11 @@ sudo c-backup repo key import <id> <key-hex>
 The import is refused unless the key matches the fingerprint in the
 repository's marker. The marker never contains the key.
 
+A `passphrase` repository needs no import: registering it with its
+passphrase (`repo add <path> --passphrase '...'`) unwraps the key and caches
+it on this host, whether or not it is already registered. A wrong passphrase
+is refused with `wrong passphrase`.
+
 ---
 
 ## 14. Replication
@@ -1056,7 +1061,16 @@ On a new host with the daemon installed:
    sudo c-backup repo key import 1 <key-hex>
    ```
 
-   For a `passphrase` repository, register it and supply the passphrase.
+   For a `passphrase` repository, register it with its passphrase, which
+   unwraps the key from the marker and caches it in `security.key_dir`:
+
+   ```sh
+   sudo c-backup repo add /srv/backup/main "Main" --passphrase '...'
+   ```
+
+   A wrong passphrase is refused and registers nothing. Registering without
+   one succeeds but answers `"key_loaded":false` with a warning; run the
+   same command again with the passphrase to unlock it.
 3. `sudo c-backup reindex 1`, then restore.
 
 Without the key, a `system`-encrypted repository cannot be read by anyone.

@@ -133,6 +133,14 @@ typedef struct {
     int             already_registered; /* the row existed: same path or moved */
     int             label_updated;      /* already registered, label changed */
     repo_enc_mode_t enc_mode;           /* as the marker records it */
+    /* An existing passphrase repository whose passphrase was given and
+     * verified: its key is now cached in the key directory. */
+    int             key_unlocked;
+    /* An existing encrypted repository registered without its key being
+     * available on this host. Registration succeeds, because verifying an
+     * offsite copy needs no key, but reading it will not work until the key
+     * is imported or the passphrase supplied. */
+    int             key_missing;
 } repo_register_out_t;
 
 /*
@@ -147,6 +155,29 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
 
 status_t repo_register(cutils_db_t *db, const char *path, const char *label,
                        int64_t *out_repo_id);
+
+/*
+ * The one message for "this repository is encrypted and its key is not on
+ * this host", so a refused request, a failed job and a registration warning
+ * all say the same plain thing. The second %s is the hint for the mode.
+ */
+#define REPO_NO_KEY_FMT "no key loaded for repository %s; %s"
+#define REPO_NO_KEY_HINT_SYSTEM \
+    "import it with c-backup repo key import <repo-id> <key-hex>"
+#define REPO_NO_KEY_HINT_PASS \
+    "import it with c-backup repo key import <repo-id> <key-hex>, or unlock it " \
+    "with c-backup repo add <path> --passphrase <passphrase>"
+
+/* Encrypted per the marker and no keyfile for it in the key directory. */
+int repo_key_is_missing(const char *path);
+
+/*
+ * OK for an unencrypted repository or one whose key is on this host;
+ * otherwise ERR_INVALID with the REPO_NO_KEY_FMT message. For anything that
+ * has to read or write content: refusing up front says what is wrong, where
+ * the work itself fails later with a message about a pack entry.
+ */
+status_t repo_require_key(const char *path);
 
 /* Remove the registration and its index rows. The repository directory is
  * never touched: deleting backup data is the operator's act, not a side

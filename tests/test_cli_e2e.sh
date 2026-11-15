@@ -364,6 +364,37 @@ else
     bad "encrypted round trip is byte-identical" "identical" "differs"
 fi
 
+# B042: a passphrase repository recovered with nothing but its passphrase.
+# The host loses its key cache and its registration; a wrong passphrase was
+# accepted, and the right one wrote no key, so reindex found nothing and the
+# restore after it found no snapshot.
+PASS_ID=$(printf '%s' "$PASS_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+PASS_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/passrepo/.cbackup" | head -1)
+cb backup "$PASS_ID" "$WORK/src" >/dev/null
+rm -f "$WORK/keys/$PASS_UUID.key"
+cb repo remove "$PASS_ID" >/dev/null
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'wrong horse' 2>&1); RC=$?
+check    "a wrong passphrase is refused" 1 "$RC"
+contains "and says so" "wrong passphrase" "$OUT"
+check    "and registers nothing" 0 "$(cb repo list | grep -c passrepo)"
+OUT=$(cb repo add "$WORK/passrepo" pass2 2>&1); RC=$?
+check    "no passphrase still registers" 0 "$RC"
+contains "but says the key is missing" "no key loaded for repository $PASS_UUID" "$OUT"
+PASS_ID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+# B045: registering it again with the passphrase unlocks it.
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=$?
+check    "the right passphrase unlocks a registered repo" 0 "$RC"
+contains "and says it did" '"key_unlocked":true' "$OUT"
+check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
+contains "the unlocked repo reindexes" '"completed"' "$(cb reindex "$PASS_ID")"
+contains "and lists its snapshot" '"id":"1"' "$(cb snapshots "$PASS_ID")"
+cb restore "$PASS_ID" 1 "$WORK/passout" >/dev/null
+if diff -r "$WORK/src" "$WORK/passout$WORK/src" >/dev/null 2>&1; then
+    ok "a passphrase-recovered repo restores byte-identical"
+else
+    bad "a passphrase-recovered repo restores byte-identical" "identical" "differs"
+fi
+
 # Verify records runs and findings, and both were unreachable until now: the
 # counters reached an operator only through /metrics and the findings not at
 # all. A scrub whose answer you cannot read is a scrub you did not run.

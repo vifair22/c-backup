@@ -79,7 +79,14 @@ stores that form. It answers:
 |---|---|---|
 | 201 | `{id}`, plus `encryption` and key fields for an encrypted repository | a new registration: a repository created, or an existing one adopted |
 | 200 | `{id, already_registered: true, label_updated, encryption}` | the repository was already registered, at this path or, if it moved, at its old one |
-| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, or asks for an encryption mode the existing repository does not have |
+| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, asks for an encryption mode the existing repository does not have, or gives a passphrase that does not unlock it (`wrong passphrase`) |
+
+Registering an existing passphrase repository with its `passphrase`, whether
+or not it is already registered, unwraps the key from the marker and caches
+it in `security.key_dir`; the answer carries `key_unlocked: true`. Registering
+an existing encrypted repository whose key is not on this host still
+succeeds, and the answer carries `key_loaded: false` and a `warning` saying
+`no key loaded for repository <uuid>` and how to supply it.
 
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is

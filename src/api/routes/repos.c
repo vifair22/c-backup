@@ -164,6 +164,21 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     status_t st = repo_register_detail(db, path, label, &enc, &reg);
     int64_t id = reg.id;
 
+    /*
+     * An encrypted repository registered without its key is registered -
+     * verifying an offsite copy needs no key - but the answer has to say
+     * that nothing in it can be read yet. Without this the next thing the
+     * operator heard was a reindex finding nothing and a restore finding no
+     * snapshot.
+     */
+    char keywarn[384] = "";
+    if (st == OK && reg.key_missing && repo_require_key(path) != OK) {
+        snprintf(keywarn, sizeof(keywarn), ",\"key_loaded\":false,\"warning\":\"%s\"",
+                 err_msg());
+        err_clear();
+    }
+    const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
+
     api_response_t out;
     if (st != OK) {
         /* Distinguish "you asked for something impossible" from "we failed":
@@ -181,9 +196,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         char *body = NULL;
         int n = asprintf(&body,
             "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
-            "\"encryption\":\"%s\"}",
+            "\"encryption\":\"%s\"%s%s}",
             (long long)id, reg.label_updated ? "true" : "false",
-            repo_enc_mode_name(reg.enc_mode));
+            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn);
         out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
         log_info("repo %lld at %s was already registered%s", (long long)id, path,
                  reg.label_updated ? "; label updated" : "");
@@ -216,9 +231,10 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 (long long)id, enc.key_hex, (long long)id);
         } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s}",
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s}",
                 (long long)id, repo_enc_mode_name(reg.enc_mode),
-                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false");
+                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false",
+                unlocked, keywarn);
         } else {
             n = asprintf(&body, "{\"id\":%lld}", (long long)id);
         }
