@@ -150,20 +150,15 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
-    if (json_req_get_str_opt(jr, "encrypt", &encstr) == 0 && encstr) {
-        if (repo_enc_mode_parse(encstr, &enc.mode) != 0) {
-            free(path); free(label); free(encstr);
-            json_req_free(jr);
-            return api_error(400, "encrypt must be none, system or passphrase");
-        }
-    }
-    if (json_req_get_str_opt(jr, "passphrase", &passphrase) == 0 && passphrase)
-        enc.passphrase = passphrase;
-    if (enc.mode == REPO_ENC_PASSPHRASE && (!passphrase || !*passphrase)) {
+    if (json_req_get_str_opt(jr, "encrypt", &encstr) != 0) encstr = NULL;
+    if (json_req_get_str_opt(jr, "passphrase", &passphrase) != 0) passphrase = NULL;
+    if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
+        api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);
         json_req_free(jr);
-        return api_error(400, "passphrase encryption needs a passphrase");
+        return bad;
     }
+    if (enc.mode == REPO_ENC_PASSPHRASE) enc.passphrase = passphrase;
 
     int64_t id = 0;
     status_t st = repo_register_ex(db, path, label, &enc, &id);

@@ -89,6 +89,15 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
                                  repo_marker_t *out);
 
 /*
+ * Decide the encryption mode from what a caller sent. mode may be NULL or
+ * empty (not given). A non-empty passphrase with no mode means passphrase
+ * mode; with none or system it is ERR_INVALID, as is passphrase mode without
+ * one.
+ */
+status_t repo_enc_resolve(const char *mode, const char *passphrase,
+                          repo_enc_mode_t *out);
+
+/*
  * Normalise an absolute path lexically: no "//", no "." or ".." components,
  * no trailing slash. Symlinks are left alone. ERR_INVALID for a relative or
  * over-long path. Registration stores paths in this form.

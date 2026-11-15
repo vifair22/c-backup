@@ -306,6 +306,49 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
 /* ------------------------------------------------------------------ */
 
 /*
+ * A passphrase on its own means passphrase mode.
+ *
+ * It used to mean nothing: `repo add P --passphrase X` without --encrypt
+ * created an unencrypted repository, reported success, and the operator
+ * walked away believing their backups were protected by a passphrase they
+ * had typed. Implying the mode is safe because passphrase mode is a
+ * superset of what they asked for: the passphrase is required to recover
+ * the key, exactly as they expected.
+ *
+ * A passphrase alongside a mode that cannot use it is refused rather than
+ * ignored, for the same reason: ignoring it is how the first bug happened.
+ * An empty passphrase counts as absent, so a client that always sends the
+ * field does not trip over it.
+ */
+status_t repo_enc_resolve(const char *mode, const char *passphrase,
+                          repo_enc_mode_t *out)
+{
+    int has_pass = passphrase && *passphrase;
+    repo_enc_mode_t m = REPO_ENC_NONE;
+
+    if (!mode || !*mode) {
+        *out = has_pass ? REPO_ENC_PASSPHRASE : REPO_ENC_NONE;
+        return OK;
+    }
+    if (repo_enc_mode_parse(mode, &m) != 0)
+        return set_error(ERR_INVALID, "encrypt must be none, system or passphrase");
+    if (m == REPO_ENC_PASSPHRASE && !has_pass)
+        return set_error(ERR_INVALID, "passphrase encryption needs a passphrase");
+    if (m == REPO_ENC_NONE && has_pass)
+        return set_error(ERR_INVALID,
+                         "a passphrase was given with encrypt none; drop the "
+                         "passphrase for an unencrypted repository, or use "
+                         "encrypt passphrase");
+    if (m == REPO_ENC_SYSTEM && has_pass)
+        return set_error(ERR_INVALID,
+                         "a passphrase was given with encrypt system, which "
+                         "generates its own key; drop the passphrase, or use "
+                         "encrypt passphrase");
+    *out = m;
+    return OK;
+}
+
+/*
  * Lexical normalisation: collapse repeated slashes, drop "." components,
  * resolve ".." against the components before it, strip a trailing slash.
  *

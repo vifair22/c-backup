@@ -92,7 +92,11 @@ Converting in place would mean rewriting every object with both forms live;
 replicating into a fresh repository is the supported path instead.
 
 `POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
-last, a `passphrase`.
+last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
+`passphrase` mode. A non-empty `passphrase` with `encrypt` `none` or `system`
+is refused with 400 rather than ignored: ignoring it used to create an
+unencrypted repository for somebody who had just typed a passphrase. An empty
+`passphrase` is treated as absent.
 
 | Mode | Key lives | Recovery needs | Escrow |
 |---|---|---|---|

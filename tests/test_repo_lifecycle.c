@@ -308,6 +308,37 @@ static void test_register_allows_prefix_siblings(void **state)
     assert_int_equal(count_repos(), 2);
 }
 
+/*
+ * B011: a passphrase with no mode made an unencrypted repository. It means
+ * passphrase mode now, and a mode that cannot use one refuses it.
+ */
+static void test_enc_resolve(void **state)
+{
+    (void)state;
+    repo_enc_mode_t m = REPO_ENC_SYSTEM;
+    assert_int_equal(repo_enc_resolve(NULL, NULL, &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+    assert_int_equal(repo_enc_resolve(NULL, "", &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+    assert_int_equal(repo_enc_resolve(NULL, "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("", "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("passphrase", "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("system", NULL, &m), OK);
+    assert_int_equal(m, REPO_ENC_SYSTEM);
+    assert_int_equal(repo_enc_resolve("none", "", &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+
+    assert_int_equal(repo_enc_resolve("none", "secret", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("system", "secret", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("passphrase", NULL, &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("passphrase", "", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("rot13", NULL, &m), ERR_INVALID);
+    err_clear();
+}
+
 /* A marker is written once. Overwriting one would silently sever a repo
  * from every row that references its uuid. */
 static void test_marker_write_refuses_overwrite(void **state)
@@ -647,6 +678,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_refuses_nested_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_refuses_containing_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_allows_prefix_siblings, setup, teardown),
+        cmocka_unit_test(test_enc_resolve),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),

@@ -731,6 +731,11 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system
 sudo c-backup repo add /srv/backup/main "Main" --encrypt passphrase --passphrase '...'
 ```
 
+`--passphrase` on its own implies `--encrypt passphrase`. Giving one with
+`--encrypt none` or `--encrypt system` is refused, because neither mode can
+use it and silently dropping it would leave you believing a passphrase
+protects the repository.
+
 Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
 over AES-GCM because it does not depend on AES-NI. Hashes are of the
 plaintext, so deduplication still works within a repository.

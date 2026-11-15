@@ -271,6 +271,18 @@ contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
 contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
+# B011: a passphrase without --encrypt made an unencrypted repository and
+# exited 0. It implies passphrase mode now, and a mode that cannot use one
+# refuses it instead of dropping it.
+IMPLIED=$(cb repo add "$WORK/implied" imp --passphrase 'correct horse')
+contains "a passphrase alone implies passphrase mode" '"encryption":"passphrase"' "$IMPLIED"
+contains "and the marker says so" '"mode":"passphrase"' "$(cat "$WORK/implied/.cbackup")"
+OUT=$(cb repo add "$WORK/nonepass" np --encrypt none --passphrase 'x' 2>&1); RC=$?
+check    "encrypt none with a passphrase is refused" 1 "$RC"
+contains "and says why" "encrypt none" "$OUT"
+OUT=$(cb repo add "$WORK/syspass" sp --encrypt system --passphrase 'x' 2>&1); RC=$?
+check    "encrypt system with a passphrase is refused" 1 "$RC"
+check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
