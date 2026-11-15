@@ -359,6 +359,70 @@ static void test_journal_source_says_who_asked(void **state)
     assert_string_equal(origin, "api:0");
 }
 
+/*
+ * B090: cancelling a queued job flagged it and left it in the queue, so it
+ * read "queued" until a worker reached it, and only then "cancelled". It
+ * must be cancelled at once, journalled, and never run.
+ */
+static volatile int g_gate_open;
+static int g_gated_runs;
+
+static status_t gated_job(void *arg, volatile int *cancel,
+                          void (*progress)(const char *, uint64_t, uint64_t, void *),
+                          void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    g_gated_runs++;
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < 400 && !g_gate_open; i++) usleep(10000);
+    pthread_mutex_lock(&g_mu);
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static int g_arg_freed;
+static void count_free(void *arg) { (void)arg; g_arg_freed++; }
+
+static void test_cancelling_a_queued_job_is_immediate(void **state)
+{
+    (void)state;
+    g_gate_open = 0;
+    g_gated_runs = 0;
+    g_arg_freed = 0;
+    int64_t first = 0, second = 0, third = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, gated_job, NULL, NULL, &first), OK);
+    for (int i = 0; i < 200 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 1; i++)
+        usleep(10000);
+    /* Same repository, so both wait behind the first. */
+    assert_int_equal(job_submit(jm, 1, "verify", NULL, gated_job, NULL, count_free, &second), OK);
+    assert_int_equal(job_submit(jm, 1, "gc", NULL, gated_job, NULL, NULL, &third), OK);
+
+    assert_int_equal(job_cancel(jm, second), OK);
+
+    char q[160], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)second);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "cancelled");
+    assert_int_equal(g_arg_freed, 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE operation = 'verify'"
+                              " AND result = 'cancelled'"), 1);
+
+    /* A second cancel finds nothing left to cancel. */
+    assert_int_not_equal(job_cancel(jm, second), OK);
+
+    g_gate_open = 1;
+    wait_for(2);
+    usleep(200000);
+    /* The first and third ran; the cancelled one never did. */
+    assert_int_equal(g_gated_runs, 2);
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)third);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "completed");
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE operation = 'verify'"), 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -371,6 +435,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

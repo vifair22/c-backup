@@ -171,7 +171,9 @@ about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips what it
 already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
-job, and prints the job record with `"cancel_requested":true`.
+job, and prints the job record with `"cancel_requested":true`. A job still
+waiting in the queue never starts: it is `cancelled` in that record already,
+and in the journal as "cancelled before it started".
 
 A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on

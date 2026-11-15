@@ -79,5 +79,7 @@ void job_set_result(void *progress_ctx, const char *json_object);
  */
 void job_set_summary(void *progress_ctx, const char *text);
 
-/* Request cancellation. Returns OK if the job exists and is not finished. */
+/* Request cancellation. Returns OK if the job exists and is not finished.
+ * A queued job is removed from the queue and recorded cancelled before this
+ * returns; a running one is flagged and stops at its next check. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);
