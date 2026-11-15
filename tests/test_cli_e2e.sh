@@ -396,9 +396,30 @@ case "$(cb search 1 big)" in
     *)         ok  "cli --exclude glob drops the file" ;;
 esac
 
-OUT=$(cb snapshot delete 1 1 2>/dev/null); RC=$?
-check "snapshot delete" 0 "$RC"
-check "snapshot delete prints what it removed" '{"removed":true,"id":1}' "$OUT"
+# B101: a tagged snapshot is refused unless forced, the refusal names the
+# tag, a missing snapshot is an error, and every delete is journalled.
+cb tag set 1 guard 1 > /dev/null
+OUT=$(cb snapshot delete 1 1 2>&1); RC=$?
+check    "a tagged snapshot is not deleted" 1 "$RC"
+contains "and the refusal names the tag" 'guard' "$OUT"
+contains "and says how to force it" '--force' "$OUT"
+contains "the snapshot is still there" '"snap_id":1' "$(cb tag list 1)"
+OUT=$(cb snapshot delete 1 1 --force 2>/dev/null); RC=$?
+check "snapshot delete --force" 0 "$RC"
+check "snapshot delete prints what it removed" \
+    '{"removed":true,"id":1,"tags_removed":1}' "$OUT"
+case "$(cb tag list 1)" in
+    *guard*) bad "a forced delete removes the snapshot's tag" "absent" "present" ;;
+    *)       ok  "a forced delete removes the snapshot's tag" ;;
+esac
+contains "the delete is journalled" 'removed snapshot 1 and its tag guard (forced)' \
+    "$(cb journal 1)"
+OUT=$(cb snapshot delete 1 1 2>&1); RC=$?
+check    "deleting it again fails" 1 "$RC"
+contains "as a missing snapshot" 'HTTP 404' "$OUT"
+OUT=$(cb snapshot delete 1 999 2>&1); RC=$?
+check    "deleting a snapshot that never existed fails" 1 "$RC"
+contains "with one JSON error" '{"error":"no such snapshot"}' "$OUT"
 # The id comes from the add. This disabled a hardcoded id 2 that did not
 # exist, which passed only because a missing schedule answered success.
 VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')

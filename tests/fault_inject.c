@@ -82,3 +82,34 @@ int __wrap_sync_file_range(int fd, off_t offset, off_t nbytes, unsigned int flag
     if (fault_fsync_at >= 0) { errno = EIO; return -1; }
     return __real_sync_file_range(fd, offset, nbytes, flags);
 }
+
+const char *volatile fault_tmp_root = NULL;
+volatile int fault_tmp_refused = 0;
+
+int __wrap_mkstemp(char *tmpl) {
+    const char *root = fault_tmp_root;
+    if (root && strncmp(tmpl, root, strlen(root)) != 0) {
+        __atomic_add_fetch(&fault_tmp_refused, 1, __ATOMIC_SEQ_CST);
+        errno = EROFS;
+        return -1;
+    }
+    return __real_mkstemp(tmpl);
+}
+
+const char *volatile fault_rename_dst = NULL;
+volatile int fault_rename_skip = 0;
+volatile int fault_rename_refused = 0;
+
+int __wrap_rename(const char *from, const char *to) {
+    const char *match = fault_rename_dst;
+    if (match && strncmp(to, match, strlen(match)) == 0) {
+        if (__atomic_load_n(&fault_rename_skip, __ATOMIC_SEQ_CST) > 0) {
+            __atomic_sub_fetch(&fault_rename_skip, 1, __ATOMIC_SEQ_CST);
+        } else {
+            __atomic_add_fetch(&fault_rename_refused, 1, __ATOMIC_SEQ_CST);
+            errno = EIO;
+            return -1;
+        }
+    }
+    return __real_rename(from, to);
+}

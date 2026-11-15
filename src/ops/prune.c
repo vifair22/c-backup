@@ -2,6 +2,7 @@
 
 #include "prune.h"
 #include "db_txn.h"
+#include "repo_tags.h"
 
 #include <cutils/log.h>
 
@@ -12,33 +13,94 @@
 #include <string.h>
 #include <unistd.h>
 
-status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
-                        int64_t snap_id)
+/* The snapshot's tag names, comma separated, into out. Returns how many. */
+static unsigned collect_tags(cutils_db_t *db, const char *repo, const char *snap,
+                             prune_info_t *out)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT name FROM tags WHERE repo_id = ? AND snap_id = ? ORDER BY name",
+            (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
+        db_result_free(r);
+        return 0;
+    }
+    unsigned n = (unsigned)r->nrows;
+    if (out) {
+        size_t len = 0;
+        out->tags[0] = '\0';
+        for (int i = 0; i < r->nrows; i++) {
+            int w = snprintf(out->tags + len, sizeof(out->tags) - len, "%s%s",
+                             i ? ", " : "", r->rows[i][0]);
+            if (w < 0 || (size_t)w >= sizeof(out->tags) - len) {
+                /* Mark the cut rather than end mid-name with no sign of it. */
+                size_t cut = sizeof(out->tags) - 4;
+                memcpy(out->tags + cut, "...", 4);
+                break;
+            }
+            len += (size_t)w;
+        }
+        out->ntags = n;
+    }
+    db_result_free(r);
+    return n;
+}
+
+static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
+                           int64_t snap_id, int checked, int force,
+                           prune_info_t *info)
 {
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-
-    /*
-     * A marker first, so an interrupted prune is recognisable on restart.
-     * Without it a crash between the index delete and the record unlink
-     * leaves a snapshot record with no rows, which looks exactly like a
-     * snapshot that simply needs reindexing and would be silently resurrected.
-     */
-    char marker[64];
-    snprintf(marker, sizeof(marker), "prune-pending-%lld", (long long)snap_id);
-    if (db_execute_non_query(db,
-            "INSERT OR REPLACE INTO recovery_state (repo_id, key, value)"
-            " VALUES (?, ?, ?)",
-            (const char *[]){ repo, marker, snap, NULL }, NULL) != 0)
-        return set_error(ERR_IO, "prune: cannot record intent");
+    if (info) memset(info, 0, sizeof(*info));
 
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "prune: begin");
 
+    /*
+     * The checks share the deleting transaction, so a tag set between the
+     * check and the delete cannot be deleted unseen with its snapshot.
+     */
+    if (checked) {
+        db_result_t *r = NULL;
+        int exists = db_execute(db,
+                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+        db_result_free(r);
+        if (!exists) {
+            db_txn_rollback(db);
+            return set_error(ERR_NOT_FOUND, "no such snapshot: %lld", (long long)snap_id);
+        }
+    }
+    unsigned ntags = collect_tags(db, repo, snap, info);
+    if (checked && ntags > 0 && !force) {
+        db_txn_rollback(db);
+        return set_error(ERR_INVALID,
+                         "snapshot %lld is tagged (%s); a tag protects a snapshot "
+                         "from deletion. Remove the tag%s first, or delete with "
+                         "--force (force=1) to remove the snapshot and its tag%s",
+                         (long long)snap_id, info ? info->tags : "",
+                         ntags == 1 ? "" : "s", ntags == 1 ? "" : "s");
+    }
+
+    /*
+     * A marker, so an interrupted prune is recognisable on restart. Without
+     * it a crash between the index delete and the record unlink leaves a
+     * snapshot record with no rows, which looks exactly like a snapshot that
+     * simply needs reindexing and would be silently resurrected. Written in
+     * the deleting transaction so a refused or failed prune leaves none.
+     */
+    char marker[64];
+    snprintf(marker, sizeof(marker), "prune-pending-%lld", (long long)snap_id);
     int failed = db_execute_non_query(db,
-        "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
-        (const char *[]){ repo, snap, NULL }, NULL) != 0;
+            "INSERT OR REPLACE INTO recovery_state (repo_id, key, value)"
+            " VALUES (?, ?, ?)",
+            (const char *[]){ repo, marker, snap, NULL }, NULL) != 0;
+
+    if (!failed)
+        failed = db_execute_non_query(db,
+            "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
+            (const char *[]){ repo, snap, NULL }, NULL) != 0;
     if (!failed)
         failed = db_execute_non_query(db,
             "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
@@ -61,6 +123,17 @@ status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "prune: cannot remove snapshot %lld rows",
                          (long long)snap_id);
     }
+
+    /* The repository's copy of the tags (repo_tags.h) loses them too, in the
+     * same transaction, as every other tag change does. Left behind, a
+     * reindex would skip them only because the timestamp no longer matches. */
+    if (ntags > 0 && repo_tags_save(db, repo_id, store_root(store)) != OK) {
+        char why[256];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "prune: cannot record tags in the repository: %s", why);
+    }
+
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "prune: commit");
 
@@ -79,4 +152,16 @@ status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     log_info("prune: removed snapshot %lld", (long long)snap_id);
     return OK;
+}
+
+status_t prune_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
+                        int64_t snap_id)
+{
+    return prune_core(store, db, repo_id, snap_id, 0, 1, NULL);
+}
+
+status_t prune_snapshot_checked(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                int64_t snap_id, int force, prune_info_t *out)
+{
+    return prune_core(store, db, repo_id, snap_id, 1, force, out);
 }

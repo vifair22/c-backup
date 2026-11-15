@@ -620,14 +620,20 @@ static int cmd_snapshots(int argc, char **argv)
 
 static int cmd_snapshot(int argc, char **argv)
 {
-    if (argc < 3) return fail("usage: snapshot <delete|note|tree> <repo-id> <snapshot-id> [args]");
-
-    if (strcmp(argv[0], "delete") == 0) {
+    if (argc >= 1 && strcmp(argv[0], "delete") == 0) {
+        /* A tagged snapshot is refused unless forced; the daemon names the
+         * tags in its 409, so the operator knows what --force would drop. */
+        int force = take_flag(&argc, argv, "--force");
+        if (argc != 3)
+            return fail("usage: snapshot delete <repo-id> <snapshot-id> [--force]");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]);
         sb_puts(&p, "/snapshots/"); sb_puts(&p, argv[2]);
+        if (force) sb_puts(&p, "?force=1");
         return call_path_sb("DELETE", &p, NULL);
     }
+
+    if (argc < 3) return fail("usage: snapshot <delete|note|tree> <repo-id> <snapshot-id> [args]");
 
     if (strcmp(argv[0], "note") == 0) {
         sbuf_t p = { 0 };
@@ -1592,7 +1598,7 @@ static const struct {
     { "backup",    cmd_backup,    "backup <repo-id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
     { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite] [--no-wait]" },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
-    { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
+    { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text | --force]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
     { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
     { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]  |  grep runs <repo-id> [--limit N] [--offset N]  |  grep show <repo-id> <run-id> [--limit N] [--offset N]" },

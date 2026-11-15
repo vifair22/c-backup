@@ -206,7 +206,20 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
-| DELETE | `/repos/<id>/snapshots/<sid>` | Prune; `{"removed":true,"id"}` |
+| DELETE | `/repos/<id>/snapshots/<sid>[?force=1]` | Delete one snapshot, synchronously; `{"removed":true,"id","tags_removed"}` |
+
+Deleting a snapshot is not a job: it is a few row deletes and one unlink,
+answered in the response. GC reclaims the space later. A tagged snapshot is
+refused with `409` and an error naming its tags (`snapshot 3 is tagged
+(guard)...`) unless `force=1`, which deletes it and its tags, from the
+database and from the repository's own tag file. `tags_removed` counts
+them. A snapshot that does not exist, including one already deleted, is
+`404 {"error":"no such snapshot"}`; `force` other than `1`/`true`/`0`/`false`
+is `400`; `503` while a job holds the repository. Each delete that runs is
+journalled with `source` `api` and `operation` `snapshot-delete`, its
+message naming the snapshot and any tags a forced delete took with it
+(`removed snapshot 3 and its tag guard (forced)`); a refusal or 404 changes
+nothing and is not journalled.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
@@ -746,16 +759,32 @@ What is actually inside a repository, as opposed to what it can do.
 | GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=loose` narrows |
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
-went in, and `phys_size`, the bytes the repository spends on them: payload
-after compression, plus the header the object sits behind, plus the
-Reed-Solomon parity trailer. The header is the 64-byte `object_header_t` for
-a loose object and the 51-byte pack entry header for a packed one, and
-`/layout` reports `header_size` as whichever applies (these docs used to say
-56 for both, which was neither; the sizes are compile-time checked in
-`src/common/types.h` and `src/store/pack.h`). `phys_size` exceeding `orig_size` is normal and expected for
-incompressible input, where the payload is stored raw and the parity trailer
-is pure overhead. `pack_objects` reports `comp_size` instead, which there is
-genuinely the compressed entry payload.
+went in, and `phys_size`, the bytes the object itself is charged for. What
+that covers depends on where the object lives, by design:
+
+- **Loose:** the whole object file. The 64-byte `object_header_t`, the
+  payload after compression, and the Reed-Solomon parity trailer. This
+  matches `/layout`'s `physical_size`. `phys_size` exceeding `orig_size` is
+  normal for incompressible input, where the payload is stored raw and the
+  parity trailer is pure overhead.
+- **Packed:** the stored payload alone, after compression (and encryption,
+  nonce and tag included). The 51-byte pack entry header and the entry's
+  parity block in the pack's trailer are charged to the pack (`packs.size`),
+  not to the object. So for a packed object `phys_size` against `orig_size`
+  is its compression ratio, and the disk a repository uses is the sum of
+  `packs.size` plus `phys_size` over loose objects, with nothing counted
+  twice. `pack_objects` reports the same figure as `comp_size`.
+
+`/layout` reads the object on disk rather than the index. `header_size` is
+64 or 51, whichever header the object sits behind (the sizes are
+compile-time checked in `src/common/types.h` and `src/store/pack.h`).
+`physical_size` is the record as it sits in the file: for a loose object,
+the whole file (equal to `phys_size`); for a packed one, entry header plus
+payload, which is `phys_size + 51`, with the parity block in the pack
+trailer in neither figure. `payload_size` is `physical_size - header_size`.
+For a packed object that equals `phys_size`; for a loose one it also
+includes the parity trailer. A packed object that reports `phys_size`
+5242880 and `physical_size` 5242931 is consistent: 5242931 - 51 = 5242880.
 
 | GET | `/repos/<id>/objects` | Paginated; `?location=loose` or `?location=pack` |
 | GET | `/repos/<id>/objects/<hash>` | Where one object lives |
