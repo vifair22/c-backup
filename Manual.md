@@ -891,7 +891,14 @@ A day, week, month or year still in progress elects its latest snapshot so
 far, so the newest snapshot always holds all four tiers (`gfs_flags` 15).
 When a later backup lands in the same period, the next pass moves the tier
 to it and the earlier snapshot loses it: every pass clears and recomputes
-every snapshot's tiers. Tiers are assigned only by a retention pass, and a
+every snapshot's tiers.
+
+Because the period in progress counts, every count includes it.
+`keep_yearly` 3 keeps this year plus the two before it, not three finished
+years; `keep_daily` 7 keeps today plus the six days before it (counting only
+days that have a snapshot). This is how restic and borg count too.
+
+Tiers are assigned only by a retention pass, and a
 dry run assigns none, so a repository that has never had a real pass shows
 `gfs_flags` 0 on every snapshot. A reindex keeps the tiers the last pass
 assigned.
