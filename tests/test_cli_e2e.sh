@@ -698,7 +698,11 @@ check    "the destination keeps its own identity" "$REENC_UUID" \
     "$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)"
 if [ "$REENC_UUID" != "$SRC_UUID" ]; then ok "which is not the source's"
 else bad "which is not the source's" "a different uuid" "$REENC_UUID"; fi
-if grep -qra "$NEEDLE" "$WORK/reenc/packs" 2>/dev/null; then
+REENC_HIT=0
+while IFS= read -r -d '' f; do
+    contains_bytes "$WORK/src/random.bin" "$f" && { REENC_HIT=1; break; }
+done < <(find "$WORK/reenc/packs" -type f -print0)
+if [ "$REENC_HIT" = 1 ]; then
     bad "the re-encrypted copy holds no plaintext" "absent" "present"
 else
     ok "the re-encrypted copy holds no plaintext"
