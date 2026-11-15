@@ -1042,7 +1042,8 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT hash, status, affected_files, sample_paths, affected_snapshots"
+            "SELECT hash, status, affected_files, sample_paths, affected_snapshots,"
+            "       affected_versions, affected_snapshot_count, snapshots_truncated"
             "  FROM verify_findings WHERE repo_id = ? AND run_id = ?"
             " ORDER BY id LIMIT ? OFFSET ?",
             (const char *[]){ repo, run, limit, offset, NULL }, &r) != 0) {
@@ -1060,7 +1061,10 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
                || json_elem_add_str(&e, "status",             r->rows[i][1]) != 0
                || json_elem_add_str(&e, "affected_files",     r->rows[i][2]) != 0
                || json_elem_add_str(&e, "sample_paths",       r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][4]) != 0;
+               || json_elem_add_str(&e, "affected_snapshots", r->rows[i][4]) != 0
+               || json_elem_add_str(&e, "affected_versions",  r->rows[i][5]) != 0
+               || json_elem_add_str(&e, "affected_snapshot_count", r->rows[i][6]) != 0
+               || json_elem_add_str(&e, "snapshots_truncated", r->rows[i][7]) != 0;
         json_elem_commit(&e);
         if (bad) break;
     }

@@ -49,7 +49,8 @@ typedef struct {
     /* Registered but absent: no loose file, no pack entry. */
     uint64_t missing;
     uint64_t bytes_read;
-    /* Blast radius of everything unrecoverable or missing. */
+    /* Blast radius of everything unrecoverable or missing: distinct file
+     * paths, and distinct snapshots holding any of them. */
     uint64_t affected_files;
     uint64_t affected_snapshots;
     int64_t  run_id;

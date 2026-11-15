@@ -142,7 +142,8 @@ static void content_hash_of(const char *name, char *hex_out)
 {
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE name = ? AND content_hash IS NOT NULL",
+        "SELECT DISTINCT content_hash FROM nodes"
+        " WHERE name = ? AND content_hash IS NOT NULL",
         (const char *[]){ name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(hex_out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
@@ -281,6 +282,8 @@ static void test_verify_without_repair_leaves_disk_untouched(void **state)
 static void test_unrecoverable_damage_names_the_affected_files(void **state)
 {
     (void)state;
+    /* Two snapshots of one file: one path, two versions. */
+    run_backup();
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -307,15 +310,21 @@ static void test_unrecoverable_damage_names_the_affected_files(void **state)
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
                                 NULL, NULL, NULL, &res), OK);
     assert_int_equal(res.unrecoverable, 1);
-    assert_true(res.affected_files >= 1);
+    /* Distinct paths, not one per snapshot the file appears in. */
+    assert_int_equal(res.affected_files, 1);
+    assert_int_equal(res.affected_snapshots, 2);
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT status, affected_files, sample_paths FROM verify_findings"
+        "SELECT status, affected_files, sample_paths, affected_versions,"
+        "       affected_snapshot_count FROM verify_findings"
         " WHERE hash = ?", (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
-    assert_true(strtoll(r->rows[0][1], NULL, 10) >= 1);
-    assert_non_null(strstr(r->rows[0][2], "loose.bin"));
+    assert_string_equal(r->rows[0][1], "1");
+    /* The whole path, as restore would recreate it, not the basename. */
+    assert_string_equal(r->rows[0][2], TEST_SRC "/loose.bin");
+    assert_string_equal(r->rows[0][3], "2");
+    assert_string_equal(r->rows[0][4], "2");
     db_result_free(r);
 }
 
@@ -430,6 +439,54 @@ static void test_missing_pack_is_missing_at_every_level(void **state)
             assert_all_findings("missing", lost);
         }
     }
+}
+
+/*
+ * One object behind three paths across twelve snapshots. The finding said
+ * "orig, copy, copy" (basenames, two of them indistinguishable), counted 36
+ * files where there are three, and listed ten snapshot ids with nothing to
+ * say there were twelve.
+ */
+#define DUP_SNAPSHOTS 12
+
+static void test_findings_count_paths_not_versions(void **state)
+{
+    (void)state;
+    const char *dup = "the same bytes behind three names\n";
+    assert_int_equal(mkdir(TEST_SRC "/a", 0700), 0);
+    assert_int_equal(mkdir(TEST_SRC "/b", 0700), 0);
+    write_file(TEST_SRC "/orig",   dup);
+    write_file(TEST_SRC "/a/copy", dup);
+    write_file(TEST_SRC "/b/copy", dup);
+    for (int i = 0; i < DUP_SNAPSHOTS; i++) run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("orig", hex);
+    delete_pack_of("orig");
+
+    verify_result_t res;
+    verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &res);
+    err_clear();
+    assert_int_equal(res.affected_snapshots, DUP_SNAPSHOTS);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT affected_files, affected_versions, sample_paths,"
+        "       affected_snapshots, affected_snapshot_count, snapshots_truncated"
+        "  FROM verify_findings WHERE hash = ?",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "3");
+    assert_int_equal(atoi(r->rows[0][1]), 3 * DUP_SNAPSHOTS);
+    assert_string_equal(r->rows[0][2],
+                        TEST_SRC "/a/copy, " TEST_SRC "/b/copy, " TEST_SRC "/orig");
+    /* The list stays capped; the count and the flag say it is. */
+    int listed = 1;
+    for (const char *c = r->rows[0][3]; *c; c++) listed += (*c == ',');
+    assert_int_equal(listed, 10);
+    assert_int_equal(atoi(r->rows[0][4]), DUP_SNAPSHOTS);
+    assert_string_equal(r->rows[0][5], "1");
+    db_result_free(r);
 }
 
 /* Structure level parses headers without reading payloads, so payload damage
@@ -698,6 +755,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deep_verify_repairs_payload_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_findings_count_paths_not_versions, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_level_finds_a_deleted_object, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_level_finds_a_missing_pack, setup, teardown),
         cmocka_unit_test_setup_teardown(test_missing_pack_is_missing_at_every_level, setup, teardown),
