@@ -207,6 +207,11 @@ check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --uni
      http://localhost/repos/1/tags/milestone)"
 
 echo "restore"
+# A snapshot that does not exist is refused up front, not queued as a job
+# that fails telling the operator to reindex.
+check "restore of an unknown snapshot is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$WORK/nowhere\"}" \
+     http://localhost/repos/1/snapshots/999/restore)"
 RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$WORK/out\"}" \
                         http://localhost/repos/1/snapshots/1/restore)")
 wait_job "$RESTORE_JOB"
