@@ -1912,14 +1912,28 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
  * here. The router matches the first registered pattern, so three modules
  * each claiming it would silently leave two of them unreachable. */
 /*
- * Pruning runs inline rather than as a job: it is a handful of row deletes
- * and one unlink, so queueing it would cost more than doing it. The bytes
- * are reclaimed later by GC, which is the part that takes time.
+ * Deleting a snapshot runs inline rather than as a job: it is a handful of
+ * row deletes and one unlink, so queueing it would cost more than doing it,
+ * and the answer - removed, refused, not there - is what the caller needs
+ * back. The bytes are reclaimed later by GC, which is the part that takes
+ * time and is a job. Being synchronous does not exempt it from the journal:
+ * it is the one maintenance action that destroys a restore point, and it
+ * used to leave no record at all (B101).
+ *
+ * A tagged snapshot is refused with 409 naming its tags unless force=1, and
+ * a snapshot that does not exist is a 404 rather than a success.
  */
 api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
                                       int64_t snap_id)
 {
-    (void)req;
+    int force = 0;
+    const char *fv = api_query_param(req, "force");
+    if (fv) {
+        if (strcmp(fv, "1") == 0 || strcmp(fv, "true") == 0) force = 1;
+        else if (strcmp(fv, "0") == 0 || strcmp(fv, "false") == 0) force = 0;
+        else return api_error(400, "force must be 1 or 0");
+    }
+
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
@@ -1931,16 +1945,40 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     free(repo_path);
     if (st != OK) { repo_unlock(repo_id); return api_error(500, err_msg()); }
 
-    st = prune_snapshot(store, g_ctx.db, repo_id, snap_id);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    prune_info_t info;
+    st = prune_snapshot_checked(store, g_ctx.db, repo_id, snap_id, force, &info);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    char why[512];
+    snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
     store_close(store);
     repo_unlock(repo_id);
+    int64_t took_ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 +
+                      (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000;
 
-    if (st != OK) return api_error(500, err_msg());
+    if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
+    if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
+
+    char msg[640];
+    if (st != OK) {
+        snprintf(msg, sizeof(msg), "snapshot %lld: %s", (long long)snap_id, why);
+        journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "failed", took_ms, msg);
+        return api_error(500, why);
+    }
+
+    if (info.ntags > 0)
+        snprintf(msg, sizeof(msg), "removed snapshot %lld and its tag%s %s (forced)",
+                 (long long)snap_id, info.ntags == 1 ? "" : "s", info.tags);
+    else
+        snprintf(msg, sizeof(msg), "removed snapshot %lld", (long long)snap_id);
+    journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "success", took_ms, msg);
 
     /* A body, not a 204: the CLI's contract is one JSON document per
      * command, and an empty success printed nothing at all (B095). */
     char *out = NULL;
-    if (asprintf(&out, "{\"removed\":true,\"id\":%lld}", (long long)snap_id) < 0)
+    if (asprintf(&out, "{\"removed\":true,\"id\":%lld,\"tags_removed\":%u}",
+                 (long long)snap_id, info.ntags) < 0)
         return api_error(500, "out of memory");
     return api_ok(out);
 }
