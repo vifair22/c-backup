@@ -53,3 +53,20 @@ static inline void fault_reset_all(void) {
     fault_fsync_at  = -1;
     fault_malloc_peak = 0;
 }
+
+/*
+ * Confine temporary files to one directory tree.
+ *
+ * Not a countdown: when set, every mkstemp whose template does not start
+ * with this prefix fails with EROFS, as it would on a read-only root, and
+ * is counted. The daemon must run with / read-only and /tmp unusable
+ * (Manual section 2.3), so anything the engine stages outside the
+ * repository is a bug, and setting this to the test's own directory makes
+ * that bug a failure instead of a file quietly left in /tmp.
+ *
+ * Process-wide rather than thread-local, because pack workers create their
+ * spill files on threads of their own. NULL disables it.
+ */
+extern const char *volatile fault_tmp_root;
+extern volatile int fault_tmp_refused;
+extern int __real_mkstemp(char *);

@@ -345,6 +345,14 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->io_ctx          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
+    /* tmp/ is where every staging and spill file goes, and nothing outside
+     * the repository is used for either, so a repository whose tmp/ was
+     * removed by hand would fail every write. Recreate it. A failure is not
+     * an error here: a repository on a read-only mount can still be read,
+     * and a write would report the real cause at its mkstemp. */
+    if (mkdirat(fd, "tmp", 0755) == -1 && errno != EEXIST && errno != EROFS)
+        log_warn("store: cannot create '%s/tmp': %s", path, strerror(errno));
+
     store_sweep_tmp(r->path);
 
     *out = r;

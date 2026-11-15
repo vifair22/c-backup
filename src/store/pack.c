@@ -1716,7 +1716,8 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
  * seekable; the current position is at the end of data entries.  Reads
  * entries back from the file (still in page cache) to compute parity.
  * idx_by_offset is idx_entries sorted by dat_offset (entry write order). */
-static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
+static status_t write_dat_parity(store_t *store, FILE *dat_f,
+                                 const pack_dat_hdr_t *dat_hdr,
                                  const pack_idx_disk_entry_t *idx_by_offset,
                                  uint32_t packed) {
     rs_init();
@@ -1742,8 +1743,17 @@ static status_t write_dat_parity(FILE *dat_f, const pack_dat_hdr_t *dat_hdr,
         return set_error(ERR_NOMEM, "write_dat_parity: chunk_buf alloc failed");
     }
 
-    /* Spill dir for parity stream temp files (unlinked immediately) */
-    const char *spill_dir = "/tmp";
+    /* Parity for an entry past about 3.7 MiB outgrows the 256 KiB buffer and
+     * spills to a file, unlinked as soon as it is created. It goes in the
+     * repository's own tmp/ like every other staging file: the daemon must
+     * run on a read-only root, where /tmp may not be writable at all, and a
+     * spill there failed gc, coalescing and replication on exactly the
+     * large entries they exist to move. */
+    char spill_dir[PATH_MAX];
+    if (path_fmt(spill_dir, sizeof(spill_dir), "%s/tmp", store_root(store)) != 0) {
+        free(entry_offsets); free(chunk_buf);
+        return set_error(ERR_IO, "write_dat_parity: tmp path too long");
+    }
 
     size_t cur_trailer_pos = sizeof(fhdr_crc);  /* relative to trailer_start */
 
@@ -1991,7 +2001,7 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
         if (!by_offset) { st = ERR_NOMEM; goto fail; }
         memcpy(by_offset, idx_entries, (size_t)packed * sizeof(*by_offset));
         qsort(by_offset, packed, sizeof(*by_offset), idx_offset_cmp);
-        st = write_dat_parity(*dat_f, dat_hdr, by_offset, packed);
+        st = write_dat_parity(store, *dat_f, dat_hdr, by_offset, packed);
         free(by_offset);
     }
     if (st != OK) goto fail;
@@ -4487,7 +4497,7 @@ status_t pack_gc_stats(store_t *store,
             }
             memcpy(gc_by_offset, new_disk_idx, (size_t)live_count * sizeof(*gc_by_offset));
             qsort(gc_by_offset, live_count, sizeof(*gc_by_offset), idx_offset_cmp);
-            st = write_dat_parity(new_dat, &dhdr, gc_by_offset, live_count);
+            st = write_dat_parity(store, new_dat, &dhdr, gc_by_offset, live_count);
             free(gc_by_offset);
             if (st != OK) { free(new_disk_idx); goto pack_fail; }
         }
