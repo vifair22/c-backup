@@ -683,7 +683,7 @@ flowchart TD
   E --> F[write snapshot record<br/>into the repository]
   F --> G[index nodes in state.db]
   G --> H{maintenance.auto_pack}
-  H -- true --> I[pack loose objects<br/>compress, coalesce]
+  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects, coalesce]
   H -- false --> J[done]
   I --> J
 ```
@@ -695,7 +695,11 @@ flowchart TD
    still has exactly the metadata it had last time; if so, the recorded hash
    is reused without opening the file. Otherwise the file is read, hashed and
    stored. A file whose content already exists in the repository costs one
-   read and no write.
+   read and no write. An object of 16 MiB or less (file content, manifest
+   tree, xattr or ACL blob) goes straight into a pack as it is written,
+   compressed if that makes it smaller. Two kinds cannot, and are written
+   loose and uncompressed: the object of a sparse file, and an object over
+   16 MiB, whose pack entry header needs its hash before the bytes are read.
 
    "Exactly the metadata" is size, mtime, ctime, and the device and inode
    numbers, on a local filesystem. On a network or FUSE filesystem (NFS,
@@ -715,10 +719,17 @@ flowchart TD
 4. **Snapshot.** The snapshot record goes into the repository first, then
    the index rows go into the database. An interrupted backup leaves at most
    index rows a reindex cleans up.
-5. **Packing.** Loose objects are always stored uncompressed; compression
-   happens at pack time. So by default every backup ends by packing what it
-   wrote. Set the policy key `maintenance.auto_pack` to `false` to pack on
-   your own schedule instead.
+5. **Pack sweep.** Loose objects are always stored uncompressed, so by
+   default every backup ends with a pack run, as `pack` would do: it packs
+   the loose objects of step 2 (and anything an interrupted run left) and
+   coalesces small packs. Setting the policy key `maintenance.auto_pack` to
+   `false` skips this sweep and nothing else. Small objects still go into
+   packs during the backup, because that is how they are written; what
+   stays loose until a `pack` is only sparse files' objects and objects
+   over 16 MiB. A backup of small files therefore leaves no loose objects
+   with the key on or off, and a `pack` straight after it finds nothing to
+   do. A large incompressible object stays loose for good either way: the
+   probe marks it once and no pack run moves it (section 12).
 
 What is captured: regular files (sparse or not), directories, symlinks,
 hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
@@ -910,7 +921,9 @@ sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
 `policy list` shows the repository's own values and the defaults in force,
-`maintenance.auto_pack` (on) included.
+`maintenance.auto_pack` (on) included. `maintenance.auto_pack` decides only
+whether a backup ends with a pack sweep (section 6.3, step 5); it does not
+stop a backup writing small objects into packs.
 
 Only these keys are accepted; any other key, and any value of the wrong
 kind, is refused with a message listing what is valid:
@@ -1119,7 +1132,7 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 |---|---|---|
 | `gc 1` | Mark from every live snapshot, sweep unreferenced objects, compact packs | After retention prunes |
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
-| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off |
+| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
 | `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 

@@ -583,11 +583,14 @@ newest completed run's `cbackup_verify_unrecoverable_objects` (unrecoverable
 plus missing), `cbackup_verify_repaired_objects`,
 `cbackup_verify_recoverable_objects` and `cbackup_verify_affected_files`.
 
-Packing runs automatically at the end of every backup, because compression
-only happens at pack time: a backup that stopped at the snapshot would have
-written more bytes than it read and left one file per object behind. Set the
-policy key `maintenance.auto_pack` to `false` to turn it off, and use this
-endpoint or a schedule to pack on your own terms instead.
+A backup writes every object of 16 MiB or less straight into a pack, and
+ends with a pack sweep for what it could not: a sparse file's object and an
+object over 16 MiB are written loose and uncompressed, and the sweep packs
+them and coalesces small packs, as this endpoint does. The policy key
+`maintenance.auto_pack` set to `false` skips that sweep and nothing else;
+small objects are packed during the backup either way, so a backup of small
+files leaves nothing loose and a pack after it reports `loose` 0. With the
+key off, use this endpoint or a schedule for the sweep.
 
 ### Sources belong to the repository
 
