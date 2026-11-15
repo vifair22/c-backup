@@ -159,7 +159,21 @@ sudo c-backup health          # the daemon's health, as JSON
 sudo c-backup version
 ```
 
-### 2.2 Docker
+### 2.2 Stopping and restarting
+
+`systemctl stop c-backupd` (SIGTERM) shuts the daemon down in order: it stops
+accepting requests, stops firing schedules, then cancels running jobs, which
+stop between files and are recorded as `cancelled` in `c-backup jobs` and the
+journal. This takes about a second. A second SIGTERM or SIGINT forces an
+immediate exit. Run the cancelled job again after the restart; a backup skips
+what it already stored, a restore skips what it already wrote.
+
+A daemon that dies without stopping (a crash, `kill -9`, power loss) marks
+whatever was running as `failed: interrupted by daemon restart` on its next
+start. Either way the repository is consistent: a backup's partial pack is
+discarded and the next backup stores those files again.
+
+### 2.3 Docker
 
 CI publishes an image built from `Dockerfile`: Debian trixie, binaries built
 for `x86-64-v2`.
@@ -184,7 +198,7 @@ docker run -d --name c-backupd \
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`.
 
-### 2.3 The desktop app
+### 2.4 The desktop app
 
 The app lives in `ui/`. To build and run it from a checkout:
 
@@ -197,7 +211,7 @@ npx electron .
 
 There is no packaged installer in 1.0.
 
-### 2.4 The Debian package
+### 2.5 The Debian package
 
 `packaging/deb` holds control files for a package, but nothing builds one in
 1.0. Use the source install or the image.
@@ -1018,7 +1032,8 @@ the underlying disk.
 | App: `sign in again` mid-use | Session revoked or expired | Sign in |
 | `repo is busy` | Another job holds the repository | Wait, or `c-backup jobs` to see what |
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
-| Job `failed: interrupted by daemon restart` | The daemon stopped mid-job | Run it again; backups and restores resume cleanly |
+| Job `cancelled` after a restart | `systemctl stop` cancels running jobs (section 2.2) | Run it again |
+| Job `failed: interrupted by daemon restart` | The daemon died mid-job: crash, `kill -9`, power loss | Run it again; nothing partial is kept |
 | `restore incomplete: N entries could not be restored` | Some entries failed | The job and log name them; check permissions and space at the destination |
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
