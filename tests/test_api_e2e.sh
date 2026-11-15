@@ -1266,6 +1266,34 @@ check "so is one that never existed" '{"error":"no such snapshot"} 404' \
     "$(sock_send DELETE /repos/1/snapshots/999)"
 check "an untagged snapshot needs no force" '{"removed":true,"id":4,"tags_removed":0} 200' \
     "$(sock_send DELETE /repos/1/snapshots/4)"
+
+# Snapshot 4 was the newest, and ids were MAX(id) + 1 over the snapshots
+# present: the next backup was 4 again, and anything still naming the
+# deleted one named it. Ids are never reused now.
+NEXT_JOB=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")
+wait_job "$NEXT_JOB"
+contains "a deleted snapshot's id is not reused" '"result":{"snapshot_id":5,' \
+    "$(sock_body "/jobs/$NEXT_JOB")"
+
+# B113: removing a repository purged its job rows, and the next job took
+# the id of the removed repository's newest one. Give repository 2 the
+# newest job, remove it, wait for the purge to take that job's row, and the
+# next job must still be above it.
+GONE_JOB=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/src\"]}")")
+wait_job "$GONE_JOB"
+contains "remove repository 2" ' 200' "$(sock_send DELETE /repos/2)"
+for _ in $(seq 1 100); do
+    [ "$(sock_code "/jobs/$GONE_JOB")" = 404 ] && break
+    sleep 0.1
+done
+check "the purge took its job row" 404 "$(sock_code "/jobs/$GONE_JOB")"
+AFTER_JOB=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")
+wait_job "$AFTER_JOB"
+if [ "$AFTER_JOB" -gt "$GONE_JOB" ]; then
+    check "a purged job's id is not reused" ok ok
+else
+    check "a purged job's id is not reused" "above $GONE_JOB" "$AFTER_JOB"
+fi
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""

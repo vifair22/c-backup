@@ -303,9 +303,198 @@ static void test_repos_rebuild_keeps_rows_and_children(void **state)
     unlink_db();
 }
 
+static int64_t scalar64(cutils_db_t *db, const char *sql)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, NULL, &r), CUTILS_OK);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    int64_t v = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return v;
+}
+
+/* One row's id from an INSERT ... RETURNING id. */
+#define JOB_INSERT    "INSERT INTO jobs (repo_id, action, state) VALUES (1, 'gc', 'queued') RETURNING id"
+#define SCHED_INSERT  "INSERT INTO schedules (repo_id, action, trigger_type, trigger_spec," \
+                      " next_due_at) VALUES (1, 'gc', 'interval', '{}', 0) RETURNING id"
+#define GREP_INSERT   "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)" \
+                      " VALUES (1, 1, 'x', 0) RETURNING id"
+#define VERIFY_INSERT "INSERT INTO verify_runs (repo_id, started_at, level)" \
+                      " VALUES (1, 0, 'index') RETURNING id"
+
+/*
+ * B113: every table whose id leaves the daemon. Deleting the newest row and
+ * inserting another handed out the deleted id again: the purge of a removed
+ * repository, the 30-day job cleanup and deleting a schedule all did it.
+ */
+static void test_job_schedule_and_run_ids_are_not_reused(void **state)
+{
+    (void)state;
+    static const struct { const char *table, *insert; } t[] = {
+        { "jobs",        JOB_INSERT },
+        { "schedules",   SCHED_INSERT },
+        { "grep_runs",   GREP_INSERT },
+        { "verify_runs", VERIFY_INSERT },
+    };
+    cutils_db_t *db = fresh_db();
+    assert_int_equal(insert_repo(db, "u1"), 1);
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        assert_int_equal(scalar64(db, t[i].insert), 1);
+        assert_int_equal(scalar64(db, t[i].insert), 2);
+        char del[128];
+        snprintf(del, sizeof(del), "DELETE FROM %s", t[i].table);
+        assert_int_equal(db_execute_non_query(db, del, NULL, NULL), CUTILS_OK);
+        assert_int_equal(scalar64(db, t[i].insert), 3);
+    }
+    db_close(db);
+    unlink_db();
+}
+
+/* The migrations before the one named by prefix, as a previous release left
+ * the database. */
+static cutils_db_t *db_before(const char *prefix)
+{
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+    size_t n = 0;
+    while (app_migrations[n].name && strncmp(app_migrations[n].name, prefix, 4) != 0) n++;
+    assert_non_null(app_migrations[n].name);
+    db_migration_t *before = calloc(n + 1, sizeof(*before));
+    assert_non_null(before);
+    for (size_t i = 0; i < n; i++) before[i] = app_migrations[i];
+    assert_int_equal(db_run_compiled_migrations(db, before), CUTILS_OK);
+    free(before);
+    return db;
+}
+
+/*
+ * Migration 023 rebuilds jobs, schedules, grep_runs and verify_runs. Every
+ * row keeps its id and columns, the indexes come back under their names,
+ * the run tables' children still name them, and the next id clears every
+ * id still referred to, not just the rows that survive.
+ */
+static void test_023_rebuild_keeps_rows_and_raises_the_sequences(void **state)
+{
+    (void)state;
+    cutils_db_t *db = db_before("023_");
+
+    assert_int_equal(db_exec_raw(db,
+        "INSERT INTO repos (id, uuid, path, added_at) VALUES (1, 'ua', '/r/a', 0);"
+        "INSERT INTO jobs (id, repo_id, action, params, state, started, ended,"
+        "                  progress_phase, progress_current, progress_total, error,"
+        "                  bytes_done, bytes_total, result, origin, schedule_id)"
+        "  VALUES (5, 1, 'backup', '{}', 'completed', 10, 20, 'store', 3, 4, '',"
+        "          100, 200, '{\"snapshot_id\":2}', 'schedule', 9),"
+        "         (40, NULL, 'gc', NULL, 'failed', NULL, NULL, NULL, NULL, NULL,"
+        "          'boom', NULL, NULL, NULL, 'api', NULL);"
+        "INSERT INTO schedules (id, repo_id, action, params, trigger_type, trigger_spec,"
+        "                       on_overlap, catchup, enabled, last_fired_at,"
+        "                       next_due_at, disabled_reason)"
+        "  VALUES (3, 1, 'backup', '', 'interval', '{\"every\":60}', 'queue', 'once',"
+        "          0, 7, 8, 'repository missing');"
+        "INSERT INTO grep_runs (id, repo_id, snap_id, pattern, started_at, hits,"
+        "                       truncated, files_capped)"
+        "  VALUES (2, 1, 6, 'needle', 1, 4, 1, 2);"
+        "INSERT INTO grep_hits (run_id, repo_id, node_id, path, line_no)"
+        "  VALUES (2, 1, 1, '/a', 1), (11, 1, 1, '/b', 2);"
+        "INSERT INTO verify_runs (id, repo_id, started_at, level, recoverable)"
+        "  VALUES (8, 1, 0, 'full', 3);"
+        "INSERT INTO verify_findings (run_id, repo_id, hash, status)"
+        "  VALUES (8, 1, 'aa', 'missing');"
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (1, 4, 0, X'00');"
+        "INSERT INTO tags (repo_id, name, snap_id, created_at) VALUES (1, 'k', 5, 0);"), CUTILS_OK);
+
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT id, repo_id, action, params, state, started, ended, progress_phase,"
+        "       progress_current, progress_total, error, bytes_done, bytes_total,"
+        "       result, origin, schedule_id FROM jobs ORDER BY id", NULL, &r), CUTILS_OK);
+    assert_int_equal(r->nrows, 2);
+    assert_string_equal(r->rows[0][0], "5");
+    assert_string_equal(r->rows[0][7], "store");
+    assert_string_equal(r->rows[0][12], "200");
+    assert_string_equal(r->rows[0][13], "{\"snapshot_id\":2}");
+    assert_string_equal(r->rows[0][14], "schedule");
+    assert_string_equal(r->rows[0][15], "9");
+    assert_string_equal(r->rows[1][0], "40");
+    assert_string_equal(r->rows[1][10], "boom");
+    db_result_free(r);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT id, on_overlap, catchup, enabled, last_fired_at, next_due_at,"
+        "       disabled_reason FROM schedules", NULL, &r), CUTILS_OK);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "3");
+    assert_string_equal(r->rows[0][1], "queue");
+    assert_string_equal(r->rows[0][3], "0");
+    assert_string_equal(r->rows[0][6], "repository missing");
+    db_result_free(r);
+
+    assert_int_equal(scalar64(db, "SELECT files_capped FROM grep_runs WHERE id = 2"), 2);
+    assert_int_equal(scalar64(db, "SELECT recoverable FROM verify_runs WHERE id = 8"), 3);
+    assert_int_equal(scalar64(db, "SELECT COUNT(*) FROM grep_hits"), 2);
+    assert_int_equal(scalar64(db, "SELECT COUNT(*) FROM verify_findings"), 1);
+
+    /* Defaults survive the rebuild. */
+    assert_int_equal(db_exec_raw(db,
+        "INSERT INTO jobs (id, action, state) VALUES (1000, 'gc', 'queued');"), CUTILS_OK);
+    assert_int_equal(count_rows(db,
+        "SELECT 1 FROM jobs WHERE id = 1000 AND origin = 'api'"), 1);
+    assert_int_equal(db_exec_raw(db, "DELETE FROM jobs WHERE id = 1000;"), CUTILS_OK);
+
+    static const char *const indexes[] = {
+        "jobs_by_state", "jobs_by_repo", "schedules_next_due",
+        "grep_runs_by_repo", "verify_runs_by_repo", NULL
+    };
+    for (int i = 0; indexes[i]; i++) assert_true(object_exists(db, "index", indexes[i]));
+    assert_int_equal(count_rows(db,
+        "SELECT 1 FROM pragma_foreign_key_list('grep_hits') WHERE \"table\" = 'grep_runs'"), 1);
+    assert_int_equal(count_rows(db,
+        "SELECT 1 FROM pragma_foreign_key_list('jobs') WHERE \"table\" = 'repos'"), 1);
+    assert_int_equal(count_rows(db,
+        "SELECT name FROM sqlite_master WHERE name LIKE '%\\_new' ESCAPE '\\'"), 0);
+
+    /* Above the survivors, the schedule a job still names, and the runs a
+     * hit still names; above 1000 since that id was issued and deleted. */
+    assert_int_equal(scalar64(db, JOB_INSERT), 1001);
+    assert_int_equal(scalar64(db, SCHED_INSERT), 10);
+    assert_int_equal(scalar64(db, GREP_INSERT), 12);
+    assert_int_equal(scalar64(db, VERIFY_INSERT), 9);
+
+    /* The snapshot high-water mark counts ids a tag (5) or a search run (6)
+     * still names, above the newest snapshot present (4). */
+    assert_int_equal(scalar64(db, "SELECT last_id FROM snapshot_id_seq WHERE repo_id = 1"), 6);
+
+    db_close(db);
+    unlink_db();
+}
+
+/* An empty database: the tables still get a sequence, from 1. */
+static void test_023_on_empty_tables(void **state)
+{
+    (void)state;
+    cutils_db_t *db = db_before("023_");
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+    assert_int_equal(insert_repo(db, "u1"), 1);
+    assert_int_equal(scalar64(db, JOB_INSERT), 1);
+    assert_int_equal(scalar64(db, SCHED_INSERT), 1);
+    assert_int_equal(scalar64(db, "SELECT COUNT(*) FROM snapshot_id_seq"), 0);
+    db_close(db);
+    unlink_db();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_job_schedule_and_run_ids_are_not_reused),
+        cmocka_unit_test(test_023_rebuild_keeps_rows_and_raises_the_sequences),
+        cmocka_unit_test(test_023_on_empty_tables),
         cmocka_unit_test(test_repo_ids_are_not_reused),
         cmocka_unit_test(test_repos_rebuild_keeps_rows_and_children),
         cmocka_unit_test(test_migrations_apply),

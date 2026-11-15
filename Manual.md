@@ -594,6 +594,16 @@ A removed repository's id is never handed out again; registering it again
 gives it a new one. Ids used to be reused, so the next repository added
 could take over the removed one's schedules and history.
 
+The same holds for every other id the daemon hands out: jobs, schedules,
+search and verify runs, and snapshots within a repository. Removing a
+repository deletes its jobs, and the next job on another repository used
+to take the removed one's newest job id, so a script or log line holding
+it named an unrelated job; deleting the newest snapshot likewise gave its
+number to the next backup. Neither happens since 1.0.0, though ids already
+reused by an earlier build stay as they are. Snapshot numbering is tracked
+in the database: after a database loss, a reindex continues above the
+highest snapshot still in the repository.
+
 ### 5.3 Where to put a repository
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
