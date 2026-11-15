@@ -14,6 +14,7 @@
 #include "repo_key.h"
 #include "store.h"
 #include <cutils/db.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define CBACKUP_MARKER      ".cbackup"
@@ -88,6 +89,22 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
                                  repo_marker_t *out);
 
 /*
+ * Decide the encryption mode from what a caller sent. mode may be NULL or
+ * empty (not given). A non-empty passphrase with no mode means passphrase
+ * mode; with none or system it is ERR_INVALID, as is passphrase mode without
+ * one.
+ */
+status_t repo_enc_resolve(const char *mode, const char *passphrase,
+                          repo_enc_mode_t *out);
+
+/*
+ * Normalise an absolute path lexically: no "//", no "." or ".." components,
+ * no trailing slash. Symlinks are left alone. ERR_INVALID for a relative or
+ * over-long path. Registration stores paths in this form.
+ */
+status_t repo_path_normalize(const char *in, char *out, size_t outsz);
+
+/*
  * Register a repo directory, per section 5.2:
  *
  *   missing or empty  -> create the skeleton, write a marker, insert a row
@@ -107,6 +124,26 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
  */
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id);
+
+/* What a registration did, for a caller that has to tell the cases apart. */
+typedef struct {
+    int64_t         id;
+    int             created;            /* a new repository was made on disk */
+    int             inserted;           /* a new row: created, or adopted */
+    int             already_registered; /* the row existed: same path or moved */
+    int             label_updated;      /* already registered, label changed */
+    repo_enc_mode_t enc_mode;           /* as the marker records it */
+} repo_register_out_t;
+
+/*
+ * repo_register_ex, reporting which case happened. Registering a repository
+ * that is already registered succeeds (that is the moved-repository path),
+ * applies a non-empty label that differs from the stored one, and leaves
+ * already_registered set. Asking for an encryption mode an existing
+ * repository does not have is ERR_INVALID.
+ */
+status_t repo_register_detail(cutils_db_t *db, const char *path, const char *label,
+                              repo_enc_request_t *enc, repo_register_out_t *out);
 
 status_t repo_register(cutils_db_t *db, const char *path, const char *label,
                        int64_t *out_repo_id);

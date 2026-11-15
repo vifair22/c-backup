@@ -11,6 +11,7 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +167,178 @@ static void test_register_requires_absolute_path(void **state)
     assert_int_not_equal(repo_register(db, "relative/path", NULL, &id), OK);
 }
 
+/*
+ * B014: the path was stored exactly as typed, so a trailing slash made
+ * "/srv/backup/r/" and "/srv/backup/r" two strings for one directory.
+ */
+static void test_path_normalize(void **state)
+{
+    (void)state;
+    static const struct { const char *in, *want; } cases[] = {
+        { "/",                    "/" },
+        { "//",                   "/" },
+        { "/a",                   "/a" },
+        { "/a/",                  "/a" },
+        { "/a///b//",             "/a/b" },
+        { "/a/./b/.",             "/a/b" },
+        { "/a/b/../c",            "/a/c" },
+        { "/a/b/../../..",        "/" },
+        { "/../a",                "/a" },
+        { "/a/..b/.c",            "/a/..b/.c" },
+        { "/srv/backup/r-slash/", "/srv/backup/r-slash" },
+    };
+    char out[PATH_MAX];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        assert_int_equal(repo_path_normalize(cases[i].in, out, sizeof(out)), OK);
+        assert_string_equal(out, cases[i].want);
+    }
+    assert_int_equal(repo_path_normalize("rel/a", out, sizeof(out)), ERR_INVALID);
+    assert_int_equal(repo_path_normalize("", out, sizeof(out)), ERR_INVALID);
+    char tiny[4];
+    assert_int_equal(repo_path_normalize("/abcdef", tiny, sizeof(tiny)), ERR_INVALID);
+    err_clear();
+}
+
+static void test_register_stores_normalised_path(void **state)
+{
+    (void)state;
+    int64_t id = 0, again = 0;
+    assert_int_equal(mkdir(TEST_ROOT "/norm", 0700), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "//norm/./x/../r/", NULL, &id), OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT path FROM repos", NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], TEST_ROOT "/norm/r");
+    db_result_free(r);
+
+    /* Another spelling of the same directory is the same registration. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/norm/r//", NULL, &again), OK);
+    assert_int_equal(again, id);
+    assert_int_equal(count_repos(), 1);
+}
+
+/*
+ * B013: a repository whose parents did not exist failed with ENOENT, which
+ * the API returned as a 500.
+ */
+static void test_register_creates_missing_parents(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/p/q/r/repo", NULL, &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/p/q/r/repo", &m), OK);
+
+    struct stat sb;
+    assert_int_equal(stat(TEST_ROOT "/p/q/r/repo", &sb), 0);
+    assert_int_equal(sb.st_mode & 0777, 0700);
+    assert_int_equal(stat(TEST_ROOT "/p/q", &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+}
+
+/* A path that cannot be created is the caller's to fix: ERR_INVALID, which
+ * the route answers with a 400 rather than a 500. */
+static void test_register_under_a_file_is_invalid(void **state)
+{
+    (void)state;
+    FILE *f = fopen(TEST_ROOT "/plain", "w");
+    assert_non_null(f);
+    fclose(f);
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/plain/repo", NULL, &id), ERR_INVALID);
+    assert_int_equal(repo_register(db, TEST_ROOT "/plain/x/repo", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 0);
+    err_clear();
+}
+
+/*
+ * B012: a repository inside a registered one was accepted, so its objects
+ * landed in a directory the outer repository owns.
+ */
+static void test_register_refuses_nested_repo(void **state)
+{
+    (void)state;
+    int64_t outer = 0, id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer", "o", &outer), OK);
+
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/nested", NULL, &id), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "is inside repository"));
+    assert_non_null(strstr(err_msg(), TEST_ROOT "/outer"));
+    /* Refused before anything was created. */
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_ROOT "/outer/nested", &sb), 0);
+
+    /* Deeper, and through an existing subdirectory of the repository. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/a/b/c", NULL, &id), ERR_INVALID);
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/objects/x", NULL, &id), ERR_INVALID);
+
+    /* Spelling it differently does not route around the check. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/elsewhere/../outer/n", NULL, &id), ERR_INVALID);
+    assert_int_equal(symlink(TEST_ROOT "/outer", TEST_ROOT "/alias"), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "/alias/n", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 1);
+    err_clear();
+}
+
+static void test_register_refuses_containing_repo(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/up/inner", NULL, &id), OK);
+    assert_int_equal(repo_register(db, TEST_ROOT "/up", NULL, &id), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "contains repository"));
+
+    /* Even where the inner repository's directory has gone and the parent
+     * is empty enough to pass every other check. */
+    assert_int_equal(rename(TEST_ROOT "/up/inner", TEST_ROOT "/moved"), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "/up", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 1);
+    err_clear();
+}
+
+/* Siblings sharing a prefix are not nested: r10 is not inside r1. */
+static void test_register_allows_prefix_siblings(void **state)
+{
+    (void)state;
+    int64_t a = 0, b = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/r1", NULL, &a), OK);
+    assert_int_equal(repo_register(db, TEST_ROOT "/r10", NULL, &b), OK);
+    assert_int_not_equal(a, b);
+    assert_int_equal(count_repos(), 2);
+}
+
+/*
+ * B011: a passphrase with no mode made an unencrypted repository. It means
+ * passphrase mode now, and a mode that cannot use one refuses it.
+ */
+static void test_enc_resolve(void **state)
+{
+    (void)state;
+    repo_enc_mode_t m = REPO_ENC_SYSTEM;
+    assert_int_equal(repo_enc_resolve(NULL, NULL, &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+    assert_int_equal(repo_enc_resolve(NULL, "", &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+    assert_int_equal(repo_enc_resolve(NULL, "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("", "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("passphrase", "secret", &m), OK);
+    assert_int_equal(m, REPO_ENC_PASSPHRASE);
+    assert_int_equal(repo_enc_resolve("system", NULL, &m), OK);
+    assert_int_equal(m, REPO_ENC_SYSTEM);
+    assert_int_equal(repo_enc_resolve("none", "", &m), OK);
+    assert_int_equal(m, REPO_ENC_NONE);
+
+    assert_int_equal(repo_enc_resolve("none", "secret", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("system", "secret", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("passphrase", NULL, &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("passphrase", "", &m), ERR_INVALID);
+    assert_int_equal(repo_enc_resolve("rot13", NULL, &m), ERR_INVALID);
+    err_clear();
+}
+
 /* A marker is written once. Overwriting one would silently sever a repo
  * from every row that references its uuid. */
 static void test_marker_write_refuses_overwrite(void **state)
@@ -266,6 +439,58 @@ static repo_enc_request_t enc_request(repo_enc_mode_t mode, const char *pass)
     e.key_dir = TEST_KEYS;
     e.passphrase = pass;
     return e;
+}
+
+/*
+ * B015: registering an already-registered path answered with the id alone
+ * and dropped the label it was given.
+ */
+static void test_reregister_reports_and_relabels(void **state)
+{
+    (void)state;
+    repo_register_out_t o;
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "old", NULL, &o), OK);
+    assert_true(o.created);
+    assert_true(o.inserted);
+    assert_false(o.already_registered);
+    int64_t id = o.id;
+
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "new", NULL, &o), OK);
+    assert_int_equal(o.id, id);
+    assert_true(o.already_registered);
+    assert_true(o.label_updated);
+    assert_false(o.inserted);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT label FROM repos", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "new");
+    db_result_free(r);
+
+    /* No label, or the same one, changes nothing. */
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "", NULL, &o), OK);
+    assert_true(o.already_registered);
+    assert_false(o.label_updated);
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/lbl", "new", NULL, &o), OK);
+    assert_false(o.label_updated);
+    assert_int_equal(db_execute(db, "SELECT label FROM repos", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "new");
+    db_result_free(r);
+    assert_int_equal(count_repos(), 1);
+}
+
+/* An existing repository's encryption is fixed. Asking for another mode
+ * was accepted and recorded against a repository written otherwise. */
+static void test_reregister_refuses_a_different_encryption(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/plainrepo", NULL, &id), OK);
+    repo_enc_request_t e = enc_request(REPO_ENC_SYSTEM, NULL);
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/plainrepo", NULL, &e, &id),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "encryption none"));
+    assert_int_equal(e.key_hex[0], '\0');
+    err_clear();
 }
 
 /*
@@ -498,6 +723,16 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_adopts_unknown_uuid, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_refuses_foreign_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_requires_absolute_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_path_normalize, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_stores_normalised_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_creates_missing_parents, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_under_a_file_is_invalid, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_refuses_nested_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_refuses_containing_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_allows_prefix_siblings, setup, teardown),
+        cmocka_unit_test(test_enc_resolve),
+        cmocka_unit_test_setup_teardown(test_reregister_reports_and_relabels, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reregister_refuses_a_different_encryption, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),

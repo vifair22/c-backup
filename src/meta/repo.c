@@ -1,4 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
+/* realpath is XSI. */
+#define _XOPEN_SOURCE 700
 
 #include "repo.h"
 #include "store.h"
@@ -303,6 +305,239 @@ status_t repo_marker_write_fixed(const char *path, const repo_marker_t *in,
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A passphrase on its own means passphrase mode.
+ *
+ * It used to mean nothing: `repo add P --passphrase X` without --encrypt
+ * created an unencrypted repository, reported success, and the operator
+ * walked away believing their backups were protected by a passphrase they
+ * had typed. Implying the mode is safe because passphrase mode is a
+ * superset of what they asked for: the passphrase is required to recover
+ * the key, exactly as they expected.
+ *
+ * A passphrase alongside a mode that cannot use it is refused rather than
+ * ignored, for the same reason: ignoring it is how the first bug happened.
+ * An empty passphrase counts as absent, so a client that always sends the
+ * field does not trip over it.
+ */
+status_t repo_enc_resolve(const char *mode, const char *passphrase,
+                          repo_enc_mode_t *out)
+{
+    int has_pass = passphrase && *passphrase;
+    repo_enc_mode_t m = REPO_ENC_NONE;
+
+    if (!mode || !*mode) {
+        *out = has_pass ? REPO_ENC_PASSPHRASE : REPO_ENC_NONE;
+        return OK;
+    }
+    if (repo_enc_mode_parse(mode, &m) != 0)
+        return set_error(ERR_INVALID, "encrypt must be none, system or passphrase");
+    if (m == REPO_ENC_PASSPHRASE && !has_pass)
+        return set_error(ERR_INVALID, "passphrase encryption needs a passphrase");
+    if (m == REPO_ENC_NONE && has_pass)
+        return set_error(ERR_INVALID,
+                         "a passphrase was given with encrypt none; drop the "
+                         "passphrase for an unencrypted repository, or use "
+                         "encrypt passphrase");
+    if (m == REPO_ENC_SYSTEM && has_pass)
+        return set_error(ERR_INVALID,
+                         "a passphrase was given with encrypt system, which "
+                         "generates its own key; drop the passphrase, or use "
+                         "encrypt passphrase");
+    *out = m;
+    return OK;
+}
+
+/*
+ * Lexical normalisation: collapse repeated slashes, drop "." components,
+ * resolve ".." against the components before it, strip a trailing slash.
+ *
+ * The path was stored exactly as typed, so "/srv/backup/r/" and
+ * "/srv/backup/r" were two different strings for one directory. Every
+ * comparison against a stored path - the re-link check, the nesting check,
+ * an operator reading `repo list` - then had to know that, and none did.
+ *
+ * Deliberately lexical, not realpath: a symlink the operator chose is part
+ * of how they named the repository, and resolving it here would store a
+ * path they never typed. ".." above the root stays at the root, as the
+ * kernel treats it.
+ */
+status_t repo_path_normalize(const char *in, char *out, size_t outsz)
+{
+    if (!in || !in[0])
+        return set_error(ERR_INVALID, "repo path is empty");
+    if (in[0] != '/')
+        return set_error(ERR_INVALID, "repo path must be absolute: %s", in);
+    if (outsz < 2)
+        return set_error(ERR_INVALID, "repo path buffer too small");
+
+    size_t len = 0;
+    out[len++] = '/';
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t clen = (size_t)(p - start);
+
+        if (clen == 1 && start[0] == '.') continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.') {
+            /* Back up to the slash before the last component. */
+            while (len > 1 && out[len - 1] != '/') len--;
+            if (len > 1) len--;
+            continue;
+        }
+        if (len > 1) {
+            if (len + 1 >= outsz) goto too_long;
+            out[len++] = '/';
+        }
+        if (len + clen >= outsz) goto too_long;
+        memcpy(out + len, start, clen);
+        len += clen;
+    }
+    out[len] = '\0';
+    return OK;
+
+too_long:
+    out[0] = '\0';
+    return set_error(ERR_INVALID, "repo path too long: %s", in);
+}
+
+/*
+ * A failure the caller can fix by choosing another path is ERR_INVALID, so
+ * the API answers 4xx; anything else is the host's fault and stays ERR_IO.
+ * Before this every mkdir failure was ERR_IO, and a typo in a parent
+ * directory came back as a 500 that read like a daemon bug.
+ */
+static status_t mkdir_error(const char *what)
+{
+    switch (errno) {
+    case EACCES: case EPERM: case EROFS: case ENOTDIR: case EEXIST:
+    case ENAMETOOLONG: case ELOOP:
+        return set_error_errno(ERR_INVALID, "cannot create %s", what);
+    default:
+        return set_error_errno(ERR_IO, "cannot create %s", what);
+    }
+}
+
+/*
+ * mkdir -p for a normalised absolute path. Missing parents get 0755, the
+ * repository itself 0700: the parents are ordinary directories the operator
+ * named, and only the repository holds backup data. A repository at
+ * /srv/backup/main on a fresh disk used to fail with ENOENT until somebody
+ * created /srv/backup by hand, which nothing told them to do.
+ */
+static status_t mkdir_parents(const char *path)
+{
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1; ; p++) {
+        int leaf = (*p == '\0');
+        if (*p != '/' && !leaf) continue;
+        *p = '\0';
+        if (mkdir(buf, leaf ? 0700 : 0755) != 0) {
+            struct stat sb;
+            if (errno != EEXIST) return mkdir_error(buf);
+            if (stat(buf, &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+                errno = ENOTDIR;
+                return mkdir_error(buf);
+            }
+        }
+        if (leaf) break;
+        *p = '/';
+    }
+    return OK;
+}
+
+/*
+ * The canonical form of a normalised path that may not exist yet: realpath
+ * of its deepest existing ancestor, with the missing tail appended. A path
+ * whose ancestors cannot be resolved at all (EACCES, say) falls back to the
+ * lexical form, which is still right whenever no symlink is involved.
+ */
+static void canonical_path(const char *norm, char *out, size_t outsz)
+{
+    char head[PATH_MAX], real[PATH_MAX];
+    snprintf(head, sizeof(head), "%s", norm);
+    for (;;) {
+        if (realpath(head, real)) break;
+        if ((errno != ENOENT && errno != ENOTDIR) || strcmp(head, "/") == 0) {
+            snprintf(out, outsz, "%s", norm);
+            return;
+        }
+        char *slash = strrchr(head, '/');
+        if (slash == head) slash[1] = '\0';
+        else               *slash = '\0';
+    }
+    const char *tail = norm + strlen(head);
+    if (strcmp(head, "/") == 0 && *tail != '/') tail = norm;
+    if (strcmp(real, "/") == 0)
+        snprintf(out, outsz, "%s", *tail ? tail : "/");
+    else
+        snprintf(out, outsz, "%s%s", real, tail);
+}
+
+/* Whether child is strictly below parent, on a component boundary, so
+ * /srv/backup/r10 is not inside /srv/backup/r1. */
+static int path_is_below(const char *child, const char *parent)
+{
+    if (strcmp(parent, "/") == 0) return strcmp(child, "/") != 0;
+    size_t n = strlen(parent);
+    return strncmp(child, parent, n) == 0 && child[n] == '/';
+}
+
+/*
+ * Refuse a repository inside another registered repository, or one that
+ * would contain one.
+ *
+ * Both were accepted. Inside, the new repository's objects land in a
+ * directory the outer one owns: its GC and verify walk them as strays, and
+ * deleting either directory takes data from the other. Containing is the
+ * same thing from the other side. Paths are compared canonically, so a
+ * symlink or a ".." cannot route around the check.
+ *
+ * self_uuid is the marker already at the path, if any. A row with that uuid
+ * is this repository's own registration - the re-link and moved-repository
+ * cases - and is not a conflict with itself.
+ */
+static status_t check_not_nested(cutils_db_t *db, const char *norm,
+                                 const char *self_uuid)
+{
+    char mine[PATH_MAX];
+    canonical_path(norm, mine, sizeof(mine));
+
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT id, uuid, path FROM repos", NULL, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "cannot read registered repositories");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        const char *uuid = r->rows[i][1];
+        const char *path = r->rows[i][2];
+        if (self_uuid && *self_uuid && strcmp(uuid, self_uuid) == 0) continue;
+
+        char norm_other[PATH_MAX], theirs[PATH_MAX];
+        if (repo_path_normalize(path, norm_other, sizeof(norm_other)) != OK) {
+            err_clear();
+            continue;
+        }
+        canonical_path(norm_other, theirs, sizeof(theirs));
+
+        if (path_is_below(mine, theirs))
+            st = set_error(ERR_INVALID,
+                           "%s is inside repository %s (%s); a repository cannot "
+                           "live inside another", norm, r->rows[i][0], norm_other);
+        else if (path_is_below(theirs, mine))
+            st = set_error(ERR_INVALID,
+                           "%s contains repository %s (%s); a repository cannot "
+                           "live inside another", norm, r->rows[i][0], norm_other);
+    }
+    db_result_free(r);
+    return st;
+}
+
 /* "Empty" ignores . and .. only. A directory holding anything else is
  * someone's data until a marker says otherwise. */
 static int dir_is_empty(const char *path)
@@ -391,10 +626,26 @@ static status_t provision_key(const char *uuid, repo_enc_request_t *enc,
 status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                           repo_enc_request_t *enc, int64_t *out_repo_id)
 {
+    repo_register_out_t out;
+    status_t st = repo_register_detail(db, path, label, enc, &out);
+    if (st == OK && out_repo_id) *out_repo_id = out.id;
+    return st;
+}
+
+status_t repo_register_detail(cutils_db_t *db, const char *path, const char *label,
+                              repo_enc_request_t *enc, repo_register_out_t *out)
+{
+    repo_register_out_t discard;
+    if (!out) out = &discard;
+    memset(out, 0, sizeof(*out));
     if (!db || !path || !path[0])
         return set_error(ERR_INVALID, "repo_register: missing db or path");
-    if (path[0] != '/')
-        return set_error(ERR_INVALID, "repo path must be absolute: %s", path);
+
+    /* Everything below works on, and stores, the normalised form. */
+    char npath[PATH_MAX];
+    status_t nst = repo_path_normalize(path, npath, sizeof(npath));
+    if (nst != OK) return nst;
+    path = npath;
 
     struct stat sb;
     int exists = (stat(path, &sb) == 0);
@@ -404,9 +655,21 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
     repo_marker_t marker;
     status_t st;
 
+    /* Before anything is created: a refused path must leave no trace. */
+    repo_marker_t present;
+    memset(&present, 0, sizeof(present));
+    if (exists && repo_marker_read(path, &present) != OK) {
+        err_clear();
+        present.uuid[0] = '\0';
+    }
+    st = check_not_nested(db, path, present.uuid);
+    if (st != OK) return st;
+
     if (!exists || dir_is_empty(path)) {
-        if (!exists && mkdir(path, 0700) != 0)
-            return set_error_errno(ERR_IO, "cannot create %s", path);
+        if (!exists) {
+            st = mkdir_parents(path);
+            if (st != OK) return st;
+        }
         st = store_init_dirs(path);
         if (st != OK) return st;
 
@@ -436,7 +699,10 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
             st = repo_marker_write(path, &marker);
             if (st != OK) return st;
         }
-        return insert_repo_row(db, marker.uuid, path, label, out_repo_id);
+        out->created  = 1;
+        out->inserted = 1;
+        out->enc_mode = marker.enc_mode;
+        return insert_repo_row(db, marker.uuid, path, label, &out->id);
     }
 
     /* Non-empty. Only a valid marker makes this ours. */
@@ -455,6 +721,20 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
                          path, marker.version);
 
     /*
+     * Encryption is the marker's to say, not the request's. Asking for a
+     * mode an existing repository does not have used to be accepted, and
+     * the route then recorded the requested mode against a repository whose
+     * objects were written otherwise - a plaintext repository listed as
+     * encrypted is the worst way round for that to be wrong.
+     */
+    if (enc && enc->mode != REPO_ENC_NONE && enc->mode != marker.enc_mode)
+        return set_error(ERR_INVALID,
+                         "%s is already a repository with encryption %s; "
+                         "encryption is decided when a repository is created",
+                         path, repo_enc_mode_name(marker.enc_mode));
+    out->enc_mode = marker.enc_mode;
+
+    /*
      * Known UUID: re-link, updating the path in case the repo moved.
      *
      * Moved is the case this exists for - a mount point that changed, a
@@ -471,13 +751,22 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
      * is meant is not something to guess.
      */
     db_result_t *r = NULL;
-    if (db_execute(db, "SELECT id, path FROM repos WHERE uuid = ?",
+    if (db_execute(db, "SELECT id, path, label FROM repos WHERE uuid = ?",
                    (const char *[]){ marker.uuid, NULL }, &r) == 0 &&
         r && r->nrows == 1) {
         int64_t id = strtoll(r->rows[0][0], NULL, 10);
         const char *known = r->rows[0][1];
 
-        if (known && *known && strcmp(known, path) != 0) {
+        /* Rows written before paths were normalised may carry a trailing
+         * slash or a doubled one; compare in normal form so the same
+         * directory is never mistaken for a second copy of itself. */
+        char known_norm[PATH_MAX];
+        if (known && *known &&
+            repo_path_normalize(known, known_norm, sizeof(known_norm)) != OK) {
+            err_clear();
+            snprintf(known_norm, sizeof(known_norm), "%s", known);
+        }
+        if (known && *known && strcmp(known_norm, path) != 0) {
             repo_marker_t other;
             if (repo_marker_read(known, &other) == OK &&
                 strcmp(other.uuid, marker.uuid) == 0) {
@@ -496,13 +785,29 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
             err_clear();
         }
 
+        /*
+         * Registering an already-registered repository answered with its
+         * id and nothing else, and dropped the label it was given. That
+         * made `repo add` with a new label look like it had worked. A label
+         * that differs is applied; an absent or empty one leaves the stored
+         * label alone, because the CLI sends "" when none was typed.
+         */
+        int relabel = label && *label && strcmp(label, r->rows[0][2]) != 0;
         db_result_free(r);
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
         if (db_execute_non_query(db, "UPDATE repos SET path = ? WHERE id = ?",
                                  (const char *[]){ path, idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: path update to %s failed", (long long)id, path);
-        if (out_repo_id) *out_repo_id = id;
+        if (relabel) {
+            if (db_execute_non_query(db, "UPDATE repos SET label = ? WHERE id = ?",
+                                     (const char *[]){ label, idbuf, NULL }, NULL) != 0)
+                return set_error(ERR_IO, "cannot update label of repo %lld",
+                                 (long long)id);
+            out->label_updated = 1;
+        }
+        out->already_registered = 1;
+        out->id = id;
         return OK;
     }
     db_result_free(r);
@@ -511,7 +816,8 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
      * Adopt the existing UUID rather than minting a new one, so the repo
      * keeps its identity and a later reindex can repopulate its rows. */
     log_info("registering repo %s with pre-existing uuid %s", path, marker.uuid);
-    return insert_repo_row(db, marker.uuid, path, label, out_repo_id);
+    out->inserted = 1;
+    return insert_repo_row(db, marker.uuid, path, label, &out->id);
 }
 
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id)

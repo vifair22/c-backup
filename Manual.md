@@ -371,13 +371,30 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
 ```
 
 - A path that does not exist, or an empty directory, becomes a new
-  repository.
+  repository. Missing parent directories are created as `mkdir -p` would,
+  mode 0755; the repository directory itself is mode 0700. A path that
+  cannot be created (a parent is a regular file, a read-only filesystem, no
+  permission) is refused with HTTP 400 and the reason; only a failure of the
+  host itself, such as a full disk, is a 500.
 - A directory with a `.cbackup` marker is an existing repository and is
   re-registered, keeping its history. The UUID in the marker is its identity,
   not the path: move a repository, register the new location, and it links
   back to its snapshots.
+- Adding a repository that is already registered succeeds and says so
+  (`"already_registered":true`, HTTP 200 rather than 201). A label given
+  that differs from the stored one replaces it; leaving the label out keeps
+  the old one. Asking for an encryption mode the repository does not have is
+  refused: encryption is fixed when a repository is created.
+- Paths are stored normalised: `/srv/backup/main/` and
+  `/srv/backup//main` are both `/srv/backup/main`.
 - A non-empty directory without a marker is refused. Writing objects into
   somebody else's data is the failure this prevents.
+- A path inside a registered repository, or one containing a registered
+  repository, is refused with HTTP 400 naming that repository. One
+  repository's objects would otherwise sit in a directory the other owns, so
+  its garbage collection and verify would see them as strays, and deleting
+  either directory would take data from both. The comparison is on resolved
+  paths, so a symlink or `..` does not get around it.
 
 ### 5.2 Removing
 
@@ -742,6 +759,11 @@ create a new repository and replicate into it.
 sudo c-backup repo add /srv/backup/main "Main" --encrypt system
 sudo c-backup repo add /srv/backup/main "Main" --encrypt passphrase --passphrase '...'
 ```
+
+`--passphrase` on its own implies `--encrypt passphrase`. Giving one with
+`--encrypt none` or `--encrypt system` is refused, because neither mode can
+use it and silently dropping it would leave you believing a passphrase
+protects the repository.
 
 Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
 over AES-GCM because it does not depend on AES-NI. Hashes are of the
