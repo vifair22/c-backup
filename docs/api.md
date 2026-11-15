@@ -607,6 +607,27 @@ Both used to answer success for an id that did not exist, or that belonged
 to another repository, so a typo read as done while the schedule meant kept
 firing.
 
+The list carries the daemon's zone and each schedule's trigger and
+parameters as objects:
+
+```json
+{"timezone":"America/Chicago",
+ "schedules":[{"id":"2","action":"replicate",
+   "trigger":{"type":"calendar","every":"day","at":"03:00"},
+   "overlap":"skip","catchup":"skip","enabled":"1",
+   "next_due":"1794733200","next_due_iso":"2026-11-16T03:00:00-06:00",
+   "params":{"dest":"/mnt/nas/replica"}}]}
+```
+
+`trigger` and `params` were strings holding JSON, so every client parsed
+JSON out of JSON. `next_due` stays an epoch for scripts; `next_due_iso` is
+the same instant in the daemon's local time with its UTC offset. `timezone`
+is the `TZ` value, else the zone `/etc/localtime` names, else the
+abbreviation the C library reports (`UTC`). It is there because a container
+with no `TZ` runs in UTC, and a schedule meant for 03:00 local fired at 03:00
+UTC with nothing in the API to say so. `params` is absent for a schedule
+with none.
+
 The trigger is a nested object, validated at creation rather than at fire
 time:
 

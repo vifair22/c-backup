@@ -308,6 +308,18 @@ check "reject bad trigger" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST
      -d '{"action":"gc","trigger":{"type":"cron","spec":"* * * * *"}}' \
      http://localhost/repos/1/schedules)"
 contains "schedule listed" '"action":"gc"' "$(sock_body /repos/1/schedules)"
+# B051/B049: the trigger is an object rather than a string of JSON, and the
+# list says which zone calendar triggers run in, with a readable next fire.
+SL=$(sock_body /repos/1/schedules)
+contains "trigger is an object" '"trigger":{"type":"interval","seconds":3600}' "$SL"
+if [ -n "${TZ:-}" ]; then WANT_TZ="${TZ#:}"; else WANT_TZ="$(readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||')"; fi
+[ -n "$WANT_TZ" ] && contains "list names the daemon's zone" "\"timezone\":\"$WANT_TZ\"" "$SL"
+OFF=$(date +%z | sed 's/\(..\)$/:\1/')
+case "$SL" in
+    *'"next_due_iso":"'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"$OFF"'"'*)
+        ok "next fire is ISO 8601 with the local offset" ;;
+    *) bad "next fire is ISO 8601 with the local offset" "...$OFF" "$SL" ;;
+esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
 contains "schedule disabled" '"enabled":"0"' "$(sock_body /repos/1/schedules)"

@@ -184,6 +184,7 @@ docker run -d --name c-backupd \
   -v /srv/backup:/srv/backup \
   -v /home:/source/home:ro \
   -p 127.0.0.1:8765:8765 \
+  -e TZ=America/Chicago \
   <registry>/vifair22/c-backup:<tag>
 ```
 
@@ -194,6 +195,16 @@ docker run -d --name c-backupd \
   published port cannot reach the container's loopback. What is exposed is
   decided by `-p`. TCP serves only the health probes until an admin password
   is set.
+- **Set the time zone.** The image runs in UTC unless told otherwise, and
+  calendar schedules (section 10) fire in the daemon's local time, so on a
+  host in US Central `--at 03:00` would fire at 03:00 UTC, 21:00 the evening
+  before. Pass `-e TZ=America/Chicago` (any zone name from the tz database;
+  the image carries `tzdata`), or mount the host's zone read-only with
+  `-v /etc/localtime:/etc/localtime:ro`; `TZ` wins if both are given.
+  `c-backup schedule list` reports the zone in use (`timezone`) and each
+  schedule's next fire with its offset (`next_due_iso`), so a wrong zone is
+  visible before anything fires at the wrong hour. Changing the zone takes
+  effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
@@ -735,7 +746,10 @@ when it first fires.
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
-**Calendar** triggers use the host's local time. `every` is `day`, `week`
+**Calendar** triggers use the daemon's local time: the host's under systemd,
+UTC in the Docker image unless `TZ` is set (section 2.3). `schedule list`
+names the zone (`timezone`) and gives each next fire with its offset
+(`next_due_iso`). `every` is `day`, `week`
 (with `--on <weekday>`), `month` (with `--on-day 1-31`) or `year` (with
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice

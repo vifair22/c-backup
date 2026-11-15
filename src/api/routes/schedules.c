@@ -6,19 +6,99 @@
 #include "scheduler.h"
 #include "trigger.h"
 
+#include "cJSON.h"
+
 #include <cutils/json.h>
 #include <cutils/log.h>
 #include <cutils/mem.h>
 
+#include <limits.h>
 #include <regex.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static cutils_db_t *g_db;
 static scheduler_t *g_sched;
+
+/*
+ * The zone calendar triggers are evaluated in, by name where one can be
+ * found. A Docker image with no TZ runs in UTC, so "--at 03:00" fired at
+ * 03:00 UTC while the operator read it as their own 03:00, and nothing in
+ * the API said which zone the daemon was in.
+ *
+ * TZ first, since it overrides everything; then the /etc/localtime link,
+ * whose target names the zone; then Debian's /etc/timezone; and the
+ * abbreviation localtime reports ("UTC", "CST") when none of those say.
+ */
+static void daemon_timezone(char *out, size_t outsz)
+{
+    const char *tz = getenv("TZ");
+    char link[PATH_MAX];
+    const char *name = NULL;
+
+    if (tz && *tz) {
+        name = tz[0] == ':' ? tz + 1 : tz;
+    } else {
+        ssize_t n = readlink("/etc/localtime", link, sizeof(link) - 1);
+        if (n > 0) {
+            link[n] = '\0';
+            name = link;
+        } else {
+            FILE *f = fopen("/etc/timezone", "r");
+            if (f) {
+                if (fgets(link, sizeof(link), f)) {
+                    link[strcspn(link, "\r\n")] = '\0';
+                    if (link[0]) name = link;
+                }
+                fclose(f);
+            }
+        }
+    }
+    if (name) {
+        const char *zi = strstr(name, "zoneinfo/");
+        if (zi) name = zi + 9;
+        /* A name that does not fit is not a name; fall through to the
+         * abbreviation rather than report half of one. */
+        if (*name && strlen(name) < outsz) { memcpy(out, name, strlen(name) + 1); return; }
+    }
+
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    if (strftime(out, outsz, "%Z", &tm) == 0) snprintf(out, outsz, "UTC");
+}
+
+/* Local time with its offset, "2026-11-16T03:00:00-06:00", or "" for no
+ * instant. strftime's %z has no colon; ISO 8601 readers want one. */
+static void iso_local(time_t t, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    if (t <= 0) return;
+    struct tm tm;
+    if (!localtime_r(&t, &tm)) return;
+    char base[32], off[8];
+    if (strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &tm) == 0 ||
+        strftime(off, sizeof(off), "%z", &tm) != 5)
+        return;
+    snprintf(out, outsz, "%s%.3s:%.2s", base, off, off + 3);
+}
+
+/*
+ * Add a stored JSON column as a nested value. Both columns hold JSON this
+ * daemon wrote, and returning it as a string made every client parse JSON
+ * out of JSON. Should a row ever hold something unparseable it goes out as
+ * the string it is, which is still more use than dropping it.
+ */
+static void add_stored_json(cJSON *obj, const char *key, const char *text)
+{
+    cJSON *v = cJSON_Parse(text);
+    if (v) cJSON_AddItemToObject(obj, key, v);
+    else   cJSON_AddStringToObject(obj, key, text);
+}
 
 api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
 {
@@ -36,41 +116,42 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot list schedules");
     }
 
-    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
-    /* Create the array up front. json_resp_array_append_begin makes it
-     * lazily on first append, so a query with no rows omitted the key
-     * entirely and the response came back as {} - a second shape every
-     * client had to handle, and only when a collection happened to be
-     * empty. */
-    if (json_resp_ensure_array(resp, "schedules") != 0) {
-        /* Only fails on allocation trouble. Carrying on leaves the
-         * key absent, which is what every response did before, so
-         * there is nothing to unwind and nothing worth failing the
-         * request over. */
-    }
+    /* cJSON rather than the c-utils builder, which has no way to nest a
+     * parsed value inside an array element. */
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = root ? cJSON_AddArrayToObject(root, "schedules") : NULL;
+    if (!arr) { cJSON_Delete(root); db_result_free(r); return api_error(500, "out of memory"); }
+
+    char tz[128];
+    daemon_timezone(tz, sizeof(tz));
+    cJSON_AddStringToObject(root, "timezone", tz);
+
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        cutils_json_elem_t e;
-        if (json_resp_array_append_begin(resp, "schedules", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",        r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "action",    r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "trigger",   r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "overlap",   r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "catchup",   r->rows[i][5]) != 0
-               || json_elem_add_str(&e, "enabled",   r->rows[i][6]) != 0
-               || json_elem_add_str(&e, "next_due",  r->rows[i][8]) != 0;
+        char **row = r->rows[i];
+        cJSON *o = cJSON_CreateObject();
+        if (!o) break;
+        cJSON_AddStringToObject(o, "id",      row[0]);
+        cJSON_AddStringToObject(o, "action",  row[1]);
+        add_stored_json(o, "trigger", row[3]);
+        cJSON_AddStringToObject(o, "overlap", row[4]);
+        cJSON_AddStringToObject(o, "catchup", row[5]);
+        cJSON_AddStringToObject(o, "enabled", row[6]);
+        /* The epoch stays for scripts that compute with it; the ISO form,
+         * with the zone's offset, is what a person can read. */
+        cJSON_AddStringToObject(o, "next_due", row[8]);
+        char iso[48];
+        iso_local((time_t)strtoll(row[8], NULL, 10), iso, sizeof(iso));
+        cJSON_AddStringToObject(o, "next_due_iso", iso);
         /* Only where there is one: an empty string is what a NULL column
-         * reads back as, and every action but replicate has no parameters. */
-        if (!bad && r->rows[i][9] && r->rows[i][9][0])
-            bad = json_elem_add_str(&e, "params", r->rows[i][9]) != 0;
-        if (bad) break;
-        json_elem_commit(&e);
+         * reads back as, and several actions carry no parameters. */
+        if (row[9] && row[9][0]) add_stored_json(o, "params", row[9]);
+        cJSON_AddItemToArray(arr, o);
     }
     db_result_free(r);
 
-    char *body = NULL; size_t blen = 0;
-    if (json_resp_finalize(resp, &body, &blen) != 0)
-        return api_error(500, "cannot serialise response");
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) return api_error(500, "cannot serialise response");
     return api_ok(body);
 }
 

@@ -18,15 +18,41 @@ import type { MaintenanceOp } from '../shared/api'
 
 const api = window.cbackup
 
+interface Trigger {
+  type?: string
+  seconds?: number
+  every?: string
+  at?: string
+  on?: string
+  on_day?: number
+  on_month?: number
+}
+
+interface ScheduleParams {
+  dest?: string
+  paths?: string[]
+  pattern?: string
+}
+
+/* trigger and params arrive as objects. They were strings of JSON until
+ * the daemon stopped double-encoding them; a string is still accepted so
+ * an older daemon renders too. */
 interface Schedule {
   id: string
   action: string
-  trigger: string
+  trigger: Trigger | string
   overlap: string
   catchup: string
   enabled: string
   next_due: string
-  params?: string
+  next_due_iso?: string
+  params?: ScheduleParams | string
+}
+
+function asObject<T>(v: T | string | undefined): T | null {
+  if (v === undefined || v === '') return null
+  if (typeof v !== 'string') return v
+  try { return JSON.parse(v) as T } catch { return null }
 }
 
 interface Props {
@@ -60,32 +86,33 @@ const CADENCES: { label: string; seconds: number }[] = [
   { label: 'Weekly',      seconds: 604800 },
 ]
 
-function describeTrigger(raw: string): string {
-  try {
-    const t = JSON.parse(raw) as { type?: string; seconds?: number; spec?: string }
-    if (t.type === 'interval' && typeof t.seconds === 'number') {
-      const known = CADENCES.find(c => c.seconds === t.seconds)
-      if (known) return known.label
-      if (t.seconds % 86400 === 0) return `Every ${t.seconds / 86400} days`
-      if (t.seconds % 3600 === 0) return `Every ${t.seconds / 3600} hours`
-      return `Every ${t.seconds}s`
-    }
-    if (t.spec) return t.spec
-  } catch {
-    /* A trigger the daemon stored and this cannot read is still worth
-     * showing: the raw form tells an operator more than "unknown" does. */
+function describeTrigger(raw: Trigger | string): string {
+  const t = asObject<Trigger>(raw)
+  if (t?.type === 'interval' && typeof t.seconds === 'number') {
+    const known = CADENCES.find(c => c.seconds === t.seconds)
+    if (known) return known.label
+    if (t.seconds % 86400 === 0) return `Every ${t.seconds / 86400} days`
+    if (t.seconds % 3600 === 0) return `Every ${t.seconds / 3600} hours`
+    return `Every ${t.seconds}s`
   }
-  return raw
+  if (t?.type === 'calendar' && t.at) {
+    if (t.every === 'day') return `Daily at ${t.at}`
+    if (t.every === 'week') return `Weekly on ${t.on ?? '?'} at ${t.at}`
+    if (t.every === 'month') return `Monthly on day ${t.on_day ?? '?'} at ${t.at}`
+    if (t.every === 'year') return `Yearly on ${t.on_month ?? '?'}/${t.on_day ?? '?'} at ${t.at}`
+  }
+  /* A trigger the daemon stored and this cannot read is still worth
+   * showing: the raw form tells an operator more than "unknown" does. */
+  return typeof raw === 'string' ? raw : JSON.stringify(raw)
 }
 
-/* The destination or sources a schedule carries, if it carries any. */
-function describeParams(raw?: string): string | null {
-  if (!raw) return null
-  try {
-    const p = JSON.parse(raw) as { dest?: string; paths?: string[] }
-    if (p.dest) return p.dest
-    if (p.paths?.length) return p.paths.join(', ')
-  } catch { /* shown as nothing rather than as noise */ }
+/* The destination, sources or pattern a schedule carries, if any. */
+function describeParams(raw?: ScheduleParams | string): string | null {
+  const p = asObject<ScheduleParams>(raw)
+  if (!p) return null
+  if (p.dest) return p.dest
+  if (p.paths?.length) return p.paths.join(', ')
+  if (p.pattern) return `/${p.pattern}/`
   return null
 }
 
@@ -255,7 +282,7 @@ export function SchedulesView({ connName, repoPath, onBack }: Props): React.Reac
                 return (
                   <tr key={s.id} className="border-t border-border-subtle">
                     <td className="py-1.5 pr-3">{s.action}</td>
-                    <td className="py-1.5 pr-3">{describeTrigger(s.trigger)}</td>
+                    <td className="py-1.5 pr-3" title={s.next_due_iso ? `next: ${s.next_due_iso}` : undefined}>{describeTrigger(s.trigger)}</td>
                     <td className="py-1.5 pr-3 font-mono truncate max-w-[18rem]">
                       {target ?? <span className="text-text-muted">-</span>}
                     </td>

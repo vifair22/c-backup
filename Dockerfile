@@ -44,9 +44,13 @@ RUN if [ "$VARIANT" = asan ]; then \
 
 FROM debian:trixie-slim
 
+# tzdata because calendar schedules fire in local time, and without the zone
+# database TZ=America/Chicago silently means UTC: "--at 03:00" fired at 03:00
+# UTC, 21:00 the previous evening on the host. The container still defaults
+# to UTC; run it with -e TZ=<zone> to change that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 liblz4-1 libacl1 libsqlite3-0 \
-        libmicrohttpd12 libcurl4 \
+        libmicrohttpd12 libcurl4 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/build/bins/c-backupd /usr/local/bin/c-backupd

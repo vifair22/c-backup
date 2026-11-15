@@ -286,7 +286,7 @@ check    "a grep schedule with a bad pattern is refused" 1 "$RC"
 check    "--on-overlap queue is accepted" 0 \
     "$(cb schedule add 1 gc 3600 --on-overlap queue --catchup run_once >/dev/null 2>&1; echo $?)"
 GSID=$(cb schedule add 1 grep 1 --pattern 'passphrase is' | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-contains "a grep schedule stores its pattern" 'passphrase is' "$(cb schedule list 1)"
+contains "a grep schedule stores its pattern" '"params":{"pattern":"passphrase is"' "$(cb schedule list 1)"
 FIRED=0
 for _ in $(seq 1 50); do
     case "$(curl -s --unix-socket "$SOCK" 'http://localhost/repos/1/grep?limit=1')" in
