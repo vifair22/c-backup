@@ -1,31 +1,18 @@
 import React, { useState } from 'react'
 import { fmtSize, fmtNum, OBJECT_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
+import type { WireObjectLocate, WireObjectRef } from '../shared/wire'
 
 const api = window.cbackup
 
 /*
  * As the daemon sends them. Sizes came back as orig_size and phys_size, not
  * uncompressed_size, and a reference names the node rather than carrying a
- * "field" - so the size read as 0 B and the name column was blank. Every
- * integer is a string.
+ * "field" - so the size read as 0 B and the name column was blank. A
+ * reference's path is empty when the parent chain is broken.
  */
-interface LocateResult {
-  found?: boolean
-  type?: string
-  refcount?: string
-  orig_size?: string
-  phys_size?: string
-  location?: string
-  pack_id?: string
-}
-
-interface RefEntry {
-  snap_id: string
-  node_id: string
-  name: string
-  path?: string   /* full path; empty when the parent chain is broken */
-}
+type LocateResult = Partial<WireObjectLocate>
+type RefEntry = WireObjectRef
 
 interface Props {
   connName: string
@@ -114,7 +101,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
                 <div>
                   <div className="text-[10px] text-text-muted uppercase">Type</div>
                   <span className="text-xs font-semibold text-text-primary">
-                    {OBJECT_TYPE_NAMES[Number(locate.type ?? 0)] ?? `Unknown (${locate.type})`}
+                    {OBJECT_TYPE_NAMES[locate.type ?? 0] ?? `Unknown (${locate.type})`}
                   </span>
                 </div>
                 <div>
@@ -132,7 +119,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
                   <div className="text-[10px] text-text-muted uppercase">Stored</div>
                   <span className="text-xs text-text-primary">
                     {locate.location ?? '-'}
-                    {locate.pack_id !== undefined && Number(locate.pack_id) >= 0 && (
+                    {locate.pack_id != null && (
                       <span className="text-text-muted ml-1">#{locate.pack_id}</span>
                     )}
                   </span>
@@ -176,7 +163,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
               <tbody>
                 {refs.map((r, i) => (
                   <tr key={i}
-                    onClick={() => onNavigateToSnapshot?.(Number(r.snap_id))}
+                    onClick={() => onNavigateToSnapshot?.(r.snap_id)}
                     className="border-t border-border-default cursor-pointer hover:bg-surface-hover text-text-primary">
                     <td className="py-1 font-mono">#{r.snap_id}</td>
                     <td className="py-1 font-mono">{r.node_id}</td>

@@ -272,7 +272,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'PUT',
         path: `/repos/${req.repoId}/schedules/${req.scheduleId}`,
-        body: { enabled: req.enabled ? 1 : 0 },
+        body: { enabled: req.enabled },
       }
     case 'scheduleRemove':
       return { method: 'DELETE', path: `/repos/${req.repoId}/schedules/${req.scheduleId}` }

@@ -33,11 +33,9 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { fmtNum, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
+import type { WireSnapshot, WireTag } from '../shared/wire'
 
 const api = window.cbackup
-
-interface RawTag { name: string; snap_id?: string }
-interface RawSnapshot { id: string; ts: string; label?: string }
 
 interface Tag { name: string; snapId: number }
 interface Snapshot { id: number; ts: number; label: string }
@@ -67,14 +65,14 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
     setError(null)
     try {
       const [t, s] = await Promise.all([
-        api.apiCall<{ tags?: RawTag[] }>(connName, { kind: 'tagList', repoId }),
-        api.apiCall<{ snapshots?: RawSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 }),
+        api.apiCall<{ tags?: WireTag[] }>(connName, { kind: 'tagList', repoId }),
+        api.apiCall<{ snapshots?: WireSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 }),
       ])
       setTags((t.tags ?? [])
-        .map(x => ({ name: x.name, snapId: Number(x.snap_id ?? '0') }))
+        .map(x => ({ name: x.name, snapId: x.snap_id }))
         .sort((a, b) => a.name.localeCompare(b.name)))
       setSnaps((s.snapshots ?? []).map(x => ({
-        id: Number(x.id), ts: Number(x.ts), label: x.label ?? '',
+        id: x.id, ts: x.ts, label: x.label ?? '',
       })))
     } catch (err) {
       setError(String(err))

@@ -31,7 +31,7 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
   const handleCancel = async (taskId: number) => {
     setConfirmCancel(null)
     try {
-      await api.apiCall(connName, { kind: 'jobCancel', jobId: Number(taskId) })
+      await api.apiCall(connName, { kind: 'jobCancel', jobId: taskId })
     } catch (err) {
       setError(String(err))
     }
@@ -44,7 +44,7 @@ export function TaskListView({ jobs, connName, repoPath, onBack }: Props): React
   const sorted = [...list].sort((a, b) => {
     if (a.state === 'running' && b.state !== 'running') return -1
     if (a.state !== 'running' && b.state === 'running') return 1
-    return Number(b.id) - Number(a.id)
+    return b.id - a.id
   })
 
   return (

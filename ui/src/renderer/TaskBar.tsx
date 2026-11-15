@@ -27,16 +27,14 @@ export function TaskBar({ jobs, connName, repoPath, onViewTasks }: Props): React
   if (running.length === 0 && recentFailed.length === 0) return null
 
   const active = running[0]
-  /* current and total arrive as strings from the list route and numbers
-   * from the detail one, so both are coerced rather than trusted. */
-  const cur = Number(active?.current ?? 0)
-  const tot = Number(active?.total ?? 0)
+  const cur = active?.current ?? 0
+  const tot = active?.total ?? 0
   const pct = tot > 0 ? Math.round((cur / tot) * 100) : null
 
   const handleCancel = async (taskId: number, e: React.MouseEvent) => {
     e.stopPropagation()
     try {
-      await api.apiCall(connName, { kind: 'jobCancel', jobId: Number(taskId) })
+      await api.apiCall(connName, { kind: 'jobCancel', jobId: taskId })
     } catch { /* ignore */ }
   }
 

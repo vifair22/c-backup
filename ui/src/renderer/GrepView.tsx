@@ -15,30 +15,14 @@
  */
 
 import type { Job } from '../shared/api'
+import type { WireGrepHit, WireGrepRun } from '../shared/wire'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { absoluteTime } from './format'
 
 const api = window.cbackup
 
-interface GrepRun {
-  id: string
-  snapshot: string
-  pattern: string
-  started_at: string
-  finished_at: string
-  completed: string
-  files_scanned: string
-  files_matched: string
-  hits: string
-  truncated: string
-}
-
-interface Hit {
-  path: string
-  line: string
-  excerpt: string
-  node_id: string
-}
+type GrepRun = WireGrepRun
+type Hit = WireGrepHit
 
 interface Props {
   connName: string
@@ -48,7 +32,8 @@ interface Props {
   onBack: () => void
 }
 
-const n = (v?: string): number => Number(v ?? '0')
+/* A run that has finished without completing was cancelled partway. */
+const cancelled = (r: GrepRun): boolean => !r.completed && (r.finished_at ?? 0) > 0
 
 export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)
@@ -99,11 +84,11 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
   const openRun = async (run: GrepRun) => {
     setSelected(run)
     setHits([])
-    if (n(run.hits) === 0) return
+    if (run.hits === 0) return
     setLoadingHits(true)
     try {
       const r = await api.apiCall<{ hits?: Hit[] }>(connName, {
-        kind: 'grepHits', repoId, runId: Number(run.id), limit: 200,
+        kind: 'grepHits', repoId, runId: run.id, limit: 200,
       })
       setHits(r.hits ?? [])
     } catch (err) {
@@ -151,8 +136,8 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
           setJobId(null)
           setCancelling(false)
           const list = await loadRuns()
-          const runId = Number((job.result as { run_id?: number } | null | undefined)?.run_id ?? 0)
-          const run = runId > 0 ? list.find(r => Number(r.id) === runId) : undefined
+          const runId = (job.result as { run_id?: number } | null | undefined)?.run_id ?? 0
+          const run = runId > 0 ? list.find(r => r.id === runId) : undefined
           if (run) void openRun(run)
           if (job.state === 'failed' && job.error) setError(job.error)
         } catch (err) {
@@ -283,11 +268,11 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                     <td className="py-1.5 pr-3 font-mono truncate max-w-[9rem]">{r.pattern}</td>
                     {/* How many files the run opened. With a path set this is
                       * the number that shows the scoping worked. */}
-                    <td className="py-1.5 pr-3 text-text-muted">{n(r.files_scanned)}</td>
-                    <td className="py-1.5 pr-3">{n(r.hits)}</td>
+                    <td className="py-1.5 pr-3 text-text-muted">{r.files_scanned}</td>
+                    <td className="py-1.5 pr-3">{r.hits}</td>
                     <td className="py-1.5 whitespace-nowrap">
                       {absoluteTime(r.started_at)}
-                      {n(r.completed) !== 1 && n(r.finished_at) > 0 && (
+                      {cancelled(r) && (
                         <span className="text-status-warning ml-1" title="cancelled">*</span>
                       )}
                     </td>
@@ -306,14 +291,14 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                 * thirty of them.
                 */}
               <div className="text-xs text-text-secondary mb-2">
-                {n(selected.hits)} hit{n(selected.hits) === 1 ? '' : 's'} in{' '}
-                {n(selected.files_matched)} of {n(selected.files_scanned)} files
-                {!loadingHits && hits.length > 0 && hits.length < n(selected.hits) && (
+                {selected.hits} hit{selected.hits === 1 ? '' : 's'} in{' '}
+                {selected.files_matched} of {selected.files_scanned} files
+                {!loadingHits && hits.length > 0 && hits.length < selected.hits && (
                   <span className="text-text-muted">
                     {' '}- showing {hits.length}, at most ten per file
                   </span>
                 )}
-                {n(selected.truncated) > 0 && (
+                {selected.truncated && (
                   <span className="text-status-warning ml-2">
                     - stopped at the file limit, there may be more
                   </span>
@@ -321,7 +306,7 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                 {/* A cancelled run has real hits, just not all of them.
                   * Presenting them as a finished search would be a lie by
                   * omission. */}
-                {n(selected.completed) !== 1 && n(selected.finished_at) > 0 && (
+                {cancelled(selected) && (
                   <span className="text-status-warning ml-2">
                     - cancelled, these are the files it reached
                   </span>
