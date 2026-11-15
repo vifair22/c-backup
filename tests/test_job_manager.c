@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -211,6 +212,46 @@ static void test_a_busy_repo_does_not_block_another(void **state)
     assert_int_equal(peak_total, 2);
 }
 
+/*
+ * Finished jobs older than a month are dropped, at start and as jobs finish.
+ * A recent one stays, and so does anything not finished: age alone is never
+ * a reason to lose a job that is still running.
+ */
+static void insert_job(const char *state, long long ended_ago)
+{
+    char ended[32];
+    snprintf(ended, sizeof(ended), "%lld", (long long)time(NULL) - ended_ago);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (repo_id, action, state, started, ended)"
+        " VALUES (1, 'gc', ?, ?, ?)",
+        (const char *[]){ state, ended, ended, NULL }, NULL), 0);
+}
+
+static void test_old_finished_jobs_are_pruned_at_start(void **state)
+{
+    (void)state;
+    job_manager_stop(jm); jm = NULL;
+    insert_job("completed", 40LL * 86400);
+    insert_job("failed",    40LL * 86400);
+    insert_job("cancelled", 40LL * 86400);
+    insert_job("completed", 2LL * 86400);
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs"), 1);
+}
+
+static void test_old_finished_jobs_are_pruned_as_jobs_finish(void **state)
+{
+    (void)state;
+    insert_job("completed", 40LL * 86400);
+    submit(1, "gc");
+    wait_for(1);
+    usleep(200000);
+    /* The one just run is all that is left. */
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE ended < strftime('%s','now') - 86400"), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -218,6 +259,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_queued_jobs_all_complete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_different_repos_still_run_in_parallel, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_busy_repo_does_not_block_another, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_at_start, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_as_jobs_finish, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

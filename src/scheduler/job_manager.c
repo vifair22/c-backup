@@ -78,6 +78,33 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
     pthread_mutex_unlock(&jm->db_mu);
 }
 
+/*
+ * Finished jobs are kept for a month and then dropped.
+ *
+ * The jobs table is operational state: what is queued, what is running, and
+ * what just finished, so a client polling a job it started can read the end
+ * of it. The permanent record of what ran is the per-repository journal,
+ * written when each job ends. Without a limit the table only grew - a row per
+ * scheduled backup, verify and prune, forever - and every /jobs listing paid
+ * for it. A month covers any client still asking about a job it submitted.
+ *
+ * Run at start and after each job, under the same lock as every other jobs
+ * write. The delete is a range on finished rows and costs nothing measurable.
+ */
+#define JOB_RETAIN_SECONDS (30 * 24 * 3600)
+
+static void prune_finished_jobs(job_manager_t *jm)
+{
+    char cutoff[32];
+    snprintf(cutoff, sizeof(cutoff), "%lld",
+             (long long)time(NULL) - JOB_RETAIN_SECONDS);
+    if (db_execute_non_query(jm->db,
+            "DELETE FROM jobs WHERE state IN ('completed','failed','cancelled')"
+            " AND ended IS NOT NULL AND ended < ?",
+            (const char *[]){ cutoff, NULL }, NULL) != 0)
+        log_warn("job manager: cannot prune finished jobs");
+}
+
 typedef struct {
     job_manager_t *jm;
     int64_t        job_id;
@@ -216,6 +243,9 @@ static void *worker_main(void *arg)
                            took, detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
+        pthread_mutex_lock(&jm->db_mu);
+        prune_finished_jobs(jm);
+        pthread_mutex_unlock(&jm->db_mu);
 
         /*
          * A failed backup that nobody hears about is the whole reason
@@ -269,6 +299,7 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
             " error = 'interrupted by daemon restart'"
             " WHERE state IN ('running','queued')", NULL, NULL) != 0)
         log_warn("job manager: cannot clear stale jobs");
+    prune_finished_jobs(jm);
 
     jm->workers = calloc((size_t)max_parallel, sizeof(pthread_t));
     if (!jm->workers) { free(jm); return set_error(ERR_NOMEM, "job_manager_start: workers"); }

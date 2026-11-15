@@ -207,7 +207,7 @@ static void test_deregister_removes_row(void **state)
     int64_t id = 0;
     assert_int_equal(repo_register(db, TEST_ROOT "/gone", NULL, &id), OK);
     assert_int_equal(count_repos(), 1);
-    assert_int_equal(repo_deregister(db, id, 0), OK);
+    assert_int_equal(repo_deregister(db, id), OK);
     assert_int_equal(count_repos(), 0);
 
     /* The data directory survives: deregistering is not deleting. */

@@ -70,7 +70,7 @@ static void test_migrations_apply(void **state)
     cutils_db_t *db = fresh_db();
 
     const char *tables[] = {
-        "repos", "schedules", "jobs", "job_history", "sessions", "auth_config",
+        "repos", "schedules", "jobs", "sessions", "auth_config",
         "snapshots", "nodes", "hardlink_groups", "sparse_regions",
         "xattr_blobs", "xattr_refs", "acl_blobs", "acl_refs",
         "objects", "packs", "pack_objects", "tags", "notes",

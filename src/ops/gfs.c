@@ -386,12 +386,21 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             tier_expired[i] = 1;
     }
 
-    uint32_t snap_window = (policy->keep_snaps > 0) ? (uint32_t)policy->keep_snaps : 0;
-    uint32_t snap_window_start = 1;
-    if (snap_window > 0) {
-        uint32_t span = snap_window - 1;
-        snap_window_start = (new_snap_id > span) ? (new_snap_id - span) : 1;
-    }
+    /*
+     * keep_snaps is a minimum: the newest N snapshots stay whatever their
+     * tier. The newest is kept regardless (it is skipped below), so 0 and 1
+     * mean the same thing.
+     *
+     * 0 used to leave the window starting at snapshot 1, which put every
+     * snapshot inside it and made the whole pass a no-op. The pre-rewrite
+     * default was 1, the lift dropped it to 0, and from then on a retention
+     * pass with the shipped defaults - including a nightly scheduled one -
+     * deleted nothing, ever, while reporting success. The tier tests all
+     * passed keep_snaps = 3, so none of them saw it.
+     */
+    uint32_t snap_window = (policy->keep_snaps > 1) ? (uint32_t)policy->keep_snaps : 1;
+    uint32_t span = snap_window - 1;
+    uint32_t snap_window_start = (new_snap_id > span) ? (new_snap_id - span) : 1;
     uint32_t pruned_snaps = 0;
 
     for (uint32_t i = 0; i < n; i++) {

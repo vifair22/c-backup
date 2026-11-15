@@ -111,4 +111,7 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
 status_t repo_register(cutils_db_t *db, const char *path, const char *label,
                        int64_t *out_repo_id);
 
-status_t repo_deregister(cutils_db_t *db, int64_t repo_id, int purge);
+/* Remove the registration and its index rows. The repository directory is
+ * never touched: deleting backup data is the operator's act, not a side
+ * effect of an API call. */
+status_t repo_deregister(cutils_db_t *db, int64_t repo_id);

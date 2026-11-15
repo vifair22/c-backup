@@ -70,7 +70,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
     case 'repoRemove':
       return {
         method: 'DELETE',
-        path: `/repos/${req.repoId}${qs({ purge: req.purge ? 1 : undefined })}`,
+        path: `/repos/${req.repoId}`,
       }
 
     /* --- encryption --- */
