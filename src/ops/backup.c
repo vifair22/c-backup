@@ -87,6 +87,10 @@ typedef struct {
     pack_backup_writer_t *pack_w;
     /* Regular-file bytes handled and expected, for opts->bytes_cb. */
     uint64_t       bytes_done, bytes_total;
+    /* Inside the file being stored: how far the store has read into it, its
+     * size, and its index for the entry count. See store_bytes. */
+    uint64_t       file_bytes, file_size;
+    uint32_t       file_index;
     /* Which cache fields each device's filesystem can be trusted on, found
      * with one statfs per device rather than one per file. A backup spans a
      * handful of devices; past the table's size the rest are looked up each
@@ -214,8 +218,26 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
     }
 
     if (p->opts->bytes_cb)
-        p->opts->bytes_cb(p->opts->progress_ctx, p->bytes_done, p->bytes_total);
+        p->opts->bytes_cb(p->opts->progress_ctx, p->bytes_done + p->file_bytes,
+                          p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
+}
+
+/*
+ * Bytes read so far from the file being stored, from inside the store.
+ *
+ * Progress moved only between files, so a backup holding a 2 GiB file read
+ * "store, 1 of 16,857" with an unchanging byte count for the half minute the
+ * file took, and the event stream, which sends a frame when something
+ * changes, had nothing to send (B089). The count is capped at the file's
+ * size so a store path that rereads cannot carry it past the total.
+ */
+static void store_bytes(uint64_t bytes, void *ctx)
+{
+    pipeline_t *p = ctx;
+    p->file_bytes += bytes;
+    if (p->file_bytes > p->file_size) p->file_bytes = p->file_size;
+    report(p, "store", p->file_index, p->count);
 }
 
 /* The last path component; what the entry is called inside its parent. */
@@ -478,9 +500,19 @@ static status_t store_content(pipeline_t *p)
 
         object_write_t w;
         uint64_t _tr = phase_now();
+        p->file_bytes = 0;
+        p->file_size  = e->node.size;
+        p->file_index = i;
+        store_io_fn prev_io;
+        void *prev_io_ctx;
+        store_get_io_progress(p->store, &prev_io, &prev_io_ctx);
+        store_set_io_progress(p->store, store_bytes, p);
         status_t st = object_store_file_packed(p->store, fd, e->node.size,
                                                p->pack_w,
                                                e->node.content_hash, &w);
+        store_set_io_progress(p->store, prev_io, prev_io_ctx);
+        /* The whole file is counted into bytes_done when the loop moves on. */
+        p->file_bytes = 0;
         phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
@@ -535,6 +567,11 @@ static status_t store_content(pipeline_t *p)
 
     if (in_txn && db_txn_commit(p->db) != OK)
         log_warn("backup: cache commit failed");
+    /* The last entry is finished too. Each file is counted when the loop
+     * moves past it, and nothing moves past the last one, so every later
+     * phase reported the byte count without it: a single-file backup went
+     * from most of the file back to 0 as the trees were built. */
+    p->bytes_done = p->bytes_total;
     return OK;
     #undef CACHE_BATCH
     #undef PACK_ROLLOVER_HEADROOM
@@ -1155,7 +1192,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
                      (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0,
-                     { { 0, 0 } }, 0 };
+                     0, 0, 0, { { 0, 0 } }, 0 };
 
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else

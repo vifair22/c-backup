@@ -35,6 +35,14 @@ typedef struct {
     void           *userdata;
 } route_entry_t;
 
+#define MAX_ALLOW_FNS 8
+
+typedef struct {
+    char          pattern[128];   /* ends in '*' */
+    api_allow_fn  fn;
+    void         *userdata;
+} allow_entry_t;
+
 /* --- POST body accumulator --- */
 
 typedef struct {
@@ -52,6 +60,8 @@ struct api_server {
     char              *static_dir;
     route_entry_t      routes[MAX_ROUTES];
     int                nroutes;
+    allow_entry_t      allow_fns[MAX_ALLOW_FNS];
+    int                nallow;
     api_auth_fn        auth_fn;
     void              *auth_ud;
     void              *_tcp_cls;   /* mhd_cls_t for TCP daemon */
@@ -72,14 +82,23 @@ typedef struct {
 
 /* --- Helpers --- */
 
+/*
+ * HEAD is a GET whose body MHD drops. Anything else unrecognised is
+ * API_OTHER, never a GET: every unknown method used to become one, so
+ * PATCH /repos/1 returned the repository with a 200 and looked like a
+ * successful update that had changed nothing (B085).
+ */
 static api_method_t method_from_string(const char *method)
 {
     if (strcmp(method, "GET") == 0)    return API_GET;
+    if (strcmp(method, "HEAD") == 0)   return API_GET;
     if (strcmp(method, "POST") == 0)   return API_POST;
     if (strcmp(method, "PUT") == 0)    return API_PUT;
     if (strcmp(method, "DELETE") == 0) return API_DELETE;
-    return API_GET;
+    return API_OTHER;
 }
+
+static const char *const METHOD_NAMES[] = { "GET", "POST", "PUT", "DELETE" };
 
 static const route_entry_t *find_route(const api_server_t *srv,
                                        const char *url, api_method_t method)
@@ -109,6 +128,39 @@ static const route_entry_t *find_route(const api_server_t *srv,
         }
     }
     return best;
+}
+
+/*
+ * The Allow value for a URL that has no route for the request's method, or
+ * NULL when no method has one either, which makes it a 404.
+ *
+ * A module's own resolver wins for the paths under its wildcard, since only
+ * it knows which of them exist and what each answers. Otherwise the answer
+ * is the set of methods with a route matching the URL.
+ */
+static const char *allowed_methods(const api_server_t *srv, const char *url,
+                                   char *buf, size_t bufsz)
+{
+    const allow_entry_t *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < srv->nallow; i++) {
+        const char *pat = srv->allow_fns[i].pattern;
+        size_t plen = strlen(pat);
+        if (strncmp(url, pat, plen - 1) != 0) continue;
+        if (!best || plen > best_len) { best = &srv->allow_fns[i]; best_len = plen; }
+    }
+    if (best) return best->fn(url, best->userdata);
+
+    buf[0] = '\0';
+    size_t used = 0;
+    for (int m = API_GET; m <= API_DELETE; m++) {
+        if (!find_route(srv, url, (api_method_t)m)) continue;
+        int n = snprintf(buf + used, bufsz - used, "%s%s",
+                         used ? ", " : "", METHOD_NAMES[m]);
+        if (n < 0 || (size_t)n >= bufsz - used) break;
+        used += (size_t)n;
+    }
+    return used ? buf : NULL;
 }
 
 static const char *get_header(struct MHD_Connection *conn, const char *name)
@@ -182,10 +234,10 @@ char *api_cookie_clear(const char *name, int secure)
     return strdup(buf);
 }
 
-static enum MHD_Result send_response_ra(struct MHD_Connection *conn,
-                                        int status, const char *content_type,
-                                        const char *body, const char *set_cookie,
-                                        int retry_after)
+static enum MHD_Result send_response_full(struct MHD_Connection *conn,
+                                          int status, const char *content_type,
+                                          const char *body, const char *set_cookie,
+                                          int retry_after, const char *allow)
 {
     size_t len = body ? strlen(body) : 0;
     /* MHD copies the buffer with RESPMEM_MUST_COPY, safe to discard const */
@@ -206,10 +258,21 @@ static enum MHD_Result send_response_ra(struct MHD_Connection *conn,
         snprintf(ra, sizeof(ra), "%d", retry_after);
         MHD_add_response_header(resp, "Retry-After", ra);
     }
+    if (allow)
+        MHD_add_response_header(resp, "Allow", allow);
 
     enum MHD_Result ret = MHD_queue_response(conn, (unsigned int)status, resp);
     MHD_destroy_response(resp);
     return ret;
+}
+
+static enum MHD_Result send_response_ra(struct MHD_Connection *conn,
+                                        int status, const char *content_type,
+                                        const char *body, const char *set_cookie,
+                                        int retry_after)
+{
+    return send_response_full(conn, status, content_type, body, set_cookie,
+                              retry_after, NULL);
 }
 
 static enum MHD_Result send_response(struct MHD_Connection *conn,
@@ -493,7 +556,44 @@ static enum MHD_Result request_handler(void *cls,
     api_method_t api_method = method_from_string(method);
 
     /* Try API routes first */
-    const route_entry_t *route = find_route(srv, url, api_method);
+    const route_entry_t *route = api_method == API_OTHER
+                               ? NULL : find_route(srv, url, api_method);
+
+    /*
+     * A path the API knows, asked with a method it does not answer: 405 and
+     * what it does answer. Behind the same auth as the routes themselves, so
+     * an unauthenticated caller learns nothing it could not learn from a 401.
+     */
+    char allow_buf[64];
+    const char *allow = route ? NULL
+                      : allowed_methods(srv, url, allow_buf, sizeof(allow_buf));
+    if (allow) {
+        char peer[INET6_ADDRSTRLEN];
+        peer_address(conn, is_local, peer, sizeof(peer));
+        api_request_t req = {
+            .method      = api_method,
+            .url         = url,
+            .auth_token  = get_header(conn, "Authorization"),
+            .is_local    = is_local,
+            .client_addr = peer,
+            ._conn       = conn,
+        };
+        int verdict = srv->auth_fn ? srv->auth_fn(&req, url, srv->auth_ud)
+                                   : API_AUTH_ALLOW;
+        free(pb->data);
+        free(pb);
+        *req_cls = NULL;
+        if (verdict == API_AUTH_NOT_CONFIGURED)
+            return send_response(conn, 403, "application/json",
+                "{\"error\":\"not configured: set the admin password "
+                "with 'c-backup auth setup' on the daemon's host\"}", NULL);
+        if (verdict != API_AUTH_ALLOW)
+            return send_response(conn, 401, "application/json",
+                "{\"error\":\"unauthorized\"}", NULL);
+        return send_response_full(conn, 405, "application/json",
+            "{\"error\":\"method not allowed\"}", NULL, 0, allow);
+    }
+
     if (route) {
         char peer[INET6_ADDRSTRLEN];
         peer_address(conn, is_local, peer, sizeof(peer));
@@ -537,9 +637,9 @@ static enum MHD_Result request_handler(void *cls,
 
         api_response_t resp = route->handler.buffered(&req, route->userdata);
 
-        enum MHD_Result ret = send_response_ra(conn, resp.status,
+        enum MHD_Result ret = send_response_full(conn, resp.status,
             resp.content_type ? resp.content_type : "application/json",
-            resp.body, resp.set_cookie, resp.retry_after);
+            resp.body, resp.set_cookie, resp.retry_after, resp.allow);
 
         free(resp.body);
         free(resp.set_cookie);
@@ -685,6 +785,21 @@ int api_server_route_streaming(api_server_t *srv, const char *pattern,
     r->handler.streaming = handler;
     r->userdata = userdata;
 
+    return CUTILS_OK;
+}
+
+int api_server_route_allow(api_server_t *srv, const char *pattern,
+                           api_allow_fn fn, void *userdata)
+{
+    size_t plen = strlen(pattern);
+    if (plen == 0 || pattern[plen - 1] != '*')
+        return set_error(CUTILS_ERR, "allow resolver pattern must end in '*'");
+    if (srv->nallow >= MAX_ALLOW_FNS)
+        return set_error(CUTILS_ERR, "too many allow resolvers");
+    allow_entry_t *a = &srv->allow_fns[srv->nallow++];
+    snprintf(a->pattern, sizeof(a->pattern), "%s", pattern);
+    a->fn = fn;
+    a->userdata = userdata;
     return CUTILS_OK;
 }
 
@@ -866,6 +981,13 @@ api_response_t api_error(int status, const char *message)
         .body = CUTILS_MOVE(body),
         .content_type = "application/json",
     };
+}
+
+api_response_t api_method_not_allowed(const char *allow)
+{
+    api_response_t r = api_error(405, "method not allowed");
+    r.allow = allow;
+    return r;
 }
 
 api_response_t api_no_content(void)

@@ -1538,18 +1538,21 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    int nlim = 0;
+    /* Offset too: a run list is a collection like any other, and the CLI's
+     * --offset would otherwise be accepted and ignored (B084). */
+    int nlim = 0, noff = 0;
     api_response_t page_err;
-    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
-    char limit[16];
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
+    char limit[16], offset[16];
     snprintf(limit, sizeof(limit), "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, snap_id, pattern, started_at, finished_at, completed,"
             "       files_scanned, files_matched, hits, truncated"
-            "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
-            (const char *[]){ repo, limit, NULL }, &r) != 0) {
+            "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, limit, offset, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list searches");
     }
@@ -1662,19 +1665,22 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    int nlim = 0;
+    /* Offset too: a run list is a collection like any other, and the CLI's
+     * --offset would otherwise be accepted and ignored (B084). */
+    int nlim = 0, noff = 0;
     api_response_t page_err;
-    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
-    char limit[16];
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
+    char limit[16], offset[16];
     snprintf(limit, sizeof(limit), "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, started_at, finished_at, level, completed, checked, ok,"
             "       repaired, unrecoverable, missing, bytes_read,"
             "       affected_files, affected_snapshots, recoverable"
-            "  FROM verify_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
-            (const char *[]){ repo, limit, NULL }, &r) != 0) {
+            "  FROM verify_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (const char *[]){ repo, limit, offset, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list verify runs");
     }

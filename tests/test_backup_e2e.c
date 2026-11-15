@@ -32,6 +32,7 @@
 #include "pack.h"
 #include "object.h"
 #include "repo.h"
+#include "restore.h"
 #include "store.h"
 #include "store_index.h"
 
@@ -880,10 +881,129 @@ static void test_backup_removes_staging_files_left_by_a_killed_run(void **state)
     assert_int_equal(stat(TEST_REPO "/tmp/notes.txt", &sb), 0);
 }
 
+/*
+ * B089: bytes move while one large file is stored or restored.
+ *
+ * Progress was reported between files only, so a backup of a 2 GiB file sat
+ * at one entry and one byte count for the half minute it took, and so did
+ * the event stream built on it. These record every byte count a run reports
+ * and ask for one strictly inside a single large file: a value that only
+ * the store loops, not the per-file accounting, can produce.
+ */
+typedef struct {
+    uint64_t total;
+    int      mid;       /* reports with 0 < done < total */
+    uint64_t last;
+    int      backwards; /* a report below the one before it */
+} bytes_seen_t;
+
+static void note_bytes(void *ctx, uint64_t done, uint64_t total)
+{
+    bytes_seen_t *b = ctx;
+    if (done < b->last) b->backwards++;
+    b->last = done;
+    b->total = total;
+    if (done > 0 && done < total) b->mid++;
+}
+
+static void ignore_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)phase; (void)done; (void)total; (void)ctx;
+}
+
+static int64_t only_snapshot(void)
+{
+    db_result_t *r = NULL;
+    int64_t id = -1;
+    if (db_execute(db, "SELECT MAX(id) FROM snapshots", NULL, &r) == 0 && r && r->nrows == 1)
+        id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
+static void restore_and_watch(const char *dest, uint64_t size)
+{
+    bytes_seen_t seen = { 0, 0, 0, 0 };
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.bytes_cb = note_bytes;
+    ro.progress_cb = ignore_progress;
+    ro.progress_ctx = &seen;
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot(), dest, &ro, &rr), OK);
+    assert_int_equal(seen.total, size);
+    assert_int_equal(seen.last, size);
+    assert_true(seen.mid > 0);
+    assert_int_equal(seen.backwards, 0);
+}
+
+static void test_bytes_move_inside_one_large_file(void **state)
+{
+    (void)state;
+    const uint64_t size = 64u << 20;
+    write_big(TEST_DIR "/big.bin", 64);
+    static const char *paths[] = { TEST_DIR "/big.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    bytes_seen_t seen = { 0, 0, 0, 0 };
+    o.bytes_cb = note_bytes;
+    o.progress_cb = ignore_progress;
+    o.progress_ctx = &seen;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_int_equal(seen.total, size);
+    assert_true(seen.mid > 0);
+    assert_int_equal(seen.backwards, 0);
+
+    /* The hook is the run's, not the handle's: it is gone afterwards. */
+    store_io_fn fn = NULL;
+    void *fctx = NULL;
+    store_get_io_progress(store, &fn, &fctx);
+    assert_null(fn);
+
+    /* Restored from the loose object, then again once it is packed. */
+    restore_and_watch(TEST_DIR "/out1", size);
+    uint32_t packed = 0;
+    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
+    assert_true(packed >= 1);
+    restore_and_watch(TEST_DIR "/out2", size);
+}
+
+/* The sparse writer has its own read loop, so it is checked on its own. */
+static void test_bytes_move_inside_one_sparse_file(void **state)
+{
+    (void)state;
+    int fd = open(TEST_DIR "/sparse.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    char *buf = malloc(1 << 20);
+    assert_non_null(buf);
+    memset(buf, 'x', 1 << 20);
+    for (int i = 0; i < 32; i++)
+        assert_int_equal(write(fd, buf, 1 << 20), 1 << 20);
+    free(buf);
+    /* A trailing hole makes it sparse. */
+    assert_int_equal(ftruncate(fd, (off_t)64 << 20), 0);
+    close(fd);
+
+    static const char *paths[] = { TEST_DIR "/sparse.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    bytes_seen_t seen = { 0, 0, 0, 0 };
+    o.bytes_cb = note_bytes;
+    o.progress_cb = ignore_progress;
+    o.progress_ctx = &seen;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_int_equal(seen.total, (uint64_t)64 << 20);
+    assert_true(seen.mid > 0);
+    assert_int_equal(seen.backwards, 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_large_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_sparse_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_written, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_is_internally_consistent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_root_tree_is_walkable, setup, teardown),

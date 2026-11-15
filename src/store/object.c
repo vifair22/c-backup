@@ -539,7 +539,11 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                 size_t ask = want - got;
                 if (ask > CANCEL_READ_MAX) ask = CANCEL_READ_MAX;
                 ssize_t r = read(src_fd, buf + got, ask);
-                if (r > 0) { got += (size_t)r; retries = 0; last_was_seek = 0; continue; }
+                if (r > 0) {
+                    got += (size_t)r; retries = 0; last_was_seek = 0;
+                    store_io_progress(store, (uint64_t)r);
+                    continue;
+                }
                 if (r == -1 && errno == EINTR) continue;
                 if (r == -1 && retries < 3 &&
                     (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
@@ -1112,6 +1116,7 @@ static status_t write_sparse_object_stream(store_t *store, int fd,
             }
             st = sp_emit(&em, buf, (size_t)got);
             if (st != OK) break;
+            store_io_progress(store, (uint64_t)got);
             remaining -= (uint64_t)got;
         }
     }
@@ -1426,6 +1431,7 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                 return set_error_errno(ERR_IO, "store: read for pack staging");
             }
             if (src_path) close(fd);
+            store_io_progress(store, file_size);
             status_t pst = pack_backup_add(pack_w, OBJECT_TYPE_FILE, buf,
                                            (size_t)file_size, out_hash,
                                            out_is_new, out_phys_bytes,
@@ -1904,6 +1910,7 @@ status_t object_load_stream(store_t *store,
             }
             if (EVP_DigestUpdate(mdctx, buf, want) != 1) { st = set_error(ERR_IO, "load_stream: SHA256 update failed"); break; }
             if (io_write_full(out_fd, buf, want) != 0)      { st = set_error_errno(ERR_IO, "load_stream: write to out_fd"); break; }
+            store_io_progress(store, (uint64_t)want);
             remaining -= want;
         }
         free(buf);

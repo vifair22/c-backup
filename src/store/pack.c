@@ -1393,6 +1393,8 @@ status_t pack_object_load_stream(store_t *store,
                     if (EVP_DigestUpdate(mdctx, dst, dst_sz) != 1 ||
                         write_full_fd(out_fd, dst, dst_sz) != 0)
                         fst = set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed");
+                    else
+                        store_io_progress(store, (uint64_t)dst_sz);
                 }
                 srcp     += src_sz;
                 src_left -= src_sz;
@@ -1517,6 +1519,7 @@ status_t pack_object_load_stream(store_t *store,
             if (pn) {
                 if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
                 if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
+                store_io_progress(store, (uint64_t)pn);
             }
             par_ptr += grp_par;
             par_left = par_left > grp_par ? par_left - grp_par : 0;
@@ -1568,6 +1571,7 @@ status_t pack_object_load_stream(store_t *store,
         if (pn) {
             if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
             if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
+            store_io_progress(store, (uint64_t)pn);
         }
         remaining -= want;
     }
