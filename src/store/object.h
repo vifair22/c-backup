@@ -120,6 +120,20 @@ status_t object_load(store_t *store,
 int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /*
+ * Bytes the loose file for `hash` occupies, or 0 when there is no loose file
+ * (absent, or packed). One fstatat, no resolver query.
+ *
+ * Writers report this, rather than 0, for an object that already existed.
+ * A backup killed between installing a loose object and committing its
+ * index row leaves the file with no row, and the next run deduplicates
+ * against the file and records the row from what the writer said; saying 0
+ * filed a 2 GiB object as zero bytes and summary under-reported by that.
+ * A packed object already has its row, written by the pack commit, so it
+ * needs no size from here.
+ */
+uint64_t object_loose_phys_size(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+/*
  * Stream object content to out_fd without buffering the entire payload in RAM.
  * Safe for large OBJECT_TYPE_FILE objects that would fail object_load with
  * ERR_TOO_LARGE.  out_size and out_type may be NULL.

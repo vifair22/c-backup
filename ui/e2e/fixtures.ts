@@ -77,7 +77,7 @@ export interface Harness {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-function cli(sock: string, args: string[]): string {
+export function cli(sock: string, args: string[]): string {
   const r = spawnSync(CLI, ['--socket', sock, ...args], { encoding: 'utf-8' })
   return (r.stdout ?? '') + (r.stderr ?? '')
 }
@@ -96,7 +96,7 @@ function freePort(): Promise<number> {
 }
 
 function idFrom(out: string): number {
-  const m = out.match(/"id":"?(\d+)"?/)
+  const m = out.match(/"id":(\d+)/)
   return m ? Number(m[1]) : 0
 }
 

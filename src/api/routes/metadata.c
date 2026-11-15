@@ -3,8 +3,15 @@
 
 #include "routes.h"
 #include "db_txn.h"
+#include "repo_tags.h"
+#include "util.h"
+#include "json_row.h"
 
+#include <ctype.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -21,9 +28,9 @@
  * the whole reason the hand-rolled formats existed in the first place.
  *
  * Tags and notes are user-authored. Losing them is losing work, not losing
- * an index, so section 5.4 marks them for inclusion in the snapshot record
- * once that carries more than the root hash. Until then they live only in
- * the database, and that is a known gap rather than an oversight.
+ * an index. Tags are also the retention guard, so they are written into the
+ * repository as well (repo_tags.h) and a reindex brings them back. Notes
+ * still live only in the database, a known gap rather than an oversight.
  */
 
 static cutils_db_t *g_db;
@@ -37,6 +44,33 @@ static api_response_t finalise(cutils_json_resp_t *resp)
 }
 
 /* ---------- tags ---------- */
+
+/*
+ * Mirror the repository's tags into its directory, inside the caller's
+ * transaction. A failure here fails the request: a tag that exists only in
+ * the database is exactly the unprotected-after-recovery state this file
+ * was added to close, and saying ok over it would hide that.
+ */
+static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT path FROM repos WHERE id = ?",
+                   (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        snprintf(err, errsz, "cannot find the repository's path");
+        return -1;
+    }
+    status_t st = repo_tags_save(g_db, repo_id, r->rows[0][0]);
+    db_result_free(r);
+    if (st != OK) {
+        snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 0;
+}
 
 api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
 {
@@ -69,13 +103,58 @@ api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "tags", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "name",    r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0;
+        int bad = jrow_elem_add(&e, "name",    JCOL_STR, r->rows[i][0]) != 0
+               || jrow_elem_add(&e, "snap_id", JCOL_INT, r->rows[i][1]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
     db_result_free(r);
     return finalise(resp);
+}
+
+/*
+ * What a tag may be called: [A-Za-z0-9][A-Za-z0-9._-]{0,63}.
+ *
+ * A tag name is the last segment of DELETE /repos/<id>/tags/<name>, so it
+ * has to survive being a path segment. Restricting the name is what makes
+ * that hold for every client, rather than trusting each one to
+ * percent-encode: "a b" was accepted at set time and could then never be
+ * removed from the CLI, because the unencoded space made the request line
+ * invalid and the server answered with an HTML error page. A slash cannot
+ * round-trip either, since the server decodes %2F before routing, and a '?'
+ * truncated the name to whatever preceded it. The leading alphanumeric
+ * rules out "." and "..", which clients and proxies may collapse before a
+ * request leaves them.
+ *
+ * Only set validates. Remove accepts any non-empty name, so a tag stored
+ * before this rule existed can still be addressed (percent-encoded) and
+ * deleted.
+ */
+#define TAG_NAME_MAX 64
+
+static int tag_name_valid(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n > TAG_NAME_MAX) return 0;
+    if (!isalnum((unsigned char)s[0])) return 0;
+    for (size_t i = 1; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return 0;
+    }
+    return 1;
+}
+
+/* Tags and notes hang off a snapshot id with no foreign key behind it, so
+ * routes that accepted any number stored metadata for snapshots that never
+ * existed: a tag on 999 protected nothing and listed as if it did. */
+static int snapshot_exists(const char *repo, const char *sid)
+{
+    db_result_t *r = NULL;
+    int found = db_execute(g_db,
+            "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, sid, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
 }
 
 api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
@@ -87,24 +166,71 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
 
     CUTILS_AUTOFREE char *name = NULL;
     uint32_t snap = 0;
-    if (json_req_get_str(body, "name", &name) != 0 || !name)
+    bool move = false;
+    if (json_req_get_str(body, "name", &name) != 0 || !name || !name[0])
         return api_error(400, "name is required");
+    if (!tag_name_valid(name))
+        return api_error(400, "invalid tag name: use 1-64 of A-Z a-z 0-9 . _ -,"
+                              " starting with a letter or digit");
     if (json_req_get_u32(body, "snap_id", &snap, 1, UINT32_MAX) != 0)
         return api_error(400, "snap_id is required");
+    if (json_req_has(body, "move") && json_req_get_bool(body, "move", &move) != 0)
+        return api_error(400, "move must be true or false");
 
     char repo[32], sid[32], now[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(sid,  sizeof(sid),  "%u", snap);
     snprintf(now,  sizeof(now),  "%lld", (long long)time(NULL));
 
-    /* A tag names one snapshot; re-tagging moves it rather than erroring,
-     * which is what "tag this one instead" should do. */
+    if (!snapshot_exists(repo, sid))
+        return api_error(404, "no such snapshot");
+
+    /*
+     * A tag names one snapshot, and setting an existing name on a different
+     * snapshot is refused unless the caller says move. It used to move
+     * silently, and a tag is retention protection: "tag set keep-forever 2"
+     * typed for the wrong tag stripped snapshot 1 of its protection, and the
+     * next gfs pass planned to delete it with nothing having said so.
+     * Setting the same snapshot again succeeds, so a retried request is
+     * harmless.
+     *
+     * The check and the write share a transaction so a concurrent set cannot
+     * land between them and be overwritten unseen.
+     */
+    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT snap_id FROM tags WHERE repo_id = ? AND name = ?",
+                   (const char *[]){ repo, name, NULL }, &r) != 0) {
+        db_result_free(r);
+        db_txn_rollback(g_db);
+        return api_error(500, "cannot read tags");
+    }
+    if (r && r->nrows == 1 && strcmp(r->rows[0][0], sid) != 0 && !move) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "tag '%s' is already on snapshot %s; to move it, send"
+                 " \"move\":true (tag set --move from the CLI)",
+                 name, r->rows[0][0]);
+        db_result_free(r);
+        db_txn_rollback(g_db);
+        return api_error(409, msg);
+    }
+    db_result_free(r);
+
     if (db_execute_non_query(g_db,
             "INSERT INTO tags (repo_id, name, snap_id, created_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, name) DO UPDATE SET snap_id = excluded.snap_id",
-            (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0)
+            (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0) {
+        db_txn_rollback(g_db);
         return api_error(500, "cannot set tag");
+    }
+    char merr[PATH_MAX + 128];
+    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
+        db_txn_rollback(g_db);
+        return api_error(500, merr);
+    }
+    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit tag");
 
     char *out = strdup("{\"ok\":true}");
     return out ? api_ok(out) : api_error(500, "out of memory");
@@ -117,10 +243,26 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     if (!name || !name[0]) return api_error(400, "tag name required");
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int affected = 0;
+    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
     if (db_execute_non_query(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
-            (const char *[]){ repo, name, NULL }, NULL) != 0)
+            (const char *[]){ repo, name, NULL }, &affected) != 0) {
+        db_txn_rollback(g_db);
         return api_error(500, "cannot delete tag");
+    }
+    /* A typo used to succeed silently, which reads as "removed" to anybody
+     * checking the exit code, while the tag it meant stayed in place. */
+    if (affected == 0) {
+        db_txn_rollback(g_db);
+        return api_error(404, "no such tag");
+    }
+    char merr[PATH_MAX + 128];
+    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
+        db_txn_rollback(g_db);
+        return api_error(500, merr);
+    }
+    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit");
     return api_no_content();
 }
 
@@ -167,6 +309,9 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
     snprintf(sid,  sizeof(sid),  "%lld", (long long)snap_id);
     snprintf(now,  sizeof(now),  "%lld", (long long)time(NULL));
 
+    if (!snapshot_exists(repo, sid))
+        return api_error(404, "no such snapshot");
+
     if (db_execute_non_query(g_db,
             "INSERT INTO notes (repo_id, snap_id, body, updated_at)"
             " VALUES (?, ?, ?, ?)"
@@ -181,6 +326,60 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
 
 /* ---------- policy ---------- */
 
+/*
+ * Every key something in the daemon reads, and what it must hold.
+ *
+ * The route stored any key and any value and answered {"ok":true}, so
+ * "retention.keep_hourly 5" (no such tier), "keep_daily banana" and
+ * "keep_weekly -3" all looked accepted. The GFS job then read banana as
+ * atoi's 0, which means "no limit" for a tier, and an unknown key did
+ * nothing at all: the operator was told yes and got something else. A key
+ * belongs here only when something acts on it.
+ */
+typedef enum { POLICY_COUNT, POLICY_BOOL } policy_kind_t;
+
+static const struct {
+    const char   *key;
+    policy_kind_t kind;
+} k_policy_keys[] = {
+    { "retention.keep_snaps",   POLICY_COUNT },
+    { "retention.keep_daily",   POLICY_COUNT },
+    { "retention.keep_weekly",  POLICY_COUNT },
+    { "retention.keep_monthly", POLICY_COUNT },
+    { "retention.keep_yearly",  POLICY_COUNT },
+    { "maintenance.auto_pack",  POLICY_BOOL  },
+};
+#define N_POLICY_KEYS ((int)(sizeof(k_policy_keys) / sizeof(k_policy_keys[0])))
+
+int routes_policy_count(const char *text, int *out)
+{
+    /* Digits only: no sign, no space, no hex. strtol alone would take
+     * " 12", "+3" and "12abc" as numbers, and "-3" as a count. */
+    if (!text || !*text) return -1;
+    long v = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > INT_MAX) return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+/* Accept what a human would plausibly type rather than one blessed
+ * spelling. Returns 1, 0, or -1 for anything else. */
+static int policy_bool(const char *v)
+{
+    if (!v) return -1;
+    if (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+        strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0)
+        return 1;
+    if (strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
+        strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0)
+        return 0;
+    return -1;
+}
+
 int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def)
 {
     if (!db || !key) return def;
@@ -194,21 +393,12 @@ int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int de
         return def;
     }
 
-    const char *v = r->rows[0][0];
-    /* Accept what a human would plausibly type rather than one blessed
-     * spelling; anything unrecognised falls back to the default rather than
-     * silently reading as false. */
-    int out = def;
-    if (v) {
-        if (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
-            strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0)
-            out = 1;
-        else if (strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
-                 strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0)
-            out = 0;
-    }
+    /* Anything unrecognised falls back to the default rather than silently
+     * reading as false. The route refuses such values now, but a database
+     * written before it did may still hold one. */
+    int b = policy_bool(r->rows[0][0]);
     db_result_free(r);
-    return out;
+    return b < 0 ? def : b;
 }
 
 /*
@@ -278,34 +468,83 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
 
     /* Collected before anything is written, so a rejected path leaves the
      * existing configuration alone rather than half-replaced. */
-    char  *paths[256];
-    char  *excl[256];
+    enum { SOURCES_MAX = 256 };
+    char  *paths[SOURCES_MAX];
+    char  *excl[SOURCES_MAX];
     int    n_paths = 0, n_excl = 0;
     api_response_t bad = { 0 };
     int failed = 0;
+
+    /*
+     * Every element is checked, and anything unusable refuses the whole
+     * request. The loop used to skip what it could not read: a number, a
+     * null, a "sources" that was a string rather than a list, or no
+     * "sources" at all each produced an empty list - and since this
+     * replaces wholesale, a 204 that had just deleted the repository's
+     * configuration. Past 256 entries the rest were dropped the same way.
+     */
+    size_t n_src_in = 0, n_ex_in = 0;
+    if (json_req_array_len(body, "sources", &n_src_in) != 0)
+        return api_error(400, "sources must be a list of absolute paths");
+    if (json_req_has(body, "exclude") &&
+        json_req_array_len(body, "exclude", &n_ex_in) != 0)
+        return api_error(400, "exclude must be a list of patterns");
+    if (n_src_in > SOURCES_MAX || n_ex_in > SOURCES_MAX)
+        return api_error(400, "at most 256 sources and 256 exclude patterns");
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *out = NULL;
+    if (json_resp_new(&out) != 0 || json_resp_ensure_array(out, "warnings") != 0)
+        return api_error(500, "out of memory");
 
     CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
     if (json_iter_begin(body, "sources", &it) == 0) {
         while (json_iter_next(&it) && !failed) {
             char *sp = NULL;
-            if (json_iter_get_str(&it, "", &sp) != 0 || !sp) continue;
-            if (sp[0] != '/') {
+            if (json_iter_get_str(&it, "", &sp) != 0 || !sp) {
                 free(sp);
-                bad = api_error(400, "backup sources must be absolute paths");
+                bad = api_error(400, "every source must be a string");
                 failed = 1;
                 break;
             }
-            if (n_paths == (int)(sizeof(paths) / sizeof(paths[0]))) { free(sp); break; }
-            paths[n_paths++] = sp;
+            char norm[PATH_MAX];
+            if (!*sp || sp[0] != '/' || path_normalize(sp, norm, sizeof(norm)) != 0) {
+                bad = api_error(400, *sp ? "backup sources must be absolute paths"
+                                         : "a backup source cannot be empty");
+                free(sp);
+                failed = 1;
+                break;
+            }
+            free(sp);
+            /*
+             * A source that does not exist is accepted with a warning, not
+             * refused: it may be a share that is not mounted yet, or a disk
+             * that is attached only when the backup runs. Until it exists a
+             * backup skips it, and a backup whose every source is missing
+             * fails with "nothing to back up".
+             */
+            struct stat stt;
+            if (stat(norm, &stt) != 0) {
+                char msg[PATH_MAX + 96];
+                snprintf(msg, sizeof(msg),
+                         "%s does not exist on the daemon's host; backups will "
+                         "skip it until it does", norm);
+                if (json_resp_array_append_str(out, "warnings", msg) != 0) { /* alloc only */ }
+            }
+            paths[n_paths] = strdup(norm);
+            if (!paths[n_paths]) { bad = api_error(500, "out of memory"); failed = 1; break; }
+            n_paths++;
         }
     }
     CUTILS_AUTO_JSON_ITER cutils_json_iter_t ex;
     if (!failed && json_iter_begin(body, "exclude", &ex) == 0) {
         while (json_iter_next(&ex)) {
             char *sp = NULL;
-            if (json_iter_get_str(&ex, "", &sp) != 0 || !sp) continue;
-            if (!*sp) { free(sp); continue; }
-            if (n_excl == (int)(sizeof(excl) / sizeof(excl[0]))) { free(sp); break; }
+            if (json_iter_get_str(&ex, "", &sp) != 0 || !sp || !*sp) {
+                free(sp);
+                bad = api_error(400, "every exclude pattern must be a non-empty string");
+                failed = 1;
+                break;
+            }
             excl[n_excl++] = sp;
         }
     }
@@ -348,7 +587,35 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < n_paths; i++) free(paths[i]);
     for (int i = 0; i < n_excl; i++) free(excl[i]);
     if (failed) return bad;
-    return api_no_content();
+
+    /* 200 with a body rather than 204, so a warning has somewhere to go. */
+    if (json_resp_add_u32(out, "sources", (uint32_t)n_paths) != 0 ||
+        json_resp_add_u32(out, "exclude", (uint32_t)n_excl) != 0)
+        return api_error(500, "out of memory");
+    return finalise(out);
+}
+
+/*
+ * A stored policy value, typed by its key: a count as a number, a flag as a
+ * boolean. They are text in policy_values because one column holds both.
+ * A value stored before the PUT route validated is null, which is also how
+ * the readers treat it: ignored, with the default in force.
+ */
+static int policy_value_add(cutils_json_elem_t *e, const char *key, const char *text)
+{
+    for (int k = 0; k < N_POLICY_KEYS; k++) {
+        if (strcmp(k_policy_keys[k].key, key) != 0) continue;
+        if (k_policy_keys[k].kind == POLICY_COUNT) {
+            int n = 0;
+            return routes_policy_count(text, &n) == 0
+                ? json_elem_add_i32(e, "value", n) : json_elem_add_null(e, "value");
+        }
+        int b = policy_bool(text);
+        return b >= 0 ? json_elem_add_bool(e, "value", b != 0)
+                      : json_elem_add_null(e, "value");
+    }
+    /* A key nothing reads any more: shown as it was stored. */
+    return json_elem_add_str(e, "value", text);
 }
 
 api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
@@ -381,8 +648,8 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "policy", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "key",   r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "value", r->rows[i][1]) != 0;
+        int bad = json_elem_add_str(&e, "key", r->rows[i][0]) != 0
+               || policy_value_add(&e, r->rows[i][0], r->rows[i][1]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -400,13 +667,24 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
         int n = routes_snapshots_retention_defaults(d, 8);
         for (int i = 0; i < n; i++) {
             cutils_json_elem_t e;
-            char v[16];
-            snprintf(v, sizeof(v), "%d", d[i].value);
             if (json_resp_array_append_begin(resp, "defaults", &e) != 0) break;
             int bad = json_elem_add_str(&e, "key",   d[i].key) != 0
-                   || json_elem_add_str(&e, "value", v) != 0;
+                   || json_elem_add_i32(&e, "value", d[i].value) != 0;
             json_elem_commit(&e);
             if (bad) break;
+        }
+        /* Not a config key, so not in the retention list, but it is in
+         * force everywhere a repository has not set it, and leaving it out
+         * read as "auto_pack has no value". Must match the default
+         * backup_routes.c passes to routes_policy_flag. */
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "defaults", &e) == 0) {
+            /* Committed either way, like the rows above: an uncommitted
+             * element is never freed, and the adds fail only on allocation. */
+            int bad = json_elem_add_str(&e, "key",   "maintenance.auto_pack") != 0
+                   || json_elem_add_bool(&e, "value", true) != 0;
+            (void)bad;
+            json_elem_commit(&e);
         }
     }
     return finalise(resp);
@@ -423,15 +701,62 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *value = NULL;
     if (json_req_get_str(body, "key", &key) != 0 || !key)
         return api_error(400, "key is required");
-    if (json_req_get_str(body, "value", &value) != 0 || !value)
-        return api_error(400, "value is required");
+    /* The value as the policy GET serves it - a number or a boolean - or as
+     * text, which is how every client sent it before values were typed. */
+    if (json_req_get_str(body, "value", &value) != 0 || !value) {
+        free(value);
+        value = NULL;
+        int64_t num = 0;
+        bool flag = false;
+        if (json_req_get_i64(body, "value", &num, INT64_MIN, INT64_MAX) == 0) {
+            if (asprintf(&value, "%lld", (long long)num) < 0) value = NULL;
+        } else if (json_req_get_bool(body, "value", &flag) == 0)
+            value = strdup(flag ? "true" : "false");
+        if (!value) return api_error(400, "value is required");
+    }
+
+    int k = 0;
+    while (k < N_POLICY_KEYS && strcmp(k_policy_keys[k].key, key) != 0) k++;
+    if (k == N_POLICY_KEYS) {
+        /* List the valid keys in the refusal: the caller has just shown
+         * they do not know them, and the docs may not be at hand. */
+        char msg[512];
+        int off = snprintf(msg, sizeof(msg), "unknown policy key '%.64s'; valid keys:", key);
+        for (int i = 0; i < N_POLICY_KEYS && off > 0 && (size_t)off < sizeof(msg); i++)
+            off += snprintf(msg + off, sizeof(msg) - (size_t)off, "%s %s",
+                            i ? "," : "", k_policy_keys[i].key);
+        return api_error(400, msg);
+    }
+
+    /* Stored in one canonical spelling, so a reader of the raw rows (the
+     * app, a script over policy list) sees "true" whether "yes" or "on" was
+     * typed. */
+    char norm[16];
+    const char *store_value = norm;
+    if (k_policy_keys[k].kind == POLICY_COUNT) {
+        int n = 0;
+        if (routes_policy_count(value, &n) != 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s must be a whole number, 0 or more", key);
+            return api_error(400, msg);
+        }
+        snprintf(norm, sizeof(norm), "%d", n);
+    } else {
+        int b = policy_bool(value);
+        if (b < 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s must be true or false", key);
+            return api_error(400, msg);
+        }
+        snprintf(norm, sizeof(norm), "%s", b ? "true" : "false");
+    }
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     if (db_execute_non_query(g_db,
             "INSERT INTO policy_values (repo_id, key, value) VALUES (?, ?, ?)"
             " ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
-            (const char *[]){ repo, key, value, NULL }, NULL) != 0)
+            (const char *[]){ repo, key, store_value, NULL }, NULL) != 0)
         return api_error(500, "cannot set policy value");
 
     char *out = strdup("{\"ok\":true}");
@@ -442,12 +767,14 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
 {
-    const char *lim = api_query_param(req, "limit");
     const char *result = api_query_param(req, "result");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 100, 1000, &nlim, NULL, &page_err) != 0) return page_err;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 100);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     int rc = result
@@ -481,16 +808,16 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "entries", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",        r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "ts",        r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "source",    r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "operation", r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "result",    r->rows[i][4]) != 0
-               /* Selected since the journal existed and served to nobody.
-                * How long an operation took is most of what a log of them
-                * is for. */
-               || json_elem_add_str(&e, "duration_ms", r->rows[i][5] ? r->rows[i][5] : "") != 0
-               || json_elem_add_str(&e, "message",   r->rows[i][6] ? r->rows[i][6] : "") != 0;
+        /* duration_ms was selected since the journal existed and served to
+         * nobody; how long an operation took is most of what a log of them
+         * is for. It and message are null where nothing was recorded. */
+        static const jcol_t cols[] = {
+            { "id", 0, JCOL_INT }, { "ts", 1, JCOL_INT },
+            { "source", 2, JCOL_STR }, { "operation", 3, JCOL_STR },
+            { "result", 4, JCOL_STR }, { "duration_ms", 5, JCOL_INT },
+            { "message", 6, JCOL_STR_NULL },
+        };
+        int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }

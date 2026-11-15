@@ -4,6 +4,7 @@
 
 #include "manifest.h"
 #include "object.h"
+#include "object_crypt.h"
 #include "types.h"
 
 #include <cutils/log.h>
@@ -75,6 +76,68 @@ static int hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
     return 0;
 }
 
+/*
+ * Swap one stored payload's encryption layer for the target's.
+ *
+ * Only the outermost layer changes. The payload is compress-then-encrypt,
+ * so removing the encryption leaves exactly the compressed bytes the source
+ * stored, and those are what get encrypted again; nothing is decompressed,
+ * and the uncompressed size in the header stays true. On success *payload
+ * and *len describe the new bytes and the old buffer has been freed.
+ */
+static status_t reencrypt_payload(const store_t *store, const replica_sink_t *sink,
+                                  const uint8_t hash[OBJECT_HASH_SIZE],
+                                  object_stored_info_t *info,
+                                  void **payload, size_t *len)
+{
+    void  *plain = *payload;
+    size_t plen  = *len;
+
+    if (info->encryption != ENCRYPT_NONE) {
+        const repo_key_t *sk = store_key(store);
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(hash, hex);
+        if (!sk)
+            return set_error(ERR_INVALID,
+                             "replicate: object %s is encrypted and the source key "
+                             "is not loaded", hex);
+        if (*len < OBJECT_CRYPT_OVERHEAD)
+            return set_error(ERR_CORRUPT,
+                             "replicate: object %s is shorter than its nonce and tag", hex);
+        plen = *len - OBJECT_CRYPT_OVERHEAD;
+        plain = malloc(plen ? plen : 1);
+        if (!plain) return set_error(ERR_NOMEM, "replicate: decrypt buffer");
+        status_t st = object_decrypt(sk, *payload, plen, plain);
+        if (st != OK) {
+            free(plain);
+            return set_error(st, "replicate: object %s does not decrypt with the "
+                             "source key", hex);
+        }
+    }
+
+    void  *out  = plain;
+    size_t olen = plen;
+    uint8_t enc = ENCRYPT_NONE;
+    if (sink->dst_key) {
+        olen = plen + OBJECT_CRYPT_OVERHEAD;
+        out = malloc(olen);
+        if (!out) {
+            if (plain != *payload) free(plain);
+            return set_error(ERR_NOMEM, "replicate: encrypt buffer");
+        }
+        status_t st = object_encrypt(sink->dst_key, plain, plen, out);
+        if (plain != *payload) free(plain);
+        if (st != OK) { free(out); return st; }
+        enc = ENCRYPT_CHACHA20;
+    }
+
+    if (out != *payload) free(*payload);
+    *payload = out;
+    *len = olen;
+    info->encryption = enc;
+    return OK;
+}
+
 /* Read one object as stored and hand it over. */
 static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
 {
@@ -87,6 +150,10 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(hash, hex);
         return set_error(st, "replicate: cannot read object %s: %s", hex, err_msg());
+    }
+    if (c->sink->reencrypt) {
+        st = reencrypt_payload(c->store, c->sink, hash, &info, &payload, &len);
+        if (st != OK) { free(payload); return st; }
     }
 
     replica_object_t obj = {
@@ -283,7 +350,10 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (st != OK) break;
         if (have) { res.snapshots_skipped++; continue; }
 
+        /* Zeroed: replicate_tree returns before writing it on a bad
+         * argument, and the counters below are read either way. */
         replicate_result_t one;
+        memset(&one, 0, sizeof(one));
         st = replicate_tree(store, sink, root, cancel, &one);
         res.objects_asked    += one.objects_asked;
         res.objects_sent     += one.objects_sent;

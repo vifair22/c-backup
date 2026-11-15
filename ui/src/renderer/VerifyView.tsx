@@ -14,33 +14,18 @@
 
 import React, { useCallback, useEffect, useState } from 'react'
 import { absoluteTime } from './format'
+import type { WireVerifyFinding, WireVerifyRun } from '../shared/wire'
 
 const api = window.cbackup
 
-/* All numeric fields arrive as strings: the daemon renders integers as text
- * so that a 64-bit count cannot be mangled by a JSON number. */
-interface VerifyRun {
-  id: string
-  started_at: string
-  finished_at: string
-  level: string
-  completed: string
-  checked: string
-  ok: string
-  repaired: string
-  unrecoverable: string
-  missing: string
-  bytes_read: string
-  affected_files: string
-  affected_snapshots: string
-}
+/* recoverable: damaged on disk and readable only through parity, not
+ * written back - a scrub with repair off, or a write-back that failed. */
+type VerifyRun = WireVerifyRun
 
-interface Finding {
-  hash?: string
-  kind?: string
-  detail?: string
-  path?: string
-}
+/* This read kind, detail and path, none of which a finding carries, so
+ * every row showed "-" for the problem and the path. The daemon sends
+ * status and up to three sample paths. */
+type Finding = WireVerifyFinding
 
 interface Props {
   connName: string
@@ -48,7 +33,8 @@ interface Props {
   onBack: () => void
 }
 
-const n = (s?: string): number => Number(s ?? '0')
+/* Absent from a run recorded before the column existed. */
+const n = (v?: number | null): number => v ?? 0
 
 export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactElement {
   const repoId = Number(repoPath)
@@ -83,12 +69,13 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
     setFindings([])
     /* A run with nothing wrong has nothing to fetch. Asking anyway would be
      * a round trip to be told what the counters already said. */
-    if (n(run.unrecoverable) === 0 && n(run.missing) === 0 && n(run.repaired) === 0) return
+    if (n(run.unrecoverable) === 0 && n(run.missing) === 0 && n(run.repaired) === 0
+        && n(run.recoverable) === 0) return
 
     setLoadingFindings(true)
     try {
       const r = await api.apiCall<{ findings?: Finding[] }>(connName, {
-        kind: 'verifyFindings', repoId, runId: Number(run.id),
+        kind: 'verifyFindings', repoId, runId: run.id,
       })
       setFindings(r.findings ?? [])
     } catch (err) {
@@ -107,8 +94,9 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
    * survived and the medium is telling you something.
    */
   const verdict = (r: VerifyRun): { label: string; cls: string } => {
-    if (n(r.completed) === 0) return { label: 'incomplete', cls: 'text-text-muted' }
+    if (!r.completed) return { label: 'incomplete', cls: 'text-text-muted' }
     if (n(r.unrecoverable) > 0 || n(r.missing) > 0) return { label: 'damaged', cls: 'text-status-error' }
+    if (n(r.recoverable) > 0) return { label: 'recoverable', cls: 'text-status-warning' }
     if (n(r.repaired) > 0) return { label: 'repaired', cls: 'text-status-warning' }
     return { label: 'clean', cls: 'text-status-connected' }
   }
@@ -158,7 +146,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                       className={`border-t border-border-subtle cursor-pointer
                                   ${active ? 'bg-surface-secondary' : 'hover:bg-surface-hover'}`}>
                       <td className="py-1.5 pr-3 whitespace-nowrap">
-                        {absoluteTime(Number(r.started_at))}
+                        {absoluteTime(r.started_at)}
                       </td>
                       <td className="py-1.5 pr-3">{r.level}</td>
                       <td className={`py-1.5 ${v.cls}`}>{v.label}</td>
@@ -177,6 +165,8 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                 <Stat label="Read back clean" value={n(selected.ok)} />
                 <Stat label="Repaired"      value={n(selected.repaired)}
                       warn={n(selected.repaired) > 0} />
+                <Stat label="Recoverable"   value={n(selected.recoverable)}
+                      warn={n(selected.recoverable) > 0} />
                 <Stat label="Unrecoverable" value={n(selected.unrecoverable)}
                       bad={n(selected.unrecoverable) > 0} />
                 <Stat label="Missing"       value={n(selected.missing)}
@@ -184,6 +174,14 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                 <Stat label="Files affected" value={n(selected.affected_files)}
                       bad={n(selected.affected_files) > 0} />
               </div>
+
+              {n(selected.recoverable) > 0 && (
+                <div className="text-xs mb-3 p-2 rounded bg-surface-secondary text-status-warning border border-status-warning">
+                  {n(selected.recoverable)} object(s) are damaged on disk and readable only
+                  through parity. Nothing was written back: run a verify with repair on
+                  to fix them before more damage makes them unrecoverable.
+                </div>
+              )}
 
               {n(selected.repaired) > 0 && (
                 <div className="text-xs mb-3 p-2 rounded bg-surface-secondary text-status-warning border border-status-warning">
@@ -212,8 +210,10 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                           <td className="py-1.5 pr-3 font-mono">
                             {f.hash ? f.hash.slice(0, 12) : '-'}
                           </td>
-                          <td className="py-1.5 pr-3">{f.kind ?? f.detail ?? '-'}</td>
-                          <td className="py-1.5 truncate max-w-[20rem]">{f.path ?? '-'}</td>
+                          <td className="py-1.5 pr-3">{f.status || '-'}</td>
+                          <td className="py-1.5 truncate max-w-[20rem]" title={f.sample_paths ?? ''}>
+                            {f.sample_paths ?? '-'}
+                          </td>
                         </tr>
                       ))}
                     </tbody>

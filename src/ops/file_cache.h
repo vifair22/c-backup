@@ -26,16 +26,54 @@
 #include <sys/stat.h>
 
 /*
+ * Fields a lookup may disregard. Size and mtime are always compared.
+ *
+ * Device and inode numbers are only stable on local filesystems. An Unraid
+ * user share (shfs, a FUSE filesystem) hands out inode numbers that change
+ * between lookups, an NFS or SMB mount of it inherits that, and a container
+ * volume can come back on another device number every time it is mounted.
+ * Comparing them there turned every incremental into a full re-read of the
+ * tree while reporting nothing wrong (B087).
+ */
+#define FILE_CACHE_IGNORE_DEV    0x1u
+#define FILE_CACHE_IGNORE_INODE  0x2u
+#define FILE_CACHE_IGNORE_CTIME  0x4u
+
+/*
+ * How strictly the cache matches, from `backup.file_cache_match`:
+ *   strict  - every field, on every filesystem;
+ *   auto    - every field on a local filesystem, everything but device and
+ *             inode on a network or FUSE one (the default);
+ *   relaxed - path, size and mtime only, everywhere.
+ */
+typedef enum {
+    FILE_CACHE_MATCH_AUTO = 0,
+    FILE_CACHE_MATCH_STRICT,
+    FILE_CACHE_MATCH_RELAXED,
+} file_cache_match_t;
+
+/* Parse a `backup.file_cache_match` value; -1 for anything unknown. */
+int file_cache_match_parse(const char *s);
+
+/* Whether a filesystem magic (statfs f_type) has unstable dev/inode numbers:
+ * NFS, SMB/CIFS, FUSE (shfs, mergerfs, sshfs), 9p, Ceph and the like. */
+int file_cache_fs_is_remote(long f_type);
+
+/*
  * Does this path still hold the bytes we recorded for it?
  *
- * Returns 1 and fills out_hash when the cached entry matches the stat and the
- * object is still present in the repository, 0 otherwise. The object check is
- * not optional: GC removes objects that no live snapshot references, and
- * reusing a hash whose object has gone would write a snapshot pointing at
- * nothing.
+ * Returns 1 and fills out_hash when the cached entry matches the stat (less
+ * the fields `ignore` names) and the object is still present in the
+ * repository, 0 otherwise. The object check is not optional: GC removes
+ * objects that no live snapshot references, and reusing a hash whose object
+ * has gone would write a snapshot pointing at nothing.
+ *
+ * A miss on an existing entry is logged at debug level with the fields that
+ * differed, so a cache that never hits says why.
  */
 int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
-                      const struct stat *st, uint8_t out_hash[OBJECT_HASH_SIZE]);
+                      const struct stat *st, unsigned ignore,
+                      uint8_t out_hash[OBJECT_HASH_SIZE]);
 
 /* Record what a path holds now. Errors are logged, not propagated: a cache
  * that fails to update costs speed, and failing the backup over it would

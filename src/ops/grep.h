@@ -29,18 +29,28 @@ typedef struct {
      * has found what it was looking for should not read the rest of the
      * repository. */
     uint32_t    max_files;
-    /* Sample matching lines recorded per file. Only the first few are worth
-     * keeping: a hit list is for finding the file, not for reading it. */
+    /* Matching lines recorded per file; reading that file stops once it has
+     * this many. Only the first few are worth keeping: a hit list is for
+     * finding the file, not for reading it. 0 means
+     * GREP_DEFAULT_HITS_PER_FILE, never "no limit". A binary file records
+     * one hit whatever this says. */
     uint32_t    max_hits_per_file;
+    /* Total hits recorded across the search before it stops and reports
+     * itself truncated. 0 means GREP_DEFAULT_MAX_HITS. */
+    uint64_t    max_hits;
 } grep_opts_t;
+
+#define GREP_DEFAULT_HITS_PER_FILE 100u
+#define GREP_DEFAULT_MAX_HITS      10000u
 
 typedef struct {
     uint64_t files_scanned;
     uint64_t files_skipped;   /* unreadable or without content */
     uint64_t files_matched;
+    uint64_t files_capped;    /* stopped reading at max_hits_per_file */
     uint64_t bytes_scanned;
-    uint64_t hits;
-    int      truncated;       /* stopped early on max_files */
+    uint64_t hits;            /* recorded hits: at most max_hits */
+    int      truncated;       /* stopped early on max_files or max_hits */
     int64_t  run_id;
 } grep_result_t;
 

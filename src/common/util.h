@@ -113,3 +113,85 @@ static inline int path_is_rotational(const char *path) {
 static inline int path_is_rotational(const char *path) { (void)path; return -1; }
 #endif
 
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Path helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Lexical normalisation of an absolute path: repeated slashes collapse, "."
+ * components vanish, ".." removes the component before it and stops at the
+ * root, and no trailing slash survives except on "/" itself.
+ *
+ * Lexical on purpose. It touches no filesystem, so it works on paths that do
+ * not exist here - a snapshot's contents, an exclude pattern, a restore
+ * destination not yet created - at the price of not resolving symlinks.
+ * Callers that need to know where a path really lands use realpath on the
+ * part that exists.
+ *
+ * Returns 0, or -1 when the input is not absolute or the result does not fit.
+ */
+static inline int path_normalize(const char *in, char *out, size_t outsz) {
+    if (!in || in[0] != '/' || !out || outsz < 2) return -1;
+    size_t len = 0;
+    out[len++] = '/';
+    out[len] = '\0';
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        size_t n = (size_t)(p - s);
+        if (n == 1 && s[0] == '.') continue;
+        if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (len > 1 && out[len - 1] != '/') len--;
+            if (len > 1) len--;
+            out[len] = '\0';
+            continue;
+        }
+        if (len > 1) {
+            if (len + 1 >= outsz) return -1;
+            out[len++] = '/';
+        }
+        if (len + n >= outsz) return -1;
+        memcpy(out + len, s, n);
+        len += n;
+        out[len] = '\0';
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Time helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * File times as one signed count of nanoseconds since the epoch.
+ *
+ * Signed because a file can predate 1970: `touch -d 1960-01-01` is a
+ * legitimate timestamp, and the unsigned version of this turned it into
+ * 1.8e19, which SQLite then stored as a REAL and the restore read back as 0.
+ * An int64 of nanoseconds spans 1678 to 2262; anything outside that is
+ * clamped rather than allowed to overflow, since a wrong-but-bounded time
+ * on an absurd timestamp beats undefined behaviour.
+ */
+static inline int64_t time_to_ns(int64_t sec, int64_t nsec) {
+    const int64_t NS = 1000000000;
+    if (sec > (INT64_MAX - nsec) / NS) return INT64_MAX;
+    if (sec < (INT64_MIN + NS) / NS)   return INT64_MIN;
+    return sec * NS + nsec;
+}
+
+/* The inverse, flooring so tv_nsec stays in [0, 1e9) as utimensat requires:
+ * -0.5 s is { -1, 500000000 }, not { 0, -500000000 }. */
+static inline struct timespec ns_to_timespec(int64_t ns) {
+    const int64_t NS = 1000000000;
+    int64_t sec = ns / NS, rem = ns % NS;
+    if (rem < 0) { rem += NS; sec--; }
+    struct timespec ts;
+    ts.tv_sec  = (time_t)sec;
+    ts.tv_nsec = (long)rem;
+    return ts;
+}
+

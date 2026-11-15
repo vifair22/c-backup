@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { fmtSize, OBJECT_TYPE_NAMES } from './format'
+import type { WireObjectContent, WireObjectLayout, WireObjectLocate } from '../shared/wire'
 
 const api = window.cbackup
 
@@ -14,15 +15,7 @@ const HEX_DISPLAY_BYTES = 4096
  * truncation either: an object over the limit comes back as too_large with
  * no bytes at all, which is a different thing to show.
  */
-interface ObjectLocateResult {
-  found?: boolean
-  type: number | string
-  refcount?: string
-  orig_size?: string
-  phys_size?: string
-  location?: string
-  pack_id?: string
-}
+type ObjectLocateResult = Partial<WireObjectLocate>
 
 /*
  * The layout route reads the object off disk; locate reads the index. That
@@ -30,21 +23,8 @@ interface ObjectLocateResult {
  * between them means the index is stale - which is exactly the condition
  * reindex exists to fix and which nothing else in the app would show.
  */
-interface ObjectLayoutResult {
-  type?: number
-  uncompressed_size?: number
-  physical_size?: number
-  header_size?: number
-  payload_size?: number
-}
-
-interface ObjectContentResult {
-  type?: number
-  size?: number
-  base64?: string
-  too_large?: boolean
-  limit?: number
-}
+type ObjectLayoutResult = Partial<WireObjectLayout>
+type ObjectContentResult = WireObjectContent
 
 function isBinary(data: Uint8Array): boolean {
   const check = Math.min(data.length, 4096)
@@ -131,7 +111,7 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
         /* The daemon refuses to send an object over its limit rather than
          * cutting one short, so this is a whole file or none of it. */
         if (content.too_large) {
-          setTooLarge({ size: Number(content.size ?? 0), limit: Number(content.limit ?? 0) })
+          setTooLarge({ size: content.size ?? 0, limit: content.limit ?? 0 })
           setRawData(null)
         } else {
           const decoded = Uint8Array.from(atob(content.base64 ?? ''), c => c.charCodeAt(0))
@@ -232,14 +212,14 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Type</div>
                       <div className="text-sm text-text-primary">
-                        {OBJECT_TYPE_NAMES[Number(locate.type)] ?? `Unknown (${locate.type})`}
+                        {OBJECT_TYPE_NAMES[locate.type ?? 0] ?? `Unknown (${locate.type})`}
                       </div>
                     </div>
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Size</div>
                       <div className="text-sm text-text-primary">{fmtSize(locate.orig_size)}</div>
                       <div className="text-[10px] text-text-muted">
-                        {Number(locate.orig_size ?? 0).toLocaleString()} bytes
+                        {(locate.orig_size ?? 0).toLocaleString()} bytes
                       </div>
                     </div>
                     <div>
@@ -249,7 +229,7 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                     <div>
                       <div className="text-[10px] text-text-muted uppercase tracking-wide">Stored</div>
                       <div className="text-sm text-text-primary">{locate.location ?? '-'}</div>
-                      {locate.pack_id !== undefined && Number(locate.pack_id) >= 0 && (
+                      {locate.pack_id != null && (
                         <div className="text-[10px] text-text-muted">pack #{locate.pack_id}</div>
                       )}
                     </div>
@@ -281,9 +261,9 @@ export function ContentViewer({ connName, repoPath, hash, filename, onClose }: P
                     * healthy repository as stale.
                     */}
                   {layout?.payload_size !== undefined && locate.phys_size !== undefined
-                    && Number(locate.phys_size) > 0
-                    && Number(locate.phys_size) !== layout.payload_size
-                    && Number(locate.phys_size) !== layout.physical_size && (
+                    && locate.phys_size > 0
+                    && locate.phys_size !== layout.payload_size
+                    && locate.phys_size !== layout.physical_size && (
                     <div className="text-xs text-status-warning bg-status-warning/10 rounded px-3 py-2">
                       The index records {fmtSize(locate.phys_size)} of payload and
                       the object holds {fmtSize(layout.payload_size)}. The index is

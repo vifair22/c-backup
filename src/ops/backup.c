@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
+#include "util.h"
 #include "backup.h"
 
 #include "file_cache.h"
@@ -16,6 +17,8 @@
 
 #include <openssl/sha.h>
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -23,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,7 +85,47 @@ typedef struct {
      * ordinary auto-pack, as they always were.
      */
     pack_backup_writer_t *pack_w;
+    /* Regular-file bytes handled and expected, for opts->bytes_cb. */
+    uint64_t       bytes_done, bytes_total;
+    /* Which cache fields each device's filesystem can be trusted on, found
+     * with one statfs per device rather than one per file. A backup spans a
+     * handful of devices; past the table's size the rest are looked up each
+     * time, which is slower and still right. */
+    struct { dev_t dev; unsigned ignore; } fs_seen[16];
+    unsigned       n_fs_seen;
 } pipeline_t;
+
+/*
+ * The fields the file cache must not compare for this entry. Local
+ * filesystems keep stable device and inode numbers and are matched on every
+ * field; network and FUSE filesystems do not, and comparing them made every
+ * file a miss on an Unraid share mounted over NFS (B087).
+ */
+static unsigned cache_ignore_for(pipeline_t *p, const char *path, const struct stat *st)
+{
+    int mode = p->opts->file_cache_match;
+    if (mode == FILE_CACHE_MATCH_STRICT) return 0;
+    if (mode == FILE_CACHE_MATCH_RELAXED)
+        return FILE_CACHE_IGNORE_DEV | FILE_CACHE_IGNORE_INODE | FILE_CACHE_IGNORE_CTIME;
+
+    for (unsigned i = 0; i < p->n_fs_seen; i++)
+        if (p->fs_seen[i].dev == st->st_dev) return p->fs_seen[i].ignore;
+
+    unsigned ignore = 0;
+    struct statfs sf;
+    if (statfs(path, &sf) == 0 && file_cache_fs_is_remote((long)sf.f_type)) {
+        ignore = FILE_CACHE_IGNORE_DEV | FILE_CACHE_IGNORE_INODE;
+        log_info("backup: %s is on a network or FUSE filesystem (0x%lx); the "
+                 "file cache ignores device and inode numbers there",
+                 path, (unsigned long)sf.f_type);
+    }
+    if (p->n_fs_seen < sizeof(p->fs_seen) / sizeof(p->fs_seen[0])) {
+        p->fs_seen[p->n_fs_seen].dev = st->st_dev;
+        p->fs_seen[p->n_fs_seen].ignore = ignore;
+        p->n_fs_seen++;
+    }
+    return ignore;
+}
 
 static void hashset_free(hashset_t *s)
 {
@@ -169,6 +213,8 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
         p->last_report = now;
     }
 
+    if (p->opts->bytes_cb)
+        p->opts->bytes_cb(p->opts->progress_ctx, p->bytes_done, p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
 }
 
@@ -297,6 +343,18 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
     return OK;
 }
 
+/* Scan progress: entries found so far, against no known total. */
+typedef struct {
+    void (*cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
+    void  *ctx;
+} scan_bridge_t;
+
+static void scan_progress(uint32_t scanned, void *ctx)
+{
+    const scan_bridge_t *b = ctx;
+    b->cb("scan", scanned, 0, b->ctx);
+}
+
 static status_t store_content(pipeline_t *p)
 {
     /*
@@ -308,7 +366,17 @@ static status_t store_content(pipeline_t *p)
     uint32_t since_commit = 0;
     #define CACHE_BATCH 2000
 
+    p->bytes_total = 0;
+    p->bytes_done  = 0;
+    for (uint32_t i = 0; i < p->count; i++)
+        if (S_ISREG(p->scan->entries[i].st.st_mode))
+            p->bytes_total += p->scan->entries[i].node.size;
+
     for (uint32_t i = 0; i < p->count; i++) {
+        /* The previous entry is finished, whichever way it went: stored,
+         * vouched for by the cache, or skipped as unreadable. */
+        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode))
+            p->bytes_done += p->scan->entries[i - 1].node.size;
         if (cancelled(p)) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed on cancel");
@@ -388,6 +456,7 @@ static status_t store_content(pipeline_t *p)
          */
         uint64_t _tc = phase_now();
         int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                                          cache_ignore_for(p, e->path, &e->st),
                                           e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
@@ -415,13 +484,23 @@ static status_t store_content(pipeline_t *p)
         phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
+        if (st != OK && cancelled(p)) {
+            /* Stopped inside the file, not unreadable: no warning, and no
+             * moving on to the next one. */
+            if (in_txn && db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed on cancel");
+            return set_error(ERR_BUSY, "backup cancelled");
+        }
         if (st != OK) {
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
             continue;
         }
 
-        if (is_new) p->res->objects_new++;
+        if (is_new) {
+            p->res->objects_new++;
+            p->res->bytes_stored += w.phys_bytes;
+        }
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
@@ -818,8 +897,9 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(mode,   sizeof(mode),   "%u",   e->node.mode);
         snprintf(uid,    sizeof(uid),    "%u",   e->node.uid);
         snprintf(gid,    sizeof(gid),    "%u",   e->node.gid);
-        snprintf(mtime,  sizeof(mtime),  "%llu",
-                 (unsigned long long)(e->node.mtime_sec * 1000000000ULL + e->node.mtime_nsec));
+        snprintf(mtime,  sizeof(mtime),  "%lld",
+                 (long long)time_to_ns(e->node.mtime_sec,
+                                       (int64_t)e->node.mtime_nsec));
         snprintf(size,   sizeof(size),   "%llu", (unsigned long long)e->node.size);
 
         char chex[OBJECT_HASH_SIZE * 2 + 1];
@@ -916,12 +996,83 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every named source must exist and be readable before anything is written.
+ *
+ * The scan treats a root it cannot lstat as a warning and moves on, which is
+ * right for a file vanishing mid-walk and wrong for a source: a backup of
+ * "/data/plain /data/no-such-dir" completed with the first one's files and a
+ * log line, and the snapshot looked like a backup of both. A source is what
+ * the operator asked for by name, so not being able to read it is the job
+ * failing, the same way a source excluded down to nothing is. Unreadable
+ * files *inside* a source still warn and continue; that distinction is the
+ * Manual's 6.3.
+ */
+static status_t check_sources(const backup_opts_t *opts)
+{
+    for (int i = 0; i < opts->n_paths; i++) {
+        const char *src = opts->paths[i];
+        struct stat sb;
+        if (!src || !*src)
+            return set_error(ERR_INVALID, "source %d is empty; no snapshot written", i + 1);
+        if (lstat(src, &sb) != 0)
+            return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                             "no snapshot written", src, strerror(errno));
+        if (S_ISDIR(sb.st_mode)) {
+            DIR *d = opendir(src);
+            if (!d)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            closedir(d);
+        } else if (S_ISREG(sb.st_mode)) {
+            int fd = open(src, O_RDONLY | O_NOFOLLOW);
+            if (fd == -1)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            close(fd);
+        }
+    }
+    return OK;
+}
+
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out);
+
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out)
 {
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
 
+    status_t st = check_sources(opts);
+    if (st != OK) return st;
+
+    /*
+     * Staging files a killed run left behind. store_open only sweeps what is
+     * an hour old, because it cannot know who else is writing; a backup holds
+     * the repository's write lock, so nothing else is, and anything already
+     * in tmp/ belongs to a process that is gone. Measured: 134 MB of obj.*
+     * from one killed backup survived every later backup and gc.
+     */
+    uint64_t swept_bytes = 0;
+    unsigned swept = store_sweep_tmp_before(store, time(NULL), &swept_bytes);
+    if (swept)
+        log_info("backup: removed %u staging file(s) left by an interrupted run "
+                 "(%llu bytes)", swept, (unsigned long long)swept_bytes);
+
+    /* The job's flag reaches the object writers through the store, so a
+     * cancel lands inside a large file rather than after it. Restored on the
+     * way out: the handle may outlive this call. */
+    volatile int *prev_cancel = store_get_cancel(store);
+    if (opts->cancel) store_set_cancel(store, opts->cancel);
+    st = backup_run_inner(store, db, repo_id, opts, out);
+    store_set_cancel(store, prev_cancel);
+    return st;
+}
+
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out)
+{
     backup_result_t res;
     memset(&res, 0, sizeof(res));
 
@@ -934,6 +1085,14 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     sopts.n_exclude      = opts->n_exclude;
     sopts.collect_meta   = 1;
     sopts.one_filesystem = opts->one_filesystem;
+    /* The scan can take minutes on a large tree, and reported nothing:
+     * the job sat at an empty phase and 0/0 until the store began. */
+    scan_bridge_t bridge = { opts->progress_cb, opts->progress_ctx };
+    if (opts->progress_cb) {
+        sopts.progress_cb    = scan_progress;
+        sopts.progress_ctx   = &bridge;
+        sopts.progress_every = 1000;
+    }
 
     /* Every source root is scanned into one result set so hard links spanning
      * roots are detected once, which is why the inode map is shared. */
@@ -943,10 +1102,12 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     memset(&timers, 0, sizeof(timers));
 
     uint64_t _tscan = phase_now();
+    uint64_t from_sources = 0;
     for (int i = 0; i < opts->n_paths; i++) {
         scan_result_t *part = NULL;
         st = scan_tree(opts->paths[i], imap, &sopts, &part);
         if (st != OK) { scan_result_free(part); break; }
+        from_sources += part->root_entries;
         if (!scan) {
             scan = part;
         } else {
@@ -967,9 +1128,19 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     scan_imap_free(imap);
     if (st != OK) { scan_result_free(scan); return st; }
-    if (!scan || scan->count == 0) {
+    /*
+     * Count what the sources gave, not what the scan holds. The scan also
+     * carries the ancestors of each root (/a and /a/b for a source of
+     * /a/b/c), so `--exclude '*'` or an exclude naming the root used to
+     * leave a few synthesised directories behind and write a snapshot of
+     * nothing that reported success. Nothing is written before this.
+     */
+    if (!scan || scan->count == 0 || from_sources == 0) {
         scan_result_free(scan);
-        return set_error(ERR_INVALID, "backup_run: nothing to back up");
+        return set_error(ERR_INVALID,
+                         "nothing to back up: every source was excluded or "
+                         "could not be read (%d source%s); no snapshot written",
+                         opts->n_paths, opts->n_paths == 1 ? "" : "s");
     }
 
     phase_add(&timers, PHASE_SCAN, _tscan);
@@ -983,7 +1154,8 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0,
+                     { { 0, 0 } }, 0 };
 
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else
@@ -1027,6 +1199,18 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (p.pack_w) { pack_backup_abort(p.pack_w); p.pack_w = NULL; }
 
     if (st != OK) {
+        /*
+         * The open pack was just discarded, so rows staged into it name
+         * bytes that no longer exist. The next backup would drop them, but
+         * until then they claim objects the repository does not hold, and a
+         * cancelled backup should leave the index as it found it. The error
+         * is the backup's; a failure here is only logged.
+         */
+        char why[256];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        if (store_index_drop_staged(db, repo_id) != OK)
+            log_warn("backup: cannot drop staged rows after: %s", why);
+        set_error(st, "%s", why);
         hashset_free(&p.meta_seen);
         free(links);
         scan_result_free(scan);

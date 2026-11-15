@@ -17,6 +17,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, fmtMode, absoluteTime, gfsBadges, NODE_TYPE_NAMES } from './format'
 import { ContentViewer } from './ContentViewer'
+import type { WireSnapshot, WireTreeEntry } from '../shared/wire'
 
 const api = window.cbackup
 
@@ -72,33 +73,13 @@ interface TreeNode {
   hash: string
 }
 
-/* As the daemon sends it: every integer is a string. */
-interface RawSnapshotRow {
-  id: string
-  ts: string
-  label?: string
-  files?: string
-  size?: string
-  gfs_flags?: string
-}
-
-interface RawEntry {
-  id: string
-  name: string
-  type: string
-  mode: string
-  size: string
-  hash?: string
-  has_children?: string
-}
-
-const parseEntry = (e: RawEntry): TreeNode => ({
-  nodeId: Number(e.id),
+const parseEntry = (e: WireTreeEntry): TreeNode => ({
+  nodeId: e.id,
   name: e.name,
-  type: Number(e.type),
-  size: Number(e.size),
-  mode: Number(e.mode),
-  hasChildren: e.has_children === '1',
+  type: e.type,
+  size: e.size,
+  mode: e.mode,
+  hasChildren: e.has_children === true,
   hash: e.hash ?? '',
 })
 
@@ -156,7 +137,7 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
   const [viewerHash, setViewerHash] = useState<{ hash: string; filename: string } | null>(null)
 
   const readDir = useCallback(async (parentNodeId: number, offset = 0): Promise<TreeNode[]> => {
-    const resp = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
+    const resp = await api.apiCall<{ entries?: WireTreeEntry[] }>(connName, {
       kind: 'snapshotTree', repoId, snapshotId: snapId,
       parent: parentNodeId, limit: DIR_PAGE, offset,
     })
@@ -233,20 +214,20 @@ export function SnapshotBrowser({ connName, repoPath, snapId, initialPath, onBac
       .catch(() => { if (!cancelled) setNote(null) })
 
     Promise.all([
-      api.apiCall<{ snapshots?: RawSnapshotRow[] }>(connName, {
+      api.apiCall<{ snapshots?: WireSnapshot[] }>(connName, {
         kind: 'snapshotList', repoId, limit: 200,
       }),
       readDir(0),
     ]).then(async ([list, rootChildren]) => {
       if (cancelled) return
-      const row = (list.snapshots ?? []).find(x => Number(x.id) === snapId)
+      const row = (list.snapshots ?? []).find(x => x.id === snapId)
       setHeader(row ? {
-        id: Number(row.id),
-        ts: Number(row.ts),
+        id: row.id,
+        ts: row.ts,
         label: row.label ?? '',
-        files: Number(row.files ?? '0'),
-        size: Number(row.size ?? '0'),
-        gfsFlags: Number(row.gfs_flags ?? '0'),
+        files: row.files ?? 0,
+        size: row.size ?? 0,
+        gfsFlags: row.gfs_flags ?? 0,
       } : null)
       const treeMap = new Map([[0, rootChildren]])
       const expandedSet = new Set<number>()

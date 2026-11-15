@@ -19,20 +19,11 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { fmtSize, fmtNum, absoluteTime } from './format'
 import { ContentViewer } from './ContentViewer'
+import type { WireBucket, WirePack, WirePackEntry } from '../shared/wire'
 
 const api = window.cbackup
 
 const PAGE_SIZE = 200
-
-/* Every integer arrives as a string. */
-interface RawPack {
-  id: string
-  filename?: string
-  size?: string
-  sealed_at?: string
-  version?: string
-  entries?: string
-}
 
 interface Pack {
   id: number
@@ -41,14 +32,6 @@ interface Pack {
   sealedAt: number
   version: number
   entries: number
-}
-
-interface RawEntry {
-  hash: string
-  offset?: string
-  comp_size?: string
-  orig_size?: string
-  entry_index?: string
 }
 
 interface Entry {
@@ -61,21 +44,23 @@ interface Entry {
 
 interface Bucket { prefix: string; count: number }
 
-const parsePack = (p: RawPack): Pack => ({
-  id: Number(p.id),
+/* sealed_at is null for a pack with no seal time recorded; 0 here reads
+ * as "open" below. */
+const parsePack = (p: WirePack): Pack => ({
+  id: p.id,
   filename: p.filename ?? '',
-  size: Number(p.size ?? '0'),
-  sealedAt: Number(p.sealed_at ?? '0'),
-  version: Number(p.version ?? '0'),
-  entries: Number(p.entries ?? '0'),
+  size: p.size ?? 0,
+  sealedAt: p.sealed_at ?? 0,
+  version: p.version ?? 0,
+  entries: p.entries ?? 0,
 })
 
-const parseEntry = (e: RawEntry): Entry => ({
+const parseEntry = (e: WirePackEntry): Entry => ({
   hash: e.hash,
-  offset: Number(e.offset ?? '0'),
-  compSize: Number(e.comp_size ?? '0'),
-  origSize: Number(e.orig_size ?? '0'),
-  entryIndex: Number(e.entry_index ?? '0'),
+  offset: e.offset,
+  compSize: e.comp_size,
+  origSize: e.orig_size,
+  entryIndex: e.entry_index,
 })
 
 interface Props {
@@ -106,7 +91,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
     let cancelled = false
     setLoading(true)
     setError(null)
-    api.apiCall<{ packs?: RawPack[] }>(connName, { kind: 'packList', repoId })
+    api.apiCall<{ packs?: WirePack[] }>(connName, { kind: 'packList', repoId })
       .then(r => { if (!cancelled) setPacks((r.packs ?? []).map(parsePack)) })
       .catch(err => { if (!cancelled) setError(String(err)) })
       .finally(() => { if (!cancelled) setLoading(false) })
@@ -116,7 +101,7 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
   const loadEntries = useCallback(async (pack: Pack, pageOffset: number) => {
     setEntriesLoading(true)
     try {
-      const r = await api.apiCall<{ entries?: RawEntry[] }>(connName, {
+      const r = await api.apiCall<{ entries?: WirePackEntry[] }>(connName, {
         kind: 'packEntries', repoId, packId: pack.id,
         limit: PAGE_SIZE, offset: pageOffset,
       })
@@ -147,9 +132,9 @@ export function PackBrowser({ connName, repoPath, onBack }: Props): React.ReactE
      */
     setFanoutLoading(true)
     try {
-      const r = await api.apiCall<{ buckets?: { prefix: string; count: string }[] }>(
+      const r = await api.apiCall<{ buckets?: WireBucket[] }>(
         connName, { kind: 'fanout', repoId })
-      setBuckets((r.buckets ?? []).map(b => ({ prefix: b.prefix, count: Number(b.count) })))
+      setBuckets(r.buckets ?? [])
     } catch (err) {
       setError(String(err))
     }

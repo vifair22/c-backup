@@ -22,6 +22,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { fmtSize, fmtNum, absoluteTime } from './format'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
+import type { WireDiff, WireDiffChange, WireSnapshot } from '../shared/wire'
 
 const api = window.cbackup
 
@@ -30,20 +31,10 @@ const api = window.cbackup
 const DIFF_ROW_CAP = 2000
 const CONTENT_MAX_BYTES = 2 * 1024 * 1024 // 2 MiB
 
-interface RawSnapshot { id: string; ts: string; label?: string }
 interface Snapshot { id: number; ts: number; label: string }
 
-/* Every integer arrives as a string; a hash is empty for the side that does
- * not exist. */
-interface RawChange {
-  change: string
-  path: string
-  size?: string
-  old_size?: string
-  new_size?: string
-  old_hash?: string
-  new_hash?: string
-}
+/* A hash is null, and the size 0, for the side that does not exist. */
+type RawChange = WireDiffChange
 
 type ChangeType = 'added' | 'removed' | 'modified'
 
@@ -56,13 +47,7 @@ interface DiffChange {
   newHash: string
 }
 
-interface RawDiff {
-  changes?: RawChange[]
-  added?: string
-  removed?: string
-  modified?: string
-  truncated?: string
-}
+type RawDiff = Partial<WireDiff>
 
 interface ObjectContent {
   base64?: string
@@ -86,10 +71,10 @@ const ROW_TINT: Record<ChangeType, string> = {
 }
 
 const parseChange = (c: RawChange): DiffChange => ({
-  change: (c.change as ChangeType),
+  change: c.change,
   path: c.path,
-  oldSize: Number(c.old_size ?? '0'),
-  newSize: Number(c.new_size ?? '0'),
+  oldSize: c.old_size ?? 0,
+  newSize: c.new_size ?? 0,
   oldHash: c.old_hash ?? '',
   newHash: c.new_hash ?? '',
 })
@@ -168,11 +153,11 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
 
   useEffect(() => {
     let cancelled = false
-    api.apiCall<{ snapshots?: RawSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 })
+    api.apiCall<{ snapshots?: WireSnapshot[] }>(connName, { kind: 'snapshotList', repoId, limit: 200 })
       .then(data => {
         if (cancelled) return
         const list = (data.snapshots ?? []).map(x => ({
-          id: Number(x.id), ts: Number(x.ts), label: x.label ?? '',
+          id: x.id, ts: x.ts, label: x.label ?? '',
         }))
         setSnaps(list)
         /* Newest first, so the default comparison is the previous snapshot
@@ -199,10 +184,10 @@ export function SnapshotDiff({ connName, repoPath, initialSnapA, initialSnapB, o
       })
       setChanges((resp.changes ?? []).map(parseChange))
       setTotals({
-        added: Number(resp.added ?? '0'),
-        removed: Number(resp.removed ?? '0'),
-        modified: Number(resp.modified ?? '0'),
-        truncated: resp.truncated === 'true',
+        added: resp.added ?? 0,
+        removed: resp.removed ?? 0,
+        modified: resp.modified ?? 0,
+        truncated: resp.truncated === true,
       })
     } catch (err) {
       setError(String(err))

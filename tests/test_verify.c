@@ -142,7 +142,8 @@ static void content_hash_of(const char *name, char *hex_out)
 {
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE name = ? AND content_hash IS NOT NULL",
+        "SELECT DISTINCT content_hash FROM nodes"
+        " WHERE name = ? AND content_hash IS NOT NULL",
         (const char *[]){ name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(hex_out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
@@ -158,6 +159,19 @@ static void flip_byte(const char *path, off_t off)
     b ^= 0xFF;
     assert_int_equal(pwrite(fd, &b, 1, off), 1);
     close(fd);
+}
+
+/* The status of an object's finding in the newest run, or "" if none. */
+static void finding_status_of(const char *hex, char *out, size_t outsz)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT status FROM verify_findings WHERE hash = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_true(r->nrows <= 1);
+    snprintf(out, outsz, "%s", r->nrows ? r->rows[0][0] : "");
+    db_result_free(r);
 }
 
 /* ------------------------------------------------------------------ */
@@ -199,7 +213,13 @@ static void test_deep_verify_repairs_payload_damage(void **state)
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
                                 NULL, NULL, NULL, &res), OK);
     assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.recoverable, 0);
     assert_int_equal(res.unrecoverable, 0);
+
+    /* Itemised: the run says which object it rewrote, not just how many. */
+    char status[64];
+    finding_status_of(hex, status, sizeof(status));
+    assert_string_equal(status, "repaired");
 
     /* Written back, not just corrected in memory: a second pass finds a
      * clean repository, and the parity counters stay still. */
@@ -213,7 +233,8 @@ static void test_deep_verify_repairs_payload_damage(void **state)
 }
 
 /* Without repair the damage is reported but the disk is left alone, which is
- * what a read-only scrub promises. */
+ * what a read-only scrub promises. It used to report the object as repaired,
+ * which is exactly what it was not. */
 static void test_verify_without_repair_leaves_disk_untouched(void **state)
 {
     (void)state;
@@ -228,13 +249,29 @@ static void test_verify_without_repair_leaves_disk_untouched(void **state)
     verify_result_t res;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &res), OK);
-    assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.repaired, 0);
+    assert_int_equal(res.recoverable, 1);
+    char status[64];
+    finding_status_of(hex, status, sizeof(status));
+    assert_string_equal(status, "recoverable");
+
+    /* Recoverable is not loss: the run's blast radius stays empty. */
+    assert_int_equal(res.affected_files, 0);
 
     /* Still damaged: the next scrub has the same thing to say. */
     verify_result_t again;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &again), OK);
-    assert_int_equal(again.repaired, 1);
+    assert_int_equal(again.repaired, 0);
+    assert_int_equal(again.recoverable, 1);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT repaired, recoverable FROM verify_runs ORDER BY id DESC LIMIT 1",
+        NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "0");
+    assert_string_equal(r->rows[0][1], "1");
+    db_result_free(r);
 }
 
 /*
@@ -245,6 +282,8 @@ static void test_verify_without_repair_leaves_disk_untouched(void **state)
 static void test_unrecoverable_damage_names_the_affected_files(void **state)
 {
     (void)state;
+    /* Two snapshots of one file: one path, two versions. */
+    run_backup();
     run_backup();
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -267,19 +306,28 @@ static void test_unrecoverable_damage_names_the_affected_files(void **state)
     free(junk);
     close(fd);
 
+    /* Loss fails the run, and the result is still filled in. */
     verify_result_t res;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
-                                NULL, NULL, NULL, &res), OK);
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), "1 unrecoverable and 0 missing"));
+    err_clear();
     assert_int_equal(res.unrecoverable, 1);
-    assert_true(res.affected_files >= 1);
+    /* Distinct paths, not one per snapshot the file appears in. */
+    assert_int_equal(res.affected_files, 1);
+    assert_int_equal(res.affected_snapshots, 2);
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT status, affected_files, sample_paths FROM verify_findings"
+        "SELECT status, affected_files, sample_paths, affected_versions,"
+        "       affected_snapshot_count FROM verify_findings"
         " WHERE hash = ?", (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
-    assert_true(strtoll(r->rows[0][1], NULL, 10) >= 1);
-    assert_non_null(strstr(r->rows[0][2], "loose.bin"));
+    assert_string_equal(r->rows[0][1], "1");
+    /* The whole path, as restore would recreate it, not the basename. */
+    assert_string_equal(r->rows[0][2], TEST_SRC "/loose.bin");
+    assert_string_equal(r->rows[0][3], "2");
+    assert_string_equal(r->rows[0][4], "2");
     db_result_free(r);
 }
 
@@ -299,11 +347,153 @@ static void test_index_level_finds_a_deleted_object(void **state)
 
     verify_result_t res;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0,
-                                NULL, NULL, NULL, &res), OK);
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    err_clear();
     assert_int_equal(res.missing, 1);
     assert_true(res.affected_files >= 1);
     /* No payload was read: that is the whole point of the cheap level. */
     assert_int_equal(res.bytes_read, 0);
+}
+
+/*
+ * Delete the pack holding a file's content, and return how many indexed
+ * objects that pack held. The store resolves objects from the index, which
+ * still lists every entry of a pack whose file has gone.
+ */
+static int delete_pack_of(const char *name)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of(name, hex);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT pack_id FROM pack_objects WHERE hash = ?",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char pack[32];
+    snprintf(pack, sizeof(pack), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM pack_objects WHERE pack_id = ?",
+        (const char *[]){ pack, NULL }, &r), 0);
+    int n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    assert_true(n > 0);
+
+    char path[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO,
+                                           (uint32_t)strtoul(pack, NULL, 10)), 0);
+    assert_int_equal(unlink(path), 0);
+    return n;
+}
+
+/* Every finding of the newest run carries this status. */
+static void assert_all_findings(const char *status, int expect_rows)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT status FROM verify_findings"
+        " WHERE run_id = (SELECT MAX(id) FROM verify_runs)", NULL, &r), 0);
+    assert_int_equal(r->nrows, expect_rows);
+    for (int i = 0; i < r->nrows; i++) assert_string_equal(r->rows[i][0], status);
+    db_result_free(r);
+}
+
+/*
+ * A deleted pack file took every object in it, and the index level - the one
+ * an operator schedules often because it is cheap - reported all of them ok:
+ * the index still listed them, and that was all it asked.
+ */
+static void test_index_level_finds_a_missing_pack(void **state)
+{
+    (void)state;
+    run_backup();
+    int lost = delete_pack_of("alpha.txt");
+
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0,
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(res.missing, (uint64_t)lost);
+    assert_int_equal(res.ok, res.checked - (uint64_t)lost);
+    assert_all_findings("missing", lost);
+}
+
+/*
+ * The levels that open the pack noticed, but called it damage: "unreadable
+ * header" or "unrecoverable", counted nothing as missing, and the deep level
+ * suggested a repair that has no bytes to work from.
+ */
+static void test_missing_pack_is_missing_at_every_level(void **state)
+{
+    (void)state;
+    run_backup();
+    int lost = delete_pack_of("alpha.txt");
+
+    const verify_level_t levels[] = { VERIFY_LEVEL_STRUCTURE, VERIFY_LEVEL_DEEP };
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++) {
+        for (int repair = 0; repair <= 1; repair++) {
+            verify_result_t res;
+            assert_int_equal(verify_run(store, db, repo_id, levels[l], repair,
+                                        NULL, NULL, NULL, &res), ERR_CORRUPT);
+            err_clear();
+            assert_int_equal(res.missing, (uint64_t)lost);
+            assert_int_equal(res.unrecoverable, 0);
+            assert_int_equal(res.repaired, 0);
+            assert_all_findings("missing", lost);
+        }
+    }
+}
+
+/*
+ * One object behind three paths across twelve snapshots. The finding said
+ * "orig, copy, copy" (basenames, two of them indistinguishable), counted 36
+ * files where there are three, and listed ten snapshot ids with nothing to
+ * say there were twelve.
+ */
+#define DUP_SNAPSHOTS 12
+
+static void test_findings_count_paths_not_versions(void **state)
+{
+    (void)state;
+    const char *dup = "the same bytes behind three names\n";
+    assert_int_equal(mkdir(TEST_SRC "/a", 0700), 0);
+    assert_int_equal(mkdir(TEST_SRC "/b", 0700), 0);
+    write_file(TEST_SRC "/orig",   dup);
+    write_file(TEST_SRC "/a/copy", dup);
+    write_file(TEST_SRC "/b/copy", dup);
+    for (int i = 0; i < DUP_SNAPSHOTS; i++) run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("orig", hex);
+    delete_pack_of("orig");
+
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0,
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(res.affected_snapshots, DUP_SNAPSHOTS);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT affected_files, affected_versions, sample_paths,"
+        "       affected_snapshots, affected_snapshot_count, snapshots_truncated"
+        "  FROM verify_findings WHERE hash = ?",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "3");
+    assert_int_equal(atoi(r->rows[0][1]), 3 * DUP_SNAPSHOTS);
+    assert_string_equal(r->rows[0][2],
+                        TEST_SRC "/a/copy, " TEST_SRC "/b/copy, " TEST_SRC "/orig");
+    /* The list stays capped; the count and the flag say it is. */
+    int listed = 1;
+    for (const char *c = r->rows[0][3]; *c; c++) listed += (*c == ',');
+    assert_int_equal(listed, 10);
+    assert_int_equal(atoi(r->rows[0][4]), DUP_SNAPSHOTS);
+    assert_string_equal(r->rows[0][5], "1");
+    db_result_free(r);
 }
 
 /* Structure level parses headers without reading payloads, so payload damage
@@ -330,7 +520,7 @@ static void test_structure_level_does_not_read_payloads(void **state)
     verify_result_t deep;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &deep), OK);
-    assert_int_equal(deep.repaired, 1);
+    assert_int_equal(deep.recoverable, 1);
 }
 
 /* Packed objects go through a different read and a different repair path, so
@@ -372,6 +562,39 @@ static void test_run_is_recorded(void **state)
     assert_string_equal(r->rows[0][0], "index");
     assert_string_equal(r->rows[0][1], "1");
     assert_true(strtoll(r->rows[0][2], NULL, 10) > 0);
+    db_result_free(r);
+}
+
+/*
+ * A scrub that finds loss fails, and still leaves its answer behind: the run
+ * closed as completed (the walk did finish, and the metrics read completed
+ * runs) with its counts, and the findings beside it.
+ */
+static void test_loss_fails_the_run_and_keeps_the_record(void **state)
+{
+    (void)state;
+    run_backup();
+    int lost = delete_pack_of("alpha.txt");
+
+    verify_result_t res;
+    memset(&res, 0, sizeof(res));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &res), ERR_CORRUPT);
+    char want[64];
+    snprintf(want, sizeof(want), "0 unrecoverable and %d missing", lost);
+    assert_non_null(strstr(err_msg(), want));
+    err_clear();
+    assert_true(res.run_id > 0);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT completed, missing, finished_at,"
+        "       (SELECT COUNT(*) FROM verify_findings f WHERE f.run_id = v.id)"
+        "  FROM verify_runs v ORDER BY id DESC LIMIT 1", NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_int_equal(atoi(r->rows[0][1]), lost);
+    assert_true(r->rows[0][2][0] != '\0');
+    assert_int_equal(atoi(r->rows[0][3]), lost);
     db_result_free(r);
 }
 
@@ -572,10 +795,14 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deep_verify_repairs_payload_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_findings_count_paths_not_versions, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_level_finds_a_deleted_object, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_index_level_finds_a_missing_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_missing_pack_is_missing_at_every_level, setup, teardown),
         cmocka_unit_test_setup_teardown(test_structure_level_does_not_read_payloads, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_covers_packed_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_run_is_recorded, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_loss_fails_the_run_and_keeps_the_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelled_run_is_marked_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_object_damage_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_object_streams_through_damage, setup, teardown),

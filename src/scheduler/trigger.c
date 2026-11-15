@@ -276,6 +276,18 @@ status_t trigger_parse_at(const struct cutils_json_req *creq, const char *prefix
             st = set_error(ERR_INVALID, "yearly trigger: on_day is required");
             goto done;
         }
+        /*
+         * The day has to exist in that month in some year. 30 February was
+         * accepted and then clamped to the 28th or 29th, so the schedule
+         * fired on a day nobody chose. A leap year is the most a month ever
+         * has, which keeps 29 February: it fires on the 28th in common
+         * years, the documented clamp for a day that exists only sometimes.
+         */
+        if ((int)d > days_in_month(2000, (int)m)) {
+            st = set_error(ERR_INVALID,
+                           "yearly trigger: month %u has no day %u", m, d);
+            goto done;
+        }
         out->on_month = (int)m;
         out->on_day   = (int)d;
     } else {

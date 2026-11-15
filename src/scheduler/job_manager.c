@@ -18,6 +18,9 @@
 typedef struct {
     int64_t  job_id;
     int64_t  repo_id;
+    /* The schedule that submitted it, or 0 for a submission over the API.
+     * Decides the journal entry's source; see job_submit_scheduled. */
+    int64_t  schedule_id;
     char    *action;
     time_t   started_at;
     job_fn   fn;
@@ -52,6 +55,55 @@ struct job_manager {
      * writes. */
     pthread_mutex_t db_mu;
 };
+
+/*
+ * One journal entry for a job that ended.
+ *
+ * The source says who asked: "schedule" for the scheduler, with its id at
+ * the head of the message so the entry names which schedule, or "api" for a
+ * submission by hand through the CLI or the app. Every entry used to say
+ * "daemon", so a scheduled run and a manual one could not be told apart.
+ */
+static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
+                        const char *action, const char *outcome,
+                        int64_t took_ms, const char *message)
+{
+    if (schedule_id <= 0) {
+        journal_record(db, repo_id, "api", action, outcome, took_ms, message);
+        return;
+    }
+    char msg[640];
+    snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
+             message && *message ? ": " : "", message ? message : "");
+    journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
+}
+
+/* See job_manager_start. Runs before any worker exists, so nothing else is
+ * writing the jobs table or the journal. */
+static void journal_interrupted(cutils_db_t *db)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0)"
+            "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
+            NULL, &r) != 0) {
+        db_result_free(r);
+        log_warn("job manager: cannot list interrupted jobs to journal them");
+        return;
+    }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        int64_t repo_id = strtoll(r->rows[i][0], NULL, 10);
+        if (repo_id <= 0) continue;   /* the journal is per repository */
+        /* Duration 0: when the process died is not known, and the time
+         * since the job started would count the downtime as work. */
+        journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
+                    r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+    }
+    if (r && r->nrows > 0)
+        log_warn("job manager: %d job(s) were interrupted by the last shutdown "
+                 "and are recorded as failed", r->nrows);
+    db_result_free(r);
+}
 
 static void set_job_state(job_manager_t *jm, int64_t job_id,
                           const char *state, const char *error)
@@ -112,6 +164,13 @@ typedef struct {
      * worker thread, which is the only caller. */
     int64_t        last_ms;
     char           last_phase[32];
+    /* The latest report, written or not, for the job's closing log line. */
+    uint64_t       seen_done, seen_total;
+    /* job_progress_bytes and job_set_result. */
+    uint64_t       bytes_done, bytes_total;
+    char          *result;
+    /* job_set_summary: the journal message for a job that succeeds. */
+    char          *summary;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -139,6 +198,8 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
 {
     progress_ctx_t *pc = ctx;
     const char *ph = phase ? phase : "";
+    pc->seen_done = done;
+    pc->seen_total = total;
     int64_t now = mono_ms();
     int phase_changed = strncmp(pc->last_phase, ph, sizeof(pc->last_phase) - 1) != 0;
     int finished = total > 0 && done >= total;
@@ -147,18 +208,48 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
     pc->last_ms = now;
     snprintf(pc->last_phase, sizeof(pc->last_phase), "%s", ph);
 
-    char id[32], d[32], t[32];
+    char id[32], d[32], t[32], bd[32], bt[32];
     snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
     snprintf(d,  sizeof(d),  "%llu", (unsigned long long)done);
     snprintf(t,  sizeof(t),  "%llu", (unsigned long long)total);
+    snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc->bytes_done);
+    snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc->bytes_total);
     pthread_mutex_lock(&pc->jm->db_mu);
     /* Best effort: losing a progress tick must never fail the job. */
     if (db_execute_non_query(pc->jm->db,
             "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
-            " progress_total = ? WHERE id = ?",
-            (const char *[]){ phase, d, t, id, NULL }, NULL) != 0)
+            " progress_total = ?, bytes_done = ?, bytes_total = ? WHERE id = ?",
+            (const char *[]){ ph, d, t, bd, bt, id, NULL }, NULL) != 0)
         { /* ignored deliberately */ }
     pthread_mutex_unlock(&pc->jm->db_mu);
+}
+
+void job_progress_bytes(void *progress_ctx, uint64_t done, uint64_t total)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc) return;
+    pc->bytes_done  = done;
+    pc->bytes_total = total;
+}
+
+void job_set_result(void *progress_ctx, const char *json_object)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc || !json_object) return;
+    char *copy = strdup(json_object);
+    if (!copy) return;   /* a result is a report, not the job's outcome */
+    free(pc->result);
+    pc->result = copy;
+}
+
+void job_set_summary(void *progress_ctx, const char *text)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc || !text) return;
+    char *copy = strdup(text);
+    if (!copy) return;   /* an empty journal message, as before */
+    free(pc->summary);
+    pc->summary = copy;
 }
 
 /* Caller holds jm->mu. repo_id 0 means "not repo scoped", never busy. */
@@ -231,6 +322,11 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
+        /* A start and an end line per job. The log had neither: a backup
+         * that ran for two hours left nothing in the journal until it
+         * succeeded or failed, and no line at all saying when it began. */
+        log_info("job %lld started: %s, repo %lld",
+                 (long long)slot.job_id, slot.action, (long long)slot.repo_id);
         /*
          * Monotonic and in milliseconds. This was wall-clock seconds, so
          * every operation finishing inside a second journalled "0 ms" and
@@ -242,9 +338,31 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "" };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
+
+        /* The job's own account of what it did, and the final byte count,
+         * which the throttle may not have written. Before the final state,
+         * so a client that sees the job finished also sees its result. */
+        {
+            char id[32], bd[32], bt[32];
+            snprintf(id, sizeof(id), "%lld", (long long)slot.job_id);
+            snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc.bytes_done);
+            snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc.bytes_total);
+            pthread_mutex_lock(&jm->db_mu);
+            if (db_execute_non_query(jm->db,
+                    "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
+                    (const char *[]){ bd, bt, id, NULL }, NULL) != 0)
+                log_warn("job %s: cannot record its byte count", id);
+            if (pc.result && db_execute_non_query(jm->db,
+                    "UPDATE jobs SET result = ? WHERE id = ?",
+                    (const char *[]){ pc.result, id, NULL }, NULL) != 0)
+                log_warn("job %s: cannot record its result", id);
+            pthread_mutex_unlock(&jm->db_mu);
+            free(pc.result);
+            pc.result = NULL;
+        }
 
         /*
          * Journalling happens here rather than in each route because this is
@@ -266,6 +384,18 @@ static void *worker_main(void *arg)
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
         }
+        {
+            struct timespec fin;
+            clock_gettime(CLOCK_MONOTONIC, &fin);
+            double secs = (double)(fin.tv_sec - began.tv_sec)
+                        + (double)(fin.tv_nsec - began.tv_nsec) / 1e9;
+            log_info("job %lld %s: %s, repo %lld, %.1f s, %s %llu/%llu",
+                     (long long)slot.job_id, outcome, slot.action,
+                     (long long)slot.repo_id, secs,
+                     pc.last_phase[0] ? pc.last_phase : "no progress",
+                     (unsigned long long)pc.seen_done,
+                     (unsigned long long)pc.seen_total);
+        }
 
         if (slot.repo_id > 0) {
             pthread_mutex_lock(&jm->db_mu);
@@ -273,10 +403,15 @@ static void *worker_main(void *arg)
             clock_gettime(CLOCK_MONOTONIC, &now);
             int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
                          + (now.tv_nsec - began.tv_nsec) / 1000000;
-            journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
-                           took, detail);
+            /* A success journalled an empty message, so the entry for a
+             * retention pass could not say what it deleted - the one thing
+             * anybody reading a journal of deletions wants. */
+            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.action,
+                        outcome, took, st == OK ? pc.summary : detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
+        free(pc.summary);
+        pc.summary = NULL;
         pthread_mutex_lock(&jm->db_mu);
         prune_finished_jobs(jm);
         pthread_mutex_unlock(&jm->db_mu);
@@ -327,7 +462,14 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * Anything left in 'running' or 'queued' belongs to a previous process
      * that is gone. Nothing resumes it, so it is marked failed rather than
      * left looking active forever.
+     *
+     * And journalled. The journal is written when a job ends, by the worker
+     * that ran it, and a SIGKILL or a power cut leaves no worker to do it -
+     * so a backup interrupted that way was in the jobs table for a month and
+     * absent from the permanent record for ever. This is the only point that
+     * knows those jobs ended, so it writes their entries.
      */
+    journal_interrupted(db);
     if (db_execute_non_query(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
             " error = 'interrupted by daemon restart'"
@@ -385,17 +527,40 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     const char *params_json, job_fn fn, void *arg,
                     void (*arg_free)(void *), int64_t *out_job_id)
 {
+    return job_submit_scheduled(jm, repo_id, action, params_json, 0,
+                                fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
+                              const char *params_json, int64_t schedule_id,
+                              job_fn fn, void *arg, void (*arg_free)(void *),
+                              int64_t *out_job_id)
+{
     if (!jm || !fn || !action) return set_error(ERR_INVALID, "job_submit: null argument");
 
-    char repo[32];
+    char repo[32], sched[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(sched, sizeof(sched), "%lld", (long long)schedule_id);
 
+    /*
+     * Two statements rather than a NULL in the parameter list for an API
+     * job's schedule_id: a NULL there is a terminator, and would leave the
+     * columns after it unbound without an error.
+     */
     pthread_mutex_lock(&jm->db_mu);
-    int rc = db_execute_non_query(jm->db,
-        "INSERT INTO jobs (repo_id, action, params, state)"
-        " VALUES (?, ?, ?, 'queued')",
-        (const char *[]){ repo_id > 0 ? repo : NULL, action,
-                          params_json ? params_json : "", NULL }, NULL);
+    int rc;
+    if (schedule_id > 0)
+        rc = db_execute_non_query(jm->db,
+            "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id)"
+            " VALUES (?, ?, ?, 'queued', 'schedule', ?)",
+            (const char *[]){ repo_id > 0 ? repo : NULL, action,
+                              params_json ? params_json : "", sched, NULL }, NULL);
+    else
+        rc = db_execute_non_query(jm->db,
+            "INSERT INTO jobs (repo_id, action, params, state, origin)"
+            " VALUES (?, ?, ?, 'queued', 'api')",
+            (const char *[]){ repo_id > 0 ? repo : NULL, action,
+                              params_json ? params_json : "", NULL }, NULL);
     int64_t job_id = 0;
     if (rc == 0) {
         db_result_t *r = NULL;
@@ -418,6 +583,7 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
     job_slot_t *s = &jm->queue[jm->tail];
     s->job_id   = job_id;
     s->repo_id  = repo_id;
+    s->schedule_id = schedule_id > 0 ? schedule_id : 0;
     s->action   = strdup(action);
     s->fn       = fn;
     s->arg      = arg;

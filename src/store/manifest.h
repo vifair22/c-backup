@@ -37,7 +37,12 @@ typedef struct {
     uint16_t    name_len;
     uint8_t     type;                   /* NODE_TYPE_* */
     uint32_t    mode, uid, gid;
-    uint64_t    size, mtime_sec, mtime_nsec;
+    uint64_t    size;
+    /* Signed, because a file can predate 1970. On disk it is the same u64
+     * field it always was, holding the two's complement bit pattern, so a
+     * non-negative time serialises to exactly the bytes it always did. */
+    int64_t     mtime_sec;
+    uint64_t    mtime_nsec;
     /* Hard-link identity, not content identity: two paths sharing an inode
      * are the same file, which is different from two files that happen to
      * hold the same bytes. Stable across backups of the same filesystem. */

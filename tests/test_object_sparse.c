@@ -225,7 +225,9 @@ static void test_sparse_all_hole(void **state) {
     size_t out_len = 0;
     uint8_t out_type = 0;
     assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
-    if (out_type == OBJECT_TYPE_SPARSE) {
+    /* All hole is still sparse: zero regions, not the file stored whole. */
+    assert_int_equal(out_type, OBJECT_TYPE_SPARSE);
+    {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));
         assert_int_equal(hdr.magic, SPARSE_MAGIC);
@@ -295,7 +297,8 @@ static void test_store_all_holes_sparse(void **state) {
     size_t out_len = 0;
     uint8_t out_type = 0;
     assert_int_equal(object_load(store, hash, &out, &out_len, &out_type), OK);
-    if (out_type == OBJECT_TYPE_SPARSE) {
+    assert_int_equal(out_type, OBJECT_TYPE_SPARSE);
+    {
         sparse_hdr_t hdr;
         memcpy(&hdr, out, sizeof(hdr));
         assert_int_equal(hdr.magic, SPARSE_MAGIC);

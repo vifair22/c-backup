@@ -7,10 +7,12 @@
 #include "pack.h"
 #include "parity.h"
 #include "repo.h"
+#include "repo_key.h"
 #include "util.h"
 
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -73,6 +75,11 @@ typedef struct {
     size_t     nrows, cap;
 
     pack_stored_writer_t *w;   /* this run's pack, until close */
+
+    /* Re-encrypting into a repository of its own: never write a snapshot
+     * record over one already there, and hold the target's key. */
+    int        no_overwrite;
+    repo_key_t dst_key;
 } local_ctx_t;
 
 static int idx_cmp(const void *a, const void *b)
@@ -253,6 +260,28 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     close(fd);
 
     if (st != OK) { unlink(tmp); return st; }
+
+    /*
+     * A repository of its own may hold backups of its own, and snapshot ids
+     * are per repository: rename would replace its snapshot N with ours and
+     * the record of that backup would be gone. link fails instead when the
+     * name is taken. has_snapshot already skipped an id holding our tree, so
+     * a taken name here is always someone else's snapshot.
+     */
+    if (c->no_overwrite) {
+        int rc = link(tmp, final);
+        int err = errno;
+        unlink(tmp);
+        if (rc == 0) return OK;
+        if (err == EEXIST)
+            return set_error(ERR_INVALID,
+                             "replica: %s already has a snapshot %lld of its own; "
+                             "re-encrypting replication needs a destination that "
+                             "holds no backups of its own", c->root,
+                             (long long)snap->snapshot_id);
+        errno = err;
+        return set_error_errno(ERR_IO, "replica: install snapshot record");
+    }
     if (rename(tmp, final) != 0) {
         unlink(tmp);
         return set_error_errno(ERR_IO, "replica: rename snapshot record");
@@ -284,6 +313,7 @@ static void local_close(void *vctx)
     }
     if (c->owns_store && c->store) store_close(c->store);
     free(c->rows);
+    repo_key_wipe(&c->dst_key);
     free(c);
 }
 
@@ -335,6 +365,9 @@ static const replica_sink_vtbl_t local_vtbl = {
     .close           = local_close,
 };
 
+static status_t sink_finish_open(local_ctx_t *c, const char *path,
+                                 const repo_marker_t *m, replica_sink_t *out);
+
 status_t replica_sink_local_open(const char *path,
                                  const repo_marker_t *source_marker,
                                  replica_sink_t *out)
@@ -367,7 +400,9 @@ status_t replica_sink_local_open(const char *path,
         if (strcmp(m.uuid, source_marker->uuid) != 0) {
             free(c);
             return set_error(ERR_INVALID,
-                             "replica at %s belongs to repository %s, not %s",
+                             "replica at %s belongs to repository %s, not %s; to "
+                             "copy into a different repository under its own "
+                             "encryption, replicate with --reencrypt",
                              path, m.uuid, source_marker->uuid);
         }
         /*
@@ -382,8 +417,16 @@ status_t replica_sink_local_open(const char *path,
         }
     }
 
-    st = store_open(path, NULL, &c->store);
-    if (st != OK) { free(c); return st; }
+    return sink_finish_open(c, path, &m, out);
+}
+
+/* The shared second half of both openings: the target store, its index of
+ * what it holds, and this run's pack. Frees c on failure. */
+static status_t sink_finish_open(local_ctx_t *c, const char *path,
+                                 const repo_marker_t *m, replica_sink_t *out)
+{
+    status_t st = store_open(path, NULL, &c->store);
+    if (st != OK) { repo_key_wipe(&c->dst_key); free(c); return st; }
     c->owns_store = 1;
 
     build_index(c);
@@ -392,12 +435,74 @@ status_t replica_sink_local_open(const char *path,
     if (st != OK) {
         store_close(c->store);
         free(c->rows);
+        repo_key_wipe(&c->dst_key);
         free(c);
         return st;
     }
 
+    memset(out, 0, sizeof(*out));
     out->v   = &local_vtbl;
     out->ctx = c;
-    snprintf(out->key_id, sizeof(out->key_id), "%s", m.key_id);
+    snprintf(out->key_id, sizeof(out->key_id), "%s", m->key_id);
+    return OK;
+}
+
+status_t replica_sink_local_open_reencrypt(const char *path,
+                                           const repo_marker_t *source_marker,
+                                           replica_sink_t *out)
+{
+    if (!path || !source_marker || !out)
+        return set_error(ERR_INVALID, "replica_sink_local_open_reencrypt: null argument");
+
+    /*
+     * The target has to exist already. Its encryption is the whole point of
+     * the exercise, and choosing it is repo add's job - with its passphrase
+     * rules and its one chance to show a system key - not something to
+     * default here.
+     */
+    repo_marker_t m;
+    if (repo_marker_read(path, &m) != OK) {
+        err_clear();
+        return set_error(ERR_INVALID,
+                         "%s is not a repository; create it first with c-backup "
+                         "repo add %s <label> --encrypt <mode>, then replicate into "
+                         "it with --reencrypt", path, path);
+    }
+    if (strcmp(m.uuid, source_marker->uuid) == 0)
+        return set_error(ERR_INVALID,
+                         "%s is a replica of this repository, not a different one; "
+                         "replicate into it without --reencrypt", path);
+
+    local_ctx_t *c = calloc(1, sizeof(*c));
+    if (!c) return set_error(ERR_NOMEM, "replica: alloc");
+    if (snprintf(c->root, sizeof(c->root), "%s", path) >= (int)sizeof(c->root)) {
+        free(c);
+        return set_error(ERR_IO, "replica: path too long");
+    }
+    c->no_overwrite = 1;
+
+    int encrypted = (m.enc_mode != REPO_ENC_NONE);
+    if (encrypted) {
+        status_t kst = repo_key_load(repo_key_dir(), m.uuid, &c->dst_key);
+        if (kst != OK) {
+            err_clear();
+            free(c);
+            return set_error(ERR_INVALID, REPO_NO_KEY_FMT, m.uuid,
+                             m.enc_mode == REPO_ENC_PASSPHRASE ? REPO_NO_KEY_HINT_PASS
+                                                               : REPO_NO_KEY_HINT_SYSTEM);
+        }
+        if (strcmp(c->dst_key.id, m.key_id) != 0) {
+            repo_key_wipe(&c->dst_key);
+            free(c);
+            return set_error(ERR_INVALID,
+                             "the key in %s for repository %s is not the one its "
+                             "marker names", repo_key_dir(), m.uuid);
+        }
+    }
+
+    status_t st = sink_finish_open(c, path, &m, out);
+    if (st != OK) return st;
+    out->reencrypt = 1;
+    out->dst_key   = encrypted ? &c->dst_key : NULL;
     return OK;
 }

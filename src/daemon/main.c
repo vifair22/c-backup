@@ -25,8 +25,10 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "file_cache.h"
 #include "job_manager.h"
 #include "lock.h"
+#include "repo_purge.h"
 #include "routes.h"
 #include "scheduler.h"
 #include "server.h"
@@ -72,15 +74,16 @@ static void on_signal(int sig, void *ctx)
 static status_t schedule_dispatch(void *user, int64_t schedule_id, int64_t repo_id,
                                   const char *action, const char *params)
 {
-    (void)schedule_id;
     job_manager_t *jm = user;
 
     int64_t job_id = 0;
-    status_t st = routes_submit_scheduled(jm, repo_id, action, params, &job_id);
+    status_t st = routes_submit_scheduled(jm, repo_id, action, params,
+                                          schedule_id, &job_id);
     if (st != OK) return st;
 
-    log_info("scheduler: submitted %s for repo %lld as job %lld",
-             action, (long long)repo_id, (long long)job_id);
+    log_info("scheduler: submitted %s for repo %lld as job %lld (schedule %lld)",
+             action, (long long)repo_id, (long long)job_id,
+             (long long)schedule_id);
     return OK;
 }
 
@@ -155,6 +158,13 @@ int main(int argc, char *argv[])
     if (store_index_drop_staged(db, 0) != OK)
         log_warn("cannot drop staged objects left by an interrupted backup");
 
+    /* Removed repositories whose rows are not all gone yet, including any
+     * an earlier build left behind; the thread resumes them in the
+     * background and waits for the next removal. */
+    if (repo_purge_start(db) != OK)
+        log_warn("%s; removed repositories keep their index rows until next start",
+                 err_msg());
+
     if (!auth_is_setup(db))
         log_warn("no admin password set: TCP serves only the health probes "
                  "until one is, with 'c-backup auth setup' on this host");
@@ -163,6 +173,7 @@ int main(int argc, char *argv[])
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
         log_error("cannot start job manager");
+        repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
     }
@@ -177,6 +188,7 @@ int main(int argc, char *argv[])
         if (scheduler_open(db, schedule_dispatch, jm, &sched) != OK) {
             log_error("cannot create scheduler");
             job_manager_stop(jm);
+            repo_purge_stop();
             appguard_shutdown(guard);
             return 1;
         }
@@ -194,11 +206,28 @@ int main(int argc, char *argv[])
     api_server_t *srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
     if (!srv) {
         log_error("cannot create API server");
+        repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
     }
 
     routes_auth_set_config(cfg);
+    {
+        /* Refused rather than defaulted: a typo here would otherwise run
+         * every backup in a mode nobody chose, silently. */
+        const char *m = config_get_str(cfg, "backup.file_cache_match");
+        int mode = file_cache_match_parse(m);
+        if (mode < 0) {
+            log_error("backup.file_cache_match: '%s' is not auto, strict or relaxed", m);
+            api_server_stop(srv);
+            repo_purge_stop();
+            appguard_shutdown(guard);
+            return 1;
+        }
+        routes_backup_set_file_cache_match(mode);
+        if (mode != FILE_CACHE_MATCH_AUTO)
+            log_info("backup.file_cache_match: %s", m);
+    }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);
     routes_snapshots_set_retention(config_get_int(cfg, "retention.keep_snaps", 1),
@@ -217,6 +246,7 @@ int main(int argc, char *argv[])
         routes_register_stream(srv, db) != 0) {
         log_error("cannot register routes");
         api_server_stop(srv);
+        repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
     }
@@ -228,6 +258,7 @@ int main(int argc, char *argv[])
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server");
         api_server_stop(srv);
+        repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
     }
@@ -238,6 +269,7 @@ int main(int argc, char *argv[])
         api_server_stop(srv);
         scheduler_stop(sched);
         job_manager_stop(jm);
+        repo_purge_stop();
         appguard_shutdown(guard);
         return 1;
     }
@@ -257,6 +289,7 @@ int main(int argc, char *argv[])
     api_server_stop(srv);
     if (sched) scheduler_stop(sched);
     job_manager_stop(jm);
+    repo_purge_stop();
     repo_locks_shutdown();
     appguard_shutdown(guard);
     return 0;

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "scan.h"
+#include "util.h"
 
 #define TEST_ROOT1 "/tmp/c_backup_scan_root1"
 #define TEST_ROOT2 "/tmp/c_backup_scan_root2"
@@ -256,6 +257,55 @@ static void test_absolute_exclude_stops_at_component_boundary(void **state) {
     scan_result_free(res);
 }
 
+/*
+ * An absolute pattern is normalised before it is matched.
+ *
+ * "/a/../a/b" names /a/b to anyone reading it and matched nothing, as did a
+ * doubled slash or a "./": the scan's paths are clean and the pattern was
+ * compared as written. An exclude that silently excludes nothing is the
+ * failure the comment above is_excluded describes. Each spelling is tried
+ * on its own, against both the literal form and the absolute glob form.
+ */
+static void test_absolute_exclude_is_normalised(void **state) {
+    (void)state;
+    const char *literal[] = {
+        "/tmp/c_backup_scan_root1/../c_backup_scan_root1/sub",
+        "//tmp//c_backup_scan_root1///sub",
+        "/tmp/./c_backup_scan_root1/./sub/.",
+        "/tmp/c_backup_scan_root1/sub/x/..",
+    };
+    for (size_t i = 0; i < sizeof(literal) / sizeof(literal[0]); i++) {
+        scan_result_t *res = NULL;
+        scan_with(&literal[i], 1, &res);
+        if (saw(res, "nested.txt"))
+            fail_msg("pattern %s did not exclude sub/", literal[i]);
+        assert_true(saw(res, "keep.txt"));
+        scan_result_free(res);
+    }
+
+    const char *glob[] = { "/tmp/c_backup_scan_root1/sub/../*.tmp" };
+    scan_result_t *res = NULL;
+    scan_with(glob, 1, &res);
+    assert_false(saw(res, "skip.tmp"));
+    assert_true(saw(res, "keep.txt"));
+    scan_result_free(res);
+
+    /* And the normaliser on its own, at the edges. */
+    char out[64];
+    assert_int_equal(path_normalize("/", out, sizeof(out)), 0);
+    assert_string_equal(out, "/");
+    assert_int_equal(path_normalize("/..", out, sizeof(out)), 0);
+    assert_string_equal(out, "/");
+    assert_int_equal(path_normalize("/a/..", out, sizeof(out)), 0);
+    assert_string_equal(out, "/");
+    assert_int_equal(path_normalize("/../a//b/./c/", out, sizeof(out)), 0);
+    assert_string_equal(out, "/a/b/c");
+    assert_int_equal(path_normalize("/a/b/../../c", out, sizeof(out)), 0);
+    assert_string_equal(out, "/c");
+    assert_int_equal(path_normalize("relative", out, sizeof(out)), -1);
+    assert_int_equal(path_normalize("/abcdef", out, 4), -1);
+}
+
 static void test_scan_root_excluded_returns_empty(void **state) {
     (void)state;
     scan_imap_t *imap = scan_imap_new();
@@ -430,6 +480,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_exclude_absolute_glob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_exclude_tolerates_trailing_slash, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absolute_exclude_stops_at_component_boundary, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_absolute_exclude_is_normalised, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_root_excluded_returns_empty, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_collect_meta_off_and_collect_on_demand, setup, teardown),
         cmocka_unit_test_setup_teardown(test_scan_warns_on_unreadable_dir, setup, teardown),

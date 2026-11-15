@@ -240,7 +240,11 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'POST',
         path: `/repos/${req.repoId}/tags`,
-        body: { name: req.name, snap_id: req.snapshotId },
+        /* move only when asked: without it the daemon refuses to take an
+         * existing name off another snapshot, which is the protection. */
+        body: req.move
+          ? { name: req.name, snap_id: req.snapshotId, move: true }
+          : { name: req.name, snap_id: req.snapshotId },
       }
     case 'tagRemove':
       return { method: 'DELETE', path: `/repos/${req.repoId}/tags/${seg(req.name)}` }
@@ -268,7 +272,7 @@ export function toEndpoint(req: ApiRequest): Endpoint {
       return {
         method: 'PUT',
         path: `/repos/${req.repoId}/schedules/${req.scheduleId}`,
-        body: { enabled: req.enabled ? 1 : 0 },
+        body: { enabled: req.enabled },
       }
     case 'scheduleRemove':
       return { method: 'DELETE', path: `/repos/${req.repoId}/schedules/${req.scheduleId}` }

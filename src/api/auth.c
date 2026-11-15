@@ -313,6 +313,31 @@ void auth_revoke_token(cutils_db_t *db, const char *token)
         "DELETE FROM sessions WHERE token = ?", params, NULL));
 }
 
+int auth_revoke_all(cutils_db_t *db, const char *keep_token)
+{
+    const char *keep = keep_token;
+    if (keep && strncmp(keep, "Bearer ", 7) == 0) keep += 7;
+
+    /*
+     * Every row, both kinds. A password change exists to shut out whoever
+     * learned the old one, and a session that person opened is exactly as
+     * good as the password it came from - so a change that left sessions
+     * standing changed nothing for the attacker it was meant for. The
+     * caller's own token may be spared, so whoever just changed the
+     * password is not signed out of the client they did it from.
+     */
+    int deleted = 0;
+    int rc;
+    if (keep && keep[0])
+        rc = db_execute_non_query(db, "DELETE FROM sessions WHERE token <> ?",
+                                  (const char *[]){ keep, NULL }, &deleted);
+    else
+        rc = db_execute_non_query(db, "DELETE FROM sessions", NULL, &deleted);
+    if (rc != 0) return -1;
+    if (deleted > 0) log_info("auth: revoked %d session(s)", deleted);
+    return deleted;
+}
+
 void auth_cleanup_sessions(cutils_db_t *db)
 {
     int deleted = 0;

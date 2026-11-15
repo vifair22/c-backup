@@ -4,6 +4,10 @@
 #include "routes.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "repo_purge.h"
+#include "lock.h"
+#include "json_row.h"
+#include "cJSON.h"
 
 #include <openssl/crypto.h>
 
@@ -25,6 +29,38 @@ static const char *url_tail(const char *url, const char *prefix)
     return tail;
 }
 
+/*
+ * One repository, as both the list and the single-repo route serve it, from
+ * a row of REPO_COLUMNS. Exactly one of e and r is set.
+ *
+ * key_escrowed is a flag and encryption a mode name; a row from before
+ * either column existed reads them as unset, which means "none" and "not
+ * escrowed".
+ */
+#define REPO_COLUMNS \
+    "SELECT id, uuid, path, label, added_at, encryption, key_escrowed FROM repos"
+
+static const jcol_t k_repo_cols[] = {
+    { "id",       0, JCOL_INT },
+    { "uuid",     1, JCOL_STR },
+    { "path",     2, JCOL_STR },
+    { "label",    3, JCOL_STR_NULL },
+    { "added_at", 4, JCOL_INT },
+};
+
+static int repo_row_add(cutils_json_elem_t *e, cutils_json_resp_t *r, char **row)
+{
+    const char *enc = (row[5] && row[5][0]) ? row[5] : "none";
+    const char *esc = (row[6] && row[6][0]) ? row[6] : "0";
+    if (e)
+        return jrow_elem_add_row(e, k_repo_cols, JROW_N(k_repo_cols), row) != 0
+            || jrow_elem_add(e, "encryption", JCOL_STR, enc) != 0
+            || jrow_elem_add(e, "key_escrowed", JCOL_BOOL, esc) != 0;
+    return jrow_resp_add_row(r, k_repo_cols, JROW_N(k_repo_cols), row) != 0
+        || jrow_resp_add(r, "encryption", JCOL_STR, enc) != 0
+        || jrow_resp_add(r, "key_escrowed", JCOL_BOOL, esc) != 0;
+}
+
 static api_response_t list_repos(const api_request_t *req, void *userdata)
 {
     (void)req;
@@ -32,9 +68,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at, last_seen_at,"
-            "       encryption, key_escrowed"
-            " FROM repos ORDER BY id", NULL, &r) != 0) {
+            REPO_COLUMNS " ORDER BY id", NULL, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list repos");
     }
@@ -59,25 +93,18 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
     for (int i = 0; i < (r ? r->nrows : 0); i++) {
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "repos", &e) != 0) break;
-        int bad = json_elem_add_str(&e, "id",       r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "uuid",     r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "path",     r->rows[i][2]) != 0
-               || json_elem_add_str(&e, "label",    r->rows[i][3] ? r->rows[i][3] : "") != 0
-               || json_elem_add_str(&e, "added_at", r->rows[i][4]) != 0
-               /*
-                * Encryption state, which the app could not see at all.
-                *
-                * A system-managed key exists only in a file on this host. If
-                * the host is lost, every offsite copy of the repository is
-                * unreadable - which is precisely the disaster the backups
-                * were for. The daemon has warned about it on /metrics since
-                * the column existed, and Prometheus is not where somebody
-                * finds out their key was never written down.
-                */
-               || json_elem_add_str(&e, "encryption",
-                                    r->rows[i][6] ? r->rows[i][6] : "none") != 0
-               || json_elem_add_str(&e, "key_escrowed",
-                                    r->rows[i][7] ? r->rows[i][7] : "0") != 0;
+        /*
+         * Encryption state travels with every repo, which the app could
+         * not see at all.
+         *
+         * A system-managed key exists only in a file on this host. If the
+         * host is lost, every offsite copy of the repository is unreadable -
+         * which is precisely the disaster the backups were for. The daemon
+         * has warned about it on /metrics since the column existed, and
+         * Prometheus is not where somebody finds out their key was never
+         * written down.
+         */
+        int bad = repo_row_add(&e, NULL, r->rows[i]) != 0;
         /* Committing a partially built element would emit a row missing
          * fields the client requires; drop it and stop instead. */
         if (bad) break;
@@ -150,23 +177,40 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
-    if (json_req_get_str_opt(jr, "encrypt", &encstr) == 0 && encstr) {
-        if (repo_enc_mode_parse(encstr, &enc.mode) != 0) {
-            free(path); free(label); free(encstr);
-            json_req_free(jr);
-            return api_error(400, "encrypt must be none, system or passphrase");
-        }
-    }
-    if (json_req_get_str_opt(jr, "passphrase", &passphrase) == 0 && passphrase)
-        enc.passphrase = passphrase;
-    if (enc.mode == REPO_ENC_PASSPHRASE && (!passphrase || !*passphrase)) {
+    if (json_req_get_str_opt(jr, "encrypt", &encstr) != 0) encstr = NULL;
+    if (json_req_get_str_opt(jr, "passphrase", &passphrase) != 0) passphrase = NULL;
+    if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
+        api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);
         json_req_free(jr);
-        return api_error(400, "passphrase encryption needs a passphrase");
+        return bad;
     }
+    if (enc.mode == REPO_ENC_PASSPHRASE) enc.passphrase = passphrase;
 
-    int64_t id = 0;
-    status_t st = repo_register_ex(db, path, label, &enc, &id);
+    repo_register_out_t reg;
+    status_t st = repo_register_detail(db, path, label, &enc, &reg);
+    int64_t id = reg.id;
+
+    /*
+     * An encrypted repository registered without its key is registered -
+     * verifying an offsite copy needs no key - but the answer has to say
+     * that nothing in it can be read yet. Without this the next thing the
+     * operator heard was a reindex finding nothing and a restore finding no
+     * snapshot.
+     */
+    char keywarn[1024] = "";
+    if (st == OK && reg.key_missing && repo_require_key(path) != OK) {
+        /* Escaped: the message names the repository's UUID today, but it is
+         * error text, and a quote or backslash in it made the body invalid. */
+        cJSON *w = cJSON_CreateString(err_msg());
+        char *wq = w ? cJSON_PrintUnformatted(w) : NULL;
+        cJSON_Delete(w);
+        snprintf(keywarn, sizeof(keywarn), ",\"key_loaded\":false,\"warning\":%s",
+                 wq ? wq : "\"key not loaded\"");
+        free(wq);
+        err_clear();
+    }
+    const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
 
     api_response_t out;
     if (st != OK) {
@@ -175,18 +219,36 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
          * problem to fix, not a server fault. */
         int code = (st == ERR_INVALID) ? 400 : 500;
         out = api_error(code, err_msg());
+    } else if (reg.already_registered) {
+        /*
+         * Success, not a 409: registering a repository that is already
+         * registered is how a moved repository is re-linked, so it has to
+         * keep working. What changes is that the answer says so, instead
+         * of a bare id indistinguishable from a fresh registration.
+         */
+        char *body = NULL;
+        int n = asprintf(&body,
+            "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
+            "\"encryption\":\"%s\"%s%s}",
+            (long long)id, reg.label_updated ? "true" : "false",
+            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn);
+        out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
+        log_info("repo %lld at %s was already registered%s", (long long)id, path,
+                 reg.label_updated ? "; label updated" : "");
     } else {
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
-        if (enc.mode != REPO_ENC_NONE &&
+        /* From the marker, not the request: an adopted repository brings
+         * its own mode, and recording what was asked for would be wrong. */
+        if (reg.enc_mode != REPO_ENC_NONE &&
             db_execute_non_query(db, "UPDATE repos SET encryption = ? WHERE id = ?",
-                                 (const char *[]){ repo_enc_mode_name(enc.mode),
+                                 (const char *[]){ repo_enc_mode_name(reg.enc_mode),
                                                    idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record encryption mode", (long long)id);
 
         char *body = NULL;
         int n;
-        if (enc.mode == REPO_ENC_SYSTEM) {
+        if (reg.created && reg.enc_mode == REPO_ENC_SYSTEM) {
             /*
              * The key is returned exactly once, because it exists in exactly
              * one other place: a file on this machine. Whoever is going to
@@ -200,10 +262,12 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 "It is not shown again, and without it every copy of this "
                 "repository is unreadable. Confirm with: c-backup repo key ack %lld\"}",
                 (long long)id, enc.key_hex, (long long)id);
-        } else if (enc.mode == REPO_ENC_PASSPHRASE) {
+        } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"passphrase\",\"key_escrowed\":true}",
-                (long long)id);
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s}",
+                (long long)id, repo_enc_mode_name(reg.enc_mode),
+                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false",
+                unlocked, keywarn);
         } else {
             n = asprintf(&body, "{\"id\":%lld}", (long long)id);
         }
@@ -214,14 +278,14 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
 
         /* A passphrase repository is recoverable from the repository itself,
          * so there is nothing for the operator to file away. */
-        if (enc.mode == REPO_ENC_PASSPHRASE &&
+        if (reg.enc_mode == REPO_ENC_PASSPHRASE &&
             db_execute_non_query(db, "UPDATE repos SET key_escrowed = 1 WHERE id = ?",
                                  (const char *[]){ idbuf, NULL }, NULL) != 0)
             log_warn("repo %lld: cannot record escrow state", (long long)id);
 
         log_info("registered repo %lld at %s (%s)", (long long)id, path,
-                 repo_enc_mode_name(enc.mode));
-        if (enc.mode == REPO_ENC_SYSTEM)
+                 repo_enc_mode_name(reg.enc_mode));
+        if (reg.enc_mode == REPO_ENC_SYSTEM)
             log_warn("repo %lld holds a system-managed key that exists only in %s; "
                      "copy it elsewhere or a lost host means lost backups",
                      (long long)id, repo_key_dir());
@@ -244,8 +308,7 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT id, uuid, path, label, added_at, encryption, key_escrowed"
-            "  FROM repos WHERE id = ?",
+            REPO_COLUMNS " WHERE id = ?",
             (const char *[]){ tail, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read repo");
@@ -255,19 +318,16 @@ static api_response_t get_repo(const api_request_t *req, void *userdata)
         return api_error(404, "no such repo");
     }
 
-    /* encryption and key_escrowed travel with every repo now: without them
-     * a client cannot tell which repositories hold a key that exists on this
-     * host alone. See the note in list_repos. */
-    char *body = NULL;
-    int n = asprintf(&body,
-        "{\"id\":%s,\"uuid\":\"%s\",\"path\":\"%s\",\"label\":\"%s\","
-        "\"added_at\":%s,\"encryption\":\"%s\",\"key_escrowed\":%s}",
-        r->rows[0][0], r->rows[0][1], r->rows[0][2],
-        r->rows[0][3] ? r->rows[0][3] : "", r->rows[0][4],
-        (r->rows[0][5] && r->rows[0][5][0]) ? r->rows[0][5] : "none",
-        (r->rows[0][6] && r->rows[0][6][0]) ? r->rows[0][6] : "0");
+    /* The same object the list carries. This was a format string that
+     * spliced path and label in unescaped, so a path holding a quote or a
+     * backslash produced a body no client could parse. */
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    int bad = json_resp_new(&resp) != 0 || repo_row_add(NULL, resp, r->rows[0]) != 0;
     db_result_free(r);
-    if (n < 0) return api_error(500, "out of memory");
+    if (bad) return api_error(500, "out of memory");
+    char *body = NULL; size_t blen = 0;
+    if (json_resp_finalize(resp, &body, &blen) != 0)
+        return api_error(500, "cannot serialise response");
     return api_ok(body);
 }
 
@@ -294,8 +354,20 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
     int64_t id = strtoll(tail, NULL, 10);
     if (id <= 0) return api_error(400, "invalid repo id");
 
+    /*
+     * Not while a job runs against it: the job would go on writing rows for
+     * an id the purge is deleting. A queued job fails cleanly when it finds
+     * the repository gone.
+     */
+    if (repo_trylock_write(id) != OK) {
+        err_clear();
+        return api_error(409, "repo is busy: a job is running against it; "
+                              "cancel it or wait, then remove the repository");
+    }
     status_t st = repo_deregister(db, id);
+    repo_unlock(id);
     if (st != OK) return api_error(500, err_msg());
+    repo_purge_kick();
 
     log_info("deregistered repo %lld", (long long)id);
     return api_no_content();
@@ -308,6 +380,25 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
  * from three different modules would leave two of them permanently
  * unreachable with no error at startup. One owner, explicit dispatch.
  */
+/*
+ * Every /repos/<id>/... route answers 404 for a repository that is not
+ * registered. They answered from whatever their query found, so
+ * `summary 99` returned zero snapshots and zero objects with a 200 -
+ * indistinguishable from an empty repository that exists, which is exactly
+ * the answer a misconfigured script or monitor should not get.
+ */
+static int repo_exists(void *ud, int64_t repo_id)
+{
+    cutils_db_t *db = ud;
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int found = db_execute(db, "SELECT 1 FROM repos WHERE id = ?",
+                           (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 static int64_t split_repo_url(const char *url, const char **rest)
 {
     if (strncmp(url, "/repos/", 7) != 0) return -1;
@@ -338,12 +429,46 @@ static int64_t snap_suffix(const char *rest, const char *suffix)
  * is exactly as sensitive as reading the repository, which the same caller
  * can already do.
  */
+/*
+ * Whether a repository is unencrypted, by its marker, which is the
+ * authority; the database column is the fallback for a repository whose
+ * directory cannot be read right now.
+ *
+ * The key routes asked neither. Exporting the key of a plaintext repository
+ * answered "no key for repository ... in /etc/c-backupd/keys", which sends
+ * an operator looking for a keyfile that never existed, and acknowledging
+ * one answered ok for a key that was never there to escrow.
+ */
+static int repo_is_unencrypted(int64_t repo_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db_for_keys, "SELECT path, encryption FROM repos WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    repo_marker_t m;
+    int plain;
+    if (repo_marker_read(r->rows[0][0], &m) == OK) {
+        plain = (m.enc_mode == REPO_ENC_NONE);
+    } else {
+        err_clear();
+        plain = !r->rows[0][1][0] || strcmp(r->rows[0][1], "none") == 0;
+    }
+    db_result_free(r);
+    return plain;
+}
+
 static api_response_t key_export(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
     char uuid[64];
     if (repo_uuid_of(g_db_for_keys, repo_id, uuid, sizeof(uuid)) != 0)
         return api_error(404, "no such repo");
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; it has no key");
 
     repo_key_t k;
     status_t st = repo_key_load(repo_key_dir(), uuid, &k);
@@ -423,6 +548,8 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
 static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; there is no key to escrow");
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
     if (db_execute_non_query(g_db_for_keys,
@@ -438,6 +565,7 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (*rest == '\0') return get_repo(req, ud);
 
     if (strcmp(rest, "/key") == 0)      return key_export(req, repo_id);
@@ -490,10 +618,10 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
 
 static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
 {
-    (void)ud;
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
 
     if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
     if (strcmp(rest, "/sources") == 0) return metadata_sources_put(req, repo_id);
@@ -513,10 +641,10 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
 
 static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
 {
-    (void)ud;
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (strcmp(rest, "/key/import") == 0) return key_import(req, repo_id);
     if (strcmp(rest, "/key/ack") == 0)    return key_ack(req, repo_id);
     if (strcmp(rest, "/backup") == 0)
@@ -547,6 +675,7 @@ static api_response_t repo_scoped_delete(const api_request_t *req, void *ud)
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (*rest == '\0') return delete_repo(req, ud);
 
     if (strncmp(rest, "/tags/", 6) == 0)

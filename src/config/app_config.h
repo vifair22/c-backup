@@ -87,6 +87,16 @@ static const config_key_t app_file_keys[] = {
       "Maximum concurrently running jobs across all repos",
       CFG_STORE_FILE, 0 },
 
+    /* How a backup recognises a file it does not need to read again. "auto"
+     * compares every field on local filesystems and drops device and inode
+     * numbers on network and FUSE ones (NFS, SMB, Unraid shfs), where they
+     * are not stable; "strict" compares every field everywhere; "relaxed"
+     * compares size and mtime only, like restic's --ignore-inode and
+     * --ignore-ctime together. */
+    { "backup.file_cache_match", CFG_STRING, "auto",
+      "Unchanged-file detection: auto, strict or relaxed",
+      CFG_STORE_FILE, 0 },
+
     /* What a retention pass keeps for a repository that has not set its own
      * with the policy API (retention.* policy keys override these). */
     { "retention.keep_snaps",   CFG_INT, "1",  "Newest snapshots always kept, whatever their tier", CFG_STORE_FILE, 0 },

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
@@ -116,6 +117,16 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     gc_result_t res;
     memset(&res, 0, sizeof(res));
+
+    /*
+     * Staging files from a killed writer. gc holds the write lock, so no
+     * other job is writing this repository and anything already in tmp/
+     * belongs to a process that is gone; see store_sweep_tmp_before. A dry
+     * run promises to change nothing, and keeps that promise here too.
+     */
+    if (!dry_run)
+        res.tmp_files_removed = store_sweep_tmp_before(store, time(NULL),
+                                                       &res.tmp_bytes_removed);
 
     if (db_txn_begin(db) != OK)
         return set_error(ERR_IO, "gc: begin");
@@ -247,11 +258,17 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     db_result_free(live);
 
     uint32_t kept = 0, dropped = 0;
-    status_t pst = pack_gc(store, refs, refs_cnt, &kept, &dropped);
+    pack_gc_stats_t pstats;
+    status_t pst = pack_gc_stats(store, refs, refs_cnt, &kept, &dropped, &pstats);
     free(refs);
-    if (pst != OK) return pst;
     res.pack_entries_kept    = kept;
     res.pack_entries_dropped = dropped;
+    res.packs_rewritten      = pstats.packs_rewritten;
+    res.packs_deleted        = pstats.packs_deleted;
+    /* The sweep is committed whatever compaction did, so a caller reporting
+     * a failed or cancelled gc can still say what it removed. */
+    if (out) *out = res;
+    if (pst != OK) return pst;
 
     log_info("gc: %llu reachable references, %llu objects swept, %llu bytes, "
              "%u pack entr%s dropped",

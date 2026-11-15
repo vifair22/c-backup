@@ -286,13 +286,23 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
     snprintf(orig, sizeof(orig), "%llu", (unsigned long long)orig_size);
     snprintf(t,    sizeof(t),    "%u",   type);
 
-    /* Content-addressed: seeing the same hash twice is dedup working, not an
-     * error, so an existing row is left alone rather than overwritten. */
+    /*
+     * Content-addressed: seeing the same hash twice is dedup working, not an
+     * error, so an existing row is left alone rather than overwritten - with
+     * one exception. A row recorded as zero bytes for an object at the same
+     * location is the B060 bug's leftover (a dedup against a loose file from
+     * an interrupted run used to report no size), and no stored object is
+     * zero bytes: every one has a header and a parity trailer. Taking the
+     * real size when it is offered repairs those rows on the next backup
+     * that meets them, and cannot touch a correct one.
+     */
     if (db_execute_non_query(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " VALUES (?, ?, 0, ?, ?, ?, ?)"
-            " ON CONFLICT(repo_id, hash) DO NOTHING",
+            " ON CONFLICT(repo_id, hash) DO UPDATE SET phys_size = excluded.phys_size"
+            " WHERE objects.phys_size = 0 AND excluded.phys_size > 0"
+            "   AND objects.location = excluded.location",
             (const char *[]){ repo, hex, phys, orig, location, t, NULL }, NULL) != 0)
         return set_error(ERR_IO, "cannot record object");
     return OK;

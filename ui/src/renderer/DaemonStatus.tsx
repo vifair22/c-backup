@@ -113,6 +113,8 @@ export function DaemonStatus({ connName, onBack }: Props): React.ReactElement {
   const failed = m['cbackup_jobs_failed_total'] ?? 0
   const unrecoverable = m['cbackup_verify_unrecoverable_objects'] ?? 0
   const repaired = m['cbackup_verify_repaired_objects'] ?? 0
+  const recoverable = m['cbackup_verify_recoverable_objects'] ?? 0
+  const neverBacked = m['cbackup_repos_never_backed_up'] ?? 0
 
   const snapClass = snapAge === undefined ? 'text-text-muted'
     : snapAge > SNAPSHOT_BAD ? 'text-status-error'
@@ -131,9 +133,15 @@ export function DaemonStatus({ connName, onBack }: Props): React.ReactElement {
     alarms.push({ text: `${fmtNum(unrecoverable)} object(s) could not be recovered by the last scrub. Data is lost unless another copy has them.`, bad: true })
   }
   if (snapAge !== undefined && snapAge > SNAPSHOT_BAD) {
-    alarms.push({ text: `Nothing has been backed up in ${fmtAge(snapAge)}.`, bad: true })
+    alarms.push({ text: `A repository has not been backed up in ${fmtAge(snapAge)}.`, bad: true })
   } else if (snapAge !== undefined && snapAge > SNAPSHOT_WARN) {
-    alarms.push({ text: `The newest snapshot is ${fmtAge(snapAge)}.`, bad: false })
+    alarms.push({ text: `The stalest repository's newest snapshot is ${fmtAge(snapAge)} old.`, bad: false })
+  }
+  if (neverBacked > 0) {
+    alarms.push({ text: `${fmtNum(neverBacked)} repositor${neverBacked === 1 ? 'y has' : 'ies have'} never been backed up.`, bad: false })
+  }
+  if (recoverable > 0) {
+    alarms.push({ text: `${fmtNum(recoverable)} object(s) are damaged and readable only through parity. Run a verify with repair on.`, bad: true })
   }
   if (unescrowed > 0) {
     alarms.push({ text: `${fmtNum(unescrowed)} encrypted repositor${unescrowed === 1 ? 'y has' : 'ies have'} a key that exists only on this machine.`, bad: false })

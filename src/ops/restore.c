@@ -6,6 +6,7 @@
 
 #include "object.h"
 #include "sparse_restore.h"
+#include "util.h"
 
 #include <cutils/log.h>
 
@@ -179,11 +180,10 @@ static int hash_is_zero_hex(const char *hex)
  * entry into a directory moves its mtime forward. Nothing else about a
  * directory changes in between, so the second pass reapplies only this.
  */
-static void apply_mtime(const char *path, uint64_t mtime_ns)
+static void apply_mtime(const char *path, int64_t mtime_ns)
 {
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
@@ -192,12 +192,11 @@ static void apply_mtime(const char *path, uint64_t mtime_ns)
 /* Metadata for something the kernel must not follow: a symlink's own
  * ownership and timestamps, never its target's. */
 static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid,
-                                    uint64_t mtime_ns)
+                                    int64_t mtime_ns)
 {
     if (lchown(path, (uid_t)uid, (gid_t)gid) != 0) { /* best effort */ }
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0) { /* best effort */ }
 }
@@ -307,6 +306,22 @@ static void apply_acls(store_t *store, const char *path, const char *ahex,
         err_clear();
     }
     free(data);
+}
+
+/* Something to say when a failure arrives with no message attached. */
+static const char *status_reason(status_t st)
+{
+    switch (st) {
+    case OK:            return "no error";
+    case ERR_IO:        return "I/O error (no detail recorded)";
+    case ERR_CORRUPT:   return "corrupt beyond repair (no detail recorded)";
+    case ERR_NOMEM:     return "out of memory";
+    case ERR_INVALID:   return "invalid object (no detail recorded)";
+    case ERR_NOT_FOUND: return "not found in the repository";
+    case ERR_TOO_LARGE: return "too large to load";
+    case ERR_BUSY:      return "busy";
+    }
+    return "unknown error";
 }
 
 static int cancelled(const restore_opts_t *o)
@@ -439,7 +454,7 @@ static status_t make_parents(const char *path)
 }
 
 static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
-                           uint32_t gid, uint64_t mtime_ns)
+                           uint32_t gid, int64_t mtime_ns)
 {
     /* Ownership only succeeds as root; a non-root restore keeps the invoking
      * user's ownership rather than failing the whole operation. */
@@ -449,19 +464,39 @@ static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
         log_warn("restore: chmod %s: %s", path, strerror(errno));
 
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
 }
 
+static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  int64_t snap_id, const char *dest,
+                                  const restore_opts_t *opts, restore_result_t *out);
+
+/*
+ * The cancel flag goes onto the store for the duration, so the streaming
+ * readers can stop inside one large file instead of only between files: a
+ * restore of a 2 GiB file was otherwise uncancellable for as long as that
+ * file took. Put back afterwards, since the handle may outlive this call.
+ */
 status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                      int64_t snap_id, const char *dest,
                      const restore_opts_t *opts, restore_result_t *out)
 {
     if (!store || !db || !dest)
         return set_error(ERR_INVALID, "restore_run: missing store, db or dest");
+    volatile int *prev_cancel = store_get_cancel(store);
+    if (opts && opts->cancel) store_set_cancel(store, opts->cancel);
+    status_t st = restore_run_inner(store, db, repo_id, snap_id, dest, opts, out);
+    store_set_cancel(store, prev_cancel);
+    return st;
+}
+
+static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  int64_t snap_id, const char *dest,
+                                  const restore_opts_t *opts, restore_result_t *out)
+{
 
     restore_opts_t defaults;
     memset(&defaults, 0, sizeof(defaults));
@@ -510,6 +545,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     restore_result_t res;
+    uint64_t matched = 0;     /* nodes inside the subpath, when there is one */
     memset(&res, 0, sizeof(res));
     status_t st = OK;
 
@@ -575,8 +611,27 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         groupcount_free(&gcount);
     }
 
+    /* Bytes to restore: regular files inside the subpath, if there is one.
+     * A file's size is counted once the loop has moved past it, written or
+     * skipped alike, since both are progress through the snapshot. */
+    uint64_t bytes_total = 0, bytes_done = 0, bytes_pending = 0;
+    if (opts->bytes_cb) {
+        for (int i = 0; i < r->nrows; i++) {
+            if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+            if (opts->subpath) {
+                char rel[PATH_MAX];
+                if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) { err_clear(); continue; }
+                if (!path_within(rel, opts->subpath)) continue;
+            }
+            bytes_total += strtoull(r->rows[i][6], NULL, 10);
+        }
+    }
+
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
+        bytes_done += bytes_pending;
+        bytes_pending = 0;
+        if (opts->bytes_cb) opts->bytes_cb(opts->progress_ctx, bytes_done, bytes_total);
         /* i + 1: this is the entry being worked on, not the count already
          * finished. Reporting the bare index meant the last entry of a
          * restore was announced as 6414 of 6415 and the job then completed,
@@ -587,7 +642,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         uint32_t    mode    = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
         uint32_t    uid     = (uint32_t)strtoul(r->rows[i][3], NULL, 10);
         uint32_t    gid     = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
-        uint64_t    mtime   = strtoull(r->rows[i][5], NULL, 10);
+        int64_t     mtime   = strtoll(r->rows[i][5], NULL, 10);
         const char *chash   = r->rows[i][7];
         uint32_t    ntype   = (uint32_t)strtoul(r->rows[i][8], NULL, 10);
         const char *ltarget = r->rows[i][9];
@@ -608,6 +663,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (opts->subpath && !path_within(rel, opts->subpath))
             continue;
+        if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
+        matched++;
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
@@ -802,6 +859,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         uint64_t sz = 0;
         uint8_t  otype = 0;
+        err_clear();    /* so a reason below cannot be left over from before */
         status_t lst = object_load_stream(store, hash, fd, &sz, &otype);
         if (lst == OK && otype == OBJECT_TYPE_SPARSE) {
             /* Sparse objects arrive as a region table plus data; writing them
@@ -816,8 +874,24 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
         if (fd != -1) close(fd);
 
+        if (lst != OK && cancelled(opts)) {
+            /* Stopped inside the file. What was written is a prefix, and a
+             * file of the right name holding part of its bytes is worse
+             * than none, so it goes, without a damage warning. */
+            if (unlink(full) != 0 && errno != ENOENT)
+                log_warn("restore: cannot remove incomplete %s: %s",
+                         full, strerror(errno));
+            st = set_error(ERR_BUSY, "restore cancelled");
+            break;
+        }
         if (lst != OK) {
-            log_warn("restore: cannot write %s: %s", full, err_msg());
+            /* The fault is the repository's, not the destination's: name
+             * the object, and never end on an empty reason. Several store
+             * paths return a bare status, and this line used to read
+             * "cannot write <path>: " - pointing an operator at a disk that
+             * was fine. */
+            log_warn("restore: %s: object %s could not be read or repaired: %s",
+                     full, chash, err_msg()[0] ? err_msg() : status_reason(lst));
             err_clear();
             /*
              * Remove what was written before the failure. The streaming read
@@ -876,12 +950,22 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
             continue;
 
-        apply_mtime(full, strtoull(r->rows[i][5], NULL, 10));
+        apply_mtime(full, strtoll(r->rows[i][5], NULL, 10));
     }
 
+    if (opts->bytes_cb && st == OK)
+        opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);
     pt_free(&paths);
     db_result_free(r);
     if (st != OK) return st;
+
+    /* The route refuses this up front when the index can answer; this is
+     * the backstop for every other caller. A restore that wrote nothing
+     * because nothing matched is not a success. */
+    if (opts->subpath && matched == 0 && res.failed == 0)
+        return set_error(ERR_NOT_FOUND,
+                         "subpath %s matches nothing in snapshot %lld",
+                         opts->subpath, (long long)snap_id);
 
     log_info("restore: snapshot %lld -> %s, %llu files, %llu dirs, "
              "%llu symlinks, %llu hardlinks, %llu specials, %llu skipped, "

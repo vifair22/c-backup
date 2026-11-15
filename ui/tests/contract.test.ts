@@ -41,6 +41,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import type { ApiKind, ApiRequest } from '../src/shared/api.ts'
+import type { WireRepo, WireSchedule, WireTag, WireVerifyRun } from '../src/shared/wire.ts'
 import { toEndpoint } from '../src/main/client.ts'
 
 const ROUTER_404 = 'not found'
@@ -207,6 +208,27 @@ const SAMPLES: Record<ApiKind, ApiRequest> = {
   authLogin:       { kind: 'authLogin', password: 'contract-probe-password' },
 }
 
+/*
+ * Every value that is a number is sent as one (B008).
+ *
+ * The daemon copied database rows out as text, so ids, counts and flags
+ * arrived as "3", "1024" and "0", and screens compared ids as strings. A
+ * string of nothing but digits is what that looked like. Hex fields are the
+ * exception: a hash prefix or a short key id can be all decimal digits.
+ */
+const HEX_FIELDS = new Set(['prefix', 'hash', 'old_hash', 'new_hash', 'key', 'key_id', 'token'])
+
+function quotedNumbers(v: unknown, path = ''): string[] {
+  if (Array.isArray(v)) return v.flatMap((x, i) => quotedNumbers(x, `${path}[${i}]`))
+  if (v === null || typeof v !== 'object') return []
+  const out: string[] = []
+  for (const [k, x] of Object.entries(v)) {
+    if (typeof x === 'string' && /^-?[0-9]+$/.test(x) && !HEX_FIELDS.has(k)) out.push(`${path}.${k}=${JSON.stringify(x)}`)
+    else out.push(...quotedNumbers(x, `${path}.${k}`))
+  }
+  return out
+}
+
 describe('every request reaches a route the daemon serves', () => {
   for (const [kind, req] of Object.entries(SAMPLES) as [ApiKind, ApiRequest][]) {
     test(kind, async () => {
@@ -224,6 +246,8 @@ describe('every request reaches a route the daemon serves', () => {
         `This is the '/repos/<id>/run' failure: a path the app can produce ` +
         `and the daemon has never served.`,
       )
+      assert.deepEqual(quotedNumbers(res.body), [],
+        `${kind}: ${ep.method} ${ep.path} sent a number as a string`)
     })
   }
 })
@@ -252,7 +276,10 @@ describe('the flows behind the buttons', () => {
     /* The user says what to back up, and it comes back. */
     const src = join(work, 'src')
     const saved = await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [src] }))
-    assert.equal(saved.status, 204)
+    /* 200 with counts and any warnings, so a path the daemon cannot see
+     * yet can be reported rather than stored silently. */
+    assert.equal(saved.status, 200)
+    assert.deepEqual((saved.body as { warnings: string[] }).warnings, [])
     got = await request(toEndpoint({ kind: 'sourcesGet', repoId }))
     assert.deepEqual((got.body as { sources: string[] }).sources, [src])
 
@@ -309,24 +336,65 @@ describe('the flows behind the buttons', () => {
     assert.ok(added.status < 400, `schedule add failed: ${JSON.stringify(added.body)}`)
 
     list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
-    const rows = (list.body as { schedules: { id: string; enabled: string }[] }).schedules
+    const rows = (list.body as { schedules: WireSchedule[] }).schedules
     assert.equal(rows.length, 1)
-    assert.equal(rows[0].enabled, '1')
+    assert.equal(rows[0].enabled, true)
+    assert.equal(typeof rows[0].id, 'number')
 
     /* Pause and resume, which is the toggle in the table. */
-    const sid = Number(rows[0].id)
+    const sid = rows[0].id
     await request(toEndpoint({ kind: 'scheduleSetEnabled', repoId, scheduleId: sid, enabled: false }))
     list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
-    assert.equal((list.body as { schedules: { enabled: string }[] }).schedules[0].enabled, '0')
+    assert.equal((list.body as { schedules: WireSchedule[] }).schedules[0].enabled, false)
 
     await request(toEndpoint({ kind: 'scheduleSetEnabled', repoId, scheduleId: sid, enabled: true }))
     list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
-    assert.equal((list.body as { schedules: { enabled: string }[] }).schedules[0].enabled, '1')
+    assert.equal((list.body as { schedules: WireSchedule[] }).schedules[0].enabled, true)
 
     /* And removed, leaving the empty state the screen started from. */
     await request(toEndpoint({ kind: 'scheduleRemove', repoId, scheduleId: sid }))
     list = await request(toEndpoint({ kind: 'scheduleList', repoId }))
     assert.deepEqual((list.body as { schedules?: unknown[] }).schedules ?? [], [])
+  })
+
+  test('tags: a name in use moves only when the edit says so', async () => {
+    /*
+     * The tags screen's Edit sends move; Add does not. A set used to move
+     * any existing name silently, which took the retention protection off
+     * the snapshot it was on, so the daemon refuses now unless asked and
+     * the screen depends on that distinction.
+     */
+    const path = join(work, 'tagrepo')
+    const created = await request(toEndpoint({ kind: 'repoAdd', path, label: 'tags' }))
+    assert.equal(created.status, 201)
+    const repoId = (created.body as { id: number }).id
+    await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [join(work, 'src')] }))
+    for (let n = 1; n <= 2; n++) {
+      const started = await request(toEndpoint({ kind: 'backup', repoId }))
+      assert.equal(started.status, 202)
+      for (let i = 0; i < 60; i++) {
+        const r = await request(toEndpoint({ kind: 'snapshotList', repoId }))
+        if (((r.body as { snapshots?: unknown[] }).snapshots ?? []).length >= n) break
+        await sleep(250)
+      }
+    }
+
+    let r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 1 }))
+    assert.equal(r.status, 200)
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 2 }))
+    assert.equal(r.status, 409, 'an Add under a name in use must not move it')
+    assert.match((r.body as { error: string }).error, /snapshot 1/)
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 2, move: true }))
+    assert.equal(r.status, 200)
+    const list = await request(toEndpoint({ kind: 'tagList', repoId }))
+    assert.deepEqual((list.body as { tags: WireTag[] }).tags,
+      [{ name: 'keep', snap_id: 2 }])
+
+    /* A name the daemon would refuse, and a removal of nothing, both say so. */
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'a/b', snapshotId: 1 }))
+    assert.equal(r.status, 400)
+    r = await request(toEndpoint({ kind: 'tagRemove', repoId, name: 'absent' }))
+    assert.equal(r.status, 404)
   })
 
   test('integrity: run a verify and read its result back', async () => {
@@ -340,22 +408,22 @@ describe('the flows behind the buttons', () => {
     assert.equal(started.status, 202, `verify was refused: ${JSON.stringify(started.body)}`)
 
     /* The run has to appear, and has to say it finished. */
-    let runs: { id: string; completed: string; checked: string }[] = []
+    let runs: WireVerifyRun[] = []
     for (let i = 0; i < 60; i++) {
       const r = await request(toEndpoint({ kind: 'verifyRuns', repoId: 1, limit: 5 }))
       runs = (r.body as { runs?: typeof runs }).runs ?? []
-      if (runs.length > 0 && runs[0].completed === '1') break
+      if (runs.length > 0 && runs[0].completed === true) break
       await sleep(250)
     }
     assert.ok(runs.length > 0, 'the scrub recorded no run')
-    assert.equal(runs[0].completed, '1')
-    assert.ok(Number(runs[0].checked) > 0, 'the scrub checked nothing')
+    assert.equal(runs[0].completed, true)
+    assert.ok(runs[0].checked > 0, 'the scrub checked nothing')
 
     /* And its findings are fetchable, which is the half that had no reader.
      * A clean repository has none, and an empty list is the right answer -
      * the assertion is that the endpoint answers, not that damage exists. */
     const found = await request(toEndpoint({
-      kind: 'verifyFindings', repoId: 1, runId: Number(runs[0].id),
+      kind: 'verifyFindings', repoId: 1, runId: runs[0].id,
     }))
     assert.equal(found.status, 200)
     assert.ok(Array.isArray((found.body as { findings?: unknown[] }).findings))
@@ -376,9 +444,9 @@ describe('the flows behind the buttons', () => {
 
     /* The screen reads its state from the repo record. */
     let info = await request(toEndpoint({ kind: 'repoShow', repoId }))
-    let body = info.body as { encryption?: string; key_escrowed?: number }
+    let body = info.body as Partial<WireRepo>
     assert.equal(body.encryption, 'system')
-    assert.equal(Number(body.key_escrowed), 0, 'a fresh key must not claim to be saved')
+    assert.equal(body.key_escrowed, false, 'a fresh key must not claim to be saved')
 
     /* Show key returns something an operator can actually write down. */
     const shown = await request(toEndpoint({ kind: 'keyExport', repoId }))
@@ -391,8 +459,8 @@ describe('the flows behind the buttons', () => {
     assert.ok(acked.status < 400, `ack failed: ${JSON.stringify(acked.body)}`)
 
     info = await request(toEndpoint({ kind: 'repoShow', repoId }))
-    body = info.body as { key_escrowed?: number }
-    assert.equal(Number(body.key_escrowed), 1, 'acknowledging did not record')
+    body = info.body as Partial<WireRepo>
+    assert.equal(body.key_escrowed, true, 'acknowledging did not record')
 
     /* And an unencrypted repository says so, rather than showing an empty
      * key screen. */

@@ -8,10 +8,13 @@
 
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -44,35 +47,84 @@ static const char *level_name(verify_level_t l)
 }
 
 /*
+ * Rebuild full paths for nodes in SQL, one query for all of them.
+ *
+ * Node names are single components, so the basename alone ("orig, copy,
+ * copy") could not say which of several same-named files was hit, and
+ * counting node rows counted one file once per snapshot it appears in. The
+ * path is what an operator looks for and what restore would recreate:
+ * every component prefixed with '/', from the snapshot root down, the same
+ * shape grep hits and name search use.
+ *
+ * The seed rows differ per caller; the walk up the parents is shared. Each
+ * step is a primary-key lookup, and the depth bound stops a corrupt parent
+ * cycle from recursing forever. A chain that breaks before reaching a root
+ * drops that row rather than reporting a partial path as if it were whole.
+ *
+ * ?1 is the repo id in both.
+ */
+#define VERIFY_PATH_WALK                                                    \
+    "  UNION ALL"                                                           \
+    "  SELECT up.snap, p.parent_node_id, '/' || p.name || up.path,"          \
+    "         up.depth + 1"                                                 \
+    "    FROM up JOIN nodes p ON p.repo_id = ?1 AND p.id = up.parent"        \
+    "   WHERE up.depth < 256)"
+
+#define VERIFY_ROOTED " FROM up WHERE COALESCE(up.parent, 0) = 0"
+
+/* Example paths per finding, and snapshot ids listed per finding. Both are
+ * samples; the counts beside them are exact. */
+#define FINDING_SAMPLE_PATHS 3
+#define FINDING_SNAPSHOT_IDS 10
+#define VERIFY_STR_(x) #x
+#define VERIFY_STR(x)  VERIFY_STR_(x)
+
+/* Repaired and recoverable objects are itemised so an operator can see what
+ * was touched, but nothing was lost, so they stay out of the blast radius. */
+static int status_is_loss(const char *status)
+{
+    return strcmp(status, "repaired") != 0 && strcmp(status, "recoverable") != 0;
+}
+
+/*
  * What a damaged object costs, in files rather than in hashes.
  *
  * A hash means nothing to whoever has to decide whether this matters. The
  * node index already maps content back to paths and snapshots, so the report
  * can say which files are gone and which snapshots are still clean, which is
  * the difference between an alarm and an actionable one.
+ *
+ * affected_files is distinct paths; affected_versions is node rows, one per
+ * path per snapshot, which is what the first used to count.
  */
 static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
-                           const char *hex, const char *status,
-                           verify_result_t *res)
+                           const char *hex, const char *status)
 {
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
 
     /* A handful of example paths, not all of them: a pack entry shared by
-     * ten thousand nodes would otherwise write a row nobody can read. */
-    char paths[512];
+     * ten thousand nodes would otherwise write a row nobody can read. The
+     * window counts are over every path, before the LIMIT. */
+    char paths[FINDING_SAMPLE_PATHS * (PATH_MAX + 2)];
     size_t off = 0;
     paths[0] = '\0';
-    uint64_t n_files = 0;
+    uint64_t n_files = 0, n_versions = 0;
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT n.name, n.snap_id FROM nodes n"
-            " WHERE n.repo_id = ? AND n.content_hash = ? LIMIT 200",
-            (const char *[]){ repo, hex, NULL }, &r) == 0 && r) {
-        n_files = (uint64_t)r->nrows;
-        for (int i = 0; i < r->nrows && i < 3; i++) {
+            "WITH RECURSIVE up(snap, parent, path, depth) AS ("
+            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
+            "    FROM nodes n WHERE n.repo_id = ?1 AND n.content_hash = ?2"
+            VERIFY_PATH_WALK
+            " SELECT path, COUNT(*) OVER (), SUM(COUNT(*)) OVER ()"
+            VERIFY_ROOTED
+            " GROUP BY path ORDER BY path LIMIT " VERIFY_STR(FINDING_SAMPLE_PATHS),
+            (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
+        n_files    = strtoull(r->rows[0][1], NULL, 10);
+        n_versions = strtoull(r->rows[0][2], NULL, 10);
+        for (int i = 0; i < r->nrows && i < FINDING_SAMPLE_PATHS; i++) {
             int w = snprintf(paths + off, sizeof(paths) - off, "%s%s",
                              off ? ", " : "", r->rows[i][0]);
             if (w < 0 || (size_t)w >= sizeof(paths) - off) break;
@@ -81,17 +133,22 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     }
     db_result_free(r);
 
-    char snaps[256];
+    /* The list is capped so the row stays readable; the count is not, and
+     * the truncated flag says when the list is short of it. Silently
+     * listing 10 of 13 read as "these 10 are all". */
+    char snaps[FINDING_SNAPSHOT_IDS * 24];
     snaps[0] = '\0';
     uint64_t n_snaps = 0;
     r = NULL;
     if (db_execute(db,
-            "SELECT DISTINCT snap_id FROM nodes"
-            " WHERE repo_id = ? AND content_hash = ? ORDER BY snap_id",
-            (const char *[]){ repo, hex, NULL }, &r) == 0 && r) {
-        n_snaps = (uint64_t)r->nrows;
+            "SELECT snap_id, COUNT(*) OVER () FROM"
+            " (SELECT DISTINCT snap_id FROM nodes"
+            "   WHERE repo_id = ? AND content_hash = ?)"
+            " ORDER BY snap_id LIMIT " VERIFY_STR(FINDING_SNAPSHOT_IDS),
+            (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
+        n_snaps = strtoull(r->rows[0][1], NULL, 10);
         size_t so = 0;
-        for (int i = 0; i < r->nrows && i < 10; i++) {
+        for (int i = 0; i < r->nrows && i < FINDING_SNAPSHOT_IDS; i++) {
             int w = snprintf(snaps + so, sizeof(snaps) - so, "%s%s",
                              so ? "," : "", r->rows[i][0]);
             if (w < 0 || (size_t)w >= sizeof(snaps) - so) break;
@@ -100,30 +157,73 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     }
     db_result_free(r);
 
-    res->affected_files += n_files;
-    if (n_snaps > res->affected_snapshots) res->affected_snapshots = n_snaps;
-
-    char nf[32];
+    char nf[32], nv[32], ns[32];
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
+    snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
+    snprintf(ns, sizeof(ns), "%llu", (unsigned long long)n_snaps);
+    const char *trunc = n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0";
     if (db_execute_non_query(db,
             "INSERT INTO verify_findings"
             " (run_id, repo_id, hash, status, affected_files, sample_paths,"
-            "  affected_snapshots)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (const char *[]){ run, repo, hex, status, nf, paths, snaps, NULL },
+            "  affected_snapshots, affected_versions, affected_snapshot_count,"
+            "  snapshots_truncated)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (const char *[]){ run, repo, hex, status, nf, paths, snaps,
+                              nv, ns, trunc, NULL },
             NULL) != 0)
         log_warn("verify: cannot record finding for %s", hex);
 
     /* A tree object has no node row pointing at it, so the query above finds
      * nothing and the loss looks harmless. Say so rather than implying the
      * damage is contained. */
-    if (n_files == 0)
+    if (!status_is_loss(status))
+        log_warn("verify: %s %s (%llu file(s) in %llu snapshot(s))", status, hex,
+                 (unsigned long long)n_files, (unsigned long long)n_snaps);
+    else if (n_files == 0)
         log_error("verify: %s %s (no node references it: a manifest tree or an "
                   "object from an evicted snapshot)", status, hex);
     else
         log_error("verify: %s %s affects %llu file(s) in %llu snapshot(s): %s",
                   status, hex, (unsigned long long)n_files,
                   (unsigned long long)n_snaps, paths);
+}
+
+/*
+ * The run's blast radius, over every lost object at once.
+ *
+ * Summing per-finding counts counted a file twice when two of its objects
+ * were lost, and taking the largest per-finding snapshot count undercounted
+ * when different objects were lost from different snapshots. Distinct paths
+ * and distinct snapshots across the whole run are the numbers that mean
+ * something, and the findings rows already name every lost hash.
+ */
+static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
+                             uint64_t *out_files, uint64_t *out_snaps)
+{
+    *out_files = 0;
+    *out_snaps = 0;
+    char repo[32], run[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "WITH RECURSIVE lost(h) AS ("
+            "  SELECT DISTINCT hash FROM verify_findings"
+            "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable')),"
+            " up(snap, parent, path, depth) AS ("
+            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
+            "    FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.content_hash = lost.h"
+            VERIFY_PATH_WALK
+            " SELECT COUNT(DISTINCT path), COUNT(DISTINCT snap)"
+            VERIFY_ROOTED,
+            (const char *[]){ repo, run, NULL }, &r) == 0 && r && r->nrows == 1) {
+        *out_files = strtoull(r->rows[0][0], NULL, 10);
+        *out_snaps = strtoull(r->rows[0][1], NULL, 10);
+    } else {
+        log_warn("verify: cannot total the blast radius of run %s", run);
+    }
+    db_result_free(r);
 }
 
 /*
@@ -175,6 +275,31 @@ static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH
     status_t st = object_load_stream(store, hash, devnull, &sz, &type);
     if (st == OK && out_bytes) *out_bytes = sz;
     return st;
+}
+
+/*
+ * Is a pack's data file still there?
+ *
+ * Every per-object check below asks the store where an object lives, and the
+ * store answers from the index: a pack file deleted out from under it still
+ * resolves, so the index level reported every object in it as ok, and the
+ * levels that do open the file called the same loss "unreadable header" or
+ * "unrecoverable" and suggested a repair that has nothing to read. Asking the
+ * filesystem directly, once per pack, is what tells "the bytes are damaged"
+ * apart from "the bytes are gone".
+ *
+ * Only a definite absence counts. Any other stat failure (EACCES, EIO) falls
+ * through to the per-object checks, which will report what they can see.
+ */
+static int pack_file_missing(store_t *store, int64_t pack_id)
+{
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store),
+                              (uint32_t)pack_id) != 0)
+        return 0;
+    struct stat sb;
+    if (stat(path, &sb) == 0) return 0;
+    return errno == ENOENT || errno == ENOTDIR;
 }
 
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -267,24 +392,40 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint64_t total = (uint64_t)objs->nrows;
     status_t st = OK;
 
+    /* Rows arrive grouped by pack, so remembering the last pack's answer
+     * stats each pack file once rather than once per object. */
+    int64_t cur_pack = -1;
+    int     cur_pack_missing = 0;
+
     for (int i = 0; i < objs->nrows; i++) {
         if (cancel && *cancel) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
         if (progress && (i % 256 == 0 || i + 1 == objs->nrows))
             progress(level_name(level), (uint64_t)i, total, progress_ctx);
 
-        const char *hex    = objs->rows[i][0];
-        int         packed = (strtoll(objs->rows[i][2], NULL, 10) >= 0);
+        const char *hex     = objs->rows[i][0];
+        int64_t     pack_id = strtoll(objs->rows[i][2], NULL, 10);
+        int         packed  = (pack_id >= 0);
         uint64_t    osize  = strtoull(objs->rows[i][4], NULL, 10);
         uint8_t hash[OBJECT_HASH_SIZE];
         hex_to_hash(hex, hash);
 
         res.checked++;
 
-        /* Every level starts here: an object the store cannot locate at all
-         * is missing, and nothing further can be said about it. */
-        if (!object_exists(store, hash)) {
+        if (packed && pack_id != cur_pack) {
+            cur_pack = pack_id;
+            cur_pack_missing = pack_file_missing(store, pack_id);
+            if (cur_pack_missing)
+                log_error("verify: pack-%08u.dat is missing; every object "
+                          "indexed in it is missing", (unsigned)pack_id);
+        }
+
+        /* Every level starts here: an object the store cannot locate at all,
+         * or whose pack file is gone, is missing, and nothing further can be
+         * said about it. No level reads its bytes, and no repair is offered:
+         * parity lives in the same file as the payload it protects. */
+        if ((packed && cur_pack_missing) || !object_exists(store, hash)) {
             res.missing++;
-            record_finding(db, repo_id, res.run_id, hex, "missing", &res);
+            record_finding(db, repo_id, res.run_id, hex, "missing");
             continue;
         }
         if (level == VERIFY_LEVEL_INDEX) { res.ok++; continue; }
@@ -295,7 +436,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
             if (object_get_info(store, hash, &sz, &type) != OK) {
                 err_clear();
                 res.unrecoverable++;
-                record_finding(db, repo_id, res.run_id, hex, "unreadable header", &res);
+                record_finding(db, repo_id, res.run_id, hex, "unreadable header");
             } else {
                 res.ok++;
             }
@@ -329,6 +470,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 res.repaired++;
                 res.bytes_read += bytes;
                 log_warn("verify: repaired %s (%d byte(s) corrected)", hex, fixed);
+                record_finding(db, repo_id, res.run_id, hex, "repaired");
             } else {
                 err_clear();
                 res.unrecoverable++;
@@ -340,7 +482,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  */
                 record_finding(db, repo_id, res.run_id, hex,
                                (streamed && !repair) ? "damaged (run with repair to attempt recovery)"
-                                                     : "unrecoverable", &res);
+                                                     : "unrecoverable");
             }
             continue;
         }
@@ -348,26 +490,39 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.bytes_read += bytes;
 
         if (after.repaired > before.repaired) {
-            /* Readable only because parity covered for it. Write the
+            /*
+             * Readable only because parity covered for it. Write the
              * correction down while we still can: the next read might find
-             * one more damaged byte than parity can carry. */
-            if (repair) {
-                int fixed = (packed ? pack_object_repair(store, hash)
-                                    : object_repair(store, hash));
-                if (fixed > 0)
-                    log_warn("verify: %s was silently corrected on read; wrote "
-                             "%d byte(s) back to disk", hex, fixed);
-                else
+             * one more damaged byte than parity can carry.
+             *
+             * "repaired" means the disk now holds the right bytes, and
+             * nothing else. A scrub with repair off used to count these as
+             * repaired too, so a run that wrote nothing reported a repair
+             * and an operator had no reason to run the one that would
+             * actually fix it. Damage parity can carry but that is still on
+             * disk is "recoverable".
+             */
+            int fixed = repair ? (packed ? pack_object_repair(store, hash)
+                                         : object_repair(store, hash))
+                               : 0;
+            if (fixed > 0) {
+                log_warn("verify: %s was silently corrected on read; wrote "
+                         "%d byte(s) back to disk", hex, fixed);
+                res.repaired++;
+                record_finding(db, repo_id, res.run_id, hex, "repaired");
+            } else {
+                if (repair)
                     log_warn("verify: %s was silently corrected on read but the "
                              "correction could not be written back", hex);
-            } else {
-                log_warn("verify: %s is damaged on disk and was corrected in "
-                         "memory only (repair disabled)", hex);
+                else
+                    log_warn("verify: %s is damaged on disk and was corrected in "
+                             "memory only (repair disabled)", hex);
+                res.recoverable++;
+                record_finding(db, repo_id, res.run_id, hex, "recoverable");
             }
-            res.repaired++;
         } else if (after.uncorrectable > before.uncorrectable) {
             res.unrecoverable++;
-            record_finding(db, repo_id, res.run_id, hex, "uncorrectable parity", &res);
+            record_finding(db, repo_id, res.run_id, hex, "uncorrectable parity");
         } else {
             res.ok++;
         }
@@ -376,12 +531,17 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (devnull != -1) close(devnull);
     db_result_free(objs);
 
-    char fin[32], checked[32], ok[32], rep[32], unrec[32], miss[32], bytes_s[32];
+    if (res.unrecoverable || res.missing)
+        run_blast_radius(db, repo_id, res.run_id,
+                         &res.affected_files, &res.affected_snapshots);
+
+    char fin[32], checked[32], ok[32], rep[32], recov[32], unrec[32], miss[32], bytes_s[32];
     char afff[32], affs[32], run[32];
     snprintf(fin,     sizeof(fin),     "%lld", (long long)time(NULL));
     snprintf(checked, sizeof(checked), "%llu", (unsigned long long)res.checked);
     snprintf(ok,      sizeof(ok),      "%llu", (unsigned long long)res.ok);
     snprintf(rep,     sizeof(rep),     "%llu", (unsigned long long)res.repaired);
+    snprintf(recov,   sizeof(recov),   "%llu", (unsigned long long)res.recoverable);
     snprintf(unrec,   sizeof(unrec),   "%llu", (unsigned long long)res.unrecoverable);
     snprintf(miss,    sizeof(miss),    "%llu", (unsigned long long)res.missing);
     snprintf(bytes_s, sizeof(bytes_s), "%llu", (unsigned long long)res.bytes_read);
@@ -394,10 +554,11 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * nothing is indistinguishable from one that never ran. */
     if (db_execute_non_query(db,
             "UPDATE verify_runs SET finished_at = ?, checked = ?, ok = ?,"
-            " repaired = ?, unrecoverable = ?, missing = ?, bytes_read = ?,"
-            " affected_files = ?, affected_snapshots = ?, completed = ?"
+            " repaired = ?, recoverable = ?, unrecoverable = ?, missing = ?,"
+            " bytes_read = ?, affected_files = ?, affected_snapshots = ?,"
+            " completed = ?"
             " WHERE id = ?",
-            (const char *[]){ fin, checked, ok, rep, unrec, miss, bytes_s,
+            (const char *[]){ fin, checked, ok, rep, recov, unrec, miss, bytes_s,
                               afff, affs, st == OK ? "1" : "0", run, NULL },
             NULL) != 0)
         log_warn("verify: cannot close run record %s", run);
@@ -405,19 +566,44 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     if (res.unrecoverable || res.missing)
-        log_error("verify (%s): %llu checked, %llu repaired, %llu UNRECOVERABLE, "
-                  "%llu MISSING, affecting %llu file(s)",
+        log_error("verify (%s): %llu checked, %llu repaired, %llu recoverable, "
+                  "%llu UNRECOVERABLE, %llu MISSING, affecting %llu file(s)",
                   level_name(level), (unsigned long long)res.checked,
                   (unsigned long long)res.repaired,
+                  (unsigned long long)res.recoverable,
                   (unsigned long long)res.unrecoverable,
                   (unsigned long long)res.missing,
                   (unsigned long long)res.affected_files);
     else
-        log_info("verify (%s): %llu checked, %llu ok, %llu repaired, %llu bytes read",
+        log_info("verify (%s): %llu checked, %llu ok, %llu repaired, %llu recoverable, "
+                 "%llu bytes read",
                  level_name(level), (unsigned long long)res.checked,
                  (unsigned long long)res.ok, (unsigned long long)res.repaired,
+                 (unsigned long long)res.recoverable,
                  (unsigned long long)res.bytes_read);
 
     if (out) *out = res;
+
+    /*
+     * Loss is a failure, reported after the run record and its findings are
+     * written so they stay readable. This returned OK, so a scrub that found
+     * 4 MiB of a pack overwritten finished as a completed job and the CLI
+     * exited 0: anything that judged the run by its exit status, which is
+     * every scheduler and script, was told the repository was fine.
+     *
+     * Recoverable and repaired damage is not loss and does not fail the run.
+     * The walk itself did finish, so the record stays completed = 1 and the
+     * metrics that read completed runs still see the damage.
+     */
+    if (res.unrecoverable || res.missing)
+        return set_error(ERR_CORRUPT,
+                         "verify run %lld found data loss: %llu unrecoverable and "
+                         "%llu missing object(s), affecting %llu file(s) in %llu "
+                         "snapshot(s)",
+                         (long long)res.run_id,
+                         (unsigned long long)res.unrecoverable,
+                         (unsigned long long)res.missing,
+                         (unsigned long long)res.affected_files,
+                         (unsigned long long)res.affected_snapshots);
     return OK;
 }
