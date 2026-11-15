@@ -605,6 +605,11 @@ contains "tcp stream unknown job" 'no such job' \
     "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/999999")"
 check "tcp stream needs a token" 401 "$(tcp_code /jobs/stream/$RJOB --max-time 5)"
 
+# B053: a second client's session must not survive the password change that
+# was meant to shut it out, while the session that made the change does.
+OTHER=$(tcp_body -X POST -d '{"password":"correcthorsebattery"}' "$URL/api/auth/login" \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "second session works" 200 "$(tcp_code /repos -H "Authorization: Bearer $OTHER")"
 check "password change needs current" 401 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
      -d '{"current":"wrong","new":"brandnewpassword"}')"
 check "password change too short" 400 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
@@ -615,6 +620,23 @@ check "old password refused" 401 "$(tcp_code /api/auth/login -X POST \
      -d '{"password":"correcthorsebattery"}')"
 check "new password accepted" 200 "$(tcp_code /api/auth/login -X POST \
      -d '{"password":"brandnewpassword"}')"
+check "other session revoked by the change" 401 "$(tcp_code /repos -H "Authorization: Bearer $OTHER")"
+check "changing session survives" 200 "$(tcp_code /repos "${AUTH[@]}")"
+
+# logout-all needs a credential and takes every session, the caller's too.
+check "logout-all needs a token" 401 "$(tcp_code /api/auth/logout-all -X POST)"
+T2=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+T3=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+contains "logout-all reports what it revoked" '"revoked":' \
+    "$(tcp_body -H "Authorization: Bearer $T2" -X POST "$URL/api/auth/logout-all")"
+check "logout-all ends the caller" 401 "$(tcp_code /repos -H "Authorization: Bearer $T2")"
+check "logout-all ends the others" 401 "$(tcp_code /repos -H "Authorization: Bearer $T3")"
+check "logout-all ends the first session" 401 "$(tcp_code /repos "${AUTH[@]}")"
+TOKEN=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+AUTH=(-H "Authorization: Bearer $TOKEN")
 
 check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
 check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"

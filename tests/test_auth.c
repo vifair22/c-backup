@@ -230,9 +230,36 @@ static void test_session_expiry_slides(void **state)
     free(token);
 }
 
+/*
+ * B053. A password change revoked nothing, so a session opened with the old
+ * password kept working. Revoking everything but the caller's own token is
+ * what the password route does; with no token to keep, everything goes.
+ */
+static void test_revoke_all_spares_only_the_caller(void **state)
+{
+    (void)state;
+    char *mine  = auth_create_token(db, 24);
+    char *other = auth_create_token(db, 24);
+    char *third = auth_create_token(db, 24);
+    assert_non_null(mine); assert_non_null(other); assert_non_null(third);
+
+    char bearer[96];
+    snprintf(bearer, sizeof(bearer), "Bearer %s", mine);
+    assert_int_equal(auth_revoke_all(db, bearer), 2);
+    assert_true(auth_validate_token(db, mine));
+    assert_false(auth_validate_token(db, other));
+    assert_false(auth_validate_token(db, third));
+
+    assert_int_equal(auth_revoke_all(db, NULL), 1);
+    assert_false(auth_validate_token(db, mine));
+    assert_int_equal(auth_revoke_all(db, ""), 0);
+    free(mine); free(other); free(third);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_revoke_all_spares_only_the_caller, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fresh_db_is_not_setup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_setup_then_configured, setup, teardown),
         cmocka_unit_test_setup_teardown(test_password_verification, setup, teardown),

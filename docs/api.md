@@ -58,10 +58,18 @@ paths or file content.
 | POST | `/api/auth/setup` | `{password}`: set the first one. Socket only (`403` over TCP), `409` once set |
 | POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. `403` before setup |
 | POST | `/api/auth/logout` | Revoke the presented token; `204` |
-| POST | `/api/auth/password` | `{current, new}`: always needs the current password |
+| POST | `/api/auth/logout-all` | Revoke every session, the caller's included; `{revoked}` |
+| POST | `/api/auth/password` | `{current, new}`: always needs the current password; returns `{changed, sessions_revoked}` |
 
 Passwords are at least 8 characters. Sessions last 90 days and slide forward
 on every authenticated request.
+
+A password change revokes every session except the one that made it (over
+the socket there is none, so all of them). It used to revoke nothing, which
+left whoever the change was meant to shut out holding a token that kept
+working - and kept sliding forward - for 90 days. `logout-all` is the same
+revocation without a password change, for a lost or untrusted client; from
+the host it is `c-backup auth logout --all`.
 
 ## Repositories
 

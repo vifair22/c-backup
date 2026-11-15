@@ -677,6 +677,14 @@ OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1);
 check "password change reads both from stdin" 0 "$RC"
 contains "old password no longer logs in" "invalid password" \
     "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+# B053: from the host, logout --all ends every session a client holds. A
+# token from a login is checked over TCP, since the socket needs none.
+LTOK=$(printf 'brandnewpassword\n' | cb auth login 2>&1 | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"
+check "and the token is dead" 401 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
 OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
 check "no password on stdin fails" 1 "$RC"
 contains "and says so" "no password read" "$OUT"

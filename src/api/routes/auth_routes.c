@@ -35,6 +35,16 @@ typedef struct {
 
 static auth_ctx_t g_ctx;
 
+/* The token this request authenticated with, header first as auth_check
+ * reads it, or NULL over the socket where there is none. */
+static const char *caller_token(const api_request_t *req)
+{
+    if (req->is_local) return NULL;
+    const char *token = req->auth_token;
+    if (!token || !token[0]) token = api_cookie(req, "auth");
+    return (token && token[0]) ? token : NULL;
+}
+
 
 /* Is first-run setup still pending? Public, because a client has to know
  * whether to show a "set a password" screen or a login screen. */
@@ -162,9 +172,47 @@ static api_response_t handle_password(const api_request_t *req, void *ud)
     if (auth_set_password(ctx->db, next) != 0)
         return api_error(500, "cannot store password");
 
-    log_info("admin password changed");
-    char *out = strdup("{\"changed\":true}");
-    return out ? api_ok(out) : api_error(500, "out of memory");
+    /*
+     * Changing the password used to leave every session standing, so the
+     * person it was changed to shut out kept a working token for up to 90
+     * days, slid forward on every use. Everything goes except the session
+     * that made the change; over the socket there is none, so everything
+     * goes.
+     */
+    int revoked = auth_revoke_all(ctx->db, caller_token(req));
+    if (revoked < 0) {
+        log_error("admin password changed but sessions could not be revoked");
+        return api_error(500, "password changed, but existing sessions could not "
+                              "be revoked; run 'c-backup auth logout --all'");
+    }
+
+    log_info("admin password changed; %d other session(s) revoked", revoked);
+    char *out = NULL;
+    if (asprintf(&out, "{\"changed\":true,\"sessions_revoked\":%d}", revoked) < 0)
+        return api_error(500, "out of memory");
+    return api_ok(out);
+}
+
+/*
+ * Sign out everywhere. The way to answer "a client I no longer control has a
+ * session" without changing the password, and the recovery step if the
+ * revocation inside a password change ever fails. The caller's own session
+ * goes too: the point is that nothing is left signed in.
+ */
+static api_response_t handle_logout_all(const api_request_t *req, void *ud)
+{
+    auth_ctx_t *ctx = ud;
+    int revoked = auth_revoke_all(ctx->db, NULL);
+    if (revoked < 0) return api_error(500, "cannot revoke sessions");
+
+    log_info("all sessions revoked (%d)", revoked);
+    char *out = NULL;
+    if (asprintf(&out, "{\"revoked\":%d}", revoked) < 0)
+        return api_error(500, "out of memory");
+    int secure = ctx->cfg ? config_get_int(ctx->cfg, "auth.cookie_secure", 0) : 0;
+    api_response_t resp = api_ok(out);
+    if (!req->is_local) resp.set_cookie = api_cookie_clear("auth", secure);
+    return resp;
 }
 
 int routes_register_auth(api_server_t *srv, cutils_db_t *db)
@@ -175,6 +223,7 @@ int routes_register_auth(api_server_t *srv, cutils_db_t *db)
     if (api_server_route(srv, "/api/auth/setup",    API_POST, handle_setup_post, &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/login",    API_POST, handle_login,      &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/logout",   API_POST, handle_logout,     &g_ctx) != 0) return -1;
+    if (api_server_route(srv, "/api/auth/logout-all", API_POST, handle_logout_all, &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/password", API_POST, handle_password,   &g_ctx) != 0) return -1;
     return 0;
 }

@@ -351,8 +351,15 @@ HTTPS.
 - A login returns a token valid for 90 days. Every authenticated request
   slides the expiry forward, so a connection in regular use does not expire.
 - `c-backup auth password` changes the password; it always asks for the
-  current one.
+  current one. A change revokes every other session at once: a client that
+  signed in with the old password is signed out, not left holding a token
+  that works for another 90 days. Over TCP the session that made the change
+  survives; from the CLI, which has no session, every session goes.
 - Sign out in the app, or `POST /api/auth/logout` with the token, revokes it.
+- `sudo c-backup auth logout --all` (or `POST /api/auth/logout-all` with a
+  token) revokes every session any client holds, including the caller's.
+  Use it when a machine that was signed in is lost or no longer trusted and
+  the password itself is not in doubt.
 - The CLI never needs a password: it uses the socket.
 - The app stores the session token, never the password (section 15.2).
 

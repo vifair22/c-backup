@@ -1334,7 +1334,7 @@ static int read_new_password(const char *prompt, char *buf, size_t sz)
  */
 static int cmd_auth(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: auth <setup|login|logout|password> [args]");
+    if (argc < 1) return fail("usage: auth <setup|login|logout [--all]|password> [args]");
 
     char pw[256], pw2[256];
 
@@ -1355,8 +1355,14 @@ static int cmd_auth(int argc, char **argv)
         return call_sb("POST", setup ? "/api/auth/setup" : "/api/auth/login", &b);
     }
 
-    if (strcmp(argv[0], "logout") == 0)
+    if (strcmp(argv[0], "logout") == 0) {
+        /* The socket carries no session of its own, so a plain logout here
+         * revokes nothing; --all is the one that does something from the
+         * host: every session any client holds. */
+        if (take_flag(&argc, argv, "--all"))
+            return call("POST", "/api/auth/logout-all", NULL);
         return call("POST", "/api/auth/logout", NULL);
+    }
 
     if (strcmp(argv[0], "password") == 0) {
         const char *cur  = (argc >= 2) ? argv[1] : NULL;
@@ -1419,7 +1425,7 @@ static const struct {
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
     { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
-    { "auth",      cmd_auth,      "auth <setup|login|logout|password> (prompts for passwords)" },
+    { "auth",      cmd_auth,      "auth <setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },
