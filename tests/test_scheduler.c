@@ -390,7 +390,7 @@ static atomic_int g_started;
 static atomic_int g_release;
 static atomic_int g_deaf;
 
-static status_t slow_job(void *arg, volatile int *cancel,
+static status_t slow_job(void *arg, atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
@@ -398,7 +398,7 @@ static status_t slow_job(void *arg, volatile int *cancel,
     atomic_fetch_add(&g_started, 1);
     /* Bounded so a broken test fails instead of hanging: 20 s. */
     for (int i = 0; i < 4000; i++) {
-        if (!atomic_load(&g_deaf) && *cancel)
+        if (!atomic_load(&g_deaf) && atomic_load(cancel))
             return set_error(ERR_IO, "cancelled");
         if (atomic_load(&g_release)) return OK;
         usleep(5000);

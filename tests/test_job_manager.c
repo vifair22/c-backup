@@ -26,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -86,7 +87,7 @@ static int teardown(void **state)
 
 /* Sleeps long enough that an overlap, if the dispatcher allows one, is
  * observed rather than missed by luck of scheduling. */
-static status_t probe_job(void *arg, volatile int *cancel,
+static status_t probe_job(void *arg, atomic_int *cancel,
                           void (*progress)(const char *, uint64_t, uint64_t, void *),
                           void *progress_ctx)
 {
@@ -256,7 +257,7 @@ static void test_old_finished_jobs_are_pruned_as_jobs_finish(void **state)
  * Progress is throttled to a few writes a second, and that must not cost the
  * final tick: a job record that stops at 4,999 of 5,000 reads as a stall.
  */
-static status_t chatty_job(void *arg, volatile int *cancel,
+static status_t chatty_job(void *arg, atomic_int *cancel,
                            void (*progress)(const char *, uint64_t, uint64_t, void *),
                            void *progress_ctx)
 {
@@ -284,7 +285,7 @@ static void test_throttled_progress_keeps_the_last_tick(void **state)
  * said 170/171. The last report is what the job record must end on, whether
  * or not it reached the total.
  */
-static status_t short_phase_job(void *arg, volatile int *cancel,
+static status_t short_phase_job(void *arg, atomic_int *cancel,
                                 void (*progress)(const char *, uint64_t, uint64_t, void *),
                                 void *progress_ctx)
 {
@@ -411,7 +412,7 @@ static void *noise_inserts(void *arg)
     return NULL;
 }
 
-static status_t noop_job(void *arg, volatile int *cancel,
+static status_t noop_job(void *arg, atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
@@ -458,10 +459,10 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
  * read "queued" until a worker reached it, and only then "cancelled". It
  * must be cancelled at once, journalled, and never run.
  */
-static volatile int g_gate_open;
+static atomic_int g_gate_open;
 static int g_gated_runs;
 
-static status_t gated_job(void *arg, volatile int *cancel,
+static status_t gated_job(void *arg, atomic_int *cancel,
                           void (*progress)(const char *, uint64_t, uint64_t, void *),
                           void *progress_ctx)
 {
@@ -526,7 +527,7 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
  */
 static int g_polling_runs;
 
-static status_t polling_job(void *arg, volatile int *cancel,
+static status_t polling_job(void *arg, atomic_int *cancel,
                             void (*progress)(const char *, uint64_t, uint64_t, void *),
                             void *progress_ctx)
 {
@@ -535,7 +536,7 @@ static status_t polling_job(void *arg, volatile int *cancel,
     g_polling_runs++;
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < 2000; i++) {
-        if (*cancel) return set_error(ERR_IO, "cancelled");
+        if (atomic_load(cancel)) return set_error(ERR_IO, "cancelled");
         usleep(5000);
     }
     return set_error(ERR_IO, "polling_job: never cancelled");

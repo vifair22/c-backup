@@ -24,7 +24,7 @@
 typedef struct {
     store_t            *store;
     replica_sink_t     *sink;
-    volatile int       *cancel;
+    atomic_int       *cancel;
     replicate_result_t *res;
 
     /*
@@ -225,7 +225,7 @@ static status_t queue_hash(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
 static status_t walk_tree(walk_ctx_t *c, const uint8_t tree_hash[OBJECT_HASH_SIZE],
                           int depth)
 {
-    if (c->cancel && *c->cancel)
+    if (cancel_requested(c->cancel))
         return set_error(ERR_BUSY, "replicate: cancelled");
     if (depth > REPLICATE_MAX_DEPTH)
         return set_error(ERR_CORRUPT, "replicate: tree nesting too deep");
@@ -281,7 +281,7 @@ static status_t walk_tree(walk_ctx_t *c, const uint8_t tree_hash[OBJECT_HASH_SIZ
 
 status_t replicate_tree(store_t *store, replica_sink_t *sink,
                         const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
-                        volatile int *cancel, replicate_result_t *out)
+                        atomic_int *cancel, replicate_result_t *out)
 {
     if (!store || !sink || !sink->v || !root_tree_hash)
         return set_error(ERR_INVALID, "replicate_tree: null argument");
@@ -299,7 +299,7 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
 }
 
 status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                       replica_sink_t *sink, volatile int *cancel,
+                       replica_sink_t *sink, atomic_int *cancel,
                        task_progress_fn progress, void *progress_ctx,
                        replicate_result_t *out)
 {
@@ -328,7 +328,7 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     size_t nrows = snaps ? (size_t)snaps->nrows : 0;
 
     for (size_t i = 0; i < nrows && st == OK; i++) {
-        if (cancel && *cancel) { st = set_error(ERR_BUSY, "replicate: cancelled"); break; }
+        if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "replicate: cancelled"); break; }
 
         int64_t snap_id = strtoll(snaps->rows[i][0], NULL, 10);
         int64_t ts      = strtoll(snaps->rows[i][1], NULL, 10);

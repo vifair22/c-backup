@@ -123,7 +123,7 @@ static void backup_job_free(void *p)
     free(j);
 }
 
-static status_t backup_job_run(void *arg, volatile int *cancel,
+static status_t backup_job_run(void *arg, atomic_int *cancel,
                                void (*progress)(const char *, uint64_t, uint64_t, void *),
                                void *progress_ctx)
 {

@@ -513,7 +513,7 @@ static void test_deep_wide_tree_is_not_quadratic(void **state)
 static void test_cancellation_stops_the_run(void **state)
 {
     (void)state;
-    volatile int cancel = 1;
+    atomic_int cancel = 1;
     backup_opts_t o = basic_opts();
     o.cancel = &cancel;
     assert_int_not_equal(backup_run(store, db, repo_id, &o, NULL), OK);
@@ -656,9 +656,9 @@ static int dir_entries(const char *path)
 static void cancel_at_last_entry(const char *phase, uint64_t done, uint64_t total,
                                  void *ctx)
 {
-    volatile int *cancel = ctx;
+    atomic_int *cancel = ctx;
     if (phase && strcmp(phase, "store") == 0 && total > 0 && done + 1 == total)
-        *cancel = 1;
+        atomic_store(cancel, 1);
 }
 
 /*
@@ -678,7 +678,7 @@ static void test_cancel_lands_inside_a_large_file(void **state)
     (void)state;
     write_big(TEST_DIR "/big.bin", 64);
     static const char *paths[] = { TEST_SRC, TEST_DIR "/big.bin" };
-    volatile int cancel = 0;
+    atomic_int cancel = 0;
     backup_opts_t o = basic_opts();
     o.paths = paths;
     o.n_paths = 2;
@@ -720,7 +720,7 @@ static void test_object_writer_stops_on_the_store_flag(void **state)
     write_big(TEST_DIR "/big.bin", 24);
     int fd = open(TEST_DIR "/big.bin", O_RDONLY);
     assert_true(fd >= 0);
-    volatile int cancel = 1;
+    atomic_int cancel = 1;
     store_set_cancel(store, &cancel);
     uint8_t hash[OBJECT_HASH_SIZE];
     object_write_t w;
@@ -767,7 +767,7 @@ static void test_readers_and_packer_stop_on_the_store_flag(void **state)
 
     int out = open("/dev/null", O_WRONLY);
     assert_true(out >= 0);
-    volatile int cancel = 1;
+    atomic_int cancel = 1;
     uint64_t sz = 0;
 
     store_set_cancel(store, &cancel);

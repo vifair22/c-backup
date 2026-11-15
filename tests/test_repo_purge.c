@@ -177,7 +177,7 @@ static void test_a_stopped_purge_resumes(void **state)
     int64_t gone = repo_with_history("gone");
     assert_int_equal(repo_deregister(db, gone), OK);
 
-    volatile int stop = 1;
+    atomic_int stop = 1;
     assert_int_equal(repo_purge_run(db, &stop), ERR_BUSY);
     assert_int_equal(pending(), 1);
     assert_true(rows_for(gone) > 0);

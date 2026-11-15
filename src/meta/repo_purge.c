@@ -31,7 +31,7 @@ static const char *const keyed_tables[] = {
 
 /* Delete one table's rows for a repository, a batch per transaction. */
 static status_t purge_table(cutils_db_t *db, const char *table, const char *repo,
-                            volatile int *stop)
+                            atomic_int *stop)
 {
     char sql[256];
     snprintf(sql, sizeof(sql),
@@ -39,7 +39,8 @@ static status_t purge_table(cutils_db_t *db, const char *table, const char *repo
              " (SELECT rowid FROM %s WHERE repo_id = ? LIMIT " PURGE_BATCH ")",
              table, table);
     for (;;) {
-        if (stop && *stop) return ERR_BUSY;   /* stopped: not done, not failed */
+        /* stopped: not done, not failed */
+        if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return ERR_BUSY;
         if (db_txn_begin(db) != OK) return set_error(ERR_IO, "purge %s: begin", table);
         int n = 0;
         if (db_execute_non_query(db, sql, (const char *[]){ repo, NULL }, &n) != 0) {
@@ -63,7 +64,7 @@ static status_t purge_stmt(cutils_db_t *db, const char *sql, const char *repo)
     return db_txn_commit(db) == OK ? OK : set_error(ERR_IO, "purge: commit");
 }
 
-static status_t purge_one(cutils_db_t *db, const char *repo, volatile int *stop)
+static status_t purge_one(cutils_db_t *db, const char *repo, atomic_int *stop)
 {
     /* Runs and their findings and hits: the children are indexed by run. */
     static const char *const by_run[] = {
@@ -78,7 +79,8 @@ static status_t purge_one(cutils_db_t *db, const char *repo, volatile int *stop)
         NULL
     };
     for (int i = 0; by_run[i]; i++) {
-        if (stop && *stop) return ERR_BUSY;   /* stopped: not done, not failed */
+        /* stopped: not done, not failed */
+        if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return ERR_BUSY;
         status_t st = purge_stmt(db, by_run[i], repo);
         if (st != OK) return st;
     }
@@ -89,7 +91,7 @@ static status_t purge_one(cutils_db_t *db, const char *repo, volatile int *stop)
     return purge_stmt(db, "DELETE FROM repo_purge_pending WHERE repo_id = ?", repo);
 }
 
-status_t repo_purge_run(cutils_db_t *db, volatile int *stop)
+status_t repo_purge_run(cutils_db_t *db, atomic_int *stop)
 {
     for (;;) {
         db_result_t *r = NULL;
@@ -120,7 +122,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     cutils_db_t    *db;
-    volatile int    stop;
+    atomic_int      stop;
     int             kicked;
     int             running;
 } g_purge = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };

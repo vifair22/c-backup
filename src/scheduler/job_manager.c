@@ -26,7 +26,7 @@ typedef struct {
     job_fn   fn;
     void    *arg;
     void   (*arg_free)(void *);
-    volatile int cancel;
+    atomic_int   cancel;  /* set under mu, polled by the job without it */
     int      active;      /* claimed by a worker */
 } job_slot_t;
 
@@ -444,7 +444,8 @@ static void *worker_main(void *arg)
         if (st == OK) {
             outcome = "success";
             set_job_state(jm, slot.job_id, "completed", NULL);
-        } else if (jm->queue[slot_index].cancel) {
+        } else if (atomic_load_explicit(&jm->queue[slot_index].cancel,
+                                        memory_order_relaxed)) {
             outcome = "cancelled";
             set_job_state(jm, slot.job_id, "cancelled", NULL);
         } else {
@@ -492,7 +493,8 @@ static void *worker_main(void *arg)
          * anyone knows is when a restore is needed. push_send is a no-op when
          * Pushover is unconfigured, so this needs no feature flag.
          */
-        if (st != OK && !jm->queue[slot_index].cancel) {
+        if (st != OK && !atomic_load_explicit(&jm->queue[slot_index].cancel,
+                                             memory_order_relaxed)) {
             /* Pushover's limits: 250 for the title, 1024 for the body. */
             char title[250], body[1024];
             pthread_mutex_lock(&jm->db_mu);
@@ -631,7 +633,8 @@ void job_manager_stop(job_manager_t *jm)
     }
     /* Ask anything in flight to wind up rather than waiting for it. */
     for (int i = 0; i < JOB_QUEUE_MAX; i++)
-        if (jm->queue[i].job_id) jm->queue[i].cancel = 1;
+        if (jm->queue[i].job_id)
+            atomic_store_explicit(&jm->queue[i].cancel, 1, memory_order_relaxed);
     pthread_cond_broadcast(&jm->cv);
     pthread_mutex_unlock(&jm->mu);
 
@@ -736,7 +739,7 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
     s->fn       = fn;
     s->arg      = arg;
     s->arg_free = arg_free;
-    s->cancel   = 0;
+    atomic_store_explicit(&s->cancel, 0, memory_order_relaxed);
     s->active   = 0;
     jm->tail = (jm->tail + 1) % JOB_QUEUE_MAX;
     jm->count++;
@@ -786,7 +789,7 @@ status_t job_cancel(job_manager_t *jm, int64_t job_id)
     if (!dequeued) {
         for (int i = 0; i < JOB_QUEUE_MAX; i++) {
             if (jm->queue[i].active && jm->queue[i].job_id == job_id) {
-                jm->queue[i].cancel = 1;
+                atomic_store_explicit(&jm->queue[i].cancel, 1, memory_order_relaxed);
                 flagged = 1;
                 break;
             }
