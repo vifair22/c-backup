@@ -202,11 +202,13 @@ done:
  */
 /* The prefixes mkstemp is given under tmp/, by every writer in the engine.
  * A targeted sweep removes only these, so a file somebody put in tmp/ by
- * hand is never the engine's to delete. */
+ * hand is never the engine's to delete. "tags." is the tag mirror's staging
+ * file (repo_tags.c): written by the daemon rather than the store, but a
+ * crash between its mkstemp and rename orphans it all the same. */
 static int is_engine_tmp_name(const char *name)
 {
     static const char *const prefixes[] = {
-        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.",
+        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.", "tags.",
     };
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
         if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;

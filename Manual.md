@@ -259,6 +259,17 @@ With `--read-only`, the root filesystem is not written: state goes to the
 `/var/lib/c-backupd` volume, the socket to the `/run/c-backupd` tmpfs, and
 staging files into each repository's own `tmp/`.
 
+**No writable `/tmp` is needed**, and none is used. Every temporary file
+the engine makes goes into the repository it is working on: staged
+objects and packs, snapshot records, the tag mirror, and the parity that
+backup, `pack`, `gc` compaction and replication spill to disk for entries
+past a few MiB. A replication target's staging goes into the target's own
+`tmp/`. The `tmp/` directory is recreated when a repository is opened if
+someone removed it. SQLite's own temporary files (large sorts, temporary
+indices) go beside `state.db`, in the state volume, unless `SQLITE_TMPDIR`
+names somewhere else; set it only to a directory the daemon can write. The
+daemon logs the location at start (`sqlite temporary files: ...`).
+
 ### 2.4 The desktop app
 
 The app lives in `ui/`. To build and run it from a checkout:

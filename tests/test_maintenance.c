@@ -405,6 +405,9 @@ static void test_gc_removes_stale_staging_files(void **state)
     past[1] = past[0];
     write_file(TEST_REPO "/tmp/obj.Kk33Ll", "a killed writer's object");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/obj.Kk33Ll", past, 0), 0);
+    /* The tag mirror stages there too, and its orphans are the engine's. */
+    write_file(TEST_REPO "/tmp/tags.Mm44Nn", "{\"version\":1,\"tags\":[]}");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/tags.Mm44Nn", past, 0), 0);
     write_file(TEST_REPO "/tmp/mine.txt", "somebody else's");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/mine.txt", past, 0), 0);
 
@@ -415,9 +418,10 @@ static void test_gc_removes_stale_staging_files(void **state)
     assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), 0);
 
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
-    assert_int_equal(g.tmp_files_removed, 1);
+    assert_int_equal(g.tmp_files_removed, 2);
     assert_true(g.tmp_bytes_removed > 0);
     assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/tags.Mm44Nn", &sb), -1);
     assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
 }
 
