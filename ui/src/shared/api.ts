@@ -120,7 +120,7 @@ export type ApiRequest =
   | { kind: 'policyGet'; repoId: number }
   | { kind: 'policySet'; repoId: number; key: string; value: string }
   | { kind: 'tagList'; repoId: number }
-  | { kind: 'tagSet'; repoId: number; name: string; snapshotId: number }
+  | { kind: 'tagSet'; repoId: number; name: string; snapshotId: number; move?: boolean }
   | { kind: 'tagRemove'; repoId: number; name: string }
   | { kind: 'journal'; repoId: number; limit?: number; result?: string }
 

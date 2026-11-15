@@ -570,7 +570,21 @@ Snapshots carry notes and tags:
 ```sh
 sudo c-backup snapshot note 1 12 "before the migration"
 sudo c-backup tag set 1 pre-migration 12
+sudo c-backup tag set 1 pre-migration 14 --move   # it is on 12; move it
+sudo c-backup tag remove 1 pre-migration
 ```
+
+- A note or tag needs a snapshot that exists; naming one that does not is
+  an error, not a record attached to nothing.
+- **A tag names one snapshot, and moving it must be asked for.** Setting a
+  name that is already on another snapshot fails and says where the tag is.
+  A tag is retention protection (section 9.1), so moving it unprotects the
+  snapshot it was on; `--move` says that is intended. Setting a tag on the
+  snapshot it is already on succeeds.
+- Tag names are 1 to 64 letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit. A name is part of a URL path when it is removed, and one
+  with a space or a slash could be set but never removed.
+- Removing a tag that does not exist fails with "no such tag".
 
 ---
 
@@ -637,7 +651,20 @@ sudo c-backup policy set 1 retention.keep_daily 14
 sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
-`policy list` shows the repository's own values and the defaults in force.
+`policy list` shows the repository's own values and the defaults in force,
+`maintenance.auto_pack` (on) included.
+
+Only these keys are accepted; any other key, and any value of the wrong
+kind, is refused with a message listing what is valid:
+
+| Key | Accepts |
+|---|---|
+| `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
+| `maintenance.auto_pack` | `true` or `false` (`yes`/`no`, `on`/`off`, `1`/`0` also accepted, and stored as `true`/`false`) |
+
+A database from before this check may hold a value that would now be
+refused. A retention pass ignores it, logs a warning naming it, and uses the
+default; `policy set` with a valid value replaces it.
 
 ### 9.3 Running it
 
@@ -649,6 +676,18 @@ sudo c-backup gfs 1 --dry-run              # what would go
 sudo c-backup gfs 1
 sudo c-backup schedule add 1 gfs --every day --at 04:00
 ```
+
+The finished job says what the pass did. A dry run lists the snapshots it
+would remove, a real run the ones it removed, and both give the retention
+values the pass applied (the repository's policy over the defaults):
+
+```json
+"result":{"dry_run":true,"would_remove":[3,4,9],"count":3,
+          "retention":{"keep_snaps":1,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+```
+
+The journal entry for the pass says the same in one line, for example
+`removed 3 snapshots: 3, 4, 9`, naming up to 20 ids and counting the rest.
 
 Pruning a snapshot removes its record and index rows. The space its objects
 held is reclaimed by garbage collection (section 12), which a schedule should
@@ -1197,7 +1236,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
-| `tag list <id>`, `tag set <id> <name> <snapshot>`, `tag remove <id> <name>` | Tags |
+| `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |

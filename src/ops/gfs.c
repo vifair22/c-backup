@@ -246,7 +246,10 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, uint32_t *out_pruned) {
+                 int full_scan, gfs_result_t *out) {
+    /* Empty before any early return, so a caller can always report and
+     * free it. */
+    if (out) { out->pruned = 0; out->ids = NULL; }
     if (new_snap_id == 0) return OK;
 
     gfs_snap_info_t *snaps = NULL;
@@ -371,6 +374,12 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * and there are already >= keep_N newer snaps at the same tier. */
     int *tier_expired = calloc(n, sizeof(int));
     if (!tier_expired) { free(orig_flags); free(snaps); return set_error(ERR_NOMEM, "gfs_run: alloc tier_expired failed"); }
+    /* At most every snapshot but the newest goes, so n bounds the list. */
+    uint32_t *ids = out ? calloc(n ? n : 1, sizeof(uint32_t)) : NULL;
+    if (out && !ids) {
+        free(tier_expired); free(orig_flags); free(snaps);
+        return set_error(ERR_NOMEM, "gfs_run: alloc result ids failed");
+    }
 
     for (uint32_t i = 0; i < n; i++) {
         if (snaps[i].gfs_flags == 0) continue;
@@ -412,8 +421,10 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (dry_run) {
             log_info("gfs: would remove snapshot %u", id);
+            if (ids) ids[pruned_snaps] = id;
             pruned_snaps++;
         } else if (prune_snapshot(store, db, repo_id, (int64_t)id) == OK) {
+            if (ids) ids[pruned_snaps] = id;
             pruned_snaps++;
         } else {
             log_warn("gfs: cannot prune snapshot %u: %s", id, err_msg());
@@ -433,7 +444,14 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     free(orig_flags);
     free(snaps);
 
-    if (out_pruned) *out_pruned = pruned_snaps;
+    if (out) { out->pruned = pruned_snaps; out->ids = ids; }
 
     return st;
+}
+
+void gfs_result_free(gfs_result_t *r) {
+    if (!r) return;
+    free(r->ids);
+    r->ids = NULL;
+    r->pruned = 0;
 }

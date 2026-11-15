@@ -678,6 +678,60 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
     return st;
 }
 
+/* How many ids a gfs journal message names before it summarises the rest.
+ * The job result carries all of them; the journal is a one-line log. */
+#define GFS_SUMMARY_IDS 20
+
+/*
+ * What a retention pass did, on the job and in the journal.
+ *
+ * A dry run's whole answer - which snapshots would go - reached only the
+ * daemon log, so "gfs --dry-run" printed a job record saying "completed"
+ * and nothing else, and the journal entry for a real pass had an empty
+ * message. The retention values are reported too, since the defaults and
+ * the per-repo policy combine here and nowhere else shows the result.
+ */
+static void gfs_report(void *progress_ctx, int dry_run,
+                       const gfs_retention_t *ret, const gfs_result_t *gr)
+{
+    /* 11 bytes per id covers ten digits and a comma. */
+    size_t cap = 320 + (size_t)gr->pruned * 11;
+    char *js = malloc(cap);
+    if (js) {
+        size_t off = (size_t)snprintf(js, cap, "{\"dry_run\":%s,\"%s\":[",
+                                      dry_run ? "true" : "false",
+                                      dry_run ? "would_remove" : "removed");
+        for (uint32_t i = 0; i < gr->pruned && off < cap; i++)
+            off += (size_t)snprintf(js + off, cap - off, "%s%u", i ? "," : "", gr->ids[i]);
+        if (off < cap)
+            snprintf(js + off, cap - off,
+                     "],\"count\":%u,\"retention\":{\"keep_snaps\":%d,"
+                     "\"keep_daily\":%d,\"keep_weekly\":%d,"
+                     "\"keep_monthly\":%d,\"keep_yearly\":%d}}",
+                     gr->pruned, ret->keep_snaps, ret->keep_daily,
+                     ret->keep_weekly, ret->keep_monthly, ret->keep_yearly);
+        job_set_result(progress_ctx, js);
+        free(js);
+    }
+
+    char msg[384];
+    size_t off = (size_t)snprintf(msg, sizeof(msg), "%s",
+                                  dry_run ? "dry run: would remove " : "removed ");
+    if (gr->pruned == 0) {
+        snprintf(msg + off, sizeof(msg) - off, "no snapshots");
+    } else {
+        off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%u snapshot%s:",
+                                gr->pruned, gr->pruned == 1 ? "" : "s");
+        uint32_t shown = gr->pruned < GFS_SUMMARY_IDS ? gr->pruned : GFS_SUMMARY_IDS;
+        for (uint32_t i = 0; i < shown && off < sizeof(msg); i++)
+            off += (size_t)snprintf(msg + off, sizeof(msg) - off, "%s %u",
+                                    i ? "," : "", gr->ids[i]);
+        if (gr->pruned > shown && off < sizeof(msg))
+            snprintf(msg + off, sizeof(msg) - off, " and %u more", gr->pruned - shown);
+    }
+    job_set_summary(progress_ctx, msg);
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -773,7 +827,17 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 (const char *[]){ repo, NULL }, &r) == 0 && r) {
             for (int i = 0; i < r->nrows; i++) {
                 const char *k = r->rows[i][0];
-                int v = atoi(r->rows[i][1]);
+                /* The policy route validates now, but a database written
+                 * before it did can hold "banana" or "-3". atoi read those
+                 * as 0 and -3, and 0 for a tier means unlimited: a typo
+                 * silently turned a tier's pruning off. Skip and keep the
+                 * default instead, and say so. */
+                int v = 0;
+                if (routes_policy_count(r->rows[i][1], &v) != 0) {
+                    log_warn("gfs: repo %lld: ignoring invalid %s = '%s'",
+                             (long long)j->repo_id, k, r->rows[i][1]);
+                    continue;
+                }
                 if      (strcmp(k, "retention.keep_daily") == 0)   ret.keep_daily = v;
                 else if (strcmp(k, "retention.keep_weekly") == 0)  ret.keep_weekly = v;
                 else if (strcmp(k, "retention.keep_monthly") == 0) ret.keep_monthly = v;
@@ -793,9 +857,12 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         /* Manual runs are full scans: an operator asking for GFS explicitly
          * wants the whole history reconsidered, not the incremental pass the
          * backup pipeline does. */
+        gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, NULL)
+                            j->dry_run, 1, 1, &gr)
                   : OK;
+        if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
+        gfs_result_free(&gr);
     } else {
         restore_opts_t o;
         memset(&o, 0, sizeof(o));

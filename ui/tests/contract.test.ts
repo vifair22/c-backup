@@ -329,6 +329,46 @@ describe('the flows behind the buttons', () => {
     assert.deepEqual((list.body as { schedules?: unknown[] }).schedules ?? [], [])
   })
 
+  test('tags: a name in use moves only when the edit says so', async () => {
+    /*
+     * The tags screen's Edit sends move; Add does not. A set used to move
+     * any existing name silently, which took the retention protection off
+     * the snapshot it was on, so the daemon refuses now unless asked and
+     * the screen depends on that distinction.
+     */
+    const path = join(work, 'tagrepo')
+    const created = await request(toEndpoint({ kind: 'repoAdd', path, label: 'tags' }))
+    assert.equal(created.status, 201)
+    const repoId = (created.body as { id: number }).id
+    await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [join(work, 'src')] }))
+    for (let n = 1; n <= 2; n++) {
+      const started = await request(toEndpoint({ kind: 'backup', repoId }))
+      assert.equal(started.status, 202)
+      for (let i = 0; i < 60; i++) {
+        const r = await request(toEndpoint({ kind: 'snapshotList', repoId }))
+        if (((r.body as { snapshots?: unknown[] }).snapshots ?? []).length >= n) break
+        await sleep(250)
+      }
+    }
+
+    let r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 1 }))
+    assert.equal(r.status, 200)
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 2 }))
+    assert.equal(r.status, 409, 'an Add under a name in use must not move it')
+    assert.match((r.body as { error: string }).error, /snapshot 1/)
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'keep', snapshotId: 2, move: true }))
+    assert.equal(r.status, 200)
+    const list = await request(toEndpoint({ kind: 'tagList', repoId }))
+    assert.deepEqual((list.body as { tags: { name: string; snap_id: string }[] }).tags,
+      [{ name: 'keep', snap_id: '2' }])
+
+    /* A name the daemon would refuse, and a removal of nothing, both say so. */
+    r = await request(toEndpoint({ kind: 'tagSet', repoId, name: 'a/b', snapshotId: 1 }))
+    assert.equal(r.status, 400)
+    r = await request(toEndpoint({ kind: 'tagRemove', repoId, name: 'absent' }))
+    assert.equal(r.status, 404)
+  })
+
   test('integrity: run a verify and read its result back', async () => {
     /*
      * Verify has recorded runs and findings since it was written and

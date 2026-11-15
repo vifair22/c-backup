@@ -78,6 +78,14 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
  */
 int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def);
 
+/*
+ * Parse a retention count as the policy route accepts it: decimal digits
+ * only, 0 to INT_MAX. Returns 0 and sets *out, or -1. Readers use it too,
+ * so a value stored before the route validated is ignored rather than read
+ * through atoi as 0.
+ */
+int routes_policy_count(const char *text, int *out);
+
 /* Is this an action a schedule may name? The list lives with the dispatcher
  * so a schedule cannot be created for something that will not run. */
 int routes_action_is_schedulable(const char *action);

@@ -99,6 +99,21 @@ contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
 check    "tag remove" 0           "$(cb tag remove 1 keeper > /dev/null; echo $?)"
 
+# B038: removing a tag that is not there exited 0 with no output.
+OUT=$(cb tag remove 1 keeper 2>&1); RC=$?
+check    "tag remove of a missing tag fails" 1 "$RC"
+contains "and says so" 'no such tag' "$OUT"
+# B037: a nonexistent snapshot, or no name at all, was accepted.
+check "tag set on a missing snapshot fails" 1 "$(cb tag set 1 ghost 999 > /dev/null 2>&1; echo $?)"
+check "note on a missing snapshot fails" 1 "$(cb snapshot note 1 999 x > /dev/null 2>&1; echo $?)"
+check "tag set with an empty name fails" 1 "$(cb tag set 1 '' 1 > /dev/null 2>&1; echo $?)"
+# B036: the name went into the path unencoded, so "a b" made a request line
+# the server answered with an HTML page and a 301. Encoded, the daemon sees
+# the name and answers in JSON. And a name like that cannot be set now.
+contains "tag remove encodes the name" '{"error":"no such tag"}' "$(cb tag remove 1 'a b' 2>&1)"
+contains "a name that is not a path segment is refused" 'invalid tag name' \
+    "$(cb tag set 1 'a/b' 1 2>&1)"
+
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
 check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?)"
@@ -106,6 +121,11 @@ check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
 contains "reindex" '"state":"completed"' "$(cb reindex 1)"
 contains "gfs"     '"state":"completed"' "$(cb gfs 1)"
+# B035: a dry run printed the job record and nothing about what it would
+# remove. One snapshot, so the answer is nothing, but it is an answer.
+GFS_OUT=$(cb gfs 1 --dry-run)
+contains "gfs dry run says what it would remove" '"would_remove":[],"count":0' "$GFS_OUT"
+contains "and the retention it used" '"retention":{"keep_snaps":' "$GFS_OUT"
 contains "journal" 'entries'  "$(cb journal 1)"
 
 RESTORE_OUT=$(cb restore 1 1 "$WORK/out")
@@ -146,6 +166,11 @@ fi
 
 contains "policy set"  '"ok"'         "$(cb policy set 1 retention.keep_daily 14)"
 contains "policy list" 'keep_daily'   "$(cb policy list 1)"
+# B034: any key and any value were stored.
+OUT=$(cb policy set 1 retention.keep_hourly 5 2>&1); RC=$?
+check    "an unknown policy key fails" 1 "$RC"
+contains "and lists the valid keys" 'retention.keep_daily' "$OUT"
+check "a non-numeric count fails" 1 "$(cb policy set 1 retention.keep_daily banana > /dev/null 2>&1; echo $?)"
 
 contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')"
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
@@ -164,6 +189,16 @@ contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit
 echo "content three" > "$WORK/src/three.txt"
 contains "second backup completed" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "diff" '"added"' "$(cb diff 1 1 2)"
+
+# B033: a tag set on a name already in use moved it silently, taking the
+# retention protection off the snapshot it was on. --move says it is meant.
+contains "tag set" '"ok"' "$(cb tag set 1 pinned 1)"
+OUT=$(cb tag set 1 pinned 2 2>&1); RC=$?
+check    "a tag in use elsewhere is not moved" 1 "$RC"
+contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
+contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
+contains "to the new snapshot" '"snap_id":"2"' "$(cb tag list 1)"
+cb tag remove 1 pinned > /dev/null
 
 # Exclusions have to work from the CLI too, which is where anyone would
 # actually type them.

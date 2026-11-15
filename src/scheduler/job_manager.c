@@ -117,6 +117,8 @@ typedef struct {
     /* job_progress_bytes and job_set_result. */
     uint64_t       bytes_done, bytes_total;
     char          *result;
+    /* job_set_summary: the journal message for a job that succeeds. */
+    char          *summary;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -186,6 +188,16 @@ void job_set_result(void *progress_ctx, const char *json_object)
     if (!copy) return;   /* a result is a report, not the job's outcome */
     free(pc->result);
     pc->result = copy;
+}
+
+void job_set_summary(void *progress_ctx, const char *text)
+{
+    progress_ctx_t *pc = progress_ctx;
+    if (!pc || !text) return;
+    char *copy = strdup(text);
+    if (!copy) return;   /* an empty journal message, as before */
+    free(pc->summary);
+    pc->summary = copy;
 }
 
 /* Caller holds jm->mu. repo_id 0 means "not repo scoped", never busy. */
@@ -274,7 +286,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
 
@@ -339,10 +351,15 @@ static void *worker_main(void *arg)
             clock_gettime(CLOCK_MONOTONIC, &now);
             int64_t took = (int64_t)(now.tv_sec - began.tv_sec) * 1000
                          + (now.tv_nsec - began.tv_nsec) / 1000000;
+            /* A success journalled an empty message, so the entry for a
+             * retention pass could not say what it deleted - the one thing
+             * anybody reading a journal of deletions wants. */
             journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
-                           took, detail);
+                           took, st == OK ? pc.summary : detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
+        free(pc.summary);
+        pc.summary = NULL;
         pthread_mutex_lock(&jm->db_mu);
         prune_finished_jobs(jm);
         pthread_mutex_unlock(&jm->db_mu);

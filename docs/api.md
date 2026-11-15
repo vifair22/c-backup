@@ -488,16 +488,53 @@ same property that makes incremental backups cheap, applied to reading.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id}` |
-| DELETE | `/repos/<id>/tags/<name>` | Remove |
-| GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}` |
+| GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id, move}` |
+| DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
+| GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
 | GET | `/repos/<id>/journal` | Operation history |
 
+Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
+with no name is a 400. Removing a tag that is not there is a 404 `no such
+tag`, so a typo does not read as success.
+
+A tag names one snapshot. Setting a name that is already on a different
+snapshot is refused with a 409 that names the snapshot it is on, unless the
+body carries `"move":true` (`tag set ... --move` from the CLI). Moving a tag
+takes its retention protection off the snapshot it was on, so it has to be
+asked for; it used to happen silently, and the next retention pass could
+then delete a snapshot the operator believed was protected. Setting a name on
+the snapshot it is already on succeeds, so a retried request is harmless.
+
+Tag names are 1 to 64 characters of `A-Z a-z 0-9 . _ -`, starting with a
+letter or digit; anything else is a 400 at set time. A name is the last
+segment of the `DELETE` path, and one that cannot be a path segment (a space,
+a slash, a `?`) could be set and then never removed. Clients should still
+percent-encode the segment, as the CLI and the app do, so that a tag stored
+before this rule can be removed: the server decodes the path before routing.
+
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
-`defaults`, the daemon's configured `retention.*` values from `config.yaml`
-that apply wherever the repository has set nothing. A client cannot read the
-daemon's config file, so without them it could only guess at what is in force.
+`defaults`, what applies wherever the repository has set nothing: the
+daemon's configured `retention.*` values from `config.yaml`, and
+`maintenance.auto_pack` (`true`). A client cannot read the daemon's config
+file, so without them it could only guess at what is in force.
+
+`PUT /repos/<id>/policy` accepts only the keys something in the daemon reads,
+and refuses anything else with a 400 that lists them:
+
+| Key | Value |
+|---|---|
+| `retention.keep_snaps` | whole number, 0 or more |
+| `retention.keep_daily` | whole number, 0 or more |
+| `retention.keep_weekly` | whole number, 0 or more |
+| `retention.keep_monthly` | whole number, 0 or more |
+| `retention.keep_yearly` | whole number, 0 or more |
+| `maintenance.auto_pack` | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, any case); stored as `true` or `false` |
+
+A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
+were all stored once, and a retention pass read `banana` as 0, which for a
+tier means "keep all". A value stored before the route validated is ignored
+when read, with a warning in the daemon log, and the default applies.
 
 Retention keeps a snapshot that is among the newest `retention.keep_snaps`, or
 holds a tier (daily, weekly, monthly, yearly) and is within that tier's count,
@@ -505,6 +542,20 @@ or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
 `keep_snaps` below 1 still keeps the newest snapshot. Retention runs when
 `/repos/<id>/gfs` is called or a `gfs` schedule fires, never as a side effect
 of a backup.
+
+A retention job's `result` says what it did, and on a dry run
+(`?dry_run=1`) what it would do:
+
+```json
+{"dry_run":true,"would_remove":[1,2],"count":2,
+ "retention":{"keep_snaps":2,"keep_daily":7,"keep_weekly":4,"keep_monthly":12,"keep_yearly":3}}
+```
+
+A real pass names `removed` instead of `would_remove`, listing only the
+snapshots it actually deleted. `retention` is what the pass applied: the
+repository's policy where it has one, the daemon defaults elsewhere. The
+journal entry for the job carries the same in a line, such as `removed 2
+snapshots: 1, 2`, naming at most 20 ids and counting the rest.
 
 Any tag protects a snapshot from retention pruning. Tags are how a user says
 "keep this one", and deleting a tagged snapshot because a window rolled past

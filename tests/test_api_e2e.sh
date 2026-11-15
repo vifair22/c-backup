@@ -226,6 +226,58 @@ contains "policy readable" 'keep_daily' "$(sock_body /repos/1/policy)"
 check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/tags/milestone)"
 
+# B037, B038: metadata for a snapshot that does not exist, a tag with no
+# name, and removing a tag that is not there were all accepted in silence.
+sock_send() {  # sock_send <method> <path> [body] -> "<code> <body>"
+    curl -s -w ' %{http_code}' -X "$1" --unix-socket "$SOCK" ${3:+-d "$3"} "http://localhost$2"
+}
+check "tag on a missing snapshot is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"ghost","snap_id":999}' http://localhost/repos/1/tags)"
+check "note on a missing snapshot is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+     --unix-socket "$SOCK" -d '{"body":"x"}' http://localhost/repos/1/snapshots/999/note)"
+check "an empty tag name is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"","snap_id":1}' http://localhost/repos/1/tags)"
+contains "removing a missing tag is a 404" '{"error":"no such tag"} 404' \
+    "$(sock_send DELETE /repos/1/tags/milestone)"
+check "nothing was stored for the missing snapshot" '{"tags":[]}' "$(sock_body /repos/1/tags)"
+
+# B036: a tag name is a path segment in DELETE, so one that cannot be a
+# segment ("a b", "a/b", "x?y") could be set and then never removed.
+for n in 'a/b' 'a b' 'x?y' '.hidden' '..'; do
+    check "tag name '$n' is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+         --unix-socket "$SOCK" -d "{\"name\":\"$n\",\"snap_id\":1}" http://localhost/repos/1/tags)"
+done
+check "a 65-character tag name is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d "{\"name\":\"$(printf 'a%.0s' $(seq 1 65))\",\"snap_id\":1}" \
+     http://localhost/repos/1/tags)"
+check "a dotted, dashed name is fine" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"v1.2_pre-upgrade","snap_id":1}' http://localhost/repos/1/tags)"
+check "and removable" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" http://localhost/repos/1/tags/v1.2_pre-upgrade)"
+
+# B034: policy stored any key and any value and said ok. Each of these was
+# accepted and then ignored or misread by the retention pass.
+put_policy() { sock_send PUT /repos/1/policy "{\"key\":\"$1\",\"value\":\"$2\"}"; }
+OUT=$(put_policy retention.keep_hourly 5)
+contains "an unknown policy key is a 400" ' 400' "$OUT"
+contains "and the refusal lists the valid keys" 'maintenance.auto_pack' "$OUT"
+contains "a non-numeric count is a 400" ' 400' "$(put_policy retention.keep_daily banana)"
+contains "a negative count is a 400" ' 400' "$(put_policy retention.keep_weekly -3)"
+contains "a signed count is a 400" ' 400' "$(put_policy retention.keep_weekly +3)"
+contains "a non-boolean flag is a 400" ' 400' "$(put_policy maintenance.auto_pack maybe)"
+contains "a boolean in another spelling is accepted" ' 200' "$(put_policy maintenance.auto_pack OFF)"
+POL=$(sock_body /repos/1/policy)
+contains "and stored in one spelling" '"key":"maintenance.auto_pack","value":"false"' "$POL"
+contains "a refused value leaves the stored one" '"key":"retention.keep_daily","value":"14"' "$POL"
+case "$POL" in *keep_hourly*) bad "an unknown key is not stored" "absent" "$POL" ;;
+               *) ok "an unknown key is not stored" ;; esac
+put_policy maintenance.auto_pack true > /dev/null
+
+# B040: the defaults listed every retention key but not auto_pack, which is
+# in force everywhere a repository has not set it.
+contains "policy defaults include auto_pack, on" \
+    '{"key":"maintenance.auto_pack","value":"true"}]}' "$(sock_body /repos/1/policy)"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.
@@ -616,9 +668,63 @@ for i in 1 2 3 4; do
     echo "$i" >> "$R/src/f"
     wait_job "$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")"
 done
-wait_job "$(job_id "$(sock_post /repos/1/gfs)")"
+
+# B033: setting a tag name already on another snapshot moved it silently,
+# taking the protection off the first snapshot. Refused now, naming where
+# the tag is, unless the request says move; the same snapshot again is
+# fine. Snapshots 3 and 4 so retention below is unaffected.
+sock_tag() { curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" -d "$1" http://localhost/repos/1/tags; }
+check "tag set" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":3}')"
+check "the same snapshot again is fine" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":3}')"
+OUT=$(sock_tag '{"name":"keep","snap_id":4}')
+contains "an existing tag on another snapshot is a 409" ' 409' "$OUT"
+contains "naming where the tag is" 'already on snapshot 3' "$OUT"
+contains "and the tag did not move" '"snap_id":"3"' "$(sock_body /repos/1/tags)"
+check "move moves it" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":4,"move":true}')"
+contains "to the new snapshot" '"snap_id":"4"' "$(sock_body /repos/1/tags)"
+curl -s -o /dev/null -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/keep
+
+# B035: a dry run's answer was in the daemon log only. The job reports the
+# ids it would remove and the retention it used, and removes nothing.
+DRY=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
+wait_job "$DRY"
+DRY_BODY=$(sock_body "/jobs/$DRY")
+contains "gfs dry run names what it would remove" \
+    '"result":{"dry_run":true,"would_remove":[1,2],"count":2,' "$DRY_BODY"
+contains "and the retention it applied" '"retention":{"keep_snaps":2,' "$DRY_BODY"
+check "and removes nothing" 4 \
+    "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+
+GFS=$(job_id "$(sock_post /repos/1/gfs)")
+wait_job "$GFS"
+contains "a real pass names what it removed" \
+    '"result":{"dry_run":false,"removed":[1,2],"count":2,' "$(sock_body "/jobs/$GFS")"
 check "retention reads keep_snaps from config" 2 \
     "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"
+
+# B039: the journal entry for a retention pass had an empty message.
+JOURNAL=$(sock_body '/repos/1/journal?limit=2')
+contains "the journal says what a pass removed" \
+    '"operation":"gfs","result":"success","duration_ms":' "$JOURNAL"
+contains "with its ids" '"message":"removed 2 snapshots: 1, 2"' "$JOURNAL"
+contains "and a dry run says it was one" '"message":"dry run: would remove 2 snapshots: 1, 2"' "$JOURNAL"
+check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10' \
+    | grep -o '"operation":"backup","result":"success","duration_ms":"[0-9]*","message":""' \
+    | wc -l | tr -d ' ')"
+
+# B034, read side: a value stored before the route validated must not be
+# read as atoi's 0, which for a tier means unlimited. Written straight into
+# the database, since the route refuses it now.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
+                           VALUES (1, 'retention.keep_daily', 'banana')" 2>/dev/null
+    BAD=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
+    wait_job "$BAD"
+    contains "a stored invalid count falls back to the default" \
+        '"keep_daily":7,' "$(sock_body "/jobs/$BAD")"
+else
+    ok "a stored invalid count falls back to the default (skipped: no sqlite3)"
+fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \

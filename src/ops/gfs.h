@@ -71,10 +71,24 @@ typedef struct {
  * policy_values, tier flags are a column, and pruning is a transactional
  * row delete rather than an unlink.
  */
+/*
+ * What a pass removed, or on a dry run would remove: the snapshot ids, in
+ * ascending order, and how many. The caller reports them; a dry run whose
+ * answer reached only the daemon log answered nobody who asked for it.
+ * Ids only, so the array is bounded by the snapshot count, which the pass
+ * already holds in memory. Release with gfs_result_free.
+ */
+typedef struct {
+    uint32_t  pruned;
+    uint32_t *ids;
+} gfs_result_t;
+
+void gfs_result_free(gfs_result_t *r);
+
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, uint32_t *out_pruned);
+                 int full_scan, gfs_result_t *out);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);
