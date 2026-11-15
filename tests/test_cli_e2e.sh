@@ -480,6 +480,22 @@ for _ in $(seq 1 50); do
 done
 check "a scheduled grep runs with its pattern" 1 "$FIRED"
 cb schedule remove 1 "$GSID" >/dev/null 2>&1
+# NIT-1: ignore_case was stored as the number 1; every other flag is a
+# boolean. A schedule made before the change, holding 1, still reads.
+ISID=$(cb schedule add 1 grep 3600 --pattern 'case test' -i | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores ignore_case as a boolean" '"ignore_case":true' "$(cb schedule list 1)"
+cb schedule remove 1 "$ISID" >/dev/null 2>&1
+OLD_IC=$(curl -s -X POST --unix-socket "$SOCK" \
+         -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"old spelling","ignore_case":1}' \
+         http://localhost/repos/1/schedules)
+OSID=$(printf '%s' "$OLD_IC" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "ignore_case sent as 1 is still accepted" '"id"' "$OLD_IC"
+contains "and stored as a boolean" '"pattern":"old spelling","ignore_case":true' "$(cb schedule list 1)"
+[ -n "$OSID" ] && cb schedule remove 1 "$OSID" >/dev/null 2>&1
+check "ignore_case of 2 is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" \
+    -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"x","ignore_case":2}' \
+    http://localhost/repos/1/schedules)"
 
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.

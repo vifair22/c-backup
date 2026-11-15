@@ -1433,9 +1433,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         }
         if (json_req_get_str(body, "path_prefix", &j->path_prefix) != 0)
             j->path_prefix = NULL;
-        uint32_t ic = 0;
-        if (json_req_get_u32(body, "ignore_case", &ic, 0, 1) == 0)
-            j->ignore_case = (int)ic;
+        if (jreq_flag(body, "ignore_case", &j->ignore_case) != 0) {
+            snap_job_free(j);
+            return api_error(400, "ignore_case must be true or false");
+        }
         uint32_t mf = 0;
         if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
             j->max_files = mf;
@@ -2039,7 +2040,8 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         if (json_req_get_str_opt(p, "path_prefix", &j->path_prefix) != 0)
             j->path_prefix = NULL;
         uint32_t v = 0;
-        if (json_req_get_u32(p, "ignore_case", &v, 0, 1) == 0) j->ignore_case = (int)v;
+        /* A boolean now; schedules created before that hold 0 or 1. */
+        if (jreq_flag(p, "ignore_case", &j->ignore_case) != 0) j->ignore_case = 0;
         if (json_req_get_u32(p, "max_files", &v, 0, 1000000) == 0) j->max_files = v;
         j->snap_id = newest_snapshot(repo_id);
         if (j->snap_id <= 0) {
