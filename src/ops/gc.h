@@ -40,4 +40,4 @@ typedef struct {
 } gc_result_t;
 
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                int dry_run, volatile int *cancel, gc_result_t *out);
+                int dry_run, atomic_int *cancel, gc_result_t *out);

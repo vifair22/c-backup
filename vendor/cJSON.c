@@ -89,7 +89,15 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
-static error global_error = { NULL, 0 };
+/*
+ * c-backup local change: thread-local, where upstream has one global.
+ *
+ * Every parse writes this, and the daemon parses request bodies on several
+ * HTTP threads at once, so two concurrent PUTs raced on it (ThreadSanitizer,
+ * tests/test_db_stress.c). Per thread, cJSON_GetErrorPtr also answers for
+ * the caller's own last parse rather than whichever thread parsed last.
+ */
+static _Thread_local error global_error = { NULL, 0 };
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
 {

@@ -30,7 +30,7 @@ typedef struct {
      * checks it between entries, and backup_run lends it to the store for
      * the run so the object writers check it between chunks of one file.
      * A cancel lands within one read, not at the end of a large file. */
-    volatile int *cancel;
+    atomic_int *cancel;
 
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
     void  *progress_ctx;

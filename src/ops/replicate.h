@@ -202,7 +202,7 @@ typedef struct {
  */
 status_t replicate_tree(store_t *store, replica_sink_t *sink,
                         const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
-                        volatile int *cancel, replicate_result_t *out);
+                        atomic_int *cancel, replicate_result_t *out);
 
 /*
  * Copy every snapshot the target lacks.
@@ -213,7 +213,7 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
  * a previous one.
  */
 status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                       replica_sink_t *sink, volatile int *cancel,
+                       replica_sink_t *sink, atomic_int *cancel,
                        task_progress_fn progress, void *progress_ctx,
                        replicate_result_t *out);
 

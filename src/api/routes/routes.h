@@ -3,6 +3,7 @@
 #include "server.h"
 #include <cutils/db.h>
 #include <cutils/config.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include "error.h"
 
@@ -73,7 +74,7 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
 struct store;
 struct pack_report;
 status_t routes_run_pack(struct store *store, int64_t repo_id,
-                         volatile int *cancel,
+                         atomic_int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx, struct pack_report *out);
 

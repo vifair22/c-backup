@@ -596,6 +596,14 @@ check "bad limit on jobs is a 400"       400 "$(sock_code '/jobs?limit=-1')"
 check "bad offset on jobs is a 400"      400 "$(sock_code '/jobs?offset=x')"
 check "jobs pages with limit and offset" 200 "$(sock_code '/jobs?limit=1&offset=1')"
 check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapshots?limit=999999')"
+# NIT-6: past nine digits a limit was refused as "1 or more", true of what
+# was sent; it is a large limit like any other. And a refusal names the
+# route's range, which differs by route.
+check "an overflowing limit is clamped too" 200 "$(sock_code '/jobs?limit=99999999999')"
+check "an overflowing offset is an empty page" 200 "$(sock_code '/jobs?offset=99999999999')"
+check "a bad limit names the range" \
+    '{"error":"limit must be a whole number from 1 to 1000 (a larger one is reduced to 1000)"}' \
+    "$(sock_body '/jobs?limit=0')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than
@@ -829,6 +837,16 @@ contains "deep verify submit" '"job_id"' "$DEEP_RESP"
 DEEP_JOB=$(job_id "$DEEP_RESP")
 wait_job "$DEEP_JOB"
 contains "deep verify completed" '"state":"completed"' "$(sock_body "/jobs/$DEEP_JOB")"
+# B106: the job says what kind of run it was. A dry run's counts on a healthy
+# repository are identical to a repairing run's, so nothing else does.
+contains "a plain verify is deep and repairing" \
+    '"level":"deep","repair":true,"dry_run":false}' "$(sock_body "/jobs/$DEEP_JOB")"
+DRY_RESP=$(curl -s -X POST --unix-socket "$SOCK" \
+           "http://localhost/repos/1/verify?dry_run=1")
+DRY_JOB=$(job_id "$DRY_RESP")
+wait_job "$DRY_JOB"
+contains "a dry run is the same level, with repair off" \
+    '"level":"deep","repair":false,"dry_run":true}' "$(sock_body "/jobs/$DRY_JOB")"
 check "unknown verify level rejected" 400 \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
        "http://localhost/repos/1/verify?level=sideways")"

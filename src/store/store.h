@@ -22,6 +22,7 @@
 #include "error.h"
 #include "types.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,8 +117,21 @@ const struct repo_key *store_key(const store_t *st);
  * A write that stops on this flag returns ERR_BUSY with its temporary file
  * already removed, exactly as any other failed write does.
  */
-void store_set_cancel(store_t *st, volatile int *cancel);
-volatile int *store_get_cancel(const store_t *st);
+/*
+ * Whether a job's cancel flag is set; a NULL flag never is.
+ *
+ * The flag is atomic because the job manager sets it on one thread while the
+ * job polls it on another (OWN-14: as a volatile int it was a data race).
+ * Relaxed is enough: it orders nothing, it only says "stop at your next
+ * check", and every pipeline loop that reads it reads it again.
+ */
+static inline int cancel_requested(atomic_int *flag)
+{
+    return flag && atomic_load_explicit(flag, memory_order_relaxed);
+}
+
+void store_set_cancel(store_t *st, atomic_int *cancel);
+atomic_int *store_get_cancel(const store_t *st);
 int  store_cancelled(const store_t *st);
 
 /*

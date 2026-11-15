@@ -729,7 +729,7 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
 }
 
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
-                      volatile int *cancel, reindex_result_t *out)
+                      atomic_int *cancel, reindex_result_t *out)
 {
     char dir[PATH_MAX];
     if (snprintf(dir, sizeof(dir), "%s/snapshots", store_root(store)) >= (int)sizeof(dir))
@@ -764,7 +764,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        if (cancel && *cancel) { st = set_error(ERR_BUSY, "reindex cancelled"); break; }
+        if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "reindex cancelled"); break; }
         char *end = NULL;
         long long id = strtoll(e->d_name, &end, 10);
         if (id <= 0 || !end || *end != '\0') continue;

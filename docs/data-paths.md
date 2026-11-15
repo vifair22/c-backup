@@ -337,7 +337,9 @@ snapshot that the next reindex picks up from disk.
 ### 1.6 Auto-pack: the tail of the backup
 
 If `maintenance.auto_pack` is set (default on), the same job, still holding
-the repo write lock, runs `repo_pack`. A pack failure is logged but does
+the repo write lock, runs `repo_pack`. That sweep is all the key controls:
+objects up to 16 MiB are packed while the backup writes them (Part 1b)
+whatever it says. A pack failure is logged but does
 not fail the backup: the snapshot is committed and every object is readable
 loose; packing is retried by the next backup or an explicit pack job.
 

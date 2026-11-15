@@ -123,7 +123,7 @@ static void backup_job_free(void *p)
     free(j);
 }
 
-static status_t backup_job_run(void *arg, volatile int *cancel,
+static status_t backup_job_run(void *arg, atomic_int *cancel,
                                void (*progress)(const char *, uint64_t, uint64_t, void *),
                                void *progress_ctx)
 {
@@ -236,6 +236,13 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
      * A pack failure does not fail the backup: the snapshot is committed and
      * its objects are readable loose. It is logged and left for the next run
      * or an explicit pack.
+     *
+     * This sweep is all maintenance.auto_pack controls (B111). Objects up to
+     * PACK_STREAM_THRESHOLD went into a pack as backup_run wrote them, key or
+     * no key, so what the sweep finds is a sparse file's object, anything
+     * larger, and pack coalescing. Writing small objects loose when the key
+     * is off would honour the old wording at the cost of an inode and an
+     * uncompressed copy per object, which is what direct-to-pack removed.
      */
     if (st == OK && routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1)) {
         status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx,
