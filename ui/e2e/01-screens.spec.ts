@@ -140,13 +140,15 @@ test('snapshots: the list, with retention and sizes', async () => {
   await expect(row.locator('td').nth(3)).not.toHaveText('-')
   await expect(row.locator('td').nth(4)).not.toHaveText('-')
   /*
-   * Retention is empty here and that is correct: tier election only
-   * considers closed calendar days, so a snapshot taken minutes ago belongs
-   * to no tier yet. The tier algorithm itself is covered by tests/test_gfs.c,
-   * which can pin dates; what this checks is that the column renders its
-   * placeholder rather than throwing on a snapshot with no flags.
+   * Each period elects its latest snapshot so far, the period in progress
+   * included (B094), so the newest snapshot holds every tier and the older
+   * one taken the same day holds none. That checks both the tier letters and
+   * the placeholder for a snapshot with no flags. The election itself is
+   * covered by tests/test_gfs.c, which can pin dates.
    */
-  await expect(row.locator('td').nth(5)).toHaveText('-')
+  await expect(row.locator('td').nth(5)).toHaveText('YMWD')
+  const older = h.page.locator('tr', { hasText: '#1' }).first()
+  await expect(older.locator('td').nth(5)).toHaveText('-')
 
   await h.page.screenshot({ path: 'test-results/snapshot-list.png', fullPage: true })
 })
