@@ -3,6 +3,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "repo.h"
+#include "db_txn.h"
 #include "store.h"
 
 #include <cutils/json.h>
@@ -938,10 +939,25 @@ status_t repo_require_key(const char *path)
 
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
 {
-    char idbuf[32];
+    char idbuf[32], now[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", (long long)repo_id);
+    snprintf(now, sizeof(now), "%lld", (long long)time(NULL));
+    /*
+     * The registration goes and the purge is queued together, so a crash
+     * between them cannot leave rows nobody will ever delete. The rows
+     * themselves go in the background (repo_purge.c): see there for why.
+     */
+    if (db_txn_begin(db) != OK)
+        return set_error(ERR_IO, "cannot delete repo %lld: begin", (long long)repo_id);
     if (db_execute_non_query(db, "DELETE FROM repos WHERE id = ?",
-                             (const char *[]){ idbuf, NULL }, NULL) != 0)
+                             (const char *[]){ idbuf, NULL }, NULL) != 0 ||
+        db_execute_non_query(db,
+            "INSERT OR IGNORE INTO repo_purge_pending (repo_id, queued_at) VALUES (?, ?)",
+            (const char *[]){ idbuf, now, NULL }, NULL) != 0) {
+        db_txn_rollback(db);
         return set_error(ERR_IO, "cannot delete repo %lld", (long long)repo_id);
+    }
+    if (db_txn_commit(db) != OK)
+        return set_error(ERR_IO, "cannot delete repo %lld: commit", (long long)repo_id);
     return OK;
 }

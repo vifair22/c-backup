@@ -491,6 +491,17 @@ directory is never touched.** Deleting backup data is the operator's act:
 remove the directory yourself once you are sure. Registering it again later
 restores everything, with a reindex.
 
+The registration goes at once; the index rows (snapshots, nodes, objects,
+schedules, jobs, journal, search and verify results) are deleted afterwards
+by a background thread in short batches, so a large repository does not hold
+the database while it goes. The log says `removed repo <id>: index rows
+deleted` when it is done, and a purge cut short by a restart resumes at the
+next start. Rows earlier builds left behind for removed repositories are
+deleted the same way on the first start of this one.
+
+Removal is refused with `409` while a job is running against the
+repository; cancel it or wait for it first.
+
 A removed repository's id is never handed out again; registering it again
 gives it a new one. Ids used to be reused, so the next repository added
 could take over the removed one's schedules and history.

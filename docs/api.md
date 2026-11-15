@@ -113,7 +113,7 @@ host always has a way in.
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}` |
 | GET | `/repos/<id>` | One repository , including `encryption` and `key_escrowed` |
-| DELETE | `/repos/<id>` | Deregister; the data directory is left alone |
+| DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
 stores that form. It answers:

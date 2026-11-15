@@ -189,7 +189,7 @@ int repo_key_is_missing(const char *path);
  */
 status_t repo_require_key(const char *path);
 
-/* Remove the registration and its index rows. The repository directory is
- * never touched: deleting backup data is the operator's act, not a side
- * effect of an API call. */
+/* Remove the registration and queue its index rows for repo_purge, which
+ * the caller kicks. The repository directory is never touched: deleting
+ * backup data is the operator's act, not a side effect of an API call. */
 status_t repo_deregister(cutils_db_t *db, int64_t repo_id);

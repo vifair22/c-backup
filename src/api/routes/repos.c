@@ -4,6 +4,8 @@
 #include "routes.h"
 #include "repo.h"
 #include "repo_key.h"
+#include "repo_purge.h"
+#include "lock.h"
 
 #include <openssl/crypto.h>
 
@@ -325,8 +327,20 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
     int64_t id = strtoll(tail, NULL, 10);
     if (id <= 0) return api_error(400, "invalid repo id");
 
+    /*
+     * Not while a job runs against it: the job would go on writing rows for
+     * an id the purge is deleting. A queued job fails cleanly when it finds
+     * the repository gone.
+     */
+    if (repo_trylock_write(id) != OK) {
+        err_clear();
+        return api_error(409, "repo is busy: a job is running against it; "
+                              "cancel it or wait, then remove the repository");
+    }
     status_t st = repo_deregister(db, id);
+    repo_unlock(id);
     if (st != OK) return api_error(500, err_msg());
+    repo_purge_kick();
 
     log_info("deregistered repo %lld", (long long)id);
     return api_no_content();
