@@ -482,10 +482,36 @@ Every load verifies before it trusts:
 - `object_load_prefix`: bounded prefix for previews and probes, LZ4
   partial decode for packed entries, no hash verification (a prefix
   cannot be hash-checked).
+- `object_read_stored`: the entry as stored, for replication. No decrypt
+  or decompress, but a packed entry is CRC-checked and corrected from its
+  parity first, so damage that parity covers is not shipped to a replica
+  that would then compute fresh parity over it.
+
+Parity on a packed entry is never loaded whole. A reader records where the
+entry's RS parity sits in the trailer and fetches it one window of groups
+at a time (1,096 groups: 16.0 MiB of data, 1.07 MiB of parity), so what a
+read or repair holds is fixed by the window, not by the entry; a whole-
+entry load was 6.7% of the stored size, 3.3 GiB for a 50 GiB entry. The
+window applies to every codec, the LZ4 frame included, which used to be
+detection-only.
 
 In-place repair (`object_repair`, `pack_object_repair`) rewrites corrected
 bytes via `pwrite` and is invoked by the integrity endpoints, not by normal
-reads; normal reads repair the in-memory copy only.
+reads; normal reads repair the in-memory copy only. Both work group by
+group at any object size. `pack_object_repair` first corrects the whole
+entry in memory and checks the result against the trailer's CRC, and only
+then writes, window by window: RS can miscorrect a group damaged past its
+capacity, and writing that back would trade damage verify can see for
+damage it cannot. Writing in place is crash-safe because each write puts
+back the bytes the entry was written with and touches nothing else, so an
+interrupted repair leaves a subset of the original damage and a rerun
+finishes it. Rewriting the pack through `pack_rw_replace` would copy up to
+the whole pack to fix a few bytes, on a disk that is already failing.
+
+gc's rewrite and coalescing copy entries into new packs whose parity is
+computed afresh over what they hold. They check each entry's CRC as the
+bytes go by and rewrite it corrected on a mismatch, so a copy never turns
+damage parity could still fix into damage it protects.
 
 ---
 
@@ -622,7 +648,8 @@ never outlive their pack.
   back, and compares against its SHA-256. Objects up to 16 MiB are read
   through `object_load`, which applies the payload Reed-Solomon parity in
   memory; larger ones stream and self-correct on a second pass when the hash
-  disagrees. Damage that parity covers is written back
+  disagrees, packed LZ4-frame entries included. Damage that parity covers is
+  written back, at any size and codec,
   to disk via `object_repair`/`pack_object_repair` - the only callers those
   functions have ever had. Damage beyond parity is reported with its blast
   radius resolved through `nodes.content_hash`: which files, which snapshots.
@@ -646,9 +673,13 @@ hashes and emits, and only a hash mismatch triggers a second pass that
 re-reads group by group, corrects each group from its parity and re-emits, so
 a clean object pays nothing for the machinery. That second pass needs a
 destination it can rewind - a regular file or `/dev/null` - which covers
-restore and verify; a non-rewindable sink (the pipe inside sparse restore)
-falls back to an explicit repairing verify. Repair on disk is bounded the
-same way, one 15 KiB group at a time regardless of object size.
+restore and verify. Into a non-rewindable sink (the pipes inside grep and
+sparse restore) a loose object falls back to an explicit repairing verify;
+a packed entry is CRC-scanned first and the emitting pass corrects it when
+the scan disagrees with the trailer, which costs such a read a second pass
+over the stored bytes. Repair on disk is bounded the same way, one window of
+groups at a time regardless of object size, for loose objects and every
+packed codec alike.
 
 ## Part 6: sizes, thresholds and where they live
 
@@ -662,6 +693,7 @@ same way, one 15 KiB group at a time regardless of object size.
 | `STREAM_CHUNK` | 128 MiB | sparse-object stream buffer |
 | `STREAM_LOAD_MAX` | 16 MiB | in-memory load cap / stream chunk on load |
 | RS parity stream bound | 256 MiB | parity RAM ceiling before spilling to `<repo>/tmp/` |
+| `PARITY_WINDOW_GROUPS_DEFAULT` | 1,096 groups | packed-entry parity read window: 16.0 MiB of data, 1.07 MiB of parity, per read or repair |
 | `PACK_WORKER_THREADS_MAX` | 32 | pack worker ceiling (also capped at one per 256 MiB of input) |
 | `CACHE_BATCH` | 2,000 | file-cache entries per transaction |
 | `PACK_COALESCE_SMALL_BYTES` | 64 MiB | a pack below this is a coalesce candidate |
