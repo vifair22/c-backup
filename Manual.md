@@ -1092,6 +1092,14 @@ it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 save nothing but an inode. Large files that do compress are packed
 normally. Details are in `docs/data-paths.md`.
 
+**What `phys_size` counts.** For a loose object, the whole object file:
+header, payload and parity. For a packed object, the stored payload only;
+its 51-byte entry header and its parity are counted in the pack's size, so
+`phys_size` against `orig_size` is its compression ratio and nothing is
+counted twice. `object <id> <hash> layout` reads the object itself, and for
+a packed object its `physical_size` (header plus payload) is `phys_size`
+plus 51. docs/api.md has the full definition.
+
 `pack` reports what it did in the job's `result`, including why it did
 nothing when it did nothing:
 

@@ -657,6 +657,15 @@ contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/
 # entry header (a loose one behind the 64-byte object header).
 contains "packed header is the 51-byte entry header" '"header_size":51' \
     "$(sock_body "/repos/1/objects/$PACKED/layout")"
+# B102: a packed object's phys_size is its stored payload, the entry header
+# and parity being charged to the pack, so it equals layout's payload_size
+# and is exactly 51 less than layout's physical_size (docs/api.md).
+P_PHYS=$(sock_body "/repos/1/objects/$PACKED" | sed -n 's/.*"phys_size":\([0-9]*\).*/\1/p')
+P_LAY=$(sock_body "/repos/1/objects/$PACKED/layout")
+P_REC=$(printf '%s' "$P_LAY" | sed -n 's/.*"physical_size":\([0-9]*\).*/\1/p')
+P_PAY=$(printf '%s' "$P_LAY" | sed -n 's/.*"payload_size":\([0-9]*\).*/\1/p')
+check "packed phys_size is layout's payload_size" "$P_PAY" "$P_PHYS"
+check "and the record is that plus the entry header" "$P_REC" "$((P_PHYS + 51))"
 contains "packed object content" '"base64"'      "$(sock_body "/repos/1/objects/$PACKED/content")"
 contains "diff over packs"       '"modified"'    "$(sock_body '/repos/1/diff?from=1&to=2')"
 
