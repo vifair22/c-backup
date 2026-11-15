@@ -28,6 +28,14 @@ export interface RemoteConnectionConfig {
 
 export type ConnectionConfig = LocalConnectionConfig | RemoteConnectionConfig
 
+/** Whether two configs reach the same daemon, whatever they are called. An
+ *  edit that keeps the daemon is a rename and keeps the connection live; one
+ *  that changes it drops the session, which belongs to the old daemon. */
+export function sameDaemon(a: ConnectionConfig, b: ConnectionConfig): boolean {
+  if (a.type === 'local') return b.type === 'local' && a.socketPath === b.socketPath
+  return b.type === 'remote' && a.host === b.host && a.port === b.port
+}
+
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
 export interface ConnectionState {

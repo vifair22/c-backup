@@ -21,6 +21,7 @@ import { EventEmitter } from 'node:events'
  * type stripping, which resolves import paths literally. */
 import { DaemonClient, DaemonUnreachableError, notConfiguredMessage } from './rpc-session.ts'
 import { toEndpoint } from './client.ts'
+import { sameDaemon } from '../shared/types.ts'
 import type { ApiRequest } from '../shared/api'
 import type { WireRepo } from '../shared/wire'
 import type {
@@ -131,27 +132,56 @@ export class ConnectionManager extends EventEmitter {
     return { ok: true }
   }
 
-  editConnection(name: string, config: ConnectionConfig): { ok: boolean; error?: string } {
+  /*
+   * Edit a connection: a new name, a new address, or both.
+   *
+   * A rename is a label change on the same daemon, so it keeps the entry -
+   * client, in-memory token, status and repo list - and only rekeys it. It
+   * used to rebuild the entry, which left a signed-in connection showing
+   * "remote" and disconnected until somebody clicked Connect, and lost a
+   * session that was not stored at all.
+   *
+   * A new address is a different daemon. The token goes, because a token
+   * belongs to the daemon that issued it, and a connection that was live
+   * reconnects to the new one: for a remote daemon that means asking for
+   * its password, which the result says.
+   */
+  async editConnection(name: string, config: ConnectionConfig): Promise<ConnectResult> {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
     if (config.name !== name && this.entries.has(config.name)) {
       return { ok: false, error: `connection '${config.name}' already exists` }
     }
 
-    /* A token belongs to the daemon it was issued by. Keep it across a
-     * rename, drop it when the address changes. */
-    const old = entry.config
-    const sameDaemon = old.type === 'remote' && config.type === 'remote' &&
-      old.host === config.host && old.port === config.port
-    const token = sameDaemon ? this.store.getToken(name) : undefined
-    this.store.deleteToken(name)
-    if (token) this.store.setToken(config.name, token)
+    if (sameDaemon(entry.config, config)) {
+      if (config.name !== name) {
+        const token = this.store.getToken(name)
+        this.store.deleteToken(name)
+        if (token) this.store.setToken(config.name, token)
+      }
+      /* The client keeps the config it was made with; only the name
+       * differs, and the client never reads the name. */
+      entry.config = config
+      this.rekey(name, config.name, entry)
+      this.persist()
+      this.emitChange()
+      return { ok: true }
+    }
 
-    this.entries.delete(name)
-    this.entries.set(config.name, this.newEntry(config))
+    const wasLive = entry.status === 'connected' || entry.status === 'connecting'
+    this.store.deleteToken(name)
+    this.rekey(name, config.name, this.newEntry(config))
     this.persist()
     this.emitChange()
-    return { ok: true }
+    return wasLive ? this.connect(config.name) : { ok: true }
+  }
+
+  /* Replace a key in place, so an edit does not move the connection to the
+   * bottom of the sidebar. */
+  private rekey(from: string, to: string, entry: Entry): void {
+    const next = new Map<string, Entry>()
+    for (const [k, v] of this.entries) next.set(k === from ? to : k, k === from ? entry : v)
+    this.entries = next
   }
 
   /* ---------------------------------------------------------------- */
@@ -190,8 +220,10 @@ export class ConnectionManager extends EventEmitter {
         }
         if (credentials?.password) {
           const token = await entry.client.login(credentials.password)
-          if (credentials.remember) this.store.setToken(name, token)
-          else this.store.deleteToken(name)
+          /* By the entry's name now, not the one this was called with: a
+           * rename while the login was in flight rekeys the entry. */
+          if (credentials.remember) this.store.setToken(entry.config.name, token)
+          else this.store.deleteToken(entry.config.name)
         } else if (!entry.client.hasToken()) {
           return this.askForPassword(entry)
         }
@@ -199,7 +231,7 @@ export class ConnectionManager extends EventEmitter {
 
       const repos = await this.loadRepos(entry)
       if (repos === 'unauthorized') {
-        this.store.deleteToken(name)
+        this.store.deleteToken(entry.config.name)
         entry.client.setToken(undefined)
         return this.askForPassword(entry)
       }
