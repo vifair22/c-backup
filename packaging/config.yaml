@@ -1,28 +1,34 @@
 # c-backupd configuration.
 #
-# Values here are read before the database opens, so anything needed to open
-# the database or bind a socket lives in this file. Everything else is stored
-# in the database and changed through the API at runtime.
+# Read once at start; change it and restart the daemon. There is no API that
+# changes configuration. Per-repository settings (retention, auto-pack) are
+# separate: they are set with 'c-backup policy set'.
 #
-# Install to /etc/c-backupd/config.yaml and point the unit at it with
-# C_BACKUP_CONFIG_PATH. Keep it 0600: it holds Pushover credentials.
+# The daemon finds this file at $C_BACKUP_CONFIG_PATH. The systemd unit and
+# the container image both use /etc/c-backupd/config.yaml. Keep it 0600: it
+# holds Pushover credentials. In a container, mounting your own copy over it
+# read-only is fine.
 
 db:
-  # systemd's StateDirectory=c-backupd creates the parent directory before
-  # ExecStart, so this path is ready by the time the daemon opens it.
+  # Under the systemd unit, StateDirectory= creates /var/lib/c-backupd; the
+  # container image creates it and declares it a volume. Put it on fast
+  # storage, never a parity-protected array (Manual 18.2).
   path: /var/lib/c-backupd/state.db
 
 http:
-  # The unix socket bypasses authentication entirely; filesystem permissions
-  # on it are the access control. RuntimeDirectory=c-backupd creates the
-  # parent and removes it on stop, so a stale socket never survives a crash.
+  # The unix socket bypasses authentication entirely; it is created mode 0700,
+  # so only the daemon's own user can connect. The daemon removes it on a
+  # clean stop and replaces a stale one at start. Under systemd,
+  # RuntimeDirectory= creates /run/c-backupd; the container image creates it.
   socket: /run/c-backupd/c-backupd.sock
   # TCP is for the desktop app on another machine. It requires a bearer token
   # or session cookie, and until the admin password is set (with
   # 'c-backup auth setup' on this host) it serves only the health probes.
   # Loopback by default: set bind to 0.0.0.0, or one interface's address, to
-  # allow remote connections. The transport is plain HTTP, so put a reverse
-  # proxy or a tunnel in front on any network you do not trust.
+  # allow remote connections. The container image binds 0.0.0.0, because a
+  # published port cannot reach a container's loopback; -p decides exposure.
+  # The transport is plain HTTP, so put a reverse proxy or a tunnel in front
+  # on any network you do not trust.
   port: 8765
   bind: 127.0.0.1
 

@@ -135,9 +135,9 @@ is deliberately a persistent nag rather than a message shown once.
 
 The marker records the mode, cipher and a one-way fingerprint of the key, and
 for passphrase mode the Argon2id parameters and wrapped key. It never contains
-the key itself. Encrypted repositories use marker version 2, which a build
-predating encryption refuses outright rather than writing plaintext objects
-into.
+the key itself. Markers are version 2 for every repository, encrypted or
+not, so a build predating encryption refuses them outright rather than
+writing plaintext objects into an encrypted one.
 
 Keys are ChaCha20-Poly1305, chosen over AES-GCM because ARM64 is a deploy
 target and it does not depend on AES-NI. `security.key_dir` sets where host
