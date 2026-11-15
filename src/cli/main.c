@@ -658,7 +658,15 @@ static int cmd_search(int argc, char **argv)
 {
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
-    if (argc < 2) { free(q.buf); return fail("usage: search <repo-id> <query> [--limit N]"); }
+    const char *snap = take_opt(&argc, argv, "--snapshot");
+    if (snap) {
+        sb_puts(&q, q.len ? "&snapshot=" : "snapshot=");
+        sb_query_val(&q, snap);
+    }
+    if (argc < 2) {
+        free(q.buf);
+        return fail("usage: search <repo-id> <query> [--snapshot N] [--limit N]");
+    }
     sb_puts(&q, q.len ? "&q=" : "q=");
     sb_query_val(&q, argv[1]);
 
@@ -1429,7 +1437,7 @@ static const struct {
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
-    { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
+    { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
     { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },

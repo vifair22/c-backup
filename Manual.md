@@ -583,6 +583,9 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
 - **Name search** uses a trigram index: substring matches in milliseconds.
+  Across all snapshots, a file kept unchanged is one result with a count of
+  the snapshots holding it and the newest one's id; a file that changed
+  appears once per distinct content. `--snapshot N` searches one snapshot.
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
@@ -1268,7 +1271,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `snapshot delete <id> <snapshot>` | Prune one |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--limit N]` | File names |
+| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `diff <id> <from> <to>` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |

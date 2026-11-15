@@ -125,12 +125,24 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 |---|---|---|
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
-| GET | `/repos/<id>/search?q=<text>` | Substring filename search |
+| GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
 | DELETE | `/repos/<id>/snapshots/<sid>` | Prune |
 
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
+
+Without `snapshot`, every snapshot is searched and identical copies are
+collapsed: one result per (path, content hash), carrying the newest
+snapshot it was seen in (`snap_id`, `node_id`) and how many snapshots hold
+it (`snapshots`). A file unchanged across thirty snapshots used to come back
+thirty times. A file whose content changed is a different hash and a
+separate result, so the versions of a file stay visible. To keep a page
+cheap the search reads at most eight matching rows per result asked for
+(8,000 at most) and does not sort; when it stopped there, `partial` is
+`true` and the counts cover what was read. With `snapshot=<sid>` only that
+snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
+The CLI is `search <id> <text> [--snapshot N]`.
 
 ## Encryption
 

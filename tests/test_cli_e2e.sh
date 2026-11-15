@@ -273,6 +273,17 @@ check    "grep on a missing snapshot fails" 1 "$RC"
 contains "and says so at submission" "no such snapshot" "$OUT"
 check    "a malformed snapshot is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     --unix-socket "$SOCK" -d '{"pattern":"x","snapshot":"latest"}' http://localhost/repos/1/grep)"
+# B068: an unchanged file came back once per snapshot. Now one result per
+# path and content, counting the snapshots, and --snapshot narrows to one.
+SR=$(cb search 1 one.txt)
+check "search collapses identical copies" 1 \
+    "$(printf '%s' "$SR" | grep -o "\"path\":\"$WORK/src/one.txt\"" | wc -l | tr -d ' ')"
+NSNAP=$(printf '%s' "$SR" | sed -n 's/.*"snapshots":\([0-9]*\).*/\1/p' | head -1)
+if [ "${NSNAP:-0}" -ge 2 ]; then ok "and counts the snapshots it is in"; else bad "and counts the snapshots it is in" ">= 2" "${NSNAP:-none}"; fi
+NEWEST=$(cb snapshots 1 --limit 1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+contains "--snapshot narrows the search" "\"snap_id\":\"$NEWEST\"" "$(cb search 1 one.txt --snapshot "$NEWEST")"
+OUT=$(cb search 1 one.txt --snapshot 999 2>&1); RC=$?
+check    "search in a missing snapshot fails" 1 "$RC"
 # B067: the hit caps are request options, refused out of range rather than
 # clamped, and the job result says whether anything was cut short.
 contains "grep takes a per-file cap" 'secrets.txt' "$(cb grep 1 hunter2 --max-hits-per-file 1 --max-hits 5)"

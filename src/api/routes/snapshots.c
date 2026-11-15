@@ -563,17 +563,59 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
         return api_error(400, "search needs at least 3 characters "
                               "(the name index is built from trigrams)");
 
+    /*
+     * An optional snapshot. Without one every snapshot is searched, and a
+     * file unchanged across thirty snapshots used to come back thirty
+     * times; with one, only that snapshot is.
+     */
+    int64_t only_snap = 0;
+    const char *sq = api_query_param(req, "snapshot");
+    if (sq) {
+        char *end = NULL;
+        long long v = strtoll(sq, &end, 10);
+        if (!*sq || !end || *end || v <= 0)
+            return api_error(400, "snapshot must be a snapshot id");
+        only_snap = (int64_t)v;
+        if (!snapshot_exists(repo_id, only_snap))
+            return api_error(404, "no such snapshot");
+    }
+
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
 
-    char repo[32], lim[16];
+    int limit = page_limit(req);
+    /*
+     * Without a snapshot, identical (path, content) rows across snapshots
+     * collapse into one result, so more rows are read than results returned.
+     * Bounded, because the alternative is reading every match in the
+     * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
+     * result stops and says the counts are partial.
+     */
+    enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
+    int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
+    if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
+    if (scan < limit) scan = limit;
+
+    char repo[32], lim[16], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", scan);
+    snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
     /* Through the trigram index, not LIKE: a scan of the nodes table loses to
-     * the pre-rewrite implementation, while this beats it by ~50x. */
+     * the pre-rewrite implementation, while this beats it by ~50x. No ORDER
+     * BY: sorting would read every match to return the first page, which is
+     * the cost the index exists to avoid. A collapsed result keeps the
+     * newest copy among the rows read instead. */
     db_result_t *r = NULL;
-    int rc = db_execute(g_ctx.db,
+    int rc = only_snap
+        ? db_execute(g_ctx.db,
+            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+            "       COALESCE(n.content_hash, '')"
+            "  FROM node_fts f"
+            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+            " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ? LIMIT ?",
+            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r)
+        : db_execute(g_ctx.db,
             "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
             "       COALESCE(n.content_hash, '')"
             "  FROM node_fts f"
@@ -599,29 +641,77 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
          * there is nothing to unwind and nothing worth failing the
          * request over. */
     }
+    int nrows = r ? r->nrows : 0;
     anc_cache_t anc;
-    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, r->nrows) == 0);
+    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, nrows) == 0);
 
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        cutils_json_elem_t e;
-        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+    /*
+     * One result per (path, content). Each keeps the row of the newest
+     * snapshot it was seen in and counts the snapshots, so "in 30 snapshots,
+     * newest 41" replaces thirty identical lines. A changed file is a new
+     * hash and stays a separate result, which is the version history a
+     * search is often after. Results stay in first-seen order.
+     */
+    typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
+    hit_t *hits = calloc((size_t)limit, sizeof(*hits));
+    char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
+    int nhits = 0;
+    if (!hits || !paths) {
+        free(hits); free(paths);
+        if (have_anc) anc_free(&anc);
+        db_result_free(r);
+        return api_error(500, "out of memory");
+    }
+
+    for (int i = 0; i < nrows; i++) {
         int64_t nid = strtoll(r->rows[i][0], NULL, 10);
         int64_t sid = strtoll(r->rows[i][1], NULL, 10);
-        char *path = have_anc ? anc_path(&anc, sid, nid) : NULL;
-        int bad = json_elem_add_str(&e, "node_id", r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+        paths[i] = have_anc ? anc_path(&anc, sid, nid) : NULL;
+        /* A row with no path cannot be compared, so it stands alone. */
+        char *key = NULL;
+        if (paths[i] && asprintf(&key, "%s%c%s", paths[i], '\x01', r->rows[i][5]) < 0)
+            key = NULL;
+        int found = -1;
+        for (int k = 0; key && k < nhits; k++)
+            if (hits[k].key && strcmp(hits[k].key, key) == 0) { found = k; break; }
+        if (found >= 0) {
+            hits[found].count++;
+            if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
+            free(key);
+        } else if (nhits < limit) {
+            hits[nhits++] = (hit_t){ key, i, sid, 1 };
+        } else {
+            free(key);
+        }
+    }
+    int partial = !only_snap && nrows == scan;
+
+    for (int k = 0; k < nhits; k++) {
+        char **row = r->rows[hits[k].row];
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "node_id", row[0]) != 0
+               || json_elem_add_str(&e, "snap_id", row[1]) != 0
+               || json_elem_add_u32(&e, "snapshots", hits[k].count) != 0
+               || json_elem_add_str(&e, "name",    row[2]) != 0
                /* Empty when the chain is broken, which a partially faulted-in
                 * snapshot can produce. A hit without a path is still a hit;
                 * it is the navigation that is unavailable, not the result. */
-               || json_elem_add_str(&e, "path",    path ? path : "") != 0
-               || json_elem_add_str(&e, "type",    r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size",    r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "hash",    r->rows[i][5]) != 0;
-        free(path);
+               || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
+               || json_elem_add_str(&e, "type",    row[3]) != 0
+               || json_elem_add_str(&e, "size",    row[4]) != 0
+               || json_elem_add_str(&e, "hash",    row[5]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
+    /* More matches exist than were read: the results and their snapshot
+     * counts cover the rows read, not necessarily the whole repository. */
+    if (json_resp_add_bool(resp, "partial", partial) != 0) { /* alloc only */ }
+
+    for (int k = 0; k < nhits; k++) free(hits[k].key);
+    for (int i = 0; i < nrows; i++) free(paths[i]);
+    free(hits);
+    free(paths);
     if (have_anc) anc_free(&anc);
     db_result_free(r);
 
