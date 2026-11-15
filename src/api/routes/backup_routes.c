@@ -238,7 +238,8 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
      * or an explicit pack.
      */
     if (st == OK && routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1)) {
-        status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+        status_t pst = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx,
+                                       NULL);
         if (pst != OK) {
             log_warn("backup: snapshot %lld committed but packing failed: %s",
                      (long long)res.snapshot_id, err_msg());

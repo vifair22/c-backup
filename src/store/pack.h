@@ -45,6 +45,29 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx);
 
 /*
+ * What one pack run found and did, for the job result.
+ *
+ * A run that packed nothing said why only in the daemon log, and the job
+ * that ran it recorded no result at all (B099). `reason` is NULL when
+ * something was packed, and otherwise a static string saying why nothing
+ * was: there were no loose objects, every one was already skip-marked as
+ * incompressible, or the probe found the rest incompressible and marked
+ * them. Counts are filled as far as the run got, failure included.
+ */
+typedef struct pack_report {
+    uint64_t    loose;          /* loose objects found */
+    uint64_t    skip_marked;    /* already marked incompressible, left loose */
+    uint64_t    incompressible; /* marked by this run's probe, left loose */
+    uint64_t    packed;         /* moved into packs */
+    const char *reason;         /* why nothing was packed, or NULL */
+} pack_report_t;
+
+/* repo_pack, reporting into *out (may be NULL). repo_pack is this with
+ * only the packed count kept. */
+status_t repo_pack_report(store_t *store, pack_report_t *out,
+                          task_progress_fn progress, void *progress_ctx);
+
+/*
  * The function this used to document is gone. Packs install with a single
  * rename now, so there is no interrupted two-file move to replay; what does
  * survive a crash is an orphaned staging file, which store_open sweeps by age.

@@ -232,7 +232,13 @@ contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
 contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
-contains "pack"   '"state":"completed"' "$(cb pack 1)"
+PACK_OUT=$(cb pack 1)
+contains "pack"   '"state":"completed"' "$PACK_OUT"
+# B099: the pack job had no result, so a run that packed nothing said why
+# only in the log. Backups pack on completion, so this one has the reason.
+contains "pack reports a result" '"result":{"loose":' "$PACK_OUT"
+contains "pack says why it packed nothing" '"reason":"' "$PACK_OUT"
+contains "and the journal says so" 'nothing packed: ' "$(cb journal 1)"
 contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
 check "verify list --offset moves on" 1 \
     "$([ "$(cb verify list 1 --limit 1 --offset 1 | grep -o '"level":' | wc -l | tr -d ' ')" -le 1 ] && echo 1 || echo 0)"

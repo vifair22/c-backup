@@ -902,18 +902,56 @@ static void pack_progress_adapter(uint64_t current, uint64_t total,
 status_t routes_run_pack(struct store *store, int64_t repo_id,
                          volatile int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx)
+                         void *progress_ctx, struct pack_report *out)
 {
     /* repo_pack takes no flag of its own; it reads the store's, which is
      * how a cancel reaches the middle of packing one large object. */
     if (cancel) store_set_cancel((store_t *)store, cancel);
     pack_progress_bridge_t bridge = { progress, progress_ctx };
-    uint32_t packed = 0;
-    status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
-    if (st == OK && packed > 0)
-        log_info("pack: %u object(s) packed in repo %lld",
-                 packed, (long long)repo_id);
+    pack_report_t rep;
+    status_t st = repo_pack_report((store_t *)store, &rep, pack_progress_adapter, &bridge);
+    if (st == OK && rep.packed > 0)
+        log_info("pack: %llu object(s) packed in repo %lld",
+                 (unsigned long long)rep.packed, (long long)repo_id);
+    if (out) *out = rep;
     return st;
+}
+
+/*
+ * What a pack job did. It recorded no result at all, so a run that packed
+ * nothing - every loose object skip-marked as incompressible - read as a
+ * bare "completed" and the reason was only in the daemon log (B099).
+ * "reason" is null when something was packed.
+ */
+static void pack_job_report(void *progress_ctx, const pack_report_t *pr)
+{
+    char js[384];
+    if (pr->reason)
+        snprintf(js, sizeof(js),
+                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
+                 "\"incompressible\":%llu,\"reason\":\"%s\"}",
+                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
+                 (unsigned long long)pr->skip_marked,
+                 (unsigned long long)pr->incompressible, pr->reason);
+    else
+        snprintf(js, sizeof(js),
+                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
+                 "\"incompressible\":%llu,\"reason\":null}",
+                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
+                 (unsigned long long)pr->skip_marked,
+                 (unsigned long long)pr->incompressible);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    uint64_t left = pr->skip_marked + pr->incompressible;
+    if (pr->reason)
+        snprintf(msg, sizeof(msg), "nothing packed: %s", pr->reason);
+    else
+        snprintf(msg, sizeof(msg),
+                 "packed %llu object%s; %llu left loose as incompressible",
+                 (unsigned long long)pr->packed, pr->packed == 1 ? "" : "s",
+                 (unsigned long long)left);
+    job_set_summary(progress_ctx, msg);
 }
 
 /* How many ids a gfs journal message names before it summarises the rest.
@@ -1132,7 +1170,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         /* Loose objects are one file each, and compression only happens at
          * pack time, so an unpacked repository stores more than its source
          * and keeps one inode per object. */
-        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+        pack_report_t pr;
+        memset(&pr, 0, sizeof(pr));
+        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx, &pr);
+        pack_job_report(progress_ctx, &pr);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;
         memset(&go, 0, sizeof(go));

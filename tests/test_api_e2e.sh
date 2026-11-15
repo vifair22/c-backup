@@ -579,6 +579,12 @@ PACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repo
 check "pack submitted" "1" "$([ -n "$PACK_JOB" ] && echo 1 || echo 0)"
 wait_job "$PACK_JOB"
 contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
+# B099: the pack job's result was null; why nothing was packed was only in
+# the log. The second backup packed its own objects, so nothing is loose.
+PACK_BODY=$(sock_body "/jobs/$PACK_JOB")
+contains "pack has a result" '"result":{"loose":' "$PACK_BODY"
+contains "pack result counts what it packed" '"packed":0' "$PACK_BODY"
+contains "pack result says why nothing was packed" '"reason":"no loose objects"' "$PACK_BODY"
 contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
 contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
 # B075: missing ids answered as empty successes, which reads as "empty".
