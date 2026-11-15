@@ -190,7 +190,7 @@ static void hashset_add(hashset_t *s, const uint8_t key[OBJECT_HASH_SIZE])
 
 static int cancelled(const pipeline_t *p)
 {
-    return p->opts->cancel && *p->opts->cancel;
+    return cancel_requested(p->opts->cancel);
 }
 
 /*
@@ -377,6 +377,14 @@ static void scan_progress(uint32_t scanned, void *ctx)
     b->cb("scan", scanned, 0, b->ctx);
 }
 
+static int64_t ms_since(const struct timespec *t0)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)(now.tv_sec - t0->tv_sec) * 1000
+         + (int64_t)(now.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
 static status_t store_content(pipeline_t *p)
 {
     /*
@@ -386,7 +394,23 @@ static status_t store_content(pipeline_t *p)
      */
     int in_txn = 0;
     uint32_t since_commit = 0;
+    struct timespec txn_t0 = { 0, 0 };
     #define CACHE_BATCH 2000
+    /*
+     * A batch is bounded by time and by what it reads, not only by entries.
+     *
+     * The transaction holds the daemon-wide write lock (db_txn.h), so every
+     * tag and sources write queues behind it. Counted in entries alone, a
+     * backup of fewer than CACHE_BATCH files ran its whole store phase -
+     * every byte read and hashed - inside one transaction, and a PUT
+     * /repos/<id>/sources waited the length of the backup: 179 to 200 seconds
+     * on a tree of large files (B107). Committing after CACHE_TXN_MAX_MS keeps
+     * a batch of slow small files short, and letting go before reading a file
+     * of CACHE_TXN_YIELD_BYTES or more keeps one large read out of it
+     * entirely. The fsync a commit costs is noise beside reading 4 MiB.
+     */
+    #define CACHE_TXN_MAX_MS      200
+    #define CACHE_TXN_YIELD_BYTES ((uint64_t)4 << 20)
 
     p->bytes_total = 0;
     p->bytes_done  = 0;
@@ -444,8 +468,10 @@ static status_t store_content(pipeline_t *p)
             if (db_txn_begin(p->db) == OK) in_txn = 1;
             else err_clear();
             since_commit = 0;
+            clock_gettime(CLOCK_MONOTONIC, &txn_t0);
         }
-        if (++since_commit >= CACHE_BATCH) {
+        if (++since_commit >= CACHE_BATCH ||
+            ms_since(&txn_t0) >= CACHE_TXN_MAX_MS) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed");
             in_txn = 0;
@@ -490,6 +516,12 @@ static status_t store_content(pipeline_t *p)
             continue;
         }
 
+        if (in_txn && e->node.size >= CACHE_TXN_YIELD_BYTES) {
+            if (db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed");
+            in_txn = 0;
+        }
+
         int fd = open(e->path, O_RDONLY);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
@@ -527,6 +559,16 @@ static status_t store_content(pipeline_t *p)
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
             continue;
+        }
+
+        /* Its rows go in a transaction of the backup's own: a statement
+         * issued outside one joins whatever transaction another thread has
+         * open on the shared handle, and goes with it if that rolls back. */
+        if (!in_txn) {
+            if (db_txn_begin(p->db) == OK) in_txn = 1;
+            else err_clear();
+            since_commit = 0;
+            clock_gettime(CLOCK_MONOTONIC, &txn_t0);
         }
 
         if (is_new) {
@@ -579,6 +621,8 @@ static status_t store_content(pipeline_t *p)
     report(p, "store", p->count, p->count);
     return OK;
     #undef CACHE_BATCH
+    #undef CACHE_TXN_MAX_MS
+    #undef CACHE_TXN_YIELD_BYTES
     #undef PACK_ROLLOVER_HEADROOM
 }
 
@@ -1107,7 +1151,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* The job's flag reaches the object writers through the store, so a
      * cancel lands inside a large file rather than after it. Restored on the
      * way out: the handle may outlive this call. */
-    volatile int *prev_cancel = store_get_cancel(store);
+    atomic_int *prev_cancel = store_get_cancel(store);
     if (opts->cancel) store_set_cancel(store, opts->cancel);
     st = backup_run_inner(store, db, repo_id, opts, out);
     store_set_cancel(store, prev_cancel);

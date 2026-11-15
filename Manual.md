@@ -189,7 +189,9 @@ sudo c-backup version
 
 `systemctl stop c-backupd` (SIGTERM) shuts the daemon down in order: it stops
 accepting requests, stops firing schedules, then cancels running jobs, which
-are recorded as `cancelled` in `c-backup jobs` and the journal. A job checks
+are recorded as `cancelled` in `c-backup jobs` and the journal. Jobs still
+waiting in the queue are never started: they are recorded `cancelled` with no
+start time, and journalled as "cancelled before it started". A job checks
 for cancellation between files and between chunks inside one: storing,
 packing and restoring a file all stop within one read of at most 8 MiB, so a
 multi-gigabyte file in progress does not hold up the shutdown. This takes
@@ -683,7 +685,7 @@ flowchart TD
   E --> F[write snapshot record<br/>into the repository]
   F --> G[index nodes in state.db]
   G --> H{maintenance.auto_pack}
-  H -- true --> I[pack loose objects<br/>compress, coalesce]
+  H -- true --> I[pack sweep: sparse and<br/>over-16-MiB objects, coalesce]
   H -- false --> J[done]
   I --> J
 ```
@@ -695,7 +697,11 @@ flowchart TD
    still has exactly the metadata it had last time; if so, the recorded hash
    is reused without opening the file. Otherwise the file is read, hashed and
    stored. A file whose content already exists in the repository costs one
-   read and no write.
+   read and no write. An object of 16 MiB or less (file content, manifest
+   tree, xattr or ACL blob) goes straight into a pack as it is written,
+   compressed if that makes it smaller. Two kinds cannot, and are written
+   loose and uncompressed: the object of a sparse file, and an object over
+   16 MiB, whose pack entry header needs its hash before the bytes are read.
 
    "Exactly the metadata" is size, mtime, ctime, and the device and inode
    numbers, on a local filesystem. On a network or FUSE filesystem (NFS,
@@ -715,10 +721,17 @@ flowchart TD
 4. **Snapshot.** The snapshot record goes into the repository first, then
    the index rows go into the database. An interrupted backup leaves at most
    index rows a reindex cleans up.
-5. **Packing.** Loose objects are always stored uncompressed; compression
-   happens at pack time. So by default every backup ends by packing what it
-   wrote. Set the policy key `maintenance.auto_pack` to `false` to pack on
-   your own schedule instead.
+5. **Pack sweep.** Loose objects are always stored uncompressed, so by
+   default every backup ends with a pack run, as `pack` would do: it packs
+   the loose objects of step 2 (and anything an interrupted run left) and
+   coalesces small packs. Setting the policy key `maintenance.auto_pack` to
+   `false` skips this sweep and nothing else. Small objects still go into
+   packs during the backup, because that is how they are written; what
+   stays loose until a `pack` is only sparse files' objects and objects
+   over 16 MiB. A backup of small files therefore leaves no loose objects
+   with the key on or off, and a `pack` straight after it finds nothing to
+   do. A large incompressible object stays loose for good either way: the
+   probe marks it once and no pack run moves it (section 12).
 
 What is captured: regular files (sparse or not), directories, symlinks,
 hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
@@ -747,7 +760,16 @@ second job for a repository that has one running, and queues it instead. Jobs
 for different repositories run in parallel, up to `jobs.max_parallel`.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
-briefly for the database rather than failing.
+briefly for the database rather than failing: a backup holds the database's
+write lock for at most about 200 ms at a time, never while it reads a file of
+4 MiB or more, and a write that is waiting goes before the backup's next
+batch. Such a write returns in well under a second however long the backup
+runs.
+
+A change to a repository's sources applies to backups submitted after it. A
+backup takes its sources from the configuration when it is submitted, so a
+backup already running, or already queued, keeps the sources it was
+submitted with.
 
 ---
 
@@ -853,20 +875,46 @@ A snapshot is kept if any of these holds:
 
 1. It is among the newest `keep_snaps` snapshots (at least the newest one,
    always).
-2. It holds a tier and is within that tier's count. Each closed calendar day
+2. It holds a tier and is within that tier's count. Each calendar day
    elects its last snapshot as that day's **daily**; the last daily of each
-   week (ending Sunday) becomes the **weekly**, the last weekly of each month
-   the **monthly**, the last monthly of each year the **yearly**. A snapshot
-   can hold several tiers at once and counts against its highest.
+   week (Monday to Sunday) becomes the **weekly**, the last weekly of each
+   month the **monthly**, the last monthly of each year the **yearly**. A
+   snapshot can hold several tiers at once and counts against its highest
+   only: `keep_daily` 7 keeps the newest seven snapshots whose highest tier
+   is daily.
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
-tier. A day closes on the daemon's clock: today is never closed, so a
-snapshot taken today holds no tier until a pass runs tomorrow or later, and a
-repository whose last backup was weeks ago has that snapshot elected like any
-other. Tiers are assigned only by a retention pass, so a repository that has
-never had one shows `gfs_flags` 0 on every snapshot. A reindex keeps the tiers
-the last pass assigned.
+tier.
+
+A day, week, month or year still in progress elects its latest snapshot so
+far, so the newest snapshot always holds all four tiers (`gfs_flags` 15).
+When a later backup lands in the same period, the next pass moves the tier
+to it and the earlier snapshot loses it: every pass clears and recomputes
+every snapshot's tiers.
+
+Because the period in progress counts, every count includes it.
+`keep_yearly` 3 keeps this year plus the two before it, not three finished
+years; `keep_daily` 7 keeps today plus the six days before it (counting only
+days that have a snapshot). This is how restic and borg count too.
+
+Tiers are assigned only by a retention pass, and a
+dry run assigns none, so a repository that has never had a real pass shows
+`gfs_flags` 0 on every snapshot. A reindex keeps the tiers the last pass
+assigned.
+
+Tags and tiers are independent. A tag does not grant a tier and does not
+hide one: a tagged snapshot holds the tiers it was elected for and counts
+against them like any other, and a tagged snapshot that is not the last of
+any period shows `gfs_flags` 0. The tag keeps it either way.
+
+For example, with every tier count at 1 and `keep_snaps` 1, a pass over
+eighteen daily snapshots, Sunday the 7th to Wednesday the 24th, with the
+second one tagged, keeps four: the newest (all four tiers), the 23rd (the
+newest whose highest tier is daily), Sunday the 21st (the newest whose
+highest is weekly), and the tagged 8th (daily, kept by its tag). Taken all
+on one day instead, the same eighteen leave two: the newest, with every
+tier, and the tagged one, with none.
 
 Days are local calendar days on the daemon's host, in its timezone.
 
@@ -882,7 +930,9 @@ sudo c-backup policy set 1 retention.keep_snaps 5
 ```
 
 `policy list` shows the repository's own values and the defaults in force,
-`maintenance.auto_pack` (on) included.
+`maintenance.auto_pack` (on) included. `maintenance.auto_pack` decides only
+whether a backup ends with a pack sweep (section 6.3, step 5); it does not
+stop a backup writing small objects into packs.
 
 Only these keys are accepted; any other key, and any value of the wrong
 kind, is refused with a message listing what is valid:
@@ -967,6 +1017,26 @@ Two policies per schedule:
 
 Any other value is refused when the schedule is created.
 
+**Overlap.** A schedule overlaps when it comes due while a job for the same
+repository and action is queued or running, whoever submitted it: a backup
+started by hand counts. What each policy then does:
+
+- `skip` does nothing for this window. The next fire is computed as usual.
+- `queue` submits one run, which waits until the repository is free. A
+  schedule never has more than one run waiting: a fire that finds one of its
+  own runs still queued is folded into it, so a backup that runs across
+  three intervals is followed by one more backup, not three.
+- `cancel_running` cancels the running job exactly as `c-backup jobs cancel`
+  does, then submits one replacement. The running job stops at its next
+  check (section 2.2) and is recorded `cancelled`; the replacement waits in
+  the queue meanwhile, because jobs for one repository never run together,
+  and starts as soon as the cancelled job has let go of the repository. A
+  fire that finds its replacement still waiting repeats the cancel and adds
+  nothing, so it never cancels a replacement that has not started. Queued
+  jobs are never cancelled by this policy, only a running one. If every run
+  takes longer than the interval, every run is cancelled by the next one:
+  use `skip` or a longer interval for work that cannot finish inside it.
+
 A `backup` schedule uses the repository's sources unless it names
 `--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
 `grep` schedule needs `--pattern` (an extended regular expression, checked
@@ -1017,7 +1087,7 @@ sudo c-backup verify 1                     # deep, repairing
 sudo c-backup verify 1 --level index       # fast: every object still resolves
 sudo c-backup verify 1 --level structure   # also parses every header
 sudo c-backup verify 1 --no-repair         # check only, write nothing
-sudo c-backup verify 1 --dry-run           # the same, and wins over everything
+sudo c-backup verify 1 --dry-run           # the same: still deep, repair off
 sudo c-backup verify list 1                # past runs
 ```
 
@@ -1032,16 +1102,28 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
-`--dry-run` is a check that cannot write: it turns repair off whatever else
-the command says, so it behaves exactly as `--no-repair` and takes the read
-lock. It is there for the habit `gc --dry-run` and `gfs --dry-run` teach,
-and it means "show me, change nothing". Nothing in the repository is
-written. The daemon still records the run and its findings (`verify list`,
-`verify show`, the verify metrics), because that is the report. Objects
-up to 16 MiB are read with parity applied in memory, so damage there is
-reported `recoverable`; a larger object is streamed, cannot be checked that
-way without writing, and is reported as damaged with a note to run a
-repairing verify. A dry run that finds loss fails like any other verify.
+`--dry-run` is exactly `--no-repair`, and wins over anything else on the
+command line. It changes one thing: repair is off, so nothing in the
+repository is written. It does **not** change the level. With no `--level`
+a dry run is a deep verify, reads every payload, and takes as long as a
+plain one; on a healthy repository the two print the same counts, because
+the only count repair can change is `repaired`, and that is 0 when there is
+nothing to repair. The differences show only when there is damage:
+
+| | `verify` (default) | `verify --dry-run` or `--no-repair` |
+|---|---|---|
+| Level | deep | deep (or what `--level` says) |
+| Reads | every payload | every payload |
+| Damage within parity, object up to 16 MiB | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
+| Damage within parity, larger object | corrected on disk, counted `repaired` | reported damaged, with a note to run a repairing verify: streaming it through parity would mean writing |
+| Lock | write | read |
+| Job `result` | `"repair":true,"dry_run":false` | `"repair":false`, and `"dry_run":true` for `--dry-run` |
+
+For a quick look rather than a full read, combine it with a level:
+`verify 1 --level index --dry-run`. The daemon records a dry run like any
+other (`verify list`, `verify show`, the verify metrics), because the run
+and its findings are the report. A dry run that finds loss fails like any
+other verify.
 
 What a run counts:
 
@@ -1079,7 +1161,7 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 |---|---|---|
 | `gc 1` | Mark from every live snapshot, sweep unreferenced objects, compact packs | After retention prunes |
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
-| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off |
+| `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off and backups hold sparse files or objects over 16 MiB |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
 | `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 

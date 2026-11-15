@@ -28,6 +28,13 @@ typedef status_t (*schedule_dispatch_fn)(void *user, int64_t schedule_id,
                                          const char *params);
 
 /*
+ * How the cancel_running overlap policy stops a running job: the request
+ * `jobs cancel` makes, given the job's id. Returns OK if the job was running
+ * and has been asked to stop. Called with the dispatcher's `user`.
+ */
+typedef status_t (*schedule_cancel_fn)(void *user, int64_t job_id);
+
+/*
  * Create without starting the loop thread, then start it separately.
  *
  * Split because a running loop and an explicit tick race each other: tests
@@ -41,6 +48,10 @@ status_t scheduler_run(scheduler_t *sched);
 status_t scheduler_start(cutils_db_t *db, schedule_dispatch_fn dispatch,
                          void *user, scheduler_t **out);
 void     scheduler_stop(scheduler_t *sched);
+
+/* Install the canceller cancel_running uses; call before scheduler_run.
+ * Without one cancel_running cannot stop anything and behaves as queue. */
+void     scheduler_set_canceller(scheduler_t *sched, schedule_cancel_fn cancel);
 
 /* Recompute next_due_at for every enabled schedule and wake the loop.
  * Call after any schedule mutation. */

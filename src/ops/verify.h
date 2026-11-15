@@ -65,7 +65,7 @@ typedef struct {
  * is filled, exactly as for a clean run.
  */
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
-                    verify_level_t level, int repair, volatile int *cancel,
+                    verify_level_t level, int repair, atomic_int *cancel,
                     void (*progress)(const char *phase, uint64_t done,
                                      uint64_t total, void *ctx),
                     void *progress_ctx,

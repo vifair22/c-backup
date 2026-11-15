@@ -54,7 +54,7 @@ typedef struct {
  * rebuilt, and nothing that failed loses the index rows it had.
  */
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
-                      volatile int *cancel, reindex_result_t *out);
+                      atomic_int *cancel, reindex_result_t *out);
 
 /* Rebuild one snapshot, for faulting a cold snapshot back in on demand. */
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,

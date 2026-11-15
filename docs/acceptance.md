@@ -102,7 +102,7 @@ Legend: **CLI** = the command. **UI** = where it lives in the app.
 |---|----------|-----|----|-------|
 | F1 | Pack | `pack <id>` | Ops > Pack | Loose count drops; objects still readable |
 | F2 | Garbage collect | `gc <id>` | Ops > Garbage Collect | Runs; nothing referenced is removed |
-| F3 | Apply retention | `gfs <id>` | Ops > Apply Retention | Tier flags appear on closed days |
+| F3 | Apply retention | `gfs <id>` | Ops > Apply Retention | Tier flags appear; the newest snapshot holds all four (15) |
 | F4 | Reindex | `reindex <id>` | Ops > Reindex | Rebuilt index agrees with the pre-reindex stats |
 | F5 | Delete a snapshot | `snapshot delete <id> <snap>` | Snapshots > Delete | Gone; other snapshots still restore |
 

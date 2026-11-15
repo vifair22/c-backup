@@ -605,7 +605,7 @@ static void test_cancelled_run_is_marked_incomplete(void **state)
     (void)state;
     run_backup();
 
-    volatile int cancel = 1;
+    atomic_int cancel = 1;
     verify_result_t res;
     assert_int_not_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                     &cancel, NULL, NULL, &res), OK);

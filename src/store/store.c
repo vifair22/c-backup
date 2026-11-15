@@ -82,7 +82,7 @@ struct store {
     int                   encrypted;
 
     /* The owning job's cancel flag, or NULL. See store_set_cancel. */
-    volatile int         *cancel;
+    atomic_int         *cancel;
 
     /* Byte progress inside one object, or NULL. See store_set_io_progress. */
     store_io_fn           io_fn;
@@ -270,19 +270,19 @@ unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes)
     return sweep_tmp_dir(st->path, before, 1, bytes);
 }
 
-void store_set_cancel(store_t *st, volatile int *cancel)
+void store_set_cancel(store_t *st, atomic_int *cancel)
 {
     if (st) st->cancel = cancel;
 }
 
-volatile int *store_get_cancel(const store_t *st)
+atomic_int *store_get_cancel(const store_t *st)
 {
     return st ? st->cancel : NULL;
 }
 
 int store_cancelled(const store_t *st)
 {
-    return st && st->cancel && *st->cancel;
+    return st && cancel_requested(st->cancel);
 }
 
 void store_set_io_progress(store_t *st, store_io_fn fn, void *ctx)

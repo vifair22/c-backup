@@ -326,7 +326,7 @@ static const char *status_reason(status_t st)
 
 static int cancelled(const restore_opts_t *o)
 {
-    return o && o->cancel && *o->cancel;
+    return o && cancel_requested(o->cancel);
 }
 
 static void report(const restore_opts_t *o, const char *phase,
@@ -511,7 +511,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     if (!store || !db || !dest)
         return set_error(ERR_INVALID, "restore_run: missing store, db or dest");
-    volatile int *prev_cancel = store_get_cancel(store);
+    atomic_int *prev_cancel = store_get_cancel(store);
     if (opts && opts->cancel) store_set_cancel(store, opts->cancel);
     status_t st = restore_run_inner(store, db, repo_id, snap_id, dest, opts, out);
     store_set_cancel(store, prev_cancel);

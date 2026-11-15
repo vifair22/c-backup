@@ -11,6 +11,7 @@
  */
 
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,6 +25,7 @@
 #include <cutils/db.h>
 
 #include "routes.h"
+#include "job_manager.h"
 #include "scheduler.h"
 
 #define TEST_DB "/tmp/c_backup_test_sched.db"
@@ -37,12 +39,40 @@ static scheduler_t *sched;
 static int   g_fires;
 static char  g_last_action[64];
 
+/*
+ * When set, a fire also leaves the queued job row a real dispatch would, so
+ * the overlap policies see their own earlier fires waiting.
+ */
+static int   g_dispatch_queues;
+
 static status_t record_dispatch(void *user, int64_t schedule_id, int64_t repo_id,
                                 const char *action, const char *params)
 {
-    (void)user; (void)schedule_id; (void)repo_id; (void)params;
+    (void)user; (void)params;
     g_fires++;
     snprintf(g_last_action, sizeof(g_last_action), "%s", action ? action : "");
+    if (g_dispatch_queues) {
+        char sid[32], rid[32];
+        snprintf(sid, sizeof(sid), "%lld", (long long)schedule_id);
+        snprintf(rid, sizeof(rid), "%lld", (long long)repo_id);
+        if (db_execute_non_query(db,
+                "INSERT INTO jobs (repo_id, action, state, origin, schedule_id)"
+                " VALUES (?, ?, 'queued', 'schedule', ?)",
+                (const char *[]){ rid, action, sid, NULL }, NULL) != 0)
+            return set_error(ERR_IO, "test dispatch: cannot insert job");
+    }
+    return OK;
+}
+
+/* What the injected canceller was asked to stop. */
+static int     g_cancels;
+static int64_t g_cancelled[8];
+
+static status_t record_cancel(void *user, int64_t job_id)
+{
+    (void)user;
+    if (g_cancels < 8) g_cancelled[g_cancels] = job_id;
+    g_cancels++;
     return OK;
 }
 
@@ -60,12 +90,16 @@ static int setup(void **state)
             NULL, NULL) != 0) return -1;
     g_fires = 0;
     g_last_action[0] = '\0';
+    g_dispatch_queues = 0;
+    g_cancels = 0;
+    memset(g_cancelled, 0, sizeof(g_cancelled));
     /*
      * Opened without its loop thread. Dispatch is injected and ticks are
      * driven explicitly, so what is under test is the decision to fire; a
      * concurrent background loop would make the counts depend on timing.
      */
     if (scheduler_open(db, record_dispatch, NULL, &sched) != OK) return -1;
+    scheduler_set_canceller(sched, record_cancel);
     return 0;
 }
 
@@ -97,11 +131,28 @@ static int64_t add_schedule(const char *action, const char *spec,
     return id;
 }
 
-static void add_job(const char *action, const char *state)
+static int64_t add_job(const char *action, const char *state)
 {
-    assert_int_equal(db_execute_non_query(db,
-        "INSERT INTO jobs (repo_id, action, state) VALUES (1, ?, ?)",
-        (const char *[]){ action, state, NULL }, NULL), 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "INSERT INTO jobs (repo_id, action, state) VALUES (1, ?, ?) RETURNING id",
+        (const char *[]){ action, state, NULL }, &r), 0);
+    assert_non_null(r);
+    int64_t id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
+static int count_of(const char *sql)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db, sql, NULL, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return -1;
+    }
+    int v = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return v;
 }
 
 static time_t due_of(int64_t sid)
@@ -230,21 +281,287 @@ static void test_overlap_queue(void **state)
     assert_int_equal(g_fires, 1);
 }
 
+/*
+ * B109: queue added one run per missed fire, so a gc running across three
+ * intervals left three more lined up behind it. Fires while a run of the
+ * schedule is already waiting coalesce into that run.
+ */
+static void test_overlap_queue_coalesces_missed_fires(void **state)
+{
+    (void)state;
+    g_dispatch_queues = 1;
+    time_t now = 1720000000;
+    add_schedule("gc", SPEC_HOURLY, now - 10, "queue", NULL);
+    add_job("gc", "running");
+
+    for (int k = 0; k < 5; k++)
+        assert_int_equal(scheduler_tick(sched, now + k * 3600), OK);
+    assert_int_equal(g_fires, 1);
+    assert_int_equal(count_of("SELECT COUNT(*) FROM jobs WHERE state = 'queued'"), 1);
+}
+
+/* A queued run from somewhere else, a manual gc, is not this schedule's
+ * pending run: queue still adds one of its own, exactly once. */
+static void test_overlap_queue_counts_only_its_own_runs(void **state)
+{
+    (void)state;
+    g_dispatch_queues = 1;
+    time_t now = 1720000000;
+    add_schedule("gc", SPEC_HOURLY, now - 10, "queue", NULL);
+    add_job("gc", "running");
+    add_job("gc", "queued");
+
+    assert_int_equal(scheduler_tick(sched, now), OK);
+    assert_int_equal(scheduler_tick(sched, now + 3600), OK);
+    assert_int_equal(g_fires, 1);
+}
+
+/*
+ * cancel_running asks the job manager to stop the running job, the request
+ * `jobs cancel` makes, and submits one replacement. It does not write the
+ * job's state itself: that was all it did (B108), and the job never saw it.
+ */
 static void test_overlap_cancel_running(void **state)
 {
     (void)state;
+    time_t now = 1720000000;
+    add_schedule("backup", SPEC_HOURLY, now - 10, "cancel_running", NULL);
+    int64_t running = add_job("backup", "running");
+
+    assert_int_equal(scheduler_tick(sched, now), OK);
+    assert_int_equal(g_fires, 1);
+    assert_int_equal(g_cancels, 1);
+    assert_int_equal(g_cancelled[0], running);
+    /* Recorded cancelled by the worker once the job stops, not here. */
+    assert_int_equal(count_of("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"), 0);
+}
+
+/*
+ * The second half of B108: the old UPDATE matched queued jobs too, so every
+ * fire after the first cancelled the previous fire's replacement before it
+ * started and the schedule never completed a run. A fire that finds its
+ * replacement still waiting leaves it alone and adds nothing.
+ */
+static void test_overlap_cancel_running_spares_the_replacement(void **state)
+{
+    (void)state;
+    g_dispatch_queues = 1;
+    time_t now = 1720000000;
+    add_schedule("backup", SPEC_HOURLY, now - 10, "cancel_running", NULL);
+    int64_t running = add_job("backup", "running");
+
+    for (int k = 0; k < 4; k++)
+        assert_int_equal(scheduler_tick(sched, now + k * 3600), OK);
+
+    assert_int_equal(g_fires, 1);
+    /* Every fire repeats the request; the job manager treats a repeat as
+     * the same flag. Only the running job is ever named. */
+    assert_true(g_cancels >= 1);
+    for (int k = 0; k < g_cancels && k < 8; k++)
+        assert_int_equal(g_cancelled[k], running);
+    assert_int_equal(count_of("SELECT COUNT(*) FROM jobs WHERE state = 'queued'"), 1);
+    assert_int_equal(count_of("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"), 0);
+}
+
+/* With nothing to stop the job, cancel_running queues rather than
+ * recording a cancellation that never happened. */
+static void test_overlap_cancel_running_without_canceller(void **state)
+{
+    (void)state;
+    scheduler_set_canceller(sched, NULL);
     time_t now = 1720000000;
     add_schedule("backup", SPEC_HOURLY, now - 10, "cancel_running", NULL);
     add_job("backup", "running");
 
     assert_int_equal(scheduler_tick(sched, now), OK);
     assert_int_equal(g_fires, 1);
+    assert_int_equal(g_cancels, 0);
+    assert_int_equal(count_of("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 1);
+}
 
+/* ---------- overlap against a real job manager ---------- */
+
+/*
+ * A job that runs until it is released or cancelled, polling the way a
+ * pipeline does. While `g_deaf` is set it does not look at its cancel flag,
+ * standing in for a job busy between two checks.
+ */
+static atomic_int g_started;
+static atomic_int g_release;
+static atomic_int g_deaf;
+
+static status_t slow_job(void *arg, atomic_int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)arg; (void)progress; (void)progress_ctx;
+    atomic_fetch_add(&g_started, 1);
+    /* Bounded so a broken test fails instead of hanging: 20 s. */
+    for (int i = 0; i < 4000; i++) {
+        if (!atomic_load(&g_deaf) && atomic_load(cancel))
+            return set_error(ERR_IO, "cancelled");
+        if (atomic_load(&g_release)) return OK;
+        usleep(5000);
+    }
+    return set_error(ERR_IO, "slow_job: never released");
+}
+
+static status_t jm_dispatch(void *user, int64_t schedule_id, int64_t repo_id,
+                            const char *action, const char *params)
+{
+    return job_submit_scheduled(user, repo_id, action, params, schedule_id,
+                                slow_job, NULL, NULL, NULL);
+}
+
+static status_t jm_cancel(void *user, int64_t job_id)
+{
+    return job_cancel(user, job_id);
+}
+
+static void job_state(int64_t job_id, char *out, size_t outsz)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)job_id);
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db,
-        "SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'", NULL, &r), 0);
-    assert_int_equal(atoi(r->rows[0][0]), 1);
+    out[0] = '\0';
+    if (db_execute(db, "SELECT state FROM jobs WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1)
+        snprintf(out, outsz, "%s", r->rows[0][0]);
     db_result_free(r);
+}
+
+/* Wait up to 10 s for a job to reach a state; returns 1 if it did. */
+static int wait_state(int64_t job_id, const char *want)
+{
+    char st[32];
+    for (int i = 0; i < 2000; i++) {
+        job_state(job_id, st, sizeof(st));
+        if (strcmp(st, want) == 0) return 1;
+        usleep(5000);
+    }
+    return 0;
+}
+
+/* The schedule's jobs, oldest first. Returns how many. */
+static int schedule_jobs(int64_t sid, int64_t *ids, int max)
+{
+    char s[32];
+    snprintf(s, sizeof(s), "%lld", (long long)sid);
+    db_result_t *r = NULL;
+    int n = 0;
+    if (db_execute(db, "SELECT id FROM jobs WHERE schedule_id = ? ORDER BY id",
+                   (const char *[]){ s, NULL }, &r) == 0 && r)
+        for (int i = 0; i < r->nrows && n < max; i++)
+            ids[n++] = strtoll(r->rows[i][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * B108 end to end, on one worker so starvation shows. The first run is
+ * cancelled for real and stops; later fires while it is winding down leave
+ * the replacement alone; another repository's job, queued meanwhile, gets
+ * the worker; and the replacement then runs to completion.
+ */
+static void test_cancel_running_stops_the_job_and_the_replacement_completes(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, added_at) VALUES (2,'u2','/tmp/r2',0)",
+        NULL, NULL), 0);
+    atomic_store(&g_started, 0);
+    atomic_store(&g_release, 0);
+    atomic_store(&g_deaf, 0);
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 1, &jm), OK);
+    scheduler_t *s = NULL;
+    assert_int_equal(scheduler_open(db, jm_dispatch, jm, &s), OK);
+    scheduler_set_canceller(s, jm_cancel);
+
+    time_t now = 1720000000;
+    int64_t sid = add_schedule("backup", SPEC_HOURLY, now - 10, "cancel_running", NULL);
+
+    assert_int_equal(scheduler_tick(s, now), OK);
+    int64_t ids[8];
+    assert_int_equal(schedule_jobs(sid, ids, 8), 1);
+    int64_t first = ids[0];
+    assert_true(wait_state(first, "running"));
+
+    /* Busy between checks, so the cancel takes a while to land. */
+    atomic_store(&g_deaf, 1);
+    int64_t other = 0;
+    assert_int_equal(job_submit(jm, 2, "backup", NULL, slow_job, NULL, NULL, &other), OK);
+
+    assert_int_equal(scheduler_tick(s, now + 3600), OK);
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+    int64_t replacement = ids[1];
+
+    /* Further fires while the first is still stopping: no new run, and the
+     * waiting replacement is not cancelled. */
+    assert_int_equal(scheduler_tick(s, now + 7200), OK);
+    assert_int_equal(scheduler_tick(s, now + 10800), OK);
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+    char st[32];
+    job_state(replacement, st, sizeof(st));
+    assert_string_equal(st, "queued");
+
+    /* The job looks at its flag again and stops. */
+    atomic_store(&g_deaf, 0);
+    assert_true(wait_state(first, "cancelled"));
+    /* The freed worker takes the other repository's job, queued first. */
+    assert_true(wait_state(other, "running"));
+
+    atomic_store(&g_release, 1);
+    assert_true(wait_state(other, "completed"));
+    assert_true(wait_state(replacement, "completed"));
+    assert_int_equal(atomic_load(&g_started), 3);
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+
+    scheduler_stop(s);
+    job_manager_stop(jm);
+}
+
+/* B109 against the real queue: four missed fires behind a long run leave
+ * exactly one run waiting, and both complete. */
+static void test_queue_coalesces_against_the_job_manager(void **state)
+{
+    (void)state;
+    atomic_store(&g_started, 0);
+    atomic_store(&g_release, 0);
+    atomic_store(&g_deaf, 0);
+
+    job_manager_t *jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    scheduler_t *s = NULL;
+    assert_int_equal(scheduler_open(db, jm_dispatch, jm, &s), OK);
+    scheduler_set_canceller(s, jm_cancel);
+
+    time_t now = 1720000000;
+    int64_t sid = add_schedule("gc", SPEC_HOURLY, now - 10, "queue", NULL);
+    assert_int_equal(scheduler_tick(s, now), OK);
+    int64_t ids[8];
+    assert_int_equal(schedule_jobs(sid, ids, 8), 1);
+    assert_true(wait_state(ids[0], "running"));
+
+    for (int k = 1; k <= 4; k++)
+        assert_int_equal(scheduler_tick(s, now + k * 3600), OK);
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+    /* The one extra run is waiting, not a second one running alongside. */
+    char st[32];
+    job_state(ids[1], st, sizeof(st));
+    assert_string_equal(st, "queued");
+    assert_int_equal(atomic_load(&g_started), 1);
+
+    atomic_store(&g_release, 1);
+    assert_true(wait_state(ids[0], "completed"));
+    assert_true(wait_state(ids[1], "completed"));
+    assert_int_equal(atomic_load(&g_started), 2);
+    /* And nothing else was left queued behind it to run later. */
+    assert_int_equal(schedule_jobs(sid, ids, 8), 2);
+
+    scheduler_stop(s);
+    job_manager_stop(jm);
 }
 
 /* A finished job is not an overlap. */
@@ -544,7 +861,13 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_firing_advances_due_time, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_skip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_queue, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_queue_coalesces_missed_fires, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_queue_counts_only_its_own_runs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_cancel_running, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_cancel_running_spares_the_replacement, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_cancel_running_without_canceller, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_cancel_running_stops_the_job_and_the_replacement_completes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_queue_coalesces_against_the_job_manager, setup, teardown),
         cmocka_unit_test_setup_teardown(test_completed_job_is_not_an_overlap, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_is_per_action, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_skip_moves_forward, setup, teardown),

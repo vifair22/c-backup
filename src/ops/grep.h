@@ -56,7 +56,7 @@ typedef struct {
 
 status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                   int64_t snap_id, const grep_opts_t *opts,
-                  volatile int *cancel,
+                  atomic_int *cancel,
                   void (*progress)(const char *phase, uint64_t done,
                                    uint64_t total, void *ctx),
                   void *progress_ctx,

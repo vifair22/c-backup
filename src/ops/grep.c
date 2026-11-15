@@ -42,7 +42,7 @@ typedef struct {
     const grep_opts_t *opts;
     grep_result_t *res;
     /* Checked while reading a file, not only between files. */
-    volatile int *cancel;
+    atomic_int *cancel;
 
     /* Effective limits: the options with their defaults applied. */
     uint32_t     per_file_cap;
@@ -383,7 +383,7 @@ static int scan_object(grep_ctx_t *g, store_t *store,
                  * the 65 seconds it took to read it - which from the outside
                  * is indistinguishable from cancel being broken.
                  */
-                if (g->cancel && *g->cancel) break;
+                if (cancel_requested(g->cancel)) break;
                 if (g->file_done) break;   /* closing the pipe stops the writer */
                 ssize_t n = read(pfd[0], buf, 256 * 1024);
                 if (n <= 0) break;
@@ -415,7 +415,7 @@ static int scan_object(grep_ctx_t *g, store_t *store,
 
 status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                   int64_t snap_id, const grep_opts_t *opts,
-                  volatile int *cancel,
+                  atomic_int *cancel,
                   void (*progress)(const char *phase, uint64_t done,
                                    uint64_t total, void *ctx),
                   void *progress_ctx,
@@ -551,7 +551,7 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint64_t total = (uint64_t)objs->nrows;
 
     for (int i = 0; i < objs->nrows; i++) {
-        if (cancel && *cancel) { st = set_error(ERR_BUSY, "grep cancelled"); break; }
+        if (cancel_requested(cancel)) { st = set_error(ERR_BUSY, "grep cancelled"); break; }
         if (progress && (i % 64 == 0 || i + 1 == objs->nrows))
             progress("grep", (uint64_t)i, total, progress_ctx);
 

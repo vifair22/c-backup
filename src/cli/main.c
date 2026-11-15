@@ -1603,7 +1603,7 @@ static const struct {
     { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
     { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]  |  grep runs <repo-id> [--limit N] [--offset N]  |  grep show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
-    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  (deep and repairing by default; --dry-run is --no-repair: check only, the repository is not written)  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
+    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  (deep and repairing by default; --dry-run is --no-repair: the same deep read unless --level says otherwise, with repair off, so nothing is written)  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
