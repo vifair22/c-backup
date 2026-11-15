@@ -769,6 +769,31 @@ What some jobs report in `result`, beyond the backup and restore counts:
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted` |
 | pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
+A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
+`files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
+`trees_new`, `trees_reused`, `store_workers`) and what it wrote into the
+repository, in bytes:
+
+| Field | What |
+|---|---|
+| `bytes_written` | The sum of the categories below: everything the backup wrote into the repository apart from small metadata (the snapshot record, skip marks) |
+| `bytes_written_loose` | Loose objects installed, header and payload: files over 16 MiB and sparse files, always uncompressed |
+| `bytes_written_loose_parity` | The parity trailers of those loose objects |
+| `bytes_written_loose_discarded` | Loose objects written to `tmp/` in full and then dropped because the repository already had them, such as the second of two identical large files |
+| `bytes_written_pack` | Sealed pack files, without their parity trailers: the backup's own packs and any the pack pass wrote |
+| `bytes_written_pack_parity` | The parity trailers of those packs |
+| `bytes_written_parity_spill` | Reed-Solomon parity over its memory cap, written to `tmp/` and then copied into its trailer, so these bytes are written twice |
+| `bytes_written_pack_pass` | Of `bytes_written`, the share of the pack pass the job ends with (`maintenance.auto_pack`) |
+| `pack_pass_packed` | Objects that pass packed; `0` when it is off or found nothing |
+
+`bytes_written / bytes_logical` is the backup's write amplification: on
+storage whose write bandwidth is the limit, it is roughly the backup's time
+over a plain copy's. A loose object the pack pass compresses is counted
+twice, once loose and once in its pack, because it was written twice; its
+loose copy is deleted afterwards. The state database is not counted. The
+same figures are logged after the backup's phase profile, which also
+covers the pack pass (`pack-sweep`).
+
 A pack's `reason` is `null` when it packed something, and otherwise says why
 it did not: `no loose objects`, `all loose objects are skip-marked as
 incompressible`, `every remaining loose object is incompressible`, or `no

@@ -1552,11 +1552,49 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
+/* The pack pass reports through the backup's own progress callback. */
+typedef struct {
+    const backup_opts_t *opts;
+} sweep_bridge_t;
+
+static void sweep_progress(uint64_t current, uint64_t total, const char *phase, void *ctx)
+{
+    sweep_bridge_t *b = ctx;
+    if (!b || !b->opts->progress_cb) return;
+    uint64_t _tp = phase_now();
+    b->opts->progress_cb(phase ? phase : "pack", current, total, b->opts->progress_ctx);
+    phase_add_nested(phase_current, PHASE_PROGRESS, _tp);
+}
+
+/* One line saying where the bytes went, next to the profile saying where the
+ * time went. Ratios are of bytes_logical, the regular-file content this run
+ * covered, so an incremental that reads nothing new still reads sensibly. */
+static void log_written(const backup_result_t *r)
+{
+    const uint64_t *w = r->written.bytes;
+    double mib = 1024.0 * 1024.0;
+    double ratio = r->bytes_logical
+                 ? (double)r->written_total / (double)r->bytes_logical : 0.0;
+    log_info("backup: wrote %.1f MiB for %.1f MiB of content (%.3fx): "
+             "loose %.1f + parity %.1f, packs %.1f + parity %.1f, "
+             "parity spill %.1f, discarded duplicates %.1f; pack pass %.1f MiB",
+             (double)r->written_total / mib, (double)r->bytes_logical / mib, ratio,
+             (double)w[STORE_WR_LOOSE] / mib, (double)w[STORE_WR_LOOSE_PARITY] / mib,
+             (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib,
+             (double)w[STORE_WR_PARITY_SPILL] / mib, (double)w[STORE_WR_LOOSE_DISCARD] / mib,
+             (double)r->written_sweep / mib);
+}
+
 static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
                                  const backup_opts_t *opts, backup_result_t *out)
 {
     backup_result_t res;
     memset(&res, 0, sizeof(res));
+
+    /* The handle may have written for someone before this run; only the
+     * difference is this run's. */
+    store_write_stats_t w_start;
+    store_write_stats(store, &w_start);
 
     scan_imap_t *imap = scan_imap_new();
     if (!imap) return set_error(ERR_NOMEM, "backup_run: scan imap");
@@ -1769,6 +1807,37 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         }
     }
 
+    /*
+     * The pack pass, inside the profile. Run from the job after this
+     * function had reported, it was 70-100 s of UAT's first backup that no
+     * row accounted for. It holds no transaction of ours: the snapshot row
+     * is committed and the pack commit callback takes its own.
+     */
+    store_write_stats_t w_pre_sweep;
+    store_write_stats(store, &w_pre_sweep);
+    if (st == OK && opts->pack_after) {
+        sweep_bridge_t sb = { opts };
+        pack_report_t pr;
+        memset(&pr, 0, sizeof(pr));
+        uint64_t _tpk = phase_now(), _tpkn = phase_nested(&timers);
+        status_t pst = repo_pack_report(store, &pr, sweep_progress, &sb);
+        phase_add_excl(&timers, PHASE_PACK_SWEEP, _tpk, _tpkn);
+        if (pst != OK) {
+            log_warn("backup: snapshot %lld committed but packing failed: %s",
+                     (long long)snap_id, err_msg());
+            err_clear();
+        } else {
+            res.sweep_packed = pr.packed;
+            if (pr.packed > 0)
+                log_info("pack: %llu object(s) packed in repo %lld",
+                         (unsigned long long)pr.packed, (long long)repo_id);
+        }
+    }
+    store_write_stats_t w_end;
+    store_write_stats(store, &w_end);
+    res.written_total = store_write_stats_diff(&w_end, &w_start, &res.written);
+    res.written_sweep = store_write_stats_diff(&w_end, &w_pre_sweep, NULL);
+
     phase_current = NULL;
     res.snapshot_id = snap_id;
     res.commits_store = (uint32_t)timers.count[PHASE_COMMIT_STORE];
@@ -1798,6 +1867,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                  (unsigned long long)res.objects_new,
                  (unsigned long long)res.trees_new,
                  (unsigned long long)res.trees_reused);
+        log_written(&res);
     }
     return st;
 }

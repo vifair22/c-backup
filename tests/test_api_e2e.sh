@@ -385,7 +385,12 @@ contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")
 JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
 contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
 contains "backup result counts files" '"files":3,' "$JOB_BODY"
-contains "no large files, no store pool" '"store_workers":1}' "$JOB_BODY"
+contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
+# B086: what the backup wrote, by category. Three small files go into the
+# backup's pack and nothing is left loose for the pack pass.
+contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
+contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
+contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1237,8 +1242,10 @@ for i in 1 2 3; do head -c $((17 * 1024 * 1024)) /dev/urandom > "$R/big/f$i"; do
 SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
 wait_job "$SW"
 SW_BODY=$(sock_body "/jobs/$SW")
-contains "store_workers from config sizes the pool" '"store_workers":2}' "$SW_BODY"
+contains "store_workers from config sizes the pool" '"store_workers":2,' "$SW_BODY"
 contains "and the backup stores all three" '"objects_new":3,' "$SW_BODY"
+contains "large random files are written loose once" '"bytes_written_loose_discarded":0,' "$SW_BODY"
+contains "and the pack pass probes them and writes nothing" '"bytes_written_pack_pass":0,' "$SW_BODY"
 rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
 rmdir "$R/big"
 

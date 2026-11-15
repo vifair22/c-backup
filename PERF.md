@@ -6,6 +6,395 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - What a first backup writes, by path (B086, reopened)
+
+UAT FS2 (15.24 GB, 1,605 files over NFS; repository and state.db on btrfs
+RAID10 of DRAM-less SATA SSDs, `cp` about 80 MB/s): first backup 388 s
+serial, 398 s on 8 workers, against 188 s for `cp`. The pool gives nothing,
+which says the run is bound by something the workers share, and on that
+host that is write bandwidth. The profile also stopped 70-100 s short of
+the job: the pack pass ran after it.
+
+### Instrumented
+
+- The pack pass now runs inside `backup_run` (`pack_after`, set by the job
+  from `maintenance.auto_pack`), under `pack-sweep` with `sweep:scan+probe`
+  and `sweep:pack` beneath it. Profile total equals job wall time.
+- The store counts bytes written into the repository by category; the job
+  result carries `bytes_written` and its parts (docs/api.md), and the
+  backup logs them after the profile.
+
+### Bytes written per source byte, from the code
+
+r(P) is RS parity, 1,024 bytes per 15,296-byte group: 0.0669 P.
+
+| Path | Code | Written |
+|---|---|---|
+| File <= 16 MiB | `pack_backup_add` -> `pb_compress` (keeps LZ4 only if smaller) -> backup pack, parity in memory, sealed at 256 MiB | 51 + C + 280 + r(C) per object, once |
+| File > 16 MiB | `write_object_file_stream`: tmp/obj.*, trailer, `async_writeback`, rename into objects/ | 64 + P + 280 + r(P), always uncompressed |
+| ...its parity over the cap | `rs_parity_stream` spill to tmp/, replayed into the trailer | the excess twice; cap 256 MiB serial, 16-256 MiB per pool worker (no spill below about 239 MiB-3.7 GiB files) |
+| Duplicate large file | staged in full, found present at `object_exists` or the rename | 64 + P, discarded |
+| Pack pass, probe says incompressible | 64 KiB read, skip mark (1-byte pwrite + header parity) | ~0 |
+| Pack pass, probe says compressible | `pw_write_large`: re-read P, LZ4F the whole object with no bail-out, parity recomputed over the output, own pack if over 256 MiB, fsync, rename, then the loose copy unlinked | 51 + C + 280 + r(C), and P read again |
+| Trees | backup pack | small |
+| state.db | WAL | measured below at under 0.1% of content for large files |
+
+The probe reads only the first 64 KiB (threshold: LZ4 ratio < 0.90). A file
+whose head compresses and body does not - container tables, metadata or a
+thumbnail in front of compressed media - is rewritten whole for nothing.
+
+So, for large files with compression ratio c = C/P:
+
+- incompressible: W = 1.067 P
+- probe-compressible: W = 1.067 (1 + c) P, and 2P read
+- head-compressible, body not (c ~ 1): W = 2.13 P
+
+For FS2's 15.24 GB, the code predicts 16.3 GB written if every large file
+were incompressible (about 203 s at 80 MB/s, 1.08x `cp`), and
+1.067 x (1 + c) x 15.24 GB if they compress.
+
+UAT then measured it (serial first backup, uat-ddd87f4f): loose
+`bytes_stored` 15.75 GB, repository after the pack pass 7.77 GB (c ~ 0.49),
+host-wide writes about 23.5 GB = 15.75 loose + 7.77 packed, and the pack
+pass 63 s of 383 s. That is the second row: large compressible files
+written uncompressed and loose, then read back and rewritten compressed.
+Written once, compressed, they would put about 7.8 GB on disk, less than
+`cp` writes. FS2 is the reference; the local runs below only check the
+counters and the head-probe case.
+
+### Measured
+
+Machine: the header's, Linux 7.3.3; repository on /home (btrfs on LVM on
+LUKS on NVMe), `-c` (source evicted, trailing sync timed), 8 x 1 GiB files,
+auto workers (8). Single runs. The 80 MB/s cap is
+`systemd-run --user --scope -p "IOWriteBandwidthMax=/dev/mapper/vg0-sys 80M"`,
+which the user cgroup honours (dd: 403 MB/s uncapped, 75.5 MB/s capped).
+
+| Case | Disk | Wall | Written / content | /proc write_bytes / content | pack-sweep |
+|---|---|---:|---:|---:|---:|
+| `-l 8` random | NVMe | 4.60 s | 1.067 | 1.068 | 0.00 s |
+| `-l 8` random | slow sync 5 ms | 4.67 s | 1.067 | 1.068 | 0.00 s |
+| `-l 8` random | slow sync 20 ms | 5.89 s | 1.067 | 1.068 | 0.00 s |
+| `-l 8` random | 80 MB/s cap | 115.3 s | 1.067 | 1.068 | 0.00 s |
+| `-H 8` head-text | NVMe | 20.97 s | **2.133** | 2.142 | **14.47 s** |
+
+Random, capped: 9.16 GB in 115.3 s is 79.4 MB/s, so the backup runs at the
+cap and its time is its bytes written over the bandwidth; 1.067x is all
+parity. Head-text: the pack pass rewrote all 8 GiB to save 0.1%
+(8,184.6 MiB of pack payload for 8,192 MiB loose), 69% of the run.
+
+Not run: the head-text case under slow sync and the cap, the `-T`,
+default and FS2-shaped mixes, and the `cp` comparisons. The machine was
+needed, and FS2's own measurement (above) made them unnecessary. To
+repeat: `bench_phases -d DIR ARGS -c -k -R` once, then `-S` on the kept
+source under each condition.
+
+### Proposal (not implemented): compressible large files straight into packs
+
+Status: a design for the user's decision. Nothing here is built.
+
+**What changes.** A file over 16 MiB that the probe calls compressible is
+stored by its pool worker (or the backup thread, serially) as an LZ4F entry
+in a pack, compressed and with parity, instead of as a loose file. A file
+the probe calls incompressible is stored loose exactly as now and
+skip-marked at write time, so the pack pass has nothing to probe. Sparse
+files stay loose. The pack pass stays, for those and for anything an
+interrupted run left.
+
+**Bytes.** Per compressible file of P bytes, from 1.067 (1 + c) P written
+and 2P read to 1.067 c P written and P read. FS2: from about 23.5 GB to
+about 8.3 GB (7.77 GB plus parity), and no 63 s pack pass.
+
+#### Format
+
+No repository format change. Everything the new path writes already exists
+on disk today, because the pack pass writes it: LZ4F entries
+(`COMPRESS_LZ4_FRAME`) of any size, per-entry parity over the stored bytes,
+and single-entry packs larger than the 256 MiB seal (`pw_write_large` gives
+any entry that does not fit an open pack its own pack; OWN-19 made every
+reader take an oversized pack). The repository a backup produces is the one
+the pack pass would have produced, minus the loose stage.
+
+Two limits in the code assume more than the format does, and both bite
+today's pack pass already:
+
+- `OBJECT_SIZE_MAX` (128 GiB, pack.c) is enforced on pack entries by
+  `write_dat_parity`, coalescing and gc's rewrite, which treat a bigger
+  entry as corrupt. Loose objects have no cap. A compressible file whose
+  stored size exceeds it must stay loose (or the constant must rise; it is
+  a sanity bound, not a format field). Today the pack pass will pack such
+  a file and the next gc will call its pack corrupt.
+- Nothing else checks an entry against the seal: the seal is a writer-side
+  rollover rule (`pack_backup_full`, `rw->body + entry_total`), and
+  readers, verify and gc take any size.
+
+#### Write path
+
+1. The worker reads the first pipeline chunk (1 MiB) and runs the existing
+   probe (LZ4 over the first 64 KiB, ratio < 0.90 means compressible)
+   before writing anything. Incompressible: the loose path, with
+   `pack_skip_ver = PROBER_VERSION` in the header it writes. Compressible:
+   below.
+2. Entry header with placeholder hash and sizes into the worker's pack,
+   staged in `tmp/` (`open_new_pack`). Read -> hash -> LZ4F -> encrypt ->
+   write -> CRC + parity, as the existing three-stage pipeline, with LZ4F
+   in the writer stage. When the stream ends, patch hash, sizes and the
+   header parity, as `pw_write_large` already patches `compressed_size`.
+3. Placement: one pack writer per worker, sealed at 256 MiB like the pack
+   pass's workers; an entry that does not fit an open pack gets its own.
+   A pack per object instead would leave every file whose stored size is
+   under 64 MiB (`PACK_COALESCE_SMALL_BYTES`) as a coalescing candidate,
+   and the next gc would rewrite them: the second write moved from backup
+   to gc, not removed.
+4. Seal, install, announce: `seal_pack_file` (fsync), rename, then the
+   commit callback, exactly as `pw_finalize`. Every worker pack is sealed
+   before the snapshot record, as the backup's own pack is now.
+
+**Probe says compressible, tail is not.** The decision is made on 64 KiB,
+before the rest exists. Without anything more, LZ4F stores each block that
+does not shrink raw, so the worst case is the file stored at about its own
+size inside a pack, written once: no worse than loose, and never rewritten.
+It still spends LZ4 CPU on every block of a body that will not compress,
+against design constraint 4. The streaming bail-out below stops that.
+
+#### Crash safety
+
+- Staging and install: the pack lives in `tmp/` until sealed and fsynced,
+  then a single rename installs it, then its rows are committed (the OWN-11
+  order: install first, rows second, so an interruption leaves objects
+  invisible, never advertised and absent). `install_pack_file` refuses to
+  overwrite. Pack numbers come from one atomic counter shared by the
+  workers and the backup's own writer, as `repo_pack`'s workers share one.
+- A killed run leaves staging files that `store_sweep_tmp_before` removes
+  at the next backup (the backup holds the write lock), and staged rows
+  that `store_index_drop_staged` removes at its start. A cancelled run
+  discards every open worker pack and its staged rows as it now discards
+  the backup pack (`pack_backup_abort`).
+- OWN-20 (replace packs only once their replacements are installed)
+  concerns gc and coalescing; the backup only adds packs, so it does not
+  apply, and gc's later rewrites follow it unchanged.
+- The snapshot never names an unresolvable object: the backup thread
+  records a file only after its worker returns, and the worker returns
+  after its entry is staged; every worker pack seals and announces before
+  `write_snapshot_record`. Today the worker returns after a rename into
+  objects/, which resolves at once, so this is a new ordering rule and the
+  one most worth a test: a staged-but-unsealed entry must count as present
+  for the existence checks in the same run (as `pack_backup_holds` does
+  for the backup's pack), and must not be visible to any other job.
+- Commits from workers: the pack commit callback would run on store
+  workers while the backup thread may hold a batch transaction across a
+  pool wait (B107, OWN-16). The worker's `db_txn_begin` queues,
+  `db_txn_waiters()` makes the backup thread yield at its next 50 ms
+  pool-wait slice, and the order (pack path's lock, then transaction) is
+  the one `db_pack_commit` already takes. Alternatively the workers hand
+  sealed staging files to the backup thread to install and announce,
+  keeping every commit on one thread; simpler to reason about, at the cost
+  of a queue.
+
+#### Dedup
+
+- The hash is known only at the end. Already in the repository (found at
+  the end, as `object_exists` finds it now): ftruncate the worker's pack
+  back to the entry's start and drop its parity. It costs the file's
+  stored bytes written once, as the discarded loose copy costs now
+  (`bytes_written_loose_discarded`), but compressed.
+- Two workers storing the same object: today the second rename hits
+  EEXIST. With per-worker packs both entries could be staged, so the
+  check-and-claim must be atomic across workers: a shared set of hashes
+  staged this run under a mutex, consulted at the end of each file; the
+  loser truncates. Without it a pack pair holds one hash twice, which
+  every reader tolerates (first match wins) but gc would count as dead
+  weight.
+- Avoiding the duplicate write entirely needs the hash before the write,
+  which means reading the source twice. Not proposed.
+
+#### Memory
+
+Streaming only; no file is ever held whole. Per worker: the existing
+8 x 1 MiB pipeline chunks, an LZ4F context and its 64 KiB-block output
+buffer, and the RS parity stream with the pool's cap (16-256 MiB). An
+entry's parity cannot be written until the pack's trailer, so it is held
+until the seal: for entries that share a pack, at most about 17 MiB for
+256 MiB of body; for an oversized entry, the capped stream spilling to
+`tmp/` beyond the cap (`bytes_written_parity_spill`), as the loose path
+does now. Spill only starts above about 239 MiB of stored bytes at the
+16 MiB floor, 3.7 GiB at 256 MiB.
+
+#### Worker pool
+
+The workers do more per byte (LZ4F at roughly 600 MB/s a thread, against
+SHA-256 at about 2 GB/s) but write half as much on FS2-like data, and the
+pool exists for exactly this: CPU work spread over threads while the disk
+is the limit. The pool's memory plan gains the LZ4F state and the
+open-pack parity per worker (`store_pool_plan`'s per-worker budget). The
+pack pass's single threaded LZ4F at the end of the job disappears for
+these files.
+
+#### Effect on the readers
+
+- Restore, grep, FUSE: `pack_object_load_stream` streams LZ4F entries of any
+  size now. No change.
+- Verify: reads them through the same stream path. No change in what it
+  can check.
+- **Repair: a regression to fix first.** `object_repair` corrects a loose
+  object of any size group by group, reading parity with `pread`.
+  `pack_object_repair` only repairs entries up to 16 MiB, and the streaming
+  read of an LZ4F entry only detects a CRC mismatch ("not repairable").
+  So every large object the pack pass packs today has already lost repair,
+  and this design would keep that. Porting `object_repair`'s group loop to
+  pack entries (parity at a known offset in the trailer) restores it; RS
+  parity covers the stored, compressed bytes, so correcting them in place
+  needs no LZ4 at all. Not a format change.
+- **Reading parity: a memory bound to fix first.** `read_entry_parity`
+  mallocs an entry's whole RS parity, 6.7% of its stored size, on every
+  load of a packed object: 3.3 GiB for a 50 GiB entry, against design
+  constraint 2. Same exposure today for anything the pass packed; return
+  the parity's offset and stream it instead.
+- gc: rewrites a pack only when it has dead entries and deletes it when
+  all are dead, so a single-entry pack is never rewritten, only kept or
+  deleted. The OWN-19 split rolls over between entries, so an oversized
+  entry passes through as its own output. Coalescing only takes packs
+  under 64 MiB, which is why the placement above shares packs.
+- Reindex: rebuilds `pack_objects` from the packs themselves, whatever
+  they hold. No change.
+- Replicate: moves stored bytes, so it is indifferent to loose or packed.
+  But `object_read_stored` mallocs each object's whole stored payload
+  (and reencrypt a second copy), loose or packed, which breaks design
+  constraint 2 for large files today, independent of this design.
+
+#### Streaming bail-out inside an entry
+
+Design constraint 4 asks for a fast incompressible bailout. The 64 KiB
+probe gives it at the head of a file; this gives it for the rest. The
+writer tracks what LZ4 achieves as the entry is written, and once
+compression has stopped paying it stores the remaining blocks of that same
+entry uncompressed. A media file with a compressible header then costs LZ4
+time for its first few MiB only, and is written once.
+
+**Already in the frame format, already in today's repositories.** An LZ4
+frame is a sequence of blocks, each led by a 4-byte size whose high bit
+marks the block as stored uncompressed (LZ4 frame format, block size
+field). `LZ4F_compressUpdate` already writes such blocks on its own,
+whenever a 64 KiB block does not shrink, so mixed frames are what the pack
+pass produces today for a file like the `-H` case above (8,184.6 MiB of
+payload for 8,192 MiB of input: mostly raw blocks). Every reader decodes
+with `LZ4F_decompress` (`pack_object_load_stream`, the prefix reader at
+pack.c ~1060, verify's stream read), which
+takes compressed and uncompressed blocks in any order, as the frame
+specification requires. The entry stays `COMPRESS_LZ4_FRAME`, its header
+fields keep their meaning, and nothing outside the writer changes. No
+format change.
+
+What the bail-out adds is not a new kind of block but skipping the attempt:
+today every block is compressed and then thrown away if it did not shrink.
+
+**How the writer emits raw blocks.** Two ways, both producing the same
+bytes:
+
+- `LZ4F_compressUpdate` with `LZ4F_compressOptions_t.uncompressed = 1`.
+  That field exists from lz4 1.11 (installed here). Debian trixie, the
+  Docker image's base, ships 1.10, which has only the static-only
+  `LZ4F_uncompressedUpdate` (1.9.4+), whose export from the shared library
+  is not something to depend on.
+- Write the blocks directly: `LZ4F_flush` the context, then for each 64 KiB
+  of input emit a little-endian `size | 0x80000000` and the bytes, and
+  finish the frame with the 4-byte zero EndMark instead of
+  `LZ4F_compressEnd`. This is valid because the writer's frames carry no
+  content checksum, no block checksum and no content size (the frame
+  preferences are the library defaults, NULL), so the context holds
+  nothing the raw blocks would have to update. Portable across every lz4
+  version and recommended. The emitted bytes go through the same path as
+  compressed output (encrypt in place, write, CRC, RS parity).
+
+**N and the threshold.**
+
+- Ratio per block, 64 KiB (the frame's block size), accumulated over a
+  window: switch to raw when the last 8 MiB (128 blocks) compressed to
+  0.90 or more of their input, the same `PACK_RATIO_THRESHOLD` the probe
+  uses, so "compressible" means one thing everywhere.
+- 8 MiB, because a container header or embedded thumbnail is usually well
+  under that, so the window sees the body before deciding; and 8 MiB of
+  LZ4 is milliseconds, so deciding later saves little. N need not be
+  exact: an entry that switched late is merely a little slower to write,
+  never larger.
+- The window starts after the first 64 KiB probe region, which has
+  already been judged.
+
+**Re-probing.** Once raw, every 256 MiB the writer compresses one 64 KiB
+block into scratch without emitting it (`LZ4_compress_default`, as the
+probe does). Below the threshold, it goes back to compressing. That costs
+one block of LZ4 per 256 MiB, a 0.02% duty cycle, and catches a file
+whose compressible part follows an incompressible one (a disk image, a tar
+of mixed content).
+
+Going back to compressed blocks after raw ones needs care with linked
+blocks: a compressed block may reference the previous 64 KiB, which the
+context never saw if the writer emitted it by hand. Either write these
+frames with independent blocks (`LZ4F_blockIndependent`, chosen per frame
+in its descriptor, so readers need nothing; costs LZ4 a little ratio,
+typically a few percent at 64 KiB blocks), or make the switch one-way: no
+re-probe, and the rest of the entry stays raw. Recommended first step: the
+one-way switch, which needs no change to the frame preferences; add
+re-probing with independent blocks only if a real tree shows files that
+compress after an incompressible stretch.
+
+**Stored size and accounting.** `compressed_size` stays what it is: the
+stored bytes, now including 4 bytes per raw 64 KiB block (0.006%) and the
+frame header. `uncompressed_size`, the pack row's `comp_size` and
+`orig_size`, `bytes_stored` and `bytes_written_pack` all keep their
+meaning; a bailed-out entry is simply nearly as large as its input. An
+entry can end up larger than its input by those few bytes per block and
+the frame overhead: possible today too, harmless, and capped at about
+0.01%.
+
+**Parity.** RS parity and the CRC cover the stored bytes, whatever they
+are; raw blocks are stored bytes like any other. Nothing changes, and
+repair (once pack entries over 16 MiB can be repaired, above) corrects
+raw and compressed blocks alike, without decoding.
+
+**Dedup.** The hash is over the plaintext file content, never the stored
+form, so it is unaffected. The switch depends only on the content, so two
+copies of a file produce identical entries; dedup does not rely on that
+in any case, since stored forms already differ between writers (backup
+pack, pack pass, replica).
+
+**The probe and the skip mark.**
+
+- The 64 KiB head probe stays the first gate. Incompressible at the head:
+  the file goes loose with the skip mark set at write time and no LZ4 at
+  all. Compressible at the head: the pack path, with the bail-out
+  watching the rest. The probe catches the common case for free; the
+  bail-out catches the header-in-front-of-media case the probe misjudges.
+- The skip mark exists so that a loose object is not re-probed by every
+  pack run. A packed entry needs none: nothing re-probes a pack entry
+  (`pb_compress`'s comment), so the bail-out's verdict is durable by being
+  in the frame.
+- Until the write-once path exists, the same window helps today's pack
+  pass differently: there the loose copy already exists, so finishing the
+  entry raw would still be a full rewrite for nothing. The pass should
+  instead abandon the entry (ftruncate the pack back to the entry's
+  start, drop its parity), set the skip mark on the loose object, and
+  leave it loose. The mark keeps its meaning, "a prober said leave this
+  loose", so `PROBER_VERSION` need not change and existing marks stay
+  valid. That alone would have saved the whole 14.5 s and 8 GiB of the
+  `-H` run, without a format change.
+
+#### Alternatives considered
+
+- Probe more than the head (several 64 KiB windows): cheaper than the
+  streaming bail-out but blind between its samples. The bail-out reads
+  every block anyway, as part of writing it, so it sees the whole file
+  for the cost of a ratio check. Neither helps FS2, whose data really
+  compresses; both matter for media.
+- Compressed loose objects, so the pass only renames: every loose reader
+  refuses a codec other than `COMPRESS_NONE`. Allowing one is a reader and
+  format change, and is not needed given the above.
+
+Recommendation: fix pack-entry repair and the parity read first (both are
+bugs in today's repository, not in this design), then build the write path
+above behind the existing pool. None of it needs a format change, so it
+does not have to land before the freeze; the two fixes arguably should.
+
 ## 2026-11-15 - Batches commit only when another writer waits (OWN-16)
 
 UAT measured r8 against pre-r8 on FS2 (1,605 files, 15.24 GB, source over

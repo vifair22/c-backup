@@ -170,6 +170,51 @@ void store_get_io_progress(const store_t *st, store_io_fn *fn, void **ctx);
 void store_io_progress(const store_t *st, uint64_t bytes);
 
 /*
+ * Bytes this handle has written into the repository, by what they were.
+ *
+ * A first backup on write-bound storage runs at the speed of its writes, and
+ * the question that decides whether it can match `cp` is how many bytes it
+ * writes per byte it reads (B086). Nothing measured that: object counts and
+ * bytes_stored describe what the repository ended up holding, not what
+ * reached the disk on the way, and the two differ by every staging copy,
+ * every rewrite and every spill.
+ *
+ * Counted where each file is completed rather than per write, so the cost is
+ * one atomic add per object or pack, not per chunk. Writes abandoned by an
+ * error are not counted. The counters only grow; a caller wanting one
+ * operation's figure takes a snapshot before and after and subtracts.
+ *
+ * Categories are disjoint, so their sum is everything this handle wrote
+ * apart from small metadata (snapshot records, the one-byte skip marks a
+ * pack run patches into incompressible loose objects, the .cbackup marker).
+ */
+typedef enum {
+    STORE_WR_LOOSE = 0,      /* loose object header and payload, installed */
+    STORE_WR_LOOSE_PARITY,   /* the parity trailers of those objects */
+    STORE_WR_LOOSE_DISCARD,  /* a loose object staged in tmp/ and dropped
+                                because the repository already had it */
+    STORE_WR_PACK,           /* sealed packs: file header, entry headers, payloads */
+    STORE_WR_PACK_PARITY,    /* the parity trailers of those packs */
+    STORE_WR_PARITY_SPILL,   /* RS parity over its memory cap, staged in tmp/
+                                before being copied into its trailer */
+    STORE_WR__COUNT
+} store_write_cat_t;
+
+typedef struct {
+    uint64_t bytes[STORE_WR__COUNT];
+} store_write_stats_t;
+
+void store_count_write(store_t *st, store_write_cat_t cat, uint64_t bytes);
+/* The counter itself, for a layer that has no store_t of its own to hand
+ * (the parity stream's spill file). NULL when st is NULL. */
+uint64_t *store_write_counter(store_t *st, store_write_cat_t cat);
+void store_write_stats(const store_t *st, store_write_stats_t *out);
+/* out = after - before, per category, and the sum of them. */
+uint64_t store_write_stats_diff(const store_write_stats_t *after,
+                                const store_write_stats_t *before,
+                                store_write_stats_t *out);
+
+/*
  * Remove staging files in tmp/ last modified before `before`, limited to the
  * names the engine itself creates (obj.*, pack-dat.*, pack-idx.*, snap.*,
  * par.*). Returns how many were removed and adds their size to *bytes when
