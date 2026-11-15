@@ -354,6 +354,11 @@ R=$(restore_req "{\"dest\":\"$WORK/nothing\",\"subpath\":\"/no/such/path\"}")
 contains "missing subpath is 404"        ' 404'                                   "$R"
 contains "missing subpath says so"       'subpath /no/such/path matches nothing in snapshot 1' "$R"
 check    "missing subpath wrote nothing" "absent" "$([ -e "$WORK/nothing" ] && echo present || echo absent)"
+# A relative dest resolves against the daemon's cwd. It used to become a job
+# that then failed; it is refused at the request instead.
+R=$(restore_req '{"dest":"relative/out"}')
+contains "relative dest is 400"          ' 400'                       "$R"
+contains "relative dest says why"        'dest must be an absolute path' "$R"
 
 echo "maintenance"
 GC_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repos/1/gc)")

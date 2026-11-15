@@ -881,6 +881,14 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        /* Checked here rather than left to the job: a relative destination
+         * would resolve against the daemon's working directory, which is
+         * nobody's intent, and a job that fails on it says so long after
+         * the caller could have been told. */
+        if (j->dest[0] != '/') {
+            snap_job_free(j);
+            return api_error(400, "dest must be an absolute path");
+        }
         uint32_t ow = 0;
         if (json_req_get_u32(body, "overwrite", &ow, 0, 1) == 0) j->overwrite = (int)ow;
         /* Optional: restore one path out of the snapshot rather than all of
