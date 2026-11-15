@@ -742,6 +742,11 @@ case "$OUT" in
     *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
     *) ok "a first replicate sends objects" ;;
 esac
+# B098: a second result document, written after this one to add
+# "reencrypted", replaced it and dropped the walk's counts.
+contains "replicate reports what it asked about" '"objects_asked":' "$OUT"
+contains "and the subtrees it skipped" '"subtrees_skipped":' "$OUT"
+contains "and whether it re-encrypted" '"reencrypted":false' "$OUT"
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.

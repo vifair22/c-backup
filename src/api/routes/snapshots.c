@@ -1033,19 +1033,25 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
  * What a replication sent. A full copy, an incremental and a no-op all
  * printed the same bare job before this; the counts were only in the log.
  */
-static void replicate_report(void *progress_ctx, const replicate_result_t *rr)
+static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
+                             int reencrypt)
 {
+    /* One result document. A second job_set_result after this one, which
+     * added "reencrypted", replaced it whole and dropped objects_asked and
+     * subtrees_skipped from every replication's result (B098). */
     char js[384];
     snprintf(js, sizeof(js),
              "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
              "\"objects_asked\":%llu,\"objects_sent\":%llu,"
-             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu}",
+             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu,"
+             "\"reencrypted\":%s}",
              (unsigned long long)rr->snapshots_sent,
              (unsigned long long)rr->snapshots_skipped,
              (unsigned long long)rr->objects_asked,
              (unsigned long long)rr->objects_sent,
              (unsigned long long)rr->bytes_sent,
-             (unsigned long long)rr->subtrees_skipped);
+             (unsigned long long)rr->subtrees_skipped,
+             reencrypt ? "true" : "false");
     job_set_result(progress_ctx, js);
 
     char msg[256];
@@ -1208,7 +1214,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 sink.v->close(sink.ctx);
                 /* A cancelled run keeps what it committed, so its counts
                  * are true either way. */
-                replicate_report(progress_ctx, &rr);
+                replicate_report(progress_ctx, &rr, j->reencrypt);
                 if (st == OK)
                     log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
                              "%llu object(s), %llu byte(s), %llu subtree(s) skipped",
@@ -1217,16 +1223,6 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                              (unsigned long long)rr.objects_sent,
                              (unsigned long long)rr.bytes_sent,
                              (unsigned long long)rr.subtrees_skipped);
-                char rj[256];
-                snprintf(rj, sizeof(rj),
-                         "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
-                         "\"objects_sent\":%llu,\"bytes_sent\":%llu,\"reencrypted\":%s}",
-                         (unsigned long long)rr.snapshots_sent,
-                         (unsigned long long)rr.snapshots_skipped,
-                         (unsigned long long)rr.objects_sent,
-                         (unsigned long long)rr.bytes_sent,
-                         j->reencrypt ? "true" : "false");
-                job_set_result(progress_ctx, rj);
             }
         }
         if (dest_locked > 0) repo_unlock(dest_locked);
