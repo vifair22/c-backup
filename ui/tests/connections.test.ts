@@ -257,17 +257,68 @@ test('editing a connection saves it, keeps the session across a rename, drops it
   m.addConnection(remote('a'))
   store.setToken('a', 'token-for-a')
 
-  assert.deepEqual(m.editConnection('a', remote('b')), { ok: true })
+  assert.deepEqual(await m.editConnection('a', remote('b')), { ok: true })
   assert.deepEqual(store.saved.map((c) => c.name), ['b'])
   assert.equal(store.getToken('a'), undefined)
   assert.equal(store.getToken('b'), 'token-for-a', 'same daemon, renamed')
 
-  assert.deepEqual(m.editConnection('b', remote('b', PORT + 1)), { ok: true })
+  assert.deepEqual(await m.editConnection('b', remote('b', PORT + 1)), { ok: true })
   assert.equal(store.getToken('b'), undefined, 'a token belongs to the daemon that issued it')
 
   m.addConnection(remote('c'))
-  assert.equal(m.editConnection('b', remote('c')).ok, false, 'names stay unique')
+  assert.equal((await m.editConnection('b', remote('c'))).ok, false, 'names stay unique')
 
   assert.deepEqual(m.removeConnection('b'), { ok: true })
   assert.deepEqual(store.saved.map((c) => c.name), ['c'])
+})
+
+/* B105: renaming a signed-in connection dropped it to disconnected, and it
+ * stayed there until somebody clicked Connect. Session-only on purpose: that
+ * token lives nowhere but the client, so a rename that rebuilt the entry
+ * lost it outright. */
+test('renaming a signed-in connection keeps it connected under the new name', async () => {
+  const store = new MemoryConnectionStore()
+  const m = new ConnectionManager(store)
+  m.addConnection(local())
+  m.addConnection(remote('there'))
+  assert.equal((await m.connect('there', { password: PASSWORD, remember: false })).ok, true)
+  const repos = m.getStatus('there')?.repos
+
+  assert.deepEqual(await m.editConnection('there', remote('renamed')), { ok: true })
+  assert.equal(m.getStatus('there'), null)
+  const s = m.getStatus('renamed')
+  assert.equal(s?.status, 'connected')
+  assert.equal(s?.signedIn, true)
+  assert.equal(s?.needsCredentials, false)
+  assert.deepEqual(s?.repos, repos)
+  await m.apiCall('renamed', { kind: 'repoList' })
+  assert.deepEqual(m.listConnections().map((c) => c.config.name), ['here', 'renamed'],
+                   'in the same place in the list')
+  assert.deepEqual(store.saved.map((c) => c.name), ['here', 'renamed'])
+
+  /* A sign-in that remembers lands on the new name. */
+  assert.equal((await m.connect('renamed', { password: PASSWORD, remember: true })).ok, true)
+  assert.ok(store.getToken('renamed'))
+  assert.equal(store.getToken('there'), undefined)
+})
+
+test('a new address reconnects a live connection there, and leaves an idle one idle', async () => {
+  const store = new MemoryConnectionStore()
+  const m = new ConnectionManager(store)
+  m.addConnection(remote('there', 1))
+  assert.equal((await m.connect('there')).ok, false)
+
+  /* Not live (it failed): the edit only saves. */
+  assert.deepEqual(await m.editConnection('there', remote('there')), { ok: true })
+  assert.equal(m.getStatus('there')?.status, 'disconnected')
+
+  assert.equal((await m.connect('there', { password: PASSWORD, remember: true })).ok, true)
+  /* Live, and the address changes: the old token is dropped rather than
+   * offered to another daemon, and the connection goes there at once. */
+  const r = await m.editConnection('there', remote('there', 1))
+  assert.equal(r.ok, false)
+  assert.match(r.error ?? '', /no daemon at 127\.0\.0\.1:1/)
+  assert.equal(m.getStatus('there')?.status, 'error')
+  assert.equal(store.getToken('there'), undefined)
+  assert.equal(m.getStatus('there')?.signedIn, false)
 })
