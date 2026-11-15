@@ -1171,6 +1171,11 @@ static int cmd_schedule(int argc, char **argv)
          * a backup needs somewhere to read from. Sources repeat, so they
          * are drained rather than read once. */
         const char *dest = take_opt(&a, v, "--dest");
+        /* A grep schedule needs its pattern; there was no way to give one,
+         * so every grep schedule searched for nothing. */
+        const char *pattern = take_opt(&a, v, "--pattern");
+        const char *gprefix = take_opt(&a, v, "--path-prefix");
+        int gicase = take_flag(&a, v, "-i") | take_flag(&a, v, "--ignore-case");
         const char *src[32];
         int n_src = 0;
         for (;;) {
@@ -1185,7 +1190,8 @@ static int cmd_schedule(int argc, char **argv)
                                "schedule add <repo-id> <action> --every day|week|month|year "
                                "--at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N] "
                                "[--on-overlap skip|queue|cancel_running] [--catchup skip|run_once] "
-                               "[--dest PATH] [--source PATH]...");
+                               "[--dest PATH] [--source PATH]... "
+                               "[--pattern REGEX [--path-prefix PATH] [-i]]");
         /* Numbers go into the body bare, so a non-number would be malformed
          * JSON and come back as "invalid JSON", describing the request
          * rather than the mistake. */
@@ -1201,6 +1207,9 @@ static int cmd_schedule(int argc, char **argv)
         sb_puts(&b, "{\"action\":");
         sb_json_str(&b, v[2]);
         if (dest) { sb_puts(&b, ",\"dest\":"); sb_json_str(&b, dest); }
+        if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
+        if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
+        if (gicase)  sb_puts(&b, ",\"ignore_case\":1");
         if (n_src > 0) {
             sb_puts(&b, ",\"paths\":[");
             for (int i = 0; i < n_src; i++) {
@@ -1423,7 +1432,7 @@ static const struct {
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
     { "auth",      cmd_auth,      "auth <setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
     { "metrics",   cmd_metrics,   "metrics" },

@@ -38,14 +38,16 @@ static void set_next_due(cutils_db_t *db, int64_t schedule_id, time_t when)
         log_warn("scheduler: cannot update next_due_at for schedule %s", id);
 }
 
-status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
+static status_t recompute(cutils_db_t *db, int64_t schedule_id, time_t now,
+                          int at_startup)
 {
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)schedule_id);
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT trigger_spec, last_fired_at, catchup FROM schedules WHERE id = ?",
+            "SELECT trigger_spec, last_fired_at, catchup, next_due_at"
+            "  FROM schedules WHERE id = ?",
             (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return set_error(ERR_NOT_FOUND, "scheduler: no schedule %lld",
@@ -56,8 +58,23 @@ status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
     status_t st = trigger_parse(r->rows[0][0], &t);
     time_t last = r->rows[0][1] ? (time_t)strtoll(r->rows[0][1], NULL, 10) : 0;
     int run_once = r->rows[0][2] && strcmp(r->rows[0][2], "run_once") == 0;
+    time_t stored_due = r->rows[0][3] ? (time_t)strtoll(r->rows[0][3], NULL, 10) : 0;
     db_result_free(r);
     if (st != OK) return st;
+
+    /*
+     * A schedule that has never fired has no last fire to measure a missed
+     * window from, so run_once used to mean nothing for it: created on
+     * Friday for Saturday 03:00, daemon down over the weekend, and the
+     * window simply vanished. At startup the due time the previous process
+     * stored is the evidence instead. Only at startup: during a tick a
+     * failed dispatch also leaves a past due time and no last fire, and
+     * treating that as missed would retry it every tick.
+     */
+    if (run_once && last == 0 && at_startup && stored_due > 0 && stored_due <= now) {
+        set_next_due(db, schedule_id, now);
+        return OK;
+    }
 
     time_t next = trigger_next_fire(&t, now, last);
     if (next <= 0) return set_error(ERR_INVALID, "scheduler: trigger never fires");
@@ -77,6 +94,11 @@ status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
 
     set_next_due(db, schedule_id, next);
     return OK;
+}
+
+status_t scheduler_recompute(cutils_db_t *db, int64_t schedule_id, time_t now)
+{
+    return recompute(db, schedule_id, now, 0);
 }
 
 /*
@@ -300,7 +322,7 @@ status_t scheduler_open(cutils_db_t *db, schedule_dispatch_fn dispatch,
         time_t now = time(NULL);
         for (int i = 0; i < r->nrows; i++) {
             int64_t sid = strtoll(r->rows[i][0], NULL, 10);
-            if (scheduler_recompute(db, sid, now) != OK) err_clear();
+            if (recompute(db, sid, now, 1) != OK) err_clear();
         }
     }
     db_result_free(r);

@@ -267,6 +267,36 @@ OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
 check "grep rejects a bad pattern" 1 "$RC"
 contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
 
+# B064: schedule options are validated per action. Values outside the
+# documented sets were stored and read back as something else; parameters an
+# action never reads were stored as if they configured something; a grep
+# schedule could not be given a pattern at all.
+OUT=$(cb schedule add 1 gc 3600 --on-overlap bogus 2>&1); RC=$?
+check    "an unknown on_overlap is refused" 1 "$RC"
+contains "and the valid ones are named" "skip, queue or cancel_running" "$OUT"
+OUT=$(cb schedule add 1 gc 3600 --catchup nope 2>&1); RC=$?
+check    "an unknown catchup is refused" 1 "$RC"
+OUT=$(cb schedule add 1 gc 3600 --dest /mnt/x 2>&1); RC=$?
+check    "a parameter the action ignores is refused" 1 "$RC"
+contains "and says whose it is" "dest applies only to a replicate" "$OUT"
+OUT=$(cb schedule add 1 grep 3600 2>&1); RC=$?
+check    "a grep schedule needs a pattern" 1 "$RC"
+OUT=$(cb schedule add 1 grep 3600 --pattern 'unclosed[' 2>&1); RC=$?
+check    "a grep schedule with a bad pattern is refused" 1 "$RC"
+check    "--on-overlap queue is accepted" 0 \
+    "$(cb schedule add 1 gc 3600 --on-overlap queue --catchup run_once >/dev/null 2>&1; echo $?)"
+GSID=$(cb schedule add 1 grep 1 --pattern 'passphrase is' | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores its pattern" 'passphrase is' "$(cb schedule list 1)"
+FIRED=0
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" 'http://localhost/repos/1/grep?limit=1')" in
+        *'"pattern":"passphrase is"'*'"completed":"1"'*) FIRED=1; break ;;
+    esac
+    sleep 0.2
+done
+check "a scheduled grep runs with its pattern" 1 "$FIRED"
+cb schedule remove 1 "$GSID" >/dev/null 2>&1
+
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.
 echo "encryption"

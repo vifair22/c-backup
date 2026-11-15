@@ -748,10 +748,17 @@ Two policies per schedule:
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now. Applies to a schedule's first window too |
+
+Any other value is refused when the schedule is created.
 
 A `backup` schedule uses the repository's sources unless it names
-`--source` paths. A `replicate` schedule needs `--dest`, an absolute path.
+`--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
+`grep` schedule needs `--pattern` (an extended regular expression, checked
+when the schedule is created) and takes `--path-prefix` and `-i`; it searches
+the newest snapshot each time it fires. An option that belongs to a
+different action, such as `--dest` on a `gc` schedule, is refused rather than
+stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
 

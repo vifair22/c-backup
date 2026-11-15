@@ -108,6 +108,21 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     return path;
 }
 
+/* The newest snapshot's id, or 0 when the repository has none. */
+static int64_t newest_snapshot(int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int64_t id = 0;
+    if (db_execute(g_ctx.db,
+            "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
 /* ---------- restore request validation ---------- */
 
 /*
@@ -990,14 +1005,7 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) == 0) {
             j->snap_id = (int64_t)sid;
         } else {
-            char repo[32];
-            snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-            db_result_t *r = NULL;
-            if (db_execute(g_ctx.db,
-                    "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
-                    (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-                j->snap_id = strtoll(r->rows[0][0], NULL, 10);
-            db_result_free(r);
+            j->snap_id = newest_snapshot(repo_id);
             if (j->snap_id <= 0) {
                 snap_job_free(j);
                 return api_error(404, "repo has no snapshots to search");
@@ -1480,6 +1488,35 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
             snap_job_free(j);
             return set_error(ERR_INVALID,
                              "replicate schedule for repo %lld has no destination",
+                             (long long)repo_id);
+        }
+    }
+
+    /*
+     * A scheduled grep searches the newest snapshot as of when it fires,
+     * which is what a recurring "is this still in the backup" means. It ran
+     * with no pattern and no snapshot at all, because neither reached here.
+     */
+    if (kind == SNAP_JOB_GREP) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *p = NULL;
+        if (!params || !*params ||
+            json_req_parse(params, strlen(params), &p) != 0 ||
+            json_req_get_str(p, "pattern", &j->pattern) != 0 ||
+            !j->pattern || !*j->pattern) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID,
+                             "grep schedule for repo %lld has no pattern",
+                             (long long)repo_id);
+        }
+        if (json_req_get_str_opt(p, "path_prefix", &j->path_prefix) != 0)
+            j->path_prefix = NULL;
+        uint32_t v = 0;
+        if (json_req_get_u32(p, "ignore_case", &v, 0, 1) == 0) j->ignore_case = (int)v;
+        if (json_req_get_u32(p, "max_files", &v, 0, 1000000) == 0) j->max_files = v;
+        j->snap_id = newest_snapshot(repo_id);
+        if (j->snap_id <= 0) {
+            snap_job_free(j);
+            return set_error(ERR_NOT_FOUND, "repo %lld has no snapshots to search",
                              (long long)repo_id);
         }
     }

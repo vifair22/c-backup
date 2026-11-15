@@ -637,4 +637,22 @@ fall-back day fires once, "the 31st" clamps to the end of short months, and
 `on_overlap` decides what happens when a schedule comes due while its previous
 run is still going: `skip` (default), `queue`, or `cancel_running`. `catchup`
 decides what a missed window means after downtime: `skip` moves to the next
-future fire, `run_once` fires immediately and then resumes.
+future fire, `run_once` fires immediately and then resumes. That includes a
+schedule that has never fired: if its first due time passed while the daemon
+was down, `run_once` fires it when the daemon starts. Any other value of
+either is a 400; both used to be stored as sent and then read as something
+else.
+
+Parameters belong to one action each, and naming one on a schedule for a
+different action is a 400 rather than a value stored and never read:
+
+| Action | Parameters |
+|---|---|
+| `backup` | `paths` (optional; the repository's sources otherwise) |
+| `replicate` | `dest` (required, absolute) |
+| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case`, `max_files` |
+| others | none |
+
+A `grep` schedule searches the newest snapshot as of each fire, so it takes
+no `snapshot`. From the CLI: `schedule add 1 grep --every day --at 04:00
+--pattern 'BEGIN RSA' [--path-prefix PATH] [-i]`.

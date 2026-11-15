@@ -8,6 +8,9 @@
 
 #include <cutils/json.h>
 #include <cutils/log.h>
+#include <cutils/mem.h>
+
+#include <regex.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +74,84 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
     return api_ok(body);
 }
 
+static int one_of(const char *v, const char *const *set)
+{
+    for (; *set; set++)
+        if (strcmp(v, *set) == 0) return 1;
+    return 0;
+}
+
+/*
+ * Which action reads which parameter. Anything else that names one was
+ * accepted and ignored: `--dest` on a gc schedule stored a destination
+ * nothing would ever read, which looks like configuration and is not.
+ */
+static const struct {
+    const char *key;
+    const char *action;
+} k_param_owner[] = {
+    { "paths",       "backup"    },
+    { "dest",        "replicate" },
+    { "pattern",     "grep"      },
+    { "path_prefix", "grep"      },
+    { "ignore_case", "grep"      },
+    { "max_files",   "grep"      },
+};
+
+/*
+ * A grep schedule's parameters: the pattern it exists for, and the options
+ * the route takes. It searches the newest snapshot each time it fires, so
+ * `snapshot` is not one of them. Returns NULL with *bad set on a refusal.
+ */
+static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t *bad)
+{
+    CUTILS_AUTOFREE char *pattern = NULL;
+    CUTILS_AUTOFREE char *prefix = NULL;
+    if (json_req_get_str(body, "pattern", &pattern) != 0 || !pattern || !*pattern) {
+        *bad = api_error(400, "pattern is required for a grep schedule");
+        return NULL;
+    }
+    /* Compiled once here, so a pattern that can never run is refused now
+     * rather than failing every night. */
+    regex_t re;
+    if (regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
+        *bad = api_error(400, "pattern is not a valid extended regular expression");
+        return NULL;
+    }
+    regfree(&re);
+
+    uint32_t ic = 0, mf = 0;
+    if (json_req_has(body, "ignore_case") &&
+        json_req_get_u32(body, "ignore_case", &ic, 0, 1) != 0) {
+        *bad = api_error(400, "ignore_case must be 0 or 1");
+        return NULL;
+    }
+    if (json_req_has(body, "max_files") &&
+        json_req_get_u32(body, "max_files", &mf, 0, 1000000) != 0) {
+        *bad = api_error(400, "max_files must be a number from 0 to 1000000");
+        return NULL;
+    }
+    if (json_req_has(body, "path_prefix") &&
+        json_req_get_str(body, "path_prefix", &prefix) != 0) {
+        *bad = api_error(400, "path_prefix must be a string");
+        return NULL;
+    }
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
+    char  *pbuf = NULL;
+    size_t plen = 0;
+    if (json_resp_new(&pr) != 0 ||
+        json_resp_add_str(pr, "pattern", pattern) != 0 ||
+        (prefix && *prefix && json_resp_add_str(pr, "path_prefix", prefix) != 0) ||
+        json_resp_add_u32(pr, "ignore_case", ic) != 0 ||
+        json_resp_add_u32(pr, "max_files", mf) != 0 ||
+        json_resp_finalize(pr, &pbuf, &plen) != 0) {
+        *bad = api_error(500, "cannot encode schedule parameters");
+        return NULL;
+    }
+    return pbuf;
+}
+
 api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body) return api_error(400, "request body required");
@@ -83,8 +164,23 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *catchup = NULL;
     if (json_req_get_str(body, "action", &action) != 0 || !action)
         return api_error(400, "action is required");
-    if (json_req_get_str_opt(body, "on_overlap", &overlap) != 0) overlap = NULL;
-    if (json_req_get_str_opt(body, "catchup", &catchup) != 0) catchup = NULL;
+    /*
+     * Both policies were stored as whatever string arrived, so
+     * `--on-overlap bogus` was accepted, listed, and then read by the
+     * scheduler as "never fire while anything runs" - the fallback for an
+     * unknown value - while `--catchup nope` silently meant skip. Refused at
+     * creation, like the trigger.
+     */
+    static const char *const k_overlap[] = { "skip", "queue", "cancel_running", NULL };
+    static const char *const k_catchup[] = { "skip", "run_once", NULL };
+    if (json_req_has(body, "on_overlap") &&
+        (json_req_get_str(body, "on_overlap", &overlap) != 0 || !overlap ||
+         !one_of(overlap, k_overlap)))
+        return api_error(400, "on_overlap must be skip, queue or cancel_running");
+    if (json_req_has(body, "catchup") &&
+        (json_req_get_str(body, "catchup", &catchup) != 0 || !catchup ||
+         !one_of(catchup, k_catchup)))
+        return api_error(400, "catchup must be skip or run_once");
 
     /*
      * Refuse an action the scheduler cannot dispatch.
@@ -102,6 +198,15 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
         return api_error(400, "that action cannot be scheduled; "
                               "use backup, verify, grep, gc, gfs, reindex, pack "
                               "or replicate");
+
+    for (size_t k = 0; k < sizeof(k_param_owner) / sizeof(k_param_owner[0]); k++) {
+        if (!json_req_has(body, k_param_owner[k].key)) continue;
+        if (strcmp(action, k_param_owner[k].action) == 0) continue;
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%s applies only to a %s schedule, not %s",
+                 k_param_owner[k].key, k_param_owner[k].action, action);
+        return api_error(400, msg);
+    }
 
     /*
      * Per-action parameters, stored in the schedules.params column that has
@@ -187,6 +292,14 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             json_resp_finalize(pr, &pbuf, &plen) != 0)
             return api_error(500, "cannot encode schedule parameters");
         params = pbuf;
+    }
+
+    /* A grep schedule with no pattern was accepted and then ran a search
+     * for nothing on every tick. */
+    if (strcmp(action, "grep") == 0) {
+        api_response_t bad = { 0 };
+        params = grep_schedule_params(body, &bad);
+        if (!params) return bad;
     }
 
     /*
