@@ -586,10 +586,14 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. Binary files are reported without an excerpt.
-  `--snapshot N` picks the snapshot (newest by default), `--path-prefix`
+  names is read once. A binary file that matches is one hit, `(binary file
+  matches)`, however often it matches. `--snapshot N` picks the snapshot
+  (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
-  matching files. The hits are kept and `GET /repos/<id>/grep` lists past
+  matching files. A file stops being read after `--max-hits-per-file`
+  matches (default 100) and the whole search after `--max-hits` (default
+  10,000); when either cut it short the output says `truncated` or counts
+  `files_capped`. The hits are kept and `GET /repos/<id>/grep` lists past
   searches.
 - **Diff** walks manifest trees and skips any subtree whose hash did not
   change, so comparing two large snapshots costs what changed between them.
@@ -1265,7 +1269,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
 | `search <id> <text> [--limit N]` | File names |
-| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i]` | File contents |
+| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `diff <id> <from> <to>` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |

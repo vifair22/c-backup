@@ -273,6 +273,19 @@ check    "grep on a missing snapshot fails" 1 "$RC"
 contains "and says so at submission" "no such snapshot" "$OUT"
 check    "a malformed snapshot is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     --unix-socket "$SOCK" -d '{"pattern":"x","snapshot":"latest"}' http://localhost/repos/1/grep)"
+# B067: the hit caps are request options, refused out of range rather than
+# clamped, and the job result says whether anything was cut short.
+contains "grep takes a per-file cap" 'secrets.txt' "$(cb grep 1 hunter2 --max-hits-per-file 1 --max-hits 5)"
+OUT=$(cb grep 1 hunter2 --max-hits 0 2>&1); RC=$?
+check    "a zero hit cap is refused" 1 "$RC"
+contains "and names the range" "max_hits must be 1 to 1000000" "$OUT"
+GJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"hunter2"}' http://localhost/repos/1/grep \
+     | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
 
 # B064: schedule options are validated per action. Values outside the
 # documented sets were stored and read back as something else; parameters an

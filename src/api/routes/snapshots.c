@@ -660,6 +660,8 @@ typedef struct {
     char           *path_prefix;
     int             ignore_case;
     uint32_t        max_files;
+    uint32_t        max_hits_per_file;   /* 0: the grep default */
+    uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -807,9 +809,28 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         go.path_prefix       = j->path_prefix;
         go.ignore_case       = j->ignore_case;
         go.max_files         = j->max_files;
-        go.max_hits_per_file = 10;
+        go.max_hits_per_file = j->max_hits_per_file;
+        go.max_hits          = j->max_hits;
+        grep_result_t gr;
+        memset(&gr, 0, sizeof(gr));
         st = grep_run(store, j->db, j->repo_id, j->snap_id, &go, cancel,
-                      progress, progress_ctx, NULL);
+                      progress, progress_ctx, &gr);
+        /* What the search did, on the job, including what it stopped short
+         * of: files_capped and truncated say the hit list is not the whole
+         * answer. The run record carries the rest. */
+        if (st == OK) {
+            char rj[320];
+            snprintf(rj, sizeof(rj),
+                     "{\"run_id\":%lld,\"snapshot\":%lld,\"files_scanned\":%llu,"
+                     "\"files_matched\":%llu,\"files_capped\":%llu,\"hits\":%llu,"
+                     "\"truncated\":%s}",
+                     (long long)gr.run_id, (long long)j->snap_id,
+                     (unsigned long long)gr.files_scanned,
+                     (unsigned long long)gr.files_matched,
+                     (unsigned long long)gr.files_capped,
+                     (unsigned long long)gr.hits, gr.truncated ? "true" : "false");
+            job_set_result(progress_ctx, rj);
+        }
     } else if (j->kind == SNAP_JOB_VERIFY) {
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, NULL);
@@ -1002,6 +1023,23 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         uint32_t mf = 0;
         if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
             j->max_files = mf;
+        /* Out of range is refused rather than clamped, so a caller asking
+         * for a million hits per file learns the ceiling instead of getting
+         * quietly fewer. */
+        uint32_t hpf = 0;
+        if (json_req_has(body, "max_hits_per_file") &&
+            json_req_get_u32(body, "max_hits_per_file", &hpf, 1, 10000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits_per_file must be 1 to 10000");
+        }
+        j->max_hits_per_file = hpf;
+        uint32_t mh = 0;
+        if (json_req_has(body, "max_hits") &&
+            json_req_get_u32(body, "max_hits", &mh, 1, 1000000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits must be 1 to 1000000");
+        }
+        j->max_hits = mh;
 
         /* Which snapshot: the newest unless one was named. Searching "the
          * backup" almost always means the current one. */

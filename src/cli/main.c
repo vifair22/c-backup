@@ -697,20 +697,24 @@ static int cmd_grep(int argc, char **argv)
     const char *prefix = take_opt(&argc, argv, "--path-prefix");
     const char *snap   = take_opt(&argc, argv, "--snapshot");
     const char *maxf   = take_opt(&argc, argv, "--limit");
+    const char *hpf    = take_opt(&argc, argv, "--max-hits-per-file");
+    const char *maxh   = take_opt(&argc, argv, "--max-hits");
     int icase   = take_flag(&argc, argv, "-i") | take_flag(&argc, argv, "--ignore-case");
     int no_wait = take_flag(&argc, argv, "--no-wait");
 
     if (argc < 2)
         return fail("usage: grep <repo-id> <pattern> [--snapshot N] "
-                    "[--path-prefix PATH] [--limit N] [-i] [--no-wait]");
-    /* Both go into the body as bare numbers, where anything else is
+                    "[--path-prefix PATH] [--limit N] [--max-hits-per-file N] "
+                    "[--max-hits N] [-i] [--no-wait]");
+    /* These go into the body as bare numbers, where anything else is
      * malformed JSON and comes back as "invalid JSON". */
-    const char *nums[] = { snap, maxf };
-    for (size_t k = 0; k < 2; k++) {
+    const char *nums[] = { snap, maxf, hpf, maxh };
+    for (size_t k = 0; k < sizeof(nums) / sizeof(nums[0]); k++) {
         if (!nums[k]) continue;
         size_t n = strlen(nums[k]);
         if (n == 0 || n > 10 || strspn(nums[k], "0123456789") != n)
-            return fail("--snapshot and --limit take a whole number, not '%s'", nums[k]);
+            return fail("--snapshot, --limit, --max-hits-per-file and --max-hits "
+                        "take a whole number, not '%s'", nums[k]);
     }
 
     sbuf_t b = { 0 };
@@ -719,6 +723,8 @@ static int cmd_grep(int argc, char **argv)
     if (prefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, prefix); }
     if (snap)   { sb_puts(&b, ",\"snapshot\":");    sb_puts(&b, snap); }
     if (maxf)   { sb_puts(&b, ",\"max_files\":");   sb_puts(&b, maxf); }
+    if (hpf)    { sb_puts(&b, ",\"max_hits_per_file\":"); sb_puts(&b, hpf); }
+    if (maxh)   { sb_puts(&b, ",\"max_hits\":");    sb_puts(&b, maxh); }
     if (icase)  sb_puts(&b, ",\"ignore_case\":1");
     sb_puts(&b, "}");
 
@@ -1424,7 +1430,7 @@ static const struct {
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
     { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
-    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i] [--no-wait]" },
+    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },

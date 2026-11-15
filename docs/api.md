@@ -301,10 +301,27 @@ Matching is POSIX extended regular expressions, line by line, over every
 distinct object in the snapshot. Distinct, not every path: a file present
 under several names is one object, so it is read once and reported once
 rather than re-read per copy. Objects are visited in pack order for the same
-reason verify is. Files with NUL bytes are searched and reported without an
-excerpt, the way `grep -a` summarises a binary. `max_files` stops the search
-once it has found enough, and the run records whether it stopped early so a
-caller can tell "no more matches" from "stopped looking".
+reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
+gets one hit, excerpt `(binary file matches)`, and is not read further, the
+way `grep(1)` reports one. Three limits bound the rest:
+
+| Field | Default | Range | Effect |
+|---|---|---|---|
+| `max_files` | 0 (none) | 0-1000000 | stop after this many matching files |
+| `max_hits_per_file` | 100 | 1-10000 | stop reading a file once it has this many hits |
+| `max_hits` | 10000 | 1-1000000 | stop the search once this many hits are recorded |
+
+A value out of range is a 400, not clamped. These exist because hits were
+counted without limit: one 10 MiB binary produced 40,776 hits and one
+20 MiB log 806,597, every one of them read and matched for nothing.
+`hits` counts what was recorded, so it never exceeds `max_hits`.
+
+The run's `truncated` is 1 when `max_files` or `max_hits` stopped the search,
+so a caller can tell "no more matches" from "stopped looking". The job's
+`result` carries `run_id`, `snapshot`, `files_scanned`, `files_matched`,
+`files_capped` (files that reached `max_hits_per_file` and may hold more),
+`hits` and `truncated`. The CLI takes `--limit`, `--max-hits-per-file` and
+`--max-hits`.
 
 `snapshot` defaults to the newest. One that does not exist is `404 no such
 snapshot` when the search is submitted, and a value that is not an id is a
