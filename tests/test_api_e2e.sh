@@ -255,6 +255,24 @@ check "a dotted, dashed name is fine" 200 "$(curl -s -o /dev/null -w '%{http_cod
 check "and removable" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
      --unix-socket "$SOCK" http://localhost/repos/1/tags/v1.2_pre-upgrade)"
 
+# B034: policy stored any key and any value and said ok. Each of these was
+# accepted and then ignored or misread by the retention pass.
+put_policy() { sock_send PUT /repos/1/policy "{\"key\":\"$1\",\"value\":\"$2\"}"; }
+OUT=$(put_policy retention.keep_hourly 5)
+contains "an unknown policy key is a 400" ' 400' "$OUT"
+contains "and the refusal lists the valid keys" 'maintenance.auto_pack' "$OUT"
+contains "a non-numeric count is a 400" ' 400' "$(put_policy retention.keep_daily banana)"
+contains "a negative count is a 400" ' 400' "$(put_policy retention.keep_weekly -3)"
+contains "a signed count is a 400" ' 400' "$(put_policy retention.keep_weekly +3)"
+contains "a non-boolean flag is a 400" ' 400' "$(put_policy maintenance.auto_pack maybe)"
+contains "a boolean in another spelling is accepted" ' 200' "$(put_policy maintenance.auto_pack OFF)"
+POL=$(sock_body /repos/1/policy)
+contains "and stored in one spelling" '"key":"maintenance.auto_pack","value":"false"' "$POL"
+contains "a refused value leaves the stored one" '"key":"retention.keep_daily","value":"14"' "$POL"
+case "$POL" in *keep_hourly*) bad "an unknown key is not stored" "absent" "$POL" ;;
+               *) ok "an unknown key is not stored" ;; esac
+put_policy maintenance.auto_pack true > /dev/null
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.
@@ -596,6 +614,19 @@ check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10
     | grep -o '"operation":"backup","result":"success","duration_ms":"[0-9]*","message":""' \
     | wc -l | tr -d ' ')"
 
+# B034, read side: a value stored before the route validated must not be
+# read as atoi's 0, which for a tier means unlimited. Written straight into
+# the database, since the route refuses it now.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
+                           VALUES (1, 'retention.keep_daily', 'banana')" 2>/dev/null
+    BAD=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
+    wait_job "$BAD"
+    contains "a stored invalid count falls back to the default" \
+        '"keep_daily":7,' "$(sock_body "/jobs/$BAD")"
+else
+    ok "a stored invalid count falls back to the default (skipped: no sqlite3)"
+fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \

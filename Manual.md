@@ -607,6 +607,18 @@ sudo c-backup policy set 1 retention.keep_snaps 5
 
 `policy list` shows the repository's own values and the defaults in force.
 
+Only these keys are accepted; any other key, and any value of the wrong
+kind, is refused with a message listing what is valid:
+
+| Key | Accepts |
+|---|---|
+| `retention.keep_snaps`, `retention.keep_daily`, `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly` | a whole number, 0 or more, digits only |
+| `maintenance.auto_pack` | `true` or `false` (`yes`/`no`, `on`/`off`, `1`/`0` also accepted, and stored as `true`/`false`) |
+
+A database from before this check may hold a value that would now be
+refused. A retention pass ignores it, logs a warning naming it, and uses the
+default; `policy set` with a valid value replaces it.
+
 ### 9.3 Running it
 
 **Retention does not run on its own.** A backup never deletes snapshots.

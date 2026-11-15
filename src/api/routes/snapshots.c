@@ -700,7 +700,17 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 (const char *[]){ repo, NULL }, &r) == 0 && r) {
             for (int i = 0; i < r->nrows; i++) {
                 const char *k = r->rows[i][0];
-                int v = atoi(r->rows[i][1]);
+                /* The policy route validates now, but a database written
+                 * before it did can hold "banana" or "-3". atoi read those
+                 * as 0 and -3, and 0 for a tier means unlimited: a typo
+                 * silently turned a tier's pruning off. Skip and keep the
+                 * default instead, and say so. */
+                int v = 0;
+                if (routes_policy_count(r->rows[i][1], &v) != 0) {
+                    log_warn("gfs: repo %lld: ignoring invalid %s = '%s'",
+                             (long long)j->repo_id, k, r->rows[i][1]);
+                    continue;
+                }
                 if      (strcmp(k, "retention.keep_daily") == 0)   ret.keep_daily = v;
                 else if (strcmp(k, "retention.keep_weekly") == 0)  ret.keep_weekly = v;
                 else if (strcmp(k, "retention.keep_monthly") == 0) ret.keep_monthly = v;

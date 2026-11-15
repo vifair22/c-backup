@@ -181,8 +181,8 @@ export function PolicyEditor({ connName, repoPath, onBack }: Props): React.React
             <div style={{ maxWidth: '38rem' }}>
               <div className="text-xs text-text-secondary mb-1">Other stored values</div>
               <div className="text-xs text-text-muted mb-2">
-                Set from the CLI. Listed so nothing stored here is invisible;
-                nothing in the daemon currently reads these.
+                Set from the CLI, such as maintenance.auto_pack. Listed so
+                nothing stored here is invisible.
               </div>
               <table className="w-full text-xs">
                 <tbody>

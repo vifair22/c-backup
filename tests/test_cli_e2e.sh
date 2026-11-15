@@ -166,6 +166,11 @@ fi
 
 contains "policy set"  '"ok"'         "$(cb policy set 1 retention.keep_daily 14)"
 contains "policy list" 'keep_daily'   "$(cb policy list 1)"
+# B034: any key and any value were stored.
+OUT=$(cb policy set 1 retention.keep_hourly 5 2>&1); RC=$?
+check    "an unknown policy key fails" 1 "$RC"
+contains "and lists the valid keys" 'retention.keep_daily' "$OUT"
+check "a non-numeric count fails" 1 "$(cb policy set 1 retention.keep_daily banana > /dev/null 2>&1; echo $?)"
 
 contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')"
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"

@@ -5,6 +5,7 @@
 #include "db_txn.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <strings.h>
 
@@ -277,6 +278,60 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
 
 /* ---------- policy ---------- */
 
+/*
+ * Every key something in the daemon reads, and what it must hold.
+ *
+ * The route stored any key and any value and answered {"ok":true}, so
+ * "retention.keep_hourly 5" (no such tier), "keep_daily banana" and
+ * "keep_weekly -3" all looked accepted. The GFS job then read banana as
+ * atoi's 0, which means "no limit" for a tier, and an unknown key did
+ * nothing at all: the operator was told yes and got something else. A key
+ * belongs here only when something acts on it.
+ */
+typedef enum { POLICY_COUNT, POLICY_BOOL } policy_kind_t;
+
+static const struct {
+    const char   *key;
+    policy_kind_t kind;
+} k_policy_keys[] = {
+    { "retention.keep_snaps",   POLICY_COUNT },
+    { "retention.keep_daily",   POLICY_COUNT },
+    { "retention.keep_weekly",  POLICY_COUNT },
+    { "retention.keep_monthly", POLICY_COUNT },
+    { "retention.keep_yearly",  POLICY_COUNT },
+    { "maintenance.auto_pack",  POLICY_BOOL  },
+};
+#define N_POLICY_KEYS ((int)(sizeof(k_policy_keys) / sizeof(k_policy_keys[0])))
+
+int routes_policy_count(const char *text, int *out)
+{
+    /* Digits only: no sign, no space, no hex. strtol alone would take
+     * " 12", "+3" and "12abc" as numbers, and "-3" as a count. */
+    if (!text || !*text) return -1;
+    long v = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > INT_MAX) return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+/* Accept what a human would plausibly type rather than one blessed
+ * spelling. Returns 1, 0, or -1 for anything else. */
+static int policy_bool(const char *v)
+{
+    if (!v) return -1;
+    if (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+        strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0)
+        return 1;
+    if (strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
+        strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0)
+        return 0;
+    return -1;
+}
+
 int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int def)
 {
     if (!db || !key) return def;
@@ -290,21 +345,12 @@ int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int de
         return def;
     }
 
-    const char *v = r->rows[0][0];
-    /* Accept what a human would plausibly type rather than one blessed
-     * spelling; anything unrecognised falls back to the default rather than
-     * silently reading as false. */
-    int out = def;
-    if (v) {
-        if (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
-            strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0)
-            out = 1;
-        else if (strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
-                 strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0)
-            out = 0;
-    }
+    /* Anything unrecognised falls back to the default rather than silently
+     * reading as false. The route refuses such values now, but a database
+     * written before it did may still hold one. */
+    int b = policy_bool(r->rows[0][0]);
     db_result_free(r);
-    return out;
+    return b < 0 ? def : b;
 }
 
 /*
@@ -525,12 +571,48 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
     if (json_req_get_str(body, "value", &value) != 0 || !value)
         return api_error(400, "value is required");
 
+    int k = 0;
+    while (k < N_POLICY_KEYS && strcmp(k_policy_keys[k].key, key) != 0) k++;
+    if (k == N_POLICY_KEYS) {
+        /* List the valid keys in the refusal: the caller has just shown
+         * they do not know them, and the docs may not be at hand. */
+        char msg[512];
+        int off = snprintf(msg, sizeof(msg), "unknown policy key '%.64s'; valid keys:", key);
+        for (int i = 0; i < N_POLICY_KEYS && off > 0 && (size_t)off < sizeof(msg); i++)
+            off += snprintf(msg + off, sizeof(msg) - (size_t)off, "%s %s",
+                            i ? "," : "", k_policy_keys[i].key);
+        return api_error(400, msg);
+    }
+
+    /* Stored in one canonical spelling, so a reader of the raw rows (the
+     * app, a script over policy list) sees "true" whether "yes" or "on" was
+     * typed. */
+    char norm[16];
+    const char *store_value = norm;
+    if (k_policy_keys[k].kind == POLICY_COUNT) {
+        int n = 0;
+        if (routes_policy_count(value, &n) != 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s must be a whole number, 0 or more", key);
+            return api_error(400, msg);
+        }
+        snprintf(norm, sizeof(norm), "%d", n);
+    } else {
+        int b = policy_bool(value);
+        if (b < 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s must be true or false", key);
+            return api_error(400, msg);
+        }
+        snprintf(norm, sizeof(norm), "%s", b ? "true" : "false");
+    }
+
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     if (db_execute_non_query(g_db,
             "INSERT INTO policy_values (repo_id, key, value) VALUES (?, ?, ?)"
             " ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
-            (const char *[]){ repo, key, value, NULL }, NULL) != 0)
+            (const char *[]){ repo, key, store_value, NULL }, NULL) != 0)
         return api_error(500, "cannot set policy value");
 
     char *out = strdup("{\"ok\":true}");

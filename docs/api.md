@@ -434,6 +434,23 @@ before this rule can be removed: the server decodes the path before routing.
 that apply wherever the repository has set nothing. A client cannot read the
 daemon's config file, so without them it could only guess at what is in force.
 
+`PUT /repos/<id>/policy` accepts only the keys something in the daemon reads,
+and refuses anything else with a 400 that lists them:
+
+| Key | Value |
+|---|---|
+| `retention.keep_snaps` | whole number, 0 or more |
+| `retention.keep_daily` | whole number, 0 or more |
+| `retention.keep_weekly` | whole number, 0 or more |
+| `retention.keep_monthly` | whole number, 0 or more |
+| `retention.keep_yearly` | whole number, 0 or more |
+| `maintenance.auto_pack` | `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, any case); stored as `true` or `false` |
+
+A count is decimal digits only: `-3`, `+3` and `banana` are refused. These
+were all stored once, and a retention pass read `banana` as 0, which for a
+tier means "keep all". A value stored before the route validated is ignored
+when read, with a warning in the daemon log, and the default applies.
+
 Retention keeps a snapshot that is among the newest `retention.keep_snaps`, or
 holds a tier (daily, weekly, monthly, yearly) and is within that tier's count,
 or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
