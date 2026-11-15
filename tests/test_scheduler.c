@@ -23,6 +23,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
 
 #include "routes.h"
 #include "job_manager.h"
@@ -267,6 +268,45 @@ static void test_overlap_skip(void **state)
     assert_int_equal(g_fires, 0);
     /* Skipped, but still rescheduled: otherwise it retries every tick. */
     assert_true(due_of(sid) > now);
+}
+
+/* The skip line names the state it found (NIT-7): a queued run used to be
+ * reported as "still running", which sent an operator looking for a stuck
+ * worker. */
+static char g_last_log[512];
+
+static void capture_log(const char *ts, const char *level, const char *func,
+                        const char *message, void *userdata)
+{
+    (void)ts; (void)level; (void)func; (void)userdata;
+    if (strstr(message, "skipping this fire"))
+        snprintf(g_last_log, sizeof(g_last_log), "%s", message);
+}
+
+static void expect_skip_line(const char *job_state, const char *want)
+{
+    time_t now = 1720000000;
+    add_schedule("backup", SPEC_HOURLY, now - 10, "skip", NULL);
+    add_job("backup", job_state);
+    g_last_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_int_equal(scheduler_tick(sched, now), OK);
+    log_stream_unregister(h);
+    assert_int_equal(g_fires, 0);
+    if (!strstr(g_last_log, want))
+        fail_msg("skip line '%s' lacks '%s'", g_last_log, want);
+}
+
+static void test_overlap_skip_says_queued(void **state)
+{
+    (void)state;
+    expect_skip_line("queued", "is already queued, skipping this fire");
+}
+
+static void test_overlap_skip_says_running(void **state)
+{
+    (void)state;
+    expect_skip_line("running", "is already running, skipping this fire");
 }
 
 /* queue: the second run is meaningful once the first finishes. */
@@ -860,6 +900,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_disabled_schedule_does_not_fire, setup, teardown),
         cmocka_unit_test_setup_teardown(test_firing_advances_due_time, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_skip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_skip_says_queued, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_overlap_skip_says_running, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_queue, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_queue_coalesces_missed_fires, setup, teardown),
         cmocka_unit_test_setup_teardown(test_overlap_queue_counts_only_its_own_runs, setup, teardown),

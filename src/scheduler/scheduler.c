@@ -181,22 +181,31 @@ static int overlap_allows_fire(scheduler_t *s, int64_t schedule_id,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    /* Running and queued are counted apart so the log says which one it
+     * found: "still running" for a job that had only been queued sent an
+     * operator looking for a stuck worker (UAT NIT-7). SUM over no rows is
+     * NULL, which c-utils hands back as "", and atoi("") is 0. */
     db_result_t *r = NULL;
-    int active = 0;
+    int running = 0, queued = 0;
     if (db_execute(s->db,
-            "SELECT COUNT(*) FROM jobs"
+            "SELECT SUM(state = 'running'), SUM(state = 'queued') FROM jobs"
             " WHERE repo_id = ? AND action = ? AND state IN ('queued','running')",
-            (const char *[]){ repo, action, NULL }, &r) == 0 && r && r->nrows == 1)
-        active = atoi(r->rows[0][0]);
+            (const char *[]){ repo, action, NULL }, &r) == 0 && r && r->nrows == 1) {
+        running = atoi(r->rows[0][0]);
+        queued  = atoi(r->rows[0][1]);
+    }
     db_result_free(r);
 
-    if (active == 0) return 1;
+    if (running == 0 && queued == 0) return 1;
 
     if (!policy || strcmp(policy, "skip") == 0) {
         /* Right for long backups on tight intervals: a run already covers
          * this window, so another would duplicate work. */
-        log_info("scheduler: schedule %lld still running, skipping this fire",
-                 (long long)schedule_id);
+        log_info("scheduler: schedule %lld: a %s for repository %lld is "
+                 "already %s, skipping this fire", (long long)schedule_id,
+                 action, (long long)repo_id,
+                 running ? (queued ? "running and another queued" : "running")
+                         : "queued");
         return 0;
     }
     if (strcmp(policy, "queue") == 0) {
