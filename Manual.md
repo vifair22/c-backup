@@ -113,6 +113,23 @@ hosts: the scan's memory.
 
 ### 2.1 From source
 
+**OpenSSL 3.2 or newer is required.** Repository encryption derives keys with
+Argon2id through OpenSSL's KDF interface, which first shipped in 3.2. An older
+OpenSSL stops the build at once with a message naming the version it found.
+
+| Distribution | OpenSSL | Builds as is |
+|---|---|---|
+| Debian 13 (trixie), the Docker image's base | 3.5 | yes |
+| Arch Linux | current 3.x | yes |
+| Ubuntu 24.04 LTS | 3.0 | no: build against a newer OpenSSL, or use the Docker image |
+| Debian 12 (bookworm) | 3.0 | no, as Ubuntu 24.04 |
+
+On a distribution that ships an older OpenSSL, the Docker image (section 2.3)
+is the supported install; a newer release of the distribution (Ubuntu 25.04
+ships 3.4) also builds. Replacing the system OpenSSL on an LTS host is not
+something to do for one program, and building against a private copy is not
+a configuration the Makefile or CI supports.
+
 Build dependencies on Debian/Ubuntu:
 
 ```sh
@@ -270,7 +287,10 @@ staging files into each repository's own `tmp/`.
 
 ### 2.4 The desktop app
 
-The app lives in `ui/`. To build and run it from a checkout:
+The app lives in `ui/`. It needs Node.js 22.12 or newer, as `engines` in
+`ui/package.json` says: Vite 7 needs that to build, and `npm test` runs the
+TypeScript tests directly with `node --experimental-strip-types`. CI uses
+Node 24. To build and run it from a checkout:
 
 ```sh
 cd ui
