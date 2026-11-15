@@ -35,6 +35,11 @@ typedef struct {
     int      finished;                          /* set after _finish() */
     int      sticky_err;                        /* set to errno on first failure; subsequent feeds are no-ops */
     char     tmp_dir_buf[4096];                 /* stored tmp dir for lazy spill */
+    /* Optional, set by the caller after init: every byte written to the
+     * spill file is also added here, atomically. A store's write counter
+     * (store_write_counter) so a spill is charged to the repository that
+     * paid for it; NULL counts nothing. */
+    uint64_t *spill_counter;
 } rs_parity_stream_t;
 
 /* Returns non-zero if the stream has entered the sticky-error state. */

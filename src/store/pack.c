@@ -7,6 +7,7 @@
 #include "object_crypt.h"
 #include "store.h"
 #include "progress.h"
+#include "phase_timer.h"
 #include "util.h"
 #include <cutils/log.h>
 
@@ -1802,6 +1803,7 @@ static status_t write_dat_parity(store_t *store, FILE *dat_f,
                     free(entry_offsets); free(chunk_buf);
                     return set_error(ERR_NOMEM, "write_dat_parity: parity stream init failed");
                 }
+                ps.spill_counter = store_write_counter(store, STORE_WR_PARITY_SPILL);
                 ps_inited = 1;
             }
 
@@ -2002,6 +2004,7 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
 
     /* Write dat parity trailer */
     if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = ERR_IO; goto fail; }
+    off_t body_end = ftello(*dat_f);
     if (precomputed_parity) {
         /* Fast path: parity was computed in parallel by workers, no re-read */
         st = write_dat_parity_precomputed(*dat_f, dat_hdr, precomputed_parity, packed);
@@ -2023,6 +2026,13 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
 
     if (fflush(*dat_f) != 0 || fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
     fclose(*dat_f); *dat_f = NULL;
+
+    /* Every writer seals here - backup, pack, gc, coalescing, replication -
+     * so this is the one place a pack's bytes need counting. */
+    if (body_end > 0 && (uint64_t)body_end <= *out_size) {
+        store_count_write(store, STORE_WR_PACK, (uint64_t)body_end);
+        store_count_write(store, STORE_WR_PACK_PARITY, *out_size - (uint64_t)body_end);
+    }
 
     /* Sorting by hash is no longer for an on-disk index, but the commit
      * entries and the loose-object unlink batch both benefit from it. */
@@ -2865,6 +2875,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         free(ps); free(stream_buf);
         return ERR_NOMEM;
     }
+    ps->spill_counter = store_write_counter(pw->store, STORE_WR_PARITY_SPILL);
 
     if (m->compression == COMPRESS_NONE) {
         /* LZ4F streaming compression */
@@ -3502,9 +3513,16 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
                          "refusing to pack");
     }
 
+    /* Attributed to whichever profile this thread is filling: a backup's,
+     * when the pack run ends a backup job; nobody's otherwise. The scan
+     * span covers every early return below, which are all "found nothing
+     * worth packing" and cost exactly the scan. */
+    uint64_t _tsw_scan = phase_now();
+
     if (!loose_objects_exist(store)) {
         log_info("pack: no loose objects to pack");
         rep->reason = PACK_WHY_NO_LOOSE;
+        phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan);
         return OK;
     }
 
@@ -3513,13 +3531,14 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
     uint8_t *hashes       = NULL;
     size_t   loose_cnt = 0;
     status_t st = collect_loose(store, &hashes, &loose_cnt);
-    if (st != OK) return st;
+    if (st != OK) { phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan); return st; }
 
     rep->loose = loose_cnt;
     if (loose_cnt == 0) {
         free(hashes);
         log_info("pack: no loose objects to pack");
         rep->reason = PACK_WHY_NO_LOOSE;
+        phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan);
         return OK;
     }
 
@@ -3613,6 +3632,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
         free(meta); free(indices); free(hashes);
         log_info("pack: no packable objects (all loose objects are skip-marked)");
         rep->reason = PACK_WHY_ALL_SKIP;
+        phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan);
         return OK;
     }
 
@@ -3721,6 +3741,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
         free(meta); free(indices); free(hashes);
         log_info("pack: no packable objects after probe pass");
         rep->reason = PACK_WHY_INCOMPRESS;
+        phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan);
         return OK;
     }
 
@@ -3728,6 +3749,9 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
     if (packable_cnt > 1)
         qsort_r(indices, packable_cnt, sizeof(uint32_t),
                 pack_idx_hash_cmp, meta);
+
+    phase_add(phase_current, PHASE_SWEEP_SCAN, _tsw_scan);
+    uint64_t _tsw_pack = phase_now();
 
     /* --- Spawn unified workers --- */
     uint32_t n_workers = pack_worker_threads(store);
@@ -3810,6 +3834,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
         int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
         if (pfd >= 0) { fsync(pfd); close(pfd); }
     }
+    phase_add(phase_current, PHASE_SWEEP_PACK, _tsw_pack);
 
     pack_cache_invalidate(store);
 

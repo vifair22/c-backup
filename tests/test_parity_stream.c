@@ -311,6 +311,41 @@ static void test_double_finish(void **state)
     rs_parity_stream_destroy(&ps);
 }
 
+/*
+ * The spill counter sees every byte written to the spill file and nothing
+ * else (B086): parity that stays in memory is written once, into its
+ * trailer, and must not be charged as a spill.
+ */
+static void test_spill_counter(void **state)
+{
+    (void)state;
+    size_t len = 40 * GROUP_DATA + 123;
+    uint8_t *buf = malloc(len);
+    assert_non_null(buf);
+    fill_pattern(buf, len, 7);
+
+    rs_parity_stream_t ps;
+    uint64_t spilled = 0;
+    assert_int_equal(rs_parity_stream_init(&ps, 4 * GROUP_PAR, TMP_DIR), 0);
+    ps.spill_counter = &spilled;
+    assert_int_equal(rs_parity_stream_feed(&ps, buf, len), 0);
+    assert_int_equal(rs_parity_stream_finish(&ps), 0);
+    assert_true(ps.spill_size > 0);
+    assert_int_equal(spilled, (uint64_t)ps.spill_size);
+    /* What is still in memory at the end is not a spill. */
+    assert_true(spilled < (uint64_t)rs_parity_stream_total(&ps));
+    rs_parity_stream_destroy(&ps);
+
+    uint64_t none = 0;
+    assert_int_equal(rs_parity_stream_init(&ps, 1024 * 1024, TMP_DIR), 0);
+    ps.spill_counter = &none;
+    assert_int_equal(rs_parity_stream_feed(&ps, buf, len), 0);
+    assert_int_equal(rs_parity_stream_finish(&ps), 0);
+    assert_int_equal(none, 0);
+    rs_parity_stream_destroy(&ps);
+    free(buf);
+}
+
 /* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
@@ -334,6 +369,7 @@ int main(void)
         cmocka_unit_test(test_replay_file_spill),
         cmocka_unit_test(test_destroy_without_finish),
         cmocka_unit_test(test_double_finish),
+        cmocka_unit_test(test_spill_counter),
     };
 
     int rc = cmocka_run_group_tests(tests, NULL, NULL);
