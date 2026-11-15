@@ -283,7 +283,10 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (st != OK) break;
         if (have) { res.snapshots_skipped++; continue; }
 
+        /* Zeroed: replicate_tree returns before writing it on a bad
+         * argument, and the counters below are read either way. */
         replicate_result_t one;
+        memset(&one, 0, sizeof(one));
         st = replicate_tree(store, sink, root, cancel, &one);
         res.objects_asked    += one.objects_asked;
         res.objects_sent     += one.objects_sent;
