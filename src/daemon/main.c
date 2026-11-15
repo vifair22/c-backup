@@ -25,6 +25,7 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "file_cache.h"
 #include "job_manager.h"
 #include "lock.h"
 #include "routes.h"
@@ -200,6 +201,21 @@ int main(int argc, char *argv[])
     }
 
     routes_auth_set_config(cfg);
+    {
+        /* Refused rather than defaulted: a typo here would otherwise run
+         * every backup in a mode nobody chose, silently. */
+        const char *m = config_get_str(cfg, "backup.file_cache_match");
+        int mode = file_cache_match_parse(m);
+        if (mode < 0) {
+            log_error("backup.file_cache_match: '%s' is not auto, strict or relaxed", m);
+            api_server_stop(srv);
+            appguard_shutdown(guard);
+            return 1;
+        }
+        routes_backup_set_file_cache_match(mode);
+        if (mode != FILE_CACHE_MATCH_AUTO)
+            log_info("backup.file_cache_match: %s", m);
+    }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);
     routes_snapshots_set_retention(config_get_int(cfg, "retention.keep_snaps", 1),

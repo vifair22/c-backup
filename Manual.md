@@ -301,6 +301,7 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories |
+| `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -582,6 +583,21 @@ flowchart TD
    is reused without opening the file. Otherwise the file is read, hashed and
    stored. A file whose content already exists in the repository costs one
    read and no write.
+
+   "Exactly the metadata" is size, mtime, ctime, and the device and inode
+   numbers, on a local filesystem. On a network or FUSE filesystem (NFS,
+   SMB/CIFS, an Unraid user share, mergerfs, sshfs, 9p, Ceph) device and
+   inode numbers are not stable: shfs hands out new inode numbers, and a
+   container volume can remount on another device. There the cache compares
+   size, mtime and ctime only, and the daemon logs once per device that it
+   is doing so. Without this every incremental over such a share re-read
+   every file. `backup.file_cache_match` overrides the choice: `strict`
+   compares every field everywhere, `relaxed` compares only size and mtime
+   everywhere (for a filesystem whose ctime is not stable either). At
+   `log.level: debug` each miss on a known path is logged with the fields
+   that differed, which is the place to look when an incremental takes as
+   long as the first backup did and `files_unchanged` in the job result is
+   near zero.
 3. **Trees.** One manifest tree per directory, bottom up.
 4. **Snapshot.** The snapshot record goes into the repository first, then
    the index rows go into the database. An interrupted backup leaves at most

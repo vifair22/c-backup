@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -86,7 +87,45 @@ typedef struct {
     pack_backup_writer_t *pack_w;
     /* Regular-file bytes handled and expected, for opts->bytes_cb. */
     uint64_t       bytes_done, bytes_total;
+    /* Which cache fields each device's filesystem can be trusted on, found
+     * with one statfs per device rather than one per file. A backup spans a
+     * handful of devices; past the table's size the rest are looked up each
+     * time, which is slower and still right. */
+    struct { dev_t dev; unsigned ignore; } fs_seen[16];
+    unsigned       n_fs_seen;
 } pipeline_t;
+
+/*
+ * The fields the file cache must not compare for this entry. Local
+ * filesystems keep stable device and inode numbers and are matched on every
+ * field; network and FUSE filesystems do not, and comparing them made every
+ * file a miss on an Unraid share mounted over NFS (B087).
+ */
+static unsigned cache_ignore_for(pipeline_t *p, const char *path, const struct stat *st)
+{
+    int mode = p->opts->file_cache_match;
+    if (mode == FILE_CACHE_MATCH_STRICT) return 0;
+    if (mode == FILE_CACHE_MATCH_RELAXED)
+        return FILE_CACHE_IGNORE_DEV | FILE_CACHE_IGNORE_INODE | FILE_CACHE_IGNORE_CTIME;
+
+    for (unsigned i = 0; i < p->n_fs_seen; i++)
+        if (p->fs_seen[i].dev == st->st_dev) return p->fs_seen[i].ignore;
+
+    unsigned ignore = 0;
+    struct statfs sf;
+    if (statfs(path, &sf) == 0 && file_cache_fs_is_remote((long)sf.f_type)) {
+        ignore = FILE_CACHE_IGNORE_DEV | FILE_CACHE_IGNORE_INODE;
+        log_info("backup: %s is on a network or FUSE filesystem (0x%lx); the "
+                 "file cache ignores device and inode numbers there",
+                 path, (unsigned long)sf.f_type);
+    }
+    if (p->n_fs_seen < sizeof(p->fs_seen) / sizeof(p->fs_seen[0])) {
+        p->fs_seen[p->n_fs_seen].dev = st->st_dev;
+        p->fs_seen[p->n_fs_seen].ignore = ignore;
+        p->n_fs_seen++;
+    }
+    return ignore;
+}
 
 static void hashset_free(hashset_t *s)
 {
@@ -417,6 +456,7 @@ static status_t store_content(pipeline_t *p)
          */
         uint64_t _tc = phase_now();
         int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
+                                          cache_ignore_for(p, e->path, &e->st),
                                           e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
@@ -1114,7 +1154,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0 };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0,
+                     { { 0, 0 } }, 0 };
 
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else

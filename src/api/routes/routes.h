@@ -25,6 +25,10 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db);
 
 /* Where per-repository keys are stored. Set from config at startup. */
 void routes_repos_set_key_dir(const char *dir);
+
+/* How strictly backups recognise an unchanged file (file_cache_match_t,
+ * from backup.file_cache_match). Set from config at startup. */
+void routes_backup_set_file_cache_match(int mode);
 void routes_auth_set_config(cutils_config_t *cfg);
 
 /* Backup submission and job inspection. Needs the job manager because a

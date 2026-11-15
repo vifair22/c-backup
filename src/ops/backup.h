@@ -22,6 +22,9 @@ typedef struct {
     int          n_exclude;
     int          one_filesystem;
     const char  *label;
+    /* A file_cache_match_t: how strictly an unchanged file is recognised.
+     * Zero is auto, which is right everywhere it can tell. */
+    int          file_cache_match;
 
     /* Cooperative cancellation. The job manager sets this; the pipeline
      * checks it between entries, and backup_run lends it to the store for

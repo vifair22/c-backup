@@ -52,6 +52,14 @@ jobs:
   # always run one at a time.
   max_parallel: 2
 
+backup:
+  # How a backup recognises a file it need not read again. auto compares
+  # size, mtime, ctime, device and inode on local filesystems, and drops
+  # device and inode on network and FUSE ones (NFS, SMB, Unraid shares),
+  # where they are not stable. strict compares every field everywhere;
+  # relaxed compares only size and mtime.
+  file_cache_match: auto
+
 retention:
   # What a retention pass (c-backup gfs, or a gfs schedule) keeps for a
   # repository that has not set its own with 'c-backup policy set'. A

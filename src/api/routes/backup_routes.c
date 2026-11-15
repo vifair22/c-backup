@@ -4,6 +4,7 @@
 #include "routes.h"
 
 #include "backup.h"
+#include "file_cache.h"
 #include "job_manager.h"
 #include "cJSON.h"
 #include "lock.h"
@@ -33,6 +34,14 @@ typedef struct {
 } backup_ctx_t;
 
 static backup_ctx_t g_ctx;
+
+/* backup.file_cache_match, parsed once at start. */
+static int g_file_cache_match = FILE_CACHE_MATCH_AUTO;
+
+void routes_backup_set_file_cache_match(int mode)
+{
+    g_file_cache_match = mode;
+}
 
 /* Everything one backup job needs, owned by the job manager for its lifetime. */
 typedef struct {
@@ -173,6 +182,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
     o.exclude        = cexcl;
     o.n_exclude      = j->n_excludes;
     o.one_filesystem = j->one_filesystem;
+    o.file_cache_match = g_file_cache_match;
     o.label        = j->label;
     o.cancel       = cancel;
     o.progress_cb  = progress;

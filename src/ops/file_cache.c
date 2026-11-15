@@ -38,8 +38,35 @@ static int64_t ctime_ns_of(const struct stat *st)
     return time_to_ns((int64_t)st->st_ctim.tv_sec, (int64_t)st->st_ctim.tv_nsec);
 }
 
+int file_cache_match_parse(const char *s)
+{
+    if (!s || !*s || strcmp(s, "auto") == 0) return FILE_CACHE_MATCH_AUTO;
+    if (strcmp(s, "strict") == 0)            return FILE_CACHE_MATCH_STRICT;
+    if (strcmp(s, "relaxed") == 0)           return FILE_CACHE_MATCH_RELAXED;
+    return -1;
+}
+
+int file_cache_fs_is_remote(long f_type)
+{
+    /* Magic numbers from statfs(2). Kept as literals so this builds without
+     * <linux/magic.h>, which does not carry all of them. */
+    switch ((unsigned long)f_type & 0xFFFFFFFFul) {
+    case 0x6969ul:      /* NFS */
+    case 0x517Bul:      /* SMB */
+    case 0xFE534D42ul:  /* SMB2 */
+    case 0xFF534D42ul:  /* CIFS */
+    case 0x65735546ul:  /* FUSE: shfs, mergerfs, sshfs, rclone, virtiofs */
+    case 0x01021997ul:  /* 9p: VM shares, WSL */
+    case 0x00C36400ul:  /* Ceph */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
-                      const struct stat *st, uint8_t out_hash[OBJECT_HASH_SIZE])
+                      const struct stat *st, unsigned ignore,
+                      uint8_t out_hash[OBJECT_HASH_SIZE])
 {
     if (!db || !path || !st || !out_hash) return 0;
 
@@ -55,12 +82,22 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
         return 0;
     }
 
-    /* Every field must match. Anything else and we read the file. */
-    int same = strtoull(r->rows[0][0], NULL, 10) == (unsigned long long)st->st_dev
-            && strtoull(r->rows[0][1], NULL, 10) == (unsigned long long)st->st_ino
-            && strtoull(r->rows[0][2], NULL, 10) == (unsigned long long)st->st_size
-            && strtoll(r->rows[0][3], NULL, 10) == mtime_ns_of(st)
-            && strtoll(r->rows[0][4], NULL, 10) == ctime_ns_of(st);
+    /* Every field not ignored must match. Anything else and we read the
+     * file. */
+    int d_dev   = strtoull(r->rows[0][0], NULL, 10) != (unsigned long long)st->st_dev;
+    int d_ino   = strtoull(r->rows[0][1], NULL, 10) != (unsigned long long)st->st_ino;
+    int d_size  = strtoull(r->rows[0][2], NULL, 10) != (unsigned long long)st->st_size;
+    int d_mtime = strtoll(r->rows[0][3], NULL, 10) != mtime_ns_of(st);
+    int d_ctime = strtoll(r->rows[0][4], NULL, 10) != ctime_ns_of(st);
+    if (ignore & FILE_CACHE_IGNORE_DEV)   d_dev = 0;
+    if (ignore & FILE_CACHE_IGNORE_INODE) d_ino = 0;
+    if (ignore & FILE_CACHE_IGNORE_CTIME) d_ctime = 0;
+    int same = !(d_dev || d_ino || d_size || d_mtime || d_ctime);
+    if (!same)
+        log_debug("file cache miss %s: changed%s%s%s%s%s", path,
+                  d_dev ? " dev" : "", d_ino ? " inode" : "",
+                  d_size ? " size" : "", d_mtime ? " mtime" : "",
+                  d_ctime ? " ctime" : "");
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     snprintf(hex, sizeof(hex), "%s", r->rows[0][5] ? r->rows[0][5] : "");
