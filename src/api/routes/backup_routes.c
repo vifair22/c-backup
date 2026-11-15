@@ -559,7 +559,25 @@ static api_response_t cancel_job(const api_request_t *req, void *ud)
 
     status_t st = job_cancel(ctx->jm, id);
     if (st != OK) return api_error(404, "job is not running");
-    return api_no_content();
+
+    /*
+     * The job record, as /jobs/<id> returns it, rather than an empty 204.
+     * `c-backup jobs cancel` printed nothing at all, which reads as the
+     * command having done nothing. Cancellation is cooperative, so the state
+     * here is usually still "running": "cancel_requested" says the request
+     * landed, and the job's own record says when it stops.
+     */
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%lld", id);
+    db_result_t *r = NULL;
+    cJSON *j = NULL;
+    if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
+                   (const char *[]){ idbuf, NULL }, &r) == 0 && r && r->nrows == 1)
+        j = job_json(r->rows[0]);
+    db_result_free(r);
+    if (!j) j = cJSON_CreateObject();
+    if (j) cJSON_AddBoolToObject(j, "cancel_requested", 1);
+    return json_out(j);
 }
 
 int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)

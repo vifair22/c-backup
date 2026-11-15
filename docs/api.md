@@ -438,6 +438,11 @@ storing it, packing it, restoring it - so a cancel lands within one read
 (at most 8 MiB of I/O), not at the end of a large file. A cancelled backup
 discards its open pack, the index rows staged into it and its staging files.
 
+`POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
+returns it, plus `"cancel_requested":true`. Its `state` is usually still
+`running` (or `queued`): the job reports `cancelled` once it has stopped. A
+job that is not queued or running is a 404.
+
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered
 job endpoint.

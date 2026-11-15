@@ -202,6 +202,30 @@ OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
 check    "a missing source fails the backup" 1 "$RC"
 contains "naming the source" "no-such-dir" "$OUT"
 
+# B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
+# file is still cancellable when the request lands, whatever the machine.
+mkdir -p "$WORK/big"
+dd if=/dev/zero of="$WORK/big/big.bin" bs=1M count=512 status=none
+BJ=$(cb backup 1 "$WORK/big" --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+OUT=$(cb jobs cancel "$GJ")
+contains "jobs cancel prints the job" "\"id\":$GJ" "$OUT"
+contains "and that the cancel landed" '"cancel_requested":true' "$OUT"
+cb jobs cancel "$BJ" > /dev/null 2>&1
+for _ in $(seq 1 100); do
+    cb jobs "$GJ" | grep -q '"state":"cancelled"' && break
+    sleep 0.1
+done
+contains "the cancelled gc ends cancelled" '"state":"cancelled"' "$(cb jobs "$GJ")"
+contains "and the journal says so" '"operation":"gc","result":"cancelled"' "$(cb journal 1)"
+for _ in $(seq 1 100); do
+    cb jobs "$BJ" | grep -Eq '"state":"(cancelled|completed)"' && break
+    sleep 0.1
+done
+check "a cancelled backup leaves no staging files" "" \
+    "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
+rm -f "$WORK/big/big.bin"
+
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"
