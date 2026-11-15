@@ -15,6 +15,7 @@
 
 import { _electron as electron, expect, type ElectronApplication, type Page } from '@playwright/test'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { createServer } from 'node:net'
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -36,6 +37,23 @@ export interface HarnessOptions {
    * paging can be tested rather than assumed.
    */
   wideDir?: number
+
+  /*
+   * Serve the daemon over TCP as well, and point the app at that instead of
+   * the socket.
+   *
+   * Every other spec connects over the unix socket, which needs no
+   * credential, so none of them could notice that the remote path did not
+   * work - and it did not, for the whole of its existence. This is what
+   * makes the TCP path a tested one.
+   *
+   *   password  set as the admin password, over the socket, the only way a
+   *             first password can be set. Omit it to leave the daemon
+   *             unconfigured.
+   *   seed      put the remote connection in the app's config, or leave the
+   *             app with none so a spec can add it through the dialog.
+   */
+  remote?: { password?: string; seed: boolean }
 }
 
 export interface Harness {
@@ -45,8 +63,15 @@ export interface Harness {
   sock: string
   /** Ids of the repositories seeded below, by label. */
   repos: { plain: number; encrypted: number }
+  /** The daemon's TCP port, when the harness was started remote. */
+  port: number
+  /** The app's userData directory: config.json and credentials.json. */
+  userData: string
   /** Kill the daemon, to see what the app does without one. */
   killDaemon(): void
+  /** Close the app and start it again on the same userData, as a user
+   * quitting and reopening it would. The daemon keeps running. */
+  relaunch(): Promise<Page>
   close(): Promise<void>
 }
 
@@ -55,6 +80,19 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 function cli(sock: string, args: string[]): string {
   const r = spawnSync(CLI, ['--socket', sock, ...args], { encoding: 'utf-8' })
   return (r.stdout ?? '') + (r.stderr ?? '')
+}
+
+/* A port nothing is listening on, by asking the kernel for one. */
+function freePort(): Promise<number> {
+  return new Promise((done, fail) => {
+    const srv = createServer()
+    srv.once('error', fail)
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close(() => done(port))
+    })
+  })
 }
 
 function idFrom(out: string): number {
@@ -85,9 +123,10 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     }
   }
 
+  const port = opts.remote ? await freePort() : 0
   writeFileSync(join(work, 'config.yaml'),
     `db:\n  path: ${work}/state.db\n` +
-    `http:\n  socket: ${sock}\n  port: 0\n  bind: 127.0.0.1\n` +
+    `http:\n  socket: ${sock}\n  port: ${port}\n  bind: 127.0.0.1\n` +
     `security:\n  key_dir: ${work}/keys\n` +
     `log:\n  level: warn\n`)
 
@@ -134,28 +173,49 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
    * The connection dialog is worth testing on its own; every other screen
    * needs a connection to exist and should not re-test it.
    */
-  writeFileSync(join(userData, 'config.json'), JSON.stringify({
-    connections: [{ type: 'local', name: 'This machine', socketPath: sock }],
-  }, null, 2))
+  if (opts.remote?.password) {
+    const r = spawnSync(CLI, ['--socket', sock, 'auth', 'setup'],
+                        { input: `${opts.remote.password}\n`, encoding: 'utf-8' })
+    if (r.status !== 0) throw new Error(`auth setup failed: ${r.stderr}`)
+  }
 
-  const app = await electron.launch({
-    args: [APP_MAIN, `--user-data-dir=${userData}`, '--no-sandbox'],
-    env: { ...process.env, NODE_ENV: 'production' },
-  })
-  const page = await app.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
+  const connections = !opts.remote
+    ? [{ type: 'local', name: 'This machine', socketPath: sock }]
+    : opts.remote.seed
+      ? [{ type: 'remote', name: 'nas', host: '127.0.0.1', port }]
+      : []
+  writeFileSync(join(userData, 'config.json'), JSON.stringify({ connections }, null, 2))
 
-  return {
-    app, page, work, sock,
+  const launch = async (): Promise<{ app: ElectronApplication; page: Page }> => {
+    const a = await electron.launch({
+      args: [APP_MAIN, `--user-data-dir=${userData}`, '--no-sandbox'],
+      env: { ...process.env, NODE_ENV: 'production' },
+    })
+    const p = await a.firstWindow()
+    await p.waitForLoadState('domcontentloaded')
+    return { app: a, page: p }
+  }
+  const first = await launch()
+
+  const h: Harness = {
+    app: first.app, page: first.page, work, sock, port, userData,
     repos: { plain, encrypted },
     killDaemon() { daemon.kill('SIGKILL') },
+    async relaunch() {
+      await h.app.close().catch(() => {})
+      const next = await launch()
+      h.app = next.app
+      h.page = next.page
+      return next.page
+    },
     async close() {
-      await app.close().catch(() => {})
+      await h.app.close().catch(() => {})
       daemon.kill()
       await sleep(200)
       rmSync(work, { recursive: true, force: true })
     },
   }
+  return h
 }
 
 /*
