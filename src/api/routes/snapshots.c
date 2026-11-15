@@ -631,6 +631,7 @@ typedef struct {
     char           *path_prefix;
     int             ignore_case;
     uint32_t        max_files;
+    int             reencrypt;   /* replicate into another repository's key */
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -732,6 +733,18 @@ static void gfs_report(void *progress_ctx, int dry_run,
     job_set_summary(progress_ctx, msg);
 }
 
+/*
+ * Which jobs read or write content and so cannot run without the key.
+ * Verify works on ciphertext - parity covers it so an offsite copy can be
+ * scrubbed by whoever holds it - and retention only deletes records, so
+ * those two run keyless; everything else would fail partway with a message
+ * about a pack entry rather than about the missing key.
+ */
+static int snap_job_needs_key(snap_job_kind_t kind)
+{
+    return kind != SNAP_JOB_VERIFY && kind != SNAP_JOB_GFS;
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -759,13 +772,30 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = repo_store_open(j->repo_path, NULL, &store);
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
 
     if (j->kind == SNAP_JOB_REINDEX) {
-        st = reindex_repo(store, j->db, j->repo_id, cancel, NULL);
+        reindex_result_t rx;
+        memset(&rx, 0, sizeof(rx));
+        st = reindex_repo(store, j->db, j->repo_id, cancel, &rx);
+        /* What came back, on the job, failed or not: an operator recovering
+         * from a lost database needs to see that the tags returned, and a
+         * failed run says how much it still managed. */
+        char rj[320];
+        snprintf(rj, sizeof(rj),
+                 "{\"snapshots\":%llu,\"snapshots_failed\":%llu,\"files\":%llu,"
+                 "\"objects\":%llu,\"packs_unreadable\":%llu,"
+                 "\"tags_restored\":%llu,\"tags_skipped\":%llu}",
+                 (unsigned long long)rx.snapshots, (unsigned long long)rx.snapshots_failed,
+                 (unsigned long long)rx.files, (unsigned long long)rx.objects,
+                 (unsigned long long)rx.packs_unreadable,
+                 (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped);
+        job_set_result(progress_ctx, rj);
     } else if (j->kind == SNAP_JOB_PACK) {
         /* Loose objects are one file each, and compression only happens at
          * pack time, so an unpacked repository stores more than its source
@@ -812,9 +842,37 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          */
         repo_marker_t m;
         st = repo_marker_read(j->repo_path, &m);
+        /*
+         * A re-encrypting target is a repository in its own right, and may
+         * be registered here: hold its write lock too, so a backup into it
+         * cannot allocate a snapshot id this run is about to write. Try,
+         * never wait - the source lock is already held, and waiting for a
+         * second lock while holding one is how two jobs deadlock.
+         */
+        int64_t dest_locked = 0;
+        if (st == OK && j->reencrypt) {
+            repo_marker_t dm;
+            if (repo_marker_read(j->dest, &dm) == OK) {
+                db_result_t *r = NULL;
+                if (db_execute(j->db, "SELECT id FROM repos WHERE uuid = ?",
+                               (const char *[]){ dm.uuid, NULL }, &r) == 0 &&
+                    r && r->nrows == 1)
+                    dest_locked = strtoll(r->rows[0][0], NULL, 10);
+                db_result_free(r);
+            } else {
+                err_clear();
+            }
+            if (dest_locked > 0 && dest_locked != j->repo_id) {
+                st = repo_trylock_write(dest_locked);
+                if (st != OK) dest_locked = 0;
+            } else {
+                dest_locked = 0;
+            }
+        }
         if (st == OK) {
             replica_sink_t sink;
-            st = replica_sink_local_open(j->dest, &m, &sink);
+            st = j->reencrypt ? replica_sink_local_open_reencrypt(j->dest, &m, &sink)
+                              : replica_sink_local_open(j->dest, &m, &sink);
             if (st == OK) {
                 replicate_result_t rr;
                 memset(&rr, 0, sizeof(rr));
@@ -829,8 +887,19 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                              (unsigned long long)rr.objects_sent,
                              (unsigned long long)rr.bytes_sent,
                              (unsigned long long)rr.subtrees_skipped);
+                char rj[256];
+                snprintf(rj, sizeof(rj),
+                         "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+                         "\"objects_sent\":%llu,\"bytes_sent\":%llu,\"reencrypted\":%s}",
+                         (unsigned long long)rr.snapshots_sent,
+                         (unsigned long long)rr.snapshots_skipped,
+                         (unsigned long long)rr.objects_sent,
+                         (unsigned long long)rr.bytes_sent,
+                         j->reencrypt ? "true" : "false");
+                job_set_result(progress_ctx, rj);
             }
         }
+        if (dest_locked > 0) repo_unlock(dest_locked);
     } else if (j->kind == SNAP_JOB_GC) {
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
@@ -922,6 +991,13 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
 {
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
+
+    /* Refused while the caller is listening. Queued, a restore without the
+     * key ran and reported "1 entry could not be restored". */
+    if (snap_job_needs_key(kind) && repo_require_key(repo_path) != OK) {
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     /*
      * A restore names a snapshot, and one that does not exist is the
@@ -1039,6 +1115,13 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        bool reenc = false;
+        if (json_req_has(body, "reencrypt") &&
+            json_req_get_bool(body, "reencrypt", &reenc) != 0) {
+            snap_job_free(j);
+            return api_error(400, "reencrypt must be true or false");
+        }
+        j->reencrypt = reenc ? 1 : 0;
     }
 
     if (kind == SNAP_JOB_RESTORE) {

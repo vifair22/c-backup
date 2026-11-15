@@ -187,7 +187,16 @@ docker run -d --name c-backupd \
   <registry>/vifair22/c-backup:<tag>
 ```
 
-- `/var/lib/c-backupd` holds `state.db`. Put it on fast storage (section 18).
+- `/var/lib/c-backupd` holds `state.db` and, in `keys/`, the encryption key
+  of every encrypted repository. Put it on fast storage (section 18).
+- **The keys are the one thing on that volume a reindex cannot rebuild.**
+  The image sets `C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys`, so they
+  survive replacing the container, but lose the volume and every `system`
+  repository is unreadable. Back up `/var/lib/c-backupd/keys` somewhere other
+  than this host, or keep each key from `repo key export` (section 13). The
+  environment variable overrides `security.key_dir` in any config file you
+  mount; to move the keys, pass `-e C_BACKUP_SECURITY_KEY_DIR=...` and keep
+  the directory on a volume.
 - Mount the repositories and the sources at whatever paths you will register
   and back up. Paths are always the container's view.
 - The image binds TCP on every interface inside the container, because a
@@ -265,7 +274,7 @@ are different: they live in the database and change through the policy API
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
-| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each |
+| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
 | `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
 | `log.level` | `info` | `debug`, `info`, `warn`, `error` |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
@@ -279,6 +288,11 @@ are different: they live in the database and change through the policy API
 
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9).
+
+Every key can also be set from the environment: `C_BACKUP_` followed by the
+key in capitals with dots as underscores, so `security.key_dir` is
+`C_BACKUP_SECURITY_KEY_DIR`. The environment wins over the file. The
+container image uses this for the key directory (section 2.3).
 
 Logs go to stdout, which systemd sends to the journal
 (`journalctl -u c-backupd`). The daemon also keeps 30 days of log lines in its
@@ -385,6 +399,7 @@ A repository is a directory the daemon registers and then owns.
 <repo>/
   .cbackup          identity marker: format, version, UUID, encryption
   snapshots/<id>    snapshot records: root tree hash and metadata
+  tags              the tag list, kept so a reindex can restore it
   objects/aa/bb...  loose objects, including manifest trees
   packs/<id>.dat    packs
   tmp/              staging for atomic writes
@@ -585,6 +600,10 @@ sudo c-backup tag remove 1 pre-migration
   letter or digit. A name is part of a URL path when it is removed, and one
   with a space or a slash could be set but never removed.
 - Removing a tag that does not exist fails with "no such tag".
+- Every tag change is also written into the repository's `tags` file, so
+  tags survive losing the database (section 17.1). If that file cannot be
+  written the change is refused, rather than leaving a tag that a recovery
+  would silently drop.
 
 ---
 
@@ -821,7 +840,8 @@ ran and how it ended.
 ## 13. Encryption
 
 A repository is encrypted or not, decided when it is created. To change it,
-create a new repository and replicate into it.
+create a new repository with the encryption you want and replicate into it
+with `--reencrypt` (section 14.1).
 
 ```sh
 sudo c-backup repo add /srv/backup/main "Main" --encrypt system
@@ -832,6 +852,11 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt passphrase --passphrase
 `--encrypt none` or `--encrypt system` is refused, because neither mode can
 use it and silently dropping it would leave you believing a passphrase
 protects the repository.
+
+A new repository's passphrase must be at least 8 characters, the same floor
+as the admin password. Argon2id makes each guess slow, but a one-character
+passphrase is a handful of guesses, and a passphrase repository is meant to
+be safe to carry offsite.
 
 Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
 over AES-GCM because it does not depend on AES-NI. Hashes are of the
@@ -871,6 +896,16 @@ sudo c-backup repo key import <id> <key-hex>
 The import is refused unless the key matches the fingerprint in the
 repository's marker. The marker never contains the key.
 
+An encrypted repository whose key is not on this host can be registered and
+verified, but not read: backup, restore, reindex, grep, pack, gc and
+replicate are refused with 409 `no key loaded for repository <uuid>`, which
+names the command that fixes it. A scheduled job fails with the same message.
+
+A `passphrase` repository needs no import: registering it with its
+passphrase (`repo add <path> --passphrase '...'`) unwraps the key and caches
+it on this host, whether or not it is already registered. A wrong passphrase
+is refused with `wrong passphrase`.
+
 ---
 
 ## 14. Replication
@@ -892,7 +927,38 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
-- A destination already holding a different repository is refused.
+- A destination already holding a different repository is refused, unless
+  `--reencrypt` says that is the point (below).
+
+### 14.1 Changing a repository's encryption
+
+Encryption is fixed when a repository is created, so changing it - adding
+it, removing it, or moving to a new key or passphrase - means copying into a
+new repository with `--reencrypt`:
+
+```sh
+sudo c-backup repo add /srv/backup/main2 "Main" --encrypt passphrase --passphrase '...'
+sudo c-backup replicate 1 /srv/backup/main2 --reencrypt
+sudo c-backup reindex 2
+```
+
+The destination must already be a repository, created with the encryption
+you want; `--reencrypt` will not create one, so its mode is always chosen on
+purpose. It keeps its own UUID and key. Each object is decrypted with the
+source key and encrypted under the destination's (or written plaintext into
+an unencrypted destination) as it crosses; compression is untouched, and
+hashes are of the plaintext, so they, the trees and deduplication carry over
+unchanged. Snapshot ids carry over too, so the destination must hold no
+backups of its own: a snapshot number it already uses for a different tree
+fails the run rather than being overwritten.
+
+Unlike a plain replica, this is not for an untrusted target: the daemon
+doing it holds both keys, and so must the host the destination is used on.
+Refused when the destination is not a repository, is a replica of the source
+(replicate without `--reencrypt`), or is encrypted and its key is not on this
+host. If the destination is registered here, its write lock is held for the
+run, and `reindex` it afterwards so its index sees the new snapshots. Run it
+again after more backups and only the new snapshots are sent.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
@@ -1031,8 +1097,16 @@ sudo c-backup reindex 1
 ```
 
 Reindex walks every snapshot's trees, at roughly 764,000 rows per second.
-Lost for good: schedules, sources, policy, tags, notes, the journal, job
-history and sessions. Re-create the schedules and sources. Remote clients sign
+It fails, rather than completing, if any snapshot or pack cannot be read: the
+readable snapshots are indexed, and anything unreadable keeps whatever index
+rows it already had, so a reindex never replaces a populated index with an
+empty or partial one. An encrypted repository is refused outright until its
+key is on the host (section 13).
+Tags come back: the repository keeps its own copy of the tag list (a `tags`
+file beside `snapshots/`), and the reindex job's result reports
+`tags_restored`. A reindex that cannot read that file fails rather than
+leaving tagged snapshots silently unprotected. Lost for good: schedules,
+sources, policy, notes, the journal, job history and sessions. Re-create the schedules and sources. Remote clients sign
 in again; set the admin password again first with `auth setup`.
 
 Keep a copy of `config.yaml` and a note of your schedules somewhere else, and
@@ -1051,7 +1125,16 @@ On a new host with the daemon installed:
    sudo c-backup repo key import 1 <key-hex>
    ```
 
-   For a `passphrase` repository, register it and supply the passphrase.
+   For a `passphrase` repository, register it with its passphrase, which
+   unwraps the key from the marker and caches it in `security.key_dir`:
+
+   ```sh
+   sudo c-backup repo add /srv/backup/main "Main" --passphrase '...'
+   ```
+
+   A wrong passphrase is refused and registers nothing. Registering without
+   one succeeds but answers `"key_loaded":false` with a warning; run the
+   same command again with the passphrase to unlock it.
 3. `sudo c-backup reindex 1`, then restore.
 
 Without the key, a `system`-encrypted repository cannot be read by anyone.
@@ -1231,7 +1314,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
-| `replicate <id> <dest>` | Copy into another directory |
+| `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |

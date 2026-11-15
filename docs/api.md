@@ -79,7 +79,14 @@ stores that form. It answers:
 |---|---|---|
 | 201 | `{id}`, plus `encryption` and key fields for an encrypted repository | a new registration: a repository created, or an existing one adopted |
 | 200 | `{id, already_registered: true, label_updated, encryption}` | the repository was already registered, at this path or, if it moved, at its old one |
-| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, or asks for an encryption mode the existing repository does not have |
+| 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, asks for an encryption mode the existing repository does not have, or gives a passphrase that does not unlock it (`wrong passphrase`) |
+
+Registering an existing passphrase repository with its `passphrase`, whether
+or not it is already registered, unwraps the key from the marker and caches
+it in `security.key_dir`; the answer carries `key_unlocked: true`. Registering
+an existing encrypted repository whose key is not on this host still
+succeeds, and the answer carries `key_loaded: false` and a `warning` saying
+`no key loaded for repository <uuid>` and how to supply it.
 
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is
@@ -102,14 +109,17 @@ implementation by 2.7x; the trigram index wins by 50.9x.
 
 A repository is encrypted or not, decided at creation and never afterwards.
 Converting in place would mean rewriting every object with both forms live;
-replicating into a fresh repository is the supported path instead.
+replicating into a fresh repository with `reencrypt` (see Replication) is the
+supported path instead.
 
 `POST /repos` takes `encrypt` (`none`, `system`, `passphrase`) and, for the
 last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
 `passphrase` mode. A non-empty `passphrase` with `encrypt` `none` or `system`
 is refused with 400 rather than ignored: ignoring it used to create an
 unencrypted repository for somebody who had just typed a passphrase. An empty
-`passphrase` is treated as absent.
+`passphrase` is treated as absent. Creating a repository needs a passphrase
+of at least 8 characters (400 otherwise); unlocking an existing one accepts
+whatever it was created with.
 
 | Mode | Key lives | Recovery needs | Escrow |
 |---|---|---|---|
@@ -132,6 +142,16 @@ is deliberately a persistent nag rather than a message shown once.
 | GET | `/repos/<id>/key` | Export the key for escrow |
 | POST | `/repos/<id>/key/import` | Install a key on a host that lacks one: the recovery path after losing the original machine. Refused unless it matches the fingerprint in the marker |
 | POST | `/repos/<id>/key/ack` | Confirm the key is stored elsewhere; clears the warning |
+
+All three answer 400 `repository is not encrypted` for an unencrypted
+repository, which has no key to export, import or escrow.
+
+An encrypted repository whose key is not on this host answers 409 `no key
+loaded for repository <uuid>; ...` to backup, restore, reindex, grep, pack,
+gc and replicate, naming the command that supplies the key. Verify and gfs
+run without it: parity covers ciphertext, and retention only deletes
+records. A job that reaches the repository without the key (a scheduled
+one, or a key removed after submission) fails with the same message.
 
 The marker records the mode, cipher and a one-way fingerprint of the key, and
 for passphrase mode the Argon2id parameters and wrapped key. It never contains
@@ -196,7 +216,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
 | POST | `/repos/<id>/gfs` | Apply retention |
-| POST | `/repos/<id>/reindex` | Rebuild the index from the repository |
+| POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
 | GET | `/repos/<id>/grep` | Recent searches, newest first |
@@ -204,7 +224,7 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
 | GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
-| POST | `/repos/<id>/replicate` | Copy this repository into another one: `{dest}` |
+| POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
 pulling a single file back does not cost a full restore. It accepts the path
@@ -383,6 +403,19 @@ different repository is refused rather than merged.
 Only what is missing is sent. A directory's tree hash covers everything
 beneath it, so a subtree the target already holds is dismissed by a single
 comparison and an unchanged repository replicates in one question.
+
+`"reencrypt": true` is the exception, and the way to change a repository's
+encryption. `dest` must already be a repository with an identity of its
+own (create it with `POST /repos` and the encryption wanted); each object is
+decrypted with the source key and encrypted under the destination's, or
+written plaintext into an unencrypted destination. Hashes are of the
+plaintext, so they and the trees carry over unchanged, as do snapshot ids;
+a snapshot id the destination already uses for another tree fails the run
+instead of being overwritten. The job fails, saying which, when `dest` is
+not a repository, is a replica of the source, or is encrypted and its key is
+not on this host. The job's result reports `snapshots_sent`, `objects_sent`,
+`bytes_sent` and `reencrypted`. Re-encrypting is a manual operation: the
+schedule route does not store `reencrypt`.
 
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.

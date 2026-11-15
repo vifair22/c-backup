@@ -550,6 +550,107 @@ static void test_passphrase_repo_is_recoverable_from_the_marker_alone(void **sta
     assert_memory_equal(cached.key, recovered.key, REPO_KEY_BYTES);
 }
 
+/*
+ * B042: the recovery path passphrase mode exists for. A host with no cached
+ * key registers the repository with its passphrase; a wrong passphrase was
+ * accepted, and a right one cached nothing.
+ */
+static void test_existing_passphrase_repo_is_unlocked_by_registering(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, "correct horse");
+    repo_register_out_t o;
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/offsite", "p", &e, &o), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/offsite", &m), OK);
+    repo_key_t orig;
+    assert_int_equal(repo_key_load(TEST_KEYS, m.uuid, &orig), OK);
+
+    /* The new host: no database row, no keyfile. */
+    assert_int_equal(repo_deregister(db, o.id), OK);
+    assert_int_equal(repo_key_remove(TEST_KEYS, m.uuid), OK);
+    repo_key_dir_set(TEST_KEYS);
+
+    e = enc_request(REPO_ENC_PASSPHRASE, "wrong horse");
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/offsite", "p", &e, &o),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "wrong passphrase"));
+    err_clear();
+    assert_int_equal(count_repos(), 0);
+    assert_false(repo_key_exists(TEST_KEYS, m.uuid));
+
+    /* No passphrase registers, and says the key is missing. */
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/offsite", "p", NULL, &o), OK);
+    assert_true(o.inserted);
+    assert_true(o.key_missing);
+    assert_false(o.key_unlocked);
+    assert_int_equal(repo_require_key(TEST_ROOT "/offsite"), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "no key loaded for repository"));
+    assert_non_null(strstr(err_msg(), m.uuid));
+    err_clear();
+    assert_int_equal(repo_deregister(db, o.id), OK);
+
+    e = enc_request(REPO_ENC_PASSPHRASE, "correct horse");
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/offsite", "p", &e, &o), OK);
+    assert_true(o.inserted);
+    assert_true(o.key_unlocked);
+    assert_false(o.key_missing);
+    repo_key_t cached;
+    assert_int_equal(repo_key_load(TEST_KEYS, m.uuid, &cached), OK);
+    assert_memory_equal(cached.key, orig.key, REPO_KEY_BYTES);
+    assert_int_equal(repo_require_key(TEST_ROOT "/offsite"), OK);
+}
+
+/* B045: re-registering an already-registered passphrase repository with its
+ * passphrase answered ok and unlocked nothing. */
+static void test_reregistering_with_the_passphrase_unlocks(void **state)
+{
+    (void)state;
+    repo_key_dir_set(TEST_KEYS);
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, "correct horse");
+    repo_register_out_t o;
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/again", "p", &e, &o), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/again", &m), OK);
+    assert_int_equal(repo_key_remove(TEST_KEYS, m.uuid), OK);
+
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/again", "", NULL, &o), OK);
+    assert_true(o.already_registered);
+    assert_true(o.key_missing);
+
+    e = enc_request(REPO_ENC_PASSPHRASE, "not the one");
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/again", "", &e, &o), ERR_INVALID);
+    err_clear();
+    assert_false(repo_key_exists(TEST_KEYS, m.uuid));
+
+    e = enc_request(REPO_ENC_PASSPHRASE, "correct horse");
+    assert_int_equal(repo_register_detail(db, TEST_ROOT "/again", "", &e, &o), OK);
+    assert_true(o.already_registered);
+    assert_true(o.key_unlocked);
+    assert_false(o.key_missing);
+    assert_true(repo_key_exists(TEST_KEYS, m.uuid));
+}
+
+/* B044: "a" was accepted as a repository passphrase. Refused now, before
+ * anything is created, so the refusal leaves no directory behind. */
+static void test_short_passphrase_is_refused_at_creation(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, "a");
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/shortpass", "s", &e, &id),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "at least 8"));
+    err_clear();
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_ROOT "/shortpass", &sb), 0);
+    assert_int_equal(count_repos(), 0);
+
+    /* Eight is enough. */
+    e = enc_request(REPO_ENC_PASSPHRASE, "12345678");
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/shortpass", "s", &e, &id), OK);
+}
+
 static void test_passphrase_mode_requires_a_passphrase(void **state)
 {
     (void)state;
@@ -683,6 +784,43 @@ static void test_open_without_the_key_refuses_writes(void **state)
     store_close(store);
 }
 
+/* B041: work that reads content refuses a keyless repository up front,
+ * naming it and the fix, rather than failing deep inside the job. */
+static void test_keyed_open_refuses_a_keyless_repository(void **state)
+{
+    (void)state;
+    char keydir[512];
+    snprintf(keydir, sizeof(keydir), "%s/keys", TEST_ROOT);
+    assert_int_equal(mkdir(keydir, 0700), 0);
+    repo_key_dir_set(keydir);
+
+    repo_enc_request_t enc = { .mode = REPO_ENC_SYSTEM, .key_dir = keydir };
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/nokey", NULL, &enc, &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/nokey", &m), OK);
+
+    store_t *store = NULL;
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/nokey", NULL, &store), OK);
+    assert_non_null(store_key(store));
+    store_close(store);
+
+    assert_int_equal(repo_key_remove(keydir, m.uuid), OK);
+    store = NULL;
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/nokey", NULL, &store), ERR_INVALID);
+    assert_null(store);
+    char want[128];
+    snprintf(want, sizeof(want), "no key loaded for repository %s", m.uuid);
+    assert_non_null(strstr(err_msg(), want));
+    assert_non_null(strstr(err_msg(), "c-backup repo key import"));
+    err_clear();
+
+    /* An unencrypted repository needs nothing. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/plainkeyed", NULL, &id), OK);
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/plainkeyed", NULL, &store), OK);
+    store_close(store);
+}
+
 /* A keyfile belonging to some other repository is caught by the marker's
  * fingerprint rather than by a wall of objects that will not decrypt. */
 static void test_open_rejects_the_wrong_key(void **state)
@@ -715,6 +853,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_system_encryption_returns_the_key_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_repo_is_recoverable_from_the_marker_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_mode_requires_a_passphrase, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_short_passphrase_is_refused_at_creation, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_existing_passphrase_repo_is_unlocked_by_registering, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reregistering_with_the_passphrase_unlocks, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_with_broken_encryption_block_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_encryption_mode_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_dir, setup, teardown),
@@ -739,6 +880,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deregister_removes_row, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_attaches_the_repository_key, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_without_the_key_refuses_writes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_keyed_open_refuses_a_keyless_repository, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_rejects_the_wrong_key, setup, teardown),
         cmocka_unit_test(test_write_lock_is_exclusive),
         cmocka_unit_test(test_locks_are_per_repo),

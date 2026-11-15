@@ -875,13 +875,17 @@ static int cmd_sources(int argc, char **argv)
 
 static int cmd_replicate(int argc, char **argv)
 {
-    int no_wait = take_flag(&argc, argv, "--no-wait");
+    int no_wait   = take_flag(&argc, argv, "--no-wait");
+    /* Into a different repository, under its own encryption: the way to
+     * change a repository's encryption, which is fixed at creation. */
+    int reencrypt = take_flag(&argc, argv, "--reencrypt");
     if (argc < 2)
-        return fail("usage: replicate <repo-id> <dest-path> [--no-wait]");
+        return fail("usage: replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]");
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"dest\":");
     sb_json_str(&b, argv[1]);
+    if (reencrypt) sb_puts(&b, ",\"reencrypt\":true");
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -1406,7 +1410,7 @@ static const struct {
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
-    { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--no-wait]" },
+    { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]" },
     { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
     { "stats",     cmd_stats,     "stats <repo-id>" },
     { "summary",   cmd_summary,   "summary <repo-id>" },

@@ -38,6 +38,15 @@
 #define REPO_KEY_BYTES   32
 #define REPO_KEY_ID_LEN  17   /* 16 hex characters plus NUL */
 
+/*
+ * Shortest passphrase a new repository accepts, the same floor as the admin
+ * password. Argon2id makes each guess expensive, but "a" is one guess, and a
+ * passphrase repository is meant to survive being carried offsite where
+ * anyone can try. Applied only when a repository is created: a repository
+ * made before the floor existed must still open with whatever it was given.
+ */
+#define REPO_PASSPHRASE_MIN 8
+
 typedef enum {
     REPO_ENC_NONE = 0,
     REPO_ENC_SYSTEM,

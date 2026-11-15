@@ -311,6 +311,16 @@ contains "key readable again" "$ENC_KEY" "$(cb repo key export "$ENC_ID")"
 OUT=$(cb repo key import "$ENC_ID" "$(printf '0%.0s' $(seq 1 64))" 2>&1); RC=$?
 check "wrong key refused" 1 "$RC"
 
+# B048, B050: the key commands on an unencrypted repository. Export sent the
+# operator looking for a keyfile that never existed; ack answered ok.
+OUT=$(cb repo key export 1 2>&1); RC=$?
+check    "key export of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+contains "as a 400" "HTTP 400" "$OUT"
+OUT=$(cb repo key ack 1 2>&1); RC=$?
+check    "key ack of an unencrypted repo fails" 1 "$RC"
+contains "and says it is not encrypted" "repository is not encrypted" "$OUT"
+
 # Passphrase mode needs nothing escrowed: the wrapped key travels with the
 # repository, so the passphrase alone recovers it.
 PASS_OUT=$(cb repo add "$WORK/passrepo" pass --encrypt passphrase --passphrase 'correct horse')
@@ -319,6 +329,11 @@ contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
 contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
+# B044: a one-character passphrase was accepted.
+OUT=$(cb repo add "$WORK/shortpass" sp --passphrase 'a' 2>&1); RC=$?
+check    "a short passphrase is refused" 1 "$RC"
+contains "and says how long it must be" "at least 8" "$OUT"
+check    "and creates nothing" 1 "$([ -e "$WORK/shortpass" ]; echo $?)"
 # B011: a passphrase without --encrypt made an unencrypted repository and
 # exited 0. It implies passphrase mode now, and a mode that cannot use one
 # refuses it instead of dropping it.
@@ -367,6 +382,70 @@ if diff -r "$WORK/src" "$WORK/encout$WORK/src" >/dev/null 2>&1; then
     ok "encrypted round trip is byte-identical"
 else
     bad "encrypted round trip is byte-identical" "identical" "differs"
+fi
+
+# B041: with the key gone, backup and restore of an encrypted repository
+# failed deep inside the job ("refusing to pack", "1 entry could not be
+# restored"). They are refused up front now, naming the repository and the
+# command that fixes it.
+ENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/encrepo/.cbackup" | head -1)
+mv "$WORK/keys/$ENC_UUID.key" "$WORK/enc.key.aside"
+OUT=$(cb backup "$ENC_ID" "$WORK/src" 2>&1); RC=$?
+check    "backup without the key is refused" 1 "$RC"
+contains "and names the repository" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the fix" "c-backup repo key import" "$OUT"
+contains "as a 409" "HTTP 409" "$OUT"
+OUT=$(cb restore "$ENC_ID" 1 "$WORK/nokeyout" 2>&1); RC=$?
+check    "restore without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+check    "and writes nothing" 1 "$([ -e "$WORK/nokeyout" ]; echo $?)"
+OUT=$(cb reindex "$ENC_ID" 2>&1); RC=$?
+check    "reindex without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the index is untouched" '"id":"1"' "$(cb snapshots "$ENC_ID")"
+mv "$WORK/enc.key.aside" "$WORK/keys/$ENC_UUID.key"
+
+# B042: a passphrase repository recovered with nothing but its passphrase.
+# The host loses its key cache and its registration; a wrong passphrase was
+# accepted, and the right one wrote no key, so reindex found nothing and the
+# restore after it found no snapshot.
+PASS_ID=$(printf '%s' "$PASS_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+PASS_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/passrepo/.cbackup" | head -1)
+cb backup "$PASS_ID" "$WORK/src" >/dev/null
+# B052: tags lived only in state.db, so this recovery came back with every
+# snapshot unprotected. The repository carries them now.
+cb tag set "$PASS_ID" guard 1 >/dev/null
+contains "a tag is written into the repository" '"name":"guard"' "$(cat "$WORK/passrepo/tags" 2>&1)"
+rm -f "$WORK/keys/$PASS_UUID.key"
+cb repo remove "$PASS_ID" >/dev/null
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'wrong horse' 2>&1); RC=$?
+check    "a wrong passphrase is refused" 1 "$RC"
+contains "and says so" "wrong passphrase" "$OUT"
+check    "and registers nothing" 0 "$(cb repo list | grep -c passrepo)"
+OUT=$(cb repo add "$WORK/passrepo" pass2 2>&1); RC=$?
+check    "no passphrase still registers" 0 "$RC"
+contains "but says the key is missing" "no key loaded for repository $PASS_UUID" "$OUT"
+PASS_ID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+# B045: registering it again with the passphrase unlocks it.
+OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=$?
+check    "the right passphrase unlocks a registered repo" 0 "$RC"
+contains "and says it did" '"key_unlocked":true' "$OUT"
+check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
+REINDEX_OUT=$(cb reindex "$PASS_ID")
+contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
+contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
+contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
+contains "and lists its snapshot" '"id":"1"' "$(cb snapshots "$PASS_ID")"
+# B047: a reindexed snapshot listed "size":"".
+case "$(cb snapshots "$PASS_ID")" in
+    *'"size":""'*) bad "a reindexed snapshot keeps its size" "a size" '"size":""' ;;
+    *)             ok  "a reindexed snapshot keeps its size" ;;
+esac
+cb restore "$PASS_ID" 1 "$WORK/passout" >/dev/null
+if diff -r "$WORK/src" "$WORK/passout$WORK/src" >/dev/null 2>&1; then
+    ok "a passphrase-recovered repo restores byte-identical"
+else
+    bad "a passphrase-recovered repo restores byte-identical" "identical" "differs"
 fi
 
 # Verify records runs and findings, and both were unreachable until now: the
@@ -603,6 +682,38 @@ contains "and now reports the new path" "driftmoved" "$(cb repo show "$DRIFT_ID"
 cb repo add "$WORK/otherrepo" other >/dev/null 2>&1
 OUT=$(cb replicate "$ENC_ID" "$WORK/otherrepo" 2>&1); RC=$?
 check "replicate into a foreign repo fails" 1 "$RC"
+contains "and points at --reencrypt" "--reencrypt" "$OUT"
+
+# B069: the Manual said to change encryption by replicating into a fresh
+# repository, and replication refused every repository but a replica of
+# the source. --reencrypt copies into a repository of its own, under its
+# own key, which then reindexes and restores like any other.
+REENC_OUT=$(cb repo add "$WORK/reenc" reenc --encrypt system)
+REENC_ID=$(printf '%s' "$REENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+REENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc" --reencrypt 2>&1); RC=$?
+check    "re-encrypting replication succeeds" 0 "$RC"
+contains "and says it re-encrypted" '"reencrypted":true' "$OUT"
+check    "the destination keeps its own identity" "$REENC_UUID" \
+    "$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/reenc/.cbackup" | head -1)"
+if [ "$REENC_UUID" != "$SRC_UUID" ]; then ok "which is not the source's"
+else bad "which is not the source's" "a different uuid" "$REENC_UUID"; fi
+if grep -qra "$NEEDLE" "$WORK/reenc/packs" 2>/dev/null; then
+    bad "the re-encrypted copy holds no plaintext" "absent" "present"
+else
+    ok "the re-encrypted copy holds no plaintext"
+fi
+contains "the destination reindexes" '"completed"' "$(cb reindex "$REENC_ID")"
+contains "and lists the snapshot" '"id":"1"' "$(cb snapshots "$REENC_ID")"
+cb restore "$REENC_ID" 1 "$WORK/reencout" >/dev/null
+if diff -r "$WORK/encout" "$WORK/reencout" >/dev/null 2>&1; then
+    ok "a re-encrypted copy restores what the source does"
+else
+    bad "a re-encrypted copy restores what the source does" "identical" "differs"
+fi
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-missing" --reencrypt 2>&1); RC=$?
+check    "re-encrypting into no repository is refused" 1 "$RC"
+contains "and says to create it first" "repo add" "$OUT"
 
 echo "configured sources"
 
@@ -760,6 +871,38 @@ if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
 else
     ok "leaves no socket behind"
 fi
+
+echo "key directory"
+
+# B041: the container image kept keys at /etc/c-backupd/keys, inside the
+# container's own filesystem, so replacing the container lost every key. It
+# sets the key directory through the environment, which has to win over the
+# config file for an operator's own mounted config not to undo it.
+grep -q '^ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys$' "$(dirname "$0")/../Dockerfile" \
+    && ok "the image keeps keys on the state volume" \
+    || bad "the image keeps keys on the state volume" "ENV C_BACKUP_SECURITY_KEY_DIR" "absent"
+cat > "$WORK/envcfg.yaml" <<EOF
+db:
+  path: $WORK/env.db
+http:
+  socket: $WORK/env.sock
+  port: 0
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/filekeys
+EOF
+C_BACKUP_SECURITY_KEY_DIR="$WORK/envkeys" C_BACKUP_CONFIG_PATH="$WORK/envcfg.yaml" \
+    "$DAEMON" > "$WORK/env.log" 2>&1 &
+ENV_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/env.sock" ] && break; sleep 0.1; done
+"$CLI" --socket "$WORK/env.sock" repo add "$WORK/envrepo" e --encrypt system >/dev/null 2>&1
+check "the environment's key directory wins over the file's" 1 \
+    "$(find "$WORK/envkeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+check "and the file's is not used" 0 \
+    "$(find "$WORK/filekeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+kill $ENV_PID 2>/dev/null; wait $ENV_PID 2>/dev/null
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?

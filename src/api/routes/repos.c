@@ -164,6 +164,21 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     status_t st = repo_register_detail(db, path, label, &enc, &reg);
     int64_t id = reg.id;
 
+    /*
+     * An encrypted repository registered without its key is registered -
+     * verifying an offsite copy needs no key - but the answer has to say
+     * that nothing in it can be read yet. Without this the next thing the
+     * operator heard was a reindex finding nothing and a restore finding no
+     * snapshot.
+     */
+    char keywarn[384] = "";
+    if (st == OK && reg.key_missing && repo_require_key(path) != OK) {
+        snprintf(keywarn, sizeof(keywarn), ",\"key_loaded\":false,\"warning\":\"%s\"",
+                 err_msg());
+        err_clear();
+    }
+    const char *unlocked = reg.key_unlocked ? ",\"key_unlocked\":true" : "";
+
     api_response_t out;
     if (st != OK) {
         /* Distinguish "you asked for something impossible" from "we failed":
@@ -181,9 +196,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         char *body = NULL;
         int n = asprintf(&body,
             "{\"id\":%lld,\"already_registered\":true,\"label_updated\":%s,"
-            "\"encryption\":\"%s\"}",
+            "\"encryption\":\"%s\"%s%s}",
             (long long)id, reg.label_updated ? "true" : "false",
-            repo_enc_mode_name(reg.enc_mode));
+            repo_enc_mode_name(reg.enc_mode), unlocked, keywarn);
         out = n < 0 ? api_error(500, "out of memory") : api_ok(body);
         log_info("repo %lld at %s was already registered%s", (long long)id, path,
                  reg.label_updated ? "; label updated" : "");
@@ -216,9 +231,10 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
                 (long long)id, enc.key_hex, (long long)id);
         } else if (reg.enc_mode != REPO_ENC_NONE) {
             n = asprintf(&body,
-                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s}",
+                "{\"id\":%lld,\"encryption\":\"%s\",\"key_escrowed\":%s%s%s}",
                 (long long)id, repo_enc_mode_name(reg.enc_mode),
-                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false");
+                reg.enc_mode == REPO_ENC_PASSPHRASE ? "true" : "false",
+                unlocked, keywarn);
         } else {
             n = asprintf(&body, "{\"id\":%lld}", (long long)id);
         }
@@ -372,12 +388,46 @@ static int64_t snap_suffix(const char *rest, const char *suffix)
  * is exactly as sensitive as reading the repository, which the same caller
  * can already do.
  */
+/*
+ * Whether a repository is unencrypted, by its marker, which is the
+ * authority; the database column is the fallback for a repository whose
+ * directory cannot be read right now.
+ *
+ * The key routes asked neither. Exporting the key of a plaintext repository
+ * answered "no key for repository ... in /etc/c-backupd/keys", which sends
+ * an operator looking for a keyfile that never existed, and acknowledging
+ * one answered ok for a key that was never there to escrow.
+ */
+static int repo_is_unencrypted(int64_t repo_id)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db_for_keys, "SELECT path, encryption FROM repos WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    repo_marker_t m;
+    int plain;
+    if (repo_marker_read(r->rows[0][0], &m) == OK) {
+        plain = (m.enc_mode == REPO_ENC_NONE);
+    } else {
+        err_clear();
+        plain = !r->rows[0][1][0] || strcmp(r->rows[0][1], "none") == 0;
+    }
+    db_result_free(r);
+    return plain;
+}
+
 static api_response_t key_export(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
     char uuid[64];
     if (repo_uuid_of(g_db_for_keys, repo_id, uuid, sizeof(uuid)) != 0)
         return api_error(404, "no such repo");
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; it has no key");
 
     repo_key_t k;
     status_t st = repo_key_load(repo_key_dir(), uuid, &k);
@@ -457,6 +507,8 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
 static api_response_t key_ack(const api_request_t *req, int64_t repo_id)
 {
     (void)req;
+    if (repo_is_unencrypted(repo_id))
+        return api_error(400, "repository is not encrypted; there is no key to escrow");
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)repo_id);
     if (db_execute_non_query(g_db_for_keys,

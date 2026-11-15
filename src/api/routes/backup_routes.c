@@ -127,7 +127,7 @@ static status_t backup_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = repo_store_open(j->repo_path, NULL, &store);
+    st = repo_store_open_keyed(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
 
     st = store_index_bind(store, j->db, j->repo_id, &idx);
@@ -285,6 +285,13 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
 
     char *repo_path = repo_path_for(ctx->db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
+
+    /* Said now, while the caller is listening, rather than by a job that
+     * fails with "refusing to pack" once the whole tree has been read. */
+    if (repo_require_key(repo_path) != OK) {
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     backup_job_t *j = calloc(1, sizeof(*j));
     if (!j) { free(repo_path); return api_error(500, "out of memory"); }

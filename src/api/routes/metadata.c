@@ -3,6 +3,7 @@
 
 #include "routes.h"
 #include "db_txn.h"
+#include "repo_tags.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -24,9 +25,9 @@
  * the whole reason the hand-rolled formats existed in the first place.
  *
  * Tags and notes are user-authored. Losing them is losing work, not losing
- * an index, so section 5.4 marks them for inclusion in the snapshot record
- * once that carries more than the root hash. Until then they live only in
- * the database, and that is a known gap rather than an oversight.
+ * an index. Tags are also the retention guard, so they are written into the
+ * repository as well (repo_tags.h) and a reindex brings them back. Notes
+ * still live only in the database, a known gap rather than an oversight.
  */
 
 static cutils_db_t *g_db;
@@ -40,6 +41,33 @@ static api_response_t finalise(cutils_json_resp_t *resp)
 }
 
 /* ---------- tags ---------- */
+
+/*
+ * Mirror the repository's tags into its directory, inside the caller's
+ * transaction. A failure here fails the request: a tag that exists only in
+ * the database is exactly the unprotected-after-recovery state this file
+ * was added to close, and saying ok over it would hide that.
+ */
+static int tags_mirror(int64_t repo_id, char *err, size_t errsz)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT path FROM repos WHERE id = ?",
+                   (const char *[]){ repo, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        snprintf(err, errsz, "cannot find the repository's path");
+        return -1;
+    }
+    status_t st = repo_tags_save(g_db, repo_id, r->rows[0][0]);
+    db_result_free(r);
+    if (st != OK) {
+        snprintf(err, errsz, "cannot record tags in the repository: %s", err_msg());
+        err_clear();
+        return -1;
+    }
+    return 0;
+}
 
 api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
 {
@@ -194,6 +222,11 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
         db_txn_rollback(g_db);
         return api_error(500, "cannot set tag");
     }
+    char merr[PATH_MAX + 128];
+    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
+        db_txn_rollback(g_db);
+        return api_error(500, merr);
+    }
     if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit tag");
 
     char *out = strdup("{\"ok\":true}");
@@ -208,13 +241,25 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     int affected = 0;
+    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
     if (db_execute_non_query(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
-            (const char *[]){ repo, name, NULL }, &affected) != 0)
+            (const char *[]){ repo, name, NULL }, &affected) != 0) {
+        db_txn_rollback(g_db);
         return api_error(500, "cannot delete tag");
+    }
     /* A typo used to succeed silently, which reads as "removed" to anybody
      * checking the exit code, while the tag it meant stayed in place. */
-    if (affected == 0) return api_error(404, "no such tag");
+    if (affected == 0) {
+        db_txn_rollback(g_db);
+        return api_error(404, "no such tag");
+    }
+    char merr[PATH_MAX + 128];
+    if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
+        db_txn_rollback(g_db);
+        return api_error(500, merr);
+    }
+    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit");
     return api_no_content();
 }
 
