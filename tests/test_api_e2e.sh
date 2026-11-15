@@ -443,6 +443,14 @@ check "the repository is private" 700 "$(stat -c %a "$WORK/deep/a/b/r")"
 echo "a file" > "$WORK/plainfile"
 check "a file as a parent is a 400" 400 "$(repo_post_code "{\"path\":\"$WORK/plainfile/r\"}")"
 
+# B012: a repository inside, or around, a registered one was accepted.
+contains "a repo inside a repo is refused" "is inside repository" \
+    "$(repo_post_body "{\"path\":\"$WORK/repo/nested\"}")"
+check "and is a 400" 400 "$(repo_post_code "{\"path\":\"$WORK/repo/nested2\"}")"
+check "and creates nothing" 1 "$([ -e "$WORK/repo/nested" ]; echo $?)"
+contains "a repo around a repo is refused" "contains repository" \
+    "$(repo_post_body "{\"path\":\"$WORK/deep/a\"}")"
+
 echo "remote"
 # The same operations the desktop app drives, over TCP with a token, after
 # the socket did the setup.

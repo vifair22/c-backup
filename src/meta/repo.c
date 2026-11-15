@@ -1,4 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
+/* realpath is XSI. */
+#define _XOPEN_SOURCE 700
 
 #include "repo.h"
 #include "store.h"
@@ -405,6 +407,94 @@ static status_t mkdir_parents(const char *path)
     return OK;
 }
 
+/*
+ * The canonical form of a normalised path that may not exist yet: realpath
+ * of its deepest existing ancestor, with the missing tail appended. A path
+ * whose ancestors cannot be resolved at all (EACCES, say) falls back to the
+ * lexical form, which is still right whenever no symlink is involved.
+ */
+static void canonical_path(const char *norm, char *out, size_t outsz)
+{
+    char head[PATH_MAX], real[PATH_MAX];
+    snprintf(head, sizeof(head), "%s", norm);
+    for (;;) {
+        if (realpath(head, real)) break;
+        if ((errno != ENOENT && errno != ENOTDIR) || strcmp(head, "/") == 0) {
+            snprintf(out, outsz, "%s", norm);
+            return;
+        }
+        char *slash = strrchr(head, '/');
+        if (slash == head) slash[1] = '\0';
+        else               *slash = '\0';
+    }
+    const char *tail = norm + strlen(head);
+    if (strcmp(head, "/") == 0 && *tail != '/') tail = norm;
+    if (strcmp(real, "/") == 0)
+        snprintf(out, outsz, "%s", *tail ? tail : "/");
+    else
+        snprintf(out, outsz, "%s%s", real, tail);
+}
+
+/* Whether child is strictly below parent, on a component boundary, so
+ * /srv/backup/r10 is not inside /srv/backup/r1. */
+static int path_is_below(const char *child, const char *parent)
+{
+    if (strcmp(parent, "/") == 0) return strcmp(child, "/") != 0;
+    size_t n = strlen(parent);
+    return strncmp(child, parent, n) == 0 && child[n] == '/';
+}
+
+/*
+ * Refuse a repository inside another registered repository, or one that
+ * would contain one.
+ *
+ * Both were accepted. Inside, the new repository's objects land in a
+ * directory the outer one owns: its GC and verify walk them as strays, and
+ * deleting either directory takes data from the other. Containing is the
+ * same thing from the other side. Paths are compared canonically, so a
+ * symlink or a ".." cannot route around the check.
+ *
+ * self_uuid is the marker already at the path, if any. A row with that uuid
+ * is this repository's own registration - the re-link and moved-repository
+ * cases - and is not a conflict with itself.
+ */
+static status_t check_not_nested(cutils_db_t *db, const char *norm,
+                                 const char *self_uuid)
+{
+    char mine[PATH_MAX];
+    canonical_path(norm, mine, sizeof(mine));
+
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT id, uuid, path FROM repos", NULL, &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "cannot read registered repositories");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        const char *uuid = r->rows[i][1];
+        const char *path = r->rows[i][2];
+        if (self_uuid && *self_uuid && strcmp(uuid, self_uuid) == 0) continue;
+
+        char norm_other[PATH_MAX], theirs[PATH_MAX];
+        if (repo_path_normalize(path, norm_other, sizeof(norm_other)) != OK) {
+            err_clear();
+            continue;
+        }
+        canonical_path(norm_other, theirs, sizeof(theirs));
+
+        if (path_is_below(mine, theirs))
+            st = set_error(ERR_INVALID,
+                           "%s is inside repository %s (%s); a repository cannot "
+                           "live inside another", norm, r->rows[i][0], norm_other);
+        else if (path_is_below(theirs, mine))
+            st = set_error(ERR_INVALID,
+                           "%s contains repository %s (%s); a repository cannot "
+                           "live inside another", norm, r->rows[i][0], norm_other);
+    }
+    db_result_free(r);
+    return st;
+}
+
 /* "Empty" ignores . and .. only. A directory holding anything else is
  * someone's data until a marker says otherwise. */
 static int dir_is_empty(const char *path)
@@ -509,6 +599,16 @@ status_t repo_register_ex(cutils_db_t *db, const char *path, const char *label,
 
     repo_marker_t marker;
     status_t st;
+
+    /* Before anything is created: a refused path must leave no trace. */
+    repo_marker_t present;
+    memset(&present, 0, sizeof(present));
+    if (exists && repo_marker_read(path, &present) != OK) {
+        err_clear();
+        present.uuid[0] = '\0';
+    }
+    st = check_not_nested(db, path, present.uuid);
+    if (st != OK) return st;
 
     if (!exists || dir_is_empty(path)) {
         if (!exists) {

@@ -252,6 +252,62 @@ static void test_register_under_a_file_is_invalid(void **state)
     err_clear();
 }
 
+/*
+ * B012: a repository inside a registered one was accepted, so its objects
+ * landed in a directory the outer repository owns.
+ */
+static void test_register_refuses_nested_repo(void **state)
+{
+    (void)state;
+    int64_t outer = 0, id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer", "o", &outer), OK);
+
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/nested", NULL, &id), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "is inside repository"));
+    assert_non_null(strstr(err_msg(), TEST_ROOT "/outer"));
+    /* Refused before anything was created. */
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_ROOT "/outer/nested", &sb), 0);
+
+    /* Deeper, and through an existing subdirectory of the repository. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/a/b/c", NULL, &id), ERR_INVALID);
+    assert_int_equal(repo_register(db, TEST_ROOT "/outer/objects/x", NULL, &id), ERR_INVALID);
+
+    /* Spelling it differently does not route around the check. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/elsewhere/../outer/n", NULL, &id), ERR_INVALID);
+    assert_int_equal(symlink(TEST_ROOT "/outer", TEST_ROOT "/alias"), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "/alias/n", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 1);
+    err_clear();
+}
+
+static void test_register_refuses_containing_repo(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/up/inner", NULL, &id), OK);
+    assert_int_equal(repo_register(db, TEST_ROOT "/up", NULL, &id), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "contains repository"));
+
+    /* Even where the inner repository's directory has gone and the parent
+     * is empty enough to pass every other check. */
+    assert_int_equal(rename(TEST_ROOT "/up/inner", TEST_ROOT "/moved"), 0);
+    assert_int_equal(repo_register(db, TEST_ROOT "/up", NULL, &id), ERR_INVALID);
+    assert_int_equal(count_repos(), 1);
+    err_clear();
+}
+
+/* Siblings sharing a prefix are not nested: r10 is not inside r1. */
+static void test_register_allows_prefix_siblings(void **state)
+{
+    (void)state;
+    int64_t a = 0, b = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/r1", NULL, &a), OK);
+    assert_int_equal(repo_register(db, TEST_ROOT "/r10", NULL, &b), OK);
+    assert_int_not_equal(a, b);
+    assert_int_equal(count_repos(), 2);
+}
+
 /* A marker is written once. Overwriting one would silently sever a repo
  * from every row that references its uuid. */
 static void test_marker_write_refuses_overwrite(void **state)
@@ -588,6 +644,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_stores_normalised_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_parents, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_under_a_file_is_invalid, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_refuses_nested_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_refuses_containing_repo, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_allows_prefix_siblings, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_write_refuses_overwrite, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_rejects_garbage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_uuids_are_unique, setup, teardown),

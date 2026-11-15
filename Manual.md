@@ -382,6 +382,12 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt system      # see secti
   back to its snapshots.
 - A non-empty directory without a marker is refused. Writing objects into
   somebody else's data is the failure this prevents.
+- A path inside a registered repository, or one containing a registered
+  repository, is refused with HTTP 400 naming that repository. One
+  repository's objects would otherwise sit in a directory the other owns, so
+  its garbage collection and verify would see them as strays, and deleting
+  either directory would take data from both. The comparison is on resolved
+  paths, so a symlink or `..` does not get around it.
 
 ### 5.2 Removing
 
