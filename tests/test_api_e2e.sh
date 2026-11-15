@@ -378,6 +378,8 @@ OBJ=$(sock_body '/repos/1/objects?limit=200' \
       | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "object locate"  '"found":true' "$(sock_body "/repos/1/objects/$OBJ")"
 contains "object refs"    '"refs"'       "$(sock_body "/repos/1/objects/$OBJ/refs")"
+# B076: refs named the file but not where it is.
+contains "object refs carry full paths" "\"path\":\"$WORK/src/" "$(sock_body "/repos/1/objects/$OBJ/refs")"
 contains "object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$OBJ/layout")"
 contains "object content" '"base64"'     "$(sock_body "/repos/1/objects/$OBJ/content")"
 # A malformed hash must be rejected rather than reaching the store.
@@ -415,6 +417,10 @@ PACKED=$(sock_body '/repos/1/objects?location=pack&limit=1' \
          | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "packed object locates" '"found":true'  "$(sock_body "/repos/1/objects/$PACKED")"
 contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$PACKED/layout")"
+# B076: the docs said 56 bytes. A packed object sits behind the 51-byte pack
+# entry header (a loose one behind the 64-byte object header).
+contains "packed header is the 51-byte entry header" '"header_size":51' \
+    "$(sock_body "/repos/1/objects/$PACKED/layout")"
 contains "packed object content" '"base64"'      "$(sock_body "/repos/1/objects/$PACKED/content")"
 contains "diff over packs"       '"modified"'    "$(sock_body '/repos/1/diff?from=1&to=2')"
 

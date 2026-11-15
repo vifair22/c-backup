@@ -533,8 +533,12 @@ What is actually inside a repository, as opposed to what it can do.
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
 went in, and `phys_size`, the bytes the repository spends on them: payload
-after compression, plus the 56-byte object header, plus the Reed-Solomon
-parity trailer. `phys_size` exceeding `orig_size` is normal and expected for
+after compression, plus the header the object sits behind, plus the
+Reed-Solomon parity trailer. The header is the 64-byte `object_header_t` for
+a loose object and the 51-byte pack entry header for a packed one, and
+`/layout` reports `header_size` as whichever applies (these docs used to say
+56 for both, which was neither; the sizes are compile-time checked in
+`src/common/types.h` and `src/store/pack.h`). `phys_size` exceeding `orig_size` is normal and expected for
 incompressible input, where the payload is stored raw and the parity trailer
 is pure overhead. `pack_objects` reports `comp_size` instead, which there is
 genuinely the compressed entry payload.

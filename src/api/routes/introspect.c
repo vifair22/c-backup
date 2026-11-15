@@ -366,12 +366,34 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(lim,  sizeof(lim),  "%d", limit);
 
+    /*
+     * The full path of each referencing node, climbed in SQL one primary-key
+     * lookup per level. A bare name ("config.yaml") does not say which of
+     * the many files of that name holds the object, which was the question.
+     * A chain that breaks before the root (a partly faulted-in snapshot)
+     * leaves the path empty rather than dropping the reference.
+     */
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT snap_id, id, name FROM nodes"
-            " WHERE repo_id = ? AND content_hash = ?"
-            " ORDER BY snap_id, id LIMIT ?",
-            (const char *[]){ repo, hex, lim, NULL }, &r) != 0) {
+            "WITH RECURSIVE"
+            " refs(snap_id, nid) AS ("
+            "   SELECT snap_id, id FROM nodes"
+            "    WHERE repo_id = ? AND content_hash = ?"
+            "    ORDER BY snap_id, id LIMIT ?),"
+            " up(nid, parent, path, depth) AS ("
+            "   SELECT n.id, n.parent_node_id, n.name, 0"
+            "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   UNION ALL"
+            "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
+            "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
+            "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
+            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, '')"
+            "   FROM refs"
+            "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   LEFT JOIN up ON up.nid = refs.nid"
+            "             AND (up.parent IS NULL OR up.parent = 0)"
+            "  ORDER BY refs.snap_id, refs.nid",
+            (const char *[]){ repo, hex, lim, repo, repo, repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");
     }
@@ -394,7 +416,8 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
         if (json_resp_array_append_begin(resp, "refs", &e) != 0) break;
         int bad = json_elem_add_str(&e, "snap_id", r->rows[i][0]) != 0
                || json_elem_add_str(&e, "node_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0;
+               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "path",    r->rows[i][3]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }

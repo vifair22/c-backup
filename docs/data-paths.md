@@ -193,8 +193,9 @@ the race to a concurrent writer of the same hash is dedup, not an error.
 On-disk, a loose object is:
 
 ```
-object_header_t (56 bytes: magic, version, type, compression,
-                 pack_skip_ver, uncompressed_size, compressed_size, hash)
+object_header_t (64 bytes: magic, version, type, compression,
+                 pack_skip_ver, uncompressed_size, compressed_size, hash,
+                 encryption, 7 reserved)
 payload         (always COMPRESS_NONE for loose objects)
 parity trailer  (XOR record for the header, RS parity for the payload,
                  CRC32C, footer)
@@ -382,7 +383,7 @@ old verdicts.
 The run itself:
 
 1. **Collect**: walk `objects/XX/` for every loose hash.
-2. **Partition**: read each 56-byte header; skip-marked objects drop out
+2. **Partition**: read each 64-byte header; skip-marked objects drop out
    here. Everything else (file, sparse, tree objects alike) is packable.
 3. **Probe**: large `COMPRESS_NONE` candidates get the 64 KiB probe;
    failures are skip-marked and drop out.

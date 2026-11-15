@@ -55,8 +55,12 @@ else's data.
 
 ## Objects
 
-Content-addressed by SHA-256, stored two hex characters deep. Each carries a
-56-byte header, an LZ4-compressed payload, and a Reed-Solomon parity trailer.
+Content-addressed by SHA-256, stored two hex characters deep. A loose object
+is a 64-byte header (`object_header_t`), an uncompressed payload, and a
+Reed-Solomon parity trailer; compression happens only when objects are
+packed. Inside a pack each entry has a 51-byte entry header
+(`pack_dat_entry_hdr_t`: hash, type, compression, encryption, both sizes)
+before its possibly LZ4-compressed payload.
 
 Compression bails out early. A 64 KiB probe decides whether the payload is
 worth compressing, and an incompressible object is marked so later passes do

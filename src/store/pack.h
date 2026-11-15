@@ -272,6 +272,8 @@ typedef struct {
     uint64_t uncompressed_size;        /*  8 */
     uint64_t compressed_size;          /*  8 */
 } __attribute__((packed)) pack_dat_entry_hdr_t;  /* 51 bytes */
+/* On-disk format; /layout reports it as header_size for a packed object. */
+_Static_assert(sizeof(pack_dat_entry_hdr_t) == 51, "pack entry header is 51 bytes on disk");
 
 /* Pack index file header (12 bytes) */
 typedef struct {
