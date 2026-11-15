@@ -6,6 +6,101 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - Large files stored on a worker pool (B086, part 2)
+
+UAT's next report after the pipelined writer: 16 GiB of 8 x 2 GiB random
+files on a 12-thread Ryzen, source in page cache, repository on tmpfs, took
+86.3 s against `cp`'s 20.5 s. The files were stored strictly one after
+another at about 203 MB/s each, 1.3 cores busy. A file's SHA-256 is serial,
+so the backup now stores several files at once: files over 16 MiB that the
+cache cannot vouch for go to a pool of `backup.store_workers` threads (auto:
+two thirds of the CPUs, bounded by memory and by the number of such files).
+The snapshot and every object are identical to a serial run's.
+
+Machine: the header's (Ryzen 9 5900XT, 32 threads), Linux 7.3.3, GCC 15.
+`bench_phases` gained `-w N` (store workers; `-w 1` is the old serial path)
+and `-p many-large` (8 x 2 GiB incompressible, nothing else). The machine was
+shared with other jobs (load average 15-29 during the disk runs), so disk
+numbers are three interleaved rounds and the spread is shown.
+
+### tmpfs (`/dev/shm`), 8 x 384 MiB
+
+The full 8 x 2 GiB preset does not fit: source, repository and restore
+together need 48 GiB of a 16 GiB tmpfs. Same file count, smaller files.
+
+| first backup | serial (`-w 1`) | pool (auto, 8 workers) | `cp -r` |
+|---|---:|---:|---:|
+| time | 1.78 s (1.770, 1.775) | **0.66 s** (0.664, 0.662) | 0.87-0.90 s |
+| throughput | 1,733 MiB/s | **4,633 MiB/s** | |
+| ratio to `cp` | 2.0x | **0.75x** | |
+
+Each file takes 652 ms on a worker against 221 ms alone: eight writers
+share memory bandwidth (every byte is read, hashed, copied, parity-encoded
+and written). Wall time is the slowest file, because eight files on eight
+workers is one round.
+
+Mixed default preset (10,000 small files, 3 x 64 MiB random, 2 x 64 MiB
+text), two rounds: first backup 1.12-1.14 s serial, 0.96-0.99 s on 5
+workers. The small-file path is unchanged; the gain is the five large files.
+
+### Real disk (`/home`: btrfs on NVMe), 8 x 2 GiB, `-c`
+
+Source evicted before each backup and a trailing `sync` in every timing.
+`cp -r --reflink=never` with the same eviction and sync for reference (plain
+`cp` on btrfs reflinks and finishes in 15 ms).
+
+| first backup | serial (`-w 1`) | pool (auto, 8 workers) | `cp -r` |
+|---|---:|---:|---:|
+| median | 17.25 s | **13.38 s** | 12.64 s |
+| rounds | 16.96, 17.25, 17.36 | 13.26, 13.38, 14.14 | 12.60, 12.64, 13.13 |
+| ratio to `cp` | 1.36x | **1.06x** | |
+
+Two runs before the interleaved rounds read 12.6 s serial and 14.5 s pooled
+at lower load; `-w 2` read 15.1 s and `-w 4` 13.6 s. On this disk the
+pool's ceiling is the storage itself: it now runs at `cp`'s speed, and
+reading, hashing and writing concurrently is what closed the gap.
+
+### Store-phase commits (r8's 200 ms batch rule)
+
+The new `store-commit` phase counts and times the store phase's cache batch
+commits (one WAL sync each), to see whether the 200 ms bound B107 added
+makes slow storage commit much more often.
+
+| run | commits | per commit | share of backup |
+|---|---:|---:|---:|
+| tmpfs, 8 x 384 MiB, serial / pool | 9 / 9 | 21 / 36 us | 0.0% |
+| tmpfs, 10k small mixed, serial / pool | 11 / 10 | 0.4-0.6 ms | 0.5-0.7% |
+| disk, 8 x 2 GiB, serial | 9 | 117-124 ms | 6.1-6.6% |
+| disk, 8 x 2 GiB, pool | 5-8 | 268-472 ms | 12-20% |
+| disk, 100k small (`-n 100000 -c`), serial | 78 | 31 ms | 8.2% |
+| disk, 100k small, pool (5 workers) | 67 | 31 ms | 8.5% |
+
+Large files commit once per file (the batch is let go before each one) plus
+once at the end, whatever the storage. A 100k-file tree commits 67-78 times
+where 2,000-entry batches alone would give 50: the time bound adds about a
+third more syncs on this disk, at 31 ms each. Under the pool a commit queues
+behind eight files' writeback and takes 0.3-0.5 s, but it runs on the backup
+thread while the workers carry on, so it is mostly off the critical path
+(the backup thread spends most of a pooled run in large-file-wait anyway).
+
+### Residual limits
+
+- **One file is still one core.** SHA-256 over the whole plaintext is the
+  object identity; splitting it needs a tree hash, which changes the format
+  and every object's identity. Here io:hash runs at about 2.2 GB/s per core
+  (7.8 s CPU for 16 GiB serial), so a single 2 GiB file cannot store faster
+  than about 1 s on this machine, and a tree of one huge file gains nothing
+  from the pool. On UAT's machine the per-file rate was 203 MB/s, so its
+  ceiling per file is about ten times lower and the pool's gain is bounded
+  by how many large files there are and by its CPU count.
+- **The pool only takes files over 16 MiB.** Smaller files go through the
+  backup pack on the backup thread, as before.
+- **On storage slower than the CPU** the pool can only overlap I/O; at
+  `cp`'s speed there is nothing left to win.
+- **Memory**: the budget is an eighth of RAM or of the cgroup's memory.max,
+  whichever is smaller (256 MiB to 2 GiB, never above a quarter); RS parity
+  past each worker's share spills to the repository's tmp/.
+
 ## 2026-11-15 - One-snapshot search reads the index newest first
 
 Machine: i7-1265U laptop, `/tmp` on tmpfs. `make bench-browse` defaults

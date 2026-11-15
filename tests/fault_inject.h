@@ -85,3 +85,18 @@ extern const char *volatile fault_rename_dst;
 extern volatile int fault_rename_skip;
 extern volatile int fault_rename_refused;
 extern int __real_rename(const char *, const char *);
+
+/*
+ * Hold renames onto one path until several have arrived.
+ *
+ * With a gate set, a rename whose destination is exactly `dst` waits until
+ * `n` such renames have arrived - or until FAULT_GATE_TIMEOUT_S has passed,
+ * so a test that never brings them together fails instead of hanging - and
+ * only then goes ahead. This is how a test makes a race deterministic: two
+ * writers that both reach the install of one object are both past their
+ * existence check before either installs. NULL dst clears the gate.
+ * fault_rename_gate_arrivals reports how many arrived since it was set.
+ */
+#define FAULT_GATE_TIMEOUT_S 30
+void fault_rename_gate_set(const char *dst, int n);
+int  fault_rename_gate_arrivals(void);

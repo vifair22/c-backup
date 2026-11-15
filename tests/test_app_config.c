@@ -62,9 +62,11 @@ static void test_edges_pass(void **state)
                           "auth:\n  cookie_secure: 1\n"
                           "scheduler:\n  enabled: 0\n"
                           "retention:\n  keep_snaps: 0\n  keep_yearly: 2147483647\n"
-                          "backup:\n  file_cache_match: relaxed\n"), CUTILS_OK);
+                          "backup:\n  file_cache_match: relaxed\n  store_workers: 64\n"),
+                     CUTILS_OK);
     assert_int_equal(load("http:\n  port: 65535\n  bind: \"\"\n"
-                          "jobs:\n  max_parallel: 1\n"), CUTILS_OK);
+                          "jobs:\n  max_parallel: 1\n"
+                          "backup:\n  store_workers: 0\n"), CUTILS_OK);
 }
 
 static void test_ranges_refused(void **state)
@@ -78,6 +80,9 @@ static void test_ranges_refused(void **state)
     refused("scheduler:\n  enabled: -1\n", "scheduler.enabled: '-1'");
     refused("retention:\n  keep_daily: -1\n", "retention.keep_daily: '-1'");
     refused("retention:\n  keep_snaps: -5\n", "retention.keep_snaps: '-5'");
+    refused("backup:\n  store_workers: 65\n",
+            "backup.store_workers: '65' is not between 0 and 64");
+    refused("backup:\n  store_workers: -1\n", "backup.store_workers: '-1'");
 }
 
 static void test_bind_and_mode_refused(void **state)
