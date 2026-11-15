@@ -52,6 +52,15 @@ apt-get install build-essential pkg-config libssl-dev liblz4-dev \
                 libcurl4-openssl-dev libcmocka-dev
 ```
 
+**OpenSSL 3.2 or newer is required**, for Argon2id key derivation. Debian 13
+(trixie) and Arch ship it; Ubuntu 24.04 and Debian 12 ship 3.0 and do not
+build. Use the Docker image there. The build stops up front with a message
+naming the version it found. Manual section 2.1 has the details.
+
+The desktop app in `ui/` needs Node.js 22.12 or newer (`engines` in
+`ui/package.json`): Vite 7 needs it to build, and `npm test` runs the
+TypeScript tests directly with `--experimental-strip-types`. CI uses Node 24.
+
 ## Running
 
 ```sh
