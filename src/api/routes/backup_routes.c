@@ -530,12 +530,19 @@ static api_response_t json_out(cJSON *root)
 static api_response_t list_jobs(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
-    const char *limit = api_query_param(req, "limit");
-    const char *lim = (limit && atoi(limit) > 0) ? limit : "50";
+    /* The shared paging rules: a malformed limit or offset is a 400. This
+     * route used to fall back to 50 for anything it could not read, so
+     * `limit=-1` or `limit=ten` answered as if it had been understood. */
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 50, 1000, &limit, &offset, &page_err) != 0) return page_err;
+    char lim[16], off[16];
+    snprintf(lim, sizeof(lim), "%d", limit);
+    snprintf(off, sizeof(off), "%d", offset);
 
     db_result_t *r = NULL;
-    if (db_execute(ctx->db, JOB_COLUMNS " ORDER BY id DESC LIMIT ?",
-                   (const char *[]){ lim, NULL }, &r) != 0) {
+    if (db_execute(ctx->db, JOB_COLUMNS " ORDER BY id DESC LIMIT ? OFFSET ?",
+                   (const char *[]){ lim, off, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot list jobs");
     }

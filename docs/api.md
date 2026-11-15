@@ -567,7 +567,7 @@ and returned by `GET /repos/<id>/schedules`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/jobs` | Recent jobs |
+| GET | `/jobs` | Recent jobs, newest first. `limit` (default 50, at most 1000) and `offset`; a malformed one is a 400 |
 | GET | `/jobs/<id>` | One job with progress |
 | GET | `/jobs/stream/<id>` | Server-sent progress events |
 | POST | `/jobs/<id>/cancel` | Request cancellation |

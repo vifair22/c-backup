@@ -393,6 +393,9 @@ check "non-numeric limit is a 400"       400 "$(sock_code '/repos/1/objects?limi
 check "negative offset is a 400"         400 "$(sock_code '/repos/1/snapshots?offset=-5')"
 check "bad limit on the journal is a 400" 400 "$(sock_code '/repos/1/journal?limit=x')"
 check "bad limit on grep runs is a 400"  400 "$(sock_code '/repos/1/grep?limit=-1')"
+check "bad limit on jobs is a 400"       400 "$(sock_code '/jobs?limit=-1')"
+check "bad offset on jobs is a 400"      400 "$(sock_code '/jobs?offset=x')"
+check "jobs pages with limit and offset" 200 "$(sock_code '/jobs?limit=1&offset=1')"
 check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapshots?limit=999999')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
