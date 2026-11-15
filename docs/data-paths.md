@@ -601,7 +601,17 @@ never outlive their pack.
   The reference list is every surviving `objects` row - the sweep just
   deleted everything unreachable, so surviving is the definition of
   referenced. `pack_gc` rewrites only packs that contain dead entries,
-  then merges small packs (under a quarter of the seal size) when there
+  copying the live ones into new packs that roll over at the seal, so an
+  oversized pack (a pre-OWN-16 backup's, a pre-OWN-19 replica's) comes out
+  as ordinary 256 MiB packs the first time it is rewritten. The copies are
+  staged in `tmp/` and sealed, then installed under new numbers and
+  synced, then announced, and only then is the old pack removed behind a
+  `.deleting` marker: a crash anywhere leaves every object readable, at
+  worst beside a duplicate copy. Coalescing goes through the same code
+  (`pack_rw_t`), and reindex replays any outstanding marker before it
+  reads the packs, so it never indexes a copy the marker is about to
+  delete. A pack with no dead entries is not rewritten, oversized or not.
+  `pack_gc` then merges small packs (under a quarter of the seal size) when there
   are enough of them, under a rewrite budget, and only when the merge
   provably removes at least two pack files - merging n candidates of B
   bytes yields ceil(B/256 MiB) packs, so the reduction is known before a

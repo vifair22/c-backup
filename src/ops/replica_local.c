@@ -44,11 +44,13 @@
  * under a different one, which is exactly the property a replica must not
  * have.
  *
- * Each snapshot's new objects go into one pack, installed before that
- * snapshot's record is written (see local_commit_snapshot). The target
- * coalesces on its own schedule, which is the point of replicating objects
- * rather than pack files: the two sides are free to disagree about physical
- * layout and still hold provably the same data.
+ * Each snapshot's new objects go into packs sealed at the same size backup
+ * seals at (PACK_MAX_MULTI_BYTES), every one installed before that
+ * snapshot's record is written (see local_put_object and
+ * local_commit_snapshot). The target coalesces on its own schedule, which
+ * is the point of replicating objects rather than pack files: the two sides
+ * are free to disagree about physical layout and still hold provably the
+ * same data.
  */
 
 /*
@@ -76,9 +78,14 @@ typedef struct {
     size_t     nrows, cap;
 
     /* The pack staging the current snapshot's new objects. Opened on the
-     * first object, installed by commit_snapshot, so NULL between
-     * snapshots and for a snapshot that brought nothing new. */
+     * first object, installed when it fills (put_object) or when the
+     * snapshot is committed, so NULL between snapshots and for a snapshot
+     * that brought nothing new. */
     pack_stored_writer_t *w;
+
+    /* Objects installed for the current snapshot by packs that filled
+     * before its commit, for the log line commit_snapshot writes. */
+    uint32_t   sealed_in_snapshot;
 
     /* Re-encrypting into a repository of its own: never write a snapshot
      * record over one already there, and hold the target's key. */
@@ -261,6 +268,35 @@ static status_t local_put_object(void *vctx, const replica_object_t *obj)
     if (object_exists(c->store, obj->hash) || pack_stored_has(c->w, obj->hash))
         return OK;
 
+    /*
+     * Seal at the size backup seals at. One pack per snapshot made a 1 TB
+     * first snapshot a 1 TB pack, which gc can only rewrite whole and only
+     * with that much free space.
+     *
+     * Installing here, mid-snapshot, keeps the commit's promise: every pack
+     * a record depends on is installed and synced before the record is
+     * written, and this one is installed before the snapshot's later
+     * objects are even staged. A failure fails the snapshot the same way a
+     * failure at commit does - replicate_run names it and writes no record -
+     * and the objects of the packs already installed are unreferenced until
+     * a later run's record names them, which is what the next run reuses.
+     *
+     * The objects of a sealed pack drop out of the staged set and resolve
+     * through the index from here on (seal_pack adds them to it), so
+     * nothing is sent twice across the boundary.
+     */
+    if (c->w && pack_stored_full(c->w, (uint64_t)obj->payload_len)) {
+        uint32_t packed = 0;
+        status_t st = seal_pack(c, &packed);
+        if (st != OK) {
+            char why[256];
+            snprintf(why, sizeof(why), "%s", err_msg());
+            return set_error(st, "replica: cannot install a full pack in %s: %s",
+                             c->root, why);
+        }
+        c->sealed_in_snapshot += packed;
+    }
+
     if (!c->w) {
         status_t st = pack_stored_open(c->store, &c->w);
         if (st != OK) return st;
@@ -321,10 +357,16 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
      * snapshots whose objects did not exist. Installing per snapshot, and
      * refusing to write the record when the install fails, makes a record
      * on the target mean what it says. It also bounds what an interruption
-     * throws away to one snapshot's worth of staging.
+     * throws away to one pack's worth of staging.
+     *
+     * A snapshot larger than the seal had its earlier packs installed by
+     * put_object as each filled; this installs the last, so by the time the
+     * record is written every pack it depends on is in place and synced.
      */
     uint32_t packed = 0;
     status_t pst = seal_pack(c, &packed);
+    packed += c->sealed_in_snapshot;
+    c->sealed_in_snapshot = 0;
     if (pst != OK) {
         /* Copied first: err_msg() is the buffer set_error writes into. */
         char why[256];
