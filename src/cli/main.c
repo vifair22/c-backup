@@ -1105,7 +1105,20 @@ static int cmd_schedule(int argc, char **argv)
 
     if (strcmp(argv[0], "add") == 0) {
         int a = argc; char **v = argv;
-        const char *cron = take_opt(&a, v, "--cron");
+        /*
+         * Calendar triggers, which is what the daemon offers besides an
+         * interval. This took --cron and sent a cron trigger, which the
+         * daemon rejects by design and the API suite checks it rejects, so
+         * the option could only ever fail - and nothing could make a
+         * calendar schedule from the CLI at all.
+         */
+        const char *every    = take_opt(&a, v, "--every");
+        const char *at       = take_opt(&a, v, "--at");
+        const char *on       = take_opt(&a, v, "--on");
+        const char *on_day   = take_opt(&a, v, "--on-day");
+        const char *on_month = take_opt(&a, v, "--on-month");
+        const char *overlap  = take_opt(&a, v, "--on-overlap");
+        const char *catchup  = take_opt(&a, v, "--catchup");
         /* Two actions carry parameters: replication needs somewhere to go,
          * a backup needs somewhere to read from. Sources repeat, so they
          * are drained rather than read once. */
@@ -1121,8 +1134,21 @@ static int cmd_schedule(int argc, char **argv)
             src[n_src++] = sp;
         }
         if (a < 3) return fail("usage: schedule add <repo-id> <action> <seconds> | "
-                               "schedule add <repo-id> <action> --cron '<spec>' "
+                               "schedule add <repo-id> <action> --every day|week|month|year "
+                               "--at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N] "
+                               "[--on-overlap skip|queue|cancel_running] [--catchup skip|run_once] "
                                "[--dest PATH] [--source PATH]...");
+        /* Numbers go into the body bare, so a non-number would be malformed
+         * JSON and come back as "invalid JSON", describing the request
+         * rather than the mistake. */
+        const char *nums[] = { on_day, on_month };
+        for (size_t k = 0; k < 2; k++) {
+            if (!nums[k]) continue;
+            char *endp = NULL;
+            long n = strtol(nums[k], &endp, 10);
+            if (!nums[k][0] || !endp || *endp || n <= 0)
+                return fail("--on-day and --on-month take a positive number, not '%s'", nums[k]);
+        }
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"action\":");
         sb_json_str(&b, v[2]);
@@ -1135,9 +1161,17 @@ static int cmd_schedule(int argc, char **argv)
             }
             sb_puts(&b, "]");
         }
-        if (cron) {
-            sb_puts(&b, ",\"trigger\":{\"type\":\"cron\",\"spec\":");
-            sb_json_str(&b, cron);
+        if (overlap) { sb_puts(&b, ",\"on_overlap\":"); sb_json_str(&b, overlap); }
+        if (catchup) { sb_puts(&b, ",\"catchup\":");    sb_json_str(&b, catchup); }
+        if (every) {
+            /* The daemon validates the combination and says what is
+             * missing, so this only assembles it. */
+            sb_puts(&b, ",\"trigger\":{\"type\":\"calendar\",\"every\":");
+            sb_json_str(&b, every);
+            if (at)       { sb_puts(&b, ",\"at\":");       sb_json_str(&b, at); }
+            if (on)       { sb_puts(&b, ",\"on\":");       sb_json_str(&b, on); }
+            if (on_day)   { sb_puts(&b, ",\"on_day\":");   sb_puts(&b, on_day); }
+            if (on_month) { sb_puts(&b, ",\"on_month\":"); sb_puts(&b, on_month); }
             sb_puts(&b, "}}");
         } else {
             if (a < 4) { free(b.buf); return fail("usage: schedule add <repo-id> <action> <seconds>"); }
@@ -1157,7 +1191,7 @@ static int cmd_schedule(int argc, char **argv)
                 return fail("interval must be a positive number of seconds, "
                             "not '%s'\n"
                             "       usage: schedule add <repo-id> <action> <seconds>\n"
-                            "              schedule add <repo-id> <action> --cron '<spec>'",
+                            "              schedule add <repo-id> <action> --every day --at HH:MM",
                             v[3]);
             }
             sb_puts(&b, ",\"trigger\":{\"type\":\"interval\",\"seconds\":");
@@ -1335,7 +1369,7 @@ static const struct {
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [args]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args] [--source PATH]... [--dest PATH]" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
     { "auth",      cmd_auth,      "auth <setup|login|logout|password> (prompts for passwords)" },
     { "metrics",   cmd_metrics,   "metrics" },

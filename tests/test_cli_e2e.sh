@@ -179,6 +179,19 @@ check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
 contains "schedule enable/disable" '"ok"' \
     "$(cb schedule add 1 verify 7200 > /dev/null; cb schedule list 1 | grep -q verify && cb schedule disable 1 2 || echo miss)"
 
+# Calendar schedules. The CLI offered --cron, which built a trigger type the
+# daemon rejects by design, and had no way to ask for the calendar triggers
+# the daemon does support.
+contains "weekly schedule from the CLI" '"id"' \
+    "$(cb schedule add 1 gfs --every week --on sunday --at 03:00 --catchup skip --on-overlap skip)"
+contains "monthly schedule from the CLI" '"id"' \
+    "$(cb schedule add 1 verify --every month --on-day 31 --at 02:30)"
+contains "calendar schedules listed" 'calendar' "$(cb schedule list 1)"
+contains "a weekly schedule needs its day" 'weekday' \
+    "$(cb schedule add 1 gc --every week --at 03:00 2>&1)"
+contains "a non-numeric day is refused before sending" 'positive number' \
+    "$(cb schedule add 1 gc --every month --on-day first --at 03:00 2>&1)"
+
 # Content search. The pre-daemon CLI had this and the rewrite dropped it, so
 # "which backup still has that line" had no answer short of restoring one.
 echo "grep"
