@@ -170,8 +170,10 @@ static void test_last_of_day_wins(void **state)
     gfs_retention_t ret = { 0, 30, 8, 12, 3 };
     assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1, NULL), OK);
 
-    assert_false(flags_of(1) & GFS_DAILY);
     assert_true(flags_of(2) & GFS_DAILY);
+    /* The earlier one holds no tier and is not among the newest, so it is
+     * pruned outright rather than kept unflagged. */
+    assert_int_equal(flags_of(1), 0xFFFFFFFFu);
 }
 
 /* Sunday's daily is promoted to weekly. */
@@ -284,6 +286,50 @@ static void test_zero_retention_keeps_everything(void **state)
     assert_int_equal(snapshot_count(), before);
 }
 
+/*
+ * The defaults the daemon ships, keep_snaps included, must actually prune.
+ *
+ * Every other prune test here passes keep_snaps = 3. The shipped default was
+ * 0, which the window treated as "everything is recent", so a scheduled
+ * retention pass on a default install deleted nothing for as long as it ran.
+ * Ninety days of one backup a day, under 7 daily and 4 weekly: well over half
+ * of them have to go.
+ */
+static void test_shipped_defaults_prune(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 90; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
+
+    gfs_retention_t ret = { 0, 7, 4, 12, 3 };
+    uint32_t pruned = 0;
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, 1, &pruned), OK);
+
+    assert_true(pruned > 45);
+    assert_int_equal(snapshot_count(), 90 - (int)pruned);
+    /* The newest stays, and so does the most recent closed day's daily. */
+    assert_int_not_equal(flags_of(90), 0xFFFFFFFFu);
+    assert_true(flags_of(89) & GFS_DAILY);
+}
+
+/* keep_snaps protects the newest N whatever their tier, and 0 is not a
+ * window that covers everything. */
+static void test_keep_snaps_is_a_minimum(void **state)
+{
+    (void)state;
+    /* Ten snapshots inside one day: none is a daily until the day closes,
+     * so only the recency window can keep them. */
+    for (int i = 0; i < 10; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * 60);
+    add_snapshot(11, SUNDAY_2024_01_07 + DAY);
+
+    gfs_retention_t ret = { 4, 7, 4, 12, 3 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 11, 0, 1, 1, NULL), OK);
+    /* 8..11 are the newest four; 10 is also the closed day's daily. */
+    for (int id = 8; id <= 11; id++) assert_int_not_equal(flags_of(id), 0xFFFFFFFFu);
+    for (int id = 1; id <= 7; id++)  assert_int_equal(flags_of(id), 0xFFFFFFFFu);
+}
+
 static void test_empty_repo_is_not_an_error(void **state)
 {
     (void)state;
@@ -325,6 +371,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_prune_removes_expired_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_tagged_snapshots_are_preserved, setup, teardown),
         cmocka_unit_test_setup_teardown(test_zero_retention_keeps_everything, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shipped_defaults_prune, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_keep_snaps_is_a_minimum, setup, teardown),
         cmocka_unit_test_setup_teardown(test_empty_repo_is_not_an_error, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gfs_is_idempotent, setup, teardown),
     };
