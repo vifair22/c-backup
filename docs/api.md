@@ -193,7 +193,9 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
-weekly, 4 monthly, 8 yearly. `materialized` is `false` for a cold snapshot
+weekly, 4 monthly, 8 yearly. A retention pass assigns them, for every local
+calendar day the daemon's clock has closed, so a snapshot taken today holds
+none yet; the last snapshot of a closed year holds all four, 15. `materialized` is `false` for a cold snapshot
 whose rows must be faulted back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,

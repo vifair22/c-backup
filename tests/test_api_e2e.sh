@@ -1057,6 +1057,27 @@ if command -v sqlite3 > /dev/null 2>&1; then
 else
     ok "a stored invalid count falls back to the default (skipped: no sqlite3)"
 fi
+
+# B094: tiers close on the clock, not on a later snapshot. Every snapshot
+# showed gfs_flags 0 after a pass because the newest one's day never closed
+# and same-day snapshots hold no tier. Moved to the last Saturday and Sunday
+# of 2024 (noon UTC, so the same local day in any zone within 11 hours), the
+# Sunday is that year's last daily, weekly, monthly and yearly: 15. Read
+# back through the listing, which is what clients see.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
+                           UPDATE snapshots SET ts = 1735473600 WHERE repo_id = 1 AND id = 4"
+    TIERS=$(job_id "$(sock_post /repos/1/gfs)")
+    wait_job "$TIERS"
+    LIST=$(sock_body /repos/1/snapshots)
+    contains "the newest of a closed year holds every tier" '"id":4,"ts":1735473600,' "$LIST"
+    contains "gfs_flags 15 on it" '"gfs_flags":15,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":4,[^}]*}')"
+    contains "and the day before is a daily" '"gfs_flags":1,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":3,[^}]*}')"
+else
+    ok "tier flags reach the listing (skipped: no sqlite3)"
+fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.
 contains "policy reports the configured defaults" \

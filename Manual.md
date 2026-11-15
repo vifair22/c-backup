@@ -797,8 +797,12 @@ A snapshot is kept if any of these holds:
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
-tier. The current day is never closed, so a snapshot taken today holds no
-tier until tomorrow.
+tier. A day closes on the daemon's clock: today is never closed, so a
+snapshot taken today holds no tier until a pass runs tomorrow or later, and a
+repository whose last backup was weeks ago has that snapshot elected like any
+other. Tiers are assigned only by a retention pass, so a repository that has
+never had one shows `gfs_flags` 0 on every snapshot. A reindex keeps the tiers
+the last pass assigned.
 
 Days are local calendar days on the daemon's host, in its timezone.
 

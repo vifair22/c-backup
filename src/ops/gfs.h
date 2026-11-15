@@ -14,6 +14,7 @@ typedef struct {
 } gfs_retention_t;
 #include <cutils/db.h>
 #include <stdint.h>
+#include <time.h>
 
 /*
  * Tier membership, stored as a bitfield in snapshots.gfs_flags.
@@ -85,10 +86,18 @@ typedef struct {
 
 void gfs_result_free(gfs_result_t *r);
 
+/*
+ * now is the wall-clock instant the pass treats as the present: every local
+ * calendar day before now's is closed and gets its elections. It used to be
+ * the newest snapshot's day instead, so the newest snapshot never held a
+ * tier however long ago it was taken - a repository whose last backup was
+ * last month showed gfs_flags 0 on it after every pass. The daemon passes
+ * time(NULL); tests pin it.
+ */
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, gfs_result_t *out);
+                 int full_scan, time_t now, gfs_result_t *out);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);
