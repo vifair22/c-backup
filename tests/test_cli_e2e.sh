@@ -62,7 +62,16 @@ contains "explains the daemon is not running" "daemon not running" "$OUT"
 # B080: the advice fits where the CLI runs. It said systemctl inside the
 # Docker image, which has no systemd. CI itself may be a container, so the
 # expectation follows the same signals the CLI reads.
-if [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
+# B103: systemd with the unit installed wins even inside a container, and a
+# container booting systemd without the unit gets both commands.
+UNIT=0
+for u in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system \
+         /usr/lib/systemd/system /lib/systemd/system; do
+    [ -e "$u/c-backupd.service" ] && UNIT=1
+done
+if [ -d /run/systemd/system ] && [ "$UNIT" = 1 ]; then
+    contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+elif [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
     contains "suggests how to start it" "start that container" "$OUT"
 elif [ -d /run/systemd/system ]; then
     contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
@@ -72,11 +81,24 @@ fi
 contains "names the socket options" "--socket PATH" "$OUT"
 contains "and the variable" "C_BACKUP_SOCKET" "$OUT"
 OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" repo list 2>&1)
-contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
-case "$OUT" in
-    *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
-    *)           ok  "and not systemctl" ;;
-esac
+if [ -d /run/systemd/system ] && [ "$UNIT" = 1 ]; then
+    contains "a container with the unit installed says systemctl" "systemctl start c-backupd" "$OUT"
+elif [ -d /run/systemd/system ]; then
+    # The marker alone cannot be faked on a host booted with systemd; the
+    # decision table itself is covered by test_start_advice.
+    contains "a container running systemd gives both: docker" "docker start c-backupd" "$OUT"
+    contains "and systemctl" "systemctl start c-backupd" "$OUT"
+else
+    contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
+    case "$OUT" in
+        *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
+        *)           ok  "and not systemctl" ;;
+    esac
+fi
+# jobs watch had its own copy of the advice, which always said systemctl.
+OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" jobs watch 1 2>&1); RC=$?
+check    "watch without a daemon exits non-zero" 1 "$RC"
+contains "watch gives the same advice" "--socket PATH" "$OUT"
 
 echo "offline commands"
 contains "version" "c-backup" "$("$CLI" --version)"

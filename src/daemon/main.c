@@ -31,6 +31,7 @@
 #include "repo_purge.h"
 #include "routes.h"
 #include "scheduler.h"
+#include "sd_notify.h"
 #include "server.h"
 #include "store_index.h"
 
@@ -271,6 +272,11 @@ int main(int argc, char *argv[])
         return 1;
     }
     log_info("c-backupd ready");
+    /* Only now: api_server_start returns with the unix socket and the TCP
+     * listener both bound, and the scheduler is running. Telling systemd any
+     * earlier lets `systemctl start` return before a client can connect. */
+    if (sd_notify_state("READY=1") != OK)
+        log_warn("cannot notify the service manager: %s", err_msg());
 
     while (atomic_load(&running)) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
@@ -283,6 +289,10 @@ int main(int argc, char *argv[])
      * ended, which needs the database AppGuard closes last.
      */
     log_info("shutting down");
+    /* Joining running jobs can take a while; STOPPING=1 lets systemctl show
+     * "deactivating" for it rather than a service that looks healthy. */
+    if (sd_notify_state("STOPPING=1") != OK)
+        log_warn("cannot notify the service manager: %s", err_msg());
     api_server_stop(srv);
     if (sched) scheduler_stop(sched);
     job_manager_stop(jm);

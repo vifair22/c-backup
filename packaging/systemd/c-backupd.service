@@ -5,7 +5,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify, not simple: the daemon sends READY=1 once its unix socket and TCP
+# listener are bound, so `systemctl start` (and anything ordered After= this
+# unit) returns only when a client can connect. Under simple the unit went
+# active at fork, and `systemctl enable --now c-backupd; c-backup health`
+# found no socket yet. Startup applies schema migrations before it is ready,
+# which on a large state database outlasts the 90 s default.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=10min
 ExecStart=/usr/local/bin/c-backupd
 Environment=C_BACKUP_CONFIG_PATH=/etc/c-backupd/config.yaml
 

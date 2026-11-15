@@ -152,6 +152,15 @@ restoring ownership both need it. systemd creates `/run/c-backupd` (the
 socket directory) and `/var/lib/c-backupd` (the database directory, mode
 0700) on start.
 
+The unit is `Type=notify`: the daemon tells systemd it is ready only once its
+unix socket and TCP listener are bound, so `systemctl start` (and
+`enable --now`) returns when the CLI can connect, and a unit ordered
+`After=c-backupd.service` starts no earlier. Startup applies any schema
+migrations first; the unit allows ten minutes for that (`TimeoutStartSec`).
+On stop it reports `deactivating` while running jobs are cancelled. The
+daemon implements the notification protocol itself and does not link
+libsystemd; run outside systemd it simply skips it.
+
 Check it:
 
 ```sh
@@ -1567,7 +1576,7 @@ the underlying disk.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies |
+| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies: systemctl wherever systemd runs with the unit installed, a container included, and both commands in a container running systemd without it |
 | `permission denied` on the socket | Not root, and the socket is root-only | `sudo`, or section 4.1 |
 | `another daemon is serving <socket>` at start | A second instance | Stop the other one; only one daemon owns a host |
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |
