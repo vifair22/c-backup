@@ -101,7 +101,9 @@ not retry: there is no point spending CPU on video, audio or database files
 that will not shrink. Objects up to 16 MiB are written straight into packs
 by the backup; an object over 16 MiB is written loose, and one that fails the
 probe is marked in its header (`pack_skip_ver`) and stays loose for good,
-never packed (see `docs/data-paths.md`).
+never packed (see `docs/data-paths.md`). So is one whose body stops
+compressing partway through the pack pass, which abandons it rather than
+finish an entry that saves nothing.
 
 Sparse files are stored as a region table plus data, so a 1 TiB sparse file
 does not become 1 TiB of zeroes. Restoring one linearly would inflate it to

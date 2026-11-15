@@ -120,6 +120,23 @@ _Static_assert(PACK_COALESCE_SMALL_BYTES < PACK_MAX_MULTI_BYTES,
 #define PACK_RATIO_THRESHOLD 0.90                             /* skip if ratio >= this */
 #define PACK_PROBE_SIZE      (64 * 1024)                      /* 64 KiB probe */
 
+/*
+ * The pack pass's bail-out inside a large entry (OWN-27). The head probe
+ * judges 64 KiB; a file whose head compresses and body does not (container
+ * tables or a thumbnail in front of compressed media) used to be compressed
+ * and rewritten whole for nothing. pw_write_large measures what LZ4 achieves
+ * over the trailing PACK_BAIL_WINDOW of input past the probe region and,
+ * once that reaches PACK_RATIO_THRESHOLD, abandons the entry and leaves the
+ * object loose and skip-marked. 8 MiB, because a container header is usually
+ * well under it, so the window sees the body before deciding, and 8 MiB of
+ * LZ4 is milliseconds. See PERF.md, "Streaming bail-out inside an entry".
+ */
+#define PACK_BAIL_WINDOW     ((uint64_t)(8 * 1024 * 1024))
+#define PACK_LARGE_CHUNK     (256 * 1024)                     /* pw_write_large read size */
+/* Slots in the window's ring: twice what full reads need, so short reads
+ * still leave a whole window measured before the oldest slot is forced out. */
+#define PACK_BAIL_SLOTS      ((size_t)(2 * PACK_BAIL_WINDOW / PACK_LARGE_CHUNK))
+
 /* cache_cmp: uses hash_cmp from util.h */
 #define cache_cmp hash_cmp
 
@@ -151,6 +168,31 @@ static int path_fmt(char *buf, size_t sz, const char *fmt, ...) {
     int n = vsnprintf(buf, sz, fmt, ap);
     va_end(ap);
     return (n >= 0 && (size_t)n < sz) ? 0 : -1;
+}
+
+/*
+ * Set the prober's skip mark on a loose object, so no later pack run reads
+ * it again. Best effort, because the mark only saves work: one that does not
+ * land costs the next run a probe. Shared by the probe pass, the small-object
+ * worker's probe and the large-object bail-out, so "skip-marked" means one
+ * thing whichever of them decided.
+ */
+static void mark_loose_skip(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                            uint64_t compressed_size)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char path[PATH_MAX];
+    if (path_fmt(path, sizeof(path), "%s/objects/%.2s/%s",
+                 store_root(store), hex, hex + 2) != 0)
+        return;
+    int wfd = open(path, O_RDWR);
+    if (wfd < 0) return;
+    uint8_t sv = PROBER_VERSION;
+    ssize_t wr = pwrite(wfd, &sv, 1, offsetof(object_header_t, pack_skip_ver));
+    (void)wr;
+    update_loose_header_parity(wfd, compressed_size);
+    close(wfd);
 }
 
 /* ---- Sharded pack path helpers ----
@@ -2793,20 +2835,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                                           sample_len, pw->comp_buf_size);
             if (sc > 0 && (double)sc / (double)sample_len >= PACK_RATIO_THRESHOLD) {
                 /* Incompressible: mark in the loose file and skip */
-                uint8_t sv = PROBER_VERSION;
-                char hex[OBJECT_HASH_SIZE * 2 + 1];
-                object_hash_to_hex(m->hash, hex);
-                char path[PATH_MAX];
-                path_fmt(path, sizeof(path), "%s/objects/%.2s/%s",
-                         store_root(ctx->store), hex, hex + 2);
-                int wfd = open(path, O_RDWR);
-                if (wfd >= 0) {
-                    ssize_t pw2 = pwrite(wfd, &sv, 1,
-                                         offsetof(object_header_t, pack_skip_ver));
-                    (void)pw2;
-                    update_loose_header_parity(wfd, m->compressed_size);
-                    close(wfd);
-                }
+                mark_loose_skip(ctx->store, m->hash, m->compressed_size);
                 atomic_fetch_add(&ctx->prog->skipped, 1);
                 return OK; /* skip */
             }
@@ -2843,6 +2872,44 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     return est;
 }
 
+/*
+ * Take a half-written entry back off the pack being built, and leave its
+ * object loose and skip-marked: the bail-out's verdict that the body does
+ * not compress (OWN-27).
+ *
+ * Nothing outside this writer has seen the entry. It has no index slot yet
+ * (those are filled only once an entry is complete), so no row and no
+ * parity can name it, and the pack is still a staging file in tmp/ that
+ * only this worker holds. Truncating to the entry's start therefore leaves
+ * the pack exactly as it was after the previous entry, and the next one is
+ * written where this one began. A crash anywhere in here leaves an
+ * unsealed staging file that the next backup sweeps, as for any crash
+ * mid-pack, and the loose object untouched apart from the skip mark: it is
+ * only ever read here, and unlink_loose_batch removes only what
+ * idx_entries lists.
+ *
+ * The truncated bytes did reach the file, so they are counted, apart from
+ * the pack accounting they never became part of.
+ */
+static status_t pw_abandon_entry(pack_writer_t *pw, pack_unified_ctx_t *ctx,
+                                 const pack_obj_meta_t *m, off_t entry_start)
+{
+    if (fflush(pw->dat_f) != 0)
+        return set_error_errno(ERR_IO, "pack: cannot flush an abandoned entry");
+    off_t end = ftello(pw->dat_f);
+    if (end < entry_start)
+        return set_error(ERR_IO, "pack: abandoned entry ends before it starts");
+    if (ftruncate(fileno(pw->dat_f), entry_start) != 0)
+        return set_error_errno(ERR_IO, "pack: cannot truncate an abandoned entry");
+    if (fseeko(pw->dat_f, entry_start, SEEK_SET) != 0)
+        return set_error_errno(ERR_IO, "pack: cannot rewind past an abandoned entry");
+    store_count_write(pw->store, STORE_WR_PACK_ABANDONED, (uint64_t)(end - entry_start));
+
+    mark_loose_skip(pw->store, m->hash, m->compressed_size);
+    atomic_fetch_add(&ctx->prog->skipped, 1);
+    return OK;
+}
+
 /* Write a large object (streamed from fd). */
 static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                                 pack_obj_meta_t *m, int fd)
@@ -2862,7 +2929,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
     uint64_t actual_compressed_size = m->compressed_size;
     uint32_t running_crc = 0;
-    uint8_t *stream_buf = malloc(256 * 1024);
+    uint8_t *stream_buf = malloc(PACK_LARGE_CHUNK);
     if (!stream_buf) return ERR_NOMEM;
     status_t st = OK;
 
@@ -2880,7 +2947,7 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
     if (m->compression == COMPRESS_NONE) {
         /* LZ4F streaming compression */
         LZ4F_cctx *cctx = NULL;
-        size_t comp_bound = LZ4F_compressBound((256 * 1024), NULL);
+        size_t comp_bound = LZ4F_compressBound(PACK_LARGE_CHUNK, NULL);
         uint8_t *comp_out = malloc(comp_bound);
         LZ4F_errorCode_t lz4err = LZ4F_createCompressionContext(&cctx, LZ4F_VERSION);
 
@@ -2965,10 +3032,50 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
             }                                                                 \
         } while (0)
 
+        /*
+         * LZ4's output is held back in io_buf, which only pw_write_small
+         * uses and is idle here, until it would overflow those 16 MiB. An
+         * entry abandoned before then - a header in front of media, the case
+         * this exists for, whose verdict comes a few MiB past the probe -
+         * never reaches the pack at all. Holding only until the first window
+         * passed was not enough: a 1 MiB header that compresses to almost
+         * nothing leaves the first window at 0.88, just under the threshold,
+         * and the verdict lands one read later with 8 MiB already written.
+         * An abandon after the overflow (a long compressible stretch, then
+         * not) finds its bytes written and truncates them. Holding back only
+         * defers PW_EMIT, and PW_EMIT is order-preserving, so the cipher
+         * stream, CRC and parity see exactly the bytes they would have.
+         */
+        uint8_t *held     = pw->io_buf;
+        size_t   held_len = 0;
+        int      holding  = held != NULL;
+        #define PW_OUT(buf, n) do {                                           \
+            size_t _o = (n);                                                  \
+            if (holding && held_len + _o <= (size_t)PACK_STREAM_THRESHOLD) {  \
+                memcpy(held + held_len, (buf), _o);                           \
+                held_len += _o;                                               \
+            } else {                                                          \
+                if (holding) { PW_EMIT(held, held_len); holding = 0; }        \
+                PW_EMIT((buf), _o);                                           \
+            }                                                                 \
+        } while (0)
+
         /* LZ4 frame header */
         size_t hdr_sz = LZ4F_compressBegin(cctx, comp_out, comp_bound, NULL);
         if (LZ4F_isError(hdr_sz)) st = ERR_IO;
-        else PW_EMIT(comp_out, hdr_sz);
+        else PW_OUT(comp_out, hdr_sz);
+
+        /*
+         * The window: input and output sizes of the reads past the probe
+         * region, oldest first, trimmed so they cover PACK_BAIL_WINDOW of
+         * input and no more. LZ4F holds back a partial 64 KiB block between
+         * calls, so a slot's output can lag its input by up to one block;
+         * over 8 MiB that is under 1%.
+         */
+        uint32_t win_in[PACK_BAIL_SLOTS], win_out[PACK_BAIL_SLOTS];
+        size_t   win_head = 0, win_n = 0;
+        uint64_t win_in_sum = 0, win_out_sum = 0, fed = 0;
+        int      abandon = 0;
 
         /* Stream: read -> decrypt -> compress -> encrypt -> write */
         uint64_t remaining = plain_remaining;
@@ -2976,8 +3083,11 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
             /* Packing a multi-gigabyte loose object takes as long as storing
              * it did; a cancel must not wait for the whole of it. */
             if (store_cancelled(pw->store)) { st = ERR_BUSY; break; }
-            size_t want = (remaining > (256 * 1024))
-                          ? (256 * 1024) : (size_t)remaining;
+            /* The first read ends at the probe region, which the probe has
+             * already judged, so the window measures only what follows. */
+            size_t cap  = fed < PACK_PROBE_SIZE ? (size_t)(PACK_PROBE_SIZE - fed)
+                                                : (size_t)PACK_LARGE_CHUNK;
+            size_t want = (remaining > cap) ? cap : (size_t)remaining;
             ssize_t got = read(fd, stream_buf, want);
             if (got <= 0) {
                 if (got < 0 && errno == EINTR) continue;
@@ -2991,32 +3101,64 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
             size_t out_sz = LZ4F_compressUpdate(cctx, comp_out, comp_bound,
                                                 stream_buf, (size_t)got, NULL);
             if (LZ4F_isError(out_sz)) { st = ERR_IO; break; }
-            PW_EMIT(comp_out, out_sz);
+            PW_OUT(comp_out, out_sz);
             if (st != OK) break;
             atomic_fetch_add(&ctx->prog->bytes, (uint64_t)got);
             remaining -= (uint64_t)got;
+
+            int past_probe = fed >= PACK_PROBE_SIZE;
+            fed += (uint64_t)got;
+            if (!past_probe) continue;
+
+            if (win_n == PACK_BAIL_SLOTS) {
+                win_in_sum  -= win_in[win_head];
+                win_out_sum -= win_out[win_head];
+                win_head = (win_head + 1) % PACK_BAIL_SLOTS;
+                win_n--;
+            }
+            size_t slot = (win_head + win_n) % PACK_BAIL_SLOTS;
+            win_in[slot]  = (uint32_t)got;
+            win_out[slot] = (uint32_t)out_sz;
+            win_in_sum   += (uint64_t)got;
+            win_out_sum  += (uint64_t)out_sz;
+            win_n++;
+            while (win_n > 1 && win_in_sum - win_in[win_head] >= PACK_BAIL_WINDOW) {
+                win_in_sum  -= win_in[win_head];
+                win_out_sum -= win_out[win_head];
+                win_head = (win_head + 1) % PACK_BAIL_SLOTS;
+                win_n--;
+            }
+            if (win_in_sum < PACK_BAIL_WINDOW) continue;
+
+            if ((double)win_out_sum >= PACK_RATIO_THRESHOLD * (double)win_in_sum) {
+                abandon = 1;
+                break;
+            }
         }
 
         /* The loose object's tag closes its stream. Checking it here is the
          * only chance to notice that what we just packed was not what was
          * stored; past this point the plaintext is already compressed. */
-        if (st == OK && dec) {
+        if (st == OK && !abandon && dec) {
             uint8_t in_tag[OBJECT_CRYPT_TAG_BYTES];
             if (read_full_fd(fd, in_tag, sizeof(in_tag)) != 0 ||
                 object_crypt_stream_finish(dec, NULL, in_tag) != OK)
                 st = ERR_CORRUPT;
         }
 
-        if (st == OK) {
+        if (st == OK && !abandon) {
             /* LZ4 frame footer */
             size_t end_sz = LZ4F_compressEnd(cctx, comp_out, comp_bound, NULL);
             if (LZ4F_isError(end_sz)) st = ERR_IO;
-            else PW_EMIT(comp_out, end_sz);
+            else PW_OUT(comp_out, end_sz);
         }
+        /* Whatever is still held goes out before the tag, which follows it
+         * on disk. */
+        if (st == OK && !abandon && holding) { PW_EMIT(held, held_len); holding = 0; }
 
         /* Our own tag lands after the payload, inside compressed_size, so
          * every offset stays a plain byte count. */
-        if (st == OK && enc) {
+        if (st == OK && !abandon && enc) {
             uint8_t out_tag[OBJECT_CRYPT_TAG_BYTES];
             if (object_crypt_stream_finish(enc, out_tag, NULL) != OK) st = ERR_IO;
             else {
@@ -3031,12 +3173,21 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
             }
         }
 
+        #undef PW_OUT
         #undef PW_EMIT
 
         object_crypt_stream_free(dec);
         object_crypt_stream_free(enc);
         free(comp_out);
         LZ4F_freeCompressionContext(cctx);
+
+        if (st == OK && abandon) {
+            st = pw_abandon_entry(pw, ctx, m, ehdr_offset);
+            free(stream_buf);
+            rs_parity_stream_destroy(ps);
+            free(ps);
+            return st;
+        }
 
         if (st != OK) goto done;
 
@@ -3700,21 +3851,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
                             if (csz > 0 &&
                                 (double)csz / (double)probe_len >= PACK_RATIO_THRESHOLD) {
                                 skip = 1;
-                                char phex[OBJECT_HASH_SIZE * 2 + 1];
-                                object_hash_to_hex(lm->hash, phex);
-                                char ppath[PATH_MAX];
-                                if (path_fmt(ppath, sizeof(ppath),
-                                             "%s/objects/%.2s/%s", store_root(store), phex, phex + 2) == 0) {
-                                    uint8_t sv = PROBER_VERSION;
-                                    int wfd = open(ppath, O_RDWR);
-                                    if (wfd >= 0) {
-                                        ssize_t pw = pwrite(wfd, &sv, 1,
-                                                            offsetof(object_header_t, pack_skip_ver));
-                                        (void)pw;
-                                        update_loose_header_parity(wfd, lm->compressed_size);
-                                        close(wfd);
-                                    }
-                                }
+                                mark_loose_skip(store, lm->hash, lm->compressed_size);
                             }
                             free(cbuf);
                         }

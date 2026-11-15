@@ -463,13 +463,14 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     const uint64_t *w = res->written.bytes;
     double lb = res->bytes_logical ? (double)res->bytes_logical : 1.0;
     printf("      written %.1f MiB = %.3f x content: loose %.1f + parity %.1f, "
-           "packs %.1f + parity %.1f, spill %.1f, discarded %.1f; "
+           "packs %.1f + parity %.1f, spill %.1f, discarded %.1f, abandoned %.1f; "
            "of which pack pass %.1f (%" PRIu64 " packed)\n",
            (double)res->written_total / 1048576.0, (double)res->written_total / lb,
            (double)w[STORE_WR_LOOSE] / 1048576.0, (double)w[STORE_WR_LOOSE_PARITY] / 1048576.0,
            (double)w[STORE_WR_PACK] / 1048576.0, (double)w[STORE_WR_PACK_PARITY] / 1048576.0,
            (double)w[STORE_WR_PARITY_SPILL] / 1048576.0,
            (double)w[STORE_WR_LOOSE_DISCARD] / 1048576.0,
+           (double)w[STORE_WR_PACK_ABANDONED] / 1048576.0,
            (double)res->written_sweep / 1048576.0, res->sweep_packed);
     if (wb1 >= wb0 && wb1)
         printf("      /proc/self/io write_bytes %.1f MiB = %.3f x content "

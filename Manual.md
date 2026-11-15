@@ -736,7 +736,8 @@ flowchart TD
    over 16 MiB. A backup of small files therefore leaves no loose objects
    with the key on or off, and a `pack` straight after it finds nothing to
    do. A large incompressible object stays loose for good either way: the
-   probe marks it once and no pack run moves it (section 12).
+   probe, or the pack step's check on the rest of the file, marks it once
+   and no pack run moves it (section 12).
 
 What is captured: regular files (sparse or not), directories, symlinks,
 hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
@@ -1240,7 +1241,16 @@ states.
 16 MiB straight into packs. Anything larger is written as one loose file,
 and the pack step then reads its first 64 KiB: if that does not compress
 (video, audio, disk images, encrypted or already-compressed archives) the
-object is marked and is never packed, by this or any later `pack` run. It is
+object is marked and is never packed, by this or any later `pack` run. A
+file whose head compresses and whose body does not (a container header or a
+thumbnail in front of compressed media) is caught as it is packed: the pack
+step measures what compression achieves over the last 8 MiB it read, and
+once that is no better than the probe's threshold it abandons the entry,
+takes it back off the pack it was writing, and marks the object the same
+way. Abandoned before its compressed output passes 16 MiB, as a header in
+front of media is, nothing of it reaches the pack; the backup's
+`bytes_written_pack_abandoned` counts what a later abandon had to take back
+(docs/api.md). It is
 stored raw with its parity trailer, so `stats` and `summary` keep counting
 it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 (section 18.1). That is deliberate: rewriting gigabytes into a pack would

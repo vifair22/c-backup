@@ -1513,11 +1513,13 @@ static void log_written(const backup_result_t *r)
                  ? (double)r->written_total / (double)r->bytes_logical : 0.0;
     log_info("backup: wrote %.1f MiB for %.1f MiB of content (%.3fx): "
              "loose %.1f + parity %.1f, packs %.1f + parity %.1f, "
-             "parity spill %.1f, discarded duplicates %.1f; pack pass %.1f MiB",
+             "parity spill %.1f, discarded duplicates %.1f, "
+             "abandoned pack entries %.1f; pack pass %.1f MiB",
              (double)r->written_total / mib, (double)r->bytes_logical / mib, ratio,
              (double)w[STORE_WR_LOOSE] / mib, (double)w[STORE_WR_LOOSE_PARITY] / mib,
              (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib,
              (double)w[STORE_WR_PARITY_SPILL] / mib, (double)w[STORE_WR_LOOSE_DISCARD] / mib,
+             (double)w[STORE_WR_PACK_ABANDONED] / mib,
              (double)r->written_sweep / mib);
 }
 

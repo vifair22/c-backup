@@ -6,6 +6,37 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - The pack pass bails out inside an entry (OWN-27)
+
+The pack-pass half of the streaming bail-out proposed below ("Until the
+write-once path exists, the same window helps today's pack pass"), built.
+`pw_write_large` reads the 64 KiB the probe judged first, then tracks LZ4's
+output over the trailing 8 MiB of input (`PACK_BAIL_WINDOW`); at a ratio of
+0.90 or more (`PACK_RATIO_THRESHOLD`) it abandons the entry: truncates the
+staging pack back to the entry's start, skip-marks the loose object and
+leaves it loose. Output is held in the worker's idle 16 MiB read buffer
+until it would overflow, so an object abandoned before then writes nothing
+to the pack. A new write counter, `bytes_written_pack_abandoned`, counts
+what a later abandon truncates.
+
+Holding only until the first window passed was the first version, and
+`-H` showed why it was not enough: bench_phases' 1 MiB head is one line
+repeated, which LZ4 takes to almost nothing, so the first window holds it
+at 7.06 / 8 = 0.88, under the threshold, and the verdict came one read
+later with the window already written: 58.6 MiB truncated over 8 files.
+
+Same machine and command as the `-H 8` row below (`-n 0 -l 0 -t 0 -H 8
+-m 1024 -c -R`, repository on /home, NVMe), single run:
+
+| Case | Wall | Written / content | /proc write_bytes / content | pack-sweep |
+|---|---:|---:|---:|---:|
+| `-H 8` head-text, before | 20.97 s | 2.133 | 2.142 | 14.47 s |
+| `-H 8` head-text, OWN-27 | **7.36 s** | **1.067** | 1.068 | **0.13 s** |
+
+1.067x is the loose copy and its parity, nothing else: the same as `-l 8`
+random. The 0.13 s is LZ4 over each file's first 8 MiB or so and nothing
+written; the next backup's sweep skips all eight on the mark (0.1 ms).
+
 ## 2026-11-15 - What a first backup writes, by path (B086, reopened)
 
 UAT FS2 (15.24 GB, 1,605 files over NFS; repository and state.db on btrfs
