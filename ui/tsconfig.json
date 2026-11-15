@@ -10,7 +10,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
-    "outDir": "dist",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
     "paths": {
       "@main/*": ["./src/main/*"],
       "@renderer/*": ["./src/renderer/*"],

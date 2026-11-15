@@ -27,6 +27,32 @@ export class DaemonUnreachableError extends Error {
   }
 }
 
+/*
+ * Network failures that mean "nothing answered there", as opposed to a
+ * request that reached a daemon and failed. Only ENOENT and ECONNREFUSED
+ * counted before, which is all a unix socket produces; a remote host that is
+ * down, unroutable or misspelled surfaced as a raw transport error instead.
+ */
+const UNREACHABLE = new Set([
+  'ENOENT', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EHOSTDOWN',
+  'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET',
+])
+
+/*
+ * How long a remote request may sit idle before it is abandoned. Without one
+ * a host that drops packets holds the request for as long as the kernel keeps
+ * retrying, which leaves the sidebar on "connecting" for minutes. Every route
+ * answers well inside this; long work runs as a job and is polled.
+ */
+const REMOTE_IDLE_TIMEOUT_MS = 30_000
+
+/* Said when a remote daemon has no admin password yet. Setup is accepted only
+ * over the daemon's own socket, so the fix is on that host, not in this app. */
+export function notConfiguredMessage(target: string): string {
+  return `the daemon at ${target} has no admin password yet. ` +
+    `Set one on that host with 'c-backup auth setup', then connect again.`
+}
+
 export class DaemonClient {
   private config: ConnectionConfig
   private token?: string
@@ -103,15 +129,22 @@ export class DaemonClient {
       })
 
       req.on('error', (err: NodeJS.ErrnoException) => {
-        // ENOENT and ECONNREFUSED both mean nothing is listening, which is a
-        // different problem from a request that failed, and the UI should say
-        // so rather than showing a transport error.
-        if (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') {
+        // Nothing answering is a different problem from a request that
+        // failed, and the UI should say so rather than show a transport error.
+        if (err.code && UNREACHABLE.has(err.code)) {
           reject(new DaemonUnreachableError(this.target(), err.code))
         } else {
           reject(err)
         }
       })
+
+      if (this.config.type === 'remote') {
+        req.setTimeout(REMOTE_IDLE_TIMEOUT_MS, () => {
+          const e: NodeJS.ErrnoException = new Error('timed out')
+          e.code = 'ETIMEDOUT'
+          req.destroy(e)
+        })
+      }
 
       if (payload) req.write(payload)
       req.end()
@@ -132,11 +165,29 @@ export class DaemonClient {
     const res = await this.request<{ token?: string }>('POST', '/api/auth/login', {
       password,
     })
+    if (res.status === 403) {
+      throw new Error(notConfiguredMessage(this.target()))
+    }
     if (res.status !== 200 || !res.body?.token) {
       throw new Error('login failed: check the admin password')
     }
     this.token = res.body.token
     return res.body.token
+  }
+
+  /* Revoke the current session on the daemon. Best effort: a token the daemon
+   * no longer knows is as signed out as it gets. */
+  async logout(): Promise<void> {
+    if (!this.token) return
+    try {
+      await this.request('POST', '/api/auth/logout')
+    } finally {
+      this.token = undefined
+    }
+  }
+
+  hasToken(): boolean {
+    return !!this.token
   }
 
   async isSetup(): Promise<boolean> {

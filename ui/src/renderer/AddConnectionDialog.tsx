@@ -48,6 +48,14 @@ export function AddConnectionDialog({
       setError('a host is required')
       return
     }
+    if (type === 'remote' && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+      setError('the port must be a number from 1 to 65535')
+      return
+    }
+    if (type === 'local' && !socketPath.trim().startsWith('/')) {
+      setError('the socket path must be absolute')
+      return
+    }
     onAdd(
       type === 'local'
         ? { type: 'local', name: name.trim(), socketPath: socketPath.trim() }
@@ -135,7 +143,8 @@ export function AddConnectionDialog({
             </label>
             <p className="mb-3 text-xs text-zinc-500">
               You will be asked for the daemon's admin password when connecting.
-              The token it returns is kept in the system keychain.
+              The daemon listens on loopback only unless its http.bind is set
+              to an address this machine can reach.
             </p>
           </>
         )}

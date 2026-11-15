@@ -1,13 +1,15 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { ConnectionManager } from './connection-manager'
-import { loadConfig, loadCredentials, updateWindowBounds } from './config-store'
+import {
+  loadConfig, loadCredentials, updateWindowBounds, credentialInfo, electronConnectionStore,
+} from './config-store'
 import { IPC } from '../shared/types'
 import type { ConnectionConfig } from '../shared/types'
 import type { ApiRequest } from '../shared/api'
 
 let mainWindow: BrowserWindow | null = null
-const connectionManager = new ConnectionManager()
+const connectionManager = new ConnectionManager(electronConnectionStore)
 
 function createWindow(): void {
   const config = loadConfig()
@@ -54,8 +56,9 @@ app.whenReady().then(() => {
   const config = loadConfig()
   loadCredentials()
 
-  // Restore connections and repos from config
-  connectionManager.restoreFromConfig(config.connections)
+  // Restore connections from config. Local ones, and remote ones with a
+  // stored session, connect on their own.
+  void connectionManager.restoreFromConfig(config.connections)
 
   registerIpcHandlers()
   createWindow()
@@ -83,18 +86,16 @@ function registerIpcHandlers(): void {
     return connectionManager.removeConnection(name)
   })
 
-  ipcMain.handle(IPC.CONNECTION_CONNECT, async (_e, name: string, credentials?: { password?: string; sudoPassword?: string; save?: boolean }) => {
+  ipcMain.handle(IPC.CONNECTION_CONNECT, async (_e, name: string, credentials?: { password?: string; remember?: boolean }) => {
     return connectionManager.connect(name, credentials)
   })
 
-  ipcMain.handle(IPC.CREDENTIAL_HAS, async (_e, name: string) => {
-    return connectionManager.canAutoConnect(name)
+  ipcMain.handle(IPC.CONNECTION_SIGN_OUT, async (_e, name: string) => {
+    return connectionManager.signOut(name)
   })
 
-  ipcMain.handle(IPC.CREDENTIAL_DELETE, async (_e, name: string) => {
-    const { deleteCredentials: delCreds } = await import('./config-store')
-    delCreds(name)
-    return { ok: true }
+  ipcMain.handle(IPC.CREDENTIAL_INFO, async () => {
+    return credentialInfo()
   })
 
   ipcMain.handle(IPC.CONNECTION_DISCONNECT, async (_e, name: string) => {
@@ -117,32 +118,15 @@ function registerIpcHandlers(): void {
     return connectionManager.restartConnection(name)
   })
 
-  ipcMain.handle(IPC.REPO_INIT, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.initRepo(connectionName, repoPath)
-  })
-
-  ipcMain.handle(IPC.REPO_EDIT, async (_e, connectionName: string, oldPath: string, newPath: string) => {
-    return connectionManager.editRepo()
-  })
-
   ipcMain.handle(IPC.REPO_ADD, async (_e, connectionName: string, repoPath: string) => {
     return connectionManager.addRepo(connectionName, repoPath)
   })
 
-  ipcMain.handle(IPC.REPO_REMOVE, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.removeRepo(connectionName, Number(repoPath))
-  })
-
-  ipcMain.handle(IPC.REPO_OPEN, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.openRepo(connectionName, Number(repoPath))
-  })
-
-  ipcMain.handle(IPC.REPO_CLOSE, async (_e, connectionName: string, repoPath: string) => {
-    return connectionManager.closeRepo(connectionName, Number(repoPath))
+  ipcMain.handle(IPC.REPO_REMOVE, async (_e, connectionName: string, repoId: number) => {
+    return connectionManager.removeRepo(connectionName, repoId)
   })
 
   ipcMain.handle(IPC.API_CALL, async (_e, connectionName: string, req: ApiRequest) => {
     return connectionManager.apiCall(connectionName, req)
   })
-
 }

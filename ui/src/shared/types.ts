@@ -2,8 +2,6 @@
 /* Connection types                                                    */
 /* ------------------------------------------------------------------ */
 
-export type ConnectionType = 'local' | 'ssh'
-
 /*
  * A connection is a c-backupd instance, not a machine to run a binary on.
  *
@@ -26,9 +24,6 @@ export interface RemoteConnectionConfig {
   name: string
   host: string
   port: number
-  /** Identifier for the bearer token in Electron safeStorage. The token
-   *  itself is never written to the config file. */
-  tokenId?: string
 }
 
 export type ConnectionConfig = LocalConnectionConfig | RemoteConnectionConfig
@@ -40,6 +35,26 @@ export interface ConnectionState {
   status: ConnectionStatus
   error?: string
   repos: RepoState[]
+  /** A remote daemon is waiting for the admin password: none is stored, or
+   *  the stored session was refused. The UI prompts rather than retrying. */
+  needsCredentials?: boolean
+  /** A session token is stored for this connection, so it can reconnect at
+   *  startup without asking and "Sign out" has something to revoke. */
+  signedIn?: boolean
+}
+
+/** Outcome of a connect attempt, for the renderer to act on. */
+export interface ConnectResult {
+  ok: boolean
+  error?: string
+  needsCredentials?: boolean
+}
+
+/** What the credential store can promise, so the sign-in dialog can say it. */
+export interface CredentialInfo {
+  /** Tokens are encrypted with the OS keyring. When false they are still
+   *  kept, base64 in a file only this account can read, and the UI says so. */
+  encrypted: boolean
 }
 
 /* ------------------------------------------------------------------ */
@@ -70,12 +85,6 @@ export interface DaemonInfo {
   version: string
 }
 
-export interface RpcResponse<T = unknown> {
-  status: 'ok' | 'error'
-  data?: T
-  message?: string
-}
-
 /* ------------------------------------------------------------------ */
 /* App config (persisted to disk)                                      */
 /* ------------------------------------------------------------------ */
@@ -101,13 +110,10 @@ export const IPC = {
   CONNECTION_EDIT: 'connection:edit',
   CONNECTION_RESTART: 'connection:restart',
 
-  // Repo management
+  // Repo management. Registration creates the directory and marker when it
+  // does not exist, so adding and creating are one operation.
   REPO_ADD: 'repo:add',
   REPO_REMOVE: 'repo:remove',
-  REPO_INIT: 'repo:init',
-  REPO_EDIT: 'repo:edit',
-  REPO_OPEN: 'repo:open',
-  REPO_CLOSE: 'repo:close',
 
   /*
    * The typed entry point. One channel rather than one per operation,
@@ -117,11 +123,7 @@ export const IPC = {
    */
   API_CALL: 'api:call',
 
-  /* The old action-string passthrough, on its way out. Every component
-   * still using it is a component that has not been migrated; it goes when
-   * the last one has. */
-
-  // Credential management
-  CREDENTIAL_HAS: 'credential:has',
-  CREDENTIAL_DELETE: 'credential:delete',
+  // Credentials. Sign-out revokes the session on the daemon and forgets it.
+  CREDENTIAL_INFO: 'credential:info',
+  CONNECTION_SIGN_OUT: 'connection:signOut',
 } as const
