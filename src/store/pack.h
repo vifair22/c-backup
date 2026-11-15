@@ -38,6 +38,19 @@
 #define PACK_STREAM_THRESHOLD ((uint64_t)(16 * 1024 * 1024))
 
 /*
+ * The seal: the body size a pack is closed at. When adding the next entry
+ * would take a pack past it, the pack is installed and another started.
+ * Every writer seals here - backup, pack, coalescing, gc's rewrite and
+ * replication - so a pack holds at most this much plus, when one entry is
+ * itself larger, that one entry.
+ *
+ * Packs larger than this exist anyway and every reader accepts them: a
+ * backup before OWN-16 and a replication before OWN-19 wrote one pack per
+ * run or per snapshot, of any size.
+ */
+#define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
+
+/*
  * Pack all loose objects into a new pack file.
  * *out_packed (may be NULL) receives the number of objects packed.
  */
@@ -158,6 +171,13 @@ int pack_stored_has(const pack_stored_writer_t *w,
                     const uint8_t hash[OBJECT_HASH_SIZE]);
 
 uint32_t pack_stored_count(const pack_stored_writer_t *w);
+
+/* Would adding an entry storing len bytes take the open pack past the seal
+ * (PACK_MAX_MULTI_BYTES)? Never true of an empty pack, so an entry larger
+ * than the seal still goes in, alone. The writer does not roll over by
+ * itself: a caller that has promised its objects are durable before it
+ * says so (replication) has to install each pack at a point it chooses. */
+int pack_stored_full(const pack_stored_writer_t *w, uint64_t len);
 
 /* The number the pack will be installed under. Read it before finish, which
  * frees the writer. */

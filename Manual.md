@@ -1340,11 +1340,14 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
-- **Whole snapshots only.** Each snapshot's new objects are written as one
-  pack and synced to disk before the snapshot's record is written, so a
-  snapshot the replica lists is one it can restore. If writing a pack
+- **Whole snapshots only.** Each snapshot's new objects are written into
+  packs sealed at 256 MiB, the size a backup seals at, and every one of
+  them is synced to disk before the snapshot's record is written, so a
+  snapshot the replica lists is one it can restore. A large snapshot fills
+  several packs, each installed as it fills. If installing any of them
   fails, the job fails naming the snapshot, and that snapshot and the ones
-  after it are not recorded. A run that is cancelled, fails or is killed
+  after it are not recorded; the packs that did go in are reused by the
+  next run rather than sent again. A run that is cancelled, fails or is killed
   part-way leaves the replica openable and verify-clean with the snapshots
   it finished; the next run skips those and carries on. Objects it had
   staged for an unfinished snapshot are either kept (reused by the next

@@ -102,11 +102,7 @@ typedef struct {
 
 #define PACK_WORKER_THREADS_MAX 32
 
-/* Maximum body size for multi-object packs.  When adding the next object
- * would exceed this limit, the current pack is finalized and a new one is
- * started.  Both large (streamed) and small (worker-compressed) objects
- * are batched into shared packs up to this cap. */
-#define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
+/* PACK_MAX_MULTI_BYTES, the seal, is in pack.h. */
 
 /*
  * The relationship, not the numbers, is what matters. A pack is sealed when
@@ -2132,6 +2128,7 @@ struct pack_stored_writer {
     pack_idx_disk_entry_t *entries;
     uint32_t               count;
     uint32_t               cap;
+    uint64_t               body;   /* entry bytes written, headers included */
 
     staged_set_t           seen;
 };
@@ -2211,6 +2208,15 @@ int pack_stored_has(const pack_stored_writer_t *w,
 uint32_t pack_stored_count(const pack_stored_writer_t *w)
 {
     return w ? w->count : 0;
+}
+
+/* The same test pack_backup_full makes, against the same seal. The caller
+ * knows the stored size exactly, so there is no headroom to guess at: a pack
+ * goes over the seal only when a single entry is larger than the seal. */
+int pack_stored_full(const pack_stored_writer_t *w, uint64_t len)
+{
+    if (!w || w->count == 0) return 0;
+    return w->body + sizeof(pack_dat_entry_hdr_t) + len > PACK_MAX_MULTI_BYTES;
 }
 
 status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
@@ -2329,6 +2335,7 @@ status_t pack_stored_add(pack_stored_writer_t *w,
     staged_set_insert(&w->seen, hash, w->count);
 
     w->count++;
+    w->body += sizeof(eh) + len;
     return OK;
 }
 
