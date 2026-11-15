@@ -35,16 +35,15 @@ typedef struct {
 /*
  * GFS (Grandfather-Father-Son) retention engine.
  *
- * GFS boundaries are fixed to standard calendar days (UTC):
- *   daily   — last backup of each calendar day
- *   weekly  — Sunday's daily is promoted to weekly
- *   monthly — last Sunday of the month's weekly is promoted to monthly
- *   yearly  — December's monthly is promoted to yearly
- *
- * After each backup run, gfs_run():
- *   1. Detects which boundaries were crossed by the new snapshot
- *   2. Flags the appropriate snap(s) with GFS tier bits
- *   3. Prunes non-GFS snaps outside the snapshot retention window
+ * Periods are local calendar days on the daemon's host:
+ *   daily   - the last snapshot of each day
+ *   weekly  - the last daily of each Monday-Sunday week
+ *   monthly - the last weekly of each month
+ *   yearly  - the last monthly of each year
+ * A period still in progress elects its latest snapshot so far, so the
+ * newest snapshot holds every tier. Each pass recomputes every snapshot's
+ * tiers from nothing, flushes the ones that changed, then prunes what no
+ * tier, recency window or tag keeps. Manual section 9.1 is the contract.
  */
 
 /* Working record for a single snapshot during GFS processing */
@@ -55,23 +54,6 @@ typedef struct {
     int      preserved;   /* protected by a preserved tag */
 } gfs_snap_info_t;
 
-/*
- * Main entry point.  Call after each successful backup_run_opts.
- * new_snap_id is the ID just committed (== HEAD).
- */
-/*
- * full_scan=0: incremental — process only windows closed since the
- *              previous snapshot.
- * full_scan=1: clear all existing GFS flags and recompute from scratch
- *              across the full history.  Use for manual `backup gfs` runs.
- */
-/*
- * Ported to the database in Phase 6. The calendar boundaries and the tier
- * promotion algorithm are unchanged; only where the data comes from and
- * where the results go have moved. Retention counters come from
- * policy_values, tier flags are a column, and pruning is a transactional
- * row delete rather than an unlink.
- */
 /*
  * What a pass removed, or on a dry run would remove: the snapshot ids, in
  * ascending order, and how many. The caller reports them; a dry run whose
@@ -87,17 +69,14 @@ typedef struct {
 void gfs_result_free(gfs_result_t *r);
 
 /*
- * now is the wall-clock instant the pass treats as the present: every local
- * calendar day before now's is closed and gets its elections. It used to be
- * the newest snapshot's day instead, so the newest snapshot never held a
- * tier however long ago it was taken - a repository whose last backup was
- * last month showed gfs_flags 0 on it after every pass. The daemon passes
- * time(NULL); tests pin it.
+ * new_snap_id is the repository's newest snapshot (the head): it is never
+ * pruned and anchors the keep_snaps window. There is no incremental mode and
+ * no notion of a closed day any more; see the election in gfs.c for why.
  */
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, time_t now, gfs_result_t *out);
+                 gfs_result_t *out);
 
 /* Human-readable GFS tier string, e.g. "daily+weekly+monthly". */
 void gfs_flags_str(uint32_t flags, char *buf, size_t sz);

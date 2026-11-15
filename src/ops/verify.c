@@ -570,18 +570,20 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     if (res.unrecoverable || res.missing)
-        log_error("verify (%s): %llu checked, %llu repaired, %llu recoverable, "
+        log_error("verify (%s%s): %llu checked, %llu repaired, %llu recoverable, "
                   "%llu UNRECOVERABLE, %llu MISSING, affecting %llu file(s)",
-                  level_name(level), (unsigned long long)res.checked,
+                  level_name(level), repair ? "" : ", check only",
+                  (unsigned long long)res.checked,
                   (unsigned long long)res.repaired,
                   (unsigned long long)res.recoverable,
                   (unsigned long long)res.unrecoverable,
                   (unsigned long long)res.missing,
                   (unsigned long long)res.affected_files);
     else
-        log_info("verify (%s): %llu checked, %llu ok, %llu repaired, %llu recoverable, "
+        log_info("verify (%s%s): %llu checked, %llu ok, %llu repaired, %llu recoverable, "
                  "%llu bytes read",
-                 level_name(level), (unsigned long long)res.checked,
+                 level_name(level), repair ? "" : ", check only",
+                 (unsigned long long)res.checked,
                  (unsigned long long)res.ok, (unsigned long long)res.repaired,
                  (unsigned long long)res.recoverable,
                  (unsigned long long)res.bytes_read);

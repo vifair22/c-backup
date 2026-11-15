@@ -20,7 +20,11 @@
  * turns a failure into a wait, and a wait behind a transaction spanning a whole
  * snapshot's node rows would be worse than the failure it replaced. Anything
  * writing per-entry has to commit in batches. See index_nodes and
- * store_content, which both do.
+ * store_content, which both do; store_content also bounds a batch by time
+ * and never holds one across reading a large file, because a batch counted
+ * in entries alone spanned a whole backup of a few large files (B107).
+ * Writers are served in arrival order, so one that is waiting goes before the
+ * holder's next transaction.
  *
  * These wrap the raw statements rather than sitting beside them so the lock
  * cannot drift out of step with the transaction across the many rollback

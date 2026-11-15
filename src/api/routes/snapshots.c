@@ -1207,8 +1207,29 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
             job_set_result(progress_ctx, rj);
         }
     } else if (j->kind == SNAP_JOB_VERIFY) {
+        verify_result_t vr;
+        memset(&vr, 0, sizeof(vr));
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
-                        j->verify_repair, cancel, progress, progress_ctx, NULL);
+                        j->verify_repair, cancel, progress, progress_ctx, &vr);
+        /*
+         * What kind of run it was, on the job (B106). The run record holds
+         * the counts and not the mode, and on a healthy repository a dry
+         * run's counts are identical to a repairing run's, so without this
+         * nothing a client can read says the dry run was one.
+         */
+        const char *lvl = j->verify_level == VERIFY_LEVEL_INDEX     ? "index"
+                        : j->verify_level == VERIFY_LEVEL_STRUCTURE ? "structure"
+                        :                                             "deep";
+        char rid[32];
+        if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
+        else               snprintf(rid, sizeof(rid), "null");
+        char vj[160];
+        snprintf(vj, sizeof(vj),
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 rid, lvl,
+                 j->verify_repair ? "true" : "false",
+                 j->dry_run ? "true" : "false");
+        job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
          * A replica carries the source's identity, so the source's marker is
@@ -1314,12 +1335,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
             head = (uint32_t)strtoul(r->rows[0][0], NULL, 10);
         db_result_free(r);
 
-        /* Manual runs are full scans: an operator asking for GFS explicitly
-         * wants the whole history reconsidered, not the incremental pass the
-         * backup pipeline does. */
+        /* Every pass reconsiders the whole history. */
         gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, time(NULL), &gr)
+                            j->dry_run, 1, &gr)
                   : OK;
         if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
         gfs_result_free(&gr);

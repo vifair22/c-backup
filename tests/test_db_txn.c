@@ -158,6 +158,53 @@ static void test_a_second_writer_waits_instead_of_failing(void **state)
 }
 
 /*
+ * B107: a writer already waiting goes before the holder's next transaction.
+ *
+ * A backup commits one batch and begins the next within microseconds. With a
+ * bare mutex the waiting writer was woken but the backup thread usually took
+ * the lock back first, so a sources write could lose to batch after batch.
+ * Here the holder commits and immediately begins again; the contender, queued
+ * well before that commit, must have finished its own transaction by the
+ * time the holder's second begin returns.
+ */
+static void test_a_waiting_writer_goes_first(void **state)
+{
+    (void)state;
+
+    struct handoff h;
+    memset(&h, 0, sizeof(h));
+    pthread_mutex_init(&h.mu, NULL);
+    pthread_cond_init(&h.cv, NULL);
+    h.contender_status = ERR_IO;
+
+    assert_int_equal(db_txn_begin(db), OK);
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, contender_main, &h), 0);
+    pthread_mutex_lock(&h.mu);
+    h.holder_inside = 1;
+    pthread_cond_broadcast(&h.cv);
+    pthread_mutex_unlock(&h.mu);
+
+    /* Long enough for the contender to be queued in its begin. */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(db_txn_begin(db), OK);
+    pthread_mutex_lock(&h.mu);
+    int done = h.contender_done;
+    pthread_mutex_unlock(&h.mu);
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(pthread_join(t, NULL), 0);
+
+    assert_true(done);
+    assert_int_equal(h.contender_status, OK);
+
+    pthread_mutex_destroy(&h.mu);
+    pthread_cond_destroy(&h.cv);
+}
+
+/*
  * A rollback has to release the lock too, or one failed write wedges every
  * writer for the life of the process. This is the path most easily got wrong,
  * because it is the one no successful run exercises.
@@ -196,6 +243,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_a_second_writer_waits_instead_of_failing, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_waiting_writer_goes_first, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
     };

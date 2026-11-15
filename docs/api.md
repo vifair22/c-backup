@@ -31,9 +31,11 @@ so it does not. **No route returns a whole snapshot.**
 
 `limit` and `offset` must be plain decimal counts: `limit` 1 or more,
 `offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
-400 naming the parameter; they used to be replaced by the defaults, which
-answered a request the server had not understood as if it had. A `limit`
-above a route's maximum is clamped to it. The same goes for filters with a
+400 naming the parameter, and for `limit` the route's range: `limit must be
+a whole number from 1 to 1000 (a larger one is reduced to 1000)`. They used
+to be replaced by the defaults, which answered a request the server had not
+understood as if it had. A `limit` above a route's maximum is clamped to it,
+however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
 fixed set of values: `objects?location=` takes `loose`, `pack` (or
 `packed`) or `all`, and anything else is a 400 rather than an unfiltered
 listing.
@@ -223,10 +225,12 @@ nothing and is not journalled.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
-weekly, 4 monthly, 8 yearly. A retention pass assigns them, for every local
-calendar day the daemon's clock has closed, so a snapshot taken today holds
-none yet; the last snapshot of a closed year holds all four, 15. `materialized` is `false` for a cold snapshot
-whose rows must be faulted back in before it can be browsed.
+weekly, 4 monthly, 8 yearly. Only a retention pass (not a dry run) assigns
+them, recomputing every snapshot's flags each time, by the rules under
+Retention below; the newest snapshot holds all four, 15, as does the last
+snapshot of any year. A snapshot no tier elected shows 0, tagged or not.
+`materialized` is `false` for a cold snapshot whose rows must be faulted
+back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
 has_children}`. `id` is the node id to pass back as `parent`. `hash` is
@@ -518,6 +522,18 @@ writing the correction while already there costs almost nothing extra. Pass
 damage, and for small objects it still distinguishes recoverable damage from
 loss, because it can apply parity in memory without writing.
 
+`dry_run=1` is `repair=0` and nothing else: it overrides `repair`, and it
+does not lower the level, so with no `level` it is a full deep read like a
+plain verify, with the same counts on a healthy repository. The job's
+`result` says which kind of run it was, since the run record does not:
+
+```json
+{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+```
+
+`run_id` is null when the walk did not finish (cancelled or aborted); the
+partial run is still in `GET /repos/<id>/verify`, with `completed` false.
+
 A checking-only verify takes the repository read lock, so a backup can run
 underneath it. With repair on it takes the write lock like any other writer.
 
@@ -567,11 +583,14 @@ newest completed run's `cbackup_verify_unrecoverable_objects` (unrecoverable
 plus missing), `cbackup_verify_repaired_objects`,
 `cbackup_verify_recoverable_objects` and `cbackup_verify_affected_files`.
 
-Packing runs automatically at the end of every backup, because compression
-only happens at pack time: a backup that stopped at the snapshot would have
-written more bytes than it read and left one file per object behind. Set the
-policy key `maintenance.auto_pack` to `false` to turn it off, and use this
-endpoint or a schedule to pack on your own terms instead.
+A backup writes every object of 16 MiB or less straight into a pack, and
+ends with a pack sweep for what it could not: a sparse file's object and an
+object over 16 MiB are written loose and uncompressed, and the sweep packs
+them and coalesces small packs, as this endpoint does. The policy key
+`maintenance.auto_pack` set to `false` skips that sweep and nothing else;
+small objects are packed during the backup either way, so a backup of small
+files leaves nothing loose and a pack after it reports `loose` 0. With the
+key off, use this endpoint or a schedule for the sweep.
 
 ### Sources belong to the repository
 
@@ -592,6 +611,11 @@ that does not exist on the daemon's host is accepted with a warning rather
 than refused, because it may be a share that is not mounted yet, and the
 warning says that a backup fails while it is missing: a backup does not skip
 a missing source, it fails the job (see above).
+
+A `PUT` during a running backup returns promptly; it does not wait for the
+backup (it did, for the whole run, before B107). The new list applies to
+backups submitted after it: a backup reads the sources when it is submitted,
+so one already running or queued keeps the list it was submitted with.
 
 Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
@@ -886,6 +910,29 @@ or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
 `keep_snaps` below 1 still keeps the newest snapshot. Retention runs when
 `/repos/<id>/gfs` is called or a `gfs` schedule fires, never as a side effect
 of a backup.
+
+Tiers, exactly. Periods are local calendar days in the daemon's timezone.
+Within each period the latest snapshot (by timestamp, then id) is elected:
+
+- daily: the last snapshot of each day;
+- weekly: the last daily of each Monday-to-Sunday week;
+- monthly: the last weekly of each month;
+- yearly: the last monthly of each year.
+
+A period still in progress elects its latest snapshot so far, so the newest
+snapshot always holds all four tiers. A later snapshot in the same period
+takes the tier over on the next pass, and the earlier one loses it: every
+pass clears and recomputes the flags of every snapshot. A snapshot counts
+against the count of its highest tier only. Tier `keep_N` keeps the newest
+N snapshots whose highest tier is that tier; so with every count at 1 a pass
+keeps the newest snapshot (yearly), the newest whose highest tier is daily,
+the newest whose highest is weekly, and the newest whose highest is
+monthly, plus the `keep_snaps` window and tagged snapshots.
+
+Tags play no part in electing tiers. A tagged snapshot holds whatever tiers
+it was elected for and counts against them like any other; a tagged
+snapshot no period elected holds none and shows `gfs_flags` 0. Either way
+the tag keeps it.
 
 A retention job's `result` says what it did, and on a dry run
 (`?dry_run=1`) what it would do:
