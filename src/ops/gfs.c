@@ -87,31 +87,12 @@ static int64_t month_start_of(int64_t day) {
     return tm_to_day(&tm);
 }
 
-/* Return the cal_day of the last day of the month containing day. */
-static int64_t month_end_of(int64_t day) {
-    struct tm tm;
-    day_to_tm(day, &tm);
-    tm.tm_mon++;
-    if (tm.tm_mon >= 12) { tm.tm_mon = 0; tm.tm_year++; }
-    tm.tm_mday = 1;
-    return tm_to_day(&tm) - 1;
-}
-
 /* Return the cal_day of Jan 1 of the year containing day. */
 static int64_t year_start_of(int64_t day) {
     struct tm tm;
     day_to_tm(day, &tm);
     tm.tm_mon = 0; tm.tm_mday = 1;
     return tm_to_day(&tm);
-}
-
-/* Return the cal_day of Dec 31 of the year containing day. */
-static int64_t year_end_of(int64_t day) {
-    struct tm tm;
-    day_to_tm(day, &tm);
-    tm.tm_year++;
-    tm.tm_mon = 0; tm.tm_mday = 1;
-    return tm_to_day(&tm) - 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,36 +189,49 @@ static status_t load_snap_infos(cutils_db_t *db, int64_t repo_id, uint32_t head_
 }
 
 /* ------------------------------------------------------------------ */
-/* Election helper                                                     */
+/* Election                                                            */
 /* ------------------------------------------------------------------ */
 
-/*
- * Find the index in snaps[] of the latest snap (highest ts, then
- * highest id as tiebreak) whose cal_day falls in [d_start, d_end].
- * If required_flag != 0, the snap must have that flag set in
- * its current (in-memory) gfs_flags.
- * Returns UINT32_MAX if no qualifying snap is found.
- */
-static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
-                                   int64_t d_start, int64_t d_end,
-                                   uint32_t required_flag) {
-    uint32_t best_idx = UINT32_MAX;
-    uint64_t best_ts  = 0;
-    uint32_t best_id  = 0;
+typedef struct {
+    uint64_t ts;
+    uint32_t id;
+    uint32_t idx;      /* into the snapshot array */
+    int64_t  day;      /* local calendar day */
+} gfs_order_t;
 
-    for (uint32_t i = 0; i < n; i++) {
-        if (required_flag != 0 && !(snaps[i].gfs_flags & required_flag)) continue;
-        int64_t d = cal_day(snaps[i].ts);
-        if (d < d_start || d > d_end) continue;
-        if (snaps[i].ts > best_ts ||
-            (snaps[i].ts == best_ts && snaps[i].id > best_id)) {
-            best_ts  = snaps[i].ts;
-            best_id  = snaps[i].id;
-            best_idx = i;
-        }
-    }
-    return best_idx;
+static int order_cmp(const void *a, const void *b)
+{
+    const gfs_order_t *x = a, *y = b;
+    if (x->ts != y->ts) return x->ts < y->ts ? -1 : 1;
+    if (x->id != y->id) return x->id < y->id ? -1 : 1;
+    return 0;
 }
+
+/*
+ * Elect one tier: within each period (the groups `key` maps days onto), the
+ * latest snapshot that already holds `required` (0 for the daily pass) gains
+ * `flag`. ord[] is in (ts, id) order and every key is monotonic in the day,
+ * so each period is a contiguous run and one backward sweep finds every
+ * period's latest: the first qualifying snapshot met after the key changes.
+ */
+static void elect(gfs_snap_info_t *snaps, const gfs_order_t *ord, uint32_t n,
+                  int64_t (*key)(int64_t), uint32_t required, uint32_t flag)
+{
+    int     have_key = 0;
+    int64_t cur = 0;
+    int     done = 0;   /* the current period already has its winner */
+    for (uint32_t k = n; k-- > 0;) {
+        int64_t kv = key(ord[k].day);
+        if (!have_key || kv != cur) { cur = kv; have_key = 1; done = 0; }
+        if (done) continue;
+        gfs_snap_info_t *sn = &snaps[ord[k].idx];
+        if (required && !(sn->gfs_flags & required)) continue;
+        sn->gfs_flags |= flag;
+        done = 1;
+    }
+}
+
+static int64_t key_day(int64_t d) { return d; }
 
 /* ------------------------------------------------------------------ */
 /* gfs_run                                                             */
@@ -246,7 +240,7 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, time_t now, gfs_result_t *out) {
+                 gfs_result_t *out) {
     /* Empty before any early return, so a caller can always report and
      * free it. */
     if (out) { out->pruned = 0; out->ids = NULL; }
@@ -256,104 +250,61 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint32_t n = 0;
     status_t st = load_snap_infos(db, repo_id, new_snap_id, &snaps, &n);
     if (st != OK) return st;
+    if (n == 0) { free(snaps); return OK; }
 
     /* Save original flags so we can detect what changed at flush time. */
     uint32_t *orig_flags = calloc(n, sizeof(uint32_t));
-    if (!orig_flags) { free(snaps); return set_error(ERR_NOMEM, "gfs_run: alloc orig_flags failed"); }
-    for (uint32_t i = 0; i < n; i++) orig_flags[i] = snaps[i].gfs_flags;
-
-    /* Full scan: clear all in-memory flags; flush will overwrite on disk. */
-    if (full_scan) {
-        for (uint32_t i = 0; i < n; i++) snaps[i].gfs_flags = 0;
+    gfs_order_t *ord = calloc(n, sizeof(*ord));
+    if (!orig_flags || !ord) {
+        free(orig_flags); free(ord); free(snaps);
+        return set_error(ERR_NOMEM, "gfs_run: alloc failed");
     }
-
-    /* Determine scan interval [scan_start_day, scan_end_day).
-     * scan_end_day is exclusive: the current day is not yet closed.
-     * For incremental: start from the day of the most recent surviving
-     * snap before new_snap_id (robust against ID gaps from pruning).
-     * For full scan: start from epoch (day 0). */
-    uint64_t new_ts  = 0;
-    uint64_t prev_ts = 0;
-    uint32_t prev_id = 0;
+    int have_new = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (snaps[i].id == new_snap_id) {
-            new_ts = snaps[i].ts;
-        } else if (snaps[i].id < new_snap_id && snaps[i].id > prev_id) {
-            prev_id = snaps[i].id;
-            prev_ts = snaps[i].ts;
-        }
+        orig_flags[i] = snaps[i].gfs_flags;
+        if (snaps[i].id == new_snap_id) have_new = 1;
+        /* Every pass recomputes every tier from nothing; see below. */
+        snaps[i].gfs_flags = 0;
+        ord[i].ts  = snaps[i].ts;
+        ord[i].id  = snaps[i].id;
+        ord[i].idx = i;
+        ord[i].day = cal_day(snaps[i].ts);
     }
-    if (new_ts == 0) { free(orig_flags); free(snaps); return OK; }
+    if (!have_new) { free(ord); free(orig_flags); free(snaps); return OK; }
+    qsort(ord, n, sizeof(*ord), order_cmp);
 
-    /* The present closes days, not the newest snapshot. A snapshot dated
-     * after now (a clock that went backwards) keeps its own day open rather
-     * than being elected for a day the clock says has not happened. */
-    int64_t scan_end_day   = cal_day(new_ts);
-    if (now > 0) {
-        int64_t today = cal_day((uint64_t)now);
-        if (today > scan_end_day) scan_end_day = today;
-    }
-    int64_t scan_start_day = full_scan ? 0 : cal_day(prev_ts);
-
-    /* Incremental recovery: if any surviving snap on a *closed* day
-     * (i.e., day < scan_end_day) has gfs_flags == 0, an earlier
-     * gfs_run was likely missed (crash, error, interruption).  Extend
-     * scan_start_day backward to cover that snap's day so it gets
-     * flagged on this run.  This makes incremental GFS self-healing. */
-    if (!full_scan) {
-        for (uint32_t i = 0; i < n; i++) {
-            if (snaps[i].gfs_flags != 0) continue;
-            int64_t d = cal_day(snaps[i].ts);
-            if (d < scan_end_day && d < scan_start_day)
-                scan_start_day = d;
-        }
-    }
-
-    /* ---- Pass 1: Daily election ----
-     * For each closed day in the scan interval, elect the latest snap
-     * of that day as the daily anchor. */
-    for (int64_t d = scan_start_day; d < scan_end_day; d++) {
-        uint32_t idx = find_best_in_range(snaps, n, d, d, 0);
-        if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_DAILY;
-    }
-
-    /* ---- Pass 2: Weekly election (Mon–Sun windows) ----
-     * For each complete week whose Sunday falls in the scan interval,
-     * elect the latest daily anchor within that week. */
-    int64_t sun = week_sunday_of(scan_start_day);
-    for (; sun < scan_end_day; sun += 7) {
-        int64_t mon = sun - 6;
-        uint32_t idx = find_best_in_range(snaps, n, mon, sun, GFS_DAILY);
-        if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_WEEKLY;
-    }
-
-    /* ---- Pass 3: Monthly election ----
-     * For each complete month whose last day falls in the scan interval,
-     * elect the latest weekly anchor within that month. */
-    {
-        int64_t ms = month_start_of(scan_start_day);
-        for (;;) {
-            int64_t me = month_end_of(ms);
-            if (me >= scan_end_day) break;
-            uint32_t idx = find_best_in_range(snaps, n, ms, me, GFS_WEEKLY);
-            if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_MONTHLY;
-            ms = me + 1;
-        }
-    }
-
-    /* ---- Pass 4: Yearly election ----
-     * For each complete year whose last day falls in the scan interval,
-     * elect the latest monthly anchor within that year. */
-    {
-        int64_t ys = year_start_of(scan_start_day);
-        for (;;) {
-            int64_t ye = year_end_of(ys);
-            if (ye >= scan_end_day) break;
-            uint32_t idx = find_best_in_range(snaps, n, ys, ye, GFS_MONTHLY);
-            if (idx != UINT32_MAX) snaps[idx].gfs_flags |= GFS_YEARLY;
-            ys = ye + 1;
-        }
-    }
+    /*
+     * Every period elects its latest snapshot, the current one included.
+     *
+     * Daily: the last snapshot of each local calendar day. Weekly: the last
+     * daily of each Monday-Sunday week. Monthly: the last weekly of each
+     * month. Yearly: the last monthly of each year. A day, week, month or
+     * year still in progress elects the latest snapshot so far, so the
+     * newest snapshot always holds all four tiers.
+     *
+     * B094, second round. The first fix closed every day before today and
+     * elected only those, so a snapshot taken today held no tier - and a
+     * tester running a pass with every tier at 1 over a day's worth of
+     * snapshots saw gfs_flags 0 on all of them, newest included. Electing
+     * the open period is safe because nothing is incremental any more:
+     * every pass clears the flags and recomputes them over the whole
+     * history, so a provisional winner that a later backup supersedes loses
+     * the tier on the next pass instead of keeping it alongside the new one.
+     * The incremental mode that would have made that wrong had no caller.
+     *
+     * One sort and four linear sweeps. The old elections walked every day
+     * from 1970 and scanned every snapshot for each, with a localtime_r per
+     * comparison: twenty thousand days times the snapshot count.
+     *
+     * Tags play no part here. A tagged snapshot holds whatever tiers it is
+     * elected for, exactly as an untagged one would; the tag only keeps it
+     * from being pruned, below.
+     */
+    elect(snaps, ord, n, key_day,        0,           GFS_DAILY);
+    elect(snaps, ord, n, week_sunday_of, GFS_DAILY,   GFS_WEEKLY);
+    elect(snaps, ord, n, month_start_of, GFS_WEEKLY,  GFS_MONTHLY);
+    elect(snaps, ord, n, year_start_of,  GFS_MONTHLY, GFS_YEARLY);
+    free(ord);
 
     /* ---- Flush changed flags to disk ---- */
     if (!dry_run) {

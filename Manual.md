@@ -862,20 +862,39 @@ A snapshot is kept if any of these holds:
 
 1. It is among the newest `keep_snaps` snapshots (at least the newest one,
    always).
-2. It holds a tier and is within that tier's count. Each closed calendar day
+2. It holds a tier and is within that tier's count. Each calendar day
    elects its last snapshot as that day's **daily**; the last daily of each
-   week (ending Sunday) becomes the **weekly**, the last weekly of each month
-   the **monthly**, the last monthly of each year the **yearly**. A snapshot
-   can hold several tiers at once and counts against its highest.
+   week (Monday to Sunday) becomes the **weekly**, the last weekly of each
+   month the **monthly**, the last monthly of each year the **yearly**. A
+   snapshot can hold several tiers at once and counts against its highest
+   only: `keep_daily` 7 keeps the newest seven snapshots whose highest tier
+   is daily.
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
-tier. A day closes on the daemon's clock: today is never closed, so a
-snapshot taken today holds no tier until a pass runs tomorrow or later, and a
-repository whose last backup was weeks ago has that snapshot elected like any
-other. Tiers are assigned only by a retention pass, so a repository that has
-never had one shows `gfs_flags` 0 on every snapshot. A reindex keeps the tiers
-the last pass assigned.
+tier.
+
+A day, week, month or year still in progress elects its latest snapshot so
+far, so the newest snapshot always holds all four tiers (`gfs_flags` 15).
+When a later backup lands in the same period, the next pass moves the tier
+to it and the earlier snapshot loses it: every pass clears and recomputes
+every snapshot's tiers. Tiers are assigned only by a retention pass, and a
+dry run assigns none, so a repository that has never had a real pass shows
+`gfs_flags` 0 on every snapshot. A reindex keeps the tiers the last pass
+assigned.
+
+Tags and tiers are independent. A tag does not grant a tier and does not
+hide one: a tagged snapshot holds the tiers it was elected for and counts
+against them like any other, and a tagged snapshot that is not the last of
+any period shows `gfs_flags` 0. The tag keeps it either way.
+
+For example, with every tier count at 1 and `keep_snaps` 1, a pass over
+eighteen daily snapshots, Sunday the 7th to Wednesday the 24th, with the
+second one tagged, keeps four: the newest (all four tiers), the 23rd (the
+newest whose highest tier is daily), Sunday the 21st (the newest whose
+highest is weekly), and the tagged 8th (daily, kept by its tag). Taken all
+on one day instead, the same eighteen leave two: the newest, with every
+tier, and the tagged one, with none.
 
 Days are local calendar days on the daemon's host, in its timezone.
 

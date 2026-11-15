@@ -1314,12 +1314,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
             head = (uint32_t)strtoul(r->rows[0][0], NULL, 10);
         db_result_free(r);
 
-        /* Manual runs are full scans: an operator asking for GFS explicitly
-         * wants the whole history reconsidered, not the incremental pass the
-         * backup pipeline does. */
+        /* Every pass reconsiders the whole history. */
         gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, time(NULL), &gr)
+                            j->dry_run, 1, &gr)
                   : OK;
         if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
         gfs_result_free(&gr);

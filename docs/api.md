@@ -223,10 +223,12 @@ nothing and is not journalled.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
-weekly, 4 monthly, 8 yearly. A retention pass assigns them, for every local
-calendar day the daemon's clock has closed, so a snapshot taken today holds
-none yet; the last snapshot of a closed year holds all four, 15. `materialized` is `false` for a cold snapshot
-whose rows must be faulted back in before it can be browsed.
+weekly, 4 monthly, 8 yearly. Only a retention pass (not a dry run) assigns
+them, recomputing every snapshot's flags each time, by the rules under
+Retention below; the newest snapshot holds all four, 15, as does the last
+snapshot of any year. A snapshot no tier elected shows 0, tagged or not.
+`materialized` is `false` for a cold snapshot whose rows must be faulted
+back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
 has_children}`. `id` is the node id to pass back as `parent`. `hash` is
@@ -890,6 +892,29 @@ or is tagged. Everything else is pruned. A count of 0 keeps all of a tier;
 `keep_snaps` below 1 still keeps the newest snapshot. Retention runs when
 `/repos/<id>/gfs` is called or a `gfs` schedule fires, never as a side effect
 of a backup.
+
+Tiers, exactly. Periods are local calendar days in the daemon's timezone.
+Within each period the latest snapshot (by timestamp, then id) is elected:
+
+- daily: the last snapshot of each day;
+- weekly: the last daily of each Monday-to-Sunday week;
+- monthly: the last weekly of each month;
+- yearly: the last monthly of each year.
+
+A period still in progress elects its latest snapshot so far, so the newest
+snapshot always holds all four tiers. A later snapshot in the same period
+takes the tier over on the next pass, and the earlier one loses it: every
+pass clears and recomputes the flags of every snapshot. A snapshot counts
+against the count of its highest tier only. Tier `keep_N` keeps the newest
+N snapshots whose highest tier is that tier; so with every count at 1 a pass
+keeps the newest snapshot (yearly), the newest whose highest tier is daily,
+the newest whose highest is weekly, and the newest whose highest is
+monthly, plus the `keep_snaps` window and tagged snapshots.
+
+Tags play no part in electing tiers. A tagged snapshot holds whatever tiers
+it was elected for and counts against them like any other; a tagged
+snapshot no period elected holds none and shows `gfs_flags` 0. Either way
+the tag keeps it.
 
 A retention job's `result` says what it did, and on a dry run
 (`?dry_run=1`) what it would do:
