@@ -29,6 +29,7 @@
 #include "routes.h"
 #include "scheduler.h"
 #include "server.h"
+#include "store_index.h"
 
 #ifndef VERSION_STRING
 #define VERSION_STRING "0.0.0-dev"
@@ -140,6 +141,11 @@ int main(int argc, char *argv[])
         appguard_shutdown(guard);
         return 1;
     }
+    /* Nothing is running yet, so any staged object rows belong to a backup
+     * that died with the last process, along with the pack they were in. */
+    if (store_index_drop_staged(db, 0) != OK)
+        log_warn("cannot drop staged objects left by an interrupted backup");
+
     if (!auth_is_setup(db))
         log_warn("no admin password set: TCP serves only the health probes "
                  "until one is, with 'c-backup auth setup' on this host");

@@ -24,6 +24,31 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
                           store_index_t **out);
 void     store_index_free(store_index_t *idx);
 
+/*
+ * An object staged in a pack that is still open is recorded as 'staged', not
+ * 'loose'. Its bytes are in a temporary file that only becomes the pack when
+ * it is sealed, and the seal's commit callback rewrites the location to the
+ * pack. Until then the row is a promise, not a fact.
+ *
+ * Recording it as loose made a crash mid-backup unsafe in a way nothing
+ * reported. The rows committed in batches while the pack was open; the pack
+ * died with the process; and the next backup's file cache found the paths
+ * unchanged, found their objects "present", and wrote a snapshot referencing
+ * bytes that were never on disk - 23,674 files in one measured run, with the
+ * backup reporting success.
+ *
+ * A staged row can outlive its pack only through a crash or an aborted
+ * backup, so they are dropped at daemon start and at the start of every
+ * backup, which holds the repository's write lock.
+ */
+status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint8_t type, uint64_t phys_size, uint64_t orig_size);
+
+/* Drop staged rows left by an interrupted backup: one repository, or every
+ * repository when repo_id is 0. Only safe when no backup is running on it. */
+status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id);
+
 /* Record a loose object. Called by the backup pipeline after a successful
  * write, so the object is findable before any snapshot references it. */
 status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,

@@ -255,6 +255,19 @@ static int scan_path_cmp(const void *a, const void *b)
  * shared-DB-handle pattern that has starved the daemon before; hashing the
  * few bytes locally and remembering the answer makes repeats free.
  */
+/*
+ * Record a stored object in the index: staged when it went into the open
+ * pack, loose when it went to its own file. See store_index_put_staged for
+ * why the difference decides whether a crash can lose data silently.
+ */
+static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
+                              uint8_t type, uint64_t phys, uint64_t orig)
+{
+    return pack_backup_holds(p->pack_w, hash)
+        ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
+        : store_index_put_loose(p->db, p->repo_id, hash, type, phys, orig);
+}
+
 static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
                                 const uint8_t *data, size_t len,
                                 uint8_t out_hash[OBJECT_HASH_SIZE])
@@ -277,8 +290,7 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
     if (st != OK) return st;
     if (is_new) {
         p->res->objects_new++;
-        st = store_index_put_loose(p->db, p->repo_id, out_hash, obj_type,
-                                   phys, len);
+        st = record_object(p, out_hash, obj_type, phys, len);
         if (st != OK) return st;
     }
     hashset_add(&p->meta_seen, out_hash);
@@ -427,9 +439,8 @@ static status_t store_content(pipeline_t *p)
          * and different trailing holes share a payload and so share a hash.
          */
         uint64_t _ti = phase_now();
-        st = store_index_put_loose(p->db, p->repo_id, e->node.content_hash,
-                                   OBJECT_TYPE_FILE, w.phys_bytes,
-                                   w.payload_size);
+        st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
+                           w.phys_bytes, w.payload_size);
         phase_add(p->timers, PHASE_INDEX_PUT, _ti);
         if (st != OK) {
             if (in_txn && db_txn_commit(p->db) != OK)
@@ -534,8 +545,7 @@ static status_t build_one_tree(pipeline_t *p, uint32_t dir_index,
          * what the store actually wrote, header and parity trailer included,
          * and only the store knows it. Recording len for both understated
          * every tree by the trailer. */
-        st = store_index_put_loose(p->db, p->repo_id, out_hash,
-                                   OBJECT_TYPE_TREE, tree_phys, len);
+        st = record_object(p, out_hash, OBJECT_TYPE_TREE, tree_phys, len);
         if (st != OK) return st;
     } else {
         p->res->trees_reused++;
@@ -975,7 +985,11 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
                      (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL };
 
-    st = pack_backup_open(store, &p.pack_w);
+    /* Rows a crashed or aborted backup staged into a pack that never
+     * landed. This job holds the repository's write lock, so nothing else
+     * can be staging now. */
+    st = store_index_drop_staged(db, repo_id);
+    if (st == OK) st = pack_backup_open(store, &p.pack_w);
     if (st != OK) { free(links); scan_result_free(scan); return st; }
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
