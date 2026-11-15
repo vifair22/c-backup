@@ -26,6 +26,9 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "gc.h"
+#include "prune.h"
+#include "restore.h"
 #include "reindex.h"
 #include "repo.h"
 #include "repo_key.h"
@@ -268,6 +271,80 @@ static void test_reindex_restores_size_and_file_count(void **state)
                             " AND total_size IS NULL"), 0);
 }
 
+/* ---------- B073 ---------- */
+
+/* The refcounts GC's own mark produces, for comparison. */
+static void gc_marked_refcounts(char *out, size_t outsz)
+{
+    /* A real run, not a dry one, which rolls its marks back. Nothing is
+     * unreachable yet, so the sweep changes nothing but the counts. */
+    gc_result_t g;
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.swept, 0);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT group_concat(hash || ':' || refcount, ',') FROM"
+        " (SELECT hash, refcount FROM objects WHERE repo_id = ? ORDER BY hash)",
+        (const char *[]){ repo, NULL }, &r), 0);
+    snprintf(out, outsz, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
+/*
+ * Reindex left every refcount at zero while the refs endpoint showed the
+ * object referenced. They are counted now, to the same numbers GC's mark
+ * gives, and a GC straight after a reindex deletes nothing live.
+ */
+static void test_reindex_counts_refs_and_gc_after_it_keeps_live_objects(void **state)
+{
+    (void)state;
+    /* Two snapshots sharing most of their trees, and one file whose
+     * content appears twice, so counts above one are exercised. */
+    write_file(TEST_SRC "/dup.txt", "top level content\n");
+    backup_once();
+    write_file(TEST_SRC "/nested/mid.txt", "changed\n");
+    backup_once();
+
+    char expect[8192];
+    gc_marked_refcounts(expect, sizeof(expect));
+
+    /* Database loss: every derived row goes. */
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM objects", NULL, NULL), 0);
+
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                            " AND refcount = 0"), 0);
+    assert_true(scalar("SELECT MAX(refcount) FROM objects WHERE repo_id = ?") > 1);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT group_concat(hash || ':' || refcount, ',') FROM"
+        " (SELECT hash, refcount FROM objects WHERE repo_id = ? ORDER BY hash)",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_string_equal(r->rows[0][0], expect);
+    db_result_free(r);
+
+    long long objects = scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?");
+    gc_result_t g;
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.swept, 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"), objects);
+
+    /* And both snapshots still restore. */
+    for (int64_t sid = 1; sid <= 2; sid++) {
+        char dst[PATH_MAX];
+        snprintf(dst, sizeof(dst), "%s/dst%lld", TEST_DIR, (long long)sid);
+        restore_result_t rr;
+        assert_int_equal(restore_run(store, db, repo_id, sid, dst, NULL, &rr), OK);
+        assert_int_equal(rr.failed, 0);
+        assert_int_equal(rr.files, 3);
+    }
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -278,6 +355,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unreadable_pack_keeps_its_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_reindex_reports_no_failures, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_restores_size_and_file_count, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_counts_refs_and_gc_after_it_keeps_live_objects,
+                                        setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

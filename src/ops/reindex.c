@@ -72,9 +72,10 @@ static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
  * A hash referenced by a thousand nodes would otherwise be stat'd a thousand
  * times, and on a repository with real dedup that dominates the rebuild.
  *
- * refcount starts at zero because that is what the backup path records too:
- * GC owns refcounts, zeroing and recomputing them from every live snapshot on
- * each run, so anything written here would be discarded at the next sweep.
+ * refcount starts at zero and is counted once every snapshot has been
+ * walked, by recompute_refcounts: counting here would double on every
+ * repeated reindex, since a snapshot's nodes are replaced but its objects
+ * are not.
  */
 static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_id);
 
@@ -663,6 +664,57 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
     return OK;
 }
 
+/*
+ * Count every object's references from the rebuilt index.
+ *
+ * A reindex left every refcount at zero, so the object listing said nothing
+ * referenced an object the refs endpoint showed two nodes using. GC does not
+ * trust the column - it zeroes and re-marks from the trees on every run - so
+ * this is not what keeps a post-reindex GC from deleting live objects; it is
+ * what makes the column true between reindex and the next GC.
+ *
+ * The count is the one GC's mark produces: one per visit of a tree,
+ * reaching it as a snapshot root or as a directory's subtree, plus one per
+ * entry for its content, xattr and ACL objects. A tree shared by ten
+ * snapshots counts ten. Every node row carries exactly those hashes, so the
+ * count is a single grouped pass over the rows just written rather than a
+ * second walk of the trees.
+ */
+static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    if (db_txn_begin(db) != OK)
+        return set_error(ERR_IO, "reindex: cannot begin refcount pass");
+    int failed =
+        db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
+                             (const char *[]){ repo, NULL }, NULL) != 0 ||
+        db_execute_non_query(db,
+            "WITH refs(hash) AS ("
+            "  SELECT root_tree_hash FROM snapshots"
+            "   WHERE repo_id = ?1 AND root_tree_hash IS NOT NULL"
+            "  UNION ALL SELECT content_hash FROM nodes"
+            "   WHERE repo_id = ?1 AND content_hash IS NOT NULL"
+            "  UNION ALL SELECT subtree_hash FROM nodes"
+            "   WHERE repo_id = ?1 AND subtree_hash IS NOT NULL"
+            "  UNION ALL SELECT xattr_hash FROM nodes"
+            "   WHERE repo_id = ?1 AND xattr_hash IS NOT NULL"
+            "  UNION ALL SELECT acl_hash FROM nodes"
+            "   WHERE repo_id = ?1 AND acl_hash IS NOT NULL),"
+            " counts(hash, n) AS (SELECT hash, COUNT(*) FROM refs GROUP BY hash)"
+            " UPDATE objects SET refcount = counts.n FROM counts"
+            " WHERE objects.repo_id = ?1 AND objects.hash = counts.hash",
+            (const char *[]){ repo, NULL }, NULL) != 0;
+    if (failed) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "reindex: cannot recompute refcounts");
+    }
+    if (db_txn_commit(db) != OK)
+        return set_error(ERR_IO, "reindex: cannot commit refcounts");
+    return OK;
+}
+
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       volatile int *cancel, reindex_result_t *out)
 {
@@ -735,6 +787,8 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Every snapshot has contributed its hashes by now, so each distinct
      * object is sized exactly once. */
     st = fill_object_sizes(store, db, repo_id);
+    if (st != OK) return st;
+    st = recompute_refcounts(db, repo_id);
     if (st != OK) return st;
 
     log_info("reindex: %llu snapshot(s), %llu nodes, %llu trees read, "
