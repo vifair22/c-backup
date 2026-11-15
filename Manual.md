@@ -534,8 +534,20 @@ hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
 extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
 
-Files that cannot be read are logged and skipped; the backup continues. A
-source that is unreadable as a whole fails the job.
+A file inside a source that cannot be read is logged and skipped; the backup
+continues. A source itself - a path named on the command line or configured
+with `sources set` - that does not exist or cannot be opened fails the job
+before anything is written, with an error naming it, even when the other
+sources are fine:
+
+```
+c-backup: source /data/no-such-dir cannot be read (No such file or directory); no snapshot written
+```
+
+The difference is deliberate. A file vanishing between the scan and the read
+is normal on a live filesystem; a whole source missing is a mount that did
+not come up or a typo, and a snapshot without it would look like a backup of
+everything that was asked for.
 
 ### 6.4 Concurrency
 

@@ -196,6 +196,12 @@ contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
 contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
 contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
 
+# B077: a source that does not exist failed nothing; the backup completed
+# with the other source's files and a log line.
+OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
+check    "a missing source fails the backup" 1 "$RC"
+contains "naming the source" "no-such-dir" "$OUT"
+
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"

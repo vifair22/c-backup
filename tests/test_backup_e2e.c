@@ -537,8 +537,8 @@ static void test_rejects_empty_path_list(void **state)
  * and those ancestors were all that was left, so `--exclude '*'` used to
  * complete with a snapshot holding no files at all. Three ways in: a glob
  * matching everything, an exclude naming the root, and a source that does
- * not exist. A second source that does contribute must still back up, so
- * the check is on the sources as a whole, not each one.
+ * not exist. The excluded cases are judged on the sources as a whole; a
+ * missing source fails on its own, whatever the others contribute (B077).
  */
 static void test_backup_of_nothing_fails_without_a_snapshot(void **state)
 {
@@ -562,17 +562,61 @@ static void test_backup_of_nothing_fails_without_a_snapshot(void **state)
     backup_opts_t o = basic_opts();
     o.paths = missing;
     assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "no-such-source"));
 
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", repo), 0);
 
-    /* One empty source beside a real one is a normal backup. */
-    static const char *mixed[] = { TEST_DIR "/no-such-source", TEST_SRC };
+    /*
+     * B077: a missing source beside a real one fails too, naming the one
+     * that is missing. It used to complete with the real one's files and a
+     * log line, so a snapshot that silently lacked a whole source looked
+     * like a backup of both.
+     */
+    static const char *mixed[] = { TEST_SRC, TEST_DIR "/no-such-source" };
     o = basic_opts();
     o.paths = mixed;
     o.n_paths = 2;
+    err_clear();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), ERR_INVALID);
+    assert_non_null(strstr(err_msg(), TEST_DIR "/no-such-source"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", repo), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects", NULL), 0);
+}
+
+/*
+ * A source that exists but cannot be read fails the same way. A file inside
+ * a source that cannot be read does not: it is skipped with a warning, and
+ * the backup goes on, which is the distinction Manual 6.3 draws.
+ */
+static void test_unreadable_source_fails_but_unreadable_file_does_not(void **state)
+{
+    (void)state;
+    if (geteuid() == 0) { skip(); return; }   /* root reads through mode 000 */
+
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+
+    assert_int_equal(mkdir(TEST_DIR "/locked", 0700), 0);
+    assert_int_equal(chmod(TEST_DIR "/locked", 0), 0);
+    static const char *locked[] = { TEST_SRC, TEST_DIR "/locked" };
+    backup_opts_t o = basic_opts();
+    o.paths = locked;
+    o.n_paths = 2;
+    err_clear();
+    status_t st = backup_run(store, db, repo_id, &o, NULL);
+    assert_int_equal(chmod(TEST_DIR "/locked", 0700), 0);
+    assert_int_equal(st, ERR_INVALID);
+    assert_non_null(strstr(err_msg(), TEST_DIR "/locked"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?", repo), 0);
+
+    write_file(TEST_SRC "/secret.txt", "nobody reads this");
+    assert_int_equal(chmod(TEST_SRC "/secret.txt", 0), 0);
     backup_result_t res;
-    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
-    assert_int_equal(res.files, 3);
+    o = basic_opts();
+    st = backup_run(store, db, repo_id, &o, &res);
+    assert_int_equal(chmod(TEST_SRC "/secret.txt", 0600), 0);
+    assert_int_equal(st, OK);
+    assert_int_equal(res.files, 3);   /* alpha, beta, gamma; not secret */
 }
 
 /* A non-sparse file of `mib` MiB, filled with a pattern rather than zeroes
@@ -852,6 +896,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancellation_stops_the_run, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_empty_path_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_of_nothing_fails_without_a_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unreadable_source_fails_but_unreadable_file_does_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),

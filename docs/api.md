@@ -245,10 +245,18 @@ on the text, not the filesystem, so it does not follow symlinks. Directories are
 descends, so excluding one prunes its subtree rather than filtering entries
 on the way out.
 
-A backup in which every source is excluded, or none could be read, fails
-with "nothing to back up" and writes no snapshot. It used to succeed with a
-snapshot holding only the directories above each source, which looks like a
-backup and restores nothing.
+A backup in which every source is excluded fails with "nothing to back up"
+and writes no snapshot. It used to succeed with a snapshot holding only the
+directories above each source, which looks like a backup and restores
+nothing.
+
+A source that does not exist, or cannot be opened, fails the job before
+anything is written, with an error naming it (`source /data/x cannot be read
+(No such file or directory); no snapshot written`), whatever the other
+sources hold. It used to be skipped with a log line, so a snapshot silently
+lacking a whole source looked like a backup of everything asked for. A file
+*inside* a source that cannot be read is still skipped with a warning and the
+backup goes on.
 
 Before this, the matcher accepted absolute prefixes only and silently
 skipped everything else, and the route did not read the field at all: a

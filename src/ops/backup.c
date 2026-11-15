@@ -17,6 +17,8 @@
 
 #include <openssl/sha.h>
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -954,6 +956,45 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every named source must exist and be readable before anything is written.
+ *
+ * The scan treats a root it cannot lstat as a warning and moves on, which is
+ * right for a file vanishing mid-walk and wrong for a source: a backup of
+ * "/data/plain /data/no-such-dir" completed with the first one's files and a
+ * log line, and the snapshot looked like a backup of both. A source is what
+ * the operator asked for by name, so not being able to read it is the job
+ * failing, the same way a source excluded down to nothing is. Unreadable
+ * files *inside* a source still warn and continue; that distinction is the
+ * Manual's 6.3.
+ */
+static status_t check_sources(const backup_opts_t *opts)
+{
+    for (int i = 0; i < opts->n_paths; i++) {
+        const char *src = opts->paths[i];
+        struct stat sb;
+        if (!src || !*src)
+            return set_error(ERR_INVALID, "source %d is empty; no snapshot written", i + 1);
+        if (lstat(src, &sb) != 0)
+            return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                             "no snapshot written", src, strerror(errno));
+        if (S_ISDIR(sb.st_mode)) {
+            DIR *d = opendir(src);
+            if (!d)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            closedir(d);
+        } else if (S_ISREG(sb.st_mode)) {
+            int fd = open(src, O_RDONLY | O_NOFOLLOW);
+            if (fd == -1)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            close(fd);
+        }
+    }
+    return OK;
+}
+
 static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
                                  const backup_opts_t *opts, backup_result_t *out);
 
@@ -962,6 +1003,9 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 {
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
+
+    status_t st = check_sources(opts);
+    if (st != OK) return st;
 
     /*
      * Staging files a killed run left behind. store_open only sweeps what is
@@ -981,7 +1025,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * way out: the handle may outlive this call. */
     volatile int *prev_cancel = store_get_cancel(store);
     if (opts->cancel) store_set_cancel(store, opts->cancel);
-    status_t st = backup_run_inner(store, db, repo_id, opts, out);
+    st = backup_run_inner(store, db, repo_id, opts, out);
     store_set_cancel(store, prev_cancel);
     return st;
 }
