@@ -109,7 +109,9 @@ last, a `passphrase`. A non-empty `passphrase` with no `encrypt` means
 `passphrase` mode. A non-empty `passphrase` with `encrypt` `none` or `system`
 is refused with 400 rather than ignored: ignoring it used to create an
 unencrypted repository for somebody who had just typed a passphrase. An empty
-`passphrase` is treated as absent.
+`passphrase` is treated as absent. Creating a repository needs a passphrase
+of at least 8 characters (400 otherwise); unlocking an existing one accepts
+whatever it was created with.
 
 | Mode | Key lives | Recovery needs | Escrow |
 |---|---|---|---|

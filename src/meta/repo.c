@@ -666,6 +666,14 @@ status_t repo_register_detail(cutils_db_t *db, const char *path, const char *lab
     if (st != OK) return st;
 
     if (!exists || dir_is_empty(path)) {
+        /* Checked before anything is created, so a refusal leaves no
+         * directory behind. Only creation enforces it; unlocking an existing
+         * repository takes the passphrase it was made with. */
+        if (enc && enc->mode == REPO_ENC_PASSPHRASE && enc->passphrase &&
+            strlen(enc->passphrase) < REPO_PASSPHRASE_MIN)
+            return set_error(ERR_INVALID,
+                             "passphrase must be at least %d characters",
+                             REPO_PASSPHRASE_MIN);
         if (!exists) {
             st = mkdir_parents(path);
             if (st != OK) return st;

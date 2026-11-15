@@ -550,6 +550,26 @@ static void test_passphrase_repo_is_recoverable_from_the_marker_alone(void **sta
     assert_memory_equal(cached.key, recovered.key, REPO_KEY_BYTES);
 }
 
+/* B044: "a" was accepted as a repository passphrase. Refused now, before
+ * anything is created, so the refusal leaves no directory behind. */
+static void test_short_passphrase_is_refused_at_creation(void **state)
+{
+    (void)state;
+    repo_enc_request_t e = enc_request(REPO_ENC_PASSPHRASE, "a");
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/shortpass", "s", &e, &id),
+                     ERR_INVALID);
+    assert_non_null(strstr(err_msg(), "at least 8"));
+    err_clear();
+    struct stat sb;
+    assert_int_not_equal(stat(TEST_ROOT "/shortpass", &sb), 0);
+    assert_int_equal(count_repos(), 0);
+
+    /* Eight is enough. */
+    e = enc_request(REPO_ENC_PASSPHRASE, "12345678");
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/shortpass", "s", &e, &id), OK);
+}
+
 static void test_passphrase_mode_requires_a_passphrase(void **state)
 {
     (void)state;
@@ -715,6 +735,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_system_encryption_returns_the_key_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_repo_is_recoverable_from_the_marker_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_passphrase_mode_requires_a_passphrase, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_short_passphrase_is_refused_at_creation, setup, teardown),
         cmocka_unit_test_setup_teardown(test_marker_with_broken_encryption_block_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_encryption_mode_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_dir, setup, teardown),

@@ -833,6 +833,11 @@ sudo c-backup repo add /srv/backup/main "Main" --encrypt passphrase --passphrase
 use it and silently dropping it would leave you believing a passphrase
 protects the repository.
 
+A new repository's passphrase must be at least 8 characters, the same floor
+as the admin password. Argon2id makes each guess slow, but a one-character
+passphrase is a handful of guesses, and a passphrase repository is meant to
+be safe to carry offsite.
+
 Objects are encrypted with ChaCha20-Poly1305 before they reach disk, chosen
 over AES-GCM because it does not depend on AES-NI. Hashes are of the
 plaintext, so deduplication still works within a repository.

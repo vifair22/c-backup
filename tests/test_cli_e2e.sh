@@ -309,6 +309,11 @@ contains "passphrase repo escrowed"  '"key_escrowed":true'       "$PASS_OUT"
 contains "wrapped key in the marker" '"wrapped"' "$(cat "$WORK/passrepo/.cbackup")"
 OUT=$(cb repo add "$WORK/nopass" np --encrypt passphrase 2>&1); RC=$?
 check "passphrase mode requires a passphrase" 1 "$RC"
+# B044: a one-character passphrase was accepted.
+OUT=$(cb repo add "$WORK/shortpass" sp --passphrase 'a' 2>&1); RC=$?
+check    "a short passphrase is refused" 1 "$RC"
+contains "and says how long it must be" "at least 8" "$OUT"
+check    "and creates nothing" 1 "$([ -e "$WORK/shortpass" ]; echo $?)"
 # B011: a passphrase without --encrypt made an unencrypted repository and
 # exited 0. It implies passphrase mode now, and a mode that cannot use one
 # refuses it instead of dropping it.
