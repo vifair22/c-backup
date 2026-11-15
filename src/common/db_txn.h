@@ -19,12 +19,17 @@
  * instead of fail. That only works while every transaction is short: the lock
  * turns a failure into a wait, and a wait behind a transaction spanning a whole
  * snapshot's node rows would be worse than the failure it replaced. Anything
- * writing per-entry has to commit in batches. See index_nodes and
- * store_content, which both do; store_content also bounds a batch by time
- * and never holds one across reading a large file, because a batch counted
- * in entries alone spanned a whole backup of a few large files (B107).
- * Writers are served in arrival order, so one that is waiting goes before the
- * holder's next transaction.
+ * writing per-entry has to commit in batches. See index_nodes, build_trees
+ * and store_content, which all do. Writers are served in arrival order, so
+ * one that is waiting goes before the holder's next transaction.
+ *
+ * A long-running holder asks db_txn_waiters() rather than committing on a
+ * timer. B107 bounded the backup's batch by time and let go around every
+ * large file, which kept a sources write prompt and also turned a 1,605-file
+ * backup into 1,600 commits that nobody was waiting for: a WAL sync each,
+ * and 60 seconds on the UAT host's storage (OWN-16). A batch now ends early
+ * only when somebody is queued behind it, so the commits a backup adds are
+ * bounded by the number of foreign transactions, not by its own length.
  *
  * These wrap the raw statements rather than sitting beside them so the lock
  * cannot drift out of step with the transaction across the many rollback
@@ -58,3 +63,21 @@ status_t db_txn_commit(cutils_db_t *db);
  * because every caller is already on an error path with a status worth more
  * than this one. */
 void db_txn_rollback(cutils_db_t *db);
+
+/*
+ * How many threads are queued for the write lock right now, not counting the
+ * one holding it. One relaxed atomic load: cheap enough to ask per entry and
+ * per chunk read. A holder that sees non-zero should commit at its next safe
+ * point; the waiter is served first and the holder's next begin queues behind
+ * it. The answer is a snapshot and may be stale by the time it is used, which
+ * only moves a commit by one check.
+ */
+unsigned db_txn_waiters(void);
+
+/*
+ * Time spent in this module is attributed to the calling thread's phase
+ * timers (phase_timer.h), when it has any: lock wait and BEGIN as txn-wait,
+ * COMMIT and ROLLBACK, WAL sync included, as txn-commit. Both are recorded as
+ * nested spans so the phase enclosing them can report its own time without
+ * them; see phase_add_excl.
+ */

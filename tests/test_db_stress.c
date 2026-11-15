@@ -4,9 +4,11 @@
  * Concurrent metadata writes against a running backup.
  *
  * B107 changed how the daemon's one write lock is shared: db_txn became a
- * FIFO ticket lock, and store_content now gives the lock up every 200 ms and
- * around every file of 4 MiB or more. Each of those is a new point where
- * another thread's transaction lands in the middle of a backup. The unit tests
+ * FIFO ticket lock, and the backup gives the lock up mid-phase. Since OWN-16
+ * it does so whenever a writer is queued (db_txn_waiters): between entries,
+ * between reads of a file being stored, between trees, and between slices of
+ * a wait on the large-file workers. Each of those is a point where another
+ * thread's transaction lands in the middle of a backup. The unit tests
  * beside the fix force one interleaving each; this one throws the real write
  * paths at a real backup and checks the outcome.
  *
@@ -19,9 +21,10 @@
  *   - tags:    the real tag set and remove handlers on snapshot 1
  *   - raw:     db_txn_begin/insert/commit, the shape every other writer has
  *
- * The backup covers large files on both sides of the yield threshold (6 MiB,
- * packed; 20 MiB, loose) and 3,000 small ones, past the 2,000-entry batch,
- * so it crosses count and time commits, large-file yields and pack seals.
+ * The backup covers large files on both sides of the 16 MiB pack threshold
+ * (6 MiB, packed; 20 MiB, loose) and 3,000 small ones, past the 2,000-entry
+ * batch, so it crosses count commits, commits for a waiter mid-file and pack
+ * seals.
  *
  * What is asserted: no handler returns anything but success, every write is
  * in the final state, no single write waited longer than the bound, the

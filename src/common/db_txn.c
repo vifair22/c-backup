@@ -1,7 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "db_txn.h"
+
+#include "phase_timer.h"
 
 #include <cutils/log.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /*
@@ -22,17 +27,37 @@ static pthread_cond_t  g_ticket_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t        g_next_ticket;
 static uint64_t        g_now_serving;
 
+/* Threads inside write_lock that have not been served yet. Written under
+ * g_ticket_mu, read without it by db_txn_waiters. */
+static atomic_uint     g_waiting;
+
+/*
+ * Whether this thread holds the lock. A second begin on the holding thread
+ * would queue behind its own ticket and never return; with this it fails
+ * instead, loudly, which is the difference between a test failure and a
+ * hung daemon. The backup holds its batch across more than it used to
+ * (OWN-16), so the path that must not begin a nested transaction - sealing
+ * a pack from inside a batch - is one refactor away from being taken.
+ */
+static _Thread_local int tls_held;
+
 static void write_lock(void)
 {
     pthread_mutex_lock(&g_ticket_mu);
     uint64_t mine = g_next_ticket++;
-    while (mine != g_now_serving)
-        pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
+    if (mine != g_now_serving) {
+        atomic_fetch_add_explicit(&g_waiting, 1, memory_order_relaxed);
+        while (mine != g_now_serving)
+            pthread_cond_wait(&g_ticket_cv, &g_ticket_mu);
+        atomic_fetch_sub_explicit(&g_waiting, 1, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_ticket_mu);
+    tls_held = 1;
 }
 
 static void write_unlock(void)
 {
+    tls_held = 0;
     pthread_mutex_lock(&g_ticket_mu);
     g_now_serving++;
     pthread_cond_broadcast(&g_ticket_cv);
@@ -42,9 +67,15 @@ static void write_unlock(void)
 status_t db_txn_begin(cutils_db_t *db)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_begin: null handle");
+    if (tls_held)
+        return set_error(ERR_BUSY, "db_txn_begin: this thread already holds "
+                                   "the write lock (nested transaction)");
 
+    uint64_t t0 = phase_now();
     write_lock();
-    if (db_exec_raw(db, "BEGIN") != 0) {
+    int rc = db_exec_raw(db, "BEGIN");
+    phase_add_nested(phase_current, PHASE_TXN_WAIT, t0);
+    if (rc != 0) {
         write_unlock();
         return set_error(ERR_IO, "cannot begin");
     }
@@ -55,7 +86,9 @@ status_t db_txn_commit(cutils_db_t *db)
 {
     if (!db) return set_error(ERR_INVALID, "db_txn_commit: null handle");
 
+    uint64_t t0 = phase_now();
     int rc = db_exec_raw(db, "COMMIT");
+    phase_add_commit(phase_current, t0);
     write_unlock();
     if (rc != 0) return set_error(ERR_IO, "cannot commit");
     return OK;
@@ -65,7 +98,14 @@ void db_txn_rollback(cutils_db_t *db)
 {
     if (!db) return;
 
+    uint64_t t0 = phase_now();
     if (db_exec_raw(db, "ROLLBACK") != 0)
         log_error("db_txn: rollback failed");
+    phase_add_commit(phase_current, t0);
     write_unlock();
+}
+
+unsigned db_txn_waiters(void)
+{
+    return atomic_load_explicit(&g_waiting, memory_order_relaxed);
 }

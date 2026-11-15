@@ -1719,14 +1719,26 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
                 if (src_path) close(fd);
                 return set_error(ERR_NOMEM, "store: pack staging buffer");
             }
-            if (lseek(fd, 0, SEEK_SET) == (off_t)-1 ||
-                io_read_full(fd, buf, (size_t)file_size) != 0) {
+            /*
+             * Read a chunk at a time, reporting each, rather than in one call.
+             * Progress is also where a backup notices a writer queued for the
+             * database lock (OWN-16), and up to 16 MiB in one read is long
+             * enough on a slow source to hold that writer for seconds.
+             */
+            int rerr = lseek(fd, 0, SEEK_SET) == (off_t)-1;
+            for (uint64_t off = 0; !rerr && off < file_size; ) {
+                size_t n = (file_size - off) < STREAM_PIPE_CHUNK
+                         ? (size_t)(file_size - off) : STREAM_PIPE_CHUNK;
+                if (io_read_full(fd, buf + off, n) != 0) { rerr = 1; break; }
+                off += n;
+                store_io_progress(store, (uint64_t)n);
+            }
+            if (rerr) {
                 free(buf);
                 if (src_path) close(fd);
                 return set_error_errno(ERR_IO, "store: read for pack staging");
             }
             if (src_path) close(fd);
-            store_io_progress(store, file_size);
             status_t pst = pack_backup_add(pack_w, OBJECT_TYPE_FILE, buf,
                                            (size_t)file_size, out_hash,
                                            out_is_new, out_phys_bytes,

@@ -41,10 +41,29 @@ typedef enum {
     PHASE_INDEX_NODES,   /* nodes and node_fts inserts */
     PHASE_CACHE_SWEEP,   /* dropping cache rows for paths the scan no longer sees */
     PHASE_STORE_WAIT,    /* the backup thread blocked on the large-file workers */
-    /* The store phase's cache batch commits: one WAL sync each, so their
-     * count is the figure to watch on slow storage, where the 200 ms batch
-     * bound (B107) turns into more of them. */
-    PHASE_STORE_COMMIT,
+    PHASE_SETUP,         /* dropping stale staged rows, opening the backup pack */
+    PHASE_PACK_SEAL,     /* sealing a full backup pack, and the last one */
+    PHASE_SNAPSHOT,      /* snapshot id, the record file and its row */
+    /*
+     * Nested spans: recorded from inside whichever phase is running, and
+     * subtracted from it by phase_add_excl, so the top-level rows stay
+     * disjoint and still sum to the wall clock.
+     *
+     * The transaction rows are recorded by db_txn itself, for every
+     * transaction this thread takes: the store phase's batches, the trees
+     * batch, index_nodes, and the pack commit callback a seal runs. On a
+     * deployment whose storage syncs slowly txn-commit is where the time
+     * goes, and before these existed it was "elsewhere" (OWN-16).
+     */
+    PHASE_TXN_WAIT,      /* the ticket lock and BEGIN */
+    PHASE_TXN_COMMIT,    /* COMMIT or ROLLBACK, WAL sync included */
+    PHASE_PROGRESS,      /* the job's progress callbacks: a database write each */
+    /* Not accounted: txn-commit again, by which phase took the transaction.
+     * Set through phase_timers_t.txn_site. */
+    PHASE_COMMIT_STORE,
+    PHASE_COMMIT_TREES,
+    PHASE_COMMIT_INDEX,
+    PHASE_COMMIT_PACK,
     /* Inside PHASE_READ_HASH, which on real storage is 82% of a full backup
      * and far too coarse to act on. These break that bucket apart. */
     PHASE_OBJ_SETUP,     /* mkstemp, header write, parity stream init */
@@ -86,6 +105,11 @@ typedef struct {
     /* How many threads stored large files concurrently; 0 or 1 means the
      * obj:* figures are this thread's wall time and nothing was summed. */
     unsigned store_threads;
+    /* Total of every nested span so far (PHASE_TXN_*, PHASE_PROGRESS); a
+     * top-level span subtracts what accrued while it ran. */
+    uint64_t nested_ns;
+    /* Which commit:* row a transaction commit is also charged to, or 0. */
+    phase_id_t txn_site;
 } phase_timers_t;
 
 /*
@@ -113,6 +137,53 @@ static inline void phase_add(phase_timers_t *t, phase_id_t id, uint64_t start)
     if (!t) return;
     t->ns[id]    += phase_now() - start;
     t->count[id] += 1;
+}
+
+/* The nested total to hand phase_add_excl when a top-level span starts. */
+static inline uint64_t phase_nested(const phase_timers_t *t)
+{
+    return t ? t->nested_ns : 0;
+}
+
+/*
+ * A top-level span, less the nested spans recorded while it ran. Every
+ * top-level phase that can contain a transaction or a progress write is
+ * recorded this way, or the same second would be counted twice and the
+ * profile would claim more time than the run took.
+ */
+static inline void phase_add_excl(phase_timers_t *t, phase_id_t id,
+                                  uint64_t start, uint64_t nested_start)
+{
+    if (!t) return;
+    uint64_t span = phase_now() - start;
+    uint64_t inner = t->nested_ns - nested_start;
+    t->ns[id]    += span > inner ? span - inner : 0;
+    t->count[id] += 1;
+}
+
+/* A nested span: counted under its own row and in nested_ns. */
+static inline void phase_add_nested(phase_timers_t *t, phase_id_t id, uint64_t start)
+{
+    if (!t) return;
+    uint64_t span = phase_now() - start;
+    t->ns[id]     += span;
+    t->count[id]  += 1;
+    t->nested_ns  += span;
+}
+
+/* A commit or rollback: txn-commit, and the commit:* row of the phase that
+ * took the transaction, when one has said so. */
+static inline void phase_add_commit(phase_timers_t *t, uint64_t start)
+{
+    if (!t) return;
+    uint64_t span = phase_now() - start;
+    t->ns[PHASE_TXN_COMMIT]    += span;
+    t->count[PHASE_TXN_COMMIT] += 1;
+    t->nested_ns               += span;
+    if (t->txn_site) {
+        t->ns[t->txn_site]    += span;
+        t->count[t->txn_site] += 1;
+    }
 }
 
 /*
