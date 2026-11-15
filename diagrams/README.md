@@ -12,11 +12,13 @@ read `docs/data-paths.md`; for what lands on disk, `docs/repo-format.md`.
 
 | # | File | Topic |
 |---|------|-------|
-| 03 | [fuse-ring-concurrency](03-fuse-ring-concurrency.md) | FUSE readahead ring: producer/consumer threading, mutex/condvar, recovery tiers. Off by default (`enable_fuse_readahead`) |
 | 04 | [gfs-promotion-prune](04-gfs-promotion-prune.md) | GFS tier promotion (daily/weekly/monthly/yearly) and prune keep/delete logic |
 | 05 | [parity-trailer-layout](05-parity-trailer-layout.md) | Byte-level parity trailer structure for loose objects and pack `.dat` |
 | 09 | [dedup-cascade](09-dedup-cascade.md) | Layered existence check: in-memory loose set, `faccessat` fallback, pack lookup |
 | 12 | [pack-creation-dispatch](12-pack-creation-dispatch.md) | Large vs small partition, per-worker packs, 256 MiB cap, atomic pack numbers |
+
+The FUSE readahead ring diagram went with the ring, which no configuration
+could switch on and was removed before 1.0.
 
 Eight diagrams were removed rather than revised: they described the
 pre-daemon CLI's flows (retry queues, two-pass parallel restore, pathmap
