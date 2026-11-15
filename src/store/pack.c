@@ -578,9 +578,38 @@ static size_t parity_window_groups(void)
     return atomic_load_explicit(&parity_window_groups_cfg, memory_order_relaxed);
 }
 
+/*
+ * OWN-30: the footer's trailer_size and each block's entry_parity_size are
+ * uint32. Parity is 1,024 bytes per 15,296, so they wrap once the parity
+ * reaches 4 GiB, at about 59.75 GiB of stored data, and a trailer located
+ * through a wrapped size is somebody else's bytes. Correcting from those
+ * would write a wrong correction with full confidence. A pack file below
+ * this size cannot hold enough parity to wrap, so the file size is the test.
+ *
+ * TODO(OWN-30): switch to the shared parity_fields_fit helper from
+ * fix/own30-repair-guard when it lands; this is the equivalent check.
+ */
+#define PARITY_FIT_LIMIT_DEFAULT \
+    ((uint64_t)((UINT64_C(1) << 32) / EP_GROUP_PAR) * (uint64_t)EP_GROUP_DATA)
+static _Atomic uint64_t parity_fit_limit = PARITY_FIT_LIMIT_DEFAULT;
+
+void pack_test_set_parity_fit_limit(uint64_t bytes)
+{
+    atomic_store_explicit(&parity_fit_limit, bytes ? bytes : PARITY_FIT_LIMIT_DEFAULT,
+                          memory_order_relaxed);
+}
+
+static int parity_fields_fit(uint64_t pack_bytes)
+{
+    return pack_bytes < atomic_load_explicit(&parity_fit_limit, memory_order_relaxed);
+}
+
 /* Locate a pack entry's parity in the .dat parity trailer: reads the header
  * parity record and the payload CRC, and only finds the RS parity.
- * Returns 0 on success, -1 if parity is unavailable. */
+ * Returns 0 on success, -1 if parity is unavailable - including for a pack
+ * whose 32-bit trailer sizes may have wrapped (parity_fields_fit), so every
+ * reader, repair and copy treats such an entry as having no parity and
+ * nothing is ever corrected or written from it. */
 static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *out) {
     if (entry_index == UINT32_MAX) return -1;
     memset(out, 0, sizeof(*out));
@@ -593,6 +622,11 @@ static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *ou
 
     off_t file_end = ftello(f);
     if (file_end < 0) return -1;
+    if (!parity_fields_fit((uint64_t)file_end)) {
+        log_warn("pack: %llu-byte pack is past where its 32-bit parity sizes can be "
+                 "trusted; parity not applied (OWN-30)", (unsigned long long)file_end);
+        return -1;
+    }
     off_t trailer_start = file_end - (off_t)pftr.trailer_size;
     if (trailer_start < 0) return -1;
 
@@ -877,19 +911,57 @@ status_t pack_object_read_stored(store_t *store,
 }
 
 /*
- * The same entry, opened for the caller to read in pieces.
- *
- * A private stream rather than one checked out of the dat cache: the caller
- * holds it for as long as a large payload takes to move, and a cached
- * handle held that long is one every reader of that pack waits on.
+ * Groups a stored-entry reader holds at once: 64 groups is 979 KiB of data
+ * and 64 KiB of parity. Smaller than the readers' window because
+ * replication's whole transfer is held to the 4 MiB the parity stream
+ * replays a trailer through, and this buffer sits inside that transfer.
  */
+#define STORED_READ_GROUPS ((size_t)64)
+
+/*
+ * A packed entry read as stored, in pieces, with its parity applied.
+ *
+ * Replication hands each piece to the target as soon as it is read, and the
+ * target computes fresh parity over whatever it is given, so a damaged byte
+ * shipped as it stood would arrive protected as if it were right: the
+ * source could have corrected it and the replica never can. A piece already
+ * handed over cannot be taken back, so a clean single pass is not something
+ * the reader can promise. It CRC-scans the stored bytes at open instead, one
+ * window at a time, and only if the scan disagrees with the trailer does it
+ * serve the payload from a window corrected from parity. A clean entry
+ * costs one extra sequential read and the same memory either way.
+ *
+ * Damage beyond parity is served as it is, with a warning and the
+ * uncorrectable count, the same choice gc's copy makes: the object was lost
+ * before the copy, its hash still exposes it at either end, and refusing it
+ * would stop every later replication of the repository at one bad object.
+ */
+struct pack_stored_reader {
+    FILE          *f;              /* private stream, not a cached handle */
+    off_t          pay_start;
+    uint64_t       len;
+    uint64_t       pos;            /* next payload byte to hand over */
+    int            repair;
+    entry_parity_t ep;
+    uint8_t       *win;            /* corrected window (repair mode only) */
+    uint8_t       *par;
+    size_t         win_cap;
+    size_t         par_cap;
+    uint64_t       win_off;
+    size_t         win_len;        /* 0: no window loaded */
+    int64_t        fixed;
+    uint64_t       bad;
+    uint8_t        hash[OBJECT_HASH_SIZE];
+};
+
 status_t pack_object_open_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  uint8_t *out_type, uint8_t *out_compression,
                                  uint8_t *out_encryption,
                                  uint64_t *out_uncompressed_size,
-                                 uint64_t *out_len, FILE **out_f) {
+                                 uint64_t *out_len, pack_stored_reader_t **out) {
     pack_cache_entry_t found;
+    memset(&found, 0, sizeof(found));
     status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
@@ -898,31 +970,169 @@ status_t pack_object_open_stored(store_t *store,
                               store_root(store), found.pack_num) != 0)
         return set_error(ERR_IO, "pack_object_open_stored: path too long");
 
-    FILE *f = fopen(dat_path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_object_open_stored: fopen(%s)", dat_path);
+    pack_stored_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "pack_object_open_stored: alloc");
+    memcpy(r->hash, hash, OBJECT_HASH_SIZE);
+
+    r->f = fopen(dat_path, "rb");
+    if (!r->f) {
+        free(r);
+        return set_error_errno(ERR_IO, "pack_object_open_stored: fopen(%s)", dat_path);
+    }
 
     pack_dat_entry_hdr_t ehdr;
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+    if (fseeko(r->f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+        st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+        goto fail;
     }
     /* read_entry_hdr refuses a length the file cannot hold, so a reader of
      * *out_len bytes cannot be sent past the end of the pack. */
-    if (read_entry_hdr(f, &ehdr) != 0 || memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s",
-                         dat_path);
+    if (read_entry_hdr(r->f, &ehdr) != 0) {
+        st = set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s", dat_path);
+        goto fail;
+    }
+
+    int have_parity = found.pack_version == PACK_VERSION &&
+                      locate_entry_parity(r->f, found.entry_index, &r->ep) == 0;
+    if (have_parity) {
+        int hrc = parity_record_check(&ehdr, sizeof(ehdr), &r->ep.hdr_par);
+        if (hrc == 1) {
+            log_warn("pack: repaired entry header via parity (stored stream)");
+            parity_stats_add_repaired(1);
+        } else if (hrc < 0) {
+            log_warn("pack: entry header parity uncorrectable (stored stream)");
+            parity_stats_add_uncorrectable(1);
+        }
+        if (found.dat_offset + sizeof(ehdr) + ehdr.compressed_size >
+            (uint64_t)r->ep.trailer_start) {
+            st = set_error(ERR_CORRUPT, "pack_object_open_stored: entry runs into the "
+                           "parity trailer in %s", dat_path);
+            goto fail;
+        }
+    }
+    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
+        st = set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s", dat_path);
+        goto fail;
+    }
+
+    r->pay_start = (off_t)(found.dat_offset + sizeof(ehdr));
+    r->len       = ehdr.compressed_size;
+
+    if (have_parity && r->ep.rs_sz > 0 && r->len > 0) {
+        size_t groups = parity_window_groups();
+        if (groups > STORED_READ_GROUPS) groups = STORED_READ_GROUPS;
+        r->win_cap = groups * EP_GROUP_DATA;
+        r->par_cap = groups * EP_GROUP_PAR;
+        r->win = malloc(r->win_cap);
+        if (!r->win) { st = set_error(ERR_NOMEM, "pack_object_open_stored: window"); goto fail; }
+
+        if (fseeko(r->f, r->pay_start, SEEK_SET) != 0) {
+            st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+            goto fail;
+        }
+        uint32_t crc = 0;
+        for (uint64_t o = 0; o < r->len; ) {
+            size_t want = r->len - o < r->win_cap ? (size_t)(r->len - o) : r->win_cap;
+            if (fread_full(r->win, want, r->f) != 0) {
+                st = set_error(ERR_CORRUPT, "pack_object_open_stored: short read in %s", dat_path);
+                goto fail;
+            }
+            crc = crc32c_update(crc, r->win, want);
+            o += want;
+        }
+        if (crc != r->ep.payload_crc) {
+            r->repair = 1;
+            r->par = malloc(r->par_cap);
+            if (!r->par) { st = set_error(ERR_NOMEM, "pack_object_open_stored: parity window"); goto fail; }
+        } else {
+            free(r->win);
+            r->win = NULL;
+        }
+    }
+    if (!r->repair && fseeko(r->f, r->pay_start, SEEK_SET) != 0) {
+        st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+        goto fail;
     }
 
     *out_type              = ehdr.type;
     *out_compression       = ehdr.compression;
     *out_encryption        = ehdr.encryption;
     *out_uncompressed_size = ehdr.uncompressed_size;
-    *out_len               = ehdr.compressed_size;
-    *out_f                 = f;
+    *out_len               = r->len;
+    *out                   = r;
+    return OK;
+
+fail:
+    fclose(r->f);
+    free(r->win);
+    free(r->par);
+    free(r);
+    return st;
+}
+
+status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n)
+{
+    if ((uint64_t)n > r->len - r->pos)
+        return set_error(ERR_INVALID, "pack_stored_read: %zu bytes asked for, %llu left",
+                         n, (unsigned long long)(r->len - r->pos));
+    if (!r->repair) {
+        if (n && fread_full(buf, n, r->f) != 0)
+            return set_error(ERR_CORRUPT, "pack_stored_read: short read");
+        r->pos += n;
+        return OK;
+    }
+
+    uint8_t *out = buf;
+    while (n > 0) {
+        if (r->win_len == 0 || r->pos < r->win_off || r->pos >= r->win_off + r->win_len) {
+            /* Windows start on group boundaries: win_cap is whole groups. */
+            r->win_off = r->pos - r->pos % r->win_cap;
+            uint64_t left = r->len - r->win_off;
+            r->win_len = left < r->win_cap ? (size_t)left : r->win_cap;
+            if (fseeko(r->f, r->pay_start + (off_t)r->win_off, SEEK_SET) != 0 ||
+                fread_full(r->win, r->win_len, r->f) != 0) {
+                r->win_len = 0;
+                return set_error(ERR_CORRUPT, "pack_stored_read: short read");
+            }
+            int64_t fx = entry_repair_buf(fileno(r->f), &r->ep, r->win_off, r->win,
+                                          r->win_len, r->par, r->par_cap, &r->bad);
+            if (fx < 0) {
+                r->win_len = 0;
+                return set_error_errno(ERR_IO, "pack_stored_read: cannot read parity");
+            }
+            r->fixed += fx;
+        }
+        size_t at   = (size_t)(r->pos - r->win_off);
+        size_t take = r->win_len - at < n ? r->win_len - at : n;
+        memcpy(out, r->win + at, take);
+        out    += take;
+        n      -= take;
+        r->pos += take;
+    }
     return OK;
 }
 
+void pack_stored_close(pack_stored_reader_t *r)
+{
+    if (!r) return;
+    if (r->repair) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(r->hash, hex);
+        if (r->bad > 0) {
+            log_warn("pack: %s is damaged beyond its parity (%llu group(s)); "
+                     "read as stored", hex, (unsigned long long)r->bad);
+            parity_stats_add_uncorrectable(1);
+        } else if (r->fixed > 0) {
+            log_warn("pack: %s corrected from parity while reading it as stored "
+                     "(%lld byte(s))", hex, (long long)r->fixed);
+            parity_stats_add_repaired(1);
+        }
+    }
+    fclose(r->f);
+    free(r->win);
+    free(r->par);
+    free(r);
+}
 
 /*
  * Decrypt an entry payload in place, before anything decompresses it.

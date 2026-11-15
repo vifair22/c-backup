@@ -482,10 +482,23 @@ Every load verifies before it trusts:
 - `object_load_prefix`: bounded prefix for previews and probes, LZ4
   partial decode for packed entries, no hash verification (a prefix
   cannot be hash-checked).
-- `object_read_stored`: the entry as stored, for replication. No decrypt
-  or decompress, but a packed entry is CRC-checked and corrected from its
-  parity first, so damage that parity covers is not shipped to a replica
-  that would then compute fresh parity over it.
+- `object_stored_open` / `object_stored_read`: the object as stored, in
+  pieces, which is what replication moves. No decrypt or decompress, but
+  open CRC-scans the payload (loose or packed) and on a mismatch every read
+  is served from a window corrected from parity, so damage parity covers is
+  never shipped to a replica that would compute fresh parity over it. A
+  clean object costs one extra sequential read; memory is one window (a
+  15 KiB group for loose, at most 64 groups for packed). Damage beyond
+  parity is sent as it is, logged and counted uncorrectable: it was already
+  lost and its hash still exposes it. `object_read_stored` is the
+  whole-buffer form, for tests and inspection, with the same correction.
+
+A pack at or above about 59.75 GiB is not corrected from at all (OWN-30):
+the trailer's `trailer_size` and per-entry `entry_parity_size` are 32-bit
+and wrap once its parity reaches 4 GiB, and parity located through a
+wrapped size would produce a confident wrong correction. Every reader,
+repair and copy treats such a pack's entries as having no parity; repair
+reports failure and writes nothing.
 
 Parity on a packed entry is never loaded whole. A reader records where the
 entry's RS parity sits in the trailer and fetches it one window of groups

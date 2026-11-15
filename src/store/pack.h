@@ -140,16 +140,26 @@ status_t pack_object_read_stored(store_t *store,
 
 /*
  * Open a packed object's entry for reading as stored, without loading it.
- * On OK, *out_f is positioned at the first payload byte and holds *out_len
- * of them; the caller reads and fcloses it. object_stored_open is the
- * caller and the only one that should be.
+ * On OK, *out reads *out_len payload bytes, in order, through
+ * pack_stored_read; pack_stored_close releases it. object_stored_open is
+ * the caller and the only one that should be.
+ *
+ * The bytes handed over are corrected from the entry's parity: open
+ * CRC-scans the payload, and on a mismatch every read is served from a
+ * window corrected group by group, so damage parity can carry is never
+ * passed on. Memory is one window (at most 64 groups, about 1 MiB) whatever
+ * the entry's size.
  */
+typedef struct pack_stored_reader pack_stored_reader_t;
+
 status_t pack_object_open_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  uint8_t *out_type, uint8_t *out_compression,
                                  uint8_t *out_encryption,
                                  uint64_t *out_uncompressed_size,
-                                 uint64_t *out_len, FILE **out_f);
+                                 uint64_t *out_len, pack_stored_reader_t **out);
+status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n);
+void     pack_stored_close(pack_stored_reader_t *r);
 
 /*
  * Write a pack out of objects that are already in stored form.
@@ -343,6 +353,14 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
  * few MiB through many windows and measure that memory stays bounded.
  */
 void pack_test_set_parity_window(size_t groups);
+
+/*
+ * Test hook: the pack size at and above which parity is not trusted because
+ * the trailer's 32-bit sizes may have wrapped (OWN-30; about 59.75 GiB). 0
+ * restores the default. Lowering it lets a test show that repair refuses
+ * such a pack and writes nothing.
+ */
+void pack_test_set_parity_fit_limit(uint64_t bytes);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only

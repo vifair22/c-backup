@@ -76,6 +76,7 @@ static int teardown(void **state)
 {
     (void)state;
     pack_test_set_parity_window(0);
+    pack_test_set_parity_fit_limit(0);
     if (store) { store_close(store); store = NULL; }
     cleanup();
     return 0;
@@ -382,8 +383,8 @@ static void test_gc_copy_does_not_launder_damage(void **state)
     assert_int_equal((int)parity_stats_get().repaired, 0);
 }
 
-/* Replication's read side hands over stored bytes; damage parity covers is
- * corrected first, for the same reason as gc's copy. */
+/* The whole-buffer stored read (tests, inspection) hands over stored bytes;
+ * damage parity covers is corrected first, for the same reason as gc's copy. */
 static void test_stored_read_corrects_damage(void **state)
 {
     (void)state;
@@ -411,6 +412,56 @@ static void test_stored_read_corrects_damage(void **state)
     assert_true(parity_stats_get().repaired > 0);
     free(got);
     free(clean);
+}
+
+/*
+ * The streaming stored read replication uses: pieces of an awkward size,
+ * which straddle the reader's corrected windows, come back as the entry was
+ * written, and the reader holds one window however large the entry is.
+ */
+static void test_streaming_stored_read_corrects_damage(void **state)
+{
+    (void)state;
+    size_t len = (size_t)3 * 1024 * 1024;
+    uint8_t *data = malloc(len);
+    assert_non_null(data);
+    fill_random(data, len, 0x5743AEDu);
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, len, h), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    char dat[512]; off_t pay = 0; uint64_t csize = 0; uint8_t codec = 0;
+    entry_info(h, dat, sizeof(dat), &pay, &csize, &codec);
+    assert_int_equal(codec, COMPRESS_NONE);
+    flip(dat, pay + 12345);
+    flip(dat, pay + (off_t)(len - 777));
+
+    parity_stats_reset();
+    fault_malloc_peak = 0;
+    object_stored_info_t info;
+    uint64_t slen = 0;
+    object_stored_reader_t *r = NULL;
+    assert_int_equal(object_stored_open(store, h, &info, &slen, &r), OK);
+    size_t peak_open = fault_malloc_peak;
+    assert_int_equal(slen, len);
+    uint8_t *got = malloc(len);   /* the test's own copy, after the peak is read */
+    assert_non_null(got);
+    fault_malloc_peak = 0;
+    for (size_t o = 0; o < len; ) {
+        size_t n = len - o < 10007 ? len - o : 10007;
+        assert_int_equal(object_stored_read(r, got + o, n), OK);
+        o += n;
+    }
+    size_t peak_read = fault_malloc_peak;
+    object_stored_close(r);
+
+    assert_memory_equal(got, data, len);
+    assert_true(peak_open <= PEAK_BOUND);
+    assert_true(peak_read <= PEAK_BOUND);
+    assert_true(parity_stats_get().repaired > 0);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+    free(got);
+    free(data);
 }
 
 /*
@@ -463,6 +514,66 @@ static void test_damage_past_256_mib_is_repaired(void **state)
     close(nul);
 }
 
+/* Every byte of a file, for comparing before and after. */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    *len = (size_t)sb.st_size;
+    uint8_t *b = malloc(*len);
+    assert_non_null(b);
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, b, *len, 0), (ssize_t)*len);
+    close(fd);
+    return b;
+}
+
+/*
+ * OWN-30: a pack past the size where its 32-bit trailer sizes can wrap
+ * (about 59.75 GiB, faked low here) is not corrected from at all. Repair
+ * refuses and reports failure, and not one byte of the pack changes; the
+ * damaged entry reads as damaged rather than as a confident wrong
+ * correction.
+ */
+static void test_repair_refuses_past_the_parity_fit_limit(void **state)
+{
+    (void)state;
+    uint8_t a[50000];
+    fill_random(a, sizeof(a), 0x0B5E55EDu);
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, a, sizeof(a), h), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    char dat[512]; off_t pay = 0; uint64_t csize = 0;
+    entry_info(h, dat, sizeof(dat), &pay, &csize, NULL);
+    flip(dat, pay + 1000);
+    flip(dat, 4);   /* the entry header too: its XOR record must not be used */
+
+    size_t blen = 0;
+    uint8_t *before = slurp(dat, &blen);
+    pack_test_set_parity_fit_limit((uint64_t)blen - 1);
+
+    parity_stats_reset();
+    assert_int_equal(pack_object_repair(store, h), -1);
+    err_clear();
+    void *out = NULL;
+    size_t got = 0;
+    assert_int_not_equal(object_load(store, h, &out, &got, NULL), OK);
+    err_clear();
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+
+    size_t alen = 0;
+    uint8_t *after = slurp(dat, &alen);
+    assert_int_equal(alen, blen);
+    assert_memory_equal(after, before, blen);
+
+    /* Below the limit the same pack repairs, so it was the guard that held. */
+    pack_test_set_parity_fit_limit(0);
+    assert_true(pack_object_repair(store, h) > 0);
+    free(before);
+    free(after);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -472,7 +583,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_block_entry_corrected_across_windows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_copy_does_not_launder_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stored_read_corrects_damage, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_streaming_stored_read_corrects_damage, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damage_past_256_mib_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_repair_refuses_past_the_parity_fit_limit, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
