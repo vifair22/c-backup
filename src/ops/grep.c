@@ -443,20 +443,23 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     char started[32];
     snprintf(started, sizeof(started), "%lld", (long long)time(NULL));
-    if (db_execute_non_query(db,
+    /* The id comes back from the INSERT itself. last_insert_rowid() is per
+     * connection, and every thread shares one: another thread's insert
+     * between the two statements handed this caller someone else's id. */
+    db_result_t *r = NULL;
+    if (db_execute(db,
             "INSERT INTO grep_runs (repo_id, snap_id, pattern, path_prefix,"
             " ignore_case, started_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
             (const char *[]){ repo, snap, opts->pattern,
                               opts->path_prefix ? opts->path_prefix : "",
                               opts->ignore_case ? "1" : "0", started, NULL },
-            NULL) != 0) {
+            &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
         regfree(&re);
         return set_error(ERR_IO, "grep: cannot open run record");
     }
-    db_result_t *r = NULL;
-    if (db_execute(db, "SELECT last_insert_rowid()", NULL, &r) == 0 && r && r->nrows == 1)
-        res.run_id = strtoll(r->rows[0][0], NULL, 10);
+    res.run_id = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
 
     /*
