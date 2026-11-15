@@ -362,7 +362,7 @@ the database or binds a socket:
 
 ```
 /etc/c-backupd/config.yaml:12: error: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
-appguard: config init failed: /etc/c-backupd/config.yaml:12: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+appguard: config init failed; the problems are listed above
 ```
 
 What stops it:
