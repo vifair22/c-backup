@@ -205,6 +205,73 @@ static void test_a_waiting_writer_goes_first(void **state)
 }
 
 /*
+ * OWN-16: a holder can tell whether anybody is queued behind it.
+ *
+ * The backup holds its batch for as long as nobody else wants the lock and
+ * lets it go as soon as somebody does, so db_txn_waiters has to read zero
+ * with nobody queued - or every check is a commit, which is B107's cost -
+ * and non-zero once a writer is blocked in its begin, or the writer waits
+ * for the whole batch.
+ */
+static void test_waiters_counts_queued_writers(void **state)
+{
+    (void)state;
+
+    assert_int_equal(db_txn_waiters(), 0);
+    assert_int_equal(db_txn_begin(db), OK);
+    /* Holding is not waiting. */
+    assert_int_equal(db_txn_waiters(), 0);
+
+    struct handoff h;
+    memset(&h, 0, sizeof(h));
+    pthread_mutex_init(&h.mu, NULL);
+    pthread_cond_init(&h.cv, NULL);
+    h.contender_status = ERR_IO;
+    h.holder_inside = 1;
+
+    pthread_t t;
+    assert_int_equal(pthread_create(&t, NULL, contender_main, &h), 0);
+
+    /* Until the contender is queued; bounded so a broken count fails the
+     * test rather than hanging it. */
+    int seen = 0;
+    for (int i = 0; i < 500 && !seen; i++) {
+        if (db_txn_waiters() == 1) { seen = 1; break; }
+        struct timespec ts = { 0, 2 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    assert_true(seen);
+
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(pthread_join(t, NULL), 0);
+    assert_int_equal(h.contender_status, OK);
+    /* Served and gone. */
+    assert_int_equal(db_txn_waiters(), 0);
+
+    pthread_mutex_destroy(&h.mu);
+    pthread_cond_destroy(&h.cv);
+}
+
+/*
+ * A second begin on the thread that holds the lock fails instead of queuing
+ * behind its own ticket for ever. The backup holds its batch across more
+ * than it did (OWN-16), so a seal or any other transaction begun from inside
+ * one is a hang one refactor away; this turns it into an error.
+ */
+static void test_a_nested_begin_fails_instead_of_hanging(void **state)
+{
+    (void)state;
+
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_begin(db), ERR_BUSY);
+    /* The failed attempt left the outer transaction and the lock as they
+     * were: commit works, and the lock is free afterwards. */
+    assert_int_equal(db_txn_commit(db), OK);
+    assert_int_equal(db_txn_begin(db), OK);
+    assert_int_equal(db_txn_commit(db), OK);
+}
+
+/*
  * A rollback has to release the lock too, or one failed write wedges every
  * writer for the life of the process. This is the path most easily got wrong,
  * because it is the one no successful run exercises.
@@ -244,6 +311,8 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_a_second_writer_waits_instead_of_failing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_waiting_writer_goes_first, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_waiters_counts_queued_writers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_nested_begin_fails_instead_of_hanging, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rollback_releases_the_lock, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repeated_cycles_do_not_leak_the_lock, setup, teardown),
     };

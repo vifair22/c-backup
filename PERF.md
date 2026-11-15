@@ -6,6 +6,107 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - Batches commit only when another writer waits (OWN-16)
+
+UAT measured r8 against pre-r8 on FS2 (1,605 files, 15.24 GB, source over
+NFS, state.db and repositories on btrfs RAID10 over LUKS on DRAM-less SATA
+SSDs): 335.7 s before, 402.9 s after. Reading, hashing and writing were no
+slower; about 60 s per run was in no phase at all, and the trees phase took
+16-19 s.
+
+**Unattributed time.** B107 commits the store phase's batch every 200 ms and
+before every file of 4 MiB or more, whether or not anybody is waiting for the
+lock. That is one WAL sync per such file. r8 predates the store-commit row
+(B086 added it), so those commits were "elsewhere": about 1,600 of them at
+the host's ~37 ms per sync. The job's progress UPDATEs, issued between
+batches, were commits of their own too.
+
+**Trees.** Every new tree recorded its staged row with no transaction open,
+so each directory was a commit and a sync. That is the same in pre-r8: here
+pre-r8 and post-r8 spend identical time in trees at every sync delay (9.0-10.0
+s at 20 ms for 305 directories). UAT's 0.5 s pre-r8 figure is not reproduced
+by any code difference between fc511b9 and r8; the likeliest reading is that
+those runs reused their trees. Either way the per-tree sync was the cost.
+
+**Fix.** db_txn_waiters() says whether anybody is queued for the lock. A
+batch ends at 2,000 entries, or at the next check point after a writer
+queues (each entry, each 1 MiB read of a file being stored, each 50 ms slice
+of a pool wait, each tree); once a waiter is seen it follows B107's rules for
+1 s, so two persistent writers alternate every 200 ms rather than once per
+entry. Trees are recorded in a batch. Transaction time is now attributed:
+txn-wait, txn-commit (with commit:store/trees/index/pack), progress-cb,
+pack-seal, setup and snapshot-record, and "elsewhere" is 0.01 s.
+
+### Method
+
+Machine: the header's (Ryzen 9 5900XT, 32 threads), Linux 7.3.3, GCC 15.
+`bench_phases -n 1500 -s 4194304 -D 5 -l 105 -t 0 -m 24 -j`: 1,605 files,
+8.3 GiB, 305 directories; 1,500 files of 2-6 MiB (packed, half over the old
+4 MiB line) and 105 of 24 MiB (to the pool), with the daemon's job-progress
+writes. On the NVMe disk (/home, btrfs on LVM), slow sync through
+`build/bins/slow_sync.so` with `SLOW_SYNC_DIRS` set to the working
+directory, which holds both state.db and the repository, as on the UAT
+host. Builds: pre-r8 = fc511b9, post-r8 = origin/perf/b086-pool (r8 plus the
+large-file pool), fixed = this branch. Single runs; where a row was repeated
+both are shown.
+
+### First backup, seconds
+
+| sync delay | pre-r8 | post-r8 | fixed |
+|---|---:|---:|---:|
+| none (real fsync, ~6.6 ms a commit) | 18.84 | 22.50 | 15.61, 16.56 |
+| 5 ms | 20.85 | 28.50 | 16.04, 21.52 |
+| 20 ms | 28.28, 25.54 | 52.41, 47.13 | 16.58, 18.33 |
+| 50 ms | 41.21 | 96.93 | 17.88, 19.78 |
+
+The regression reproduces and grows with sync cost (post-r8 is 2.4x pre-r8 at
+50 ms); the fix is flat across delays and faster than pre-r8 at every one,
+since pre-r8 still synced once per tree and had no pool. The 21.52 s fixed run
+at 5 ms is disk noise: its commits took 0.64 s, and the repeat read 16.04 s.
+
+### Where the time and syncs went (first backup)
+
+| | pre-r8 | post-r8 | fixed |
+|---|---:|---:|---:|
+| commits (store phase / all) | - | 777-793 store-commit | 10 / 22 |
+| syncs delayed by the shim | 362-426 | 1,221-1,460 | 63-65 |
+| store-commit / txn-commit at 20 ms | - | 21.1-24.4 s | 0.67-0.83 s |
+| store-commit / txn-commit at 50 ms | - | 45.6 s | 1.40-1.58 s |
+| trees at 5 / 20 / 50 ms | 3.6 / 9.0-10.0 / 22.9 s | 3.8 / 8.9-10.0 / 23.0 s | 0.01 s |
+| txn-wait | - | - | 0.00 s |
+| elsewhere (unattributed) | 0.57-0.77 s | 0.44-0.69 s | 0.01 s |
+
+Fixed, the 22 commits are 10 store batches (one before each of nine pack
+seals, one at the end), 10 pack commits, one trees batch and one index_nodes
+batch. A sync count of 63 is those plus the pack and snapshot record fsyncs.
+
+### No-change incremental, seconds
+
+| sync delay | pre-r8 | post-r8 | fixed |
+|---|---:|---:|---:|
+| none | 0.105 | 0.112 | 0.103-0.105 |
+| 5 ms | 0.157 | 0.154 | 0.145-0.173 |
+| 20 ms | 0.263-0.286 | 0.263-0.285 | 0.264-0.285 |
+| 50 ms | 0.529 | 0.523 | 0.531-0.614 |
+
+Unchanged: three or four commits either way (store, trees, index, snapshot).
+
+### tmpfs
+
+`-n 1555 -s 1048576 -D 5 -l 50 -t 0 -m 20 -j` on /tmp (2.5 GiB; the restore
+step ran out of tmpfs space and is not reported). First backup: pre-r8 4.11 s,
+post-r8 3.62 s (63 store commits), fixed 3.60-3.64 s (8 commits). No-change
+incremental 0.06 s for all three. On tmpfs a commit is 0.2 ms and none of
+this shows, which is how B107 passed review.
+
+### Contention
+
+A writer that queues once a millisecond during a 6,000-file backup
+(test_a_persistent_writer_does_not_cost_a_commit_per_file): 4 store commits
+in 430 ms. With the contended window disabled the same run made 250. The
+stress test (4 writers against a backup) keeps its max write wait at
+15-140 ms against the 2 s bound.
+
 ## 2026-11-15 - Large files stored on a worker pool (B086, part 2)
 
 UAT's next report after the pipelined writer: 16 GiB of 8 x 2 GiB random

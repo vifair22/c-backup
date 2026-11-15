@@ -585,7 +585,13 @@ $(BINS)/bench_fuse_xfer: $(BENCH)/fuse_xfer.c $(REL_LIB_OBJS) | $(BINS)
 $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
 
-bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse
+# An LD_PRELOAD shim, not linked into anything: it delays fsync and fdatasync
+# under chosen directories so bench_phases can model slow sync storage. See
+# bench/slow_sync.c.
+$(BINS)/slow_sync.so: $(BENCH)/slow_sync.c | $(BINS)
+	$(CC) -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O2 -fPIC -shared $< -o $@ -ldl -lpthread
+
+bench: $(BINS)/bench_micro $(BINS)/bench_phases $(BINS)/bench_browse $(BINS)/slow_sync.so
 	@echo "=== micro ===" && $(BINS)/bench_micro
 	@echo "=== phases ===" && $(BINS)/bench_phases
 	@echo "=== browse ===" && $(BINS)/bench_browse

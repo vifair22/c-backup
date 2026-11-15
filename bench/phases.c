@@ -32,6 +32,10 @@
  *     -p, --preset NAME    many-large: 8 incompressible files of 2 GiB and
  *                          nothing else, the B086 case; later options still
  *                          override it
+ *     -D, --per-dir N      small files per directory            (BENCH_PER_DIR, 100)
+ *     -j, --job-progress   write progress to a jobs row the way the daemon's
+ *                          job manager does, at most every 250 ms
+ *                                                          (BENCH_JOB_PROGRESS, 0)
  *     -c, --cold           sync and evict the source from the page cache before
  *                          each backup, and include a trailing sync in every
  *                          timing; only meaningful on a real filesystem
@@ -52,7 +56,6 @@
 #include "pack.h"
 #include "restore.h"
 
-#define FILES_PER_DIR 100
 #define WRITE_CHUNK   (1u << 20)
 
 typedef struct {
@@ -64,6 +67,8 @@ typedef struct {
     uint64_t text_files;
     uint64_t large_mib;
     unsigned workers;
+    uint64_t per_dir;
+    int      job_progress;
     int      cold;
     int      keep;
 } opts_t;
@@ -174,14 +179,14 @@ static int generate(const opts_t *o, const char *src, tree_stats_t *st)
     snprintf(path, sizeof(path), "%s/small", src);
     if (bench_mkdir(path) != 0) goto out;
     for (uint64_t i = 0; i < o->small_files; i++) {
-        if (i % FILES_PER_DIR == 0) {
-            snprintf(path, sizeof(path), "%s/small/%05" PRIu64, src, i / FILES_PER_DIR);
+        if (i % o->per_dir == 0) {
+            snprintf(path, sizeof(path), "%s/small/%05" PRIu64, src, i / o->per_dir);
             if (bench_mkdir(path) != 0) goto out;
         }
         /* Uniform in [mean/2, 3*mean/2), so the mean is what was asked for. */
         uint64_t size = o->small_bytes / 2 + (o->small_bytes ? xorshift() % o->small_bytes : 0);
         snprintf(path, sizeof(path), "%s/small/%05" PRIu64 "/f%07" PRIu64 ".dat",
-                 src, i / FILES_PER_DIR, i);
+                 src, i / o->per_dir, i);
         if (make_file(path, size, FILL_SMALL, buf) != 0) goto out;
         st->files++;
         st->bytes += size;
@@ -250,6 +255,83 @@ static double finish_timing(const opts_t *o, double t0)
     return bench_now() - t0;
 }
 
+/* ---------- job progress ---------- */
+
+/*
+ * What the daemon's job manager does with a backup's progress (on_progress
+ * in job_manager.c): an UPDATE of the job's row at most every 250 ms and on
+ * every phase change, on the backup's own thread, through the shared handle.
+ * Off by default so earlier PERF.md entries stay comparable; on, it puts the
+ * daemon's progress writes back into the measurement. A write issued while
+ * the backup has no batch open is a commit of its own, and on slow storage
+ * a sync of its own (OWN-16).
+ */
+typedef struct {
+    cutils_db_t *db;
+    char         job_id[32];
+    int64_t      last_ms;
+    char         last_phase[32];
+    uint64_t     bytes_done, bytes_total;
+    uint64_t     writes;
+} job_progress_t;
+
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void job_progress_cb(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    job_progress_t *jp = ctx;
+    const char *ph = phase ? phase : "";
+    int64_t now = mono_ms();
+    int changed  = strncmp(jp->last_phase, ph, sizeof(jp->last_phase) - 1) != 0;
+    int finished = total > 0 && done >= total;
+    if (!changed && !finished && now - jp->last_ms < 250) return;
+    jp->last_ms = now;
+    snprintf(jp->last_phase, sizeof(jp->last_phase), "%s", ph);
+
+    char d[32], t[32], bd[32], bt[32];
+    snprintf(d,  sizeof(d),  "%" PRIu64, done);
+    snprintf(t,  sizeof(t),  "%" PRIu64, total);
+    snprintf(bd, sizeof(bd), "%" PRIu64, jp->bytes_done);
+    snprintf(bt, sizeof(bt), "%" PRIu64, jp->bytes_total);
+    /* Best effort, as in the daemon: a lost tick never fails the backup. */
+    if (db_execute_non_query(jp->db,
+        "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
+        " progress_total = ?, bytes_done = ?, bytes_total = ? WHERE id = ?",
+        (const char *[]){ ph, d, t, bd, bt, jp->job_id, NULL }, NULL) == 0)
+        jp->writes++;
+}
+
+static void job_bytes_cb(void *ctx, uint64_t done, uint64_t total)
+{
+    job_progress_t *jp = ctx;
+    jp->bytes_done  = done;
+    jp->bytes_total = total;
+}
+
+static int job_progress_open(job_progress_t *jp, bench_env_t *e)
+{
+    memset(jp, 0, sizeof(*jp));
+    jp->db = e->db;
+    db_result_t *r = NULL;
+    int rc = db_execute(e->db,
+        "INSERT INTO jobs (repo_id, action, params, state)"
+        " VALUES (?, 'backup', '{}', 'running') RETURNING id",
+        (const char *[]){ e->repo_id_s, NULL }, &r);
+    if (rc == 0 && r && r->nrows == 1)
+        snprintf(jp->job_id, sizeof(jp->job_id), "%s", r->rows[0][0]);
+    db_result_free(r);
+    if (!jp->job_id[0]) {
+        fprintf(stderr, "bench: cannot create a jobs row\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* ---------- the run ---------- */
 
 static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
@@ -262,6 +344,14 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
     bo.paths = paths;
     bo.n_paths = 1;
     bo.store_workers = o->workers;
+    job_progress_t jp;
+    memset(&jp, 0, sizeof(jp));
+    if (o->job_progress) {
+        if (job_progress_open(&jp, e) != 0) return -1;
+        bo.progress_cb  = job_progress_cb;
+        bo.bytes_cb     = job_bytes_cb;
+        bo.progress_ctx = &jp;
+    }
 
     if (o->cold) evict(src);
     section(label);
@@ -299,6 +389,8 @@ static int timed_backup(const opts_t *o, bench_env_t *e, const char *src,
            "%u packed, %u store workers)\n",
            res->files, res->dirs, res->files_unchanged, res->objects_new,
            res->trees_new, res->trees_reused, packed, res->store_workers);
+    if (o->job_progress)
+        printf("      (%" PRIu64 " job progress writes)\n", jp.writes);
     return 0;
 }
 
@@ -332,7 +424,7 @@ static void usage(FILE *f)
 {
     fprintf(f,
         "usage: bench_phases [-d DIR] [-n SMALL] [-s BYTES] [-l LARGE] [-t TEXT]\n"
-        "                    [-m MIB] [-w N] [-p PRESET] [-c] [-k]\n"
+        "                    [-m MIB] [-w N] [-p PRESET] [-D N] [-j] [-c] [-k]\n"
         "  -d, --dir DIR        parent of the working directory (BENCH_DIR, /tmp)\n"
         "  -n, --small N        small files (BENCH_SMALL_FILES, 10000)\n"
         "  -s, --small-bytes B  mean small-file size (BENCH_SMALL_BYTES, 4096)\n"
@@ -341,6 +433,8 @@ static void usage(FILE *f)
         "  -m, --large-mib M    MiB per large file (BENCH_LARGE_MIB, 64)\n"
         "  -w, --workers N      large-file store workers, 0 auto, 1 serial (BENCH_STORE_WORKERS, 0)\n"
         "  -p, --preset NAME    many-large: 8 x 2 GiB incompressible, no small files\n"
+        "  -D, --per-dir N      small files per directory (BENCH_PER_DIR, 100)\n"
+        "  -j, --job-progress   write job progress like the daemon (BENCH_JOB_PROGRESS, 0)\n"
         "  -c, --cold           evict the source before each backup, sync in timings\n"
         "  -k, --keep           keep the working directory\n");
 }
@@ -356,6 +450,8 @@ static void parse(int argc, char **argv, opts_t *o)
     o->large_mib   = bench_env_u64("BENCH_LARGE_MIB", 64);
     uint64_t w     = bench_env_u64("BENCH_STORE_WORKERS", 0);
     o->workers     = w > 64 ? 64u : (unsigned)w;
+    o->per_dir     = bench_env_u64("BENCH_PER_DIR", 100);
+    o->job_progress = bench_env_u64("BENCH_JOB_PROGRESS", 0) != 0;
 
     static const struct option lo[] = {
         { "dir",         required_argument, NULL, 'd' },
@@ -366,13 +462,15 @@ static void parse(int argc, char **argv, opts_t *o)
         { "large-mib",   required_argument, NULL, 'm' },
         { "workers",     required_argument, NULL, 'w' },
         { "preset",      required_argument, NULL, 'p' },
+        { "per-dir",     required_argument, NULL, 'D' },
+        { "job-progress", no_argument,      NULL, 'j' },
         { "cold",        no_argument,       NULL, 'c' },
         { "keep",        no_argument,       NULL, 'k' },
         { "help",        no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "d:n:s:l:t:m:w:p:ckh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:n:s:l:t:m:w:p:D:jckh", lo, NULL)) != -1) {
         switch (c) {
         case 'd': snprintf(o->parent, sizeof(o->parent), "%s", optarg); break;
         case 'n': o->small_files = bench_parse_u64("--small", optarg); break;
@@ -396,6 +494,8 @@ static void parse(int argc, char **argv, opts_t *o)
             o->text_files  = 0;
             o->large_mib   = 2048;
             break;
+        case 'D': o->per_dir = bench_parse_u64("--per-dir", optarg); break;
+        case 'j': o->job_progress = 1; break;
         case 'c': o->cold = 1; break;
         case 'k': o->keep = 1; break;
         case 'h': usage(stdout); exit(0);
@@ -403,6 +503,10 @@ static void parse(int argc, char **argv, opts_t *o)
         }
     }
     if (optind != argc) { usage(stderr); exit(2); }
+    if (o->per_dir == 0) {
+        fprintf(stderr, "bench: --per-dir must be at least 1\n");
+        exit(2);
+    }
     if (o->large_mib > (UINT64_MAX >> 21)) {
         fprintf(stderr, "bench: --large-mib too large\n");
         exit(2);

@@ -764,11 +764,15 @@ second job for a repository that has one running, and queues it instead. Jobs
 for different repositories run in parallel, up to `jobs.max_parallel`.
 
 Metadata writes (tags, notes, policy, sources) during a running backup wait
-briefly for the database rather than failing: a backup holds the database's
-write lock for at most about 200 ms at a time, never while it reads a file of
-4 MiB or more, and a write that is waiting goes before the backup's next
-batch. Such a write returns in well under a second however long the backup
-runs.
+briefly for the database rather than failing. A backup holds the database's
+write lock across batches of up to 2,000 files, and lets it go as soon as
+another write is queued for it: at the next file, the next read of the file
+it is storing (at most 1 MiB), the next directory tree, or within 50 ms while
+it waits on its large-file workers. A write that is waiting goes before the
+backup's next batch, so it returns in well under a second however long the
+backup runs. A backup nobody interrupts commits once per 2,000 files and
+once per sealed pack, which matters on storage where each commit's sync is
+slow.
 
 A change to a repository's sources applies to backups submitted after it. A
 backup takes its sources from the configuration when it is submitted, so a

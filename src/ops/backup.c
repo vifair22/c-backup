@@ -61,6 +61,14 @@ typedef struct {
     uint32_t cnt;
 } hashset_t;
 
+/* A phase's open batch of index writes; see batch_open below. */
+typedef struct {
+    int      in_txn;
+    uint32_t since_commit;
+    uint64_t opened_ns;           /* phase_now() at the batch's BEGIN */
+    uint64_t contended_until_ns;  /* B107's rules apply until then */
+} batch_t;
+
 typedef struct {
     store_t       *store;
     cutils_db_t   *db;
@@ -78,6 +86,10 @@ typedef struct {
     hashset_t      meta_seen;
     /* Per-component attribution for the whole run. */
     phase_timers_t *timers;
+    /* The running phase's batch. Here rather than on the phase's stack so
+     * the store's byte-progress hook can let it go mid-file when a writer
+     * queues. Only one phase runs at a time, and each starts it zeroed. */
+    batch_t        batch;
     /*
      * Every object this run produces goes into this pack. There is no second
      * mode: the loose path is what objects fall back to when the pack format
@@ -225,12 +237,18 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
         p->last_report = now;
     }
 
+    /* In the daemon each of these is an UPDATE of the job's row, and one
+     * issued with no batch open is a commit and a sync of its own. */
+    uint64_t _tp = phase_now();
     if (p->opts->bytes_cb)
         p->opts->bytes_cb(p->opts->progress_ctx,
                           p->bytes_done + p->file_bytes + store_pool_bytes(p->pool),
                           p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
+    phase_add_nested(p->timers, PHASE_PROGRESS, _tp);
 }
+
+static void batch_yield(pipeline_t *p, batch_t *b);
 
 /*
  * Bytes read so far from the file being stored, from inside the store.
@@ -247,6 +265,9 @@ static void store_bytes(uint64_t bytes, void *ctx)
     p->file_bytes += bytes;
     if (p->file_bytes > p->file_size) p->file_bytes = p->file_size;
     report(p, "store", p->file_index, p->count);
+    /* Called per read, so a writer that queues while a large file is being
+     * read waits for one read rather than for the file. */
+    batch_yield(p, &p->batch);
 }
 
 /* The last path component; what the entry is called inside its parent. */
@@ -386,28 +407,45 @@ static void scan_progress(uint32_t scanned, void *ctx)
     b->cb("scan", scanned, 0, b->ctx);
 }
 
-static int64_t ms_since(const struct timespec *t0)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (int64_t)(now.tv_sec - t0->tv_sec) * 1000
-         + (int64_t)(now.tv_nsec - t0->tv_nsec) / 1000000;
-}
-
 /*
- * The store phase's open cache batch, if any.
+ * A phase's open batch of index writes, if any: the store phase's cache and
+ * object rows, and the trees phase's tree rows.
  *
- * One struct rather than three locals because the pool's drain has to open
- * and close the same batch the loop does: results are recorded inside one
- * (a statement outside a transaction joins whatever another thread has open
- * on the shared handle), and the batch is let go before the backup thread
- * waits on the workers, so a wait never holds the write lock (B107).
+ * One struct rather than locals because the pool's drain and the store's
+ * byte-progress hook have to open and close the same batch the loop does.
+ * Rows are recorded inside one: a statement outside a transaction joins
+ * whatever another thread has open on the shared handle, and outside any
+ * it is a commit, and a WAL sync, of its own.
+ *
+ * How long a batch stays open (OWN-16). B107 committed every 200 ms and
+ * around every file of 4 MiB or more, which kept a sources write prompt and
+ * cost one sync per large file whether or not anybody was waiting: 1,600
+ * commits for a 1,605-file backup, about 60 s on the UAT host's storage, all
+ * of it unattributed. Now the backup asks (db_txn_waiters) at every point
+ * that can: every entry, every read of a file being stored, every slice of a
+ * wait on the large-file workers, every tree.
+ *
+ *   - Nobody waiting: the batch ends at BATCH_ENTRIES entries, as it did
+ *     before B107, and is held across large files and pool waits.
+ *   - A writer queues: the batch ends at the next check, so it waits for
+ *     one entry or one read at most, and the batch becomes contended for
+ *     BATCH_CONTENDED_MS from the last time a waiter was seen.
+ *   - Contended: B107's rules - commit after BATCH_CONTENDED_HOLD_MS, and
+ *     let go before reading a file of BATCH_YIELD_BYTES or more and before
+ *     waiting on the workers - rather than letting go at every check.
+ *
+ * The contended state is for a writer that does not go away, and the one
+ * that matters is another backup: two backups of different repositories,
+ * each yielding at every check to the other, would hand the lock back and
+ * forth once per entry and per 1 MiB read, a commit each. Under B107's
+ * rules they alternate at most every 200 ms, as they did before this. A
+ * one-off tag or sources write costs one immediate commit and a second or
+ * so of B107's, not a sync per large file for the rest of the backup.
  */
-typedef struct {
-    int             in_txn;
-    uint32_t        since_commit;
-    struct timespec t0;
-} batch_t;
+#define BATCH_ENTRIES           2000
+#define BATCH_CONTENDED_MS      1000
+#define BATCH_CONTENDED_HOLD_MS 200
+#define BATCH_YIELD_BYTES       ((uint64_t)4 << 20)
 
 static void batch_open(pipeline_t *p, batch_t *b)
 {
@@ -415,17 +453,48 @@ static void batch_open(pipeline_t *p, batch_t *b)
     if (db_txn_begin(p->db) == OK) b->in_txn = 1;
     else err_clear();
     b->since_commit = 0;
-    clock_gettime(CLOCK_MONOTONIC, &b->t0);
+    b->opened_ns = phase_now();
+}
+
+static int batch_contended(const batch_t *b)
+{
+    return b->contended_until_ns > phase_now();
 }
 
 static void batch_close(pipeline_t *p, batch_t *b)
 {
     if (!b->in_txn) return;
-    uint64_t _tc = phase_now();
+    /* db_txn attributes the commit's time (txn-commit, commit:<phase>). */
     if (db_txn_commit(p->db) != OK)
-        log_warn("backup: cache commit failed");
-    phase_add(p->timers, PHASE_STORE_COMMIT, _tc);
+        log_warn("backup: index batch commit failed");
     b->in_txn = 0;
+}
+
+/*
+ * A check point: let the batch go if somebody newly wants the lock, or if it
+ * is contended and has been held for BATCH_CONTENDED_HOLD_MS. A waiter's
+ * transaction runs next, and this thread's next batch_open queues behind it.
+ */
+static void batch_yield(pipeline_t *p, batch_t *b)
+{
+    if (!b->in_txn) return;
+    uint64_t now = phase_now();
+    if (db_txn_waiters() > 0) {
+        int was = b->contended_until_ns > now;
+        b->contended_until_ns = now + (uint64_t)BATCH_CONTENDED_MS * 1000000ULL;
+        if (!was) { batch_close(p, b); return; }
+    }
+    if (b->contended_until_ns > now &&
+        now - b->opened_ns >= (uint64_t)BATCH_CONTENDED_HOLD_MS * 1000000ULL)
+        batch_close(p, b);
+}
+
+/* One entry recorded: end the batch at its size, or for a waiter. */
+static void batch_count(pipeline_t *p, batch_t *b)
+{
+    if (!b->in_txn) return;
+    if (++b->since_commit >= BATCH_ENTRIES) batch_close(p, b);
+    else batch_yield(p, b);
 }
 
 /*
@@ -480,19 +549,30 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
 }
 
 /*
+ * How long one wait on the workers lasts while a batch is held. An
+ * uncontended batch stays open across the wait now (OWN-16), so this is how
+ * long a writer that queues during one can be kept waiting before it is
+ * noticed.
+ */
+#define POOL_WAIT_HELD_MS 50
+
+/*
  * Take back and record every finished large file, waiting up to wait_ms for
  * one first when asked. The wait is the backup thread idle on the workers,
- * which is what large-file-wait reports, and the batch is committed before
- * it: holding the write lock while waiting on a 2 GiB file is B107 again.
+ * which is what large-file-wait reports. The batch is held across it unless
+ * somebody wants the lock, in slices short enough to notice when they do.
  */
 static status_t pool_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
 {
     if (!p->pool) return OK;
     if (wait_ms) {
-        batch_close(p, b);
+        batch_yield(p, b);
+        if (batch_contended(b)) batch_close(p, b);
+        if (b->in_txn && wait_ms > POOL_WAIT_HELD_MS) wait_ms = POOL_WAIT_HELD_MS;
         uint64_t _tw = phase_now();
         store_pool_wait(p->pool, wait_ms);
         phase_add(p->timers, PHASE_STORE_WAIT, _tw);
+        batch_yield(p, b);
     }
     store_pool_job_t *j;
     while ((j = store_pool_take(p->pool)) != NULL) {
@@ -500,6 +580,7 @@ static status_t pool_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
         status_t st = pool_record(p, j);
         store_pool_job_free(j);
         if (st != OK) return st;
+        batch_count(p, b);
     }
     return OK;
 }
@@ -547,6 +628,7 @@ static status_t store_content(pipeline_t *p)
     }
     p->res->store_workers = workers;
 
+    p->timers->txn_site = PHASE_COMMIT_STORE;
     status_t st = store_content_loop(p);
 
     char why[ERR_MSG_MAX];
@@ -568,23 +650,17 @@ static status_t store_content_loop(pipeline_t *p)
      * between every entry, and on a tree of any size that costs more than the
      * hashing it exists to avoid.
      */
-    batch_t b = { 0, 0, { 0, 0 } };
-    #define CACHE_BATCH 2000
+    batch_t *b = &p->batch;
+    memset(b, 0, sizeof(*b));
     /*
-     * A batch is bounded by time and by what it reads, not only by entries.
-     *
      * The transaction holds the daemon-wide write lock (db_txn.h), so every
      * tag and sources write queues behind it. Counted in entries alone, a
-     * backup of fewer than CACHE_BATCH files ran its whole store phase -
+     * backup of fewer than BATCH_ENTRIES files ran its whole store phase -
      * every byte read and hashed - inside one transaction, and a PUT
      * /repos/<id>/sources waited the length of the backup: 179 to 200 seconds
-     * on a tree of large files (B107). Committing after CACHE_TXN_MAX_MS keeps
-     * a batch of slow small files short, and letting go before reading a file
-     * of CACHE_TXN_YIELD_BYTES or more keeps one large read out of it
-     * entirely. The fsync a commit costs is noise beside reading 4 MiB.
+     * on a tree of large files (B107). The batch is let go whenever a writer
+     * is queued instead; see batch_t.
      */
-    #define CACHE_TXN_MAX_MS      200
-    #define CACHE_TXN_YIELD_BYTES ((uint64_t)4 << 20)
 
     p->bytes_total = 0;
     p->bytes_done  = 0;
@@ -603,14 +679,14 @@ static status_t store_content_loop(pipeline_t *p)
             p->bytes_done += p->scan->entries[i - 1].node.size;
         prev_pooled = 0;
         if (cancelled(p)) {
-            batch_close(p, &b);
+            batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
         }
 
         /* Results come back between entries. */
-        status_t dst = pool_drain(p, &b, 0);
+        status_t dst = pool_drain(p, b, 0);
         if (dst != OK) {
-            batch_close(p, &b);
+            batch_close(p, b);
             return dst;
         }
 
@@ -630,12 +706,38 @@ static status_t store_content_loop(pipeline_t *p)
                                   e->node.acl_hash);
         phase_add(p->timers, PHASE_META_BLOB, _tm);
         if (mst != OK) {
-            batch_close(p, &b);
+            batch_close(p, b);
             return mst;
         }
 
         if (e->node.type == NODE_TYPE_DIR) { p->res->dirs++; continue; }
         if (e->node.type != NODE_TYPE_REG) continue;
+
+        /*
+         * Seal the open pack here, if it has filled, and nowhere else.
+         *
+         * Sealing emits the commit callback, which begins a transaction of
+         * its own, and the write lock is not recursive, so the batch is let
+         * go first. This used to run only when the batch happened to be
+         * closed already, which was most entries after B107 and almost none
+         * before it: a backup of fewer than 2,000 files never sealed in the
+         * loop, and every packed file it read went into one pack however
+         * large that grew. Committing for a seal costs one sync per 256 MiB.
+         *
+         * The headroom is what the next entry might need. Checking after the
+         * fact instead would let one file push the pack past its seal, which
+         * is harmless for a 14 KiB file and is not for a 16 MiB one.
+         */
+        #define PACK_ROLLOVER_HEADROOM PACK_STREAM_THRESHOLD
+        if (pack_backup_full(p->pack_w, PACK_ROLLOVER_HEADROOM)) {
+            batch_close(p, b);
+            uint64_t _ts = phase_now(), _tsn = phase_nested(p->timers);
+            p->timers->txn_site = PHASE_COMMIT_PACK;
+            status_t rst = pack_backup_rollover(p->pack_w);
+            p->timers->txn_site = PHASE_COMMIT_STORE;
+            phase_add_excl(p->timers, PHASE_PACK_SEAL, _ts, _tsn);
+            if (rst != OK) return rst;
+        }
 
         /*
          * A transaction spans a batch of entries whether or not they write.
@@ -648,28 +750,8 @@ static status_t store_content_loop(pipeline_t *p)
          * grows - 17ms a lookup by the end. Both extremes were measured; this
          * is the middle.
          */
-        batch_open(p, &b);
-        if (++b.since_commit >= CACHE_BATCH ||
-            ms_since(&b.t0) >= CACHE_TXN_MAX_MS)
-            batch_close(p, &b);
-
-        /*
-         * Seal the open pack here, if it has filled, and nowhere else.
-         *
-         * This is the only point in the loop where no transaction is held.
-         * Sealing emits the commit callback, which begins one of its own, and
-         * the write lock is not recursive - doing it a few lines further down,
-         * inside the batch, deadlocks the backup against itself.
-         *
-         * The headroom is what the next entry might need. Checking after the
-         * fact instead would let one file push the pack past its seal, which
-         * is harmless for a 14 KiB file and is not for a 16 MiB one.
-         */
-        #define PACK_ROLLOVER_HEADROOM PACK_STREAM_THRESHOLD
-        if (!b.in_txn && pack_backup_full(p->pack_w, PACK_ROLLOVER_HEADROOM)) {
-            status_t rst = pack_backup_rollover(p->pack_w);
-            if (rst != OK) return rst;
-        }
+        batch_open(p, b);
+        batch_count(p, b);
 
         /*
          * The file is only opened when the cache cannot vouch for it. This is
@@ -695,26 +777,28 @@ static status_t store_content_loop(pipeline_t *p)
         /*
          * A large file goes to the pool once there is room for it; the
          * backup thread carries on with the entries after it. Waiting for
-         * room commits the batch first (pool_drain), so the write lock is
-         * never held across a worker's file.
+         * room holds the batch only while nobody else wants the lock
+         * (pool_drain).
          */
         int to_pool = p->pool && e->node.size > PACK_STREAM_THRESHOLD;
         while (to_pool &&
                store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
             status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
-                                        : pool_drain(p, &b, POOL_WAIT_MS);
+                                        : pool_drain(p, b, POOL_WAIT_MS);
             if (wst != OK) {
-                batch_close(p, &b);
+                batch_close(p, b);
                 return wst;
             }
             report(p, "store", i, p->count);
         }
 
-        /* A file read on this thread is read with the batch let go; one the
-         * pool takes is not read here at all. */
-        if (!to_pool && e->node.size >= CACHE_TXN_YIELD_BYTES)
-            batch_close(p, &b);
+        /* Contended, a large read on this thread is done with the batch let
+         * go, as B107 did; uncontended it is held (batch_t). */
+        if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
+            batch_close(p, b);
 
+        /* Open is part of reading: over NFS it is a round trip per file. */
+        uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
         int fd = open(e->path, O_RDONLY);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
@@ -726,7 +810,7 @@ static status_t store_content_loop(pipeline_t *p)
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
             if (sst != OK) {
-                batch_close(p, &b);
+                batch_close(p, b);
                 return sst;
             }
             prev_pooled = 1;
@@ -734,7 +818,6 @@ static status_t store_content_loop(pipeline_t *p)
         }
 
         object_write_t w;
-        uint64_t _tr = phase_now();
         p->file_bytes = 0;
         p->file_size  = e->node.size;
         p->file_index = i;
@@ -748,13 +831,13 @@ static status_t store_content_loop(pipeline_t *p)
         store_set_io_progress(p->store, prev_io, prev_io_ctx);
         /* The whole file is counted into bytes_done when the loop moves on. */
         p->file_bytes = 0;
-        phase_add(p->timers, PHASE_READ_HASH, _tr);
+        phase_add_excl(p->timers, PHASE_READ_HASH, _tr, _trn);
         int is_new = w.is_new;
         close(fd);
         if (st != OK && cancelled(p)) {
             /* Stopped inside the file, not unreadable: no warning, and no
              * moving on to the next one. */
-            batch_close(p, &b);
+            batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
         }
         if (st != OK) {
@@ -766,7 +849,7 @@ static status_t store_content_loop(pipeline_t *p)
         /* Its rows go in a transaction of the backup's own: a statement
          * issued outside one joins whatever transaction another thread has
          * open on the shared handle, and goes with it if that rolls back. */
-        batch_open(p, &b);
+        batch_open(p, b);
 
         if (is_new) {
             p->res->objects_new++;
@@ -793,7 +876,7 @@ static status_t store_content_loop(pipeline_t *p)
                            w.phys_bytes, w.payload_size);
         phase_add(p->timers, PHASE_INDEX_PUT, _ti);
         if (st != OK) {
-            batch_close(p, &b);
+            batch_close(p, b);
             return st;
         }
 
@@ -808,16 +891,16 @@ static status_t store_content_loop(pipeline_t *p)
      * are left. */
     while (p->pool && store_pool_outstanding(p->pool) > 0) {
         status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
-                                    : pool_drain(p, &b, POOL_WAIT_MS);
+                                    : pool_drain(p, b, POOL_WAIT_MS);
         if (wst != OK) {
-            batch_close(p, &b);
+            batch_close(p, b);
             return wst;
         }
         unsigned left = store_pool_outstanding(p->pool);
         report(p, "store", p->count > left ? p->count - left : 0, p->count);
     }
 
-    batch_close(p, &b);
+    batch_close(p, b);
     /* The last entry is finished too. Each file is counted when the loop
      * moves past it, and nothing moves past the last one, so every later
      * phase reported the byte count without it: a single-file backup went
@@ -829,9 +912,6 @@ static status_t store_content_loop(pipeline_t *p)
     p->file_bytes = 0;
     report(p, "store", p->count, p->count);
     return OK;
-    #undef CACHE_BATCH
-    #undef CACHE_TXN_MAX_MS
-    #undef CACHE_TXN_YIELD_BYTES
     #undef PACK_ROLLOVER_HEADROOM
 }
 
@@ -1052,21 +1132,52 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
         free(sorted);
         free(counts);
         free(depth);
-
-        for (uint32_t a = 0; a < ndirs; a++) {
-            if (cancelled(p)) { free(dirs); return set_error(ERR_BUSY, "backup cancelled"); }
-            report(p, "trees", a, ndirs);
-            status_t st = build_one_tree(p, dirs[a], p->links[dirs[a]].tree_hash);
-            if (st != OK) { free(dirs); return st; }
-            p->links[dirs[a]].hash_ready = 1;
-        }
-        /* Every directory is built: see the closing store report. */
-        report(p, "trees", ndirs, ndirs);
-        free(dirs);
     }
 
-    /* The synthetic root ties the source paths together into one tree. */
-    return build_one_tree(p, UINT32_MAX, root_hash);
+    /*
+     * Tree rows are written in batches, like the store phase's (batch_t).
+     *
+     * Each new tree records one staged row, and these went in one statement
+     * at a time with no transaction open: a commit, and a WAL sync, per new
+     * directory. That was 9 s of a 19 s backup of 308 directories with sync
+     * at 20 ms, and 16 to 19 s per run on the UAT host (OWN-16). In a batch
+     * they are one commit, and the job's progress writes in this phase join
+     * it instead of syncing on their own. A writer that queues is let in
+     * between trees.
+     *
+     * Nothing in this loop may begin a transaction of its own while the
+     * batch is held. Nothing does: trees go into the open pack, which only
+     * seals in the store phase and after this one.
+     */
+    batch_t *b = &p->batch;
+    memset(b, 0, sizeof(*b));
+    p->timers->txn_site = PHASE_COMMIT_TREES;
+    status_t st = OK;
+
+    for (uint32_t a = 0; a < ndirs; a++) {
+        if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
+        report(p, "trees", a, ndirs);
+        batch_open(p, b);
+        st = build_one_tree(p, dirs[a], p->links[dirs[a]].tree_hash);
+        if (st != OK) break;
+        p->links[dirs[a]].hash_ready = 1;
+        batch_count(p, b);
+    }
+    free(dirs);
+
+    if (st == OK) {
+        /* Every directory is built: see the closing store report. */
+        if (ndirs) report(p, "trees", ndirs, ndirs);
+        /* The synthetic root ties the source paths together into one tree. */
+        batch_open(p, b);
+        st = build_one_tree(p, UINT32_MAX, root_hash);
+    }
+
+    /* Committed on failure too, as the store phase does: the rows name
+     * objects in the open pack, and the caller drops staged rows when the
+     * pack is discarded. */
+    batch_close(p, b);
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1176,6 +1287,7 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
      */
     #define NODE_BATCH 2000
     uint32_t since_commit = 0;
+    p->timers->txn_site = PHASE_COMMIT_INDEX;
     status_t bst = db_txn_begin(p->db);
     if (bst != OK) return bst;
 
@@ -1472,23 +1584,27 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     p.cache_stamp = (int64_t)time(NULL);
     p.timers      = &timers;
 
+    /* Layers below here attribute through the thread-local; see phase_timer.h.
+     * Set before setup so its transaction is counted with the rest. */
+    phase_current = &timers;
+
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else
      * can be staging now. */
+    uint64_t _tsu = phase_now(), _tsun = phase_nested(&timers);
     st = store_index_drop_staged(db, repo_id);
     if (st == OK) st = pack_backup_open(store, &p.pack_w);
+    phase_add_excl(&timers, PHASE_SETUP, _tsu, _tsun);
     if (st != OK) { free(links); scan_result_free(scan); return st; }
 
     uint8_t root_hash[OBJECT_HASH_SIZE];
     struct timespec t0, t1, t2, t3;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    /* Layers below here attribute through the thread-local; see phase_timer.h. */
-    phase_current = &timers;
     st = store_content(&p);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    uint64_t _ttr = phase_now();
+    uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
     if (st == OK) st = build_trees(&p, root_hash);
-    phase_add(&timers, PHASE_TREES, _ttr);
+    phase_add_excl(&timers, PHASE_TREES, _ttr, _ttrn);
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     /*
@@ -1506,7 +1622,11 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      */
     if (st == OK) {
         uint32_t staged = 0;
+        uint64_t _tps = phase_now(), _tpsn = phase_nested(&timers);
+        timers.txn_site = PHASE_COMMIT_PACK;
         st = pack_backup_finish(p.pack_w, &staged);
+        timers.txn_site = 0;
+        phase_add_excl(&timers, PHASE_PACK_SEAL, _tps, _tpsn);
         p.pack_w = NULL;
         if (st == OK && staged)
             log_info("backup: staged %u object(s) directly into pack files", staged);
@@ -1533,6 +1653,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     }
 
     /* Snapshot ids are per repo and monotonic. */
+    uint64_t _tsr = phase_now(), _tsrn = phase_nested(&timers);
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
@@ -1544,11 +1665,15 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     time_t now = time(NULL);
     st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
-    uint64_t _tin = phase_now();
+    phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
+    uint64_t _tin = phase_now(), _tinn = phase_nested(&timers);
     if (st == OK) st = index_nodes(&p, snap_id);
-    phase_add(&timers, PHASE_INDEX_NODES, _tin);
+    timers.txn_site = 0;
+    phase_add_excl(&timers, PHASE_INDEX_NODES, _tin, _tinn);
     clock_gettime(CLOCK_MONOTONIC, &t3);
 
+    _tsr = phase_now();
+    _tsrn = phase_nested(&timers);
     if (st == OK) {
         char snap[32], ts[32], files[32], bytes[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
         snprintf(snap,  sizeof(snap),  "%lld", (long long)snap_id);
@@ -1565,6 +1690,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                                   files, bytes, ts, rhex, NULL }, NULL) != 0)
             st = set_error(ERR_IO, "backup_run: cannot record snapshot");
     }
+    phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
 
     /* Paths the scan no longer sees keep their cache rows otherwise, and the
      * cache would grow for every file that ever existed under this repo. */
@@ -1576,15 +1702,19 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                 if (scan->entries[i].node.type == NODE_TYPE_REG)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);
-            uint64_t _tsw = phase_now();
+            uint64_t _tsw = phase_now(), _tswn = phase_nested(&timers);
             file_cache_sweep(db, repo_id, seen, n_seen);
-            phase_add(&timers, PHASE_CACHE_SWEEP, _tsw);
+            phase_add_excl(&timers, PHASE_CACHE_SWEEP, _tsw, _tswn);
             free(seen);
         }
     }
 
     phase_current = NULL;
     res.snapshot_id = snap_id;
+    res.commits_store = (uint32_t)timers.count[PHASE_COMMIT_STORE];
+    res.commits_trees = (uint32_t)timers.count[PHASE_COMMIT_TREES];
+    res.commits_index = (uint32_t)timers.count[PHASE_COMMIT_INDEX];
+    res.commits_pack  = (uint32_t)timers.count[PHASE_COMMIT_PACK];
     hashset_free(&p.meta_seen);
     free(links);
     scan_result_free(scan);
