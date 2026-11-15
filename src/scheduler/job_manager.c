@@ -78,6 +78,33 @@ static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
     journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
 }
 
+/* See job_manager_start. Runs before any worker exists, so nothing else is
+ * writing the jobs table or the journal. */
+static void journal_interrupted(cutils_db_t *db)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0)"
+            "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
+            NULL, &r) != 0) {
+        db_result_free(r);
+        log_warn("job manager: cannot list interrupted jobs to journal them");
+        return;
+    }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        int64_t repo_id = strtoll(r->rows[i][0], NULL, 10);
+        if (repo_id <= 0) continue;   /* the journal is per repository */
+        /* Duration 0: when the process died is not known, and the time
+         * since the job started would count the downtime as work. */
+        journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
+                    r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+    }
+    if (r && r->nrows > 0)
+        log_warn("job manager: %d job(s) were interrupted by the last shutdown "
+                 "and are recorded as failed", r->nrows);
+    db_result_free(r);
+}
+
 static void set_job_state(job_manager_t *jm, int64_t job_id,
                           const char *state, const char *error)
 {
@@ -435,7 +462,14 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * Anything left in 'running' or 'queued' belongs to a previous process
      * that is gone. Nothing resumes it, so it is marked failed rather than
      * left looking active forever.
+     *
+     * And journalled. The journal is written when a job ends, by the worker
+     * that ran it, and a SIGKILL or a power cut leaves no worker to do it -
+     * so a backup interrupted that way was in the jobs table for a month and
+     * absent from the permanent record for ever. This is the only point that
+     * knows those jobs ended, so it writes their entries.
      */
+    journal_interrupted(db);
     if (db_execute_non_query(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
             " error = 'interrupted by daemon restart'"

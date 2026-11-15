@@ -173,9 +173,10 @@ restart; a backup skips what it already stored, a restore skips what it
 already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
 job, and prints the job record with `"cancel_requested":true`.
 
-A daemon that dies without stopping (a crash, `kill -9`, power
+A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on
-its next start. Either way the repository is consistent: a backup's partial pack
+its next start, and journals each such job then, since the killed process
+could not. Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
 those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup or gc, which hold the repository's write

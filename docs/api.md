@@ -462,7 +462,8 @@ Finished jobs are kept for 30 days and then deleted, so `/jobs/<id>` answers
 permanent record of what ran is each repository's journal
 (`GET /repos/<id>/journal`). A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
-one starts, since nothing resumes it.
+one starts, since nothing resumes it, and journalled then with that message:
+a daemon that was killed had no chance to journal it itself.
 
 A journal entry's `source` is the job's origin: `api`, or `schedule` with the
 message starting `schedule <id>`.

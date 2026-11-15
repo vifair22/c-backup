@@ -298,6 +298,42 @@ static int db_text(const char *sql, char *out, size_t cap)
  * no worker left to write it, so the permanent record simply lacked every
  * interrupted backup.
  */
+static void test_interrupted_jobs_are_journalled_at_start(void **state)
+{
+    (void)state;
+    job_manager_stop(jm); jm = NULL;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (repo_id, action, state, started, origin, schedule_id)"
+        " VALUES (1, 'backup', 'running', strftime('%s','now'), 'schedule', 7)",
+        NULL, NULL), 0);
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO jobs (repo_id, action, state) VALUES (2, 'verify', 'queued')",
+        NULL, NULL), 0);
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"
+                              " AND error = 'interrupted by daemon restart'"), 2);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 2);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 1"
+                              " AND operation = 'backup' AND result = 'failed'"
+                              " AND source = 'schedule'"
+                              " AND message = 'schedule 7: interrupted by daemon restart'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE repo_id = 2"
+                              " AND operation = 'verify' AND result = 'failed'"
+                              " AND source = 'api'"
+                              " AND message = 'interrupted by daemon restart'"), 1);
+
+    /* Once only: the next start finds nothing left to journal. */
+    job_manager_stop(jm); jm = NULL;
+    assert_int_equal(job_manager_start(db, 2, &jm), OK);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal"), 2);
+}
+
+/*
+ * B072: every journal entry said source "daemon", so a scheduled backup and
+ * one run by hand could not be told apart afterwards. The job carries its
+ * origin, and the journal says which schedule.
+ */
 static void test_journal_source_says_who_asked(void **state)
 {
     (void)state;
@@ -333,6 +369,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_as_jobs_finish, setup, teardown),
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
