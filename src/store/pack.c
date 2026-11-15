@@ -3181,7 +3181,12 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
      * a pack holding the same hash twice.
      */
     if (staged_set_contains(&w->seen, w->pw.idx_entries, out_hash)) return OK;
-    if (object_exists(w->pw.store, out_hash)) return OK;
+    if (object_exists(w->pw.store, out_hash)) {
+        /* A loose copy from an interrupted run may have no index row yet;
+         * see object_loose_phys_size. */
+        if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(w->pw.store, out_hash);
+        return OK;
+    }
 
     status_t st = pb_ensure_open(w);
     if (st != OK) return st;

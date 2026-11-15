@@ -143,6 +143,19 @@ int object_exists(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     return pack_object_exists(store, hash);
 }
 
+uint64_t object_loose_phys_size(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    int objfd = store_objects_fd(store);
+    if (objfd == -1) return 0;
+    char rel[3 + OBJECT_HASH_SIZE * 2];
+    snprintf(rel, sizeof(rel), "%s/%s", subdir, fname);
+    struct stat sb;
+    if (fstatat(objfd, rel, &sb, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(sb.st_mode))
+        return 0;
+    return (uint64_t)sb.st_size;
+}
+
 status_t object_physical_size(store_t *store,
                               const uint8_t hash[OBJECT_HASH_SIZE],
                               uint64_t *out_bytes,
@@ -182,7 +195,10 @@ static status_t write_object(store_t *store, uint8_t type,
     sha256(data, len, out_hash);
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
-    if (object_exists(store, out_hash)) return OK;
+    if (object_exists(store, out_hash)) {
+        if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
+        return OK;
+    }
 
     /* Always store uncompressed; the pack sweeper handles compression. */
     const void *payload = data;
@@ -311,6 +327,7 @@ static status_t write_object(store_t *store, uint8_t type,
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
             unlink(tmppath);
             close(subfd); free(compressed); free(ciphertext);
+            if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
             return OK;
         }
         st = set_error_errno(ERR_IO, "rename(%s, %s)", tmppath, dstpath);
@@ -741,7 +758,9 @@ done:
     if (out_is_new) *out_is_new = 0;
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(store, out_hash)) {
-        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath); return OK;
+        rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
+        return OK;
     }
 
     /* Patch header: fill in sizes and hash now that we know them */
@@ -838,7 +857,9 @@ done:
     uint64_t _pt_rn = phase_now();
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
-            close(subfd); unlink(tmppath); return OK;
+            close(subfd); unlink(tmppath);
+            if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
+            return OK;
         }
         close(subfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: rename(%s, %s)", tmppath, dstpath);
     }
@@ -1152,6 +1173,7 @@ sp_done:
     if (out_phys_bytes) *out_phys_bytes = 0;
     if (object_exists(store, out_hash)) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
+        if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
         return OK;
     }
 
@@ -1224,7 +1246,9 @@ sp_done:
     }
     if (rename(tmppath, dstpath) == -1) {
         if ((errno == EEXIST || errno == ENOTEMPTY) && obj_name_exists_at(subfd, fname)) {
-            close(subfd); unlink(tmppath); return OK;
+            close(subfd); unlink(tmppath);
+            if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(store, out_hash);
+            return OK;
         }
         close(subfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "sparse_stream: rename(%s, %s)", tmppath, dstpath);

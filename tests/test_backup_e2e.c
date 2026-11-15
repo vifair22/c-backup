@@ -746,6 +746,63 @@ static void test_readers_and_packer_stop_on_the_store_flag(void **state)
     close(out);
 }
 
+/*
+ * B060: an object an interrupted run left loose, with no index row, is
+ * recorded at its real size when the next run meets it.
+ *
+ * A backup killed after a large object was installed but before the batch
+ * holding its row committed leaves exactly that. The next run deduplicated
+ * against the file, the writer reported a physical size of 0 for an object
+ * it had not written, and the row went in as zero bytes - a 2,291,249,496
+ * byte object, in the report that found it, so summary under-reported by
+ * that much.
+ */
+static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
+{
+    (void)state;
+    write_big(TEST_DIR "/big.bin", 20);
+
+    /* What the killed run left: the loose object, and no row. */
+    int fd = open(TEST_DIR "/big.bin", O_RDONLY);
+    assert_true(fd >= 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    object_write_t w;
+    assert_int_equal(object_store_file_info(store, fd, 20u << 20, hash, &w), OK);
+    close(fd);
+    assert_int_equal(w.is_new, 1);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    char loose[PATH_MAX];
+    snprintf(loose, sizeof(loose), TEST_REPO "/objects/%.2s/%s", hex, hex + 2);
+    struct stat sb;
+    assert_int_equal(stat(loose, &sb), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects", NULL), 0);
+
+    static const char *paths[] = { TEST_DIR "/big.bin" };
+    backup_opts_t o = basic_opts();
+    o.paths = paths;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
+
+    /* A row an earlier build already wrote as zero is repaired by the next
+     * run that meets the object, and only such a row. */
+    snprintf(sql, sizeof(sql), "UPDATE objects SET phys_size = 0 WHERE hash = '%s'", hex);
+    assert_int_equal(db_execute_non_query(db, sql, NULL, NULL), 0);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           (uint64_t)sb.st_size, 20u << 20), OK);
+    snprintf(sql, sizeof(sql),
+             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
+    assert_int_equal(store_index_put_loose(db, repo_id, hash, OBJECT_TYPE_FILE,
+                                           1, 20u << 20), OK);
+    assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -765,6 +822,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_object_left_by_an_interrupted_run_keeps_its_size, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
