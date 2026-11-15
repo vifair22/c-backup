@@ -244,7 +244,6 @@ static api_response_t handle_logout_all(const api_request_t *req, void *ud)
 int routes_register_auth(api_server_t *srv, cutils_db_t *db)
 {
     g_ctx.db = db;
-    g_ctx.cfg = NULL;
     if (api_server_route(srv, "/api/auth/setup",    API_GET,  handle_setup_get,  &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/setup",    API_POST, handle_setup_post, &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/api/auth/login",    API_POST, handle_login,      &g_ctx) != 0) return -1;
