@@ -51,7 +51,9 @@ that will not shrink.
 
 Sparse files are stored as a region table plus data, so a 1 TiB sparse file
 does not become 1 TiB of zeroes. Restoring one linearly would inflate it to
-its full logical size, so restore routes them through a scatter path.
+its full logical size, so restore routes them through a scatter path. A file
+that is entirely hole has an empty region table: it costs a header, and
+restores as an `ftruncate` with nothing allocated.
 
 ## Manifest trees
 
