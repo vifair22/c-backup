@@ -53,7 +53,7 @@ api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot list tags");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -142,7 +142,7 @@ api_response_t metadata_note_get(const api_request_t *req, int64_t repo_id,
         return api_error(404, "no note for that snapshot");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     int bad = json_resp_add_str(resp, "body", r->rows[0][0]) != 0;
     db_result_free(r);
@@ -234,7 +234,7 @@ api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot read backup sources");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Both arrays up front, so a repository with no excludes still answers
      * with the key and a client can iterate unconditionally. */
@@ -251,11 +251,8 @@ api_response_t metadata_sources_get(const api_request_t *req, int64_t repo_id)
 
     char  *body = NULL;
     size_t len  = 0;
-    if (json_resp_finalize(resp, &body, &len) != 0) {
-        json_resp_free(resp);
+    if (json_resp_finalize(resp, &body, &len) != 0)
         return api_error(500, "out of memory");
-    }
-    json_resp_free(resp);
     return api_ok(body);
 }
 
@@ -368,7 +365,7 @@ api_response_t metadata_policy_get(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot read policy");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -468,7 +465,7 @@ api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot read journal");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
