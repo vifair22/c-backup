@@ -304,6 +304,12 @@ contains "alerts sent metric"    "cbackup_alerts_sent_total 0" "$METRICS"
 contains "alerts failed metric"  "cbackup_alerts_failed_total 0" "$METRICS"
 contains "alerts failed is a counter" "# TYPE cbackup_alerts_failed_total counter" "$METRICS"
 contains "alerts pending metric" "cbackup_alerts_pending 0" "$METRICS"
+# B092: the ages are the stalest repository's, and an info series says which
+# one, so an alert can name it without a series per repository.
+contains "stalest backup is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label=""} 1' "$METRICS"
+contains "stalest verify is named" \
+    'cbackup_stalest_verify_repo_info{repo_id="1",label=""} 1' "$METRICS"
 check "unknown repo" 404 "$(sock_code /repos/99)"
 
 echo "methods"
@@ -1127,6 +1133,45 @@ if command -v sqlite3 > /dev/null 2>&1; then
         '"keep_daily":7,' "$(sock_body "/jobs/$BAD")"
 else
     ok "a stored invalid count falls back to the default (skipped: no sqlite3)"
+fi
+
+# B094: tiers close on the clock, not on a later snapshot. Every snapshot
+# showed gfs_flags 0 after a pass because the newest one's day never closed
+# and same-day snapshots hold no tier. Moved to the last Saturday and Sunday
+# of 2024 (noon UTC, so the same local day in any zone within 11 hours), the
+# Sunday is that year's last daily, weekly, monthly and yearly: 15. Read
+# back through the listing, which is what clients see.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
+                           UPDATE snapshots SET ts = 1735473600 WHERE repo_id = 1 AND id = 4"
+    TIERS=$(job_id "$(sock_post /repos/1/gfs)")
+    wait_job "$TIERS"
+    LIST=$(sock_body /repos/1/snapshots)
+    contains "the newest of a closed year holds every tier" '"id":4,"ts":1735473600,' "$LIST"
+    contains "gfs_flags 15 on it" '"gfs_flags":15,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":4,[^}]*}')"
+    contains "and the day before is a daily" '"gfs_flags":1,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":3,[^}]*}')"
+else
+    ok "tier flags reach the listing (skipped: no sqlite3)"
+fi
+
+# B092: the info series follows the stalest repository, and a label is
+# free text, so its value is escaped as the exposition format requires.
+# Repository 1's newest snapshot is now from 2024; a second one registered
+# at the epoch is staler still.
+sock_post /repos "{\"path\":\"$R/repo2\",\"label\":\"q\\\"u\\\\o\"}" > /dev/null
+contains "the staler of two is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label="r"} 1' "$(sock_body /metrics)"
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
+    METRICS=$(sock_body /metrics)
+    contains "and it moves when another becomes staler, label escaped" \
+        'cbackup_stalest_snapshot_repo_info{repo_id="2",label="q\"u\\o"} 1' "$METRICS"
+    check "one series, not one per repository" 1 \
+        "$(printf '%s\n' "$METRICS" | grep -c '^cbackup_stalest_snapshot_repo_info{')"
+else
+    ok "the info series follows the stalest repository (skipped: no sqlite3)"
 fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.

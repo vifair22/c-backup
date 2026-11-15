@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Snapshot browsing, restore submission, and reindex.
@@ -1281,7 +1282,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
          * backup pipeline does. */
         gfs_result_t gr = { 0, NULL };
         st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, 1, &gr)
+                            j->dry_run, 1, 1, time(NULL), &gr)
                   : OK;
         if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
         gfs_result_free(&gr);

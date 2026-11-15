@@ -99,7 +99,11 @@ accepted.
 Health and metrics are public deliberately: an endpoint that needs a
 credential cannot report a daemon too unhealthy to authenticate, and a client
 asks `/readyz` before it has logged in. Metrics carry counts and ages, never
-paths or file content.
+paths or file content. The only repository they name is the stalest one, by id
+and label, in `cbackup_stalest_snapshot_repo_info` and
+`cbackup_stalest_verify_repo_info`: one series each, value 1, so an alert on
+the matching age can say which repository it means without a series per
+repository. Label values are escaped per the text exposition format.
 
 ## Auth
 
@@ -206,7 +210,9 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
-weekly, 4 monthly, 8 yearly. `materialized` is `false` for a cold snapshot
+weekly, 4 monthly, 8 yearly. A retention pass assigns them, for every local
+calendar day the daemon's clock has closed, so a snapshot taken today holds
+none yet; the last snapshot of a closed year holds all four, 15. `materialized` is `false` for a cold snapshot
 whose rows must be faulted back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
@@ -856,7 +862,7 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule; 409 enabling one that breaks a creation rule |
 | DELETE | `/repos/<id>/schedules/<sid>` | Remove; `{"removed":true,"id"}`, 404 if this repository has no such schedule |
 
 Both used to answer success for an id that did not exist, or that belonged
@@ -919,6 +925,24 @@ schedule that has never fired: if its first due time passed while the daemon
 was down, `run_once` fires it when the daemon starts. Any other value of
 either is a 400; both used to be stored as sent and then read as something
 else.
+
+A schedule stored before one of these rules existed survives an upgrade, so
+at every start the daemon checks each enabled schedule's action, trigger,
+`on_overlap` and `catchup` against them, and disables one that fails rather
+than reinterpreting it. The list then carries `"enabled":false` and a
+`disabled_reason`, present only when the daemon turned the schedule off:
+
+```json
+{"id":4,"action":"gc","trigger":{"type":"interval","seconds":3600},
+ "overlap":"skip","catchup":"always","enabled":false,
+ "disabled_reason":"catchup 'always' is not skip or run_once", ...}
+```
+
+Enabling such a schedule is a 409 naming the same problem; delete it and
+create it again. Any `PUT` that succeeds clears the reason. Parameters that
+depend on the host, such as a replication destination, are not part of the
+check: they can be right again tomorrow, and fail at fire time with the job
+saying why.
 
 Parameters belong to one action each, and naming one on a schedule for a
 different action is a 400 rather than a value stored and never read:

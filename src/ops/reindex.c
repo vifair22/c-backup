@@ -324,11 +324,23 @@ status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
         snprintf(files, sizeof(files), "%llu", (unsigned long long)res.files);
         snprintf(bytes, sizeof(bytes), "%llu", (unsigned long long)res.bytes);
         hash_hex(root, rhex);
+        /* An upsert, not INSERT OR REPLACE: REPLACE deletes the row and
+         * inserts a fresh one, which reset gfs_flags to its default of 0, so
+         * a reindex quietly stripped every snapshot of the tiers the last
+         * retention pass gave it. Everything the walk derives is
+         * overwritten; what it cannot derive is kept. */
         if (db_execute_non_query(db,
-                "INSERT OR REPLACE INTO snapshots (repo_id, id, ts, label,"
+                "INSERT INTO snapshots (repo_id, id, ts, label,"
                 " file_count, total_size, completed_at, root_tree_hash,"
                 " nodes_materialized)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)"
+                " ON CONFLICT (repo_id, id) DO UPDATE SET"
+                "  ts = excluded.ts, label = excluded.label,"
+                "  file_count = excluded.file_count,"
+                "  total_size = excluded.total_size,"
+                "  completed_at = excluded.completed_at,"
+                "  root_tree_hash = excluded.root_tree_hash,"
+                "  nodes_materialized = 1",
                 (const char *[]){ repo, snap, tsbuf, label ? label : "",
                                   files, bytes, tsbuf, rhex, NULL }, NULL) != 0)
             failed = 1;

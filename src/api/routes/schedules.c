@@ -109,7 +109,7 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_db,
             "SELECT id, action, trigger_type, trigger_spec, on_overlap, catchup,"
-            "       enabled, last_fired_at, next_due_at, params"
+            "       enabled, last_fired_at, next_due_at, params, disabled_reason"
             "  FROM schedules WHERE repo_id = ? ORDER BY id",
             (const char *[]){ repo, NULL }, &r) != 0) {
         db_result_free(r);
@@ -136,6 +136,10 @@ api_response_t schedules_get(const api_request_t *req, int64_t repo_id)
         cJSON_AddStringToObject(o, "overlap", row[4]);
         cJSON_AddStringToObject(o, "catchup", row[5]);
         cJSON_AddBoolToObject(o, "enabled", strtoll(row[6], NULL, 10) != 0);
+        /* Only when the daemon turned it off, and says why: a row that
+         * broke a rule the route added after it was written. */
+        if (row[10] && row[10][0])
+            cJSON_AddStringToObject(o, "disabled_reason", row[10]);
         /* The epoch stays for scripts that compute with it; the ISO form,
          * with the zone's offset, is what a person can read. */
         cJSON_AddNumberToObject(o, "next_due", (double)strtoll(row[8], NULL, 10));
@@ -160,6 +164,90 @@ static int one_of(const char *v, const char *const *set)
     for (; *set; set++)
         if (strcmp(v, *set) == 0) return 1;
     return 0;
+}
+
+/* The policy values the route accepts. Shared with the stored-row check, so
+ * a row is held to exactly what a new schedule would be. */
+static const char *const k_overlap[] = { "skip", "queue", "cancel_running", NULL };
+static const char *const k_catchup[] = { "skip", "run_once", NULL };
+
+#define SCHEDULABLE_ACTIONS "backup, verify, grep, gc, gfs, reindex, pack or replicate"
+
+/*
+ * What is wrong with a stored schedule by the rules the route applies to a
+ * new one, or 0 with why empty when nothing is. Covers what is a fact about
+ * the row: the action, the trigger, the two policies. Not the parameters
+ * that depend on the host, such as a replication destination that may be
+ * unmounted at this moment and back tomorrow; those fail at fire time with
+ * the job saying why, as they would for a schedule made today.
+ */
+static int schedule_row_problem(const char *action, const char *spec,
+                                const char *overlap, const char *catchup,
+                                char *why, size_t whysz)
+{
+    why[0] = '\0';
+    if (!action || !routes_action_is_schedulable(action)) {
+        snprintf(why, whysz, "action '%s' cannot be scheduled; use " SCHEDULABLE_ACTIONS,
+                 action ? action : "");
+        return 1;
+    }
+    trigger_t t;
+    if (trigger_parse(spec ? spec : "", &t) != OK) {
+        snprintf(why, whysz, "invalid trigger: %s", err_msg());
+        err_clear();
+        return 1;
+    }
+    if (!overlap || !one_of(overlap, k_overlap)) {
+        snprintf(why, whysz, "on_overlap '%s' is not skip, queue or cancel_running",
+                 overlap ? overlap : "");
+        return 1;
+    }
+    if (!catchup || !one_of(catchup, k_catchup)) {
+        snprintf(why, whysz, "catchup '%s' is not skip or run_once",
+                 catchup ? catchup : "");
+        return 1;
+    }
+    return 0;
+}
+
+int routes_schedules_audit(cutils_db_t *db)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT id, repo_id, action, trigger_spec, on_overlap, catchup"
+            "  FROM schedules WHERE enabled = 1 ORDER BY id",
+            NULL, &r) != 0) {
+        db_result_free(r);
+        log_warn("schedules: cannot read schedules to check them");
+        return -1;
+    }
+
+    int disabled = 0;
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        char **row = r->rows[i];
+        char why[384];
+        if (!schedule_row_problem(row[2], row[3], row[4], row[5], why, sizeof(why)))
+            continue;
+        /*
+         * Disabled rather than repaired. Each of these has a nearest valid
+         * reading - clamp the day, map "always" to run_once - and each would
+         * be a schedule nobody chose running under the old one's name. Off,
+         * with the reason beside it, is a state the operator can see and
+         * decide about.
+         */
+        if (db_execute_non_query(db,
+                "UPDATE schedules SET enabled = 0, disabled_reason = ? WHERE id = ?",
+                (const char *[]){ why, row[0], NULL }, NULL) != 0) {
+            log_warn("schedules: cannot disable invalid schedule %s", row[0]);
+            continue;
+        }
+        log_warn("schedules: disabled schedule %s (repo %s, %s): %s; "
+                 "delete it and create it again",
+                 row[0], row[1], row[2], why);
+        disabled++;
+    }
+    db_result_free(r);
+    return disabled;
 }
 
 /*
@@ -252,8 +340,6 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
      * unknown value - while `--catchup nope` silently meant skip. Refused at
      * creation, like the trigger.
      */
-    static const char *const k_overlap[] = { "skip", "queue", "cancel_running", NULL };
-    static const char *const k_catchup[] = { "skip", "run_once", NULL };
     if (json_req_has(body, "on_overlap") &&
         (json_req_get_str(body, "on_overlap", &overlap) != 0 || !overlap ||
          !one_of(overlap, k_overlap)))
@@ -277,8 +363,7 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
      */
     if (!routes_action_is_schedulable(action))
         return api_error(400, "that action cannot be scheduled; "
-                              "use backup, verify, grep, gc, gfs, reindex, pack "
-                              "or replicate");
+                              "use " SCHEDULABLE_ACTIONS);
 
     for (size_t k = 0; k < sizeof(k_param_owner) / sizeof(k_param_owner[0]); k++) {
         if (!json_req_has(body, k_param_owner[k].key)) continue;
@@ -458,12 +543,45 @@ api_response_t schedules_patch(const api_request_t *req, int64_t repo_id,
     snprintf(sid,  sizeof(sid),  "%lld", (long long)schedule_id);
     snprintf(en,   sizeof(en),   "%u", enabled);
 
+    /*
+     * Enabling a row that breaks the route's rules is refused: the startup
+     * check would only turn it off again, and until then it would run
+     * under whatever the scheduler made of it. The answer names the
+     * problem, which is all an operator needs to recreate it.
+     */
+    if (enabled) {
+        db_result_t *r = NULL;
+        if (db_execute(g_db,
+                "SELECT action, trigger_spec, on_overlap, catchup FROM schedules"
+                " WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, sid, NULL }, &r) != 0) {
+            db_result_free(r);
+            return api_error(500, "cannot read schedule");
+        }
+        char why[384];
+        int bad = r && r->nrows == 1 &&
+                  schedule_row_problem(r->rows[0][0], r->rows[0][1],
+                                       r->rows[0][2], r->rows[0][3],
+                                       why, sizeof(why));
+        db_result_free(r);
+        if (bad) {
+            char msg[480];
+            snprintf(msg, sizeof(msg),
+                     "schedule %s cannot be enabled: %s; delete it and create it again",
+                     sid, why);
+            return api_error(409, msg);
+        }
+    }
+
     /* A schedule that is not there, or belongs to another repository, is a
      * 404. Both used to answer {"ok":true}, so a typo in the id read as
-     * success while the schedule meant went on firing. */
+     * success while the schedule meant went on firing. A change by hand
+     * clears the daemon's reason: off is now someone's decision, and on
+     * passed the check above. */
     int changed = 0;
     if (db_execute_non_query(g_db,
-            "UPDATE schedules SET enabled = ? WHERE repo_id = ? AND id = ?",
+            "UPDATE schedules SET enabled = ?, disabled_reason = NULL"
+            " WHERE repo_id = ? AND id = ?",
             (const char *[]){ en, repo, sid, NULL }, &changed) != 0)
         return api_error(500, "cannot update schedule");
     if (changed == 0) return api_error(404, "no such schedule in this repository");

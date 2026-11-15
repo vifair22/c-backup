@@ -44,6 +44,13 @@ static cutils_db_t *db;
 static store_t     *store;
 static int64_t      repo_id;
 
+/*
+ * The instant a pass treats as now. Pinned to the newest snapshot by
+ * default, so that snapshot's day is still open as it is for a pass run
+ * straight after a backup; tests about days closed since override it.
+ */
+static time_t       latest_ts;
+
 static void rmrf(const char *p)
 {
     char cmd[512];
@@ -54,6 +61,7 @@ static void rmrf(const char *p)
 static int setup(void **state)
 {
     (void)state;
+    latest_ts = 0;
     rmrf(TEST_DIR);
     if (mkdir(TEST_DIR, 0700) != 0) return -1;
     if (db_open(&db, TEST_DB) != 0) return -1;
@@ -88,6 +96,7 @@ static void add_snapshot(int id, time_t ts)
         "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash, gfs_flags)"
         " VALUES (?, ?, ?, X'00', 0)",
         (const char *[]){ repo, sid, tsb, NULL }, NULL), 0);
+    if (ts > latest_ts) latest_ts = ts;
 
     char path[512];
     snprintf(path, sizeof(path), "%s/snapshots/%d", TEST_REPO, id);
@@ -144,7 +153,7 @@ static void test_daily_flag_is_set(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 30, 8, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1, latest_ts, NULL), OK);
 
     /*
      * Each closed day gets its daily. The newest snapshot does not: its day
@@ -154,6 +163,58 @@ static void test_daily_flag_is_set(void **state)
     assert_true(flags_of(1) & GFS_DAILY);
     assert_true(flags_of(2) & GFS_DAILY);
     assert_int_equal(flags_of(3), 0);
+}
+
+/*
+ * B094: the newest snapshot holds its tiers once the clock closes its day.
+ *
+ * Days used to close only when a later snapshot arrived, so the newest one
+ * never held a tier however old it was, and a repository whose backups
+ * stopped showed gfs_flags 0 on its last snapshot after every pass.
+ */
+static void test_newest_is_flagged_once_its_day_closes(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 3; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
+
+    gfs_retention_t ret = { 0, 30, 8, 12, 3 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1,
+                             latest_ts + DAY, NULL), OK);
+    assert_true(flags_of(3) & GFS_DAILY);
+}
+
+/* A clock behind the newest snapshot does not close the snapshot's day. */
+static void test_clock_behind_keeps_newest_day_open(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 3; i++)
+        add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
+
+    gfs_retention_t ret = { 0, 30, 8, 12, 3 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1,
+                             latest_ts - 2 * DAY, NULL), OK);
+    assert_true(flags_of(2) & GFS_DAILY);
+    assert_int_equal(flags_of(3), 0);
+}
+
+/*
+ * The last snapshot of a closed year is that day's daily, that week's
+ * weekly, that month's monthly and that year's yearly: 15. 2024-12-29 was
+ * the year's last Sunday, so its week closed inside December.
+ */
+#define SUNDAY_2024_12_29 (1735430400L + 43200L)
+static void test_last_of_a_closed_year_holds_every_tier(void **state)
+{
+    (void)state;
+    add_snapshot(1, SUNDAY_2024_12_29 - DAY);
+    add_snapshot(2, SUNDAY_2024_12_29);
+
+    gfs_retention_t ret = { 0, 7, 4, 12, 3 };
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 2, 0, 1, 1,
+                             SUNDAY_2024_12_29 + 30 * DAY, NULL), OK);
+    assert_int_equal(flags_of(2), GFS_DAILY | GFS_WEEKLY | GFS_MONTHLY | GFS_YEARLY);
+    assert_int_equal(flags_of(1), GFS_DAILY);
 }
 
 /* Two backups on one day: only the later is that day's daily. */
@@ -168,7 +229,7 @@ static void test_last_of_day_wins(void **state)
     add_snapshot(3, SUNDAY_2024_01_07 + DAY);
 
     gfs_retention_t ret = { 0, 30, 8, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 3, 0, 1, 1, latest_ts, NULL), OK);
 
     assert_true(flags_of(2) & GFS_DAILY);
     /* The earlier one holds no tier and is not among the newest, so it is
@@ -184,7 +245,7 @@ static void test_sunday_is_promoted_to_weekly(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 30, 8, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 8, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 8, 0, 1, 1, latest_ts, NULL), OK);
 
     /* Snapshot 1 is the Sunday; the following weekdays are not. */
     assert_true(flags_of(1) & GFS_WEEKLY);
@@ -200,7 +261,7 @@ static void test_flags_are_a_bitfield(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 60, 12, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 40, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 40, 0, 1, 1, latest_ts, NULL), OK);
 
     int multi = 0;
     for (int i = 1; i <= 40; i++) {
@@ -223,7 +284,7 @@ static void test_dry_run_prunes_nothing(void **state)
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
     gfs_result_t gr = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, &gr), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, latest_ts, &gr), OK);
 
     assert_true(gr.pruned > 0);
     assert_int_equal(snapshot_count(), before);
@@ -239,7 +300,7 @@ static void test_prune_removes_expired_snapshots(void **state)
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
     gfs_result_t gr = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, &gr), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, latest_ts, &gr), OK);
 
     assert_true(gr.pruned > 0);
     assert_true(snapshot_count() < before);
@@ -267,7 +328,7 @@ static void test_tagged_snapshots_are_preserved(void **state)
         (const char *[]){ repo, NULL }, NULL), 0);
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, latest_ts, NULL), OK);
 
     assert_int_not_equal(flags_of(2), 0xFFFFFFFFu);
 }
@@ -282,7 +343,7 @@ static void test_zero_retention_keeps_everything(void **state)
 
     gfs_retention_t ret = { 0, 0, 0, 0, 0 };
     gfs_result_t gr = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 15, 0, 1, 1, &gr), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 15, 0, 1, 1, latest_ts, &gr), OK);
 
     assert_int_equal(gr.pruned, 0);
     assert_int_equal(snapshot_count(), before);
@@ -306,7 +367,7 @@ static void test_shipped_defaults_prune(void **state)
 
     gfs_retention_t ret = { 0, 7, 4, 12, 3 };
     gfs_result_t gr = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, 1, &gr), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 90, 0, 1, 1, latest_ts, &gr), OK);
 
     assert_true(gr.pruned > 45);
     assert_int_equal(snapshot_count(), 90 - (int)gr.pruned);
@@ -333,7 +394,7 @@ static void test_result_names_the_pruned_snapshots(void **state)
 
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
     gfs_result_t dry = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, &dry), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 1, 1, 1, latest_ts, &dry), OK);
     assert_true(dry.pruned > 0);
     assert_non_null(dry.ids);
     for (uint32_t i = 0; i < dry.pruned; i++) {
@@ -343,7 +404,7 @@ static void test_result_names_the_pruned_snapshots(void **state)
     }
 
     gfs_result_t real = { 0, NULL };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, &real), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 20, 0, 1, 1, latest_ts, &real), OK);
     assert_int_equal(real.pruned, dry.pruned);
     for (uint32_t i = 0; i < real.pruned; i++) {
         assert_int_equal(real.ids[i], dry.ids[i]);
@@ -368,7 +429,7 @@ static void test_keep_snaps_is_a_minimum(void **state)
     add_snapshot(11, SUNDAY_2024_01_07 + DAY);
 
     gfs_retention_t ret = { 4, 7, 4, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 11, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 11, 0, 1, 1, latest_ts, NULL), OK);
     /* 8..11 are the newest four; 10 is also the closed day's daily. */
     for (int id = 8; id <= 11; id++) assert_int_not_equal(flags_of(id), 0xFFFFFFFFu);
     for (int id = 1; id <= 7; id++)  assert_int_equal(flags_of(id), 0xFFFFFFFFu);
@@ -378,7 +439,7 @@ static void test_empty_repo_is_not_an_error(void **state)
 {
     (void)state;
     gfs_retention_t ret = { 3, 2, 1, 1, 1 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 0, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 0, 0, 1, 1, latest_ts, NULL), OK);
 }
 
 /* Running twice must be stable: the second pass changes nothing. */
@@ -389,12 +450,12 @@ static void test_gfs_is_idempotent(void **state)
         add_snapshot(i + 1, SUNDAY_2024_01_07 + i * DAY);
 
     gfs_retention_t ret = { 0, 30, 8, 12, 3 };
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 12, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 12, 0, 1, 1, latest_ts, NULL), OK);
 
     uint32_t snapshot_flags[13];
     for (int i = 1; i <= 12; i++) snapshot_flags[i] = flags_of(i);
 
-    assert_int_equal(gfs_run(store, db, repo_id, &ret, 12, 0, 1, 1, NULL), OK);
+    assert_int_equal(gfs_run(store, db, repo_id, &ret, 12, 0, 1, 1, latest_ts, NULL), OK);
     for (int i = 1; i <= 12; i++)
         assert_int_equal(flags_of(i), snapshot_flags[i]);
 }
@@ -408,6 +469,9 @@ int main(void)
 
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_daily_flag_is_set, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_newest_is_flagged_once_its_day_closes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_clock_behind_keeps_newest_day_open, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_last_of_a_closed_year_holds_every_tier, setup, teardown),
         cmocka_unit_test_setup_teardown(test_last_of_day_wins, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sunday_is_promoted_to_weekly, setup, teardown),
         cmocka_unit_test_setup_teardown(test_flags_are_a_bitfield, setup, teardown),
