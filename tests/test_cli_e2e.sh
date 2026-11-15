@@ -141,7 +141,11 @@ check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
-check    "tag remove" 0           "$(cb tag remove 1 keeper > /dev/null; echo $?)"
+# B095: the removes printed nothing on success, against the contract of one
+# JSON document per command.
+OUT=$(cb tag remove 1 keeper); RC=$?
+check    "tag remove" 0           "$RC"
+check    "tag remove prints what it removed" '{"removed":true,"name":"keeper"}' "$OUT"
 
 # B038: removing a tag that is not there exited 0 with no output.
 OUT=$(cb tag remove 1 keeper 2>&1); RC=$?
@@ -160,7 +164,9 @@ contains "a name that is not a path segment is refused" 'invalid tag name' \
 
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
-check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?)"
+OUT=$(cb schedule remove 1 1); RC=$?
+check    "schedule remove" 0      "$RC"
+check    "schedule remove prints what it removed" '{"removed":true,"id":1}' "$OUT"
 
 contains "gc"      '"state":"completed"' "$(cb gc 1)"
 contains "reindex" '"state":"completed"' "$(cb reindex 1)"
@@ -232,7 +238,13 @@ contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
 contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
-contains "pack"   '"state":"completed"' "$(cb pack 1)"
+PACK_OUT=$(cb pack 1)
+contains "pack"   '"state":"completed"' "$PACK_OUT"
+# B099: the pack job had no result, so a run that packed nothing said why
+# only in the log. Backups pack on completion, so this one has the reason.
+contains "pack reports a result" '"result":{"loose":' "$PACK_OUT"
+contains "pack says why it packed nothing" '"reason":"' "$PACK_OUT"
+contains "and the journal says so" 'nothing packed: ' "$(cb journal 1)"
 contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
 check "verify list --offset moves on" 1 \
     "$([ "$(cb verify list 1 --limit 1 --offset 1 | grep -o '"level":' | wc -l | tr -d ' ')" -le 1 ] && echo 1 || echo 0)"
@@ -272,7 +284,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
         progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
         'store')"
-    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2>&1 &
+    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
     WPID=$!
     sleep 1
     contains "jobs watch prints a running job at once" '"state":"running"' \
@@ -286,11 +298,23 @@ if command -v sqlite3 > /dev/null 2>&1; then
     else
         ok "jobs watch ends with the job"
     fi
-    wait "$WPID" 2>/dev/null
+    wait "$WPID"; WRC=$?
+    check    "and exits 0" 0 "$WRC"
     contains "and prints how it ended" '"state":"completed"' "$(cat "$WORK/watch.out")"
+    # B096: it printed the SSE framing, "data: " before each document and a
+    # blank line after it. Every line is now one JSON document.
+    check "jobs watch prints no SSE framing" "" "$(grep -n '^data:\|^event:\|^$' "$WORK/watch.out")"
+    check "every line is a JSON document" "" "$(grep -v '^{.*}$' "$WORK/watch.out")"
+    check "and nothing on stderr" "" "$(cat "$WORK/watch.err")"
 else
     ok "jobs watch prints a running job at once (skipped: no sqlite3)"
 fi
+# The daemon ends the stream with a named error event for a job it does not
+# have. That is a failure, its document an error: stderr, not stdout.
+"$CLI" --socket "$SOCK" jobs watch 987654 > "$WORK/watch.out" 2> "$WORK/watch.err"; RC=$?
+check    "jobs watch of a missing job fails" 1 "$RC"
+check    "and prints nothing on stdout" "" "$(cat "$WORK/watch.out")"
+check    "and the error is bare JSON on stderr" '{"error":"no such job"}' "$(cat "$WORK/watch.err")"
 
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
 # file is still cancellable when the request lands, whatever the machine.
@@ -350,7 +374,9 @@ case "$(cb search 1 big)" in
     *)         ok  "cli --exclude glob drops the file" ;;
 esac
 
-check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
+OUT=$(cb snapshot delete 1 1 2>/dev/null); RC=$?
+check "snapshot delete" 0 "$RC"
+check "snapshot delete prints what it removed" '{"removed":true,"id":1}' "$OUT"
 # The id comes from the add. This disabled a hardcoded id 2 that did not
 # exist, which passed only because a missing schedule answered success.
 VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -426,6 +452,20 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+# NIT-2: a file capped per file was counted on the job and not on the run,
+# so a run listed later could not say a file held more than it recorded.
+printf 'capline\ncapline\ncapline\n' > "$WORK/src/capped.txt"
+cb backup 1 "$WORK/src" > /dev/null
+CJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"capline","max_hits_per_file":1}' \
+     http://localhost/repos/1/grep | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "a capped grep job counts the capped file" '"files_capped":1' \
+    "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")"
+contains "and so does its run record" '"pattern":"capline"' "$(cb grep runs 1 --limit 1)"
+contains "the run record carries files_capped" '"files_capped":1' "$(cb grep runs 1 --limit 1)"
 
 # B084: GET /repos/<id>/grep and /grep/<run-id> had no command, so a search
 # run with --no-wait, or one whose output scrolled away, could not be read
@@ -474,6 +514,22 @@ for _ in $(seq 1 50); do
 done
 check "a scheduled grep runs with its pattern" 1 "$FIRED"
 cb schedule remove 1 "$GSID" >/dev/null 2>&1
+# NIT-1: ignore_case was stored as the number 1; every other flag is a
+# boolean. A schedule made before the change, holding 1, still reads.
+ISID=$(cb schedule add 1 grep 3600 --pattern 'case test' -i | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores ignore_case as a boolean" '"ignore_case":true' "$(cb schedule list 1)"
+cb schedule remove 1 "$ISID" >/dev/null 2>&1
+OLD_IC=$(curl -s -X POST --unix-socket "$SOCK" \
+         -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"old spelling","ignore_case":1}' \
+         http://localhost/repos/1/schedules)
+OSID=$(printf '%s' "$OLD_IC" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "ignore_case sent as 1 is still accepted" '"id"' "$OLD_IC"
+contains "and stored as a boolean" '"pattern":"old spelling","ignore_case":true' "$(cb schedule list 1)"
+[ -n "$OSID" ] && cb schedule remove 1 "$OSID" >/dev/null 2>&1
+check "ignore_case of 2 is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" \
+    -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"x","ignore_case":2}' \
+    http://localhost/repos/1/schedules)"
 
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.
@@ -549,7 +605,9 @@ check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
+OUT=$(cb repo remove "$RM_ID"); RC=$?
+check    "repo remove" 0 "$RC"
+check    "repo remove prints what it removed" "{\"removed\":true,\"id\":$RM_ID}" "$OUT"
 check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
 contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
 # B046: the newest id was handed out again, and with it the removed
@@ -742,6 +800,11 @@ case "$OUT" in
     *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
     *) ok "a first replicate sends objects" ;;
 esac
+# B098: a second result document, written after this one to add
+# "reencrypted", replaced it and dropped the walk's counts.
+contains "replicate reports what it asked about" '"objects_asked":' "$OUT"
+contains "and the subtrees it skipped" '"subtrees_skipped":' "$OUT"
+contains "and whether it re-encrypted" '"reencrypted":false' "$OUT"
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.
@@ -1055,14 +1118,25 @@ contains "and reports it configured" '"configured":true' "$OUT"
 OUT=$(printf 'anotherpassword\n' | cb auth setup 2>&1); RC=$?
 check "a second setup fails" 1 "$RC"
 contains "and says to change it instead" "already configured" "$OUT"
-contains "login reads stdin too" '"token"' "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+# B055: the CLI only talks to the socket, which needs no credential, and
+# `auth login` minted a 90-day token there that nothing stored. It refuses
+# now, before asking for a password, and prints no token.
+OUT=$(printf 'correcthorsebattery\n' | cb auth login 2>&1); RC=$?
+check    "auth login fails" 1 "$RC"
+contains "and says the socket needs no login" "needs no credential" "$OUT"
+check    "and mints no token" "" "$(printf '%s' "$OUT" | grep -o '"token"')"
+# A plain logout exited 0, printed nothing and revoked nothing.
+OUT=$(cb auth logout 2>&1); RC=$?
+check    "auth logout without --all fails" 1 "$RC"
+contains "and points at --all" "auth logout --all" "$OUT"
+tcp_login() {  # tcp_login <password>: the response body of a TCP login
+    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$PORTBASE/api/auth/login"
+}
 OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1); RC=$?
 check "password change reads both from stdin" 0 "$RC"
-contains "old password no longer logs in" "invalid password" \
-    "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
-# B053: from the host, logout --all ends every session a client holds. A
-# token from a login is checked over TCP, since the socket needs none.
-LTOK=$(printf 'brandnewpassword\n' | cb auth login 2>&1 | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+contains "old password no longer logs in" "invalid password" "$(tcp_login correcthorsebattery)"
+# B053: from the host, logout --all ends every session a client holds.
+LTOK=$(tcp_login brandnewpassword | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
 contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"

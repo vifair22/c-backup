@@ -181,8 +181,24 @@ static int sr_line(sreader_t *r, char *line, size_t cap)
     }
 }
 
-/* Copy up to `want` bytes (or everything to EOF when want is SIZE_MAX). */
-static int sr_copy(sreader_t *r, FILE *out, size_t want)
+/* Where an error body goes: a FILE, or nowhere. */
+static status_t file_sink(void *ud, const char *buf, size_t n)
+{
+    FILE *f = ud;
+    if (!f) return OK;
+    if (fwrite(buf, 1, n, f) != n) return set_error(ERR_IO, "http_stream: write failed");
+    fflush(f);
+    return OK;
+}
+
+/*
+ * Hand up to `want` bytes (or everything to EOF when want is SIZE_MAX) to
+ * the sink, one read at a time: delivering per read, not at the end, is the
+ * reason this function exists. *sink_st receives a sink's refusal, so the
+ * caller can tell it from a transport failure (-1 either way here).
+ */
+static int sr_copy(sreader_t *r, http_sink_fn sink, void *ud, size_t want,
+                   status_t *sink_st)
 {
     while (want > 0) {
         ssize_t avail = sr_fill(r);
@@ -190,9 +206,8 @@ static int sr_copy(sreader_t *r, FILE *out, size_t want)
         if (avail == 0) return want == SIZE_MAX ? 0 : -1;
         size_t take = (size_t)avail;
         if (take > want) take = want;
-        if (fwrite(r->buf + r->pos, 1, take, out) != take) return -1;
-        /* Flushed per read: the reason this function exists. */
-        fflush(out);
+        status_t st = sink(ud, r->buf + r->pos, take);
+        if (st != OK) { *sink_st = st; return -1; }
         r->pos += take;
         if (want != SIZE_MAX) want -= take;
     }
@@ -200,9 +215,10 @@ static int sr_copy(sreader_t *r, FILE *out, size_t want)
 }
 
 status_t http_stream(const char *socket_path, const char *path,
-                     FILE *out, FILE *err_out, int *out_status)
+                     http_sink_fn sink, void *ud, FILE *err_out,
+                     int *out_status)
 {
-    if (!socket_path || !path || !out || !out_status)
+    if (!socket_path || !path || !sink || !out_status)
         return set_error(ERR_INVALID, "http_stream: null argument");
 
     int fd = -1;
@@ -247,11 +263,14 @@ status_t http_stream(const char *socket_path, const char *path,
             chunked = 1;
     }
     *out_status = status;
-    FILE *dst = (status >= 200 && status < 300) ? out : (err_out ? err_out : out);
+    int ok2xx = status >= 200 && status < 300;
+    http_sink_fn dst = ok2xx ? sink : file_sink;
+    void *dst_ud = ok2xx ? ud : (void *)err_out;
 
     int rc = 0;
+    status_t sink_st = OK;
     if (!chunked) {
-        rc = sr_copy(r, dst, SIZE_MAX);
+        rc = sr_copy(r, dst, dst_ud, SIZE_MAX, &sink_st);
     } else {
         for (;;) {
             if (sr_line(r, line, sizeof(line)) != 0) { rc = -1; break; }
@@ -259,12 +278,13 @@ status_t http_stream(const char *socket_path, const char *path,
             unsigned long long sz = strtoull(line, &end, 16);
             if (end == line) { rc = -1; break; }
             if (sz == 0) break;
-            if (sr_copy(r, dst, (size_t)sz) != 0) { rc = -1; break; }
+            if (sr_copy(r, dst, dst_ud, (size_t)sz, &sink_st) != 0) { rc = -1; break; }
             if (sr_line(r, line, sizeof(line)) != 0) { rc = -1; break; }
         }
     }
     free(r);
     close(fd);
+    if (sink_st != OK) return sink_st;
     if (rc != 0) return set_error(ERR_IO, "http_stream: connection ended mid-stream");
     return OK;
 }

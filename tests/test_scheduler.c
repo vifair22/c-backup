@@ -23,6 +23,7 @@
 #include <cmocka.h>
 #include <cutils/db.h>
 
+#include "routes.h"
 #include "scheduler.h"
 
 #define TEST_DB "/tmp/c_backup_test_sched.db"
@@ -128,6 +129,18 @@ static int enabled_of(int64_t sid)
     int v = (r && r->nrows == 1) ? atoi(r->rows[0][0]) : -1;
     db_result_free(r);
     return v;
+}
+
+static void reason_of(int64_t sid, char *out, size_t outsz)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)sid);
+    db_result_t *r = NULL;
+    out[0] = '\0';
+    if (db_execute(db, "SELECT disabled_reason FROM schedules WHERE id = ?",
+                   (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1)
+        snprintf(out, outsz, "%s", r->rows[0][0] ? r->rows[0][0] : "");
+    db_result_free(r);
 }
 
 #define SPEC_HOURLY "{\"type\":\"interval\",\"seconds\":3600}"
@@ -340,6 +353,10 @@ static void test_bad_trigger_disables_schedule(void **state)
 
     assert_int_equal(scheduler_tick(sched, now), OK);
     assert_int_equal(enabled_of(sid), 0);
+    /* And says so where the list shows it, not in the log alone. */
+    char why[256];
+    reason_of(sid, why, sizeof(why));
+    assert_non_null(strstr(why, "invalid trigger"));
 }
 
 static void test_one_bad_schedule_does_not_block_others(void **state)
@@ -395,6 +412,129 @@ static void test_idle_scheduler_does_not_spin(void **state)
     assert_true(cpu1 - cpu0 < 0.05);
 }
 
+/* ---------- NIT-3 ---------- */
+
+/*
+ * Rows written before the route refused them: an impossible yearly day, an
+ * overlap and a catchup policy outside their sets, an action nothing
+ * dispatches. Each survived the upgrade and ran under whatever the
+ * scheduler made of it. The startup check disables each, naming why, and
+ * leaves a valid schedule and one a person turned off alone.
+ */
+#define SPEC_FEB30 "{\"type\":\"calendar\",\"every\":\"year\",\"on_month\":2," \
+                   "\"on_day\":30,\"at\":\"03:00\"}"
+static void test_audit_disables_rows_the_route_refuses(void **state)
+{
+    (void)state;
+    time_t now = 1720000000;
+    int64_t good    = add_schedule("gc", SPEC_HOURLY, now + 60, NULL, NULL);
+    int64_t feb30   = add_schedule("verify", SPEC_FEB30, now + 60, NULL, NULL);
+    int64_t overlap = add_schedule("gc", SPEC_HOURLY, now + 60, "sometimes", NULL);
+    int64_t catchup = add_schedule("gc", SPEC_HOURLY, now + 60, NULL, "always");
+    int64_t action  = add_schedule("defrag", SPEC_HOURLY, now + 60, NULL, NULL);
+    int64_t off     = add_schedule("gc", SPEC_HOURLY, now + 60, "sometimes", NULL);
+    char offid[32];
+    snprintf(offid, sizeof(offid), "%lld", (long long)off);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE schedules SET enabled = 0 WHERE id = ?",
+        (const char *[]){ offid, NULL }, NULL), 0);
+
+    assert_int_equal(routes_schedules_audit(db), 4);
+
+    char why[256];
+    assert_int_equal(enabled_of(good), 1);
+    reason_of(good, why, sizeof(why));
+    assert_string_equal(why, "");
+
+    assert_int_equal(enabled_of(feb30), 0);
+    reason_of(feb30, why, sizeof(why));
+    assert_non_null(strstr(why, "month 2 has no day 30"));
+
+    assert_int_equal(enabled_of(overlap), 0);
+    reason_of(overlap, why, sizeof(why));
+    assert_string_equal(why, "on_overlap 'sometimes' is not skip, queue or cancel_running");
+
+    assert_int_equal(enabled_of(catchup), 0);
+    reason_of(catchup, why, sizeof(why));
+    assert_string_equal(why, "catchup 'always' is not skip or run_once");
+
+    assert_int_equal(enabled_of(action), 0);
+    reason_of(action, why, sizeof(why));
+    assert_non_null(strstr(why, "action 'defrag' cannot be scheduled"));
+
+    /* Turned off by a person: not the daemon's to annotate. */
+    reason_of(off, why, sizeof(why));
+    assert_string_equal(why, "");
+
+    /* Nothing left to find the second time. */
+    assert_int_equal(routes_schedules_audit(db), 0);
+
+    /* And a disabled row does not fire, however overdue. */
+    assert_int_equal(scheduler_tick(sched, now + 7200), OK);
+    assert_int_equal(g_fires, 1);
+    assert_string_equal(g_last_action, "gc");
+}
+
+static api_request_t body_req(const char *body)
+{
+    api_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.method   = API_PUT;
+    req.url      = "/repos/1/schedules/x";
+    req.body     = body;
+    req.body_len = body ? strlen(body) : 0;
+    req.is_local = 1;
+    req.client_addr = "";
+    return req;
+}
+
+/* The list shows the reason, enabling one still broken is refused, and a
+ * change by hand clears what the daemon recorded. */
+static void test_disabled_reason_is_listed_and_enable_refused(void **state)
+{
+    (void)state;
+    time_t now = 1720000000;
+    int64_t bad = add_schedule("gc", SPEC_HOURLY, now + 60, NULL, "always");
+    int64_t ok  = add_schedule("gc", SPEC_HOURLY, now + 60, NULL, NULL);
+    assert_int_equal(routes_schedules_audit(db), 1);
+    routes_schedules_init(db, sched);
+
+    api_request_t get = body_req(NULL);
+    get.method = API_GET;
+    api_response_t resp = schedules_get(&get, 1);
+    assert_int_equal(resp.status, 200);
+    assert_non_null(strstr(resp.body,
+        "\"disabled_reason\":\"catchup 'always' is not skip or run_once\""));
+    /* Only on the row the daemon turned off. */
+    assert_null(strstr(strstr(resp.body, "disabled_reason") + 1, "disabled_reason"));
+    free(resp.body);
+
+    api_request_t on = body_req("{\"enabled\":true}");
+    resp = schedules_patch(&on, 1, bad);
+    assert_int_equal(resp.status, 409);
+    assert_non_null(strstr(resp.body, "catchup 'always' is not skip or run_once"));
+    free(resp.body);
+    assert_int_equal(enabled_of(bad), 0);
+
+    api_request_t offr = body_req("{\"enabled\":false}");
+    resp = schedules_patch(&offr, 1, bad);
+    assert_int_equal(resp.status, 200);
+    free(resp.body);
+    char why[256];
+    reason_of(bad, why, sizeof(why));
+    assert_string_equal(why, "");
+
+    /* A valid schedule still toggles both ways. */
+    resp = schedules_patch(&offr, 1, ok);
+    assert_int_equal(resp.status, 200);
+    free(resp.body);
+    resp = schedules_patch(&on, 1, ok);
+    assert_int_equal(resp.status, 200);
+    free(resp.body);
+    assert_int_equal(enabled_of(ok), 1);
+    routes_schedules_init(NULL, NULL);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -413,6 +553,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_bad_trigger_disables_schedule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_bad_schedule_does_not_block_others, setup, teardown),
         cmocka_unit_test_setup_teardown(test_idle_scheduler_does_not_spin, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_audit_disables_rows_the_route_refuses, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_disabled_reason_is_listed_and_enable_refused, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

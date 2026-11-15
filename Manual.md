@@ -430,7 +430,9 @@ HTTPS.
 - `sudo c-backup auth logout --all` (or `POST /api/auth/logout-all` with a
   token) revokes every session any client holds, including the caller's.
   Use it when a machine that was signed in is lost or no longer trusted and
-  the password itself is not in doubt.
+  the password itself is not in doubt. `--all` is required: the CLI has no
+  session of its own to sign out, so `auth logout` without it fails and
+  says so rather than succeeding at nothing.
 - Failed logins over TCP are throttled. Each client address gets 5 free
   failures; after that every failure locks it out for twice as long as the
   last (1 s, 2 s, 4 s, ... up to 5 minutes), and the lockout refuses the
@@ -442,7 +444,11 @@ HTTPS.
   never throttled: `sudo c-backup ...` on the host always works. Behind a
   reverse proxy every client is the proxy's address and shares one budget.
   Details are in `docs/api.md`.
-- The CLI never needs a password: it uses the socket.
+- The CLI never needs a password: it uses the socket. Sessions exist only
+  for TCP clients, so there is no `auth login`: it fails with an
+  explanation, and the daemon refuses a login over the socket with `400`.
+  A token minted there would be a live 90-day credential nothing uses. To
+  get a token for a script, log in over TCP (`POST /api/auth/login`).
 - The app stores the session token, never the password (section 15.2).
 
 ### 4.4 Public routes
@@ -450,7 +456,8 @@ HTTPS.
 `/healthz`, `/readyz`, `/metrics` and `GET /api/auth/setup` answer without a
 credential, on both transports. A health probe that needs a login cannot
 report a daemon too unhealthy to authenticate. Metrics carry counts and ages,
-never paths or file content.
+and name at most the stalest repository by id and label; never paths or file
+content.
 
 ### 4.5 What is protected, and what is not
 
@@ -571,21 +578,31 @@ A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
 `c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
 state as soon as it connects, then one per change and at least every 5
-seconds, and exits when the job ends:
+seconds, and exits when the job ends. Each line is one JSON document and
+nothing else (NDJSON), so `jq` reads the output as it arrives:
 
 ```
-data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
+{"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
 ```
 
 `current` counts entries, so it sits still while one large file is stored;
 `bytes_done` moves through the file as it is read, a few times a second, and
-each move is a new line.
+each move is a new line. A finished job keeps its last report, and each
+phase ends with `current` equal to `total`. A restore counts the entries it
+restores: with `--subpath` that is the subtree, so restoring one file ends
+at 1 of 1 rather than at the size of the snapshot.
+
+`watch` exits 0 once it has printed the job's final state, whatever that
+state is: read `state` for the outcome. It exits 1 with a message on stderr
+when there is no such job, and when the daemon stops following a job that is
+still running after an hour; watch it again to go on following.
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that
 does not exist on the daemon's host is stored with a warning in the reply,
 not refused, since it may be a share or disk that is mounted only at backup
-time; a backup skips it until it exists.
+time. A backup does not skip it: while it is missing every backup of the
+repository fails, naming it (below).
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
@@ -720,8 +737,10 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
-  10,000); when either cut it short the output says `truncated` or counts
-  `files_capped`. The hits are kept: `c-backup grep runs <id>` lists past
+  10,000). `truncated` says the search itself stopped early (`--limit` or
+  `--max-hits`); `files_capped` counts files read only as far as their cap,
+  which may hold more matches than were recorded. Both are on the job's
+  result and on the run in `grep runs`. The hits are kept: `c-backup grep runs <id>` lists past
   searches, newest first, and `c-backup grep show <id> <run>` prints one
   search's hits again, which is how a `--no-wait` search is read once it
   has finished.
@@ -802,8 +821,12 @@ A snapshot is kept if any of these holds:
 3. It is tagged. Any tag protects a snapshot from retention, whatever its age.
 
 Everything else is pruned. A tier count of `0` keeps every snapshot of that
-tier. The current day is never closed, so a snapshot taken today holds no
-tier until tomorrow.
+tier. A day closes on the daemon's clock: today is never closed, so a
+snapshot taken today holds no tier until a pass runs tomorrow or later, and a
+repository whose last backup was weeks ago has that snapshot elected like any
+other. Tiers are assigned only by a retention pass, so a repository that has
+never had one shows `gfs_flags` 0 on every snapshot. A reindex keeps the tiers
+the last pass assigned.
 
 Days are local calendar days on the daemon's host, in its timezone.
 
@@ -914,6 +937,24 @@ stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
 
+**Schedules from older builds.** Each rule above was added at some point, and
+a schedule stored before its rule existed is still in the database after an
+upgrade: an impossible day such as 30 February, an overlap or catchup value
+outside the table, an action nothing runs. At every start the daemon holds
+each enabled schedule to the rules a new one must pass and disables any that
+fails, with a warning naming it:
+
+```
+schedules: disabled schedule 4 (repo 1, gc): catchup 'always' is not skip or run_once; delete it and create it again
+```
+
+It disables rather than repairs. Each of these has a nearest valid reading,
+and running that under the old schedule's name would be a schedule nobody
+chose. `schedule list` shows the schedule as `"enabled": false` with
+`disabled_reason` saying why, and `schedule enable` refuses it with the same
+reason until it is deleted and created again. The scheduler records a reason
+the same way when it disables a schedule it cannot compute a next fire for.
+
 A suggested set for one repository:
 
 | What | When |
@@ -1020,6 +1061,23 @@ it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 (section 18.1). That is deliberate: rewriting gigabytes into a pack would
 save nothing but an inode. Large files that do compress are packed
 normally. Details are in `docs/data-paths.md`.
+
+`pack` reports what it did in the job's `result`, including why it did
+nothing when it did nothing:
+
+```json
+{"loose":3,"packed":0,"skip_marked":3,"incompressible":0,
+ "reason":"all loose objects are skip-marked as incompressible"}
+```
+
+`loose` is what it found, `packed` what it moved into packs, `skip_marked`
+objects an earlier run already marked incompressible, and `incompressible`
+those this run's probe marked. `reason` is `null` when something was packed,
+and otherwise one of `no loose objects`, `all loose objects are skip-marked
+as incompressible`, `every remaining loose object is incompressible` or `no
+loose object could be packed`. The journal entry says the same in a line
+(`nothing packed: no loose objects`). Backups pack on completion, so a `pack`
+run by hand afterwards usually finds nothing loose.
 
 ---
 
@@ -1151,10 +1209,10 @@ again after more backups and only the new snapshots are sent.
 
 The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
 (already complete at the target), `objects_asked`, `objects_sent`,
-`bytes_sent` (as stored, so what crossed to the target) and
-`subtrees_skipped`. A run with nothing to send reports zeros and journals
-`target already up to date`, so a no-op and a full copy are told apart at a
-glance.
+`bytes_sent` (as stored, so what crossed to the target),
+`subtrees_skipped` and `reencrypted`. A run with nothing to send reports
+zeros and journals `target already up to date`, so a no-op and a full copy
+are told apart at a glance.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
@@ -1232,7 +1290,8 @@ Both are public, on the socket and on TCP.
 ### 16.2 Metrics
 
 `/metrics` is Prometheus text exposition, public, daemon-wide aggregates (no
-per-repository labels).
+per-repository series; see below for why, and for how an alert still names
+the repository).
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -1246,10 +1305,14 @@ per-repository labels).
 | `cbackup_jobs_failed_total` | counter | Jobs that failed |
 | `cbackup_jobs_completed_total` | counter | Jobs that completed |
 | `cbackup_schedules_enabled` | gauge | Enabled schedules |
-| `cbackup_last_snapshot_age_seconds` | gauge | Age of the newest snapshot |
+| `cbackup_last_snapshot_age_seconds` | gauge | Seconds since the stalest repository's newest snapshot, or since it was registered if it has none |
+| `cbackup_stalest_snapshot_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the age above measures |
+| `cbackup_repos_never_backed_up` | gauge | Repositories with no snapshot |
 | `cbackup_repos_key_unescrowed` | gauge | Encrypted repositories whose key is not acknowledged as stored elsewhere |
 | `cbackup_repos_encrypted` | gauge | Encrypted repositories |
-| `cbackup_last_verify_age_seconds` | gauge | Age of the newest verify run |
+| `cbackup_last_verify_age_seconds` | gauge | Seconds since the stalest repository's last completed verify, or since it was registered if it has none |
+| `cbackup_stalest_verify_repo_info` | gauge | Always 1; its `repo_id` and `label` labels name the repository the verify age measures |
+| `cbackup_repos_never_verified` | gauge | Repositories with no completed verify |
 | `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
 | `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
 | `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
@@ -1260,6 +1323,34 @@ per-repository labels).
 
 The `cbackup_alerts_*` series count from zero each time the daemon starts, and
 read zero when Pushover is not configured.
+
+There are no per-repository series, by decision. A `repo` label on every
+series multiplies the series count by the number of repositories, and the
+gauges here are what an alert needs daemon-wide: the worst age, the summed
+damage. The ages are the *stalest* repository's, so an alert on them fires
+when any repository falls behind. To say which one, each age has an info
+series: a single series, value 1, whose labels name that repository and
+change when a different one becomes the stalest:
+
+```
+cbackup_last_snapshot_age_seconds 93784
+cbackup_stalest_snapshot_repo_info{repo_id="3",label="nas"} 1
+```
+
+Ties go to the lowest repository id. The label is the repository's label
+(empty when it has none), escaped as the exposition format requires; a
+repository's path never appears. An alert rule templates the labels into its
+message by joining the two; multiplying by the info series' 1 keeps the age
+as the value and adds its labels:
+
+```
+(cbackup_last_snapshot_age_seconds > 90000)
+  * on(instance) group_left(repo_id, label) cbackup_stalest_snapshot_repo_info
+```
+
+Only the stalest repository is named. When two have stopped, the alert names
+the worse, and the other surfaces once that one is fixed; `c-backup repo list`
+and each repository's summary give the full picture.
 
 Alerts worth having:
 
@@ -1535,7 +1626,9 @@ Not in 1.0, by decision:
 
 Every command talks to the daemon over its socket: `--socket PATH` before the
 command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
-JSON, one document per command, on stdout; errors go to stderr. The exit
+JSON, one document per command, on stdout (a remove prints what it removed,
+`{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
+that prints several: one document per line until the job ends. The exit
 status is 0 on success and 1 otherwise. Flags may appear anywhere after the
 command. Commands that start a job wait for it unless given `--no-wait`.
 
@@ -1572,7 +1665,8 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
 | `auth status` | Whether an admin password is set |
-| `auth setup\|login\|logout\|password` | Admin password and sessions (prompts) |
+| `auth setup\|password` | Set or change the admin password (prompts) |
+| `auth logout --all` | Revoke every remote session (section 4.3) |
 | `health [live]`, `metrics`, `version` | The daemon |
 | `help` | This list, from the binary |
 

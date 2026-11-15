@@ -218,6 +218,9 @@ export interface WireGrepRun {
   files_matched: number
   hits: number
   truncated: boolean
+  /* Files read only as far as the per-file hit cap. Absent from a daemon
+   * older than the column. */
+  files_capped?: number
 }
 
 export interface WireGrepHit {

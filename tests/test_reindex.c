@@ -272,6 +272,25 @@ static void test_reindex_restores_size_and_file_count(void **state)
                             " AND total_size IS NULL"), 0);
 }
 
+/* ---------- B094 ---------- */
+
+/*
+ * Reindex rewrote each snapshot row with INSERT OR REPLACE, which put
+ * gfs_flags back to 0: a reindex after a retention pass stripped every
+ * tier. The walk cannot derive tiers, so it must leave them alone.
+ */
+static void test_reindex_keeps_gfs_flags(void **state)
+{
+    (void)state;
+    backup_once();
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE snapshots SET gfs_flags = 15", NULL, NULL), 0);
+    reindex_result_t rx;
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots, 1);
+    assert_int_equal(scalar("SELECT gfs_flags FROM snapshots WHERE repo_id = ?"), 15);
+}
+
 /* ---------- B073 ---------- */
 
 /* The refcounts GC's own mark produces, for comparison. */
@@ -462,6 +481,7 @@ int main(void)
                                         setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_pack_keeps_its_rows, setup, teardown),
         cmocka_unit_test_setup_teardown(test_clean_reindex_reports_no_failures, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_reindex_keeps_gfs_flags, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_restores_size_and_file_count, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_counts_refs_and_gc_after_it_keeps_live_objects,
                                         setup, teardown),
