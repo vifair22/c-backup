@@ -226,6 +226,21 @@ contains "policy readable" 'keep_daily' "$(sock_body /repos/1/policy)"
 check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/tags/milestone)"
 
+# B037, B038: metadata for a snapshot that does not exist, a tag with no
+# name, and removing a tag that is not there were all accepted in silence.
+sock_send() {  # sock_send <method> <path> [body] -> "<code> <body>"
+    curl -s -w ' %{http_code}' -X "$1" --unix-socket "$SOCK" ${3:+-d "$3"} "http://localhost$2"
+}
+check "tag on a missing snapshot is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"ghost","snap_id":999}' http://localhost/repos/1/tags)"
+check "note on a missing snapshot is a 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+     --unix-socket "$SOCK" -d '{"body":"x"}' http://localhost/repos/1/snapshots/999/note)"
+check "an empty tag name is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"name":"","snap_id":1}' http://localhost/repos/1/tags)"
+contains "removing a missing tag is a 404" '{"error":"no such tag"} 404' \
+    "$(sock_send DELETE /repos/1/tags/milestone)"
+check "nothing was stored for the missing snapshot" '{"tags":[]}' "$(sock_body /repos/1/tags)"
+
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
 # that fails telling the operator to reindex.

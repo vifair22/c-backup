@@ -524,7 +524,12 @@ Snapshots carry notes and tags:
 ```sh
 sudo c-backup snapshot note 1 12 "before the migration"
 sudo c-backup tag set 1 pre-migration 12
+sudo c-backup tag remove 1 pre-migration
 ```
+
+- A note or tag needs a snapshot that exists; naming one that does not is
+  an error, not a record attached to nothing.
+- Removing a tag that does not exist fails with "no such tag".
 
 ---
 

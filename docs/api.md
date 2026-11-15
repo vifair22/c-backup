@@ -405,10 +405,14 @@ same property that makes incremental backups cheap, applied to reading.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id}` |
-| DELETE | `/repos/<id>/tags/<name>` | Remove |
-| GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}` |
+| DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
+| GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
 | GET | `/repos/<id>/journal` | Operation history |
+
+Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
+with no name is a 400. Removing a tag that is not there is a 404 `no such
+tag`, so a typo does not read as success.
 
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
 `defaults`, the daemon's configured `retention.*` values from `config.yaml`

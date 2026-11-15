@@ -78,6 +78,19 @@ api_response_t metadata_tags_get(const api_request_t *req, int64_t repo_id)
     return finalise(resp);
 }
 
+/* Tags and notes hang off a snapshot id with no foreign key behind it, so
+ * routes that accepted any number stored metadata for snapshots that never
+ * existed: a tag on 999 protected nothing and listed as if it did. */
+static int snapshot_exists(const char *repo, const char *sid)
+{
+    db_result_t *r = NULL;
+    int found = db_execute(g_db,
+            "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, sid, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body) return api_error(400, "request body required");
@@ -87,7 +100,7 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
 
     CUTILS_AUTOFREE char *name = NULL;
     uint32_t snap = 0;
-    if (json_req_get_str(body, "name", &name) != 0 || !name)
+    if (json_req_get_str(body, "name", &name) != 0 || !name || !name[0])
         return api_error(400, "name is required");
     if (json_req_get_u32(body, "snap_id", &snap, 1, UINT32_MAX) != 0)
         return api_error(400, "snap_id is required");
@@ -96,6 +109,9 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(sid,  sizeof(sid),  "%u", snap);
     snprintf(now,  sizeof(now),  "%lld", (long long)time(NULL));
+
+    if (!snapshot_exists(repo, sid))
+        return api_error(404, "no such snapshot");
 
     /* A tag names one snapshot; re-tagging moves it rather than erroring,
      * which is what "tag this one instead" should do. */
@@ -117,10 +133,14 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
     if (!name || !name[0]) return api_error(400, "tag name required");
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    int affected = 0;
     if (db_execute_non_query(g_db,
             "DELETE FROM tags WHERE repo_id = ? AND name = ?",
-            (const char *[]){ repo, name, NULL }, NULL) != 0)
+            (const char *[]){ repo, name, NULL }, &affected) != 0)
         return api_error(500, "cannot delete tag");
+    /* A typo used to succeed silently, which reads as "removed" to anybody
+     * checking the exit code, while the tag it meant stayed in place. */
+    if (affected == 0) return api_error(404, "no such tag");
     return api_no_content();
 }
 
@@ -166,6 +186,9 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(sid,  sizeof(sid),  "%lld", (long long)snap_id);
     snprintf(now,  sizeof(now),  "%lld", (long long)time(NULL));
+
+    if (!snapshot_exists(repo, sid))
+        return api_error(404, "no such snapshot");
 
     if (db_execute_non_query(g_db,
             "INSERT INTO notes (repo_id, snap_id, body, updated_at)"

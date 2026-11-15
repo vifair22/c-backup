@@ -99,6 +99,15 @@ contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
 check    "tag remove" 0           "$(cb tag remove 1 keeper > /dev/null; echo $?)"
 
+# B038: removing a tag that is not there exited 0 with no output.
+OUT=$(cb tag remove 1 keeper 2>&1); RC=$?
+check    "tag remove of a missing tag fails" 1 "$RC"
+contains "and says so" 'no such tag' "$OUT"
+# B037: a nonexistent snapshot, or no name at all, was accepted.
+check "tag set on a missing snapshot fails" 1 "$(cb tag set 1 ghost 999 > /dev/null 2>&1; echo $?)"
+check "note on a missing snapshot fails" 1 "$(cb snapshot note 1 999 x > /dev/null 2>&1; echo $?)"
+check "tag set with an empty name fails" 1 "$(cb tag set 1 '' 1 > /dev/null 2>&1; echo $?)"
+
 contains "schedule add"    '"id"' "$(cb schedule add 1 gc 3600)"
 contains "schedule list"   'gc'   "$(cb schedule list 1)"
 check    "schedule remove" 0      "$(cb schedule remove 1 1 > /dev/null; echo $?)"
