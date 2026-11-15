@@ -26,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
 
@@ -395,19 +396,35 @@ static void test_journal_source_says_who_asked(void **state)
  * shares the one connection: a grep or verify inserting its run row in
  * between gave the submitter that row's id. The CLI then waited on, and
  * reported, some other job. Here a thread inserts rows into another table
- * as fast as it can while jobs are submitted, and every id handed back has
- * to be the job that was submitted.
+ * while each job is submitted, and every id handed back has to be the job
+ * that was submitted.
+ *
+ * The noise runs on a budget per submission rather than flat out (FLAKE-5).
+ * A thread re-taking the database mutex in a tight loop can hold it for as
+ * long as the scheduler lets it, and this test sometimes took a minute
+ * waiting for its turn. Each submission now races a burst of up to
+ * NOISE_PER_SUBMIT inserts, released just before it starts, which is the
+ * same window the old code lost ids in, and the database is quiet while the
+ * returned id is checked.
  */
-static volatile int g_noise_stop;
+#define NOISE_PER_SUBMIT 32
+
+static atomic_int  g_noise_stop;
+static atomic_int  g_noise_budget;
+static atomic_long g_noise_rows;
 
 static void *noise_inserts(void *arg)
 {
     (void)arg;
-    while (!g_noise_stop) {
-        int rc = db_execute_non_query(db,
-            "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
-            " VALUES (1, 1, 'noise', 0)", NULL, NULL);
-        (void)rc;
+    while (!atomic_load(&g_noise_stop)) {
+        int left = atomic_load(&g_noise_budget);
+        if (left <= 0) { sched_yield(); continue; }
+        if (!atomic_compare_exchange_weak(&g_noise_budget, &left, left - 1))
+            continue;
+        if (db_execute_non_query(db,
+                "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
+                " VALUES (1, 1, 'noise', 0)", NULL, NULL) == 0)
+            atomic_fetch_add(&g_noise_rows, 1);
     }
     return NULL;
 }
@@ -429,7 +446,9 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         "INSERT INTO grep_runs (id, repo_id, snap_id, pattern, started_at)"
         " VALUES (1000000, 1, 1, 'seed', 0)", NULL, NULL), 0);
 
-    g_noise_stop = 0;
+    atomic_store(&g_noise_stop, 0);
+    atomic_store(&g_noise_budget, 0);
+    atomic_store(&g_noise_rows, 0);
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, noise_inserts, NULL), 0);
 
@@ -438,8 +457,10 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         char action[32];
         snprintf(action, sizeof(action), "probe-%d", i);
         int64_t id = 0;
+        atomic_store(&g_noise_budget, NOISE_PER_SUBMIT);
         assert_int_equal(job_submit(jm, 1 + (i % 4), action, NULL, noop_job,
                                     NULL, NULL, &id), OK);
+        atomic_store(&g_noise_budget, 0);
         char idbuf[32];
         snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
         db_result_t *r = NULL;
@@ -449,9 +470,11 @@ static void test_job_ids_survive_concurrent_inserts(void **state)
         db_result_free(r);
         if (i % 16 == 15) usleep(20000);   /* let the workers drain the queue */
     }
-    g_noise_stop = 1;
+    atomic_store(&g_noise_stop, 1);
     pthread_join(th, NULL);
     assert_int_equal(wrong, 0);
+    /* The noise has to have happened for the ids to prove anything. */
+    assert_true(atomic_load(&g_noise_rows) > 0);
 }
 
 /*
