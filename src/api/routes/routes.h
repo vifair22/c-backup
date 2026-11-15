@@ -98,9 +98,10 @@ int routes_policy_count(const char *text, int *out);
 
 /*
  * Read ?limit= and (when offset is non-NULL) ?offset= for a collection
- * route. Absent means def_limit and 0; a limit above max_limit is clamped.
- * Anything that is not a plain decimal count - negative, signed, zero for a
- * limit, trailing junk - returns -1 with *bad set to a 400.
+ * route. Absent means def_limit and 0; a limit above max_limit is clamped
+ * and an offset past INT_MAX reads as INT_MAX. Something that is not a
+ * whole number ("lots", "+5", "1.5") or a value below the minimum (0 for a
+ * limit, negative for either) returns -1 with *bad set to a 400.
  */
 int routes_paging(const api_request_t *req, int def_limit, int max_limit,
                   int *limit, int *offset, api_response_t *bad);

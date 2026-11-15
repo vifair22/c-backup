@@ -162,25 +162,37 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     if (json_req_parse(req->body, req->body_len, &jr) != 0 || !jr)
         return api_error(400, "body is not valid JSON");
 
+    /*
+     * Each field is read for its type as well as its presence. A label of
+     * the wrong type used to read as no label, so an array registered the
+     * repository unlabelled and answered 201 (B112).
+     */
     char *path = NULL, *label = NULL;
-    if (json_req_get_str(jr, "path", &path) != 0 || !path) {
-        json_req_free(jr);
-        free(path);
-        return api_error(400, "path is required");
+    char *encstr = NULL, *passphrase = NULL;
+    jreq_err_t je;
+    int rc = jreq_str(jr, "path", &path, &je);
+    if (rc == JREQ_ABSENT) {
+        rc = JREQ_BAD;
+        snprintf(je.msg, sizeof(je.msg), "path is required");
     }
-    if (json_req_get_str_opt(jr, "label", &label) != 0) label = NULL;
+    if (rc == JREQ_OK && jreq_str(jr, "label", &label, &je) == JREQ_BAD) rc = JREQ_BAD;
+    if (rc == JREQ_OK && jreq_str(jr, "encrypt", &encstr, &je) == JREQ_BAD) rc = JREQ_BAD;
+    if (rc == JREQ_OK && jreq_str(jr, "passphrase", &passphrase, &je) == JREQ_BAD)
+        rc = JREQ_BAD;
+    if (rc != JREQ_OK) {
+        json_req_free(jr);
+        free(path); free(label); free(encstr); free(passphrase);
+        return api_error(400, je.msg);
+    }
 
     /*
      * Encryption is decided here and never again: converting a repository in
      * place would mean rewriting every object with both forms live, and
      * replicating into a fresh repository is the supported path instead.
      */
-    char *encstr = NULL, *passphrase = NULL;
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
-    if (json_req_get_str_opt(jr, "encrypt", &encstr) != 0) encstr = NULL;
-    if (json_req_get_str_opt(jr, "passphrase", &passphrase) != 0) passphrase = NULL;
     if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
         api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);
@@ -624,8 +636,10 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
         return api_error(400, "body is not valid JSON");
 
     char *hex = NULL;
-    if (json_req_get_str(jr, "key", &hex) != 0 || !hex)
-        return api_error(400, "key is required");
+    jreq_err_t je;
+    int rc = jreq_str(jr, "key", &hex, &je);
+    if (rc == JREQ_ABSENT) return api_error(400, "key is required");
+    if (rc != JREQ_OK) return api_error(400, je.msg);
 
     repo_key_t k;
     status_t st = repo_key_from_hex(hex, &k);

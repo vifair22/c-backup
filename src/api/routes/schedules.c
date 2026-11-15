@@ -279,7 +279,13 @@ static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t 
 {
     CUTILS_AUTOFREE char *pattern = NULL;
     CUTILS_AUTOFREE char *prefix = NULL;
-    if (json_req_get_str(body, "pattern", &pattern) != 0 || !pattern || !*pattern) {
+    jreq_err_t je;
+    int rc = jreq_str(body, "pattern", &pattern, &je);
+    if (rc == JREQ_BAD) {
+        *bad = api_error(400, je.msg);
+        return NULL;
+    }
+    if (rc == JREQ_ABSENT || !*pattern) {
         *bad = api_error(400, "pattern is required for a grep schedule");
         return NULL;
     }
@@ -298,14 +304,9 @@ static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t 
         *bad = api_error(400, "ignore_case must be true or false");
         return NULL;
     }
-    if (json_req_has(body, "max_files") &&
-        json_req_get_u32(body, "max_files", &mf, 0, 1000000) != 0) {
-        *bad = api_error(400, "max_files must be a number from 0 to 1000000");
-        return NULL;
-    }
-    if (json_req_has(body, "path_prefix") &&
-        json_req_get_str(body, "path_prefix", &prefix) != 0) {
-        *bad = api_error(400, "path_prefix must be a string");
+    if (jreq_u32(body, "max_files", &mf, 0, 1000000, &je) == JREQ_BAD ||
+        jreq_str(body, "path_prefix", &prefix, &je) == JREQ_BAD) {
+        *bad = api_error(400, je.msg);
         return NULL;
     }
 
@@ -334,8 +335,10 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     CUTILS_AUTOFREE char *action = NULL;
     CUTILS_AUTOFREE char *overlap = NULL;
     CUTILS_AUTOFREE char *catchup = NULL;
-    if (json_req_get_str(body, "action", &action) != 0 || !action)
-        return api_error(400, "action is required");
+    jreq_err_t aerr;
+    int arc = jreq_str(body, "action", &action, &aerr);
+    if (arc == JREQ_ABSENT) return api_error(400, "action is required");
+    if (arc == JREQ_BAD) return api_error(400, aerr.msg);
     /*
      * Both policies were stored as whatever string arrived, so
      * `--on-overlap bogus` was accepted, listed, and then read by the
@@ -378,6 +381,27 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     }
 
     /*
+     * The trigger arrives as a nested object, not a string of JSON inside
+     * JSON, and is validated here rather than at fire time: a schedule the
+     * scheduler will silently disable on its first tick is a confusing way to
+     * learn about a typo.
+     *
+     * Everything the body says is checked before anything about the
+     * repository. A malformed trigger on a repository without sources used
+     * to be told about the sources (B112): the client's own mistake, the one
+     * it can fix from what it sent, came second.
+     */
+    trigger_t t;
+    if (trigger_parse_at((const struct cutils_json_req *)body, "trigger", &t) != OK)
+        return api_error(400, err_msg());
+
+    /* Store the canonical form rather than the client's text, so what comes
+     * back out is exactly what was validated. */
+    char spec[256];
+    if (trigger_serialise(&t, spec, sizeof(spec)) != OK)
+        return api_error(400, err_msg());
+
+    /*
      * Per-action parameters, stored in the schedules.params column that has
      * existed since the first migration and was never written to.
      *
@@ -392,53 +416,38 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
 
     CUTILS_AUTOFREE char *dest = NULL;
     CUTILS_AUTOFREE char *params = NULL;
-    if (json_req_get_str_opt(body, "dest", &dest) != 0) dest = NULL;
+    jreq_err_t je;
+    if (jreq_str(body, "dest", &dest, &je) == JREQ_BAD) return api_error(400, je.msg);
 
+    int need_sources = 0;
     if (strcmp(action, "backup") == 0) {
-        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
-        if (json_resp_new(&pr) != 0 || json_resp_ensure_array(pr, "paths") != 0)
-            return api_error(500, "cannot encode schedule parameters");
+        char **paths = NULL;
+        size_t npaths = 0;
+        if (jreq_strv(body, "paths", 256, &paths, &npaths, &je) == JREQ_BAD)
+            return api_error(400, je.msg);
 
-        int npaths = 0;
-        CUTILS_AUTO_JSON_ITER cutils_json_iter_t it;
-        if (json_iter_begin(body, "paths", &it) == 0) {
-            while (json_iter_next(&it)) {
-                char *sp = NULL;
-                if (json_iter_get_str(&it, "", &sp) != 0 || !sp) continue;
-                if (sp[0] != '/') {
-                    free(sp);
-                    return api_error(400, "backup source paths must be absolute");
-                }
-                /* A bare string, which is what the route's own body holds
-                 * and what the parser on the other side iterates. The
-                 * element builder makes objects, so it is the wrong tool
-                 * here. */
-                if (json_resp_array_append_str(pr, "paths", sp) == 0) npaths++;
-                free(sp);
+        CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
+        if (json_resp_new(&pr) != 0 || json_resp_ensure_array(pr, "paths") != 0) {
+            jreq_strv_free(paths, npaths);
+            return api_error(500, "cannot encode schedule parameters");
+        }
+        for (size_t i = 0; i < npaths; i++) {
+            if (paths[i][0] != '/') {
+                jreq_strv_free(paths, npaths);
+                return api_error(400, "backup source paths must be absolute");
+            }
+            /* A bare string, which is what the route's own body holds and
+             * what the parser on the other side iterates. The element
+             * builder makes objects, so it is the wrong tool here. */
+            if (json_resp_array_append_str(pr, "paths", paths[i]) != 0) {
+                jreq_strv_free(paths, npaths);
+                return api_error(500, "cannot encode schedule parameters");
             }
         }
-        /*
-         * No paths given is fine when the repository has some configured -
-         * that is the ordinary case, since sources belong to the repo. What
-         * is refused is a schedule with nowhere to read from at all, which
-         * would otherwise fail nightly with only a log line to say so.
-         */
-        if (npaths == 0) {
-            db_result_t *cnt = NULL;
-            long have = 0;
-            if (db_execute(g_db,
-                    "SELECT COUNT(*) FROM repo_backup_paths"
-                    " WHERE repo_id = ? AND kind = 'source'",
-                    (const char *[]){ repo, NULL }, &cnt) == 0 && cnt && cnt->nrows == 1)
-                have = strtol(cnt->rows[0][0], NULL, 10);
-            db_result_free(cnt);
-
-            if (have == 0)
-                return api_error(400,
-                                 "this repository has no backup sources configured, "
-                                 "and none were given");
-            params = NULL;   /* the job reads them from the repository */
-        }
+        jreq_strv_free(paths, npaths);
+        /* No paths given is fine when the repository has some configured;
+         * whether it does is a fact about the repository, checked below. */
+        need_sources = npaths == 0;
 
         char  *pbuf = NULL;
         size_t plen = 0;
@@ -450,9 +459,6 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (strcmp(action, "replicate") == 0) {
         if (!dest || !*dest)
             return api_error(400, "dest is required for a replicate schedule");
-        char why[PATH_MAX + 128];
-        if (routes_replicate_dest_check(repo_id, dest, why, sizeof(why)) != 0)
-            return api_error(400, why);
 
         CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
         char  *pbuf = NULL;
@@ -472,21 +478,37 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
         if (!params) return bad;
     }
 
-    /*
-     * The trigger arrives as a nested object, not a string of JSON inside
-     * JSON, and is validated here rather than at fire time: a schedule the
-     * scheduler will silently disable on its first tick is a confusing way to
-     * learn about a typo.
-     */
-    trigger_t t;
-    if (trigger_parse_at((const struct cutils_json_req *)body, "trigger", &t) != OK)
-        return api_error(400, err_msg());
+    /* ---- the repository, now that the request itself is sound ---- */
 
-    /* Store the canonical form rather than the client's text, so what comes
-     * back out is exactly what was validated. */
-    char spec[256];
-    if (trigger_serialise(&t, spec, sizeof(spec)) != OK)
-        return api_error(400, err_msg());
+    /*
+     * What is refused is a backup schedule with nowhere to read from at
+     * all, which would otherwise fail nightly with only a log line to say
+     * so. Sources belong to the repository, so a schedule naming none is
+     * the ordinary case when it has some.
+     */
+    if (need_sources) {
+        db_result_t *cnt = NULL;
+        long have = 0;
+        if (db_execute(g_db,
+                "SELECT COUNT(*) FROM repo_backup_paths"
+                " WHERE repo_id = ? AND kind = 'source'",
+                (const char *[]){ repo, NULL }, &cnt) == 0 && cnt && cnt->nrows == 1)
+            have = strtol(cnt->rows[0][0], NULL, 10);
+        db_result_free(cnt);
+
+        if (have == 0)
+            return api_error(400,
+                             "this repository has no backup sources configured, "
+                             "and none were given");
+    }
+
+    /* Where the destination sits relative to registered repositories, and
+     * what is mounted there, is host state, so it comes after the body. */
+    if (strcmp(action, "replicate") == 0) {
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, dest, why, sizeof(why)) != 0)
+            return api_error(400, why);
+    }
 
     char due[32];
     time_t now = time(NULL);

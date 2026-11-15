@@ -26,7 +26,9 @@
  */
 
 #include <cutils/json.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum {
     JCOL_STR,       /* text, as is; "" stays "" */
@@ -68,5 +70,97 @@ int jrow_resp_add_row(cutils_json_resp_t *r, const jcol_t *cols, size_t n,
  * value.
  */
 int jreq_flag(const cutils_json_req_t *req, const char *key, int *out);
+
+/*
+ * Typed request fields.
+ *
+ * The c-utils getters fail the same way for a field that is absent and a
+ * field of the wrong type, and the routes read a failure as absence: an
+ * array `label` registered a repository with no label and answered 201,
+ * and `"snap_id":1e999` was told "snap_id is required" about a field it had
+ * plainly sent. These tell the three apart, so a route can say "is
+ * required" only when it is true and name the expected type otherwise.
+ *
+ * Each returns JREQ_OK with *out set, JREQ_ABSENT with *out untouched when
+ * the key is not in the body, or JREQ_BAD with err->msg naming the field
+ * and what it must be. A JSON null is a value of the wrong type, not
+ * absence: every client omits a field it means to leave out, and treating
+ * null as absent would let a mistyped client keep half-working. jreq_flag
+ * above already refused it.
+ *
+ * key may be a dot path ("trigger.seconds"); the message names it as given.
+ */
+enum { JREQ_BAD = -1, JREQ_OK = 0, JREQ_ABSENT = 1 };
+
+typedef struct {
+    char msg[192];
+} jreq_err_t;
+
+/* What a field holds. JREQ_T_HUGE is a number cJSON read as infinite, such
+ * as 1e999: a number the client sent, too large for any field. */
+typedef enum {
+    JREQ_T_ABSENT,
+    JREQ_T_NULL,
+    JREQ_T_BOOL,
+    JREQ_T_NUMBER,
+    JREQ_T_HUGE,
+    JREQ_T_STRING,
+    JREQ_T_ARRAY,
+    JREQ_T_OBJECT
+} jreq_type_t;
+
+jreq_type_t jreq_type(const cutils_json_req_t *req, const char *key);
+
+/* A string; *out is malloc'd and the caller frees it. */
+int jreq_str(const cutils_json_req_t *req, const char *key, char **out,
+             jreq_err_t *err);
+
+/* A JSON boolean, and only that. */
+int jreq_bool(const cutils_json_req_t *req, const char *key, bool *out,
+              jreq_err_t *err);
+
+/*
+ * A whole number in [min, max]. A fraction is "must be a whole number"; a
+ * number outside the range, a negative one for an unsigned field, or one
+ * too large to represent (1e999) is "is out of range", with the range.
+ * Bounds wider than 2^53 are narrowed to it, the largest integer a double
+ * holds exactly: past it the value read would not be the value sent.
+ */
+int jreq_u32(const cutils_json_req_t *req, const char *key, uint32_t *out,
+             uint32_t min, uint32_t max, jreq_err_t *err);
+int jreq_u64(const cutils_json_req_t *req, const char *key, uint64_t *out,
+             uint64_t min, uint64_t max, jreq_err_t *err);
+int jreq_i64(const cutils_json_req_t *req, const char *key, int64_t *out,
+             int64_t min, int64_t max, jreq_err_t *err);
+
+/*
+ * An array of strings, every element checked: one that is not a string
+ * refuses the whole field rather than being skipped, which is how a backup
+ * body with a number among its paths used to back up the rest and say
+ * nothing. More than max elements is refused too. On JREQ_OK *out holds
+ * *n malloc'd strings (NULL when the array is empty); free it with
+ * jreq_strv_free.
+ */
+int jreq_strv(const cutils_json_req_t *req, const char *key, size_t max,
+              char ***out, size_t *n, jreq_err_t *err);
+void jreq_strv_free(char **v, size_t n);
+
+/*
+ * Query-string numbers, by the same rules and in the same words as a body.
+ *
+ * jquery_number reads text in JSON's number grammar into *out (which may
+ * be infinite for 1e999) and returns 0, or -1 for anything else - "lots",
+ * "+5", " 3", "0x10".
+ *
+ * jquery_i64 is the query counterpart of jreq_i64: JREQ_ABSENT for a NULL
+ * text, JREQ_BAD with "<name> must be a whole number" for something that
+ * is not a number or not whole, and "<name> is out of range; it must be
+ * from <min> to <max>" for a negative, oversized or unrepresentable one.
+ * An id each route parsed its own way used to clamp an overflowing value
+ * to LLONG_MAX and answer 404, as though the id were merely unknown.
+ */
+int jquery_number(const char *text, double *out);
+int jquery_i64(const char *text, const char *name, int64_t min, int64_t max,
+               int64_t *out, jreq_err_t *err);
 
 #endif
