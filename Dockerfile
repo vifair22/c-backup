@@ -39,6 +39,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /build/build/bins/c-backupd /usr/local/bin/c-backupd
 COPY --from=build /build/build/bins/c-backup  /usr/local/bin/c-backup
 COPY packaging/config.yaml /etc/c-backupd/config.yaml
+# Inside a container, loopback is the container's own: a published port
+# reaches nothing bound there. The image binds every interface instead, and
+# what is actually exposed is decided by -p at run time. Until an admin
+# password is set (docker exec <container> c-backup auth setup) TCP serves
+# only the health probes.
+RUN sed -i 's/^  bind: 127.0.0.1$/  bind: 0.0.0.0/' /etc/c-backupd/config.yaml \
+    && grep -q '^  bind: 0.0.0.0$' /etc/c-backupd/config.yaml
 
 # The socket directory has to exist before the daemon binds. systemd creates
 # it outside a container; here it is the image's job.

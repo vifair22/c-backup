@@ -12,9 +12,11 @@ fi
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
-    # Not started automatically: the operator should set an admin password
-    # before the TCP listener accepts anything, and starting first would leave
-    # a window where it does not.
+    # Not started automatically: the config is the operator's to review
+    # first. The TCP listener binds loopback by default and serves only the
+    # health probes until an admin password is set, which is done over the
+    # unix socket once the daemon is running.
     echo "c-backup installed. Review /etc/c-backupd/config.yaml, then:"
     echo "  systemctl enable --now c-backupd"
+    echo "  c-backup auth setup      # only needed for remote access"
 fi

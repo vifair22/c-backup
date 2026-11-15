@@ -1,5 +1,5 @@
 Package: c-backup
-Version: 0.10.0
+Version: 1.0.0
 Section: admin
 Priority: optional
 Architecture: amd64
