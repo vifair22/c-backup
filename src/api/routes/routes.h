@@ -86,6 +86,23 @@ int routes_policy_flag(cutils_db_t *db, int64_t repo_id, const char *key, int de
  */
 int routes_policy_count(const char *text, int *out);
 
+/*
+ * Read ?limit= and (when offset is non-NULL) ?offset= for a collection
+ * route. Absent means def_limit and 0; a limit above max_limit is clamped.
+ * Anything that is not a plain decimal count - negative, signed, zero for a
+ * limit, trailing junk - returns -1 with *bad set to a 400.
+ */
+int routes_paging(const api_request_t *req, int def_limit, int max_limit,
+                  int *limit, int *offset, api_response_t *bad);
+
+/*
+ * Can repository repo_id replicate to dest? Refuses a relative dest, and one
+ * that is the source repository, lies inside it, or contains it (compared
+ * canonically). Returns 0, or -1 with the reason written to why.
+ */
+int routes_replicate_dest_check(int64_t repo_id, const char *dest,
+                                char *why, size_t whysz);
+
 /* Is this an action a schedule may name? The list lives with the dispatcher
  * so a schedule cannot be created for something that will not run. */
 int routes_action_is_schedulable(const char *action);

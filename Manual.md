@@ -194,6 +194,7 @@ docker run -d --name c-backupd \
   -v /srv/backup:/srv/backup \
   -v /home:/source/home:ro \
   -p 127.0.0.1:8765:8765 \
+  -e TZ=America/Chicago \
   <registry>/vifair22/c-backup:<tag>
 ```
 
@@ -213,6 +214,16 @@ docker run -d --name c-backupd \
   published port cannot reach the container's loopback. What is exposed is
   decided by `-p`. TCP serves only the health probes until an admin password
   is set.
+- **Set the time zone.** The image runs in UTC unless told otherwise, and
+  calendar schedules (section 10) fire in the daemon's local time, so on a
+  host in US Central `--at 03:00` would fire at 03:00 UTC, 21:00 the evening
+  before. Pass `-e TZ=America/Chicago` (any zone name from the tz database;
+  the image carries `tzdata`), or mount the host's zone read-only with
+  `-v /etc/localtime:/etc/localtime:ro`; `TZ` wins if both are given.
+  `c-backup schedule list` reports the zone in use (`timezone`) and each
+  schedule's next fire with its offset (`next_due_iso`), so a wrong zone is
+  visible before anything fires at the wrong hour. Changing the zone takes
+  effect at the next daemon start.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
   `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
@@ -375,8 +386,26 @@ HTTPS.
 - A login returns a token valid for 90 days. Every authenticated request
   slides the expiry forward, so a connection in regular use does not expire.
 - `c-backup auth password` changes the password; it always asks for the
-  current one.
+  current one. A change revokes every other session at once: a client that
+  signed in with the old password is signed out, not left holding a token
+  that works for another 90 days. Over TCP the session that made the change
+  survives; from the CLI, which has no session, every session goes.
 - Sign out in the app, or `POST /api/auth/logout` with the token, revokes it.
+- `sudo c-backup auth logout --all` (or `POST /api/auth/logout-all` with a
+  token) revokes every session any client holds, including the caller's.
+  Use it when a machine that was signed in is lost or no longer trusted and
+  the password itself is not in doubt.
+- Failed logins over TCP are throttled. Each client address gets 5 free
+  failures; after that every failure locks it out for twice as long as the
+  last (1 s, 2 s, 4 s, ... up to 5 minutes), and the lockout refuses the
+  correct password too, with `429` and a `Retry-After` header. An address is
+  forgotten after 15 minutes without a failure, or at once when it logs in.
+  Across all addresses, a burst of 60 failures, or a sustained rate above
+  one every 2 seconds, refuses every TCP login until the rate falls; that caps an attacker who
+  rotates addresses - and can lock you out while one is trying. The socket is
+  never throttled: `sudo c-backup ...` on the host always works. Behind a
+  reverse proxy every client is the proxy's address and shares one budget.
+  Details are in `docs/api.md`.
 - The CLI never needs a password: it uses the socket.
 - The app stores the session token, never the password (section 15.2).
 
@@ -461,6 +490,10 @@ directory is never touched.** Deleting backup data is the operator's act:
 remove the directory yourself once you are sure. Registering it again later
 restores everything, with a reindex.
 
+A removed repository's id is never handed out again; registering it again
+gives it a new one. Ids used to be reused, so the next repository added
+could take over the removed one's schedules and history.
+
 ### 5.3 Where to put a repository
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
@@ -490,6 +523,12 @@ seconds, and exits when the job ends:
 ```
 data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
 ```
+
+`sources set` replaces the whole list. Each source must be an absolute path
+(empty or relative ones are refused, and nothing is changed). A path that
+does not exist on the daemon's host is stored with a warning in the reply,
+not refused, since it may be a share or disk that is mounted only at backup
+time; a backup skips it until it exists.
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
@@ -597,13 +636,20 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
 - Every listing pages. No request returns a whole snapshot, which is what
   keeps browsing fast at any size (section 18.4).
 - **Name search** uses a trigram index: substring matches in milliseconds.
+  Across all snapshots, a file kept unchanged is one result with a count of
+  the snapshots holding it and the newest one's id; a file that changed
+  appears once per distinct content. `--snapshot N` searches one snapshot.
 - **Content search** (`grep`) runs as a job, because it reads the
   repository. Matching is POSIX extended regular expressions, line by line,
   over every distinct object in the snapshot; a file present under several
-  names is read once. Binary files are reported without an excerpt.
-  `--snapshot N` picks the snapshot (newest by default), `--path-prefix`
+  names is read once. A binary file that matches is one hit, `(binary file
+  matches)`, however often it matches. `--snapshot N` picks the snapshot
+  (newest by default; one that does not exist is an error), `--path-prefix`
   limits it to a subtree, `-i` ignores case, `--limit N` stops after N
-  matching files. The hits are kept and `GET /repos/<id>/grep` lists past
+  matching files. A file stops being read after `--max-hits-per-file`
+  matches (default 100) and the whole search after `--max-hits` (default
+  10,000); when either cut it short the output says `truncated` or counts
+  `files_capped`. The hits are kept and `GET /repos/<id>/grep` lists past
   searches.
 - **Diff** walks manifest trees and skips any subtree whose hash did not
   change, so comparing two large snapshots costs what changed between them.
@@ -764,22 +810,33 @@ when it first fires.
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
-**Calendar** triggers use the host's local time. `every` is `day`, `week`
+**Calendar** triggers use the daemon's local time: the host's under systemd,
+UTC in the Docker image unless `TZ` is set (section 2.3). `schedule list`
+names the zone (`timezone`) and gives each next fire with its offset
+(`next_due_iso`). `every` is `day`, `week`
 (with `--on <weekday>`), `month` (with `--on-day 1-31`) or `year` (with
 `--on-month` and `--on-day`). The edge cases are handled: a time that does
 not exist on a spring-forward day still fires once, a time that occurs twice
 on a fall-back day fires once, the 31st clamps to the last day of shorter
-months, and 29 February fires every year.
+months, and 29 February fires every year (on the 28th in common years). A day
+no year has, such as 30 February, is refused when the schedule is created.
 
 Two policies per schedule:
 
 | Option | Values | Meaning |
 |---|---|---|
 | `--on-overlap` | `skip` (default), `queue`, `cancel_running` | The schedule comes due while its previous run is still going |
-| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now |
+| `--catchup` | `skip` (default), `run_once` | Windows missed while the daemon was down: move to the next, or fire once now. Applies to a schedule's first window too |
+
+Any other value is refused when the schedule is created.
 
 A `backup` schedule uses the repository's sources unless it names
-`--source` paths. A `replicate` schedule needs `--dest`, an absolute path.
+`--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
+`grep` schedule needs `--pattern` (an extended regular expression, checked
+when the schedule is created) and takes `--path-prefix` and `-i`; it searches
+the newest snapshot each time it fires. An option that belongs to a
+different action, such as `--dest` on a `gc` schedule, is refused rather than
+stored and ignored.
 
 `scheduler.enabled: 0` in `config.yaml` stops every schedule.
 
@@ -879,6 +936,17 @@ would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
 does not do; `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
 
+**Large incompressible objects stay loose.** A backup writes objects up to
+16 MiB straight into packs. Anything larger is written as one loose file,
+and the pack step then reads its first 64 KiB: if that does not compress
+(video, audio, disk images, encrypted or already-compressed archives) the
+object is marked and is never packed, by this or any later `pack` run. It is
+stored raw with its parity trailer, so `stats` and `summary` keep counting
+it as loose and `phys_size` exceeds `orig_size` by the parity overhead
+(section 18.1). That is deliberate: rewriting gigabytes into a pack would
+save nothing but an inode. Large files that do compress are packed
+normally. Details are in `docs/data-paths.md`.
+
 ---
 
 ## 13. Encryption
@@ -973,6 +1041,9 @@ restored from.
   compromised source cannot delete the offsite copy through replication.
 - A destination already holding a different repository is refused, unless
   `--reencrypt` says that is the point (below).
+- So is the source repository's own directory, anything inside it, and any
+  directory containing it, even through a symlink: a replica there is not a
+  second copy of anything.
 
 ### 14.1 Changing a repository's encryption
 
@@ -1220,7 +1291,20 @@ running). `docs/acceptance.md` has the full results.
 - Deduplication is per repository, across every snapshot.
 - Already-compressed data (media, archives, git objects) gains nothing from
   compression and is detected quickly; expect source size, less duplicates,
-  plus parity overhead of a few percent.
+  **plus 6.7% for parity**.
+- **Parity costs 6.7% of every stored payload, measured and by design.**
+  Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
+  data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
+  damaged bytes per codeword, and codewords are interleaved 64 deep so a
+  contiguous burst of up to 512 bytes is repairable. Parity is computed in
+  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
+  so the last group is paid in full: a tiny file still costs 1 KiB of
+  parity. On top of that every object carries about 280 fixed bytes (a
+  260-byte parity record for its header, a CRC32C, a reserved word and a
+  12-byte footer). For compressible data the 6.7% applies to the compressed
+  size; for a large incompressible file it is essentially the whole
+  difference between `phys_size` and `orig_size`, which is where the
+  measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
 
@@ -1283,12 +1367,13 @@ the underlying disk.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`; `--socket PATH` or `C_BACKUP_SOCKET` |
+| `c-backup: daemon not running at /run/c-backupd/c-backupd.sock` | The daemon is stopped, or the socket path differs | `systemctl status c-backupd`, or in Docker `docker ps` (the daemon is the container's process: start the container, or `docker exec` into the right one); `--socket PATH` or `C_BACKUP_SOCKET`. The message itself says which applies |
 | `permission denied` on the socket | Not root, and the socket is root-only | `sudo`, or section 4.1 |
 | `another daemon is serving <socket>` at start | A second instance | Stop the other one; only one daemon owns a host |
 | App: `no daemon at host:port`, mentions `http.bind` | TCP not reachable: bound to loopback, firewalled, or the daemon is down | Set `http.bind`, open the port, check the daemon |
 | App or API: 403 `not configured` | No admin password yet | `sudo c-backup auth setup` on the daemon's host |
 | App: `login failed: check the admin password` | Wrong password | Retry; `c-backup auth password` on the host to change it |
+| `429 too many failed logins` | The login throttle (section 4.3) locked out this address, or every address during an attack | Wait the `Retry-After` seconds; the socket is never throttled |
 | App: `sign in again` mid-use | Session revoked or expired | Sign in |
 | `repo is busy` | Another job holds the repository | Wait, or `c-backup jobs` to see what |
 | Backup logs `key not escrowed` | System key not acknowledged | Section 13 |
@@ -1357,8 +1442,8 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `snapshot delete <id> <snapshot>` | Prune one |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--limit N]` | File names |
-| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i]` | File contents |
+| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
+| `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `diff <id> <from> <to>` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |

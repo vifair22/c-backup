@@ -59,7 +59,24 @@ echo "no daemon"
 OUT=$("$CLI" --socket "$WORK/absent.sock" repo list 2>&1); RC=$?
 check    "exits non-zero without a daemon" 1 "$RC"
 contains "explains the daemon is not running" "daemon not running" "$OUT"
-contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+# B080: the advice fits where the CLI runs. It said systemctl inside the
+# Docker image, which has no systemd. CI itself may be a container, so the
+# expectation follows the same signals the CLI reads.
+if [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -n "${container:-}" ]; then
+    contains "suggests how to start it" "start that container" "$OUT"
+elif [ -d /run/systemd/system ]; then
+    contains "suggests how to start it" "systemctl start c-backupd" "$OUT"
+else
+    contains "suggests how to start it" "Start c-backupd." "$OUT"
+fi
+contains "names the socket options" "--socket PATH" "$OUT"
+contains "and the variable" "C_BACKUP_SOCKET" "$OUT"
+OUT=$(container=podman "$CLI" --socket "$WORK/absent.sock" repo list 2>&1)
+contains "in a container it says to start the container" "docker start c-backupd" "$OUT"
+case "$OUT" in
+    *systemctl*) bad "and not systemctl" "no systemctl" "$OUT" ;;
+    *)           ok  "and not systemctl" ;;
+esac
 
 echo "offline commands"
 contains "version" "c-backup" "$("$CLI" --version)"
@@ -115,6 +132,12 @@ contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":"1"'            "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
+# B074: these were silently replaced by the defaults.
+OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
+check    "snapshots --limit -1 fails" 1 "$RC"
+contains "and says why" "limit must be a whole number" "$OUT"
+OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
+check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"
@@ -169,6 +192,10 @@ contains "objects filtered by location" '"objects"' "$(cb objects 1 --location p
 contains "empty location filter keeps its key" '"objects"' \
     "$(cb objects 1 --location loose --limit 5)"
 contains "packs"    '"'          "$(cb packs 1)"
+# B075: these printed an empty listing and exited 0 for ids that do not exist.
+check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1; echo $?)"
+check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
+check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
 contains "fanout"   '"'          "$(cb fanout 1)"
 contains "metrics"  'cbackup_'   "$(cb metrics)"
 contains "health live" 'ok'      "$(cb health live)"
@@ -314,8 +341,10 @@ case "$(cb search 1 big)" in
 esac
 
 check "snapshot delete" 0 "$(cb snapshot delete 1 1 > /dev/null 2>&1; echo $?)"
-contains "schedule enable/disable" '"ok"' \
-    "$(cb schedule add 1 verify 7200 > /dev/null; cb schedule list 1 | grep -q verify && cb schedule disable 1 2 || echo miss)"
+# The id comes from the add. This disabled a hardcoded id 2 that did not
+# exist, which passed only because a missing schedule answered success.
+VSID=$(cb schedule add 1 verify 7200 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "schedule enable/disable" '"ok"' "$(cb schedule disable 1 "$VSID" || echo miss)"
 
 # Calendar schedules. The CLI offered --cron, which built a trigger type the
 # daemon rejects by design, and had no way to ask for the calendar triggers
@@ -356,6 +385,67 @@ esac
 OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
 check "grep rejects a bad pattern" 1 "$RC"
 contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
+# B066: a snapshot that does not exist completed with zero files, which
+# reads as "not in that backup".
+OUT=$(cb grep 1 hunter2 --snapshot 999 2>&1); RC=$?
+check    "grep on a missing snapshot fails" 1 "$RC"
+contains "and says so at submission" "no such snapshot" "$OUT"
+check    "a malformed snapshot is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" -d '{"pattern":"x","snapshot":"latest"}' http://localhost/repos/1/grep)"
+# B068: an unchanged file came back once per snapshot. Now one result per
+# path and content, counting the snapshots, and --snapshot narrows to one.
+SR=$(cb search 1 one.txt)
+check "search collapses identical copies" 1 \
+    "$(printf '%s' "$SR" | grep -o "\"path\":\"$WORK/src/one.txt\"" | wc -l | tr -d ' ')"
+NSNAP=$(printf '%s' "$SR" | sed -n 's/.*"snapshots":\([0-9]*\).*/\1/p' | head -1)
+if [ "${NSNAP:-0}" -ge 2 ]; then ok "and counts the snapshots it is in"; else bad "and counts the snapshots it is in" ">= 2" "${NSNAP:-none}"; fi
+NEWEST=$(cb snapshots 1 --limit 1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
+contains "--snapshot narrows the search" "\"snap_id\":\"$NEWEST\"" "$(cb search 1 one.txt --snapshot "$NEWEST")"
+OUT=$(cb search 1 one.txt --snapshot 999 2>&1); RC=$?
+check    "search in a missing snapshot fails" 1 "$RC"
+# B067: the hit caps are request options, refused out of range rather than
+# clamped, and the job result says whether anything was cut short.
+contains "grep takes a per-file cap" 'secrets.txt' "$(cb grep 1 hunter2 --max-hits-per-file 1 --max-hits 5)"
+OUT=$(cb grep 1 hunter2 --max-hits 0 2>&1); RC=$?
+check    "a zero hit cap is refused" 1 "$RC"
+contains "and names the range" "max_hits must be 1 to 1000000" "$OUT"
+GJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"hunter2"}' http://localhost/repos/1/grep \
+     | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+
+# B064: schedule options are validated per action. Values outside the
+# documented sets were stored and read back as something else; parameters an
+# action never reads were stored as if they configured something; a grep
+# schedule could not be given a pattern at all.
+OUT=$(cb schedule add 1 gc 3600 --on-overlap bogus 2>&1); RC=$?
+check    "an unknown on_overlap is refused" 1 "$RC"
+contains "and the valid ones are named" "skip, queue or cancel_running" "$OUT"
+OUT=$(cb schedule add 1 gc 3600 --catchup nope 2>&1); RC=$?
+check    "an unknown catchup is refused" 1 "$RC"
+OUT=$(cb schedule add 1 gc 3600 --dest /mnt/x 2>&1); RC=$?
+check    "a parameter the action ignores is refused" 1 "$RC"
+contains "and says whose it is" "dest applies only to a replicate" "$OUT"
+OUT=$(cb schedule add 1 grep 3600 2>&1); RC=$?
+check    "a grep schedule needs a pattern" 1 "$RC"
+OUT=$(cb schedule add 1 grep 3600 --pattern 'unclosed[' 2>&1); RC=$?
+check    "a grep schedule with a bad pattern is refused" 1 "$RC"
+check    "--on-overlap queue is accepted" 0 \
+    "$(cb schedule add 1 gc 3600 --on-overlap queue --catchup run_once >/dev/null 2>&1; echo $?)"
+GSID=$(cb schedule add 1 grep 1 --pattern 'passphrase is' | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores its pattern" '"params":{"pattern":"passphrase is"' "$(cb schedule list 1)"
+FIRED=0
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" 'http://localhost/repos/1/grep?limit=1')" in
+        *'"pattern":"passphrase is"'*'"completed":"1"'*) FIRED=1; break ;;
+    esac
+    sleep 0.2
+done
+check "a scheduled grep runs with its pattern" 1 "$FIRED"
+cb schedule remove 1 "$GSID" >/dev/null 2>&1
 
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.
@@ -434,6 +524,15 @@ RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
 check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
 contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
+# B046: the newest id was handed out again, and with it the removed
+# repository's schedules and history.
+NEXT_ID=$(cb repo add "$WORK/after-gone" after | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+if [ -n "$NEXT_ID" ] && [ "$NEXT_ID" -gt "$RM_ID" ]; then
+    ok "a removed repository's id is not reused"
+else
+    bad "a removed repository's id is not reused" "greater than $RM_ID" "${NEXT_ID:-none}"
+fi
+cb repo remove "$NEXT_ID" >/dev/null 2>&1
 
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the
@@ -665,6 +764,20 @@ contains "no objects either" '"objects_sent":0,' "$OUT"
 contains "the journal says the target was current" 'target already up to date' \
     "$(cb journal "$ENC_ID")"
 
+# B071: into the source's own directory it "completed" having copied
+# nothing, since the target was the source. Inside or above it is refused
+# too, and the comparison sees through a symlink.
+OUT=$(cb replicate "$ENC_ID" "$WORK/encrepo" 2>&1); RC=$?
+check    "replicate into itself fails" 1 "$RC"
+contains "and says why" "the source repository itself" "$OUT"
+check    "replicate inside itself fails" 1 "$(cb replicate "$ENC_ID" "$WORK/encrepo/sub" >/dev/null 2>&1; echo $?)"
+check    "replicate above itself fails"  1 "$(cb replicate "$ENC_ID" "$WORK" >/dev/null 2>&1; echo $?)"
+ln -s "$WORK/encrepo" "$WORK/enclink"
+check    "replicate through a symlink to itself fails" 1 \
+    "$(cb replicate "$ENC_ID" "$WORK/enclink" >/dev/null 2>&1; echo $?)"
+check    "a schedule into itself is refused" 1 \
+    "$(cb schedule add "$ENC_ID" replicate 3600 --dest "$WORK/encrepo" >/dev/null 2>&1; echo $?)"
+
 # Replication can be scheduled, which is the point of an offsite copy: one
 # that only runs when somebody remembers is not a backup strategy. The
 # destination lives in schedules.params, a column that has existed since the
@@ -876,7 +989,17 @@ contains "and says what is missing" "sources" "$OUT"
 OUT=$(cb schedule add 1 backup 3600 2>&1); RC=$?
 check    "a backup schedule inherits the repo sources" 0 "$RC"
 SID0=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p' | head -1)
+# B065: another repository's schedule, or one that does not exist, is not
+# this repository's to remove or disable; both reported success.
+OUT=$(cb schedule remove 2 "$SID0" 2>&1); RC=$?
+check    "removing another repo's schedule fails" 1 "$RC"
+contains "and says there is no such schedule" "no such schedule" "$OUT"
+OUT=$(cb schedule disable 2 "$SID0" 2>&1); RC=$?
+check    "disabling another repo's schedule fails" 1 "$RC"
+contains "the schedule survives" "\"id\":\"$SID0\"" "$(cb schedule list 1)"
 [ -n "$SID0" ] && cb schedule remove 1 "$SID0" >/dev/null 2>&1
+OUT=$(cb schedule remove 1 "$SID0" 2>&1); RC=$?
+check    "removing it twice fails" 1 "$RC"
 
 # The one that proves it: a one-second interval must produce real snapshots.
 BEFORE=$(cb snapshots 1 | grep -o '"id"' | wc -l)
@@ -907,6 +1030,14 @@ OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1);
 check "password change reads both from stdin" 0 "$RC"
 contains "old password no longer logs in" "invalid password" \
     "$(printf 'correcthorsebattery\n' | cb auth login 2>&1)"
+# B053: from the host, logout --all ends every session a client holds. A
+# token from a login is checked over TCP, since the socket needs none.
+LTOK=$(printf 'brandnewpassword\n' | cb auth login 2>&1 | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"
+check "and the token is dead" 401 "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
 OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
 check "no password on stdin fails" 1 "$RC"
 contains "and says so" "no password read" "$OUT"

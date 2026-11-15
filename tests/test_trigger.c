@@ -109,6 +109,29 @@ static void test_parse_rejects_nonsense(void **state)
         "{\"type\":\"calendar\",\"every\":\"week\",\"on\":\"caturday\",\"at\":\"01:00\"}", &t), OK);
 }
 
+/* B065: a yearly day that no year has is refused, while 29 February, which
+ * some years have, is kept. */
+static void test_parse_yearly_day_must_exist(void **state)
+{
+    (void)state;
+    trigger_t t;
+    static const struct { int month, day, ok; } cases[] = {
+        { 2, 30, 0 }, { 2, 31, 0 }, { 4, 31, 0 }, { 6, 31, 0 }, { 9, 31, 0 },
+        { 11, 31, 0 }, { 2, 29, 1 }, { 2, 28, 1 }, { 1, 31, 1 }, { 12, 31, 1 },
+        { 4, 30, 1 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char js[160];
+        snprintf(js, sizeof(js),
+                 "{\"type\":\"calendar\",\"every\":\"year\",\"on_month\":%d,"
+                 "\"on_day\":%d,\"at\":\"05:00\"}", cases[i].month, cases[i].day);
+        status_t st = trigger_parse(js, &t);
+        if (cases[i].ok) assert_int_equal(st, OK);
+        else             assert_int_not_equal(st, OK);
+        err_clear();
+    }
+}
+
 /* ---------- interval ---------- */
 
 /*
@@ -354,6 +377,7 @@ int main(void)
         cmocka_unit_test(test_parse_interval),
         cmocka_unit_test(test_parse_calendar_forms),
         cmocka_unit_test(test_parse_rejects_nonsense),
+        cmocka_unit_test(test_parse_yearly_day_must_exist),
         cmocka_unit_test(test_interval_anchors_to_last_fire),
         cmocka_unit_test(test_interval_skips_past_missed_windows),
         cmocka_unit_test(test_interval_without_history),

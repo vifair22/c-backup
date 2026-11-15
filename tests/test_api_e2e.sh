@@ -222,6 +222,27 @@ contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
 
+echo "sources"
+# B078: anything the loop could not read was skipped, and the route replaces
+# wholesale - so a malformed request answered 204 having deleted the
+# configuration. Every element is checked now and a refusal changes nothing.
+put_sources() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+                     -d "$1" http://localhost/repos/1/sources; }
+check "sources set" 200 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"*.tmp\"]}")"
+check "sources as a string refused"   400 "$(put_sources '{"sources":"/x"}')"
+check "missing sources refused"       400 "$(put_sources '{}')"
+check "a non-string source refused"   400 "$(put_sources '{"sources":[123]}')"
+check "an empty source refused"       400 "$(put_sources '{"sources":[""]}')"
+check "a relative source refused"     400 "$(put_sources '{"sources":["rel/path"]}')"
+check "an empty exclude refused"      400 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"\"]}")"
+contains "a refusal leaves the configuration alone" "$WORK/src" "$(sock_body /repos/1/sources)"
+contains "an absent source is accepted with a warning" "does not exist on the daemon's host" \
+    "$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
+       http://localhost/repos/1/sources)"
+contains "sources are stored normalised" '"sources":["/a/b"]' \
+    "$(put_sources '{"sources":["/a//b/./"]}' >/dev/null; sock_body /repos/1/sources)"
+check "sources cleared" 200 "$(put_sources '{"sources":[]}')"
+
 echo "metadata"
 check "set tag" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
      -d '{"name":"milestone","snap_id":1}' http://localhost/repos/1/tags)"
@@ -314,6 +335,18 @@ check "reject bad trigger" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST
      -d '{"action":"gc","trigger":{"type":"cron","spec":"* * * * *"}}' \
      http://localhost/repos/1/schedules)"
 contains "schedule listed" '"action":"gc"' "$(sock_body /repos/1/schedules)"
+# B051/B049: the trigger is an object rather than a string of JSON, and the
+# list says which zone calendar triggers run in, with a readable next fire.
+SL=$(sock_body /repos/1/schedules)
+contains "trigger is an object" '"trigger":{"type":"interval","seconds":3600}' "$SL"
+if [ -n "${TZ:-}" ]; then WANT_TZ="${TZ#:}"; else WANT_TZ="$(readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||')"; fi
+[ -n "$WANT_TZ" ] && contains "list names the daemon's zone" "\"timezone\":\"$WANT_TZ\"" "$SL"
+OFF=$(date +%z | sed 's/\(..\)$/:\1/')
+case "$SL" in
+    *'"next_due_iso":"'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"$OFF"'"'*)
+        ok "next fire is ISO 8601 with the local offset" ;;
+    *) bad "next fire is ISO 8601 with the local offset" "...$OFF" "$SL" ;;
+esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
 contains "schedule disabled" '"enabled":"0"' "$(sock_body /repos/1/schedules)"
@@ -332,6 +365,15 @@ else
 fi
 check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
+# B065: these answered success for a schedule that does not exist.
+check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+     --unix-socket "$SOCK" http://localhost/repos/1/schedules/1)"
+check "disable a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+     --unix-socket "$SOCK" -d '{"enabled":0}' http://localhost/repos/1/schedules/999)"
+check "yearly trigger on 30 February refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" \
+     -d '{"action":"gc","trigger":{"type":"calendar","every":"year","on_month":2,"on_day":30,"at":"05:00"}}' \
+     http://localhost/repos/1/schedules)"
 
 echo "introspection"
 contains "summary"      '"snapshots"'  "$(sock_body /repos/1/summary)"
@@ -341,6 +383,17 @@ contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
 well_formed "loose stats scope answers" "$(sock_body '/repos/1/stats?scope=loose')"
 contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
 contains "packs"        '{'            "$(sock_body /repos/1/packs)"
+# B074: values that cannot mean anything were ignored, so the default page
+# came back as though the request had been understood.
+check "unknown object location is a 400" 400 "$(sock_code '/repos/1/objects?location=nowhere')"
+check "location=all is accepted"         200 "$(sock_code '/repos/1/objects?location=all')"
+check "negative limit is a 400"          400 "$(sock_code '/repos/1/snapshots?limit=-1')"
+check "zero limit is a 400"              400 "$(sock_code '/repos/1/snapshots?limit=0')"
+check "non-numeric limit is a 400"       400 "$(sock_code '/repos/1/objects?limit=lots')"
+check "negative offset is a 400"         400 "$(sock_code '/repos/1/snapshots?offset=-5')"
+check "bad limit on the journal is a 400" 400 "$(sock_code '/repos/1/journal?limit=x')"
+check "bad limit on grep runs is a 400"  400 "$(sock_code '/repos/1/grep?limit=-1')"
+check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapshots?limit=999999')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than
@@ -352,6 +405,8 @@ OBJ=$(sock_body '/repos/1/objects?limit=200' \
       | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "object locate"  '"found":true' "$(sock_body "/repos/1/objects/$OBJ")"
 contains "object refs"    '"refs"'       "$(sock_body "/repos/1/objects/$OBJ/refs")"
+# B076: refs named the file but not where it is.
+contains "object refs carry full paths" "\"path\":\"$WORK/src/" "$(sock_body "/repos/1/objects/$OBJ/refs")"
 contains "object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$OBJ/layout")"
 contains "object content" '"base64"'     "$(sock_body "/repos/1/objects/$OBJ/content")"
 # A malformed hash must be rejected rather than reaching the store.
@@ -377,12 +432,22 @@ wait_job "$PACK_JOB"
 contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
 contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
 contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
+# B075: missing ids answered as empty successes, which reads as "empty".
+check "entries of a missing pack"   404 "$(sock_code '/repos/1/packs/99999/entries')"
+check "tree of a missing snapshot"  404 "$(sock_code '/repos/1/snapshots/99999/tree?parent=0')"
+check "tree under a missing node"   404 "$(sock_code '/repos/1/snapshots/1/tree?parent=99999999')"
+check "findings of a missing verify run" 404 "$(sock_code '/repos/1/verify/99999')"
+check "hits of a missing search"    404 "$(sock_code '/repos/1/grep/99999')"
 # Objects are in packs now, so every read path has to resolve through the
 # index rather than the objects directory.
 PACKED=$(sock_body '/repos/1/objects?location=pack&limit=1' \
          | sed -n 's/.*"hash":"\([a-f0-9]*\)".*/\1/p')
 contains "packed object locates" '"found":true'  "$(sock_body "/repos/1/objects/$PACKED")"
 contains "packed object layout"  '"header_size"' "$(sock_body "/repos/1/objects/$PACKED/layout")"
+# B076: the docs said 56 bytes. A packed object sits behind the 51-byte pack
+# entry header (a loose one behind the 64-byte object header).
+contains "packed header is the 51-byte entry header" '"header_size":51' \
+    "$(sock_body "/repos/1/objects/$PACKED/layout")"
 contains "packed object content" '"base64"'      "$(sock_body "/repos/1/objects/$PACKED/content")"
 contains "diff over packs"       '"modified"'    "$(sock_body '/repos/1/diff?from=1&to=2')"
 
@@ -611,6 +676,11 @@ contains "tcp stream unknown job" 'no such job' \
     "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/999999")"
 check "tcp stream needs a token" 401 "$(tcp_code /jobs/stream/$RJOB --max-time 5)"
 
+# B053: a second client's session must not survive the password change that
+# was meant to shut it out, while the session that made the change does.
+OTHER=$(tcp_body -X POST -d '{"password":"correcthorsebattery"}' "$URL/api/auth/login" \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "second session works" 200 "$(tcp_code /repos -H "Authorization: Bearer $OTHER")"
 check "password change needs current" 401 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
      -d '{"current":"wrong","new":"brandnewpassword"}')"
 check "password change too short" 400 "$(tcp_code /api/auth/password "${AUTH[@]}" -X POST \
@@ -621,9 +691,53 @@ check "old password refused" 401 "$(tcp_code /api/auth/login -X POST \
      -d '{"password":"correcthorsebattery"}')"
 check "new password accepted" 200 "$(tcp_code /api/auth/login -X POST \
      -d '{"password":"brandnewpassword"}')"
+check "other session revoked by the change" 401 "$(tcp_code /repos -H "Authorization: Bearer $OTHER")"
+check "changing session survives" 200 "$(tcp_code /repos "${AUTH[@]}")"
+
+# logout-all needs a credential and takes every session, the caller's too.
+check "logout-all needs a token" 401 "$(tcp_code /api/auth/logout-all -X POST)"
+T2=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+T3=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+contains "logout-all reports what it revoked" '"revoked":' \
+    "$(tcp_body -H "Authorization: Bearer $T2" -X POST "$URL/api/auth/logout-all")"
+check "logout-all ends the caller" 401 "$(tcp_code /repos -H "Authorization: Bearer $T2")"
+check "logout-all ends the others" 401 "$(tcp_code /repos -H "Authorization: Bearer $T3")"
+check "logout-all ends the first session" 401 "$(tcp_code /repos "${AUTH[@]}")"
+TOKEN=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+AUTH=(-H "Authorization: Bearer $TOKEN")
 
 check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
 check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"
+
+echo "login throttle"
+# B054: 100 wrong passwords took 2.66 s and the right one still worked
+# afterwards. Now the first few failures are free and then the address is
+# locked out, for longer each time, and the lockout holds even for the right
+# password - otherwise it would not slow guessing at all.
+CODES=""
+for _ in $(seq 1 12); do
+    c=$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')
+    CODES="$CODES $c"
+    [ "$c" = 429 ] && break
+done
+contains "wrong logins end in 429" "429" "$CODES"
+contains "after the free attempts" "401 401 401 401 401 401" "$CODES"
+sleep 1.2
+check "another failure once the lockout lapses" 401 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"guessing"}')"
+check "the right password is refused while locked out" 429 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
+contains "429 carries Retry-After" "retry-after:" \
+    "$(curl -s -D - -o /dev/null -X POST -d '{"password":"brandnewpassword"}' \
+       "$URL/api/auth/login" | tr 'A-Z' 'a-z')"
+check "the socket is never throttled" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     --unix-socket "$SOCK" -d '{"password":"brandnewpassword"}' http://localhost/api/auth/login)"
+sleep 2.2
+check "the right password works once it lapses" 200 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
 
 echo "shutdown"
 kill -TERM "$DAEMON_PID" 2>/dev/null

@@ -77,21 +77,8 @@ int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max
 #define PAGE_DEFAULT 200
 #define PAGE_MAX     1000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
+/* Run records are small and a client usually wants the last few. */
+#define RUNS_DEFAULT 20
 
 static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
 {
@@ -106,6 +93,35 @@ static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
     char *path = strdup(r->rows[0][0]);
     db_result_free(r);
     return path;
+}
+
+/* The newest snapshot's id, or 0 when the repository has none. */
+static int64_t newest_snapshot(int64_t repo_id)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int64_t id = 0;
+    if (db_execute(g_ctx.db,
+            "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
+        id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
+/* Does this repository have a snapshot with this id? */
+static int snapshot_exists(int64_t repo_id, int64_t snap_id)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db,
+            "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
 }
 
 /* ---------- restore request validation ---------- */
@@ -149,6 +165,44 @@ static int path_is_under(const char *path, const char *dir)
     size_t n = strlen(dir);
     if (n == 1 && dir[0] == '/') return 1;
     return strncmp(path, dir, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+int routes_replicate_dest_check(int64_t repo_id, const char *dest,
+                                char *why, size_t whysz)
+{
+    if (!dest || dest[0] != '/') {
+        snprintf(why, whysz, "dest must be an absolute path");
+        return -1;
+    }
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) { snprintf(why, whysz, "no such repo"); return -1; }
+
+    /*
+     * Into its own directory, the replica is the source: the sink opened
+     * the existing marker, found its own uuid, saw every object already
+     * present and reported success having copied nothing - the "offsite
+     * copy" was the original. Inside the source, it writes a repository
+     * into a tree GC cannot account for; above it, the source ends up
+     * inside its own replica. All three are refused, compared as canonical
+     * paths so a symlink or ".." cannot route around it.
+     */
+    char cdest[PATH_MAX], crepo[PATH_MAX];
+    int rc = 0;
+    if (canonical_path(dest, cdest) != 0 || canonical_path(repo_path, crepo) != 0) {
+        snprintf(why, whysz, "dest cannot be resolved");
+        rc = -1;
+    } else if (strcmp(cdest, crepo) == 0) {
+        snprintf(why, whysz, "dest is the source repository itself (%s)", repo_path);
+        rc = -1;
+    } else if (path_is_under(cdest, crepo)) {
+        snprintf(why, whysz, "dest is inside the source repository at %s", repo_path);
+        rc = -1;
+    } else if (path_is_under(crepo, cdest)) {
+        snprintf(why, whysz, "dest contains the source repository at %s", repo_path);
+        rc = -1;
+    }
+    free(repo_path);
+    return rc;
 }
 
 /*
@@ -236,10 +290,13 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
 static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -301,11 +358,36 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
                                 int64_t snap_id)
 {
     const char *parent = api_query_param(req, "parent");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
+    /*
+     * A snapshot or directory that is not there is a 404. Both answered an
+     * empty listing, which is what an empty directory looks like, so a
+     * mistyped id read as "nothing in here".
+     */
+    if (!snapshot_exists(repo_id, snap_id)) return api_error(404, "no such snapshot");
+    if (parent && !*parent) parent = NULL;
+    if (parent && strcmp(parent, "0") != 0) {
+        char *end = NULL;
+        long long pid = strtoll(parent, &end, 10);
+        if (pid <= 0 || !end || *end) return api_error(400, "parent must be a node id");
+        char rb[32], sb[32];
+        snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
+        snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
+        db_result_t *pr = NULL;
+        int found = db_execute(g_ctx.db,
+                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
+                (const char *[]){ rb, sb, parent, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+        db_result_free(pr);
+        if (!found) return api_error(404, "no such directory in this snapshot");
+    }
+
     char repo[32], snap[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -534,17 +616,61 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
         return api_error(400, "search needs at least 3 characters "
                               "(the name index is built from trigrams)");
 
+    /*
+     * An optional snapshot. Without one every snapshot is searched, and a
+     * file unchanged across thirty snapshots used to come back thirty
+     * times; with one, only that snapshot is.
+     */
+    int64_t only_snap = 0;
+    const char *sq = api_query_param(req, "snapshot");
+    if (sq) {
+        char *end = NULL;
+        long long v = strtoll(sq, &end, 10);
+        if (!*sq || !end || *end || v <= 0)
+            return api_error(400, "snapshot must be a snapshot id");
+        only_snap = (int64_t)v;
+        if (!snapshot_exists(repo_id, only_snap))
+            return api_error(404, "no such snapshot");
+    }
+
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
+
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
+    /*
+     * Without a snapshot, identical (path, content) rows across snapshots
+     * collapse into one result, so more rows are read than results returned.
+     * Bounded, because the alternative is reading every match in the
+     * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
+     * result stops and says the counts are partial.
+     */
+    enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
+    int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
+    if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
+    if (scan < limit) scan = limit;
 
-    char repo[32], lim[16];
+    char repo[32], lim[16], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", scan);
+    snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
 
     /* Through the trigram index, not LIKE: a scan of the nodes table loses to
-     * the pre-rewrite implementation, while this beats it by ~50x. */
+     * the pre-rewrite implementation, while this beats it by ~50x. No ORDER
+     * BY: sorting would read every match to return the first page, which is
+     * the cost the index exists to avoid. A collapsed result keeps the
+     * newest copy among the rows read instead. */
     db_result_t *r = NULL;
-    int rc = db_execute(g_ctx.db,
+    int rc = only_snap
+        ? db_execute(g_ctx.db,
+            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
+            "       COALESCE(n.content_hash, '')"
+            "  FROM node_fts f"
+            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
+            " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ? LIMIT ?",
+            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r)
+        : db_execute(g_ctx.db,
             "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
             "       COALESCE(n.content_hash, '')"
             "  FROM node_fts f"
@@ -570,29 +696,77 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
          * there is nothing to unwind and nothing worth failing the
          * request over. */
     }
+    int nrows = r ? r->nrows : 0;
     anc_cache_t anc;
-    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, r->nrows) == 0);
+    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, nrows) == 0);
 
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        cutils_json_elem_t e;
-        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+    /*
+     * One result per (path, content). Each keeps the row of the newest
+     * snapshot it was seen in and counts the snapshots, so "in 30 snapshots,
+     * newest 41" replaces thirty identical lines. A changed file is a new
+     * hash and stays a separate result, which is the version history a
+     * search is often after. Results stay in first-seen order.
+     */
+    typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
+    hit_t *hits = calloc((size_t)limit, sizeof(*hits));
+    char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
+    int nhits = 0;
+    if (!hits || !paths) {
+        free(hits); free(paths);
+        if (have_anc) anc_free(&anc);
+        db_result_free(r);
+        return api_error(500, "out of memory");
+    }
+
+    for (int i = 0; i < nrows; i++) {
         int64_t nid = strtoll(r->rows[i][0], NULL, 10);
         int64_t sid = strtoll(r->rows[i][1], NULL, 10);
-        char *path = have_anc ? anc_path(&anc, sid, nid) : NULL;
-        int bad = json_elem_add_str(&e, "node_id", r->rows[i][0]) != 0
-               || json_elem_add_str(&e, "snap_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+        paths[i] = have_anc ? anc_path(&anc, sid, nid) : NULL;
+        /* A row with no path cannot be compared, so it stands alone. */
+        char *key = NULL;
+        if (paths[i] && asprintf(&key, "%s%c%s", paths[i], '\x01', r->rows[i][5]) < 0)
+            key = NULL;
+        int found = -1;
+        for (int k = 0; key && k < nhits; k++)
+            if (hits[k].key && strcmp(hits[k].key, key) == 0) { found = k; break; }
+        if (found >= 0) {
+            hits[found].count++;
+            if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
+            free(key);
+        } else if (nhits < limit) {
+            hits[nhits++] = (hit_t){ key, i, sid, 1 };
+        } else {
+            free(key);
+        }
+    }
+    int partial = !only_snap && nrows == scan;
+
+    for (int k = 0; k < nhits; k++) {
+        char **row = r->rows[hits[k].row];
+        cutils_json_elem_t e;
+        if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
+        int bad = json_elem_add_str(&e, "node_id", row[0]) != 0
+               || json_elem_add_str(&e, "snap_id", row[1]) != 0
+               || json_elem_add_u32(&e, "snapshots", hits[k].count) != 0
+               || json_elem_add_str(&e, "name",    row[2]) != 0
                /* Empty when the chain is broken, which a partially faulted-in
                 * snapshot can produce. A hit without a path is still a hit;
                 * it is the navigation that is unavailable, not the result. */
-               || json_elem_add_str(&e, "path",    path ? path : "") != 0
-               || json_elem_add_str(&e, "type",    r->rows[i][3]) != 0
-               || json_elem_add_str(&e, "size",    r->rows[i][4]) != 0
-               || json_elem_add_str(&e, "hash",    r->rows[i][5]) != 0;
-        free(path);
+               || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
+               || json_elem_add_str(&e, "type",    row[3]) != 0
+               || json_elem_add_str(&e, "size",    row[4]) != 0
+               || json_elem_add_str(&e, "hash",    row[5]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
+    /* More matches exist than were read: the results and their snapshot
+     * counts cover the rows read, not necessarily the whole repository. */
+    if (json_resp_add_bool(resp, "partial", partial) != 0) { /* alloc only */ }
+
+    for (int k = 0; k < nhits; k++) free(hits[k].key);
+    for (int i = 0; i < nrows; i++) free(paths[i]);
+    free(hits);
+    free(paths);
     if (have_anc) anc_free(&anc);
     db_result_free(r);
 
@@ -632,6 +806,8 @@ typedef struct {
     int             ignore_case;
     uint32_t        max_files;
     int             reencrypt;   /* replicate into another repository's key */
+    uint32_t        max_hits_per_file;   /* 0: the grep default */
+    uint64_t        max_hits;            /* 0: the grep default */
     snap_job_kind_t kind;
 } snap_job_t;
 
@@ -899,27 +1075,28 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         go.path_prefix       = j->path_prefix;
         go.ignore_case       = j->ignore_case;
         go.max_files         = j->max_files;
-        go.max_hits_per_file = 10;
+        go.max_hits_per_file = j->max_hits_per_file;
+        go.max_hits          = j->max_hits;
         grep_result_t gr;
         memset(&gr, 0, sizeof(gr));
         st = grep_run(store, j->db, j->repo_id, j->snap_id, &go, cancel,
                       progress, progress_ctx, &gr);
-        /*
-         * The run this job produced, so a client follows the job and then
-         * opens that run. The app used to poll the run list and take the
-         * newest finished one, which before this job's run existed was an
-         * older search: it showed the previous result, or none, at random.
-         */
+        /* What the search did, on the job, including what it stopped short
+         * of: files_capped and truncated say the hit list is not the whole
+         * answer. The run record carries the rest. Recorded whenever a
+         * run exists, cancelled or not, so a client following the job
+         * opens this job's run and never an older one. */
         if (gr.run_id > 0) {
-            char rj[256];
+            char rj[320];
             snprintf(rj, sizeof(rj),
-                     "{\"run_id\":%lld,\"files_scanned\":%llu,"
-                     "\"files_matched\":%llu,\"hits\":%llu,\"truncated\":%s}",
-                     (long long)gr.run_id,
+                     "{\"run_id\":%lld,\"snapshot\":%lld,\"files_scanned\":%llu,"
+                     "\"files_matched\":%llu,\"files_capped\":%llu,\"hits\":%llu,"
+                     "\"truncated\":%s}",
+                     (long long)gr.run_id, (long long)j->snap_id,
                      (unsigned long long)gr.files_scanned,
                      (unsigned long long)gr.files_matched,
-                     (unsigned long long)gr.hits,
-                     gr.truncated ? "true" : "false");
+                     (unsigned long long)gr.files_capped,
+                     (unsigned long long)gr.hits, gr.truncated ? "true" : "false");
             job_set_result(progress_ctx, rj);
         }
     } else if (j->kind == SNAP_JOB_VERIFY) {
@@ -1103,19 +1280,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
      * sends an operator to rebuild an index that is fine, for a snapshot
      * that retention or a delete had already removed.
      */
-    if (snap_id > 0) {
-        char repo[32], snap[32];
-        snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-        snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-        db_result_t *r = NULL;
-        int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
-                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
-        db_result_free(r);
-        if (!found) {
-            free(repo_path);
-            return api_error(404, "no such snapshot");
-        }
+    if (snap_id > 0 && !snapshot_exists(repo_id, snap_id)) {
+        free(repo_path);
+        return api_error(404, "no such snapshot");
     }
 
     snap_job_t *j = calloc(1, sizeof(*j));
@@ -1176,21 +1343,46 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         uint32_t mf = 0;
         if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
             j->max_files = mf;
+        /* Out of range is refused rather than clamped, so a caller asking
+         * for a million hits per file learns the ceiling instead of getting
+         * quietly fewer. */
+        uint32_t hpf = 0;
+        if (json_req_has(body, "max_hits_per_file") &&
+            json_req_get_u32(body, "max_hits_per_file", &hpf, 1, 10000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits_per_file must be 1 to 10000");
+        }
+        j->max_hits_per_file = hpf;
+        uint32_t mh = 0;
+        if (json_req_has(body, "max_hits") &&
+            json_req_get_u32(body, "max_hits", &mh, 1, 1000000) != 0) {
+            snap_job_free(j);
+            return api_error(400, "max_hits must be 1 to 1000000");
+        }
+        j->max_hits = mh;
 
         /* Which snapshot: the newest unless one was named. Searching "the
          * backup" almost always means the current one. */
         uint32_t sid = 0;
-        if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) == 0) {
+        if (json_req_has(body, "snapshot")) {
+            /*
+             * A named snapshot is checked now. One that did not exist was
+             * searched anyway: the job found no files, completed, and
+             * reported zero matches - an answer to a question nobody asked,
+             * indistinguishable from "not in this backup". A malformed one
+             * fell back to the newest snapshot, which is worse.
+             */
+            if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) != 0) {
+                snap_job_free(j);
+                return api_error(400, "snapshot must be a snapshot id");
+            }
             j->snap_id = (int64_t)sid;
+            if (!snapshot_exists(repo_id, j->snap_id)) {
+                snap_job_free(j);
+                return api_error(404, "no such snapshot");
+            }
         } else {
-            char repo[32];
-            snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-            db_result_t *r = NULL;
-            if (db_execute(g_ctx.db,
-                    "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
-                    (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-                j->snap_id = strtoll(r->rows[0][0], NULL, 10);
-            db_result_free(r);
+            j->snap_id = newest_snapshot(repo_id);
             if (j->snap_id <= 0) {
                 snap_job_free(j);
                 return api_error(404, "repo has no snapshots to search");
@@ -1219,6 +1411,11 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "reencrypt must be true or false");
         }
         j->reencrypt = reenc ? 1 : 0;
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return api_error(400, why);
+        }
     }
 
     if (kind == SNAP_JOB_RESTORE) {
@@ -1323,9 +1520,11 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1364,17 +1563,38 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     return api_ok(body);
 }
 
+/*
+ * Is run_id one of this repository's runs in `table`? A run that is not
+ * there answered with an empty list, which is also what a clean scrub or a
+ * search with no matches looks like - so `verify show 1 999` read as
+ * "nothing wrong". The table name is one of two literals, never input.
+ */
+static int run_exists(const char *table, int64_t repo_id, int64_t run_id)
+{
+    char repo[32], run[32], sql[96];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    snprintf(sql, sizeof(sql), "SELECT 1 FROM %s WHERE repo_id = ? AND id = ?", table);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db, sql, (const char *[]){ repo, run, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
                                     int64_t run_id)
 {
+    if (!run_exists("grep_runs", repo_id, run_id)) return api_error(404, "no such search run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1424,9 +1644,11 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1474,14 +1696,16 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 static api_response_t verify_findings_get(const api_request_t *req, int64_t repo_id,
                                           int64_t run_id)
 {
+    if (!run_exists("verify_runs", repo_id, run_id)) return api_error(404, "no such verify run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1680,6 +1904,43 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
             snap_job_free(j);
             return set_error(ERR_INVALID,
                              "replicate schedule for repo %lld has no destination",
+                             (long long)repo_id);
+        }
+        /* Checked again at fire time: the repository may have moved since
+         * the schedule was made. */
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID, "replicate schedule for repo %lld: %s",
+                             (long long)repo_id, why);
+        }
+    }
+
+    /*
+     * A scheduled grep searches the newest snapshot as of when it fires,
+     * which is what a recurring "is this still in the backup" means. It ran
+     * with no pattern and no snapshot at all, because neither reached here.
+     */
+    if (kind == SNAP_JOB_GREP) {
+        CUTILS_AUTO_JSON_REQ cutils_json_req_t *p = NULL;
+        if (!params || !*params ||
+            json_req_parse(params, strlen(params), &p) != 0 ||
+            json_req_get_str(p, "pattern", &j->pattern) != 0 ||
+            !j->pattern || !*j->pattern) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID,
+                             "grep schedule for repo %lld has no pattern",
+                             (long long)repo_id);
+        }
+        if (json_req_get_str_opt(p, "path_prefix", &j->path_prefix) != 0)
+            j->path_prefix = NULL;
+        uint32_t v = 0;
+        if (json_req_get_u32(p, "ignore_case", &v, 0, 1) == 0) j->ignore_case = (int)v;
+        if (json_req_get_u32(p, "max_files", &v, 0, 1000000) == 0) j->max_files = v;
+        j->snap_id = newest_snapshot(repo_id);
+        if (j->snap_id <= 0) {
+            snap_job_free(j);
+            return set_error(ERR_NOT_FOUND, "repo %lld has no snapshots to search",
                              (long long)repo_id);
         }
     }

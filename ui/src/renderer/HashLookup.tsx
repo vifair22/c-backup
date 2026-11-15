@@ -24,6 +24,7 @@ interface RefEntry {
   snap_id: string
   node_id: string
   name: string
+  path?: string   /* full path; empty when the parent chain is broken */
 }
 
 interface Props {
@@ -169,7 +170,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
                 <tr className="text-text-muted text-left">
                   <th className="font-medium pb-1 w-16">Snap</th>
                   <th className="font-medium pb-1 w-24">Node</th>
-                  <th className="font-medium pb-1">Name</th>
+                  <th className="font-medium pb-1">Path</th>
                 </tr>
               </thead>
               <tbody>
@@ -179,7 +180,7 @@ export function HashLookup({ connName, repoPath, onNavigateToSnapshot, onBack }:
                     className="border-t border-border-default cursor-pointer hover:bg-surface-hover text-text-primary">
                     <td className="py-1 font-mono">#{r.snap_id}</td>
                     <td className="py-1 font-mono">{r.node_id}</td>
-                    <td className="py-1 font-mono">{r.name}</td>
+                    <td className="py-1 font-mono">{r.path || r.name}</td>
                   </tr>
                 ))}
               </tbody>

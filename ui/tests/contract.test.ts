@@ -252,7 +252,10 @@ describe('the flows behind the buttons', () => {
     /* The user says what to back up, and it comes back. */
     const src = join(work, 'src')
     const saved = await request(toEndpoint({ kind: 'sourcesSet', repoId, sources: [src] }))
-    assert.equal(saved.status, 204)
+    /* 200 with counts and any warnings, so a path the daemon cannot see
+     * yet can be reported rather than stored silently. */
+    assert.equal(saved.status, 200)
+    assert.deepEqual((saved.body as { warnings: string[] }).warnings, [])
     got = await request(toEndpoint({ kind: 'sourcesGet', repoId }))
     assert.deepEqual((got.body as { sources: string[] }).sources, [src])
 

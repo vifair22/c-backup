@@ -89,6 +89,9 @@ typedef struct {
     uint8_t  encryption;   /* ENCRYPT_* */
     uint8_t  reserved[7];
 } __attribute__((packed)) object_header_t;  /* 64 bytes */
+/* On-disk format, and quoted in docs/api.md and docs/repo-format.md, which
+ * once said 56. A field added here changes every loose object. */
+_Static_assert(sizeof(object_header_t) == 64, "object_header_t is 64 bytes on disk");
 
 /* ---------- snapshot ---------- */
 

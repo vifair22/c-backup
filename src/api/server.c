@@ -182,9 +182,10 @@ char *api_cookie_clear(const char *name, int secure)
     return strdup(buf);
 }
 
-static enum MHD_Result send_response(struct MHD_Connection *conn,
-                                     int status, const char *content_type,
-                                     const char *body, const char *set_cookie)
+static enum MHD_Result send_response_ra(struct MHD_Connection *conn,
+                                        int status, const char *content_type,
+                                        const char *body, const char *set_cookie,
+                                        int retry_after)
 {
     size_t len = body ? strlen(body) : 0;
     /* MHD copies the buffer with RESPMEM_MUST_COPY, safe to discard const */
@@ -200,10 +201,41 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
      * reaching here is safe to pass through without further validation. */
     if (set_cookie)
         MHD_add_response_header(resp, "Set-Cookie", set_cookie);
+    if (retry_after > 0) {
+        char ra[16];
+        snprintf(ra, sizeof(ra), "%d", retry_after);
+        MHD_add_response_header(resp, "Retry-After", ra);
+    }
 
     enum MHD_Result ret = MHD_queue_response(conn, (unsigned int)status, resp);
     MHD_destroy_response(resp);
     return ret;
+}
+
+static enum MHD_Result send_response(struct MHD_Connection *conn,
+                                     int status, const char *content_type,
+                                     const char *body, const char *set_cookie)
+{
+    return send_response_ra(conn, status, content_type, body, set_cookie, 0);
+}
+
+/* The TCP peer as text, or "" when there is none to report. */
+static void peer_address(struct MHD_Connection *conn, int is_local,
+                         char *out, size_t outsz)
+{
+    out[0] = '\0';
+    if (is_local) return;
+    const union MHD_ConnectionInfo *ci =
+        MHD_get_connection_info(conn, MHD_CONNECTION_INFO_CLIENT_ADDRESS);
+    if (!ci || !ci->client_addr) return;
+    const struct sockaddr *sa = ci->client_addr;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *in4 = (const struct sockaddr_in *)(const void *)sa;
+        if (!inet_ntop(AF_INET, &in4->sin_addr, out, (socklen_t)outsz)) out[0] = '\0';
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)(const void *)sa;
+        if (!inet_ntop(AF_INET6, &in6->sin6_addr, out, (socklen_t)outsz)) out[0] = '\0';
+    }
 }
 
 /* --- Streaming response (SSE etc.) ---
@@ -463,14 +495,17 @@ static enum MHD_Result request_handler(void *cls,
     /* Try API routes first */
     const route_entry_t *route = find_route(srv, url, api_method);
     if (route) {
+        char peer[INET6_ADDRSTRLEN];
+        peer_address(conn, is_local, peer, sizeof(peer));
         api_request_t req = {
-            .method     = api_method,
-            .url        = url,
-            .body       = pb->data,
-            .body_len   = pb->len,
-            .auth_token = get_header(conn, "Authorization"),
-            .is_local   = is_local,
-            ._conn      = conn,
+            .method      = api_method,
+            .url         = url,
+            .body        = pb->data,
+            .body_len    = pb->len,
+            .auth_token  = get_header(conn, "Authorization"),
+            .is_local    = is_local,
+            .client_addr = peer,
+            ._conn       = conn,
         };
 
         /* Auth check */
@@ -502,9 +537,9 @@ static enum MHD_Result request_handler(void *cls,
 
         api_response_t resp = route->handler.buffered(&req, route->userdata);
 
-        enum MHD_Result ret = send_response(conn, resp.status,
+        enum MHD_Result ret = send_response_ra(conn, resp.status,
             resp.content_type ? resp.content_type : "application/json",
-            resp.body, resp.set_cookie);
+            resp.body, resp.set_cookie, resp.retry_after);
 
         free(resp.body);
         free(resp.set_cookie);

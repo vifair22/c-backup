@@ -27,6 +27,10 @@ typedef struct {
     size_t        body_len;
     const char   *auth_token;  /* from Authorization header, NULL if absent */
     int           is_local;    /* 1 if request came via unix socket (trusted) */
+    /* Peer address as text for TCP ("127.0.0.1", "::1"), "" over the
+     * socket. The direct peer, so behind a reverse proxy it is the proxy:
+     * a forwarded-for header is whatever the client chose to send. */
+    const char   *client_addr;
     void         *_conn;       /* internal: MHD connection for query params */
 } api_request_t;
 
@@ -49,6 +53,8 @@ typedef struct {
      * Build via api_cookie_set / api_cookie_clear so attributes are
      * formatted consistently. */
     char         *set_cookie;
+    /* Seconds for a Retry-After header; 0 sends none. */
+    int           retry_after;
 } api_response_t;
 
 /* Build a Set-Cookie value with HttpOnly, SameSite=Strict, Path=/ baked

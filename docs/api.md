@@ -29,6 +29,15 @@ while the first page through the index costs 93 us and beats it. The
 regression only exists if the API offers a way to ask for everything at once,
 so it does not. **No route returns a whole snapshot.**
 
+`limit` and `offset` must be plain decimal counts: `limit` 1 or more,
+`offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
+400 naming the parameter; they used to be replaced by the defaults, which
+answered a request the server had not understood as if it had. A `limit`
+above a route's maximum is clamped to it. The same goes for filters with a
+fixed set of values: `objects?location=` takes `loose`, `pack` (or
+`packed`) or `all`, and anything else is a 400 rather than an unfiltered
+listing.
+
 Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
@@ -58,10 +67,44 @@ paths or file content.
 | POST | `/api/auth/setup` | `{password}`: set the first one. Socket only (`403` over TCP), `409` once set |
 | POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. `403` before setup |
 | POST | `/api/auth/logout` | Revoke the presented token; `204` |
-| POST | `/api/auth/password` | `{current, new}`: always needs the current password |
+| POST | `/api/auth/logout-all` | Revoke every session, the caller's included; `{revoked}` |
+| POST | `/api/auth/password` | `{current, new}`: always needs the current password; returns `{changed, sessions_revoked}` |
 
 Passwords are at least 8 characters. Sessions last 90 days and slide forward
 on every authenticated request.
+
+A password change revokes every session except the one that made it (over
+the socket there is none, so all of them). It used to revoke nothing, which
+left whoever the change was meant to shut out holding a token that kept
+working - and kept sliding forward - for 90 days. `logout-all` is the same
+revocation without a password change, for a lost or untrusted client; from
+the host it is `c-backup auth logout --all`.
+
+### Login throttle
+
+Failed logins over TCP are throttled; before this, 100 wrong passwords took
+2.66 s and the right one still worked straight afterwards.
+
+| Rule | Value |
+|---|---|
+| Free failures per client address | 5 |
+| Lockout after each further failure | 1 s, doubling each time (1, 2, 4, ...), at most 300 s |
+| Address forgotten after | 900 s without a failure, or at once on a successful login |
+| Global cap, all addresses together | a bucket of 60 failures draining one every 2 s; while full, every TCP login is refused |
+| Addresses remembered | 256; when full, the one that failed longest ago is dropped |
+
+A refused attempt is `429 {"error":"too many failed logins; retry in N
+seconds"}` with a `Retry-After` header. It is refused before the password is
+hashed, so it reveals nothing and costs nothing, and the correct password is
+refused too while the lockout lasts - a throttle that let the right answer
+through would not slow guessing at all. A refused attempt does not extend
+the lockout.
+
+The address is the TCP peer. Behind a reverse proxy every client shares the
+proxy's address and so one budget; `X-Forwarded-For` is not trusted, because
+it is whatever the client sent. The global cap can lock the owner out during
+an attack as well as the attacker. The unix socket is never throttled, so the
+host always has a way in.
 
 ## Repositories
 
@@ -88,6 +131,12 @@ an existing encrypted repository whose key is not on this host still
 succeeds, and the answer carries `key_loaded: false` and a `warning` saying
 `no key loaded for repository <uuid>` and how to supply it.
 
+Repository ids are never reused. Removing the newest repository used to
+make its id the next one handed out, and the new repository inherited the
+old one's schedules, history and index rows, which deregistering does not
+delete. Migration 019 rebuilt `repos` with `AUTOINCREMENT`, starting above
+every id any table still refers to.
+
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is
 applied (`label_updated: true`); an absent or empty one leaves it alone.
@@ -98,12 +147,30 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 |---|---|---|
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
-| GET | `/repos/<id>/search?q=<text>` | Substring filename search |
+| GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
 | DELETE | `/repos/<id>/snapshots/<sid>` | Prune |
 
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
+
+`tree` answers 404 for a snapshot that does not exist and for a `parent`
+that is not a node of that snapshot; so do `packs/<pid>/entries` for a
+missing pack, `verify/<run-id>` and `grep/<run-id>` for a missing run. All
+of them answered an empty list, which is what an empty directory, an empty
+pack and a clean scrub look like.
+
+Without `snapshot`, every snapshot is searched and identical copies are
+collapsed: one result per (path, content hash), carrying the newest
+snapshot it was seen in (`snap_id`, `node_id`) and how many snapshots hold
+it (`snapshots`). A file unchanged across thirty snapshots used to come back
+thirty times. A file whose content changed is a different hash and a
+separate result, so the versions of a file stay visible. To keep a page
+cheap the search reads at most eight matching rows per result asked for
+(8,000 at most) and does not sort; when it stopped there, `partial` is
+`true` and the counts cover what was read. With `snapshot=<sid>` only that
+snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
+The CLI is `search <id> <text> [--snapshot N]`.
 
 ## Encryption
 
@@ -295,10 +362,32 @@ Matching is POSIX extended regular expressions, line by line, over every
 distinct object in the snapshot. Distinct, not every path: a file present
 under several names is one object, so it is read once and reported once
 rather than re-read per copy. Objects are visited in pack order for the same
-reason verify is. Files with NUL bytes are searched and reported without an
-excerpt, the way `grep -a` summarises a binary. `max_files` stops the search
-once it has found enough, and the run records whether it stopped early so a
-caller can tell "no more matches" from "stopped looking".
+reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
+gets one hit, excerpt `(binary file matches)`, and is not read further, the
+way `grep(1)` reports one. Three limits bound the rest:
+
+| Field | Default | Range | Effect |
+|---|---|---|---|
+| `max_files` | 0 (none) | 0-1000000 | stop after this many matching files |
+| `max_hits_per_file` | 100 | 1-10000 | stop reading a file once it has this many hits |
+| `max_hits` | 10000 | 1-1000000 | stop the search once this many hits are recorded |
+
+A value out of range is a 400, not clamped. These exist because hits were
+counted without limit: one 10 MiB binary produced 40,776 hits and one
+20 MiB log 806,597, every one of them read and matched for nothing.
+`hits` counts what was recorded, so it never exceeds `max_hits`.
+
+The run's `truncated` is 1 when `max_files` or `max_hits` stopped the search,
+so a caller can tell "no more matches" from "stopped looking". The job's
+`result` carries `run_id`, `snapshot`, `files_scanned`, `files_matched`,
+`files_capped` (files that reached `max_hits_per_file` and may hold more),
+`hits` and `truncated`. The CLI takes `--limit`, `--max-hits-per-file` and
+`--max-hits`.
+
+`snapshot` defaults to the newest. One that does not exist is `404 no such
+snapshot` when the search is submitted, and a value that is not an id is a
+400; the first used to complete with zero files scanned, which reads as "not
+in that backup", and the second silently searched the newest instead.
 
 The hits outlive the job, so they are fetched separately: `GET
 /repos/<id>/grep` lists runs newest-first and `GET /repos/<id>/grep/<run-id>`
@@ -384,7 +473,19 @@ where `backup 1 /home/me` reads exactly what it says, and wrong for
 everything else: a desktop button had nowhere to get them and no way to ask,
 and a schedule had the same problem. Both were broken because of it.
 
-`PUT /repos/<id>/sources` stores them once. After that a backup with no
+`PUT /repos/<id>/sources` replaces the list and answers `200
+{"sources":N,"exclude":M,"warnings":[...]}`. `sources` is required and must
+be a list of at most 256 absolute paths; `exclude`, if present, a list of at
+most 256 non-empty patterns. Anything else - a missing or non-list
+`sources`, a non-string, an empty or relative path - is a 400 that leaves the
+stored configuration untouched. It used to skip what it could not read, and
+since the route replaces wholesale, a malformed request answered 204 having
+emptied the list. Paths are stored normalised (`/a//b/./` is `/a/b`). A path
+that does not exist on the daemon's host is accepted with a warning rather
+than refused, because it may be a share that is not mounted yet; a backup
+skips it until it exists.
+
+Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
 and a timer. A request that does name paths still overrides, because the
 CLI's explicitness is worth keeping - and excludes are only inherited when
@@ -394,7 +495,13 @@ wants excluded.
 ### Replication
 
 `dest` is a path, so any target this machine can mount is valid: a second
-disk, a NAS share, a USB dock. What is copied is objects, not files - packs
+disk, a NAS share, a USB dock. It must be absolute and must not be the
+source repository's own directory, inside it, or above it, compared as
+canonical paths so a symlink or `..` cannot route around the check; each is
+a 400 when the job is submitted or the schedule created, and a scheduled
+fire checks again. Into its own directory a replication used to "complete":
+the target was the source, already held every object, and nothing was
+copied anywhere. What is copied is objects, not files - packs
 get rewritten by GC and by coalescing, and a file-level copy would re-send a
 whole pack because one object inside it was collected. The target stores what
 it receives and packs it on its own schedule, so the two sides may disagree
@@ -525,8 +632,12 @@ What is actually inside a repository, as opposed to what it can do.
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
 went in, and `phys_size`, the bytes the repository spends on them: payload
-after compression, plus the 56-byte object header, plus the Reed-Solomon
-parity trailer. `phys_size` exceeding `orig_size` is normal and expected for
+after compression, plus the header the object sits behind, plus the
+Reed-Solomon parity trailer. The header is the 64-byte `object_header_t` for
+a loose object and the 51-byte pack entry header for a packed one, and
+`/layout` reports `header_size` as whichever applies (these docs used to say
+56 for both, which was neither; the sizes are compile-time checked in
+`src/common/types.h` and `src/store/pack.h`). `phys_size` exceeding `orig_size` is normal and expected for
 incompressible input, where the payload is stored raw and the parity trailer
 is pure overhead. `pack_objects` reports `comp_size` instead, which there is
 genuinely the compressed entry payload.
@@ -641,8 +752,33 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}` |
-| DELETE | `/repos/<id>/schedules/<sid>` | Remove |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`; 404 if this repository has no such schedule |
+| DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
+
+Both used to answer success for an id that did not exist, or that belonged
+to another repository, so a typo read as done while the schedule meant kept
+firing.
+
+The list carries the daemon's zone and each schedule's trigger and
+parameters as objects:
+
+```json
+{"timezone":"America/Chicago",
+ "schedules":[{"id":"2","action":"replicate",
+   "trigger":{"type":"calendar","every":"day","at":"03:00"},
+   "overlap":"skip","catchup":"skip","enabled":"1",
+   "next_due":"1794733200","next_due_iso":"2026-11-16T03:00:00-06:00",
+   "params":{"dest":"/mnt/nas/replica"}}]}
+```
+
+`trigger` and `params` were strings holding JSON, so every client parsed
+JSON out of JSON. `next_due` stays an epoch for scripts; `next_due_iso` is
+the same instant in the daemon's local time with its UTC offset. `timezone`
+is the `TZ` value, else the zone `/etc/localtime` names, else the
+abbreviation the C library reports (`UTC`). It is there because a container
+with no `TZ` runs in UTC, and a schedule meant for 03:00 local fired at 03:00
+UTC with nothing in the API to say so. `params` is absent for a schedule
+with none.
 
 The trigger is a nested object, validated at creation rather than at fire
 time:
@@ -656,8 +792,9 @@ time:
 ```
 
 `every` is `day`, `week` (with `on`, a weekday name), `month` (with
-`on_day`, 1-31) or `year` (with `on_month` and `on_day`). There is no cron
-syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
+`on_day`, 1-31) or `year` (with `on_month` and `on_day`, a day that month
+has: 30 February and 31 April are refused, 29 February is accepted). There
+is no cron syntax. The CLI builds the same with `--every`, `--at`, `--on`, `--on-day`
 and `--on-month`, or takes a number of seconds for an interval.
 
 Interval triggers anchor to the last successful fire, not to wall-clock
@@ -673,4 +810,22 @@ fall-back day fires once, "the 31st" clamps to the end of short months, and
 `on_overlap` decides what happens when a schedule comes due while its previous
 run is still going: `skip` (default), `queue`, or `cancel_running`. `catchup`
 decides what a missed window means after downtime: `skip` moves to the next
-future fire, `run_once` fires immediately and then resumes.
+future fire, `run_once` fires immediately and then resumes. That includes a
+schedule that has never fired: if its first due time passed while the daemon
+was down, `run_once` fires it when the daemon starts. Any other value of
+either is a 400; both used to be stored as sent and then read as something
+else.
+
+Parameters belong to one action each, and naming one on a schedule for a
+different action is a 400 rather than a value stored and never read:
+
+| Action | Parameters |
+|---|---|
+| `backup` | `paths` (optional; the repository's sources otherwise) |
+| `replicate` | `dest` (required, absolute) |
+| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case`, `max_files` |
+| others | none |
+
+A `grep` schedule searches the newest snapshot as of each fire, so it takes
+no `snapshot`. From the CLI: `schedule add 1 grep --every day --at 04:00
+--pattern 'BEGIN RSA' [--path-prefix PATH] [-i]`.

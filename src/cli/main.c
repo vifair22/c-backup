@@ -201,6 +201,39 @@ static const char *take_opt_multi(int *argc, char **argv, const char *name)
  * Callers that want fields pipe through jq; what matters is that the exit
  * code reflects the HTTP status.
  */
+/*
+ * What to say when nothing answers on the socket.
+ *
+ * It used to say "systemctl start c-backupd" everywhere, including inside
+ * the Docker image, where there is no systemd and the daemon is the
+ * container's own process: if it is not answering, the container is not
+ * running it, or this is a different container. A container is recognised
+ * by Docker's /.dockerenv, podman's /run/.containerenv, or the `container`
+ * variable podman and systemd-nspawn set. A wrong socket path is the other
+ * common cause, so the way to name one is always given.
+ */
+static void daemon_down(void)
+{
+    fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+    const char *cv = getenv("container");
+    int in_container = access("/.dockerenv", F_OK) == 0 ||
+                       access("/run/.containerenv", F_OK) == 0 ||
+                       (cv && *cv);
+    if (in_container)
+        fprintf(stderr,
+                "          This looks like a container: the daemon runs as the\n"
+                "          c-backupd container's own process, so start that container\n"
+                "          (docker start c-backupd), or run this command in it\n"
+                "          (docker exec c-backupd c-backup ...).\n");
+    else if (access("/run/systemd/system", F_OK) == 0)
+        fprintf(stderr, "          Start it with 'systemctl start c-backupd'.\n");
+    else
+        fprintf(stderr, "          Start c-backupd.\n");
+    fprintf(stderr,
+            "          If it runs with another socket, name it with --socket PATH\n"
+            "          or C_BACKUP_SOCKET.\n");
+}
+
 static int call(const char *method, const char *path, const char *body)
 {
     http_response_t resp;
@@ -208,9 +241,7 @@ static int call(const char *method, const char *path, const char *body)
 
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr,
-                "c-backup: daemon not running at %s.\n"
-                "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+        daemon_down();
         return 1;
     }
     if (st != OK) return fail("%s", err_msg());
@@ -307,7 +338,7 @@ static long job_submit(const char *method, const char *path, const char *body)
     memset(&resp, 0, sizeof(resp));
     status_t st = http_request(g_socket, method, path, body, &resp);
     if (st == ERR_NOT_FOUND) {
-        fprintf(stderr, "c-backup: daemon not running at %s.\n", g_socket);
+        daemon_down();
         return -1;
     }
     if (st != OK) { fail("%s", err_msg()); return -1; }
@@ -658,7 +689,15 @@ static int cmd_search(int argc, char **argv)
 {
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
-    if (argc < 2) { free(q.buf); return fail("usage: search <repo-id> <query> [--limit N]"); }
+    const char *snap = take_opt(&argc, argv, "--snapshot");
+    if (snap) {
+        sb_puts(&q, q.len ? "&snapshot=" : "snapshot=");
+        sb_query_val(&q, snap);
+    }
+    if (argc < 2) {
+        free(q.buf);
+        return fail("usage: search <repo-id> <query> [--snapshot N] [--limit N]");
+    }
     sb_puts(&q, q.len ? "&q=" : "q=");
     sb_query_val(&q, argv[1]);
 
@@ -697,12 +736,25 @@ static int cmd_grep(int argc, char **argv)
     const char *prefix = take_opt(&argc, argv, "--path-prefix");
     const char *snap   = take_opt(&argc, argv, "--snapshot");
     const char *maxf   = take_opt(&argc, argv, "--limit");
+    const char *hpf    = take_opt(&argc, argv, "--max-hits-per-file");
+    const char *maxh   = take_opt(&argc, argv, "--max-hits");
     int icase   = take_flag(&argc, argv, "-i") | take_flag(&argc, argv, "--ignore-case");
     int no_wait = take_flag(&argc, argv, "--no-wait");
 
     if (argc < 2)
         return fail("usage: grep <repo-id> <pattern> [--snapshot N] "
-                    "[--path-prefix PATH] [--limit N] [-i] [--no-wait]");
+                    "[--path-prefix PATH] [--limit N] [--max-hits-per-file N] "
+                    "[--max-hits N] [-i] [--no-wait]");
+    /* These go into the body as bare numbers, where anything else is
+     * malformed JSON and comes back as "invalid JSON". */
+    const char *nums[] = { snap, maxf, hpf, maxh };
+    for (size_t k = 0; k < sizeof(nums) / sizeof(nums[0]); k++) {
+        if (!nums[k]) continue;
+        size_t n = strlen(nums[k]);
+        if (n == 0 || n > 10 || strspn(nums[k], "0123456789") != n)
+            return fail("--snapshot, --limit, --max-hits-per-file and --max-hits "
+                        "take a whole number, not '%s'", nums[k]);
+    }
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"pattern\":");
@@ -710,6 +762,8 @@ static int cmd_grep(int argc, char **argv)
     if (prefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, prefix); }
     if (snap)   { sb_puts(&b, ",\"snapshot\":");    sb_puts(&b, snap); }
     if (maxf)   { sb_puts(&b, ",\"max_files\":");   sb_puts(&b, maxf); }
+    if (hpf)    { sb_puts(&b, ",\"max_hits_per_file\":"); sb_puts(&b, hpf); }
+    if (maxh)   { sb_puts(&b, ",\"max_hits\":");    sb_puts(&b, maxh); }
     if (icase)  sb_puts(&b, ",\"ignore_case\":1");
     sb_puts(&b, "}");
 
@@ -1190,6 +1244,11 @@ static int cmd_schedule(int argc, char **argv)
          * a backup needs somewhere to read from. Sources repeat, so they
          * are drained rather than read once. */
         const char *dest = take_opt(&a, v, "--dest");
+        /* A grep schedule needs its pattern; there was no way to give one,
+         * so every grep schedule searched for nothing. */
+        const char *pattern = take_opt(&a, v, "--pattern");
+        const char *gprefix = take_opt(&a, v, "--path-prefix");
+        int gicase = take_flag(&a, v, "-i") | take_flag(&a, v, "--ignore-case");
         const char *src[32];
         int n_src = 0;
         for (;;) {
@@ -1204,7 +1263,8 @@ static int cmd_schedule(int argc, char **argv)
                                "schedule add <repo-id> <action> --every day|week|month|year "
                                "--at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N] "
                                "[--on-overlap skip|queue|cancel_running] [--catchup skip|run_once] "
-                               "[--dest PATH] [--source PATH]...");
+                               "[--dest PATH] [--source PATH]... "
+                               "[--pattern REGEX [--path-prefix PATH] [-i]]");
         /* Numbers go into the body bare, so a non-number would be malformed
          * JSON and come back as "invalid JSON", describing the request
          * rather than the mistake. */
@@ -1220,6 +1280,9 @@ static int cmd_schedule(int argc, char **argv)
         sb_puts(&b, "{\"action\":");
         sb_json_str(&b, v[2]);
         if (dest) { sb_puts(&b, ",\"dest\":"); sb_json_str(&b, dest); }
+        if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
+        if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
+        if (gicase)  sb_puts(&b, ",\"ignore_case\":1");
         if (n_src > 0) {
             sb_puts(&b, ",\"paths\":[");
             for (int i = 0; i < n_src; i++) {
@@ -1353,7 +1416,7 @@ static int read_new_password(const char *prompt, char *buf, size_t sz)
  */
 static int cmd_auth(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: auth <setup|login|logout|password> [args]");
+    if (argc < 1) return fail("usage: auth <setup|login|logout [--all]|password> [args]");
 
     char pw[256], pw2[256];
 
@@ -1374,8 +1437,14 @@ static int cmd_auth(int argc, char **argv)
         return call_sb("POST", setup ? "/api/auth/setup" : "/api/auth/login", &b);
     }
 
-    if (strcmp(argv[0], "logout") == 0)
+    if (strcmp(argv[0], "logout") == 0) {
+        /* The socket carries no session of its own, so a plain logout here
+         * revokes nothing; --all is the one that does something from the
+         * host: every session any client holds. */
+        if (take_flag(&argc, argv, "--all"))
+            return call("POST", "/api/auth/logout-all", NULL);
         return call("POST", "/api/auth/logout", NULL);
+    }
 
     if (strcmp(argv[0], "password") == 0) {
         const char *cur  = (argc >= 2) ? argv[1] : NULL;
@@ -1418,8 +1487,8 @@ static const struct {
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
-    { "search",    cmd_search,    "search <repo-id> <query> [--limit N]" },
-    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [-i] [--no-wait]" },
+    { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
+    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
     { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
@@ -1436,9 +1505,9 @@ static const struct {
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
-    { "auth",      cmd_auth,      "auth <setup|login|logout|password> (prompts for passwords)" },
+    { "auth",      cmd_auth,      "auth <setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },

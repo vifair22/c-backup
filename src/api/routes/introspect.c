@@ -31,21 +31,6 @@ static cutils_db_t *g_db;
 #define PAGE_DEFAULT 500
 #define PAGE_MAX     5000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
 
 static api_response_t finalise(cutils_json_resp_t *resp)
 {
@@ -252,10 +237,19 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
 {
     const char *loc = api_query_param(req, "location");
+    /* Anything else used to fall through to the unfiltered listing, so
+     * `--location nowhere` answered with every object: a filter that
+     * silently filtered nothing. */
+    if (loc && strcmp(loc, "loose") != 0 && strcmp(loc, "pack") != 0 &&
+        strcmp(loc, "packed") != 0 && strcmp(loc, "all") != 0)
+        return api_error(400, "location must be loose, pack (or packed), or all");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     int rc;
@@ -365,16 +359,41 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
 {
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
     char repo[32], lim[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
 
+    /*
+     * The full path of each referencing node, climbed in SQL one primary-key
+     * lookup per level. A bare name ("config.yaml") does not say which of
+     * the many files of that name holds the object, which was the question.
+     * A chain that breaks before the root (a partly faulted-in snapshot)
+     * leaves the path empty rather than dropping the reference.
+     */
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT snap_id, id, name FROM nodes"
-            " WHERE repo_id = ? AND content_hash = ?"
-            " ORDER BY snap_id, id LIMIT ?",
-            (const char *[]){ repo, hex, lim, NULL }, &r) != 0) {
+            "WITH RECURSIVE"
+            " refs(snap_id, nid) AS ("
+            "   SELECT snap_id, id FROM nodes"
+            "    WHERE repo_id = ? AND content_hash = ?"
+            "    ORDER BY snap_id, id LIMIT ?),"
+            " up(nid, parent, path, depth) AS ("
+            "   SELECT n.id, n.parent_node_id, n.name, 0"
+            "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   UNION ALL"
+            "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
+            "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
+            "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
+            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, '')"
+            "   FROM refs"
+            "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
+            "   LEFT JOIN up ON up.nid = refs.nid"
+            "             AND (up.parent IS NULL OR up.parent = 0)"
+            "  ORDER BY refs.snap_id, refs.nid",
+            (const char *[]){ repo, hex, lim, repo, repo, repo, NULL }, &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");
     }
@@ -397,7 +416,8 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
         if (json_resp_array_append_begin(resp, "refs", &e) != 0) break;
         int bad = json_elem_add_str(&e, "snap_id", r->rows[i][0]) != 0
                || json_elem_add_str(&e, "node_id", r->rows[i][1]) != 0
-               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0;
+               || json_elem_add_str(&e, "name",    r->rows[i][2]) != 0
+               || json_elem_add_str(&e, "path",    r->rows[i][3]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -585,13 +605,24 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id,
                                        int64_t pack_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], pid[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(pid,  sizeof(pid),  "%lld", (long long)pack_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
+    /* A pack that is not there is a 404, not an empty pack. */
     db_result_t *r = NULL;
+    int found = db_execute(g_db, "SELECT 1 FROM packs WHERE repo_id = ? AND id = ?",
+                           (const char *[]){ repo, pid, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    if (!found) return api_error(404, "no such pack");
+
+    r = NULL;
     if (db_execute(g_db,
             "SELECT hash, offset, comp_size, orig_size, entry_index"
             "  FROM pack_objects WHERE repo_id = ? AND pack_id = ?"

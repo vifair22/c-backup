@@ -397,8 +397,102 @@ static void test_binary_file_matches_without_an_excerpt(void **state)
     assert_int_equal(res.files_matched, 1);
     char *hits = hits_text(res.run_id);
     assert_non_null(strstr(hits, "blob.bin"));
-    assert_non_null(strstr(hits, "(binary file)"));
+    assert_non_null(strstr(hits, "(binary file matches)"));
     free(hits);
+}
+
+/* Write `lines` lines of "<word> N\n" to path. */
+static void write_lines(const char *path, const char *word, int lines)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    for (int i = 0; i < lines; i++) fprintf(f, "%s %d\n", word, i);
+    fclose(f);
+}
+
+static long count_hit_rows(int64_t run_id)
+{
+    char run[32];
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT COUNT(*) FROM grep_hits WHERE run_id = ?",
+                                (const char *[]){ run, NULL }, &r), 0);
+    long n = strtol(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * B067: a binary that matches everywhere is one hit, not one per line. A
+ * 10 MiB binary gave 40,776 "(binary file)" hits, each read and matched.
+ */
+static void test_binary_file_is_one_hit_however_often_it_matches(void **state)
+{
+    (void)state;
+    FILE *f = fopen(TEST_SRC "/many.bin", "wb");
+    assert_non_null(f);
+    for (int i = 0; i < 5000; i++) {
+        fputc('\0', f);
+        fputs("needle\n", f);
+    }
+    fclose(f);
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("needle");
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 1);
+    assert_int_equal(res.hits, 1);
+    assert_int_equal(count_hit_rows(res.run_id), 1);
+    assert_false(res.truncated);
+}
+
+/* B067: one log matching on every line stops at the per-file cap, counts
+ * no more than it recorded, and says it was capped. */
+static void test_per_file_cap_stops_reading_the_file(void **state)
+{
+    (void)state;
+    write_lines(TEST_SRC "/big.log", "repeat", 20000);
+    write_lines(TEST_SRC "/small.log", "repeat", 3);
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("repeat");
+    o.max_hits_per_file = 50;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.files_matched, 2);
+    assert_int_equal(res.hits, 53);
+    assert_int_equal(count_hit_rows(res.run_id), 53);
+    assert_int_equal(res.files_capped, 1);
+    assert_false(res.truncated);
+
+    /* 0 is the default, not unlimited. */
+    o.max_hits_per_file = 0;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.hits, GREP_DEFAULT_HITS_PER_FILE + 3);
+}
+
+/* B067: --limit capped files only; a total cap ends the search and marks
+ * it truncated so "no more matches" and "stopped looking" differ. */
+static void test_total_hit_cap_truncates_the_search(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 6; i++) {
+        char p[256];
+        snprintf(p, sizeof(p), TEST_SRC "/part%d.log", i);
+        write_lines(p, "chunkline", 10 + i);   /* distinct content per file */
+    }
+    int64_t snap = run_backup();
+
+    grep_opts_t o = opts_for("chunkline");
+    o.max_hits_per_file = 5;
+    o.max_hits = 12;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.hits, 12);
+    assert_int_equal(count_hit_rows(res.run_id), 12);
+    assert_true(res.truncated);
+    assert_int_equal(res.files_matched, 3);
 }
 
 /*
@@ -477,6 +571,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_max_files_stops_early, setup, teardown),
         cmocka_unit_test_setup_teardown(test_searches_packed_content, setup, teardown),
         cmocka_unit_test_setup_teardown(test_binary_file_matches_without_an_excerpt, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_binary_file_is_one_hit_however_often_it_matches, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_per_file_cap_stops_reading_the_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_total_hit_cap_truncates_the_search, setup, teardown),
         cmocka_unit_test_setup_teardown(test_duplicate_content_is_scanned_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_marks_the_run_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_very_long_line_does_not_buffer_without_bound, setup, teardown),

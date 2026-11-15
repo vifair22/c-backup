@@ -393,11 +393,14 @@ export function App(): React.ReactElement {
     setSourcesLoading(true)
     setError(null)
     try {
-      await api.apiCall(activeRepo.conn, {
+      const r = await api.apiCall<{ warnings?: string[] } | null>(activeRepo.conn, {
         kind: 'sourcesSet', repoId: activeRepo.id, sources: paths,
       })
       setSources(paths)
       setEditingSources(false)
+      /* Saved, but a path the daemon cannot see yet is worth saying: it may
+       * be an unmounted share, or a typo. */
+      if (r?.warnings?.length) setError(`Saved. ${r.warnings.join('; ')}`)
     } catch (err) {
       setError(String(err))
     }

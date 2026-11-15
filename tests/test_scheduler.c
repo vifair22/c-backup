@@ -302,6 +302,34 @@ static void test_catchup_run_once_fires_now(void **state)
     assert_int_equal(due_of(sid), now);
 }
 
+/*
+ * B064: catchup was stored and only honoured for a schedule that had fired
+ * before. One that never fired and missed its first window while the
+ * daemon was down simply lost it. A restart is where that is decided, so
+ * reopen the scheduler over a past due time with no last fire.
+ */
+static void test_catchup_run_once_without_history_fires_at_startup(void **state)
+{
+    (void)state;
+    time_t past = time(NULL) - 100000;
+    int64_t once = add_schedule("gc", SPEC_HOURLY, past, "skip", "run_once");
+    int64_t skip = add_schedule("verify", SPEC_HOURLY, past, "skip", "skip");
+
+    scheduler_stop(sched);
+    sched = NULL;
+    time_t before = time(NULL);
+    assert_int_equal(scheduler_open(db, record_dispatch, NULL, &sched), OK);
+    time_t after = time(NULL);
+
+    assert_true(due_of(once) >= before && due_of(once) <= after);
+    assert_true(due_of(skip) > after);
+
+    /* A tick that cannot tell a failed dispatch from a missed window must
+     * not apply it: recomputing outside startup moves to the future. */
+    assert_int_equal(scheduler_recompute(db, once, after), OK);
+    assert_true(due_of(once) > after);
+}
+
 /* An unparseable trigger disables its schedule rather than failing the tick
  * forever: one bad row must not stop every other schedule on the machine. */
 static void test_bad_trigger_disables_schedule(void **state)
@@ -381,6 +409,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_overlap_is_per_action, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_skip_moves_forward, setup, teardown),
         cmocka_unit_test_setup_teardown(test_catchup_run_once_fires_now, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_catchup_run_once_without_history_fires_at_startup, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bad_trigger_disables_schedule, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_bad_schedule_does_not_block_others, setup, teardown),
         cmocka_unit_test_setup_teardown(test_idle_scheduler_does_not_spin, setup, teardown),

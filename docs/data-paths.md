@@ -14,11 +14,16 @@ rather than surprises.
 ## The one-paragraph version
 
 A backup scans the source into a flat entry list, stores file content as
-loose content-addressed objects (skipping files the metadata cache can vouch
-for), serialises one manifest tree object per directory bottom-up, writes a
-snapshot record, and indexes everything into the database. Packing then runs
-as the tail of the same job: loose objects are compressed into 256 MiB pack
-files, incompressible ones are skip-marked and stay loose. A restore reads
+content-addressed objects (skipping files the metadata cache can vouch for),
+serialises one manifest tree object per directory bottom-up, writes a
+snapshot record, and indexes everything into the database. Objects up to
+16 MiB go straight into a pack as they are written; sparse files and objects
+over 16 MiB are written loose, because a pack entry header carries the hash
+and cannot be written before the whole object has been read. Packing then
+runs as the tail of the same job over what is loose: compressible ones are
+packed and compressed, and **an incompressible object over 16 MiB is
+skip-marked and stays loose for good** - one file, payload stored raw,
+parity trailer and all (Part 2). A restore reads
 node rows from the database, resolves each content hash through the store
 (loose first, then packs via the DB resolver), and rebuilds the tree with
 per-type handling for directories, symlinks, hardlinks, sparse files and
@@ -193,8 +198,9 @@ the race to a concurrent writer of the same hash is dedup, not an error.
 On-disk, a loose object is:
 
 ```
-object_header_t (56 bytes: magic, version, type, compression,
-                 pack_skip_ver, uncompressed_size, compressed_size, hash)
+object_header_t (64 bytes: magic, version, type, compression,
+                 pack_skip_ver, uncompressed_size, compressed_size, hash,
+                 encryption, 7 reserved)
 payload         (always COMPRESS_NONE for loose objects)
 parity trailer  (XOR record for the header, RS parity for the payload,
                  CRC32C, footer)
@@ -367,6 +373,15 @@ place compression happens. The classification matrix it implements:
 | **small (<= 16 MiB)** | packed, LZ4 block per entry (objects under 4 KiB skip compression: not worth the header) | packed uncompressed (inode reduction still pays) |
 | **large (> 16 MiB)** | packed, LZ4 frame streamed | **skip-marked, stays loose forever** |
 
+Since direct-to-pack (`docs/direct-to-pack.md`) the small row is mostly
+reached at backup time rather than here: a backup writes objects up to
+16 MiB straight into a pack, compressed or not, so `repo_pack` sees them
+only in a repository written before that change. The large row is unchanged
+and is what an operator sees: a large video, disk image or archive is one
+loose file under `objects/` indefinitely, counted as `loose` by `stats` and
+`summary`, and neither `pack` nor GC's coalescing moves it. That is the
+intended outcome, not a stuck pack run.
+
 "Large" is `PACK_STREAM_THRESHOLD` (16 MiB); pack bodies seal at
 `PACK_MAX_MULTI_BYTES` (256 MiB). "Incompressible" is decided by a 64 KiB
 LZ4 probe: for large objects a compressed/original ratio >= 0.90, for the
@@ -382,7 +397,7 @@ old verdicts.
 The run itself:
 
 1. **Collect**: walk `objects/XX/` for every loose hash.
-2. **Partition**: read each 56-byte header; skip-marked objects drop out
+2. **Partition**: read each 64-byte header; skip-marked objects drop out
    here. Everything else (file, sparse, tree objects alike) is packable.
 3. **Probe**: large `COMPRESS_NONE` candidates get the 64 KiB probe;
    failures are skip-marked and drop out.
