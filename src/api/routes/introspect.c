@@ -274,7 +274,7 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       location FROM objects"
-            " WHERE repo_id = ? AND location <> 'loose'"
+            " WHERE repo_id = ? AND location NOT IN ('loose', 'staged')"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else {

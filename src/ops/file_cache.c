@@ -75,7 +75,8 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
      */
     db_result_t *o = NULL;
     int present = db_execute(db,
-            "SELECT 1 FROM objects WHERE repo_id = ? AND hash = ?",
+            "SELECT 1 FROM objects WHERE repo_id = ? AND hash = ?"
+            " AND location <> 'staged'",
             (const char *[]){ repo, hex, NULL }, &o) == 0 && o && o->nrows == 1;
     db_result_free(o);
     if (!present) return 0;
