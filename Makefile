@@ -56,10 +56,11 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
-                -I src/config -I src/daemon -I $(CUTILS_DIR)/include
+                -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
+                -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) \
                  -fstack-protector-strong -fstack-clash-protection \
-                 $(SRC_INCLUDES) -I vendor $(VERSION_DEF) $(CUTILS_VERSION_DEF)
+                 $(SRC_INCLUDES) $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 
 # The dev machine is Zen 3, so that is the default. CI and the container image
 # override it, because a binary built for znver3 and run anywhere else dies on
@@ -117,8 +118,12 @@ ALL_SRCS    := $(shell find $(SRC) -name '*.c')
 SRCS        := $(filter-out $(DAEMON_MAIN) $(CLI_MAIN), $(ALL_SRCS))
 SRC_DIRS    := $(sort $(dir $(ALL_SRCS)))
 VPATH       := $(SRC_DIRS)
-VENDOR_OBJS := $(OBJ_DIR)/cJSON.o
-LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) $(VENDOR_OBJS) \
+# cJSON is not compiled here. c-utils carries it and libc-utils.a holds its
+# object. A copy compiled here is linked ahead of the archive, so it shadows
+# that member for the whole binary, c-utils' own json.o included: the daemon
+# ran on whichever cJSON this repository happened to carry, not the one the
+# pinned c-utils was tested with.
+LIB_OBJS    := $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                $(OBJ_DIR)/app_migrations.o
 # Objects are flattened into one directory by basename, so two sources with
 # the same filename in different subdirectories silently clobber each other
@@ -133,13 +138,14 @@ DAEMON_OBJ  := $(OBJ_DIR)/daemon_main.o
 CLI_OBJ     := $(OBJ_DIR)/cli_main.o
 OBJS        := $(LIB_OBJS) $(DAEMON_OBJ) $(CLI_OBJ)
 
-# Vendor flags: match optimisation level but drop strict warnings
+# Generated code (the embedded migrations): match the optimisation level but
+# drop the strict warnings, since nobody edits it by hand.
 ifeq ($(BUILD_TYPE),debug)
-  VENDOR_CFLAGS := -std=c11 -Og -g $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -Og -g $(SRC_INCLUDES) $(VERSION_DEF)
 else ifeq ($(BUILD_TYPE),asan)
-  VENDOR_CFLAGS := -std=c11 -O1 -g $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -O1 -g $(SRC_INCLUDES) $(VERSION_DEF)
 else
-  VENDOR_CFLAGS := -std=c11 -O3 -flto=auto -march=$(MARCH) $(SRC_INCLUDES) -I vendor $(VERSION_DEF)
+  GEN_CFLAGS := -std=c11 -O3 -flto=auto -march=$(MARCH) $(SRC_INCLUDES) $(VERSION_DEF)
 endif
 
 # ---- Phony targets ----------------------------------------------------
@@ -173,9 +179,6 @@ $(BINS):
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(TYPE_CFLAGS) -MMD -MP -c $< -o $@
 
-$(OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(OBJ_DIR)
-	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
-
 # ---- Embedded SQL migrations ------------------------------------------
 # Compiled into the binary so a deployed daemon carries its own schema and
 # cannot half-migrate against a stale migrations/ directory on disk.
@@ -189,7 +192,7 @@ $(MIGRATE_SRC): migrations $(wildcard migrations/*.sql) | $(BUILD)
 	$(CUTILS_DIR)/tools/embed_sql.sh migrations/ app_migrations > $@
 
 $(OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(OBJ_DIR)
-	$(CC) $(VENDOR_CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(GEN_CFLAGS) -MMD -MP -c $< -o $@
 
 .PHONY: embed-migrations
 embed-migrations: $(MIGRATE_SRC)
@@ -216,9 +219,9 @@ $(CLI_TARGET): $(LIB_OBJS) $(CLI_OBJ) $(CUTILS_ARCHIVE) | $(BINS)
 # ---- Tests (link against release lib objects) -------------------------
 REL_OBJ_DIR := $(BUILD)/release
 REL_LIB_OBJS = $(patsubst %.c, $(REL_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-               $(REL_OBJ_DIR)/cJSON.o $(REL_OBJ_DIR)/app_migrations.o
+               $(REL_OBJ_DIR)/app_migrations.o
 
-TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) -Wno-unused-result $(SRC_INCLUDES) -I vendor
+TEST_CFLAGS  := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) -Wno-unused-result $(SRC_INCLUDES)
 TEST_LDFLAGS := -flto=auto $(LDFLAGS) -lcmocka
 
 # Every suite in tests/ is live. Helpers are linked into suites rather than
@@ -293,9 +296,9 @@ test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-ui
 # ---- ASAN tests -------------------------------------------------------
 ASAN_OBJ_DIR := $(BUILD)/asan
 ASAN_LIB_OBJS = $(patsubst %.c, $(ASAN_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
-                $(ASAN_OBJ_DIR)/cJSON.o $(ASAN_OBJ_DIR)/app_migrations.o
+                $(ASAN_OBJ_DIR)/app_migrations.o
 
-ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+ASAN_TEST_CFLAGS := -std=c11 -Wall -Wextra -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wno-unused-result $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 ASAN_TEST_BINS   := $(patsubst $(TESTS)/%.c, $(BINS)/%-asan, $(TEST_SRCS))
 
 $(BINS)/%-asan: $(TESTS)/%.c $(TESTS)/fake_index.c $(ASAN_LIB_OBJS) | $(BINS)
@@ -328,13 +331,18 @@ FUZZ_BINS     := $(patsubst $(TESTS)/fuzz/%.c, $(FUZZ_BIN_DIR)/%, $(FUZZ_SRCS))
 # packs anything needs it: since the .idx sidecar went away the engine has
 # no index of its own and asks a callback where a hash lives, so without one
 # a packed object is simply not found.
+#
+# cJSON is the one c-utils source compiled here, from c-utils' own tree, so
+# the sanitizers and the fuzzer's coverage reach it. Defined in an object, it
+# wins over the archive's member, which then never gets pulled in.
+CUTILS_CJSON_SRC := $(CUTILS_DIR)/lib/cJSON/cJSON.c
 FUZZ_LIB_OBJS := $(patsubst %.c, $(FUZZ_OBJ_DIR)/%.o, $(notdir $(SRCS))) \
                  $(FUZZ_OBJ_DIR)/cJSON.o $(FUZZ_OBJ_DIR)/app_migrations.o \
                  $(FUZZ_OBJ_DIR)/fake_index.o
 
 FUZZ_SAN    := -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g
 FUZZ_CFLAGS := -std=c11 -Wall -Wextra -O1 -Wno-unused-result $(FUZZ_SAN) \
-               $(SRC_INCLUDES) -I vendor -I $(TESTS) $(CUTILS_VERSION_DEF)
+               $(SRC_INCLUDES) -I $(TESTS) $(CUTILS_VERSION_DEF)
 FUZZ_LDFLAGS := -fsanitize=fuzzer,address,undefined \
                 $(CUTILS_LIB) -lmicrohttpd -llz4 -lssl -lcrypto -lacl -lsqlite3 -lcurl -lpthread
 
@@ -347,8 +355,8 @@ $(FUZZ_OBJ_DIR)/$(notdir $(basename $(1))).o: $(1) | $(FUZZ_OBJ_DIR)
 endef
 $(foreach s,$(SRCS),$(eval $(call FUZZ_OBJ_RULE,$(s))))
 
-$(FUZZ_OBJ_DIR)/cJSON.o: vendor/cJSON.c | $(FUZZ_OBJ_DIR)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -Wno-everything -c $< -o $@
+$(FUZZ_OBJ_DIR)/cJSON.o: $(CUTILS_CJSON_SRC) | $(FUZZ_OBJ_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -DCUTILS_CJSON_ALLOW -Wno-everything -c $< -o $@
 
 $(FUZZ_OBJ_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(FUZZ_OBJ_DIR)
 	$(FUZZ_CC) $(FUZZ_CFLAGS) -c $< -o $@
@@ -434,7 +442,7 @@ FUZZCOV_OBJ  := $(FUZZCOV_DIR)/obj
 FUZZCOV_BIN  := $(FUZZCOV_DIR)/bin
 FUZZCOV_CF   := -std=c11 -O1 -g -fsanitize=fuzzer-no-link \
                 -fprofile-instr-generate -fcoverage-mapping -Wno-unused-result \
-                $(SRC_INCLUDES) -I vendor -I $(TESTS) $(CUTILS_VERSION_DEF)
+                $(SRC_INCLUDES) -I $(TESTS) $(CUTILS_VERSION_DEF)
 LLVM_PROFDATA ?= llvm-profdata
 LLVM_COV      ?= llvm-cov
 
@@ -444,7 +452,7 @@ fuzz-cov: $(MIGRATE_SRC)
 	@for f in $(SRCS); do \
 	    $(FUZZ_CC) $(FUZZCOV_CF) -c $$f -o $(FUZZCOV_OBJ)/$$(basename $${f%.c}).o || exit 1; \
 	done
-	@$(FUZZ_CC) $(FUZZCOV_CF) -Wno-everything -c vendor/cJSON.c -o $(FUZZCOV_OBJ)/cJSON.o
+	@$(FUZZ_CC) $(FUZZCOV_CF) -DCUTILS_CJSON_ALLOW -Wno-everything -c $(CUTILS_CJSON_SRC) -o $(FUZZCOV_OBJ)/cJSON.o
 	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(MIGRATE_SRC) -o $(FUZZCOV_OBJ)/app_migrations.o
 	@$(FUZZ_CC) $(FUZZCOV_CF) -c $(TESTS)/fake_index.c -o $(FUZZCOV_OBJ)/fake_index.o
 	@for t in $(FUZZ_SRCS); do \
@@ -497,7 +505,7 @@ fuzz-regress: fuzz
 	exit $$rc
 
 # ---- Static analysis --------------------------------------------------
-ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) -I vendor $(CUTILS_VERSION_DEF)
+ANALYZE_CFLAGS := -std=c11 -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
 analyze: | $(BUILD)
@@ -526,16 +534,16 @@ analyze: | $(BUILD)
 	    --suppress=missingIncludeSystem \
 	    --suppress=normalCheckLevelMaxBranches \
 	    --suppress=toomanyconfigs \
-	    --suppress=*:vendor/* \
+	    --suppress=*:$(CUTILS_DIR)/lib/cJSON/* \
 	    --suppress=oppositeInnerCondition:src/store/object.c \
 	    -DVERSION_STRING=\"0.0.0\" \
 	    --inline-suppr \
-	    --quiet $(SRC_INCLUDES) -I vendor $(SRCS)
+	    --quiet $(SRC_INCLUDES) $(SRCS)
 	@echo "cppcheck: OK"
 
 lint:
 	@echo "=== clang-tidy ==="
-	@clang-tidy $(SRCS) -- -std=c11 $(SRC_INCLUDES) -I vendor 2>&1 | \
+	@clang-tidy $(SRCS) -- -std=c11 $(SRC_INCLUDES) 2>&1 | \
 	    grep -E "warning:|error:" || echo "clang-tidy: OK"
 
 # ---- Editor index -----------------------------------------------------
@@ -563,7 +571,7 @@ BENCH        := bench
 # twice: after the April src/ reorganisation, and again when the daemon
 # rewrite added src/meta, src/scheduler, src/config and the c-utils headers.
 BENCH_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic $(WARN_FLAGS) -O3 -flto=auto $(ARCH_CFLAGS) \
-                $(SRC_INCLUDES) -I vendor
+                $(SRC_INCLUDES)
 
 $(BINS)/bench_micro: $(BENCH)/micro.c $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
@@ -594,12 +602,11 @@ bench-browse: $(BINS)/bench_browse
 # ---- Coverage ---------------------------------------------------------
 COV_DIR     := $(BUILD)/coverage
 COV_CFLAGS  := -std=c11 -Wall -Wextra -O0 -g --coverage -march=$(MARCH) \
-               -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) -I vendor \
+               -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) \
                $(VERSION_DEF) $(CUTILS_VERSION_DEF)
 COV_LDFLAGS := --coverage $(LDFLAGS)
 COV_OBJS    := $(patsubst $(SRC)/%.c, $(COV_DIR)/%.o, $(SRCS))
-COV_VENDOR  := $(COV_DIR)/cJSON.o $(COV_DIR)/app_migrations.o
-COV_OBJS    += $(COV_VENDOR)
+COV_OBJS    += $(COV_DIR)/app_migrations.o
 COV_MAIN    := $(COV_DIR)/main.o
 COV_LIB     := $(filter-out $(COV_MAIN), $(COV_OBJS))
 COV_TESTS   := $(patsubst $(TESTS)/%.c, $(COV_DIR)/%, $(TEST_SRCS))
@@ -626,9 +633,7 @@ $(COV_DIR)/%.o: $(SRC)/%.c | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) -c $< -o $@
 
 $(COV_DIR)/app_migrations.o: $(MIGRATE_SRC) | $(COV_DIR)
-	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -I vendor -c $< -o $@
-$(COV_DIR)/cJSON.o: vendor/cJSON.c | $(COV_DIR)
-	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -I vendor -c $< -o $@
+	$(CC) -std=c11 -O0 -g --coverage $(SRC_INCLUDES) -c $< -o $@
 
 $(COV_DIR)/%: $(TESTS)/%.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) -lcmocka
@@ -693,13 +698,12 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	    || echo "coverage: test_api_e2e.sh failed or timed out"
 	@timeout $(COV_E2E_TIMEOUT) ./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 \
 	    || echo "coverage: test_cli_e2e.sh failed or timed out"
-	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html \
-	    --exclude '.*vendor.*'
+	@gcovr -r $(SRC) $(COV_DIR) --html-details $(COV_DIR)/coverage.html
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
 	    --fail-under-line $(COV_STORE_MIN) -s
 	@echo "=== whole repo (min $(COV_MIN)% lines) ==="
-	@gcovr -r $(SRC) $(COV_DIR) --exclude '.*vendor.*' --txt $(COV_DIR)/coverage.txt \
+	@gcovr -r $(SRC) $(COV_DIR) --txt $(COV_DIR)/coverage.txt \
 	    --fail-under-line $(COV_MIN) -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 

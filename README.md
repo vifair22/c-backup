@@ -32,7 +32,8 @@ binary that reads them.
 
 Needs a sibling checkout of [c-utils](https://git.airies.net/vifair22/c-utils)
 at `../c-utils`, or `CUTILS_DIR` pointing elsewhere. The pinned version is in
-`cutils_version`.
+`cutils_version`. c-utils also supplies cJSON; this repository carries no
+copy of its own.
 
 ```sh
 make            # c-backupd and c-backup into build/bins/
