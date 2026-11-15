@@ -308,6 +308,25 @@ static api_response_t delete_repo(const api_request_t *req, void *userdata)
  * from three different modules would leave two of them permanently
  * unreachable with no error at startup. One owner, explicit dispatch.
  */
+/*
+ * Every /repos/<id>/... route answers 404 for a repository that is not
+ * registered. They answered from whatever their query found, so
+ * `summary 99` returned zero snapshots and zero objects with a 200 -
+ * indistinguishable from an empty repository that exists, which is exactly
+ * the answer a misconfigured script or monitor should not get.
+ */
+static int repo_exists(void *ud, int64_t repo_id)
+{
+    cutils_db_t *db = ud;
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    int found = db_execute(db, "SELECT 1 FROM repos WHERE id = ?",
+                           (const char *[]){ id, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 static int64_t split_repo_url(const char *url, const char **rest)
 {
     if (strncmp(url, "/repos/", 7) != 0) return -1;
@@ -438,6 +457,7 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (*rest == '\0') return get_repo(req, ud);
 
     if (strcmp(rest, "/key") == 0)      return key_export(req, repo_id);
@@ -490,10 +510,10 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
 
 static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
 {
-    (void)ud;
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
 
     if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
     if (strcmp(rest, "/sources") == 0) return metadata_sources_put(req, repo_id);
@@ -513,10 +533,10 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
 
 static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
 {
-    (void)ud;
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (strcmp(rest, "/key/import") == 0) return key_import(req, repo_id);
     if (strcmp(rest, "/key/ack") == 0)    return key_ack(req, repo_id);
     if (strcmp(rest, "/backup") == 0)
@@ -547,6 +567,7 @@ static api_response_t repo_scoped_delete(const api_request_t *req, void *ud)
     const char *rest = NULL;
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
+    if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
     if (*rest == '\0') return delete_repo(req, ud);
 
     if (strncmp(rest, "/tags/", 6) == 0)
