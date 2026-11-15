@@ -328,10 +328,21 @@ status_t pack_resolve_location(store_t *store,
                                uint64_t *out_dat_offset);
 
 /*
- * Attempt to repair a packed object's entry in-place via pwrite().
- * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
+ * Attempt to repair a packed object's entry in-place via pwrite(), at any
+ * entry size and codec, in memory bounded by the parity window. Writes only
+ * once the corrected payload matches the trailer's CRC.
+ * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error or
+ * damage beyond parity.
  */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+/*
+ * Test hook: how many RS groups (15,296 data bytes, 1,024 parity bytes each)
+ * a packed-entry reader or repair holds at once. 0 restores the default of
+ * 1,096 groups (16 MiB of data). Lowering it lets a test push an entry of a
+ * few MiB through many windows and measure that memory stays bounded.
+ */
+void pack_test_set_parity_window(size_t groups);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
