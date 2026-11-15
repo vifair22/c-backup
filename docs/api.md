@@ -690,8 +690,9 @@ discards its open pack, the index rows staged into it and its staging files.
 `POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
 returns it, plus `"cancel_requested":true`. A queued job is taken out of the
 queue and never runs: its `state` is already `cancelled`, and the journal
-records it as cancelled with the message "cancelled before it started". A
-running job's `state` is usually still `running`: it reports `cancelled` once
+records it as cancelled with the message "cancelled before it started"; its
+`started` is null. Shutting the daemon down does the same to every queued
+job. A running job's `state` is usually still `running`: it reports `cancelled` once
 it has stopped. A job that is not queued or running is a 404.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted

@@ -189,7 +189,9 @@ sudo c-backup version
 
 `systemctl stop c-backupd` (SIGTERM) shuts the daemon down in order: it stops
 accepting requests, stops firing schedules, then cancels running jobs, which
-are recorded as `cancelled` in `c-backup jobs` and the journal. A job checks
+are recorded as `cancelled` in `c-backup jobs` and the journal. Jobs still
+waiting in the queue are never started: they are recorded `cancelled` with no
+start time, and journalled as "cancelled before it started". A job checks
 for cancellation between files and between chunks inside one: storing,
 packing and restoring a file all stop within one read of at most 8 MiB, so a
 multi-gigabyte file in progress does not hold up the shutdown. This takes
