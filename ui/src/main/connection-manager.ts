@@ -261,6 +261,9 @@ export class ConnectionManager extends EventEmitter {
     entry.client.setToken(undefined)
     this.store.deleteToken(name)
     this.disconnect(name)
+    /* Signed out, and shown as that: the way back is the password. */
+    entry.needsCredentials = true
+    this.emitChange()
     return { ok: true }
   }
 
