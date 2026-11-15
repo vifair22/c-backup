@@ -306,6 +306,11 @@ excerpt, the way `grep -a` summarises a binary. `max_files` stops the search
 once it has found enough, and the run records whether it stopped early so a
 caller can tell "no more matches" from "stopped looking".
 
+`snapshot` defaults to the newest. One that does not exist is `404 no such
+snapshot` when the search is submitted, and a value that is not an id is a
+400; the first used to complete with zero files scanned, which reads as "not
+in that backup", and the second silently searched the newest instead.
+
 The hits outlive the job, so they are fetched separately: `GET
 /repos/<id>/grep` lists runs newest-first and `GET /repos/<id>/grep/<run-id>`
 returns the hits. `c-backup grep` does all three steps and prints the

@@ -123,6 +123,20 @@ static int64_t newest_snapshot(int64_t repo_id)
     return id;
 }
 
+/* Does this repository have a snapshot with this id? */
+static int snapshot_exists(int64_t repo_id, int64_t snap_id)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db,
+            "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 /* ---------- restore request validation ---------- */
 
 /*
@@ -925,19 +939,9 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
      * sends an operator to rebuild an index that is fine, for a snapshot
      * that retention or a delete had already removed.
      */
-    if (snap_id > 0) {
-        char repo[32], snap[32];
-        snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-        snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-        db_result_t *r = NULL;
-        int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
-                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
-        db_result_free(r);
-        if (!found) {
-            free(repo_path);
-            return api_error(404, "no such snapshot");
-        }
+    if (snap_id > 0 && !snapshot_exists(repo_id, snap_id)) {
+        free(repo_path);
+        return api_error(404, "no such snapshot");
     }
 
     snap_job_t *j = calloc(1, sizeof(*j));
@@ -1002,8 +1006,23 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         /* Which snapshot: the newest unless one was named. Searching "the
          * backup" almost always means the current one. */
         uint32_t sid = 0;
-        if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) == 0) {
+        if (json_req_has(body, "snapshot")) {
+            /*
+             * A named snapshot is checked now. One that did not exist was
+             * searched anyway: the job found no files, completed, and
+             * reported zero matches - an answer to a question nobody asked,
+             * indistinguishable from "not in this backup". A malformed one
+             * fell back to the newest snapshot, which is worse.
+             */
+            if (json_req_get_u32(body, "snapshot", &sid, 1, 1000000000) != 0) {
+                snap_job_free(j);
+                return api_error(400, "snapshot must be a snapshot id");
+            }
             j->snap_id = (int64_t)sid;
+            if (!snapshot_exists(repo_id, j->snap_id)) {
+                snap_job_free(j);
+                return api_error(404, "no such snapshot");
+            }
         } else {
             j->snap_id = newest_snapshot(repo_id);
             if (j->snap_id <= 0) {

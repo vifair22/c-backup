@@ -266,6 +266,13 @@ esac
 OUT=$(cb grep 1 'unclosed[' 2>&1); RC=$?
 check "grep rejects a bad pattern" 1 "$RC"
 contains "grep --no-wait returns a job" '"job_id"' "$(cb grep 1 hunter2 --no-wait)"
+# B066: a snapshot that does not exist completed with zero files, which
+# reads as "not in that backup".
+OUT=$(cb grep 1 hunter2 --snapshot 999 2>&1); RC=$?
+check    "grep on a missing snapshot fails" 1 "$RC"
+contains "and says so at submission" "no such snapshot" "$OUT"
+check    "a malformed snapshot is a 400" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" -d '{"pattern":"x","snapshot":"latest"}' http://localhost/repos/1/grep)"
 
 # B064: schedule options are validated per action. Values outside the
 # documented sets were stored and read back as something else; parameters an

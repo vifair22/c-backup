@@ -703,6 +703,15 @@ static int cmd_grep(int argc, char **argv)
     if (argc < 2)
         return fail("usage: grep <repo-id> <pattern> [--snapshot N] "
                     "[--path-prefix PATH] [--limit N] [-i] [--no-wait]");
+    /* Both go into the body as bare numbers, where anything else is
+     * malformed JSON and comes back as "invalid JSON". */
+    const char *nums[] = { snap, maxf };
+    for (size_t k = 0; k < 2; k++) {
+        if (!nums[k]) continue;
+        size_t n = strlen(nums[k]);
+        if (n == 0 || n > 10 || strspn(nums[k], "0123456789") != n)
+            return fail("--snapshot and --limit take a whole number, not '%s'", nums[k]);
+    }
 
     sbuf_t b = { 0 };
     sb_puts(&b, "{\"pattern\":");
