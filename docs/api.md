@@ -42,6 +42,14 @@ Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
 
+A path the API serves, asked with a method it does not answer, is a `405`
+with an `Allow` header listing the methods that work there (`PATCH
+/repos/1` gives `405`, `Allow: GET, DELETE`). Any method other than GET,
+HEAD, POST, PUT and DELETE is one of those; it used to be served as a GET.
+A path that names nothing, under any method, is a `404`, and so is anything
+under `/repos/<id>` for a repository that is not registered. The 405 comes
+after authentication, so over TCP it needs a token like everything else.
+
 Long operations return `202` with a job id rather than blocking. A backup can
 run for hours, and a request that lives that long dies to any timeout between
 client and daemon.
@@ -305,7 +313,11 @@ every one of them. A capability reachable through the API but not the CLI
 means an operator has to hand-write a `curl --unix-socket` call, or open the
 desktop app, to run their own backup tool - which is the friction the daemon
 rewrite existed to remove. When an endpoint is added, a command goes with it,
-and `tests/test_cli_e2e.sh` exercises the whole table.
+and `tests/test_cli_e2e.sh` exercises the whole table. The search and verify
+run lists, a search's hits, `GET /api/auth/setup` (`auth status`), the jobs
+list's paging and `stats?scope=loose` were found missing in an audit of this
+table and added; every route and query parameter here now has a command or
+a flag.
 
 The desktop app is the second client and is held to the same rule. Its
 requests are one closed union in `ui/src/shared/api.ts`, translated to method
@@ -346,10 +358,10 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
-| GET | `/repos/<id>/grep` | Recent searches, newest first |
+| GET | `/repos/<id>/grep` | Recent searches, newest first; `limit` and `offset` |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
-| GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) |
+| GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
 | POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
 
@@ -639,9 +651,11 @@ storing it, packing it, restoring it - so a cancel lands within one read
 discards its open pack, the index rows staged into it and its staging files.
 
 `POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
-returns it, plus `"cancel_requested":true`. Its `state` is usually still
-`running` (or `queued`): the job reports `cancelled` once it has stopped. A
-job that is not queued or running is a 404.
+returns it, plus `"cancel_requested":true`. A queued job is taken out of the
+queue and never runs: its `state` is already `cancelled`, and the journal
+records it as cancelled with the message "cancelled before it started". A
+running job's `state` is usually still `running`: it reports `cancelled` once
+it has stopped. A job that is not queued or running is a 404.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
 over the API (the CLI and the app both are), `schedule` for the scheduler, with
@@ -652,6 +666,9 @@ is, then a frame whenever it changes, and the same frame again every 5 seconds
 while it does not, so a watcher can tell a busy job from a dead stream. The
 stream ends after the frame with a terminal state. A frame is
 `{"id","state","phase","current","total","bytes_done","bytes_total","error"}`.
+`bytes_done` advances inside a file as backup and restore read and write it,
+not only between files, so a job spending minutes on one large file still
+sends a changed frame a few times a second.
 
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered

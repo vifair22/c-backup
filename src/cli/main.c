@@ -733,6 +733,36 @@ static int cmd_diff(int argc, char **argv)
  */
 static int cmd_grep(int argc, char **argv)
 {
+    /*
+     * Past searches. A run's hits were reachable only by waiting on the
+     * search that made them; once it had printed, or with --no-wait, there
+     * was no command to list the runs or read one back (B084). A repository
+     * id is a number, so neither word can be mistaken for one.
+     */
+    if (argc >= 1 && strcmp(argv[0], "runs") == 0) {
+        sbuf_t q = { 0 };
+        paging(&argc, argv, &q);
+        if (argc < 2) { free(q.buf); return fail("usage: grep runs <repo-id> [--limit N] [--offset N]"); }
+        int rc = get_repo_scoped(argv[1], "/grep", q.buf);
+        free(q.buf);
+        return rc;
+    }
+    if (argc >= 1 && strcmp(argv[0], "show") == 0) {
+        sbuf_t q = { 0 };
+        paging(&argc, argv, &q);
+        if (argc < 3) {
+            free(q.buf);
+            return fail("usage: grep show <repo-id> <run-id> [--limit N] [--offset N]");
+        }
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/grep/"); sb_puts(&p, argv[2]);
+        if (p.oom) { free(p.buf); free(q.buf); return fail("request too large"); }
+        int rc = get_repo_scoped(argv[1], p.buf, q.buf);
+        free(p.buf);
+        free(q.buf);
+        return rc;
+    }
+
     const char *prefix = take_opt(&argc, argv, "--path-prefix");
     const char *snap   = take_opt(&argc, argv, "--snapshot");
     const char *maxf   = take_opt(&argc, argv, "--limit");
@@ -834,12 +864,21 @@ static int cmd_jobs(int argc, char **argv)
         }
         return 0;
     }
+    /* The list pages like every other collection; the CLI could only ever
+     * read its first 50 (B084 audit). */
+    sbuf_t q = { 0 };
+    paging(&argc, argv, &q);
     if (argc >= 1) {
+        free(q.buf);
         sbuf_t p = { 0 };
         sb_puts(&p, "/jobs/"); sb_puts(&p, argv[0]);
         return call_path_sb("GET", &p, NULL);
     }
-    return call("GET", "/jobs", NULL);
+    sbuf_t p = { 0 };
+    sb_puts(&p, "/jobs");
+    if (q.len) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+    free(q.buf);
+    return call_path_sb("GET", &p, NULL);
 }
 
 /* Maintenance actions share a shape: POST /repos/<id>/<action>. */
@@ -1005,18 +1044,27 @@ static int cmd_verify(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[0], "list") == 0) {
         sbuf_t q = { 0 };
-        const char *lim = take_opt(&argc, argv, "--limit");
-        if (lim) { sb_puts(&q, "limit="); sb_query_val(&q, lim); }
-        int rc = get_repo_scoped(argv[1], "/verify", q.buf);
+        paging(&argc, argv, &q);
+        int rc = argc >= 2 ? get_repo_scoped(argv[1], "/verify", q.buf)
+                           : fail("usage: verify list <repo-id> [--limit N] [--offset N]");
         free(q.buf);
         return rc;
     }
+    /* The findings are paginated; without --offset only the first page of a
+     * run with many could be read. */
     if (argc >= 3 && strcmp(argv[0], "show") == 0) {
+        sbuf_t q = { 0 };
+        paging(&argc, argv, &q);
+        if (argc < 3) {
+            free(q.buf);
+            return fail("usage: verify show <repo-id> <run-id> [--limit N] [--offset N]");
+        }
         sbuf_t p = { 0 };
         sb_puts(&p, "/verify/"); sb_puts(&p, argv[2]);
-        if (p.oom) { free(p.buf); return fail("request too large"); }
-        int rc = get_repo_scoped(argv[1], p.buf, NULL);
+        if (p.oom) { free(p.buf); free(q.buf); return fail("request too large"); }
+        int rc = get_repo_scoped(argv[1], p.buf, q.buf);
         free(p.buf);
+        free(q.buf);
         return rc;
     }
 
@@ -1076,8 +1124,13 @@ static int cmd_verify(int argc, char **argv)
 
 static int cmd_stats(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: stats <repo-id>");
-    return get_repo_scoped(argv[0], "/stats", NULL);
+    /* ?scope=loose had no flag (B084 audit). Only "loose" narrows; anything
+     * else is refused here rather than sent and silently ignored. */
+    const char *scope = take_opt(&argc, argv, "--scope");
+    if (argc < 1) return fail("usage: stats <repo-id> [--scope loose]");
+    if (scope && strcmp(scope, "loose") != 0)
+        return fail("--scope takes 'loose', not '%s'", scope);
+    return get_repo_scoped(argv[0], "/stats", scope ? "scope=loose" : NULL);
 }
 
 static int cmd_summary(int argc, char **argv)
@@ -1416,7 +1469,11 @@ static int read_new_password(const char *prompt, char *buf, size_t sz)
  */
 static int cmd_auth(int argc, char **argv)
 {
-    if (argc < 1) return fail("usage: auth <setup|login|logout [--all]|password> [args]");
+    if (argc < 1) return fail("usage: auth <status|setup|login|logout [--all]|password> [args]");
+
+    /* Whether an admin password is set: GET /api/auth/setup, which had no
+     * command (B084 audit). */
+    if (strcmp(argv[0], "status") == 0) return call("GET", "/api/auth/setup", NULL);
 
     char pw[256], pw2[256];
 
@@ -1488,15 +1545,15 @@ static const struct {
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
     { "search",    cmd_search,    "search <repo-id> <query> [--snapshot N] [--limit N]  (one result per path and content, with a count of snapshots)" },
-    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]" },
+    { "grep",      cmd_grep,      "grep <repo-id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i] [--no-wait]  |  grep runs <repo-id> [--limit N] [--offset N]  |  grep show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "diff",      cmd_diff,      "diff <repo-id> <from-snapshot> <to-snapshot>" },
-    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N]  |  verify show <repo-id> <run-id>" },
+    { "verify",    cmd_verify,    "verify <repo-id> [--level index|structure|deep] [--no-repair] [--dry-run] [--no-wait]  |  verify list <repo-id> [--limit N] [--offset N]  |  verify show <repo-id> <run-id> [--limit N] [--offset N]" },
     { "gc",        cmd_gc,        "gc <repo-id> [--dry-run] [--no-wait]" },
     { "gfs",       cmd_gfs,       "gfs <repo-id> [--dry-run] [--no-wait]" },
     { "pack",      cmd_pack,      "pack <repo-id> [--no-wait]" },
     { "replicate", cmd_replicate, "replicate <repo-id> <dest-path> [--reencrypt] [--no-wait]" },
     { "reindex",   cmd_reindex,   "reindex <repo-id> [--no-wait]" },
-    { "stats",     cmd_stats,     "stats <repo-id>" },
+    { "stats",     cmd_stats,     "stats <repo-id> [--scope loose]" },
     { "summary",   cmd_summary,   "summary <repo-id>" },
     { "objects",   cmd_objects,   "objects <repo-id> [--location loose|packed] [--limit N]" },
     { "object",    cmd_object,    "object <repo-id> <hash> [refs|layout|content]" },
@@ -1506,8 +1563,8 @@ static const struct {
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
     { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
-    { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
-    { "auth",      cmd_auth,      "auth <setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
+    { "jobs",      cmd_jobs,      "jobs [--limit N] [--offset N] | jobs <job-id> | jobs cancel <job-id> | jobs watch <job-id>" },
+    { "auth",      cmd_auth,      "auth <status|setup|login|logout [--all]|password> (prompts for passwords; logout --all revokes every session)" },
     { "metrics",   cmd_metrics,   "metrics" },
     { "health",    cmd_health,    "health [live]" },
     { "version",   cmd_version,   "version" },

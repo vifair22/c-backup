@@ -92,6 +92,71 @@ echo "alpha content"  > "$WORK/src/a.txt"
 echo "beta content"   > "$WORK/src/b.txt"
 echo "nested content" > "$WORK/src/docs/c.txt"
 
+echo "config refusal"
+# Each of these used to start the daemon normally, running on defaults the
+# operator never chose (UAT B081). Now each must stop it before it binds,
+# naming the file, the line and what is wrong.
+refuses() {  # refuses <name> <expected stderr fragment> <config lines...>
+    local name="$1" want="$2"; shift 2
+    local cfg="$WORK/bad.yaml"
+    {
+        printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' "$WORK" "$WORK"
+        printf '%s\n' "$@"
+    } > "$cfg"
+    chmod 600 "$cfg"
+    local out rc
+    out=$(C_BACKUP_CONFIG_PATH="$cfg" timeout 10 "$BIN" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+        bad "$name: refuses to start" "exit 1" "exit $rc: $out"
+    else
+        contains "$name: refuses to start" "$want" "$out"
+    fi
+    [ -e "$WORK/bad.sock" ] && bad "$name: never listened" "no socket" "socket created"
+    rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock"
+}
+refuses "malformed yaml" "bad.yaml:6: error: flow collections" 'log: [unclosed'
+refuses "unknown log level" "bad.yaml:7: error: log.level: 'chatty' is not one of" \
+    'log:' '  level: chatty'
+refuses "unknown top-level key" "bad.yaml:6: error: 'verbose: true' at the top level" \
+    'verbose: true'
+refuses "unknown section" "bad.yaml:7: error: unknown key 'mystery.thing'" \
+    'mystery:' '  thing: 1'
+refuses "typo'd key" "unknown key 'security.key_dri' (did you mean 'security.key_dir'?)" \
+    'security:' '  key_dri: /x'
+refuses "integer key not an integer" "bad.yaml:7: error: jobs.max_parallel: 'eighty' is not an integer" \
+    'jobs:' '  max_parallel: eighty'
+refuses "nested mapping" "bad.yaml:8: error: indented deeper" \
+    'jobs:' '  max_parallel: 2' '    extra: 1'
+refuses "every problem reported" "(and 1 more, printed above)" \
+    'jobs:' '  max_parallel: x' '  max_paralel: 2'
+# An environment override has no line, so it is named instead.
+printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' \
+    "$WORK" "$WORK" > "$WORK/bad.yaml"
+out=$(C_BACKUP_JOBS_MAX_PARALLEL=lots C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" \
+      timeout 10 "$BIN" 2>&1)
+contains "bad environment override refused" \
+    "environment C_BACKUP_JOBS_MAX_PARALLEL (jobs.max_parallel): 'lots' is not an integer" "$out"
+check "and nothing was opened" "" "$(ls "$WORK"/bad.db* 2>/dev/null)"
+rm -f "$WORK/bad.yaml"
+
+# The config the packages and the image ship has to pass the same checks,
+# or an edit to it would ship a daemon that will not start. Paths are
+# redirected; everything else is as shipped.
+sed -e "s#/var/lib/c-backupd/state.db#$WORK/pkg.db#" \
+    -e "s#/run/c-backupd/c-backupd.sock#$WORK/pkg.sock#" \
+    -e "s#^  port: 8765#  port: 0#" \
+    "$(dirname "$0")/../packaging/config.yaml" > "$WORK/pkg.yaml"
+chmod 600 "$WORK/pkg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/pkg.yaml" C_BACKUP_SECURITY_KEY_DIR="$WORK/pkgkeys" \
+    "$BIN" > "$WORK/pkg.log" 2>&1 &
+PKG_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/pkg.sock" ] && break; sleep 0.1; done
+if [ -S "$WORK/pkg.sock" ]; then ok "shipped config starts the daemon"
+else bad "shipped config starts the daemon" "a socket" "$(cat "$WORK/pkg.log")"; fi
+kill -TERM "$PKG_PID" 2>/dev/null
+wait "$PKG_PID" 2>/dev/null
+
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -101,6 +166,8 @@ http:
   bind: 127.0.0.1
 log:
   level: warn
+auth:
+  cookie_secure: 1
 EOF
 
 C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$BIN" > "$WORK/daemon.log" 2>&1 &
@@ -165,6 +232,12 @@ check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN"
 check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
 check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
 check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
+# B082: the key was read into the route context and then cleared when the
+# routes registered, so the flag was parsed and never honoured.
+LOGIN_HDRS=$(curl -s -D - -o /dev/null -X POST -d '{"password":"correcthorsebattery"}' \
+             "http://127.0.0.1:$PORT/api/auth/login")
+contains "cookie_secure sets Secure on the session cookie" "; Secure" \
+    "$(printf '%s' "$LOGIN_HDRS" | grep -i '^set-cookie:')"
 # No CORS: nothing here is a browser client, and a wildcard origin let any
 # page in a browser on the host read the API.
 contains "no CORS header" "no-cors" \
@@ -181,7 +254,51 @@ contains "get repo" '"uuid"' "$(sock_body /repos/1)"
 # A repository with no snapshot is counted. Its age runs from registration,
 # so it trips an age alert like any stale repository instead of reading 0.
 contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
+# Alert delivery is countable (UAT B083): present, as zeros, with Pushover
+# unconfigured, so an alert rule on them is never matching an absent series.
+METRICS=$(sock_body /metrics)
+contains "alerts sent metric"    "cbackup_alerts_sent_total 0" "$METRICS"
+contains "alerts failed metric"  "cbackup_alerts_failed_total 0" "$METRICS"
+contains "alerts failed is a counter" "# TYPE cbackup_alerts_failed_total counter" "$METRICS"
+contains "alerts pending metric" "cbackup_alerts_pending 0" "$METRICS"
 check "unknown repo" 404 "$(sock_code /repos/99)"
+
+echo "methods"
+# B085: every method the router did not recognise was served as a GET, so
+# PATCH /repos/1 answered 200 with the repository and looked like an update
+# that changed nothing. A known path asked with the wrong method is a 405
+# naming the methods it does answer; an unknown path stays a 404.
+sock_method() {  # sock_method <METHOD> <path> -> "<code> <Allow value>"
+    # HEAD through -I: with -X HEAD curl waits for a body that never comes.
+    local how=(-X "$1"); [ "$1" = HEAD ] && how=(-I)
+    curl -s -o /dev/null -D - "${how[@]}" --max-time 5 --unix-socket "$SOCK" "http://localhost$2" \
+        | tr -d '\r' | awk 'NR==1 {c=$2} tolower($1)=="allow:" {sub(/^[^:]*: */,""); a=$0}
+                          END {print c, a}'
+}
+check "PATCH a repo"            "405 GET, DELETE" "$(sock_method PATCH /repos/1)"
+check "repo still there after"  200               "$(sock_code /repos/1)"
+check "PUT a repo"              "405 GET, DELETE" "$(sock_method PUT /repos/1)"
+check "POST a repo"             "405 GET, DELETE" "$(sock_method POST /repos/1)"
+check "PATCH the repo list"     "405 GET, POST"   "$(sock_method PATCH /repos)"
+check "DELETE the repo list"    "405 GET, POST"   "$(sock_method DELETE /repos)"
+check "POST a read-only path"   "405 GET"         "$(sock_method POST /repos/1/journal)"
+check "DELETE a read-only path" "405 GET"         "$(sock_method DELETE /repos/1/summary)"
+check "GET a job submission"    "405 POST"        "$(sock_method GET /repos/1/backup)"
+check "OPTIONS on schedules"    "405 GET, POST"   "$(sock_method OPTIONS /repos/1/schedules)"
+check "GET one schedule"        "405 PUT, DELETE" "$(sock_method GET /repos/1/schedules/5)"
+check "PUT a snapshot"          "405 DELETE"      "$(sock_method PUT /repos/1/snapshots/5)"
+check "POST a note"             "405 GET, PUT"    "$(sock_method POST /repos/1/snapshots/5/note)"
+check "GET a cancel"            "405 POST"        "$(sock_method GET /jobs/5/cancel)"
+check "POST a job"              "405 GET"         "$(sock_method POST /jobs/5)"
+check "PUT a job stream"        "405 GET"         "$(sock_method PUT /jobs/stream/5)"
+check "PUT healthz"             "405 GET"         "$(sock_method PUT /healthz)"
+check "PATCH an auth route"     "405 GET, POST"   "$(sock_method PATCH /api/auth/setup)"
+check "HEAD is a GET"           "200 "            "$(sock_method HEAD /repos/1)"
+check "unknown path, any method" "404 "           "$(sock_method PATCH /nonexistent)"
+check "unknown repo sub-path"   "404 "            "$(sock_method POST /repos/1/nonexistent)"
+check "PATCH an unknown repo"   "404 "            "$(sock_method PATCH /repos/999)"
+# And DELETE of a repository that does not exist is a 404, not a 204.
+check "DELETE an unknown repo"  "404 "            "$(sock_method DELETE /repos/999)"
 # And every route under it: these answered 200 with empty results, which a
 # script cannot tell from an empty repository that exists.
 check "unknown repo: summary" 404 "$(sock_code /repos/99/summary)"
@@ -358,6 +475,21 @@ esac
 check "disable schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"enabled":0}' http://localhost/repos/1/schedules/1)"
 contains "schedule disabled" '"enabled":false' "$(sock_body /repos/1/schedules)"
+# B091: {"enabled":false} was refused with "enabled must be 0 or 1". JSON
+# booleans and 0/1 both work, both ways, and anything else is a 400.
+sched_put() { curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+                   -d "$1" http://localhost/repos/1/schedules/1; }
+check "enable with true"   200 "$(sched_put '{"enabled":true}')"
+contains "enabled by true"  '"enabled":true'  "$(sock_body /repos/1/schedules)"
+check "disable with false" 200 "$(sched_put '{"enabled":false}')"
+contains "disabled by false" '"enabled":false' "$(sock_body /repos/1/schedules)"
+check "enable with 1"      200 "$(sched_put '{"enabled":1}')"
+contains "enabled by 1"     '"enabled":true'  "$(sock_body /repos/1/schedules)"
+check "disable with 0"     200 "$(sched_put '{"enabled":0}')"
+contains "disabled by 0"    '"enabled":false' "$(sock_body /repos/1/schedules)"
+check "enabled 2 refused"  400 "$(sched_put '{"enabled":2}')"
+check "enabled string refused" 400 "$(sched_put '{"enabled":"yes"}')"
+contains "a refusal changes nothing" '"enabled":false' "$(sock_body /repos/1/schedules)"
 
 # A schedule already due must fire on the next tick and produce a real job.
 curl -s -X POST --unix-socket "$SOCK" \
@@ -732,6 +864,10 @@ contains "tcp job stream" '"state":"completed"' \
 contains "tcp stream unknown job" 'no such job' \
     "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/999999")"
 check "tcp stream needs a token" 401 "$(tcp_code /jobs/stream/$RJOB --max-time 5)"
+# A 405 comes after auth: the network learns nothing about the API's shape
+# without a token.
+check "tcp 405 needs a token" 401 "$(tcp_code /repos/1 -X PATCH)"
+check "tcp 405 with a token" 405 "$(tcp_code /repos/1 -X PATCH "${AUTH[@]}")"
 
 # B053: a second client's session must not survive the password change that
 # was meant to shut it out, while the session that made the change does.

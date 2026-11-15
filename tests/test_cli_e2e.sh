@@ -196,6 +196,14 @@ contains "packs"    '"'          "$(cb packs 1)"
 check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1; echo $?)"
 check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
 check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
+# The B084 audit: routes and parameters with no command or flag.
+contains "stats --scope loose" '"per_type"' "$(cb stats 1 --scope loose)"
+check "stats --scope takes only loose" 1 "$(cb stats 1 --scope packed >/dev/null 2>&1; echo $?)"
+check "jobs --limit pages" 1 "$(cb jobs --limit 1 | grep -o '"action":' | wc -l | tr -d ' ')"
+# A bad offset reaching the daemon's 400 proves the flag is sent at all.
+OUT=$(cb jobs --offset x 2>&1); RC=$?
+check    "jobs --offset is sent" 1 "$RC"
+contains "and checked by the daemon" "offset must be" "$OUT"
 contains "fanout"   '"'          "$(cb fanout 1)"
 contains "metrics"  'cbackup_'   "$(cb metrics)"
 contains "health live" 'ok'      "$(cb health live)"
@@ -226,6 +234,8 @@ contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
 contains "pack"   '"state":"completed"' "$(cb pack 1)"
 contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
+check "verify list --offset moves on" 1 \
+    "$([ "$(cb verify list 1 --limit 1 --offset 1 | grep -o '"level":' | wc -l | tr -d ' ')" -le 1 ] && echo 1 || echo 0)"
 VERIFY_OUT=$(cb verify 1 --level deep)
 contains "deep verify reports its run" '"level":"deep"' "$VERIFY_OUT"
 contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
@@ -416,6 +426,24 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+
+# B084: GET /repos/<id>/grep and /grep/<run-id> had no command, so a search
+# run with --no-wait, or one whose output scrolled away, could not be read
+# back. Every search above left a run behind.
+RUNS=$(cb grep runs 1)
+contains "grep runs lists searches" '"runs":[{"id":' "$RUNS"
+contains "grep runs names the pattern" '"pattern":"hunter2"' "$RUNS"
+check "grep runs --limit pages" 1 \
+    "$(cb grep runs 1 --limit 1 | grep -o '"pattern":' | wc -l | tr -d ' ')"
+FIRST=$(cb grep runs 1 --limit 1 | sed -n 's/.*"runs":\[{"id":\([0-9]*\).*/\1/p')
+SECOND=$(cb grep runs 1 --limit 1 --offset 1 | sed -n 's/.*"runs":\[{"id":\([0-9]*\).*/\1/p')
+check "grep runs --offset moves on" 1 "$([ -n "$SECOND" ] && [ "$SECOND" -lt "$FIRST" ] && echo 1 || echo 0)"
+HIT_RUN=$(printf '%s' "$RUNS" | grep -o '"id":[0-9]*,"snapshot":[0-9]*,"pattern":"hunter2"' | head -1 \
+          | sed 's/"id":\([0-9]*\).*/\1/')
+contains "grep show reads a run's hits" 'secrets.txt' "$(cb grep show 1 "$HIT_RUN")"
+contains "grep show pages" '"hits"' "$(cb grep show 1 "$HIT_RUN" --limit 1 --offset 0)"
+check "grep show on a missing run fails" 1 "$(cb grep show 1 99999 >/dev/null 2>&1; echo $?)"
+check "grep runs without a repo is usage" 1 "$(cb grep runs >/dev/null 2>&1; echo $?)"
 
 # B064: schedule options are validated per action. Values outside the
 # documented sets were stored and read back as something else; parameters an
@@ -1017,6 +1045,7 @@ SID=$(cb schedule list 1 | tr '}' '\n' | grep '"action":"backup"' | sed -n 's/.*
 [ -n "$SID" ] && cb schedule remove 1 "$SID" >/dev/null 2>&1
 
 echo "auth"
+contains "auth status before setup" '"configured":false' "$(cb auth status)"
 # Setup is socket-only, so this is the one way the first admin password gets
 # set. It reads the password rather than taking it as an argument, which
 # would put it in shell history and /proc/<pid>/cmdline.

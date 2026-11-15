@@ -171,7 +171,9 @@ about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips what it
 already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
-job, and prints the job record with `"cancel_requested":true`.
+job, and prints the job record with `"cancel_requested":true`. A job still
+waiting in the queue never starts: it is `cancelled` in that record already,
+and in the journal as "cancelled before it started".
 
 A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on
@@ -297,7 +299,7 @@ are different: they live in the database and change through the policy API
 | `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
 | `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
 | `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
-| `log.level` | `info` | `debug`, `info`, `warn`, `error` |
+| `log.level` | `info` | `debug`, `info`, `warn` (or `warning`), `error`. Anything else stops the daemon at start |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories |
@@ -311,10 +313,38 @@ are different: they live in the database and change through the policy API
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9).
 
+The daemon refuses to start on a file it cannot honour, rather than running
+on defaults nobody chose. Each problem is printed with the file and line,
+all of them in one run, and the daemon exits with status 1 before it opens
+the database or binds a socket:
+
+```
+/etc/c-backupd/config.yaml:12: error: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+appguard: config init failed: /etc/c-backupd/config.yaml:12: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+```
+
+What stops it:
+
+| Problem | Example |
+|---|---|
+| A line the parser does not understand | `log: [debug]`, a nested key, a top-level `verbose: true`, an unclosed `"`, a single-quoted value, a key indented differently from the rest of its section |
+| An unknown key, or one in an unknown section | `security.key_dri`, `mystery.thing` |
+| A key set twice | |
+| A number that is not one | `jobs.max_parallel: eighty`, or a value out of range |
+| A `log.level` that is not a level | `log.level: chatty` |
+| A `backup.file_cache_match` that is not a mode | `fast` |
+
+The file format is a small subset of YAML: sections at the left margin, each
+holding `key: value` lines indented the same way, `#` comments, and double
+quotes around a value that contains ` #`. Nothing else: no lists, no nesting,
+no single quotes, no anchors. The c-utils Manual (section 5) lists the subset
+exactly.
+
 Every key can also be set from the environment: `C_BACKUP_` followed by the
 key in capitals with dots as underscores, so `security.key_dir` is
 `C_BACKUP_SECURITY_KEY_DIR`. The environment wins over the file. The
-container image uses this for the key directory (section 2.3).
+container image uses this for the key directory (section 2.3). A number set
+this way is checked like one in the file, and the error names the variable.
 
 Logs go to stdout, which systemd sends to the journal
 (`journalctl -u c-backupd`). The daemon also keeps 30 days of log lines in its
@@ -510,9 +540,15 @@ could take over the removed one's schedules and history.
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within
 the repository must be atomic, so `tmp/` lives inside it. Local disks, ZFS,
-XFS, ext4 and NFS mounts all work. On Unraid, measured, a repository on a
-parity-protected array disk is several times slower than on the cache pool
-or an unassigned device; see section 18.
+XFS, ext4 and NFS mounts all work.
+
+Which disk is fastest for a repository depends on the hardware, not on the
+kind of storage, so measure before assuming. On one Unraid server a
+repository on the parity array (an 18 TB HDD with parity) was faster than on
+a SATA SSD cache pool: a first backup took 295 s against 391 s, and a backup
+with nothing changed 2.0 s against 6.6 s, with `state.db` on the cache both
+times. What does matter is where `state.db` lives: it belongs on fast
+storage and never on a parity array. See section 18.2.
 
 ---
 
@@ -533,8 +569,12 @@ state as soon as it connects, then one per change and at least every 5
 seconds, and exits when the job ends:
 
 ```
-data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
+data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":1350565888,"bytes_total":2291249496,"error":""}
 ```
+
+`current` counts entries, so it sits still while one large file is stored;
+`bytes_done` moves through the file as it is read, a few times a second, and
+each move is a new line.
 
 `sources set` replaces the whole list. Each source must be an absolute path
 (empty or relative ones are refused, and nothing is changed). A path that
@@ -676,8 +716,10 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
   10,000); when either cut it short the output says `truncated` or counts
-  `files_capped`. The hits are kept and `GET /repos/<id>/grep` lists past
-  searches.
+  `files_capped`. The hits are kept: `c-backup grep runs <id>` lists past
+  searches, newest first, and `c-backup grep show <id> <run>` prints one
+  search's hits again, which is how a `--no-wait` search is read once it
+  has finished.
 - **Diff** walks manifest trees and skips any subtree whose hash did not
   change, so comparing two large snapshots costs what changed between them.
 
@@ -1207,6 +1249,12 @@ per-repository labels).
 | `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
 | `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
 | `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
+| `cbackup_alerts_sent_total` | counter | Push notifications Pushover accepted |
+| `cbackup_alerts_failed_total` | counter | Push notifications given up on: rejected by Pushover (bad token or user key), or expired after 24 hours of failed retries |
+| `cbackup_alerts_pending` | gauge | Push notifications queued and not yet sent |
+
+The `cbackup_alerts_*` series count from zero each time the daemon starts, and
+read zero when Pushover is not configured.
 
 Alerts worth having:
 
@@ -1220,12 +1268,34 @@ Alerts worth having:
   on disk by a checking-only verify; run a repairing one.
 - `increase(cbackup_jobs_failed_total[1d]) > 0`.
 - `cbackup_repos_key_unescrowed > 0`.
+- `increase(cbackup_alerts_failed_total[1d]) > 0`: failure notifications are
+  not arriving, so the alert above is the only one you will get.
 
 ### 16.3 Push notifications
 
 With `pushover.token` and `pushover.user` set, every failed job sends a
 notification naming the action, the repository and the error. A cancelled
-job does not.
+job does not. The title names the action and the repository's label; the
+body gives the label, id and path, the job id and the error:
+
+```
+c-backup: backup of photos failed
+
+Repository photos (id 3) at /mnt/backup/photos
+Job 118 (backup) failed: cannot read /data/photos/2024: Permission denied
+```
+
+A notification that cannot be delivered is retried for 24 hours unless
+Pushover rejects it outright (a wrong token or user key), in which case it is
+dropped at once. Either way the journal has a line naming the notification,
+with Pushover's reason for a rejection:
+
+```
+push permanently failed (HTTP 400, {"user":"invalid",...}): c-backup: backup of photos failed
+```
+
+and `cbackup_alerts_failed_total` counts it (section 16.2). Watch that
+counter: an alert path that has stopped working is otherwise silent.
 
 ---
 
@@ -1341,9 +1411,14 @@ a parity-protected array.** Measured on the same 60,875 files, with only the
 index moving: 3.35 ms/file on an Unraid array disk against 1.05 ms/file on
 the SSD cache, a 3.2x difference for byte-identical repositories.
 
-A repository is written in large sequential pieces and is less sensitive, but
-on Unraid it too belongs on cache, an unassigned device, or anything outside
-the array.
+That 3.2x was the index, not the repository. A repository is written in
+large sequential pieces and is far less sensitive, and where it is fastest
+depends on the hardware. Measured on one Unraid server with `state.db` on
+the SSD cache both times, a repository on the parity array (18 TB HDD plus
+parity) beat the same repository on a SATA SSD cache pool: first backup
+295 s against 391 s, an unchanged backup 2.0 s against 6.6 s. Put the
+repository wherever capacity and your own measurements say; keep `state.db`
+on fast storage.
 
 ### 18.3 Memory
 
@@ -1353,8 +1428,10 @@ the array.
   several repositories or several sources backed up separately. Section 20.
 - File content is streamed in bounded chunks whatever its size. Parity for a
   large object spills to `<repo>/tmp` beyond 256 MiB.
-- Storing a large file holds a 128 MiB read buffer, and the Reed-Solomon
-  parity for it is kept in memory up to 256 MiB before spilling to disk.
+- Storing a large file holds 8 MiB of pipeline buffers (eight 1 MiB chunks
+  shared by a reading, a hashing and a writing thread), and the
+  Reed-Solomon parity for it is kept in memory up to 256 MiB before
+  spilling to disk.
 - A large pack run uses up to about 1 GB of buffers at its widest (32
   workers, each with a 16 MiB read buffer and a compression buffer). The
   worker count is capped at one per 256 MiB of data to pack, so small runs
@@ -1410,7 +1487,9 @@ the underlying disk.
 | `purge is not supported` | `repo remove` never deletes data | Delete the directory yourself |
 | Retention keeps everything | Retention is not scheduled, every snapshot is tagged, or tiers are 0 | `c-backup gfs <id> --dry-run`; section 9 |
 | Repository much larger than expected right after a backup | Packing has not run or is running | Wait for the job; `c-backup pack <id>`; check `maintenance.auto_pack` |
-| Backups slow on Unraid | `state.db` or the repository on the parity array | Section 18.2 |
+| Backups slow on Unraid | `state.db` on the parity array | Section 18.2 |
+| Daemon exits at start with `config.yaml:N: error: ...` | The config file has a line, key or value the daemon cannot honour | Fix the line it names; every problem is listed (section 3) |
+| No failure notifications arrive | Pushover credentials wrong, or Pushover unreachable for 24 hours | `cbackup_alerts_failed_total`; the journal's `push permanently failed` line says why (section 16.3) |
 
 `journalctl -u c-backupd` has the daemon's log; `log.level: debug` for more.
 `c-backup journal <id>` shows every operation on a repository and its outcome.
@@ -1471,21 +1550,23 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
 | `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
+| `grep runs <id> [--limit N] [--offset N]`, `grep show <id> <run> [--limit N] [--offset N]` | Past content searches, and one search's hits |
 | `diff <id> <from> <to>` | Compare two snapshots |
-| `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |
+| `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
-| `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
+| `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
-| `jobs`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
+| `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
+| `auth status` | Whether an admin password is set |
 | `auth setup\|login\|logout\|password` | Admin password and sessions (prompts) |
 | `health [live]`, `metrics`, `version` | The daemon |
 | `help` | This list, from the binary |

@@ -17,6 +17,7 @@
 #include "error.h"
 
 #include <cutils/db.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct job_manager job_manager_t;
@@ -79,5 +80,17 @@ void job_set_result(void *progress_ctx, const char *json_object);
  */
 void job_set_summary(void *progress_ctx, const char *text);
 
-/* Request cancellation. Returns OK if the job exists and is not finished. */
+/*
+ * The title and body of the push alert for a failed job: the action, the
+ * repository by label, id and path, the job id and the error. A repository
+ * no longer registered is named by id. Exposed for its test; the worker is
+ * the only caller.
+ */
+void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                       const char *action, const char *detail,
+                       char *title, size_t title_sz, char *body, size_t body_sz);
+
+/* Request cancellation. Returns OK if the job exists and is not finished.
+ * A queued job is removed from the queue and recorded cancelled before this
+ * returns; a running one is flagged and stops at its next check. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);

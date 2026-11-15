@@ -4,6 +4,7 @@
 #include "routes.h"
 
 #include <cutils/log.h>
+#include <cutils/push.h>
 
 #include <stdarg.h>
 
@@ -197,6 +198,34 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "not repair, summed.", "gauge",
                 "SELECT COALESCE(SUM(v.affected_files), 0)" LATEST_RUNS);
 #undef LATEST_RUNS
+
+    /*
+     * Alert delivery. The one exception to "everything is a query": a push
+     * the worker gave up on leaves no row anybody can count (c-utils marks
+     * it failed and keeps nothing that says so for long), so these are
+     * c-utils' own counters. They start at zero with the daemon, which is
+     * what a Prometheus counter is allowed to do. A failed alert was a log
+     * line and nothing else, so a daemon whose alerts all bounced - wrong
+     * token, wrong user key - looked exactly like one with nothing to say.
+     * Emitted when Pushover is unconfigured too, as zeros, so an alert rule
+     * on them never silently matches nothing.
+     */
+    {
+        push_stats_t ps;
+        if (push_get_stats(&ps) != 0)
+            log_warn("metrics: cannot count queued alerts");
+        mb_addf(&m, "# HELP cbackup_alerts_sent_total Push notifications Pushover "
+                    "accepted.\n# TYPE cbackup_alerts_sent_total counter\n"
+                    "cbackup_alerts_sent_total %llu\n", ps.sent);
+        mb_addf(&m, "# HELP cbackup_alerts_failed_total Push notifications given up on: "
+                    "rejected by Pushover, or expired before a send succeeded.\n"
+                    "# TYPE cbackup_alerts_failed_total counter\n"
+                    "cbackup_alerts_failed_total %llu\n", ps.failed);
+        if (ps.pending >= 0)
+            mb_addf(&m, "# HELP cbackup_alerts_pending Push notifications queued and "
+                        "not yet sent.\n# TYPE cbackup_alerts_pending gauge\n"
+                        "cbackup_alerts_pending %lld\n", ps.pending);
+    }
 
     if (!m.buf) return api_error(500, "cannot build metrics");
 

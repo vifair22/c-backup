@@ -225,9 +225,8 @@ static void progress_cb(uint64_t chunk_bytes, void *ctx)
 }
 
 /* The callback is what a UI renders a progress bar from, so the byte total it
- * reports has to add up to the file. It fires once per STREAM_CHUNK, which is
- * 128 MiB, so a test file sized to force several calls would cost more disk
- * than the assertion is worth; the total is the part that matters. */
+ * reports has to add up to the file. It fires once per 1 MiB pipeline chunk
+ * (B086; it was once per 128 MiB), so a 17 MiB file reports more than once. */
 static void test_streaming_store_reports_progress(void **state)
 {
     (void)state;
@@ -246,7 +245,7 @@ static void test_streaming_store_reports_progress(void **state)
                                           &is_new, &phys, progress_cb, NULL), OK);
     close(fd);
 
-    assert_true(g_progress_calls >= 1);
+    assert_true(g_progress_calls > 1);
     assert_int_equal(g_progress_bytes, LARGE_SIZE);
 }
 
