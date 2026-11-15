@@ -217,6 +217,7 @@ test('signing out revokes the session on the daemon and forgets it here', async 
   assert.deepEqual(await m.signOut('there'), { ok: true })
   assert.equal(store.getToken('there'), undefined)
   assert.equal(m.getStatus('there')?.signedIn, false)
+  assert.equal(m.getStatus('there')?.needsCredentials, true, 'shown as signed out')
   assert.equal(await tcp('GET', '/repos', token), 401, 'the daemon no longer accepts it')
 })
 
