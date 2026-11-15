@@ -400,6 +400,15 @@ RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 check    "repo remove" 0 "$(cb repo remove "$RM_ID" > /dev/null; echo $?)"
 check    "repo remove keeps the directory" 0 "$([ -f "$WORK/gone/.cbackup" ]; echo $?)"
 contains "repo remove deregisters" '"error"' "$(cb repo show "$RM_ID" 2>&1)"
+# B046: the newest id was handed out again, and with it the removed
+# repository's schedules and history.
+NEXT_ID=$(cb repo add "$WORK/after-gone" after | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+if [ -n "$NEXT_ID" ] && [ "$NEXT_ID" -gt "$RM_ID" ]; then
+    ok "a removed repository's id is not reused"
+else
+    bad "a removed repository's id is not reused" "greater than $RM_ID" "${NEXT_ID:-none}"
+fi
+cb repo remove "$NEXT_ID" >/dev/null 2>&1
 
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the

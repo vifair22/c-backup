@@ -465,6 +465,10 @@ directory is never touched.** Deleting backup data is the operator's act:
 remove the directory yourself once you are sure. Registering it again later
 restores everything, with a reindex.
 
+A removed repository's id is never handed out again; registering it again
+gives it a new one. Ids used to be reused, so the next repository added
+could take over the removed one's schedules and history.
+
 ### 5.3 Where to put a repository
 
 Anywhere the daemon can write with ordinary POSIX semantics: `rename` within

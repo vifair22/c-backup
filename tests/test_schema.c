@@ -211,9 +211,103 @@ static void test_repo_delete_cascades(void **state)
     unlink_db();
 }
 
+static int64_t insert_repo(cutils_db_t *db, const char *uuid)
+{
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (uuid, path, added_at) VALUES (?, '/tmp/r', 0)",
+        (const char *[]){ uuid, NULL }, NULL), CUTILS_OK);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT id FROM repos WHERE uuid = ?",
+                                (const char *[]){ uuid, NULL }, &r), CUTILS_OK);
+    int64_t id = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return id;
+}
+
+/* B046: removing the newest repository and adding another handed out the
+ * same id, and with it the old repository's leftover rows. */
+static void test_repo_ids_are_not_reused(void **state)
+{
+    (void)state;
+    cutils_db_t *db = fresh_db();
+    assert_int_equal(insert_repo(db, "u1"), 1);
+    assert_int_equal(insert_repo(db, "u2"), 2);
+    assert_int_equal(db_execute_non_query(db, "DELETE FROM repos WHERE id = 2",
+                                          NULL, NULL), CUTILS_OK);
+    assert_int_equal(insert_repo(db, "u3"), 3);
+    db_close(db);
+    unlink_db();
+}
+
+/*
+ * Migration 018 rebuilds repos. Every row must keep its id and columns, the
+ * child rows that refer to those ids must survive the DROP, and the next id
+ * must clear ids that only orphaned rows still use.
+ */
+static void test_repos_rebuild_keeps_rows_and_children(void **state)
+{
+    (void)state;
+    unlink_db();
+    cutils_db_t *db = NULL;
+    assert_int_equal(db_open(&db, TEST_DB), CUTILS_OK);
+    assert_int_equal(db_run_lib_migrations(db), CUTILS_OK);
+
+    /* Everything before 018, as a database written by the previous release. */
+    size_t n = 0;
+    while (app_migrations[n].name && strncmp(app_migrations[n].name, "018_", 4) != 0) n++;
+    assert_non_null(app_migrations[n].name);   /* 018 exists */
+    db_migration_t *before = calloc(n + 1, sizeof(*before));
+    assert_non_null(before);
+    for (size_t i = 0; i < n; i++) before[i] = app_migrations[i];
+    assert_int_equal(db_run_compiled_migrations(db, before), CUTILS_OK);
+    free(before);
+
+    assert_int_equal(db_exec_raw(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at, encryption, key_escrowed)"
+        "  VALUES (1, 'ua', '/r/a', 'alpha', 11, 'system', 1),"
+        "         (4, 'ub', '/r/b', 'beta',  12, 'none',   0);"
+        "INSERT INTO snapshots (repo_id, id, ts, root_tree_hash) VALUES (4, 1, 0, X'00');"
+        "INSERT INTO schedules (repo_id, action, trigger_type, trigger_spec, enabled,"
+        "                       next_due_at) VALUES (1, 'gc', 'interval', '{}', 1, 0);"
+        /* Left behind by a repository 7 removed before the upgrade. */
+        "INSERT INTO journal (repo_id, id, ts, source, operation, result)"
+        "  VALUES (7, 1, 0, 'cli', 'backup', 'success');"), CUTILS_OK);
+
+    assert_int_equal(db_run_compiled_migrations(db, app_migrations), CUTILS_OK);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT id, uuid, path, label, added_at, encryption, key_escrowed"
+        "  FROM repos ORDER BY id", NULL, &r), CUTILS_OK);
+    assert_int_equal(r->nrows, 2);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_string_equal(r->rows[0][3], "alpha");
+    assert_string_equal(r->rows[0][5], "system");
+    assert_string_equal(r->rows[0][6], "1");
+    assert_string_equal(r->rows[1][0], "4");
+    assert_string_equal(r->rows[1][4], "12");
+    db_result_free(r);
+
+    assert_int_equal(count_rows(db, "SELECT id FROM snapshots WHERE repo_id = 4"), 1);
+    assert_int_equal(count_rows(db, "SELECT id FROM schedules WHERE repo_id = 1"), 1);
+    assert_int_equal(count_rows(db, "SELECT id FROM journal WHERE repo_id = 7"), 1);
+
+    /* Above the orphan, not just above the survivors. */
+    assert_int_equal(insert_repo(db, "uc"), 8);
+
+    /* And the children still name repos as their parent. */
+    assert_int_equal(count_rows(db,
+        "SELECT 1 FROM pragma_foreign_key_list('snapshots') WHERE \"table\" = 'repos'"), 1);
+
+    db_close(db);
+    unlink_db();
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_repo_ids_are_not_reused),
+        cmocka_unit_test(test_repos_rebuild_keeps_rows_and_children),
         cmocka_unit_test(test_migrations_apply),
         cmocka_unit_test(test_migrations_are_idempotent),
         cmocka_unit_test(test_child_index_includes_name),

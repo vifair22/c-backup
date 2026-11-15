@@ -124,6 +124,12 @@ stores that form. It answers:
 | 200 | `{id, already_registered: true, label_updated, encryption}` | the repository was already registered, at this path or, if it moved, at its old one |
 | 400 | `{error}` | the path is relative, cannot be created, is inside or contains a registered repository, is a non-empty directory with no marker, or asks for an encryption mode the existing repository does not have |
 
+Repository ids are never reused. Removing the newest repository used to
+make its id the next one handed out, and the new repository inherited the
+old one's schedules, history and index rows, which deregistering does not
+delete. Migration 018 rebuilt `repos` with `AUTOINCREMENT`, starting above
+every id any table still refers to.
+
 Re-registering is a success rather than a 409 because it is how a moved
 repository re-links. A non-empty `label` that differs from the stored one is
 applied (`label_updated: true`); an absent or empty one leaves it alone.
