@@ -30,6 +30,10 @@ typedef status_t (*job_fn)(void *arg, volatile int *cancel,
                            void *progress_ctx);
 
 status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **out);
+
+/* Shut down: every queued job is recorded cancelled without starting, every
+ * running job is asked to stop, and this returns once the workers have
+ * joined. A submit racing the shutdown is refused. */
 void     job_manager_stop(job_manager_t *jm);
 
 /*

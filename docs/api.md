@@ -690,8 +690,9 @@ discards its open pack, the index rows staged into it and its staging files.
 `POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
 returns it, plus `"cancel_requested":true`. A queued job is taken out of the
 queue and never runs: its `state` is already `cancelled`, and the journal
-records it as cancelled with the message "cancelled before it started". A
-running job's `state` is usually still `running`: it reports `cancelled` once
+records it as cancelled with the message "cancelled before it started"; its
+`started` is null. Shutting the daemon down does the same to every queued
+job. A running job's `state` is usually still `running`: it reports `cancelled` once
 it has stopped. A job that is not queued or running is a 404.
 
 A job record carries `origin`, who asked for it: `api` for anything submitted
@@ -964,8 +965,14 @@ a spring-forward day resolves to a real instant, a time that occurs twice on a
 fall-back day fires once, "the 31st" clamps to the end of short months, and
 29 February fires every year rather than every fourth.
 
-`on_overlap` decides what happens when a schedule comes due while its previous
-run is still going: `skip` (default), `queue`, or `cancel_running`. `catchup`
+`on_overlap` decides what happens when a schedule comes due while a job for
+the same repository and action is queued or running: `skip` (default) does
+nothing; `queue` submits one run that waits for the repository, unless one of
+the schedule's runs is already queued, which the fire is folded into;
+`cancel_running` cancels the running job as `POST /jobs/<id>/cancel` does and
+submits one replacement, which starts once the cancelled job has stopped. A
+`cancel_running` fire that finds its replacement still queued adds nothing and
+never cancels a queued job. Manual section 10 has the details. `catchup`
 decides what a missed window means after downtime: `skip` moves to the next
 future fire, `run_once` fires immediately and then resumes. That includes a
 schedule that has never fired: if its first due time passed while the daemon

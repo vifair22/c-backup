@@ -168,13 +168,18 @@ static void set_job_state(job_manager_t *jm, int64_t job_id,
                 (const char *[]){ state, error, id, NULL }, NULL) != 0)
             log_error("job %s: cannot record failure", id);
     } else {
+        /* Only a worker claiming the job starts it. A queued job cancelled
+         * by `jobs cancel` or by shutdown never ran, and used to be given a
+         * start time anyway; it now reads "started": null. */
         if (db_execute_non_query(jm->db,
                 "UPDATE jobs SET state = ?,"
-                " started = COALESCE(started, strftime('%s','now')),"
+                " started = CASE WHEN ? = 'running'"
+                "                THEN COALESCE(started, strftime('%s','now'))"
+                "                ELSE started END,"
                 " ended = CASE WHEN ? IN ('completed','failed','cancelled')"
                 "              THEN strftime('%s','now') ELSE ended END"
                 " WHERE id = ?",
-                (const char *[]){ state, state, id, NULL }, NULL) != 0)
+                (const char *[]){ state, state, state, id, NULL }, NULL) != 0)
             log_error("job %s: cannot record state %s", id, state);
     }
     pthread_mutex_unlock(&jm->db_mu);
@@ -568,16 +573,73 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
     return OK;
 }
 
+/*
+ * Record a job that was taken out of the queue before any worker claimed it:
+ * cancelled in the jobs table and the journal, its argument released. The
+ * slot is a copy the caller owns; nothing else can reach it any more.
+ */
+static void finish_unstarted(job_manager_t *jm, job_slot_t *taken)
+{
+    set_job_state(jm, taken->job_id, "cancelled", NULL);
+    log_info("job %lld cancelled before it started: %s, repo %lld",
+             (long long)taken->job_id, taken->action, (long long)taken->repo_id);
+    if (taken->repo_id > 0) {
+        pthread_mutex_lock(&jm->db_mu);
+        journal_job(jm->db, taken->repo_id, taken->schedule_id, taken->action,
+                    "cancelled", 0, "cancelled before it started");
+        pthread_mutex_unlock(&jm->db_mu);
+    }
+    if (taken->arg_free) taken->arg_free(taken->arg);
+    free(taken->action);
+    taken->action = NULL;
+}
+
 void job_manager_stop(job_manager_t *jm)
 {
     if (!jm) return;
+
+    /*
+     * Queued jobs are taken out of the queue and recorded cancelled here;
+     * only jobs already on a worker are asked to stop.
+     *
+     * Stopping used to flag every slot and let the workers drain the queue,
+     * so each queued job was claimed, marked running, started with its
+     * cancel flag already set and recorded cancelled moments later (B110).
+     * Manual 2.2 promises a queued job never starts, and a job that briefly
+     * ran can have taken a repository lock, opened a store and logged a
+     * start for no reason. Emptying the queue under its lock means no
+     * worker can claim one afterwards.
+     */
+    job_slot_t *taken = NULL;
+    int ntaken = 0;
     pthread_mutex_lock(&jm->mu);
     jm->stopping = 1;
+    if (jm->count > 0) {
+        taken = malloc((size_t)jm->count * sizeof(*taken));
+        if (taken) {
+            for (int k = 0; k < jm->count; k++) {
+                int i = (jm->head + k) % JOB_QUEUE_MAX;
+                taken[ntaken++] = jm->queue[i];
+                memset(&jm->queue[i], 0, sizeof(jm->queue[i]));
+            }
+            jm->head = jm->tail;
+            jm->count = 0;
+        }
+        /* Without the memory to hold them, the queued jobs are flagged
+         * below with the rest and start already cancelled, as they used to:
+         * worse, but still a shutdown. */
+    }
     /* Ask anything in flight to wind up rather than waiting for it. */
     for (int i = 0; i < JOB_QUEUE_MAX; i++)
         if (jm->queue[i].job_id) jm->queue[i].cancel = 1;
     pthread_cond_broadcast(&jm->cv);
     pthread_mutex_unlock(&jm->mu);
+
+    for (int k = 0; k < ntaken; k++)
+        finish_unstarted(jm, &taken[k]);
+    free(taken);
+    if (ntaken > 0)
+        log_info("job manager: %d queued job(s) cancelled by shutdown", ntaken);
 
     for (int i = 0; i < jm->nworkers; i++)
         pthread_join(jm->workers[i], NULL);
@@ -644,13 +706,26 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
     db_result_free(r);
     pthread_mutex_unlock(&jm->db_mu);
 
-    if (rc != 0 || job_id == 0)
+    /* The argument is ours from the call on, as the header says, so every
+     * refusal from here releases it; no caller frees it after a failure. */
+    if (rc != 0 || job_id == 0) {
+        if (arg_free) arg_free(arg);
         return set_error(ERR_IO, "job_submit: cannot record job");
+    }
 
     pthread_mutex_lock(&jm->mu);
+    /* Shutdown has emptied the queue for the last time; a job added after
+     * that would never be claimed, or would start during the shutdown. */
+    if (jm->stopping) {
+        pthread_mutex_unlock(&jm->mu);
+        set_job_state(jm, job_id, "cancelled", NULL);
+        if (arg_free) arg_free(arg);
+        return set_error(ERR_BUSY, "daemon is shutting down");
+    }
     if (jm->count >= JOB_QUEUE_MAX) {
         pthread_mutex_unlock(&jm->mu);
         set_job_state(jm, job_id, "failed", "job queue full");
+        if (arg_free) arg_free(arg);
         return set_error(ERR_BUSY, "job queue full");
     }
     job_slot_t *s = &jm->queue[jm->tail];
@@ -722,16 +797,6 @@ status_t job_cancel(job_manager_t *jm, int64_t job_id)
     if (!dequeued)
         return set_error(ERR_NOT_FOUND, "job %lld is not running", (long long)job_id);
 
-    set_job_state(jm, taken.job_id, "cancelled", NULL);
-    log_info("job %lld cancelled before it started: %s, repo %lld",
-             (long long)taken.job_id, taken.action, (long long)taken.repo_id);
-    if (taken.repo_id > 0) {
-        pthread_mutex_lock(&jm->db_mu);
-        journal_job(jm->db, taken.repo_id, taken.schedule_id, taken.action,
-                    "cancelled", 0, "cancelled before it started");
-        pthread_mutex_unlock(&jm->db_mu);
-    }
-    if (taken.arg_free) taken.arg_free(taken.arg);
-    free(taken.action);
+    finish_unstarted(jm, &taken);
     return OK;
 }

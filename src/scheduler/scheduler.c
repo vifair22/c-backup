@@ -14,6 +14,7 @@
 struct scheduler {
     cutils_db_t          *db;
     schedule_dispatch_fn  dispatch;
+    schedule_cancel_fn    cancel;
     void                 *user;
     pthread_t             thread;
     int                   thread_started;
@@ -115,13 +116,65 @@ static void disable_schedule(cutils_db_t *db, int64_t schedule_id, const char *w
         log_warn("scheduler: cannot disable schedule %s", idb);
 }
 
+/* Jobs this schedule submitted that are still waiting for a worker. */
+static int schedule_has_queued_run(cutils_db_t *db, int64_t schedule_id)
+{
+    char sid[32];
+    snprintf(sid, sizeof(sid), "%lld", (long long)schedule_id);
+    db_result_t *r = NULL;
+    int n = 0;
+    if (db_execute(db,
+            "SELECT COUNT(*) FROM jobs WHERE schedule_id = ? AND state = 'queued'",
+            (const char *[]){ sid, NULL }, &r) == 0 && r && r->nrows == 1)
+        n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    return n > 0;
+}
+
 /*
- * on_overlap decides what happens when a schedule comes due while its own
- * previous run is still going.
+ * Ask the job manager to stop every running job that overlaps this schedule,
+ * the same request `jobs cancel` makes. Queued jobs are left alone: one of
+ * them may be the replacement this policy exists to start.
+ */
+static void cancel_running_overlap(scheduler_t *s, int64_t schedule_id,
+                                   const char *repo, const char *action)
+{
+    db_result_t *r = NULL;
+    if (db_execute(s->db,
+            "SELECT id FROM jobs WHERE repo_id = ? AND action = ? AND state = 'running'",
+            (const char *[]){ repo, action, NULL }, &r) != 0) {
+        db_result_free(r);
+        log_warn("scheduler: schedule %lld cannot list its running jobs",
+                 (long long)schedule_id);
+        return;
+    }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        int64_t job_id = strtoll(r->rows[i][0], NULL, 10);
+        log_info("scheduler: schedule %lld cancelling running job %lld",
+                 (long long)schedule_id, (long long)job_id);
+        if (s->cancel(s->user, job_id) != OK) {
+            /* It finished between the query and the request: nothing to stop. */
+            log_info("scheduler: job %lld was no longer running: %s",
+                     (long long)job_id, err_msg());
+            err_clear();
+        }
+    }
+    db_result_free(r);
+}
+
+/*
+ * on_overlap decides what happens when a schedule comes due while a job for
+ * the same repository and action is still queued or running, whoever
+ * submitted it.
+ *
+ * No policy leaves more than one run of a schedule waiting. A queued run of
+ * this schedule already covers any later fire, so a second would only repeat
+ * the same work back to back: queue used to add one per missed fire, and a
+ * backup running across three intervals left three more lined up behind it.
  *
  * Returns 1 if the schedule should fire now.
  */
-static int overlap_allows_fire(cutils_db_t *db, int64_t schedule_id,
+static int overlap_allows_fire(scheduler_t *s, int64_t schedule_id,
                                int64_t repo_id, const char *action,
                                const char *policy)
 {
@@ -130,7 +183,7 @@ static int overlap_allows_fire(cutils_db_t *db, int64_t schedule_id,
 
     db_result_t *r = NULL;
     int active = 0;
-    if (db_execute(db,
+    if (db_execute(s->db,
             "SELECT COUNT(*) FROM jobs"
             " WHERE repo_id = ? AND action = ? AND state IN ('queued','running')",
             (const char *[]){ repo, action, NULL }, &r) == 0 && r && r->nrows == 1)
@@ -149,17 +202,40 @@ static int overlap_allows_fire(cutils_db_t *db, int64_t schedule_id,
     if (strcmp(policy, "queue") == 0) {
         /* Right for gc after backup: the second run is meaningful once the
          * first finishes. */
+        if (schedule_has_queued_run(s->db, schedule_id)) {
+            log_info("scheduler: schedule %lld already has a run queued,"
+                     " coalescing this fire into it", (long long)schedule_id);
+            return 0;
+        }
         return 1;
     }
     if (strcmp(policy, "cancel_running") == 0) {
-        log_info("scheduler: schedule %lld cancelling its running job",
-                 (long long)schedule_id);
-        if (db_execute_non_query(db,
-                "UPDATE jobs SET state = 'cancelled', ended = strftime('%s','now')"
-                " WHERE repo_id = ? AND action = ? AND state IN ('queued','running')",
-                (const char *[]){ repo, action, NULL }, NULL) != 0)
-            log_warn("scheduler: cannot cancel running jobs for schedule %lld",
+        /*
+         * The running job is stopped through the job manager, which sets the
+         * flag the job polls. This used to write 'cancelled' into the jobs
+         * table and nothing else (B108): the job never saw it and ran on,
+         * holding its worker and the repository, and because the UPDATE also
+         * matched queued jobs, every later fire marked the previous fire's
+         * replacement cancelled before it had started.
+         *
+         * The replacement is submitted now and waits in the queue. The job
+         * manager never starts a second job for a busy repository, so it
+         * runs once the cancelled job has stopped and let go of it. A fire
+         * that finds a replacement already waiting repeats the cancel, which
+         * is harmless, and adds nothing.
+         */
+        if (s->cancel)
+            cancel_running_overlap(s, schedule_id, repo, action);
+        else
+            /* Nothing can stop the running job, so this degrades to queue
+             * rather than claiming it was cancelled. */
+            log_warn("scheduler: schedule %lld cannot cancel its running job:"
+                     " no canceller installed", (long long)schedule_id);
+        if (schedule_has_queued_run(s->db, schedule_id)) {
+            log_info("scheduler: schedule %lld already has a replacement queued",
                      (long long)schedule_id);
+            return 0;
+        }
         return 1;
     }
     return 0;
@@ -200,7 +276,7 @@ status_t scheduler_tick(scheduler_t *sched, time_t now)
             continue;
         }
 
-        if (overlap_allows_fire(sched->db, sid, repo, action, r->rows[i][4])) {
+        if (overlap_allows_fire(sched, sid, repo, action, r->rows[i][4])) {
             status_t st = sched->dispatch ? sched->dispatch(sched->user, sid, repo,
                                                             action, r->rows[i][3])
                                           : OK;
@@ -353,6 +429,11 @@ status_t scheduler_start(cutils_db_t *db, schedule_dispatch_fn dispatch,
     st = scheduler_run(*out);
     if (st != OK) { scheduler_stop(*out); *out = NULL; }
     return st;
+}
+
+void scheduler_set_canceller(scheduler_t *sched, schedule_cancel_fn cancel)
+{
+    if (sched) sched->cancel = cancel;
 }
 
 void scheduler_notify(scheduler_t *sched)

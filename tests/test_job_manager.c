@@ -518,6 +518,63 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
 }
 
 /*
+ * B110: stopping flagged every slot and let the workers drain the queue, so
+ * each queued job was claimed, marked running and started already cancelled.
+ * Manual 2.2 promises a queued job never starts: it is recorded cancelled
+ * and journalled "cancelled before it started", and only the running job is
+ * asked to stop. Queued jobs on another repository are no different.
+ */
+static int g_polling_runs;
+
+static status_t polling_job(void *arg, volatile int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)arg; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    g_polling_runs++;
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < 2000; i++) {
+        if (*cancel) return set_error(ERR_IO, "cancelled");
+        usleep(5000);
+    }
+    return set_error(ERR_IO, "polling_job: never cancelled");
+}
+
+static void test_shutdown_never_starts_a_queued_job(void **state)
+{
+    (void)state;
+    g_polling_runs = 0;
+    g_arg_freed = 0;
+    int64_t a = 0, b = 0, q1 = 0, q2 = 0, q3 = 0;
+    /* Two workers, both busy, so everything after waits in the queue. */
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, polling_job, NULL, NULL, &a), OK);
+    assert_int_equal(job_submit(jm, 2, "backup", NULL, polling_job, NULL, NULL, &b), OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 2; i++)
+        usleep(5000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 2);
+    assert_int_equal(job_submit(jm, 1, "verify", NULL, polling_job, NULL, count_free, &q1), OK);
+    assert_int_equal(job_submit(jm, 2, "gc", NULL, polling_job, NULL, count_free, &q2), OK);
+    assert_int_equal(job_submit(jm, 3, "gc", NULL, polling_job, NULL, count_free, &q3), OK);
+
+    job_manager_stop(jm);
+    jm = NULL;
+
+    /* Only the two that were running ever started. */
+    assert_int_equal(g_polling_runs, 2);
+    assert_int_equal(g_arg_freed, 3);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"), 5);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'cancelled'"
+                              " AND started IS NULL"), 3);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE result = 'cancelled'"
+                              " AND message = 'cancelled before it started'"), 3);
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "cancelled");
+}
+
+/*
  * B083: a failed job's alert said "repo 3: <error>" under the title
  * "c-backup: backup failed", and the title is all c-utils logs when a send
  * is rejected, so neither the line in the journal nor the notification named
@@ -570,6 +627,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
