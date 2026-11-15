@@ -1,18 +1,20 @@
 /**
- * Config store — persists app configuration to disk.
+ * Config store: what the app keeps on disk.
  *
  * Non-secret config: <userData>/config.json
- *   - connections (with repos list inside each connection)
- *   - window bounds
+ *   - connections and window bounds
  *
- * Secrets (passwords): <userData>/credentials.json
- *   - encrypted via Electron safeStorage (OS keychain)
+ * Session tokens: <userData>/credentials.json, mode 0600
+ *   - one per remote connection, encrypted with Electron safeStorage when the
+ *     OS keyring is available. Passwords are never stored: a password is
+ *     exchanged for a token at sign-in and then forgotten.
  */
 
 import { app, safeStorage } from 'electron'
-import { readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join } from 'path'
-import type { AppConfig, ConnectionConfig } from '../shared/types'
+import type { AppConfig, ConnectionConfig, CredentialInfo } from '../shared/types'
+import type { ConnectionStore } from './connection-manager'
 
 const CONFIG_FILE = 'config.json'
 const CREDENTIALS_FILE = 'credentials.json'
@@ -40,9 +42,12 @@ export function loadConfig(): AppConfig {
     const raw = readFileSync(configPath(), 'utf-8')
     const parsed = JSON.parse(raw)
     _config = { ...defaultConfig, ...parsed }
-    // Ensure every connection has a repos array
-    for (const conn of _config.connections) {
-    }
+    /* Only the two shapes a connection can have. A config written by the
+     * old SSH transport has entries of type 'ssh', with no host or port a
+     * daemon could be reached at; carrying them would make them remote
+     * connections to nowhere. */
+    _config.connections = (_config.connections ?? []).filter(
+      (c) => c.type === 'local' || c.type === 'remote')
   } catch {
     _config = { ...defaultConfig }
   }
@@ -63,25 +68,10 @@ export function getConfig(): AppConfig {
   return _config
 }
 
-export function addConnectionConfig(config: ConnectionConfig): void {
-  _config.connections = _config.connections.filter(c => c.name !== config.name)
-  _config.connections.push(config)
+export function saveConnections(configs: ConnectionConfig[]): void {
+  _config.connections = configs
   saveConfig()
 }
-
-export function removeConnectionConfig(name: string): void {
-  _config.connections = _config.connections.filter(c => c.name !== name)
-  saveConfig()
-}
-
-export function updateConnectionConfig(name: string, newConfig: ConnectionConfig): void {
-  const idx = _config.connections.findIndex(c => c.name === name)
-  if (idx === -1) return
-  _config.connections[idx] = newConfig
-  saveConfig()
-}
-
-
 
 export function updateWindowBounds(bounds: { x: number; y: number; width: number; height: number }): void {
   _config.windowBounds = bounds
@@ -89,93 +79,105 @@ export function updateWindowBounds(bounds: { x: number; y: number; width: number
 }
 
 /* ------------------------------------------------------------------ */
-/* Secrets (passwords encrypted via safeStorage)                       */
+/* Session tokens                                                      */
 /* ------------------------------------------------------------------ */
 
-interface CredentialStore {
-  [connectionName: string]: {
-    password?: string      // encrypted base64
-    sudoPassword?: string  // encrypted base64
-  }
+/*
+ * One bearer token per remote connection. A token is a 90-day credential for
+ * the daemon, so the file is created 0600 and kept that way: written with
+ * defaults it was 0644, readable by every account on the machine.
+ */
+interface TokenStore {
+  [connectionName: string]: { token?: string }   // 'enc:' or 'b64:' + base64
 }
 
-let _credentials: CredentialStore = {}
+let _tokens: TokenStore = {}
 
 export function loadCredentials(): void {
   try {
     const raw = readFileSync(credentialsPath(), 'utf-8')
-    _credentials = JSON.parse(raw)
+    const parsed = JSON.parse(raw) as Record<string, { token?: string }>
+    /* Only tokens. Earlier versions kept password and sudoPassword slots,
+     * which nothing reads any more and nothing should keep. */
+    _tokens = {}
+    for (const [name, entry] of Object.entries(parsed ?? {})) {
+      if (entry && typeof entry.token === 'string') _tokens[name] = { token: entry.token }
+    }
   } catch {
-    _credentials = {}
+    _tokens = {}
   }
 }
 
 function saveCredentials(): void {
   try {
     mkdirSync(app.getPath('userData'), { recursive: true })
-    writeFileSync(credentialsPath(), JSON.stringify(_credentials, null, 2), 'utf-8')
+    const path = credentialsPath()
+    writeFileSync(path, JSON.stringify(_tokens, null, 2), { encoding: 'utf-8', mode: 0o600 })
+    /* mode only applies when the file is created; one written by an earlier
+     * version keeps whatever it had. */
+    chmodSync(path, 0o600)
   } catch (err) {
     console.error('[credentials] save failed:', err)
   }
 }
 
-function encrypt(plaintext: string): string {
-  if (!safeStorage.isEncryptionAvailable()) {
-    console.warn('[credentials] safeStorage not available — using base64 (insecure)')
-    return 'b64:' + Buffer.from(plaintext, 'utf-8').toString('base64')
-  }
-  const encrypted = safeStorage.encryptString(plaintext)
-  return 'enc:' + encrypted.toString('base64')
+/*
+ * Encrypted with the OS keyring when there is one. Without one (a Linux
+ * session with no secret service running, typically) the token is kept as
+ * base64 in the 0600 file: anyone who can read this account's files can use
+ * it, which the sign-in dialog says, so the choice is a visible one.
+ */
+export function credentialInfo(): CredentialInfo {
+  return { encrypted: safeStorage.isEncryptionAvailable() }
 }
 
-function decrypt(stored: string): string {
+function encrypt(plaintext: string): string {
+  if (!safeStorage.isEncryptionAvailable()) {
+    return 'b64:' + Buffer.from(plaintext, 'utf-8').toString('base64')
+  }
+  return 'enc:' + safeStorage.encryptString(plaintext).toString('base64')
+}
+
+function decrypt(stored: string): string | undefined {
   if (stored.startsWith('b64:')) {
     return Buffer.from(stored.slice(4), 'base64').toString('utf-8')
   }
   if (stored.startsWith('enc:')) {
     if (!safeStorage.isEncryptionAvailable()) {
-      console.error('[credentials] cannot decrypt: safeStorage not available')
-      return ''
+      console.error('[credentials] cannot decrypt: the OS keyring is not available')
+      return undefined
     }
-    const buf = Buffer.from(stored.slice(4), 'base64')
-    return safeStorage.decryptString(buf)
+    return safeStorage.decryptString(Buffer.from(stored.slice(4), 'base64'))
   }
-  return stored
+  return undefined
 }
 
-export function setCredential(
-  connectionName: string,
-  type: 'password' | 'sudoPassword',
-  value: string
-): void {
-  if (!_credentials[connectionName]) _credentials[connectionName] = {}
-  _credentials[connectionName][type] = encrypt(value)
-  saveCredentials()
-}
-
-export function getCredential(
-  connectionName: string,
-  type: 'password' | 'sudoPassword'
-): string | undefined {
-  const entry = _credentials[connectionName]
-  if (!entry) return undefined
-  const stored = entry[type]
+export function getToken(name: string): string | undefined {
+  const stored = _tokens[name]?.token
   if (!stored) return undefined
   try {
     return decrypt(stored)
   } catch (err) {
-    console.error(`[credentials] decrypt failed for ${connectionName}:`, err)
+    console.error(`[credentials] decrypt failed for ${name}:`, err)
     return undefined
   }
 }
 
-export function deleteCredentials(connectionName: string): void {
-  delete _credentials[connectionName]
+export function setToken(name: string, token: string): void {
+  _tokens[name] = { token: encrypt(token) }
   saveCredentials()
 }
 
-export function hasStoredCredentials(connectionName: string): boolean {
-  const entry = _credentials[connectionName]
-  if (!entry) return false
-  return !!(entry.password || entry.sudoPassword)
+export function deleteToken(name: string): void {
+  if (!(name in _tokens)) return
+  delete _tokens[name]
+  saveCredentials()
+}
+
+/* The store the connection manager is given in the app. */
+export const electronConnectionStore: ConnectionStore = {
+  saveConnections,
+  getToken,
+  setToken,
+  deleteToken,
 }
