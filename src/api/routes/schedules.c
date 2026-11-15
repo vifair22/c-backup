@@ -407,20 +407,23 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     /* A NULL in a c-utils params array terminates it rather than binding a
      * NULL column, so an absent params value is bound as an empty string and
      * read back as one. Testing the string is the only way to tell. */
-    if (db_execute_non_query(g_db,
+    /* The id comes back from the INSERT itself. last_insert_rowid() is per
+     * connection, and every thread shares one: another thread's insert
+     * between the two statements handed this caller someone else's id. */
+    db_result_t *r = NULL;
+    if (db_execute(g_db,
             "INSERT INTO schedules (repo_id, action, params, trigger_type, trigger_spec,"
             " on_overlap, catchup, enabled, next_due_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) RETURNING id",
             (const char *[]){ repo, action, params ? params : "",
                               t.type == TRIGGER_INTERVAL ? "interval" : "calendar",
                               spec, overlap ? overlap : "skip",
-                              catchup ? catchup : "skip", due, NULL }, NULL) != 0)
+                              catchup ? catchup : "skip", due, NULL }, &r) != 0 ||
+        !r || r->nrows != 1) {
+        db_result_free(r);
         return api_error(500, "cannot create schedule");
-
-    db_result_t *r = NULL;
-    int64_t id = 0;
-    if (db_execute(g_db, "SELECT last_insert_rowid()", NULL, &r) == 0 && r && r->nrows == 1)
-        id = strtoll(r->rows[0][0], NULL, 10);
+    }
+    int64_t id = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
 
     /* Wake the loop: a schedule due sooner than anything it is currently

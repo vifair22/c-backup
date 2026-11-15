@@ -359,6 +359,71 @@ static void test_journal_source_says_who_asked(void **state)
     assert_string_equal(origin, "api:0");
 }
 
+/*
+ * Job ids come from the job's own INSERT. They came from a following
+ * SELECT last_insert_rowid(), which is per connection, and every thread
+ * shares the one connection: a grep or verify inserting its run row in
+ * between gave the submitter that row's id. The CLI then waited on, and
+ * reported, some other job. Here a thread inserts rows into another table
+ * as fast as it can while jobs are submitted, and every id handed back has
+ * to be the job that was submitted.
+ */
+static volatile int g_noise_stop;
+
+static void *noise_inserts(void *arg)
+{
+    (void)arg;
+    while (!g_noise_stop) {
+        int rc = db_execute_non_query(db,
+            "INSERT INTO grep_runs (repo_id, snap_id, pattern, started_at)"
+            " VALUES (1, 1, 'noise', 0)", NULL, NULL);
+        (void)rc;
+    }
+    return NULL;
+}
+
+static status_t noop_job(void *arg, volatile int *cancel,
+                         void (*progress)(const char *, uint64_t, uint64_t, void *),
+                         void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    return OK;
+}
+
+static void test_job_ids_survive_concurrent_inserts(void **state)
+{
+    (void)state;
+    /* Start the other table far ahead, so a stolen id cannot also happen
+     * to be a real job's. */
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO grep_runs (id, repo_id, snap_id, pattern, started_at)"
+        " VALUES (1000000, 1, 1, 'seed', 0)", NULL, NULL), 0);
+
+    g_noise_stop = 0;
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, noise_inserts, NULL), 0);
+
+    int wrong = 0;
+    for (int i = 0; i < 200; i++) {
+        char action[32];
+        snprintf(action, sizeof(action), "probe-%d", i);
+        int64_t id = 0;
+        assert_int_equal(job_submit(jm, 1 + (i % 4), action, NULL, noop_job,
+                                    NULL, NULL, &id), OK);
+        char idbuf[32];
+        snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
+        db_result_t *r = NULL;
+        assert_int_equal(db_execute(db, "SELECT action FROM jobs WHERE id = ?",
+                                    (const char *[]){ idbuf, NULL }, &r), 0);
+        if (!r || r->nrows != 1 || strcmp(r->rows[0][0], action) != 0) wrong++;
+        db_result_free(r);
+        if (i % 16 == 15) usleep(20000);   /* let the workers drain the queue */
+    }
+    g_noise_stop = 1;
+    pthread_join(th, NULL);
+    assert_int_equal(wrong, 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -371,6 +436,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

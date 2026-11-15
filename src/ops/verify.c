@@ -321,15 +321,19 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     char started_s[32];
     snprintf(started_s, sizeof(started_s), "%lld", (long long)started);
 
-    if (db_execute_non_query(db,
-            "INSERT INTO verify_runs (repo_id, started_at, level)"
-            " VALUES (?, ?, ?)",
-            (const char *[]){ repo, started_s, level_name(level), NULL }, NULL) != 0)
-        return set_error(ERR_IO, "verify: cannot open run record");
-
+    /* The id comes back from the INSERT itself. last_insert_rowid() is per
+     * connection, and every thread shares one: another thread's insert
+     * between the two statements handed this caller someone else's id. */
     db_result_t *r = NULL;
-    if (db_execute(db, "SELECT last_insert_rowid()", NULL, &r) == 0 && r && r->nrows == 1)
-        res.run_id = strtoll(r->rows[0][0], NULL, 10);
+    if (db_execute(db,
+            "INSERT INTO verify_runs (repo_id, started_at, level)"
+            " VALUES (?, ?, ?) RETURNING id",
+            (const char *[]){ repo, started_s, level_name(level), NULL }, &r) != 0 ||
+        !r || r->nrows != 1) {
+        db_result_free(r);
+        return set_error(ERR_IO, "verify: cannot open run record");
+    }
+    res.run_id = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);
 
     /*
