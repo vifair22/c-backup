@@ -946,6 +946,9 @@ restored from.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
 - A destination already holding a different repository is refused.
+- So is the source repository's own directory, anything inside it, and any
+  directory containing it, even through a symlink: a replica there is not a
+  second copy of anything.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.

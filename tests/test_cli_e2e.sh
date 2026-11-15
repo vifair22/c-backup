@@ -552,6 +552,20 @@ cb replicate "$ENC_ID" "$REPL" >/dev/null
 AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
 
+# B071: into the source's own directory it "completed" having copied
+# nothing, since the target was the source. Inside or above it is refused
+# too, and the comparison sees through a symlink.
+OUT=$(cb replicate "$ENC_ID" "$WORK/encrepo" 2>&1); RC=$?
+check    "replicate into itself fails" 1 "$RC"
+contains "and says why" "the source repository itself" "$OUT"
+check    "replicate inside itself fails" 1 "$(cb replicate "$ENC_ID" "$WORK/encrepo/sub" >/dev/null 2>&1; echo $?)"
+check    "replicate above itself fails"  1 "$(cb replicate "$ENC_ID" "$WORK" >/dev/null 2>&1; echo $?)"
+ln -s "$WORK/encrepo" "$WORK/enclink"
+check    "replicate through a symlink to itself fails" 1 \
+    "$(cb replicate "$ENC_ID" "$WORK/enclink" >/dev/null 2>&1; echo $?)"
+check    "a schedule into itself is refused" 1 \
+    "$(cb schedule add "$ENC_ID" replicate 3600 --dest "$WORK/encrepo" >/dev/null 2>&1; echo $?)"
+
 # Replication can be scheduled, which is the point of an offsite copy: one
 # that only runs when somebody remembers is not a backup strategy. The
 # destination lives in schedules.params, a column that has existed since the

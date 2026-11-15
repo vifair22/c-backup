@@ -362,8 +362,9 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
     if (strcmp(action, "replicate") == 0) {
         if (!dest || !*dest)
             return api_error(400, "dest is required for a replicate schedule");
-        if (dest[0] != '/')
-            return api_error(400, "dest must be an absolute path");
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, dest, why, sizeof(why)) != 0)
+            return api_error(400, why);
 
         CUTILS_AUTO_JSON_RESP cutils_json_resp_t *pr = NULL;
         char  *pbuf = NULL;

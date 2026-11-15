@@ -461,7 +461,13 @@ wants excluded.
 ### Replication
 
 `dest` is a path, so any target this machine can mount is valid: a second
-disk, a NAS share, a USB dock. What is copied is objects, not files - packs
+disk, a NAS share, a USB dock. It must be absolute and must not be the
+source repository's own directory, inside it, or above it, compared as
+canonical paths so a symlink or `..` cannot route around the check; each is
+a 400 when the job is submitted or the schedule created, and a scheduled
+fire checks again. Into its own directory a replication used to "complete":
+the target was the source, already held every object, and nothing was
+copied anywhere. What is copied is objects, not files - packs
 get rewritten by GC and by coalescing, and a file-level copy would re-send a
 whole pack because one object inside it was collected. The target stores what
 it receives and packs it on its own schedule, so the two sides may disagree

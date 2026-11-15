@@ -167,6 +167,44 @@ static int path_is_under(const char *path, const char *dir)
     return strncmp(path, dir, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
+int routes_replicate_dest_check(int64_t repo_id, const char *dest,
+                                char *why, size_t whysz)
+{
+    if (!dest || dest[0] != '/') {
+        snprintf(why, whysz, "dest must be an absolute path");
+        return -1;
+    }
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) { snprintf(why, whysz, "no such repo"); return -1; }
+
+    /*
+     * Into its own directory, the replica is the source: the sink opened
+     * the existing marker, found its own uuid, saw every object already
+     * present and reported success having copied nothing - the "offsite
+     * copy" was the original. Inside the source, it writes a repository
+     * into a tree GC cannot account for; above it, the source ends up
+     * inside its own replica. All three are refused, compared as canonical
+     * paths so a symlink or ".." cannot route around it.
+     */
+    char cdest[PATH_MAX], crepo[PATH_MAX];
+    int rc = 0;
+    if (canonical_path(dest, cdest) != 0 || canonical_path(repo_path, crepo) != 0) {
+        snprintf(why, whysz, "dest cannot be resolved");
+        rc = -1;
+    } else if (strcmp(cdest, crepo) == 0) {
+        snprintf(why, whysz, "dest is the source repository itself (%s)", repo_path);
+        rc = -1;
+    } else if (path_is_under(cdest, crepo)) {
+        snprintf(why, whysz, "dest is inside the source repository at %s", repo_path);
+        rc = -1;
+    } else if (path_is_under(crepo, cdest)) {
+        snprintf(why, whysz, "dest contains the source repository at %s", repo_path);
+        rc = -1;
+    }
+    free(repo_path);
+    return rc;
+}
+
 /*
  * A restore must not write into any registered repository. Restored files
  * landing beside objects/ and packs/ are at best clutter a GC cannot account
@@ -1191,6 +1229,11 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "dest is required");
         }
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return api_error(400, why);
+        }
     }
 
     if (kind == SNAP_JOB_RESTORE) {
@@ -1680,6 +1723,14 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
             return set_error(ERR_INVALID,
                              "replicate schedule for repo %lld has no destination",
                              (long long)repo_id);
+        }
+        /* Checked again at fire time: the repository may have moved since
+         * the schedule was made. */
+        char why[PATH_MAX + 128];
+        if (routes_replicate_dest_check(repo_id, j->dest, why, sizeof(why)) != 0) {
+            snap_job_free(j);
+            return set_error(ERR_INVALID, "replicate schedule for repo %lld: %s",
+                             (long long)repo_id, why);
         }
     }
 
