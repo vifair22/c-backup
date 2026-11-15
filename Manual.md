@@ -682,8 +682,10 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
   10,000); when either cut it short the output says `truncated` or counts
-  `files_capped`. The hits are kept and `GET /repos/<id>/grep` lists past
-  searches.
+  `files_capped`. The hits are kept: `c-backup grep runs <id>` lists past
+  searches, newest first, and `c-backup grep show <id> <run>` prints one
+  search's hits again, which is how a `--no-wait` search is read once it
+  has finished.
 - **Diff** walks manifest trees and skips any subtree whose hash did not
   change, so comparing two large snapshots costs what changed between them.
 
@@ -1477,21 +1479,23 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
 | `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
+| `grep runs <id> [--limit N] [--offset N]`, `grep show <id> <run> [--limit N] [--offset N]` | Past content searches, and one search's hits |
 | `diff <id> <from> <to>` | Compare two snapshots |
-| `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id>` | Integrity |
+| `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
 | `pack <id>` | Pack and compress |
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
-| `stats <id>`, `summary <id>`, `fanout <id>` | Repository statistics |
+| `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
-| `jobs`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
+| `jobs [--limit N] [--offset N]`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |
+| `auth status` | Whether an admin password is set |
 | `auth setup\|login\|logout\|password` | Admin password and sessions (prompts) |
 | `health [live]`, `metrics`, `version` | The daemon |
 | `help` | This list, from the binary |

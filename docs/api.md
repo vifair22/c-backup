@@ -313,7 +313,11 @@ every one of them. A capability reachable through the API but not the CLI
 means an operator has to hand-write a `curl --unix-socket` call, or open the
 desktop app, to run their own backup tool - which is the friction the daemon
 rewrite existed to remove. When an endpoint is added, a command goes with it,
-and `tests/test_cli_e2e.sh` exercises the whole table.
+and `tests/test_cli_e2e.sh` exercises the whole table. The search and verify
+run lists, a search's hits, `GET /api/auth/setup` (`auth status`), the jobs
+list's paging and `stats?scope=loose` were found missing in an audit of this
+table and added; every route and query parameter here now has a command or
+a flag.
 
 The desktop app is the second client and is held to the same rule. Its
 requests are one closed union in `ui/src/shared/api.ts`, translated to method
@@ -354,10 +358,10 @@ lazily on first append, which used to leave an empty result serialising as
 | POST | `/repos/<id>/reindex` | Rebuild the index from the repository; the job fails if any snapshot or pack cannot be read, and what could not be read keeps its previous rows |
 | POST | `/repos/<id>/pack` | Coalesce loose objects into pack files |
 | POST | `/repos/<id>/grep` | Content search as a job: `{pattern, snapshot, path_prefix, ignore_case, max_files}` |
-| GET | `/repos/<id>/grep` | Recent searches, newest first |
+| GET | `/repos/<id>/grep` | Recent searches, newest first; `limit` and `offset` |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
-| GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) |
+| GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) and `offset` |
 | GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
 | POST | `/repos/<id>/replicate` | Copy this repository somewhere else: `{dest, reencrypt}` |
 
