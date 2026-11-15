@@ -693,6 +693,28 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
 
+    /*
+     * A restore names a snapshot, and one that does not exist is the
+     * caller's mistake to hear about now. It used to be queued, and the job
+     * then failed with "has no nodes ... reindex it first" - advice that
+     * sends an operator to rebuild an index that is fine, for a snapshot
+     * that retention or a delete had already removed.
+     */
+    if (snap_id > 0) {
+        char repo[32], snap[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+        snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+        db_result_t *r = NULL;
+        int found = db_execute(g_ctx.db,
+                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
+        db_result_free(r);
+        if (!found) {
+            free(repo_path);
+            return api_error(404, "no such snapshot");
+        }
+    }
+
     snap_job_t *j = calloc(1, sizeof(*j));
     if (!j) { free(repo_path); return api_error(500, "out of memory"); }
     j->db = g_ctx.db;
