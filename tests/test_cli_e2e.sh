@@ -432,6 +432,20 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+# NIT-2: a file capped per file was counted on the job and not on the run,
+# so a run listed later could not say a file held more than it recorded.
+printf 'capline\ncapline\ncapline\n' > "$WORK/src/capped.txt"
+cb backup 1 "$WORK/src" > /dev/null
+CJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"capline","max_hits_per_file":1}' \
+     http://localhost/repos/1/grep | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "a capped grep job counts the capped file" '"files_capped":1' \
+    "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")"
+contains "and so does its run record" '"pattern":"capline"' "$(cb grep runs 1 --limit 1)"
+contains "the run record carries files_capped" '"files_capped":1' "$(cb grep runs 1 --limit 1)"
 
 # B084: GET /repos/<id>/grep and /grep/<run-id> had no command, so a search
 # run with --no-wait, or one whose output scrolled away, could not be read

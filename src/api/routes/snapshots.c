@@ -1629,7 +1629,7 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, snap_id, pattern, started_at, finished_at, completed,"
-            "       files_scanned, files_matched, hits, truncated"
+            "       files_scanned, files_matched, hits, truncated, files_capped"
             "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, limit, offset, NULL }, &r) != 0) {
         db_result_free(r);
@@ -1649,6 +1649,7 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
             { "finished_at", 4, JCOL_INT }, { "completed", 5, JCOL_BOOL },
             { "files_scanned", 6, JCOL_INT }, { "files_matched", 7, JCOL_INT },
             { "hits", 8, JCOL_INT }, { "truncated", 9, JCOL_BOOL },
+            { "files_capped", 10, JCOL_INT },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
