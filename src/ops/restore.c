@@ -434,6 +434,16 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     if (r->nrows == 0) {
         db_result_free(r);
+        /* Two different situations, and only one of them is fixed by a
+         * reindex. */
+        db_result_t *s = NULL;
+        int exists = db_execute(db,
+                "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                (const char *[]){ repo, snap, NULL }, &s) == 0 && s && s->nrows == 1;
+        db_result_free(s);
+        if (!exists)
+            return set_error(ERR_NOT_FOUND, "restore: no snapshot %lld in this repository",
+                             (long long)snap_id);
         return set_error(ERR_NOT_FOUND, "restore: snapshot %lld has no nodes"
                          " (it may have been evicted; reindex it first)",
                          (long long)snap_id);
