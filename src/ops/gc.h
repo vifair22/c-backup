@@ -29,6 +29,10 @@ typedef struct {
      * contained anything dead. */
     uint64_t pack_entries_kept;
     uint64_t pack_entries_dropped;
+    /* Staging files an interrupted run left in tmp/, removed by this run.
+     * A dry run removes none. */
+    uint32_t tmp_files_removed;
+    uint64_t tmp_bytes_removed;
 } gc_result_t;
 
 status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,

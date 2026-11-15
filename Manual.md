@@ -176,7 +176,10 @@ A daemon that dies without stopping (a crash, `kill -9`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on
 its next start. Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
-those files again.
+those files again. Staging files a killed writer left in the repository's
+`tmp/` are removed by the next backup or gc, which hold the repository's write
+lock and so know nothing else is writing there; opening a repository also
+removes any an hour old.
 
 ### 2.3 Docker
 

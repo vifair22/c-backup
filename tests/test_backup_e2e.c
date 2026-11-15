@@ -803,6 +803,39 @@ static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
     assert_int_equal(scalar(sql, NULL), (int)sb.st_size);
 }
 
+/*
+ * B061: staging files a killed run left in tmp/ go at the next backup.
+ *
+ * store_open only removes what is an hour old, because it cannot know who
+ * else is writing; a backup holds the repository's write lock and can. 134
+ * MB of obj.* from one killed backup survived every later run. Only the
+ * engine's own names are touched.
+ */
+static void test_backup_removes_staging_files_left_by_a_killed_run(void **state)
+{
+    (void)state;
+    const char *stale[] = { TEST_REPO "/tmp/obj.Ab12Cd", TEST_REPO "/tmp/pack-dat.Zz99Yy",
+                            TEST_REPO "/tmp/snap.Qq11Ww", TEST_REPO "/tmp/par.Rr22Tt" };
+    struct timespec past[2];
+    clock_gettime(CLOCK_REALTIME, &past[0]);
+    past[0].tv_sec -= 30;
+    past[1] = past[0];
+    for (size_t i = 0; i < sizeof(stale) / sizeof(stale[0]); i++) {
+        write_file(stale[i], "left behind");
+        assert_int_equal(utimensat(AT_FDCWD, stale[i], past, 0), 0);
+    }
+    write_file(TEST_REPO "/tmp/notes.txt", "not ours");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/notes.txt", past, 0), 0);
+
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    struct stat sb;
+    for (size_t i = 0; i < sizeof(stale) / sizeof(stale[0]); i++)
+        assert_int_equal(stat(stale[i], &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/notes.txt", &sb), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -823,6 +856,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_object_writer_stops_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_readers_and_packer_stop_on_the_store_flag, setup, teardown),
         cmocka_unit_test_setup_teardown(test_object_left_by_an_interrupted_run_keeps_its_size, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_backup_removes_staging_files_left_by_a_killed_run, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

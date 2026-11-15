@@ -963,6 +963,19 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
 
+    /*
+     * Staging files a killed run left behind. store_open only sweeps what is
+     * an hour old, because it cannot know who else is writing; a backup holds
+     * the repository's write lock, so nothing else is, and anything already
+     * in tmp/ belongs to a process that is gone. Measured: 134 MB of obj.*
+     * from one killed backup survived every later backup and gc.
+     */
+    uint64_t swept_bytes = 0;
+    unsigned swept = store_sweep_tmp_before(store, time(NULL), &swept_bytes);
+    if (swept)
+        log_info("backup: removed %u staging file(s) left by an interrupted run "
+                 "(%llu bytes)", swept, (unsigned long long)swept_bytes);
+
     /* The job's flag reaches the object writers through the store, so a
      * cancel lands inside a large file rather than after it. Restored on the
      * way out: the handle may outlive this call. */

@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -383,6 +385,39 @@ static void test_node_ids_do_not_repeat_across_snapshots(void **state)
     db_result_free(r);
 }
 
+/*
+ * B061: gc removes staging files a killed writer left in tmp/, as backup
+ * does, and reports them. A dry run promises to change nothing and removes
+ * nothing; a file that is not one of the engine's names is never touched.
+ */
+static void test_gc_removes_stale_staging_files(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+
+    struct timespec past[2];
+    clock_gettime(CLOCK_REALTIME, &past[0]);
+    past[0].tv_sec -= 30;
+    past[1] = past[0];
+    write_file(TEST_REPO "/tmp/obj.Kk33Ll", "a killed writer's object");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/obj.Kk33Ll", past, 0), 0);
+    write_file(TEST_REPO "/tmp/mine.txt", "somebody else's");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/mine.txt", past, 0), 0);
+
+    struct stat sb;
+    gc_result_t g;
+    assert_int_equal(gc_run(store, db, repo_id, 1, NULL, &g), OK);
+    assert_int_equal(g.tmp_files_removed, 0);
+    assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), 0);
+
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.tmp_files_removed, 1);
+    assert_true(g.tmp_bytes_removed > 0);
+    assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -397,6 +432,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_refuses_to_sweep_on_unreadable_tree, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_after_reindex_keeps_older_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_node_ids_do_not_repeat_across_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_removes_stale_staging_files, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
