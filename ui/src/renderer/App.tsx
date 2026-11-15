@@ -120,6 +120,10 @@ export function App(): React.ReactElement {
   const [showBackupModal, setShowBackupModal] = useState(false)
   const [sources, setSources] = useState<string[]>([])
   const [sourceDraft, setSourceDraft] = useState('')
+  /* Excludes travel with the sources: the daemon replaces both lists on
+   * every save, so a save that left them out cleared them. */
+  const [excludes, setExcludes] = useState<string[]>([])
+  const [excludeDraft, setExcludeDraft] = useState('')
   const [editingSources, setEditingSources] = useState(false)
   const [sourcesLoading, setSourcesLoading] = useState(false)
   const [backupVerify, setBackupVerify] = useState(false)
@@ -381,6 +385,8 @@ export function App(): React.ReactElement {
         activeRepo.conn, { kind: 'sourcesGet', repoId: activeRepo.id })
       setSources(r.sources ?? [])
       setSourceDraft((r.sources ?? []).join('\n'))
+      setExcludes(r.exclude ?? [])
+      setExcludeDraft((r.exclude ?? []).join('\n'))
     } catch (err) {
       setError(String(err))
     }
@@ -390,13 +396,15 @@ export function App(): React.ReactElement {
   const handleSaveSources = async () => {
     if (!activeRepo) return
     const paths = sourceDraft.split('\n').map(s => s.trim()).filter(Boolean)
+    const exclude = excludeDraft.split('\n').map(s => s.trim()).filter(Boolean)
     setSourcesLoading(true)
     setError(null)
     try {
       const r = await api.apiCall<{ warnings?: string[] } | null>(activeRepo.conn, {
-        kind: 'sourcesSet', repoId: activeRepo.id, sources: paths,
+        kind: 'sourcesSet', repoId: activeRepo.id, sources: paths, exclude,
       })
       setSources(paths)
+      setExcludes(exclude)
       setEditingSources(false)
       /* Saved, but a path the daemon cannot see yet is worth saying: it may
        * be an unmounted share, or a typo. */
@@ -1013,12 +1021,27 @@ export function App(): React.ReactElement {
                                text-text-primary border border-border-default resize-y"
                   />
                   <div className="text-xs text-text-tertiary mt-1">One absolute path per line.</div>
+                  <div className="text-xs text-text-secondary mt-2 mb-1.5">Exclude</div>
+                  <textarea
+                    aria-label="Exclude patterns"
+                    value={excludeDraft}
+                    onChange={e => setExcludeDraft(e.target.value)}
+                    rows={3}
+                    placeholder={'*.tmp\n/home/me/.cache'}
+                    className="w-full text-xs font-mono p-2 rounded bg-surface-tertiary
+                               text-text-primary border border-border-default resize-y"
+                  />
+                  <div className="text-xs text-text-tertiary mt-1">One pattern per line (Manual 6.2).</div>
                   <div className="flex gap-2 mt-2">
                     <button onClick={handleSaveSources}
                       className="px-2 py-1 text-xs cursor-pointer rounded bg-accent text-accent-text border-none">
                       Save
                     </button>
-                    <button onClick={() => { setEditingSources(false); setSourceDraft(sources.join('\n')) }}
+                    <button onClick={() => {
+                      setEditingSources(false)
+                      setSourceDraft(sources.join('\n'))
+                      setExcludeDraft(excludes.join('\n'))
+                    }}
                       className="px-2 py-1 text-xs cursor-pointer rounded bg-surface-tertiary
                                  text-text-secondary border-none">
                       Cancel
@@ -1038,6 +1061,14 @@ export function App(): React.ReactElement {
                   <ul className="text-xs font-mono m-0 pl-4 text-text-primary">
                     {sources.map(p => <li key={p} className="truncate">{p}</li>)}
                   </ul>
+                  {excludes.length > 0 && (
+                    <>
+                      <div className="text-xs text-text-secondary mt-2 mb-1">Excluding</div>
+                      <ul className="text-xs font-mono m-0 pl-4 text-text-primary">
+                        {excludes.map(p => <li key={p} className="truncate">{p}</li>)}
+                      </ul>
+                    </>
+                  )}
                   <button onClick={() => setEditingSources(true)}
                     className="underline cursor-pointer bg-transparent border-none text-accent p-0 text-xs mt-1.5">
                     Edit

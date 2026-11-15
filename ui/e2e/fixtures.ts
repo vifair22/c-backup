@@ -77,7 +77,7 @@ export interface Harness {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-function cli(sock: string, args: string[]): string {
+export function cli(sock: string, args: string[]): string {
   const r = spawnSync(CLI, ['--socket', sock, ...args], { encoding: 'utf-8' })
   return (r.stdout ?? '') + (r.stderr ?? '')
 }
