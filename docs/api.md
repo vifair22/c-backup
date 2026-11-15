@@ -964,8 +964,14 @@ a spring-forward day resolves to a real instant, a time that occurs twice on a
 fall-back day fires once, "the 31st" clamps to the end of short months, and
 29 February fires every year rather than every fourth.
 
-`on_overlap` decides what happens when a schedule comes due while its previous
-run is still going: `skip` (default), `queue`, or `cancel_running`. `catchup`
+`on_overlap` decides what happens when a schedule comes due while a job for
+the same repository and action is queued or running: `skip` (default) does
+nothing; `queue` submits one run that waits for the repository, unless one of
+the schedule's runs is already queued, which the fire is folded into;
+`cancel_running` cancels the running job as `POST /jobs/<id>/cancel` does and
+submits one replacement, which starts once the cancelled job has stopped. A
+`cancel_running` fire that finds its replacement still queued adds nothing and
+never cancels a queued job. Manual section 10 has the details. `catchup`
 decides what a missed window means after downtime: `skip` moves to the next
 future fire, `run_once` fires immediately and then resumes. That includes a
 schedule that has never fired: if its first due time passed while the daemon

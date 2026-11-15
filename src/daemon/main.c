@@ -91,6 +91,14 @@ static status_t schedule_dispatch(void *user, int64_t schedule_id, int64_t repo_
     return OK;
 }
 
+/* cancel_running stops the job it overlaps the way `jobs cancel` does, so
+ * the job sees its flag, stops at its next check and frees the repository
+ * for the replacement. */
+static status_t schedule_cancel(void *user, int64_t job_id)
+{
+    return job_cancel(user, job_id);
+}
+
 static void tighten_umask(void)
 {
     umask(0077);
@@ -231,6 +239,7 @@ int main(int argc, char *argv[])
             appguard_shutdown(guard);
             return 1;
         }
+        scheduler_set_canceller(sched, schedule_cancel);
     } else {
         log_info("scheduler disabled by config");
     }

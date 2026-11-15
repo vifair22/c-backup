@@ -967,6 +967,26 @@ Two policies per schedule:
 
 Any other value is refused when the schedule is created.
 
+**Overlap.** A schedule overlaps when it comes due while a job for the same
+repository and action is queued or running, whoever submitted it: a backup
+started by hand counts. What each policy then does:
+
+- `skip` does nothing for this window. The next fire is computed as usual.
+- `queue` submits one run, which waits until the repository is free. A
+  schedule never has more than one run waiting: a fire that finds one of its
+  own runs still queued is folded into it, so a backup that runs across
+  three intervals is followed by one more backup, not three.
+- `cancel_running` cancels the running job exactly as `c-backup jobs cancel`
+  does, then submits one replacement. The running job stops at its next
+  check (section 2.2) and is recorded `cancelled`; the replacement waits in
+  the queue meanwhile, because jobs for one repository never run together,
+  and starts as soon as the cancelled job has let go of the repository. A
+  fire that finds its replacement still waiting repeats the cancel and adds
+  nothing, so it never cancels a replacement that has not started. Queued
+  jobs are never cancelled by this policy, only a running one. If every run
+  takes longer than the interval, every run is cancelled by the next one:
+  use `skip` or a longer interval for work that cannot finish inside it.
+
 A `backup` schedule uses the repository's sources unless it names
 `--source` paths. A `replicate` schedule needs `--dest`, an absolute path. A
 `grep` schedule needs `--pattern` (an extended regular expression, checked
