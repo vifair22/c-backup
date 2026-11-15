@@ -14,9 +14,28 @@ import { join, resolve } from 'node:path'
  *
  * Skipped unless CBACKUP_ACCEPTANCE_SOCKET points at that daemon, so a
  * normal `npx playwright test` run is unaffected.
+ *
+ * The same checks run over TCP when CBACKUP_ACCEPTANCE_REMOTE is host:port and
+ * CBACKUP_ACCEPTANCE_PASSWORD is the daemon's admin password: the app gets a
+ * remote connection instead, signs in through the dialog, and drives the same
+ * screens. The socket is still needed for the check that kills nothing and
+ * for naming the daemon; remote is the transport, not a different daemon.
  */
 
 const SOCKET = process.env.CBACKUP_ACCEPTANCE_SOCKET ?? ''
+const REMOTE = process.env.CBACKUP_ACCEPTANCE_REMOTE ?? ''
+const PASSWORD = process.env.CBACKUP_ACCEPTANCE_PASSWORD ?? ''
+
+/*
+ * The data, which differs by machine. Each set is the absolute path that was
+ * backed up, which the tree walk follows segment by segment, and a filename
+ * fragment known to be in it. The defaults are the first pass's.
+ */
+const D_PATH = process.env.CBACKUP_ACCEPTANCE_D_PATH ?? '/home/vifair/Documents'
+const D_TERM = process.env.CBACKUP_ACCEPTANCE_D_TERM ?? 'Scan2025'
+const G_PATH = process.env.CBACKUP_ACCEPTANCE_G_PATH ?? '/home/vifair/git'
+const G_TERM = process.env.CBACKUP_ACCEPTANCE_G_TERM ?? 'CMakeLists'
+const segments = (p: string) => p.split('/').filter(Boolean)
 const APP_MAIN = resolve(__dirname, '..', 'out', 'main', 'index.js')
 
 test.describe.configure({ mode: 'serial' })
@@ -40,15 +59,30 @@ test.beforeAll(async () => {
   if (!SOCKET) return
   if (!existsSync(APP_MAIN)) throw new Error(`run 'npm run build' first: ${APP_MAIN}`)
   const userData = mkdtempSync(join(tmpdir(), 'cbackup-acc-ui-'))
-  writeFileSync(join(userData, 'config.json'), JSON.stringify({
-    connections: [{ type: 'local', name: 'Acceptance', socketPath: SOCKET }],
-  }, null, 2))
+  const [host, port] = REMOTE.split(':')
+  const conn = REMOTE
+    ? { type: 'remote', name: 'Acceptance', host, port: Number(port) }
+    : { type: 'local', name: 'Acceptance', socketPath: SOCKET }
+  writeFileSync(join(userData, 'config.json'), JSON.stringify({ connections: [conn] }, null, 2))
   app = await electron.launch({
     args: [APP_MAIN, `--user-data-dir=${userData}`, '--no-sandbox'],
     env: { ...process.env, NODE_ENV: 'production' },
   })
   page = await app.firstWindow()
   await page.waitForLoadState('domcontentloaded')
+
+  if (REMOTE) {
+    /* Nothing is stored yet, so the connection waits to be asked. */
+    await timed('K2', 'sign in over TCP', async () => {
+      await page.getByRole('button', { name: 'Connect', exact: true }).click()
+      await expect(page.getByText('Sign in: Acceptance')).toBeVisible({ timeout: 15_000 })
+      await page.locator('input[type="password"]').fill(PASSWORD)
+      /* Scoped: the sidebar shows a Sign in link of the same name. */
+      await page.locator('form', { hasText: 'Sign in: Acceptance' })
+        .getByRole('button', { name: 'Sign in', exact: true }).click()
+      await expect(page.getByText('(remote, connected)')).toBeVisible({ timeout: 15_000 })
+    })
+  }
 })
 
 test.afterAll(async () => {
@@ -100,13 +134,13 @@ test('C3/C4 browsing into a real tree', async () => {
   })
 
   /*
-   * Down to the real Documents directory: home > vifair > Documents.
-   * Scoped to the tree table - "Documents" unqualified also matches the
-   * repository in the sidebar, and clicking that navigates away from the
-   * screen under test rather than descending into it.
+   * Down to the directory that was backed up, one segment at a time.
+   * Scoped to the tree table - a segment like "Documents" unqualified also
+   * matches the repository in the sidebar, and clicking that navigates away
+   * from the screen under test rather than descending into it.
    */
   const tree = page.locator('tbody')
-  for (const seg of ['home', 'vifair', 'Documents']) {
+  for (const seg of segments(D_PATH)) {
     await timed('C4', `expand ${seg}`, async () => {
       await tree.getByText(seg, { exact: true }).first().click()
       await page.waitForTimeout(50)
@@ -123,12 +157,12 @@ test('C5 searching a real index', async () => {
   await expect(page.getByRole('heading', { name: 'File Search' })).toBeVisible()
 
   const ms = await timed('C5', 'search a real index', async () => {
-    await page.getByPlaceholder(/filename contains/i).fill('Scan2025')
+    await page.getByPlaceholder(/filename contains/i).fill(D_TERM)
     await page.getByRole('button', { name: /^search$/i }).last().click()
     await expect(page.locator('tbody tr').first()).toBeVisible()
   })
   expect(ms, 'the name index should not care how much data is behind it').toBeLessThan(1000)
-  await expect(page.locator('tbody tr').first()).toContainText('/home/vifair/Documents/')
+  await expect(page.locator('tbody tr').first()).toContainText(D_PATH + '/')
   await page.screenshot({ path: 'test-results/acc-search.png', fullPage: true })
 })
 
@@ -178,7 +212,7 @@ test('B7/C5 the 225k-file repository', async () => {
   expect(tree, 'one directory, not the whole snapshot').toBeLessThan(1000)
 
   const body = page.locator('tbody')
-  for (const seg of ['home', 'vifair', 'git']) {
+  for (const seg of segments(G_PATH)) {
     await timed('C4g', `expand ${seg}`, async () => {
       await body.getByText(seg, { exact: true }).first().click()
       await page.waitForTimeout(60)
@@ -190,7 +224,7 @@ test('B7/C5 the 225k-file repository', async () => {
   await page.getByRole('button', { name: /dashboard/i }).first().click()
   await page.getByRole('button', { name: /^search$/i }).first().click()
   const search = await timed('C5g', 'search 225k names', async () => {
-    await page.getByPlaceholder(/filename contains/i).fill('CMakeLists')
+    await page.getByPlaceholder(/filename contains/i).fill(G_TERM)
     await page.getByRole('button', { name: /^search$/i }).last().click()
     await expect(page.locator('tbody tr').first()).toBeVisible()
   })
