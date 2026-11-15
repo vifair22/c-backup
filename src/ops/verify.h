@@ -37,10 +37,13 @@ typedef enum {
 typedef struct {
     uint64_t checked;
     uint64_t ok;
-    /* Damaged on disk and corrected from parity. With repair enabled the
-     * correction was written back; without it, the object was readable but
-     * the disk copy is still wrong. */
+    /* Damaged on disk, corrected from parity, and the correction written
+     * back. Only a repairing run can count anything here. */
     uint64_t repaired;
+    /* Damaged on disk and readable only through parity, with the disk copy
+     * still wrong: repair was off, or the write-back failed. Not loss yet,
+     * but one more bad byte away from it. */
+    uint64_t recoverable;
     /* Damaged beyond what parity can reconstruct. These are data loss. */
     uint64_t unrecoverable;
     /* Registered but absent: no loose file, no pack entry. */

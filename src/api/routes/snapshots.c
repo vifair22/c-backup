@@ -989,7 +989,7 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
     if (db_execute(g_ctx.db,
             "SELECT id, started_at, finished_at, level, completed, checked, ok,"
             "       repaired, unrecoverable, missing, bytes_read,"
-            "       affected_files, affected_snapshots"
+            "       affected_files, affected_snapshots, recoverable"
             "  FROM verify_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ?",
             (const char *[]){ repo, limit, NULL }, &r) != 0) {
         db_result_free(r);
@@ -1010,6 +1010,7 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
                || json_elem_add_str(&e, "checked",            r->rows[i][5]) != 0
                || json_elem_add_str(&e, "ok",                 r->rows[i][6]) != 0
                || json_elem_add_str(&e, "repaired",           r->rows[i][7]) != 0
+               || json_elem_add_str(&e, "recoverable",        r->rows[i][13]) != 0
                || json_elem_add_str(&e, "unrecoverable",      r->rows[i][8]) != 0
                || json_elem_add_str(&e, "missing",            r->rows[i][9]) != 0
                || json_elem_add_str(&e, "bytes_read",         r->rows[i][10]) != 0

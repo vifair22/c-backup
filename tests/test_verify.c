@@ -160,6 +160,19 @@ static void flip_byte(const char *path, off_t off)
     close(fd);
 }
 
+/* The status of an object's finding in the newest run, or "" if none. */
+static void finding_status_of(const char *hex, char *out, size_t outsz)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT status FROM verify_findings WHERE hash = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_true(r->nrows <= 1);
+    snprintf(out, outsz, "%s", r->nrows ? r->rows[0][0] : "");
+    db_result_free(r);
+}
+
 /* ------------------------------------------------------------------ */
 
 static void test_clean_repo_verifies_clean(void **state)
@@ -199,7 +212,13 @@ static void test_deep_verify_repairs_payload_damage(void **state)
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
                                 NULL, NULL, NULL, &res), OK);
     assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.recoverable, 0);
     assert_int_equal(res.unrecoverable, 0);
+
+    /* Itemised: the run says which object it rewrote, not just how many. */
+    char status[64];
+    finding_status_of(hex, status, sizeof(status));
+    assert_string_equal(status, "repaired");
 
     /* Written back, not just corrected in memory: a second pass finds a
      * clean repository, and the parity counters stay still. */
@@ -213,7 +232,8 @@ static void test_deep_verify_repairs_payload_damage(void **state)
 }
 
 /* Without repair the damage is reported but the disk is left alone, which is
- * what a read-only scrub promises. */
+ * what a read-only scrub promises. It used to report the object as repaired,
+ * which is exactly what it was not. */
 static void test_verify_without_repair_leaves_disk_untouched(void **state)
 {
     (void)state;
@@ -228,13 +248,29 @@ static void test_verify_without_repair_leaves_disk_untouched(void **state)
     verify_result_t res;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &res), OK);
-    assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.repaired, 0);
+    assert_int_equal(res.recoverable, 1);
+    char status[64];
+    finding_status_of(hex, status, sizeof(status));
+    assert_string_equal(status, "recoverable");
+
+    /* Recoverable is not loss: the run's blast radius stays empty. */
+    assert_int_equal(res.affected_files, 0);
 
     /* Still damaged: the next scrub has the same thing to say. */
     verify_result_t again;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &again), OK);
-    assert_int_equal(again.repaired, 1);
+    assert_int_equal(again.repaired, 0);
+    assert_int_equal(again.recoverable, 1);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT repaired, recoverable FROM verify_runs ORDER BY id DESC LIMIT 1",
+        NULL, &r), 0);
+    assert_string_equal(r->rows[0][0], "0");
+    assert_string_equal(r->rows[0][1], "1");
+    db_result_free(r);
 }
 
 /*
@@ -420,7 +456,7 @@ static void test_structure_level_does_not_read_payloads(void **state)
     verify_result_t deep;
     assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
                                 NULL, NULL, NULL, &deep), OK);
-    assert_int_equal(deep.repaired, 1);
+    assert_int_equal(deep.recoverable, 1);
 }
 
 /* Packed objects go through a different read and a different repair path, so

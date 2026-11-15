@@ -103,8 +103,14 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     }
     db_result_free(r);
 
-    res->affected_files += n_files;
-    if (n_snaps > res->affected_snapshots) res->affected_snapshots = n_snaps;
+    /* Repaired and recoverable objects are itemised so an operator can see
+     * what was touched, but nothing was lost, so they stay out of the blast
+     * radius the run reports. */
+    int loss = strcmp(status, "repaired") != 0 && strcmp(status, "recoverable") != 0;
+    if (loss) {
+        res->affected_files += n_files;
+        if (n_snaps > res->affected_snapshots) res->affected_snapshots = n_snaps;
+    }
 
     char nf[32];
     snprintf(nf, sizeof(nf), "%llu", (unsigned long long)n_files);
@@ -120,7 +126,10 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     /* A tree object has no node row pointing at it, so the query above finds
      * nothing and the loss looks harmless. Say so rather than implying the
      * damage is contained. */
-    if (n_files == 0)
+    if (!loss)
+        log_warn("verify: %s %s (%llu file(s) in %llu snapshot(s))", status, hex,
+                 (unsigned long long)n_files, (unsigned long long)n_snaps);
+    else if (n_files == 0)
         log_error("verify: %s %s (no node references it: a manifest tree or an "
                   "object from an evicted snapshot)", status, hex);
     else
@@ -373,6 +382,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 res.repaired++;
                 res.bytes_read += bytes;
                 log_warn("verify: repaired %s (%d byte(s) corrected)", hex, fixed);
+                record_finding(db, repo_id, res.run_id, hex, "repaired", &res);
             } else {
                 err_clear();
                 res.unrecoverable++;
@@ -392,23 +402,36 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.bytes_read += bytes;
 
         if (after.repaired > before.repaired) {
-            /* Readable only because parity covered for it. Write the
+            /*
+             * Readable only because parity covered for it. Write the
              * correction down while we still can: the next read might find
-             * one more damaged byte than parity can carry. */
-            if (repair) {
-                int fixed = (packed ? pack_object_repair(store, hash)
-                                    : object_repair(store, hash));
-                if (fixed > 0)
-                    log_warn("verify: %s was silently corrected on read; wrote "
-                             "%d byte(s) back to disk", hex, fixed);
-                else
+             * one more damaged byte than parity can carry.
+             *
+             * "repaired" means the disk now holds the right bytes, and
+             * nothing else. A scrub with repair off used to count these as
+             * repaired too, so a run that wrote nothing reported a repair
+             * and an operator had no reason to run the one that would
+             * actually fix it. Damage parity can carry but that is still on
+             * disk is "recoverable".
+             */
+            int fixed = repair ? (packed ? pack_object_repair(store, hash)
+                                         : object_repair(store, hash))
+                               : 0;
+            if (fixed > 0) {
+                log_warn("verify: %s was silently corrected on read; wrote "
+                         "%d byte(s) back to disk", hex, fixed);
+                res.repaired++;
+                record_finding(db, repo_id, res.run_id, hex, "repaired", &res);
+            } else {
+                if (repair)
                     log_warn("verify: %s was silently corrected on read but the "
                              "correction could not be written back", hex);
-            } else {
-                log_warn("verify: %s is damaged on disk and was corrected in "
-                         "memory only (repair disabled)", hex);
+                else
+                    log_warn("verify: %s is damaged on disk and was corrected in "
+                             "memory only (repair disabled)", hex);
+                res.recoverable++;
+                record_finding(db, repo_id, res.run_id, hex, "recoverable", &res);
             }
-            res.repaired++;
         } else if (after.uncorrectable > before.uncorrectable) {
             res.unrecoverable++;
             record_finding(db, repo_id, res.run_id, hex, "uncorrectable parity", &res);
@@ -420,12 +443,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (devnull != -1) close(devnull);
     db_result_free(objs);
 
-    char fin[32], checked[32], ok[32], rep[32], unrec[32], miss[32], bytes_s[32];
+    char fin[32], checked[32], ok[32], rep[32], recov[32], unrec[32], miss[32], bytes_s[32];
     char afff[32], affs[32], run[32];
     snprintf(fin,     sizeof(fin),     "%lld", (long long)time(NULL));
     snprintf(checked, sizeof(checked), "%llu", (unsigned long long)res.checked);
     snprintf(ok,      sizeof(ok),      "%llu", (unsigned long long)res.ok);
     snprintf(rep,     sizeof(rep),     "%llu", (unsigned long long)res.repaired);
+    snprintf(recov,   sizeof(recov),   "%llu", (unsigned long long)res.recoverable);
     snprintf(unrec,   sizeof(unrec),   "%llu", (unsigned long long)res.unrecoverable);
     snprintf(miss,    sizeof(miss),    "%llu", (unsigned long long)res.missing);
     snprintf(bytes_s, sizeof(bytes_s), "%llu", (unsigned long long)res.bytes_read);
@@ -438,10 +462,11 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      * nothing is indistinguishable from one that never ran. */
     if (db_execute_non_query(db,
             "UPDATE verify_runs SET finished_at = ?, checked = ?, ok = ?,"
-            " repaired = ?, unrecoverable = ?, missing = ?, bytes_read = ?,"
-            " affected_files = ?, affected_snapshots = ?, completed = ?"
+            " repaired = ?, recoverable = ?, unrecoverable = ?, missing = ?,"
+            " bytes_read = ?, affected_files = ?, affected_snapshots = ?,"
+            " completed = ?"
             " WHERE id = ?",
-            (const char *[]){ fin, checked, ok, rep, unrec, miss, bytes_s,
+            (const char *[]){ fin, checked, ok, rep, recov, unrec, miss, bytes_s,
                               afff, affs, st == OK ? "1" : "0", run, NULL },
             NULL) != 0)
         log_warn("verify: cannot close run record %s", run);
@@ -449,17 +474,20 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (st != OK) return st;
 
     if (res.unrecoverable || res.missing)
-        log_error("verify (%s): %llu checked, %llu repaired, %llu UNRECOVERABLE, "
-                  "%llu MISSING, affecting %llu file(s)",
+        log_error("verify (%s): %llu checked, %llu repaired, %llu recoverable, "
+                  "%llu UNRECOVERABLE, %llu MISSING, affecting %llu file(s)",
                   level_name(level), (unsigned long long)res.checked,
                   (unsigned long long)res.repaired,
+                  (unsigned long long)res.recoverable,
                   (unsigned long long)res.unrecoverable,
                   (unsigned long long)res.missing,
                   (unsigned long long)res.affected_files);
     else
-        log_info("verify (%s): %llu checked, %llu ok, %llu repaired, %llu bytes read",
+        log_info("verify (%s): %llu checked, %llu ok, %llu repaired, %llu recoverable, "
+                 "%llu bytes read",
                  level_name(level), (unsigned long long)res.checked,
                  (unsigned long long)res.ok, (unsigned long long)res.repaired,
+                 (unsigned long long)res.recoverable,
                  (unsigned long long)res.bytes_read);
 
     if (out) *out = res;

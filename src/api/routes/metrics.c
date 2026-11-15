@@ -175,6 +175,11 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "Objects repaired from parity by the most recent completed verify.", "gauge",
                 "SELECT COALESCE((SELECT repaired FROM verify_runs"
                 " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
+    emit_scalar(&m, "cbackup_verify_recoverable_objects",
+                "Objects the most recent completed verify found damaged on disk and readable "
+                "only through parity (repair off, or the write-back failed).", "gauge",
+                "SELECT COALESCE((SELECT recoverable FROM verify_runs"
+                " WHERE completed = 1 ORDER BY finished_at DESC LIMIT 1), 0)");
     emit_scalar(&m, "cbackup_verify_affected_files",
                 "Files affected by damage the most recent completed verify could not repair.",
                 "gauge",
