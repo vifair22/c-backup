@@ -105,6 +105,56 @@ static void journal_interrupted(cutils_db_t *db)
     db_result_free(r);
 }
 
+/*
+ * The Pushover alert for a failed job.
+ *
+ * Manual 16.3 promises the action, the repository and the error. It sent
+ * "repo 3: <error>" under the title "c-backup: backup failed", and the
+ * title is all c-utils logs when a send is rejected, so the one line an
+ * operator saw named neither the repository nor the reason. The repository
+ * is named by its label and path, because an id means nothing on a phone,
+ * and the label goes in the title as well so that it survives into that log
+ * line.
+ */
+void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                       const char *action, const char *detail,
+                       char *title, size_t title_sz, char *body, size_t body_sz)
+{
+    char idbuf[24];
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)repo_id);
+
+    char label[128] = "";
+    char path[512] = "";
+    db_result_t *r = NULL;
+    const char *params[] = { idbuf, NULL };
+    if (db && db_execute(db, "SELECT COALESCE(label, ''), path FROM repos WHERE id = ?",
+                         params, &r) == 0 && r && r->nrows == 1) {
+        snprintf(label, sizeof(label), "%s", r->rows[0][0]);
+        snprintf(path, sizeof(path), "%s", r->rows[0][1]);
+    }
+    db_result_free(r);
+
+    const char *what = action && action[0] ? action : "job";
+    const char *why  = detail && detail[0] ? detail : "no detail recorded";
+
+    /* c-utils returns NULL columns as "", so an unlabelled repository and a
+     * removed one both arrive as an empty label. */
+    if (label[0])
+        snprintf(title, title_sz, "c-backup: %s of %s failed", what, label);
+    else
+        snprintf(title, title_sz, "c-backup: %s of repo %lld failed", what,
+                 (long long)repo_id);
+
+    if (path[0])
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %s",
+                 label[0] ? label : "(no label)", (long long)repo_id, path,
+                 (long long)job_id, what, why);
+    else
+        snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
+                 "Job %lld (%s) failed: %s",
+                 (long long)repo_id, (long long)job_id, what, why);
+}
+
 static void set_job_state(job_manager_t *jm, int64_t job_id,
                           const char *state, const char *error)
 {
@@ -423,10 +473,12 @@ static void *worker_main(void *arg)
          * Pushover is unconfigured, so this needs no feature flag.
          */
         if (st != OK && !jm->queue[slot_index].cancel) {
-            char title[128], body[512];
-            snprintf(title, sizeof(title), "c-backup: %s failed", slot.action);
-            snprintf(body, sizeof(body), "repo %lld: %s",
-                     (long long)slot.repo_id, detail ? detail : "no detail");
+            /* Pushover's limits: 250 for the title, 1024 for the body. */
+            char title[250], body[1024];
+            pthread_mutex_lock(&jm->db_mu);
+            job_alert_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
+                              detail, title, sizeof(title), body, sizeof(body));
+            pthread_mutex_unlock(&jm->db_mu);
             if (push_send(title, body) != 0)
                 log_warn("cannot queue failure notification for job %lld",
                          (long long)slot.job_id);

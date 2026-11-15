@@ -92,6 +92,71 @@ echo "alpha content"  > "$WORK/src/a.txt"
 echo "beta content"   > "$WORK/src/b.txt"
 echo "nested content" > "$WORK/src/docs/c.txt"
 
+echo "config refusal"
+# Each of these used to start the daemon normally, running on defaults the
+# operator never chose (UAT B081). Now each must stop it before it binds,
+# naming the file, the line and what is wrong.
+refuses() {  # refuses <name> <expected stderr fragment> <config lines...>
+    local name="$1" want="$2"; shift 2
+    local cfg="$WORK/bad.yaml"
+    {
+        printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' "$WORK" "$WORK"
+        printf '%s\n' "$@"
+    } > "$cfg"
+    chmod 600 "$cfg"
+    local out rc
+    out=$(C_BACKUP_CONFIG_PATH="$cfg" timeout 10 "$BIN" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 1 ]; then
+        bad "$name: refuses to start" "exit 1" "exit $rc: $out"
+    else
+        contains "$name: refuses to start" "$want" "$out"
+    fi
+    [ -e "$WORK/bad.sock" ] && bad "$name: never listened" "no socket" "socket created"
+    rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock"
+}
+refuses "malformed yaml" "bad.yaml:6: error: flow collections" 'log: [unclosed'
+refuses "unknown log level" "bad.yaml:7: error: log.level: 'chatty' is not one of" \
+    'log:' '  level: chatty'
+refuses "unknown top-level key" "bad.yaml:6: error: 'verbose: true' at the top level" \
+    'verbose: true'
+refuses "unknown section" "bad.yaml:7: error: unknown key 'mystery.thing'" \
+    'mystery:' '  thing: 1'
+refuses "typo'd key" "unknown key 'security.key_dri' (did you mean 'security.key_dir'?)" \
+    'security:' '  key_dri: /x'
+refuses "integer key not an integer" "bad.yaml:7: error: jobs.max_parallel: 'eighty' is not an integer" \
+    'jobs:' '  max_parallel: eighty'
+refuses "nested mapping" "bad.yaml:8: error: indented deeper" \
+    'jobs:' '  max_parallel: 2' '    extra: 1'
+refuses "every problem reported" "(and 1 more, printed above)" \
+    'jobs:' '  max_parallel: x' '  max_paralel: 2'
+# An environment override has no line, so it is named instead.
+printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' \
+    "$WORK" "$WORK" > "$WORK/bad.yaml"
+out=$(C_BACKUP_JOBS_MAX_PARALLEL=lots C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" \
+      timeout 10 "$BIN" 2>&1)
+contains "bad environment override refused" \
+    "environment C_BACKUP_JOBS_MAX_PARALLEL (jobs.max_parallel): 'lots' is not an integer" "$out"
+check "and nothing was opened" "" "$(ls "$WORK"/bad.db* 2>/dev/null)"
+rm -f "$WORK/bad.yaml"
+
+# The config the packages and the image ship has to pass the same checks,
+# or an edit to it would ship a daemon that will not start. Paths are
+# redirected; everything else is as shipped.
+sed -e "s#/var/lib/c-backupd/state.db#$WORK/pkg.db#" \
+    -e "s#/run/c-backupd/c-backupd.sock#$WORK/pkg.sock#" \
+    -e "s#^  port: 8765#  port: 0#" \
+    "$(dirname "$0")/../packaging/config.yaml" > "$WORK/pkg.yaml"
+chmod 600 "$WORK/pkg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/pkg.yaml" C_BACKUP_SECURITY_KEY_DIR="$WORK/pkgkeys" \
+    "$BIN" > "$WORK/pkg.log" 2>&1 &
+PKG_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/pkg.sock" ] && break; sleep 0.1; done
+if [ -S "$WORK/pkg.sock" ]; then ok "shipped config starts the daemon"
+else bad "shipped config starts the daemon" "a socket" "$(cat "$WORK/pkg.log")"; fi
+kill -TERM "$PKG_PID" 2>/dev/null
+wait "$PKG_PID" 2>/dev/null
+
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -181,6 +246,13 @@ contains "get repo" '"uuid"' "$(sock_body /repos/1)"
 # A repository with no snapshot is counted. Its age runs from registration,
 # so it trips an age alert like any stale repository instead of reading 0.
 contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
+# Alert delivery is countable (UAT B083): present, as zeros, with Pushover
+# unconfigured, so an alert rule on them is never matching an absent series.
+METRICS=$(sock_body /metrics)
+contains "alerts sent metric"    "cbackup_alerts_sent_total 0" "$METRICS"
+contains "alerts failed metric"  "cbackup_alerts_failed_total 0" "$METRICS"
+contains "alerts failed is a counter" "# TYPE cbackup_alerts_failed_total counter" "$METRICS"
+contains "alerts pending metric" "cbackup_alerts_pending 0" "$METRICS"
 check "unknown repo" 404 "$(sock_code /repos/99)"
 # And every route under it: these answered 200 with empty results, which a
 # script cannot tell from an empty repository that exists.

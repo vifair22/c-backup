@@ -147,6 +147,15 @@ static inline appguard_config_t app_appguard_config(void)
          * chmod'ing them after a brief window. */
         .db_mode                = 0600,
         .config_mode            = 0600,
+        /*
+         * Refuse to start on a config file the daemon cannot honour: a line
+         * outside c-utils' YAML subset, an unknown or misspelt key, a value
+         * of the wrong type, a log.level that is not a level. Each of those
+         * used to start the daemon normally and run it on defaults the
+         * operator never chose, with nothing in the log to say so. Every
+         * problem is printed with its file and line before the exit.
+         */
+        .config_validate        = CFG_VALIDATE_STRICT,
     };
     return cfg;
 }
