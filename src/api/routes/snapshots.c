@@ -779,8 +779,28 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         go.ignore_case       = j->ignore_case;
         go.max_files         = j->max_files;
         go.max_hits_per_file = 10;
+        grep_result_t gr;
+        memset(&gr, 0, sizeof(gr));
         st = grep_run(store, j->db, j->repo_id, j->snap_id, &go, cancel,
-                      progress, progress_ctx, NULL);
+                      progress, progress_ctx, &gr);
+        /*
+         * The run this job produced, so a client follows the job and then
+         * opens that run. The app used to poll the run list and take the
+         * newest finished one, which before this job's run existed was an
+         * older search: it showed the previous result, or none, at random.
+         */
+        if (gr.run_id > 0) {
+            char rj[256];
+            snprintf(rj, sizeof(rj),
+                     "{\"run_id\":%lld,\"files_scanned\":%llu,"
+                     "\"files_matched\":%llu,\"hits\":%llu,\"truncated\":%s}",
+                     (long long)gr.run_id,
+                     (unsigned long long)gr.files_scanned,
+                     (unsigned long long)gr.files_matched,
+                     (unsigned long long)gr.hits,
+                     gr.truncated ? "true" : "false");
+            job_set_result(progress_ctx, rj);
+        }
     } else if (j->kind == SNAP_JOB_VERIFY) {
         st = verify_run(store, j->db, j->repo_id, j->verify_level,
                         j->verify_repair, cancel, progress, progress_ctx, NULL);

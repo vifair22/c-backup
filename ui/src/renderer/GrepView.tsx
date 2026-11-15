@@ -14,6 +14,7 @@
  * that it started.
  */
 
+import type { Job } from '../shared/api'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { absoluteTime } from './format'
 
@@ -131,27 +132,33 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
        * so and fill in when there is something to show.
        */
       if (poll.current) clearInterval(poll.current)
+      const jobIdNow = started.job_id
+      /*
+       * Follow the job, then open the run it reports.
+       *
+       * This polled the run list and took the newest finished run. Until
+       * this job's own run existed, that was an older search - so the screen
+       * showed a previous result, or stayed on "Searching..." after a cancel,
+       * depending on timing. The job knows which run is its own.
+       */
       poll.current = setInterval(async () => {
         try {
-          const list = await loadRuns()
-          const newest = list[0]
-          /*
-           * finished_at, not completed. A cancelled run sets a finish time
-           * and leaves completed at 0, so waiting for completed meant the
-           * screen said "Searching..." for ever after a cancel - which is
-           * what cancelling from the app looked like from the outside, even
-           * once the job itself had stopped.
-           */
-          if (newest && n(newest.finished_at) > 0) {
-            if (poll.current) { clearInterval(poll.current); poll.current = null }
-            setSearching(false)
-            setJobId(null)
-            setCancelling(false)
-            void openRun(newest)
-          }
-        } catch {
+          if (!jobIdNow) throw new Error('the daemon did not return a job id')
+          const job = await api.apiCall<Job>(connName, { kind: 'jobGet', jobId: jobIdNow })
+          if (job.state === 'queued' || job.state === 'running') return
           if (poll.current) { clearInterval(poll.current); poll.current = null }
           setSearching(false)
+          setJobId(null)
+          setCancelling(false)
+          const list = await loadRuns()
+          const runId = Number((job.result as { run_id?: number } | null | undefined)?.run_id ?? 0)
+          const run = runId > 0 ? list.find(r => Number(r.id) === runId) : undefined
+          if (run) void openRun(run)
+          if (job.state === 'failed' && job.error) setError(job.error)
+        } catch (err) {
+          if (poll.current) { clearInterval(poll.current); poll.current = null }
+          setSearching(false)
+          setError(String(err))
         }
       }, 400)
     } catch (err) {

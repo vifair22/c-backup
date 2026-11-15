@@ -563,6 +563,9 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                               run, NULL }, NULL) != 0)
         log_warn("grep: cannot close run record %s", run);
 
+    /* Filled on a cancel too: the run record exists and is closed, and a
+     * caller needs its id to show what was found before it stopped. */
+    if (out) *out = res;
     if (st != OK) return st;
 
     log_info("grep: %llu file(s) scanned, %llu matched, %llu hit(s), %llu bytes%s",
