@@ -1974,25 +1974,26 @@ static int idx_offset_cmp(const void *a, const void *b) {
 }
 
 /*
- * Seal a pack: patch its header, write the parity trailer, install it, and
- * hand its contents to the daemon.
+ * The three steps of putting a pack in place, split so that a writer which
+ * produces several packs from one operation can seal all of them before it
+ * installs any. finalize_pack runs them back to back, which is what every
+ * single-pack writer wants; gc's rewrite of a pack runs them a phase at a
+ * time (see gc_rewrite_pack).
  *
- * There is no .idx sidecar any more. Pack contents are rows in pack_objects,
- * delivered through the pack-commit callback, so the install is a single file
- * and the second half of the old two-file staging dance is now a database
- * insert the caller performs. That pair is not atomic and cannot be; the
- * ordering (install first, then rows) is deliberate, so an interruption
- * leaves objects invisible rather than advertised-but-absent. See
- * daemonization-spec.md section 12.
+ * seal_pack_file: patch the header, write the parity trailer, fsync, close.
+ * The file stays at its staging path and nothing outside this process can
+ * see it. Sorts idx_entries by hash afterwards; entry_index keeps the on-disk
+ * order, which is what the parity trailer is indexed by.
  */
-static status_t finalize_pack(store_t *store, FILE **dat_f,
-                              char *dat_tmp,
-                              pack_dat_hdr_t *dat_hdr,
-                              pack_idx_disk_entry_t *idx_entries,
-                              uint32_t packed, uint32_t pack_num,
-                              const pack_entry_parity_t *precomputed_parity)
+static status_t seal_pack_file(store_t *store, FILE **dat_f,
+                               pack_dat_hdr_t *dat_hdr,
+                               pack_idx_disk_entry_t *idx_entries,
+                               uint32_t packed,
+                               const pack_entry_parity_t *precomputed_parity,
+                               uint64_t *out_size)
 {
     status_t st = OK;
+    *out_size = 0;
 
     /* Patch the object count into the dat header */
     if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = ERR_IO; goto fail; }
@@ -2015,10 +2016,9 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
     }
     if (st != OK) goto fail;
 
-    uint64_t dat_size = 0;
     {
         off_t end = ftello(*dat_f);
-        if (end > 0) dat_size = (uint64_t)end;
+        if (end > 0) *out_size = (uint64_t)end;
     }
 
     if (fflush(*dat_f) != 0 || fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
@@ -2027,74 +2027,107 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
     /* Sorting by hash is no longer for an on-disk index, but the commit
      * entries and the loose-object unlink batch both benefit from it. */
     qsort(idx_entries, packed, sizeof(*idx_entries), idx_disk_cmp);
-
-    /* Install: single file, so a plain rename is already atomic. The staging
-     * directory the two-file version needed, and pack_resume_installing()
-     * which replayed interrupted moves, are both gone with it. */
-    {
-        char dat_final[PATH_MAX];
-        if (pack_dat_path(dat_final, sizeof(dat_final),
-                          store_root(store), pack_num) != 0) {
-            st = set_error(ERR_IO, "finalize_pack: path too long"); goto fail;
-        }
-
-        pack_ensure_shard_dir(store_root(store), pack_num);
-
-        /* next_pack_num() returns max+1 so this should never trigger, but if
-         * it does we would silently destroy data. Fail loudly instead. */
-        struct stat _st_chk;
-        if (stat(dat_final, &_st_chk) == 0) {
-            st = set_error(ERR_IO,
-                           "finalize_pack: pack %08u already exists - refusing to overwrite",
-                           pack_num);
-            goto fail;
-        }
-
-        if (rename(dat_tmp, dat_final) != 0) {
-            st = set_error_errno(ERR_IO, "finalize_pack: rename dat to final");
-            goto fail;
-        }
-
-        struct stat dst_stat;
-        if (stat(dat_final, &dst_stat) != 0 || dst_stat.st_size == 0) {
-            st = set_error(ERR_IO, "finalize_pack: post-rename verification failed");
-            goto fail;
-        }
-        if (dat_size == 0) dat_size = (uint64_t)dst_stat.st_size;
-    }
-
-    /* Hand the contents to the daemon. Only after the file is durably in
-     * place: rows that point at a pack which does not exist yet would make
-     * readers fail on objects the index claims are present. */
-    if (packed > 0) {
-        pack_commit_entry_t *ce = malloc((size_t)packed * sizeof(*ce));
-        if (!ce) return set_error(ERR_NOMEM, "finalize_pack: commit entries");
-        for (uint32_t i = 0; i < packed; i++) {
-            memcpy(ce[i].hash, idx_entries[i].hash, OBJECT_HASH_SIZE);
-            ce[i].offset      = idx_entries[i].dat_offset;
-            ce[i].comp_size   = idx_entries[i].compressed_size;
-            ce[i].orig_size   = idx_entries[i].uncompressed_size;
-            ce[i].entry_index = idx_entries[i].entry_index;
-        }
-        char fname[64];
-        snprintf(fname, sizeof(fname), "pack-%08u.dat", pack_num);
-        pack_commit_info_t info = {
-            .pack_id     = pack_num,
-            .filename    = fname,
-            .size        = dat_size,
-            .entry_count = packed,
-            .entries     = ce,
-        };
-        store_emit_pack_commit(store, &info);
-        free(ce);
-    }
-
     return OK;
 
 fail:
     if (*dat_f) { fclose(*dat_f); *dat_f = NULL; }
-    unlink(dat_tmp);
     return st;
+}
+
+/*
+ * install_pack_file: rename a sealed staging file to its pack number. Single
+ * file, so a plain rename is already atomic. The directory entries are not
+ * synced here; a caller that goes on to write something depending on the
+ * pack syncs them (pack_stored_finish, gc_rewrite_pack). *io_size is the size
+ * seal_pack_file measured, filled from the installed file if that was 0.
+ * The staging file is left where it was on failure.
+ */
+static status_t install_pack_file(store_t *store, const char *dat_tmp,
+                                  uint32_t pack_num, uint64_t *io_size)
+{
+    char dat_final[PATH_MAX];
+    if (pack_dat_path(dat_final, sizeof(dat_final), store_root(store), pack_num) != 0)
+        return set_error(ERR_IO, "install_pack_file: path too long");
+
+    pack_ensure_shard_dir(store_root(store), pack_num);
+
+    /* next_pack_num() returns max+1 so this should never trigger, but if
+     * it does we would silently destroy data. Fail loudly instead. */
+    struct stat st_chk;
+    if (stat(dat_final, &st_chk) == 0)
+        return set_error(ERR_IO,
+                         "install_pack_file: pack %08u already exists - refusing to overwrite",
+                         pack_num);
+
+    if (rename(dat_tmp, dat_final) != 0)
+        return set_error_errno(ERR_IO, "install_pack_file: rename to %s", dat_final);
+
+    struct stat dst_stat;
+    if (stat(dat_final, &dst_stat) != 0 || dst_stat.st_size == 0)
+        return set_error(ERR_IO, "install_pack_file: post-rename verification of %s failed",
+                         dat_final);
+    if (*io_size == 0) *io_size = (uint64_t)dst_stat.st_size;
+    return OK;
+}
+
+/*
+ * announce_pack: hand an installed pack's contents to the daemon. Only after
+ * the file is in place: rows that point at a pack which does not exist yet
+ * would make readers fail on objects the index claims are present. entries
+ * is the hash-sorted array seal_pack_file left behind, each entry_index
+ * still its on-disk position.
+ */
+static status_t announce_pack(store_t *store, uint32_t pack_num, uint64_t size,
+                              const pack_idx_disk_entry_t *entries, uint32_t packed)
+{
+    if (packed == 0) return OK;
+    pack_commit_entry_t *ce = malloc((size_t)packed * sizeof(*ce));
+    if (!ce) return set_error(ERR_NOMEM, "announce_pack: commit entries");
+    for (uint32_t i = 0; i < packed; i++) {
+        memcpy(ce[i].hash, entries[i].hash, OBJECT_HASH_SIZE);
+        ce[i].offset      = entries[i].dat_offset;
+        ce[i].comp_size   = entries[i].compressed_size;
+        ce[i].orig_size   = entries[i].uncompressed_size;
+        ce[i].entry_index = entries[i].entry_index;
+    }
+    char fname[64];
+    snprintf(fname, sizeof(fname), "pack-%08u.dat", pack_num);
+    pack_commit_info_t info = {
+        .pack_id     = pack_num,
+        .filename    = fname,
+        .size        = size,
+        .entry_count = packed,
+        .entries     = ce,
+    };
+    store_emit_pack_commit(store, &info);
+    free(ce);
+    return OK;
+}
+
+/*
+ * Seal a pack, install it, and hand its contents to the daemon.
+ *
+ * There is no .idx sidecar any more. Pack contents are rows in pack_objects,
+ * delivered through the pack-commit callback, so the install is a single file
+ * and the second half of the old two-file staging dance is now a database
+ * insert the caller performs. That pair is not atomic and cannot be; the
+ * ordering (install first, then rows) is deliberate, so an interruption
+ * leaves objects invisible rather than advertised-but-absent. See
+ * daemonization-spec.md section 12.
+ */
+static status_t finalize_pack(store_t *store, FILE **dat_f,
+                              char *dat_tmp,
+                              pack_dat_hdr_t *dat_hdr,
+                              pack_idx_disk_entry_t *idx_entries,
+                              uint32_t packed, uint32_t pack_num,
+                              const pack_entry_parity_t *precomputed_parity)
+{
+    uint64_t dat_size = 0;
+    status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
+                                 packed, precomputed_parity, &dat_size);
+    if (st == OK) st = install_pack_file(store, dat_tmp, pack_num, &dat_size);
+    if (st != OK) { unlink(dat_tmp); return st; }
+    return announce_pack(store, pack_num, dat_size, idx_entries, packed);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4330,6 +4363,343 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     return fixed;
 }
 
+/*
+ * Write a .deleting-NNNNNNNN marker naming packs to remove, atomically.
+ *
+ * pack_resume_deleting replays a marker by deleting every pack it names, so
+ * a marker cut short by a crash is worse than none: "123" truncated to "12"
+ * names some other pack. Written in tmp/ and renamed into packs/, it is
+ * either whole or absent. The staging name must not itself look like a
+ * marker, which is why it does not live in packs/.
+ *
+ * On failure after the rename the marker stays where it is, and that is
+ * safe for both callers: they write it only once everything it would let a
+ * resume delete is held elsewhere, durably.
+ */
+static status_t write_deleting_marker(store_t *store, uint32_t key,
+                                      const uint32_t *nums, size_t n,
+                                      char *out_path, size_t out_sz)
+{
+    char tmp[PATH_MAX], packs_dir[PATH_MAX];
+    if (path_fmt(tmp, sizeof(tmp), "%s/tmp/deleting.XXXXXX", store_root(store)) != 0 ||
+        path_fmt(packs_dir, sizeof(packs_dir), "%s/packs", store_root(store)) != 0 ||
+        path_fmt(out_path, out_sz, "%s/.deleting-%08u", packs_dir, key) != 0)
+        return set_error(ERR_IO, "pack marker: path too long");
+
+    int fd = mkstemp(tmp);
+    if (fd == -1) return set_error_errno(ERR_IO, "pack marker: mkstemp in %s/tmp",
+                                         store_root(store));
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        int err = errno;
+        close(fd);
+        unlink(tmp);
+        errno = err;
+        return set_error_errno(ERR_IO, "pack marker: fdopen");
+    }
+    int ok = 1;
+    for (size_t i = 0; i < n; i++)
+        if (fprintf(f, "%u\n", nums[i]) < 0) ok = 0;
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        int err = errno;
+        unlink(tmp);
+        errno = err;
+        return set_error_errno(ERR_IO, "pack marker: write");
+    }
+    if (rename(tmp, out_path) != 0) {
+        int err = errno;
+        unlink(tmp);
+        errno = err;
+        return set_error_errno(ERR_IO, "pack marker: install %s", out_path);
+    }
+    if (fsync_dir_path(packs_dir) != 0)
+        return set_error_errno(ERR_IO, "pack marker: sync %s", packs_dir);
+    return OK;
+}
+
+/* One sealed output of a gc rewrite, still in tmp/. Its entries are a
+ * slice of the rewrite's shared array. */
+typedef struct {
+    char     tmp[PATH_MAX];
+    uint32_t first;
+    uint32_t n;
+    uint64_t size;
+} gc_output_t;
+
+/* Remove the outputs of a rewrite that is being abandoned: installed ones
+ * from packs/ (with the removal callback, though none was announced yet),
+ * the rest from tmp/. */
+static void gc_outputs_discard(store_t *store, const gc_output_t *outs, size_t nouts,
+                               uint32_t base, size_t installed)
+{
+    for (size_t k = 0; k < nouts; k++) {
+        if (k < installed) {
+            char p[PATH_MAX];
+            uint32_t num = base + (uint32_t)k;
+            if (pack_dat_path(p, sizeof(p), store_root(store), num) == 0) unlink(p);
+            store_emit_pack_removed(store, num);
+        } else {
+            unlink(outs[k].tmp);
+        }
+    }
+}
+
+/*
+ * Rewrite one pack without its dead entries, split at the seal.
+ *
+ * gc used to copy a pack's live entries into one new file and rename it over
+ * the old one, whatever its size. A pack written before the seal applied to
+ * everything (a pre-OWN-16 backup, a pre-OWN-19 replica) could be any size,
+ * so dropping one entry from a 1 TB pack rewrote 1 TB into another 1 TB
+ * pack, and did it again the next time anything in it died. Rolling over at
+ * PACK_MAX_MULTI_BYTES makes that the last time: the outputs are ordinary
+ * packs, and the next rewrite of any of them costs at most the seal.
+ *
+ * The free space it needs is unchanged - the live entries, once, beside the
+ * old pack, which cannot go until its contents are held elsewhere.
+ *
+ * The phases are ordered so that a crash or failure at any point leaves
+ * every object readable, through the index as it stands and after a
+ * reindex:
+ *
+ *   1. Copy. Live entries go into outputs staged in tmp/, each sealed (parity
+ *      written, fsynced) when the next entry would pass the seal. Nothing in
+ *      packs/ changes, so this phase - the long one, proportional to the
+ *      pack - can fail, be cancelled or be killed and leave only staging
+ *      files, which the next backup or gc sweeps.
+ *   2. Install. Each output is renamed to a fresh pack number and the
+ *      directories are synced. A failure removes those already installed;
+ *      none has index rows yet, so the old pack and its rows are untouched.
+ *   3. Announce. The commit callback for each new pack moves its objects'
+ *      rows to it (INSERT OR REPLACE by hash).
+ *   4. Remove the old pack, behind a .deleting marker so a crash between
+ *      the unlink and the removal callback is finished by the next gc.
+ *
+ * A crash between 2 and 4 leaves the old pack beside complete copies of its
+ * live entries: duplicates, which waste space and lose nothing. Rewriting in
+ * place under the same number had a worse window - after the rename and
+ * before the callbacks, the index pointed at offsets in a file that no
+ * longer held them - so every rewrite now takes new numbers, split or not.
+ *
+ * Returns ERR_BUSY, with nothing changed, when the store is cancelled
+ * between outputs.
+ */
+static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_path,
+                                const pack_idx_disk_entry_t *disk_idx, uint32_t count,
+                                const uint8_t *refs, size_t refs_cnt,
+                                char *chunk, size_t chunk_sz,
+                                uint32_t *out_kept, uint32_t *out_dropped,
+                                uint32_t *out_written)
+{
+    *out_kept = 0;
+    *out_dropped = 0;
+    *out_written = 0;
+
+    FILE *old = fopen(dat_path, "rb");
+    if (!old) return set_error_errno(ERR_IO, "pack_gc: cannot open pack %u", pnum);
+
+    pack_idx_disk_entry_t *ents = malloc((size_t)count * sizeof(*ents));
+    if (!ents) {
+        fclose(old);
+        return set_error(ERR_NOMEM, "pack_gc: entry array for pack %u", pnum);
+    }
+
+    gc_output_t *outs = NULL;
+    size_t nouts = 0, outs_cap = 0;
+
+    FILE *cur = NULL;
+    char cur_tmp[PATH_MAX];
+    cur_tmp[0] = '\0';
+    pack_dat_hdr_t hdr;
+    uint64_t body = 0;
+    uint32_t cur_first = 0, cur_n = 0;
+    uint32_t kept = 0, dropped = 0;
+    status_t st = OK;
+
+    /* ---- 1. copy ---- */
+    for (uint32_t i = 0; st == OK && i <= count; i++) {
+        int last = (i == count);
+        pack_dat_entry_hdr_t ehdr;
+        uint64_t entry_total = 0;
+
+        if (!last) {
+            if (!bsearch(disk_idx[i].hash, refs, refs_cnt, OBJECT_HASH_SIZE, ref_cmp)) {
+                dropped++;
+                continue;
+            }
+            if (fseeko(old, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) {
+                st = set_error_errno(ERR_IO, "pack_gc: seek in pack %u", pnum);
+                break;
+            }
+            if (read_entry_hdr(old, &ehdr) != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
+                st = set_error(ERR_CORRUPT, "pack_gc: bad entry header at %llu in pack %u",
+                               (unsigned long long)disk_idx[i].dat_offset, pnum);
+                break;
+            }
+            entry_total = sizeof(ehdr) + ehdr.compressed_size;
+        }
+
+        /* Seal the open output when this entry would pass the seal, or at
+         * the end. An empty output never seals, so an entry larger than the
+         * seal is written alone rather than refused. */
+        if (cur && cur_n > 0 &&
+            (last || body + entry_total > PACK_MAX_MULTI_BYTES)) {
+            if (nouts == outs_cap) {
+                size_t nc = outs_cap ? outs_cap * 2 : 4;
+                gc_output_t *no = realloc(outs, nc * sizeof(*no));
+                if (!no) { st = set_error(ERR_NOMEM, "pack_gc: output list"); break; }
+                outs = no;
+                outs_cap = nc;
+            }
+            uint64_t size = 0;
+            err_clear();   /* so a failure with no message of its own is told apart */
+            st = seal_pack_file(store, &cur, &hdr, ents + cur_first, cur_n, NULL, &size);
+            if (st != OK) {
+                if (!err_msg()[0])
+                    set_error(st, "pack_gc: cannot seal a rewrite of pack %u", pnum);
+                break;
+            }
+            gc_output_t *o = &outs[nouts++];
+            memcpy(o->tmp, cur_tmp, sizeof(o->tmp));
+            o->first = cur_first;
+            o->n     = cur_n;
+            o->size  = size;
+            cur_tmp[0] = '\0';
+
+            /* A rewrite of a large pack can run for hours. Between outputs
+             * is a clean place to stop: nothing is installed yet. */
+            if (!last && store_cancelled(store)) {
+                st = set_error(ERR_BUSY, "pack compaction cancelled");
+                break;
+            }
+        }
+        if (last) break;
+
+        if (!cur) {
+            st = open_new_pack(store, 0, &cur, cur_tmp, &hdr);
+            if (st != OK) { cur_tmp[0] = '\0'; break; }
+            body = 0;
+            cur_first = kept;
+            cur_n = 0;
+        }
+
+        if (fwrite(&ehdr, sizeof(ehdr), 1, cur) != 1) {
+            st = set_error_errno(ERR_IO, "pack_gc: write entry header");
+            break;
+        }
+        uint64_t remaining = ehdr.compressed_size;
+        while (st == OK && remaining > 0) {
+            size_t want = remaining < chunk_sz ? (size_t)remaining : chunk_sz;
+            if (fread_full(chunk, want, old) != 0)
+                st = set_error(ERR_CORRUPT, "pack_gc: short entry in pack %u", pnum);
+            else if (fwrite_full(chunk, want, cur) != 0)
+                st = set_error_errno(ERR_IO, "pack_gc: write entry payload");
+            remaining -= want;
+        }
+        if (st != OK) break;
+
+        pack_idx_disk_entry_t *e = &ents[kept];
+        memset(e, 0, sizeof(*e));
+        memcpy(e->hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
+        e->dat_offset        = sizeof(hdr) + body;
+        /* Position in this output, which is what its parity trailer is
+         * indexed by - not the position in the old pack, and not the index
+         * after seal_pack_file sorts the slice by hash. */
+        e->entry_index       = cur_n;
+        e->type              = ehdr.type;
+        e->compression       = ehdr.compression;
+        e->encryption        = ehdr.encryption;
+        e->uncompressed_size = ehdr.uncompressed_size;
+        e->compressed_size   = ehdr.compressed_size;
+        kept++;
+        cur_n++;
+        body += entry_total;
+    }
+    fclose(old);
+
+    /* The caller only rewrites a pack with at least one live entry, and
+     * removing the old pack with nothing written would lose it. */
+    if (st == OK && nouts == 0)
+        st = set_error(ERR_INVALID, "pack_gc: rewrite of pack %u kept nothing", pnum);
+
+    if (st != OK) {
+        if (cur) fclose(cur);
+        if (cur_tmp[0]) unlink(cur_tmp);
+        gc_outputs_discard(store, outs, nouts, 0, 0);
+        free(outs);
+        free(ents);
+        return st;
+    }
+
+    /* ---- 2. install ---- */
+    uint32_t base = next_pack_num(store);
+    size_t installed = 0;
+    for (; installed < nouts; installed++) {
+        st = install_pack_file(store, outs[installed].tmp, base + (uint32_t)installed,
+                               &outs[installed].size);
+        if (st != OK) break;
+    }
+    if (st == OK) {
+        uint32_t synced_shard = UINT32_MAX;
+        for (size_t k = 0; st == OK && k < nouts; k++) {
+            uint32_t shard = (base + (uint32_t)k) / 256;
+            if (shard == synced_shard) continue;
+            char dir[PATH_MAX];
+            if (path_fmt(dir, sizeof(dir), "%s/packs/%04x", store_root(store), shard) != 0 ||
+                fsync_dir_path(dir) != 0)
+                st = set_error_errno(ERR_IO, "pack_gc: sync %s", dir);
+            synced_shard = shard;
+        }
+        char dir[PATH_MAX];
+        if (st == OK &&
+            (path_fmt(dir, sizeof(dir), "%s/packs", store_root(store)) != 0 ||
+             fsync_dir_path(dir) != 0))
+            st = set_error_errno(ERR_IO, "pack_gc: sync %s", dir);
+    }
+    if (st != OK) {
+        gc_outputs_discard(store, outs, nouts, base, installed);
+        free(outs);
+        free(ents);
+        return st;
+    }
+
+    /* ---- 3. announce ---- */
+    for (size_t k = 0; st == OK && k < nouts; k++)
+        st = announce_pack(store, base + (uint32_t)k, outs[k].size,
+                           ents + outs[k].first, outs[k].n);
+    if (st != OK) {
+        /* Installed and partly indexed: the old pack stays, so every object
+         * is readable whichever pack its row names. */
+        free(outs);
+        free(ents);
+        pack_cache_invalidate(store);
+        return st;
+    }
+
+    /* ---- 4. remove the old pack ---- */
+    char marker[PATH_MAX];
+    st = write_deleting_marker(store, base, &pnum, 1, marker, sizeof(marker));
+    if (st == OK) {
+        unlink(dat_path);
+        store_emit_pack_removed(store, pnum);
+        unlink(marker);
+    }
+
+    if (nouts > 1)
+        log_info("pack-gc: split pack %u into %zu pack(s) %u-%u (%u live, %u dropped)",
+                 pnum, nouts, base, base + (uint32_t)nouts - 1, kept, dropped);
+
+    *out_kept = kept;
+    *out_dropped = dropped;
+    *out_written = (uint32_t)nouts;
+    free(outs);
+    free(ents);
+    pack_cache_invalidate(store);
+    return st;
+}
+
 status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
@@ -4427,202 +4797,29 @@ status_t pack_gc_stats(store_t *store,
             continue;
         }
 
-        /* Partial rewrite: copy live entries into new tmp dat+idx */
-        char dat_tmp[PATH_MAX], idx_tmp[PATH_MAX];
-        if (path_fmt(dat_tmp, sizeof(dat_tmp), "%s/tmp/pack-dat.XXXXXX",
-                     store_root(store)) != 0 ||
-            path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
-                     store_root(store)) != 0) {
-            free(disk_idx); free(gc_chunk); free(pack_nums);
-            return set_error(ERR_IO, "pack_gc: tmp path too long for pack %u", pnum);
+        uint32_t kept = 0, dropped = 0, written = 0;
+        status_t st = gc_rewrite_pack(store, pnum, dat_path, disk_idx, count,
+                                      refs, refs_cnt, gc_chunk, GC_CHUNK,
+                                      &kept, &dropped, &written);
+        free(disk_idx);
+        if (st == ERR_BUSY) {
+            /* Cancelled mid-rewrite, with nothing installed: the pack is
+             * still the old one, as at any other stopping point. */
+            err_clear();
+            gc_cancelled = 1;
+            break;
         }
-
-        int new_dat_fd = mkstemp(dat_tmp);
-        int new_idx_fd = mkstemp(idx_tmp);
-        if (new_dat_fd == -1 || new_idx_fd == -1) {
-            int err = errno;
-            if (new_dat_fd >= 0) { close(new_dat_fd); unlink(dat_tmp); }
-            if (new_idx_fd >= 0) { close(new_idx_fd); unlink(idx_tmp); }
-            free(disk_idx);
+        if (st != OK) {
             free(gc_chunk);
             free(pack_nums);
-            errno = err;
-            return set_error_errno(ERR_IO, "pack_gc: mkstemp failed for pack %u", pnum);
-        }
-
-        FILE *new_dat = fdopen(new_dat_fd, "w+b");
-        FILE *new_idx = fdopen(new_idx_fd, "wb");
-        if (!new_dat || !new_idx) {
-            int err = errno;
-            if (new_dat) fclose(new_dat); else close(new_dat_fd);
-            if (new_idx) fclose(new_idx); else close(new_idx_fd);
-            unlink(dat_tmp);
-            unlink(idx_tmp);
-            free(disk_idx);
-            free(gc_chunk);
-            free(pack_nums);
-            errno = err;
-            return set_error_errno(ERR_IO, "pack_gc: fdopen failed for pack %u", pnum);
-        }
-
-        FILE *old_dat = fopen(dat_path, "rb");
-        if (!old_dat) {
-            fclose(new_dat); fclose(new_idx);
-            unlink(dat_tmp); unlink(idx_tmp);
-            free(disk_idx);
-            continue;
-        }
-
-        /* Placeholder dat header — patch count after we know it */
-        pack_dat_hdr_t dhdr = { PACK_DAT_MAGIC, PACK_VERSION, 0 };
-        status_t st = OK;
-        if (fwrite(&dhdr, sizeof(dhdr), 1, new_dat) != 1) { st = ERR_IO; goto pack_fail; }
-
-        uint32_t live_count = 0;
-        uint64_t new_offset = sizeof(dhdr);
-
-        /* Build new idx in a temp buffer, sorted by hash at the end */
-        pack_idx_disk_entry_t *new_disk_idx = malloc(count * sizeof(*new_disk_idx));
-        if (!new_disk_idx) { st = ERR_NOMEM; goto pack_fail; }
-
-        for (uint32_t i = 0; i < count; i++) {
-            int referenced = bsearch(disk_idx[i].hash, refs, refs_cnt,
-                                     OBJECT_HASH_SIZE, ref_cmp) != NULL;
-            if (!referenced) { total_deleted++; continue; }
-
-            /* Seek to this entry's position in the old dat and copy it */
-            if (fseeko(old_dat, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) {
-                st = ERR_IO; free(new_disk_idx); goto pack_fail;
-            }
-            pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(old_dat, &ehdr) != 0) {
-                st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
-            }
-            if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
-                st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
-            }
-            /* Write entry header, then stream-copy payload in chunks */
-            if (fwrite(&ehdr, sizeof(ehdr), 1, new_dat) != 1) {
-                st = ERR_IO; free(new_disk_idx); goto pack_fail;
-            }
-            {
-                size_t remaining = (size_t)ehdr.compressed_size;
-                while (remaining > 0) {
-                    size_t want = remaining < GC_CHUNK ? remaining : GC_CHUNK;
-                    if (fread_full(gc_chunk, want, old_dat) != 0) {
-                        st = ERR_CORRUPT; free(new_disk_idx); goto pack_fail;
-                    }
-                    if (fwrite_full(gc_chunk, want, new_dat) != 0) {
-                        st = ERR_IO; free(new_disk_idx); goto pack_fail;
-                    }
-                    remaining -= want;
-                }
-            }
-
-            memcpy(new_disk_idx[live_count].hash, disk_idx[i].hash, OBJECT_HASH_SIZE);
-            new_disk_idx[live_count].dat_offset         = new_offset;
-            new_disk_idx[live_count].entry_index        = live_count;
-            new_disk_idx[live_count].type               = ehdr.type;
-            new_disk_idx[live_count].compression        = ehdr.compression;
-            new_disk_idx[live_count].encryption         = ehdr.encryption;
-            new_disk_idx[live_count].uncompressed_size  = ehdr.uncompressed_size;
-            new_disk_idx[live_count].compressed_size    = ehdr.compressed_size;
-            live_count++;
-            new_offset += sizeof(ehdr) + ehdr.compressed_size;
-            total_kept++;
-        }
-        /* Patch dat header count */
-        if (fseeko(new_dat, 0, SEEK_SET) != 0) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        dhdr.count = live_count;
-        if (fwrite(&dhdr, sizeof(dhdr), 1, new_dat) != 1) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        /* Write dat parity trailer */
-        if (fseeko(new_dat, 0, SEEK_END) != 0) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        {
-            pack_idx_disk_entry_t *gc_by_offset = malloc((size_t)live_count * sizeof(*gc_by_offset));
-            if (!gc_by_offset) {
-                st = ERR_NOMEM; free(new_disk_idx); goto pack_fail;
-            }
-            memcpy(gc_by_offset, new_disk_idx, (size_t)live_count * sizeof(*gc_by_offset));
-            qsort(gc_by_offset, live_count, sizeof(*gc_by_offset), idx_offset_cmp);
-            st = write_dat_parity(store, new_dat, &dhdr, gc_by_offset, live_count);
-            free(gc_by_offset);
-            if (st != OK) { free(new_disk_idx); goto pack_fail; }
-        }
-        if (fflush(new_dat) != 0 || fsync(fileno(new_dat)) != 0) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        fclose(new_dat); new_dat = NULL;
-        fclose(old_dat); old_dat = NULL;
-
-        qsort(new_disk_idx, live_count, sizeof(*new_disk_idx), idx_disk_cmp);
-
-        /* Replace old pack with new. One file, so one rename. */
-        if (rename(dat_tmp, dat_path) != 0) {
-            st = ERR_IO; free(new_disk_idx); goto pack_fail;
-        }
-        {
-            struct stat gc_dst_stat;
-            if (stat(dat_path, &gc_dst_stat) != 0 || gc_dst_stat.st_size == 0) {
-                st = ERR_IO; free(new_disk_idx); goto pack_fail;
-            }
-        }
-        {
-            int pfd = openat(store_fd(store), "packs", O_RDONLY | O_DIRECTORY);
-            if (pfd >= 0) { fsync(pfd); close(pfd); }
-        }
-
-        stats->packs_rewritten++;
-
-        /* Re-announce the rewritten pack. GC drops dead objects, so the
-         * daemon's pack_objects rows for this pack are now wrong; the commit
-         * callback replaces them. Emitted after the rename for the same
-         * reason as in finalize_pack: rows must never describe a pack that
-         * is not on disk yet. */
-        store_emit_pack_removed(store, pnum);
-        if (live_count > 0) {
-            pack_commit_entry_t *ce = malloc((size_t)live_count * sizeof(*ce));
-            if (ce) {
-                for (uint32_t ei = 0; ei < live_count; ei++) {
-                    memcpy(ce[ei].hash, new_disk_idx[ei].hash, OBJECT_HASH_SIZE);
-                    ce[ei].offset      = new_disk_idx[ei].dat_offset;
-                    ce[ei].comp_size   = new_disk_idx[ei].compressed_size;
-                    ce[ei].orig_size   = new_disk_idx[ei].uncompressed_size;
-                    ce[ei].entry_index = new_disk_idx[ei].entry_index;
-                }
-                struct stat gc_sz;
-                char fname[64];
-                snprintf(fname, sizeof(fname), "pack-%08u.dat", pnum);
-                pack_commit_info_t info = {
-                    .pack_id     = pnum,
-                    .filename    = fname,
-                    .size        = (stat(dat_path, &gc_sz) == 0) ? (uint64_t)gc_sz.st_size : 0,
-                    .entry_count = live_count,
-                    .entries     = ce,
-                };
-                store_emit_pack_commit(store, &info);
-                free(ce);
-            }
-        }
-        free(new_disk_idx);
-        free(disk_idx);
-        continue;
-
-pack_fail:
-        if (new_dat) fclose(new_dat);
-        if (new_idx) fclose(new_idx);
-        if (old_dat) fclose(old_dat);
-        unlink(dat_tmp);
-        unlink(idx_tmp);
-        free(disk_idx);
-        free(gc_chunk);
-        free(pack_nums);
+            if (out_kept)    *out_kept    = total_kept;
+            if (out_deleted) *out_deleted = total_deleted;
+            pack_cache_invalidate(store);
             return st;
+        }
+        total_kept    += kept;
+        total_deleted += dropped;
+        stats->packs_rewritten++;
     }
     free(gc_chunk);
 

@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 _Thread_local int fault_malloc_at  = -1;
 _Thread_local int fault_fread_at   = -1;
@@ -140,8 +141,21 @@ static void gate_wait(const char *to) {
     pthread_mutex_unlock(&gate_mu);
 }
 
+const char *volatile fault_rename_die_dst = NULL;
+volatile int fault_rename_die_skip = 0;
+volatile int fault_rename_die_after = 0;
+
 int __wrap_rename(const char *from, const char *to) {
     gate_wait(to);
+    const char *die = fault_rename_die_dst;
+    if (die && strncmp(to, die, strlen(die)) == 0) {
+        if (__atomic_load_n(&fault_rename_die_skip, __ATOMIC_SEQ_CST) > 0) {
+            __atomic_sub_fetch(&fault_rename_die_skip, 1, __ATOMIC_SEQ_CST);
+        } else {
+            if (fault_rename_die_after) (void)__real_rename(from, to);
+            _exit(0);
+        }
+    }
     const char *match = fault_rename_dst;
     if (match && strncmp(to, match, strlen(match)) == 0) {
         if (__atomic_load_n(&fault_rename_skip, __ATOMIC_SEQ_CST) > 0) {

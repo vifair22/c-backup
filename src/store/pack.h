@@ -46,7 +46,8 @@
  *
  * Packs larger than this exist anyway and every reader accepts them: a
  * backup before OWN-16 and a replication before OWN-19 wrote one pack per
- * run or per snapshot, of any size.
+ * run or per snapshot, of any size. gc splits such a pack at the seal the
+ * first time it rewrites it.
  */
 #define PACK_MAX_MULTI_BYTES ((uint64_t)(256 * 1024 * 1024))
 
@@ -290,6 +291,11 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
  * entries whose hash appears in the sorted refs array (refs_cnt entries of
  * OBJECT_HASH_SIZE bytes each).  Called by repo_gc after collecting refs.
  * *out_kept / *out_deleted (may be NULL) receive aggregate counts.
+ *
+ * A rewritten pack's live entries go into new packs under new numbers,
+ * rolling over at PACK_MAX_MULTI_BYTES, and the old pack is removed only
+ * once they are installed, synced and announced. A pack with no dead
+ * entries is left alone whatever its size.
  */
 status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
