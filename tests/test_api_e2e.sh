@@ -453,6 +453,11 @@ else
     ok "clean SIGTERM shutdown"
 fi
 DAEMON_PID=""
+# And it was the daemon's shutdown that ran, not AppGuard's exit: that one
+# closed the database under running jobs and skipped everything below,
+# which left the socket behind.
+if [ -e "$SOCK" ]; then bad "shutdown removes the socket" "no $SOCK" "still there"
+else ok "shutdown removes the socket"; fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

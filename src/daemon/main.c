@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,12 +36,25 @@
 #define VERSION_STRING "0.0.0-dev"
 #endif
 
-static volatile sig_atomic_t running = 1;
+/*
+ * Shutdown on SIGINT or SIGTERM is the daemon's, not AppGuard's.
+ *
+ * AppGuard blocks both signals in every thread and receives them on a
+ * watcher of its own, so the sigaction handler this used to install never
+ * ran. AppGuard's default on a signal is to close the database and exit:
+ * under systemctl stop, running backup jobs had the database closed
+ * underneath them and none of the shutdown below executed - no listener
+ * stopped, no job cancelled, no socket removed. With on_signal, the first
+ * signal only ends the main loop, and teardown happens here in order while
+ * the database is still open. A second signal still forces the exit.
+ */
+static atomic_int running = 1;
 
-static void sig_handler(int sig)
+static void on_signal(int sig, void *ctx)
 {
-    (void)sig;
-    running = 0;
+    (void)ctx;
+    log_info("received %s, stopping", sig == SIGINT ? "SIGINT" : "SIGTERM");
+    atomic_store(&running, 0);
 }
 
 /*
@@ -87,6 +101,7 @@ int main(int argc, char *argv[])
     appguard_set_argv(argc, argv);
 
     appguard_config_t ag_cfg = app_appguard_config();
+    ag_cfg.on_signal = on_signal;
     appguard_t *guard = appguard_init(&ag_cfg);
     if (!guard)
         return 1;
@@ -109,12 +124,6 @@ int main(int argc, char *argv[])
         appguard_shutdown(guard);
         return 1;
     }
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sig_handler;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 
     /*
      * A write to a pipe whose reader has gone must return EPIPE, not kill
@@ -229,11 +238,16 @@ int main(int argc, char *argv[])
     }
     log_info("c-backupd ready");
 
-    while (running) {
+    while (atomic_load(&running)) {
         struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
         nanosleep(&req, NULL);
     }
 
+    /*
+     * Outside in: stop taking requests, stop firing schedules, then cancel
+     * and join running jobs - they stop between files and record how they
+     * ended, which needs the database AppGuard closes last.
+     */
     log_info("shutting down");
     api_server_stop(srv);
     if (sched) scheduler_stop(sched);
