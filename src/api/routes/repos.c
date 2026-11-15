@@ -421,6 +421,121 @@ static int64_t snap_suffix(const char *rest, const char *suffix)
     return sid;
 }
 
+/* A positive decimal id and nothing else in [p, end-of-segment). Returns a
+ * pointer past it, or NULL. */
+static const char *skip_id(const char *p)
+{
+    if (*p < '1' || *p > '9') return NULL;
+    while (*p >= '0' && *p <= '9') p++;
+    return p;
+}
+
+/*
+ * Every resource under /repos/<id>, and the methods it answers.
+ *
+ * The four repo-scoped handlers each dispatch on the path for their own
+ * method, so none of them could say whether a path it did not serve existed
+ * under another method: PUT /repos/1 and POST /repos/1/journal were 404s,
+ * and an unknown method was served as a GET (B085). This is the one place
+ * that knows the whole tree, and each handler consults it before
+ * dispatching, so a path is either served, refused with 405 and the methods
+ * that would work, or 404. A route added to a handler has to be added here
+ * or it answers 405; tests/test_api_e2e.sh exercises the table.
+ */
+static const char *repo_path_allow(const char *rest)
+{
+    static const struct { const char *path; const char *allow; } fixed[] = {
+        { "",            "GET, DELETE" },
+        { "/key",        "GET" },
+        { "/key/import", "POST" },
+        { "/key/ack",    "POST" },
+        { "/tags",       "GET, POST" },
+        { "/schedules",  "GET, POST" },
+        { "/policy",     "GET, PUT" },
+        { "/sources",    "GET, PUT" },
+        { "/journal",    "GET" },
+        { "/summary",    "GET" },
+        { "/stats",      "GET" },
+        { "/diff",       "GET" },
+        { "/fanout",     "GET" },
+        { "/objects",    "GET" },
+        { "/packs",      "GET" },
+        { "/snapshots",  "GET" },
+        { "/search",     "GET" },
+        { "/grep",       "GET, POST" },
+        { "/verify",     "GET, POST" },
+        { "/backup",     "POST" },
+        { "/gc",         "POST" },
+        { "/gfs",        "POST" },
+        { "/reindex",    "POST" },
+        { "/pack",       "POST" },
+        { "/replicate",  "POST" },
+    };
+    for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
+        if (strcmp(rest, fixed[i].path) == 0) return fixed[i].allow;
+
+    const char *e;
+    if (strncmp(rest, "/tags/", 6) == 0 && rest[6]) return "DELETE";
+    if (strncmp(rest, "/schedules/", 11) == 0 &&
+        (e = skip_id(rest + 11)) && *e == '\0') return "PUT, DELETE";
+    if (strncmp(rest, "/grep/", 6) == 0 &&
+        (e = skip_id(rest + 6)) && *e == '\0') return "GET";
+    if (strncmp(rest, "/verify/", 8) == 0 &&
+        (e = skip_id(rest + 8)) && *e == '\0') return "GET";
+    /* Pack numbers start at 0, unlike every other id here. */
+    if (strncmp(rest, "/packs/", 7) == 0 && rest[7] >= '0' && rest[7] <= '9') {
+        e = rest + 7;
+        while (*e >= '0' && *e <= '9') e++;
+        if (strcmp(e, "/entries") == 0) return "GET";
+    }
+    if (strncmp(rest, "/objects/", 9) == 0 && rest[9] && rest[9] != '/') {
+        const char *slash = strchr(rest + 9, '/');
+        if (!slash || strcmp(slash, "/refs") == 0 || strcmp(slash, "/layout") == 0 ||
+            strcmp(slash, "/content") == 0)
+            return "GET";
+        return NULL;
+    }
+    if (strncmp(rest, "/snapshots/", 11) == 0 && (e = skip_id(rest + 11))) {
+        if (*e == '\0')                    return "DELETE";
+        if (strcmp(e, "/note") == 0)       return "GET, PUT";
+        if (strcmp(e, "/tree") == 0)       return "GET";
+        if (strcmp(e, "/restore") == 0)    return "POST";
+    }
+    return NULL;
+}
+
+/* Whether `method` is one of the comma-separated names in `allow`. */
+static int allow_has(const char *allow, const char *method)
+{
+    size_t n = strlen(method);
+    for (const char *p = allow; (p = strstr(p, method)) != NULL; p += n) {
+        int starts = (p == allow || p[-1] == ' ');
+        int ends   = (p[n] == '\0' || p[n] == ',');
+        if (starts && ends) return 1;
+    }
+    return 0;
+}
+
+/* Gate for one scoped handler: 0 to go ahead, or 1 with the 404 or 405 to
+ * send in *out. */
+static int repo_path_refused(const char *rest, const char *method,
+                             api_response_t *out)
+{
+    const char *allow = repo_path_allow(rest);
+    if (!allow) { *out = api_error(404, "not found"); return 1; }
+    if (!allow_has(allow, method)) { *out = api_method_not_allowed(allow); return 1; }
+    return 0;
+}
+
+/* For the router: a method no handler is registered for (PATCH, OPTIONS). */
+static const char *repo_allow_for_url(const char *url, void *ud)
+{
+    const char *rest = NULL;
+    int64_t repo_id = split_repo_url(url, &rest);
+    if (repo_id < 0 || !repo_exists(ud, repo_id)) return NULL;
+    return repo_path_allow(rest);
+}
+
 /*
  * Hand back the key so it can be put somewhere safe.
  *
@@ -566,6 +681,8 @@ static api_response_t repo_scoped_get(const api_request_t *req, void *ud)
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
+    api_response_t refused;
+    if (repo_path_refused(rest, "GET", &refused)) return refused;
     if (*rest == '\0') return get_repo(req, ud);
 
     if (strcmp(rest, "/key") == 0)      return key_export(req, repo_id);
@@ -622,6 +739,8 @@ static api_response_t repo_scoped_put(const api_request_t *req, void *ud)
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
+    api_response_t refused;
+    if (repo_path_refused(rest, "PUT", &refused)) return refused;
 
     if (strcmp(rest, "/policy") == 0) return metadata_policy_put(req, repo_id);
     if (strcmp(rest, "/sources") == 0) return metadata_sources_put(req, repo_id);
@@ -645,6 +764,8 @@ static api_response_t repo_scoped_post(const api_request_t *req, void *ud)
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
+    api_response_t refused;
+    if (repo_path_refused(rest, "POST", &refused)) return refused;
     if (strcmp(rest, "/key/import") == 0) return key_import(req, repo_id);
     if (strcmp(rest, "/key/ack") == 0)    return key_ack(req, repo_id);
     if (strcmp(rest, "/backup") == 0)
@@ -665,6 +786,7 @@ int routes_register_repos(api_server_t *srv, cutils_db_t *db)
     if (api_server_route(srv, "/repos/*", API_POST,   repo_scoped_post, db) != 0) return -1;
     if (api_server_route(srv, "/repos/*", API_PUT,    repo_scoped_put,  db) != 0) return -1;
     if (api_server_route(srv, "/repos/*", API_DELETE, repo_scoped_delete, db) != 0) return -1;
+    if (api_server_route_allow(srv, "/repos/*", repo_allow_for_url, db) != 0) return -1;
     return 0;
 }
 
@@ -676,6 +798,8 @@ static api_response_t repo_scoped_delete(const api_request_t *req, void *ud)
     int64_t repo_id = split_repo_url(req->url, &rest);
     if (repo_id < 0) return api_error(400, "invalid repo id");
     if (!repo_exists(ud, repo_id)) return api_error(404, "no such repo");
+    api_response_t refused;
+    if (repo_path_refused(rest, "DELETE", &refused)) return refused;
     if (*rest == '\0') return delete_repo(req, ud);
 
     if (strncmp(rest, "/tags/", 6) == 0)

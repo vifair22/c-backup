@@ -235,10 +235,12 @@ describe('every request reaches a route the daemon serves', () => {
       const ep = toEndpoint(req)
       const res = await request(ep)
 
-      const routerMissed =
+      // A 405 is the same failure with the right path and the wrong method:
+      // the daemon answers it for any path it serves under another method.
+      const routerMissed = res.status === 405 || (
         res.status === 404 &&
         typeof res.body === 'object' && res.body !== null &&
-        (res.body as { error?: string }).error === ROUTER_404
+        (res.body as { error?: string }).error === ROUTER_404)
 
       assert.ok(
         !routerMissed,

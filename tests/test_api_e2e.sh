@@ -182,6 +182,43 @@ contains "get repo" '"uuid"' "$(sock_body /repos/1)"
 # so it trips an age alert like any stale repository instead of reading 0.
 contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
 check "unknown repo" 404 "$(sock_code /repos/99)"
+
+echo "methods"
+# B085: every method the router did not recognise was served as a GET, so
+# PATCH /repos/1 answered 200 with the repository and looked like an update
+# that changed nothing. A known path asked with the wrong method is a 405
+# naming the methods it does answer; an unknown path stays a 404.
+sock_method() {  # sock_method <METHOD> <path> -> "<code> <Allow value>"
+    # HEAD through -I: with -X HEAD curl waits for a body that never comes.
+    local how=(-X "$1"); [ "$1" = HEAD ] && how=(-I)
+    curl -s -o /dev/null -D - "${how[@]}" --max-time 5 --unix-socket "$SOCK" "http://localhost$2" \
+        | tr -d '\r' | awk 'NR==1 {c=$2} tolower($1)=="allow:" {sub(/^[^:]*: */,""); a=$0}
+                          END {print c, a}'
+}
+check "PATCH a repo"            "405 GET, DELETE" "$(sock_method PATCH /repos/1)"
+check "repo still there after"  200               "$(sock_code /repos/1)"
+check "PUT a repo"              "405 GET, DELETE" "$(sock_method PUT /repos/1)"
+check "POST a repo"             "405 GET, DELETE" "$(sock_method POST /repos/1)"
+check "PATCH the repo list"     "405 GET, POST"   "$(sock_method PATCH /repos)"
+check "DELETE the repo list"    "405 GET, POST"   "$(sock_method DELETE /repos)"
+check "POST a read-only path"   "405 GET"         "$(sock_method POST /repos/1/journal)"
+check "DELETE a read-only path" "405 GET"         "$(sock_method DELETE /repos/1/summary)"
+check "GET a job submission"    "405 POST"        "$(sock_method GET /repos/1/backup)"
+check "OPTIONS on schedules"    "405 GET, POST"   "$(sock_method OPTIONS /repos/1/schedules)"
+check "GET one schedule"        "405 PUT, DELETE" "$(sock_method GET /repos/1/schedules/5)"
+check "PUT a snapshot"          "405 DELETE"      "$(sock_method PUT /repos/1/snapshots/5)"
+check "POST a note"             "405 GET, PUT"    "$(sock_method POST /repos/1/snapshots/5/note)"
+check "GET a cancel"            "405 POST"        "$(sock_method GET /jobs/5/cancel)"
+check "POST a job"              "405 GET"         "$(sock_method POST /jobs/5)"
+check "PUT a job stream"        "405 GET"         "$(sock_method PUT /jobs/stream/5)"
+check "PUT healthz"             "405 GET"         "$(sock_method PUT /healthz)"
+check "PATCH an auth route"     "405 GET, POST"   "$(sock_method PATCH /api/auth/setup)"
+check "HEAD is a GET"           "200 "            "$(sock_method HEAD /repos/1)"
+check "unknown path, any method" "404 "           "$(sock_method PATCH /nonexistent)"
+check "unknown repo sub-path"   "404 "            "$(sock_method POST /repos/1/nonexistent)"
+check "PATCH an unknown repo"   "404 "            "$(sock_method PATCH /repos/999)"
+# And DELETE of a repository that does not exist is a 404, not a 204.
+check "DELETE an unknown repo"  "404 "            "$(sock_method DELETE /repos/999)"
 # And every route under it: these answered 200 with empty results, which a
 # script cannot tell from an empty repository that exists.
 check "unknown repo: summary" 404 "$(sock_code /repos/99/summary)"
@@ -732,6 +769,10 @@ contains "tcp job stream" '"state":"completed"' \
 contains "tcp stream unknown job" 'no such job' \
     "$(curl -s --max-time 5 "${AUTH[@]}" "$URL/jobs/stream/999999")"
 check "tcp stream needs a token" 401 "$(tcp_code /jobs/stream/$RJOB --max-time 5)"
+# A 405 comes after auth: the network learns nothing about the API's shape
+# without a token.
+check "tcp 405 needs a token" 401 "$(tcp_code /repos/1 -X PATCH)"
+check "tcp 405 with a token" 405 "$(tcp_code /repos/1 -X PATCH "${AUTH[@]}")"
 
 # B053: a second client's session must not survive the password change that
 # was meant to shut it out, while the session that made the change does.

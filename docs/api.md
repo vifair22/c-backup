@@ -42,6 +42,14 @@ Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.
 
+A path the API serves, asked with a method it does not answer, is a `405`
+with an `Allow` header listing the methods that work there (`PATCH
+/repos/1` gives `405`, `Allow: GET, DELETE`). Any method other than GET,
+HEAD, POST, PUT and DELETE is one of those; it used to be served as a GET.
+A path that names nothing, under any method, is a `404`, and so is anything
+under `/repos/<id>` for a repository that is not registered. The 405 comes
+after authentication, so over TCP it needs a token like everything else.
+
 Long operations return `202` with a job id rather than blocking. A backup can
 run for hours, and a request that lives that long dies to any timeout between
 client and daemon.

@@ -556,16 +556,35 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
     return json_out(root);
 }
 
+/*
+ * What each path under /jobs/ answers: /jobs/<id> is GET, /jobs/<id>/cancel
+ * is POST, /jobs/stream/<id> is GET (its own route). A wrong method on one of
+ * them is a 405 naming the right one, not the 404 or 400 the other method's
+ * handler made of it (B085). NULL for anything else.
+ */
+static const char *jobs_allow_for_url(const char *url, void *ud)
+{
+    (void)ud;
+    if (strncmp(url, "/jobs/", 6) != 0) return NULL;
+    const char *p = url + 6;
+    if (strncmp(p, "stream/", 7) == 0) p += 7;
+    char *end = NULL;
+    long long id = strtoll(p, &end, 10);
+    if (id <= 0 || !end || end == p || *p < '1' || *p > '9') return NULL;
+    if (*end == '\0') return "GET";
+    if (p == url + 6 && strcmp(end, "/cancel") == 0) return "POST";
+    return NULL;
+}
+
 static api_response_t get_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    const char *allow = jobs_allow_for_url(req->url, NULL);
+    if (!allow) return api_error(404, "not found");
+    if (strcmp(allow, "GET") != 0) return api_method_not_allowed(allow);
     const char *tail = req->url + strlen("/jobs/");
     char *end = NULL;
     long long id = strtoll(tail, &end, 10);
-    if (id <= 0) return api_error(400, "invalid job id");
-
-    /* /jobs/<id>/cancel is a POST; a GET on it is not a job lookup. */
-    if (end && *end != '\0') return api_error(404, "not found");
 
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%lld", id);
@@ -583,11 +602,12 @@ static api_response_t get_job(const api_request_t *req, void *ud)
 static api_response_t cancel_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    const char *allow = jobs_allow_for_url(req->url, NULL);
+    if (!allow) return api_error(404, "not found");
+    if (strcmp(allow, "POST") != 0) return api_method_not_allowed(allow);
     const char *tail = req->url + strlen("/jobs/");
     char *end = NULL;
     long long id = strtoll(tail, &end, 10);
-    if (id <= 0 || !end || strcmp(end, "/cancel") != 0)
-        return api_error(400, "invalid job id");
 
     status_t st = job_cancel(ctx->jm, id);
     if (st != OK) return api_error(404, "job is not running");
@@ -619,5 +639,6 @@ int routes_register_jobs(api_server_t *srv, cutils_db_t *db, job_manager_t *jm)
     if (api_server_route(srv, "/jobs",    API_GET,  list_jobs,     &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_GET,  get_job,       &g_ctx) != 0) return -1;
     if (api_server_route(srv, "/jobs/*",  API_POST, cancel_job,    &g_ctx) != 0) return -1;
+    if (api_server_route_allow(srv, "/jobs/*", jobs_allow_for_url, NULL) != 0) return -1;
     return 0;
 }
