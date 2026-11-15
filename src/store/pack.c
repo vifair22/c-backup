@@ -4385,10 +4385,10 @@ status_t pack_gc_stats(store_t *store,
         }
         uint32_t count = ghdr.count;
         if (count > 10000000u) {
-            fclose(gcidxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
+            fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
         }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
-        if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
+        if (!disk_idx) { fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
         if (build_disk_idx_from_dat(gcidxf, count, disk_idx) != 0) {
             free(disk_idx); fclose(gcidxf); continue;
         }
@@ -4425,27 +4425,35 @@ status_t pack_gc_stats(store_t *store,
                      store_root(store)) != 0 ||
             path_fmt(idx_tmp, sizeof(idx_tmp), "%s/tmp/pack-idx.XXXXXX",
                      store_root(store)) != 0) {
-            free(disk_idx);
+            free(disk_idx); free(gc_chunk); free(pack_nums);
             return set_error(ERR_IO, "pack_gc: tmp path too long for pack %u", pnum);
         }
 
         int new_dat_fd = mkstemp(dat_tmp);
         int new_idx_fd = mkstemp(idx_tmp);
         if (new_dat_fd == -1 || new_idx_fd == -1) {
+            int err = errno;
             if (new_dat_fd >= 0) { close(new_dat_fd); unlink(dat_tmp); }
             if (new_idx_fd >= 0) { close(new_idx_fd); unlink(idx_tmp); }
             free(disk_idx);
+            free(gc_chunk);
             free(pack_nums);
+            errno = err;
             return set_error_errno(ERR_IO, "pack_gc: mkstemp failed for pack %u", pnum);
         }
 
         FILE *new_dat = fdopen(new_dat_fd, "w+b");
         FILE *new_idx = fdopen(new_idx_fd, "wb");
         if (!new_dat || !new_idx) {
-            if (new_dat) fclose(new_dat); else { close(new_dat_fd); unlink(dat_tmp); }
-            if (new_idx) fclose(new_idx); else { close(new_idx_fd); unlink(idx_tmp); }
+            int err = errno;
+            if (new_dat) fclose(new_dat); else close(new_dat_fd);
+            if (new_idx) fclose(new_idx); else close(new_idx_fd);
+            unlink(dat_tmp);
+            unlink(idx_tmp);
             free(disk_idx);
+            free(gc_chunk);
             free(pack_nums);
+            errno = err;
             return set_error_errno(ERR_IO, "pack_gc: fdopen failed for pack %u", pnum);
         }
 
