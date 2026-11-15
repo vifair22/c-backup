@@ -191,6 +191,21 @@ lazily on first append, which used to leave an empty result serialising as
 pulling a single file back does not cost a full restore. It accepts the path
 either as it appears in the browser or without its leading slash, and matches
 on path boundaries, so `/src/doc` does not also pull in `/src/documents`.
+It is normalised first: repeated slashes collapse and `.` and `..` resolve,
+so `/src//doc/./` names the same directory as `/src/doc`.
+
+A restore request is refused before any job is created when it cannot do
+what was asked:
+
+| Response | When |
+|---|---|
+| `400 dest must be an absolute path` | `dest` is relative; it would resolve against the daemon's working directory |
+| `400 dest is inside the repository at <path>` | `dest`, compared as a canonical path so a symlink or `..` cannot route around it, is a registered repository or lies beneath one |
+| `404 subpath <p> matches nothing in snapshot <n>` | `subpath` names nothing in the snapshot; the index answers this with one lookup per path component |
+
+A snapshot whose nodes are not resident cannot be checked up front, so for
+that one a subpath that matches nothing fails the job with the same message
+instead of reporting a restore that wrote nothing.
 
 `exclude` takes patterns, and how one is matched follows from what it
 contains rather than from a flag:
