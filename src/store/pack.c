@@ -115,9 +115,6 @@ typedef struct {
 _Static_assert(PACK_COALESCE_SMALL_BYTES < PACK_MAX_MULTI_BYTES,
                "coalesce smallness must be below the pack seal size");
 
-/* Maximum plausible object size: 128 GiB */
-#define OBJECT_SIZE_MAX ((uint64_t)(128ull * 1024ull * 1024ull * 1024ull))
-
 /* Sweeper intelligence constants */
 #define PACK_SIZE_THRESHOLD  ((uint64_t)(16 * 1024 * 1024))  /* 16 MiB */
 #define PACK_RATIO_THRESHOLD 0.90                             /* skip if ratio >= this */
@@ -1785,11 +1782,14 @@ static status_t write_dat_parity(store_t *store, FILE *dat_f,
         parity_record_t hdr_par;
         parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
 
-        /* Read payload in chunks for CRC and RS parity */
-        if (ehdr.compressed_size > OBJECT_SIZE_MAX) {
-            free(entry_offsets); free(chunk_buf);
-            return set_error(ERR_CORRUPT, "write_dat_parity: entry %u compressed_size exceeds max", i);
-        }
+        /*
+         * Read payload in chunks for CRC and RS parity. No size limit: the
+         * payload is streamed, and one the file does not hold fails the
+         * read below. A 128 GiB cap used to stand here, and in gc and
+         * coalescing, while the pack pass packed larger entries freely, so
+         * a large enough file was packed and then refused as corrupt by the
+         * next gc (OWN-25).
+         */
         size_t csize = (size_t)ehdr.compressed_size;
 
         uint32_t payload_crc = 0;
@@ -4479,7 +4479,7 @@ static status_t maybe_coalesce_packs(store_t *store,
                 break;
             }
             pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(datf, &ehdr) != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
+            if (read_entry_hdr(datf, &ehdr) != 0) {
                 rc = set_error(ERR_CORRUPT, "pack-coalesce: bad entry header in pack %u",
                                cand[ci].num);
                 break;
@@ -4659,7 +4659,9 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
             break;
         }
         pack_dat_entry_hdr_t ehdr;
-        if (read_entry_hdr(old, &ehdr) != 0 || ehdr.compressed_size > OBJECT_SIZE_MAX) {
+        /* read_entry_hdr bounds the size by what the file holds, which is
+         * the only bound that means anything: the copy below streams. */
+        if (read_entry_hdr(old, &ehdr) != 0) {
             st = set_error(ERR_CORRUPT, "pack_gc: bad entry header at %llu in pack %u",
                            (unsigned long long)disk_idx[i].dat_offset, pnum);
             break;
