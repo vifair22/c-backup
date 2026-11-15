@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "scan.h"
+#include "util.h"
 #include <cutils/log.h>
 
 #include <dirent.h>
@@ -580,6 +581,18 @@ static int pattern_matches(const char *pat, const char *full) {
     if (plen >= sizeof(trimmed)) return 0;
     memcpy(trimmed, pat, plen);
     trimmed[plen] = '\0';
+
+    /* An absolute pattern is a path, and the paths it is compared with are
+     * already clean: "/a/../a/b" or "/a//b" matched nothing at all, silently,
+     * which is the same failure as an exclude the matcher ignored. Resolved
+     * lexically, since the pattern may name something that does not exist
+     * here. Relative patterns are fragments matched at any depth, where ".."
+     * has nothing to resolve against, so they are left as written. */
+    if (trimmed[0] == '/') {
+        char norm[PATH_MAX];
+        if (path_normalize(trimmed, norm, sizeof(norm)) != 0) return 0;
+        memcpy(trimmed, norm, strlen(norm) + 1);
+    }
 
     int cross = strstr(trimmed, "**") != NULL;
 

@@ -219,7 +219,10 @@ contains rather than from a flag:
 | anything containing `**` | as above, but wildcards may cross `/` |
 
 A trailing slash is accepted and ignored, so `node_modules/` and
-`node_modules` mean the same thing. Directories are tested before the walk
+`node_modules` mean the same thing. An absolute pattern is normalised
+lexically before matching: repeated slashes collapse and `.` and `..`
+resolve, so `/a/../a/b` and `/a//b` exclude what `/a/b` does. This is done
+on the text, not the filesystem, so it does not follow symlinks. Directories are tested before the walk
 descends, so excluding one prunes its subtree rather than filtering entries
 on the way out.
 
