@@ -202,6 +202,34 @@ OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
 check    "a missing source fails the backup" 1 "$RC"
 contains "naming the source" "no-such-dir" "$OUT"
 
+# B058: `jobs watch` on a running job printed nothing until the job ended,
+# because the CLI read the whole response before printing any of it. A job
+# row nothing will finish holds the stream open for as long as the test
+# needs, so the assertion is on what arrived, not on a race with real work.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+        progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
+        'store')"
+    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2>&1 &
+    WPID=$!
+    sleep 1
+    contains "jobs watch prints a running job at once" '"state":"running"' \
+        "$(cat "$WORK/watch.out")"
+    sqlite3 "$WORK/state.db" "UPDATE jobs SET state = 'completed',
+        ended = strftime('%s','now') WHERE id = 9999"
+    for _ in $(seq 1 50); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$WPID" 2>/dev/null; then
+        bad "jobs watch ends with the job" "exited" "still running"
+        kill "$WPID" 2>/dev/null
+    else
+        ok "jobs watch ends with the job"
+    fi
+    wait "$WPID" 2>/dev/null
+    contains "and prints how it ended" '"state":"completed"' "$(cat "$WORK/watch.out")"
+else
+    ok "jobs watch prints a running job at once (skipped: no sqlite3)"
+fi
+
 # B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
 # file is still cancellable when the request lands, whatever the machine.
 mkdir -p "$WORK/big"

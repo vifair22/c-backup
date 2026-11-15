@@ -467,7 +467,13 @@ sudo c-backup backup 1 /home/me/projects   # or name paths for this run
 
 A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
-`c-backup jobs watch <id>` follow it.
+`c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
+state as soon as it connects, then one per change and at least every 5
+seconds, and exits when the job ends:
+
+```
+data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
+```
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths

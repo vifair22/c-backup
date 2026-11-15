@@ -443,6 +443,12 @@ returns it, plus `"cancel_requested":true`. Its `state` is usually still
 `running` (or `queued`): the job reports `cancelled` once it has stopped. A
 job that is not queued or running is a 404.
 
+`/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
+is, then a frame whenever it changes, and the same frame again every 5 seconds
+while it does not, so a watcher can tell a busy job from a dead stream. The
+stream ends after the frame with a terminal state. A frame is
+`{"id","state","phase","current","total","bytes_done","bytes_total","error"}`.
+
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered
 job endpoint.
