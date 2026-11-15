@@ -39,6 +39,8 @@
 #include "restore.h"
 #include "store_index.h"
 #include "verify.h"
+#include "gc.h"
+#include "prune.h"
 
 #define TEST_DIR  "/tmp/c_backup_test_verify_packed_large"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -478,9 +480,122 @@ static void test_stored_entry_damage_beyond_parity_is_unrecoverable(void **state
     beyond_parity("stored.bin", x, &at, snap);
 }
 
+/* ------------------------------------------------------------------ */
+/* Rewrites: gc and coalescing must not launder damage (OWN-29)        */
+/* ------------------------------------------------------------------ */
+
+static void write_random_file(const char *name, size_t len, uint32_t seed)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", TEST_SRC, name);
+    write_incompressible(path, len, seed);
+}
+
+static int count_pack_files(void)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "find '%s/packs' -name 'pack-*.dat' | wc -l", TEST_REPO);
+    FILE *p = popen(cmd, "r");
+    assert_non_null(p);
+    int n = -1;
+    if (fscanf(p, "%d", &n) != 1) n = -1;
+    pclose(p);
+    return n;
+}
+
+/*
+ * After a rewrite has copied a damaged entry: the copy holds the right
+ * bytes, and its new parity and CRC describe those bytes rather than the
+ * damage. A deep verify reads it without parity's help, a repair finds
+ * nothing to do, and a restore is byte for byte.
+ */
+static void assert_rewritten_clean(const uint8_t hash[OBJECT_HASH_SIZE],
+                                   const char *old_dat, int64_t snap, const char *name)
+{
+    entry_at_t now;
+    entry_at(hash, &now);
+    assert_string_not_equal(now.dat, old_dat);
+
+    parity_stats_reset();
+    verify_result_t res;
+    verify_deep(0, &res);
+    assert_int_equal(res.ok, res.checked);
+    assert_int_equal(res.recoverable, 0);
+    assert_int_equal(res.unrecoverable, 0);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+
+    assert_int_equal(pack_object_repair(store, hash), 0);
+    assert_int_equal(restore_and_compare(snap, name), OK);
+}
+
+/* gc rewriting a pack because something in it died, with a repairable
+ * corrupt live entry in the same pack. */
+static void test_gc_rewrite_corrects_a_damaged_live_entry(void **state)
+{
+    (void)state;
+    write_random_file("keep.bin", 256 * 1024, 0x1111u);
+    write_random_file("drop.bin", 256 * 1024, 0x2222u);
+    int64_t s1 = run_backup();
+    char drop[PATH_MAX];
+    snprintf(drop, sizeof(drop), "%s/drop.bin", TEST_SRC);
+    assert_int_equal(unlink(drop), 0);
+    int64_t s2 = run_backup();
+
+    uint8_t h[OBJECT_HASH_SIZE]; char x[OBJECT_HASH_SIZE * 2 + 1];
+    hash_of("keep.bin", x, h);
+    entry_at_t at;
+    entry_at(h, &at);
+    smash(at.dat, at.payload + 70000, 1, NULL);
+    smash(at.dat, at.payload + 150000, 300, NULL);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    parity_stats_reset();
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_true(g.swept >= 1);
+    assert_true(parity_stats_get().repaired > 0);
+
+    assert_rewritten_clean(h, at.dat, s2, "keep.bin");
+}
+
+/* Coalescing small packs, one of which holds a repairable corrupt entry. */
+static void test_coalesce_corrects_a_damaged_entry(void **state)
+{
+    (void)state;
+    int64_t snap = 0;
+    for (int i = 0; i < 10; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "f%02d.bin", i);
+        write_random_file(name, 64 * 1024, 0x3000u + (uint32_t)i);
+        snap = run_backup();
+    }
+    int before = count_pack_files();
+    assert_true(before >= 10);
+
+    /* An early pack: coalescing never takes the newest two. */
+    uint8_t h[OBJECT_HASH_SIZE]; char x[OBJECT_HASH_SIZE * 2 + 1];
+    hash_of("f02.bin", x, h);
+    entry_at_t at;
+    entry_at(h, &at);
+    smash(at.dat, at.payload + 20000, 200, NULL);
+
+    parity_stats_reset();
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_true(count_pack_files() < before);
+    assert_true(parity_stats_get().repaired > 0);
+
+    assert_rewritten_clean(h, at.dat, snap, "f02.bin");
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_gc_rewrite_corrects_a_damaged_live_entry, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_coalesce_corrects_a_damaged_entry, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_packed_entries_restore_and_verify_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_entry_one_byte_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_entry_burst_is_repaired, setup, teardown),
