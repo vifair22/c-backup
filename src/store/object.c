@@ -1293,23 +1293,29 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
         /* Empty file, shouldn't reach here but be safe */
         is_sparse = 0;
     } else if (pos == -1 && errno == ENXIO) {
-        /* SEEK_DATA returns ENXIO for two reasons:
-         * 1. File is entirely a hole (all zeroes) — legitimate sparse
-         * 2. Filesystem (e.g. FUSE/shfs) doesn't support SEEK_DATA
+        /*
+         * No data at or after offset 0. That is what an all-hole file
+         * (`truncate -s 100M f`) reports, and storing it whole turned 0
+         * allocated blocks into 100M of zeroes on restore.
          *
-         * Distinguish by attempting a probe read.  A real all-zero sparse
-         * file will read zeroes; a FUSE that doesn't support SEEK_DATA
-         * will also read real data.  Either way we fall through to the
-         * non-sparse streaming path which handles both correctly. */
-        char probe;
-        if (pread(fd, &probe, 1, 0) == 1) {
-            /* File is readable — SEEK_DATA unsupported or has real data.
-             * Treat as non-sparse to avoid misclassifying. */
-            is_sparse = 0;
+         * It is also what some FUSE layers return when they do not
+         * implement SEEK_DATA, and treating a file full of real data as one
+         * big hole would lose it. The block count tells the two apart: a
+         * file with no allocated blocks has nothing to read but zeroes,
+         * whatever lseek says. Anything else keeps the old, safe behaviour
+         * of storing the file whole.
+         */
+        struct stat fst;
+        if (fstat(fd, &fst) == 0 && fst.st_blocks == 0) {
+            is_sparse = 1;      /* zero regions: the whole file is a hole */
         } else {
-            /* Can't even read the file — real I/O error */
-            if (src_path) close(fd);
-            return set_error_errno(ERR_IO, "store: read probe failed");
+            char probe;
+            if (pread(fd, &probe, 1, 0) != 1) {
+                /* Can't even read the file: a real I/O error */
+                if (src_path) close(fd);
+                return set_error_errno(ERR_IO, "store: read probe failed");
+            }
+            is_sparse = 0;
         }
     } else if (pos != -1) {
         /* Check if first data region starts at 0 — if not, file is sparse */
@@ -1342,8 +1348,10 @@ static status_t object_store_file_ex_cb(store_t *store, int fd,
     }
 
     /* If the file isn't sparse (or the FS doesn't report holes), read it whole.
-     * write_object_file_stream takes ownership of fd (closes it on return). */
-    if (!is_sparse || n_regions == 0) {
+     * write_object_file_stream takes ownership of fd (closes it on return).
+     * A sparse file with no regions is all hole, and is stored as a header
+     * and an empty region table rather than as that many zeroes. */
+    if (!is_sparse) {
         free(regions);
         /* The plain stream writes uncompressed_size = file_size, so for a file
          * with no holes the payload and the logical size are the same number. */

@@ -213,23 +213,46 @@ static void test_sparse_file_round_trips_with_its_holes(void **state)
     check_sparse_restore(br.snapshot_id);
 }
 
-/* A file that is nothing but a hole has no data region at all, and SEEK_DATA
- * answers ENXIO for it, the same answer a filesystem without hole support
- * gives. It is stored whole; what matters is that it comes back. */
+/*
+ * A file that is nothing but a hole restores with nothing allocated.
+ *
+ * SEEK_DATA on such a file fails with ENXIO, which the store used to read as
+ * "this filesystem does not report holes" and so stored the file whole. The
+ * restore then wrote every zero: `truncate -s 100M` came back as 204,800
+ * allocated blocks. Comparing contents cannot catch that, since the bytes
+ * are identical; only the block count says the restore inflated the file.
+ */
 static void test_file_that_is_all_hole_round_trips(void **state)
 {
     (void)state;
-    int fd = open(TEST_SRC "/empty.img", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const char *src = TEST_SRC "/hole.bin";
+    const off_t size = 8 * 1024 * 1024;
+    int fd = open(src, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     assert_true(fd >= 0);
-    assert_int_equal(ftruncate(fd, 256 * 1024), 0);
+    assert_int_equal(ftruncate(fd, size), 0);
     close(fd);
+
+    struct stat sb;
+    assert_int_equal(stat(src, &sb), 0);
+    if (sb.st_blocks != 0) {
+        /* The fixture is already dense here, so there is nothing to keep. */
+        skip();
+    }
 
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
     restore_result_t rr;
-    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+
+    char dst[512];
+    snprintf(dst, sizeof(dst), "%s/hole.bin", restored_root());
+    assert_int_equal(stat(dst, &sb), 0);
+    assert_int_equal(sb.st_size, size);
+    assert_int_equal(sb.st_blocks, 0);
 }
 
 /*
