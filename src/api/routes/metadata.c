@@ -4,6 +4,7 @@
 #include "routes.h"
 #include "db_txn.h"
 
+#include <stdbool.h>
 #include <strings.h>
 
 #include <cutils/json.h>
@@ -100,10 +101,13 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
 
     CUTILS_AUTOFREE char *name = NULL;
     uint32_t snap = 0;
+    bool move = false;
     if (json_req_get_str(body, "name", &name) != 0 || !name || !name[0])
         return api_error(400, "name is required");
     if (json_req_get_u32(body, "snap_id", &snap, 1, UINT32_MAX) != 0)
         return api_error(400, "snap_id is required");
+    if (json_req_has(body, "move") && json_req_get_bool(body, "move", &move) != 0)
+        return api_error(400, "move must be true or false");
 
     char repo[32], sid[32], now[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -113,14 +117,47 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
     if (!snapshot_exists(repo, sid))
         return api_error(404, "no such snapshot");
 
-    /* A tag names one snapshot; re-tagging moves it rather than erroring,
-     * which is what "tag this one instead" should do. */
+    /*
+     * A tag names one snapshot, and setting an existing name on a different
+     * snapshot is refused unless the caller says move. It used to move
+     * silently, and a tag is retention protection: "tag set keep-forever 2"
+     * typed for the wrong tag stripped snapshot 1 of its protection, and the
+     * next gfs pass planned to delete it with nothing having said so.
+     * Setting the same snapshot again succeeds, so a retried request is
+     * harmless.
+     *
+     * The check and the write share a transaction so a concurrent set cannot
+     * land between them and be overwritten unseen.
+     */
+    if (db_txn_begin(g_db) != OK) return api_error(500, "cannot begin");
+    db_result_t *r = NULL;
+    if (db_execute(g_db, "SELECT snap_id FROM tags WHERE repo_id = ? AND name = ?",
+                   (const char *[]){ repo, name, NULL }, &r) != 0) {
+        db_result_free(r);
+        db_txn_rollback(g_db);
+        return api_error(500, "cannot read tags");
+    }
+    if (r && r->nrows == 1 && strcmp(r->rows[0][0], sid) != 0 && !move) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "tag '%s' is already on snapshot %s; to move it, send"
+                 " \"move\":true (tag set --move from the CLI)",
+                 name, r->rows[0][0]);
+        db_result_free(r);
+        db_txn_rollback(g_db);
+        return api_error(409, msg);
+    }
+    db_result_free(r);
+
     if (db_execute_non_query(g_db,
             "INSERT INTO tags (repo_id, name, snap_id, created_at)"
             " VALUES (?, ?, ?, ?)"
             " ON CONFLICT(repo_id, name) DO UPDATE SET snap_id = excluded.snap_id",
-            (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0)
+            (const char *[]){ repo, name, sid, now, NULL }, NULL) != 0) {
+        db_txn_rollback(g_db);
         return api_error(500, "cannot set tag");
+    }
+    if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit tag");
 
     char *out = strdup("{\"ok\":true}");
     return out ? api_ok(out) : api_error(500, "out of memory");

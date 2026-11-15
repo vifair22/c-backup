@@ -524,11 +524,17 @@ Snapshots carry notes and tags:
 ```sh
 sudo c-backup snapshot note 1 12 "before the migration"
 sudo c-backup tag set 1 pre-migration 12
+sudo c-backup tag set 1 pre-migration 14 --move   # it is on 12; move it
 sudo c-backup tag remove 1 pre-migration
 ```
 
 - A note or tag needs a snapshot that exists; naming one that does not is
   an error, not a record attached to nothing.
+- **A tag names one snapshot, and moving it must be asked for.** Setting a
+  name that is already on another snapshot fails and says where the tag is.
+  A tag is retention protection (section 9.1), so moving it unprotects the
+  snapshot it was on; `--move` says that is intended. Setting a tag on the
+  snapshot it is already on succeeds.
 - Removing a tag that does not exist fails with "no such tag".
 
 ---
@@ -1115,7 +1121,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
-| `tag list <id>`, `tag set <id> <name> <snapshot>`, `tag remove <id> <name>` | Tags |
+| `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
 | `schedule list\|add\|remove\|enable\|disable <id> ...` | Schedules (section 10) |
 | `jobs`, `jobs <job-id>`, `jobs cancel <job-id>`, `jobs watch <job-id>` | Jobs |

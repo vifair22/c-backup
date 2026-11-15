@@ -404,7 +404,7 @@ same property that makes incremental backups cheap, applied to reading.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id}` |
+| GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id, move}` |
 | DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
@@ -413,6 +413,14 @@ same property that makes incremental backups cheap, applied to reading.
 Setting a tag or a note on a snapshot that does not exist is a 404, and a tag
 with no name is a 400. Removing a tag that is not there is a 404 `no such
 tag`, so a typo does not read as success.
+
+A tag names one snapshot. Setting a name that is already on a different
+snapshot is refused with a 409 that names the snapshot it is on, unless the
+body carries `"move":true` (`tag set ... --move` from the CLI). Moving a tag
+takes its retention protection off the snapshot it was on, so it has to be
+asked for; it used to happen silently, and the next retention pass could
+then delete a snapshot the operator believed was protected. Setting a name on
+the snapshot it is already on succeeds, so a retried request is harmless.
 
 `GET /repos/<id>/policy` returns `policy`, what the repository has set, and
 `defaults`, the daemon's configured `retention.*` values from `config.yaml`

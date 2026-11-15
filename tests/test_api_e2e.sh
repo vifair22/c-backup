@@ -538,6 +538,21 @@ for i in 1 2 3 4; do
     echo "$i" >> "$R/src/f"
     wait_job "$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")"
 done
+
+# B033: setting a tag name already on another snapshot moved it silently,
+# taking the protection off the first snapshot. Refused now, naming where
+# the tag is, unless the request says move; the same snapshot again is
+# fine. Snapshots 3 and 4 so retention below is unaffected.
+sock_tag() { curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" -d "$1" http://localhost/repos/1/tags; }
+check "tag set" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":3}')"
+check "the same snapshot again is fine" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":3}')"
+OUT=$(sock_tag '{"name":"keep","snap_id":4}')
+contains "an existing tag on another snapshot is a 409" ' 409' "$OUT"
+contains "naming where the tag is" 'already on snapshot 3' "$OUT"
+contains "and the tag did not move" '"snap_id":"3"' "$(sock_body /repos/1/tags)"
+check "move moves it" '{"ok":true} 200' "$(sock_tag '{"name":"keep","snap_id":4,"move":true}')"
+contains "to the new snapshot" '"snap_id":"4"' "$(sock_body /repos/1/tags)"
+curl -s -o /dev/null -X DELETE --unix-socket "$SOCK" http://localhost/repos/1/tags/keep
 wait_job "$(job_id "$(sock_post /repos/1/gfs)")"
 check "retention reads keep_snaps from config" 2 \
     "$(sock_body /repos/1/snapshots | grep -o '"id":"[0-9]*"' | wc -l | tr -d ' ')"

@@ -174,6 +174,16 @@ echo "content three" > "$WORK/src/three.txt"
 contains "second backup completed" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
 contains "diff" '"added"' "$(cb diff 1 1 2)"
 
+# B033: a tag set on a name already in use moved it silently, taking the
+# retention protection off the snapshot it was on. --move says it is meant.
+contains "tag set" '"ok"' "$(cb tag set 1 pinned 1)"
+OUT=$(cb tag set 1 pinned 2 2>&1); RC=$?
+check    "a tag in use elsewhere is not moved" 1 "$RC"
+contains "and the refusal says where it is" 'already on snapshot 1' "$OUT"
+contains "--move moves it" '"ok"' "$(cb tag set 1 pinned 2 --move)"
+contains "to the new snapshot" '"snap_id":"2"' "$(cb tag list 1)"
+cb tag remove 1 pinned > /dev/null
+
 # Exclusions have to work from the CLI too, which is where anyone would
 # actually type them.
 mkdir -p "$WORK/exsrc/cache"

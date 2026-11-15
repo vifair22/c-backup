@@ -15,8 +15,14 @@
  *
  * Renaming is two calls rather than one route: setting the new name and
  * removing the old. The daemon has no rename verb and neither does the CLI,
- * and a tag set is an upsert, so this composes out of what exists instead of
- * asking for a route that only the app would use.
+ * so this composes out of what exists instead of asking for a route that
+ * only the app would use.
+ *
+ * A set no longer moves an existing name silently: the daemon answers 409
+ * unless the request says move, because moving a tag strips the snapshot it
+ * was on of its retention protection. Editing a tag and picking another
+ * snapshot is that explicit request, so the edit dialog sends move; adding
+ * a tag under a name already in use does not, and shows the refusal.
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
@@ -103,11 +109,14 @@ export function TagsView({ connName, repoPath, onSelectSnapshot, onBack }: Props
     setError(null)
     try {
       /*
-       * Set first, remove second. A tag set is an upsert, so the new name
-       * exists before the old one goes; the reverse order would leave the
-       * snapshot briefly untagged and unprotected if the second call failed.
+       * Set first, remove second, so the new name exists before the old one
+       * goes; the reverse order would leave the snapshot briefly untagged and
+       * unprotected if the second call failed. Only an edit that keeps the
+       * name moves it: a rename onto another tag's name is refused rather
+       * than silently taking that tag off its snapshot.
        */
-      await api.apiCall(connName, { kind: 'tagSet', repoId, name, snapshotId: editDialog.snapId })
+      const move = editDialog.mode === 'rename' && editDialog.oldName === name
+      await api.apiCall(connName, { kind: 'tagSet', repoId, name, snapshotId: editDialog.snapId, move })
       if (editDialog.mode === 'rename' && editDialog.oldName && editDialog.oldName !== name) {
         await api.apiCall(connName, { kind: 'tagRemove', repoId, name: editDialog.oldName })
       }

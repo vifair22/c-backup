@@ -1057,12 +1057,17 @@ static int cmd_tag(int argc, char **argv)
         return get_repo_scoped(argv[1], "/tags", NULL);
 
     if (strcmp(argv[0], "set") == 0) {
-        if (argc < 4) return fail("usage: tag set <repo-id> <name> <snapshot-id>");
+        /* Moving a tag that is already on another snapshot takes its
+         * retention protection from that snapshot, so it has to be asked
+         * for; without --move the daemon refuses and says where it is. */
+        int move = take_flag(&argc, argv, "--move");
+        if (argc < 4) return fail("usage: tag set <repo-id> <name> <snapshot-id> [--move]");
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"name\":");
         sb_json_str(&b, argv[2]);
         sb_puts(&b, ",\"snap_id\":");
         sb_puts(&b, argv[3]);
+        if (move) sb_puts(&b, ",\"move\":true");
         sb_puts(&b, "}");
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]); sb_puts(&p, "/tags");
@@ -1368,7 +1373,7 @@ static const struct {
     { "packs",     cmd_packs,     "packs <repo-id> [pack-id]" },
     { "fanout",    cmd_fanout,    "fanout <repo-id>" },
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
-    { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [args]" },
+    { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
     { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH])" },
     { "jobs",      cmd_jobs,      "jobs [job-id | cancel <job-id> | watch <job-id>]" },
