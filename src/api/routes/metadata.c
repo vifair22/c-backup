@@ -633,12 +633,14 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 
 api_response_t metadata_journal_get(const api_request_t *req, int64_t repo_id)
 {
-    const char *lim = api_query_param(req, "limit");
     const char *result = api_query_param(req, "result");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, 100, 1000, &nlim, NULL, &page_err) != 0) return page_err;
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 100);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     int rc = result

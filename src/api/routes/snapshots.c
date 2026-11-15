@@ -77,21 +77,8 @@ int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max
 #define PAGE_DEFAULT 200
 #define PAGE_MAX     1000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
+/* Run records are small and a client usually wants the last few. */
+#define RUNS_DEFAULT 20
 
 static char *repo_path_for(cutils_db_t *db, int64_t repo_id)
 {
@@ -265,10 +252,13 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
 static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -330,11 +320,14 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
                                 int64_t snap_id)
 {
     const char *parent = api_query_param(req, "parent");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], snap[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -580,10 +573,12 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
             return api_error(404, "no such snapshot");
     }
 
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
+
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
-
-    int limit = page_limit(req);
     /*
      * Without a snapshot, identical (path, content) rows across snapshots
      * collapse into one result, so more rows are read than results returned.
@@ -1278,9 +1273,11 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1325,11 +1322,12 @@ static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1379,9 +1377,11 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 {
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    const char *lim = api_query_param(req, "limit");
+    int nlim = 0;
+    api_response_t page_err;
+    if (routes_paging(req, RUNS_DEFAULT, PAGE_MAX, &nlim, NULL, &page_err) != 0) return page_err;
     char limit[16];
-    snprintf(limit, sizeof(limit), "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 20);
+    snprintf(limit, sizeof(limit), "%d", nlim);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
@@ -1432,11 +1432,12 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
-    const char *lim = api_query_param(req, "limit");
-    const char *off = api_query_param(req, "offset");
+    int nlim = 0, noff = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &nlim, &noff, &page_err) != 0) return page_err;
     char limit[16], offset[16];
-    snprintf(limit,  sizeof(limit),  "%d", (lim && atoi(lim) > 0) ? atoi(lim) : 200);
-    snprintf(offset, sizeof(offset), "%d", (off && atoi(off) > 0) ? atoi(off) : 0);
+    snprintf(limit,  sizeof(limit),  "%d", nlim);
+    snprintf(offset, sizeof(offset), "%d", noff);
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,

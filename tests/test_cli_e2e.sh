@@ -97,6 +97,12 @@ contains "jobs list"     '"action"'            "$(cb jobs)"
 contains "snapshots"     '"id":"1"'            "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
+# B074: these were silently replaced by the defaults.
+OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
+check    "snapshots --limit -1 fails" 1 "$RC"
+contains "and says why" "limit must be a whole number" "$OUT"
+OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
+check    "objects --location nowhere fails" 1 "$RC"
 
 contains "tag set"    '"ok"'      "$(cb tag set 1 keeper 1)"
 contains "tag list"   'keeper'    "$(cb tag list 1)"

@@ -356,6 +356,17 @@ contains "stats"        '"per_type"'   "$(sock_body /repos/1/stats)"
 well_formed "loose stats scope answers" "$(sock_body '/repos/1/stats?scope=loose')"
 contains "objects"      '"hash"'       "$(sock_body '/repos/1/objects?limit=2')"
 contains "packs"        '{'            "$(sock_body /repos/1/packs)"
+# B074: values that cannot mean anything were ignored, so the default page
+# came back as though the request had been understood.
+check "unknown object location is a 400" 400 "$(sock_code '/repos/1/objects?location=nowhere')"
+check "location=all is accepted"         200 "$(sock_code '/repos/1/objects?location=all')"
+check "negative limit is a 400"          400 "$(sock_code '/repos/1/snapshots?limit=-1')"
+check "zero limit is a 400"              400 "$(sock_code '/repos/1/snapshots?limit=0')"
+check "non-numeric limit is a 400"       400 "$(sock_code '/repos/1/objects?limit=lots')"
+check "negative offset is a 400"         400 "$(sock_code '/repos/1/snapshots?offset=-5')"
+check "bad limit on the journal is a 400" 400 "$(sock_code '/repos/1/journal?limit=x')"
+check "bad limit on grep runs is a 400"  400 "$(sock_code '/repos/1/grep?limit=-1')"
+check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapshots?limit=999999')"
 contains "fanout"       '"buckets"'    "$(sock_body /repos/1/fanout)"
 
 # type 1 is a file. Tree objects are referenced by subtree_hash rather than

@@ -29,6 +29,15 @@ while the first page through the index costs 93 us and beats it. The
 regression only exists if the API offers a way to ask for everything at once,
 so it does not. **No route returns a whole snapshot.**
 
+`limit` and `offset` must be plain decimal counts: `limit` 1 or more,
+`offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
+400 naming the parameter; they used to be replaced by the defaults, which
+answered a request the server had not understood as if it had. A `limit`
+above a route's maximum is clamped to it. The same goes for filters with a
+fixed set of values: `objects?location=` takes `loose`, `pack` (or
+`packed`) or `all`, and anything else is a 400 rather than an unfiltered
+listing.
+
 Directory listings are ordered by name because the index carries `name` as its
 trailing column, making the query a range scan rather than a sort of every
 child.

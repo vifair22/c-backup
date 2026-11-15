@@ -31,21 +31,6 @@ static cutils_db_t *g_db;
 #define PAGE_DEFAULT 500
 #define PAGE_MAX     5000
 
-static int page_limit(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "limit");
-    int n = v ? atoi(v) : PAGE_DEFAULT;
-    if (n <= 0) n = PAGE_DEFAULT;
-    if (n > PAGE_MAX) n = PAGE_MAX;
-    return n;
-}
-
-static int page_offset(const api_request_t *req)
-{
-    const char *v = api_query_param(req, "offset");
-    int n = v ? atoi(v) : 0;
-    return n < 0 ? 0 : n;
-}
 
 static api_response_t finalise(cutils_json_resp_t *resp)
 {
@@ -252,10 +237,19 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
 {
     const char *loc = api_query_param(req, "location");
+    /* Anything else used to fall through to the unfiltered listing, so
+     * `--location nowhere` answered with every object: a filter that
+     * silently filtered nothing. */
+    if (loc && strcmp(loc, "loose") != 0 && strcmp(loc, "pack") != 0 &&
+        strcmp(loc, "packed") != 0 && strcmp(loc, "all") != 0)
+        return api_error(400, "location must be loose, pack (or packed), or all");
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     int rc;
@@ -365,9 +359,12 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
 {
     if (!hex_ok(hex)) return api_error(400, "hash must be 64 lowercase hex characters");
 
+    int limit = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
     char repo[32], lim[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
@@ -585,11 +582,14 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
 api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id,
                                        int64_t pack_id)
 {
+    int limit = 0, offset = 0;
+    api_response_t page_err;
+    if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
     char repo[32], pid[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(pid,  sizeof(pid),  "%lld", (long long)pack_id);
-    snprintf(lim,  sizeof(lim),  "%d", page_limit(req));
-    snprintf(off,  sizeof(off),  "%d", page_offset(req));
+    snprintf(lim,  sizeof(lim),  "%d", limit);
+    snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
