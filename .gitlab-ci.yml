@@ -721,3 +721,21 @@ build:image:uat:
     - docker push "$CI_REGISTRY_IMAGE:uat"
   only:
     - /^uat\//
+
+# UAT only, never merged: the same branch built with AddressSanitizer, for
+# running on real data. Tagged :uat-asan-<sha> and :uat-asan.
+build:image:uat-asan:
+  extends: build:image
+  needs: []
+  script:
+    - docker build --provenance=false --sbom=false --build-arg VARIANT=asan -t "$CI_REGISTRY_IMAGE:uat-asan-$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE:uat-asan" .
+    - docker run -d --name smoke-uat-asan "$CI_REGISTRY_IMAGE:uat-asan-$CI_COMMIT_SHORT_SHA"
+    - sleep 8
+    - docker ps --filter name=smoke-uat-asan --filter status=running | grep -q smoke-uat-asan
+    - docker logs smoke-uat-asan
+    - docker rm -f smoke-uat-asan
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker push "$CI_REGISTRY_IMAGE:uat-asan-$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:uat-asan"
+  only:
+    - /^uat\//
