@@ -1896,7 +1896,13 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     repo_unlock(repo_id);
 
     if (st != OK) return api_error(500, err_msg());
-    return api_no_content();
+
+    /* A body, not a 204: the CLI's contract is one JSON document per
+     * command, and an empty success printed nothing at all (B095). */
+    char *out = NULL;
+    if (asprintf(&out, "{\"removed\":true,\"id\":%lld}", (long long)snap_id) < 0)
+        return api_error(500, "out of memory");
+    return api_ok(out);
 }
 
 /*

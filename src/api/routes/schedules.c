@@ -492,7 +492,13 @@ api_response_t schedules_delete(const api_request_t *req, int64_t repo_id,
     if (removed == 0) return api_error(404, "no such schedule in this repository");
 
     scheduler_notify(g_sched);
-    return api_no_content();
+
+    /* A body, not a 204: the CLI's contract is one JSON document per
+     * command, and an empty success printed nothing at all (B095). */
+    char *out = NULL;
+    if (asprintf(&out, "{\"removed\":true,\"id\":%lld}", (long long)schedule_id) < 0)
+        return api_error(500, "out of memory");
+    return api_ok(out);
 }
 
 void routes_schedules_init(cutils_db_t *db, scheduler_t *sched)

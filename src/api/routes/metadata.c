@@ -263,7 +263,15 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
         return api_error(500, merr);
     }
     if (db_txn_commit(g_db) != OK) return api_error(500, "cannot commit");
-    return api_no_content();
+
+    /* A body, not a 204: the CLI's contract is one JSON document per
+     * command, and an empty success printed nothing at all (B095). */
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) return api_error(500, "out of memory");
+    if (json_resp_add_bool(resp, "removed", true) != 0 ||
+        json_resp_add_str(resp, "name", name) != 0)
+        return api_error(500, "cannot serialise response");
+    return finalise(resp);
 }
 
 /* ---------- notes ---------- */
@@ -518,16 +526,17 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
             /*
              * A source that does not exist is accepted with a warning, not
              * refused: it may be a share that is not mounted yet, or a disk
-             * that is attached only when the backup runs. Until it exists a
-             * backup skips it, and a backup whose every source is missing
-             * fails with "nothing to back up".
+             * that is attached only when the backup runs. It is not skipped
+             * when the backup runs: a missing source fails the whole job
+             * (B077), so the warning has to say that and not promise a
+             * partial backup that will never happen (B097).
              */
             struct stat stt;
             if (stat(norm, &stt) != 0) {
                 char msg[PATH_MAX + 96];
                 snprintf(msg, sizeof(msg),
-                         "%s does not exist on the daemon's host; backups will "
-                         "skip it until it does", norm);
+                         "%s does not exist on the daemon's host; a backup "
+                         "fails while it is missing", norm);
                 if (json_resp_array_append_str(out, "warnings", msg) != 0) { /* alloc only */ }
             }
             paths[n_paths] = strdup(norm);
