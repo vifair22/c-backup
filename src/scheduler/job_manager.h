@@ -23,6 +23,10 @@
 
 typedef struct job_manager job_manager_t;
 
+/* How many jobs may wait for a worker. Running jobs do not count against it;
+ * a submit beyond it is refused with ERR_BUSY, which the routes answer 503. */
+#define JOB_QUEUE_MAX 256
+
 /* What a job does. Returns OK on success; the message from err_msg() is
  * recorded against the job on failure. */
 typedef status_t (*job_fn)(void *arg, atomic_int *cancel,

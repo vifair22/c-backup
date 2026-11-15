@@ -13,8 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JOB_QUEUE_MAX 256
-
 typedef struct {
     int64_t  job_id;
     int64_t  repo_id;
@@ -26,9 +24,27 @@ typedef struct {
     job_fn   fn;
     void    *arg;
     void   (*arg_free)(void *);
-    atomic_int   cancel;  /* set under mu, polled by the job without it */
-    int      active;      /* claimed by a worker */
 } job_slot_t;
+
+/*
+ * What a worker is running, kept per worker rather than in the queue.
+ *
+ * A claimed job used to stay in its ring slot behind the head, flagged
+ * active, while the full check counted only the queued jobs. Once enough
+ * were queued the tail wrapped onto a running job's slot and the next submit
+ * overwrote it, cancel flag and all (OWN-15): `jobs cancel` then flagged the
+ * wrong job or found none. The ring now holds queued jobs only, and nothing
+ * a submit can reach holds running state.
+ *
+ * The cancel flag is atomic because the job reads it without the lock while
+ * job_cancel and shutdown set it under the lock (OWN-14).
+ */
+typedef struct {
+    int        claimed;   /* a worker owns this entry; see worker_main */
+    int64_t    job_id;    /* 0 while idle */
+    int64_t    repo_id;   /* 0 while idle or not repo scoped */
+    atomic_int cancel;
+} worker_state_t;
 
 struct job_manager {
     cutils_db_t    *db;
@@ -40,15 +56,15 @@ struct job_manager {
     int             head, tail, count;
     int             stopping;
     /*
-     * Repositories with a job on a worker right now.
+     * One entry per worker: the job it is running, if any.
      *
-     * Every repo-scoped job takes the repo write lock, and that lock rejects
+     * Also the set of repositories with a job on a worker right now. Every repo-scoped job takes the repo write lock, and that lock rejects
      * rather than queues, so dispatching two jobs for one repo made the
      * second fail instantly with "repo is busy". The queue was generating the
      * contention the lock exists to catch. One entry per worker is enough:
      * a repo can only be busy because some worker is holding it.
      */
-    int64_t        *running_repo;
+    worker_state_t *running;
     /* Guards DB writes from worker threads. c-utils serialises internally,
      * but progress updates are frequent enough that batching them behind one
      * lock keeps them from interleaving mid-transaction with a job's own
@@ -312,8 +328,27 @@ static int repo_is_running(const job_manager_t *jm, int64_t repo_id)
 {
     if (repo_id <= 0) return 0;
     for (int i = 0; i < jm->nworkers; i++)
-        if (jm->running_repo[i] == repo_id) return 1;
+        if (jm->running[i].repo_id == repo_id) return 1;
     return 0;
+}
+
+/*
+ * Remove the queued job k places from the head, closing the gap from the
+ * head side so the ring stays contiguous. The freed slot is zeroed: the
+ * returned copy is the job's only owner from here. Caller holds jm->mu.
+ */
+static job_slot_t dequeue_at(job_manager_t *jm, int k)
+{
+    job_slot_t out = jm->queue[(jm->head + k) % JOB_QUEUE_MAX];
+    for (int m = k; m > 0; m--) {
+        int dst = (jm->head + m) % JOB_QUEUE_MAX;
+        int src = (jm->head + m - 1) % JOB_QUEUE_MAX;
+        jm->queue[dst] = jm->queue[src];
+    }
+    memset(&jm->queue[jm->head], 0, sizeof(jm->queue[jm->head]));
+    jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
+    jm->count--;
+    return out;
 }
 
 /*
@@ -321,59 +356,52 @@ static int repo_is_running(const job_manager_t *jm, int64_t repo_id)
  *
  * Scanning past a blocked job rather than waiting on it keeps one slow
  * repository from stalling every other one, which a strict head-of-queue
- * policy would do. Returns the ring index, or -1 if nothing is runnable
- * right now. Caller holds jm->mu.
+ * policy would do. Returns 1 with the job in *out, or 0 if nothing is
+ * runnable right now. Caller holds jm->mu.
  */
 static int take_runnable(job_manager_t *jm, job_slot_t *out)
 {
     for (int k = 0; k < jm->count; k++) {
         int i = (jm->head + k) % JOB_QUEUE_MAX;
         if (repo_is_running(jm, jm->queue[i].repo_id)) continue;
-
-        *out = jm->queue[i];
-        /* Close the gap so the ring stays contiguous from head. */
-        for (int m = k; m > 0; m--) {
-            int dst = (jm->head + m) % JOB_QUEUE_MAX;
-            int src = (jm->head + m - 1) % JOB_QUEUE_MAX;
-            jm->queue[dst] = jm->queue[src];
-        }
-        int slot_index = jm->head;
-        jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
-        jm->count--;
-        jm->queue[slot_index] = *out;
-        jm->queue[slot_index].active = 1;
-        return slot_index;
+        *out = dequeue_at(jm, k);
+        return 1;
     }
-    return -1;
+    return 0;
 }
 
 static void *worker_main(void *arg)
 {
     job_manager_t *jm = arg;
 
+    /* Each worker claims the first free entry on entry, so it has a stable
+     * index, and a stable cancel flag, for the life of the thread. */
     int me = 0;
     pthread_mutex_lock(&jm->mu);
     for (int i = 0; i < jm->nworkers; i++) {
-        if (jm->running_repo[i] == -1) { me = i; jm->running_repo[i] = 0; break; }
+        if (!jm->running[i].claimed) { me = i; jm->running[i].claimed = 1; break; }
     }
     pthread_mutex_unlock(&jm->mu);
+    worker_state_t *ws = &jm->running[me];
 
     for (;;) {
         pthread_mutex_lock(&jm->mu);
         job_slot_t slot;
-        int slot_index = -1;
         for (;;) {
-            if (jm->stopping && jm->count == 0) {
+            /* Shutdown takes every queued job out itself (B110), so a
+             * stopping worker never claims one. */
+            if (jm->stopping) {
                 pthread_mutex_unlock(&jm->mu);
                 return NULL;
             }
-            slot_index = take_runnable(jm, &slot);
-            if (slot_index >= 0) break;
+            if (take_runnable(jm, &slot)) break;
             /* Either nothing queued, or everything queued belongs to a repo
              * another worker is busy with. Both resolve on the next signal. */
             pthread_cond_wait(&jm->cv, &jm->mu);
         }
-        jm->running_repo[me] = slot.repo_id;
+        ws->job_id  = slot.job_id;
+        ws->repo_id = slot.repo_id;
+        atomic_store_explicit(&ws->cancel, 0, memory_order_relaxed);
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
@@ -394,7 +422,7 @@ static void *worker_main(void *arg)
         clock_gettime(CLOCK_MONOTONIC, &began);
 
         progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0, 0, 0, NULL, NULL };
-        status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
+        status_t st = slot.fn(slot.arg, &ws->cancel,
                               on_progress, &pc);
 
         /* The job's own account of what it did, and the final byte count,
@@ -441,11 +469,11 @@ static void *worker_main(void *arg)
          */
         const char *outcome;
         const char *detail = NULL;
+        int cancelled = atomic_load_explicit(&ws->cancel, memory_order_relaxed);
         if (st == OK) {
             outcome = "success";
             set_job_state(jm, slot.job_id, "completed", NULL);
-        } else if (atomic_load_explicit(&jm->queue[slot_index].cancel,
-                                        memory_order_relaxed)) {
+        } else if (cancelled) {
             outcome = "cancelled";
             set_job_state(jm, slot.job_id, "cancelled", NULL);
         } else {
@@ -493,8 +521,7 @@ static void *worker_main(void *arg)
          * anyone knows is when a restore is needed. push_send is a no-op when
          * Pushover is unconfigured, so this needs no feature flag.
          */
-        if (st != OK && !atomic_load_explicit(&jm->queue[slot_index].cancel,
-                                             memory_order_relaxed)) {
+        if (st != OK && !cancelled) {
             /* Pushover's limits: 250 for the title, 1024 for the body. */
             char title[250], body[1024];
             pthread_mutex_lock(&jm->db_mu);
@@ -511,9 +538,8 @@ static void *worker_main(void *arg)
         free(slot.action);
 
         pthread_mutex_lock(&jm->mu);
-        jm->queue[slot_index].active = 0;
-        jm->queue[slot_index].job_id = 0;
-        jm->running_repo[me] = 0;
+        ws->job_id  = 0;
+        ws->repo_id = 0;
         /* This repo just became free, so a worker parked on it can proceed. */
         pthread_cond_broadcast(&jm->cv);
         pthread_mutex_unlock(&jm->mu);
@@ -553,14 +579,13 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
 
     jm->workers = calloc((size_t)max_parallel, sizeof(pthread_t));
     if (!jm->workers) { free(jm); return set_error(ERR_NOMEM, "job_manager_start: workers"); }
-    jm->running_repo = calloc((size_t)max_parallel, sizeof(*jm->running_repo));
-    if (!jm->running_repo) {
+    jm->running = calloc((size_t)max_parallel, sizeof(*jm->running));
+    if (!jm->running) {
         free(jm->workers); free(jm);
         return set_error(ERR_NOMEM, "job_manager_start: running set");
     }
-    /* -1 marks a slot no worker has claimed yet; each worker takes the first
-     * on entry so it has a stable index for the life of the thread. */
-    for (int i = 0; i < max_parallel; i++) jm->running_repo[i] = -1;
+    for (int i = 0; i < max_parallel; i++)
+        atomic_init(&jm->running[i].cancel, 0);
     jm->nworkers = max_parallel;
     for (int i = 0; i < max_parallel; i++) {
         if (pthread_create(&jm->workers[i], NULL, worker_main, jm) != 0) {
@@ -611,36 +636,29 @@ void job_manager_stop(job_manager_t *jm)
      * ran can have taken a repository lock, opened a store and logged a
      * start for no reason. Emptying the queue under its lock means no
      * worker can claim one afterwards.
+     *
+     * One at a time, so emptying the queue needs no allocation and cannot
+     * fail. Workers stop claiming the moment stopping is set and a submit
+     * after it is refused, so nothing refills the queue in between.
      */
-    job_slot_t *taken = NULL;
-    int ntaken = 0;
     pthread_mutex_lock(&jm->mu);
     jm->stopping = 1;
-    if (jm->count > 0) {
-        taken = malloc((size_t)jm->count * sizeof(*taken));
-        if (taken) {
-            for (int k = 0; k < jm->count; k++) {
-                int i = (jm->head + k) % JOB_QUEUE_MAX;
-                taken[ntaken++] = jm->queue[i];
-                memset(&jm->queue[i], 0, sizeof(jm->queue[i]));
-            }
-            jm->head = jm->tail;
-            jm->count = 0;
-        }
-        /* Without the memory to hold them, the queued jobs are flagged
-         * below with the rest and start already cancelled, as they used to:
-         * worse, but still a shutdown. */
-    }
     /* Ask anything in flight to wind up rather than waiting for it. */
-    for (int i = 0; i < JOB_QUEUE_MAX; i++)
-        if (jm->queue[i].job_id)
-            atomic_store_explicit(&jm->queue[i].cancel, 1, memory_order_relaxed);
+    for (int i = 0; i < jm->nworkers; i++)
+        if (jm->running[i].job_id)
+            atomic_store_explicit(&jm->running[i].cancel, 1, memory_order_relaxed);
     pthread_cond_broadcast(&jm->cv);
     pthread_mutex_unlock(&jm->mu);
 
-    for (int k = 0; k < ntaken; k++)
-        finish_unstarted(jm, &taken[k]);
-    free(taken);
+    int ntaken = 0;
+    for (;;) {
+        pthread_mutex_lock(&jm->mu);
+        if (jm->count == 0) { pthread_mutex_unlock(&jm->mu); break; }
+        job_slot_t taken = dequeue_at(jm, 0);
+        pthread_mutex_unlock(&jm->mu);
+        finish_unstarted(jm, &taken);
+        ntaken++;
+    }
     if (ntaken > 0)
         log_info("job manager: %d queued job(s) cancelled by shutdown", ntaken);
 
@@ -648,7 +666,7 @@ void job_manager_stop(job_manager_t *jm)
         pthread_join(jm->workers[i], NULL);
 
     free(jm->workers);
-    free(jm->running_repo);
+    free(jm->running);
     pthread_mutex_destroy(&jm->mu);
     pthread_mutex_destroy(&jm->db_mu);
     pthread_cond_destroy(&jm->cv);
@@ -725,11 +743,14 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
         if (arg_free) arg_free(arg);
         return set_error(ERR_BUSY, "daemon is shutting down");
     }
+    /* Running jobs live in jm->running, so the ring's whole capacity is
+     * queue and this count is everything occupying it. */
     if (jm->count >= JOB_QUEUE_MAX) {
         pthread_mutex_unlock(&jm->mu);
         set_job_state(jm, job_id, "failed", "job queue full");
         if (arg_free) arg_free(arg);
-        return set_error(ERR_BUSY, "job queue full");
+        return set_error(ERR_BUSY, "job queue full: %d jobs already queued, "
+                         "retry once some have run", JOB_QUEUE_MAX);
     }
     job_slot_t *s = &jm->queue[jm->tail];
     s->job_id   = job_id;
@@ -739,8 +760,6 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
     s->fn       = fn;
     s->arg      = arg;
     s->arg_free = arg_free;
-    atomic_store_explicit(&s->cancel, 0, memory_order_relaxed);
-    s->active   = 0;
     jm->tail = (jm->tail + 1) % JOB_QUEUE_MAX;
     jm->count++;
     pthread_cond_signal(&jm->cv);
@@ -771,25 +790,15 @@ status_t job_cancel(job_manager_t *jm, int64_t job_id)
     int flagged = 0;
     pthread_mutex_lock(&jm->mu);
     for (int k = 0; k < jm->count; k++) {
-        int i = (jm->head + k) % JOB_QUEUE_MAX;
-        if (jm->queue[i].job_id != job_id) continue;
-        taken = jm->queue[i];
-        /* Close the gap from the head side, as take_runnable does. */
-        for (int m = k; m > 0; m--) {
-            int dst = (jm->head + m) % JOB_QUEUE_MAX;
-            int src = (jm->head + m - 1) % JOB_QUEUE_MAX;
-            jm->queue[dst] = jm->queue[src];
-        }
-        memset(&jm->queue[jm->head], 0, sizeof(jm->queue[jm->head]));
-        jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
-        jm->count--;
+        if (jm->queue[(jm->head + k) % JOB_QUEUE_MAX].job_id != job_id) continue;
+        taken = dequeue_at(jm, k);
         dequeued = 1;
         break;
     }
     if (!dequeued) {
-        for (int i = 0; i < JOB_QUEUE_MAX; i++) {
-            if (jm->queue[i].active && jm->queue[i].job_id == job_id) {
-                atomic_store_explicit(&jm->queue[i].cancel, 1, memory_order_relaxed);
+        for (int i = 0; i < jm->nworkers; i++) {
+            if (jm->running[i].job_id == job_id) {
+                atomic_store_explicit(&jm->running[i].cancel, 1, memory_order_relaxed);
                 flagged = 1;
                 break;
             }

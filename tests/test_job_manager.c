@@ -477,7 +477,7 @@ static status_t gated_job(void *arg, atomic_int *cancel,
     return OK;
 }
 
-static int g_arg_freed;
+static atomic_int g_arg_freed;
 static void count_free(void *arg) { (void)arg; g_arg_freed++; }
 
 static void test_cancelling_a_queued_job_is_immediate(void **state)
@@ -525,7 +525,7 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
  * and journalled "cancelled before it started", and only the running job is
  * asked to stop. Queued jobs on another repository are no different.
  */
-static int g_polling_runs;
+static atomic_int g_polling_runs;
 
 static status_t polling_job(void *arg, atomic_int *cancel,
                             void (*progress)(const char *, uint64_t, uint64_t, void *),
@@ -573,6 +573,101 @@ static void test_shutdown_never_starts_a_queued_job(void **state)
     snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
     assert_int_equal(db_text(q, st, sizeof(st)), 0);
     assert_string_equal(st, "cancelled");
+}
+
+/*
+ * OWN-15: a claimed job stayed in its ring slot behind the head while the
+ * full check counted only queued jobs, so with every worker busy the tail
+ * wrapped onto a running job's slot after JOB_QUEUE_MAX - workers queued
+ * jobs. The next submits overwrote it, cancel flag included: `jobs cancel`
+ * on the running job then answered "not running" and it ran on.
+ *
+ * Here both workers are busy, the queue takes exactly JOB_QUEUE_MAX more,
+ * the one after is refused cleanly, and the running jobs are untouched:
+ * still running, never flagged, and still stopped by a cancel.
+ */
+static int g_never_runs_calls;
+
+static status_t never_runs_job(void *arg, atomic_int *cancel,
+                               void (*progress)(const char *, uint64_t, uint64_t, void *),
+                               void *progress_ctx)
+{
+    (void)arg; (void)cancel; (void)progress; (void)progress_ctx;
+    pthread_mutex_lock(&g_mu);
+    g_never_runs_calls++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void test_full_queue_refuses_and_spares_running_jobs(void **state)
+{
+    (void)state;
+    g_polling_runs = 0;
+    g_arg_freed = 0;
+    g_never_runs_calls = 0;
+    int64_t a = 0, b = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, polling_job, NULL, NULL, &a), OK);
+    assert_int_equal(job_submit(jm, 2, "backup", NULL, polling_job, NULL, NULL, &b), OK);
+    for (int i = 0; i < 400 && db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'") != 2; i++)
+        usleep(5000);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'running'"), 2);
+
+    /* Every slot the ring has, all on the busy repositories so none can
+     * start: a running job's slot would be overwritten from the
+     * (JOB_QUEUE_MAX - 1)th of these on. */
+    for (int i = 0; i < JOB_QUEUE_MAX; i++) {
+        int64_t id = 0;
+        assert_int_equal(job_submit(jm, 1 + (i % 2), "verify", NULL, never_runs_job,
+                                    NULL, count_free, &id), OK);
+        assert_true(id > b);
+    }
+
+    /* One more is refused, cleanly: busy (503 at the route), a message
+     * that says why, its argument released, its row marked failed. */
+    int64_t over = -1;
+    assert_int_equal(job_submit(jm, 3, "gc", NULL, never_runs_job, NULL, count_free, &over),
+                     ERR_BUSY);
+    assert_int_equal(over, -1);
+    assert_non_null(strstr(err_msg(), "job queue full"));
+    err_clear();
+    assert_int_equal(g_arg_freed, 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"
+                              " AND error = 'job queue full'"), 1);
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'queued'"),
+                     JOB_QUEUE_MAX);
+
+    /* The running jobs: same ids, still running, never flagged (a polling
+     * job returns as soon as it sees the flag), and nothing queued ran. */
+    char q[96], st[32];
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)a);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "running");
+    snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)b);
+    assert_int_equal(db_text(q, st, sizeof(st)), 0);
+    assert_string_equal(st, "running");
+    assert_int_equal(g_never_runs_calls, 0);
+
+    /* Cancelling each still reaches that job and stops it. */
+    assert_int_equal(job_cancel(jm, a), OK);
+    assert_int_equal(job_cancel(jm, b), OK);
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id IN (%lld, %lld)"
+             " AND state = 'cancelled'", (long long)a, (long long)b);
+    for (int i = 0; i < 400 && db_count(q) != 2; i++) usleep(5000);
+    assert_int_equal(db_count(q), 2);
+    assert_int_equal(g_polling_runs, 2);
+
+    /* And the queue behind them drains in full, every job intact. */
+    for (int i = 0; i < 1000; i++) {
+        if (db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'") == JOB_QUEUE_MAX)
+            break;
+        usleep(5000);
+    }
+    assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'"
+                              " AND action = 'verify'"), JOB_QUEUE_MAX);
+    pthread_mutex_lock(&g_mu);
+    int calls = g_never_runs_calls;
+    pthread_mutex_unlock(&g_mu);
+    assert_int_equal(calls, JOB_QUEUE_MAX);
 }
 
 /*
@@ -629,6 +724,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancelling_a_queued_job_is_immediate, setup, teardown),
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
