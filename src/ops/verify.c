@@ -475,6 +475,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                 res.bytes_read += bytes;
                 log_warn("verify: repaired %s (%d byte(s) corrected)", hex, fixed);
                 record_finding(db, repo_id, res.run_id, hex, "repaired");
+            } else if (fixed == PARITY_REPAIR_REFUSED_TOO_LARGE) {
+                /* Repair declined to touch it (OWN-30), so this is not data
+                 * parity failed to recover; it is data parity was not
+                 * allowed to try on. Say which. */
+                res.unrecoverable++;
+                record_finding(db, repo_id, res.run_id, hex,
+                               "unrecoverable: " PARITY_TOO_LARGE_REASON);
             } else {
                 err_clear();
                 res.unrecoverable++;
@@ -514,6 +521,13 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          "%d byte(s) back to disk", hex, fixed);
                 res.repaired++;
                 record_finding(db, repo_id, res.run_id, hex, "repaired");
+            } else if (fixed == PARITY_REPAIR_REFUSED_TOO_LARGE) {
+                /* Readable, since the in-memory correction was checked
+                 * against the hash, but repair would not write it back
+                 * (OWN-30), so the damage stays on disk. */
+                res.recoverable++;
+                record_finding(db, repo_id, res.run_id, hex,
+                               "recoverable, not written back: " PARITY_TOO_LARGE_REASON);
             } else {
                 if (repair)
                     log_warn("verify: %s was silently corrected on read but the "

@@ -5,6 +5,7 @@
 #include "object.h"
 #include "progress.h"
 #include <stdint.h>
+#include <stdio.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
@@ -285,6 +286,13 @@ status_t pack_resolve_location(store_t *store,
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
  */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+/*
+ * 1 when the pack open on f cannot have a parity trailer whose uint32 size
+ * fields wrapped, 0 when repair must leave it alone (OWN-30). Exposed for
+ * the tests that pin it against real trailers.
+ */
+int pack_parity_fields_fit(FILE *f);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only

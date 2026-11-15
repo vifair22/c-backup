@@ -1721,6 +1721,22 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
     return OK;
 }
 
+/*
+ * OWN-30: the pack trailer's size goes into a uint32 footer field and each
+ * entry's block size into another. Past the limit they wrap and repair
+ * refuses the whole pack, so say so when the pack is written. The write
+ * itself goes ahead - design constraint 1 is arbitrary size.
+ */
+static void warn_if_pack_parity_unusable(uint64_t blocks_end, uint32_t packed)
+{
+    uint64_t total = blocks_end + sizeof(packed) + (uint64_t)packed * sizeof(uint64_t)
+                   + sizeof(parity_footer_t);
+    if (total <= parity_trailer_limit()) return;
+    log_warn("pack: parity trailer of %llu bytes (%u entries) is too large for "
+             "32-bit parity fields; parity in this pack cannot be used for repair "
+             "until the format is fixed", (unsigned long long)total, packed);
+}
+
 /* Write parity trailer for a .dat file.  The dat file must be open and
  * seekable; the current position is at the end of data entries.  Reads
  * entries back from the file (still in page cache) to compute parity.
@@ -1877,6 +1893,7 @@ static status_t write_dat_parity(store_t *store, FILE *dat_f,
     }
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -1948,6 +1965,7 @@ static status_t write_dat_parity_precomputed(FILE *dat_f,
         return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_count failed");
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -4496,6 +4514,40 @@ static status_t maybe_coalesce_packs(store_t *store,
     return rc;
 }
 
+/*
+ * OWN-30 stopgap. load_entry_parity finds the trailer through the footer's
+ * uint32 trailer_size, and in a pack whose trailer outgrew it that points
+ * into the wrong bytes - for every entry, not just a large one, since an
+ * old unsealed pack can hold any amount. The bound is taken from the file
+ * size and the larger of the two entry counts, never an entry header,
+ * because a header is what repair may be about to rewrite.
+ *
+ * An unreadable count says nothing about size, so it passes here and
+ * load_entry_parity, which reads the same bytes, refuses on its own terms.
+ */
+int pack_parity_fields_fit(FILE *f)
+{
+    struct stat sb;
+    if (fstat(fileno(f), &sb) != 0) return 1;
+    uint64_t fsize = (uint64_t)sb.st_size;
+    if (fsize <= parity_trailer_limit()) return 1;
+
+    pack_dat_hdr_t dh;
+    uint32_t tail_count = 0;
+    if (pread(fileno(f), &dh, sizeof(dh), 0) != (ssize_t)sizeof(dh) ||
+        pread(fileno(f), &tail_count, sizeof(tail_count), (off_t)(fsize - 16))
+            != (ssize_t)sizeof(tail_count))
+        return 1;
+    uint64_t n = dh.count > tail_count ? dh.count : tail_count;
+
+    return parity_trailer_fits_file(fsize, n,
+        sizeof(pack_dat_hdr_t), sizeof(pack_dat_entry_hdr_t),
+        /* header CRC, entry_count, footer */
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(parity_footer_t),
+        /* header parity, CRC, rs_data_len, block size, offset table slot */
+        sizeof(parity_record_t) + 3 * sizeof(uint32_t) + sizeof(uint64_t));
+}
+
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t found;
     if (pack_find_entry(store, hash, &found) != OK) return -1;
@@ -4511,6 +4563,13 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     /* Open read-only FILE* for load_entry_parity and reading current data */
     FILE *f = fopen(dat_path, "rb");
     if (!f) return -1;
+
+    if (!pack_parity_fields_fit(f)) {
+        log_warn("pack %u: not repaired: pack is " PARITY_TOO_LARGE_REASON,
+                 found.pack_num);
+        fclose(f);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
+    }
 
     /* Load parity data */
     parity_record_t hdr_par;

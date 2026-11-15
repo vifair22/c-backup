@@ -50,6 +50,27 @@ static void hash_to_path(const uint8_t hash[OBJECT_HASH_SIZE],
     fname[OBJECT_HASH_SIZE * 2 - 2] = '\0';
 }
 
+/* A loose trailer's bytes besides the RS parity: header parity record,
+ * payload CRC, the deprecated rs_data_len and the footer. */
+#define LOOSE_TRAILER_FIXED \
+    (sizeof(parity_record_t) + 2 * sizeof(uint32_t) + sizeof(parity_footer_t))
+_Static_assert(LOOSE_TRAILER_FIXED <= PARITY_TRAILER_FIXED_MAX,
+               "the loose trailer must sit under the shared threshold");
+
+/*
+ * The write is never refused - design constraint 1 is arbitrary size - but
+ * an object whose trailer_size wraps has parity no repair will use, and the
+ * operator should hear that when it is written rather than when it is
+ * damaged. `what` names the writer, since the hash is not always known yet.
+ */
+static void warn_if_parity_unusable(uint64_t stored_size, const char *what)
+{
+    if (parity_fields_fit(stored_size)) return;
+    log_warn("%s: stored size %llu is too large for 32-bit parity fields; "
+             "its parity cannot be used for repair until the format is fixed",
+             what, (unsigned long long)stored_size);
+}
+
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf) {
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
@@ -278,6 +299,7 @@ static status_t write_object(store_t *store, uint8_t type,
     }
 
     size_t rs_sz = rs_parity_size(payload_size);
+    warn_if_parity_unusable(payload_size, "write_object");
     uint8_t *rs_buf = NULL;
     if (rs_sz > 0) {
         rs_buf = malloc(rs_sz);
@@ -1057,6 +1079,7 @@ done:
         }
 
         size_t rs_sz = rs_parity_stream_total(&ps);
+        warn_if_parity_unusable(hdr.compressed_size, "stream");
 
         if (rs_sz > 0) {
             if (rs_parity_stream_replay_fd(&ps, tfd) != 0) {
@@ -1481,6 +1504,7 @@ sp_done:
         return set_error_errno(ERR_IO, "sparse_stream: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "sparse_stream");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "sparse_stream: write rs parity");
@@ -2609,6 +2633,7 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
         return set_error_errno(ERR_IO, "store_fd: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "store_fd");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "store_fd: write rs parity");
@@ -2685,6 +2710,25 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
         != (ssize_t)sizeof(pftr) ||
         pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) {
         close(fd); return 0;
+    }
+
+    /*
+     * OWN-30 stopgap: past the threshold trailer_size has wrapped, so the
+     * trailer_start computed below points into the wrong bytes and every
+     * "correction" read from there would be written into user data. The
+     * file size is checked as well as the header's length because the
+     * header is one of the things this function rewrites.
+     */
+    if (!parity_fields_fit(hdr.compressed_size) ||
+        !parity_trailer_fits_file((uint64_t)file_end, 1, sizeof(hdr), 0,
+                                  LOOSE_TRAILER_FIXED, 0)) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        log_warn("object %s: not repaired: %lld-byte file (header claims "
+                 "%llu stored) is " PARITY_TOO_LARGE_REASON, hex,
+                 (long long)file_end, (unsigned long long)hdr.compressed_size);
+        close(fd);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
     }
 
     off_t trailer_start = file_end - (off_t)pftr.trailer_size;
