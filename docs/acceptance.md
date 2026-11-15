@@ -283,6 +283,14 @@ not a slow-disk story.
 **A repository does not belong on a parity-protected array disk.** Cache, an
 unassigned device, or anything outside the array.
 
+Superseded by a later measurement (B088). On a different Unraid server, with
+`state.db` on the SSD cache both times, a repository on the parity array
+(18 TB HDD plus parity) was faster than on a SATA SSD cache pool: first
+backup 295 s against 391 s, unchanged backup 2.0 s against 6.6 s. The 3.2x
+slowdown measured with only the index moving (Manual section 18.2) is the
+placement that matters. Repository placement is hardware-dependent;
+`state.db` belongs on fast storage.
+
 ## What was ruled out
 
 - **`build_trees` is linear.** 341 trees/s at 580 trees and 326 trees/s at

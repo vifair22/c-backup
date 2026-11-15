@@ -17,6 +17,10 @@ typedef enum {
     API_POST,
     API_PUT,
     API_DELETE,
+    /* Any other method (PATCH, OPTIONS, ...). No route registers it; it
+     * exists so such a request is answered 405 rather than served as a GET,
+     * which is what mapping every unknown method to API_GET used to do. */
+    API_OTHER,
 } api_method_t;
 
 /* Request context passed to route handlers */
@@ -55,6 +59,8 @@ typedef struct {
     char         *set_cookie;
     /* Seconds for a Retry-After header; 0 sends none. */
     int           retry_after;
+    /* Allow header value (static, not freed), for a 405. NULL sends none. */
+    const char   *allow;
 } api_response_t;
 
 /* Build a Set-Cookie value with HttpOnly, SameSite=Strict, Path=/ baked
@@ -73,6 +79,22 @@ char *api_cookie_clear(const char *name, int secure);
 
 /* Route handler function */
 typedef api_response_t (*api_handler_fn)(const api_request_t *req, void *userdata);
+
+/*
+ * Which methods a path under a wildcard pattern answers, as an Allow header
+ * value ("GET, PUT"), or NULL when the path names nothing.
+ *
+ * The router knows methods only per pattern, and a wildcard pattern is one
+ * entry covering many resources: "/repos/<id>/..." is registered for all four
+ * methods, while /repos/<id>/journal answers only GET. A module that owns a
+ * wildcard registers one of these so a request with the wrong method gets
+ * 405 and an Allow that is true for that resource; without one the router
+ * falls back to the methods registered for the pattern.
+ */
+typedef const char *(*api_allow_fn)(const char *url, void *userdata);
+
+/* 405 with an Allow header. `allow` is static, e.g. "GET, DELETE". */
+api_response_t api_method_not_allowed(const char *allow);
 
 /* --- Streaming responses (Server-Sent Events, etc.) ---
  *
@@ -147,6 +169,10 @@ int api_server_route_streaming(api_server_t *srv, const char *pattern,
                                api_method_t method,
                                api_stream_handler_fn handler,
                                void *userdata);
+
+/* Register the Allow resolver for a wildcard pattern; see api_allow_fn. */
+int api_server_route_allow(api_server_t *srv, const char *pattern,
+                           api_allow_fn fn, void *userdata);
 
 /* Set an auth check callback. Called before every API route handler.
  * Return API_AUTH_ALLOW to serve the request, API_AUTH_DENY to reject it

@@ -105,6 +105,56 @@ static void journal_interrupted(cutils_db_t *db)
     db_result_free(r);
 }
 
+/*
+ * The Pushover alert for a failed job.
+ *
+ * Manual 16.3 promises the action, the repository and the error. It sent
+ * "repo 3: <error>" under the title "c-backup: backup failed", and the
+ * title is all c-utils logs when a send is rejected, so the one line an
+ * operator saw named neither the repository nor the reason. The repository
+ * is named by its label and path, because an id means nothing on a phone,
+ * and the label goes in the title as well so that it survives into that log
+ * line.
+ */
+void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
+                       const char *action, const char *detail,
+                       char *title, size_t title_sz, char *body, size_t body_sz)
+{
+    char idbuf[24];
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)repo_id);
+
+    char label[128] = "";
+    char path[512] = "";
+    db_result_t *r = NULL;
+    const char *params[] = { idbuf, NULL };
+    if (db && db_execute(db, "SELECT COALESCE(label, ''), path FROM repos WHERE id = ?",
+                         params, &r) == 0 && r && r->nrows == 1) {
+        snprintf(label, sizeof(label), "%s", r->rows[0][0]);
+        snprintf(path, sizeof(path), "%s", r->rows[0][1]);
+    }
+    db_result_free(r);
+
+    const char *what = action && action[0] ? action : "job";
+    const char *why  = detail && detail[0] ? detail : "no detail recorded";
+
+    /* c-utils returns NULL columns as "", so an unlabelled repository and a
+     * removed one both arrive as an empty label. */
+    if (label[0])
+        snprintf(title, title_sz, "c-backup: %s of %s failed", what, label);
+    else
+        snprintf(title, title_sz, "c-backup: %s of repo %lld failed", what,
+                 (long long)repo_id);
+
+    if (path[0])
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %s",
+                 label[0] ? label : "(no label)", (long long)repo_id, path,
+                 (long long)job_id, what, why);
+    else
+        snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
+                 "Job %lld (%s) failed: %s",
+                 (long long)repo_id, (long long)job_id, what, why);
+}
+
 static void set_job_state(job_manager_t *jm, int64_t job_id,
                           const char *state, const char *error)
 {
@@ -423,10 +473,12 @@ static void *worker_main(void *arg)
          * Pushover is unconfigured, so this needs no feature flag.
          */
         if (st != OK && !jm->queue[slot_index].cancel) {
-            char title[128], body[512];
-            snprintf(title, sizeof(title), "c-backup: %s failed", slot.action);
-            snprintf(body, sizeof(body), "repo %lld: %s",
-                     (long long)slot.repo_id, detail ? detail : "no detail");
+            /* Pushover's limits: 250 for the title, 1024 for the body. */
+            char title[250], body[1024];
+            pthread_mutex_lock(&jm->db_mu);
+            job_alert_compose(jm->db, slot.repo_id, slot.job_id, slot.action,
+                              detail, title, sizeof(title), body, sizeof(body));
+            pthread_mutex_unlock(&jm->db_mu);
             if (push_send(title, body) != 0)
                 log_warn("cannot queue failure notification for job %lld",
                          (long long)slot.job_id);
@@ -608,15 +660,63 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
 status_t job_cancel(job_manager_t *jm, int64_t job_id)
 {
     if (!jm) return set_error(ERR_INVALID, "job_cancel: null manager");
-    status_t st = set_error(ERR_NOT_FOUND, "job %lld is not running", (long long)job_id);
+
+    /*
+     * A job still in the queue is taken out of it and finished here, not
+     * flagged and left for a worker to discover.
+     *
+     * Flagging was all this did, so a queued job answered the cancel with
+     * success and then went on reading "queued" - for as long as whatever
+     * held its repository kept running - before a worker picked it up, saw
+     * the flag and recorded it cancelled. A cancel the client cannot see
+     * take effect reads as one that was ignored. Removing it under the
+     * queue lock also means no worker can claim it afterwards, so it never
+     * runs at all.
+     */
+    job_slot_t taken;
+    int dequeued = 0;
+    int flagged = 0;
     pthread_mutex_lock(&jm->mu);
-    for (int i = 0; i < JOB_QUEUE_MAX; i++) {
-        if (jm->queue[i].job_id == job_id) {
-            jm->queue[i].cancel = 1;
-            st = OK;
-            break;
+    for (int k = 0; k < jm->count; k++) {
+        int i = (jm->head + k) % JOB_QUEUE_MAX;
+        if (jm->queue[i].job_id != job_id) continue;
+        taken = jm->queue[i];
+        /* Close the gap from the head side, as take_runnable does. */
+        for (int m = k; m > 0; m--) {
+            int dst = (jm->head + m) % JOB_QUEUE_MAX;
+            int src = (jm->head + m - 1) % JOB_QUEUE_MAX;
+            jm->queue[dst] = jm->queue[src];
+        }
+        memset(&jm->queue[jm->head], 0, sizeof(jm->queue[jm->head]));
+        jm->head = (jm->head + 1) % JOB_QUEUE_MAX;
+        jm->count--;
+        dequeued = 1;
+        break;
+    }
+    if (!dequeued) {
+        for (int i = 0; i < JOB_QUEUE_MAX; i++) {
+            if (jm->queue[i].active && jm->queue[i].job_id == job_id) {
+                jm->queue[i].cancel = 1;
+                flagged = 1;
+                break;
+            }
         }
     }
     pthread_mutex_unlock(&jm->mu);
-    return st;
+    if (flagged) return OK;
+    if (!dequeued)
+        return set_error(ERR_NOT_FOUND, "job %lld is not running", (long long)job_id);
+
+    set_job_state(jm, taken.job_id, "cancelled", NULL);
+    log_info("job %lld cancelled before it started: %s, repo %lld",
+             (long long)taken.job_id, taken.action, (long long)taken.repo_id);
+    if (taken.repo_id > 0) {
+        pthread_mutex_lock(&jm->db_mu);
+        journal_job(jm->db, taken.repo_id, taken.schedule_id, taken.action,
+                    "cancelled", 0, "cancelled before it started");
+        pthread_mutex_unlock(&jm->db_mu);
+    }
+    if (taken.arg_free) taken.arg_free(taken.arg);
+    free(taken.action);
+    return OK;
 }
