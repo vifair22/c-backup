@@ -323,6 +323,28 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     int limit = 0, offset = 0;
     api_response_t page_err;
     if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
+    /*
+     * A snapshot or directory that is not there is a 404. Both answered an
+     * empty listing, which is what an empty directory looks like, so a
+     * mistyped id read as "nothing in here".
+     */
+    if (!snapshot_exists(repo_id, snap_id)) return api_error(404, "no such snapshot");
+    if (parent && !*parent) parent = NULL;
+    if (parent && strcmp(parent, "0") != 0) {
+        char *end = NULL;
+        long long pid = strtoll(parent, &end, 10);
+        if (pid <= 0 || !end || *end) return api_error(400, "parent must be a node id");
+        char rb[32], sb[32];
+        snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
+        snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
+        db_result_t *pr = NULL;
+        int found = db_execute(g_ctx.db,
+                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
+                (const char *[]){ rb, sb, parent, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+        db_result_free(pr);
+        if (!found) return api_error(404, "no such directory in this snapshot");
+    }
+
     char repo[32], snap[32], lim[16], off[16];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
@@ -1316,9 +1338,29 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     return api_ok(body);
 }
 
+/*
+ * Is run_id one of this repository's runs in `table`? A run that is not
+ * there answered with an empty list, which is also what a clean scrub or a
+ * search with no matches looks like - so `verify show 1 999` read as
+ * "nothing wrong". The table name is one of two literals, never input.
+ */
+static int run_exists(const char *table, int64_t repo_id, int64_t run_id)
+{
+    char repo[32], run[32], sql[96];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    snprintf(sql, sizeof(sql), "SELECT 1 FROM %s WHERE repo_id = ? AND id = ?", table);
+    db_result_t *r = NULL;
+    int found = db_execute(g_ctx.db, sql, (const char *[]){ repo, run, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    return found;
+}
+
 static api_response_t grep_hits_get(const api_request_t *req, int64_t repo_id,
                                     int64_t run_id)
 {
+    if (!run_exists("grep_runs", repo_id, run_id)) return api_error(404, "no such search run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
@@ -1429,6 +1471,7 @@ static api_response_t verify_runs_get(const api_request_t *req, int64_t repo_id)
 static api_response_t verify_findings_get(const api_request_t *req, int64_t repo_id,
                                           int64_t run_id)
 {
+    if (!run_exists("verify_runs", repo_id, run_id)) return api_error(404, "no such verify run");
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);

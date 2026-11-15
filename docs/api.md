@@ -141,6 +141,12 @@ Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
 implementation by 2.7x; the trigram index wins by 50.9x.
 
+`tree` answers 404 for a snapshot that does not exist and for a `parent`
+that is not a node of that snapshot; so do `packs/<pid>/entries` for a
+missing pack, `verify/<run-id>` and `grep/<run-id>` for a missing run. All
+of them answered an empty list, which is what an empty directory, an empty
+pack and a clean scrub look like.
+
 Without `snapshot`, every snapshot is searched and identical copies are
 collapsed: one result per (path, content hash), carrying the newest
 snapshot it was seen in (`snap_id`, `node_id`) and how many snapshots hold

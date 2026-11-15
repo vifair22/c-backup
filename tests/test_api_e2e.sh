@@ -403,6 +403,12 @@ wait_job "$PACK_JOB"
 contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
 contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
 contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
+# B075: missing ids answered as empty successes, which reads as "empty".
+check "entries of a missing pack"   404 "$(sock_code '/repos/1/packs/99999/entries')"
+check "tree of a missing snapshot"  404 "$(sock_code '/repos/1/snapshots/99999/tree?parent=0')"
+check "tree under a missing node"   404 "$(sock_code '/repos/1/snapshots/1/tree?parent=99999999')"
+check "findings of a missing verify run" 404 "$(sock_code '/repos/1/verify/99999')"
+check "hits of a missing search"    404 "$(sock_code '/repos/1/grep/99999')"
 # Objects are in packs now, so every read path has to resolve through the
 # index rather than the objects directory.
 PACKED=$(sock_body '/repos/1/objects?location=pack&limit=1' \

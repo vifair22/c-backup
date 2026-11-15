@@ -591,7 +591,15 @@ api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id
     snprintf(lim,  sizeof(lim),  "%d", limit);
     snprintf(off,  sizeof(off),  "%d", offset);
 
+    /* A pack that is not there is a 404, not an empty pack. */
     db_result_t *r = NULL;
+    int found = db_execute(g_db, "SELECT 1 FROM packs WHERE repo_id = ? AND id = ?",
+                           (const char *[]){ repo, pid, NULL }, &r) == 0
+             && r && r->nrows == 1;
+    db_result_free(r);
+    if (!found) return api_error(404, "no such pack");
+
+    r = NULL;
     if (db_execute(g_db,
             "SELECT hash, offset, comp_size, orig_size, entry_index"
             "  FROM pack_objects WHERE repo_id = ? AND pack_id = ?"

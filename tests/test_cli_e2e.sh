@@ -157,6 +157,10 @@ contains "objects filtered by location" '"objects"' "$(cb objects 1 --location p
 contains "empty location filter keeps its key" '"objects"' \
     "$(cb objects 1 --location loose --limit 5)"
 contains "packs"    '"'          "$(cb packs 1)"
+# B075: these printed an empty listing and exited 0 for ids that do not exist.
+check "packs on a missing pack fails"      1 "$(cb packs 1 99999 >/dev/null 2>&1; echo $?)"
+check "ls on a missing snapshot fails"     1 "$(cb ls 1 99999 >/dev/null 2>&1; echo $?)"
+check "verify show on a missing run fails" 1 "$(cb verify show 1 99999 >/dev/null 2>&1; echo $?)"
 contains "fanout"   '"'          "$(cb fanout 1)"
 contains "metrics"  'cbackup_'   "$(cb metrics)"
 contains "health live" 'ok'      "$(cb health live)"
