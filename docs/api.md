@@ -185,6 +185,8 @@ lazily on first append, which used to leave an empty result serialising as
 | GET | `/repos/<id>/grep` | Recent searches, newest first |
 | GET | `/repos/<id>/grep/<run-id>` | The hits from one search, paginated |
 | POST | `/repos/<id>/verify` | Scrub: prove stored objects still read back. `?level=index\|structure\|deep` (default `deep`), `?repair=0` to check without writing |
+| GET | `/repos/<id>/verify` | Recent verify runs, newest first; `?limit=N` (default 20) |
+| GET | `/repos/<id>/verify/<run-id>` | The findings from one run, paginated |
 | POST | `/repos/<id>/replicate` | Copy this repository into another one: `{dest}` |
 
 `subpath` restores one path out of the snapshot instead of all of it, so
@@ -237,10 +239,13 @@ matches, so it feels like `grep(1)` despite the work happening elsewhere.
 
 Verify is the answer to "is the backup still good", which is a different
 question from "did the backup run". Three levels, because the cost spread is
-enormous: `index` confirms every registered object still resolves and reads no
-payloads; `structure` additionally parses each object header; `deep` reads
-every payload and checks its SHA-256, which is the only level that can prove
-the bytes are right.
+enormous: `index` confirms every registered object still resolves and that
+every pack file the index refers to exists, and reads no payloads;
+`structure` additionally parses each object header; `deep` reads every
+payload and checks its SHA-256, which is the only level that can prove the
+bytes are right. Every object in a pack file that has gone is `missing` at
+every level, never "damaged": parity lives in the same file as the payload,
+so there is nothing for a repair to work from.
 
 By default a deep verify repairs what it can. Every object carries Reed-Solomon
 parity, and the read that proves damage exists is the expensive part, so
@@ -252,12 +257,51 @@ loss, because it can apply parity in memory without writing.
 A checking-only verify takes the repository read lock, so a backup can run
 underneath it. With repair on it takes the write lock like any other writer.
 
-Findings name files, not hashes: a damaged object is reported with how many
-files reference it, a sample of their names, and which snapshots contain them,
-so the report says what was lost and what is still clean. Runs are recorded,
-and `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
+**A verify that finds loss fails.** If the walk finishes with any
+`unrecoverable` or `missing` object, the job ends `failed` with an error
+naming the run and the counts, and `c-backup verify` exits 1. The run record
+and its findings are written first and read back exactly as for a clean run;
+the run is still `completed: 1`, since the walk did finish. Repaired and
+recoverable damage is not loss and does not fail the job.
+
+A run (`GET /repos/<id>/verify`) carries these counts:
+
+| Field | Meaning |
+|---|---|
+| `checked` | Objects examined |
+| `ok` | Intact on disk |
+| `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
+| `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
+| `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
+| `missing` | Indexed but absent: no loose file, no pack entry, or a pack file that has gone. Data loss |
+| `affected_files` | Distinct file paths referencing a lost object |
+| `affected_snapshots` | Distinct snapshots holding any of those files |
+
+Findings (`GET /repos/<id>/verify/<run-id>`) name files, not hashes, so the
+report says what was lost and what is still clean. Every object that is not
+`ok` gets one, with `status` one of `missing`, `unrecoverable`, `unreadable
+header`, `uncorrectable parity`, `damaged (run with repair to attempt
+recovery)` (a large streamed object with repair off, whose recoverability
+cannot be known without writing), `recoverable` or `repaired`:
+
+| Field | Meaning |
+|---|---|
+| `affected_files` | Distinct paths referencing the object |
+| `affected_versions` | Node rows referencing it: one per path per snapshot |
+| `sample_paths` | Up to three full paths, `, `-separated, sorted, as restore would recreate them |
+| `affected_snapshots` | Up to ten snapshot ids, comma-separated, ascending |
+| `affected_snapshot_count` | Every snapshot referencing it |
+| `snapshots_truncated` | `1` when `affected_snapshots` lists fewer than `affected_snapshot_count` |
+
+An object no file references - a manifest tree, or one from an evicted
+snapshot - reports zero files; that is not a claim the loss is harmless.
+
+`/metrics` exposes `cbackup_last_verify_age_seconds` alongside
 `cbackup_last_snapshot_age_seconds` - between them, an alert can tell that
-backups are running *and* that what they wrote is still readable.
+backups are running *and* that what they wrote is still readable - plus the
+newest completed run's `cbackup_verify_unrecoverable_objects` (unrecoverable
+plus missing), `cbackup_verify_repaired_objects`,
+`cbackup_verify_recoverable_objects` and `cbackup_verify_affected_files`.
 
 Packing runs automatically at the end of every backup, because compression
 only happens at pack time: a backup that stopped at the snapshot would have

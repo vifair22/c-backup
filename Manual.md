@@ -678,7 +678,7 @@ sudo c-backup verify list 1                # past runs
 
 | Level | Reads | Proves |
 |---|---|---|
-| `index` | no payloads | every registered object resolves to a location |
+| `index` | no payloads | every registered object resolves to a location, and every pack file it names exists |
 | `structure` | headers | every object's header is well formed |
 | `deep` | everything | every payload's SHA-256 matches its name |
 
@@ -687,9 +687,31 @@ Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
 recoverable damage from loss for small objects, applying parity in memory.
 
-Findings name files, not hashes: each damaged object is reported with how
-many files reference it, a sample of their paths, and which snapshots contain
-them. The CLI prints the run and its findings as one JSON document.
+What a run counts:
+
+| Count | Meaning |
+|---|---|
+| `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` |
+| `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
+| `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
+| `missing` | Indexed but absent, including every object in a pack file that has gone. **Data loss** |
+
+**Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
+job `failed`, with an error naming the run and the counts, and
+`c-backup verify` exits 1, so a scheduler or script that checks the exit
+status sees it. The run and its findings are still recorded and still
+printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
+reads them back later. A missing pack is reported as missing, never as
+damage to repair: its parity went with it.
+
+Findings name files, not hashes: each object that is not intact is reported
+with its status, how many distinct paths reference it (`affected_files`),
+how many versions of them across snapshots (`affected_versions`), up to
+three full paths, and up to ten snapshot ids beside the exact count
+(`affected_snapshot_count`, with `snapshots_truncated` set when the list is
+short). The run's `affected_files` and `affected_snapshots` are distinct
+paths and snapshots across every lost object. The CLI prints the run and its
+findings as one JSON document.
 
 A checking verify takes the read lock; a repairing one takes the write lock.
 
@@ -876,9 +898,10 @@ per-repository labels).
 | `cbackup_repos_key_unescrowed` | gauge | Encrypted repositories whose key is not acknowledged as stored elsewhere |
 | `cbackup_repos_encrypted` | gauge | Encrypted repositories |
 | `cbackup_last_verify_age_seconds` | gauge | Age of the newest verify run |
-| `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify could not repair |
-| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired |
-| `cbackup_verify_affected_files` | gauge | Files referencing damaged objects |
+| `cbackup_verify_unrecoverable_objects` | gauge | Objects the last verify found unrecoverable or missing |
+| `cbackup_verify_repaired_objects` | gauge | Objects the last verify repaired and wrote back |
+| `cbackup_verify_recoverable_objects` | gauge | Objects the last verify found damaged but did not write back |
+| `cbackup_verify_affected_files` | gauge | Distinct paths referencing lost objects |
 
 Alerts worth having:
 
@@ -888,6 +911,8 @@ Alerts worth having:
   checking what was written.
 - `cbackup_verify_unrecoverable_objects > 0`: data is lost; the findings say
   which files.
+- `cbackup_verify_recoverable_objects > 0`: damage parity still covers, left
+  on disk by a checking-only verify; run a repairing one.
 - `increase(cbackup_jobs_failed_total[1d]) > 0`.
 - `cbackup_repos_key_unescrowed > 0`.
 
