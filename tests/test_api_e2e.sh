@@ -200,6 +200,15 @@ contains "submit" '"job_id"' "$BACKUP_RESP"
 BACKUP_JOB=$(job_id "$BACKUP_RESP")
 wait_job "$BACKUP_JOB"
 contains "job completed" '"state":"completed"' "$(sock_body "/jobs/$BACKUP_JOB")"
+# A finished job says what it did, and how big and how long. It said only
+# "completed" with the last phase's entry count.
+JOB_BODY=$(sock_body "/jobs/$BACKUP_JOB")
+contains "backup result names its snapshot" '"result":{"snapshot_id":1,' "$JOB_BODY"
+contains "backup result counts files" '"files":3,' "$JOB_BODY"
+contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
+contains "job reports when it started" '"started":1' "$JOB_BODY"
+contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
+contains "the job list carries the same detail" '"elapsed_s":' "$(sock_body /jobs)"
 contains "snapshot listed" '"id":"1"' "$(sock_body /repos/1/snapshots)"
 contains "tree lists root" '"name"' "$(sock_body '/repos/1/snapshots/1/tree?parent=0')"
 contains "search finds file" 'a.txt' "$(sock_body '/repos/1/search?q=txt')"
@@ -227,6 +236,7 @@ RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$W
                         http://localhost/repos/1/snapshots/1/restore)")
 wait_job "$RESTORE_JOB"
 contains "restore completed" '"state":"completed"' "$(sock_body "/jobs/$RESTORE_JOB")"
+contains "restore result counts what it wrote" '"result":{"files":3,' "$(sock_body "/jobs/$RESTORE_JOB")"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else

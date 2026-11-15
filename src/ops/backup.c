@@ -81,6 +81,8 @@ typedef struct {
      * ordinary auto-pack, as they always were.
      */
     pack_backup_writer_t *pack_w;
+    /* Regular-file bytes handled and expected, for opts->bytes_cb. */
+    uint64_t       bytes_done, bytes_total;
 } pipeline_t;
 
 static void hashset_free(hashset_t *s)
@@ -169,6 +171,8 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
         p->last_report = now;
     }
 
+    if (p->opts->bytes_cb)
+        p->opts->bytes_cb(p->opts->progress_ctx, p->bytes_done, p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
 }
 
@@ -297,6 +301,18 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
     return OK;
 }
 
+/* Scan progress: entries found so far, against no known total. */
+typedef struct {
+    void (*cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
+    void  *ctx;
+} scan_bridge_t;
+
+static void scan_progress(uint32_t scanned, void *ctx)
+{
+    const scan_bridge_t *b = ctx;
+    b->cb("scan", scanned, 0, b->ctx);
+}
+
 static status_t store_content(pipeline_t *p)
 {
     /*
@@ -308,7 +324,17 @@ static status_t store_content(pipeline_t *p)
     uint32_t since_commit = 0;
     #define CACHE_BATCH 2000
 
+    p->bytes_total = 0;
+    p->bytes_done  = 0;
+    for (uint32_t i = 0; i < p->count; i++)
+        if (S_ISREG(p->scan->entries[i].st.st_mode))
+            p->bytes_total += p->scan->entries[i].node.size;
+
     for (uint32_t i = 0; i < p->count; i++) {
+        /* The previous entry is finished, whichever way it went: stored,
+         * vouched for by the cache, or skipped as unreadable. */
+        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode))
+            p->bytes_done += p->scan->entries[i - 1].node.size;
         if (cancelled(p)) {
             if (in_txn && db_txn_commit(p->db) != OK)
                 log_warn("backup: cache commit failed on cancel");
@@ -421,7 +447,10 @@ static status_t store_content(pipeline_t *p)
             continue;
         }
 
-        if (is_new) p->res->objects_new++;
+        if (is_new) {
+            p->res->objects_new++;
+            p->res->bytes_stored += w.phys_bytes;
+        }
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
@@ -934,6 +963,14 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     sopts.n_exclude      = opts->n_exclude;
     sopts.collect_meta   = 1;
     sopts.one_filesystem = opts->one_filesystem;
+    /* The scan can take minutes on a large tree, and reported nothing:
+     * the job sat at an empty phase and 0/0 until the store began. */
+    scan_bridge_t bridge = { opts->progress_cb, opts->progress_ctx };
+    if (opts->progress_cb) {
+        sopts.progress_cb    = scan_progress;
+        sopts.progress_ctx   = &bridge;
+        sopts.progress_every = 1000;
+    }
 
     /* Every source root is scanned into one result set so hard links spanning
      * roots are detected once, which is why the inode map is shared. */
@@ -983,7 +1020,7 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     pipeline_t p = { store, db, repo_id, scan, links, scan->count, &res, opts,
-                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL };
+                     (int64_t)time(NULL), { 0, 0 }, { NULL, 0, 0 }, &timers, NULL, 0, 0 };
 
     /* Rows a crashed or aborted backup staged into a pack that never
      * landed. This job holds the repository's write lock, so nothing else

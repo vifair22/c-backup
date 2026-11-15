@@ -30,6 +30,11 @@ typedef struct {
 
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);
     void  *progress_ctx;
+    /* Optional: bytes of regular-file content handled so far, and expected
+     * in total, called alongside progress_cb with the same context. Entry
+     * counts crawl through large files and say little about how far a
+     * backup has to go; bytes do. */
+    void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
 } backup_opts_t;
 
 typedef struct {
@@ -44,6 +49,9 @@ typedef struct {
     uint64_t files_unchanged;
     uint64_t trees_new;
     uint64_t trees_reused;
+    /* Bytes this run added to the repository for new file content, before
+     * packing compresses them. Everything else was already there. */
+    uint64_t bytes_stored;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,

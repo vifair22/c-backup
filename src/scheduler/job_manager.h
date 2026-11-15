@@ -45,5 +45,20 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     const char *params_json, job_fn fn, void *arg,
                     void (*arg_free)(void *), int64_t *out_job_id);
 
+/*
+ * What a job reports beyond its phase and item count, through the progress
+ * context the job function was given. Both are optional: a job that never
+ * calls them has no bytes and no result. NULL is ignored.
+ *
+ * job_progress_bytes: bytes done and expected, written with the next
+ * progress update (so under the same throttle).
+ *
+ * job_set_result: a JSON object describing what the job did - the snapshot
+ * a backup made, what a restore skipped. Stored when the job ends, success
+ * or failure, and returned by /jobs/<id>. The text is copied.
+ */
+void job_progress_bytes(void *progress_ctx, uint64_t done, uint64_t total);
+void job_set_result(void *progress_ctx, const char *json_object);
+
 /* Request cancellation. Returns OK if the job exists and is not finished. */
 status_t job_cancel(job_manager_t *jm, int64_t job_id);

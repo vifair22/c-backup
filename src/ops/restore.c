@@ -575,8 +575,27 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         groupcount_free(&gcount);
     }
 
+    /* Bytes to restore: regular files inside the subpath, if there is one.
+     * A file's size is counted once the loop has moved past it, written or
+     * skipped alike, since both are progress through the snapshot. */
+    uint64_t bytes_total = 0, bytes_done = 0, bytes_pending = 0;
+    if (opts->bytes_cb) {
+        for (int i = 0; i < r->nrows; i++) {
+            if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+            if (opts->subpath) {
+                char rel[PATH_MAX];
+                if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) { err_clear(); continue; }
+                if (!path_within(rel, opts->subpath)) continue;
+            }
+            bytes_total += strtoull(r->rows[i][6], NULL, 10);
+        }
+    }
+
     for (int i = 0; i < r->nrows && st == OK; i++) {
         if (cancelled(opts)) { st = set_error(ERR_BUSY, "restore cancelled"); break; }
+        bytes_done += bytes_pending;
+        bytes_pending = 0;
+        if (opts->bytes_cb) opts->bytes_cb(opts->progress_ctx, bytes_done, bytes_total);
         /* i + 1: this is the entry being worked on, not the count already
          * finished. Reporting the bare index meant the last entry of a
          * restore was announced as 6414 of 6415 and the job then completed,
@@ -608,6 +627,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         if (opts->subpath && !path_within(rel, opts->subpath))
             continue;
+        if (ntype == NODE_TYPE_REG) bytes_pending = strtoull(r->rows[i][6], NULL, 10);
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
@@ -879,6 +899,8 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         apply_mtime(full, strtoull(r->rows[i][5], NULL, 10));
     }
 
+    if (opts->bytes_cb && st == OK)
+        opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);
     pt_free(&paths);
     db_result_free(r);
     if (st != OK) return st;
