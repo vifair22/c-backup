@@ -196,7 +196,36 @@ docker run -d --name c-backupd \
   is set.
 - Run the CLI inside the container: `docker exec c-backupd c-backup ...`.
 - Override configuration by mounting a file over
-  `/etc/c-backupd/config.yaml`.
+  `/etc/c-backupd/config.yaml`; a read-only mount (`:ro`) is fine. Keep the
+  file 0600: the daemon warns at start if it is not and cannot fix it.
+
+**Privileges.** The daemon runs as root inside the container, because it
+has to read every source file whatever its owner and restore ownership,
+modes and device nodes. It does not need root's full capability set. This
+set covers backup and restore:
+
+```sh
+docker run -d --name c-backupd \
+  --cap-drop ALL \
+  --cap-add DAC_READ_SEARCH --cap-add DAC_OVERRIDE \
+  --cap-add CHOWN --cap-add FOWNER --cap-add FSETID --cap-add MKNOD \
+  --read-only --tmpfs /run/c-backupd \
+  -v cbackup-state:/var/lib/c-backupd ... \
+  <image>
+```
+
+| Capability | Needed for |
+|---|---|
+| `DAC_READ_SEARCH` | reading source files and directories regardless of their permissions |
+| `DAC_OVERRIDE` | writing restored files into directories owned by others |
+| `CHOWN` | restoring ownership |
+| `FOWNER` | restoring modes and times on files owned by others |
+| `FSETID` | keeping setuid and setgid bits on restored files |
+| `MKNOD` | restoring device nodes (without it they are skipped and counted) |
+
+With `--read-only`, the root filesystem is not written: state goes to the
+`/var/lib/c-backupd` volume, the socket to the `/run/c-backupd` tmpfs, and
+staging files into each repository's own `tmp/`.
 
 ### 2.4 The desktop app
 
@@ -993,8 +1022,19 @@ the array.
   several repositories or several sources backed up separately. Section 20.
 - File content is streamed in bounded chunks whatever its size. Parity for a
   large object spills to `<repo>/tmp` beyond 256 MiB.
+- Storing a large file holds a 128 MiB read buffer, and the Reed-Solomon
+  parity for it is kept in memory up to 256 MiB before spilling to disk.
 - A large pack run uses up to about 1 GB of buffers at its widest (32
-  workers). Smaller runs use proportionally less.
+  workers, each with a 16 MiB read buffer and a compression buffer). The
+  worker count is capped at one per 256 MiB of data to pack, so small runs
+  use far less.
+
+So peak memory is the scan's share plus whichever of these is running. As a
+measured reference, a first backup of 66,218 entries and 417 GB of mostly
+large media files peaked at 723 MiB resident (VmHWM) on a 12-core host:
+about 50 MiB of scan, the store buffers, and packing at the end. Plan on
+about 1 GB for a large first backup on a many-core machine, and more only
+for trees of several million files (the scan's 820 bytes each).
 
 ### 18.4 What to expect
 

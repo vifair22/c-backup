@@ -9,7 +9,7 @@ daemon's database is an index over this, not the only copy.
   .cbackup            identity marker
   snapshots/<id>      snapshot records: root tree hash plus metadata
   objects/aa/bb...    loose objects, including manifest trees
-  packs/<id>.dat      packs
+  packs/NNNN/pack-XXXXXXXX.dat   packs, 256 per directory
   tmp/                staging for atomic writes; never read back
 ```
 
@@ -19,11 +19,25 @@ Every durable write is `mkstemp`, `fsync`, `rename`, and `rename` only works
 within a filesystem. A staging directory in `/tmp` would silently become a
 copy across a device boundary, losing atomicity exactly when it matters.
 
+## `packs/`
+
+Pack `n` lives at `packs/<n / 256 as 4 hex digits>/pack-<n as 8 decimal
+digits>.dat`: pack 0 is `packs/0000/pack-00000000.dat`, pack 300 is
+`packs/0001/pack-00000300.dat`. Sharding keeps any one directory to 256
+packs. Readers also accept the flat `packs/pack-XXXXXXXX.dat` layout of
+earlier development builds.
+
 ## `.cbackup`
 
 ```json
-{"format":"cbackup-repo","version":1,"uuid":"d4011a91-..."}
+{"format":"cbackup-repo","version":2,"uuid":"d4011a91-..."}
+{"format":"cbackup-repo","version":2,"uuid":"...","encryption":{"mode":"system","cipher":"chacha20-poly1305","key_id":"7752b59887c21e7f"}}
 ```
+
+Every repository this version creates carries version 2, encrypted or not;
+version 1 markers from before encryption existed are still read. A build
+older than the marker's version refuses the repository rather than writing
+objects in a format it does not know.
 
 The UUID is the repository's identity, not its path. Move the directory,
 register the new location, and it re-links to its existing history. The UUID
