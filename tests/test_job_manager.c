@@ -252,6 +252,32 @@ static void test_old_finished_jobs_are_pruned_as_jobs_finish(void **state)
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE ended < strftime('%s','now') - 86400"), 0);
 }
 
+/*
+ * Progress is throttled to a few writes a second, and that must not cost the
+ * final tick: a job record that stops at 4,999 of 5,000 reads as a stall.
+ */
+static status_t chatty_job(void *arg, volatile int *cancel,
+                           void (*progress)(const char *, uint64_t, uint64_t, void *),
+                           void *progress_ctx)
+{
+    (void)arg; (void)cancel;
+    for (uint64_t i = 1; i <= 5000; i++) progress("work", i, 5000, progress_ctx);
+    pthread_mutex_lock(&g_mu);
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void test_throttled_progress_keeps_the_last_tick(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "gc", NULL, chatty_job, NULL, NULL, &id), OK);
+    wait_for(1);
+    usleep(200000);
+    assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 5000);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -261,6 +287,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_a_busy_repo_does_not_block_another, setup, teardown),
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_as_jobs_finish, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -108,11 +108,45 @@ static void prune_finished_jobs(job_manager_t *jm)
 typedef struct {
     job_manager_t *jm;
     int64_t        job_id;
+    /* Throttle state: see on_progress. Touched only by the job's own
+     * worker thread, which is the only caller. */
+    int64_t        last_ms;
+    char           last_phase[32];
 } progress_ctx_t;
 
+/* How often a running job's progress reaches the database. */
+#define PROGRESS_INTERVAL_MS 250
+
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Progress reaches the database at most every PROGRESS_INTERVAL_MS, plus on
+ * every phase change and at completion.
+ *
+ * Pipelines report per item - every restored entry, every stored file,
+ * every packed object - and each report was a committed UPDATE through the
+ * one database handle every thread shares. A restore of one file out of an
+ * 82,604-entry snapshot took 5 minutes 46 seconds, nearly all of it writing
+ * a progress row per skipped entry. Nobody reads progress faster than a few
+ * times a second; the CLI polls every 100 ms and the app less often.
+ */
 static void on_progress(const char *phase, uint64_t done, uint64_t total, void *ctx)
 {
     progress_ctx_t *pc = ctx;
+    const char *ph = phase ? phase : "";
+    int64_t now = mono_ms();
+    int phase_changed = strncmp(pc->last_phase, ph, sizeof(pc->last_phase) - 1) != 0;
+    int finished = total > 0 && done >= total;
+    if (!phase_changed && !finished && now - pc->last_ms < PROGRESS_INTERVAL_MS)
+        return;
+    pc->last_ms = now;
+    snprintf(pc->last_phase, sizeof(pc->last_phase), "%s", ph);
+
     char id[32], d[32], t[32];
     snprintf(id, sizeof(id), "%lld", (long long)pc->job_id);
     snprintf(d,  sizeof(d),  "%llu", (unsigned long long)done);
@@ -208,7 +242,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "" };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
 
