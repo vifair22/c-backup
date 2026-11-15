@@ -2,9 +2,15 @@
 
 #include "json_row.h"
 
+#include <cutils/error.h>
+
 #include <errno.h>
+#include <float.h>
+#include <inttypes.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -127,4 +133,190 @@ int jreq_flag(const cutils_json_req_t *req, const char *key, int *out)
     uint32_t n = 0;
     if (json_req_get_u32(req, key, &n, 0, 1) == 0) { *out = (int)n; return 0; }
     return -1;
+}
+
+jreq_type_t jreq_type(const cutils_json_req_t *req, const char *key)
+{
+    if (!json_req_has(req, key))    return JREQ_T_ABSENT;
+    if (json_req_is_null(req, key)) return JREQ_T_NULL;
+
+    bool b = false;
+    if (json_req_get_bool(req, key, &b) == 0) return JREQ_T_BOOL;
+    size_t n = 0;
+    if (json_req_array_len(req, key, &n) == 0) return JREQ_T_ARRAY;
+    char *s = NULL;
+    if (json_req_get_str(req, key, &s) == 0) { free(s); return JREQ_T_STRING; }
+    double d = 0.0;
+    if (json_req_get_f64(req, key, &d, -DBL_MAX, DBL_MAX) == 0) return JREQ_T_NUMBER;
+
+    /*
+     * What is left is an object or a number cJSON read as infinite, and the
+     * c-utils getters have no way to say which except their message: the
+     * request handle is opaque, and an empty object has no member to probe
+     * for. The number getter was the last call, so the buffer holds its
+     * verdict. If c-utils rewords it, 1e999 is reported as the wrong type -
+     * still a 400 naming the field - and test_json_row fails on it.
+     */
+    if (strstr(cutils_get_error(), "non-finite")) return JREQ_T_HUGE;
+    return JREQ_T_OBJECT;
+}
+
+__attribute__((format(printf, 2, 3)))
+static int jreq_bad(jreq_err_t *err, const char *fmt, ...)
+{
+    if (err) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(err->msg, sizeof(err->msg), fmt, ap);
+        va_end(ap);
+    }
+    return JREQ_BAD;
+}
+
+int jreq_str(const cutils_json_req_t *req, const char *key, char **out,
+             jreq_err_t *err)
+{
+    jreq_type_t t = jreq_type(req, key);
+    if (t == JREQ_T_ABSENT) return JREQ_ABSENT;
+    if (t != JREQ_T_STRING) return jreq_bad(err, "%s must be a string", key);
+    char *s = NULL;
+    if (json_req_get_str(req, key, &s) != 0 || !s) {
+        free(s);
+        return jreq_bad(err, "%s could not be read (out of memory)", key);
+    }
+    *out = s;
+    return JREQ_OK;
+}
+
+int jreq_bool(const cutils_json_req_t *req, const char *key, bool *out,
+              jreq_err_t *err)
+{
+    jreq_type_t t = jreq_type(req, key);
+    if (t == JREQ_T_ABSENT) return JREQ_ABSENT;
+    bool b = false;
+    if (t != JREQ_T_BOOL || json_req_get_bool(req, key, &b) != 0)
+        return jreq_bad(err, "%s must be true or false", key);
+    *out = b;
+    return JREQ_OK;
+}
+
+#define JREQ_EXACT 9007199254740992.0 /* 2^53 */
+
+/*
+ * The shared half of the integer getters. lo and hi are already exact
+ * doubles (narrowed to 2^53 by the caller), and range is their text for the
+ * message, printed from the integers so it never reads 4.29497e+09.
+ */
+static int jreq_whole(const cutils_json_req_t *req, const char *key,
+                      double lo, double hi, const char *range,
+                      double *out, jreq_err_t *err)
+{
+    switch (jreq_type(req, key)) {
+    case JREQ_T_ABSENT: return JREQ_ABSENT;
+    case JREQ_T_NUMBER: break;
+    case JREQ_T_HUGE:
+        return jreq_bad(err, "%s is out of range; it must be %s", key, range);
+    case JREQ_T_NULL:
+    case JREQ_T_BOOL:
+    case JREQ_T_STRING:
+    case JREQ_T_ARRAY:
+    case JREQ_T_OBJECT:
+    default:
+        return jreq_bad(err, "%s must be a number", key);
+    }
+    double d = 0.0;
+    if (json_req_get_f64(req, key, &d, -DBL_MAX, DBL_MAX) != 0)
+        return jreq_bad(err, "%s must be a number", key);
+    if (d != floor(d)) return jreq_bad(err, "%s must be a whole number", key);
+    if (d < lo || d > hi)
+        return jreq_bad(err, "%s is out of range; it must be %s", key, range);
+    *out = d;
+    return JREQ_OK;
+}
+
+int jreq_u32(const cutils_json_req_t *req, const char *key, uint32_t *out,
+             uint32_t min, uint32_t max, jreq_err_t *err)
+{
+    char range[64];
+    snprintf(range, sizeof(range), "from %" PRIu32 " to %" PRIu32, min, max);
+    double d = 0.0;
+    int rc = jreq_whole(req, key, (double)min, (double)max, range, &d, err);
+    if (rc == JREQ_OK) *out = (uint32_t)d;
+    return rc;
+}
+
+int jreq_u64(const cutils_json_req_t *req, const char *key, uint64_t *out,
+             uint64_t min, uint64_t max, jreq_err_t *err)
+{
+    const uint64_t exact = (uint64_t)1 << 53;
+    if (max > exact) max = exact;
+    if (min > max) min = max;
+    char range[64];
+    snprintf(range, sizeof(range), "from %" PRIu64 " to %" PRIu64, min, max);
+    double d = 0.0;
+    int rc = jreq_whole(req, key, (double)min, (double)max, range, &d, err);
+    if (rc == JREQ_OK) *out = (uint64_t)d;
+    return rc;
+}
+
+int jreq_i64(const cutils_json_req_t *req, const char *key, int64_t *out,
+             int64_t min, int64_t max, jreq_err_t *err)
+{
+    const int64_t exact = (int64_t)1 << 53;
+    if (max > exact)  max = exact;
+    if (min < -exact) min = -exact;
+    if (min > max) min = max;
+    char range[64];
+    snprintf(range, sizeof(range), "from %" PRId64 " to %" PRId64, min, max);
+    double d = 0.0;
+    int rc = jreq_whole(req, key, (double)min, (double)max, range, &d, err);
+    if (rc == JREQ_OK) *out = (int64_t)d;
+    return rc;
+}
+
+void jreq_strv_free(char **v, size_t n)
+{
+    if (!v) return;
+    for (size_t i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+int jreq_strv(const cutils_json_req_t *req, const char *key, size_t max,
+              char ***out, size_t *n, jreq_err_t *err)
+{
+    jreq_type_t t = jreq_type(req, key);
+    if (t == JREQ_T_ABSENT) return JREQ_ABSENT;
+    if (t != JREQ_T_ARRAY) return jreq_bad(err, "%s must be a list of strings", key);
+
+    size_t len = 0;
+    if (json_req_array_len(req, key, &len) != 0)
+        return jreq_bad(err, "%s must be a list of strings", key);
+    if (len > max)
+        return jreq_bad(err, "%s takes at most %zu entries", key, max);
+
+    char **v = len ? calloc(len, sizeof(*v)) : NULL;
+    if (len && !v) return jreq_bad(err, "%s could not be read (out of memory)", key);
+
+    size_t got = 0;
+    cutils_json_iter_t it;
+    if (json_iter_begin(req, key, &it) != 0) {
+        free(v);
+        return jreq_bad(err, "%s must be a list of strings", key);
+    }
+    while (got < len && json_iter_next(&it)) {
+        /* "" is the element itself: these are bare strings, not objects. */
+        char *s = NULL;
+        if (json_iter_get_str(&it, "", &s) != 0 || !s) {
+            free(s);
+            json_iter_end(&it);
+            jreq_strv_free(v, got);
+            return jreq_bad(err, "%s must be a list of strings; entry %zu is not one",
+                            key, got + 1);
+        }
+        v[got++] = s;
+    }
+    json_iter_end(&it);
+    *out = v;
+    *n = got;
+    return JREQ_OK;
 }
