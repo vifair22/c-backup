@@ -151,15 +151,11 @@ today's pack pass already:
    before the snapshot record, as the backup's own pack is now.
 
 **Probe says compressible, tail is not.** The decision is made on 64 KiB,
-before the rest exists. LZ4F stores an incompressible 64 KiB block raw with
-4 bytes of overhead, so the worst case is the file stored at about its own
-size inside a pack, written once: no worse than loose. Nothing is
-rewritten, unlike today's pass, which would have rewritten it. If the
-whole-file outcome matters (a compressed entry the size of its input still
-costs an LZ4F decode on every read), the writer can compare output to input
-every 64 MiB and, if the saving is under the threshold, abandon the entry
-(ftruncate back to its start) and restart the file on the loose path from
-the beginning: a reread of what was consumed, bounded by when it checks.
+before the rest exists. Without anything more, LZ4F stores each block that
+does not shrink raw, so the worst case is the file stored at about its own
+size inside a pack, written once: no worse than loose, and never rewritten.
+It still spends LZ4 CPU on every block of a body that will not compress,
+against design constraint 4. The streaming bail-out below stops that.
 
 #### Crash safety
 
@@ -266,12 +262,130 @@ these files.
   (and reencrypt a second copy), loose or packed, which breaks design
   constraint 2 for large files today, independent of this design.
 
+#### Streaming bail-out inside an entry
+
+Design constraint 4 asks for a fast incompressible bailout. The 64 KiB
+probe gives it at the head of a file; this gives it for the rest. The
+writer tracks what LZ4 achieves as the entry is written, and once
+compression has stopped paying it stores the remaining blocks of that same
+entry uncompressed. A media file with a compressible header then costs LZ4
+time for its first few MiB only, and is written once.
+
+**Already in the frame format, already in today's repositories.** An LZ4
+frame is a sequence of blocks, each led by a 4-byte size whose high bit
+marks the block as stored uncompressed (LZ4 frame format, block size
+field). `LZ4F_compressUpdate` already writes such blocks on its own,
+whenever a 64 KiB block does not shrink, so mixed frames are what the pack
+pass produces today for a file like the `-H` case above (8,184.6 MiB of
+payload for 8,192 MiB of input: mostly raw blocks). Every reader decodes
+with `LZ4F_decompress` (`pack_object_load_stream`, the prefix reader at
+pack.c ~1060, verify's stream read), which
+takes compressed and uncompressed blocks in any order, as the frame
+specification requires. The entry stays `COMPRESS_LZ4_FRAME`, its header
+fields keep their meaning, and nothing outside the writer changes. No
+format change.
+
+What the bail-out adds is not a new kind of block but skipping the attempt:
+today every block is compressed and then thrown away if it did not shrink.
+
+**How the writer emits raw blocks.** Two ways, both producing the same
+bytes:
+
+- `LZ4F_compressUpdate` with `LZ4F_compressOptions_t.uncompressed = 1`.
+  That field exists from lz4 1.11 (installed here). Debian trixie, the
+  Docker image's base, ships 1.10, which has only the static-only
+  `LZ4F_uncompressedUpdate` (1.9.4+), whose export from the shared library
+  is not something to depend on.
+- Write the blocks directly: `LZ4F_flush` the context, then for each 64 KiB
+  of input emit a little-endian `size | 0x80000000` and the bytes, and
+  finish the frame with the 4-byte zero EndMark instead of
+  `LZ4F_compressEnd`. This is valid because the writer's frames carry no
+  content checksum, no block checksum and no content size (the frame
+  preferences are the library defaults, NULL), so the context holds
+  nothing the raw blocks would have to update. Portable across every lz4
+  version and recommended. The emitted bytes go through the same path as
+  compressed output (encrypt in place, write, CRC, RS parity).
+
+**N and the threshold.**
+
+- Ratio per block, 64 KiB (the frame's block size), accumulated over a
+  window: switch to raw when the last 8 MiB (128 blocks) compressed to
+  0.90 or more of their input, the same `PACK_RATIO_THRESHOLD` the probe
+  uses, so "compressible" means one thing everywhere.
+- 8 MiB, because a container header or embedded thumbnail is usually well
+  under that, so the window sees the body before deciding; and 8 MiB of
+  LZ4 is milliseconds, so deciding later saves little. N need not be
+  exact: an entry that switched late is merely a little slower to write,
+  never larger.
+- The window starts after the first 64 KiB probe region, which has
+  already been judged.
+
+**Re-probing.** Once raw, every 256 MiB the writer compresses one 64 KiB
+block into scratch without emitting it (`LZ4_compress_default`, as the
+probe does). Below the threshold, it goes back to compressing. That costs
+one block of LZ4 per 256 MiB, a 0.02% duty cycle, and catches a file
+whose compressible part follows an incompressible one (a disk image, a tar
+of mixed content).
+
+Going back to compressed blocks after raw ones needs care with linked
+blocks: a compressed block may reference the previous 64 KiB, which the
+context never saw if the writer emitted it by hand. Either write these
+frames with independent blocks (`LZ4F_blockIndependent`, chosen per frame
+in its descriptor, so readers need nothing; costs LZ4 a little ratio,
+typically a few percent at 64 KiB blocks), or make the switch one-way: no
+re-probe, and the rest of the entry stays raw. Recommended first step: the
+one-way switch, which needs no change to the frame preferences; add
+re-probing with independent blocks only if a real tree shows files that
+compress after an incompressible stretch.
+
+**Stored size and accounting.** `compressed_size` stays what it is: the
+stored bytes, now including 4 bytes per raw 64 KiB block (0.006%) and the
+frame header. `uncompressed_size`, the pack row's `comp_size` and
+`orig_size`, `bytes_stored` and `bytes_written_pack` all keep their
+meaning; a bailed-out entry is simply nearly as large as its input. An
+entry can end up larger than its input by those few bytes per block and
+the frame overhead: possible today too, harmless, and capped at about
+0.01%.
+
+**Parity.** RS parity and the CRC cover the stored bytes, whatever they
+are; raw blocks are stored bytes like any other. Nothing changes, and
+repair (once pack entries over 16 MiB can be repaired, above) corrects
+raw and compressed blocks alike, without decoding.
+
+**Dedup.** The hash is over the plaintext file content, never the stored
+form, so it is unaffected. The switch depends only on the content, so two
+copies of a file produce identical entries; dedup does not rely on that
+in any case, since stored forms already differ between writers (backup
+pack, pack pass, replica).
+
+**The probe and the skip mark.**
+
+- The 64 KiB head probe stays the first gate. Incompressible at the head:
+  the file goes loose with the skip mark set at write time and no LZ4 at
+  all. Compressible at the head: the pack path, with the bail-out
+  watching the rest. The probe catches the common case for free; the
+  bail-out catches the header-in-front-of-media case the probe misjudges.
+- The skip mark exists so that a loose object is not re-probed by every
+  pack run. A packed entry needs none: nothing re-probes a pack entry
+  (`pb_compress`'s comment), so the bail-out's verdict is durable by being
+  in the frame.
+- Until the write-once path exists, the same window helps today's pack
+  pass differently: there the loose copy already exists, so finishing the
+  entry raw would still be a full rewrite for nothing. The pass should
+  instead abandon the entry (ftruncate the pack back to the entry's
+  start, drop its parity), set the skip mark on the loose object, and
+  leave it loose. The mark keeps its meaning, "a prober said leave this
+  loose", so `PROBER_VERSION` need not change and existing marks stay
+  valid. That alone would have saved the whole 14.5 s and 8 GiB of the
+  `-H` run, without a format change.
+
 #### Alternatives considered
 
-- Probe more than the head (several 64 KiB windows) and let the pack pass
-  bail out mid-object: cheap, no format question, but it only helps files
-  whose head misleads the probe; FS2's data really is compressible, so it
-  would not have helped there.
+- Probe more than the head (several 64 KiB windows): cheaper than the
+  streaming bail-out but blind between its samples. The bail-out reads
+  every block anyway, as part of writing it, so it sees the whole file
+  for the cost of a ratio check. Neither helps FS2, whose data really
+  compresses; both matter for media.
 - Compressed loose objects, so the pass only renames: every loose reader
   refuses a codec other than `COMPRESS_NONE`. Allowing one is a reader and
   format change, and is not needed given the above.
