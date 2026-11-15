@@ -248,12 +248,12 @@ database.
 ### 4.1 Two ways in
 
 **The unix socket** carries no authentication. Whoever can open it is
-authorised, so file permissions on it are the access control. The daemon
-creates it under the process umask; as root under systemd that means only
-root can connect, and the CLI is run with `sudo`. To let a group use the CLI
-without root, give the socket's directory and the socket to that group
-(for instance with a systemd drop-in setting `UMask=0007` and `Group=`), and
-understand that everyone in it then has full control of every repository.
+authorised, so file permissions on it are the access control. The daemon sets
+its umask to 0077 at start, so the socket is created mode 0700, owned by the
+user the daemon runs as: under the shipped unit, only root can connect, and
+the CLI is run with `sudo`. There is no setting to widen it in 1.0, by design:
+anyone who can open the socket controls every repository and can read any
+file the daemon can.
 
 **TCP** is for the desktop app on another machine. It binds loopback by
 default, so nothing off the host can reach it until `http.bind` is changed.
