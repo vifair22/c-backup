@@ -632,16 +632,12 @@ $(COV_CLI): $(COV_DIR)/cli_main.o $(COV_LIB)
 $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/fake_index.c $(COV_LIB) | $(COV_DIR)
 	$(CC) $(COV_CFLAGS) $^ -o $@ $(COV_LDFLAGS) $(FAULT_WRAP) -lcmocka
 
-# Ratchet, not aspiration: the floor is what the current phase actually
-# achieves, raised as each phase lands. src/store/ is gated separately because
-# it is the code that survives.
+# Two gates. The whole repository holds the 80% standard. src/store/ has a
+# ratchet of its own because it is the code that survives: the floor is what
+# it actually achieves, raised as tests land, and the standard is 80% there too.
 #
-# What stands between here and the 80% standard, measured rather than guessed:
+# What stands between src/store and 80%, measured rather than guessed:
 #
-#   - object.c carries ~170 uncovered lines of FUSE readahead ring. It needs
-#     both the opt-in config and an fd whose fstatfs reports FUSE_SUPER_MAGIC,
-#     so reaching it means mounting a real FUSE filesystem in the suite -
-#     /dev/fuse and privileges a CI container does not have.
 #   - pack.c's largest block is the RS repair inside pack_object_load_stream.
 #     A flipped payload byte does not reach it: the block-level parity repairs
 #     the damage before the CRC scan runs, so need_rs_repair never sets. It
@@ -649,14 +645,21 @@ $(COV_DIR)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS
 #   - The rest is error paths behind read(), write() and pwrite(), which the
 #     fault injector does not wrap yet.
 #
-# See daemonization-spec.md section 14.
-COV_STORE_MIN := 74
+# The FUSE readahead ring used to be the largest single block. It could not be
+# switched on from any configuration and was removed instead of tested.
+COV_MIN       := 80
+COV_STORE_MIN := 78
 
 # The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
 # the last "lines:" in the log, and printing the store gate second made every
 # pipeline report src/store as the project figure. The HTML report is still
 # written first, so a failing store gate leaves it behind for the artifact.
+#
+# Counters from an earlier run are cleared first. gcov adds to whatever .gcda
+# it finds, so a second local run reported the sum of both, and a few runs in
+# the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
 coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
+	@find $(COV_DIR) -name '*.gcda' -delete
 	@for t in $(COV_TESTS) $(COV_FAULT_TESTS); do $$t >/dev/null 2>&1 || true; done
 	@./$(TESTS)/test_api_e2e.sh $(COV_DAEMON) >/dev/null 2>&1 || true
 	@./$(TESTS)/test_cli_e2e.sh $(COV_DAEMON) $(COV_CLI) >/dev/null 2>&1 || true
@@ -665,8 +668,9 @@ coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
 	@echo "=== src/store gate (min $(COV_STORE_MIN)% lines) ==="
 	@gcovr -r $(SRC) $(COV_DIR) --filter 'src/store/.*' \
 	    --fail-under-line $(COV_STORE_MIN) -s
-	@echo "=== whole repo ==="
-	@gcovr -r $(SRC) $(COV_DIR) --exclude '.*vendor.*' --txt $(COV_DIR)/coverage.txt -s
+	@echo "=== whole repo (min $(COV_MIN)% lines) ==="
+	@gcovr -r $(SRC) $(COV_DIR) --exclude '.*vendor.*' --txt $(COV_DIR)/coverage.txt \
+	    --fail-under-line $(COV_MIN) -s
 	@echo "Coverage report: $(COV_DIR)/coverage.html"
 
 .PHONY: coverage
