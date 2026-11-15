@@ -6,6 +6,88 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-15 - Large-file first backup, pipelined (B086)
+
+UAT reported a first backup of 16 GiB (6 x 2 GiB random, 2 x 2 GiB identical
+text) on a 4x SATA SSD btrfs pool at 266 s, against 131 s for
+`cp -r --reflink=never` on the same pool. Reproduced at 3 GiB scale: 4 x
+512 MiB random, 2 x 512 MiB identical text. Different machine from the header:
+i7-1265U laptop (2P+8E cores), 16 GB RAM, btrfs on LUKS on NVMe, GCC 16.2.1,
+Linux 7.2.15. Source page cache evicted before every run; times include a
+trailing `sync`; three interleaved rounds each.
+
+| | before | after | `cp` |
+|---|---:|---:|---:|
+| repo on disk (btrfs), median | 7.80 s | **5.28 s** | 3.15 s |
+| repo on disk, range | 7.41-7.89 s | 4.68-5.40 s | 3.07-3.17 s |
+| repo on tmpfs, median | 6.17 s | **4.16 s** | 1.68 s |
+| ratio to `cp`, disk | 2.5x | 1.7x | |
+
+The tmpfs run is the diagnosis: with no write I/O at all the old backup was
+only 20% faster, so it was CPU-bound on one thread.
+
+### Where the time went
+
+Per-phase (`phase_report`), repo on disk, one representative round:
+
+| | before | after |
+|---|---:|---:|
+| read+hash+write | 5.93 s | 3.28 s |
+| of which obj:io-loop | 5.33 s | 2.66 s |
+| of which payload fadvise + writeback start | ~0.6 s (untimed) | 0.58 s |
+| auto-pack of the text object (job minus profile) | ~1.4 s | ~1.4 s |
+| scan, trees, index | < 0.05 s | < 0.05 s |
+
+The loop read 128 MiB, then hashed it, then wrote it, then fed it to CRC and
+RS parity, all on one thread. Each pass over a 128 MiB buffer comes from DRAM,
+and SHA-256 (2.07 GB/s here with SHA-NI), RS encode (3.6 GB/s), the write copy
+and the read copy add up serially to roughly 600 MB/s.
+
+### What changed
+
+`write_object_file_stream` is now a three-stage pipeline over 1 MiB chunks,
+eight in flight: the caller reads (keeping the read-recovery ladder), a hasher
+thread runs SHA-256, a writer thread encrypts in place, writes, and feeds CRC
+and parity. Each stage sees chunks in file order and only the writer touches
+the temp file, so the output is unchanged: backing the same data up with the
+old and new binaries gives byte-identical loose objects (sha256 of every file
+under `objects/`). Buffer memory per large file falls from 128 MiB to 8 MiB.
+Files of 4 MiB or less run the stages inline.
+
+The `POSIX_FADV_DONTNEED` on the finished temp file is now timed inside
+`obj:sync`. Its pages are still dirty, so it starts writeback rather than
+evicting, and on btrfs that costs 0.6-0.8 s per 3 GiB in the caller.
+
+### Tried and dropped
+
+- Chunk size and depth: 256 KiB x 32, 1 MiB x 8, 1 MiB x 16, 4 MiB x 8 all
+  landed within noise (2.65-2.93 s io-loop on tmpfs). Kept 1 MiB x 8.
+- Two stages (read+hash, then write): io-loop 3.3 s against 2.5 s for three.
+- `sync_file_range(WRITE)` every 8 MiB from the writer: worse (5-7 s io-loop),
+  the writer absorbed btrfs's writeback work and became the slow stage.
+- Dropping the end-of-object fadvise and `sync_file_range`: no faster end to
+  end; the same work came back as dirty-page throttling in the writer.
+
+### Remaining gap
+
+1.7x `cp` on disk, 2.5x on tmpfs. What is left:
+
+- **SHA-256 is serial** and is the slowest stage: 1.55 s of pure hashing for
+  3 GiB at this machine's single-core rate, against `cp`'s 1.6 s on tmpfs.
+  Parallel hashing would need a tree hash, which is a format change.
+- **The auto-pack re-copies compressible large files**: about 1.4 s here for
+  one 512 MiB text object (re-read, single-threaded LZ4F at ~600 MB/s, write,
+  fsync). Writing compressible large files straight into a pack during backup
+  would remove a full write and read of them; it means streaming into the
+  backup pack writer with the hash patched in afterwards and a truncate on a
+  dedup hit, which is a larger change than this fix.
+- **The writeback start** above, about 0.6 s.
+
+On UAT's I/O-bound pool the overlap matters more than the CPU: reads of the
+source now proceed while the previous chunk is hashed and written, where
+before each 128 MiB read waited for the write of the one before it. Not
+measured there yet.
+
 ## 2026-08-25 - Objects go straight into packs
 
 The rename that was 41% of a full backup is gone, because the file it renamed

@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -346,8 +347,8 @@ fail:
 }
 
 /* ------------------------------------------------------------------ */
-/* Streaming file → object store.  Single-threaded read → hash → write */
-/* loop.                                                             */
+/* Streaming file -> object store: read and hash on the caller's thread, */
+/* encrypt, write and parity on a second one.                         */
 /* ------------------------------------------------------------------ */
 
 #define STREAM_CHUNK      ((size_t)(128 * 1024 * 1024)) /* 128 MiB write buffer */
@@ -362,6 +363,247 @@ fail:
 #define PROBE_RATIO_MAX   0.98                  /* skip LZ4 if > 98% size */
 
 #define STREAM_REOPEN_MAX 5   /* max seek/reopen recovery attempts per file */
+
+/*
+ * The plain stream's chunk and pipeline (B086).
+ *
+ * The stream used to read 128 MiB, then hash it, then write it, then feed it
+ * to parity, all on one thread. Every pass over a buffer that size came from
+ * DRAM rather than cache, and nothing overlapped: a first backup of large
+ * files ran at about half the speed `cp` managed on the same disks, and with
+ * the repository on tmpfs it was barely faster, which is what a CPU-bound
+ * loop looks like.
+ *
+ * Now each 1 MiB chunk passes through three stages, each on its own thread:
+ * the caller reads it (and owns the read-recovery ladder), a hasher feeds it
+ * to SHA-256, and a writer encrypts it in place, writes it, and feeds the CRC
+ * and the Reed-Solomon stream. Encryption has to wait for the hash, because
+ * the hash is over plaintext, and that is the order the ring enforces. SHA-256
+ * is serial and is the slowest stage, so a deeper split would only queue
+ * behind it. Each stage sees chunks in file order and the writer is the only
+ * thread touching the temp file, the cipher and the parity stream, so the
+ * bytes on disk are identical to what the single-threaded loop wrote.
+ *
+ * Memory is bounded at STREAM_PIPE_DEPTH chunks, 8 MiB, where the old buffer
+ * was 128 MiB. Files no larger than STREAM_PIPE_MIN run every stage inline on
+ * the caller: two threads per small object would cost more than they overlap.
+ */
+#define STREAM_PIPE_CHUNK ((size_t)(1024 * 1024))
+#define STREAM_PIPE_DEPTH 8u
+#define STREAM_PIPE_MIN   ((uint64_t)(4 * 1024 * 1024))
+
+/* Which writer step failed, so the reading thread can say so with the
+ * messages the single-threaded loop used. Error state is thread-local, so a
+ * worker records what happened and the caller raises it. */
+enum { SINK_OK = 0, SINK_ENCRYPT, SINK_WRITE, SINK_PARITY };
+
+typedef struct {
+    /* Stage state. The hasher alone touches md and the writer alone the rest
+     * while they run; the caller has all of it before start and after join. */
+    EVP_MD_CTX             *md;
+    int                     tfd;
+    object_crypt_stream_t  *cs;
+    rs_parity_stream_t     *ps;
+    uint32_t                crc;
+    uint64_t                written;
+    int                     hash_fail;
+    int                     fail_stage;
+    int                     fail_errno;
+
+    /* The ring. Chunk i lives in slot i % DEPTH and moves read -> hashed ->
+     * written; each count only grows. The reader may fill a slot once the
+     * writer has released it, so at most DEPTH chunks are in flight. */
+    uint8_t                *buf[STREAM_PIPE_DEPTH];
+    size_t                  len[STREAM_PIPE_DEPTH];
+    uint64_t                n_read, n_hashed, n_written;
+    int                     closing;    /* no more chunks are coming */
+    int                     abandon;    /* discard what is queued */
+    int                     failed;     /* a stage failed; set under mu */
+    int                     threaded;
+    pthread_t               hasher, writer;
+    pthread_mutex_t         mu;
+    pthread_cond_t          cv;
+} stream_sink_t;
+
+static void sink_hash(stream_sink_t *s, const uint8_t *b, size_t n)
+{
+    if (s->hash_fail) return;
+    if (EVP_DigestUpdate(s->md, b, n) != 1) s->hash_fail = 1;
+}
+
+static void sink_consume(stream_sink_t *s, uint8_t *b, size_t n)
+{
+    if (s->fail_stage) return;
+    /* Hashed as plaintext, stored as ciphertext, encrypted in place: the
+     * chunk is the writer's until it is released. */
+    if (s->cs && object_crypt_stream_update(s->cs, b, n, b) != OK) {
+        s->fail_stage = SINK_ENCRYPT; s->fail_errno = EIO; return;
+    }
+    if (io_write_full(s->tfd, b, n) != 0) {
+        s->fail_stage = SINK_WRITE; s->fail_errno = errno ? errno : EIO; return;
+    }
+    s->crc = crc32c_update(s->crc, b, n);
+    if (rs_parity_stream_feed(s->ps, b, n) != 0) {
+        s->fail_stage = SINK_PARITY; s->fail_errno = errno ? errno : EIO; return;
+    }
+    s->written += n;
+}
+
+static void *sink_hasher(void *arg)
+{
+    stream_sink_t *s = arg;
+    pthread_mutex_lock(&s->mu);
+    for (;;) {
+        while (s->n_hashed == s->n_read && !s->closing)
+            pthread_cond_wait(&s->cv, &s->mu);
+        if (s->n_hashed == s->n_read) break;
+        unsigned slot = (unsigned)(s->n_hashed % STREAM_PIPE_DEPTH);
+        int skip = s->abandon || s->failed;
+        pthread_mutex_unlock(&s->mu);
+
+        if (!skip) sink_hash(s, s->buf[slot], s->len[slot]);
+
+        pthread_mutex_lock(&s->mu);
+        if (s->hash_fail) s->failed = 1;
+        s->n_hashed++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return NULL;
+}
+
+static void *sink_writer(void *arg)
+{
+    stream_sink_t *s = arg;
+    pthread_mutex_lock(&s->mu);
+    for (;;) {
+        /* The hasher exits only once everything read is hashed, so caught up
+         * with it, with nothing more coming, is the end. */
+        while (s->n_written == s->n_hashed &&
+               !(s->closing && s->n_hashed == s->n_read))
+            pthread_cond_wait(&s->cv, &s->mu);
+        if (s->n_written == s->n_hashed) break;
+        unsigned slot = (unsigned)(s->n_written % STREAM_PIPE_DEPTH);
+        int skip = s->abandon || s->failed;
+        pthread_mutex_unlock(&s->mu);
+
+        if (!skip) sink_consume(s, s->buf[slot], s->len[slot]);
+
+        pthread_mutex_lock(&s->mu);
+        if (s->fail_stage) s->failed = 1;
+        s->n_written++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return NULL;
+}
+
+/* Allocation happens here, on the calling thread, so the fault-injection
+ * countdowns (thread-local) still see every buffer the stream takes. */
+static int sink_init(stream_sink_t *s, EVP_MD_CTX *md, int tfd,
+                     object_crypt_stream_t *cs, rs_parity_stream_t *ps,
+                     uint32_t crc, uint64_t written, uint64_t file_size)
+{
+    memset(s, 0, sizeof(*s));
+    s->md = md; s->tfd = tfd; s->cs = cs; s->ps = ps;
+    s->crc = crc; s->written = written;
+    unsigned n = file_size > STREAM_PIPE_MIN ? STREAM_PIPE_DEPTH : 1u;
+    for (unsigned i = 0; i < n; i++) {
+        s->buf[i] = malloc(STREAM_PIPE_CHUNK);
+        if (!s->buf[i]) {
+            for (unsigned j = 0; j < i; j++) { free(s->buf[j]); s->buf[j] = NULL; }
+            return -1;
+        }
+    }
+    if (n == 1) return 0;
+    if (pthread_mutex_init(&s->mu, NULL) != 0) goto nothread;
+    if (pthread_cond_init(&s->cv, NULL) != 0) {
+        pthread_mutex_destroy(&s->mu); goto nothread;
+    }
+    if (pthread_create(&s->hasher, NULL, sink_hasher, s) != 0) {
+        pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->mu);
+        goto nothread;
+    }
+    if (pthread_create(&s->writer, NULL, sink_writer, s) != 0) {
+        pthread_mutex_lock(&s->mu);
+        s->closing = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        pthread_join(s->hasher, NULL);
+        pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->mu);
+        goto nothread;
+    }
+    s->threaded = 1;
+    return 0;
+nothread:
+    /* No threads is not an error: the inline path writes the same bytes. */
+    for (unsigned i = 1; i < n; i++) { free(s->buf[i]); s->buf[i] = NULL; }
+    return 0;
+}
+
+static int sink_failed(const stream_sink_t *s)
+{
+    return s->hash_fail || s->fail_stage;
+}
+
+/* The next free chunk, or NULL once a stage has failed. */
+static uint8_t *sink_slot(stream_sink_t *s)
+{
+    if (!s->threaded) return sink_failed(s) ? NULL : s->buf[0];
+    pthread_mutex_lock(&s->mu);
+    while (s->n_read - s->n_written == STREAM_PIPE_DEPTH && !s->failed)
+        pthread_cond_wait(&s->cv, &s->mu);
+    uint8_t *b = s->failed ? NULL : s->buf[s->n_read % STREAM_PIPE_DEPTH];
+    pthread_mutex_unlock(&s->mu);
+    return b;
+}
+
+/* Queue the chunk sink_slot returned, now holding n bytes. */
+static void sink_push(stream_sink_t *s, size_t n)
+{
+    if (!s->threaded) {
+        sink_hash(s, s->buf[0], n);
+        if (!s->hash_fail) sink_consume(s, s->buf[0], n);
+        return;
+    }
+    pthread_mutex_lock(&s->mu);
+    s->len[s->n_read % STREAM_PIPE_DEPTH] = n;
+    s->n_read++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Drain (or, with abandon, discard) what is queued, stop the workers and free
+ * the chunks. Afterwards every piece of stage state is the caller's again. */
+static void sink_close(stream_sink_t *s, int abandon)
+{
+    if (s->threaded) {
+        pthread_mutex_lock(&s->mu);
+        s->closing = 1;
+        if (abandon) s->abandon = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        pthread_join(s->hasher, NULL);
+        pthread_join(s->writer, NULL);
+        pthread_cond_destroy(&s->cv);
+        pthread_mutex_destroy(&s->mu);
+        s->threaded = 0;
+    }
+    for (unsigned i = 0; i < STREAM_PIPE_DEPTH; i++) { free(s->buf[i]); s->buf[i] = NULL; }
+}
+
+/* Raise a stage failure on the calling thread. */
+static status_t sink_error(const stream_sink_t *s)
+{
+    if (s->hash_fail) return set_error(ERR_IO, "stream: SHA256 update failed");
+    errno = s->fail_errno;
+    switch (s->fail_stage) {
+    case SINK_ENCRYPT: return set_error(ERR_IO, "stream: encryption failed");
+    case SINK_WRITE:   return set_error_errno(ERR_IO, "stream: write payload chunk");
+    case SINK_PARITY:  return set_error_errno(ERR_IO, "stream: RS parity feed failed (spill)");
+    default:           return OK;
+    }
+}
 
 static status_t write_object_file_stream(store_t *store, int src_fd,
                                          const char *src_path,
@@ -424,9 +666,9 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
      *
      * The nonce is drawn now and written ahead of the ciphertext, so a reader
      * has it before the first byte it needs to decrypt. Chunks are encrypted
-     * in place: the plaintext is hashed first, and the buffer is ours until
-     * it is written, so a second buffer the size of a stream chunk would be
-     * 128 MiB of nothing.
+     * in place: the plaintext is hashed first, and the chunk is the
+     * consumer's until it is written, so a second buffer per chunk would be
+     * memory spent on nothing.
      */
     const repo_key_t *enc_key = store_key(store);
     object_crypt_stream_t *cs = NULL;
@@ -458,14 +700,6 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
     }
 
-    uint8_t *buf = malloc(STREAM_CHUNK);
-    if (!buf) {
-        EVP_MD_CTX_free(mdctx);
-        if (src_path) close(src_fd);
-        close(tfd); unlink(tmppath);
-        return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
-    }
-
     posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     /* ----------------------------------------------------------------
@@ -476,7 +710,6 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     rs_parity_stream_t ps;
     int ps_ok = rs_parity_stream_init(&ps, 256 * 1024 * 1024, ps_tmp_dir);
     if (ps_ok != 0) {
-        free(buf);
         EVP_MD_CTX_free(mdctx);
         if (src_path) close(src_fd);
         close(tfd); unlink(tmppath);
@@ -510,6 +743,13 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
             st = set_error_errno(ERR_IO, "stream: RS parity feed failed (nonce)");
     }
 
+    /* From here until sink_close the consumer thread owns tfd, cs, ps, the
+     * CRC and the byte count; see STREAM_PIPE_CHUNK. */
+    stream_sink_t sink;
+    if (sink_init(&sink, mdctx, tfd, cs, &ps, stream_crc, total_written, file_size) != 0 &&
+        st == OK)
+        st = set_error(ERR_NOMEM, "malloc(%zu)", STREAM_PIPE_CHUNK);
+
     #define STREAM_LOG(logfn, msg) logfn("%s", (msg))
 
     {
@@ -517,10 +757,13 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         int recoveries = 0;
         int last_was_seek = 0;
 
-        while (offset < file_size) {
-            size_t want = STREAM_CHUNK;
+        while (st == OK && offset < file_size) {
+            size_t want = STREAM_PIPE_CHUNK;
             if ((uint64_t)want > file_size - offset)
                 want = (size_t)(file_size - offset);
+
+            uint8_t *buf = sink_slot(&sink);
+            if (!buf) { st = sink_error(&sink); goto done; }
 
             /* Read with EINTR + transient-error retry */
             size_t got = 0;
@@ -529,8 +772,8 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
                 /*
                  * Cancellation is checked per read, and a read is capped, so
                  * a cancel lands within one CANCEL_READ_MAX of I/O rather
-                 * than at the end of the file. The chunk stays large for the
-                 * writes and parity groups; only the read is split.
+                 * than at the end of the file. A pipeline chunk is smaller
+                 * than the cap today; the cap is what keeps that true.
                  */
                 if (store_cancelled(store)) {
                     st = set_error(ERR_BUSY, "cancelled while storing an object");
@@ -675,30 +918,10 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
             /* Drop source pages from cache */
             posix_fadvise(src_fd, (off_t)offset, (off_t)want, POSIX_FADV_DONTNEED);
 
-            /* Hash */
-            if (EVP_DigestUpdate(mdctx, buf, got) != 1) {
-                st = set_error(ERR_IO, "stream: SHA256 update failed"); goto done;
-            }
+            /* Hashed, then encrypted in place, by the stages behind this
+             * one: the chunk is not ours after this. */
+            sink_push(&sink, got);
 
-            /* Hashed as plaintext, stored as ciphertext, encrypted in place. */
-            if (cs && object_crypt_stream_update(cs, buf, got, buf) != OK) {
-                st = set_error(ERR_IO, "stream: encryption failed"); goto done;
-            }
-
-            /* Write the payload chunk */
-            if (write(tfd, buf, got) != (ssize_t)got) {
-                if (errno == 0) errno = EIO;
-                st = set_error_errno(ERR_IO, "stream: write payload chunk"); goto done;
-            }
-            stream_crc = crc32c_update(stream_crc, buf, got);
-
-            /* Accumulate RS parity inline via bounded-RAM stream */
-            if (rs_parity_stream_feed(&ps, buf, got) != 0) {
-                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (spill)");
-                goto done;
-            }
-
-            total_written += got;
             offset += (uint64_t)got;
             if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
         }
@@ -707,7 +930,10 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
     #undef STREAM_LOG
 
 done:
-    free(buf);
+    sink_close(&sink, st != OK);
+    if (st == OK && sink_failed(&sink)) st = sink_error(&sink);
+    stream_crc    = sink.crc;
+    total_written = sink.written;
     if (src_path) close(src_fd);  /* only close if we own the fd */
 
     /* (No LZ4 frame end mark — write path always uses COMPRESS_NONE) */
@@ -824,10 +1050,19 @@ done:
     }
     /* ---- End parity trailer ---- */
 
-    /* Evict payload pages — no parity re-read needed */
+    /*
+     * Evict payload pages - no parity re-read needed.
+     *
+     * Timed with the writeback below because that is what it costs: the
+     * pages are still dirty, so DONTNEED starts their writeback rather than
+     * dropping them, and on btrfs that was 0.6-0.9 s of a 3 GiB backup spent
+     * here (B086). Dropping both calls did not make the backup faster; the
+     * same work then landed on the writer as dirty-page throttling. It stays
+     * for what it was for: a large backup not evicting the page cache.
+     */
+    uint64_t _pt_sync = phase_now();
     posix_fadvise(tfd, (off_t)sizeof(hdr), (off_t)total_written, POSIX_FADV_DONTNEED);
 
-    uint64_t _pt_sync = phase_now();
     if (async_writeback(tfd) == -1) { close(tfd); unlink(tmppath); return set_error_errno(ERR_IO, "stream: fdatasync"); }
     phase_add(phase_current, PHASE_OBJ_SYNC, _pt_sync);
     uint64_t _pt_inst = phase_now();

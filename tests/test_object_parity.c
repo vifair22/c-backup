@@ -28,6 +28,8 @@
 
 #include <cmocka.h>
 
+#include <openssl/sha.h>
+
 #include "fake_index.h"
 #include "manifest.h"
 #include "object.h"
@@ -350,11 +352,95 @@ static void test_encrypted_object_reads_without_repair(void **state)
     assert_int_equal((int)ps.uncorrectable, 0);
 }
 
+/*
+ * B086: the streaming writer now hashes on one thread and writes, encrypts
+ * and computes parity on another, for anything over 4 MiB. The bytes must be
+ * exactly what the single-threaded loop wrote, or the CRC and RS parity
+ * describe a payload that is not on disk - which, as the test above shows,
+ * nothing reports loudly.
+ *
+ * 12 MiB takes the threaded path (over 4 MiB) and still reads back through
+ * the whole-file loader that checks the CRC (under 16 MiB), so a clean read
+ * needing no repair proves CRC and parity agree with the payload, and a
+ * flipped byte coming back repaired proves the parity covers the right bytes.
+ * Run plain and keyed, because the key moves encryption onto the writer.
+ */
+static void pipelined_object_round_trips(int keyed)
+{
+    repo_key_t key;
+    if (keyed) {
+        assert_int_equal(repo_key_generate(&key), OK);
+        store_set_key(store, &key);
+    }
+
+    const char *src = TEST_REPO "/tmp/pipeline_src.bin";
+    int fd = open(src, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    assert_true(fd >= 0);
+    enum { N = 12 * 1024 * 1024 + 4321 };   /* not a whole number of chunks */
+    uint8_t *body = malloc(N);
+    assert_non_null(body);
+    uint32_t x = 2463534242u;
+    for (size_t i = 0; i < N; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        body[i] = (uint8_t)x;
+    }
+    assert_int_equal(write(fd, body, N), (ssize_t)N);
+    assert_int_equal(lseek(fd, 0, SEEK_SET), 0);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store_file(store, fd, N, hash), OK);
+    close(fd);
+    unlink(src);
+
+    /* The hash is of the plaintext, however many threads computed it. */
+    uint8_t want[OBJECT_HASH_SIZE];
+    SHA256(body, N, want);
+    assert_memory_equal(hash, want, OBJECT_HASH_SIZE);
+
+    parity_stats_reset();
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, N);
+    assert_memory_equal(out, body, N);
+    free(out);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+
+    /* Late in the payload, past several chunk boundaries. */
+    char path[512];
+    object_path(hash, path);
+    flip_byte(path, (off_t)sizeof(object_header_t) + (off_t)N - 1000);
+
+    parity_stats_reset();
+    out = NULL;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, N);
+    assert_memory_equal(out, body, N);
+    free(out);
+    assert_true(parity_stats_get().repaired > 0);
+    free(body);
+}
+
+static void test_pipelined_object_round_trips(void **state)
+{
+    (void)state;
+    pipelined_object_round_trips(0);
+}
+
+static void test_pipelined_encrypted_object_round_trips(void **state)
+{
+    (void)state;
+    pipelined_object_round_trips(1);
+}
+
 int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_clean_object_needs_no_repair, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pipelined_object_round_trips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pipelined_encrypted_object_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_payload_corruption_is_repaired_on_read, setup, teardown),
         cmocka_unit_test_setup_teardown(test_header_corruption_is_repaired_on_read, setup, teardown),
         cmocka_unit_test_setup_teardown(test_double_header_corruption_is_reported, setup, teardown),

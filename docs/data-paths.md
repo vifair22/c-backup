@@ -214,11 +214,17 @@ consequence is that a repository that never packs stores more than its
 source, which is why packing is part of the backup job and not a separate
 op someone has to remember.
 
-The non-sparse streaming path reads 128 MiB chunks (1-4 MiB on FUSE),
-feeding three consumers per chunk: the SHA-256 context, the temp file
-write, and the parity accumulators (CRC32C plus a Reed-Solomon parity
-stream that holds at most 256 MiB in RAM and spills to `<repo>/tmp/`
+The non-sparse streaming path is a three-stage pipeline over 1 MiB chunks,
+eight in flight (B086): the calling thread reads, a hasher thread feeds the
+SHA-256 context, and a writer thread encrypts in place (when keyed), writes
+the temp file and feeds the parity accumulators (CRC32C plus a Reed-Solomon
+parity stream that holds at most 256 MiB in RAM and spills to `<repo>/tmp/`
 beyond that; `rs_parity_size` of the payload is written into the trailer).
+Every stage sees the chunks in file order and only the writer touches the
+temp file, so the bytes on disk are what a single thread would write. It
+replaced one thread making four passes over a 128 MiB buffer, which ran at
+about half of `cp` on the same disks. Objects of 4 MiB or less run the same
+stages inline.
 The hash is only known at the end, so the header is patched by `pwrite` and
 the existence check runs after hashing; a duplicate costs a full read of
 the source file but never a second copy in the repo. Source pages are
@@ -640,7 +646,8 @@ same way, one 15 KiB group at a time regardless of object size.
 | `PACK_RATIO_THRESHOLD` | 0.90 | probe ratio at/above which a large object is skip-marked |
 | `PACK_STREAM_THRESHOLD` | 16 MiB | small/large split for pack entries; also the whole-object load cap |
 | `PACK_MAX_MULTI_BYTES` | 256 MiB | pack body seal size |
-| `STREAM_CHUNK` | 128 MiB | backup read chunk (non-FUSE) |
+| `STREAM_PIPE_CHUNK` x `STREAM_PIPE_DEPTH` | 1 MiB x 8 | backup stream pipeline chunks in flight |
+| `STREAM_CHUNK` | 128 MiB | sparse-object stream buffer |
 | `STREAM_LOAD_MAX` | 16 MiB | in-memory load cap / stream chunk on load |
 | RS parity stream bound | 256 MiB | parity RAM ceiling before spilling to `<repo>/tmp/` |
 | `PACK_WORKER_THREADS_MAX` | 32 | pack worker ceiling (also capped at one per 256 MiB of input) |

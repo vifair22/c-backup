@@ -1353,8 +1353,10 @@ the array.
   several repositories or several sources backed up separately. Section 20.
 - File content is streamed in bounded chunks whatever its size. Parity for a
   large object spills to `<repo>/tmp` beyond 256 MiB.
-- Storing a large file holds a 128 MiB read buffer, and the Reed-Solomon
-  parity for it is kept in memory up to 256 MiB before spilling to disk.
+- Storing a large file holds 8 MiB of pipeline buffers (eight 1 MiB chunks
+  shared by a reading, a hashing and a writing thread), and the
+  Reed-Solomon parity for it is kept in memory up to 256 MiB before
+  spilling to disk.
 - A large pack run uses up to about 1 GB of buffers at its widest (32
   workers, each with a 16 MiB read buffer and a compression buffer). The
   worker count is capped at one per 256 MiB of data to pack, so small runs
