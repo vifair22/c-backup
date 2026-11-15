@@ -407,6 +407,63 @@ static void test_skipped_object_still_loads(void **state)
     assert_streams_match(hash, TEST_SRC "/skipped.bin", LARGE_SIZE);
 }
 
+/*
+ * B099: what a pack run did, for the job result. A run that packed nothing
+ * said why only in the log. Every no-op reason, and the counts beside them,
+ * through one store's life: empty, packed, all skip-marked.
+ */
+static void test_pack_report_says_why_nothing_was_packed(void **state)
+{
+    (void)state;
+    pack_report_t rep;
+
+    assert_int_equal(repo_pack_report(store, &rep, NULL, NULL), OK);
+    assert_int_equal(rep.packed, 0);
+    assert_non_null(rep.reason);
+    assert_string_equal(rep.reason, "no loose objects");
+
+    create_compressible_file(TEST_SRC "/rep_small.txt", 64u * 1024u);
+    create_prng_file(TEST_SRC "/rep_random.bin", LARGE_SIZE);
+    uint8_t hs[OBJECT_HASH_SIZE], hr[OBJECT_HASH_SIZE];
+    store_path(TEST_SRC "/rep_small.txt", hs);
+    store_path(TEST_SRC "/rep_random.bin", hr);
+
+    /* The compressible one packs; the probe marks the random one. */
+    assert_int_equal(repo_pack_report(store, &rep, NULL, NULL), OK);
+    assert_int_equal(rep.loose, 2);
+    assert_int_equal(rep.packed, 1);
+    assert_int_equal(rep.incompressible, 1);
+    assert_int_equal(rep.skip_marked, 0);
+    assert_null(rep.reason);
+
+    /* Only the marked one is left, and the next run says so. */
+    assert_int_equal(repo_pack_report(store, &rep, NULL, NULL), OK);
+    assert_int_equal(rep.loose, 1);
+    assert_int_equal(rep.packed, 0);
+    assert_int_equal(rep.skip_marked, 1);
+    assert_int_equal(rep.incompressible, 0);
+    assert_non_null(rep.reason);
+    assert_string_equal(rep.reason,
+                        "all loose objects are skip-marked as incompressible");
+}
+
+/* At the stream threshold the worker probes rather than the probe pass, and
+ * a run that packed nothing that way still has to say why. */
+static void test_pack_report_counts_a_worker_skip(void **state)
+{
+    (void)state;
+    create_prng_file(TEST_SRC "/rep_16m.bin", BOUNDARY_SIZE);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    store_path(TEST_SRC "/rep_16m.bin", hash);
+
+    pack_report_t rep;
+    assert_int_equal(repo_pack_report(store, &rep, NULL, NULL), OK);
+    assert_int_equal(rep.packed, 0);
+    assert_int_equal(rep.incompressible, 1);
+    assert_non_null(rep.reason);
+    assert_string_equal(rep.reason, "every remaining loose object is incompressible");
+}
+
 int main(void)
 {
     rs_init();
@@ -422,6 +479,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_incompressible_large_object_gets_skip_marker, setup, teardown),
         cmocka_unit_test_setup_teardown(test_incompressible_boundary_object_gets_skip_marker, setup, teardown),
         cmocka_unit_test_setup_teardown(test_skipped_object_still_loads, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_report_says_why_nothing_was_packed, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_report_counts_a_worker_skip, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

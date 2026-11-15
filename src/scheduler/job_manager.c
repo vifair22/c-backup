@@ -394,17 +394,32 @@ static void *worker_main(void *arg)
 
         /* The job's own account of what it did, and the final byte count,
          * which the throttle may not have written. Before the final state,
-         * so a client that sees the job finished also sees its result. */
+         * so a client that sees the job finished also sees its result.
+         *
+         * The final item count as well, for the same reason. The throttle
+         * writes a phase's first report and then at most every 250 ms, so a
+         * phase finishing inside that window was left at its first count:
+         * /jobs said trees 0/171 for a job whose closing log line, which
+         * reads the latest report, said 170/171 (B093). Both now come from
+         * the same last report. */
         {
-            char id[32], bd[32], bt[32];
+            char id[32], bd[32], bt[32], d[32], t[32];
             snprintf(id, sizeof(id), "%lld", (long long)slot.job_id);
             snprintf(bd, sizeof(bd), "%llu", (unsigned long long)pc.bytes_done);
             snprintf(bt, sizeof(bt), "%llu", (unsigned long long)pc.bytes_total);
+            snprintf(d,  sizeof(d),  "%llu", (unsigned long long)pc.seen_done);
+            snprintf(t,  sizeof(t),  "%llu", (unsigned long long)pc.seen_total);
             pthread_mutex_lock(&jm->db_mu);
             if (db_execute_non_query(jm->db,
                     "UPDATE jobs SET bytes_done = ?, bytes_total = ? WHERE id = ?",
                     (const char *[]){ bd, bt, id, NULL }, NULL) != 0)
                 log_warn("job %s: cannot record its byte count", id);
+            /* A job that never reported keeps the empty progress it has. */
+            if (pc.last_phase[0] && db_execute_non_query(jm->db,
+                    "UPDATE jobs SET progress_phase = ?, progress_current = ?,"
+                    " progress_total = ? WHERE id = ?",
+                    (const char *[]){ pc.last_phase, d, t, id, NULL }, NULL) != 0)
+                log_warn("job %s: cannot record its final progress", id);
             if (pc.result && db_execute_non_query(jm->db,
                     "UPDATE jobs SET result = ? WHERE id = ?",
                     (const char *[]){ pc.result, id, NULL }, NULL) != 0)

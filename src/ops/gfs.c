@@ -246,7 +246,7 @@ static uint32_t find_best_in_range(const gfs_snap_info_t *snaps, uint32_t n,
 status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                  const gfs_retention_t *policy,
                  uint32_t new_snap_id, int dry_run, int quiet,
-                 int full_scan, gfs_result_t *out) {
+                 int full_scan, time_t now, gfs_result_t *out) {
     /* Empty before any early return, so a caller can always report and
      * free it. */
     if (out) { out->pruned = 0; out->ids = NULL; }
@@ -268,7 +268,7 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     /* Determine scan interval [scan_start_day, scan_end_day).
-     * scan_end_day is exclusive — the current day is not yet closed.
+     * scan_end_day is exclusive: the current day is not yet closed.
      * For incremental: start from the day of the most recent surviving
      * snap before new_snap_id (robust against ID gaps from pruning).
      * For full scan: start from epoch (day 0). */
@@ -285,7 +285,14 @@ status_t gfs_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
     if (new_ts == 0) { free(orig_flags); free(snaps); return OK; }
 
+    /* The present closes days, not the newest snapshot. A snapshot dated
+     * after now (a clock that went backwards) keeps its own day open rather
+     * than being elected for a day the clock says has not happened. */
     int64_t scan_end_day   = cal_day(new_ts);
+    if (now > 0) {
+        int64_t today = cal_day((uint64_t)now);
+        if (today > scan_end_day) scan_end_day = today;
+    }
     int64_t scan_start_day = full_scan ? 0 : cal_day(prev_ts);
 
     /* Incremental recovery: if any surviving snap on a *closed* day

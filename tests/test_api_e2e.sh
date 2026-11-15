@@ -304,6 +304,12 @@ contains "alerts sent metric"    "cbackup_alerts_sent_total 0" "$METRICS"
 contains "alerts failed metric"  "cbackup_alerts_failed_total 0" "$METRICS"
 contains "alerts failed is a counter" "# TYPE cbackup_alerts_failed_total counter" "$METRICS"
 contains "alerts pending metric" "cbackup_alerts_pending 0" "$METRICS"
+# B092: the ages are the stalest repository's, and an info series says which
+# one, so an alert can name it without a series per repository.
+contains "stalest backup is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label=""} 1' "$METRICS"
+contains "stalest verify is named" \
+    'cbackup_stalest_verify_repo_info{repo_id="1",label=""} 1' "$METRICS"
 check "unknown repo" 404 "$(sock_code /repos/99)"
 
 echo "methods"
@@ -396,9 +402,14 @@ check "an empty source refused"       400 "$(put_sources '{"sources":[""]}')"
 check "a relative source refused"     400 "$(put_sources '{"sources":["rel/path"]}')"
 check "an empty exclude refused"      400 "$(put_sources "{\"sources\":[\"$WORK/src\"],\"exclude\":[\"\"]}")"
 contains "a refusal leaves the configuration alone" "$WORK/src" "$(sock_body /repos/1/sources)"
+ABSENT=$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
+       http://localhost/repos/1/sources)
 contains "an absent source is accepted with a warning" "does not exist on the daemon's host" \
-    "$(curl -s -X PUT --unix-socket "$SOCK" -d '{"sources":["/no/such/mount"]}' \
-       http://localhost/repos/1/sources)"
+    "$ABSENT"
+# B097: the warning promised the source would be skipped, but a backup with
+# a missing source fails (B077). It has to say what actually happens.
+contains "and the warning says a backup fails" "a backup fails while it is missing" "$ABSENT"
+check "and does not promise a skip" "" "$(printf '%s' "$ABSENT" | grep -o 'skip')"
 contains "sources are stored normalised" '"sources":["/a/b"]' \
     "$(put_sources '{"sources":["/a//b/./"]}' >/dev/null; sock_body /repos/1/sources)"
 check "sources cleared" 200 "$(put_sources '{"sources":[]}')"
@@ -413,7 +424,7 @@ contains "note readable" 'first backup' "$(sock_body /repos/1/snapshots/1/note)"
 check "set policy" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
      -d '{"key":"retention.keep_daily","value":"14"}' http://localhost/repos/1/policy)"
 contains "policy readable" 'keep_daily' "$(sock_body /repos/1/policy)"
-check "delete tag" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
+check "delete tag" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/tags/milestone)"
 
 # B037, B038: metadata for a snapshot that does not exist, a tag with no
@@ -442,7 +453,7 @@ check "a 65-character tag name is refused" 400 "$(curl -s -o /dev/null -w '%{htt
      http://localhost/repos/1/tags)"
 check "a dotted, dashed name is fine" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      --unix-socket "$SOCK" -d '{"name":"v1.2_pre-upgrade","snap_id":1}' http://localhost/repos/1/tags)"
-check "and removable" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+check "and removable" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
      --unix-socket "$SOCK" http://localhost/repos/1/tags/v1.2_pre-upgrade)"
 
 # B034: policy stored any key and any value and said ok. Each of these was
@@ -487,6 +498,11 @@ RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$W
 wait_job "$RESTORE_JOB"
 contains "restore completed" '"state":"completed"' "$(sock_body "/jobs/$RESTORE_JOB")"
 contains "restore result counts what it wrote" '"result":{"files":3,' "$(sock_body "/jobs/$RESTORE_JOB")"
+# B093: a finished job's count is the last report, and it ends at its total.
+RJ_BODY=$(sock_body "/jobs/$RESTORE_JOB")
+RJ_CUR=$(printf '%s' "$RJ_BODY" | sed -n 's/.*"current":\([0-9]*\).*/\1/p')
+RJ_TOT=$(printf '%s' "$RJ_BODY" | sed -n 's/.*"total":\([0-9]*\).*/\1/p')
+check "a finished restore's count reaches its total" "$RJ_TOT" "$RJ_CUR"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
@@ -546,7 +562,7 @@ if [ "$JOBS_AFTER" -gt "$JOBS_BEFORE" ]; then
 else
     bad "due schedule submitted a job" "more than $JOBS_BEFORE jobs" "$JOBS_AFTER"
 fi
-check "delete schedule" 204 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
+check "delete schedule" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --unix-socket "$SOCK" \
      http://localhost/repos/1/schedules/1)"
 # B065: these answered success for a schedule that does not exist.
 check "delete a missing schedule" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
@@ -617,6 +633,12 @@ PACK_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" http://localhost/repo
 check "pack submitted" "1" "$([ -n "$PACK_JOB" ] && echo 1 || echo 0)"
 wait_job "$PACK_JOB"
 contains "pack completed" '"state":"completed"' "$(sock_body "/jobs/$PACK_JOB")"
+# B099: the pack job's result was null; why nothing was packed was only in
+# the log. The second backup packed its own objects, so nothing is loose.
+PACK_BODY=$(sock_body "/jobs/$PACK_JOB")
+contains "pack has a result" '"result":{"loose":' "$PACK_BODY"
+contains "pack result counts what it packed" '"packed":0' "$PACK_BODY"
+contains "pack result says why nothing was packed" '"reason":"no loose objects"' "$PACK_BODY"
 contains "packs listed"  '"filename"'            "$(sock_body /repos/1/packs)"
 contains "pack entries"  '"entry_index"'         "$(sock_body '/repos/1/packs/0/entries?limit=1')"
 # B075: missing ids answered as empty successes, which reads as "empty".
@@ -660,6 +682,10 @@ SUB_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
           http://localhost/repos/1/snapshots/1/restore)")
 wait_job "$SUB_JOB"
 contains "subpath restore completed" '"state":"completed"' "$(sock_body "/jobs/$SUB_JOB")"
+# B093: the count was the snapshot's entries, so a one-file restore said
+# 104 of 104. The subtree is docs/ and c.txt: two entries of work.
+contains "a subpath restore counts the subtree" '"phase":"restore","current":2,"total":2' \
+    "$(sock_body "/jobs/$SUB_JOB")"
 # Only the requested subtree, so the siblings must not be there.
 if [ -f "$WORK/sub$WORK/src/docs/c.txt" ]; then ok "subpath restored its file"
 else bad "subpath restored its file" "$WORK/sub$WORK/src/docs/c.txt exists" "missing"; fi
@@ -945,6 +971,29 @@ TOKEN=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/log
         | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
+# B055: sessions are a TCP concept. Over the socket a login minted a token
+# nothing used, and a logout with nothing to revoke answered 204.
+sock_auth() {  # sock_auth <path> [curl args]: status and body over the socket
+    local p=$1; shift
+    curl -s -w ' %{http_code}' -X POST --unix-socket "$SOCK" "$@" "http://localhost$p"
+}
+OUT=$(sock_auth /api/auth/login -d '{"password":"brandnewpassword"}')
+contains "socket login refused" " 400" "$OUT"
+contains "and says the socket needs no credential" "needs no credential" "$OUT"
+check "and mints no token" "" "$(printf '%s' "$OUT" | grep -o '"token"')"
+OUT=$(sock_auth /api/auth/logout)
+contains "socket logout with no token refused" " 400" "$OUT"
+contains "and points at logout-all" "logout-all" "$OUT"
+# A token named over the socket is revoked: the host's way to end one
+# session without ending all of them.
+SOCKREV=$(tcp_body -X POST -d '{"password":"brandnewpassword"}' "$URL/api/auth/login" \
+          | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+check "socket logout revokes a named token" 204 "$(curl -s -o /dev/null -w '%{http_code}' \
+     -X POST --unix-socket "$SOCK" -H "Authorization: Bearer $SOCKREV" \
+     http://localhost/api/auth/logout)"
+check "and that token is dead" 401 "$(tcp_code /repos -H "Authorization: Bearer $SOCKREV")"
+check "while the caller's own is not" 200 "$(tcp_code /repos "${AUTH[@]}")"
+
 check "logout" 204 "$(tcp_code /api/auth/logout "${AUTH[@]}" -X POST)"
 check "token dead after logout" 401 "$(tcp_code /repos "${AUTH[@]}")"
 
@@ -985,8 +1034,8 @@ check "another failure once the lockout lapses" 401 \
 LAST=$(login_hdrs brandnewpassword)
 check "the right password is refused while locked out" 429 "$(status_of "$LAST")"
 contains "429 carries Retry-After" "retry-after:" "$LAST"
-check "the socket is never throttled" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-     --unix-socket "$SOCK" -d '{"password":"brandnewpassword"}' http://localhost/api/auth/login)"
+check "the socket is never locked out" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
+     --unix-socket "$SOCK" http://localhost/repos)"
 wait_retry_after "$LAST"
 check "the right password works once it lapses" 200 \
     "$(tcp_code /api/auth/login -X POST -d '{"password":"brandnewpassword"}')"
@@ -1099,6 +1148,45 @@ if command -v sqlite3 > /dev/null 2>&1; then
         '"keep_daily":7,' "$(sock_body "/jobs/$BAD")"
 else
     ok "a stored invalid count falls back to the default (skipped: no sqlite3)"
+fi
+
+# B094: tiers close on the clock, not on a later snapshot. Every snapshot
+# showed gfs_flags 0 after a pass because the newest one's day never closed
+# and same-day snapshots hold no tier. Moved to the last Saturday and Sunday
+# of 2024 (noon UTC, so the same local day in any zone within 11 hours), the
+# Sunday is that year's last daily, weekly, monthly and yearly: 15. Read
+# back through the listing, which is what clients see.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
+                           UPDATE snapshots SET ts = 1735473600 WHERE repo_id = 1 AND id = 4"
+    TIERS=$(job_id "$(sock_post /repos/1/gfs)")
+    wait_job "$TIERS"
+    LIST=$(sock_body /repos/1/snapshots)
+    contains "the newest of a closed year holds every tier" '"id":4,"ts":1735473600,' "$LIST"
+    contains "gfs_flags 15 on it" '"gfs_flags":15,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":4,[^}]*}')"
+    contains "and the day before is a daily" '"gfs_flags":1,' \
+        "$(printf '%s' "$LIST" | grep -o '{"id":3,[^}]*}')"
+else
+    ok "tier flags reach the listing (skipped: no sqlite3)"
+fi
+
+# B092: the info series follows the stalest repository, and a label is
+# free text, so its value is escaped as the exposition format requires.
+# Repository 1's newest snapshot is now from 2024; a second one registered
+# at the epoch is staler still.
+sock_post /repos "{\"path\":\"$R/repo2\",\"label\":\"q\\\"u\\\\o\"}" > /dev/null
+contains "the staler of two is named" \
+    'cbackup_stalest_snapshot_repo_info{repo_id="1",label="r"} 1' "$(sock_body /metrics)"
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
+    METRICS=$(sock_body /metrics)
+    contains "and it moves when another becomes staler, label escaped" \
+        'cbackup_stalest_snapshot_repo_info{repo_id="2",label="q\"u\\o"} 1' "$METRICS"
+    check "one series, not one per repository" 1 \
+        "$(printf '%s\n' "$METRICS" | grep -c '^cbackup_stalest_snapshot_repo_info{')"
+else
+    ok "the info series follows the stalest repository (skipped: no sqlite3)"
 fi
 # And a client can see them: the app shows the value in force, and these
 # live in a file on this host that it cannot read.

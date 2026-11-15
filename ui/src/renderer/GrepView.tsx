@@ -303,6 +303,13 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                     - stopped at the file limit, there may be more
                   </span>
                 )}
+                {/* A capped file was read only as far as its hit cap, so it
+                  * may hold more than the list shows. */}
+                {(selected.files_capped ?? 0) > 0 && (
+                  <span className="text-status-warning ml-2">
+                    - {selected.files_capped} file(s) stopped at the per-file hit limit
+                  </span>
+                )}
                 {/* A cancelled run has real hits, just not all of them.
                   * Presenting them as a finished search would be a lie by
                   * omission. */}

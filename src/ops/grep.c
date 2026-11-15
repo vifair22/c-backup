@@ -593,6 +593,11 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     regfree(&re);
 
     char fin[32], scanned[32], matched[32], skipped[32], bytes[32], hits[32], run[32];
+    /* files_capped on the run record as well as the job result: a run
+     * listed later said truncated:false and could not show that some files
+     * had more matches than it recorded. */
+    char capped[32];
+    snprintf(capped,  sizeof(capped),  "%llu", (unsigned long long)res.files_capped);
     snprintf(fin,     sizeof(fin),     "%lld", (long long)time(NULL));
     snprintf(scanned, sizeof(scanned), "%llu", (unsigned long long)res.files_scanned);
     snprintf(matched, sizeof(matched), "%llu", (unsigned long long)res.files_matched);
@@ -604,8 +609,8 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_execute_non_query(db,
             "UPDATE grep_runs SET finished_at = ?, files_scanned = ?,"
             " files_matched = ?, files_skipped = ?, bytes_scanned = ?, hits = ?,"
-            " truncated = ?, completed = ? WHERE id = ?",
-            (const char *[]){ fin, scanned, matched, skipped, bytes, hits,
+            " files_capped = ?, truncated = ?, completed = ? WHERE id = ?",
+            (const char *[]){ fin, scanned, matched, skipped, bytes, hits, capped,
                               res.truncated ? "1" : "0", st == OK ? "1" : "0",
                               run, NULL }, NULL) != 0)
         log_warn("grep: cannot close run record %s", run);
@@ -615,11 +620,13 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (out) *out = res;
     if (st != OK) return st;
 
-    log_info("grep: %llu file(s) scanned, %llu matched, %llu hit(s), %llu bytes%s",
+    log_info("grep: %llu file(s) scanned, %llu matched, %llu hit(s), %llu bytes, "
+             "%llu file(s) capped at the per-file hit limit%s",
              (unsigned long long)res.files_scanned,
              (unsigned long long)res.files_matched,
              (unsigned long long)res.hits,
              (unsigned long long)res.bytes_scanned,
+             (unsigned long long)res.files_capped,
              !res.truncated ? ""
              : g.stop_all   ? " (stopped at the hit limit)"
                             : " (stopped at the file limit)");

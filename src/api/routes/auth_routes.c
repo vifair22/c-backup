@@ -27,7 +27,13 @@
  * Both a bearer token and a cookie are issued on login. The cookie exists
  * because EventSource cannot set an Authorization header, so the SSE streams
  * in Phase 10 have no other way to authenticate; the token in the body is
- * what the CLI and any scripted client use.
+ * what the desktop app and any scripted TCP client use.
+ *
+ * Sessions are a TCP concept. The socket is authorised by file permissions
+ * and carries no session, so login and a plain logout are refused there
+ * (B055): a login minted a 90-day token that nothing stored, printed to a
+ * terminal, and a logout answered 204 having revoked nothing. Both now say
+ * what to do instead.
  */
 
 typedef struct {
@@ -98,6 +104,10 @@ static api_response_t handle_setup_post(const api_request_t *req, void *ud)
 static api_response_t handle_login(const api_request_t *req, void *ud)
 {
     auth_ctx_t *ctx = ud;
+    if (req->is_local)
+        return api_error(400, "login is for TCP clients: the local socket needs "
+                              "no credential, so a session minted here would "
+                              "be a live token that nothing uses");
     if (!req->body) return api_error(400, "request body required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
@@ -111,33 +121,31 @@ static api_response_t handle_login(const api_request_t *req, void *ud)
     /*
      * Throttled before the password is even hashed: a client that is locked
      * out learns nothing from trying, and does not get to spend the
-     * daemon's CPU on PBKDF2 either. The socket is exempt - it needs no
-     * password at all, and it is the way back in if an attack has filled
+     * daemon's CPU on PBKDF2 either. The socket never reaches this: it
+     * needs no login, and it is the way back in if an attack has filled
      * the global bucket.
      */
-    const char *peer = req->is_local ? NULL : req->client_addr;
+    const char *peer = req->client_addr;
     time_t now = time(NULL);
-    if (!req->is_local) {
-        long wait = login_throttle_check(peer, now);
-        if (wait > 0) {
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "too many failed logins; retry in %ld second%s",
-                     wait, wait == 1 ? "" : "s");
-            api_response_t resp = api_error(429, msg);
-            resp.retry_after = (int)wait;
-            return resp;
-        }
+    long wait = login_throttle_check(peer, now);
+    if (wait > 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "too many failed logins; retry in %ld second%s",
+                 wait, wait == 1 ? "" : "s");
+        api_response_t resp = api_error(429, msg);
+        resp.retry_after = (int)wait;
+        return resp;
     }
 
     if (!auth_verify_password(ctx->db, password)) {
         /* No detail on why: distinguishing "no password set" from "wrong
          * password" tells an unauthenticated caller about daemon state. */
-        log_warn("failed login attempt from %s", peer && *peer ? peer : "the socket");
-        if (!req->is_local) login_throttle_fail(peer, now);
+        log_warn("failed login attempt from %s", peer && *peer ? peer : "unknown");
+        login_throttle_fail(peer, now);
         return api_error(401, "invalid password");
     }
-    if (!req->is_local) login_throttle_success(peer);
+    login_throttle_success(peer);
 
     CUTILS_AUTOFREE char *token = auth_create_token(ctx->db, AUTH_SESSION_TTL_HOURS);
     if (!token) return api_error(500, "cannot create session");
@@ -157,12 +165,27 @@ static api_response_t handle_login(const api_request_t *req, void *ud)
     return resp;
 }
 
+/*
+ * Revoke the presented session. Over TCP the middleware has already proved
+ * there is one. Over the socket there is none unless the caller names a
+ * token in the Authorization header, which is how the host revokes one
+ * known token without ending every session; without one this used to answer
+ * 204 having revoked nothing, which reads as "signed out" (B055).
+ */
 static api_response_t handle_logout(const api_request_t *req, void *ud)
 {
     auth_ctx_t *ctx = ud;
     const char *token = req->auth_token;
-    if (!token) token = api_cookie(req, "auth");
-    if (token) auth_revoke_token(ctx->db, token);
+    if (!token || !token[0]) token = api_cookie(req, "auth");
+    if (!token || !token[0]) {
+        if (req->is_local)
+            return api_error(400, "the local socket has no session to sign out; "
+                                  "present a token to revoke it, or use "
+                                  "/api/auth/logout-all ('c-backup auth logout "
+                                  "--all') to revoke every session");
+        return api_error(401, "no session to sign out");
+    }
+    auth_revoke_token(ctx->db, token);
 
     int secure = ctx->cfg ? config_get_int(ctx->cfg, "auth.cookie_secure", 0) : 0;
     api_response_t resp = api_no_content();

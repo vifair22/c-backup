@@ -155,6 +155,36 @@ static void test_resp_row(void **state)
     free(body);
 }
 
+/*
+ * NIT-1: request flags. A boolean is the spelling written now; 0 and 1 are
+ * still read, because grep schedules stored before the change hold them.
+ * Anything else is refused, and absence leaves the default alone.
+ */
+static int flag_of(const char *body, int *out)
+{
+    cutils_json_req_t *req = NULL;
+    assert_int_equal(json_req_parse(body, strlen(body), &req), 0);
+    int rc = jreq_flag(req, "f", out);
+    json_req_free(req);
+    return rc;
+}
+
+static void test_request_flags(void **state)
+{
+    (void)state;
+    int v = 7;
+    assert_int_equal(flag_of("{\"f\":true}", &v), 0);  assert_int_equal(v, 1);
+    assert_int_equal(flag_of("{\"f\":false}", &v), 0); assert_int_equal(v, 0);
+    assert_int_equal(flag_of("{\"f\":1}", &v), 0);     assert_int_equal(v, 1);
+    assert_int_equal(flag_of("{\"f\":0}", &v), 0);     assert_int_equal(v, 0);
+    v = 7;
+    assert_int_equal(flag_of("{}", &v), 0);              assert_int_equal(v, 7);
+    assert_int_equal(flag_of("{\"f\":2}", &v), -1);
+    assert_int_equal(flag_of("{\"f\":\"yes\"}", &v), -1);
+    assert_int_equal(flag_of("{\"f\":null}", &v), -1);
+    assert_int_equal(v, 7);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -166,6 +196,7 @@ int main(void)
         cmocka_unit_test(test_strings),
         cmocka_unit_test(test_row),
         cmocka_unit_test(test_resp_row),
+        cmocka_unit_test(test_request_flags),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

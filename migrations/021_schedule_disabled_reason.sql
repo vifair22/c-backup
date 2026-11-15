@@ -1,0 +1,15 @@
+-- Why the daemon, rather than a person, turned a schedule off.
+--
+-- The schedule route has refused more as it was tightened: 30 February,
+-- on_overlap "sometimes", catchup "always", actions nothing dispatches. Rows
+-- written before each check survived the upgrade untouched and kept running
+-- with whatever the scheduler made of them - an unknown overlap policy read
+-- as "never while anything runs", an unknown catchup as skip, an impossible
+-- day as an error a year later. A startup pass now holds every enabled row to
+-- the route's rules and disables one that fails, rather than reinterpreting
+-- it, and records the reason here so the list shows it next to
+-- "enabled": false instead of leaving it in the daemon log alone.
+--
+-- NULL for a schedule that is enabled or that someone disabled on purpose.
+-- Enabling one clears it.
+ALTER TABLE schedules ADD COLUMN disabled_reason TEXT;

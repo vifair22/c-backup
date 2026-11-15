@@ -422,6 +422,20 @@ static long count_hit_rows(int64_t run_id)
     return n;
 }
 
+/* A run record's column, as a number. */
+static long run_column(int64_t run_id, const char *col)
+{
+    char run[32], sql[128];
+    snprintf(run, sizeof(run), "%lld", (long long)run_id);
+    snprintf(sql, sizeof(sql), "SELECT %s FROM grep_runs WHERE id = ?", col);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, sql, (const char *[]){ run, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    long n = strtol(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
 /*
  * B067: a binary that matches everywhere is one hit, not one per line. A
  * 10 MiB binary gave 40,776 "(binary file)" hits, each read and matched.
@@ -465,6 +479,10 @@ static void test_per_file_cap_stops_reading_the_file(void **state)
     assert_int_equal(count_hit_rows(res.run_id), 53);
     assert_int_equal(res.files_capped, 1);
     assert_false(res.truncated);
+    /* NIT-2: the run record says so too, not only the job result, so a run
+     * listed later can show that a file holds more than was recorded. */
+    assert_int_equal(run_column(res.run_id, "files_capped"), 1);
+    assert_int_equal(run_column(res.run_id, "truncated"), 0);
 
     /* 0 is the default, not unlimited. */
     o.max_hits_per_file = 0;

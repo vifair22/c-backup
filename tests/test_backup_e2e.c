@@ -911,6 +911,42 @@ static void ignore_progress(const char *phase, uint64_t done, uint64_t total, vo
     (void)phase; (void)done; (void)total; (void)ctx;
 }
 
+/*
+ * B093: each phase ends on done == total. The store and trees loops report
+ * the number finished before each item, so their last report was one short
+ * and a finished job read trees 170/171.
+ */
+typedef struct {
+    uint64_t store_done, store_total, trees_done, trees_total;
+    int      trees_seen;
+} phase_end_t;
+
+static void note_phase_end(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    phase_end_t *pe = ctx;
+    if (!phase) return;
+    if (strcmp(phase, "store") == 0) { pe->store_done = done; pe->store_total = total; }
+    if (strcmp(phase, "trees") == 0) {
+        pe->trees_done = done; pe->trees_total = total; pe->trees_seen = 1;
+    }
+}
+
+static void test_phases_end_at_their_totals(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    phase_end_t pe;
+    memset(&pe, 0, sizeof(pe));
+    o.progress_cb = note_phase_end;
+    o.progress_ctx = &pe;
+    assert_int_equal(backup_run(store, db, repo_id, &o, NULL), OK);
+    assert_true(pe.store_total > 0);
+    assert_int_equal(pe.store_done, pe.store_total);
+    assert_true(pe.trees_seen);
+    assert_true(pe.trees_total > 0);
+    assert_int_equal(pe.trees_done, pe.trees_total);
+}
+
 static int64_t only_snapshot(void)
 {
     db_result_t *r = NULL;
@@ -1003,6 +1039,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_backup_runs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_large_file, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_phases_end_at_their_totals, setup, teardown),
         cmocka_unit_test_setup_teardown(test_bytes_move_inside_one_sparse_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_snapshot_record_written, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_is_internally_consistent, setup, teardown),

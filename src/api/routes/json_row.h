@@ -56,4 +56,17 @@ int jrow_resp_add_row(cutils_json_resp_t *r, const jcol_t *cols, size_t n,
 
 #define JROW_N(cols) (sizeof(cols) / sizeof((cols)[0]))
 
+/*
+ * A request flag, as a JSON boolean or the 0/1 an earlier client sent.
+ *
+ * Flags were read with the u32 getter, so the only spelling accepted was a
+ * number, and a grep schedule stored "ignore_case":1 in its parameters
+ * where every other flag in the API is a boolean. Writers now send and store
+ * true/false; 0 and 1 are still read, because schedules created before the
+ * change hold them. Returns 0 with *out set when the key is present and
+ * valid, 0 with *out untouched when it is absent, and -1 for any other
+ * value.
+ */
+int jreq_flag(const cutils_json_req_t *req, const char *key, int *out);
+
 #endif

@@ -342,6 +342,9 @@ static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
 typedef struct {
     _Atomic uint64_t items;
     _Atomic uint64_t bytes;
+    /* Objects a worker's own probe found incompressible and skip-marked;
+     * repo_pack_report adds them to what the probe pass marked. */
+    _Atomic uint64_t skipped;
 } pack_counts_t;
 
 /* Accumulated parity data for one entry in the current pack. */
@@ -2706,6 +2709,7 @@ static status_t pw_write_small(pack_writer_t *pw, pack_unified_ctx_t *ctx,
                     update_loose_header_parity(wfd, m->compressed_size);
                     close(wfd);
                 }
+                atomic_fetch_add(&ctx->prog->skipped, 1);
                 return OK; /* skip */
             }
         }
@@ -3385,11 +3389,26 @@ out:
 
 status_t repo_pack(store_t *store, uint32_t *out_packed,
                    task_progress_fn progress, void *progress_ctx) {
+    pack_report_t rep;
+    status_t st = repo_pack_report(store, &rep, progress, progress_ctx);
+    if (out_packed) *out_packed = (uint32_t)rep.packed;
+    return st;
+}
+
+#define PACK_WHY_NO_LOOSE     "no loose objects"
+#define PACK_WHY_ALL_SKIP     "all loose objects are skip-marked as incompressible"
+#define PACK_WHY_INCOMPRESS   "every remaining loose object is incompressible"
+#define PACK_WHY_NONE         "no loose object could be packed"
+
+status_t repo_pack_report(store_t *store, pack_report_t *out,
+                          task_progress_fn progress, void *progress_ctx) {
+    pack_report_t rep_local;
+    pack_report_t *rep = out ? out : &rep_local;
+    memset(rep, 0, sizeof(*rep));
 
     /* Packing rewrites every object it touches, so without the key it would
      * turn an encrypted repository into a plaintext one, one pack at a time. */
     if (store_needs_key(store)) {
-        if (out_packed) *out_packed = 0;
         return set_error(ERR_INVALID,
                          "repository is encrypted and no key is loaded: "
                          "refusing to pack");
@@ -3397,7 +3416,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
 
     if (!loose_objects_exist(store)) {
         log_info("pack: no loose objects to pack");
-        if (out_packed) *out_packed = 0;
+        rep->reason = PACK_WHY_NO_LOOSE;
         return OK;
     }
 
@@ -3408,10 +3427,11 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     status_t st = collect_loose(store, &hashes, &loose_cnt);
     if (st != OK) return st;
 
+    rep->loose = loose_cnt;
     if (loose_cnt == 0) {
         free(hashes);
         log_info("pack: no loose objects to pack");
-        if (out_packed) *out_packed = 0;
+        rep->reason = PACK_WHY_NO_LOOSE;
         return OK;
     }
 
@@ -3490,8 +3510,10 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         meta_cnt++;
 
         /* Skip objects already marked as incompressible — they stay loose */
-        if (ohdr.pack_skip_ver == PROBER_VERSION)
+        if (ohdr.pack_skip_ver == PROBER_VERSION) {
+            rep->skip_marked++;
             continue;
+        }
 
         indices[packable_cnt++] = mi;
         total_bytes_for_pack += ohdr.compressed_size;
@@ -3502,7 +3524,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
             if (meta[mi2].fd >= 0) close(meta[mi2].fd);
         free(meta); free(indices); free(hashes);
         log_info("pack: no packable objects (all loose objects are skip-marked)");
-        if (out_packed) *out_packed = 0;
+        rep->reason = PACK_WHY_ALL_SKIP;
         return OK;
     }
 
@@ -3594,6 +3616,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                     if (skip) {
                         close(lm->fd);
                         lm->fd = -1;
+                        rep->incompressible++;
                         continue;
                     }
                     lseek(lm->fd, (off_t)sizeof(object_header_t), SEEK_SET);
@@ -3609,7 +3632,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
             if (meta[mi2].fd >= 0) close(meta[mi2].fd);
         free(meta); free(indices); free(hashes);
         log_info("pack: no packable objects after probe pass");
-        if (out_packed) *out_packed = 0;
+        rep->reason = PACK_WHY_INCOMPRESS;
         return OK;
     }
 
@@ -3632,6 +3655,7 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     pack_counts_t prog;
     atomic_init(&prog.items, 0);
     atomic_init(&prog.bytes, 0);
+    atomic_init(&prog.skipped, 0);
 
     pack_unified_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3671,6 +3695,13 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         pthread_join(tids[i], NULL);
 
     packed = (uint32_t)atomic_load(&prog.items);
+    /* Before the error check: a stopped run installed what it sealed. */
+    rep->packed = packed;
+    rep->incompressible += atomic_load(&prog.skipped);
+    /* The workers probe too (an object at the stream threshold takes their
+     * path), so a run can reach here having packed nothing. */
+    if (packed == 0)
+        rep->reason = rep->incompressible ? PACK_WHY_INCOMPRESS : PACK_WHY_NONE;
 
     /* Check for worker errors */
     {
@@ -3708,7 +3739,6 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
                  packed);
         log_info("%s", msg);
     }
-    if (out_packed) *out_packed = packed;
     if (progress) progress((uint64_t)packed, (uint64_t)packed, "packing", progress_ctx);
     return OK;
 

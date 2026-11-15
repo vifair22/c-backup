@@ -572,6 +572,11 @@ static status_t store_content(pipeline_t *p)
      * phase reported the byte count without it: a single-file backup went
      * from most of the file back to 0 as the trees were built. */
     p->bytes_done = p->bytes_total;
+    /* The loop reports each entry by the number finished before it, so its
+     * last report is one short. Say the phase finished, or the job's final
+     * progress reads one entry short of the work it actually did (B093). */
+    p->file_bytes = 0;
+    report(p, "store", p->count, p->count);
     return OK;
     #undef CACHE_BATCH
     #undef PACK_ROLLOVER_HEADROOM
@@ -802,6 +807,8 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
             if (st != OK) { free(dirs); return st; }
             p->links[dirs[a]].hash_ready = 1;
         }
+        /* Every directory is built: see the closing store report. */
+        report(p, "trees", ndirs, ndirs);
         free(dirs);
     }
 

@@ -278,6 +278,35 @@ static void test_throttled_progress_keeps_the_last_tick(void **state)
     assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 5000);
 }
 
+/*
+ * B093: a phase that ends short of its total inside one throttle window kept
+ * its first count. /jobs said trees 0/171 for a job whose closing log line
+ * said 170/171. The last report is what the job record must end on, whether
+ * or not it reached the total.
+ */
+static status_t short_phase_job(void *arg, volatile int *cancel,
+                                void (*progress)(const char *, uint64_t, uint64_t, void *),
+                                void *progress_ctx)
+{
+    (void)arg; (void)cancel;
+    for (uint64_t i = 0; i < 171; i++) progress("trees", i, 171, progress_ctx);
+    pthread_mutex_lock(&g_mu);
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+static void test_final_progress_is_the_last_report(void **state)
+{
+    (void)state;
+    int64_t id = 0;
+    assert_int_equal(job_submit(jm, 1, "backup", NULL, short_phase_job, NULL, NULL, &id), OK);
+    wait_for(1);
+    usleep(200000);
+    assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 170);
+    assert_int_equal(db_count("SELECT progress_total FROM jobs WHERE id = 1"), 171);
+}
+
 static int db_text(const char *sql, char *out, size_t cap)
 {
     db_result_t *r = NULL;
@@ -536,6 +565,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_old_finished_jobs_are_pruned_as_jobs_finish, setup, teardown),
         cmocka_unit_test_setup_teardown(test_throttled_progress_keeps_the_last_tick, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_final_progress_is_the_last_report, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_jobs_are_journalled_at_start, setup, teardown),
         cmocka_unit_test_setup_teardown(test_journal_source_says_who_asked, setup, teardown),
         cmocka_unit_test_setup_teardown(test_job_ids_survive_concurrent_inserts, setup, teardown),

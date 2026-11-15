@@ -50,6 +50,11 @@ A path that names nothing, under any method, is a `404`, and so is anything
 under `/repos/<id>` for a repository that is not registered. The 405 comes
 after authentication, so over TCP it needs a token like everything else.
 
+Every success carries a JSON body, removes included: a `DELETE` answers
+`200` with `{"removed":true,"id":N}` (or `"name"` for a tag) naming what went.
+They used to answer `204` with no body, and `c-backup repo remove` printed
+nothing on success. `POST /api/auth/logout` over TCP is the one `204` left.
+
 Long operations return `202` with a job id rather than blocking. A backup can
 run for hours, and a request that lives that long dies to any timeout between
 client and daemon.
@@ -94,15 +99,19 @@ accepted.
 Health and metrics are public deliberately: an endpoint that needs a
 credential cannot report a daemon too unhealthy to authenticate, and a client
 asks `/readyz` before it has logged in. Metrics carry counts and ages, never
-paths or file content.
+paths or file content. The only repository they name is the stalest one, by id
+and label, in `cbackup_stalest_snapshot_repo_info` and
+`cbackup_stalest_verify_repo_info`: one series each, value 1, so an alert on
+the matching age can say which repository it means without a series per
+repository. Label values are escaped per the text exposition format.
 
 ## Auth
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/auth/setup` | `{password}`: set the first one. Socket only (`403` over TCP), `409` once set |
-| POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. `403` before setup |
-| POST | `/api/auth/logout` | Revoke the presented token; `204` |
+| POST | `/api/auth/login` | `{password}` returns `{token, expires_in}` and sets the `auth` cookie. TCP only (`400` over the socket), `403` before setup |
+| POST | `/api/auth/logout` | Revoke the presented token; `204`. Over the socket, `400` unless a token is presented |
 | POST | `/api/auth/logout-all` | Revoke every session, the caller's included; `{revoked}` |
 | POST | `/api/auth/password` | `{current, new}`: always needs the current password; returns `{changed, sessions_revoked}` |
 
@@ -115,6 +124,14 @@ left whoever the change was meant to shut out holding a token that kept
 working - and kept sliding forward - for 90 days. `logout-all` is the same
 revocation without a password change, for a lost or untrusted client; from
 the host it is `c-backup auth logout --all`.
+
+Sessions are for TCP clients. The socket is authorised by its file
+permissions and carries no session, so over it a login is a `400` (it used to
+mint a 90-day token that nothing held, and `c-backup auth login` printed it),
+and a logout is a `400` unless the request names a token in `Authorization:
+Bearer`, which revokes that one session: the host's way to end a single known
+token without ending the rest. It used to answer `204` having revoked
+nothing. The CLI has no `auth login`, and its `auth logout` needs `--all`.
 
 ### Login throttle
 
@@ -149,7 +166,7 @@ host always has a way in.
 | GET | `/repos` | List |
 | POST | `/repos` | Register: `{path, label}` |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list |
-| DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it |
+| DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
 `POST /repos` normalises the path (no `//`, `.`, `..` or trailing slash) and
 stores that form. It answers:
@@ -189,11 +206,13 @@ applied (`label_updated: true`); an absent or empty one leaves it alone.
 | GET | `/repos/<id>/snapshots` | List, paged |
 | GET | `/repos/<id>/snapshots/<sid>/tree?parent=<node>` | One directory level |
 | GET | `/repos/<id>/search?q=<text>[&snapshot=<sid>]` | Substring filename search |
-| DELETE | `/repos/<id>/snapshots/<sid>` | Prune |
+| DELETE | `/repos/<id>/snapshots/<sid>` | Prune; `{"removed":true,"id"}` |
 
 A snapshot is `{id, ts, label, files, size, gfs_flags, materialized}`.
 `gfs_flags` is a bitfield of the retention tiers holding it: 1 daily, 2
-weekly, 4 monthly, 8 yearly. `materialized` is `false` for a cold snapshot
+weekly, 4 monthly, 8 yearly. A retention pass assigns them, for every local
+calendar day the daemon's clock has closed, so a snapshot taken today holds
+none yet; the last snapshot of a closed year holds all four, 15. `materialized` is `false` for a cold snapshot
 whose rows must be faulted back in before it can be browsed.
 
 A tree entry is `{id, name, type, mode, size, mtime, mtime_nsec, hash,
@@ -449,11 +468,14 @@ counted without limit: one 10 MiB binary produced 40,776 hits and one
 20 MiB log 806,597, every one of them read and matched for nothing.
 `hits` counts what was recorded, so it never exceeds `max_hits`.
 
-The run's `truncated` is 1 when `max_files` or `max_hits` stopped the search,
-so a caller can tell "no more matches" from "stopped looking". The job's
-`result` carries `run_id`, `snapshot`, `files_scanned`, `files_matched`,
-`files_capped` (files that reached `max_hits_per_file` and may hold more),
-`hits` and `truncated`. The CLI takes `--limit`, `--max-hits-per-file` and
+The run's `truncated` is `true` when `max_files` or `max_hits` stopped the
+search, so a caller can tell "no more matches" from "stopped looking". A file
+that reached `max_hits_per_file` does not set it; it is counted in
+`files_capped` (files that may hold more than was recorded), which both the
+run record in `GET /repos/<id>/grep` and the job's `result` carry. The
+`result` also has `run_id`, `snapshot`, `files_scanned`, `files_matched`,
+`hits` and `truncated`. `ignore_case` is a boolean; `0` and `1` are still
+accepted. The CLI takes `--limit`, `--max-hits-per-file` and
 `--max-hits`.
 
 `snapshot` defaults to the newest. One that does not exist is `404 no such
@@ -554,8 +576,9 @@ stored configuration untouched. It used to skip what it could not read, and
 since the route replaces wholesale, a malformed request answered 204 having
 emptied the list. Paths are stored normalised (`/a//b/./` is `/a/b`). A path
 that does not exist on the daemon's host is accepted with a warning rather
-than refused, because it may be a share that is not mounted yet; a backup
-skips it until it exists.
+than refused, because it may be a share that is not mounted yet, and the
+warning says that a backup fails while it is missing: a backup does not skip
+a missing source, it fails the job (see above).
 
 Stored once, they serve every run. After that a backup with no
 `paths` uses them, so the same configuration serves an ad-hoc run, a button
@@ -600,8 +623,9 @@ plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
-not on this host. The job's result reports `snapshots_sent`, `objects_sent`,
-`bytes_sent` and `reencrypted`. Re-encrypting is a manual operation: the
+not on this host. The job's result reports `snapshots_sent`,
+`snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,
+`subtrees_skipped` and `reencrypted`. Re-encrypting is a manual operation: the
 schedule route does not store `reencrypt`.
 
 There is no delete. Retention at the target belongs to the target, which is
@@ -690,13 +714,27 @@ What some jobs report in `result`, beyond the backup and restore counts:
 | Job | `result` |
 |---|---|
 | gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
-| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped` |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted` |
+| pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
-Both also put a one-line summary in their journal entry, such as `swept 12
-objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
-removed` or `target already up to date (3 snapshots present)`. A dry-run gc
-removes nothing, temp files included; its pack figures are zero because
-compaction does not run.
+A pack's `reason` is `null` when it packed something, and otherwise says why
+it did not: `no loose objects`, `all loose objects are skip-marked as
+incompressible`, `every remaining loose object is incompressible`, or `no
+loose object could be packed`. It had no result at all before, so a run that
+packed nothing read as a bare `completed`.
+
+All three also put a one-line summary in their journal entry, such as `swept
+12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
+removed`, `target already up to date (3 snapshots present)` or `nothing
+packed: no loose objects`. A dry-run gc removes nothing, temp files
+included; its pack figures are zero because compaction does not run.
+
+A finished job's `phase`, `current` and `total` are its last progress report.
+Progress reaches the database a few times a second, and the final report is
+written when the job ends, so a phase that finished inside one interval no
+longer stays at its first count. Each phase ends with `current` equal to
+`total`. A restore counts the entries in scope: the whole snapshot, or with
+a `subpath` only that subtree, so a one-file restore ends at 1 of 1.
 
 ## Introspection
 
@@ -762,7 +800,7 @@ same property that makes incremental backups cheap, applied to reading.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/tags` | List, or set `{name, snap_id, move}` |
-| DELETE | `/repos/<id>/tags/<name>` | Remove; 404 if there is no such tag |
+| DELETE | `/repos/<id>/tags/<name>` | Remove; `{"removed":true,"name"}`, 404 if there is no such tag |
 | GET/PUT | `/repos/<id>/snapshots/<sid>/note` | Read or write `{body}`; 404 for a snapshot that does not exist |
 | GET/PUT | `/repos/<id>/policy` | Read, or set `{key, value}` |
 | GET | `/repos/<id>/journal` | Operation history: `{id, ts, source, operation, result, duration_ms, message}`, `duration_ms` and `message` `null` where none was recorded |
@@ -842,8 +880,8 @@ would be the worst kind of surprise.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/repos/<id>/schedules` | List, or create |
-| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule |
-| DELETE | `/repos/<id>/schedules/<sid>` | Remove; 404 if this repository has no such schedule |
+| PUT | `/repos/<id>/schedules/<sid>` | `{enabled}`, `true`/`false` (or `1`/`0`); 404 if this repository has no such schedule; 409 enabling one that breaks a creation rule |
+| DELETE | `/repos/<id>/schedules/<sid>` | Remove; `{"removed":true,"id"}`, 404 if this repository has no such schedule |
 
 Both used to answer success for an id that did not exist, or that belonged
 to another repository, so a typo read as done while the schedule meant kept
@@ -906,6 +944,24 @@ was down, `run_once` fires it when the daemon starts. Any other value of
 either is a 400; both used to be stored as sent and then read as something
 else.
 
+A schedule stored before one of these rules existed survives an upgrade, so
+at every start the daemon checks each enabled schedule's action, trigger,
+`on_overlap` and `catchup` against them, and disables one that fails rather
+than reinterpreting it. The list then carries `"enabled":false` and a
+`disabled_reason`, present only when the daemon turned the schedule off:
+
+```json
+{"id":4,"action":"gc","trigger":{"type":"interval","seconds":3600},
+ "overlap":"skip","catchup":"always","enabled":false,
+ "disabled_reason":"catchup 'always' is not skip or run_once", ...}
+```
+
+Enabling such a schedule is a 409 naming the same problem; delete it and
+create it again. Any `PUT` that succeeds clears the reason. Parameters that
+depend on the host, such as a replication destination, are not part of the
+check: they can be right again tomorrow, and fail at fire time with the job
+saying why.
+
 Parameters belong to one action each, and naming one on a schedule for a
 different action is a 400 rather than a value stored and never read:
 
@@ -913,7 +969,7 @@ different action is a 400 rather than a value stored and never read:
 |---|---|
 | `backup` | `paths` (optional; the repository's sources otherwise) |
 | `replicate` | `dest` (required, absolute) |
-| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case`, `max_files` |
+| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case` (a boolean, stored as one; `0`/`1` accepted), `max_files` |
 | others | none |
 
 A `grep` schedule searches the newest snapshot as of each fire, so it takes
