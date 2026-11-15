@@ -42,6 +42,35 @@ typedef struct {
 
 static snap_ctx_t g_ctx;
 
+/* The configured defaults, set at start. The values here are the documented
+ * defaults, for a caller (a test) that never sets them. */
+static gfs_retention_t g_retention = { 1, 7, 4, 12, 3 };
+
+void routes_snapshots_set_retention(int keep_snaps, int keep_daily, int keep_weekly,
+                                    int keep_monthly, int keep_yearly)
+{
+    g_retention.keep_snaps   = keep_snaps;
+    g_retention.keep_daily   = keep_daily;
+    g_retention.keep_weekly  = keep_weekly;
+    g_retention.keep_monthly = keep_monthly;
+    g_retention.keep_yearly  = keep_yearly;
+}
+
+int routes_snapshots_retention_defaults(routes_retention_default_t *out, int max)
+{
+    const routes_retention_default_t all[] = {
+        { "retention.keep_snaps",   g_retention.keep_snaps   },
+        { "retention.keep_daily",   g_retention.keep_daily   },
+        { "retention.keep_weekly",  g_retention.keep_weekly  },
+        { "retention.keep_monthly", g_retention.keep_monthly },
+        { "retention.keep_yearly",  g_retention.keep_yearly  },
+    };
+    int n = (int)(sizeof(all) / sizeof(all[0]));
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = all[i];
+    return n;
+}
+
 #define PAGE_DEFAULT 200
 #define PAGE_MAX     1000
 
@@ -605,8 +634,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
     } else if (j->kind == SNAP_JOB_GFS) {
         /* Retention comes from policy_values, falling back to the daemon
-         * defaults when a repo has not set its own. */
-        gfs_retention_t ret = { 0, 7, 4, 12, 3 };
+         * defaults when a repo has not set its own. Those were hard-coded
+         * here while the config keys claiming to set them went unread. */
+        gfs_retention_t ret = g_retention;
         char repo[32];
         snprintf(repo, sizeof(repo), "%lld", (long long)j->repo_id);
         db_result_t *r = NULL;

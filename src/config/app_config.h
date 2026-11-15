@@ -8,9 +8,10 @@
 /*
  * Config keys and the AppGuard builder for c-backupd.
  *
- * File-backed keys are read before the DB exists, so anything needed to open
- * the DB or bind a socket lives there. Everything else is DB-backed and
- * mutable at runtime through the API.
+ * Every key is file-backed, read from config.yaml at start. Some have to be:
+ * they open the DB or bind a socket before the DB exists. The rest are there
+ * because the daemon has no route that changes configuration, so a key kept
+ * in the database could only be changed by editing it by hand.
  */
 
 static const config_key_t app_file_keys[] = {
@@ -72,23 +73,27 @@ static const config_key_t app_file_keys[] = {
       "Set the Secure flag on session cookies (requires HTTPS in front)",
       CFG_STORE_FILE, 0 },
 
-    { NULL, 0, NULL, NULL, 0, 0 }
-};
-
-static const config_key_t app_db_keys[] = {
+    /*
+     * Jobs, scheduling and default retention. File-backed like everything
+     * above: the daemon has no route that changes configuration, so a
+     * database-backed key could only be set by editing SQLite by hand, and
+     * the retention defaults were not read at all. config.yaml is where an
+     * operator already looks.
+     */
     { "scheduler.enabled",   CFG_INT, "1",
       "Run scheduled backups and maintenance",
-      CFG_STORE_DB, 0 },
+      CFG_STORE_FILE, 0 },
     { "jobs.max_parallel",   CFG_INT, "2",
       "Maximum concurrently running jobs across all repos",
-      CFG_STORE_DB, 0 },
+      CFG_STORE_FILE, 0 },
 
-    /* Defaults for newly registered repos; per-repo values live in
-     * policy_values and override these. */
-    { "retention.keep_daily",   CFG_INT, "7",  "Default daily snapshots to keep",   CFG_STORE_DB, 0 },
-    { "retention.keep_weekly",  CFG_INT, "4",  "Default weekly snapshots to keep",  CFG_STORE_DB, 0 },
-    { "retention.keep_monthly", CFG_INT, "12", "Default monthly snapshots to keep", CFG_STORE_DB, 0 },
-    { "retention.keep_yearly",  CFG_INT, "3",  "Default yearly snapshots to keep",  CFG_STORE_DB, 0 },
+    /* What a retention pass keeps for a repository that has not set its own
+     * with the policy API (retention.* policy keys override these). */
+    { "retention.keep_snaps",   CFG_INT, "1",  "Newest snapshots always kept, whatever their tier", CFG_STORE_FILE, 0 },
+    { "retention.keep_daily",   CFG_INT, "7",  "Default daily snapshots to keep",   CFG_STORE_FILE, 0 },
+    { "retention.keep_weekly",  CFG_INT, "4",  "Default weekly snapshots to keep",  CFG_STORE_FILE, 0 },
+    { "retention.keep_monthly", CFG_INT, "12", "Default monthly snapshots to keep", CFG_STORE_FILE, 0 },
+    { "retention.keep_yearly",  CFG_INT, "3",  "Default yearly snapshots to keep",  CFG_STORE_FILE, 0 },
 
     { NULL, 0, NULL, NULL, 0, 0 }
 };
@@ -101,7 +106,6 @@ static const config_section_t app_sections[] = {
     { "scheduler",  "Scheduler" },
     { "jobs",       "Job Manager" },
     { "retention",  "Default Retention" },
-    { "store",      "Storage Engine" },
     { NULL, NULL }
 };
 
@@ -118,7 +122,7 @@ static inline appguard_config_t app_appguard_config(void)
         .config_path            = NULL,
         .on_first_run           = CFG_FIRST_RUN_CONTINUE,
         .file_keys              = app_file_keys,
-        .db_keys                = app_db_keys,
+        .db_keys                = NULL,
         .sections               = app_sections,
         .enable_pushover        = 1,
         .log_retention_days     = 30,

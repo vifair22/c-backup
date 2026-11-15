@@ -118,6 +118,13 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
    * backup, so without it every snapshot shows an empty retention column
    * and the tier filters have nothing to filter.
    */
+  /*
+   * The shipped defaults keep only the newest snapshot of a day that has not
+   * closed, so with them this pass would prune the older of the two backups
+   * above, and the screens below need both. Retention is applied for its
+   * flags here, not for what it removes.
+   */
+  cli(sock, ['policy', 'set', String(plain), 'retention.keep_snaps', '100'])
   cli(sock, ['gfs', String(plain)])
   /* One scrub, so the integrity screen has a run to open on. */
   cli(sock, ['verify', String(plain), '--level', 'deep'])

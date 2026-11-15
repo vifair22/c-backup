@@ -192,6 +192,11 @@ int main(int argc, char *argv[])
     routes_auth_set_config(cfg);
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);
+    routes_snapshots_set_retention(config_get_int(cfg, "retention.keep_snaps", 1),
+                                   config_get_int(cfg, "retention.keep_daily", 7),
+                                   config_get_int(cfg, "retention.keep_weekly", 4),
+                                   config_get_int(cfg, "retention.keep_monthly", 12),
+                                   config_get_int(cfg, "retention.keep_yearly", 3));
     routes_metadata_init(db);
     routes_introspect_init(db);
     routes_schedules_init(db, sched);

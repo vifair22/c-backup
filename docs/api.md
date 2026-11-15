@@ -348,6 +348,13 @@ The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered
 job endpoint.
 
+Finished jobs are kept for 30 days and then deleted, so `/jobs/<id>` answers
+404 for a job older than that. The jobs table is operational state; the
+permanent record of what ran is each repository's journal
+(`GET /repos/<id>/journal`). A job left running or queued by a daemon that
+stopped is marked failed with "interrupted by daemon restart" when the next
+one starts, since nothing resumes it.
+
 ## Introspection
 
 What is actually inside a repository, as opposed to what it can do.
