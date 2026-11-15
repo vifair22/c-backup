@@ -31,9 +31,11 @@ so it does not. **No route returns a whole snapshot.**
 
 `limit` and `offset` must be plain decimal counts: `limit` 1 or more,
 `offset` 0 or more. Anything else (`-1`, `0` for a limit, `+5`, `lots`) is a
-400 naming the parameter; they used to be replaced by the defaults, which
-answered a request the server had not understood as if it had. A `limit`
-above a route's maximum is clamped to it. The same goes for filters with a
+400 naming the parameter, and for `limit` the route's range: `limit must be
+a whole number from 1 to 1000 (a larger one is reduced to 1000)`. They used
+to be replaced by the defaults, which answered a request the server had not
+understood as if it had. A `limit` above a route's maximum is clamped to it,
+however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
 fixed set of values: `objects?location=` takes `loose`, `pack` (or
 `packed`) or `all`, and anything else is a 400 rather than an unfiltered
 listing.
