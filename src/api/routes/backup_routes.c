@@ -6,6 +6,8 @@
 #include "backup.h"
 #include "file_cache.h"
 #include "job_manager.h"
+/* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
+#define CUTILS_CJSON_ALLOW
 #include "cJSON.h"
 #include "lock.h"
 #include "repo.h"

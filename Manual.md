@@ -140,7 +140,10 @@ apt-get install build-essential pkg-config libssl-dev liblz4-dev \
 
 The build needs [c-utils](https://git.airies.net/vifair22/c-utils) checked out
 at `../c-utils`, or `CUTILS_DIR` pointing at it, at the version in
-`cutils_version`:
+`cutils_version`. The JSON parser comes from there too: c-utils carries cJSON
+and `libc-utils.a` holds it, so the daemon and CLI run on the cJSON the pinned
+release was tested with, and moving the pin moves cJSON with it.
+To fetch and build it:
 
 ```sh
 git clone https://git.airies.net/vifair22/c-utils.git ../c-utils
@@ -362,7 +365,7 @@ the database or binds a socket:
 
 ```
 /etc/c-backupd/config.yaml:12: error: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
-appguard: config init failed: /etc/c-backupd/config.yaml:12: unknown key 'security.key_dri' (did you mean 'security.key_dir'?)
+appguard: config init failed; the problems are listed above
 ```
 
 What stops it:

@@ -128,7 +128,10 @@ refuses "integer key not an integer" "bad.yaml:7: error: jobs.max_parallel: 'eig
     'jobs:' '  max_parallel: eighty'
 refuses "nested mapping" "bad.yaml:8: error: indented deeper" \
     'jobs:' '  max_parallel: 2' '    extra: 1'
-refuses "every problem reported" "(and 1 more, printed above)" \
+# Both lines, not just the first: the second problem is what a parser that
+# stops at the first error would never reach. c-utils 1.5.1 no longer repeats
+# the first problem with an "(and N more)" count; it points at the list.
+refuses "every problem reported" "bad.yaml:8: error: unknown key 'jobs.max_paralel'" \
     'jobs:' '  max_parallel: x' '  max_paralel: 2'
 # Values of the right type the daemon cannot honour (B081 reopened): each
 # used to start, port 99999 logging "listening on 0.0.0.0:99999".
