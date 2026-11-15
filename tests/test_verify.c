@@ -306,6 +306,96 @@ static void test_index_level_finds_a_deleted_object(void **state)
     assert_int_equal(res.bytes_read, 0);
 }
 
+/*
+ * Delete the pack holding a file's content, and return how many indexed
+ * objects that pack held. The store resolves objects from the index, which
+ * still lists every entry of a pack whose file has gone.
+ */
+static int delete_pack_of(const char *name)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of(name, hex);
+
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT pack_id FROM pack_objects WHERE hash = ?",
+        (const char *[]){ hex, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char pack[32];
+    snprintf(pack, sizeof(pack), "%s", r->rows[0][0]);
+    db_result_free(r);
+
+    r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM pack_objects WHERE pack_id = ?",
+        (const char *[]){ pack, NULL }, &r), 0);
+    int n = atoi(r->rows[0][0]);
+    db_result_free(r);
+    assert_true(n > 0);
+
+    char path[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO,
+                                           (uint32_t)strtoul(pack, NULL, 10)), 0);
+    assert_int_equal(unlink(path), 0);
+    return n;
+}
+
+/* Every finding of the newest run carries this status. */
+static void assert_all_findings(const char *status, int expect_rows)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT status FROM verify_findings"
+        " WHERE run_id = (SELECT MAX(id) FROM verify_runs)", NULL, &r), 0);
+    assert_int_equal(r->nrows, expect_rows);
+    for (int i = 0; i < r->nrows; i++) assert_string_equal(r->rows[i][0], status);
+    db_result_free(r);
+}
+
+/*
+ * A deleted pack file took every object in it, and the index level - the one
+ * an operator schedules often because it is cheap - reported all of them ok:
+ * the index still listed them, and that was all it asked.
+ */
+static void test_index_level_finds_a_missing_pack(void **state)
+{
+    (void)state;
+    run_backup();
+    int lost = delete_pack_of("alpha.txt");
+
+    verify_result_t res;
+    verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &res);
+    err_clear();
+    assert_int_equal(res.missing, (uint64_t)lost);
+    assert_int_equal(res.ok, res.checked - (uint64_t)lost);
+    assert_all_findings("missing", lost);
+}
+
+/*
+ * The levels that open the pack noticed, but called it damage: "unreadable
+ * header" or "unrecoverable", counted nothing as missing, and the deep level
+ * suggested a repair that has no bytes to work from.
+ */
+static void test_missing_pack_is_missing_at_every_level(void **state)
+{
+    (void)state;
+    run_backup();
+    int lost = delete_pack_of("alpha.txt");
+
+    const verify_level_t levels[] = { VERIFY_LEVEL_STRUCTURE, VERIFY_LEVEL_DEEP };
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++) {
+        for (int repair = 0; repair <= 1; repair++) {
+            verify_result_t res;
+            verify_run(store, db, repo_id, levels[l], repair, NULL, NULL, NULL, &res);
+            err_clear();
+            assert_int_equal(res.missing, (uint64_t)lost);
+            assert_int_equal(res.unrecoverable, 0);
+            assert_int_equal(res.repaired, 0);
+            assert_all_findings("missing", lost);
+        }
+    }
+}
+
 /* Structure level parses headers without reading payloads, so payload damage
  * slips past it. That is the documented trade, and worth pinning down so
  * nobody mistakes a structure pass for a guarantee. */
@@ -573,6 +663,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_verify_without_repair_leaves_disk_untouched, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unrecoverable_damage_names_the_affected_files, setup, teardown),
         cmocka_unit_test_setup_teardown(test_index_level_finds_a_deleted_object, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_index_level_finds_a_missing_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_missing_pack_is_missing_at_every_level, setup, teardown),
         cmocka_unit_test_setup_teardown(test_structure_level_does_not_read_payloads, setup, teardown),
         cmocka_unit_test_setup_teardown(test_verify_covers_packed_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_run_is_recorded, setup, teardown),

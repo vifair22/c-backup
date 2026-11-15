@@ -8,10 +8,13 @@
 
 #include <cutils/log.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -177,6 +180,31 @@ static status_t read_whole_object(store_t *store, const uint8_t hash[OBJECT_HASH
     return st;
 }
 
+/*
+ * Is a pack's data file still there?
+ *
+ * Every per-object check below asks the store where an object lives, and the
+ * store answers from the index: a pack file deleted out from under it still
+ * resolves, so the index level reported every object in it as ok, and the
+ * levels that do open the file called the same loss "unreadable header" or
+ * "unrecoverable" and suggested a repair that has nothing to read. Asking the
+ * filesystem directly, once per pack, is what tells "the bytes are damaged"
+ * apart from "the bytes are gone".
+ *
+ * Only a definite absence counts. Any other stat failure (EACCES, EIO) falls
+ * through to the per-object checks, which will report what they can see.
+ */
+static int pack_file_missing(store_t *store, int64_t pack_id)
+{
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store),
+                              (uint32_t)pack_id) != 0)
+        return 0;
+    struct stat sb;
+    if (stat(path, &sb) == 0) return 0;
+    return errno == ENOENT || errno == ENOTDIR;
+}
+
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     verify_level_t level, int repair, volatile int *cancel,
                     void (*progress)(const char *phase, uint64_t done,
@@ -267,22 +295,38 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     uint64_t total = (uint64_t)objs->nrows;
     status_t st = OK;
 
+    /* Rows arrive grouped by pack, so remembering the last pack's answer
+     * stats each pack file once rather than once per object. */
+    int64_t cur_pack = -1;
+    int     cur_pack_missing = 0;
+
     for (int i = 0; i < objs->nrows; i++) {
         if (cancel && *cancel) { st = set_error(ERR_BUSY, "verify cancelled"); break; }
         if (progress && (i % 256 == 0 || i + 1 == objs->nrows))
             progress(level_name(level), (uint64_t)i, total, progress_ctx);
 
-        const char *hex    = objs->rows[i][0];
-        int         packed = (strtoll(objs->rows[i][2], NULL, 10) >= 0);
+        const char *hex     = objs->rows[i][0];
+        int64_t     pack_id = strtoll(objs->rows[i][2], NULL, 10);
+        int         packed  = (pack_id >= 0);
         uint64_t    osize  = strtoull(objs->rows[i][4], NULL, 10);
         uint8_t hash[OBJECT_HASH_SIZE];
         hex_to_hash(hex, hash);
 
         res.checked++;
 
-        /* Every level starts here: an object the store cannot locate at all
-         * is missing, and nothing further can be said about it. */
-        if (!object_exists(store, hash)) {
+        if (packed && pack_id != cur_pack) {
+            cur_pack = pack_id;
+            cur_pack_missing = pack_file_missing(store, pack_id);
+            if (cur_pack_missing)
+                log_error("verify: pack-%08u.dat is missing; every object "
+                          "indexed in it is missing", (unsigned)pack_id);
+        }
+
+        /* Every level starts here: an object the store cannot locate at all,
+         * or whose pack file is gone, is missing, and nothing further can be
+         * said about it. No level reads its bytes, and no repair is offered:
+         * parity lives in the same file as the payload it protects. */
+        if ((packed && cur_pack_missing) || !object_exists(store, hash)) {
             res.missing++;
             record_finding(db, repo_id, res.run_id, hex, "missing", &res);
             continue;
