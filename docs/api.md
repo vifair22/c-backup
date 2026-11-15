@@ -145,6 +145,13 @@ is deliberately a persistent nag rather than a message shown once.
 All three answer 400 `repository is not encrypted` for an unencrypted
 repository, which has no key to export, import or escrow.
 
+An encrypted repository whose key is not on this host answers 409 `no key
+loaded for repository <uuid>; ...` to backup, restore, reindex, grep, pack,
+gc and replicate, naming the command that supplies the key. Verify and gfs
+run without it: parity covers ciphertext, and retention only deletes
+records. A job that reaches the repository without the key (a scheduled
+one, or a key removed after submission) fails with the same message.
+
 The marker records the mode, cipher and a one-way fingerprint of the key, and
 for passphrase mode the Argon2id parameters and wrapped key. It never contains
 the key itself. Markers are version 2 for every repository, encrypted or

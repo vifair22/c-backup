@@ -187,7 +187,16 @@ docker run -d --name c-backupd \
   <registry>/vifair22/c-backup:<tag>
 ```
 
-- `/var/lib/c-backupd` holds `state.db`. Put it on fast storage (section 18).
+- `/var/lib/c-backupd` holds `state.db` and, in `keys/`, the encryption key
+  of every encrypted repository. Put it on fast storage (section 18).
+- **The keys are the one thing on that volume a reindex cannot rebuild.**
+  The image sets `C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys`, so they
+  survive replacing the container, but lose the volume and every `system`
+  repository is unreadable. Back up `/var/lib/c-backupd/keys` somewhere other
+  than this host, or keep each key from `repo key export` (section 13). The
+  environment variable overrides `security.key_dir` in any config file you
+  mount; to move the keys, pass `-e C_BACKUP_SECURITY_KEY_DIR=...` and keep
+  the directory on a volume.
 - Mount the repositories and the sources at whatever paths you will register
   and back up. Paths are always the container's view.
 - The image binds TCP on every interface inside the container, because a
@@ -265,7 +274,7 @@ are different: they live in the database and change through the policy API
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, IPv4. `0.0.0.0` for every interface |
-| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each |
+| `security.key_dir` | `/etc/c-backupd/keys` | Where per-repository encryption keys live, one 0600 file each. The container image sets `/var/lib/c-backupd/keys` (section 2.3) |
 | `auth.cookie_secure` | `0` | Set `Secure` on session cookies. Only behind HTTPS |
 | `log.level` | `info` | `debug`, `info`, `warn`, `error` |
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
@@ -279,6 +288,11 @@ are different: they live in the database and change through the policy API
 
 The `retention.*` keys are defaults for repositories that have not set their
 own (section 9).
+
+Every key can also be set from the environment: `C_BACKUP_` followed by the
+key in capitals with dots as underscores, so `security.key_dir` is
+`C_BACKUP_SECURITY_KEY_DIR`. The environment wins over the file. The
+container image uses this for the key directory (section 2.3).
 
 Logs go to stdout, which systemd sends to the journal
 (`journalctl -u c-backupd`). The daemon also keeps 30 days of log lines in its
@@ -875,6 +889,11 @@ sudo c-backup repo key import <id> <key-hex>
 
 The import is refused unless the key matches the fingerprint in the
 repository's marker. The marker never contains the key.
+
+An encrypted repository whose key is not on this host can be registered and
+verified, but not read: backup, restore, reindex, grep, pack, gc and
+replicate are refused with 409 `no key loaded for repository <uuid>`, which
+names the command that fixes it. A scheduled job fails with the same message.
 
 A `passphrase` repository needs no import: registering it with its
 passphrase (`repo add <path> --passphrase '...'`) unwraps the key and caches

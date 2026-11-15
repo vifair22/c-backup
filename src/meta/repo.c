@@ -89,6 +89,22 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
     return OK;
 }
 
+status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
+                               store_t **out)
+{
+    status_t st = repo_store_open(path, cfg, out);
+    if (st != OK || !store_needs_key(*out)) return st;
+
+    store_close(*out);
+    *out = NULL;
+    st = repo_require_key(path);
+    /* The keyfile appeared between the open and the check. Rare enough that
+     * saying so beats retrying, and the message still names the fix. */
+    if (st == OK)
+        st = set_error(ERR_INVALID, REPO_NO_KEY_FMT, path, REPO_NO_KEY_HINT_SYSTEM);
+    return st;
+}
+
 status_t repo_marker_read(const char *path, repo_marker_t *out)
 {
     char mp[PATH_MAX];

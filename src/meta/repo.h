@@ -72,6 +72,16 @@ typedef struct {
 status_t repo_store_open(const char *path, const store_config_t *cfg,
                          store_t **out);
 
+/*
+ * repo_store_open for work that reads or writes content: backup, restore,
+ * reindex, grep, pack, gc, replicate. An encrypted repository whose key is
+ * not on this host fails here with the REPO_NO_KEY_FMT message, instead of
+ * opening and failing deep inside the work with "pack entry is encrypted
+ * and no key is loaded", or worse, "1 entry could not be restored".
+ */
+status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
+                               store_t **out);
+
 /* Read the marker from a repo directory. ERR_NOT_FOUND if absent,
  * ERR_CORRUPT if present but malformed or of an unknown format. */
 status_t repo_marker_read(const char *path, repo_marker_t *out);

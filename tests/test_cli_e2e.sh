@@ -374,6 +374,27 @@ else
     bad "encrypted round trip is byte-identical" "identical" "differs"
 fi
 
+# B041: with the key gone, backup and restore of an encrypted repository
+# failed deep inside the job ("refusing to pack", "1 entry could not be
+# restored"). They are refused up front now, naming the repository and the
+# command that fixes it.
+ENC_UUID=$(sed -n 's/.*"uuid"[: ]*"\([^"]*\)".*/\1/p' "$WORK/encrepo/.cbackup" | head -1)
+mv "$WORK/keys/$ENC_UUID.key" "$WORK/enc.key.aside"
+OUT=$(cb backup "$ENC_ID" "$WORK/src" 2>&1); RC=$?
+check    "backup without the key is refused" 1 "$RC"
+contains "and names the repository" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the fix" "c-backup repo key import" "$OUT"
+contains "as a 409" "HTTP 409" "$OUT"
+OUT=$(cb restore "$ENC_ID" 1 "$WORK/nokeyout" 2>&1); RC=$?
+check    "restore without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+check    "and writes nothing" 1 "$([ -e "$WORK/nokeyout" ]; echo $?)"
+OUT=$(cb reindex "$ENC_ID" 2>&1); RC=$?
+check    "reindex without the key is refused" 1 "$RC"
+contains "and says why" "no key loaded for repository $ENC_UUID" "$OUT"
+contains "and the index is untouched" '"id":"1"' "$(cb snapshots "$ENC_ID")"
+mv "$WORK/enc.key.aside" "$WORK/keys/$ENC_UUID.key"
+
 # B042: a passphrase repository recovered with nothing but its passphrase.
 # The host loses its key cache and its registration; a wrong passphrase was
 # accepted, and the right one wrote no key, so reindex found nothing and the
@@ -793,6 +814,38 @@ if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
 else
     ok "leaves no socket behind"
 fi
+
+echo "key directory"
+
+# B041: the container image kept keys at /etc/c-backupd/keys, inside the
+# container's own filesystem, so replacing the container lost every key. It
+# sets the key directory through the environment, which has to win over the
+# config file for an operator's own mounted config not to undo it.
+grep -q '^ENV C_BACKUP_SECURITY_KEY_DIR=/var/lib/c-backupd/keys$' "$(dirname "$0")/../Dockerfile" \
+    && ok "the image keeps keys on the state volume" \
+    || bad "the image keeps keys on the state volume" "ENV C_BACKUP_SECURITY_KEY_DIR" "absent"
+cat > "$WORK/envcfg.yaml" <<EOF
+db:
+  path: $WORK/env.db
+http:
+  socket: $WORK/env.sock
+  port: 0
+  bind: 127.0.0.1
+log:
+  level: warn
+security:
+  key_dir: $WORK/filekeys
+EOF
+C_BACKUP_SECURITY_KEY_DIR="$WORK/envkeys" C_BACKUP_CONFIG_PATH="$WORK/envcfg.yaml" \
+    "$DAEMON" > "$WORK/env.log" 2>&1 &
+ENV_PID=$!
+for _ in $(seq 1 50); do [ -S "$WORK/env.sock" ] && break; sleep 0.1; done
+"$CLI" --socket "$WORK/env.sock" repo add "$WORK/envrepo" e --encrypt system >/dev/null 2>&1
+check "the environment's key directory wins over the file's" 1 \
+    "$(find "$WORK/envkeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+check "and the file's is not used" 0 \
+    "$(find "$WORK/filekeys" -name '*.key' 2>/dev/null | wc -l | tr -d ' ')"
+kill $ENV_PID 2>/dev/null; wait $ENV_PID 2>/dev/null
 
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?

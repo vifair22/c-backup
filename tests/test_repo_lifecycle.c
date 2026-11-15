@@ -784,6 +784,43 @@ static void test_open_without_the_key_refuses_writes(void **state)
     store_close(store);
 }
 
+/* B041: work that reads content refuses a keyless repository up front,
+ * naming it and the fix, rather than failing deep inside the job. */
+static void test_keyed_open_refuses_a_keyless_repository(void **state)
+{
+    (void)state;
+    char keydir[512];
+    snprintf(keydir, sizeof(keydir), "%s/keys", TEST_ROOT);
+    assert_int_equal(mkdir(keydir, 0700), 0);
+    repo_key_dir_set(keydir);
+
+    repo_enc_request_t enc = { .mode = REPO_ENC_SYSTEM, .key_dir = keydir };
+    int64_t id = 0;
+    assert_int_equal(repo_register_ex(db, TEST_ROOT "/nokey", NULL, &enc, &id), OK);
+    repo_marker_t m;
+    assert_int_equal(repo_marker_read(TEST_ROOT "/nokey", &m), OK);
+
+    store_t *store = NULL;
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/nokey", NULL, &store), OK);
+    assert_non_null(store_key(store));
+    store_close(store);
+
+    assert_int_equal(repo_key_remove(keydir, m.uuid), OK);
+    store = NULL;
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/nokey", NULL, &store), ERR_INVALID);
+    assert_null(store);
+    char want[128];
+    snprintf(want, sizeof(want), "no key loaded for repository %s", m.uuid);
+    assert_non_null(strstr(err_msg(), want));
+    assert_non_null(strstr(err_msg(), "c-backup repo key import"));
+    err_clear();
+
+    /* An unencrypted repository needs nothing. */
+    assert_int_equal(repo_register(db, TEST_ROOT "/plainkeyed", NULL, &id), OK);
+    assert_int_equal(repo_store_open_keyed(TEST_ROOT "/plainkeyed", NULL, &store), OK);
+    store_close(store);
+}
+
 /* A keyfile belonging to some other repository is caught by the marker's
  * fingerprint rather than by a wall of objects that will not decrypt. */
 static void test_open_rejects_the_wrong_key(void **state)
@@ -843,6 +880,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_deregister_removes_row, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_attaches_the_repository_key, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_without_the_key_refuses_writes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_keyed_open_refuses_a_keyless_repository, setup, teardown),
         cmocka_unit_test_setup_teardown(test_open_rejects_the_wrong_key, setup, teardown),
         cmocka_unit_test(test_write_lock_is_exclusive),
         cmocka_unit_test(test_locks_are_per_repo),

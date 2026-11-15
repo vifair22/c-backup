@@ -732,6 +732,18 @@ static void gfs_report(void *progress_ctx, int dry_run,
     job_set_summary(progress_ctx, msg);
 }
 
+/*
+ * Which jobs read or write content and so cannot run without the key.
+ * Verify works on ciphertext - parity covers it so an offsite copy can be
+ * scrubbed by whoever holds it - and retention only deletes records, so
+ * those two run keyless; everything else would fail partway with a message
+ * about a pack entry rather than about the missing key.
+ */
+static int snap_job_needs_key(snap_job_kind_t kind)
+{
+    return kind != SNAP_JOB_VERIFY && kind != SNAP_JOB_GFS;
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -759,7 +771,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
 
     store_t *store = NULL;
     store_index_t *idx = NULL;
-    st = repo_store_open(j->repo_path, NULL, &store);
+    st = snap_job_needs_key(j->kind)
+             ? repo_store_open_keyed(j->repo_path, NULL, &store)
+             : repo_store_open(j->repo_path, NULL, &store);
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
@@ -902,6 +916,13 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
 {
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");
+
+    /* Refused while the caller is listening. Queued, a restore without the
+     * key ran and reported "1 entry could not be restored". */
+    if (snap_job_needs_key(kind) && repo_require_key(repo_path) != OK) {
+        free(repo_path);
+        return api_error(409, err_msg());
+    }
 
     /*
      * A restore names a snapshot, and one that does not exist is the
