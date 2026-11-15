@@ -16,6 +16,13 @@
  * operator relies on: the run said it failed, the replica opens and
  * verifies clean with only whole snapshots in it, and the next run
  * completes it.
+ *
+ * Since OWN-19 a snapshot larger than the 256 MiB seal is written as
+ * several packs, the earlier ones installed mid-snapshot as they fill. The
+ * last three tests hold that to the same promise: every pack a record
+ * depends on is in place before the record, and an install that fails at
+ * either kind of seal - mid-snapshot or at the commit - fails the run
+ * naming the snapshot and leaves no record of it.
  */
 
 #include <setjmp.h>
@@ -26,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -34,6 +42,7 @@
 
 #include "backup.h"
 #include "fault_inject.h"
+#include "pack.h"
 #include "reindex.h"
 #include "replicate.h"
 #include "repo.h"
@@ -47,6 +56,9 @@
 #define TEST_REPO  TEST_DIR "/repo"
 #define TEST_SRC   TEST_DIR "/src"
 #define TEST_REPL  TEST_DIR "/replica"
+
+#define SEAL_BYTES PACK_MAX_MULTI_BYTES
+#define BIG_FILES  18        /* of 16 MiB: 288 MiB, two packs at the seal */
 
 extern const db_migration_t app_migrations[];
 
@@ -128,6 +140,47 @@ static void three_snapshots(void)
     backup();
 }
 
+/* Incompressible, so a pack grows by what is put in it; every file gets its
+ * own seed, so nothing dedups. */
+static void fill_random(uint8_t *buf, size_t n, uint64_t seed)
+{
+    uint64_t r = seed * 0x9E3779B97F4A7C15ull + 1;
+    for (size_t i = 0; i + 8 <= n; i += 8) {
+        r ^= r >> 12; r ^= r << 25; r ^= r >> 27;
+        uint64_t v = r * 0x2545F4914F6CDD1Dull;
+        memcpy(buf + i, &v, sizeof(v));
+    }
+}
+
+/* A small first snapshot, then a second past the seal: 288 MiB of files the
+ * first does not have, which replicate as two packs. Each file is exactly
+ * PACK_STREAM_THRESHOLD, the largest a backup writes straight into a pack. */
+static void small_then_big_snapshot(void)
+{
+    write_file(TEST_SRC "/a", "first snapshot's file, with its own bytes");
+    backup();
+
+    const size_t n = (size_t)PACK_STREAM_THRESHOLD;
+    uint8_t *buf = malloc(n);
+    assert_non_null(buf);
+    for (int i = 0; i < BIG_FILES; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), TEST_SRC "/big%02d.bin", i);
+        fill_random(buf, n, 500u + (uint64_t)i);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        assert_true(fd >= 0);
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(fd, buf + off, n - off);
+            assert_true(w > 0);
+            off += (size_t)w;
+        }
+        close(fd);
+    }
+    free(buf);
+    backup();
+}
+
 static int record_exists(int64_t id)
 {
     char p[256];
@@ -151,7 +204,16 @@ static status_t replicate_once(replicate_result_t *rr)
  * object any of them names must be present and intact. Returns how many
  * snapshots the replica holds.
  */
+static uint64_t assert_replica_verifies_packs(int *out_packs, uint64_t *out_max_body);
+
 static uint64_t assert_replica_verifies(void)
+{
+    return assert_replica_verifies_packs(NULL, NULL);
+}
+
+/* The same, also reporting how many packs the replica holds and the largest
+ * one's entry bytes (headers included), which is what the seal measures. */
+static uint64_t assert_replica_verifies_packs(int *out_packs, uint64_t *out_max_body)
 {
     rmrf(TEST_RDB);
     cutils_db_t *rdb = NULL;
@@ -179,6 +241,25 @@ static uint64_t assert_replica_verifies(void)
     assert_int_equal(vr.missing, 0);
     assert_int_equal(vr.unrecoverable, 0);
     assert_int_equal(vr.recoverable, 0);
+
+    if (out_packs || out_max_body) {
+        char repo[32];
+        snprintf(repo, sizeof(repo), "%lld", (long long)rid);
+        db_result_t *r = NULL;
+        assert_int_equal(db_execute(rdb,
+            "SELECT pack_id, SUM(comp_size + 51) FROM pack_objects"
+            " WHERE repo_id = ? GROUP BY pack_id",
+            (const char *[]){ repo, NULL }, &r), 0);
+        int n = r ? r->nrows : 0;
+        uint64_t mx = 0;
+        for (int i = 0; i < n; i++) {
+            uint64_t b = strtoull(r->rows[i][1], NULL, 10);
+            if (b > mx) mx = b;
+        }
+        db_result_free(r);
+        if (out_packs)    *out_packs = n;
+        if (out_max_body) *out_max_body = mx;
+    }
 
     store_index_free(ri);
     store_close(rs);
@@ -385,6 +466,113 @@ static void test_killed_run_leaves_whole_snapshots(void **state)
     assert_int_equal(assert_replica_verifies(), 3);
 }
 
+/* ------------------------------------------------------------------ */
+
+static int replica_tmp_is_empty(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp')\"", TEST_REPL);
+    return system(cmd) == 0;
+}
+
+/*
+ * OWN-19. A snapshot past the seal replicates as several packs, none past
+ * it, and the replica reindexes and verifies like any other.
+ */
+static void test_a_snapshot_past_the_seal_writes_several_packs(void **state)
+{
+    (void)state;
+    small_then_big_snapshot();
+
+    replicate_result_t rr;
+    assert_int_equal(replicate_once(&rr), OK);
+    assert_int_equal(rr.snapshots_sent, 2);
+
+    int packs = 0;
+    uint64_t max_body = 0;
+    assert_int_equal(assert_replica_verifies_packs(&packs, &max_body), 2);
+    /* Snapshot 1's pack, then the 288 MiB of snapshot 2 in two. */
+    assert_true(packs >= 3);
+    assert_true(max_body <= SEAL_BYTES);
+}
+
+/*
+ * The second snapshot's second pack - installed at the commit, after its
+ * first was installed mid-snapshot - cannot go in. The run fails naming
+ * snapshot 2 and writes no record of it, though half its objects are in
+ * place; the next run sends only what is missing and completes it.
+ */
+static void test_failed_install_of_a_snapshots_last_pack(void **state)
+{
+    (void)state;
+    small_then_big_snapshot();
+
+    fault_rename_dst = TEST_REPL "/packs/";
+    fault_rename_skip = 2;            /* snapshot 1's pack, snapshot 2's first */
+    replicate_result_t rr;
+    status_t st = replicate_once(&rr);
+    disarm();
+
+    assert_int_not_equal(st, OK);
+    assert_non_null(strstr(err_msg(), "snapshot 2"));
+    err_clear();
+    assert_int_equal(fault_rename_refused, 1);
+    assert_int_equal(rr.snapshots_sent, 1);
+    assert_true(record_exists(1));
+    assert_false(record_exists(2));
+    assert_int_equal(assert_replica_verifies(), 1);
+    assert_true(replica_tmp_is_empty());
+    uint64_t first_bytes = rr.bytes_sent;
+
+    st = replicate_once(&rr);
+    assert_int_equal(st, OK);
+    assert_int_equal(rr.snapshots_skipped, 1);
+    assert_int_equal(rr.snapshots_sent, 1);
+    /* The pack that did go in is reused, not sent again. */
+    assert_true(rr.bytes_sent < first_bytes);
+    assert_true(record_exists(2));
+
+    int packs = 0;
+    uint64_t max_body = 0;
+    assert_int_equal(assert_replica_verifies_packs(&packs, &max_body), 2);
+    assert_true(max_body <= SEAL_BYTES);
+}
+
+/*
+ * The install that fails is the one at the seal, inside put_object, before
+ * the snapshot's last objects have even been read. Same outcome: the run
+ * fails naming the snapshot, no record, nothing left staged.
+ */
+static void test_failed_install_at_the_seal_mid_snapshot(void **state)
+{
+    (void)state;
+    small_then_big_snapshot();
+
+    fault_rename_dst = TEST_REPL "/packs/";
+    fault_rename_skip = 1;            /* snapshot 1's pack */
+    replicate_result_t rr;
+    status_t st = replicate_once(&rr);
+    disarm();
+
+    assert_int_not_equal(st, OK);
+    assert_non_null(strstr(err_msg(), "snapshot 2"));
+    assert_non_null(strstr(err_msg(), "full pack"));
+    err_clear();
+    assert_int_equal(fault_rename_refused, 1);
+    assert_int_equal(rr.snapshots_sent, 1);
+    assert_true(record_exists(1));
+    assert_false(record_exists(2));
+    assert_int_equal(assert_replica_verifies(), 1);
+    assert_true(replica_tmp_is_empty());
+
+    assert_int_equal(replicate_once(&rr), OK);
+    assert_int_equal(rr.snapshots_sent, 1);
+    int packs = 0;
+    uint64_t max_body = 0;
+    assert_int_equal(assert_replica_verifies_packs(&packs, &max_body), 2);
+    assert_true(max_body <= SEAL_BYTES);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -392,6 +580,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_first_install_writes_no_record, setup, teardown),
         cmocka_unit_test_setup_teardown(test_interrupted_run_leaves_whole_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_killed_run_leaves_whole_snapshots, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_snapshot_past_the_seal_writes_several_packs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_install_of_a_snapshots_last_pack, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_failed_install_at_the_seal_mid_snapshot, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -1222,6 +1222,28 @@ would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
 does not do; `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
 
+**Compaction rewrites a pack without its dead entries, split at 256 MiB.**
+A pack holding any entry no snapshot names is copied, live entries only,
+into new packs that seal at 256 MiB like a backup's, and the old pack is
+deleted once the new ones are on disk and indexed. Packs every build since
+OWN-19 writes are at most 256 MiB (plus one entry, when a single object is
+larger), so a rewrite costs at most that much I/O and free space. Earlier
+builds could write larger ones: a replica held one pack per snapshot of
+whatever size the snapshot was, and a backup of fewer than 2,000 files put
+everything it packed into one. Such a pack is split the first time
+compaction rewrites it, which needs free space for its live entries once;
+after that it is ordinary 256 MiB packs. A pack with no dead entries is
+never rewritten, however large: splitting it would cost a full copy and free
+nothing, and the same split happens anyway the first time something in it
+dies. A gc interrupted during compaction (cancelled, failed or killed)
+leaves every object readable. Cancelled or failed while copying, it leaves
+only staging files in `tmp/`; killed after installing the new packs but
+before deleting the old one, it leaves the old pack beside copies of its
+live entries, which wastes that space until the snapshots naming them are
+pruned and loses nothing; killed while deleting, it is finished by the next
+gc or reindex. Merging small packs (coalescing, which gc also does) follows
+the same steps and leaves the same states.
+
 **Large incompressible objects stay loose.** A backup writes objects up to
 16 MiB straight into packs. Anything larger is written as one loose file,
 and the pack step then reads its first 64 KiB: if that does not compress
@@ -1350,11 +1372,14 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
-- **Whole snapshots only.** Each snapshot's new objects are written as one
-  pack and synced to disk before the snapshot's record is written, so a
-  snapshot the replica lists is one it can restore. If writing a pack
+- **Whole snapshots only.** Each snapshot's new objects are written into
+  packs sealed at 256 MiB, the size a backup seals at, and every one of
+  them is synced to disk before the snapshot's record is written, so a
+  snapshot the replica lists is one it can restore. A large snapshot fills
+  several packs, each installed as it fills. If installing any of them
   fails, the job fails naming the snapshot, and that snapshot and the ones
-  after it are not recorded. A run that is cancelled, fails or is killed
+  after it are not recorded; the packs that did go in are reused by the
+  next run rather than sent again. A run that is cancelled, fails or is killed
   part-way leaves the replica openable and verify-clean with the snapshots
   it finished; the next run skips those and carries on. Objects it had
   staged for an unfinished snapshot are either kept (reused by the next
@@ -1675,6 +1700,10 @@ running). `docs/acceptance.md` has the full results.
 
 ### 18.1 Disk
 
+- **gc needs free space for the pack it is rewriting.** Compaction copies a
+  pack's live entries before deleting it, so it needs up to 256 MiB free per
+  pack, or the live size of a larger pack written by an earlier build, once
+  (section 12).
 - **Transient headroom: about twice the final size on a first backup.**
   Loose objects are written uncompressed and packing compresses them at the
   end. A 46 GB backup peaked at 53 GB of repository and settled at 26 GB.

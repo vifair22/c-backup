@@ -359,7 +359,20 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.objects_sent     += one.objects_sent;
         res.bytes_sent       += one.bytes_sent;
         res.subtrees_skipped += one.subtrees_skipped;
-        if (st != OK) break;
+        if (st != OK) {
+            /*
+             * Named here because the sink cannot: a sink seals packs as they
+             * fill, so an install can fail inside put_object, which is not
+             * told which snapshot it is serving. Whatever failed, this
+             * snapshot gets no record and neither does any after it.
+             * Copied first: err_msg() is the buffer set_error writes into.
+             */
+            char why[256];
+            snprintf(why, sizeof(why), "%s", err_msg());
+            st = set_error(st, "replicate: snapshot %lld was not recorded: %s",
+                           (long long)snap_id, why);
+            break;
+        }
 
         replica_snapshot_t rs = {
             .snapshot_id = snap_id,

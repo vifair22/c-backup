@@ -87,6 +87,20 @@ extern volatile int fault_rename_refused;
 extern int __real_rename(const char *, const char *);
 
 /*
+ * Die at a rename into one place, as a crash or power cut would.
+ *
+ * When fault_rename_die_dst is set, a rename whose destination starts with
+ * it ends the process with _exit(0), after the first fault_rename_die_skip
+ * such renames have been let through. With fault_rename_die_after set the
+ * rename is carried out first and the process dies just after it, so a test
+ * can stop an operation on either side of the step that commits it. Meant
+ * for a forked child: nothing is flushed and no handler runs.
+ */
+extern const char *volatile fault_rename_die_dst;
+extern volatile int fault_rename_die_skip;
+extern volatile int fault_rename_die_after;
+
+/*
  * Hold renames onto one path until several have arrived.
  *
  * With a gate set, a rename whose destination is exactly `dst` waits until

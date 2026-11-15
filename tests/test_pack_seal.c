@@ -13,10 +13,12 @@
  * often anything else commits.
  *
  * The second is the other half: repositories already written hold oversized
- * packs, and replication writes one pack per snapshot with no size cap at
- * all, so nothing may assume a pack is at most 256 MiB. It builds one the
- * way an old backup did, backs up against it, and runs verify (with a repair
- * past the 256 MiB offset), restore, replication and gc over it.
+ * packs (a pre-OWN-16 backup, a pre-OWN-19 replica, which wrote one pack per
+ * snapshot with no cap), so nothing may assume a pack is at most 256 MiB. It
+ * builds one the way an old backup did, backs up against it, and runs verify
+ * (with a repair past the 256 MiB offset), restore, replication and gc over
+ * it. Since OWN-19 the replica and gc's rewrite both come out sealed at
+ * 256 MiB, and the test holds them to it.
  */
 
 #include <setjmp.h>
@@ -52,6 +54,7 @@
 #define TEST_SRC   TEST_DIR "/src"
 #define TEST_REPL  TEST_DIR "/replica"
 #define TEST_OUT   TEST_DIR "/out"
+#define TEST_OUT2  TEST_DIR "/out-after-gc"
 
 #define MIB        ((uint64_t)1 << 20)
 #define SEAL_BYTES (256 * MIB)                       /* PACK_MAX_MULTI_BYTES */
@@ -141,27 +144,68 @@ static backup_result_t run_backup(void)
 
 /*
  * Bytes of entries in each pack, from the index: what the seal measures.
- * Returns the number of packs; the largest goes to *max_bytes.
+ * Returns the number of packs; the largest goes to *max_bytes, and how many
+ * hold more than 16 MiB of entries - the packs the big files went into, as
+ * against the small ones a backup's trees land in - to *big (may be NULL).
  */
-static int pack_body_sizes(uint64_t *max_bytes)
+static int pack_body_sizes_in(cutils_db_t *d, int64_t rid, uint64_t *max_bytes, int *big)
 {
     char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(repo, sizeof(repo), "%lld", (long long)rid);
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db,
+    assert_int_equal(db_execute(d,
         "SELECT pack_id, SUM(comp_size + 51), COUNT(*) FROM pack_objects"
         " WHERE repo_id = ? GROUP BY pack_id ORDER BY pack_id",
         (const char *[]){ repo, NULL }, &r), 0);
     *max_bytes = 0;
+    if (big) *big = 0;
     int n = r ? r->nrows : 0;
     for (int i = 0; i < n; i++) {
         uint64_t b = strtoull(r->rows[i][1], NULL, 10);
         print_message("  pack %s: %llu bytes in %s entries\n", r->rows[i][0],
                       (unsigned long long)b, r->rows[i][2]);
         if (b > *max_bytes) *max_bytes = b;
+        if (big && b > PACK_STREAM_THRESHOLD) (*big)++;
     }
     db_result_free(r);
     return n;
+}
+
+static int pack_body_sizes(uint64_t *max_bytes)
+{
+    return pack_body_sizes_in(db, repo_id, max_bytes, NULL);
+}
+
+/* Restore the snapshot into out and compare every big file with what was
+ * written, byte for byte. */
+static void restore_big_files(int64_t snap_id, const char *out, int first, int last,
+                              uint8_t *buf, size_t n)
+{
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, snap_id, out, &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(rr.files, (uint64_t)(last - first));
+    uint8_t *got = malloc(n);
+    assert_non_null(got);
+    for (int i = first; i < last; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s" TEST_SRC "/big%02d.bin", out, i);
+        int rfd = open(path, O_RDONLY);
+        assert_true(rfd >= 0);
+        size_t have = 0;
+        while (have < n) {
+            ssize_t g = read(rfd, got + have, n - have);
+            assert_true(g > 0);
+            have += (size_t)g;
+        }
+        close(rfd);
+        fill_random(buf, n, 1000u + (uint64_t)i);
+        assert_memory_equal(got, buf, n);
+    }
+    free(got);
 }
 
 static void verify_clean(store_t *s, cutils_db_t *d, int64_t rid)
@@ -310,34 +354,13 @@ static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **s
     verify_clean(store, db, repo_id);
 
     /* Restore reads every entry back, including the repaired one. */
-    restore_opts_t ro;
-    memset(&ro, 0, sizeof(ro));
-    restore_result_t rr;
-    memset(&rr, 0, sizeof(rr));
-    assert_int_equal(restore_run(store, db, repo_id, r.snapshot_id, TEST_OUT, &ro, &rr), OK);
-    assert_int_equal(rr.failed, 0);
-    assert_int_equal(rr.files, BIG_ENTRIES - BIG_DEAD);
-    uint8_t *got = malloc(n);
-    assert_non_null(got);
-    for (int i = BIG_DEAD; i < BIG_ENTRIES; i++) {
-        char path[256];
-        snprintf(path, sizeof(path), TEST_OUT TEST_SRC "/big%02d.bin", i);
-        int rfd = open(path, O_RDONLY);
-        assert_true(rfd >= 0);
-        size_t have = 0;
-        while (have < n) {
-            ssize_t g = read(rfd, got + have, n - have);
-            assert_true(g > 0);
-            have += (size_t)g;
-        }
-        close(rfd);
-        fill_random(buf, n, 1000u + (uint64_t)i);
-        assert_memory_equal(got, buf, n);
-    }
-    free(got);
-    free(buf);
+    restore_big_files(r.snapshot_id, TEST_OUT, BIG_DEAD, BIG_ENTRIES, buf, n);
 
-    /* Replication copies out of it, and the replica reindexes and verifies. */
+    /*
+     * Replication copies out of it, and the replica reindexes and verifies.
+     * The snapshot's 288 MiB of files does not arrive as one pack, as it
+     * did before OWN-19, but sealed at 256 MiB like a backup's.
+     */
     replica_sink_t sink;
     assert_int_equal(replica_sink_local_open(TEST_REPL, &marker, &sink), OK);
     replicate_result_t rep;
@@ -363,25 +386,49 @@ static void test_an_oversized_pack_verifies_restores_replicates_and_gcs(void **s
         assert_int_equal(rx.packs_unreadable, 0);
         assert_int_equal(rx.snapshots, 1);
         verify_clean(rs, rdb, rid);
+        uint64_t rmax = 0;
+        int rbig = 0;
+        pack_body_sizes_in(rdb, rid, &rmax, &rbig);
+        assert_true(rbig >= 2);
+        assert_true(rmax <= SEAL_BYTES);
         store_index_free(ri);
         store_close(rs);
         db_close(rdb);
     }
 
     /*
-     * gc drops the two entries nothing names and rewrites what is left.
-     * pack_gc copies a pack's live entries into one new pack and does not
-     * split it at the seal (coalescing does; it only takes small packs), so
-     * the 288 MiB left stays one oversized pack. That is not asserted either
-     * way: the point here is that it works, not what size it comes out.
+     * gc drops the two entries nothing names and rewrites what is left,
+     * split at the seal (OWN-19): the 288 MiB of live entries come out as
+     * two packs, neither past 256 MiB, where they used to stay one
+     * oversized pack that every later rewrite would copy whole again.
      */
     gc_result_t g;
     memset(&g, 0, sizeof(g));
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
     assert_int_equal(g.pack_entries_dropped, BIG_DEAD);
-    assert_true(g.packs_rewritten >= 1);
-    assert_true(pack_body_sizes(&max_bytes) >= 1);
-    assert_true(max_bytes >= (uint64_t)(BIG_ENTRIES - BIG_DEAD) * n);
+    assert_int_equal(g.packs_rewritten, 1);
+    int big = 0;
+    pack_body_sizes_in(db, repo_id, &max_bytes, &big);
+    assert_int_equal(big, 2);
+    assert_true(max_bytes <= SEAL_BYTES);
+    verify_clean(store, db, repo_id);
+
+    /* The old pack is gone from disk, not just from the index. */
+    char old_dat[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(old_dat, sizeof(old_dat),
+                                           store_root(store), pack_num), 0);
+    assert_int_not_equal(access(old_dat, F_OK), 0);
+
+    restore_big_files(r.snapshot_id, TEST_OUT2, BIG_DEAD, BIG_ENTRIES, buf, n);
+    free(buf);
+
+    /* And a reindex from the pack files alone agrees with the index gc
+     * left: nothing it moved is unreachable or stale. */
+    reindex_result_t rx;
+    memset(&rx, 0, sizeof(rx));
+    assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+    assert_int_equal(rx.snapshots_failed, 0);
+    assert_int_equal(rx.packs_unreadable, 0);
     verify_clean(store, db, repo_id);
 }
 
