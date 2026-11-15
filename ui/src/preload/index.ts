@@ -1,26 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/types'
-import type { ConnectionConfig, ConnectionState } from '../shared/types'
+import type { ConnectionConfig, ConnectionState, ConnectResult, CredentialInfo } from '../shared/types'
 import type { ApiRequest } from '../shared/api'
 
 export interface CBackupApi {
   // Connection management
   connectionAdd(config: ConnectionConfig): Promise<{ ok: boolean; error?: string }>
   connectionRemove(name: string): Promise<{ ok: boolean; error?: string }>
-  connectionConnect(name: string, credentials?: { password?: string; sudoPassword?: string }): Promise<{ ok: boolean; error?: string }>
+  /* A password is only for a remote daemon; remember keeps the session
+   * token it is exchanged for, never the password. */
+  connectionConnect(name: string, credentials?: { password?: string; remember?: boolean }): Promise<ConnectResult>
   connectionEdit(name: string, config: ConnectionConfig): Promise<{ ok: boolean; error?: string }>
-  connectionRestart(name: string): Promise<{ ok: boolean; error?: string }>
+  connectionRestart(name: string): Promise<ConnectResult>
   connectionDisconnect(name: string): Promise<{ ok: boolean }>
+  /* Revoke the session on the daemon and forget the stored token. */
+  connectionSignOut(name: string): Promise<{ ok: boolean; error?: string }>
   connectionList(): Promise<ConnectionState[]>
   connectionStatus(name: string): Promise<ConnectionState | null>
 
-  // Repo management
-  repoInit(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string; needsCredentials?: boolean }>
+  // Repo management. Adding creates the repository when it does not exist.
   repoAdd(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string }>
-  repoRemove(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string }>
-  repoEdit(connectionName: string, oldPath: string, newPath: string): Promise<{ ok: boolean; error?: string }>
-  repoOpen(connectionName: string, repoPath: string): Promise<{ ok: boolean; error?: string; version?: string; needsCredentials?: boolean }>
-  repoClose(connectionName: string, repoPath: string): Promise<{ ok: boolean }>
+  repoRemove(connectionName: string, repoId: number): Promise<{ ok: boolean; error?: string }>
 
   /*
    * The typed call. A request the union does not describe will not compile,
@@ -30,9 +30,8 @@ export interface CBackupApi {
   apiCall<T = unknown>(connectionName: string, req: ApiRequest): Promise<T>
 
 
-  // Credentials
-  credentialHas(connectionName: string): Promise<boolean>
-  credentialDelete(connectionName: string): Promise<{ ok: boolean }>
+  // Whether stored tokens are encrypted, so the sign-in dialog can say so.
+  credentialInfo(): Promise<CredentialInfo>
 }
 
 /*
@@ -56,20 +55,16 @@ const api: CBackupApi = {
   connectionEdit: (name, config) => ipcRenderer.invoke(IPC.CONNECTION_EDIT, name, config),
   connectionRestart: (name) => ipcRenderer.invoke(IPC.CONNECTION_RESTART, name),
   connectionDisconnect: (name) => ipcRenderer.invoke(IPC.CONNECTION_DISCONNECT, name),
+  connectionSignOut: (name) => ipcRenderer.invoke(IPC.CONNECTION_SIGN_OUT, name),
   connectionList: () => ipcRenderer.invoke(IPC.CONNECTION_LIST),
   connectionStatus: (name) => ipcRenderer.invoke(IPC.CONNECTION_STATUS, name),
 
-  repoInit: (conn, path) => ipcRenderer.invoke(IPC.REPO_INIT, conn, path),
   repoAdd: (conn, path) => ipcRenderer.invoke(IPC.REPO_ADD, conn, path),
-  repoRemove: (conn, path) => ipcRenderer.invoke(IPC.REPO_REMOVE, conn, path),
-  repoEdit: (conn, oldPath, newPath) => ipcRenderer.invoke(IPC.REPO_EDIT, conn, oldPath, newPath),
-  repoOpen: (conn, path) => ipcRenderer.invoke(IPC.REPO_OPEN, conn, path),
-  repoClose: (conn, path) => ipcRenderer.invoke(IPC.REPO_CLOSE, conn, path),
+  repoRemove: (conn, repoId) => ipcRenderer.invoke(IPC.REPO_REMOVE, conn, repoId),
 
   apiCall: (conn, req) => ipcRenderer.invoke(IPC.API_CALL, conn, req).catch(unwrap),
 
-  credentialHas: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_HAS, name),
-  credentialDelete: (name) => ipcRenderer.invoke(IPC.CREDENTIAL_DELETE, name),
+  credentialInfo: () => ipcRenderer.invoke(IPC.CREDENTIAL_INFO),
 }
 
 contextBridge.exposeInMainWorld('cbackup', api)

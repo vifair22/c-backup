@@ -2,25 +2,55 @@
  * Connection manager.
  *
  * A connection is a c-backupd instance. Connecting means checking that the
- * daemon answers and listing the repos it owns; it does not mean spawning
- * anything, so there are no child processes to supervise, no sudo prompts to
- * detect on stderr, and no SSH lifecycle to coordinate. That machinery made up
- * most of the previous version of this file and all of it is gone.
+ * daemon answers, signing in if it is remote, and listing the repos it owns;
+ * it does not mean spawning anything, so there are no child processes to
+ * supervise and no SSH lifecycle to coordinate.
  *
- * Repos are no longer configured per connection either. The daemon knows which
- * repos it owns; the app asks.
+ * Repos are not configured per connection. The daemon knows which repos it
+ * owns; the app asks.
+ *
+ * Persistence comes in through ConnectionStore rather than an import of the
+ * Electron-backed config store, so this file runs under plain node and is
+ * tested against a real daemon in tests/connections.test.ts. It used to be
+ * reachable only through the window, and the remote path it carried had never
+ * once been exercised.
  */
 
 import { EventEmitter } from 'node:events'
-import { DaemonClient, DaemonUnreachableError } from './rpc-session'
-import { toEndpoint } from './client'
+/* With extensions, so tests/connections.test.ts can load this under node's
+ * type stripping, which resolves import paths literally. */
+import { DaemonClient, DaemonUnreachableError, notConfiguredMessage } from './rpc-session.ts'
+import { toEndpoint } from './client.ts'
 import type { ApiRequest } from '../shared/api'
 import type {
   ConnectionConfig,
   ConnectionState,
   ConnectionStatus,
+  ConnectResult,
   RepoState,
 } from '../shared/types'
+
+/*
+ * What the manager needs kept between runs. Connections go to the config
+ * file and session tokens to the credential file; the password itself is
+ * never stored anywhere.
+ */
+export interface ConnectionStore {
+  saveConnections(configs: ConnectionConfig[]): void
+  getToken(name: string): string | undefined
+  setToken(name: string, token: string): void
+  deleteToken(name: string): void
+}
+
+/* For tests and for anything that should not touch disk. */
+export class MemoryConnectionStore implements ConnectionStore {
+  saved: ConnectionConfig[] = []
+  tokens = new Map<string, string>()
+  saveConnections(configs: ConnectionConfig[]): void { this.saved = configs.map((c) => ({ ...c })) }
+  getToken(name: string): string | undefined { return this.tokens.get(name) }
+  setToken(name: string, token: string): void { this.tokens.set(name, token) }
+  deleteToken(name: string): void { this.tokens.delete(name) }
+}
 
 interface Entry {
   config: ConnectionConfig
@@ -29,21 +59,63 @@ interface Entry {
   error?: string
   repos: RepoState[]
   version?: string
+  needsCredentials?: boolean
+}
+
+function describe(config: ConnectionConfig): string {
+  return config.type === 'local' ? config.socketPath : `${config.host}:${config.port}`
+}
+
+/* What to tell someone whose daemon did not answer. The remedy differs: a
+ * local daemon is a systemctl away, a remote one could be down, firewalled,
+ * or listening on loopback only, which is the default. */
+function unreachableMessage(config: ConnectionConfig, err: DaemonUnreachableError): string {
+  if (config.type === 'local') {
+    return `${err.message}. Start it with 'systemctl start c-backupd'.`
+  }
+  return `${err.message}. Check that the host is up and that c-backupd there ` +
+    `listens on the network: it binds 127.0.0.1 unless http.bind says otherwise.`
 }
 
 export class ConnectionManager extends EventEmitter {
   private entries = new Map<string, Entry>()
+  private store: ConnectionStore
 
-  addConnection(config: ConnectionConfig): { ok: boolean; error?: string } {
+  constructor(store: ConnectionStore = new MemoryConnectionStore()) {
+    super()
+    this.store = store
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Connection list, persisted                                         */
+  /* ---------------------------------------------------------------- */
+
+  /*
+   * Every change to the list is saved. The save functions existed and nothing
+   * called them, so a connection added in the window was gone on the next
+   * launch; the e2e suites never noticed because they write config.json
+   * themselves.
+   */
+  private persist(): void {
+    this.store.saveConnections(Array.from(this.entries.values()).map((e) => e.config))
+  }
+
+  private newEntry(config: ConnectionConfig): Entry {
+    const token = config.type === 'remote' ? this.store.getToken(config.name) : undefined
+    return {
+      config,
+      client: new DaemonClient(config, token),
+      status: 'disconnected',
+      repos: [],
+    }
+  }
+
+  addConnection(config: ConnectionConfig, opts: { persist?: boolean } = {}): { ok: boolean; error?: string } {
     if (this.entries.has(config.name)) {
       return { ok: false, error: `connection '${config.name}' already exists` }
     }
-    this.entries.set(config.name, {
-      config,
-      client: new DaemonClient(config),
-      status: 'disconnected',
-      repos: [],
-    })
+    this.entries.set(config.name, this.newEntry(config))
+    if (opts.persist !== false) this.persist()
     this.emitChange()
     return { ok: true }
   }
@@ -52,6 +124,8 @@ export class ConnectionManager extends EventEmitter {
     if (!this.entries.delete(name)) {
       return { ok: false, error: `no connection '${name}'` }
     }
+    this.store.deleteToken(name)
+    this.persist()
     this.emitChange()
     return { ok: true }
   }
@@ -59,32 +133,50 @@ export class ConnectionManager extends EventEmitter {
   editConnection(name: string, config: ConnectionConfig): { ok: boolean; error?: string } {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
-    entry.config = config
-    entry.client = new DaemonClient(config)
-    entry.status = 'disconnected'
-    entry.repos = []
-    if (config.name !== name) {
-      this.entries.delete(name)
-      this.entries.set(config.name, entry)
+    if (config.name !== name && this.entries.has(config.name)) {
+      return { ok: false, error: `connection '${config.name}' already exists` }
     }
+
+    /* A token belongs to the daemon it was issued by. Keep it across a
+     * rename, drop it when the address changes. */
+    const old = entry.config
+    const sameDaemon = old.type === 'remote' && config.type === 'remote' &&
+      old.host === config.host && old.port === config.port
+    const token = sameDaemon ? this.store.getToken(name) : undefined
+    this.store.deleteToken(name)
+    if (token) this.store.setToken(config.name, token)
+
+    this.entries.delete(name)
+    this.entries.set(config.name, this.newEntry(config))
+    this.persist()
     this.emitChange()
     return { ok: true }
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Connect and sign in                                                */
+  /* ---------------------------------------------------------------- */
+
   /*
-   * Connect: confirm the daemon is ready, authenticate if remote, and load its
-   * repo list. A password is only needed for a remote daemon that has been set
-   * up; the unix socket is gated by filesystem permissions instead.
+   * Connect: confirm the daemon is ready, sign in if it is remote, and load
+   * its repo list.
+   *
+   * For a remote daemon the order is: a password if one was just typed;
+   * otherwise the stored session token, if any; otherwise ask. A token the
+   * daemon refuses (expired, revoked by a sign-out elsewhere, or the daemon's
+   * database replaced) is forgotten and the user is asked, rather than
+   * failing the connection with "unauthorized".
    */
   async connect(
     name: string,
-    credentials?: { password?: string }
-  ): Promise<{ ok: boolean; error?: string; needsCredentials?: boolean }> {
+    credentials?: { password?: string; remember?: boolean }
+  ): Promise<ConnectResult> {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
 
     entry.status = 'connecting'
     entry.error = undefined
+    entry.needsCredentials = false
     this.emitChange()
 
     try {
@@ -92,63 +184,104 @@ export class ConnectionManager extends EventEmitter {
       entry.version = info.version
 
       if (entry.config.type === 'remote') {
+        if (!(await entry.client.isSetup())) {
+          return this.fail(entry, notConfiguredMessage(describe(entry.config)))
+        }
         if (credentials?.password) {
-          await entry.client.login(credentials.password)
-        } else if (await entry.client.isSetup()) {
-          /* Configured but no token: the UI must prompt rather than fail, or
-           * the user has no way to supply one. */
-          entry.status = 'disconnected'
-          this.emitChange()
-          return { ok: false, needsCredentials: true, error: 'password required' }
+          const token = await entry.client.login(credentials.password)
+          if (credentials.remember) this.store.setToken(name, token)
+          else this.store.deleteToken(name)
+        } else if (!entry.client.hasToken()) {
+          return this.askForPassword(entry)
         }
       }
 
-      entry.repos = await this.loadRepos(entry)
+      const repos = await this.loadRepos(entry)
+      if (repos === 'unauthorized') {
+        this.store.deleteToken(name)
+        entry.client.setToken(undefined)
+        return this.askForPassword(entry)
+      }
+      entry.repos = repos
       entry.status = 'connected'
       this.emitChange()
       return { ok: true }
     } catch (err) {
       const message =
         err instanceof DaemonUnreachableError
-          ? `${err.message}. Start it with 'systemctl start c-backupd'.`
+          ? unreachableMessage(entry.config, err)
           : err instanceof Error
             ? err.message
             : String(err)
-      entry.status = 'error'
-      entry.error = message
-      this.emitChange()
-      return { ok: false, error: message }
+      return this.fail(entry, message)
     }
+  }
+
+  private fail(entry: Entry, message: string): ConnectResult {
+    entry.status = 'error'
+    entry.error = message
+    entry.repos = []
+    this.emitChange()
+    return { ok: false, error: message }
+  }
+
+  private askForPassword(entry: Entry): ConnectResult {
+    entry.status = 'disconnected'
+    entry.needsCredentials = true
+    entry.repos = []
+    this.emitChange()
+    return { ok: false, needsCredentials: true, error: 'password required' }
   }
 
   disconnect(name: string): { ok: boolean } {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false }
-    /* Nothing to tear down: there is no session, only requests. */
+    /* Nothing to tear down: there is no session, only requests. The stored
+     * token stays, so connecting again does not ask. */
     entry.status = 'disconnected'
     entry.repos = []
+    entry.needsCredentials = false
     this.emitChange()
     return { ok: true }
   }
 
   /*
-   * Through toEndpoint like everything else.
-   *
-   * These three built their paths by hand - 'GET /repos', 'POST /repos',
-   * `DELETE /repos/${id}` - which is the exact hole the union exists to
-   * close, just one process further in. It happened to be correct, but
-   * nothing checked that and nothing would have said so if a route moved.
-   * The contract suite covers repoList, repoAdd and repoRemove against a
-   * live daemon; it could not vouch for these until they went through it.
+   * Sign out: revoke the session on the daemon and forget the token. The
+   * next connect asks for the password. Revocation is best effort, because a
+   * daemon that cannot be reached still should not leave a token behind here.
+   */
+  async signOut(name: string): Promise<{ ok: boolean; error?: string }> {
+    const entry = this.entries.get(name)
+    if (!entry) return { ok: false, error: `no connection '${name}'` }
+    try {
+      await entry.client.logout()
+    } catch {
+      /* forgotten locally either way */
+    }
+    entry.client.setToken(undefined)
+    this.store.deleteToken(name)
+    this.disconnect(name)
+    return { ok: true }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Requests                                                          */
+  /* ---------------------------------------------------------------- */
+
+  /*
+   * Through toEndpoint like everything else, so the set of paths this can
+   * produce is fixed at compile time and checked against a live daemon by
+   * tests/contract.test.ts.
    */
   private async requestVia<T>(entry: Entry, req: ApiRequest) {
     const ep = toEndpoint(req)
     return entry.client.request<T>(ep.method, ep.path, ep.body)
   }
 
-  private async loadRepos(entry: Entry): Promise<RepoState[]> {
+  private async loadRepos(entry: Entry): Promise<RepoState[] | 'unauthorized'> {
     const res = await this.requestVia<{ repos?: Array<Record<string, string>> }>(
       entry, { kind: 'repoList' })
+    if (res.status === 401) return 'unauthorized'
     if (res.status !== 200) throw new Error(`cannot list repos (HTTP ${res.status})`)
     return (res.body?.repos ?? []).map((r) => ({
       id: Number(r.id),
@@ -158,9 +291,25 @@ export class ConnectionManager extends EventEmitter {
     }))
   }
 
-  /* Registration replaces the old init/add/open trio: the daemon creates the
-   * directory if needed, writes the marker, and records the row, so there is
-   * one operation rather than three. */
+  /* A 401 after connecting means the session ended under us: the token
+   * expired, or was revoked by a sign-out elsewhere. Say so and ask again,
+   * rather than leave the sidebar on "connected" while every request fails. */
+  private sessionEnded(entry: Entry): Error {
+    this.store.deleteToken(entry.config.name)
+    entry.client.setToken(undefined)
+    this.askForPassword(entry)
+    return new Error('the session with this daemon has ended: sign in again')
+  }
+
+  private async refreshRepos(entry: Entry): Promise<void> {
+    const repos = await this.loadRepos(entry)
+    if (repos === 'unauthorized') throw this.sessionEnded(entry)
+    entry.repos = repos
+    this.emitChange()
+  }
+
+  /* Registration creates the directory and marker if they do not exist, so
+   * "add an existing repository" and "create a new one" are one operation. */
   async addRepo(
     name: string,
     repoPath: string,
@@ -172,27 +321,32 @@ export class ConnectionManager extends EventEmitter {
       const res = await this.requestVia<{ error?: string }>(entry, {
         kind: 'repoAdd', path: repoPath, label: label ?? '',
       })
+      if (res.status === 401) throw this.sessionEnded(entry)
       if (res.status !== 200 && res.status !== 201) {
         return { ok: false, error: res.body?.error ?? `HTTP ${res.status}` }
       }
-      entry.repos = await this.loadRepos(entry)
-      this.emitChange()
+      await this.refreshRepos(entry)
       return { ok: true }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   }
 
+  /* By id. The renderer used to pass the path here, which became
+   * /repos/NaN, and removing a repository from the sidebar did nothing. */
   async removeRepo(name: string, repoId: number): Promise<{ ok: boolean; error?: string }> {
     const entry = this.entries.get(name)
     if (!entry) return { ok: false, error: `no connection '${name}'` }
+    if (!Number.isInteger(repoId) || repoId <= 0) {
+      return { ok: false, error: `not a repository id: ${repoId}` }
+    }
     try {
-      const res = await this.requestVia(entry, { kind: 'repoRemove', repoId })
+      const res = await this.requestVia<{ error?: string }>(entry, { kind: 'repoRemove', repoId })
+      if (res.status === 401) throw this.sessionEnded(entry)
       if (res.status !== 204 && res.status !== 200) {
-        return { ok: false, error: `HTTP ${res.status}` }
+        return { ok: false, error: res.body?.error ?? `HTTP ${res.status}` }
       }
-      entry.repos = await this.loadRepos(entry)
-      this.emitChange()
+      await this.refreshRepos(entry)
       return { ok: true }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
@@ -202,37 +356,27 @@ export class ConnectionManager extends EventEmitter {
   /*
    * The renderer's only way to reach the daemon.
    *
-   * The endpoint comes from client.ts rather than from interpolating a
-   * caller's string, so the set of paths this can produce is fixed at
-   * compile time and checked against a live daemon by
-   * tests/contract.test.ts. There used to be a second entry point beside
-   * this one that took an action name and looked it up in a table; it is
-   * gone, along with every screen that depended on it.
+   * A daemon that dies after a connection is established used to leave the
+   * sidebar saying "connected" while every request failed, and a remote
+   * session that expired did the same with "unauthorized". The status is what
+   * somebody looks at to decide whether the problem is theirs, so it follows
+   * the daemon rather than remembering the last time it was asked.
    */
   async apiCall<T = unknown>(name: string, req: ApiRequest): Promise<T> {
     const entry = this.entries.get(name)
     if (!entry) throw new Error(`no connection '${name}'`)
     if (entry.status !== 'connected') throw new Error(`'${name}' is not connected`)
 
-    /*
-     * A daemon that dies after a connection is established used to leave the
-     * sidebar saying "connected" while every request failed: unreachability
-     * was only ever handled during connect. The status is what somebody
-     * looks at to decide whether the problem is theirs, so it has to follow
-     * the daemon rather than remember the last time it was asked.
-     */
     let res
     try {
       res = await this.requestVia<T>(entry, req)
     } catch (err) {
       if (err instanceof DaemonUnreachableError) {
-        entry.status = 'error'
-        entry.error = `${err.message}. Start it with 'systemctl start c-backupd'.`
-        entry.repos = []
-        this.emitChange()
+        this.fail(entry, unreachableMessage(entry.config, err))
       }
       throw err
     }
+    if (res.status === 401 && entry.config.type === 'remote') throw this.sessionEnded(entry)
     if (res.status >= 400) {
       const body = res.body as { error?: string } | undefined
       throw new Error(body?.error ?? `HTTP ${res.status}`)
@@ -240,86 +384,57 @@ export class ConnectionManager extends EventEmitter {
     return res.body
   }
 
+  /* ---------------------------------------------------------------- */
+  /* State                                                             */
+  /* ---------------------------------------------------------------- */
 
-  listConnections(): ConnectionState[] {
-    return Array.from(this.entries.values()).map((e) => ({
+  private stateOf(e: Entry): ConnectionState {
+    return {
       config: e.config,
       status: e.status,
       error: e.error,
       repos: e.repos,
-    }))
+      needsCredentials: e.needsCredentials,
+      signedIn: e.config.type === 'remote' && e.client.hasToken(),
+    }
+  }
+
+  listConnections(): ConnectionState[] {
+    return Array.from(this.entries.values()).map((e) => this.stateOf(e))
   }
 
   getStatus(name: string): ConnectionState | null {
     const e = this.entries.get(name)
-    if (!e) return null
-    return { config: e.config, status: e.status, error: e.error, repos: e.repos }
+    return e ? this.stateOf(e) : null
   }
 
-  /* Reconnect everything the config file remembers, at startup. */
+  /*
+   * Bring back what the config file remembers, at startup. Local daemons
+   * need no credential and a remote one with a stored session needs none
+   * either, so both connect unattended; a remote with nothing stored waits
+   * for the user to choose Connect.
+   */
   async restoreFromConfig(configs: ConnectionConfig[]): Promise<void> {
     for (const config of configs) {
-      if (!this.entries.has(config.name)) this.addConnection(config)
-      /* Local daemons need no credential, so they can come up on their own.
-       * Remote ones wait for the user, since a token may be needed. */
-      if (config.type === 'local') await this.connect(config.name)
+      if (!this.entries.has(config.name)) this.addConnection(config, { persist: false })
     }
-  }
-
-  /* A local connection can connect unattended; a remote one may need a
-   * password the app does not have. */
-  canAutoConnect(name: string): boolean {
-    const e = this.entries.get(name)
-    return !!e && e.config.type === 'local'
+    await Promise.all(configs.map((config) => {
+      const entry = this.entries.get(config.name)
+      if (!entry) return undefined
+      if (config.type === 'local' || entry.client.hasToken()) return this.connect(config.name)
+      return undefined
+    }))
   }
 
   async disconnectAll(): Promise<void> {
     for (const name of this.entries.keys()) this.disconnect(name)
   }
 
-  /* Reconnecting is the whole of "restart" now. There is no child process to
-   * kill and respawn: the daemon's lifetime is systemd's business, not the
-   * app's. */
-  async restartConnection(name: string): Promise<{ ok: boolean; error?: string }> {
+  /* Reconnecting is the whole of "restart": the daemon's lifetime is
+   * systemd's business, not the app's. */
+  async restartConnection(name: string): Promise<ConnectResult> {
     this.disconnect(name)
     return this.connect(name)
-  }
-
-  /*
-   * Registration creates the repo if it does not exist, so there is no longer
-   * a separate init step. Kept as a distinct entry point because the UI still
-   * distinguishes "make me a new one" from "adopt this one", and the daemon
-   * treats both the same way.
-   */
-  async initRepo(name: string, repoPath: string): Promise<{ ok: boolean; error?: string }> {
-    return this.addRepo(name, repoPath)
-  }
-
-  /*
-   * There is no session to open or close. The old transport had to spawn a
-   * process per repo and hold it; requests are stateless now, so these exist
-   * only so the renderer's existing calls remain valid.
-   */
-  async openRepo(_name: string, _repoId: number): Promise<{ ok: boolean }> {
-    return { ok: true }
-  }
-
-  async closeRepo(_name: string, _repoId: number): Promise<{ ok: boolean }> {
-    return { ok: true }
-  }
-
-  /*
-   * Moving a repo is not an edit the daemon can make on the app's behalf: the
-   * data has to move on disk first, after which registering the new path
-   * re-links it by uuid and keeps its history.
-   */
-  async editRepo(): Promise<{ ok: boolean; error?: string }> {
-    return {
-      ok: false,
-      error:
-        'move the repository directory, then register the new path; ' +
-        'it is re-linked by its .cbackup uuid',
-    }
   }
 
   private emitChange(): void {

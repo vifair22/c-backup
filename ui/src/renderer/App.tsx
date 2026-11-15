@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import type { Job } from '../shared/api'
 import type { MaintenanceOp } from '../shared/api'
-import type { ConnectionState, ConnectionConfig } from '../shared/types'
+import type { ConnectionState, ConnectionConfig, CredentialInfo } from '../shared/types'
 import { AddConnectionDialog } from './AddConnectionDialog'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -128,17 +128,17 @@ export function App(): React.ReactElement {
   // Dialogs
   const [showAddConnection, setShowAddConnection] = useState(false)
   const [editingConnection, setEditingConnection] = useState<ConnectionConfig | null>(null)
-  const [connectingName, setConnectingName] = useState<string | null>(null)
-  const [pendingRepoOpen, setPendingRepoOpen] = useState<{ conn: string; path: string; id: number } | null>(null)
-  const [sudoPasswordInput, setSudoPasswordInput] = useState('')
-  const [savePassword, setSavePassword] = useState(true)
+  /* The remote connection the sign-in dialog is open for, and what it says. */
+  const [signingIn, setSigningIn] = useState<string | null>(null)
+  const [passwordInput, setPasswordInput] = useState('')
+  const [rememberSession, setRememberSession] = useState(true)
+  const [signInError, setSignInError] = useState<string | null>(null)
+  const [signInBusy, setSignInBusy] = useState(false)
+  const [credInfo, setCredInfo] = useState<CredentialInfo | null>(null)
   const [addRepoConn, setAddRepoConn] = useState<string | null>(null)
   const [repoPathInput, setRepoPathInput] = useState('')
+  const [addRepoBusy, setAddRepoBusy] = useState(false)
   const [postCreateConn, setPostCreateConn] = useState<string | null>(null)
-  const [editingRepo, setEditingRepo] = useState<{ connName: string; oldPath: string } | null>(null)
-  const [initRepoConn, setInitRepoConn] = useState<string | null>(null)
-  const [initRepoPath, setInitRepoPath] = useState('')
-  const [initRepoLoading, setInitRepoLoading] = useState(false)
 
   // Collapsed connections
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -197,6 +197,14 @@ export function App(): React.ReactElement {
     const result = await api.connectionAdd(config)
     if (!result.ok) { setError(result.error ?? 'Failed to add connection'); return }
     await refreshConnections()
+    /* Connect straight away, so a mistyped address or a daemon with no
+     * password shows up now rather than at the first click. A remote one
+     * asks for its password here; offering to add a repository only makes
+     * sense once there is a daemon to add it to. */
+    const conn = await api.connectionConnect(config.name)
+    await refreshConnections()
+    if (conn.needsCredentials) { openSignIn(config.name); return }
+    if (!conn.ok) { setError(conn.error ?? 'Connection failed'); return }
     setPostCreateConn(config.name)
   }
 
@@ -212,37 +220,56 @@ export function App(): React.ReactElement {
     setEditingConnection(null)
   }
 
-  const handleConnectWithCredentials = async () => {
-    if (!connectingName) return
+  /* The password prompt, for a remote daemon that needs one. */
+  const openSignIn = (name: string) => {
+    setSigningIn(name)
+    setPasswordInput('')
+    setRememberSession(true)
+    setSignInError(null)
+    if (!credInfo) void api.credentialInfo().then(setCredInfo).catch(() => {})
+  }
+
+  const handleConnect = async (name: string) => {
     setError(null)
-    const conn = connections.find(c => c.config.name === connectingName)
-    const creds: { password?: string; sudoPassword?: string; save?: boolean } = { save: savePassword }
-    /* Only a remote daemon needs a credential: the unix socket is gated by
-     * file permissions, and there is no sudo escalation any more. */
-    if (conn?.config.type === 'remote') creds.password = sudoPasswordInput
-
-    setConnectingName(null)
-    const result = await api.connectionConnect(connectingName, creds)
-    if (!result.ok) { setError(result.error ?? 'Connection failed'); return }
+    const result = await api.connectionConnect(name)
     await refreshConnections()
+    if (result.needsCredentials) { openSignIn(name); return }
+    if (!result.ok) setError(result.error ?? 'Connection failed')
+  }
 
-    // If we were trying to do something, retry now
-    if (pendingRepoOpen && pendingRepoOpen.conn === connectingName) {
-      const pending = pendingRepoOpen
-      setPendingRepoOpen(null)
-      if (pending.path === '' && initRepoConn) {
-        // Was trying to init a repo
-        await handleInitRepo()
-      } else {
-        await handleOpenRepo(pending.conn, pending.path, pending.id)
-      }
+  /* Wrong passwords keep the dialog open with the reason, rather than
+   * closing it and leaving a banner the user has to dismiss to retry. */
+  const handleSignIn = async () => {
+    if (!signingIn) return
+    const name = signingIn
+    setSignInBusy(true)
+    setSignInError(null)
+    const result = await api.connectionConnect(name, {
+      password: passwordInput, remember: rememberSession,
+    })
+    setSignInBusy(false)
+    await refreshConnections()
+    if (!result.ok) { setSignInError(result.error ?? 'Sign-in failed'); return }
+    setSigningIn(null)
+    setPasswordInput('')
+  }
+
+  const handleSignOut = async (name: string) => {
+    setError(null)
+    await api.connectionSignOut(name)
+    if (activeRepo?.conn === name) {
+      setActiveRepo(null)
+      setNavHistory([{ view: 'dashboard' }])
+      setNavIndex(0)
+      setTaskList([])
     }
+    await refreshConnections()
   }
 
   const handleRemoveConnection = async (name: string) => {
     setConfirmDialog({
       title: 'Delete Connection',
-      message: `Delete "${name}"? All repo sessions will be closed and saved credentials will be removed.`,
+      message: `Delete "${name}"? Its saved sign-in is forgotten. The daemon and its repositories are not touched.`,
       onConfirm: async () => {
         setConfirmDialog(null)
         await api.connectionRemove(name)
@@ -260,90 +287,37 @@ export function App(): React.ReactElement {
   const handleRestartConnection = async (name: string) => {
     setError(null)
     const result = await api.connectionRestart(name)
-    if (!result.ok) setError(result.error ?? 'Restart failed')
     await refreshConnections()
+    if (result.needsCredentials) { openSignIn(name); return }
+    if (!result.ok) setError(result.error ?? 'Reconnect failed')
   }
 
+  /* One operation for "adopt this repository" and "create a new one": the
+   * daemon makes the directory and its marker when they do not exist. */
   const handleAddRepo = async () => {
     if (!addRepoConn || !repoPathInput.trim()) return
     const connName = addRepoConn
     const path = repoPathInput.trim()
     setError(null)
+    setAddRepoBusy(true)
     const result = await api.repoAdd(connName, path)
-    if (!result.ok) { setError(result.error ?? 'Failed to add repo'); return }
+    setAddRepoBusy(false)
+    await refreshConnections()
+    if (!result.ok) { setError(result.error ?? 'Failed to add repository'); return }
     setAddRepoConn(null)
     setRepoPathInput('')
-    await refreshConnections()
-
-    // Probe the repo to verify it's reachable
-    const probe = await api.repoOpen(connName, path)
-    if (!probe.ok && !probe.needsCredentials) {
-      setConfirmDialog({
-        title: 'Repository Not Reachable',
-        message: `Could not open "${path.split('/').pop() || path}": ${probe.error ?? 'unknown error'}. Keep it anyway?`,
-        confirmLabel: 'Keep',
-        cancelLabel: 'Remove',
-        danger: false,
-        onConfirm: () => setConfirmDialog(null),
-        onCancel: async () => {
-          setConfirmDialog(null)
-          await api.repoRemove(connName, path)
-          await refreshConnections()
-        },
-      })
-    } else {
-      await refreshConnections()
-    }
   }
 
-  const handleInitRepo = async () => {
-    if (!initRepoConn || !initRepoPath.trim()) return
-    const connName = initRepoConn
-    const path = initRepoPath.trim()
-    setError(null)
-    setInitRepoLoading(true)
-    const result = await api.repoInit(connName, path)
-    setInitRepoLoading(false)
-    if (!result.ok) {
-      if (result.needsCredentials) {
-        // Stash the init intent, show credential dialog
-        setPendingRepoOpen({ conn: connName, path: '', id: 0 }) // empty path signals init, not open
-        setConnectingName(connName)
-        setSudoPasswordInput('')
-        setSavePassword(true)
-        return
-      }
-      setError(result.error ?? 'Failed to create repo')
-      return
-    }
-    setInitRepoConn(null)
-    setInitRepoPath('')
-    await refreshConnections()
-  }
-
-  const handleEditRepo = async () => {
-    if (!editingRepo || !repoPathInput.trim()) return
-    if (repoPathInput.trim() === editingRepo.oldPath) { setEditingRepo(null); return }
-    setError(null)
-    const result = await api.repoEdit(editingRepo.connName, editingRepo.oldPath, repoPathInput.trim())
-    if (!result.ok) setError(result.error ?? 'Failed to edit repo')
-    if (activeRepo?.conn === editingRepo.connName && activeRepo?.path === editingRepo.oldPath) {
-      setActiveRepo(prev => prev ? { ...prev, path: repoPathInput.trim() } : prev)
-    }
-    await refreshConnections()
-    setEditingRepo(null)
-    setRepoPathInput('')
-  }
-
-  const handleRemoveRepo = (connName: string, repoPath: string) => {
+  const handleRemoveRepo = (connName: string, repo: { id: number; path: string; label?: string }) => {
     setConfirmDialog({
       title: 'Remove Repository',
-      message: `Remove "${repoPath.split('/').pop() || repoPath}" from this connection? This does not delete the actual data.`,
+      message: `Remove "${repo.label || repo.path.split('/').pop() || repo.path}" from this daemon? The data on disk is not deleted.`,
       confirmLabel: 'Remove',
       onConfirm: async () => {
         setConfirmDialog(null)
-        await api.repoRemove(connName, repoPath)
-        if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
+        const result = await api.repoRemove(connName, repo.id)
+        if (!result.ok) { setError(result.error ?? 'Failed to remove repository'); return }
+        if (activeRepo?.conn === connName && activeRepo?.id === repo.id) {
           setActiveRepo(null)
           setNavHistory([{ view: 'dashboard' }])
           setNavIndex(0)
@@ -354,7 +328,9 @@ export function App(): React.ReactElement {
     })
   }
 
-  const handleOpenRepo = async (connName: string, repoPath: string, repoId: number) => {
+  /* Requests are stateless, so opening a repository is choosing it. There
+   * used to be an "open" round trip here that did nothing. */
+  const handleOpenRepo = (connName: string, repoPath: string, repoId: number) => {
     setError(null)
     /* Opening a repository leaves the daemon screen, which otherwise sits
      * in front of it. */
@@ -362,23 +338,6 @@ export function App(): React.ReactElement {
     setActiveRepo({ conn: connName, id: repoId, path: repoPath })
     setNavHistory([{ view: 'dashboard' }])
     setNavIndex(0)
-    try {
-      const result = await api.repoOpen(connName, repoPath)
-      if (!result.ok) {
-        if (result.needsCredentials) {
-          setPendingRepoOpen({ conn: connName, path: repoPath, id: repoId })
-          setConnectingName(connName)
-          setSudoPasswordInput('')
-          setSavePassword(true)
-          return
-        }
-        setError(result.error ?? 'Failed to open repo')
-        return
-      }
-      await refreshConnections()
-    } catch (err) {
-      setError(`RPC error: ${err}`)
-    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -509,56 +468,67 @@ export function App(): React.ReactElement {
   /* Context menus                                                     */
   /* ---------------------------------------------------------------- */
 
+  const leaveConnection = (name: string) => {
+    if (activeRepo?.conn === name) {
+      setActiveRepo(null)
+      setNavHistory([{ view: 'dashboard' }])
+      setNavIndex(0)
+      setTaskList([])
+    }
+  }
+
   const showConnectionMenu = (e: React.MouseEvent, conn: ConnectionState) => {
     e.preventDefault()
+    const name = conn.config.name
+    const connected = conn.status === 'connected'
+    const busy = conn.status === 'connecting'
     setContextMenu({
       x: e.clientX, y: e.clientY,
       items: [
-        { label: 'Edit', onClick: () => setEditingConnection(conn.config) },
-        { label: 'Add Repo', onClick: () => { setAddRepoConn(conn.config.name); setRepoPathInput('') } },
-        { label: 'Create New Repo', onClick: () => { setInitRepoConn(conn.config.name); setInitRepoPath('') } },
-        ...(conn.status === 'connected' ? [
+        ...(!connected && !busy ? [
+          conn.needsCredentials
+            ? { label: 'Sign in', onClick: () => openSignIn(name) }
+            : { label: 'Connect', onClick: () => { void handleConnect(name) } },
+        ] : []),
+        ...(connected ? [
+          { label: 'Add Repository', onClick: () => { setAddRepoConn(name); setRepoPathInput('') } },
+          { label: 'Daemon status', onClick: () => setStatusConn(name) },
+          { label: 'Reconnect', onClick: () => handleRestartConnection(name) },
           { label: 'Disconnect', onClick: async () => {
-            await api.connectionDisconnect(conn.config.name)
-            if (activeRepo?.conn === conn.config.name) {
-              setActiveRepo(null)
-              setNavHistory([{ view: 'dashboard' }])
-              setNavIndex(0)
-              setTaskList([])
-            }
+            await api.connectionDisconnect(name)
+            leaveConnection(name)
             await refreshConnections()
           }},
-          { label: 'Restart', onClick: () => handleRestartConnection(conn.config.name) },
-          { label: 'Daemon status', onClick: () => setStatusConn(conn.config.name) },
         ] : []),
-        { label: 'Delete', danger: true, onClick: () => handleRemoveConnection(conn.config.name) },
+        ...(conn.signedIn ? [
+          { label: 'Sign out', onClick: () => { void handleSignOut(name) } },
+        ] : []),
+        { label: 'Edit', onClick: () => setEditingConnection(conn.config) },
+        { label: 'Delete', danger: true, onClick: () => handleRemoveConnection(name) },
       ]
     })
   }
 
-  const showRepoMenu = (e: React.MouseEvent, connName: string, repoPath: string) => {
+  const showRepoMenu = (e: React.MouseEvent, connName: string, repo: { id: number; path: string; label?: string }) => {
     e.preventDefault()
     e.stopPropagation()
-    const repo = connections.find(c => c.config.name === connName)?.repos.find(r => r.path === repoPath)
     setContextMenu({
       x: e.clientX, y: e.clientY,
       items: [
-        ...(repo ? [{
-          label: 'Disconnect', onClick: async () => {
-            await api.repoClose(connName, repoPath)
-            if (activeRepo?.conn === connName && activeRepo?.path === repoPath) {
-              setActiveRepo(null)
-              setNavHistory([{ view: 'dashboard' }])
-              setNavIndex(0)
-              setTaskList([])
-            }
-            await refreshConnections()
-          }
-        }] : []),
-        { label: 'Edit Path', onClick: () => { setEditingRepo({ connName, oldPath: repoPath }); setRepoPathInput(repoPath) } },
-        { label: 'Remove', danger: true, onClick: () => handleRemoveRepo(connName, repoPath) },
+        { label: 'Remove', danger: true, onClick: () => handleRemoveRepo(connName, repo) },
       ]
     })
+  }
+
+  /* Paths typed into the app are resolved by the daemon, on its host. For a
+   * remote connection that is not this machine, and the forms say so. */
+  const hostOf = (connName: string): string | null => {
+    const c = connections.find(x => x.config.name === connName)?.config
+    return c && c.type === 'remote' ? c.host : null
+  }
+  const pathLabel = (connName: string, what: string): string => {
+    const host = hostOf(connName)
+    return host ? `${what} on ${host}` : what
   }
 
   /* ---------------------------------------------------------------- */
@@ -574,8 +544,14 @@ export function App(): React.ReactElement {
     }
   }
 
+  /* The status in words beside the dot, on the connection rather than on
+   * every repository under it, where a "connected" tag used to sit on each
+   * row whatever the connection was doing. */
   const connLabel = (conn: ConnectionState) => {
     const parts = [conn.config.type === 'remote' ? 'remote' : 'local']
+    if (conn.status === 'connected') parts.push('connected')
+    else if (conn.status === 'connecting') parts.push('connecting')
+    else if (conn.needsCredentials) parts.push('signed out')
     return parts.join(', ')
   }
 
@@ -621,15 +597,27 @@ export function App(): React.ReactElement {
                 <div className="text-status-error text-[11px] ml-4 mt-0.5">{conn.error}</div>
               )}
 
+              {/* A disconnected connection says how to bring it back, so the
+                * only way in is not a right-click nobody knows about. */}
+              {conn.status !== 'connected' && conn.status !== 'connecting' && (
+                <div className="ml-4 mt-0.5">
+                  <button
+                    onClick={() => conn.needsCredentials ? openSignIn(conn.config.name) : void handleConnect(conn.config.name)}
+                    className="text-[11px] cursor-pointer text-accent hover:text-accent-hover bg-transparent border-none p-0">
+                    {conn.needsCredentials ? 'Sign in' : 'Connect'}
+                  </button>
+                </div>
+              )}
+
               {/* Repos */}
               {!collapsed.has(conn.config.name) && <div className="ml-4 mt-1">
                 {conn.repos.map(repo => (
                   <div
-                    key={repo.path}
+                    key={repo.id}
                     onClick={() => handleOpenRepo(conn.config.name, repo.path, repo.id)}
-                    onContextMenu={e => showRepoMenu(e, conn.config.name, repo.path)}
+                    onContextMenu={e => showRepoMenu(e, conn.config.name, repo)}
                     className={`text-xs py-1 px-1.5 rounded mb-0.5 cursor-pointer hover:bg-surface-hover ${
-                      activeRepo?.conn === conn.config.name && activeRepo?.path === repo.path ? 'bg-surface-active' : ''
+                      activeRepo?.conn === conn.config.name && activeRepo?.id === repo.id ? 'bg-surface-active' : ''
                     }`}
                   >
                     {/*
@@ -642,15 +630,14 @@ export function App(): React.ReactElement {
                     <span className="text-text-primary" title={repo.path}>
                       {repo.label || repo.path.split('/').pop() || repo.path}
                     </span>
-                    {(
-                      <span className="text-status-connected text-[10px] ml-1.5">connected</span>
-                    )}
                   </div>
                 ))}
-                <button onClick={() => { setAddRepoConn(conn.config.name); setRepoPathInput('') }}
-                  className="text-[10px] mt-0.5 cursor-pointer text-accent hover:text-accent-hover bg-transparent border-none px-1.5">
-                  + Add repo
-                </button>
+                {conn.status === 'connected' && (
+                  <button onClick={() => { setAddRepoConn(conn.config.name); setRepoPathInput('') }}
+                    className="text-[10px] mt-0.5 cursor-pointer text-accent hover:text-accent-hover bg-transparent border-none px-1.5">
+                    + Add repo
+                  </button>
+                )}
               </div>}
             </div>
           ))}
@@ -884,106 +871,78 @@ export function App(): React.ReactElement {
         </Overlay>
       )}
 
-      {/* Credential prompt */}
-      {connectingName && (
+      {/* Sign-in prompt, for a remote daemon */}
+      {signingIn && (
         <Overlay>
-          <form onSubmit={e => { e.preventDefault(); handleConnectWithCredentials() }} className="bg-surface-primary rounded-lg p-5 w-80 shadow-xl border border-border-default">
-            <h3 className="text-sm font-semibold m-0 mb-3">Connect: {connectingName}</h3>
+          <form onSubmit={e => { e.preventDefault(); void handleSignIn() }} className="bg-surface-primary rounded-lg p-5 w-80 shadow-xl border border-border-default">
+            <h3 className="text-sm font-semibold m-0 mb-1">Sign in: {signingIn}</h3>
+            <div className="text-text-muted text-[11px] mb-3">
+              The daemon's admin password, set on its host with <span className="font-mono">c-backup auth setup</span>.
+            </div>
             <div className="mb-3">
               <label className="block text-xs font-medium text-text-secondary mb-1">
                 Admin password
               </label>
-              <input type="password" value={sudoPasswordInput} onChange={e => setSudoPasswordInput(e.target.value)}
+              <input type="password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)}
                 className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
-                autoFocus required />
+                autoFocus required disabled={signInBusy} />
             </div>
             <div className="mb-3">
               <label className="text-xs flex items-center gap-1.5 cursor-pointer text-text-secondary">
-                <input type="checkbox" checked={savePassword} onChange={e => setSavePassword(e.target.checked)} />
-                Save password (encrypted in OS keychain)
+                <input type="checkbox" checked={rememberSession} onChange={e => setRememberSession(e.target.checked)} />
+                Stay signed in
               </label>
+              {/* What staying signed in keeps, and how. Never the password:
+                * the daemon issues a session token and that is stored. */}
+              {rememberSession && credInfo && (
+                <div className="text-[10px] text-text-muted mt-1 ml-5">
+                  {credInfo.encrypted
+                    ? 'Keeps a session token, encrypted with the system keyring. Not the password.'
+                    : 'No system keyring is available, so the session token is stored unencrypted, in a file only your account can read. Not the password.'}
+                </div>
+              )}
             </div>
+            {signInError && (
+              <div className="text-status-error text-[11px] mb-3">{signInError}</div>
+            )}
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => { setConnectingName(null); setPendingRepoOpen(null) }}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
+              <button type="button" onClick={() => { setSigningIn(null); setPasswordInput('') }}
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
+                disabled={signInBusy}>Cancel</button>
               <button type="submit"
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Connect</button>
+                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
+                disabled={signInBusy}>{signInBusy ? 'Signing in...' : 'Sign in'}</button>
             </div>
           </form>
         </Overlay>
       )}
 
-      {/* Add repo dialog */}
+      {/* Add repo dialog. Creates the repository when the path is new. */}
       {addRepoConn && (
         <Overlay>
-          <form onSubmit={e => { e.preventDefault(); handleAddRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
+          <form onSubmit={e => { e.preventDefault(); void handleAddRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
             <h3 className="text-sm font-semibold m-0 mb-2">Add Repository</h3>
             <div className="text-text-muted text-xs mb-3">Connection: {addRepoConn}</div>
             <div className="mb-3">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Repository Path (absolute)</label>
+              <label className="block text-xs font-medium text-text-secondary mb-1">{pathLabel(addRepoConn, 'Repository path')} (absolute)</label>
               <input value={repoPathInput} onChange={e => setRepoPathInput(e.target.value)}
                 placeholder="/path/to/backup/repo"
                 className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
-                autoFocus required />
+                autoFocus required disabled={addRepoBusy} />
+              <div className="text-[10px] text-text-muted mt-1">An existing repository is added as it is. A new path is created and initialised.</div>
             </div>
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setAddRepoConn(null)}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
-              <button type="submit"
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Add</button>
-            </div>
-          </form>
-        </Overlay>
-      )}
-
-      {/* Edit repo dialog */}
-      {/* Create new repo dialog */}
-      {initRepoConn && (
-        <Overlay>
-          <form onSubmit={e => { e.preventDefault(); handleInitRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
-            <h3 className="text-sm font-semibold m-0 mb-2">Create New Repository</h3>
-            <div className="text-text-muted text-xs mb-3">Connection: {initRepoConn}</div>
-            <div className="mb-3">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Repository Path (absolute)</label>
-              <input value={initRepoPath} onChange={e => setInitRepoPath(e.target.value)}
-                placeholder="/path/to/new/repo"
-                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
-                autoFocus required />
-              <div className="text-[10px] text-text-muted mt-1">The directory will be created and initialized as a c-backup repository.</div>
-            </div>
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setInitRepoConn(null)}
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none"
-                disabled={initRepoLoading}>Cancel</button>
+                disabled={addRepoBusy}>Cancel</button>
               <button type="submit"
                 className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none"
-                disabled={initRepoLoading}>{initRepoLoading ? 'Creating...' : 'Create'}</button>
+                disabled={addRepoBusy}>{addRepoBusy ? 'Adding...' : 'Add'}</button>
             </div>
           </form>
         </Overlay>
       )}
 
-      {editingRepo && (
-        <Overlay>
-          <form onSubmit={e => { e.preventDefault(); handleEditRepo() }} className="bg-surface-primary rounded-lg p-5 w-96 shadow-xl border border-border-default">
-            <h3 className="text-sm font-semibold m-0 mb-2">Edit Repository</h3>
-            <div className="text-text-muted text-xs mb-3">Connection: {editingRepo.connName}</div>
-            <div className="mb-3">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Repository Path (absolute)</label>
-              <input value={repoPathInput} onChange={e => setRepoPathInput(e.target.value)}
-                placeholder="/path/to/backup/repo"
-                className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent"
-                autoFocus required />
-            </div>
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setEditingRepo(null)}
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-surface-tertiary text-text-secondary hover:bg-surface-hover border-none">Cancel</button>
-              <button type="submit"
-                className="px-3 py-1.5 text-xs cursor-pointer rounded bg-accent text-accent-text hover:bg-accent-hover border-none">Save</button>
-            </div>
-          </form>
-        </Overlay>
-      )}
       {/* Restore modal */}
       {restoreModal && (
         <Overlay>
@@ -997,7 +956,7 @@ export function App(): React.ReactElement {
               {restoreModal.filePath && <span className="font-mono ml-1">— {restoreModal.filePath}</span>}
             </div>
             <div className="mb-3">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Destination Path</label>
+              <label className="block text-xs font-medium text-text-secondary mb-1">{activeRepo ? pathLabel(activeRepo.conn, 'Destination path') : 'Destination path'}</label>
               <input value={restoreDest} onChange={e => setRestoreDest(e.target.value)}
                 placeholder="/path/to/restore/destination"
                 className="w-full px-2 py-1 border border-border-default rounded text-sm bg-surface-primary text-text-primary focus:outline-none focus:border-accent font-mono"
@@ -1037,7 +996,7 @@ export function App(): React.ReactElement {
               * absence, and verifying on a schedule is the better shape.
               */}
             <div className="mb-3">
-              <div className="text-xs text-text-secondary mb-1.5">Sources</div>
+              <div className="text-xs text-text-secondary mb-1.5">{activeRepo && hostOf(activeRepo.conn) ? `Sources, on ${hostOf(activeRepo.conn)}` : 'Sources'}</div>
               {sourcesLoading ? (
                 <div className="text-xs text-text-tertiary">Loading...</div>
               ) : editingSources ? (
