@@ -66,7 +66,8 @@ test('a wrong password is refused and the dialog stays open', async () => {
   const { page } = h
   await page.locator('input[type="password"]').fill('not the password')
   await signInDialog().getByRole('button', { name: 'Sign in', exact: true }).click()
-  await expect(page.getByText(/login failed/)).toBeVisible({ timeout: 15_000 })
+  /* In the dialog: the sidebar shows the connection's error as well. */
+  await expect(signInDialog().getByText(/login failed/)).toBeVisible({ timeout: 15_000 })
   await expect(page.getByText('Sign in: nas')).toBeVisible()
   expect(credentials()).not.toContain('nas')
 })
