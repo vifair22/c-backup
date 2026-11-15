@@ -28,6 +28,9 @@ interface VerifyRun {
   checked: string
   ok: string
   repaired: string
+  /* Damaged on disk and readable only through parity, not written back:
+   * a scrub with repair off, or a write-back that failed. */
+  recoverable?: string
   unrecoverable: string
   missing: string
   bytes_read: string
@@ -83,7 +86,8 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
     setFindings([])
     /* A run with nothing wrong has nothing to fetch. Asking anyway would be
      * a round trip to be told what the counters already said. */
-    if (n(run.unrecoverable) === 0 && n(run.missing) === 0 && n(run.repaired) === 0) return
+    if (n(run.unrecoverable) === 0 && n(run.missing) === 0 && n(run.repaired) === 0
+        && n(run.recoverable) === 0) return
 
     setLoadingFindings(true)
     try {
@@ -109,6 +113,7 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
   const verdict = (r: VerifyRun): { label: string; cls: string } => {
     if (n(r.completed) === 0) return { label: 'incomplete', cls: 'text-text-muted' }
     if (n(r.unrecoverable) > 0 || n(r.missing) > 0) return { label: 'damaged', cls: 'text-status-error' }
+    if (n(r.recoverable) > 0) return { label: 'recoverable', cls: 'text-status-warning' }
     if (n(r.repaired) > 0) return { label: 'repaired', cls: 'text-status-warning' }
     return { label: 'clean', cls: 'text-status-connected' }
   }
@@ -177,6 +182,8 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                 <Stat label="Read back clean" value={n(selected.ok)} />
                 <Stat label="Repaired"      value={n(selected.repaired)}
                       warn={n(selected.repaired) > 0} />
+                <Stat label="Recoverable"   value={n(selected.recoverable)}
+                      warn={n(selected.recoverable) > 0} />
                 <Stat label="Unrecoverable" value={n(selected.unrecoverable)}
                       bad={n(selected.unrecoverable) > 0} />
                 <Stat label="Missing"       value={n(selected.missing)}
@@ -184,6 +191,14 @@ export function VerifyView({ connName, repoPath, onBack }: Props): React.ReactEl
                 <Stat label="Files affected" value={n(selected.affected_files)}
                       bad={n(selected.affected_files) > 0} />
               </div>
+
+              {n(selected.recoverable) > 0 && (
+                <div className="text-xs mb-3 p-2 rounded bg-surface-secondary text-status-warning border border-status-warning">
+                  {n(selected.recoverable)} object(s) are damaged on disk and readable only
+                  through parity. Nothing was written back: run a verify with repair on
+                  to fix them before more damage makes them unrecoverable.
+                </div>
+              )}
 
               {n(selected.repaired) > 0 && (
                 <div className="text-xs mb-3 p-2 rounded bg-surface-secondary text-status-warning border border-status-warning">
