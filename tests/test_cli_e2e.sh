@@ -12,6 +12,9 @@ set -u
 DAEMON="${1:-build/bins/c-backupd}"
 CLI="${2:-build/bins/c-backup}"
 WORK="$(mktemp -d /tmp/c_backup_cli_e2e.XXXXXX)"
+# Ports per run, so concurrent suites (CI jobs on one runner, parallel
+# worktrees) never reach each other's daemons.
+PORTBASE=$((20000 + ($$ % 15000) * 3))
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
@@ -59,7 +62,7 @@ db:
   path: $WORK/state.db
 http:
   socket: $SOCK
-  port: 18801
+  port: $PORTBASE
   bind: 127.0.0.1
 log:
   level: warn
@@ -536,7 +539,7 @@ db:
   path: $WORK/state2.db
 http:
   socket: $SOCK2
-  port: 18802
+  port: $((PORTBASE + 1))
   bind: 127.0.0.1
 log:
   level: warn
@@ -685,7 +688,7 @@ echo "listen address"
 # proxy", and it was never read: MHD was started without a socket address,
 # which binds every interface. Setting it to 127.0.0.1 produced a port
 # answering on the LAN and a config file saying it did not.
-BINDPORT=18809
+BINDPORT=$((PORTBASE + 2))
 cat > "$WORK/bindcfg.yaml" <<EOF
 db:
   path: $WORK/bind.db
