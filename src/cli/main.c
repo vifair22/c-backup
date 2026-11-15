@@ -309,6 +309,55 @@ static long job_submit(const char *method, const char *path, const char *body)
 }
 
 /*
+ * Print a finished run and its result as one JSON object.
+ *
+ * grep and verify each answer with two responses, the run record and what the
+ * run found, and printed both one after the other. Two JSON documents in a row
+ * is not JSON, so piping either command to a JSON reader failed. Both
+ * responses are objects with distinct keys ("runs", and "hits" or
+ * "findings"), so the merge is splicing the second's members into the first.
+ * Takes ownership of the path buffer.
+ */
+static int print_with_result(const http_response_t *runs, sbuf_t *path)
+{
+    if (path->oom) { free(path->buf); return fail("request too large"); }
+    http_response_t res;
+    memset(&res, 0, sizeof(res));
+    status_t st = http_request(g_socket, "GET", path->buf, NULL, &res);
+    free(path->buf);
+    if (st != OK) return fail("%s", err_msg());
+    if (res.status < 200 || res.status >= 300 || !res.body) {
+        int rc = fail("request failed with HTTP %d", res.status);
+        http_response_free(&res);
+        return rc;
+    }
+
+    const char *a = runs->body ? runs->body : "{}";
+    size_t alen = strlen(a);
+    while (alen && (a[alen - 1] == '\n' || a[alen - 1] == ' ')) alen--;
+    const char *b = res.body;
+    while (*b == ' ' || *b == '\n') b++;
+    size_t blen = strlen(b);
+    while (blen && (b[blen - 1] == '\n' || b[blen - 1] == ' ')) blen--;
+
+    int ok = alen >= 2 && a[0] == '{' && a[alen - 1] == '}'
+          && blen >= 2 && b[0] == '{' && b[blen - 1] == '}';
+    if (!ok) {
+        /* Not two objects: print the result alone rather than guess. */
+        fwrite(b, 1, blen, stdout);
+    } else if (blen == 2) {
+        fwrite(a, 1, alen, stdout);
+    } else {
+        fwrite(a, 1, alen - 1, stdout);       /* without its closing brace */
+        if (alen > 2) fputc(',', stdout);
+        fwrite(b + 1, 1, blen - 1, stdout);   /* without its opening brace */
+    }
+    fputc('\n', stdout);
+    http_response_free(&res);
+    return 0;
+}
+
+/*
  * Poll until the job reaches a terminal state. Returns 0 if it completed, 1
  * otherwise - and on failure prints the job record, because the daemon puts
  * the reason in its error field and that is the whole point of waiting.
@@ -670,16 +719,20 @@ static int cmd_grep(int argc, char **argv)
     long run = -1;
     const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
     if (ip) run = strtol(ip + 6, NULL, 10);
-    if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
-    http_response_free(&rr);
-    if (run < 0) return 0;
+    if (run < 0) {
+        if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
+        http_response_free(&rr);
+        return 0;
+    }
 
     sbuf_t hp = { 0 };
     sb_puts(&hp, "/repos/"); sb_puts(&hp, argv[0]); sb_puts(&hp, "/grep/");
     char runbuf[32];
     snprintf(runbuf, sizeof(runbuf), "%ld", run);
     sb_puts(&hp, runbuf);
-    return call_path_sb("GET", &hp, NULL);
+    int out = print_with_result(&rr, &hp);
+    http_response_free(&rr);
+    return out;
 }
 
 static int cmd_jobs(int argc, char **argv)
@@ -889,16 +942,20 @@ static int cmd_verify(int argc, char **argv)
     long run = -1;
     const char *ip = rr.body ? strstr(rr.body, "\"id\":\"") : NULL;
     if (ip) run = strtol(ip + 6, NULL, 10);
-    if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
-    http_response_free(&rr);
-    if (run < 0) return 0;
+    if (run < 0) {
+        if (rr.body) { fputs(rr.body, stdout); fputc('\n', stdout); }
+        http_response_free(&rr);
+        return 0;
+    }
 
     sbuf_t fp = { 0 };
     sb_puts(&fp, "/repos/"); sb_puts(&fp, argv[0]); sb_puts(&fp, "/verify/");
     char runbuf[32];
     snprintf(runbuf, sizeof(runbuf), "%ld", run);
     sb_puts(&fp, runbuf);
-    return call_path_sb("GET", &fp, NULL);
+    int out = print_with_result(&rr, &fp);
+    http_response_free(&rr);
+    return out;
 }
 
 static int cmd_stats(int argc, char **argv)

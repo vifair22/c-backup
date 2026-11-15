@@ -221,9 +221,10 @@ does not evict the page cache.
 
 Read errors mid-stream get a recovery ladder (transient retry, `lseek` on
 the same fd, reopen by path and seek), capped at 5 attempts; this exists
-for FUSE-backed sources that drop connections under load. The optional
-FUSE readahead ring (a 4-slot reader thread) is off by default,
-`enable_fuse_readahead` opts in.
+for FUSE-backed sources that drop connections under load. There is no
+readahead thread: a FUSE readahead ring existed, could not be switched on
+from any configuration, and was removed before 1.0. Measured on a real shfs
+union, reading through FUSE without it costs about 7%.
 
 **Sparse files.** `SEEK_DATA`/`SEEK_HOLE` discovers data regions before any
 reading. A file with holes is stored as `OBJECT_TYPE_SPARSE`: a small

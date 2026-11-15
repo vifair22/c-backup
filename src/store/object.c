@@ -16,10 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 
-#include <pthread.h>
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -332,252 +330,17 @@ fail:
 
 /* ------------------------------------------------------------------ */
 /* Streaming file → object store.  Single-threaded read → hash → write */
-/* loop.  Uses smaller chunks on FUSE to avoid overwhelming userspace. */
+/* loop.                                                             */
 /* ------------------------------------------------------------------ */
 
 #define STREAM_CHUNK      ((size_t)(128 * 1024 * 1024)) /* 128 MiB write buffer */
-#define STREAM_CHUNK_FUSE ((size_t)(  1 * 1024 * 1024)) /*   1 MiB on FUSE */
 #define STREAM_LOAD_MAX   ((size_t)( 16 * 1024 * 1024)) /*  16 MiB load threshold */
-
-#ifndef FUSE_SUPER_MAGIC
-#define FUSE_SUPER_MAGIC 0x65735546
-#endif
-
-/* Detect whether fd lives on a FUSE filesystem. */
-static int fd_is_fuse(int fd) {
-    struct statfs sfs;
-    if (fstatfs(fd, &sfs) != 0) return 0;
-    return sfs.f_type == (__typeof__(sfs.f_type))FUSE_SUPER_MAGIC;
-}
 
 /* Probe size and compression threshold for LZ4 frame decision */
 #define PROBE_SIZE        (64  * 1024)          /* 64 KiB sample          */
 #define PROBE_RATIO_MAX   0.98                  /* skip LZ4 if > 98% size */
 
 #define STREAM_REOPEN_MAX 5   /* max seek/reopen recovery attempts per file */
-
-/* ------------------------------------------------------------------ */
-/* FUSE readahead ring — overlaps FUSE reads with disk writes.        */
-/*                                                                    */
-/* A single reader thread fills a small bounded ring of 1 MiB buffers */
-/* while the main thread processes (hash + write + CRC + RS).  The    */
-/* ring is small (4 slots) so the FUSE daemon never has more than one */
-/* outstanding read, avoiding the flooding that caused ENXIO before.  */
-/* ------------------------------------------------------------------ */
-
-#define FUSE_RING_SLOTS  4
-#define FUSE_RING_CHUNK  ((size_t)(4 * 1024 * 1024))   /* 4 MiB per slot */
-
-typedef struct {
-    /* Ring state */
-    uint8_t *bufs[FUSE_RING_SLOTS];   /* per-slot buffers, each FUSE_RING_CHUNK */
-    size_t   lens[FUSE_RING_SLOTS];   /* bytes valid in each slot */
-    int      head;                     /* next slot to fill (reader) */
-    int      tail;                     /* next slot to consume (main) */
-    int      count;                    /* slots currently filled */
-
-    /* Synchronization */
-    pthread_mutex_t mu;
-    pthread_cond_t  not_full;          /* reader waits when ring is full */
-    pthread_cond_t  not_empty;         /* main waits when ring is empty */
-
-    /* Reader thread state */
-    int      src_fd;
-    char    *src_path;                 /* for reopen recovery (NULL if no path) */
-    uint64_t file_size;
-    uint64_t read_offset;              /* how far the reader has gotten */
-
-    /* Completion / error signaling */
-    int      done;                     /* reader finished (EOF or error) */
-    int      error;                    /* errno from reader, 0 if none */
-    int      stop;                     /* main thread requests early stop */
-    int      recoveries;              /* shared recovery count */
-} fuse_ring_t;
-
-static int fuse_ring_init(fuse_ring_t *r, int src_fd, const char *src_path,
-                          uint64_t file_size)
-{
-    memset(r, 0, sizeof(*r));
-    r->src_fd    = src_fd;
-    r->src_path  = src_path ? strdup(src_path) : NULL;
-    r->file_size = file_size;
-
-    pthread_mutex_init(&r->mu, NULL);
-    pthread_cond_init(&r->not_full, NULL);
-    pthread_cond_init(&r->not_empty, NULL);
-
-    for (int i = 0; i < FUSE_RING_SLOTS; i++) {
-        r->bufs[i] = malloc(FUSE_RING_CHUNK);
-        if (!r->bufs[i]) {
-            for (int j = 0; j < i; j++) free(r->bufs[j]);
-            free(r->src_path);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static void fuse_ring_destroy(fuse_ring_t *r)
-{
-    for (int i = 0; i < FUSE_RING_SLOTS; i++)
-        free(r->bufs[i]);
-    free(r->src_path);
-    pthread_mutex_destroy(&r->mu);
-    pthread_cond_destroy(&r->not_full);
-    pthread_cond_destroy(&r->not_empty);
-}
-
-/* Reader thread: fills ring slots with FUSE reads, one at a time. */
-static void *fuse_reader_thread(void *arg)
-{
-    fuse_ring_t *r = (fuse_ring_t *)arg;
-
-    while (r->read_offset < r->file_size) {
-        size_t want = FUSE_RING_CHUNK;
-        if ((uint64_t)want > r->file_size - r->read_offset)
-            want = (size_t)(r->file_size - r->read_offset);
-
-        /* Wait for a free slot */
-        pthread_mutex_lock(&r->mu);
-        while (r->count == FUSE_RING_SLOTS && !r->stop)
-            pthread_cond_wait(&r->not_full, &r->mu);
-        if (r->stop) {
-            r->done = 1;
-            pthread_cond_signal(&r->not_empty);
-            pthread_mutex_unlock(&r->mu);
-            return NULL;
-        }
-        int slot = r->head;
-        pthread_mutex_unlock(&r->mu);
-
-        /* Read into this slot (outside the lock) */
-        size_t got = 0;
-        int retries = 0;
-        int last_was_seek = 0;
-
-        while (got < want) {
-            ssize_t rd = read(r->src_fd, r->bufs[slot] + got, want - got);
-            if (rd > 0) { got += (size_t)rd; retries = 0; last_was_seek = 0; continue; }
-            if (rd == -1 && errno == EINTR) continue;
-            if (rd == -1 && retries < 3 &&
-                (errno == EIO || errno == ENXIO || errno == EAGAIN)) {
-                retries++;
-                struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-                nanosleep(&ts, NULL);
-                continue;
-            }
-            if (rd == 0) errno = ESTALE;
-
-            /* Recovery: seek or reopen */
-            int saved_errno = errno;
-
-            if (r->recoveries >= STREAM_REOPEN_MAX) {
-                pthread_mutex_lock(&r->mu);
-                r->error = saved_errno ? saved_errno : EIO;
-                r->done = 1;
-                pthread_cond_signal(&r->not_empty);
-                pthread_mutex_unlock(&r->mu);
-                return NULL;
-            }
-
-            /* Tier 1: seek on existing fd */
-            if (!last_was_seek) {
-                off_t target = (off_t)(r->read_offset + got);
-                if (lseek(r->src_fd, target, SEEK_SET) == target) {
-                    r->recoveries++;
-                    last_was_seek = 1;
-                    continue;
-                }
-            }
-
-            /* Tier 2: reopen by path */
-            if (r->src_path) {
-                off_t target = (off_t)(r->read_offset + got);
-                int new_fd = open(r->src_path, O_RDONLY);
-                if (new_fd >= 0 && lseek(new_fd, target, SEEK_SET) == target) {
-                    close(r->src_fd);
-                    r->src_fd = new_fd;
-                    r->recoveries++;
-                    last_was_seek = 0;
-                    continue;
-                }
-                if (new_fd >= 0) close(new_fd);
-            }
-
-            /* Unrecoverable */
-            pthread_mutex_lock(&r->mu);
-            r->error = saved_errno ? saved_errno : EIO;
-            r->done = 1;
-            pthread_cond_signal(&r->not_empty);
-            pthread_mutex_unlock(&r->mu);
-            return NULL;
-        }
-
-        /* Slot filled — publish it */
-        pthread_mutex_lock(&r->mu);
-        r->lens[slot] = got;
-        r->head = (r->head + 1) % FUSE_RING_SLOTS;
-        r->count++;
-        r->read_offset += got;
-        pthread_cond_signal(&r->not_empty);
-        pthread_mutex_unlock(&r->mu);
-    }
-
-    /* EOF — signal done */
-    pthread_mutex_lock(&r->mu);
-    r->done = 1;
-    pthread_cond_signal(&r->not_empty);
-    pthread_mutex_unlock(&r->mu);
-    return NULL;
-}
-
-/* Pull the next filled buffer from the ring.
- * Returns pointer to buffer and sets *out_len.
- * Returns NULL on error (sets *out_errno) or when done (*out_len = 0).
- *
- * IMPORTANT: The returned buffer remains owned by the ring.  The caller
- * must call fuse_ring_release() after it is done processing the buffer.
- * Until release, the reader thread cannot reuse this slot. */
-static uint8_t *fuse_ring_pull(fuse_ring_t *r, size_t *out_len, int *out_errno)
-{
-    pthread_mutex_lock(&r->mu);
-    while (r->count == 0 && !r->done)
-        pthread_cond_wait(&r->not_empty, &r->mu);
-
-    if (r->count == 0) {
-        /* Ring empty and done */
-        if (r->error) {
-            *out_errno = r->error;
-            pthread_mutex_unlock(&r->mu);
-            return NULL;
-        }
-        *out_len = 0;
-        pthread_mutex_unlock(&r->mu);
-        return NULL;
-    }
-
-    int slot = r->tail;
-    *out_len = r->lens[slot];
-    uint8_t *buf = r->bufs[slot];
-    /* Advance tail but do NOT decrement count yet — the buffer is still
-     * in use by the caller.  count is decremented in fuse_ring_release(). */
-    r->tail = (r->tail + 1) % FUSE_RING_SLOTS;
-    pthread_mutex_unlock(&r->mu);
-
-    *out_errno = 0;
-    return buf;
-}
-
-/* Release a previously pulled buffer back to the ring.
- * Must be called after the caller is done processing the buffer
- * returned by fuse_ring_pull(). */
-static void fuse_ring_release(fuse_ring_t *r)
-{
-    pthread_mutex_lock(&r->mu);
-    r->count--;
-    pthread_cond_signal(&r->not_full);
-    pthread_mutex_unlock(&r->mu);
-}
 
 static status_t write_object_file_stream(store_t *store, int src_fd,
                                          const char *src_path,
@@ -674,30 +437,15 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         return set_error(ERR_NOMEM, "EVP_MD_CTX_new");
     }
 
-    /* The readahead ring overlaps FUSE reads with disk writes and is a real
-     * throughput win, but it is implicated in short-read failures under load
-     * (dd sustains 172 MB/s on the same source where the backup path drops to
-     * 51 MB/s and then fails with ENXIO). Off unless the operator opts in,
-     * until that is understood; the non-ring path is correct, just slower. */
-    const store_config_t *scfg = store_config(store);
-    int is_fuse = (scfg && scfg->enable_fuse_readahead) && fd_is_fuse(src_fd);
-
-    /* Non-FUSE path uses a single large buffer; FUSE path uses ring buffers */
-    uint8_t *buf = NULL;
-    if (!is_fuse) {
-        buf = malloc(STREAM_CHUNK);
-        if (!buf) {
-            EVP_MD_CTX_free(mdctx);
-            if (src_path) close(src_fd);
-            close(tfd); unlink(tmppath);
-            return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
-        }
+    uint8_t *buf = malloc(STREAM_CHUNK);
+    if (!buf) {
+        EVP_MD_CTX_free(mdctx);
+        if (src_path) close(src_fd);
+        close(tfd); unlink(tmppath);
+        return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_CHUNK);
     }
 
-    /* On FUSE, POSIX_FADV_SEQUENTIAL triggers aggressive kernel readahead
-     * that floods the userspace daemon — use conservative readahead instead. */
-    if (!is_fuse)
-        posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     /* ----------------------------------------------------------------
      * RS parity accumulator — bounded-RAM streaming, spills to temp file.
@@ -741,98 +489,10 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
             st = set_error_errno(ERR_IO, "stream: RS parity feed failed (nonce)");
     }
 
-    /* Helper: push the progress line down before logging so our messages
-     * aren't overwritten by the \r-based progress display. */
-    #define STREAM_LOG(logfn, msg) do { \
-        fprintf(stderr, "\n"); fflush(stderr); \
-        logfn("%s", (msg)); \
-    } while (0)
+    #define STREAM_LOG(logfn, msg) logfn("%s", (msg))
 
-    if (is_fuse) {
-        /* ---- FUSE path: reader thread fills ring, main thread processes ---- */
-        fuse_ring_t ring;
-        if (fuse_ring_init(&ring, src_fd, src_path, file_size) != 0) {
-            free(buf);
-            rs_parity_stream_destroy(&ps);
-            EVP_MD_CTX_free(mdctx);
-            close(tfd); unlink(tmppath);
-            return set_error(ERR_NOMEM, "stream: fuse ring init");
-        }
-
-        pthread_t reader_thr;
-        if (pthread_create(&reader_thr, NULL, fuse_reader_thread, &ring) != 0) {
-            fuse_ring_destroy(&ring);
-            free(buf);
-            rs_parity_stream_destroy(&ps);
-            EVP_MD_CTX_free(mdctx);
-            close(tfd); unlink(tmppath);
-            return set_error(ERR_IO, "stream: pthread_create reader");
-        }
-
-        while (st == OK) {
-            size_t got = 0;
-            int pull_errno = 0;
-            uint8_t *chunk_buf = fuse_ring_pull(&ring, &got, &pull_errno);
-
-            if (!chunk_buf && got == 0 && pull_errno == 0)
-                break;  /* EOF */
-
-            if (!chunk_buf || pull_errno) {
-                errno = pull_errno ? pull_errno : EIO;
-                st = set_error_errno(ERR_IO,
-                    "stream: FUSE read error at offset %llu/%llu (%.1f%%)",
-                    (unsigned long long)offset,
-                    (unsigned long long)file_size,
-                    file_size > 0 ? 100.0 * (double)offset / (double)file_size : 0.0);
-                break;
-            }
-
-            if (EVP_DigestUpdate(mdctx, chunk_buf, got) != 1) {
-                st = set_error(ERR_IO, "stream: SHA256 update failed");
-                fuse_ring_release(&ring); break;
-            }
-            /* Hashed as plaintext, stored as ciphertext. In place: the ring
-             * slot is ours until it is released just below. */
-            if (cs && object_crypt_stream_update(cs, chunk_buf, got, chunk_buf) != OK) {
-                st = set_error(ERR_IO, "stream: encryption failed");
-                fuse_ring_release(&ring); break;
-            }
-            if (write(tfd, chunk_buf, got) != (ssize_t)got) {
-                if (errno == 0) errno = EIO;
-                st = set_error_errno(ERR_IO, "stream: write payload chunk");
-                fuse_ring_release(&ring); break;
-            }
-            stream_crc = crc32c_update(stream_crc, chunk_buf, got);
-            if (rs_parity_stream_feed(&ps, chunk_buf, got) != 0) {
-                st = set_error_errno(ERR_IO, "stream: RS parity feed failed (spill)");
-                fuse_ring_release(&ring); break;
-            }
-
-            /* Done with buffer — release slot back to reader */
-            fuse_ring_release(&ring);
-
-            total_written += got;
-            offset += (uint64_t)got;
-            if (progress_cb) progress_cb((uint64_t)got, progress_ctx);
-        }
-
-        /* Signal reader to stop (in case it's blocked on not_full) */
-        pthread_mutex_lock(&ring.mu);
-        ring.stop = 1;
-        pthread_cond_signal(&ring.not_full);
-        pthread_mutex_unlock(&ring.mu);
-
-        pthread_join(reader_thr, NULL);
-
-        /* Reader thread may have reopened src_fd — update for cleanup. */
-        if (ring.src_fd != src_fd)
-            src_fd = ring.src_fd;
-        fuse_ring_destroy(&ring);
-
-        goto post_loop;
-
-    } else {
-        /* ---- Non-FUSE path: direct read with recovery ---- */
+    {
+        /* Direct read, with recovery for sources that fail transiently. */
         int recoveries = 0;
         int last_was_seek = 0;
 
@@ -1011,7 +671,6 @@ static status_t write_object_file_stream(store_t *store, int src_fd,
         }
     }
 
-post_loop:
     #undef STREAM_LOG
 
 done:
