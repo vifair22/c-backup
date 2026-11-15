@@ -698,6 +698,71 @@ static void test_subpath_matching_nothing_fails(void **state)
 }
 
 /*
+ * B093: the restore's item count is the entries it restores. It was the
+ * snapshot's entry count, so a one-file restore reported 104 of 104: neither
+ * what was asked for nor what was done. The count ends at its total on a
+ * full run, and with a subpath the total is the subtree, not the snapshot.
+ */
+typedef struct {
+    uint64_t last_done, last_total, calls;
+    int      backwards, over;
+} count_seen_t;
+
+static void note_count(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    count_seen_t *s = ctx;
+    if (!phase || strcmp(phase, "restore") != 0) return;
+    if (s->calls && (done < s->last_done || total != s->last_total)) s->backwards = 1;
+    if (done > total) s->over = 1;
+    s->last_done = done;
+    s->last_total = total;
+    s->calls++;
+}
+
+static void test_restore_counts_what_it_restores(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    /* The subtree: nested, mid.txt, deeper and leaf.txt. */
+    count_seen_t seen;
+    memset(&seen, 0, sizeof(seen));
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.subpath = TEST_SRC "/nested";
+    ro.progress_cb = note_count;
+    ro.progress_ctx = &seen;
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(rr.files, 2);
+    assert_int_equal(seen.last_total, 4);
+    assert_int_equal(seen.last_done, 4);
+    assert_int_equal(seen.backwards, 0);
+    assert_int_equal(seen.over, 0);
+
+    /* One file: one entry of work, however big the snapshot. */
+    memset(&seen, 0, sizeof(seen));
+    ro.subpath = TEST_SRC "/top.txt";
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST "/one", &ro, &rr), OK);
+    assert_int_equal(rr.files, 1);
+    assert_int_equal(seen.last_total, 1);
+    assert_int_equal(seen.last_done, 1);
+
+    /* Everything: the count reaches the snapshot's entries. */
+    memset(&seen, 0, sizeof(seen));
+    ro.subpath = NULL;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST "/all", &ro, &rr), OK);
+    assert_true(seen.last_total > 4);
+    assert_int_equal(seen.last_done, seen.last_total);
+    assert_int_equal(seen.backwards, 0);
+}
+
+/*
  * Symlinks and hardlinks survive a round trip.
  *
  * Nothing in this suite had a link in it until a 223,000-file tree was backed
@@ -1582,6 +1647,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),
         cmocka_unit_test_setup_teardown(test_subpath_matching_nothing_fails, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_restore_counts_what_it_restores, setup, teardown),
         cmocka_unit_test_setup_teardown(test_symlinks_and_hardlinks_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_links_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resumed_restore_relinks_hardlinks, setup, teardown),

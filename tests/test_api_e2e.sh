@@ -444,6 +444,11 @@ RESTORE_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"dest\":\"$W
 wait_job "$RESTORE_JOB"
 contains "restore completed" '"state":"completed"' "$(sock_body "/jobs/$RESTORE_JOB")"
 contains "restore result counts what it wrote" '"result":{"files":3,' "$(sock_body "/jobs/$RESTORE_JOB")"
+# B093: a finished job's count is the last report, and it ends at its total.
+RJ_BODY=$(sock_body "/jobs/$RESTORE_JOB")
+RJ_CUR=$(printf '%s' "$RJ_BODY" | sed -n 's/.*"current":\([0-9]*\).*/\1/p')
+RJ_TOT=$(printf '%s' "$RJ_BODY" | sed -n 's/.*"total":\([0-9]*\).*/\1/p')
+check "a finished restore's count reaches its total" "$RJ_TOT" "$RJ_CUR"
 if diff -r "$WORK/src" "$WORK/out$WORK/src" > /dev/null 2>&1; then
     ok "restored tree is identical"
 else
@@ -617,6 +622,10 @@ SUB_JOB=$(job_id "$(curl -s -X POST --unix-socket "$SOCK" \
           http://localhost/repos/1/snapshots/1/restore)")
 wait_job "$SUB_JOB"
 contains "subpath restore completed" '"state":"completed"' "$(sock_body "/jobs/$SUB_JOB")"
+# B093: the count was the snapshot's entries, so a one-file restore said
+# 104 of 104. The subtree is docs/ and c.txt: two entries of work.
+contains "a subpath restore counts the subtree" '"phase":"restore","current":2,"total":2' \
+    "$(sock_body "/jobs/$SUB_JOB")"
 # Only the requested subtree, so the siblings must not be there.
 if [ -f "$WORK/sub$WORK/src/docs/c.txt" ]; then ok "subpath restored its file"
 else bad "subpath restored its file" "$WORK/sub$WORK/src/docs/c.txt exists" "missing"; fi
