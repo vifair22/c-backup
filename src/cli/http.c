@@ -2,8 +2,10 @@
 
 #include "http.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -131,4 +133,138 @@ void http_response_free(http_response_t *r)
     free(r->body);
     r->body = NULL;
     r->body_len = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Streaming                                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int    fd;
+    char   buf[READ_CHUNK];
+    size_t len, pos;
+    int    eof;
+} sreader_t;
+
+/* Refill when empty. Returns bytes available, 0 at EOF, -1 on error. */
+static ssize_t sr_fill(sreader_t *r)
+{
+    if (r->pos < r->len) return (ssize_t)(r->len - r->pos);
+    if (r->eof) return 0;
+    for (;;) {
+        ssize_t n = read(r->fd, r->buf, sizeof(r->buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return -1;
+        if (n == 0) { r->eof = 1; return 0; }
+        r->len = (size_t)n;
+        r->pos = 0;
+        return n;
+    }
+}
+
+/* One CRLF- or LF-terminated line, without the terminator. -1 on EOF/error
+ * before a terminator, or a line that does not fit. */
+static int sr_line(sreader_t *r, char *line, size_t cap)
+{
+    size_t n = 0;
+    for (;;) {
+        ssize_t avail = sr_fill(r);
+        if (avail <= 0) return -1;
+        char c = r->buf[r->pos++];
+        if (c == '\n') {
+            if (n > 0 && line[n - 1] == '\r') n--;
+            line[n] = '\0';
+            return 0;
+        }
+        if (n + 1 >= cap) return -1;
+        line[n++] = c;
+    }
+}
+
+/* Copy up to `want` bytes (or everything to EOF when want is SIZE_MAX). */
+static int sr_copy(sreader_t *r, FILE *out, size_t want)
+{
+    while (want > 0) {
+        ssize_t avail = sr_fill(r);
+        if (avail < 0) return -1;
+        if (avail == 0) return want == SIZE_MAX ? 0 : -1;
+        size_t take = (size_t)avail;
+        if (take > want) take = want;
+        if (fwrite(r->buf + r->pos, 1, take, out) != take) return -1;
+        /* Flushed per read: the reason this function exists. */
+        fflush(out);
+        r->pos += take;
+        if (want != SIZE_MAX) want -= take;
+    }
+    return 0;
+}
+
+status_t http_stream(const char *socket_path, const char *path,
+                     FILE *out, FILE *err_out, int *out_status)
+{
+    if (!socket_path || !path || !out || !out_status)
+        return set_error(ERR_INVALID, "http_stream: null argument");
+
+    int fd = -1;
+    status_t st = connect_socket(socket_path, &fd);
+    if (st != OK) return st;
+
+    char header[1024];
+    int hn = snprintf(header, sizeof(header),
+        "GET %s HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "Accept: text/event-stream\r\n"
+        "\r\n", path);
+    if (hn < 0 || (size_t)hn >= sizeof(header)) {
+        close(fd);
+        return set_error(ERR_INVALID, "http_stream: request line too long");
+    }
+    if (write_all(fd, header, (size_t)hn) != 0) {
+        close(fd);
+        return set_error_errno(ERR_IO, "http_stream: write failed");
+    }
+
+    sreader_t *r = calloc(1, sizeof(*r));
+    if (!r) { close(fd); return set_error(ERR_NOMEM, "http_stream: alloc"); }
+    r->fd = fd;
+
+    char line[1024];
+    int status = 0, chunked = 0;
+    if (sr_line(r, line, sizeof(line)) != 0 ||
+        sscanf(line, "HTTP/1.%*d %d", &status) != 1) {
+        free(r); close(fd);
+        return set_error(ERR_CORRUPT, "http_stream: malformed response");
+    }
+    for (;;) {
+        if (sr_line(r, line, sizeof(line)) != 0) {
+            free(r); close(fd);
+            return set_error(ERR_CORRUPT, "http_stream: truncated headers");
+        }
+        if (line[0] == '\0') break;
+        for (char *c = line; *c; c++) *c = (char)tolower((unsigned char)*c);
+        if (strncmp(line, "transfer-encoding:", 18) == 0 && strstr(line + 18, "chunked"))
+            chunked = 1;
+    }
+    *out_status = status;
+    FILE *dst = (status >= 200 && status < 300) ? out : (err_out ? err_out : out);
+
+    int rc = 0;
+    if (!chunked) {
+        rc = sr_copy(r, dst, SIZE_MAX);
+    } else {
+        for (;;) {
+            if (sr_line(r, line, sizeof(line)) != 0) { rc = -1; break; }
+            char *end = NULL;
+            unsigned long long sz = strtoull(line, &end, 16);
+            if (end == line) { rc = -1; break; }
+            if (sz == 0) break;
+            if (sr_copy(r, dst, (size_t)sz) != 0) { rc = -1; break; }
+            if (sr_line(r, line, sizeof(line)) != 0) { rc = -1; break; }
+        }
+    }
+    free(r);
+    close(fd);
+    if (rc != 0) return set_error(ERR_IO, "http_stream: connection ended mid-stream");
+    return OK;
 }

@@ -470,12 +470,33 @@ static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
 }
 
+static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  int64_t snap_id, const char *dest,
+                                  const restore_opts_t *opts, restore_result_t *out);
+
+/*
+ * The cancel flag goes onto the store for the duration, so the streaming
+ * readers can stop inside one large file instead of only between files: a
+ * restore of a 2 GiB file was otherwise uncancellable for as long as that
+ * file took. Put back afterwards, since the handle may outlive this call.
+ */
 status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                      int64_t snap_id, const char *dest,
                      const restore_opts_t *opts, restore_result_t *out)
 {
     if (!store || !db || !dest)
         return set_error(ERR_INVALID, "restore_run: missing store, db or dest");
+    volatile int *prev_cancel = store_get_cancel(store);
+    if (opts && opts->cancel) store_set_cancel(store, opts->cancel);
+    status_t st = restore_run_inner(store, db, repo_id, snap_id, dest, opts, out);
+    store_set_cancel(store, prev_cancel);
+    return st;
+}
+
+static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                  int64_t snap_id, const char *dest,
+                                  const restore_opts_t *opts, restore_result_t *out)
+{
 
     restore_opts_t defaults;
     memset(&defaults, 0, sizeof(defaults));
@@ -853,6 +874,16 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         }
         if (fd != -1) close(fd);
 
+        if (lst != OK && cancelled(opts)) {
+            /* Stopped inside the file. What was written is a prefix, and a
+             * file of the right name holding part of its bytes is worse
+             * than none, so it goes, without a damage warning. */
+            if (unlink(full) != 0 && errno != ENOENT)
+                log_warn("restore: cannot remove incomplete %s: %s",
+                         full, strerror(errno));
+            st = set_error(ERR_BUSY, "restore cancelled");
+            break;
+        }
         if (lst != OK) {
             /* The fault is the repository's, not the destination's: name
              * the object, and never end on an empty reason. Several store

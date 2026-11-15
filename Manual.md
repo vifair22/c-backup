@@ -163,15 +163,25 @@ sudo c-backup version
 
 `systemctl stop c-backupd` (SIGTERM) shuts the daemon down in order: it stops
 accepting requests, stops firing schedules, then cancels running jobs, which
-stop between files and are recorded as `cancelled` in `c-backup jobs` and the
-journal. This takes about a second. A second SIGTERM or SIGINT forces an
-immediate exit. Run the cancelled job again after the restart; a backup skips
-what it already stored, a restore skips what it already wrote.
+are recorded as `cancelled` in `c-backup jobs` and the journal. A job checks
+for cancellation between files and between chunks inside one: storing,
+packing and restoring a file all stop within one read of at most 8 MiB, so a
+multi-gigabyte file in progress does not hold up the shutdown. This takes
+about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
+or SIGINT forces an immediate exit. Run the cancelled job again after the
+restart; a backup skips what it already stored, a restore skips what it
+already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
+job, and prints the job record with `"cancel_requested":true`.
 
-A daemon that dies without stopping (a crash, `kill -9`, power loss) marks
-whatever was running as `failed: interrupted by daemon restart` on its next
-start. Either way the repository is consistent: a backup's partial pack is
-discarded and the next backup stores those files again.
+A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
+loss) marks whatever was running as `failed: interrupted by daemon restart` on
+its next start, and journals each such job then, since the killed process
+could not. Either way the repository is consistent: a backup's partial pack
+and the index rows staged into it are discarded, and the next backup stores
+those files again. Staging files a killed writer left in the repository's
+`tmp/` are removed by the next backup or gc, which hold the repository's write
+lock and so know nothing else is writing there; opening a repository also
+removes any an hour old.
 
 ### 2.3 Docker
 
@@ -473,7 +483,13 @@ sudo c-backup backup 1 /home/me/projects   # or name paths for this run
 
 A backup is a job. The CLI submits it and waits, printing the finished job;
 `--no-wait` returns the job id at once. `c-backup jobs <id>` and
-`c-backup jobs watch <id>` follow it.
+`c-backup jobs watch <id>` follow it. `watch` prints a line with the job's
+state as soon as it connects, then one per change and at least every 5
+seconds, and exits when the job ends:
+
+```
+data: {"id":7,"state":"running","phase":"store","current":3,"total":4,"bytes_done":0,"bytes_total":2291249496,"error":""}
+```
 
 Sources belong to the repository so that a schedule, the app's Run Backup
 button and the CLI all back up the same thing. A backup that names paths
@@ -541,8 +557,20 @@ hardlinks (as groups), FIFOs, device nodes, modes, owner and group, times,
 extended attributes and POSIX ACLs. A unix socket has no content and is
 recorded without one; restore skips it.
 
-Files that cannot be read are logged and skipped; the backup continues. A
-source that is unreadable as a whole fails the job.
+A file inside a source that cannot be read is logged and skipped; the backup
+continues. A source itself - a path named on the command line or configured
+with `sources set` - that does not exist or cannot be opened fails the job
+before anything is written, with an error naming it, even when the other
+sources are fine:
+
+```
+c-backup: source /data/no-such-dir cannot be read (No such file or directory); no snapshot written
+```
+
+The difference is deliberate. A file vanishing between the scan and the read
+is normal on a live filesystem; a whole source missing is a mount that did
+not come up or a typo, and a snapshot without it would look like a backup of
+everything that was asked for.
 
 ### 6.4 Concurrency
 
@@ -833,7 +861,23 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 
 Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
 per-repository journal (`c-backup journal 1`) is the permanent record of what
-ran and how it ended.
+ran and how it ended. A journal entry's `source` says who asked: `api` for a
+job run by hand (the CLI and the app both go through the API), `schedule` for
+one a schedule fired, with the message starting `schedule <id>`.
+
+`gc` reports what it did in the job's `result`, and `gc --dry-run` what it
+would do:
+
+```json
+{"dry_run":false,"reachable":5210,"objects_swept":12,"bytes_freed":40960,
+ "pack_entries_kept":5100,"pack_entries_dropped":12,"packs_rewritten":1,
+ "packs_deleted":0,"tmp_files_removed":0,"tmp_bytes_removed":0}
+```
+
+`objects_swept` and `bytes_freed` are what was swept, or on a dry run what
+would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
+does not do; `tmp_files_removed` counts staging files an interrupted run left
+behind (section 2.2). The journal entry carries the same in a line.
 
 ---
 
@@ -959,6 +1003,13 @@ Refused when the destination is not a repository, is a replica of the source
 host. If the destination is registered here, its write lock is held for the
 run, and `reindex` it afterwards so its index sees the new snapshots. Run it
 again after more backups and only the new snapshots are sent.
+
+The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
+(already complete at the target), `objects_asked`, `objects_sent`,
+`bytes_sent` (as stored, so what crossed to the target) and
+`subtrees_skipped`. A run with nothing to send reports zeros and journals
+`target already up to date`, so a no-op and a full copy are told apart at a
+glance.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.

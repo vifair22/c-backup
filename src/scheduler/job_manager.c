@@ -18,6 +18,9 @@
 typedef struct {
     int64_t  job_id;
     int64_t  repo_id;
+    /* The schedule that submitted it, or 0 for a submission over the API.
+     * Decides the journal entry's source; see job_submit_scheduled. */
+    int64_t  schedule_id;
     char    *action;
     time_t   started_at;
     job_fn   fn;
@@ -52,6 +55,55 @@ struct job_manager {
      * writes. */
     pthread_mutex_t db_mu;
 };
+
+/*
+ * One journal entry for a job that ended.
+ *
+ * The source says who asked: "schedule" for the scheduler, with its id at
+ * the head of the message so the entry names which schedule, or "api" for a
+ * submission by hand through the CLI or the app. Every entry used to say
+ * "daemon", so a scheduled run and a manual one could not be told apart.
+ */
+static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
+                        const char *action, const char *outcome,
+                        int64_t took_ms, const char *message)
+{
+    if (schedule_id <= 0) {
+        journal_record(db, repo_id, "api", action, outcome, took_ms, message);
+        return;
+    }
+    char msg[640];
+    snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
+             message && *message ? ": " : "", message ? message : "");
+    journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
+}
+
+/* See job_manager_start. Runs before any worker exists, so nothing else is
+ * writing the jobs table or the journal. */
+static void journal_interrupted(cutils_db_t *db)
+{
+    db_result_t *r = NULL;
+    if (db_execute(db,
+            "SELECT COALESCE(repo_id, 0), action, COALESCE(schedule_id, 0)"
+            "  FROM jobs WHERE state IN ('running','queued') ORDER BY id",
+            NULL, &r) != 0) {
+        db_result_free(r);
+        log_warn("job manager: cannot list interrupted jobs to journal them");
+        return;
+    }
+    for (int i = 0; i < (r ? r->nrows : 0); i++) {
+        int64_t repo_id = strtoll(r->rows[i][0], NULL, 10);
+        if (repo_id <= 0) continue;   /* the journal is per repository */
+        /* Duration 0: when the process died is not known, and the time
+         * since the job started would count the downtime as work. */
+        journal_job(db, repo_id, strtoll(r->rows[i][2], NULL, 10),
+                    r->rows[i][1], "failed", 0, "interrupted by daemon restart");
+    }
+    if (r && r->nrows > 0)
+        log_warn("job manager: %d job(s) were interrupted by the last shutdown "
+                 "and are recorded as failed", r->nrows);
+    db_result_free(r);
+}
 
 static void set_job_state(job_manager_t *jm, int64_t job_id,
                           const char *state, const char *error)
@@ -354,8 +406,8 @@ static void *worker_main(void *arg)
             /* A success journalled an empty message, so the entry for a
              * retention pass could not say what it deleted - the one thing
              * anybody reading a journal of deletions wants. */
-            journal_record(jm->db, slot.repo_id, "daemon", slot.action, outcome,
-                           took, st == OK ? pc.summary : detail);
+            journal_job(jm->db, slot.repo_id, slot.schedule_id, slot.action,
+                        outcome, took, st == OK ? pc.summary : detail);
             pthread_mutex_unlock(&jm->db_mu);
         }
         free(pc.summary);
@@ -410,7 +462,14 @@ status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **ou
      * Anything left in 'running' or 'queued' belongs to a previous process
      * that is gone. Nothing resumes it, so it is marked failed rather than
      * left looking active forever.
+     *
+     * And journalled. The journal is written when a job ends, by the worker
+     * that ran it, and a SIGKILL or a power cut leaves no worker to do it -
+     * so a backup interrupted that way was in the jobs table for a month and
+     * absent from the permanent record for ever. This is the only point that
+     * knows those jobs ended, so it writes their entries.
      */
+    journal_interrupted(db);
     if (db_execute_non_query(db,
             "UPDATE jobs SET state = 'failed', ended = strftime('%s','now'),"
             " error = 'interrupted by daemon restart'"
@@ -468,17 +527,40 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     const char *params_json, job_fn fn, void *arg,
                     void (*arg_free)(void *), int64_t *out_job_id)
 {
+    return job_submit_scheduled(jm, repo_id, action, params_json, 0,
+                                fn, arg, arg_free, out_job_id);
+}
+
+status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
+                              const char *params_json, int64_t schedule_id,
+                              job_fn fn, void *arg, void (*arg_free)(void *),
+                              int64_t *out_job_id)
+{
     if (!jm || !fn || !action) return set_error(ERR_INVALID, "job_submit: null argument");
 
-    char repo[32];
+    char repo[32], sched[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(sched, sizeof(sched), "%lld", (long long)schedule_id);
 
+    /*
+     * Two statements rather than a NULL in the parameter list for an API
+     * job's schedule_id: a NULL there is a terminator, and would leave the
+     * columns after it unbound without an error.
+     */
     pthread_mutex_lock(&jm->db_mu);
-    int rc = db_execute_non_query(jm->db,
-        "INSERT INTO jobs (repo_id, action, params, state)"
-        " VALUES (?, ?, ?, 'queued')",
-        (const char *[]){ repo_id > 0 ? repo : NULL, action,
-                          params_json ? params_json : "", NULL }, NULL);
+    int rc;
+    if (schedule_id > 0)
+        rc = db_execute_non_query(jm->db,
+            "INSERT INTO jobs (repo_id, action, params, state, origin, schedule_id)"
+            " VALUES (?, ?, ?, 'queued', 'schedule', ?)",
+            (const char *[]){ repo_id > 0 ? repo : NULL, action,
+                              params_json ? params_json : "", sched, NULL }, NULL);
+    else
+        rc = db_execute_non_query(jm->db,
+            "INSERT INTO jobs (repo_id, action, params, state, origin)"
+            " VALUES (?, ?, ?, 'queued', 'api')",
+            (const char *[]){ repo_id > 0 ? repo : NULL, action,
+                              params_json ? params_json : "", NULL }, NULL);
     int64_t job_id = 0;
     if (rc == 0) {
         db_result_t *r = NULL;
@@ -501,6 +583,7 @@ status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
     job_slot_t *s = &jm->queue[jm->tail];
     s->job_id   = job_id;
     s->repo_id  = repo_id;
+    s->schedule_id = schedule_id > 0 ? schedule_id : 0;
     s->action   = strdup(action);
     s->fn       = fn;
     s->arg      = arg;

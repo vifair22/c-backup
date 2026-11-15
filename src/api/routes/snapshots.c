@@ -669,7 +669,9 @@ status_t routes_run_pack(struct store *store, int64_t repo_id,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
                          void *progress_ctx)
 {
-    (void)cancel;   /* repo_pack has no cancellation hook of its own yet */
+    /* repo_pack takes no flag of its own; it reads the store's, which is
+     * how a cancel reaches the middle of packing one large object. */
+    if (cancel) store_set_cancel((store_t *)store, cancel);
     pack_progress_bridge_t bridge = { progress, progress_ctx };
     uint32_t packed = 0;
     status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
@@ -745,6 +747,92 @@ static int snap_job_needs_key(snap_job_kind_t kind)
     return kind != SNAP_JOB_VERIFY && kind != SNAP_JOB_GFS;
 }
 
+/*
+ * What a gc did, or would do, on the job and in the journal.
+ *
+ * gc and gc --dry-run both printed a bare job record: the counts reached the
+ * daemon log and nowhere a client could read them, so a dry run - whose
+ * whole purpose is the answer - answered nothing. Recorded on failure and
+ * cancellation too, because the sweep commits before compaction starts and
+ * what it removed is still true.
+ */
+static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
+{
+    char js[512];
+    snprintf(js, sizeof(js),
+             "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
+             "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
+             "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
+             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"tmp_bytes_removed\":%llu}",
+             dry_run ? "true" : "false",
+             (unsigned long long)gr->reachable,
+             (unsigned long long)gr->swept,
+             (unsigned long long)gr->bytes_freed,
+             (unsigned long long)gr->pack_entries_kept,
+             (unsigned long long)gr->pack_entries_dropped,
+             gr->packs_rewritten, gr->packs_deleted,
+             gr->tmp_files_removed,
+             (unsigned long long)gr->tmp_bytes_removed);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (dry_run)
+        snprintf(msg, sizeof(msg),
+                 "dry run: would sweep %llu object%s (%llu bytes)",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed);
+    else
+        snprintf(msg, sizeof(msg),
+                 "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
+                 "%u deleted; %u stale temp file%s removed",
+                 (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
+                 (unsigned long long)gr->bytes_freed,
+                 gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
+                 gr->packs_deleted,
+                 gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
+}
+
+/*
+ * What a replication sent. A full copy, an incremental and a no-op all
+ * printed the same bare job before this; the counts were only in the log.
+ */
+static void replicate_report(void *progress_ctx, const replicate_result_t *rr)
+{
+    char js[384];
+    snprintf(js, sizeof(js),
+             "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+             "\"objects_asked\":%llu,\"objects_sent\":%llu,"
+             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu}",
+             (unsigned long long)rr->snapshots_sent,
+             (unsigned long long)rr->snapshots_skipped,
+             (unsigned long long)rr->objects_asked,
+             (unsigned long long)rr->objects_sent,
+             (unsigned long long)rr->bytes_sent,
+             (unsigned long long)rr->subtrees_skipped);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (rr->snapshots_sent == 0 && rr->objects_sent == 0)
+        snprintf(msg, sizeof(msg),
+                 "target already up to date (%llu snapshot%s present)",
+                 (unsigned long long)rr->snapshots_skipped,
+                 rr->snapshots_skipped == 1 ? "" : "s");
+    else
+        snprintf(msg, sizeof(msg),
+                 "sent %llu snapshot%s, %llu object%s, %llu bytes; "
+                 "%llu subtree%s skipped",
+                 (unsigned long long)rr->snapshots_sent,
+                 rr->snapshots_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->objects_sent,
+                 rr->objects_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->bytes_sent,
+                 (unsigned long long)rr->subtrees_skipped,
+                 rr->subtrees_skipped == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -778,6 +866,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
     if (st != OK) { repo_unlock(j->repo_id); return st; }
     st = store_index_bind(store, j->db, j->repo_id, &idx);
     if (st != OK) { store_close(store); repo_unlock(j->repo_id); return st; }
+    /* Every loop below the engine boundary that can run for a whole large
+     * object checks this; see store_set_cancel. */
+    store_set_cancel(store, cancel);
 
     if (j->kind == SNAP_JOB_REINDEX) {
         reindex_result_t rx;
@@ -879,6 +970,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                /* A cancelled run keeps what it committed, so its counts
+                 * are true either way. */
+                replicate_report(progress_ctx, &rr);
                 if (st == OK)
                     log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
                              "%llu object(s), %llu byte(s), %llu subtree(s) skipped",
@@ -901,7 +995,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         }
         if (dest_locked > 0) repo_unlock(dest_locked);
     } else if (j->kind == SNAP_JOB_GC) {
-        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, NULL);
+        gc_result_t gr;
+        memset(&gr, 0, sizeof(gr));
+        st = gc_run(store, j->db, j->repo_id, j->dry_run, cancel, &gr);
+        gc_report(progress_ctx, j->dry_run, &gr);
     } else if (j->kind == SNAP_JOB_GFS) {
         /* Retention comes from policy_values, falling back to the daemon
          * defaults when a repo has not set its own. Those were hard-coded
@@ -1538,7 +1635,7 @@ int routes_action_is_schedulable(const char *action)
 
 status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                  const char *action, const char *params,
-                                 int64_t *out_job_id)
+                                 int64_t schedule_id, int64_t *out_job_id)
 {
     /*
      * Backup is a different job type, owned by backup_routes.c, so it is
@@ -1547,7 +1644,7 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
      * tick while the schedule showed as enabled.
      */
     if (strcmp(action, "backup") == 0)
-        return routes_submit_backup(jm, repo_id, params, out_job_id);
+        return routes_submit_backup(jm, repo_id, params, schedule_id, out_job_id);
 
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
@@ -1587,8 +1684,9 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         }
     }
 
-    return job_submit(jm ? jm : g_ctx.jm, repo_id, action, NULL,
-                      snap_job_run, j, snap_job_free, out_job_id);
+    return job_submit_scheduled(jm ? jm : g_ctx.jm, repo_id, action, NULL,
+                                schedule_id, snap_job_run, j, snap_job_free,
+                                out_job_id);
 }
 
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)

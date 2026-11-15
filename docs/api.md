@@ -265,10 +265,18 @@ on the text, not the filesystem, so it does not follow symlinks. Directories are
 descends, so excluding one prunes its subtree rather than filtering entries
 on the way out.
 
-A backup in which every source is excluded, or none could be read, fails
-with "nothing to back up" and writes no snapshot. It used to succeed with a
-snapshot holding only the directories above each source, which looks like a
-backup and restores nothing.
+A backup in which every source is excluded fails with "nothing to back up"
+and writes no snapshot. It used to succeed with a snapshot holding only the
+directories above each source, which looks like a backup and restores
+nothing.
+
+A source that does not exist, or cannot be opened, fails the job before
+anything is written, with an error naming it (`source /data/x cannot be read
+(No such file or directory); no snapshot written`), whatever the other
+sources hold. It used to be skipped with a log line, so a snapshot silently
+lacking a whole source looked like a backup of everything asked for. A file
+*inside* a source that cannot be read is still skipped with a warning and the
+backup goes on.
 
 Before this, the matcher accepted absolute prefixes only and silently
 skipped everything else, and the route did not read the field at all: a
@@ -457,9 +465,26 @@ and returned by `GET /repos/<id>/schedules`.
 | GET | `/jobs/stream/<id>` | Server-sent progress events |
 | POST | `/jobs/<id>/cancel` | Request cancellation |
 
-Cancellation is cooperative: the flag is set and the pipeline checks it
-between files, so a cancelled backup stops within one file rather than at the
-end of the run.
+Cancellation is cooperative: the flag is set and the job stops at its next
+check. Those sit between files and also between chunks inside one file -
+storing it, packing it, restoring it - so a cancel lands within one read
+(at most 8 MiB of I/O), not at the end of a large file. A cancelled backup
+discards its open pack, the index rows staged into it and its staging files.
+
+`POST /jobs/<id>/cancel` answers 200 with the job record, as `/jobs/<id>`
+returns it, plus `"cancel_requested":true`. Its `state` is usually still
+`running` (or `queued`): the job reports `cancelled` once it has stopped. A
+job that is not queued or running is a 404.
+
+A job record carries `origin`, who asked for it: `api` for anything submitted
+over the API (the CLI and the app both are), `schedule` for the scheduler, with
+`schedule_id` naming the schedule (null otherwise).
+
+`/jobs/stream/<id>` sends one `data:` frame at once with the job's state as it
+is, then a frame whenever it changes, and the same frame again every 5 seconds
+while it does not, so a watcher can tell a busy job from a dead stream. The
+stream ends after the frame with a terminal state. A frame is
+`{"id","state","phase","current","total","bytes_done","bytes_total","error"}`.
 
 The stream path puts the id last because the router matches a trailing
 wildcard, and `/jobs/<id>/stream` would be indistinguishable from the buffered
@@ -470,7 +495,24 @@ Finished jobs are kept for 30 days and then deleted, so `/jobs/<id>` answers
 permanent record of what ran is each repository's journal
 (`GET /repos/<id>/journal`). A job left running or queued by a daemon that
 stopped is marked failed with "interrupted by daemon restart" when the next
-one starts, since nothing resumes it.
+one starts, since nothing resumes it, and journalled then with that message:
+a daemon that was killed had no chance to journal it itself.
+
+A journal entry's `source` is the job's origin: `api`, or `schedule` with the
+message starting `schedule <id>`.
+
+What some jobs report in `result`, beyond the backup and restore counts:
+
+| Job | `result` |
+|---|---|
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped` |
+
+Both also put a one-line summary in their journal entry, such as `swept 12
+objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
+removed` or `target already up to date (3 snapshots present)`. A dry-run gc
+removes nothing, temp files included; its pack figures are zero because
+compaction does not run.
 
 ## Introspection
 

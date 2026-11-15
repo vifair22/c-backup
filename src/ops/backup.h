@@ -24,8 +24,9 @@ typedef struct {
     const char  *label;
 
     /* Cooperative cancellation. The job manager sets this; the pipeline
-     * checks it between entries so a cancelled backup stops within one file
-     * rather than at the end of the run. */
+     * checks it between entries, and backup_run lends it to the store for
+     * the run so the object writers check it between chunks of one file.
+     * A cancel lands within one read, not at the end of a large file. */
     volatile int *cancel;
 
     void (*progress_cb)(const char *phase, uint64_t done, uint64_t total, void *ctx);

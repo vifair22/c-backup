@@ -6,7 +6,8 @@
  * Replaces the fork-detach-and-write-a-status-file pattern the one-shot CLI
  * used for long operations. Jobs run on a small worker pool inside the daemon,
  * their state lives in the jobs table, and cancellation is cooperative: the
- * flag is set here and the pipeline checks it between files.
+ * flag is set here and the pipeline checks it between files, and through the
+ * store (store_set_cancel) between chunks inside one.
  *
  * Jobs that were running when the daemon died are marked failed on the next
  * start rather than left claiming to be in progress, since nothing is
@@ -44,6 +45,16 @@ void     job_manager_stop(job_manager_t *jm);
 status_t job_submit(job_manager_t *jm, int64_t repo_id, const char *action,
                     const char *params_json, job_fn fn, void *arg,
                     void (*arg_free)(void *), int64_t *out_job_id);
+
+/*
+ * job_submit for a job a schedule asked for. The job row and its journal
+ * entry carry the schedule as their origin ("schedule", and its id), where
+ * job_submit records "api". schedule_id <= 0 is the same as job_submit.
+ */
+status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *action,
+                              const char *params_json, int64_t schedule_id,
+                              job_fn fn, void *arg, void (*arg_free)(void *),
+                              int64_t *out_job_id);
 
 /*
  * What a job reports beyond its phase and item count, through the progress

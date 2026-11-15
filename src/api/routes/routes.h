@@ -93,13 +93,15 @@ int routes_action_is_schedulable(const char *action);
 /* Submit a backup from a schedule's params, which carry the same shape the
  * route's request body does. */
 status_t routes_submit_backup(struct job_manager *jm, int64_t repo_id,
-                              const char *params_json, int64_t *out_job_id);
+                              const char *params_json, int64_t schedule_id,
+                              int64_t *out_job_id);
 
 /* params is the schedules.params column, action-specific and possibly empty.
- * Backup reads its source paths out of it, replication its destination. */
+ * Backup reads its source paths out of it, replication its destination.
+ * schedule_id names the schedule on the job and in its journal entry. */
 status_t routes_submit_scheduled(struct job_manager *jm, int64_t repo_id,
                                  const char *action, const char *params,
-                                 int64_t *out_job_id);
+                                 int64_t schedule_id, int64_t *out_job_id);
 
 /* Tags, notes, policy and the journal. Repo-scoped sub-handlers, dispatched
  * from repos.c like the snapshot ones. */

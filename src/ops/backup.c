@@ -17,6 +17,8 @@
 
 #include <openssl/sha.h>
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -442,6 +444,13 @@ static status_t store_content(pipeline_t *p)
         phase_add(p->timers, PHASE_READ_HASH, _tr);
         int is_new = w.is_new;
         close(fd);
+        if (st != OK && cancelled(p)) {
+            /* Stopped inside the file, not unreadable: no warning, and no
+             * moving on to the next one. */
+            if (in_txn && db_txn_commit(p->db) != OK)
+                log_warn("backup: cache commit failed on cancel");
+            return set_error(ERR_BUSY, "backup cancelled");
+        }
         if (st != OK) {
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
@@ -947,12 +956,83 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every named source must exist and be readable before anything is written.
+ *
+ * The scan treats a root it cannot lstat as a warning and moves on, which is
+ * right for a file vanishing mid-walk and wrong for a source: a backup of
+ * "/data/plain /data/no-such-dir" completed with the first one's files and a
+ * log line, and the snapshot looked like a backup of both. A source is what
+ * the operator asked for by name, so not being able to read it is the job
+ * failing, the same way a source excluded down to nothing is. Unreadable
+ * files *inside* a source still warn and continue; that distinction is the
+ * Manual's 6.3.
+ */
+static status_t check_sources(const backup_opts_t *opts)
+{
+    for (int i = 0; i < opts->n_paths; i++) {
+        const char *src = opts->paths[i];
+        struct stat sb;
+        if (!src || !*src)
+            return set_error(ERR_INVALID, "source %d is empty; no snapshot written", i + 1);
+        if (lstat(src, &sb) != 0)
+            return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                             "no snapshot written", src, strerror(errno));
+        if (S_ISDIR(sb.st_mode)) {
+            DIR *d = opendir(src);
+            if (!d)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            closedir(d);
+        } else if (S_ISREG(sb.st_mode)) {
+            int fd = open(src, O_RDONLY | O_NOFOLLOW);
+            if (fd == -1)
+                return set_error(ERR_INVALID, "source %s cannot be read (%s); "
+                                 "no snapshot written", src, strerror(errno));
+            close(fd);
+        }
+    }
+    return OK;
+}
+
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out);
+
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out)
 {
     if (!store || !db || !opts || opts->n_paths < 1)
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
 
+    status_t st = check_sources(opts);
+    if (st != OK) return st;
+
+    /*
+     * Staging files a killed run left behind. store_open only sweeps what is
+     * an hour old, because it cannot know who else is writing; a backup holds
+     * the repository's write lock, so nothing else is, and anything already
+     * in tmp/ belongs to a process that is gone. Measured: 134 MB of obj.*
+     * from one killed backup survived every later backup and gc.
+     */
+    uint64_t swept_bytes = 0;
+    unsigned swept = store_sweep_tmp_before(store, time(NULL), &swept_bytes);
+    if (swept)
+        log_info("backup: removed %u staging file(s) left by an interrupted run "
+                 "(%llu bytes)", swept, (unsigned long long)swept_bytes);
+
+    /* The job's flag reaches the object writers through the store, so a
+     * cancel lands inside a large file rather than after it. Restored on the
+     * way out: the handle may outlive this call. */
+    volatile int *prev_cancel = store_get_cancel(store);
+    if (opts->cancel) store_set_cancel(store, opts->cancel);
+    st = backup_run_inner(store, db, repo_id, opts, out);
+    store_set_cancel(store, prev_cancel);
+    return st;
+}
+
+static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
+                                 const backup_opts_t *opts, backup_result_t *out)
+{
     backup_result_t res;
     memset(&res, 0, sizeof(res));
 
@@ -1078,6 +1158,18 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (p.pack_w) { pack_backup_abort(p.pack_w); p.pack_w = NULL; }
 
     if (st != OK) {
+        /*
+         * The open pack was just discarded, so rows staged into it name
+         * bytes that no longer exist. The next backup would drop them, but
+         * until then they claim objects the repository does not hold, and a
+         * cancelled backup should leave the index as it found it. The error
+         * is the backup's; a failure here is only logged.
+         */
+        char why[256];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        if (store_index_drop_staged(db, repo_id) != OK)
+            log_warn("backup: cannot drop staged rows after: %s", why);
+        set_error(st, "%s", why);
         hashset_free(&p.meta_seen);
         free(links);
         scan_result_free(scan);

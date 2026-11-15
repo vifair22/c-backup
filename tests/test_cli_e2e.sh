@@ -197,6 +197,80 @@ contains "deep verify checked objects" '"checked"'      "$VERIFY_OUT"
 contains "gc dry run" '"state":"completed"' "$(cb gc 1 --dry-run)"
 contains "journal result filter" '"entries"' "$(cb journal 1 --result ok --limit 5)"
 
+echo "job reporting"
+# B062: gc and its dry run printed a bare job; the counts were only logged.
+GC_OUT=$(cb gc 1)
+contains "gc reports what it swept" '"objects_swept":' "$GC_OUT"
+contains "and what compaction did" '"packs_rewritten":' "$GC_OUT"
+contains "and the stale temp files it removed" '"tmp_files_removed":' "$GC_OUT"
+contains "gc dry run says it is one" '"dry_run":true' "$(cb gc 1 --dry-run)"
+contains "gc journals a summary" '"message":"swept ' "$(cb journal 1)"
+
+# B072: every entry said "daemon", so a manual run and a scheduled one could
+# not be told apart.
+contains "journal says a manual job came over the api" '"source":"api"' "$(cb journal 1)"
+check    "and no entry claims the daemon asked" "" \
+    "$(cb journal 1 | grep -o '"source":"daemon"')"
+contains "the job record says so too" '"origin":"api"' "$(cb jobs)"
+
+# B077: a source that does not exist failed nothing; the backup completed
+# with the other source's files and a log line.
+OUT=$(cb backup 1 "$WORK/src" "$WORK/no-such-dir" 2>&1); RC=$?
+check    "a missing source fails the backup" 1 "$RC"
+contains "naming the source" "no-such-dir" "$OUT"
+
+# B058: `jobs watch` on a running job printed nothing until the job ended,
+# because the CLI read the whole response before printing any of it. A job
+# row nothing will finish holds the stream open for as long as the test
+# needs, so the assertion is on what arrived, not on a race with real work.
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+        progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
+        'store')"
+    "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2>&1 &
+    WPID=$!
+    sleep 1
+    contains "jobs watch prints a running job at once" '"state":"running"' \
+        "$(cat "$WORK/watch.out")"
+    sqlite3 "$WORK/state.db" "UPDATE jobs SET state = 'completed',
+        ended = strftime('%s','now') WHERE id = 9999"
+    for _ in $(seq 1 50); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$WPID" 2>/dev/null; then
+        bad "jobs watch ends with the job" "exited" "still running"
+        kill "$WPID" 2>/dev/null
+    else
+        ok "jobs watch ends with the job"
+    fi
+    wait "$WPID" 2>/dev/null
+    contains "and prints how it ended" '"state":"completed"' "$(cat "$WORK/watch.out")"
+else
+    ok "jobs watch prints a running job at once (skipped: no sqlite3)"
+fi
+
+# B057: `jobs cancel` printed nothing. A gc queued behind a backup of a large
+# file is still cancellable when the request lands, whatever the machine.
+mkdir -p "$WORK/big"
+dd if=/dev/zero of="$WORK/big/big.bin" bs=1M count=512 status=none
+BJ=$(cb backup 1 "$WORK/big" --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+GJ=$(cb gc 1 --no-wait | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+OUT=$(cb jobs cancel "$GJ")
+contains "jobs cancel prints the job" "\"id\":$GJ" "$OUT"
+contains "and that the cancel landed" '"cancel_requested":true' "$OUT"
+cb jobs cancel "$BJ" > /dev/null 2>&1
+for _ in $(seq 1 100); do
+    cb jobs "$GJ" | grep -q '"state":"cancelled"' && break
+    sleep 0.1
+done
+contains "the cancelled gc ends cancelled" '"state":"cancelled"' "$(cb jobs "$GJ")"
+contains "and the journal says so" '"operation":"gc","result":"cancelled"' "$(cb journal 1)"
+for _ in $(seq 1 100); do
+    cb jobs "$BJ" | grep -Eq '"state":"(cancelled|completed)"' && break
+    sleep 0.1
+done
+check "a cancelled backup leaves no staging files" "" \
+    "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
+rm -f "$WORK/big/big.bin"
+
 # A second snapshot so diff has two sides, and so snapshot delete has
 # something to remove that is not the only copy.
 echo "content three" > "$WORK/src/three.txt"
@@ -524,6 +598,14 @@ REPL="$WORK/replica"
 OUT=$(cb replicate "$ENC_ID" "$REPL"); RC=$?
 check    "replicate waits for its job"  0             "$RC"
 contains "replicate reports completion" '"completed"' "$OUT"
+# B070: a full copy, an incremental and a no-op all printed the same bare
+# job; what was sent was only in the log.
+contains "replicate reports what it sent" '"objects_sent":' "$OUT"
+contains "including the snapshots" '"snapshots_sent":' "$OUT"
+case "$OUT" in
+    *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
+    *) ok "a first replicate sends objects" ;;
+esac
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.
@@ -567,9 +649,13 @@ fi
 # Running it again moves nothing: the target already has the root tree, so
 # one question ends the walk.
 BEFORE=$(find "$REPL" -type f | wc -l)
-cb replicate "$ENC_ID" "$REPL" >/dev/null
+OUT=$(cb replicate "$ENC_ID" "$REPL")
 AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
+contains "and says it sent nothing" '"snapshots_sent":0' "$OUT"
+contains "no objects either" '"objects_sent":0,' "$OUT"
+contains "the journal says the target was current" 'target already up to date' \
+    "$(cb journal "$ENC_ID")"
 
 # Replication can be scheduled, which is the point of an offsite copy: one
 # that only runs when somebody remembers is not a backup strategy. The
@@ -602,6 +688,14 @@ for _ in $(seq 1 60); do
 done
 check "a scheduled replicate fires and writes its pack" 1 "$FIRED"
 contains "the fired job ran as a replicate job" '"action":"replicate"' "$(cb jobs)"
+# B072: and its journal entry says a schedule asked, and which.
+SCHED_J=""
+for _ in $(seq 1 40); do
+    SCHED_J=$(cb journal "$ENC_ID" | grep -o '"source":"schedule"[^}]*' | head -1)
+    [ -n "$SCHED_J" ] && break
+    sleep 0.25
+done
+contains "a scheduled job journals its schedule" '"message":"schedule ' "$SCHED_J"
 # Stop it before it fires again under the rest of the suite.
 SID=$(cb schedule list "$ENC_ID" 2>/dev/null | tr ',' '\n' | grep -B0 -A0 '"id"' | head -1 | sed -n 's/.*"id":"\([0-9]*\)".*/\1/p')
 cb schedule remove "$ENC_ID" "$SID" >/dev/null 2>&1 || true

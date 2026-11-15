@@ -1369,6 +1369,10 @@ status_t pack_object_load_stream(store_t *store,
             return fst;
         }
         while (remaining > 0 && fst == OK) {
+            /* A restore of one large object is cancellable inside it. */
+            if (store_cancelled(store)) {
+                fst = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+            }
             size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                           (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
             if (fread(src, 1, want, f) != want) { fst = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 frame in %s", dat_path); break; }
@@ -1490,6 +1494,9 @@ status_t pack_object_load_stream(store_t *store,
         int total_corrected = 0;
 
         while (remaining > 0 && stream_st == OK) {
+            if (store_cancelled(store)) {
+                stream_st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+            }
             size_t want = (remaining < grp_data) ? (size_t)remaining : grp_data;
             if (fread(gbuf, 1, want, f) != want) { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
 
@@ -1549,6 +1556,9 @@ status_t pack_object_load_stream(store_t *store,
     plain_sink_t sink;
     status_t stream_st = sink_init(&sink, store, &ehdr);
     while (remaining > 0 && stream_st == OK) {
+        if (store_cancelled(store)) {
+            stream_st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+        }
         size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
                       (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
         if (fread(buf, 1, want, f) != want)           { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
@@ -2856,6 +2866,9 @@ static status_t pw_write_large(pack_writer_t *pw, pack_unified_ctx_t *ctx,
         /* Stream: read -> decrypt -> compress -> encrypt -> write */
         uint64_t remaining = plain_remaining;
         while (remaining > 0 && st == OK) {
+            /* Packing a multi-gigabyte loose object takes as long as storing
+             * it did; a cancel must not wait for the whole of it. */
+            if (store_cancelled(pw->store)) { st = ERR_BUSY; break; }
             size_t want = (remaining > (256 * 1024))
                           ? (256 * 1024) : (size_t)remaining;
             ssize_t got = read(fd, stream_buf, want);
@@ -2937,6 +2950,7 @@ raw_copy:
 
         uint64_t remaining = m->compressed_size;
         while (remaining > 0 && st == OK) {
+            if (store_cancelled(pw->store)) { st = ERR_BUSY; break; }
             size_t want = (remaining > (256 * 1024))
                           ? (256 * 1024) : (size_t)remaining;
             ssize_t got = read(fd, stream_buf, want);
@@ -3167,7 +3181,12 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
      * a pack holding the same hash twice.
      */
     if (staged_set_contains(&w->seen, w->pw.idx_entries, out_hash)) return OK;
-    if (object_exists(w->pw.store, out_hash)) return OK;
+    if (object_exists(w->pw.store, out_hash)) {
+        /* A loose copy from an interrupted run may have no index row yet;
+         * see object_loose_phys_size. */
+        if (out_phys_bytes) *out_phys_bytes = object_loose_phys_size(w->pw.store, out_hash);
+        return OK;
+    }
 
     status_t st = pb_ensure_open(w);
     if (st != OK) return st;
@@ -3270,6 +3289,16 @@ static void *pack_unified_worker(void *arg) {
 
     for (;;) {
         if (atomic_load(&ctx->stop)) break;
+        /* Between objects: a cancelled pack keeps the packs it already
+         * sealed (they are complete and committed) and discards the one in
+         * progress, whose loose objects are still where they were. */
+        if (store_cancelled(ctx->store)) {
+            pw.error = ERR_BUSY;
+            atomic_store(&ctx->stop, 1);
+            int expected = OK;
+            atomic_compare_exchange_strong(&ctx->error, &expected, (int)ERR_BUSY);
+            break;
+        }
 
         size_t idx = atomic_fetch_add(&ctx->next_index, 1);
         if (idx >= ctx->total_cnt) break;
@@ -3330,7 +3359,12 @@ static void *pack_unified_worker(void *arg) {
         }
     }
 
-    /* Finalize last pack */
+    /* Finalize last pack, unless the run was cancelled under it. */
+    if (pw.error == OK && pw.dat_f && pw.packed > 0 && store_cancelled(ctx->store)) {
+        pw.error = ERR_BUSY;
+        int expected = OK;
+        atomic_compare_exchange_strong(&ctx->error, &expected, (int)ERR_BUSY);
+    }
     if (pw.error == OK && pw.dat_f && pw.packed > 0) {
         pw.error = pw_finalize(&pw);
         if (pw.error != OK) {
@@ -3392,6 +3426,9 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
     uint64_t total_bytes_for_pack = 0;
 
     for (size_t i = 0; i < loose_cnt; i++) {
+        if (store_cancelled(store)) {
+            st = set_error(ERR_BUSY, "pack cancelled"); goto cleanup;
+        }
         const uint8_t *hash = hashes + i * OBJECT_HASH_SIZE;
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
@@ -3470,6 +3507,9 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         const repo_key_t *probe_key = store_key(store);
         size_t new_cnt = 0;
         for (size_t i = 0; i < packable_cnt; i++) {
+            if (store_cancelled(store)) {
+                st = set_error(ERR_BUSY, "pack cancelled"); goto cleanup;
+            }
             pack_obj_meta_t *lm = &meta[indices[i]];
             if (lm->compressed_size > PACK_STREAM_THRESHOLD &&
                 lm->skip_ver == 0 && lm->compression == COMPRESS_NONE) {
@@ -3633,6 +3673,11 @@ status_t repo_pack(store_t *store, uint32_t *out_packed,
         int werr = atomic_load(&ctx.error);
         if (werr != OK) {
             st = (status_t)werr;
+            if (st == ERR_BUSY && store_cancelled(store))
+                set_error(ERR_BUSY, "pack cancelled");
+            /* Whatever sealed before the stop is installed; drop the cached
+             * view so a reader sees those packs. */
+            pack_cache_invalidate(store);
             goto cleanup;
         }
     }
@@ -4199,6 +4244,16 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
 status_t pack_gc(store_t *store,
                  const uint8_t *refs, size_t refs_cnt,
                  uint32_t *out_kept, uint32_t *out_deleted) {
+    return pack_gc_stats(store, refs, refs_cnt, out_kept, out_deleted, NULL);
+}
+
+status_t pack_gc_stats(store_t *store,
+                       const uint8_t *refs, size_t refs_cnt,
+                       uint32_t *out_kept, uint32_t *out_deleted,
+                       pack_gc_stats_t *stats) {
+    pack_gc_stats_t scratch_stats;
+    if (!stats) stats = &scratch_stats;
+    memset(stats, 0, sizeof(*stats));
     pack_resume_deleting(store);
     uint32_t total_kept = 0, total_deleted = 0;
     char gc_packs_dir[PATH_MAX];
@@ -4227,7 +4282,11 @@ status_t pack_gc(store_t *store,
     char *gc_chunk = malloc(GC_CHUNK);
     if (!gc_chunk) { free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: gc_chunk alloc failed"); }
 
+    int gc_cancelled = 0;
     for (size_t pi = 0; pi < npack; pi++) {
+        /* Between packs only: each rewrite is installed whole or not at
+         * all, so stopping here leaves every pack either old or new. */
+        if (store_cancelled(store)) { gc_cancelled = 1; break; }
         uint32_t pnum = pack_nums[pi];
 
         char dat_path[PATH_MAX];
@@ -4274,6 +4333,7 @@ status_t pack_gc(store_t *store,
             unlink(dat_path);
             store_emit_pack_removed(store, pnum);
             total_deleted += count;
+            stats->packs_deleted++;
             free(disk_idx);
             continue;
         }
@@ -4420,6 +4480,8 @@ status_t pack_gc(store_t *store,
             if (pfd >= 0) { fsync(pfd); close(pfd); }
         }
 
+        stats->packs_rewritten++;
+
         /* Re-announce the rewritten pack. GC drops dead objects, so the
          * daemon's pack_objects rows for this pack are now wrong; the commit
          * callback replaces them. Emitted after the rename for the same
@@ -4466,6 +4528,14 @@ pack_fail:
             return st;
     }
     free(gc_chunk);
+
+    if (gc_cancelled) {
+        if (total_deleted > 0) pack_cache_invalidate(store);
+        if (out_kept)    *out_kept    = total_kept;
+        if (out_deleted) *out_deleted = total_deleted;
+        free(pack_nums);
+        return set_error(ERR_BUSY, "pack compaction cancelled");
+    }
 
     status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
     if (coalesce_st != OK)

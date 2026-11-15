@@ -80,6 +80,9 @@ struct store {
     /* The marker said encrypted. Independent of has_key: a scrub of an
      * offsite copy is encrypted with no key, and must still work. */
     int                   encrypted;
+
+    /* The owning job's cancel flag, or NULL. See store_set_cancel. */
+    volatile int         *cancel;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -193,23 +196,38 @@ done:
  * slow its source. A file younger than that is left alone even if it is in
  * fact an orphan; it will be swept on a later open.
  */
-static void store_sweep_tmp(const char *root)
+/* The prefixes mkstemp is given under tmp/, by every writer in the engine.
+ * A targeted sweep removes only these, so a file somebody put in tmp/ by
+ * hand is never the engine's to delete. */
+static int is_engine_tmp_name(const char *name)
+{
+    static const char *const prefixes[] = {
+        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    return 0;
+}
+
+/* Unlink regular files in <root>/tmp whose mtime is before `cutoff`.
+ * `engine_only` limits it to the engine's own staging names. */
+static unsigned sweep_tmp_dir(const char *root, time_t cutoff, int engine_only,
+                              uint64_t *out_bytes)
 {
     char tmp_dir[PATH_MAX];
     if (snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", root) >= (int)sizeof(tmp_dir))
-        return;
+        return 0;
 
     DIR *d = opendir(tmp_dir);
-    if (!d) return;
+    if (!d) return 0;
 
-    const time_t now = time(NULL);
-    const time_t stale_after = 60 * 60;   /* one hour, see above */
     unsigned swept = 0;
     uint64_t bytes = 0;
 
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
+        if (engine_only && !is_engine_tmp_name(de->d_name)) continue;
 
         char path[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name)
@@ -218,7 +236,7 @@ static void store_sweep_tmp(const char *root)
 
         struct stat sb;
         if (lstat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
-        if (now - sb.st_mtime < stale_after) continue;
+        if (sb.st_mtime >= cutoff) continue;
 
         if (unlink(path) == 0) {
             swept++;
@@ -227,9 +245,38 @@ static void store_sweep_tmp(const char *root)
     }
     closedir(d);
 
+    if (out_bytes) *out_bytes += bytes;
     if (swept)
         log_info("store: swept %u stale staging file(s) from tmp (%llu bytes)",
                  swept, (unsigned long long)bytes);
+    return swept;
+}
+
+static void store_sweep_tmp(const char *root)
+{
+    const time_t stale_after = 60 * 60;   /* one hour, see above */
+    (void)sweep_tmp_dir(root, time(NULL) - stale_after, 0, NULL);
+}
+
+unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes)
+{
+    if (!st) return 0;
+    return sweep_tmp_dir(st->path, before, 1, bytes);
+}
+
+void store_set_cancel(store_t *st, volatile int *cancel)
+{
+    if (st) st->cancel = cancel;
+}
+
+volatile int *store_get_cancel(const store_t *st)
+{
+    return st ? st->cancel : NULL;
+}
+
+int store_cancelled(const store_t *st)
+{
+    return st && st->cancel && *st->cancel;
 }
 
 status_t store_open(const char *path, const store_config_t *cfg, store_t **out) {
@@ -271,6 +318,7 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->commit_user     = NULL;
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
+    r->cancel          = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     store_sweep_tmp(r->path);

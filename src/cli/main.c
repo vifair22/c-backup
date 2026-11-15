@@ -763,7 +763,22 @@ static int cmd_jobs(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[0], "watch") == 0) {
         sbuf_t p = { 0 };
         sb_puts(&p, "/jobs/stream/"); sb_puts(&p, argv[1]);
-        return call_path_sb("GET", &p, NULL);
+        if (p.oom) { free(p.buf); return fail("request path too large"); }
+        int status = 0;
+        status_t st = http_stream(g_socket, p.buf, stdout, stderr, &status);
+        free(p.buf);
+        if (st == ERR_NOT_FOUND) {
+            fprintf(stderr,
+                    "c-backup: daemon not running at %s.\n"
+                    "          Start it with 'systemctl start c-backupd'.\n", g_socket);
+            return 1;
+        }
+        if (st != OK) return fail("%s", err_msg());
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "c-backup: request failed with HTTP %d\n", status);
+            return 1;
+        }
+        return 0;
     }
     if (argc >= 1) {
         sbuf_t p = { 0 };

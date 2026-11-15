@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef struct store store_t;
 struct repo_key;
@@ -98,6 +99,41 @@ int  store_needs_key(const store_t *st);
 
 /* NULL when the repository is not encrypted. */
 const struct repo_key *store_key(const store_t *st);
+
+/* ---------- cancellation ---------- */
+
+/*
+ * The job's cancel flag, consulted between chunks inside one object.
+ *
+ * Checking only between files made a cancel wait for the file in hand to
+ * finish: 17 seconds for a 2 GiB file, longer than the 10 second grace a
+ * `docker stop` gives, so a shutdown during a large backup ended in SIGKILL
+ * and a job recorded as interrupted. The flag lives on the handle rather
+ * than in every signature because each job opens its own store, and the
+ * loops that need it sit several layers below anything that knows about
+ * jobs. NULL, the default, means nothing can cancel.
+ *
+ * A write that stops on this flag returns ERR_BUSY with its temporary file
+ * already removed, exactly as any other failed write does.
+ */
+void store_set_cancel(store_t *st, volatile int *cancel);
+volatile int *store_get_cancel(const store_t *st);
+int  store_cancelled(const store_t *st);
+
+/*
+ * Remove staging files in tmp/ last modified before `before`, limited to the
+ * names the engine itself creates (obj.*, pack-dat.*, pack-idx.*, snap.*,
+ * par.*). Returns how many were removed and adds their size to *bytes when
+ * that is not NULL.
+ *
+ * store_open sweeps with an hour's margin because it cannot know who else is
+ * writing. A caller holding the repository's write lock can: no other job
+ * writes this repository, and the daemon is the only process that does, so
+ * anything already in tmp/ when it started belongs to a writer that is gone.
+ * Backup and gc call this with their own start time; nothing else should.
+ */
+unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
+
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 
