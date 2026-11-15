@@ -916,6 +916,13 @@ restored from.
   compromised source cannot delete the offsite copy through replication.
 - A destination already holding a different repository is refused.
 
+The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
+(already complete at the target), `objects_asked`, `objects_sent`,
+`bytes_sent` (as stored, so what crossed to the target) and
+`subtrees_skipped`. A run with nothing to send reports zeros and journals
+`target already up to date`, so a no-op and a full copy are told apart at a
+glance.
+
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
 A network transport is not in 1.0.

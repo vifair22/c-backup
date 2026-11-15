@@ -446,10 +446,11 @@ What some jobs report in `result`, beyond the backup and restore counts:
 | Job | `result` |
 |---|---|
 | gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped` |
 
-It also puts a one-line summary in its journal entry, such as `swept 12
+Both also put a one-line summary in their journal entry, such as `swept 12
 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
-removed`. A dry-run gc
+removed` or `target already up to date (3 snapshots present)`. A dry-run gc
 removes nothing, temp files included; its pack figures are zero because
 compaction does not run.
 

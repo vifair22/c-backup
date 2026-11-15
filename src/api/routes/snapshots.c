@@ -781,6 +781,45 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
     job_set_summary(progress_ctx, msg);
 }
 
+/*
+ * What a replication sent. A full copy, an incremental and a no-op all
+ * printed the same bare job before this; the counts were only in the log.
+ */
+static void replicate_report(void *progress_ctx, const replicate_result_t *rr)
+{
+    char js[384];
+    snprintf(js, sizeof(js),
+             "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
+             "\"objects_asked\":%llu,\"objects_sent\":%llu,"
+             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu}",
+             (unsigned long long)rr->snapshots_sent,
+             (unsigned long long)rr->snapshots_skipped,
+             (unsigned long long)rr->objects_asked,
+             (unsigned long long)rr->objects_sent,
+             (unsigned long long)rr->bytes_sent,
+             (unsigned long long)rr->subtrees_skipped);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    if (rr->snapshots_sent == 0 && rr->objects_sent == 0)
+        snprintf(msg, sizeof(msg),
+                 "target already up to date (%llu snapshot%s present)",
+                 (unsigned long long)rr->snapshots_skipped,
+                 rr->snapshots_skipped == 1 ? "" : "s");
+    else
+        snprintf(msg, sizeof(msg),
+                 "sent %llu snapshot%s, %llu object%s, %llu bytes; "
+                 "%llu subtree%s skipped",
+                 (unsigned long long)rr->snapshots_sent,
+                 rr->snapshots_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->objects_sent,
+                 rr->objects_sent == 1 ? "" : "s",
+                 (unsigned long long)rr->bytes_sent,
+                 (unsigned long long)rr->subtrees_skipped,
+                 rr->subtrees_skipped == 1 ? "" : "s");
+    job_set_summary(progress_ctx, msg);
+}
+
 static status_t snap_job_run(void *arg, volatile int *cancel,
                              void (*progress)(const char *, uint64_t, uint64_t, void *),
                              void *progress_ctx)
@@ -853,6 +892,9 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 st = replicate_run(store, j->db, j->repo_id, &sink, cancel,
                                    NULL, NULL, &rr);
                 sink.v->close(sink.ctx);
+                /* A cancelled run keeps what it committed, so its counts
+                 * are true either way. */
+                replicate_report(progress_ctx, &rr);
                 if (st == OK)
                     log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
                              "%llu object(s), %llu byte(s), %llu subtree(s) skipped",

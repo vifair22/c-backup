@@ -444,6 +444,14 @@ REPL="$WORK/replica"
 OUT=$(cb replicate "$ENC_ID" "$REPL"); RC=$?
 check    "replicate waits for its job"  0             "$RC"
 contains "replicate reports completion" '"completed"' "$OUT"
+# B070: a full copy, an incremental and a no-op all printed the same bare
+# job; what was sent was only in the log.
+contains "replicate reports what it sent" '"objects_sent":' "$OUT"
+contains "including the snapshots" '"snapshots_sent":' "$OUT"
+case "$OUT" in
+    *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
+    *) ok "a first replicate sends objects" ;;
+esac
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.
@@ -484,9 +492,13 @@ fi
 # Running it again moves nothing: the target already has the root tree, so
 # one question ends the walk.
 BEFORE=$(find "$REPL" -type f | wc -l)
-cb replicate "$ENC_ID" "$REPL" >/dev/null
+OUT=$(cb replicate "$ENC_ID" "$REPL")
 AFTER=$(find "$REPL" -type f | wc -l)
 check "second replicate is a no-op" "$BEFORE" "$AFTER"
+contains "and says it sent nothing" '"snapshots_sent":0' "$OUT"
+contains "no objects either" '"objects_sent":0,' "$OUT"
+contains "the journal says the target was current" 'target already up to date' \
+    "$(cb journal "$ENC_ID")"
 
 # Replication can be scheduled, which is the point of an offsite copy: one
 # that only runs when somebody remembers is not a backup strategy. The
