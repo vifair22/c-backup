@@ -54,11 +54,15 @@ static void mb_addf(mbuf_t *m, const char *fmt, ...)
     m->buf[m->len] = '\0';
 }
 
-/* Single-value query; -1 when it cannot be answered. */
+/* Single-value query; -1 when it cannot be answered, including a NULL
+ * result. c-utils returns a NULL column as an empty string, not a NULL
+ * pointer, so the empty string is the test: an aggregate over no rows used
+ * to parse as 0 and report "just now" for something that never happened. */
 static long long scalar(const char *sql)
 {
     db_result_t *r = NULL;
-    if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1 || !r->rows[0][0]) {
+    if (db_execute(g_db, sql, NULL, &r) != 0 || !r || r->nrows != 1 ||
+        !r->rows[0][0] || !r->rows[0][0][0]) {
         db_result_free(r);
         return -1;
     }
@@ -109,14 +113,27 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
                 "SELECT COUNT(*) FROM schedules WHERE enabled = 1");
 
     /*
-     * Age of the newest snapshot. This is the number that actually matters for
-     * a backup system: "did it run" is more useful than any throughput figure,
-     * and it is the one an alert should watch.
+     * Backup age, for the stalest repository. This is the number an alert
+     * should watch: "did it run" matters more than any throughput figure.
+     *
+     * Daemon-wide, but the worst repository rather than the newest snapshot
+     * anywhere. It was the latter, which let one repository backing up every
+     * night hide another that never ran, and it read 0 - "just now" - for a
+     * repository with no snapshot at all. A repository that has never been
+     * backed up ages from when it was registered, so it trips an "age > N"
+     * alert like any other stale one. With no repositories the series is
+     * absent rather than a false zero.
      */
     emit_scalar(&m, "cbackup_last_snapshot_age_seconds",
-                "Seconds since the most recent snapshot completed.", "gauge",
-                "SELECT CAST(strftime('%s','now') AS INTEGER) - COALESCE(MAX(ts), "
-                "CAST(strftime('%s','now') AS INTEGER)) FROM snapshots");
+                "Seconds since the stalest repository's newest snapshot (or since it "
+                "was registered, if it has none).", "gauge",
+                "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - COALESCE("
+                "(SELECT MAX(s.ts) FROM snapshots s WHERE s.repo_id = r.id), r.added_at))"
+                " FROM repos r");
+    emit_scalar(&m, "cbackup_repos_never_backed_up",
+                "Repositories with no snapshot.", "gauge",
+                "SELECT COUNT(*) FROM repos r WHERE NOT EXISTS"
+                " (SELECT 1 FROM snapshots s WHERE s.repo_id = r.id)");
 
     /*
      * Repositories whose key exists only on this machine and which nobody has
@@ -140,9 +157,16 @@ static api_response_t handle_metrics(const api_request_t *req, void *ud)
      * should page on.
      */
     emit_scalar(&m, "cbackup_last_verify_age_seconds",
-                "Seconds since the most recent completed verify finished.", "gauge",
-                "SELECT CAST(strftime('%s','now') AS INTEGER) - COALESCE(MAX(finished_at), "
-                "CAST(strftime('%s','now') AS INTEGER)) FROM verify_runs WHERE completed = 1");
+                "Seconds since the stalest repository's last completed verify (or since "
+                "it was registered, if it has none).", "gauge",
+                "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - COALESCE("
+                "(SELECT MAX(v.finished_at) FROM verify_runs v"
+                "  WHERE v.repo_id = r.id AND v.completed = 1), r.added_at))"
+                " FROM repos r");
+    emit_scalar(&m, "cbackup_repos_never_verified",
+                "Repositories with no completed verify.", "gauge",
+                "SELECT COUNT(*) FROM repos r WHERE NOT EXISTS"
+                " (SELECT 1 FROM verify_runs v WHERE v.repo_id = r.id AND v.completed = 1)");
     emit_scalar(&m, "cbackup_verify_unrecoverable_objects",
                 "Objects the most recent completed verify could not reconstruct.", "gauge",
                 "SELECT COALESCE((SELECT unrecoverable + missing FROM verify_runs"

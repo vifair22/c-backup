@@ -169,7 +169,18 @@ echo "repos"
 contains "register" '"id":1' \
     "$(curl -s -X POST --unix-socket "$SOCK" -d "{\"path\":\"$WORK/repo\"}" http://localhost/repos)"
 contains "get repo" '"uuid"' "$(sock_body /repos/1)"
+# A repository with no snapshot is counted. Its age runs from registration,
+# so it trips an age alert like any stale repository instead of reading 0.
+contains "never backed up is counted" "cbackup_repos_never_backed_up 1" "$(sock_body /metrics)"
 check "unknown repo" 404 "$(sock_code /repos/99)"
+# And every route under it: these answered 200 with empty results, which a
+# script cannot tell from an empty repository that exists.
+check "unknown repo: summary" 404 "$(sock_code /repos/99/summary)"
+check "unknown repo: snapshots" 404 "$(sock_code /repos/99/snapshots)"
+check "unknown repo: backup" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" \
+     -d '{"paths":["/tmp"]}' http://localhost/repos/99/backup)"
+check "unknown repo: policy" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --unix-socket "$SOCK" \
+     -d '{"key":"retention.keep_daily","value":"1"}' http://localhost/repos/99/policy)"
 
 mkdir -p "$WORK/foreign" && echo "not ours" > "$WORK/foreign/data.txt"
 check "refuses foreign dir" 400 \

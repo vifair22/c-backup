@@ -75,6 +75,14 @@ if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; e
 echo "with daemon"
 contains "health" "ready" "$(cb health)"
 contains "repo add" '"id":1' "$(cb repo add "$WORK/repo" main)"
+check "an unknown repo id is an error" 1 "$(cb summary 99 >/dev/null 2>&1; echo $?)"
+# Errors go to stderr, so stdout piped to a JSON reader never holds one.
+check "an error body stays off stdout" "" "$(cb summary 99 2>/dev/null)"
+contains "and is on stderr" '"error"' "$(cb summary 99 2>&1 >/dev/null)"
+# --help after a command answers locally, before any validation or request.
+contains "command --help shows its usage" "usage: c-backup repo" "$(cb repo add --help)"
+check    "command --help exits 0" 0 "$(cb backup --help >/dev/null; echo $?)"
+contains "help <command>" "usage: c-backup restore" "$(cb help restore)"
 contains "repo list" '"path"' "$(cb repo list)"
 contains "repo show" '"uuid"' "$(cb repo show 1)"
 

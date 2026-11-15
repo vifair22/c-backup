@@ -112,6 +112,8 @@ typedef struct {
      * worker thread, which is the only caller. */
     int64_t        last_ms;
     char           last_phase[32];
+    /* The latest report, written or not, for the job's closing log line. */
+    uint64_t       seen_done, seen_total;
 } progress_ctx_t;
 
 /* How often a running job's progress reaches the database. */
@@ -139,6 +141,8 @@ static void on_progress(const char *phase, uint64_t done, uint64_t total, void *
 {
     progress_ctx_t *pc = ctx;
     const char *ph = phase ? phase : "";
+    pc->seen_done = done;
+    pc->seen_total = total;
     int64_t now = mono_ms();
     int phase_changed = strncmp(pc->last_phase, ph, sizeof(pc->last_phase) - 1) != 0;
     int finished = total > 0 && done >= total;
@@ -231,6 +235,11 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&jm->mu);
 
         set_job_state(jm, slot.job_id, "running", NULL);
+        /* A start and an end line per job. The log had neither: a backup
+         * that ran for two hours left nothing in the journal until it
+         * succeeded or failed, and no line at all saying when it began. */
+        log_info("job %lld started: %s, repo %lld",
+                 (long long)slot.job_id, slot.action, (long long)slot.repo_id);
         /*
          * Monotonic and in milliseconds. This was wall-clock seconds, so
          * every operation finishing inside a second journalled "0 ms" and
@@ -242,7 +251,7 @@ static void *worker_main(void *arg)
         struct timespec began;
         clock_gettime(CLOCK_MONOTONIC, &began);
 
-        progress_ctx_t pc = { jm, slot.job_id, 0, "" };
+        progress_ctx_t pc = { jm, slot.job_id, 0, "", 0, 0 };
         status_t st = slot.fn(slot.arg, &jm->queue[slot_index].cancel,
                               on_progress, &pc);
 
@@ -265,6 +274,18 @@ static void *worker_main(void *arg)
             set_job_state(jm, slot.job_id, "failed", detail);
             log_warn("job %lld (%s) failed: %s",
                      (long long)slot.job_id, slot.action, detail);
+        }
+        {
+            struct timespec fin;
+            clock_gettime(CLOCK_MONOTONIC, &fin);
+            double secs = (double)(fin.tv_sec - began.tv_sec)
+                        + (double)(fin.tv_nsec - began.tv_nsec) / 1e9;
+            log_info("job %lld %s: %s, repo %lld, %.1f s, %s %llu/%llu",
+                     (long long)slot.job_id, outcome, slot.action,
+                     (long long)slot.repo_id, secs,
+                     pc.last_phase[0] ? pc.last_phase : "no progress",
+                     (unsigned long long)pc.seen_done,
+                     (unsigned long long)pc.seen_total);
         }
 
         if (slot.repo_id > 0) {
