@@ -468,11 +468,14 @@ counted without limit: one 10 MiB binary produced 40,776 hits and one
 20 MiB log 806,597, every one of them read and matched for nothing.
 `hits` counts what was recorded, so it never exceeds `max_hits`.
 
-The run's `truncated` is 1 when `max_files` or `max_hits` stopped the search,
-so a caller can tell "no more matches" from "stopped looking". The job's
-`result` carries `run_id`, `snapshot`, `files_scanned`, `files_matched`,
-`files_capped` (files that reached `max_hits_per_file` and may hold more),
-`hits` and `truncated`. The CLI takes `--limit`, `--max-hits-per-file` and
+The run's `truncated` is `true` when `max_files` or `max_hits` stopped the
+search, so a caller can tell "no more matches" from "stopped looking". A file
+that reached `max_hits_per_file` does not set it; it is counted in
+`files_capped` (files that may hold more than was recorded), which both the
+run record in `GET /repos/<id>/grep` and the job's `result` carry. The
+`result` also has `run_id`, `snapshot`, `files_scanned`, `files_matched`,
+`hits` and `truncated`. `ignore_case` is a boolean; `0` and `1` are still
+accepted. The CLI takes `--limit`, `--max-hits-per-file` and
 `--max-hits`.
 
 `snapshot` defaults to the newest. One that does not exist is `404 no such
@@ -620,8 +623,9 @@ plaintext, so they and the trees carry over unchanged, as do snapshot ids;
 a snapshot id the destination already uses for another tree fails the run
 instead of being overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
-not on this host. The job's result reports `snapshots_sent`, `objects_sent`,
-`bytes_sent` and `reencrypted`. Re-encrypting is a manual operation: the
+not on this host. The job's result reports `snapshots_sent`,
+`snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,
+`subtrees_skipped` and `reencrypted`. Re-encrypting is a manual operation: the
 schedule route does not store `reencrypt`.
 
 There is no delete. Retention at the target belongs to the target, which is
@@ -710,13 +714,27 @@ What some jobs report in `result`, beyond the backup and restore counts:
 | Job | `result` |
 |---|---|
 | gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
-| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped` |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted` |
+| pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
-Both also put a one-line summary in their journal entry, such as `swept 12
-objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
-removed` or `target already up to date (3 snapshots present)`. A dry-run gc
-removes nothing, temp files included; its pack figures are zero because
-compaction does not run.
+A pack's `reason` is `null` when it packed something, and otherwise says why
+it did not: `no loose objects`, `all loose objects are skip-marked as
+incompressible`, `every remaining loose object is incompressible`, or `no
+loose object could be packed`. It had no result at all before, so a run that
+packed nothing read as a bare `completed`.
+
+All three also put a one-line summary in their journal entry, such as `swept
+12 objects (40960 bytes); 1 pack rewritten, 0 deleted; 0 stale temp files
+removed`, `target already up to date (3 snapshots present)` or `nothing
+packed: no loose objects`. A dry-run gc removes nothing, temp files
+included; its pack figures are zero because compaction does not run.
+
+A finished job's `phase`, `current` and `total` are its last progress report.
+Progress reaches the database a few times a second, and the final report is
+written when the job ends, so a phase that finished inside one interval no
+longer stays at its first count. Each phase ends with `current` equal to
+`total`. A restore counts the entries in scope: the whole snapshot, or with
+a `subpath` only that subtree, so a one-file restore ends at 1 of 1.
 
 ## Introspection
 
@@ -951,7 +969,7 @@ different action is a 400 rather than a value stored and never read:
 |---|---|
 | `backup` | `paths` (optional; the repository's sources otherwise) |
 | `replicate` | `dest` (required, absolute) |
-| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case`, `max_files` |
+| `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case` (a boolean, stored as one; `0`/`1` accepted), `max_files` |
 | others | none |
 
 A `grep` schedule searches the newest snapshot as of each fire, so it takes

@@ -903,18 +903,56 @@ static void pack_progress_adapter(uint64_t current, uint64_t total,
 status_t routes_run_pack(struct store *store, int64_t repo_id,
                          volatile int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx)
+                         void *progress_ctx, struct pack_report *out)
 {
     /* repo_pack takes no flag of its own; it reads the store's, which is
      * how a cancel reaches the middle of packing one large object. */
     if (cancel) store_set_cancel((store_t *)store, cancel);
     pack_progress_bridge_t bridge = { progress, progress_ctx };
-    uint32_t packed = 0;
-    status_t st = repo_pack((store_t *)store, &packed, pack_progress_adapter, &bridge);
-    if (st == OK && packed > 0)
-        log_info("pack: %u object(s) packed in repo %lld",
-                 packed, (long long)repo_id);
+    pack_report_t rep;
+    status_t st = repo_pack_report((store_t *)store, &rep, pack_progress_adapter, &bridge);
+    if (st == OK && rep.packed > 0)
+        log_info("pack: %llu object(s) packed in repo %lld",
+                 (unsigned long long)rep.packed, (long long)repo_id);
+    if (out) *out = rep;
     return st;
+}
+
+/*
+ * What a pack job did. It recorded no result at all, so a run that packed
+ * nothing - every loose object skip-marked as incompressible - read as a
+ * bare "completed" and the reason was only in the daemon log (B099).
+ * "reason" is null when something was packed.
+ */
+static void pack_job_report(void *progress_ctx, const pack_report_t *pr)
+{
+    char js[384];
+    if (pr->reason)
+        snprintf(js, sizeof(js),
+                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
+                 "\"incompressible\":%llu,\"reason\":\"%s\"}",
+                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
+                 (unsigned long long)pr->skip_marked,
+                 (unsigned long long)pr->incompressible, pr->reason);
+    else
+        snprintf(js, sizeof(js),
+                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
+                 "\"incompressible\":%llu,\"reason\":null}",
+                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
+                 (unsigned long long)pr->skip_marked,
+                 (unsigned long long)pr->incompressible);
+    job_set_result(progress_ctx, js);
+
+    char msg[256];
+    uint64_t left = pr->skip_marked + pr->incompressible;
+    if (pr->reason)
+        snprintf(msg, sizeof(msg), "nothing packed: %s", pr->reason);
+    else
+        snprintf(msg, sizeof(msg),
+                 "packed %llu object%s; %llu left loose as incompressible",
+                 (unsigned long long)pr->packed, pr->packed == 1 ? "" : "s",
+                 (unsigned long long)left);
+    job_set_summary(progress_ctx, msg);
 }
 
 /* How many ids a gfs journal message names before it summarises the rest.
@@ -1034,19 +1072,25 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
  * What a replication sent. A full copy, an incremental and a no-op all
  * printed the same bare job before this; the counts were only in the log.
  */
-static void replicate_report(void *progress_ctx, const replicate_result_t *rr)
+static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
+                             int reencrypt)
 {
+    /* One result document. A second job_set_result after this one, which
+     * added "reencrypted", replaced it whole and dropped objects_asked and
+     * subtrees_skipped from every replication's result (B098). */
     char js[384];
     snprintf(js, sizeof(js),
              "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
              "\"objects_asked\":%llu,\"objects_sent\":%llu,"
-             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu}",
+             "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu,"
+             "\"reencrypted\":%s}",
              (unsigned long long)rr->snapshots_sent,
              (unsigned long long)rr->snapshots_skipped,
              (unsigned long long)rr->objects_asked,
              (unsigned long long)rr->objects_sent,
              (unsigned long long)rr->bytes_sent,
-             (unsigned long long)rr->subtrees_skipped);
+             (unsigned long long)rr->subtrees_skipped,
+             reencrypt ? "true" : "false");
     job_set_result(progress_ctx, js);
 
     char msg[256];
@@ -1127,7 +1171,10 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
         /* Loose objects are one file each, and compression only happens at
          * pack time, so an unpacked repository stores more than its source
          * and keeps one inode per object. */
-        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx);
+        pack_report_t pr;
+        memset(&pr, 0, sizeof(pr));
+        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx, &pr);
+        pack_job_report(progress_ctx, &pr);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;
         memset(&go, 0, sizeof(go));
@@ -1209,7 +1256,7 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                 sink.v->close(sink.ctx);
                 /* A cancelled run keeps what it committed, so its counts
                  * are true either way. */
-                replicate_report(progress_ctx, &rr);
+                replicate_report(progress_ctx, &rr, j->reencrypt);
                 if (st == OK)
                     log_info("replicate: repo %lld -> %s: %llu snapshot(s), "
                              "%llu object(s), %llu byte(s), %llu subtree(s) skipped",
@@ -1218,16 +1265,6 @@ static status_t snap_job_run(void *arg, volatile int *cancel,
                              (unsigned long long)rr.objects_sent,
                              (unsigned long long)rr.bytes_sent,
                              (unsigned long long)rr.subtrees_skipped);
-                char rj[256];
-                snprintf(rj, sizeof(rj),
-                         "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
-                         "\"objects_sent\":%llu,\"bytes_sent\":%llu,\"reencrypted\":%s}",
-                         (unsigned long long)rr.snapshots_sent,
-                         (unsigned long long)rr.snapshots_skipped,
-                         (unsigned long long)rr.objects_sent,
-                         (unsigned long long)rr.bytes_sent,
-                         j->reencrypt ? "true" : "false");
-                job_set_result(progress_ctx, rj);
             }
         }
         if (dest_locked > 0) repo_unlock(dest_locked);
@@ -1397,9 +1434,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
         }
         if (json_req_get_str(body, "path_prefix", &j->path_prefix) != 0)
             j->path_prefix = NULL;
-        uint32_t ic = 0;
-        if (json_req_get_u32(body, "ignore_case", &ic, 0, 1) == 0)
-            j->ignore_case = (int)ic;
+        if (jreq_flag(body, "ignore_case", &j->ignore_case) != 0) {
+            snap_job_free(j);
+            return api_error(400, "ignore_case must be true or false");
+        }
         uint32_t mf = 0;
         if (json_req_get_u32(body, "max_files", &mf, 0, 1000000) == 0)
             j->max_files = mf;
@@ -1592,7 +1630,7 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
             "SELECT id, snap_id, pattern, started_at, finished_at, completed,"
-            "       files_scanned, files_matched, hits, truncated"
+            "       files_scanned, files_matched, hits, truncated, files_capped"
             "  FROM grep_runs WHERE repo_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
             (const char *[]){ repo, limit, offset, NULL }, &r) != 0) {
         db_result_free(r);
@@ -1612,6 +1650,7 @@ static api_response_t grep_runs_get(const api_request_t *req, int64_t repo_id)
             { "finished_at", 4, JCOL_INT }, { "completed", 5, JCOL_BOOL },
             { "files_scanned", 6, JCOL_INT }, { "files_matched", 7, JCOL_INT },
             { "hits", 8, JCOL_INT }, { "truncated", 9, JCOL_BOOL },
+            { "files_capped", 10, JCOL_INT },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         json_elem_commit(&e);
@@ -2009,7 +2048,8 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
         if (json_req_get_str_opt(p, "path_prefix", &j->path_prefix) != 0)
             j->path_prefix = NULL;
         uint32_t v = 0;
-        if (json_req_get_u32(p, "ignore_case", &v, 0, 1) == 0) j->ignore_case = (int)v;
+        /* A boolean now; schedules created before that hold 0 or 1. */
+        if (jreq_flag(p, "ignore_case", &j->ignore_case) != 0) j->ignore_case = 0;
         if (json_req_get_u32(p, "max_files", &v, 0, 1000000) == 0) j->max_files = v;
         j->snap_id = newest_snapshot(repo_id);
         if (j->snap_id <= 0) {

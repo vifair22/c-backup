@@ -118,3 +118,13 @@ int jrow_resp_add_row(cutils_json_resp_t *r, const jcol_t *cols, size_t n, char 
     const target_t t = { NULL, r };
     return add_row(&t, cols, n, row);
 }
+
+int jreq_flag(const cutils_json_req_t *req, const char *key, int *out)
+{
+    if (!json_req_has(req, key)) return 0;
+    bool b = false;
+    if (json_req_get_bool(req, key, &b) == 0) { *out = b ? 1 : 0; return 0; }
+    uint32_t n = 0;
+    if (json_req_get_u32(req, key, &n, 0, 1) == 0) { *out = (int)n; return 0; }
+    return -1;
+}

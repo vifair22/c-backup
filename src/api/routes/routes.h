@@ -71,10 +71,11 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
  * callback with the counters first.
  */
 struct store;
+struct pack_report;
 status_t routes_run_pack(struct store *store, int64_t repo_id,
                          volatile int *cancel,
                          void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx);
+                         void *progress_ctx, struct pack_report *out);
 
 /*
  * Read a boolean policy flag, falling back to def when the repo has not set

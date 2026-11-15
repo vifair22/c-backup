@@ -801,7 +801,7 @@ static int cmd_grep(int argc, char **argv)
     if (maxf)   { sb_puts(&b, ",\"max_files\":");   sb_puts(&b, maxf); }
     if (hpf)    { sb_puts(&b, ",\"max_hits_per_file\":"); sb_puts(&b, hpf); }
     if (maxh)   { sb_puts(&b, ",\"max_hits\":");    sb_puts(&b, maxh); }
-    if (icase)  sb_puts(&b, ",\"ignore_case\":1");
+    if (icase)  sb_puts(&b, ",\"ignore_case\":true");
     sb_puts(&b, "}");
 
     sbuf_t p = { 0 };
@@ -1387,7 +1387,7 @@ static int cmd_schedule(int argc, char **argv)
         if (dest) { sb_puts(&b, ",\"dest\":"); sb_json_str(&b, dest); }
         if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
         if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
-        if (gicase)  sb_puts(&b, ",\"ignore_case\":1");
+        if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
         if (n_src > 0) {
             sb_puts(&b, ",\"paths\":[");
             for (int i = 0; i < n_src; i++) {

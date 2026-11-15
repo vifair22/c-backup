@@ -570,7 +570,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     }
 
     restore_result_t res;
-    uint64_t matched = 0;     /* nodes inside the subpath, when there is one */
+    uint64_t matched = 0;     /* entries in scope passed so far: all, or the subpath's */
     memset(&res, 0, sizeof(res));
     status_t st = OK;
 
@@ -638,17 +638,25 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
     /* Bytes to restore: regular files inside the subpath, if there is one.
      * A file's size is counted once the loop has moved past it, written or
-     * skipped alike, since both are progress through the snapshot. */
+     * skipped alike, since both are progress through the snapshot.
+     *
+     * And the entries to restore, which is what the item count measures.
+     * It was the snapshot's entry count, so a one-file restore out of a
+     * 104-entry snapshot reported 104 of 104 (B093): neither the work asked
+     * for nor the work done. With no subpath every entry is in scope and no
+     * pass is needed for the count. */
     uint64_t bytes_total = 0, bytes_done = 0, bytes_pending = 0;
-    if (opts->bytes_cb) {
+    uint64_t work_total = opts->subpath ? 0 : (uint64_t)r->nrows;
+    if (opts->bytes_cb || opts->subpath) {
         for (int i = 0; i < r->nrows; i++) {
-            if ((uint32_t)strtoul(r->rows[i][8], NULL, 10) != NODE_TYPE_REG) continue;
+            int reg = (uint32_t)strtoul(r->rows[i][8], NULL, 10) == NODE_TYPE_REG;
             if (opts->subpath) {
                 char rel[PATH_MAX];
                 if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) { err_clear(); continue; }
                 if (!path_within(rel, opts->subpath)) continue;
+                work_total++;
             }
-            bytes_total += strtoull(r->rows[i][6], NULL, 10);
+            if (reg) bytes_total += strtoull(r->rows[i][6], NULL, 10);
         }
     }
 
@@ -657,12 +665,10 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         bytes_done += bytes_pending;
         bytes_pending = 0;
         if (opts->bytes_cb) opts->bytes_cb(opts->progress_ctx, bytes_done, bytes_total);
-        /* i + 1: this is the entry being worked on, not the count already
-         * finished. Reporting the bare index meant the last entry of a
-         * restore was announced as 6414 of 6415 and the job then completed,
-         * so a progress bar stopped just short of full every time and read
-         * as a stall at the worst possible moment. */
-        report(opts, "restore", (uint64_t)i + 1, (uint64_t)r->nrows);
+        /* Entries in scope finished so far. Reported before the subpath
+         * test so a long run of out-of-scope entries still reaches the job
+         * (and its cancel check) at the throttle's rate. */
+        report(opts, "restore", matched, work_total);
 
         uint32_t    mode    = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
         uint32_t    uid     = (uint32_t)strtoul(r->rows[i][3], NULL, 10);
@@ -683,6 +689,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
             log_warn("restore: cannot reconstruct the path of node %s", r->rows[i][0]);
             res.failed++;
             err_clear();
+            /* Without a subpath it is in work_total, and it is finished. */
+            if (!opts->subpath) matched++;
             continue;
         }
 
@@ -887,7 +895,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
         err_clear();    /* so a reason below cannot be left over from before */
         restore_io_t io = { opts, bytes_done, bytes_total,
                             strtoull(r->rows[i][6], NULL, 10), 0,
-                            (uint64_t)i + 1, (uint64_t)r->nrows };
+                            matched - 1, work_total };
         store_io_fn prev_io;
         void *prev_io_ctx;
         store_get_io_progress(store, &prev_io, &prev_io_ctx);
@@ -989,6 +997,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
     if (opts->bytes_cb && st == OK)
         opts->bytes_cb(opts->progress_ctx, bytes_done + bytes_pending, bytes_total);
+    /* The loop reports what was finished before each entry, so the last
+     * entry is counted here: matched equals work_total on a full run. */
+    if (st == OK) report(opts, "restore", matched, work_total);
     pt_free(&paths);
     db_result_free(r);
     if (st != OK) return st;

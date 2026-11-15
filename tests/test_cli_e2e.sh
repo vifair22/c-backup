@@ -238,7 +238,13 @@ contains "snapshot note set" '"ok"'   "$(cb snapshot note 1 1 'checked by hand')
 contains "snapshot note get" 'checked by hand' "$(cb snapshot note 1 1)"
 contains "snapshot tree"     '"name"' "$(cb snapshot tree 1 1)"
 
-contains "pack"   '"state":"completed"' "$(cb pack 1)"
+PACK_OUT=$(cb pack 1)
+contains "pack"   '"state":"completed"' "$PACK_OUT"
+# B099: the pack job had no result, so a run that packed nothing said why
+# only in the log. Backups pack on completion, so this one has the reason.
+contains "pack reports a result" '"result":{"loose":' "$PACK_OUT"
+contains "pack says why it packed nothing" '"reason":"' "$PACK_OUT"
+contains "and the journal says so" 'nothing packed: ' "$(cb journal 1)"
 contains "verify" '"level":"index"'     "$(cb verify 1 --level index)"
 check "verify list --offset moves on" 1 \
     "$([ "$(cb verify list 1 --limit 1 --offset 1 | grep -o '"level":' | wc -l | tr -d ' ')" -le 1 ] && echo 1 || echo 0)"
@@ -446,6 +452,20 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 contains "the grep job reports its caps" '"files_capped":0' "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$GJ")"
+# NIT-2: a file capped per file was counted on the job and not on the run,
+# so a run listed later could not say a file held more than it recorded.
+printf 'capline\ncapline\ncapline\n' > "$WORK/src/capped.txt"
+cb backup 1 "$WORK/src" > /dev/null
+CJ=$(curl -s -X POST --unix-socket "$SOCK" -d '{"pattern":"capline","max_hits_per_file":1}' \
+     http://localhost/repos/1/grep | sed -n 's/.*"job_id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 50); do
+    case "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")" in *'"state":"completed"'*) break ;; esac
+    sleep 0.1
+done
+contains "a capped grep job counts the capped file" '"files_capped":1' \
+    "$(curl -s --unix-socket "$SOCK" "http://localhost/jobs/$CJ")"
+contains "and so does its run record" '"pattern":"capline"' "$(cb grep runs 1 --limit 1)"
+contains "the run record carries files_capped" '"files_capped":1' "$(cb grep runs 1 --limit 1)"
 
 # B084: GET /repos/<id>/grep and /grep/<run-id> had no command, so a search
 # run with --no-wait, or one whose output scrolled away, could not be read
@@ -494,6 +514,22 @@ for _ in $(seq 1 50); do
 done
 check "a scheduled grep runs with its pattern" 1 "$FIRED"
 cb schedule remove 1 "$GSID" >/dev/null 2>&1
+# NIT-1: ignore_case was stored as the number 1; every other flag is a
+# boolean. A schedule made before the change, holding 1, still reads.
+ISID=$(cb schedule add 1 grep 3600 --pattern 'case test' -i | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a grep schedule stores ignore_case as a boolean" '"ignore_case":true' "$(cb schedule list 1)"
+cb schedule remove 1 "$ISID" >/dev/null 2>&1
+OLD_IC=$(curl -s -X POST --unix-socket "$SOCK" \
+         -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"old spelling","ignore_case":1}' \
+         http://localhost/repos/1/schedules)
+OSID=$(printf '%s' "$OLD_IC" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "ignore_case sent as 1 is still accepted" '"id"' "$OLD_IC"
+contains "and stored as a boolean" '"pattern":"old spelling","ignore_case":true' "$(cb schedule list 1)"
+[ -n "$OSID" ] && cb schedule remove 1 "$OSID" >/dev/null 2>&1
+check "ignore_case of 2 is refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    --unix-socket "$SOCK" \
+    -d '{"action":"grep","trigger":{"type":"interval","seconds":3600},"pattern":"x","ignore_case":2}' \
+    http://localhost/repos/1/schedules)"
 
 # Encryption at creation, and the escrow path that keeps a system-managed key
 # from existing only on the machine being backed up.
@@ -764,6 +800,11 @@ case "$OUT" in
     *'"objects_sent":0,'*) bad "a first replicate sends objects" ">0" "$OUT" ;;
     *) ok "a first replicate sends objects" ;;
 esac
+# B098: a second result document, written after this one to add
+# "reencrypted", replaced it and dropped the walk's counts.
+contains "replicate reports what it asked about" '"objects_asked":' "$OUT"
+contains "and the subtrees it skipped" '"subtrees_skipped":' "$OUT"
+contains "and whether it re-encrypted" '"reencrypted":false' "$OUT"
 
 # The replica is the same repository, not a new one. A fresh uuid would mean
 # nothing that reads a marker could tell the two are related.

@@ -5,6 +5,7 @@
 
 #include "scheduler.h"
 #include "trigger.h"
+#include "json_row.h"
 
 #include "cJSON.h"
 
@@ -289,10 +290,10 @@ static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t 
     }
     regfree(&re);
 
-    uint32_t ic = 0, mf = 0;
-    if (json_req_has(body, "ignore_case") &&
-        json_req_get_u32(body, "ignore_case", &ic, 0, 1) != 0) {
-        *bad = api_error(400, "ignore_case must be 0 or 1");
+    int ic = 0;
+    uint32_t mf = 0;
+    if (jreq_flag(body, "ignore_case", &ic) != 0) {
+        *bad = api_error(400, "ignore_case must be true or false");
         return NULL;
     }
     if (json_req_has(body, "max_files") &&
@@ -312,7 +313,7 @@ static char *grep_schedule_params(const cutils_json_req_t *body, api_response_t 
     if (json_resp_new(&pr) != 0 ||
         json_resp_add_str(pr, "pattern", pattern) != 0 ||
         (prefix && *prefix && json_resp_add_str(pr, "path_prefix", prefix) != 0) ||
-        json_resp_add_u32(pr, "ignore_case", ic) != 0 ||
+        json_resp_add_bool(pr, "ignore_case", ic != 0) != 0 ||
         json_resp_add_u32(pr, "max_files", mf) != 0 ||
         json_resp_finalize(pr, &pbuf, &plen) != 0) {
         *bad = api_error(500, "cannot encode schedule parameters");
