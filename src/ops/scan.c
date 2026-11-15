@@ -456,7 +456,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     nd->uid            = (uint32_t)st.st_uid;
     nd->gid            = (uint32_t)st.st_gid;
     nd->size           = (uint64_t)st.st_size;
-    nd->mtime_sec      = (uint64_t)st.st_mtim.tv_sec;
+    nd->mtime_sec      = (int64_t)st.st_mtim.tv_sec;
     nd->mtime_nsec     = (uint64_t)st.st_mtim.tv_nsec;
     nd->link_count     = (uint32_t)st.st_nlink;
 
@@ -767,7 +767,7 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
             nd->uid            = (uint32_t)st.st_uid;
             nd->gid            = (uint32_t)st.st_gid;
             nd->size           = (uint64_t)st.st_size;
-            nd->mtime_sec      = (uint64_t)st.st_mtim.tv_sec;
+            nd->mtime_sec      = (int64_t)st.st_mtim.tv_sec;
             nd->mtime_nsec     = (uint64_t)st.st_mtim.tv_nsec;
             nd->link_count     = (uint32_t)st.st_nlink;
 

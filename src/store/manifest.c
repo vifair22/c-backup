@@ -15,7 +15,7 @@
  *
  *   header:  magic u32 | version u16 | count u32
  *   entry:   name_len u16 | link_len u16 | type u8 | mode u32 | uid u32 |
- *            gid u32 | size u64 | mtime_sec u64 | mtime_nsec u64 |
+ *            gid u32 | size u64 | mtime_sec i64 | mtime_nsec u64 |
  *            inode_identity u64 | dev_major u32 | dev_minor u32 (v2+) |
  *            target_hash[32] | xattr_hash[32] | acl_hash[32] |
  *            name | link_target
@@ -98,6 +98,25 @@ static uint64_t get_u64(const uint8_t *p)
 }
 
 /*
+ * A signed field travels as the two's complement bit pattern in a u64 slot.
+ * mtime_sec was u64 before it was signed, so this keeps every tree already
+ * written readable and every non-negative time serialising to the same
+ * bytes; the hash of a tree does not move. Both directions are spelled out
+ * rather than cast, because converting an out-of-range u64 to int64 is
+ * implementation-defined.
+ */
+static uint64_t i64_to_u64(int64_t v)
+{
+    return (uint64_t)v;     /* well defined: reduced modulo 2^64 */
+}
+
+static int64_t u64_to_i64(uint64_t v)
+{
+    if (v <= (uint64_t)INT64_MAX) return (int64_t)v;
+    return -(int64_t)(~v) - 1;
+}
+
+/*
  * Sort by name in memcmp byte order, not locale collation. Locale-aware
  * ordering would make a tree's hash depend on the environment of whichever
  * process wrote it.
@@ -130,7 +149,10 @@ static int entry_cmp(const void *a, const void *b)
     CMP_SCALAR(uid);
     CMP_SCALAR(gid);
     CMP_SCALAR(size);
-    CMP_SCALAR(mtime_sec);
+    /* Ordered by the stored bit pattern, not the signed value, so the
+     * tie-break is the one trees were always written with. */
+    if (x->mtime_sec != y->mtime_sec)
+        return i64_to_u64(x->mtime_sec) < i64_to_u64(y->mtime_sec) ? -1 : 1;
     CMP_SCALAR(mtime_nsec);
     CMP_SCALAR(inode_identity);
     CMP_SCALAR(dev_major);
@@ -172,7 +194,7 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
         put_u32(&b, e->uid);
         put_u32(&b, e->gid);
         put_u64(&b, e->size);
-        put_u64(&b, e->mtime_sec);
+        put_u64(&b, i64_to_u64(e->mtime_sec));
         put_u64(&b, e->mtime_nsec);
         put_u64(&b, e->inode_identity);
         put_u32(&b, e->dev_major);
@@ -269,7 +291,7 @@ status_t manifest_parse(const void *buf, size_t len,
         e->uid             = get_u32(p + off); off += 4;
         e->gid             = get_u32(p + off); off += 4;
         e->size            = get_u64(p + off); off += 8;
-        e->mtime_sec       = get_u64(p + off); off += 8;
+        e->mtime_sec       = u64_to_i64(get_u64(p + off)); off += 8;
         e->mtime_nsec      = get_u64(p + off); off += 8;
         e->inode_identity  = get_u64(p + off); off += 8;
         e->dev_major = get_u32(p + off); off += 4;

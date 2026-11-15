@@ -99,7 +99,7 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint64_t size;
-    uint64_t mtime_sec;
+    int64_t  mtime_sec;     /* signed: a file can predate 1970 */
     uint64_t mtime_nsec;
     uint8_t  content_hash[OBJECT_HASH_SIZE];
     uint8_t  xattr_hash[OBJECT_HASH_SIZE];

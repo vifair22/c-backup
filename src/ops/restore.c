@@ -6,6 +6,7 @@
 
 #include "object.h"
 #include "sparse_restore.h"
+#include "util.h"
 
 #include <cutils/log.h>
 
@@ -179,11 +180,10 @@ static int hash_is_zero_hex(const char *hex)
  * entry into a directory moves its mtime forward. Nothing else about a
  * directory changes in between, so the second pass reapplies only this.
  */
-static void apply_mtime(const char *path, uint64_t mtime_ns)
+static void apply_mtime(const char *path, int64_t mtime_ns)
 {
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
@@ -192,12 +192,11 @@ static void apply_mtime(const char *path, uint64_t mtime_ns)
 /* Metadata for something the kernel must not follow: a symlink's own
  * ownership and timestamps, never its target's. */
 static void apply_metadata_nofollow(const char *path, uint32_t uid, uint32_t gid,
-                                    uint64_t mtime_ns)
+                                    int64_t mtime_ns)
 {
     if (lchown(path, (uid_t)uid, (gid_t)gid) != 0) { /* best effort */ }
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0) { /* best effort */ }
 }
@@ -439,7 +438,7 @@ static status_t make_parents(const char *path)
 }
 
 static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
-                           uint32_t gid, uint64_t mtime_ns)
+                           uint32_t gid, int64_t mtime_ns)
 {
     /* Ownership only succeeds as root; a non-root restore keeps the invoking
      * user's ownership rather than failing the whole operation. */
@@ -449,8 +448,7 @@ static void apply_metadata(const char *path, uint32_t mode, uint32_t uid,
         log_warn("restore: chmod %s: %s", path, strerror(errno));
 
     struct timespec times[2];
-    times[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
-    times[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+    times[0] = ns_to_timespec(mtime_ns);
     times[1] = times[0];
     if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
         log_warn("restore: utimensat %s: %s", path, strerror(errno));
@@ -587,7 +585,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         uint32_t    mode    = (uint32_t)strtoul(r->rows[i][2], NULL, 10);
         uint32_t    uid     = (uint32_t)strtoul(r->rows[i][3], NULL, 10);
         uint32_t    gid     = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
-        uint64_t    mtime   = strtoull(r->rows[i][5], NULL, 10);
+        int64_t     mtime   = strtoll(r->rows[i][5], NULL, 10);
         const char *chash   = r->rows[i][7];
         uint32_t    ntype   = (uint32_t)strtoul(r->rows[i][8], NULL, 10);
         const char *ltarget = r->rows[i][9];
@@ -876,7 +874,7 @@ status_t restore_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full))
             continue;
 
-        apply_mtime(full, strtoull(r->rows[i][5], NULL, 10));
+        apply_mtime(full, strtoll(r->rows[i][5], NULL, 10));
     }
 
     pt_free(&paths);

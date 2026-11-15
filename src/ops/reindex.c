@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
+#include "util.h"
 #include "reindex.h"
 
 #include "manifest.h"
@@ -127,8 +128,8 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
         snprintf(mode,  sizeof(mode),  "%u", e->mode);
         snprintf(uid,   sizeof(uid),   "%u", e->uid);
         snprintf(gid,   sizeof(gid),   "%u", e->gid);
-        snprintf(mtime, sizeof(mtime), "%llu",
-                 (unsigned long long)(e->mtime_sec * 1000000000ULL + e->mtime_nsec));
+        snprintf(mtime, sizeof(mtime), "%lld",
+                 (long long)time_to_ns(e->mtime_sec, (int64_t)e->mtime_nsec));
         snprintf(size,  sizeof(size),  "%llu", (unsigned long long)e->size);
 
         int is_dir = (e->type == NODE_TYPE_DIR);

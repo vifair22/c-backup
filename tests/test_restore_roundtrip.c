@@ -448,6 +448,87 @@ static void test_restore_preserves_directory_mtimes(void **state)
     assert_int_equal(stat(path, &sb), 0);
 }
 
+/* What the index holds for one node's mtime, and the type SQLite gave it. */
+static void node_mtime(const char *name, char *val, size_t vlen,
+                       char *type, size_t tlen)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT mtime_ns, typeof(mtime_ns) FROM nodes WHERE name = ?",
+        (const char *[]){ name, NULL }, &r), 0);
+    assert_non_null(r);
+    assert_int_equal(r->nrows, 1);
+    snprintf(val, vlen, "%s", r->rows[0][0]);
+    snprintf(type, tlen, "%s", r->rows[0][1]);
+    db_result_free(r);
+}
+
+static void assert_mtime(const char *path, time_t sec, long nsec)
+{
+    struct stat sb;
+    assert_int_equal(lstat(path, &sb), 0);
+    assert_int_equal((long long)sb.st_mtim.tv_sec, (long long)sec);
+    assert_int_equal(sb.st_mtim.tv_nsec, nsec);
+}
+
+/*
+ * Times before 1970 survive, to the nanosecond.
+ *
+ * The time was unsigned end to end: 1960-01-01 became 1.8e19 nanoseconds,
+ * SQLite stored that as a REAL ("1.81311464737096e+19"), and the restore
+ * parsed it as an integer and set the file's times to 0. Two shapes are
+ * checked: a plain pre-epoch time with a sub-second part, and half a second
+ * before the epoch, where the seconds and nanoseconds have to be floored
+ * apart ({-1, 500000000}) rather than truncated, or utimensat refuses the
+ * negative tv_nsec. The restore is repeated from a reindexed database, so
+ * the manifest tree's encoding of the time is checked as well as the row
+ * the backup wrote.
+ */
+static void test_pre_epoch_mtimes_round_trip(void **state)
+{
+    (void)state;
+    const time_t s1960 = -315619200;            /* 1960-01-01T00:00:00Z */
+    struct timespec t[2];
+    t[0].tv_sec = s1960; t[0].tv_nsec = 123456789;
+    t[1] = t[0];
+    assert_int_equal(utimensat(AT_FDCWD, TEST_SRC "/top.txt", t, 0), 0);
+    t[0].tv_sec = -1; t[0].tv_nsec = 500000000;
+    t[1] = t[0];
+    assert_int_equal(utimensat(AT_FDCWD, TEST_SRC "/nested/mid.txt", t, 0), 0);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    char val[64], type[16];
+    node_mtime("top.txt", val, sizeof(val), type, sizeof(type));
+    assert_string_equal(type, "integer");
+    assert_string_equal(val, "-315619199876543211");
+    node_mtime("mid.txt", val, sizeof(val), type, sizeof(type));
+    assert_string_equal(type, "integer");
+    assert_string_equal(val, "-500000000");
+
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            rmrf(TEST_DST);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM nodes", NULL, NULL), 0);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM node_fts", NULL, NULL), 0);
+            assert_int_equal(db_execute_non_query(db, "DELETE FROM snapshots", NULL, NULL), 0);
+            reindex_result_t rx;
+            assert_int_equal(reindex_repo(store, db, repo_id, NULL, &rx), OK);
+            node_mtime("top.txt", val, sizeof(val), type, sizeof(type));
+            assert_string_equal(val, "-315619199876543211");
+        }
+        assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                     TEST_DST, NULL, NULL), OK);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/top.txt", restored_root());
+        assert_mtime(path, s1960, 123456789);
+        snprintf(path, sizeof(path), "%s/nested/mid.txt", restored_root());
+        assert_mtime(path, -1, 500000000);
+    }
+}
+
 static void test_restore_recreates_directory_structure(void **state)
 {
     (void)state;
@@ -1373,6 +1454,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_directory_mtimes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pre_epoch_mtimes_round_trip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_recreates_directory_structure, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_the_requested_snapshot, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_of_unknown_snapshot_fails, setup, teardown),

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
+#include "util.h"
 #include "backup.h"
 
 #include "file_cache.h"
@@ -818,8 +819,9 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
         snprintf(mode,   sizeof(mode),   "%u",   e->node.mode);
         snprintf(uid,    sizeof(uid),    "%u",   e->node.uid);
         snprintf(gid,    sizeof(gid),    "%u",   e->node.gid);
-        snprintf(mtime,  sizeof(mtime),  "%llu",
-                 (unsigned long long)(e->node.mtime_sec * 1000000000ULL + e->node.mtime_nsec));
+        snprintf(mtime,  sizeof(mtime),  "%lld",
+                 (long long)time_to_ns(e->node.mtime_sec,
+                                       (int64_t)e->node.mtime_nsec));
         snprintf(size,   sizeof(size),   "%llu", (unsigned long long)e->node.size);
 
         char chex[OBJECT_HASH_SIZE * 2 + 1];
