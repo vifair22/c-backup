@@ -147,8 +147,10 @@ typedef struct {
     status_t (*put_object)(void *ctx, const replica_object_t *obj);
 
     /* Record a snapshot. Called only once every object beneath its root tree
-     * has been stored, so a target may treat this as the point the snapshot
-     * becomes restorable. */
+     * has been handed to put_object. A sink that stages objects must make
+     * them durable before writing the record, and fail this call when it
+     * cannot: a record the target holds is a promise that its tree is
+     * complete, and later runs skip the snapshot on the strength of it. */
     status_t (*commit_snapshot)(void *ctx, const replica_snapshot_t *snap);
 
     /* Which snapshots does the target already have? Lets a run skip a
@@ -158,8 +160,9 @@ typedef struct {
                              const uint8_t root_tree_hash[OBJECT_HASH_SIZE],
                              int *out_present);
 
-    /* Release whatever the sink holds. Never fails: a transfer that got as
-     * far as committing has already succeeded. */
+    /* Release whatever the sink holds. Never fails: every committed
+     * snapshot is already durable, so anything still staged here is an
+     * optimisation for the next run at most. */
     void (*close)(void *ctx);
 } replica_sink_vtbl_t;
 

@@ -259,6 +259,17 @@ With `--read-only`, the root filesystem is not written: state goes to the
 `/var/lib/c-backupd` volume, the socket to the `/run/c-backupd` tmpfs, and
 staging files into each repository's own `tmp/`.
 
+**No writable `/tmp` is needed**, and none is used. Every temporary file
+the engine makes goes into the repository it is working on: staged
+objects and packs, snapshot records, the tag mirror, and the parity that
+backup, `pack`, `gc` compaction and replication spill to disk for entries
+past a few MiB. A replication target's staging goes into the target's own
+`tmp/`. The `tmp/` directory is recreated when a repository is opened if
+someone removed it. SQLite's own temporary files (large sorts, temporary
+indices) go beside `state.db`, in the state volume, unless `SQLITE_TMPDIR`
+names somewhere else; set it only to a directory the daemon can write. The
+daemon logs the location at start (`sqlite temporary files: ...`).
+
 ### 2.4 The desktop app
 
 The app lives in `ui/`. To build and run it from a checkout:
@@ -1029,13 +1040,32 @@ A checking verify takes the read lock; a repairing one takes the write lock.
 | `gc 1 --dry-run` | Report what would be removed | Before the first real run |
 | `pack 1` | Pack and compress loose objects, coalesce small packs | If `maintenance.auto_pack` is off |
 | `reindex 1` | Rebuild the repository's index from its manifest trees | After a database loss, or if the index is suspect |
-| `snapshot delete 1 12` | Prune one snapshot | By hand; GC reclaims its space |
+| `snapshot delete 1 12` | Delete one snapshot | By hand; GC reclaims its space |
 
-Each is a job. Finished jobs stay visible for 30 days (`c-backup jobs`); the
-per-repository journal (`c-backup journal 1`) is the permanent record of what
-ran and how it ended. A journal entry's `source` says who asked: `api` for a
-job run by hand (the CLI and the app both go through the API), `schedule` for
-one a schedule fired, with the message starting `schedule <id>`.
+`gc`, `pack` and `reindex` are jobs. Finished jobs stay visible for 30 days
+(`c-backup jobs`); the per-repository journal (`c-backup journal 1`) is the
+permanent record of what ran and how it ended. A journal entry's `source`
+says who asked: `api` for a job run by hand (the CLI and the app both go
+through the API), `schedule` for one a schedule fired, with the message
+starting `schedule <id>`.
+
+**Deleting a snapshot** is not a job: it removes a few rows and one file and
+answers at once, `{"removed":true,"id":12,"tags_removed":0}`. It is
+journalled all the same, as operation `snapshot-delete`. A snapshot
+carrying a tag is refused, and the error names the tags:
+
+```
+$ c-backup snapshot delete 1 12
+{"error":"snapshot 12 is tagged (guard); a tag protects a snapshot from deletion. ..."}
+c-backup: request failed with HTTP 409
+```
+
+Remove the tag first (`tag remove 1 guard`), or pass `--force` to delete the
+snapshot and its tags together; the journal entry then names the tags it
+took (`removed snapshot 12 and its tag guard (forced)`). A snapshot that
+does not exist, or was already deleted, is an error (HTTP 404, exit 1)
+rather than a silent success. Retention never deletes a tagged snapshot
+(section 9.1).
 
 `gc` reports what it did in the job's `result`, and `gc --dry-run` what it
 would do:
@@ -1061,6 +1091,14 @@ it as loose and `phys_size` exceeds `orig_size` by the parity overhead
 (section 18.1). That is deliberate: rewriting gigabytes into a pack would
 save nothing but an inode. Large files that do compress are packed
 normally. Details are in `docs/data-paths.md`.
+
+**What `phys_size` counts.** For a loose object, the whole object file:
+header, payload and parity. For a packed object, the stored payload only;
+its 51-byte entry header and its parity are counted in the pack's size, so
+`phys_size` against `orig_size` is its compression ratio and nothing is
+counted twice. `object <id> <hash> layout` reads the object itself, and for
+a packed object its `physical_size` (header plus payload) is `phys_size`
+plus 51. docs/api.md has the full definition.
 
 `pack` reports what it did in the job's `result`, including why it did
 nothing when it did nothing:
@@ -1171,6 +1209,15 @@ restored from.
   source.
 - **No deletion.** Retention at the target is the target's business. A
   compromised source cannot delete the offsite copy through replication.
+- **Whole snapshots only.** Each snapshot's new objects are written as one
+  pack and synced to disk before the snapshot's record is written, so a
+  snapshot the replica lists is one it can restore. If writing a pack
+  fails, the job fails naming the snapshot, and that snapshot and the ones
+  after it are not recorded. A run that is cancelled, fails or is killed
+  part-way leaves the replica openable and verify-clean with the snapshots
+  it finished; the next run skips those and carries on. Objects it had
+  staged for an unfinished snapshot are either kept (reused by the next
+  run) or left in the replica's `tmp/`, where a later open sweeps them.
 - A destination already holding a different repository is refused, unless
   `--reencrypt` says that is the point (below).
 - So is the source repository's own directory, anything inside it, and any
@@ -1643,7 +1690,7 @@ command. Commands that start a job wait for it unless given `--no-wait`.
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
-| `snapshot delete <id> <snapshot>` | Prune one |
+| `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
 | `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
 | `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |

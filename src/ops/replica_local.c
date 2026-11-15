@@ -44,10 +44,11 @@
  * under a different one, which is exactly the property a replica must not
  * have.
  *
- * Each run writes one pack. The target coalesces on its own schedule, which
- * is the point of replicating objects rather than pack files: the two sides
- * are free to disagree about physical layout and still hold provably the
- * same data.
+ * Each snapshot's new objects go into one pack, installed before that
+ * snapshot's record is written (see local_commit_snapshot). The target
+ * coalesces on its own schedule, which is the point of replicating objects
+ * rather than pack files: the two sides are free to disagree about physical
+ * layout and still hold provably the same data.
  */
 
 /*
@@ -74,7 +75,10 @@ typedef struct {
     idx_row_t *rows;
     size_t     nrows, cap;
 
-    pack_stored_writer_t *w;   /* this run's pack, until close */
+    /* The pack staging the current snapshot's new objects. Opened on the
+     * first object, installed by commit_snapshot, so NULL between
+     * snapshots and for a snapshot that brought nothing new. */
+    pack_stored_writer_t *w;
 
     /* Re-encrypting into a repository of its own: never write a snapshot
      * record over one already there, and hold the target's key. */
@@ -148,6 +152,74 @@ static void build_index(local_ctx_t *c)
     store_set_locate_cb(c->store, idx_locate, c);
 }
 
+/*
+ * Add a pack this run just installed to the index.
+ *
+ * The objects in it were answered for by the staging writer until now; from
+ * here on the next snapshot asks the repository, and a hash missing from
+ * the index would be sent a second time into a second pack. The new rows
+ * are sorted on their own and merged, so a run of many snapshots costs one
+ * linear merge per snapshot rather than a full sort.
+ */
+static void index_add_pack(local_ctx_t *c, uint32_t pack_num)
+{
+    size_t old_n = c->nrows;
+    scan_pack(pack_num, c);
+    size_t add = c->nrows - old_n;
+    if (add == 0) return;
+    qsort(c->rows + old_n, add, sizeof(*c->rows), idx_cmp);
+    if (old_n == 0) return;
+
+    idx_row_t *merged = malloc(c->nrows * sizeof(*merged));
+    if (!merged) {
+        /* Correct either way; the merge only saves time. */
+        qsort(c->rows, c->nrows, sizeof(*c->rows), idx_cmp);
+        return;
+    }
+    size_t i = 0, j = old_n, k = 0;
+    while (i < old_n && j < c->nrows)
+        merged[k++] = idx_cmp(&c->rows[i], &c->rows[j]) <= 0 ? c->rows[i++] : c->rows[j++];
+    while (i < old_n)    merged[k++] = c->rows[i++];
+    while (j < c->nrows) merged[k++] = c->rows[j++];
+    free(c->rows);
+    c->rows = merged;
+    c->cap  = c->nrows;
+}
+
+/*
+ * Install whatever the current snapshot staged, and say whether that worked.
+ *
+ * Returned, not logged: this is the step a snapshot record depends on, and
+ * the bug it replaces was a failure here reported only in the log while the
+ * run said OK. On failure the staged objects are gone (finish removes the
+ * staging file), which costs a re-send next run and nothing else, because
+ * no record names them yet.
+ */
+static status_t seal_pack(local_ctx_t *c, uint32_t *out_packed)
+{
+    *out_packed = 0;
+    if (!c->w) return OK;
+    pack_stored_writer_t *w = c->w;
+    uint32_t pack_num = pack_stored_pack_num(w);
+    c->w = NULL;
+    status_t st = pack_stored_finish(w, out_packed);
+    if (st != OK) return st;
+    if (*out_packed > 0) index_add_pack(c, pack_num);
+    return OK;
+}
+
+/* fsync a directory, so an entry renamed into it survives a power cut. */
+static int fsync_dir(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    int rc = fsync(fd);
+    int err = errno;
+    close(fd);
+    errno = err;
+    return rc;
+}
+
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
     static const char *d = "0123456789abcdef";
@@ -188,6 +260,11 @@ static status_t local_put_object(void *vctx, const replica_object_t *obj)
 
     if (object_exists(c->store, obj->hash) || pack_stored_has(c->w, obj->hash))
         return OK;
+
+    if (!c->w) {
+        status_t st = pack_stored_open(c->store, &c->w);
+        if (st != OK) return st;
+    }
 
     return pack_stored_add(c->w, obj->hash, obj->type, obj->compression,
                            obj->encryption, obj->uncompressed_size,
@@ -233,11 +310,39 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
 {
     local_ctx_t *c = vctx;
 
+    /*
+     * Objects first, durably, then the record that names them.
+     *
+     * A record on the target is a promise that its whole tree is there:
+     * has_snapshot skips it on every later run, and a restore trusts it.
+     * The pack used to be installed only when the sink closed, after every
+     * record of the run was already written, and a failure there could
+     * only be logged - so a run reported OK over a replica holding
+     * snapshots whose objects did not exist. Installing per snapshot, and
+     * refusing to write the record when the install fails, makes a record
+     * on the target mean what it says. It also bounds what an interruption
+     * throws away to one snapshot's worth of staging.
+     */
+    uint32_t packed = 0;
+    status_t pst = seal_pack(c, &packed);
+    if (pst != OK) {
+        /* Copied first: err_msg() is the buffer set_error writes into. */
+        char why[256];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        return set_error(pst, "replica: cannot install the pack for snapshot %lld "
+                         "in %s, so its record was not written: %s",
+                         (long long)snap->snapshot_id, c->root, why);
+    }
+    if (packed > 0)
+        log_info("replica: %s gained %u object(s) for snapshot %lld", c->root,
+                 packed, (long long)snap->snapshot_id);
+
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     hash_hex(snap->root_tree_hash, hex);
 
-    char tmp[PATH_MAX], final[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/tmp/snap.XXXXXX", c->root) >= (int)sizeof(tmp) ||
+    char tmp[PATH_MAX], final[PATH_MAX], snap_dir[PATH_MAX];
+    if (snprintf(snap_dir, sizeof(snap_dir), "%s/snapshots", c->root) >= (int)sizeof(snap_dir) ||
+        snprintf(tmp, sizeof(tmp), "%s/tmp/snap.XXXXXX", c->root) >= (int)sizeof(tmp) ||
         snprintf(final, sizeof(final), "%s/snapshots/%lld", c->root,
                  (long long)snap->snapshot_id) >= (int)sizeof(final))
         return set_error(ERR_IO, "replica: path too long");
@@ -272,7 +377,11 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         int rc = link(tmp, final);
         int err = errno;
         unlink(tmp);
-        if (rc == 0) return OK;
+        if (rc == 0) {
+            if (fsync_dir(snap_dir) != 0)
+                return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
+            return OK;
+        }
         if (err == EEXIST)
             return set_error(ERR_INVALID,
                              "replica: %s already has a snapshot %lld of its own; "
@@ -286,17 +395,23 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
         unlink(tmp);
         return set_error_errno(ERR_IO, "replica: rename snapshot record");
     }
+    /* replicate_run counts the snapshot as sent once this returns. */
+    if (fsync_dir(snap_dir) != 0)
+        return set_error_errno(ERR_IO, "replica: sync %s", snap_dir);
     return OK;
 }
 
 /*
- * Install the pack, then release everything.
+ * Install any leftover staging, then release everything.
  *
- * A failure here is logged rather than returned: close has no way to report
- * one, and the alternative - dropping the staging file silently - would lose
- * a whole transfer's worth of objects while the run that produced them
- * reported success. Anything already committed stays committed; the next run
- * asks the target what it has and re-sends the rest.
+ * Every committed snapshot's objects were installed by commit_snapshot, so
+ * what is still staged here belongs to a snapshot whose run stopped before
+ * its record: a cancel, a source read error, a link drop. Installing it is
+ * only an optimisation - objects no record names are garbage the target's
+ * gc reclaims, and keeping them saves the next run re-sending them - so a
+ * failure is logged and affects no snapshot either way. The tree ordering
+ * in replicate.c keeps a partial subtree honest: a tree is staged only after
+ * everything it names.
  */
 static void local_close(void *vctx)
 {
@@ -420,8 +535,9 @@ status_t replica_sink_local_open(const char *path,
     return sink_finish_open(c, path, &m, out);
 }
 
-/* The shared second half of both openings: the target store, its index of
- * what it holds, and this run's pack. Frees c on failure. */
+/* The shared second half of both openings: the target store and its index
+ * of what it holds. The pack is opened by the first object that needs one.
+ * Frees c on failure. */
 static status_t sink_finish_open(local_ctx_t *c, const char *path,
                                  const repo_marker_t *m, replica_sink_t *out)
 {
@@ -430,15 +546,6 @@ static status_t sink_finish_open(local_ctx_t *c, const char *path,
     c->owns_store = 1;
 
     build_index(c);
-
-    st = pack_stored_open(c->store, &c->w);
-    if (st != OK) {
-        store_close(c->store);
-        free(c->rows);
-        repo_key_wipe(&c->dst_key);
-        free(c);
-        return st;
-    }
 
     memset(out, 0, sizeof(*out));
     out->v   = &local_vtbl;

@@ -9,7 +9,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <libgen.h>
+#include <limits.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +95,35 @@ static void tighten_umask(void)
     umask(0077);
 }
 
+/*
+ * Where SQLite puts its own temporary files: sorts that outgrow the page
+ * cache, temporary indices, spilled statement journals.
+ *
+ * Left alone it tries SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp and the
+ * working directory, all of which are on the root filesystem in the
+ * hardened container (Manual section 2.3, --read-only), and a large query
+ * would then fail with an I/O error. The state database's own directory is
+ * a volume that must be writable anyway, so temporaries go there unless the
+ * operator chose otherwise with SQLITE_TMPDIR. SQLite unlinks each file as
+ * soon as it opens it, so nothing accumulates.
+ *
+ * Set once, before any job thread exists; SQLite reads the pointer without
+ * a lock and documents it as a startup-only setting.
+ */
+static void pin_sqlite_temp_dir(const char *db_path)
+{
+    if (!db_path || !*db_path || getenv("SQLITE_TMPDIR")) return;
+
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", db_path) >= (int)sizeof(buf)) return;
+    const char *dir = dirname(buf);
+
+    char *copy = sqlite3_mprintf("%s", dir);
+    if (!copy) return;
+    sqlite3_temp_directory = copy;
+    log_info("sqlite temporary files: %s", dir);
+}
+
 int main(int argc, char *argv[])
 {
     /* Line-buffer so log lines reach journald whole. Without this libc
@@ -127,6 +159,8 @@ int main(int argc, char *argv[])
         appguard_shutdown(guard);
         return 1;
     }
+
+    pin_sqlite_temp_dir(db_path);
 
     /*
      * A write to a pipe whose reader has gone must return EPIPE, not kill
