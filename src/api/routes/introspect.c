@@ -156,7 +156,7 @@ api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot read object statistics");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
 
     /* Create the array up front. json_resp_array_append_begin makes it
@@ -289,7 +289,7 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot list objects");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -379,7 +379,7 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
         return api_error(500, "cannot read object references");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -553,7 +553,7 @@ api_response_t introspect_packs(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot list packs");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -601,7 +601,7 @@ api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id
         return api_error(500, "cannot list pack entries");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -653,7 +653,7 @@ api_response_t introspect_fanout(const api_request_t *req, int64_t repo_id)
         return api_error(500, "cannot compute hash distribution");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     /* Create the array up front. json_resp_array_append_begin makes it
      * lazily on first append, so a query with no rows omitted the key
@@ -881,7 +881,7 @@ api_response_t introspect_diff(const api_request_t *req, int64_t repo_id)
     status_t st = open_bound_store(repo_id, &store, &idx);
     if (st != OK) return api_error(st == ERR_NOT_FOUND ? 404 : 500, err_msg());
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) {
         close_bound_store(store, idx);
         return api_error(500, "out of memory");
