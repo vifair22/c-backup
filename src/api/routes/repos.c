@@ -39,7 +39,7 @@ static api_response_t list_repos(const api_request_t *req, void *userdata)
         return api_error(500, "cannot list repos");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) {
         db_result_free(r);
         return api_error(500, "out of memory");

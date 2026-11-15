@@ -423,7 +423,7 @@ static api_response_t list_jobs(const api_request_t *req, void *ud)
         return api_error(500, "cannot list jobs");
     }
 
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
 
     /* Create the array up front. json_resp_array_append_begin makes it
@@ -490,7 +490,7 @@ static api_response_t get_job(const api_request_t *req, void *ud)
     /* Built rather than printed: phase and error carry paths and strerror
      * text, and one quote or backslash in either would produce a body no
      * client can parse. */
-    cutils_json_resp_t *resp = NULL;
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
     if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
     int bad = json_resp_add_str(resp, "id",      r->rows[0][0]) != 0
            || json_resp_add_str(resp, "action",  r->rows[0][1]) != 0
