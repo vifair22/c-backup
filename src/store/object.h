@@ -227,9 +227,15 @@ typedef struct {
  * Read an object without decrypting or decompressing it.
  *
  * The payload comes back exactly as stored: compressed, then encrypted, with
- * the nonce and tag included. Replication uses this so that a copy holds
- * what the source holds and a target which never receives the key can still
- * store, verify and repair it - parity covers ciphertext for that reason.
+ * the nonce and tag included. This is the form replication moves, so that a
+ * copy holds what the source holds and a target which never receives the
+ * key can still store, verify and repair it - parity covers ciphertext for
+ * that reason.
+ *
+ * Loads the whole stored payload, so it is for objects known to be small -
+ * tests and inspection. Anything that moves arbitrary objects streams them
+ * through object_stored_open below instead; replication did not, and could
+ * not copy an object larger than its memory (OWN-26).
  *
  * The hash is not checked, and cannot be: it covers the plaintext, which is
  * the one thing this function deliberately does not produce. A caller
@@ -242,6 +248,26 @@ status_t object_read_stored(store_t *store,
                             const uint8_t hash[OBJECT_HASH_SIZE],
                             object_stored_info_t *out_info,
                             void **out_payload, size_t *out_len);
+
+/*
+ * The same bytes, read in pieces rather than loaded whole.
+ *
+ * object_read_stored allocates the full stored size, which for a 50 GiB
+ * file is 50 GiB; replication used it and so could not move an object
+ * larger than the memory of the machine doing the moving (design
+ * constraint 2). This is what it uses instead: open finds the object loose
+ * or packed and reports its header and stored length, and each read hands
+ * over exactly the bytes asked for, in order, with nothing held between
+ * calls but a file position. Reading past the stored length is refused.
+ * The same caveats apply: nothing is decoded or checked.
+ */
+typedef struct object_stored_reader object_stored_reader_t;
+
+status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                            object_stored_info_t *out_info, uint64_t *out_len,
+                            object_stored_reader_t **out);
+status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n);
+void     object_stored_close(object_stored_reader_t *r);
 
 /*
  * Attempt to repair a loose object file in-place using its parity data.
