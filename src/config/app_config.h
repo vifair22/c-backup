@@ -101,7 +101,6 @@ static const config_section_t app_sections[] = {
     { "scheduler",  "Scheduler" },
     { "jobs",       "Job Manager" },
     { "retention",  "Default Retention" },
-    { "store",      "Storage Engine" },
     { NULL, NULL }
 };
 
