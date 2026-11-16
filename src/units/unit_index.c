@@ -117,7 +117,7 @@ status_t unit_index_from_tree(store_t *store, cutils_db_t *db, int64_t repo_id,
     unit_json_t u;
     int parsed = 0;
     if (find_entry(store, dir, "unit.json", &type, fh, &found) != OK) {
-        snprintf(why, sizeof(why), "%s", err_msg());
+        snprintf(why, sizeof(why), "%.250s", err_msg());
     } else if (!found || type != NODE_TYPE_REG) {
         snprintf(why, sizeof(why), "no unit.json");
     } else {
@@ -125,11 +125,11 @@ status_t unit_index_from_tree(store_t *store, cutils_db_t *db, int64_t repo_id,
         size_t len = 0;
         uint64_t full = 0;
         if (content_read_prefix(store, fh, UNIT_JSON_MAX + 1, &data, &len, &full) != OK)
-            snprintf(why, sizeof(why), "%s", err_msg());
+            snprintf(why, sizeof(why), "%.250s", err_msg());
         else if (full > UNIT_JSON_MAX)
             snprintf(why, sizeof(why), "unit.json is %llu bytes", (unsigned long long)full);
         else if (unit_json_parse(data, len, &u) != OK)
-            snprintf(why, sizeof(why), "%s", err_msg());
+            snprintf(why, sizeof(why), "%.250s", err_msg());
         else
             parsed = 1;
         free(data);

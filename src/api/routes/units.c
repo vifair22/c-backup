@@ -673,7 +673,7 @@ static status_t units_job_run(void *arg, atomic_int *cancel,
         }
         if (u->warning[0]) {
             cJSON_AddStringToObject(x, "warning", u->warning);
-            if (!warn[0]) snprintf(warn, sizeof(warn), "unit %s: %s", u->name, u->warning);
+            if (!warn[0]) snprintf(warn, sizeof(warn), "unit %.80s: %.500s", u->name, u->warning);
         }
     }
     if (root) {

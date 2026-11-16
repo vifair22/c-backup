@@ -619,7 +619,7 @@ status_t unit_backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         if (one == OK) {
             out->ok++;
         } else {
-            snprintf(r->error, sizeof(r->error), "%s", err_msg());
+            snprintf(r->error, sizeof(r->error), "%.500s", err_msg());
             log_warn("unit backup: %s: %s", r->unit_key, r->error);
             err_clear();
             out->failed++;
