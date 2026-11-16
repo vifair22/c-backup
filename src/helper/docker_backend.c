@@ -1174,6 +1174,233 @@ static status_t d_mount_root(sp_ctx_t *c, const char *mount, char *buf, size_t s
     return OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* Restore: define (container-backup.md 11.2)                          */
+/* ------------------------------------------------------------------ */
+
+static void urlenc(const char *in, char *out, size_t sz)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (; *in && o + 4 < sz; in++) {
+        unsigned char ch = (unsigned char)*in;
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_' || ch == '.' || ch == '~') out[o++] = (char)ch;
+        else { out[o++] = '%'; out[o++] = hex[ch >> 4]; out[o++] = hex[ch & 15]; }
+    }
+    out[o] = '\0';
+}
+
+static int name_ok(const char *n)
+{
+    size_t l = strlen(n);
+    if (l == 0 || l > 128 || !((n[0] >= 'a' && n[0] <= 'z') || (n[0] >= 'A' && n[0] <= 'Z') || (n[0] >= '0' && n[0] <= '9')))
+        return 0;
+    return strspn(n, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") == l;
+}
+
+/* Settings that make a container root on the host, refused without
+ * allow_privileged_define. */
+static const char *privileged_reason(const cJSON *hc)
+{
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(hc, "Privileged"))) return "Privileged";
+    if (cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(hc, "CapAdd")) > 0) return "CapAdd";
+    if (cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(hc, "Devices")) > 0) return "Devices";
+    const char *pid = jstr(hc, "PidMode"), *net = jstr(hc, "NetworkMode");
+    if (strcmp(pid, "host") == 0) return "PidMode host";
+    if (strcmp(net, "host") == 0) return "NetworkMode host";
+    return NULL;
+}
+
+/* Pull by the recorded digest; if the registry no longer serves it, the
+ * recorded tag with a warning, unless pinned (C3). *ref is what to create
+ * from. */
+static status_t pull_image(struct sp_ctx *c, const cJSON *image, int pin, char *ref, size_t rsz, cJSON *warn)
+{
+    const char *dg = cJSON_GetStringValue(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(image, "RepoDigests"), 0));
+    const char *tag = cJSON_GetStringValue(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(image, "RepoTags"), 0));
+    docker_api_t a = c->api;
+    a.timeout_s = 3600;            /* a first pull of a large image */
+    char q[1200], enc[1024];
+    if (dg && strchr(dg, '@')) {
+        urlenc(dg, enc, sizeof(enc));
+        snprintf(q, sizeof(q), "/images/create?fromImage=%s", enc);
+        if (docker_call(&a, "POST", q, NULL, 0, NULL, NULL) == OK) { snprintf(ref, rsz, "%s", dg); return OK; }
+        char why[300];
+        snprintf(why, sizeof(why), "%.290s", err_msg());
+        err_clear();
+        if (pin || !tag) return set_error(ERR_NOT_FOUND, "docker: image %s is no longer available%s (%s)", dg,
+                                          pin ? " and pin_digest refuses a tag" : ", and no tag is recorded", why);
+        char w[600];
+        snprintf(w, sizeof(w), "image digest %s no longer available; pulled tag %s instead", strchr(dg, '@') + 1, tag);
+        cJSON_AddItemToArray(warn, cJSON_CreateString(w));
+        log_warn("docker: %s", w);
+    } else if (!tag) {
+        return set_error(ERR_INVALID, "docker: the definition records no image digest or tag");
+    } else if (pin) {
+        return set_error(ERR_INVALID, "docker: no digest recorded and pin_digest refuses a tag");
+    }
+    urlenc(tag, enc, sizeof(enc));
+    snprintf(q, sizeof(q), "/images/create?fromImage=%s", enc);
+    status_t st = docker_call(&a, "POST", q, NULL, 0, NULL, NULL);
+    if (st == OK) snprintf(ref, rsz, "%s", tag);
+    return st;
+}
+
+/* Move a file aside under the same directory, never delete it. */
+static status_t move_aside(struct sp_ctx *c, const char *path, char *moved, size_t msz)
+{
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX], hm[PATH_MAX + HOST_TOOL_PATH_MAX];
+    snprintf(moved, msz, "%s.cbackup-old-%lld", path, (long long)time(NULL));
+    if (host_path(&c->tools, path, hp, sizeof(hp)) != 0 || host_path(&c->tools, moved, hm, sizeof(hm)) != 0)
+        return set_error(ERR_INVALID, "docker: path too long");
+    struct stat sb;
+    if (lstat(hp, &sb) != 0) { moved[0] = '\0'; return OK; }
+    if (rename(hp, hm) != 0) return set_error_errno(ERR_IO, "docker: moving %s aside", path);
+    return OK;
+}
+
+/*
+ * The definition, as the daemon read it from the snapshot:
+ *   {"inspect": {...}, "image": {"RepoDigests": [...], "RepoTags": [...]},
+ *    "template": "<xml>", "name": "", "replace": false, "pin_digest": false,
+ *    "start": false}
+ * Every field is read by name and the create body is built here; nothing
+ * the daemon sent is forwarded as it is.
+ */
+static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definition,
+                         const helper_policy_t *pol, cJSON **result)
+{
+    *result = NULL;
+    if (strncmp(unit_id, "compose:", 8) == 0)
+        return set_error(ERR_INVALID, "docker: define of a compose project is not built; restore its files "
+                         "and data, then run docker compose up");
+    cJSON *d = cJSON_Parse(definition);
+    const cJSON *in = cJSON_GetObjectItemCaseSensitive(d, "inspect");
+    const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(in, "Config");
+    const cJSON *hc = cJSON_GetObjectItemCaseSensitive(in, "HostConfig");
+    if (!cJSON_IsObject(in) || !cJSON_IsObject(cfg)) {
+        cJSON_Delete(d);
+        return set_error(ERR_INVALID, "docker: the definition has no inspect with a Config");
+    }
+    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
+    int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
+    int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
+    char name[160];
+    const char *want = jstr(d, "name");
+    const char *orig = jstr(in, "Name");
+    snprintf(name, sizeof(name), "%s", want[0] ? want : (orig[0] == '/' ? orig + 1 : orig));
+    status_t st = OK;
+    if (!name_ok(name)) st = set_error(ERR_INVALID, "docker: bad container name %.100s", name);
+    const char *why = st == OK ? privileged_reason(hc) : NULL;
+    if (st == OK && why && !pol->allow_privileged_define)
+        st = set_error(ERR_INVALID, "docker: the definition sets %s, and allow_privileged_define is off", why);
+
+    /* A name in use is refused unless replacing; the one replaced must be
+     * stopped, and is renamed aside, never removed. */
+    cJSON *res = cJSON_CreateObject();
+    cJSON *warn = res ? cJSON_AddArrayToObject(res, "warnings") : NULL;
+    if (st == OK && !warn) st = set_error(ERR_NOMEM, "docker: define");
+    char path[512];
+    snprintf(path, sizeof(path), "/containers/%s/json", name);
+    cJSON *have = NULL;
+    if (st == OK && docker_call(&c->api, "GET", path, NULL, 0, NULL, &have) == OK) {
+        if (!replace) {
+            st = set_error(ERR_BUSY, "docker: a container named %s exists; pass replace, or a new name", name);
+        } else if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(have, "State"), "Running"))) {
+            st = set_error(ERR_BUSY, "docker: %s is running; stop it before replacing it", name);
+        } else {
+            char aside[200], q[512];
+            snprintf(aside, sizeof(aside), "%.128s.cbackup-old-%lld", name, (long long)time(NULL));
+            snprintf(q, sizeof(q), "/containers/%s/rename?name=%s", jstr(have, "Id"), aside);
+            st = docker_call(&c->api, "POST", q, NULL, 0, NULL, NULL);
+            if (st == OK) cJSON_AddStringToObject(res, "previous", aside);
+        }
+    } else if (st == OK) {
+        err_clear();           /* no such container: the name is free */
+    }
+    cJSON_Delete(have);
+
+    char ref[600] = "";
+    if (st == OK) st = pull_image(c, cJSON_GetObjectItemCaseSensitive(d, "image"), pin, ref, sizeof(ref), warn);
+
+    /* The create body: Config and HostConfig as recorded, the image pinned,
+     * and the networks by name with their static addresses. */
+    char *body = NULL;
+    if (st == OK) {
+        cJSON *b = cJSON_CreateObject();
+        cJSON *bc = cJSON_Duplicate(cfg, 1);
+        if (bc) {
+            cJSON_DeleteItemFromObjectCaseSensitive(bc, "Image");
+            cJSON_AddStringToObject(bc, "Image", ref);
+            cJSON_DeleteItemFromObjectCaseSensitive(bc, "Hostname");
+        }
+        if (b && bc) {
+            cJSON *child = bc->child;
+            bc->child = NULL;
+            cJSON_Delete(bc);
+            for (cJSON *x = child; x; ) { cJSON *nx = x->next; x->prev = x->next = NULL; cJSON_AddItemToObject(b, x->string, x); x = nx; }
+            if (hc) cJSON_AddItemToObject(b, "HostConfig", cJSON_Duplicate(hc, 1));
+            const cJSON *nets = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "NetworkSettings"), "Networks");
+            cJSON *ep = cJSON_CreateObject();
+            const cJSON *n;
+            cJSON_ArrayForEach(n, nets) {
+                cJSON *e = cJSON_CreateObject();
+                const cJSON *ipam = cJSON_GetObjectItemCaseSensitive(n, "IPAMConfig");
+                if (e && cJSON_IsObject(ipam)) cJSON_AddItemToObject(e, "IPAMConfig", cJSON_Duplicate(ipam, 1));
+                if (e && ep) cJSON_AddItemToObject(ep, n->string, e);
+            }
+            cJSON *nc = cJSON_CreateObject();
+            if (nc && ep) cJSON_AddItemToObject(nc, "EndpointsConfig", ep);
+            if (nc) cJSON_AddItemToObject(b, "NetworkingConfig", nc);
+            body = cJSON_PrintUnformatted(b);
+        } else {
+            cJSON_Delete(bc);
+        }
+        cJSON_Delete(b);
+        if (!body) st = set_error(ERR_NOMEM, "docker: create body");
+    }
+    cJSON *made = NULL;
+    if (st == OK) {
+        snprintf(path, sizeof(path), "/containers/create?name=%s", name);
+        st = docker_call(&c->api, "POST", path, body, 0, NULL, &made);
+    }
+    free(body);
+    const char *id = jstr(made, "Id");
+
+    /* The Unraid template, so Unraid's UI knows the container. */
+    const char *tmpl = jstr(d, "template");
+    if (st == OK && tmpl[0] && pol->templates_dir[0]) {
+        char tp[PATH_MAX], moved[PATH_MAX + 40], hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+        snprintf(tp, sizeof(tp), "%.3900s/my-%s.xml", pol->templates_dir, name);
+        st = move_aside(c, tp, moved, sizeof(moved));
+        if (st == OK && moved[0]) cJSON_AddStringToObject(res, "previous_template", moved);
+        FILE *f = st == OK && host_path(&c->tools, tp, hp, sizeof(hp)) == 0 ? fopen(hp, "wxe") : NULL;
+        if (st == OK && !f) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
+        if (f) {
+            if (fputs(tmpl, f) == EOF) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
+            if (fclose(f) != 0 && st == OK) st = set_error_errno(ERR_IO, "docker: writing %s", tp);
+            if (st == OK) cJSON_AddStringToObject(res, "template", tp);
+        }
+    }
+    if (st == OK && start) {
+        snprintf(path, sizeof(path), "/containers/%s/start", id);
+        st = docker_call(&c->api, "POST", path, NULL, 304, NULL, NULL);
+    }
+    if (st == OK) {
+        cJSON_AddStringToObject(res, "container", id);
+        cJSON_AddStringToObject(res, "name", name);
+        cJSON_AddStringToObject(res, "image", ref);
+        cJSON_AddBoolToObject(res, "started", start);
+        *result = res;
+        res = NULL;
+    }
+    cJSON_Delete(made);
+    cJSON_Delete(res);
+    cJSON_Delete(d);
+    return st;
+}
+
 status_t docker_backend_init(const helper_policy_t *pol, helper_backend_t *out)
 {
     struct sp_ctx *c = calloc(1, sizeof(*c));
@@ -1197,7 +1424,7 @@ status_t docker_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .name = "docker", .ops = &k_docker_ops, .ctx = c,
         .blob_data = d_blob_data, .unit_state = d_unit_state, .set_running = d_set_running,
         .mount_root = d_mount_root, .hook_start = d_hook_start, .hook_poll = d_hook_poll,
-        .hook_kill = d_hook_kill, .hook_free = d_hook_free,
+        .hook_kill = d_hook_kill, .hook_free = d_hook_free, .define = d_define,
     };
     return OK;
 }

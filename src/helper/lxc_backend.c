@@ -14,6 +14,7 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -490,6 +491,100 @@ static status_t x_set_running(sp_ctx_t *c, const char *unit_id, int run)
     return lxc(c, run ? "lxc-start" : "lxc-stop", unit_id, NULL, NULL);
 }
 
+/*
+ * Restore define (container-backup.md 11.2): the recorded config written to
+ * <lxcpath>/<name>/config with lxc.uts.name and lxc.rootfs.path rewritten
+ * for the name, and every lxc.net.*.hwaddr dropped (LXC generates one)
+ * unless keep_macs. The rootfs itself is data, restored to the rootfs path
+ * the result names. A name in use is refused unless replacing a stopped
+ * container, whose config is moved aside, never deleted.
+ *   {"config": "<text>", "name": "", "replace": false, "keep_macs": false,
+ *    "start": false}
+ */
+static status_t x_define(sp_ctx_t *c, const char *unit_id, const char *definition,
+                         const helper_policy_t *pol, cJSON **result)
+{
+    (void)pol;
+    *result = NULL;
+    cJSON *d = cJSON_Parse(definition);
+    const char *cfg = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "config"));
+    const char *want = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(d, "name"));
+    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
+    int keep_macs = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "keep_macs"));
+    int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
+    char name[64];
+    snprintf(name, sizeof(name), "%s", want && *want ? want : unit_id);
+    status_t st = OK;
+    if (!cfg) st = set_error(ERR_INVALID, "lxc: the definition has no config");
+    else if (!valid_name(name)) st = set_error(ERR_INVALID, "lxc: bad container name");
+    char dir[PATH_MAX], conf[PATH_MAX + 16], rootfs[PATH_MAX + 16], hp[PATH_MAX + HOST_TOOL_PATH_MAX + 16];
+    snprintf(dir, sizeof(dir), "%.3900s/%s", c->pol->lxc_path, name);
+    snprintf(conf, sizeof(conf), "%s/config", dir);
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", dir);
+    cJSON *res = cJSON_CreateObject();
+    if (st == OK && !res) st = set_error(ERR_NOMEM, "lxc: define");
+    struct stat sb;
+    if (st == OK && host_path(&c->tools, conf, hp, sizeof(hp)) == 0 && lstat(hp, &sb) == 0) {
+        int state = state_of(c, name);
+        if (!replace) st = set_error(ERR_BUSY, "lxc: a container named %s exists; pass replace, or a new name", name);
+        else if (state != SP_STATE_STOPPED) st = set_error(ERR_BUSY, "lxc: %s is not stopped; stop it before replacing it", name);
+        else {
+            char aside[PATH_MAX + 64], ha[PATH_MAX + HOST_TOOL_PATH_MAX + 64];
+            snprintf(aside, sizeof(aside), "%s.cbackup-old-%lld", conf, (long long)time(NULL));
+            if (host_path(&c->tools, aside, ha, sizeof(ha)) != 0 || rename(hp, ha) != 0)
+                st = set_error_errno(ERR_IO, "lxc: moving %s aside", conf);
+            else cJSON_AddStringToObject(res, "previous_config", aside);
+        }
+    }
+    /* Rewrite line by line; everything else is kept as recorded. */
+    size_t cap = cfg ? strlen(cfg) + 2 * PATH_MAX + 256 : 0;
+    char *out = st == OK ? malloc(cap) : NULL;
+    if (st == OK && !out) st = set_error(ERR_NOMEM, "lxc: config");
+    size_t o = 0;
+    for (const char *l = cfg; st == OK && l && *l; ) {
+        size_t n = strcspn(l, "\n");
+        char key[128] = "";
+        const char *eq = memchr(l, '=', n);
+        if (eq) {
+            size_t k = (size_t)(eq - l);
+            while (k && (l[k - 1] == ' ' || l[k - 1] == '\t')) k--;
+            const char *ks = l;
+            while (ks < l + k && (*ks == ' ' || *ks == '\t')) { ks++; }
+            snprintf(key, sizeof(key), "%.*s", (int)(l + k - ks), ks);
+        }
+        if (strcmp(key, "lxc.uts.name") == 0) o += (size_t)snprintf(out + o, cap - o, "lxc.uts.name = %s\n", name);
+        else if (strcmp(key, "lxc.rootfs.path") == 0) o += (size_t)snprintf(out + o, cap - o, "lxc.rootfs.path = dir:%s\n", rootfs);
+        else if (!keep_macs && strncmp(key, "lxc.net.", 8) == 0 && strstr(key, ".hwaddr")) { /* LXC makes a new one */ }
+        else { memcpy(out + o, l, n); o += n; out[o++] = '\n'; }
+        l += n + (l[n] == '\n');
+    }
+    if (st == OK) {
+        char hd[PATH_MAX + HOST_TOOL_PATH_MAX];
+        if (host_path(&c->tools, dir, hd, sizeof(hd)) != 0 || (mkdir(hd, 0755) != 0 && errno != EEXIST) ||
+            host_path(&c->tools, conf, hp, sizeof(hp)) != 0)
+            st = set_error_errno(ERR_IO, "lxc: creating %s", dir);
+    }
+    FILE *f = st == OK ? fopen(hp, "wxe") : NULL;
+    if (st == OK && !f) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
+    if (f) {
+        if (fwrite(out, 1, o, f) != o) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
+        if (fclose(f) != 0 && st == OK) st = set_error_errno(ERR_IO, "lxc: writing %s", conf);
+    }
+    free(out);
+    if (st == OK && start) st = lxc(c, "lxc-start", name, NULL, NULL);
+    if (st == OK) {
+        cJSON_AddStringToObject(res, "name", name);
+        cJSON_AddStringToObject(res, "config", conf);
+        cJSON_AddStringToObject(res, "rootfs", rootfs);
+        cJSON_AddBoolToObject(res, "started", start);
+        *result = res;
+        res = NULL;
+    }
+    cJSON_Delete(res);
+    cJSON_Delete(d);
+    return st;
+}
+
 status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
 {
     struct sp_ctx *c = calloc(1, sizeof(*c));
@@ -504,6 +599,7 @@ status_t lxc_backend_init(const helper_policy_t *pol, helper_backend_t *out)
         .name = "lxc", .ops = &k_lxc_ops, .ctx = c,
         .blob_data = x_blob_data, .unit_state = x_unit_state, .set_running = x_set_running,
         .hook_start = x_hook_start, .hook_poll = x_hook_poll, .hook_kill = x_hook_kill, .hook_free = x_hook_free,
+        .define = x_define,
     };
     return OK;
 }

@@ -39,7 +39,13 @@ typedef struct {
     int  pauses, unpauses, starts, stops, execs;
     char exec_cmd[16][256];
     int  n_exec;
+    int  digest_gone;          /* image pulls by digest fail, as a registry that dropped it */
+    char pulled[512];          /* the last fromImage */
+    char created_body[8192];   /* the last create body */
 } fake_docker_t;
+
+static void fake_docker_add(fake_docker_t *f, const char *id, const char *name, const char *state,
+                            const char *project, const char *mounts);
 
 static fd_container_t *fd_find(fake_docker_t *f, const char *id)
 {
@@ -101,7 +107,27 @@ static void fd_serve(fake_docker_t *f, int fd)
     char out[16384];
     char id[256];
     pthread_mutex_lock(&f->mu);
-    if (strcmp(p, "/version") == 0) {
+    if (strncmp(p, "/images/create?fromImage=", 25) == 0) {
+        snprintf(f->pulled, sizeof(f->pulled), "%s", p + 25);
+        if (f->digest_gone && strstr(p, "%40sha256")) fd_reply(fd, 404, "{\"message\":\"manifest unknown\"}");
+        else fd_reply(fd, 200, "{\"status\":\"Pulling\"}\n{\"status\":\"Done\"}");
+    } else if (strncmp(p, "/containers/create?name=", 24) == 0) {
+        if (fd_find(f, p + 24)) fd_reply(fd, 409, "{\"message\":\"Conflict. The name is already in use\"}");
+        else {
+            snprintf(f->created_body, sizeof(f->created_body), "%s", body);
+            char nid[32];
+            snprintf(nid, sizeof(nid), "beef%02d", f->n);
+            fake_docker_add(f, nid, p + 24, "created", NULL, "[]");
+            snprintf(out, sizeof(out), "{\"Id\":\"%s\",\"Warnings\":[]}", nid);
+            fd_reply(fd, 201, out);
+        }
+    } else if (strncmp(p, "/containers/", 12) == 0 && strstr(p, "/rename?name=")) {
+        char *q = strstr(p, "/rename?name=");
+        *q = '\0';
+        fd_container_t *c = fd_find(f, p + 12);
+        if (!c) fd_reply(fd, 404, "{\"message\":\"No such container\"}");
+        else { snprintf(c->name, sizeof(c->name), "%s", q + 13); fd_reply(fd, 204, ""); }
+    } else if (strcmp(p, "/version") == 0) {
         fd_reply(fd, 200, "{\"ApiVersion\":\"1.43\",\"Version\":\"fake\"}");
     } else if (strcmp(p, "/containers/json?all=1") == 0) {
         size_t o = (size_t)snprintf(out, sizeof(out), "[");
@@ -118,8 +144,9 @@ static void fd_serve(fake_docker_t *f, int fd)
         else {
             snprintf(out, sizeof(out), "{\"Id\":\"%s\",\"Name\":\"/%s\",\"Image\":\"%s\",\"Config\":{\"Labels\":{"
                      "\"com.docker.compose.project.config_files\":\"%s\",\"com.docker.compose.project.working_dir\":\"%s\","
-                     "\"secret\":\"kept verbatim\"}},\"Mounts\":%s}",
-                     c->id, c->name, c->image, c->config_files, c->working_dir, c->mounts[0] ? c->mounts : "[]");
+                     "\"secret\":\"kept verbatim\"}},\"State\":{\"Running\":%s},\"Mounts\":%s}",
+                     c->id, c->name, c->image, c->config_files, c->working_dir,
+                     strcmp(c->state, "running") == 0 ? "true" : "false", c->mounts[0] ? c->mounts : "[]");
             fd_reply(fd, 200, out);
         }
     } else if (fd_route(p, "/images/", "/json", id, sizeof(id))) {

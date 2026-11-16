@@ -26,6 +26,9 @@
 #include "docker_backend.h"
 #include "docker_api.h"
 #include "fake_docker.h"
+
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
 #include "test_tmp.h"
 
 #define D      TEST_TMP "/c_backup_test_docker"
@@ -365,6 +368,70 @@ static void test_hook_logs_and_dumps(void **state)
     be.ops->desc_free(d);
 }
 
+static const char *k_def =
+    "{\"inspect\":{\"Name\":\"/solo\",\"Config\":{\"Image\":\"alpine:3\",\"Env\":[\"X=1\"],\"Hostname\":\"abc\"},"
+    "\"HostConfig\":{\"Binds\":[\"/a:/a\"]},\"NetworkSettings\":{\"Networks\":{\"br0\":{\"IPAMConfig\":"
+    "{\"IPv4Address\":\"10.0.0.9\"}}}}},"
+    "\"image\":{\"RepoDigests\":[\"alpine@sha256:abc123\"],\"RepoTags\":[\"alpine:3\"]},"
+    "\"template\":\"<Container>solo</Container>\"%s}";
+
+static status_t define(const char *extra, cJSON **res)
+{
+    char def[2048];
+    snprintf(def, sizeof(def), k_def, extra);
+    return be.define(be.ctx, "solo", def, &pol, res);
+}
+
+/* Restore define: refused over a name in use, a stopped one replaced by
+ * renaming it aside, the image by digest, then by tag with a warning, and
+ * the template written back with the old one moved aside. */
+static void test_define(void **state)
+{
+    (void)state;
+    cJSON *res = NULL;
+    assert_int_not_equal(define("", &res), OK);
+    assert_non_null(strstr(err_msg(), "exists"));
+    err_clear();
+    /* Replacing a running one: refused. */
+    assert_int_not_equal(define(",\"replace\":true", &res), OK);
+    assert_non_null(strstr(err_msg(), "running"));
+    err_clear();
+    snprintf(fdk.c[2].state, sizeof(fdk.c[2].state), "exited");
+    assert_int_equal(define(",\"replace\":true", &res), OK);
+    assert_non_null(strstr(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "previous")), "solo.cbackup-old-"));
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "image")), "alpine@sha256:abc123");
+    assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(res, "warnings")), 0);
+    assert_non_null(strstr(fdk.created_body, "\"Image\":\"alpine@sha256:abc123\""));
+    assert_non_null(strstr(fdk.created_body, "10.0.0.9"));
+    assert_null(strstr(fdk.created_body, "Hostname"));
+    assert_true(has(D "/tmpl/my-solo.xml", "<Container>solo</Container>"));
+    assert_non_null(cJSON_GetObjectItemCaseSensitive(res, "previous_template"));
+    cJSON_Delete(res);
+    res = NULL;
+
+    /* Under a new name, the digest gone: the tag, with a warning; pinned:
+     * refused. */
+    fdk.digest_gone = 1;
+    assert_int_not_equal(define(",\"name\":\"solo2\",\"pin_digest\":true", &res), OK);
+    assert_non_null(strstr(err_msg(), "no longer available"));
+    err_clear();
+    assert_int_equal(define(",\"name\":\"solo2\",\"start\":true", &res), OK);
+    assert_string_equal(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "image")), "alpine:3");
+    const cJSON *w = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(res, "warnings"), 0);
+    assert_non_null(strstr(cJSON_GetStringValue(w), "pulled tag alpine:3 instead"));
+    assert_int_equal(fdk.starts, 1);
+    cJSON_Delete(res);
+
+    /* Privileged settings need the policy's consent. */
+    res = NULL;
+    char def[2048];
+    snprintf(def, sizeof(def), "{\"inspect\":{\"Name\":\"/x\",\"Config\":{},\"HostConfig\":{\"Privileged\":true}},"
+             "\"image\":{\"RepoTags\":[\"a:1\"]},\"name\":\"solo3\"}");
+    assert_int_not_equal(be.define(be.ctx, "solo", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "Privileged"));
+    err_clear();
+}
+
 /* A mount on no snapshot domain is read live, and the level says so. */
 static void test_fallback_flagged(void **state)
 {
@@ -467,6 +534,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),

@@ -22,6 +22,9 @@
 #include <cmocka.h>
 
 #include "lxc_backend.h"
+
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
 #include "test_tmp.h"
 
 #define D      TEST_TMP "/c_backup_test_lxc"
@@ -171,11 +174,48 @@ static void test_sweep_thaws(void **state)
     assert_int_equal(be.unit_state(be.ctx, "DevBox"), SP_STATE_RUNNING);
 }
 
+static void test_define(void **state)
+{
+    (void)state;
+    const char *def = "{\"config\":\"lxc.uts.name = DevBox\\nlxc.rootfs.path = dir:/old/rootfs\\n"
+                      "lxc.net.0.hwaddr = 00:16:3e:aa:bb:cc\\nlxc.net.0.link = br0\\n\"%s}";
+    char buf[1024];
+    cJSON *res = NULL;
+    snprintf(buf, sizeof(buf), def, "");
+    assert_int_not_equal(be.define(be.ctx, "DevBox", buf, &pol, &res), OK);   /* exists */
+    assert_non_null(strstr(err_msg(), "exists"));
+    err_clear();
+    snprintf(buf, sizeof(buf), def, ",\"replace\":true");
+    assert_int_not_equal(be.define(be.ctx, "DevBox", buf, &pol, &res), OK);   /* running */
+    err_clear();
+    snprintf(buf, sizeof(buf), def, ",\"name\":\"devbox2\"");
+    assert_int_equal(be.define(be.ctx, "DevBox", buf, &pol, &res), OK);
+    cJSON_Delete(res);
+    FILE *f = fopen(LXCP "/devbox2/config", "r");
+    assert_non_null(f);
+    char cfg[1024];
+    size_t n = fread(cfg, 1, sizeof(cfg) - 1, f);
+    fclose(f);
+    cfg[n] = '\0';
+    assert_non_null(strstr(cfg, "lxc.uts.name = devbox2"));
+    assert_non_null(strstr(cfg, "lxc.rootfs.path = dir:" LXCP "/devbox2/rootfs"));
+    assert_null(strstr(cfg, "hwaddr"));
+    assert_non_null(strstr(cfg, "lxc.net.0.link = br0"));
+    /* Replacing the stopped one: the old config moved aside. */
+    put(STATE "/lxc-Parked", "STOPPED\n");
+    snprintf(buf, sizeof(buf), def, ",\"replace\":true,\"keep_macs\":true");
+    res = NULL;
+    assert_int_equal(be.define(be.ctx, "Parked", buf, &pol, &res), OK);
+    assert_non_null(strstr(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(res, "previous_config")), "config.cbackup-old-"));
+    cJSON_Delete(res);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_capture, setup, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_thaws, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
