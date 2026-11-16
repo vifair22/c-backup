@@ -267,6 +267,15 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
                             object_stored_info_t *out_info, uint64_t *out_len,
                             object_stored_reader_t **out);
 status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n);
+
+/*
+ * Reads correct damage parity can carry before handing bytes over. Damage
+ * beyond parity is handed over as it stands, so one lost object does not
+ * stop a transfer; this says, once every byte has been read, whether that
+ * happened. A caller moving the object elsewhere must report it as a
+ * failure (OWN-31): the copy is protected by fresh parity over the damage.
+ */
+int      object_stored_damaged(const object_stored_reader_t *r);
 void     object_stored_close(object_stored_reader_t *r);
 
 /*

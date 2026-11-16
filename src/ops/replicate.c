@@ -274,6 +274,21 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         st = c->sink->v->put_object(c->sink->ctx, &obj);
     }
 
+    /* Sent with damage parity could not carry: counted, not fatal here. */
+    if (st == OK && object_stored_damaged(s.r)) {
+        replicate_result_t *res = c->res;
+        if (res->damaged_listed < REPLICATE_DAMAGED_LIST_MAX) {
+            memcpy(res->damaged[res->damaged_listed].hash, hash, OBJECT_HASH_SIZE);
+            res->damaged[res->damaged_listed].snapshot_id = 0;
+            res->damaged_listed++;
+        }
+        res->objects_damaged++;
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        hash_hex(hash, hex);
+        log_error("replicate: object %s was sent damaged beyond its parity; the "
+                  "replica holds it as damaged", hex);
+    }
+
     object_crypt_stream_free(s.dec);
     object_crypt_stream_free(s.enc);
     object_stored_close(s.r);
@@ -468,6 +483,13 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         res.objects_sent     += one.objects_sent;
         res.bytes_sent       += one.bytes_sent;
         res.subtrees_skipped += one.subtrees_skipped;
+        res.objects_damaged  += one.objects_damaged;
+        for (uint32_t d = 0; d < one.damaged_listed &&
+                             res.damaged_listed < REPLICATE_DAMAGED_LIST_MAX; d++) {
+            res.damaged[res.damaged_listed] = one.damaged[d];
+            res.damaged[res.damaged_listed].snapshot_id = snap_id;
+            res.damaged_listed++;
+        }
         if (st != OK) {
             /*
              * Named here because the sink cannot: a sink seals packs as they
@@ -505,5 +527,17 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_free(snaps);
     if (out) *out = res;
+
+    /*
+     * Everything else went across and the snapshots are recorded, which is
+     * what keeps one lost object from blocking replication for ever. The
+     * job still fails: the replica holds these as damaged under parity that
+     * cannot correct them, and an OK here is a replica silently taking bad
+     * data (OWN-11). The failure path raises the alert.
+     */
+    if (st == OK && res.objects_damaged > 0)
+        st = set_error(ERR_CORRUPT, "replicated with %llu object(s) damaged beyond "
+                       "parity; the replica holds them as damaged",
+                       (unsigned long long)res.objects_damaged);
     return st;
 }

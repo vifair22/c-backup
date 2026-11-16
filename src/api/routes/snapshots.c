@@ -1035,6 +1035,50 @@ static int snap_job_needs_key(snap_job_kind_t kind)
  * cancellation too, because the sweep commits before compaction starts and
  * what it removed is still true.
  */
+/*
+ * The listed hashes of objects found damaged beyond parity, appended to a
+ * result document as ,"<count_key>":N,"damaged":[...],"damaged_listed":M}.
+ * base is the document so far without its closing brace. Bounded by the
+ * list cap, so a result never grows with the size of the loss (OWN-31).
+ * Returns a malloc'd document, or NULL to fall back to base.
+ */
+static char *with_damaged(const char *base, const char *count_key, uint64_t count,
+                          uint32_t listed, const uint8_t *(*hash_at)(const void *, uint32_t),
+                          int64_t (*snap_at)(const void *, uint32_t), const void *list)
+{
+    size_t cap = strlen(base) + 128 + (size_t)listed * 112;
+    char *js = malloc(cap);
+    if (!js) return NULL;
+    size_t n = (size_t)snprintf(js, cap, "%s,\"%s\":%llu,\"damaged\":[", base, count_key,
+                                (unsigned long long)count);
+    for (uint32_t i = 0; i < listed && n < cap; i++) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash_at(list, i), hex);
+        if (snap_at)
+            n += (size_t)snprintf(js + n, cap - n, "%s{\"hash\":\"%s\",\"snapshot\":%lld}",
+                                  i ? "," : "", hex, (long long)snap_at(list, i));
+        else
+            n += (size_t)snprintf(js + n, cap - n, "%s\"%s\"", i ? "," : "", hex);
+    }
+    if (n < cap) snprintf(js + n, cap - n, "],\"damaged_listed\":%u}", listed);
+    return js;
+}
+
+static const uint8_t *gc_hash_at(const void *list, uint32_t i)
+{
+    return ((const gc_result_t *)list)->damaged[i];
+}
+
+static const uint8_t *repl_hash_at(const void *list, uint32_t i)
+{
+    return ((const replicate_result_t *)list)->damaged[i].hash;
+}
+
+static int64_t repl_snap_at(const void *list, uint32_t i)
+{
+    return ((const replicate_result_t *)list)->damaged[i].snapshot_id;
+}
+
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
     char js[512];
@@ -1043,7 +1087,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
              "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
-             "\"tmp_bytes_removed\":%llu}",
+             "\"tmp_bytes_removed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
              (unsigned long long)gr->swept,
@@ -1053,7 +1097,16 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              gr->packs_rewritten, gr->packs_deleted,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed);
-    job_set_result(progress_ctx, js);
+    char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
+                              gr->damaged_listed, gc_hash_at, NULL, gr);
+    if (full) {
+        job_set_result(progress_ctx, full);
+        free(full);
+    } else {
+        size_t n = strlen(js);
+        if (n + 1 < sizeof(js)) { js[n] = '}'; js[n + 1] = '\0'; }
+        job_set_result(progress_ctx, js);
+    }
 
     char msg[256];
     if (dry_run)
@@ -1070,6 +1123,12 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
                  gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
                  gr->packs_deleted,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
+    if (gr->pack_entries_damaged > 0) {
+        size_t n = strlen(msg);
+        snprintf(msg + n, sizeof(msg) - n, "; %llu entr%s copied damaged beyond parity",
+                 (unsigned long long)gr->pack_entries_damaged,
+                 gr->pack_entries_damaged == 1 ? "y" : "ies");
+    }
     job_set_summary(progress_ctx, msg);
 }
 
@@ -1088,7 +1147,7 @@ static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
              "{\"snapshots_sent\":%llu,\"snapshots_skipped\":%llu,"
              "\"objects_asked\":%llu,\"objects_sent\":%llu,"
              "\"bytes_sent\":%llu,\"subtrees_skipped\":%llu,"
-             "\"reencrypted\":%s}",
+             "\"reencrypted\":%s",
              (unsigned long long)rr->snapshots_sent,
              (unsigned long long)rr->snapshots_skipped,
              (unsigned long long)rr->objects_asked,
@@ -1096,7 +1155,16 @@ static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
              (unsigned long long)rr->bytes_sent,
              (unsigned long long)rr->subtrees_skipped,
              reencrypt ? "true" : "false");
-    job_set_result(progress_ctx, js);
+    char *full = with_damaged(js, "objects_damaged", rr->objects_damaged,
+                              rr->damaged_listed, repl_hash_at, repl_snap_at, rr);
+    if (full) {
+        job_set_result(progress_ctx, full);
+        free(full);
+    } else {
+        size_t n = strlen(js);
+        if (n + 1 < sizeof(js)) { js[n] = '}'; js[n + 1] = '\0'; }
+        job_set_result(progress_ctx, js);
+    }
 
     char msg[256];
     if (rr->snapshots_sent == 0 && rr->objects_sent == 0)
@@ -1115,6 +1183,12 @@ static void replicate_report(void *progress_ctx, const replicate_result_t *rr,
                  (unsigned long long)rr->bytes_sent,
                  (unsigned long long)rr->subtrees_skipped,
                  rr->subtrees_skipped == 1 ? "" : "s");
+    if (rr->objects_damaged > 0) {
+        size_t n = strlen(msg);
+        snprintf(msg + n, sizeof(msg) - n, "; %llu object%s sent damaged beyond parity",
+                 (unsigned long long)rr->objects_damaged,
+                 rr->objects_damaged == 1 ? "" : "s");
+    }
     job_set_summary(progress_ctx, msg);
 }
 

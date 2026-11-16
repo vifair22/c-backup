@@ -2446,10 +2446,86 @@ status_t object_read_stored(store_t *store,
     return OK;
 }
 
+/*
+ * A stored-form reader, loose or packed, that never passes on damage parity
+ * can correct.
+ *
+ * Replication streams what this hands over straight into the target, which
+ * computes fresh parity over it; a damaged byte shipped as it stood would
+ * be protected there as if it were right. Bytes already handed over cannot
+ * be recalled, so open CRC-scans the payload first and, only on a mismatch
+ * with the trailer, serves every read from a group corrected from parity.
+ * The packed half lives in pack.c (pack_object_open_stored); the loose half
+ * is here, one 15 KiB group at a time so a loose transfer stays inside its
+ * chunk.
+ */
 struct object_stored_reader {
-    FILE    *f;          /* positioned at the next payload byte */
+    FILE    *f;          /* loose, plain: positioned at the next payload byte */
+    pack_stored_reader_t *p;   /* packed */
     uint64_t remaining;
+
+    /* Loose, repair mode: groups read by pread and corrected. */
+    int      fd;
+    int      repair;
+    uint64_t len;
+    off_t    par_off;
+    size_t   rs_sz;
+    uint8_t *gbuf;
+    uint8_t *gpar;
+    uint64_t g_off;
+    size_t   g_len;      /* 0: no group loaded */
+    int64_t  fixed;
+    uint64_t bad;
+    uint8_t  hash[OBJECT_HASH_SIZE];
 };
+
+/* CRC the loose payload; on a mismatch with the trailer switch r to repair
+ * mode. Returns OK whether or not there was damage. */
+static status_t loose_stored_scan(object_stored_reader_t *r, const object_header_t *hdr)
+{
+    off_t  par_off = 0;
+    size_t rs_sz   = 0;
+    if (r->len == 0 || locate_loose_rs_parity(r->fd, hdr, &par_off, &rs_sz) != 0)
+        return OK;   /* no parity to apply: read as it is */
+
+    uint32_t stored_crc = 0;
+    if (pread(r->fd, &stored_crc, sizeof(stored_crc), par_off + (off_t)rs_sz)
+        != (ssize_t)sizeof(stored_crc))
+        return OK;
+
+    r->gbuf = malloc(RS_STREAM_GROUP_DATA);
+    if (!r->gbuf) return set_error(ERR_NOMEM, "object_stored_open: group buffer");
+    uint32_t crc = 0;
+    for (uint64_t o = 0; o < r->len; ) {
+        size_t want = r->len - o < RS_STREAM_GROUP_DATA ? (size_t)(r->len - o)
+                                                         : RS_STREAM_GROUP_DATA;
+        if (pread(r->fd, r->gbuf, want, (off_t)sizeof(*hdr) + (off_t)o) != (ssize_t)want)
+            return set_error(ERR_CORRUPT, "object_stored_open: short read");
+        crc = crc32c_update(crc, r->gbuf, want);
+        o += want;
+    }
+    if (crc == stored_crc) {
+        free(r->gbuf);
+        r->gbuf = NULL;
+        return OK;
+    }
+    r->gpar = malloc(RS_STREAM_GROUP_PAR);
+    if (!r->gpar) return set_error(ERR_NOMEM, "object_stored_open: parity buffer");
+    r->repair  = 1;
+    r->par_off = par_off;
+    r->rs_sz   = rs_sz;
+    return OK;
+}
+
+static void object_stored_free(object_stored_reader_t *r)
+{
+    if (r->f) fclose(r->f);
+    else if (r->fd >= 0) close(r->fd);
+    if (r->p) pack_stored_close(r->p);
+    free(r->gbuf);
+    free(r->gpar);
+    free(r);
+}
 
 status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                             object_stored_info_t *out_info, uint64_t *out_len,
@@ -2460,6 +2536,8 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
 
     object_stored_reader_t *r = calloc(1, sizeof(*r));
     if (!r) return set_error(ERR_NOMEM, "object_stored_open: alloc");
+    r->fd = -1;
+    memcpy(r->hash, hash, OBJECT_HASH_SIZE);
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
@@ -2472,26 +2550,33 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
                                               &out_info->compression,
                                               &out_info->encryption,
                                               &out_info->uncompressed_size,
-                                              &r->remaining, &r->f);
+                                              &r->remaining, &r->p);
         if (st != OK) { free(r); return st; }
         *out_len = r->remaining;
         *out = r;
         return OK;
     }
+    r->fd = fd;
 
     /* read_object_header refuses a payload longer than the file, so the
      * reads below cannot be sent past the object. */
     object_header_t hdr;
     status_t hst = read_object_header(fd, &hdr);
-    if (hst != OK) { close(fd); free(r); return hst; }
+    if (hst != OK) { object_stored_free(r); return hst; }
+    r->remaining = r->len = hdr.compressed_size;
 
-    r->f = fdopen(fd, "rb");
-    if (!r->f) {
-        close(fd);
-        free(r);
-        return set_error_errno(ERR_IO, "object_stored_open: fdopen(%s)", path);
+    hst = loose_stored_scan(r, &hdr);
+    if (hst != OK) { object_stored_free(r); return hst; }
+
+    if (!r->repair) {
+        /* The scan used pread, so the descriptor is still just past the header. */
+        r->f = fdopen(fd, "rb");
+        if (!r->f) {
+            status_t st = set_error_errno(ERR_IO, "object_stored_open: fdopen(%s)", path);
+            object_stored_free(r);
+            return st;
+        }
     }
-    r->remaining = hdr.compressed_size;
 
     out_info->type              = hdr.type;
     out_info->compression       = hdr.compression;
@@ -2502,23 +2587,84 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     return OK;
 }
 
+/* Serve n loose payload bytes from groups corrected from parity. */
+static status_t loose_stored_read_repaired(object_stored_reader_t *r, uint8_t *out, size_t n)
+{
+    uint64_t pos = r->len - r->remaining;
+    while (n > 0) {
+        if (r->g_len == 0 || pos < r->g_off || pos >= r->g_off + r->g_len) {
+            r->g_off = pos - pos % RS_STREAM_GROUP_DATA;
+            uint64_t left = r->len - r->g_off;
+            r->g_len = left < RS_STREAM_GROUP_DATA ? (size_t)left : RS_STREAM_GROUP_DATA;
+            if (pread(r->fd, r->gbuf, r->g_len, (off_t)sizeof(object_header_t) + (off_t)r->g_off)
+                != (ssize_t)r->g_len) {
+                r->g_len = 0;
+                return set_error(ERR_CORRUPT, "object_stored_read: short read");
+            }
+            size_t pstart = (size_t)(r->g_off / RS_STREAM_GROUP_DATA) * RS_STREAM_GROUP_PAR;
+            if (pstart + RS_STREAM_GROUP_PAR <= r->rs_sz &&
+                pread(r->fd, r->gpar, RS_STREAM_GROUP_PAR, r->par_off + (off_t)pstart)
+                    == (ssize_t)RS_STREAM_GROUP_PAR) {
+                int rc = rs_parity_decode(r->gbuf, r->g_len, r->gpar, RS_STREAM_GROUP_PAR);
+                if (rc > 0)      r->fixed += rc;
+                else if (rc < 0) r->bad++;
+            } else {
+                r->bad++;
+            }
+        }
+        size_t at   = (size_t)(pos - r->g_off);
+        size_t take = r->g_len - at < n ? r->g_len - at : n;
+        memcpy(out, r->gbuf + at, take);
+        out += take;
+        n   -= take;
+        pos += take;
+        r->remaining -= take;
+    }
+    return OK;
+}
+
 status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n)
 {
     if (!r || (!buf && n)) return set_error(ERR_INVALID, "object_stored_read: null argument");
     if ((uint64_t)n > r->remaining)
         return set_error(ERR_INVALID, "object_stored_read: %zu bytes asked for, %llu left",
                          n, (unsigned long long)r->remaining);
+    if (r->p) {
+        status_t st = pack_stored_read(r->p, buf, n);
+        if (st == OK) r->remaining -= n;
+        return st;
+    }
+    if (r->repair) return loose_stored_read_repaired(r, buf, n);
     if (n && fread(buf, 1, n, r->f) != n)
         return set_error(ERR_CORRUPT, "object_stored_read: short read");
     r->remaining -= n;
     return OK;
 }
 
+int object_stored_damaged(const object_stored_reader_t *r)
+{
+    if (!r) return 0;
+    if (r->p) return pack_stored_damaged(r->p);
+    return r->bad > 0;
+}
+
 void object_stored_close(object_stored_reader_t *r)
 {
     if (!r) return;
-    if (r->f) fclose(r->f);
-    free(r);
+    if (r->repair) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(r->hash, hex);
+        if (r->bad > 0) {
+            log_warn("object %s: damaged beyond its parity (%llu group(s)); read as stored",
+                     hex, (unsigned long long)r->bad);
+            parity_stats_add_uncorrectable(1);
+        } else if (r->fixed > 0) {
+            log_warn("object %s: corrected from parity while reading it as stored "
+                     "(%lld byte(s))", hex, (long long)r->fixed);
+            parity_stats_add_repaired(1);
+        }
+    }
+    object_stored_free(r);
 }
 
 status_t object_get_info(store_t *store,
