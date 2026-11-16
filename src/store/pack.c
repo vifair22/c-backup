@@ -2043,18 +2043,38 @@ static comp_scratch_t *comp_scratch(void)
 /*
  * Decide compression for a plaintext buffer (design constraint 4).
  *
- * A 64 KiB LZ4 probe first: incompressible content (video, audio, already
- * compressed archives, databases) fails it and is stored as it is, having
- * cost LZ4 on 64 KiB rather than on the whole object. Every object is
- * bounded, so the bail-out is per object - for a large file, per chunk -
- * and needs no second look inside an entry. A compressed result is kept
- * only when it is smaller than the input, which is also what the reader's
- * bound on stored size relies on. The scratch is the calling thread's own,
- * so chunk workers compress at once.
+ * Every object is bounded, so the decision is per object - for a large file,
+ * per chunk - and is made here from the object's own bytes alone. Nothing
+ * records it: no skip mark, no file cache column, no per-file or per-backup
+ * flag, so a chunk that fails says nothing about the next chunk of the same
+ * file or the same chunk next time (B124: on 1.0.0 one failed probe 8 MiB
+ * into a disk image skip-marked the whole object for good).
+ *
+ * A 64 KiB LZ4 probe of the head, and for an object over 128 KiB one of the
+ * tail as well; the object is compressed if either passes. Incompressible
+ * content (video, audio, archives, databases) fails both and is stored as
+ * it is, having cost LZ4 on at most 128 KiB. The second probe is for the
+ * chunk a file's character changes inside: the zeros after a disk image's
+ * incompressible region run to the chunker's maximum in the chunk where they
+ * start, and a head probe alone stored up to 8 MiB of them raw. A
+ * compressed result is kept only when it is smaller than the input, which
+ * is also what the reader's bound on stored size relies on. The scratch is
+ * the calling thread's own, so chunk workers compress at once.
  *
  * On return *out points at either the caller's buffer or *owned, which the
  * caller frees.
  */
+/* Does the 64 KiB (or shorter) window at off compress enough to bother? */
+static int probe_passes(const uint8_t *in, uint64_t len, uint64_t off,
+                        const comp_scratch_t *cs)
+{
+    uint64_t left = len - off;
+    int sample_len = left > PACK_PROBE_SIZE ? PACK_PROBE_SIZE : (int)left;
+    int sc = LZ4_compress_default((const char *)in + off, (char *)cs->buf,
+                                  sample_len, cs->cap);
+    return sc > 0 && (double)sc / (double)sample_len <= PACK_PROBE_RATIO;
+}
+
 static void pb_compress(const uint8_t *in, uint64_t len,
                         const uint8_t **out, uint64_t *out_len,
                         uint8_t *out_compression, uint8_t **owned)
@@ -2077,10 +2097,10 @@ static void pb_compress(const uint8_t *in, uint64_t len,
         cs->cap = bound;
     }
 
-    int sample_len = (len > PACK_PROBE_SIZE) ? PACK_PROBE_SIZE : (int)len;
-    int sc = LZ4_compress_default((const char *)in, (char *)cs->buf,
-                                  sample_len, cs->cap);
-    if (sc <= 0 || (double)sc / (double)sample_len > PACK_PROBE_RATIO) return;
+    if (!probe_passes(in, len, 0, cs) &&
+        !(len > 2 * (uint64_t)PACK_PROBE_SIZE &&
+          probe_passes(in, len, len - PACK_PROBE_SIZE, cs)))
+        return;
 
     int csz = LZ4_compress_default((const char *)in, (char *)cs->buf,
                                    (int)len, cs->cap);

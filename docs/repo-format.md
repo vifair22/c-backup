@@ -228,13 +228,19 @@ and decrypted and checked whole before any of it is released.
 
 ### Compression
 
-Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1). A
-64 KiB probe decides first: a payload whose first 64 KiB does not compress
-to under 98% of itself is stored as it is, having cost LZ4 on 64 KiB
-rather than on the whole object, so video, audio, archives and databases
-bail out at once (design constraint 4). A compressed result is kept only
+Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1).
+Probes decide first: a payload whose first 64 KiB, and for one over
+128 KiB whose last 64 KiB too, do not compress to under 98% of themselves
+is stored as it is, having cost LZ4 on at most 128 KiB rather than on the
+whole object, so video, audio, archives and databases bail out at once
+(design constraint 4). The tail probe catches the chunk a file changes
+character in: zeros after an incompressible region run to the chunker's
+maximum in the chunk where they start. A compressed result is kept only
 when it is smaller than the input, and payloads under 4 KiB are never
-compressed. Because every large file is chunked, the bail-out is per chunk.
+compressed. Because every large file is chunked, the decision is per
+chunk, and it is recorded nowhere: no skip mark, no cache column, no
+per-file or per-backup state, so one chunk's verdict never decides another
+chunk's or the next backup's (B124; `pb_compress` in `src/store/pack.c`).
 
 ### Encryption
 

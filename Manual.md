@@ -112,7 +112,8 @@ These hold everywhere and decide many of the behaviours below.
    the file.
 3. **Millions of inodes.** Traversal and change detection are linear in the
    number of entries.
-4. **Fast incompressible bailout.** A 64 KiB probe decides compression.
+4. **Fast incompressible bailout.** 64 KiB probes of each chunk's head and
+   tail decide its compression, chunk by chunk.
 
 Section 20 records the one place 1.0 falls short of constraint 3 on small
 hosts: the scan's memory.
@@ -1312,12 +1313,14 @@ gc or reindex. Merging small packs (coalescing), which gc does after
 compaction and nothing else does, follows the same steps and leaves the same
 states.
 
-**Large incompressible files.** Each chunk is probed on its own: if its
-first 64 KiB does not compress (video, audio, disk images, encrypted or
-already-compressed archives) it is stored as it is, having cost LZ4 on
-64 KiB. A file whose head compresses and whose body does not (a container
-header or a thumbnail in front of compressed media) costs compression on the
-head's chunks only. Nothing is ever left outside a pack, and nothing is
+**Large incompressible files.** Each chunk is probed on its own: if
+neither its first nor its last 64 KiB compresses (video, audio, encrypted
+or already-compressed archives) it is stored as it is, having cost LZ4 on
+at most 128 KiB. A file whose head compresses and whose body does not (a
+container header or a thumbnail in front of compressed media) costs
+compression on the head's chunks only, and a disk image that alternates
+compressible and incompressible regions is compressed wherever it pays:
+no verdict is remembered from one chunk to the next or between backups. Nothing is ever left outside a pack, and nothing is
 written twice.
 
 **What `phys_size` counts.** The stored payload only, after compression and
