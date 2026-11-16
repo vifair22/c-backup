@@ -1380,7 +1380,7 @@ contains "and says which value was rejected" "not-an-address" "$(cat "$WORK/bind
 # the job manager, scheduler and routes all set up. Each startup failure
 # unwinds what came before it; under ASan a leak report lands in the log, so
 # its absence is the check (vacuous in a plain build).
-sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port: $PORTBASE/" \
+sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port: $MAIN_PORT/" \
     "$WORK/bindcfg.yaml"
 C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind3.log" 2>&1
 check    "a port already taken stops the daemon" 1 "$?"
