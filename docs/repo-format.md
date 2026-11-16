@@ -51,8 +51,8 @@ existing repositories are rebuilt by backing up again. The
 format 2 build is the one before this format landed.
 
 Per-file versions are belt and braces against a file copied in from another
-format by hand: `PACK_VERSION` (`src/store/pack.h`), the parity footer's
-`PARITY_VERSION`, and the tree format's `MANIFEST_TREE_VERSION`.
+format by hand: `PACK_VERSION` (`src/store/pack.h`), the pack tail's
+version, and the tree format's `MANIFEST_TREE_VERSION`.
 
 ## `.cbackup`
 
@@ -307,17 +307,18 @@ entries, count of them:
     name[32] | type u8 | compression u8 | encryption u8 |
     uncompressed_size u64 | stored_size u64
   stored payload, stored_size bytes
-parity trailer:
-  fhdr_crc            u32   CRC-32C of the 12-byte header
-  block[0..count-1], in entry order:
-    hdr_parity        260 B XOR parity record over the 51-byte entry header
-    rs_parity         R_i   ceil(C_i / 15,296) * 1,024 bytes
-    payload_crc       u32   CRC-32C of the stored payload
-    rs_data_len       u32   always 0 (dead field, kept for layout)
-    block_size        u32   260 + R_i + 12
-  offsets[count]      u64   block start, relative to the trailer start
-  entry_count         u32   at file_end - 16
-  footer (12 bytes):  magic u32 "PARI" | version u32 = 1 | trailer_size u32
+trailer (pack version 7, docs/pack-parity.md):
+  stripe parity       ceil(body_len / 15,296) x 1,024 bytes; group g covers
+                      body bytes [g x 15,296, (g+1) x 15,296), the last
+                      group shorter
+  crc table           count x 8 bytes, in entry order (entry_index):
+                      CRC-32C of the entry (header and payload) u32 |
+                      CRC-32C of the 51-byte entry header alone u32
+  table parity        RS over the crc table, the same group geometry
+  tail (32 bytes), written twice:
+                      magic u32 "PKT7" | version u32 = 1 | body_len u64 |
+                      count u32 | trailer_size u32 | reserved u32 |
+                      crc32c u32 of the 28 bytes before it
 ```
 
 `stored_size` counts what is stored: for an encrypted entry, nonce,
@@ -325,18 +326,31 @@ ciphertext and tag. An entry header is consistent with its codec or it is
 refused: an uncompressed entry stores exactly its payload (plus 28 when
 encrypted), and a compressed one stores fewer bytes than its payload.
 
-The parity is Reed-Solomon RS(255,239) over the stored payload, 16 parity
-bytes per 239 data bytes, interleaved 64 codewords deep (groups of 15,296
-data bytes, 1,024 parity bytes each, the last group paid in full), so each
-codeword corrects 8 bytes and a contiguous burst of up to 512 bytes is
-repairable: 6.7% of the stored payload, plus 280 fixed trailer bytes per
-entry. A reader CRC-checks the payload and fetches parity only on a
-mismatch; it never uses bytes that fail their CRC after correction.
+The parity is Reed-Solomon RS(255,239) over the whole body - pack header,
+entry headers and payloads alike, as one stream - with 16 parity bytes per
+239 data bytes, interleaved 64 codewords deep (groups of 15,296 data bytes,
+1,024 parity bytes each), so each codeword corrects 8 bytes and a
+contiguous burst of up to 512 bytes per group is repairable. The cost is
+the RS rate, 6.7% of the body, plus 8 bytes an entry of CRCs and their own
+6.7%, whatever the entry sizes. A reader CRC-checks an entry against the
+table and touches parity only on a mismatch, correcting just the groups the
+entry overlaps; it never uses bytes that fail their CRC after correction.
+
+No header is a single point of failure (B119). An entry header is stripe
+data, and a walk of the pack checks each against its own header CRC, so a
+damaged size field cannot send the walk astray and a damaged name cannot
+make gc drop a live object. The pack header is stripe data too, and with a
+verified tail it is derivable outright (constant magic and version, the
+tail's count). The tail is written twice; with both copies gone the
+trailer is derived from the body - the count from the pack header, body_len
+from a walk of the entries, the file size as the check. A CRC slot lost
+beyond the table's parity does not lose its entry when every codeword
+under the entry decodes clean.
 
 ### Bounds
 
-The trailer's size fields stay 32-bit. Format 3 makes wrapping impossible
-instead of widening them, by bounding every pack (`src/store/pack.h`):
+The tail's trailer_size stays 32-bit. Format 3 makes wrapping impossible
+instead of widening it, by bounding every pack (`src/store/pack.h`):
 
 | Bound | Value | Meaning |
 |-------|-------|---------|
@@ -344,40 +358,43 @@ instead of widening them, by bounding every pack (`src/store/pack.h`):
 | `PACK_MAX_ENTRIES` | 1,000,000 | entries per pack; every writer rolls over on it too |
 | `PACK_ENTRY_MAX_BYTES` | 16 MiB + 79 | the largest entry: 51-byte header, 16 MiB payload, 28 AEAD bytes |
 | `PACK_MAX_BYTES` | 285,212,751 | the largest body (header and entries): the seal plus one maximal entry |
-| `PACK_TRAILER_MAX_BYTES` | 1,323,094,548 | the largest trailer such a body can carry |
-| `PACK_MAX_FILE_BYTES` | 1,608,307,299 | the largest pack file |
+| `PACK_TRAILER_MAX_BYTES` | 27,631,168 | the largest trailer such a body can carry |
+| `PACK_MAX_FILE_BYTES` | 312,843,919 | the largest pack file |
 
-The trailer bound takes every term at its worst: 4 + count x (260 + 12 + 8)
-+ 16 fixed bytes, plus RS parity of at most (body / 15,296 + count) x 1,024
-since each entry rounds its own groups up. Entry count is bounded for the
-trailer's sake, not the body's: each entry costs 280 fixed trailer bytes and
-up to one group of rounding whatever its size, so a million one-byte entries
-make a 1.3 GB trailer. `_Static_assert`s in `pack.h` check that the trailer
-bound, and a maximal entry's parity block, fit in UINT32_MAX; if a constant
-moves, the build decides whether the format still holds.
+The trailer bound is exact rather than a worst case over rounding: 18,647
+groups of stripe parity over the largest body (19,094,528 bytes), 8 bytes of
+CRCs for each of a million entries, 524 groups of table parity and the two
+tails. Per-entry parity (pack version 6) needed 1.3 GB here, because every
+entry rounded up to a group of its own. A `_Static_assert` in `pack.h`
+checks the bound fits in UINT32_MAX; if a constant moves, the build decides
+whether the format still holds.
 
 Enforced on write at the one place every writer passes (sealing refuses a
 body past `PACK_MAX_BYTES` or a count past `PACK_MAX_ENTRIES`, and the
 backup writer refuses an entry that would cross either before writing it),
-and refused on read: a pack file past `PACK_MAX_FILE_BYTES`, a trailer
-starting past `PACK_MAX_BYTES`, or an entry count past `PACK_MAX_ENTRIES` is
-not parsed, and its parity is never applied.
+and refused on read: a pack file past `PACK_MAX_FILE_BYTES`, a tail whose
+body_len is past `PACK_MAX_BYTES`, whose count is past `PACK_MAX_ENTRIES` or
+whose sizes disagree with the file is not trusted, and its parity is never
+applied.
 
 ### Writers
 
 - the **backup writer** (`pack_backup_*`): plaintext in, named, deduplicated
   against the repository and the pack it has open, probed, compressed,
-  encrypted, parity computed in memory per entry. Backup uses it directly;
+  encrypted, appended as header and payload. Backup uses it directly;
   `object_store` uses one owned by the store.
 - the **stored writer** (`pack_stored_*`): entries already in stored form,
-  copied verbatim with fresh parity; replication's. It refuses any entry a
+  copied verbatim; replication's. It refuses any entry a
   reader would refuse (unknown type or codec, past the bound, inconsistent
   with its codec).
 - the **rewriter** in gc and coalescing: live entries of old packs copied,
   corrected from parity on the way, into new packs; the old ones removed
   only once the new ones are installed, synced and announced.
 
-A pack installs with one `rename` from `tmp/`, after `fsync`. Its contents
+Every writer appends entries and nothing else; sealing writes the trailer,
+reading the body back a window of groups at a time (64 groups) and
+computing parity and the CRC table in one pass, so memory never depends on
+the pack. A pack installs with one `rename` from `tmp/`, after `fsync`. Its contents
 reach the daemon's index through the pack-commit callback; a store with no
 resolver indexes its packs itself (`store_scan_packs`).
 
@@ -521,7 +538,7 @@ changes the hash of every large file, so neither is a tunable.
 | object payload bound | 16 MiB | format | every object, every type |
 
 Why these sizes: chunks are pack entries and each costs a 51-byte entry
-header, 280 bytes of fixed parity and an index row, so 0.03% at 1 MiB; a
+header, 8 bytes of CRCs and an index row, so 0.006% at 1 MiB; a
 256 MiB pack holds about 200 of them. Index rows grow with chunk count, not
 file count: 10 TB of large files is about 8.3M `pack_objects` rows at the
 measured 1.16 MiB mean, which SQLite holds comfortably, where a 64 KiB
@@ -785,7 +802,7 @@ Recommended for format 3 instead:
    as now.
 2. Each worker, for one chunk: name it (SHA-256 of `type || payload`),
    check the repository and the in-flight set, run the 64 KiB probe and
-   LZ4 if it says so, encrypt, CRC and RS parity, then append the prepared
+   LZ4 if it says so, encrypt, then append the prepared
    entry to the backup's pack under the pack writer's lock. The lock covers
    the write and the bookkeeping only; all CPU work is outside it.
 3. Results are taken back in submission order and appended to the file's
@@ -813,8 +830,8 @@ start.
 | grep | `content_stream`: leaves in order, holes as zeroes |
 | preview | `content_read_prefix`: only the leaves overlapping the prefix |
 | gc | marks through lists: `content_collect` visits a list once per run (a visited set, not a per-snapshot refcount walk), marking every sub-list and leaf; directories through `manifest_iter`'s object callback, fragments and tree lists included. A chunk referenced only from a list is live |
-| verify | unchanged per object (every chunk is a pack entry with parity); a reachability pass checks that every leaf of every list exists |
-| repair | unchanged: per pack entry, by its parity. Damage beyond parity fails the job per OWN-31 |
+| verify | unchanged per object (every chunk is a pack entry under the pack's parity); a reachability pass checks that every leaf of every list exists |
+| repair | per pack entry, from the groups of stripe parity it overlaps; only the entry's own bytes are written. Damage beyond parity fails the job per OWN-31 |
 | replicate | the closure of a snapshot is `content_collect` over every file plus `manifest_iter` objects over every directory; objects move as stored bytes, as now |
 | reindex | `pack_objects` from the packs as now; nodes from trees through `manifest_iter`. No chunk-membership table: the lists are in the repository and are read when needed |
 
@@ -872,6 +889,9 @@ format 3; a repository that needed one is rebuilt by backing up again.
 - `OBJECT_TYPE_SPARSE` and its region table, and the sparse restore path;
 - the OWN-30 stopgaps that refused repair of packs whose 32-bit trailer
   sizes might have wrapped (the bounds above make wrapping impossible);
+- per-entry parity (pack version 6): the 260-byte XOR header record, RS
+  groups rounded up per entry, the offsets table and the "PARI" footer,
+  replaced by striped parity over the body (OWN-44);
 - the flat `packs/pack-*.dat` layout and the four- and eight-digit names.
 
 ## Recovery

@@ -19,8 +19,9 @@ serialises one manifest tree object per directory bottom-up, seals its packs,
 writes a snapshot record, and indexes everything into the database. Every
 object is written exactly once, straight into a pack: repository format 3 has
 no loose objects and no pack pass. That works because every object is at most
-16 MiB, so each one is named, probed, compressed, encrypted and given its
-parity whole, in memory, before its entry is appended. A file larger than one
+16 MiB, so each one is named, probed, compressed and encrypted whole, in
+memory, before its entry is appended; parity is the seal's, over the pack
+as a whole. A file larger than one
 object is cut at content-defined boundaries into chunks named by a chunk list,
 and its holes are gaps in that list. A restore reads node rows from the
 database, resolves each object through the daemon's index of the packs, and
@@ -211,10 +212,11 @@ handled whole:
    under a key derived from the repository key by HKDF, a fresh random
    nonce, and the type and name as associated data, so a ciphertext moved
    under another name fails authentication where it is read.
-5. **Protect.** CRC-32C and Reed-Solomon parity over the stored bytes,
-   computed in memory, then the 51-byte entry header and the payload are
-   appended to the pack's staging file in `<repo>/tmp/`; the parity goes into
-   the trailer when the pack is sealed.
+5. **Append.** The 51-byte entry header and the payload are appended to the
+   pack's staging file in `<repo>/tmp/`. Protection comes when the pack is
+   sealed: the seal reads the body back a window of groups at a time and
+   writes Reed-Solomon parity striped over all of it, plus each entry's
+   CRCs, into the trailer.
 
 There is no per-object file, no rename per object, and no second pass. The
 one-file-per-object path this replaced spent 41% of a full backup in
@@ -351,8 +353,9 @@ from disk.
 ## Part 2: packs (`src/store/pack.c`)
 
 A pack is the only container. It holds a 12-byte header, entries of a
-51-byte header plus stored payload, and a parity trailer with one block per
-entry (`repo-format.md` has the layout). Three writers produce packs, and
+51-byte header plus stored payload, and a trailer of Reed-Solomon parity
+striped over all of that, a CRC table and a doubled tail (`repo-format.md`
+has the layout, `pack-parity.md` the design). Three writers produce packs, and
 nothing else does:
 
 - **The backup writer** (`pack_backup_*`), described in 1.3. A backup holds
@@ -364,8 +367,8 @@ nothing else does:
   fills, when the store closes, when `object_store_flush` is called, or when
   something reads an object it is still holding.
 - **The stored writer** (`pack_stored_*`): entries already in stored form
-  (compressed and encrypted as the source holds them), copied verbatim with
-  fresh parity. Replication's. It refuses any entry a reader would refuse.
+  (compressed and encrypted as the source holds them), copied verbatim; the
+  seal computes fresh parity. Replication's. It refuses any entry a reader would refuse.
 - **The rewriter** (`pack_rw_t`) in gc and coalescing, Part 5.
 
 Sealing (`finalize_pack`) patches the entry count into the header, appends
@@ -382,7 +385,7 @@ and moves each `objects` row from `staged` to the pack's id - one
 transaction per pack, serialised by a mutex because SQLite has no nested
 transactions on the shared handle. `entry_index` is the *on-disk* entry
 position (the array was sorted by name first); it is what lets a reader
-find the entry's parity block in the trailer.
+find the entry's CRCs in the trailer's table.
 
 **A pack is sealed only where no transaction is open.** Sealing emits the
 commit callback, which begins one, and the write lock is not recursive. In
@@ -429,9 +432,9 @@ Every load verifies before it trusts, and every load is whole: an object
 is at most 16 MiB, so nothing is streamed and no byte is released before it
 has been checked.
 
-- `object_load`: reads the entry, CRC-checks the stored payload and, on a
-  mismatch, corrects it from the entry's Reed-Solomon parity (the 51-byte
-  header has its own XOR parity record); decrypts and authenticates;
+- `object_load`: reads the entry (header and payload), CRC-checks it
+  against the table and, on a mismatch, corrects it from the stripe groups
+  it overlaps - header bytes like any others; decrypts and authenticates;
   decompresses (`COMPRESS_NONE` or the LZ4 block codec); and recomputes the
   name, type included, against the requested one. Restore, grep, preview,
   verify, gc's tree walk and reindex all read through it.
@@ -450,16 +453,22 @@ has been checked.
   end (OWN-31). The name is not checked here, and without the key cannot
   be.
 
-Parity is fetched only when the CRC disagrees, one window of groups at a
-time; the default window (1,097 groups) covers the largest possible entry,
-so a correction is one parity read. The pack bounds in `repo-format.md`
-make every trailer size fit its 32-bit field, so the format 2 refusal to
-correct from packs whose trailer sizes might have wrapped (OWN-30) is gone.
+Parity is fetched only when the CRC disagrees, one group (15,296 bytes and
+its 1,024 parity bytes) at a time, and only the groups the entry overlaps:
+for a small entry, one or two. The pack bounds in `repo-format.md` make the
+trailer size fit its 32-bit field, so the format 2 refusal to correct from
+packs whose trailer sizes might have wrapped (OWN-30) is gone. Readers that
+want only a header (`object_get_info`, `object_physical_size`) correct it
+from the stripe when it is not the header the index expects, and a walk of
+a pack (gc, coalescing, reindex) checks every header against its own CRC,
+so damaged header bytes cost a parity read, not the object (B119).
 
 In-place repair (`pack_object_repair`) rewrites corrected bytes via `pwrite`
 and is invoked by verify's repair mode, not by normal reads; normal reads
 repair the in-memory copy only. It first corrects the whole entry in memory
-and checks the result against the trailer's CRC, and only then writes: RS
+and checks the result against the entry's CRC, and only then writes the
+entry's own bytes - never a neighbour's from a shared group - plus, where
+they were damaged, its CRC slot, a tail copy or the pack header: RS
 can miscorrect a group damaged past its capacity, and writing that back
 would trade damage verify can see for damage it cannot. Writing in place is
 crash-safe because each write puts back the bytes the entry was written with
@@ -469,8 +478,8 @@ original damage and a rerun finishes it. Rewriting the pack through
 disk that is already failing.
 
 gc's rewrite and coalescing copy entries into new packs whose parity is
-computed afresh over what they hold. They check each entry's CRC as the
-bytes go by and rewrite it corrected on a mismatch, so a copy never turns
+computed afresh over what they hold. They fetch each entry whole, check it
+against its CRC and copy it corrected on a mismatch, so a copy never turns
 damage parity could still fix into damage it protects. An entry damaged
 beyond parity is copied as it is and listed in `pack_gc_stats_t`, and
 `gc_run` fails once compaction has finished (OWN-31).
@@ -681,14 +690,15 @@ neither exists.
 | `PACK_RATIO_THRESHOLD` | 0.90 | probe ratio above which a payload is stored uncompressed |
 | `PACK_MAX_MULTI_BYTES` | 256 MiB | pack body seal size |
 | `PACK_MAX_ENTRIES` | 1,000,000 | entries per pack; every writer rolls over on it |
-| `PACK_MAX_FILE_BYTES` | 1,608,307,299 | the largest pack file a reader accepts |
-| `PARITY_WINDOW_GROUPS_DEFAULT` | 1,097 groups | parity read window: covers the largest entry, so a correction is one read |
+| `PACK_MAX_FILE_BYTES` | 312,843,919 | the largest pack file a reader accepts |
+| `PARITY_WINDOW_GROUPS_DEFAULT` | 64 groups | the seal's read-back window: 979 KiB of body and 64 KiB of parity at a time |
 | `BATCH_ENTRIES` | 2,000 | file-cache entries per transaction |
 | `PACK_COALESCE_SMALL_BYTES` | 64 MiB | a pack below this is a coalesce candidate |
 
 Memory worth knowing: each object is held whole, so a writer holds up to
-16 MiB of payload plus an LZ4 bound-sized compress buffer and its parity
-(about 1.1 MiB at the bound). That is per object in flight, not per file.
+16 MiB of payload plus an LZ4 bound-sized compress buffer. That is per
+object in flight, not per file. Sealing a pack holds a 64-group window and
+the CRC table (8 bytes an entry).
 
 ## Part 7: where the index lives, and why it matters
 

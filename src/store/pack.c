@@ -42,21 +42,6 @@ static int fwrite_full(const void *buf, size_t len, FILE *f) {
     return 0;
 }
 
-/* Read a full buffer from a stdio stream, handling short reads.
- * Returns 0 on success, -1 on error/EOF. */
-static int fread_full(void *buf, size_t len, FILE *f) {
-    uint8_t *p = buf;
-    while (len > 0) {
-        size_t r = fread(p, 1, len, f);
-        if (r > 0) { p += r; len -= r; continue; }
-        if (feof(f)) { errno = EIO; return -1; }  /* unexpected EOF */
-        if (ferror(f)) return -1;
-        errno = EIO;
-        return -1;
-    }
-    return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /* In-memory cache entry (one per object across all packs)            */
 /* ------------------------------------------------------------------ */
@@ -66,7 +51,8 @@ typedef struct {
     uint64_t dat_offset;
     uint32_t pack_num;
     uint32_t pack_version;  /* always PACK_VERSION; kept so a stale cache entry is caught */
-    uint32_t entry_index;   /* position in .dat entry order (UINT32_MAX for pre-v3) */
+    uint32_t entry_index;   /* position in .dat entry order: indexes the CRC table */
+    uint64_t comp_size;     /* stored size, as the index records it (0: unknown) */
 } pack_cache_entry_t;
 
 typedef struct {
@@ -121,6 +107,7 @@ _Static_assert(PACK_MAX_MULTI_BYTES / PACK_COALESCE_SMALL_DIV < PACK_MAX_MULTI_B
 
 /* Forward declarations for startup recovery */
 static void pack_resume_deleting(store_t *store);
+static int pack_hdr_read_file(FILE *f, pack_dat_hdr_t *out);
 
 static int idx_disk_cmp(const void *a, const void *b) {
     return memcmp(a, b, OBJECT_HASH_SIZE);
@@ -348,45 +335,29 @@ static int entry_hdr_out_of_bounds(const pack_dat_entry_hdr_t *h)
     return 0;
 }
 
-/* Validate an entry header already read, with f positioned just past it.
- * Split from read_entry_hdr so a reader can let header parity repair the
- * bytes first: a flipped bit in a size or codec field is repairable, and
- * refusing it before parity runs would turn a correctable entry into a
- * lost one. */
-static int check_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out, int check_type) {
+/* The checks a header must pass on its own, with no file to measure. A
+ * reader applies them only after parity has had its chance: a flipped bit
+ * in a size or codec field is repairable, and refusing it first would turn
+ * a correctable entry into a lost one. */
+static int hdr_fields_valid(const pack_dat_entry_hdr_t *h, int check_type) {
     /* The one refusal with its own message: "bad entry header" would send
      * an operator looking for damage when the pack is simply newer than
      * this build (OWN-39). Callers keep this message rather than writing
      * their own over it; see entry_hdr_error. */
-    if (check_type && !object_type_known(out->type)) {
-        set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, out->type);
+    if (check_type && !object_type_known(h->type)) {
+        set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, h->type);
         return ENTRY_HDR_UNKNOWN_TYPE;
     }
-
-    if (out->compression != COMPRESS_NONE && out->compression != COMPRESS_LZ4)
+    if (h->compression != COMPRESS_NONE && h->compression != COMPRESS_LZ4)
         return -1;
-    if (out->encryption != ENCRYPT_NONE && out->encryption != ENCRYPT_CHACHA20)
+    if (h->encryption != ENCRYPT_NONE && h->encryption != ENCRYPT_CHACHA20)
         return -1;
-    if (entry_hdr_out_of_bounds(out)) return -1;
-
-    off_t payload_start = ftello(f);
-    if (payload_start < 0) return -1;
-
-    struct stat sb;
-    if (fstat(fileno(f), &sb) != 0) return -1;
-    if (sb.st_size < payload_start) return -1;
-    if (out->compressed_size > (uint64_t)(sb.st_size - payload_start)) return -1;
-
+    if (entry_hdr_out_of_bounds(h)) return -1;
     return 0;
 }
 
-static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out, int check_type) {
-    if (fread(out, sizeof(*out), 1, f) != 1) return -1;
-    return check_entry_hdr(f, out, check_type);
-}
-
 /*
- * The status for a failed read_entry_hdr: its own message when it refused
+ * The status for a failed header check: its own message when it refused
  * an unknown type, otherwise the caller's. A macro so the caller's format
  * and arguments reach set_error unchanged.
  */
@@ -395,15 +366,6 @@ static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out, int check_type) {
 
 /* write_full_fd: uses io_write_full from util.h */
 #define write_full_fd io_write_full
-
-
-/* Accumulated parity data for one entry in the current pack. */
-typedef struct {
-    parity_record_t hdr_par;
-    uint32_t payload_crc;
-    uint8_t *rs_parity;              /* malloc'd RS parity, rs_par_sz bytes */
-    size_t   rs_par_sz;
-} pack_entry_parity_t;
 
 
 /* ------------------------------------------------------------------ */
@@ -447,6 +409,7 @@ static status_t pack_find_entry(store_t *store,
     out_found->pack_num     = (uint32_t)loc.pack_id;
     out_found->pack_version = loc.pack_version;
     out_found->entry_index  = loc.entry_index;
+    out_found->comp_size    = loc.comp_size;
     return OK;
 }
 
@@ -478,6 +441,10 @@ static void dat_return_or_close(store_t *store, uint32_t pack_num, FILE *f) {
     store_dat_cache_return(store, pack_num, f);
 }
 
+static int entry_hdr_checked(int fd, const pack_cache_entry_t *found,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             pack_dat_entry_hdr_t *out);
+
 status_t pack_object_physical_size(store_t *store,
                                    const uint8_t hash[OBJECT_HASH_SIZE],
                                    uint64_t *out_bytes) {
@@ -490,13 +457,8 @@ status_t pack_object_physical_size(store_t *store,
     FILE *f = dat_open_or_checkout(store, found.pack_num);
     if (!f) return set_error_errno(ERR_IO, "pack_object_physical_size: fopen pack-%010u.dat", found.pack_num);
 
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_physical_size: fseeko pack-%010u.dat", found.pack_num);
-    }
-
     pack_dat_entry_hdr_t ehdr;
-    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    int ehrc = entry_hdr_checked(fileno(f), &found, hash, &ehdr);
     if (ehrc != 0) {
         fclose(f);
         return entry_hdr_error(ehrc, "pack_object_physical_size: bad entry header in pack-%010u.dat", found.pack_num);
@@ -517,11 +479,8 @@ status_t pack_object_get_info(store_t *store,
     FILE *f = dat_open_or_checkout(store, found.pack_num);
     if (!f) return set_error_errno(ERR_IO, "pack_object_get_info: fopen pack-%010u.dat", found.pack_num);
 
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%010u.dat", found.pack_num);
-    }
     pack_dat_entry_hdr_t ehdr;
-    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    int ehrc = entry_hdr_checked(fileno(f), &found, hash, &ehdr);
     if (ehrc != 0) {
         fclose(f); return entry_hdr_error(ehrc, "pack_object_get_info: bad entry header in pack-%010u.dat", found.pack_num);
     }
@@ -534,163 +493,54 @@ status_t pack_object_get_info(store_t *store,
 }
 
 /*
- * Where one entry's parity sits in its pack's trailer, without the parity.
+ * Striped pack parity (pack version 7, docs/pack-parity.md).
  *
- * The RS parity for an entry is 1 KiB per 15 KiB group, 6.7% of what it
- * protects: 3.3 GiB for a 50 GiB entry. It used to be read whole into one
- * malloc on every read of a packed entry - even by the in-memory reader,
- * which then found the entry too large for it and threw the buffer away -
- * which is design constraint 2 broken one level below the payload. Readers
- * now record where the parity is and fetch it a window of groups at a time,
- * so what a read holds is fixed by the window, not by the entry.
+ * Parity covers the pack body - header and every entry, back to back - as
+ * one stream of RS groups (15,296 data bytes, 1,024 parity bytes each, 64
+ * codewords interleaved), instead of each entry rounding up to groups of its
+ * own. The rate is the RS rate whatever the entry sizes. Each entry has a
+ * CRC-32C over its header and payload in a table indexed by entry_index, so
+ * damage is found per entry and a clean read touches no parity; the table
+ * has its own RS parity, and a 32-byte tail written twice locates it all.
+ *
+ *   [ body | stripe parity | crc table | table parity | tail | tail ]
  */
+#define GROUP_DATA ((size_t)PARITY_GROUP_DATA)   /* 15,296 */
+#define GROUP_PAR  ((size_t)PARITY_GROUP_PAR)    /* 1,024 */
+
+#define PACK_TAIL_MAGIC   0x37544B50u   /* "PKT7" */
+#define SLOT              ((uint64_t)PACK_CRC_SLOT_BYTES)   /* entry crc, header crc */
+#define PACK_TAIL_VERSION 1u
+
 typedef struct {
-    parity_record_t hdr_par;
-    uint32_t        payload_crc;
-    off_t           rs_off;         /* absolute offset of the RS parity */
-    uint64_t        rs_sz;          /* its length, as the trailer bounds it */
-    off_t           trailer_start;  /* no payload may run past this */
-} entry_parity_t;
+    uint32_t magic;
+    uint32_t version;
+    uint64_t body_len;
+    uint32_t count;
+    uint32_t trailer_size;   /* stripe parity to the end of the second tail */
+    uint32_t reserved;
+    uint32_t crc;            /* CRC-32C of the 28 bytes before it */
+} __attribute__((packed)) pack_tail_t;
+_Static_assert(sizeof(pack_tail_t) == PACK_TAIL_BYTES, "pack tail is 32 bytes on disk");
 
-#define EP_GROUP_DATA ((size_t)RS_K * RS_INTERLEAVE)   /* 15,296 */
-#define EP_GROUP_PAR  ((size_t)RS_2T * RS_INTERLEAVE)  /* 1,024 */
+/* Where a sealed pack's parity lives, from its tail. */
+typedef struct {
+    uint64_t body_len;
+    uint32_t count;
+    uint64_t par_off;    /* stripe parity: body_len */
+    uint64_t tab_off;    /* crc table */
+    uint64_t tpar_off;   /* table parity */
+    uint32_t tails_bad;  /* bit 0: the last tail copy failed, bit 1: the first */
+} pack_trailer_t;
 
-/*
- * Groups per parity window. The default covers the largest entry there can
- * be (OBJECT_MAX_STORED_BYTES, 1,097 groups, 1.07 MiB of parity), so every
- * correction is one parity read. A test lowers it so an entry of a few MiB
- * spans many windows; nothing else changes it.
- */
-#define PARITY_WINDOW_GROUPS_DEFAULT \
-    ((size_t)(OBJECT_MAX_STORED_BYTES / EP_GROUP_DATA + 1u))
-static _Atomic size_t parity_window_groups_cfg = PARITY_WINDOW_GROUPS_DEFAULT;
+static uint64_t groups_for(uint64_t n) { return (n + GROUP_DATA - 1) / GROUP_DATA; }
 
-/* The seal every writer rolls over at; see pack_test_set_seal. */
-static _Atomic uint64_t pack_seal_cfg = PACK_MAX_MULTI_BYTES;
-
-void pack_test_set_seal(uint64_t bytes)
+/* Everything after the body, for a body of body_len bytes holding count
+ * entries. pack.h asserts its largest value fits the tail's u32. */
+static uint64_t trailer_size_for(uint64_t body_len, uint64_t count)
 {
-    atomic_store_explicit(&pack_seal_cfg, bytes ? bytes : PACK_MAX_MULTI_BYTES,
-                          memory_order_relaxed);
-}
-
-uint64_t pack_seal_bytes(void)
-{
-    return atomic_load_explicit(&pack_seal_cfg, memory_order_relaxed);
-}
-
-void pack_test_set_parity_window(size_t groups)
-{
-    atomic_store_explicit(&parity_window_groups_cfg,
-                          groups ? groups : PARITY_WINDOW_GROUPS_DEFAULT,
-                          memory_order_relaxed);
-}
-
-static size_t parity_window_groups(void)
-{
-    return atomic_load_explicit(&parity_window_groups_cfg, memory_order_relaxed);
-}
-
-
-/* Locate a pack entry's parity in the .dat parity trailer: reads the header
- * parity record and the payload CRC, and only finds the RS parity.
- * Returns 0 on success, -1 if parity is unavailable. A pack past the format's
- * bounds (PACK_MAX_FILE_BYTES, PACK_MAX_BYTES of body, PACK_MAX_ENTRIES) is
- * not one any writer produces, so its trailer is not trusted: every reader,
- * repair and copy treats such an entry as having no parity, and nothing is
- * ever corrected or written from it. Inside the bounds the trailer's 32-bit
- * sizes cannot wrap (the static assertion in pack.h). */
-static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *out) {
-    if (entry_index == UINT32_MAX) return -1;
-    memset(out, 0, sizeof(*out));
-
-    /* Read parity footer (last 12 bytes of file) */
-    if (fseeko(f, -(off_t)sizeof(parity_footer_t), SEEK_END) != 0) return -1;
-    parity_footer_t pftr;
-    if (fread(&pftr, sizeof(pftr), 1, f) != 1) return -1;
-    if (pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) return -1;
-
-    off_t file_end = ftello(f);
-    if (file_end < 0) return -1;
-    if ((uint64_t)file_end > PACK_MAX_FILE_BYTES) {
-        log_warn("pack: %llu-byte pack is past the format's bound; parity not applied",
-                 (unsigned long long)file_end);
-        return -1;
-    }
-    off_t trailer_start = file_end - (off_t)pftr.trailer_size;
-    if (trailer_start < 0 || (uint64_t)trailer_start > PACK_MAX_BYTES) return -1;
-
-    /* Trailer tail layout (after per-entry parity blocks):
-     *   entry_parity_offsets[N](8*N) + entry_count(4) + footer(12)
-     * entry_count is at the fixed position file_end - 16. */
-    uint32_t entry_count = 0;
-    off_t ec_pos = file_end - 16;
-    if (ec_pos < trailer_start) return -1;
-    if (fseeko(f, ec_pos, SEEK_SET) != 0) return -1;
-    if (fread(&entry_count, sizeof(entry_count), 1, f) != 1) return -1;
-    if (entry_count > PACK_MAX_ENTRIES) return -1;
-
-    if (entry_index >= entry_count) return -1;
-
-    /* Read entry_parity_offsets[entry_index]; the offsets table ends at ec_pos */
-    off_t offsets_start = ec_pos - (off_t)entry_count * 8;
-    if (offsets_start < trailer_start) return -1;
-    if (fseeko(f, offsets_start + (off_t)entry_index * 8, SEEK_SET) != 0) return -1;
-    uint64_t entry_par_offset = 0;
-    if (fread(&entry_par_offset, sizeof(entry_par_offset), 1, f) != 1) return -1;
-
-    /*
-     * Every parity block lives between the start of the trailer and the
-     * start of the offsets table, so that span bounds both the offset and
-     * the block size below.
-     *
-     * Bounding it is not belt and braces. block_size used to be the plain
-     * difference of two offsets read out of the file, and a next_offset
-     * below entry_par_offset wrapped it to just under 4 GiB, which the
-     * reader then handed to malloc. A fuzzer reached it from a corrupt
-     * trailer in four minutes; on a real repository it is a bad sector in
-     * an offsets table turning a scrub into an out-of-memory kill. Nothing
-     * mallocs the block any more, but every window read is still placed by
-     * these numbers.
-     */
-    uint64_t blocks_len = (uint64_t)(offsets_start - trailer_start);
-    if (entry_par_offset >= blocks_len) return -1;
-
-    /* Seek to this entry's parity block */
-    off_t par_pos = trailer_start + (off_t)entry_par_offset;
-    if (fseeko(f, par_pos, SEEK_SET) != 0) return -1;
-
-    /* Read XOR header parity */
-    if (fread(&out->hdr_par, sizeof(out->hdr_par), 1, f) != 1) return -1;
-
-    /* Compute block size from next entry's offset or entry_count position.
-     * Block layout: hdr_parity(260) + rs_parity(var) + crc(4) + len(4) + size(4) */
-    uint64_t block_end;
-    if (entry_index + 1 < entry_count) {
-        uint64_t next_offset = 0;
-        if (fseeko(f, offsets_start + (off_t)(entry_index + 1) * 8, SEEK_SET) != 0) return -1;
-        if (fread(&next_offset, sizeof(next_offset), 1, f) != 1) return -1;
-        block_end = next_offset;
-    } else {
-        /* Last entry: block ends where offsets table begins */
-        block_end = blocks_len;
-    }
-    if (block_end <= entry_par_offset || block_end > blocks_len) return -1;
-
-    uint64_t block_size = block_end - entry_par_offset;
-    if (block_size < sizeof(parity_record_t) + 12) return -1;
-
-    out->rs_off        = par_pos + (off_t)sizeof(parity_record_t);
-    out->rs_sz         = block_size - sizeof(parity_record_t) - 12;
-    out->trailer_start = trailer_start;
-
-    /* Read payload_crc; the deprecated rs_data_len after it is ignored.
-     * Layout at block_size - 12: payload_crc(4) + rs_data_len_dep(4, ignored)
-     * + entry_parity_size(4, computed from offsets). */
-    if (fseeko(f, par_pos + (off_t)(block_size - 12), SEEK_SET) != 0) return -1;
-    if (fread(&out->payload_crc, sizeof(out->payload_crc), 1, f) != 1) return -1;
-
-    return 0;
+    return groups_for(body_len) * GROUP_PAR + SLOT * count +
+           groups_for(SLOT * count) * GROUP_PAR + 2u * PACK_TAIL_BYTES;
 }
 
 static int pread_full(int fd, void *buf, size_t n, off_t off)
@@ -717,104 +567,514 @@ static int pwrite_full(int fd, const void *buf, size_t n, off_t off)
     return 0;
 }
 
-/*
- * Correct `len` stored payload bytes held in buf, which begin at payload
- * offset pay_off. pay_off must be a multiple of the group size: groups are
- * fixed by the format, and a window that straddled one could not decode it.
- * Parity is fetched from fd into par, par_cap bytes (whole groups) at a time,
- * so a buffer of any length is corrected in the same memory.
- *
- * Returns the bytes corrected. *bad counts groups left wrong: uncorrectable,
- * or with no parity to decode them from because the trailer holds less than
- * the header says the payload needs. A failed parity read returns -1.
- */
-static int64_t entry_repair_buf(int fd, const entry_parity_t *ep, uint64_t pay_off,
-                                uint8_t *buf, size_t len,
-                                uint8_t *par, size_t par_cap, uint64_t *bad)
+static int tail_valid(const pack_tail_t *t, uint64_t file_size)
 {
-    size_t   per = par_cap / EP_GROUP_PAR;
-    uint64_t g = pay_off / EP_GROUP_DATA;
-    size_t   done = 0;
-    int64_t  corrected = 0;
+    if (t->magic != PACK_TAIL_MAGIC || t->version != PACK_TAIL_VERSION) return 0;
+    if (crc32c(t, offsetof(pack_tail_t, crc)) != t->crc) return 0;
+    if (t->body_len < sizeof(pack_dat_hdr_t) || t->body_len > PACK_MAX_BYTES) return 0;
+    if (t->count > PACK_MAX_ENTRIES) return 0;
+    if ((uint64_t)t->trailer_size != trailer_size_for(t->body_len, t->count)) return 0;
+    if (t->body_len + t->trailer_size != file_size) return 0;
+    return 1;
+}
 
-    if (per == 0) return -1;
-    rs_init();
-    while (done < len) {
-        size_t left   = len - done;
-        size_t groups = (left + EP_GROUP_DATA - 1) / EP_GROUP_DATA;
-        if (groups > per) groups = per;
-        size_t chunk  = groups * EP_GROUP_DATA < left ? groups * EP_GROUP_DATA : left;
+typedef void (*walk_fn)(void *ctx, uint32_t i, uint64_t off, const pack_dat_entry_hdr_t *h);
+static int walk_pass(int fd, const pack_trailer_t *t, uint32_t count, uint64_t lim,
+                     walk_fn fn, void *ctx, uint32_t *walked, uint64_t *end, uint32_t *fixed);
 
-        /* How many of these groups the trailer actually holds parity for. */
-        uint64_t par_start = g * EP_GROUP_PAR;
-        size_t have = 0;
-        if (ep->rs_sz > par_start) {
-            uint64_t avail = (ep->rs_sz - par_start) / EP_GROUP_PAR;
-            have = avail < groups ? (size_t)avail : groups;
-        }
-        if (have > 0 &&
-            pread_full(fd, par, have * EP_GROUP_PAR, ep->rs_off + (off_t)par_start) != 0)
-            return -1;
-
-        for (size_t j = 0; j < groups; j++) {
-            size_t goff = j * EP_GROUP_DATA;
-            size_t glen = chunk - goff < EP_GROUP_DATA ? chunk - goff : EP_GROUP_DATA;
-            if (j >= have) { (*bad)++; continue; }
-            int rc = rs_parity_decode(buf + done + goff, glen,
-                                      par + j * EP_GROUP_PAR, EP_GROUP_PAR);
-            if (rc > 0)      corrected += rc;
-            else if (rc < 0) (*bad)++;
-        }
-        done += chunk;
-        g    += groups;
+/*
+ * Read the tail: the last copy that verifies, so one damaged tail does not
+ * lose the trailer. When both fail, the trailer is derived from the body
+ * instead, since everything a tail says is redundant: the pack header gives
+ * the count, a walk of the entry headers gives body_len, and the file size
+ * has to agree with the trailer those two imply. Returns 0, or -1 when none
+ * of that holds - a pack whose parity cannot be trusted, which every reader
+ * then treats as having none. A file past PACK_MAX_FILE_BYTES is not one
+ * any writer produces.
+ */
+static int pack_trailer_read(int fd, pack_trailer_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) return -1;
+    uint64_t fsz = (uint64_t)sb.st_size;
+    if (fsz > PACK_MAX_FILE_BYTES || fsz < 2u * PACK_TAIL_BYTES + sizeof(pack_dat_hdr_t))
+        return -1;
+    pack_tail_t t;
+    int ok = 0;
+    for (int copy = 1; copy <= 2 && !ok; copy++) {
+        if (pread_full(fd, &t, sizeof(t), (off_t)(fsz - (uint64_t)copy * PACK_TAIL_BYTES)) == 0)
+            ok = tail_valid(&t, fsz);
+        if (!ok) out->tails_bad |= 1u << (copy - 1);
     }
-    return corrected;
+    if (ok) {
+        /* The first copy is checked too when the last served, so a repair
+         * knows to rewrite it. */
+        pack_tail_t t2;
+        if (!(out->tails_bad & 2u) &&
+            (pread_full(fd, &t2, sizeof(t2), (off_t)(fsz - 2u * PACK_TAIL_BYTES)) != 0 ||
+             !tail_valid(&t2, fsz)))
+            out->tails_bad |= 2u;
+        out->body_len = t.body_len;
+        out->count    = t.count;
+    } else {
+        pack_dat_hdr_t h;
+        uint32_t n = 0;
+        uint64_t end = 0;
+        if (pread_full(fd, &h, sizeof(h), 0) != 0 || h.magic != PACK_DAT_MAGIC ||
+            h.version != PACK_VERSION || h.count > PACK_MAX_ENTRIES)
+            return -1;
+        if (walk_pass(fd, NULL, h.count, fsz, NULL, NULL, &n, &end, NULL) != 0 || n != h.count ||
+            end > PACK_MAX_BYTES || end + trailer_size_for(end, h.count) != fsz)
+            return -1;
+        out->body_len = end;
+        out->count    = h.count;
+    }
+    out->par_off  = out->body_len;
+    out->tab_off  = out->par_off + groups_for(out->body_len) * GROUP_PAR;
+    out->tpar_off = out->tab_off + SLOT * (uint64_t)out->count;
+    return 0;
 }
 
 /*
- * Correct a whole payload held in memory (every entry is bounded by
- * OBJECT_MAX_STORED_BYTES), one parity window at a time, and count the
- * outcome in the parity stats. Returns 0 unless something is left wrong.
+ * Correct buf, which holds bytes [a, a + len) of a region (the body, or the
+ * crc table) of region_len bytes at region_off whose parity starts at
+ * par_off, one group at a time. Each group overlapping the range is read
+ * whole from the file with its parity, decoded, and its corrected bytes that
+ * fall inside the range copied into buf; nothing outside the range changes.
+ * Memory is one group. *fixed counts corrected bytes, *bad groups left
+ * uncorrectable. Returns -1 on an I/O error.
  */
-static int entry_repair_mem(FILE *f, const entry_parity_t *ep,
-                            uint8_t *buf, size_t len, const char *what)
+static int stripe_correct(int fd, uint64_t region_off, uint64_t region_len, uint64_t par_off,
+                          uint64_t a, uint8_t *buf, size_t len,
+                          int64_t *fixed, uint64_t *bad)
 {
-    size_t par_cap = parity_window_groups() * EP_GROUP_PAR;
-    uint8_t *par = malloc(par_cap);
-    if (!par) {
-        log_warn("pack: no memory for a parity window (%s)", what);
-        parity_stats_add_uncorrectable(1);
-        return -1;
-    }
-    uint64_t bad = 0;
-    int64_t fixed = entry_repair_buf(fileno(f), ep, 0, buf, len, par, par_cap, &bad);
-    free(par);
-    if (fixed < 0 || bad > 0) {
-        log_warn("pack: payload RS parity uncorrectable (%s)", what);
-        parity_stats_add_uncorrectable(1);
-        return -1;
-    }
-    if (fixed > 0) {
-        log_warn("pack: repaired payload via RS parity (%s)", what);
-        parity_stats_add_repaired(1);
+    uint8_t grp[GROUP_DATA];
+    uint8_t par[GROUP_PAR];
+    rs_init();
+    if (len == 0) return 0;
+    uint64_t g0 = a / GROUP_DATA, g1 = (a + len - 1) / GROUP_DATA;
+    for (uint64_t g = g0; g <= g1; g++) {
+        uint64_t gs = g * GROUP_DATA;
+        size_t glen = region_len - gs < GROUP_DATA ? (size_t)(region_len - gs) : GROUP_DATA;
+        if (pread_full(fd, grp, glen, (off_t)(region_off + gs)) != 0 ||
+            pread_full(fd, par, GROUP_PAR, (off_t)(par_off + g * GROUP_PAR)) != 0)
+            return -1;
+        int rc = rs_parity_decode(grp, glen, par, GROUP_PAR);
+        if (rc < 0) { (*bad)++; continue; }
+        *fixed += rc;
+        uint64_t lo = gs > a ? gs : a;
+        uint64_t hi = gs + glen < a + len ? gs + glen : a + len;
+        memcpy(buf + (lo - a), grp + (lo - gs), (size_t)(hi - lo));
     }
     return 0;
+}
+
+static uint32_t le32_at(const uint8_t *b)
+{
+    return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+}
+
+static void put_le32(uint8_t *b, uint32_t v)
+{
+    b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24);
+}
+
+/* An entry's slot in the crc table - the CRC of the whole entry and the
+ * CRC of its header alone - corrected from the table's parity when repair
+ * is set. Returns 0, or -1 when it cannot be read or corrected. */
+static int entry_table_slot(int fd, const pack_trailer_t *t, uint32_t idx, int repair,
+                            uint32_t *out_entry, uint32_t *out_hdr)
+{
+    if (idx >= t->count) return -1;
+    uint8_t b[SLOT];
+    if (pread_full(fd, b, SLOT, (off_t)(t->tab_off + SLOT * (uint64_t)idx)) != 0) return -1;
+    if (repair) {
+        int64_t fixed = 0;
+        uint64_t bad = 0;
+        if (stripe_correct(fd, t->tab_off, SLOT * (uint64_t)t->count, t->tpar_off,
+                           SLOT * (uint64_t)idx, b, SLOT, &fixed, &bad) != 0 || bad)
+            return -1;
+    }
+    if (out_entry) *out_entry = le32_at(b);
+    if (out_hdr)   *out_hdr   = le32_at(b + 4);
+    return 0;
+}
+
+static int entry_table_crc(int fd, const pack_trailer_t *t, uint32_t idx, int repair,
+                           uint32_t *out)
+{
+    return entry_table_slot(fd, t, idx, repair, out, NULL);
+}
+
+/*
+ * buf holds an entry's raw bytes, [off, off + len) of the body: header and
+ * payload. Check them against the entry's CRC and, on a mismatch, correct
+ * them from the stripe; then, if they still disagree, try the table's own
+ * parity in case the damage is in the CRC rather than the entry.
+ *
+ * Returns 0 when buf ends equal to its CRC (*fixed bytes corrected), 1 when
+ * the entry is damaged beyond parity (buf as corrected as it could be), -1
+ * on an I/O error.
+ */
+static int entry_verify(int fd, const pack_trailer_t *t, uint64_t off, uint32_t idx,
+                        uint8_t *buf, size_t len, int64_t *fixed)
+{
+    *fixed = 0;
+    if (off < sizeof(pack_dat_hdr_t) || off > t->body_len || len > t->body_len - off)
+        return 1;
+    uint32_t want = 0;
+    int have_crc = entry_table_crc(fd, t, idx, 0, &want) == 0;
+    if (have_crc && crc32c(buf, len) == want) return 0;
+
+    uint64_t bad = 0;
+    if (stripe_correct(fd, 0, t->body_len, t->par_off, off, buf, len, fixed, &bad) != 0)
+        return -1;
+    uint32_t got = crc32c(buf, len);
+    if (have_crc && got == want) return 0;
+    uint32_t want2 = 0;
+    int tab_ok = entry_table_crc(fd, t, idx, 1, &want2) == 0;
+    if (tab_ok && got == want2) return 0;
+    /* The CRC is beyond its own parity, and every codeword under the entry
+     * decoded clean: the bytes agree with the stripe, which is the stronger
+     * of the two witnesses, so a lost CRC does not lose the entry. */
+    if (!tab_ok && *fixed == 0 && bad == 0) return 0;
+    return 1;
+}
+
+/* What a walk needs of a header to step over it: a size that fits. Whether
+ * the step lands right is proven by the walk as a whole (pack_walk). */
+static int walk_hdr_ok(const pack_dat_entry_hdr_t *h, uint64_t off, uint64_t lim)
+{
+    return h->compressed_size <= lim - off - sizeof(*h);
+}
+
+/* A header no writer produces: worth a look at the stripe before use. */
+static int hdr_looks_damaged(const pack_dat_entry_hdr_t *h)
+{
+    return !object_type_known(h->type) || hdr_fields_valid(h, 0) != 0;
+}
+
+/* The entry header at off, corrected from the stripe when correct is set. */
+static int hdr_at(int fd, const pack_trailer_t *t, uint64_t off, int correct,
+                  pack_dat_entry_hdr_t *h)
+{
+    if (pread_full(fd, h, sizeof(*h), (off_t)off) != 0) return -1;
+    if (correct && t && off + sizeof(*h) <= t->body_len) {
+        int64_t fx = 0;
+        uint64_t bad = 0;
+        if (stripe_correct(fd, 0, t->body_len, t->par_off, off, (uint8_t *)h, sizeof(*h),
+                           &fx, &bad) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* The crc table read a block of slots at a time, for a walk. */
+#define WALK_SLOTS 256u
+typedef struct {
+    uint8_t  b[WALK_SLOTS * PACK_CRC_SLOT_BYTES];
+    uint32_t first, n;
+} slot_cursor_t;
+
+static int walk_hdr_crc(int fd, const pack_trailer_t *t, slot_cursor_t *c, uint32_t i,
+                        uint32_t *out)
+{
+    if (i >= t->count) return -1;
+    if (i < c->first || i >= c->first + c->n) {
+        uint32_t n = t->count - i < WALK_SLOTS ? t->count - i : WALK_SLOTS;
+        if (pread_full(fd, c->b, (size_t)(SLOT * n), (off_t)(t->tab_off + SLOT * (uint64_t)i)) != 0)
+            return -1;
+        c->first = i;
+        c->n = n;
+    }
+    *out = le32_at(c->b + SLOT * (i - c->first) + 4u);
+    return 0;
+}
+
+/*
+ * The header at off, as the crc table says it should be: raw when its
+ * header CRC agrees, otherwise corrected from the stripe and, if the slot
+ * itself is what is damaged, checked against the slot as the table's parity
+ * corrects it. *fixed is set when the header on disk was wrong. When no
+ * witness agrees, the stripe's version is the best there is.
+ */
+static int hdr_verified(int fd, const pack_trailer_t *t, slot_cursor_t *c, uint32_t i,
+                        uint64_t off, pack_dat_entry_hdr_t *h, int *fixed)
+{
+    *fixed = 0;
+    if (pread_full(fd, h, sizeof(*h), (off_t)off) != 0) return -1;
+    uint32_t want = 0;
+    int have = walk_hdr_crc(fd, t, c, i, &want) == 0;
+    if (have && crc32c(h, sizeof(*h)) == want) return 0;
+    pack_dat_entry_hdr_t cor;
+    if (hdr_at(fd, t, off, 1, &cor) != 0) return -1;
+    uint32_t want2 = 0;
+    int have2 = entry_table_slot(fd, t, i, 1, NULL, &want2) == 0;
+    if (have2 && crc32c(h, sizeof(*h)) == want2) return 0;   /* the slot was the damage */
+    *fixed = memcmp(&cor, h, sizeof(cor)) != 0;
+    *h = cor;
+    return 0;
+}
+
+/*
+ * One pass over a pack's entry headers, from the end of the pack header,
+ * stopping at the first that cannot be stepped over. With a trailer every
+ * header is checked against its header CRC and corrected where it fails;
+ * without one, the headers are taken as they are. *walked is how many were
+ * stepped over, *end the offset after the last, *fixed how many headers
+ * needed correcting. fn, when given, sees each.
+ */
+static int walk_pass(int fd, const pack_trailer_t *t, uint32_t count, uint64_t lim,
+                     walk_fn fn, void *ctx, uint32_t *walked, uint64_t *end, uint32_t *fixed)
+{
+    slot_cursor_t cur;
+    cur.first = 0;
+    cur.n = 0;
+    uint64_t off = sizeof(pack_dat_hdr_t);
+    uint32_t i = 0;
+    if (fixed) *fixed = 0;
+    for (; i < count; i++) {
+        if (off > lim || lim - off < sizeof(pack_dat_entry_hdr_t)) break;
+        pack_dat_entry_hdr_t h;
+        if (t) {
+            int fx = 0;
+            if (hdr_verified(fd, t, &cur, i, off, &h, &fx) != 0) return -1;
+            if (fx && fixed) (*fixed)++;
+        } else if (pread_full(fd, &h, sizeof(h), (off_t)off) != 0) {
+            return -1;
+        }
+        if (!walk_hdr_ok(&h, off, lim)) break;
+        if (fn) fn(ctx, i, off, &h);
+        off += sizeof(h) + h.compressed_size;
+    }
+    *walked = i;
+    *end = off;
+    return 0;
+}
+
+/*
+ * Walk every entry header of a pack in order, handing each to fn.
+ *
+ * Every offset after a header depends on that header's size field, and gc
+ * and coalescing decide what is live by the hash in it, so one damaged
+ * header used to cost every entry after it, or the entry itself: the walk
+ * went astray, or a live object was dropped as dead (B119). With a trailer,
+ * each header is checked against its own CRC in the table - eight bytes a
+ * header, read in blocks, so a clean pack pays no parity and no payload
+ * reads - and corrected from the stripe when it fails.
+ *
+ * Returns 0 when the walk is whole (every entry, ending at body_len when
+ * there is a trailer), 1 when it is not (fn has seen the entries before the
+ * first that failed), -1 on I/O error.
+ */
+static int pack_walk(int fd, const pack_trailer_t *t, uint32_t count, uint64_t lim,
+                     walk_fn fn, void *ctx)
+{
+    uint32_t n = 0, fixed = 0;
+    uint64_t end = 0;
+    if (t && lim > t->body_len) lim = t->body_len;
+    if (walk_pass(fd, t, count, lim, fn, ctx, &n, &end, &fixed) != 0) return -1;
+    if (fixed) {
+        log_warn("pack: %u entry header(s) corrected from parity while walking the pack", fixed);
+        parity_stats_add_repaired(fixed);
+    }
+    return n == count && (!t || end == t->body_len) ? 0 : 1;
+}
+
+/*
+ * The pack header, checked against the tail and corrected from the stripe
+ * when it fails; with a verified tail it is derivable outright (the magic
+ * and version are constants and the tail carries the count), so with
+ * parity a damaged pack header never stops a pack being read. *fixed is set
+ * when the header on disk is wrong. Returns 0, 1 for an intact header of
+ * another pack version (out holds it, for the message), -1 when unusable.
+ */
+static int pack_hdr_get(int fd, const pack_trailer_t *t, pack_dat_hdr_t *out, int *fixed)
+{
+    if (fixed) *fixed = 0;
+    if (pread_full(fd, out, sizeof(*out), 0) != 0) return -1;
+    if (out->magic == PACK_DAT_MAGIC && out->version == PACK_VERSION &&
+        (!t || out->count == t->count))
+        return 0;
+    if (!t) return out->magic == PACK_DAT_MAGIC && out->version != PACK_VERSION ? 1 : -1;
+    if (fixed) *fixed = 1;
+    *out = (pack_dat_hdr_t){ PACK_DAT_MAGIC, PACK_VERSION, t->count };
+    log_warn("pack: pack header damaged; restored from the trailer");
+    parity_stats_add_repaired(1);
+    return 0;
+}
+
+/*
+ * An entry's header alone, for the readers that want nothing else (size,
+ * type). Read raw, and corrected from the stripe when it is not the header
+ * the index expects - a field no writer produces, another name, another
+ * stored size - so a few damaged header bytes cost a parity read rather
+ * than the object (B119). Returns 0, or what hdr_fields_valid returns for a
+ * header still unusable after correction (an unknown type sets its message).
+ */
+static int entry_hdr_checked(int fd, const pack_cache_entry_t *found,
+                             const uint8_t hash[OBJECT_HASH_SIZE],
+                             pack_dat_entry_hdr_t *out)
+{
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) return -1;
+    uint64_t lim = (uint64_t)sb.st_size;
+    uint64_t off = found->dat_offset;
+    if (off > lim || lim - off < sizeof(*out)) return -1;
+    if (pread_full(fd, out, sizeof(*out), (off_t)off) != 0) return -1;
+    if (hdr_looks_damaged(out) || memcmp(out->hash, hash, OBJECT_HASH_SIZE) != 0 ||
+        (found->comp_size && out->compressed_size != found->comp_size)) {
+        pack_trailer_t t;
+        if (pack_trailer_read(fd, &t) == 0) {
+            if (hdr_at(fd, &t, off, 1, out) != 0) return -1;
+            lim = t.body_len;
+        }
+    }
+    int hv = hdr_fields_valid(out, 1);
+    if (hv != 0) return hv;
+    if (off + sizeof(*out) > lim || out->compressed_size > lim - off - sizeof(*out)) return -1;
+    return 0;
+}
+
+/* The seal every writer rolls over at; see pack_test_set_seal. */
+static _Atomic uint64_t pack_seal_cfg = PACK_MAX_MULTI_BYTES;
+
+void pack_test_set_seal(uint64_t bytes)
+{
+    atomic_store_explicit(&pack_seal_cfg, bytes ? bytes : PACK_MAX_MULTI_BYTES,
+                          memory_order_relaxed);
+}
+
+uint64_t pack_seal_bytes(void)
+{
+    return atomic_load_explicit(&pack_seal_cfg, memory_order_relaxed);
+}
+
+/*
+ * Groups the seal reads back and encodes at a time: 64 groups is 979 KiB of
+ * body and 64 KiB of parity. A test lowers it so a small pack spans many
+ * windows; nothing else changes it.
+ */
+#define PARITY_WINDOW_GROUPS_DEFAULT ((size_t)64)
+static _Atomic size_t parity_window_groups_cfg = PARITY_WINDOW_GROUPS_DEFAULT;
+
+void pack_test_set_parity_window(size_t groups)
+{
+    atomic_store_explicit(&parity_window_groups_cfg,
+                          groups ? groups : PARITY_WINDOW_GROUPS_DEFAULT,
+                          memory_order_relaxed);
+}
+
+static size_t parity_window_groups(void)
+{
+    return atomic_load_explicit(&parity_window_groups_cfg, memory_order_relaxed);
+}
+
+/*
+ * Fetch one entry whole from an open pack: its header and payload, read in
+ * one piece (every entry is bounded), checked against its CRC and corrected
+ * from the stripe on a mismatch.
+ *
+ * len_hint is the stored size the caller's index records, or 0 to take it
+ * from the header. The header is not trusted before the CRC has passed or
+ * parity has corrected it: if the corrected header names another size, the
+ * entry is read again once at that size.
+ *
+ * t is the pack's trailer, or NULL for a pack whose parity is unusable; then
+ * nothing is checked here and the caller's own check (the object name)
+ * decides. On 0, *out_buf holds *out_len bytes, header first; *damaged is
+ * set when the bytes are damaged beyond parity and handed back as corrected
+ * as they could be; *fixed counts corrected bytes. Returns -1 on an I/O
+ * error and -2 when the entry cannot be an entry (sizes past the body or
+ * the bound), -3 when it is damaged beyond parity in its own size field,
+ * so there is nothing coherent to hand back; nothing is allocated on any
+ * of them.
+ */
+static int entry_fetch(int fd, const pack_trailer_t *t, uint64_t off, uint32_t idx,
+                       uint64_t len_hint, uint8_t **out_buf, size_t *out_len,
+                       int64_t *fixed, int *damaged)
+{
+    *out_buf = NULL;
+    *out_len = 0;
+    *fixed = 0;
+    *damaged = 0;
+
+    uint64_t lim;
+    if (t) lim = t->body_len;
+    else {
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) return -1;
+        lim = (uint64_t)sb.st_size;
+    }
+    if (off < sizeof(pack_dat_hdr_t) || off >= lim || lim - off < sizeof(pack_dat_entry_hdr_t))
+        return -2;
+
+    uint64_t stored = len_hint;
+    if (stored == 0) {
+        pack_dat_entry_hdr_t h;
+        if (pread_full(fd, &h, sizeof(h), (off_t)off) != 0) return -1;
+        stored = h.compressed_size;
+    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (stored > OBJECT_MAX_STORED_BYTES ||
+            stored > lim - off - sizeof(pack_dat_entry_hdr_t))
+            return -2;
+        size_t len = sizeof(pack_dat_entry_hdr_t) + (size_t)stored;
+        uint8_t *buf = malloc(len);
+        if (!buf) { errno = ENOMEM; return -1; }
+        if (pread_full(fd, buf, len, (off_t)off) != 0) { free(buf); return -1; }
+        int64_t fx = 0;
+        int r = t ? entry_verify(fd, t, off, idx, buf, len, &fx) : 0;
+        if (r < 0) { free(buf); return -1; }
+        pack_dat_entry_hdr_t h;
+        memcpy(&h, buf, sizeof(h));
+        if (h.compressed_size != stored && attempt == 0 && t && len_hint == 0) {
+            /* The size we read by came from a damaged header: the corrected
+             * header says how much the entry really holds. */
+            stored = h.compressed_size;
+            free(buf);
+            continue;
+        }
+        if (h.compressed_size != stored) { free(buf); return r == 1 ? -3 : -2; }
+        *out_buf = buf;
+        *out_len = len;
+        *fixed = fx;
+        *damaged = r == 1;
+        return 0;
+    }
+    return -2;
+}
+
+/* Count a read's parity outcome and say so, once per entry. */
+static void note_parity_outcome(const uint8_t hash[OBJECT_HASH_SIZE], int64_t fixed,
+                                int damaged, const char *what)
+{
+    if (!fixed && !damaged) return;
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+    if (damaged) {
+        log_warn("pack: %s is damaged beyond its parity (%s)", hex, what);
+        parity_stats_add_uncorrectable(1);
+    } else {
+        log_warn("pack: %s corrected from parity (%lld byte(s), %s)", hex,
+                 (long long)fixed, what);
+        parity_stats_add_repaired(1);
+    }
 }
 
 /*
  * Read one entry's stored bytes, corrected from its parity where they need
  * it: the shared front half of every reader.
  *
- * Every entry is bounded (OBJECT_MAX_STORED_BYTES, refused by
- * read_entry_hdr), so the whole payload is read into memory and its CRC
- * checked in one pass; parity is fetched only on a mismatch, a window at a
- * time. *out_damaged is set when the payload still fails its CRC after
- * correction, which is damage beyond parity; it stays 0 when the pack has
- * no usable parity for the entry, since then nothing is known either way
- * and the caller's own check (the object name) decides.
+ * *out_damaged is set when the entry still fails its CRC after correction,
+ * which is damage beyond parity; it stays 0 when the pack has no usable
+ * parity, since then nothing is known either way and the caller's own check
+ * (the object name) decides.
  *
- * The header's type is checked only after header parity has had its
- * chance: a damaged type byte is repairable, an unknown one is not.
+ * The header's fields are judged only after the CRC and parity have had
+ * their chance: a damaged type or size byte is repairable, an unknown one
+ * is not.
  */
 static status_t entry_read(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                            const char *what, pack_dat_entry_hdr_t *out_hdr,
@@ -834,73 +1094,59 @@ static status_t entry_read(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
 
     FILE *f = dat_open_or_checkout(store, pnum);
     if (!f) return set_error_errno(ERR_IO, "%s: fopen(%s)", what, dat_path);
+    int fd = fileno(f);
 
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+    pack_trailer_t t;
+    int have_parity = found.pack_version == PACK_VERSION && pack_trailer_read(fd, &t) == 0;
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    int64_t fixed = 0;
+    int damaged = 0;
+    int fr = entry_fetch(fd, have_parity ? &t : NULL, found.dat_offset, found.entry_index,
+                         found.comp_size, &buf, &len, &fixed, &damaged);
+    if (fr != 0) {
+        int saved = errno;
         fclose(f);
-        return set_error_errno(ERR_IO, "%s: fseeko(%s)", what, dat_path);
+        errno = saved;
+        if (fr == -1 && errno == ENOMEM)
+            return set_error(ERR_NOMEM, "%s: entry buffer for %s", what, dat_path);
+        if (fr == -1) return set_error_errno(ERR_IO, "%s: read entry in %s", what, dat_path);
+        if (fr == -3) {
+            note_parity_outcome(hash, 0, 1, what);
+            if (out_damaged) *out_damaged = 1;
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(hash, hex);
+            return set_error(ERR_CORRUPT, "%s: %s in %s is damaged beyond its parity",
+                             what, hex, dat_path);
+        }
+        return set_error(ERR_CORRUPT, "%s: bad entry header in %s", what, dat_path);
     }
+    dat_return_or_close(store, pnum, f);
+    note_parity_outcome(hash, fixed, damaged, what);
+    if (damaged && out_damaged) *out_damaged = 1;
 
-    /* Raw first: header parity gets its chance before anything is checked. */
     pack_dat_entry_hdr_t ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "%s: short entry header in %s", what, dat_path);
-    }
-
-    entry_parity_t ep;
-    int have_parity = 0;
-    if (found.pack_version == PACK_VERSION &&
-        locate_entry_parity(f, found.entry_index, &ep) == 0) {
-        have_parity = 1;
-        int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
-        if (hrc == 1) {
-            log_warn("pack: repaired entry header via parity (%s)", what);
-            parity_stats_add_repaired(1);
-        } else if (hrc < 0) {
-            log_warn("pack: entry header parity uncorrectable (%s)", what);
-            parity_stats_add_uncorrectable(1);
-        }
-        if (found.dat_offset + sizeof(ehdr) + ehdr.compressed_size >
-            (uint64_t)ep.trailer_start) {
-            fclose(f);
-            return set_error(ERR_CORRUPT, "%s: entry runs into the parity trailer in %s",
-                             what, dat_path);
-        }
-    }
-    if (fseeko(f, (off_t)(found.dat_offset + sizeof(ehdr)), SEEK_SET) != 0) {
-        fclose(f);
-        return set_error_errno(ERR_IO, "%s: fseeko(%s)", what, dat_path);
-    }
-    int ehrc = check_entry_hdr(f, &ehdr, 1);
+    memcpy(&ehdr, buf, sizeof(ehdr));
+    int ehrc = hdr_fields_valid(&ehdr, 1);
     if (ehrc != 0) {
-        fclose(f);
+        free(buf);
+        if (damaged) {
+            char hex[OBJECT_HASH_SIZE * 2 + 1];
+            object_hash_to_hex(hash, hex);
+            return set_error(ERR_CORRUPT, "%s: %s in %s is damaged beyond its parity",
+                             what, hex, dat_path);
+        }
         return entry_hdr_error(ehrc, "%s: bad entry header in %s", what, dat_path);
     }
     if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
-        fclose(f);
+        free(buf);
         return set_error(ERR_CORRUPT, "%s: entry in %s is filed under another name",
                          what, dat_path);
     }
 
-    uint8_t *buf = malloc(ehdr.compressed_size ? (size_t)ehdr.compressed_size : 1);
-    if (!buf) {
-        fclose(f);
-        return set_error(ERR_NOMEM, "%s: alloc %llu", what,
-                         (unsigned long long)ehdr.compressed_size);
-    }
-    if (ehdr.compressed_size && fread_full(buf, (size_t)ehdr.compressed_size, f) != 0) {
-        free(buf);
-        fclose(f);
-        return set_error(ERR_CORRUPT, "%s: short read in %s", what, dat_path);
-    }
-    if (have_parity && crc32c(buf, (size_t)ehdr.compressed_size) != ep.payload_crc) {
-        int bad = ep.rs_sz == 0 ||
-                  entry_repair_mem(f, &ep, buf, (size_t)ehdr.compressed_size, what) != 0 ||
-                  crc32c(buf, (size_t)ehdr.compressed_size) != ep.payload_crc;
-        if (bad && out_damaged) *out_damaged = 1;
-    }
-    dat_return_or_close(store, pnum, f);
-
+    /* The payload, moved to the front of the buffer it was read into. */
+    memmove(buf, buf + sizeof(ehdr), (size_t)ehdr.compressed_size);
     *out_hdr = ehdr;
     *out_payload = buf;
     return OK;
@@ -1071,187 +1317,119 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 }
 
 
-/* Write parity trailer for a .dat file.  The dat file must be open and
- * seekable; the current position is at the end of data entries.  Reads
- * entries back from the file (still in page cache) to compute parity.
- * idx_by_offset is idx_entries sorted by dat_offset (entry write order). */
-static status_t write_dat_parity(store_t *store, FILE *dat_f,
-                                 const pack_dat_hdr_t *dat_hdr,
-                                 const pack_idx_disk_entry_t *idx_by_offset,
-                                 uint32_t packed) {
-    (void)store;
+/*
+ * Write the striped parity trailer after a body of body_len bytes on fd.
+ *
+ * by_offset is the pack's entries in on-disk order, contiguous from the end
+ * of the 12-byte header to body_len; entry i's CRC goes in table slot i,
+ * which is its entry_index. The body is read back a window of groups at a
+ * time (it was just written, so normally from the page cache) and each
+ * window's RS parity and the CRCs of the entries in it are computed in the
+ * same pass, so memory is the window plus the CRC table, whatever the pack.
+ * Returns the trailer's size in *out_size.
+ */
+static status_t write_pack_trailer(int fd, uint64_t body_len,
+                                   const pack_idx_disk_entry_t *by_offset, uint32_t count,
+                                   uint64_t *out_size)
+{
+    uint64_t pos = sizeof(pack_dat_hdr_t);
+    for (uint32_t i = 0; i < count; i++) {
+        if (by_offset[i].dat_offset != pos || by_offset[i].entry_index != i)
+            return set_error(ERR_CORRUPT, "pack seal: entry %u is not where the body "
+                             "says it is", i);
+        pos += sizeof(pack_dat_entry_hdr_t) + by_offset[i].compressed_size;
+    }
+    if (pos != body_len)
+        return set_error(ERR_CORRUPT, "pack seal: entries end at %llu, body at %llu",
+                         (unsigned long long)pos, (unsigned long long)body_len);
+
     rs_init();
-
-    /* Record where the parity trailer starts */
-    off_t trailer_start = ftello(dat_f);
-    if (trailer_start < 0) return set_error_errno(ERR_IO, "write_dat_parity: ftello failed");
-
-    /* 1. File header CRC */
-    uint32_t fhdr_crc = crc32c(dat_hdr, sizeof(*dat_hdr));
-    if (fwrite(&fhdr_crc, sizeof(fhdr_crc), 1, dat_f) != 1) return set_error_errno(ERR_IO, "write_dat_parity: fwrite header CRC failed");
-
-    /* 2. Per-entry parity blocks + build offset table.
-     * Each entry is read back whole; it is bounded by the object limit. */
-    uint64_t *entry_offsets = malloc((size_t)packed * sizeof(*entry_offsets));
-    if (!entry_offsets) return set_error(ERR_NOMEM, "write_dat_parity: entry_offsets alloc failed");
-
-    /* Every entry is bounded, so one payload buffer and one parity buffer
-     * of the bound serve all of them and parity is computed in one shot. */
-    uint8_t *pay_buf = malloc(OBJECT_MAX_STORED_BYTES);
-    uint8_t *par_buf = malloc(rs_parity_size(OBJECT_MAX_STORED_BYTES));
-    if (!pay_buf || !par_buf) {
-        free(pay_buf); free(par_buf); free(entry_offsets);
-        return set_error(ERR_NOMEM, "write_dat_parity: buffer alloc failed");
-    }
-
-    size_t cur_trailer_pos = sizeof(fhdr_crc);  /* relative to trailer_start */
+    size_t wg = parity_window_groups();
+    size_t win = wg * GROUP_DATA;
+    uint8_t *buf = malloc(win);
+    uint8_t *par = malloc(wg * GROUP_PAR);
+    uint8_t *tab = malloc(count ? (size_t)SLOT * count : 1);
     status_t st = OK;
+    if (!buf || !par || !tab) { st = set_error(ERR_NOMEM, "pack seal: parity buffers"); goto out; }
 
-    for (uint32_t i = 0; i < packed && st == OK; i++) {
-        entry_offsets[i] = (uint64_t)cur_trailer_pos;
+    /* Entry CRCs as the window passes over them: i is the entry being
+     * summed, crc its running value, end where it stops; hcrc runs over the
+     * entry's header alone, which ends at hend. */
+    uint32_t i = 0, crc = 0, hcrc = 0;
+    uint64_t end = count ? sizeof(pack_dat_hdr_t) + sizeof(pack_dat_entry_hdr_t) +
+                           by_offset[0].compressed_size : 0;
+    uint64_t at = sizeof(pack_dat_hdr_t);
+    uint64_t hend = at + sizeof(pack_dat_entry_hdr_t);
 
-        if (fseeko(dat_f, (off_t)idx_by_offset[i].dat_offset, SEEK_SET) != 0) {
-            st = set_error_errno(ERR_IO, "write_dat_parity: fseeko to entry %u failed", i);
-            break;
+    for (uint64_t ws = 0; ws < body_len; ws += win) {
+        size_t n = body_len - ws < win ? (size_t)(body_len - ws) : win;
+        if (pread_full(fd, buf, n, (off_t)ws) != 0) {
+            st = set_error_errno(ERR_IO, "pack seal: read back the body");
+            goto out;
         }
-        pack_dat_entry_hdr_t ehdr;
-        if (fread(&ehdr, sizeof(ehdr), 1, dat_f) != 1) {
-            st = set_error_errno(ERR_IO, "write_dat_parity: fread entry header %u failed", i);
-            break;
+        while (i < count && at < ws + n) {
+            uint64_t stop = end < ws + n ? end : ws + n;
+            if (at < hend) {
+                uint64_t hs = hend < stop ? hend : stop;
+                hcrc = crc32c_update(hcrc, buf + (at - ws), (size_t)(hs - at));
+            }
+            crc = crc32c_update(crc, buf + (at - ws), (size_t)(stop - at));
+            at = stop;
+            if (at == end) {
+                put_le32(tab + SLOT * i, crc);
+                put_le32(tab + SLOT * i + 4u, hcrc);
+                crc = 0;
+                hcrc = 0;
+                hend = at + sizeof(pack_dat_entry_hdr_t);
+                if (++i < count)
+                    end = at + sizeof(pack_dat_entry_hdr_t) + by_offset[i].compressed_size;
+            }
         }
-        if (ehdr.compressed_size > OBJECT_MAX_STORED_BYTES) {
-            st = set_error(ERR_CORRUPT, "write_dat_parity: entry %u is past the object bound", i);
-            break;
+        size_t pn = (size_t)groups_for(n) * GROUP_PAR;
+        rs_parity_encode(buf, n, par);
+        if (pwrite_full(fd, par, pn, (off_t)(body_len + (ws / GROUP_DATA) * GROUP_PAR)) != 0) {
+            st = set_error_errno(ERR_IO, "pack seal: write stripe parity");
+            goto out;
         }
-
-        parity_record_t hdr_par;
-        parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
-
-        size_t csize = (size_t)ehdr.compressed_size;
-        if (csize > 0 && fread_full(pay_buf, csize, dat_f) != 0) {
-            st = set_error_errno(ERR_IO, "write_dat_parity: fread payload for entry %u failed", i);
-            break;
-        }
-        uint32_t payload_crc = csize ? crc32c(pay_buf, csize) : 0;
-        size_t rs_par_sz = csize ? rs_parity_size(csize) : 0;
-        if (rs_par_sz) rs_parity_encode(pay_buf, csize, par_buf);
-
-        if (fseeko(dat_f, trailer_start + (off_t)entry_offsets[i], SEEK_SET) != 0) {
-            st = set_error_errno(ERR_IO, "write_dat_parity: fseeko to parity block %u failed", i);
-            break;
-        }
-
-        /* hdr_parity(260) + rs_parity(var) + payload_crc(4)
-         * + rs_data_len_dep(4, deprecated) + entry_parity_size(4) */
-        uint32_t rs_data_len = PARITY_RS_DATA_LEN_DEPRECATED;
-        uint32_t entry_par_sz = (uint32_t)(sizeof(hdr_par) + rs_par_sz + 4 + 4 + 4);
-        if (fwrite(&hdr_par, sizeof(hdr_par), 1, dat_f) != 1 ||
-            (rs_par_sz && fwrite_full(par_buf, rs_par_sz, dat_f) != 0) ||
-            fwrite(&payload_crc, sizeof(payload_crc), 1, dat_f) != 1 ||
-            fwrite(&rs_data_len, sizeof(rs_data_len), 1, dat_f) != 1 ||
-            fwrite(&entry_par_sz, sizeof(entry_par_sz), 1, dat_f) != 1) {
-            st = set_error_errno(ERR_IO, "write_dat_parity: fwrite parity block %u failed", i);
-            break;
-        }
-        cur_trailer_pos += entry_par_sz;
-    }
-    free(pay_buf);
-    free(par_buf);
-    if (st != OK) { free(entry_offsets); return st; }
-
-    /* 3. entry_parity_offsets table + entry_count
-     * entry_count is written AFTER offsets so it lands at a fixed position
-     * (file_end - 16) for easy reading. */
-    if (packed > 0 &&
-        fwrite(entry_offsets, sizeof(*entry_offsets), packed, dat_f) != packed) {
-        free(entry_offsets);
-        return set_error_errno(ERR_IO, "write_dat_parity: fwrite entry_offsets failed");
-    }
-    free(entry_offsets);
-    if (fwrite(&packed, sizeof(packed), 1, dat_f) != 1) {
-        return set_error_errno(ERR_IO, "write_dat_parity: fwrite entry_count failed");
     }
 
-    /* 4. Parity footer */
-    uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
-                             sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
-                             sizeof(parity_footer_t));
-    parity_footer_t footer = { PARITY_FOOTER_MAGIC, PARITY_VERSION, trailer_size };
-    if (fwrite(&footer, sizeof(footer), 1, dat_f) != 1) return set_error_errno(ERR_IO, "write_dat_parity: fwrite footer failed");
+    uint64_t tab_off  = body_len + groups_for(body_len) * GROUP_PAR;
+    uint64_t tab_len  = SLOT * (uint64_t)count;
+    uint64_t tpar_off = tab_off + tab_len;
+    uint64_t tpar_len = groups_for(tab_len) * GROUP_PAR;
+    if (tab_len && pwrite_full(fd, tab, (size_t)tab_len, (off_t)tab_off) != 0) {
+        st = set_error_errno(ERR_IO, "pack seal: write the crc table");
+        goto out;
+    }
+    if (tpar_len) {
+        uint8_t *tpar = malloc((size_t)tpar_len);
+        if (!tpar) { st = set_error(ERR_NOMEM, "pack seal: table parity"); goto out; }
+        rs_parity_encode(tab, (size_t)tab_len, tpar);
+        int wr = pwrite_full(fd, tpar, (size_t)tpar_len, (off_t)tpar_off);
+        free(tpar);
+        if (wr != 0) { st = set_error_errno(ERR_IO, "pack seal: write table parity"); goto out; }
+    }
 
-    return OK;
+    uint64_t tsize = trailer_size_for(body_len, count);
+    pack_tail_t t = {
+        .magic = PACK_TAIL_MAGIC, .version = PACK_TAIL_VERSION, .body_len = body_len,
+        .count = count, .trailer_size = (uint32_t)tsize, .reserved = 0,
+    };
+    t.crc = crc32c(&t, offsetof(pack_tail_t, crc));
+    uint64_t tail_off = tpar_off + tpar_len;
+    if (pwrite_full(fd, &t, sizeof(t), (off_t)tail_off) != 0 ||
+        pwrite_full(fd, &t, sizeof(t), (off_t)(tail_off + sizeof(t))) != 0) {
+        st = set_error_errno(ERR_IO, "pack seal: write the tail");
+        goto out;
+    }
+    *out_size = tsize;
+
+out:
+    free(buf);
+    free(par);
+    free(tab);
+    return st;
 }
-
-/* Write dat parity trailer from pre-computed parity data (no re-read). */
-static status_t write_dat_parity_precomputed(FILE *dat_f,
-                                             const pack_dat_hdr_t *dat_hdr,
-                                             const pack_entry_parity_t *parity,
-                                             uint32_t packed) {
-    /* 1. File header CRC */
-    uint32_t fhdr_crc = crc32c(dat_hdr, sizeof(*dat_hdr));
-    if (fwrite(&fhdr_crc, sizeof(fhdr_crc), 1, dat_f) != 1)
-        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite header CRC failed");
-
-    /* 2. Per-entry parity blocks + build offset table */
-    uint64_t *entry_offsets = malloc((size_t)packed * sizeof(*entry_offsets));
-    if (!entry_offsets)
-        return set_error(ERR_NOMEM, "write_dat_parity_pre: entry_offsets alloc failed");
-
-    size_t cur_trailer_pos = sizeof(fhdr_crc);
-
-    for (uint32_t i = 0; i < packed; i++) {
-        entry_offsets[i] = (uint64_t)cur_trailer_pos;
-
-        const pack_entry_parity_t *ep = &parity[i];
-        uint32_t entry_par_sz = (uint32_t)(sizeof(ep->hdr_par) + ep->rs_par_sz + 4 + 4 + 4);
-
-        if (fwrite(&ep->hdr_par, sizeof(ep->hdr_par), 1, dat_f) != 1) {
-            free(entry_offsets);
-            return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite block %u hdr failed", i);
-        }
-        if (ep->rs_par_sz > 0 && ep->rs_parity &&
-            fwrite_full(ep->rs_parity, ep->rs_par_sz, dat_f) != 0) {
-            free(entry_offsets);
-            return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite block %u rs failed", i);
-        }
-        /* Deprecated rs_data_len field — always 0, see parity.h. */
-        uint32_t rs_data_len_dep = PARITY_RS_DATA_LEN_DEPRECATED;
-        if (fwrite(&ep->payload_crc, sizeof(ep->payload_crc), 1, dat_f) != 1 ||
-            fwrite(&rs_data_len_dep, sizeof(rs_data_len_dep), 1, dat_f) != 1 ||
-            fwrite(&entry_par_sz, sizeof(entry_par_sz), 1, dat_f) != 1) {
-            free(entry_offsets);
-            return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite block %u tail failed", i);
-        }
-        cur_trailer_pos += entry_par_sz;
-    }
-
-    /* 3. entry_parity_offsets table + entry_count */
-    if (packed > 0 &&
-        fwrite(entry_offsets, sizeof(*entry_offsets), packed, dat_f) != packed) {
-        free(entry_offsets);
-        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_offsets failed");
-    }
-    free(entry_offsets);
-    if (fwrite(&packed, sizeof(packed), 1, dat_f) != 1)
-        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_count failed");
-
-    /* 4. Parity footer */
-    uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
-                             sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
-                             sizeof(parity_footer_t));
-    parity_footer_t footer = { PARITY_FOOTER_MAGIC, PARITY_VERSION, trailer_size };
-    if (fwrite(&footer, sizeof(footer), 1, dat_f) != 1)
-        return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite footer failed");
-
-    return OK;
-}
-
-
-/* ------------------------------------------------------------------ */
-/* Parallel RS parity computation                                      */
-/*                                                                      */
-/* After streaming large objects to the dat file, their payloads sit    */
-/* ------------------------------------------------------------------ */
 
 static int idx_offset_cmp(const void *a, const void *b) {
     const pack_idx_disk_entry_t *ea = a;
@@ -1277,18 +1455,17 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
                                pack_dat_hdr_t *dat_hdr,
                                pack_idx_disk_entry_t *idx_entries,
                                uint32_t packed,
-                               const pack_entry_parity_t *precomputed_parity,
                                uint64_t *out_size)
 {
     status_t st = OK;
     *out_size = 0;
 
-    /* Patch the object count into the dat header */
+    /* Patch the object count into the dat header: the header is body, so
+     * this happens before parity is computed over it. */
     if (fseeko(*dat_f, 0, SEEK_SET) != 0) { st = ERR_IO; goto fail; }
     dat_hdr->count = packed;
     if (fwrite(dat_hdr, sizeof(*dat_hdr), 1, *dat_f) != 1) { st = ERR_IO; goto fail; }
 
-    /* Write dat parity trailer */
     if (fseeko(*dat_f, 0, SEEK_END) != 0) { st = ERR_IO; goto fail; }
     off_t body_end = ftello(*dat_f);
     /* The format's bounds, enforced where every writer passes. Past them the
@@ -1299,26 +1476,21 @@ static status_t seal_pack_file(store_t *store, FILE **dat_f,
                        (unsigned long long)PACK_MAX_BYTES, PACK_MAX_ENTRIES);
         goto fail;
     }
-    if (precomputed_parity) {
-        /* Fast path: parity was computed in parallel by workers, no re-read */
-        st = write_dat_parity_precomputed(*dat_f, dat_hdr, precomputed_parity, packed);
-    } else {
-        /* Fallback: re-read dat file to compute parity (used by GC path) */
-        pack_idx_disk_entry_t *by_offset = malloc((size_t)packed * sizeof(*by_offset));
-        if (!by_offset) { st = ERR_NOMEM; goto fail; }
+    /* The body goes to the file before the trailer reads it back. */
+    if (fflush(*dat_f) != 0) { st = set_error_errno(ERR_IO, "pack seal: flush"); goto fail; }
+    {
+        pack_idx_disk_entry_t *by_offset = malloc((size_t)(packed ? packed : 1) * sizeof(*by_offset));
+        if (!by_offset) { st = set_error(ERR_NOMEM, "pack seal: entry order"); goto fail; }
         memcpy(by_offset, idx_entries, (size_t)packed * sizeof(*by_offset));
         qsort(by_offset, packed, sizeof(*by_offset), idx_offset_cmp);
-        st = write_dat_parity(store, *dat_f, dat_hdr, by_offset, packed);
+        uint64_t tsize = 0;
+        st = write_pack_trailer(fileno(*dat_f), (uint64_t)body_end, by_offset, packed, &tsize);
         free(by_offset);
-    }
-    if (st != OK) goto fail;
-
-    {
-        off_t end = ftello(*dat_f);
-        if (end > 0) *out_size = (uint64_t)end;
+        if (st != OK) goto fail;
+        *out_size = (uint64_t)body_end + tsize;
     }
 
-    if (fflush(*dat_f) != 0 || fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
+    if (fsync(fileno(*dat_f)) != 0) { st = ERR_IO; goto fail; }
     fclose(*dat_f); *dat_f = NULL;
 
     /* Every writer seals here - backup, pack, gc, coalescing, replication -
@@ -1423,12 +1595,11 @@ static status_t finalize_pack(store_t *store, FILE **dat_f,
                               char *dat_tmp,
                               pack_dat_hdr_t *dat_hdr,
                               pack_idx_disk_entry_t *idx_entries,
-                              uint32_t packed, uint32_t pack_num,
-                              const pack_entry_parity_t *precomputed_parity)
+                              uint32_t packed, uint32_t pack_num)
 {
     uint64_t dat_size = 0;
     status_t st = seal_pack_file(store, dat_f, dat_hdr, idx_entries,
-                                 packed, precomputed_parity, &dat_size);
+                                 packed, &dat_size);
     if (st == OK) st = install_pack_file(store, dat_tmp, pack_num, &dat_size);
     if (st != OK) { unlink(dat_tmp); return st; }
     return announce_pack(store, pack_num, dat_size, idx_entries, packed);
@@ -1614,7 +1785,7 @@ status_t pack_stored_add(pack_stored_writer_t *w,
      * codec nobody writes, a type no reader knows or a size past the object
      * bound would enumerate perfectly, be counted by gc and reindex, and be
      * unreadable for as long as the repository exists. The checks are the
-     * reader's own (entry_hdr_out_of_bounds and read_entry_hdr), not
+     * reader's own (entry_hdr_out_of_bounds and hdr_fields_valid), not
      * stricter ones.
      */
     if (!object_type_known(type))
@@ -1720,10 +1891,10 @@ status_t pack_stored_finish(pack_stored_writer_t *w, uint32_t *out_packed)
         return OK;
     }
 
-    /* NULL parity: finalize_pack recomputes it by reading the entries back,
-     * which keeps peak memory independent of how large the objects were. */
+    /* Sealing computes the parity by reading the body back a window at a
+     * time, so memory does not depend on the pack. */
     status_t st = finalize_pack(w->store, &w->dat_f, w->dat_tmp, &w->dat_hdr,
-                                w->entries, w->count, w->pack_num, NULL);
+                                w->entries, w->count, w->pack_num);
 
     /*
      * Make the rename itself durable before saying the pack is installed.
@@ -1765,14 +1936,14 @@ void pack_stored_abort(pack_stored_writer_t *w)
 /* The pack writer: plaintext in, a sealed pack out                    */
 /* ------------------------------------------------------------------ */
 
-/* One open pack being built from plaintext, its parity held in memory. */
+/* One open pack being built from plaintext. Parity is the seal's: entries
+ * are appended as header and payload and nothing else. */
 typedef struct {
     store_t              *store;
     FILE                 *dat_f;
     char                  dat_tmp[PATH_MAX];
     pack_dat_hdr_t        dat_hdr;
     pack_idx_disk_entry_t *idx_entries;
-    pack_entry_parity_t   *entry_parity;
     uint32_t              idx_cap;
     uint32_t              packed;
     uint64_t              body_offset;
@@ -1788,19 +1959,8 @@ static int pw_ensure_capacity(pack_writer_t *pw, uint32_t need) {
     pack_idx_disk_entry_t *ni = realloc(pw->idx_entries, (size_t)nc * sizeof(*ni));
     if (!ni) return -1;
     pw->idx_entries = ni;
-    pack_entry_parity_t *np = realloc(pw->entry_parity, (size_t)nc * sizeof(*np));
-    if (!np) return -1;
-    memset(np + pw->idx_cap, 0, (size_t)(nc - pw->idx_cap) * sizeof(*np));
-    pw->entry_parity = np;
     pw->idx_cap = nc;
     return 0;
-}
-
-static void pw_free_parity(pack_writer_t *pw) {
-    for (uint32_t i = 0; i < pw->packed; i++) {
-        free(pw->entry_parity[i].rs_parity);
-        pw->entry_parity[i].rs_parity = NULL;
-    }
 }
 
 static status_t pw_finalize(pack_writer_t *pw) {
@@ -1808,9 +1968,7 @@ static status_t pw_finalize(pack_writer_t *pw) {
 
     status_t st = finalize_pack(pw->store, &pw->dat_f,
                                 pw->dat_tmp, &pw->dat_hdr,
-                                pw->idx_entries, pw->packed, pw->pack_num,
-                                pw->entry_parity);
-    pw_free_parity(pw);
+                                pw->idx_entries, pw->packed, pw->pack_num);
     pw->packed = 0;
     pw->body_offset = 0;
     return st;
@@ -1820,15 +1978,14 @@ static void pw_destroy(pack_writer_t *pw) {
     /* Clean up if pack is still open (error path) */
     if (pw->dat_f) { fclose(pw->dat_f); pw->dat_f = NULL; }
     if (pw->dat_tmp[0]) { unlink(pw->dat_tmp); pw->dat_tmp[0] = '\0'; }
-    pw_free_parity(pw);
     free(pw->idx_entries);
-    free(pw->entry_parity);
     free(pw->comp_buf);
     memset(pw, 0, sizeof(*pw));
 }
 
 /*
- * Append one entry: encrypt, write, compute its parity, record its index slot.
+ * Append one entry: encrypt, write, record its index slot. Parity is the
+ * seal's, computed over the body as a whole.
  * This is where the on-disk format of an entry is decided.
  *
  * payload is plaintext-or-compressed and stays the caller's to free; any
@@ -1883,28 +2040,10 @@ static status_t pw_emit(pack_writer_t *pw,
     }
 
     size_t csize = (size_t)compressed_size;
-    parity_record_t hdr_par;
-    parity_record_compute(&ehdr, sizeof(ehdr), &hdr_par);
-
-    uint32_t payload_crc = 0;
-    uint8_t *rs_buf = NULL;
-    size_t rs_par_sz = 0;
-    if (csize > 0) {
-        payload_crc = crc32c(payload, csize);
-        rs_par_sz = rs_parity_size(csize);
-        rs_buf = malloc(rs_par_sz);
-        if (!rs_buf) {
-            free(cipher);
-            return set_error(ERR_NOMEM, "pack: parity buffer");
-        }
-        rs_parity_encode(payload, csize, rs_buf);
-    }
-
     uint64_t dat_off = sizeof(pack_dat_hdr_t) + pw->body_offset;
     if (fwrite(&ehdr, sizeof(ehdr), 1, pw->dat_f) != 1 ||
         (csize && fwrite_full(payload, csize, pw->dat_f) != 0)) {
         free(cipher);
-        free(rs_buf);
         return set_error_errno(ERR_IO, "pack: write entry to %s", pw->dat_tmp);
     }
 
@@ -1923,11 +2062,6 @@ static status_t pw_emit(pack_writer_t *pw,
     pw->idx_entries[pw->packed].encryption        = ehdr.encryption;
     pw->idx_entries[pw->packed].uncompressed_size = ehdr.uncompressed_size;
     pw->idx_entries[pw->packed].compressed_size   = compressed_size;
-
-    pw->entry_parity[pw->packed].hdr_par     = hdr_par;
-    pw->entry_parity[pw->packed].payload_crc = payload_crc;
-    pw->entry_parity[pw->packed].rs_parity   = rs_buf;
-    pw->entry_parity[pw->packed].rs_par_sz   = rs_par_sz;
 
     pw->body_offset += sizeof(ehdr) + compressed_size;
     pw->packed++;
@@ -2242,9 +2376,7 @@ static status_t collect_pack_meta(store_t *store,
         FILE *datf = fopen(dat_path, "rb");
         if (!datf) continue;
         pack_dat_hdr_t dhdr;
-        if (fread(&dhdr, sizeof(dhdr), 1, datf) != 1 ||
-            dhdr.magic != PACK_DAT_MAGIC ||
-            dhdr.version != PACK_VERSION) {
+        if (pack_hdr_read_file(datf, &dhdr) != 0) {
             fclose(datf);
             continue;
         }
@@ -2315,24 +2447,39 @@ static void pack_resume_deleting(store_t *store) {
  *
  * Expects f positioned immediately after the pack header.
  */
-static int build_disk_idx_from_dat(FILE *f, uint32_t count,
-                                   pack_idx_disk_entry_t *out)
+static void disk_idx_fill(void *ctx, uint32_t i, uint64_t off, const pack_dat_entry_hdr_t *h)
 {
-    uint64_t offset = sizeof(pack_dat_hdr_t);
-    for (uint32_t i = 0; i < count; i++) {
-        pack_dat_entry_hdr_t eh;
-        if (fread(&eh, sizeof(eh), 1, f) != 1) return -1;
-        /* Only the hash and the offset are wanted here - callers rebuild the
-         * rest from the entry header they read themselves. Zeroed anyway so
-         * a future caller that reads more than that gets zeros, not stack
-         * dust from a previous allocation. */
-        memset(&out[i], 0, sizeof(out[i]));
-        memcpy(out[i].hash, eh.hash, OBJECT_HASH_SIZE);
-        out[i].dat_offset = offset;
-        offset += sizeof(eh) + eh.compressed_size;
-        if (fseeko(f, (off_t)offset, SEEK_SET) != 0) return -1;
-    }
-    return 0;
+    pack_idx_disk_entry_t *e = &((pack_idx_disk_entry_t *)ctx)[i];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->hash, h->hash, OBJECT_HASH_SIZE);
+    e->dat_offset      = off;
+    e->compressed_size = h->compressed_size;
+}
+
+/*
+ * Every entry's hash, offset and stored size, from a walk of the pack that
+ * header CRCs and the stripe keep whole (pack_walk). Returns 0 only for a
+ * whole walk: gc and coalescing must not rewrite a pack they could read
+ * only part of.
+ */
+static int build_disk_idx_from_dat(FILE *f, uint32_t count, pack_idx_disk_entry_t *out)
+{
+    int fd = fileno(f);
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) return -1;
+    pack_trailer_t t;
+    int have_t = pack_trailer_read(fd, &t) == 0;
+    return pack_walk(fd, have_t ? &t : NULL, count, (uint64_t)sb.st_size,
+                     disk_idx_fill, out) == 0 ? 0 : -1;
+}
+
+/* A pack's header through pack_hdr_get: 0 when it is a usable pack header
+ * of this version, corrected or derived where it needed to be. */
+static int pack_hdr_read_file(FILE *f, pack_dat_hdr_t *out)
+{
+    pack_trailer_t t;
+    int have_t = pack_trailer_read(fileno(f), &t) == 0;
+    return pack_hdr_get(fileno(f), have_t ? &t : NULL, out, NULL) == 0 ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2484,7 +2631,7 @@ static status_t pack_rw_seal(pack_rw_t *rw)
     uint64_t size = 0;
     err_clear();   /* so a failure with no message of its own is told apart */
     status_t st = seal_pack_file(rw->store, &rw->cur, &rw->hdr,
-                                 rw->ents + rw->cur_first, rw->cur_n, NULL, &size);
+                                 rw->ents + rw->cur_first, rw->cur_n, &size);
     if (st != OK) {
         if (!err_msg()[0]) set_error(st, "pack rewrite: cannot seal an output");
         return st;
@@ -2508,163 +2655,82 @@ static void note_damaged(pack_gc_stats_t *stats, const uint8_t hash[OBJECT_HASH_
 }
 
 /*
- * Rewrite the payload just copied to out at out_pay, this time corrected
- * from the source entry's parity a window at a time.
+ * Copy one entry of a source pack into the open output - sealing it first if
+ * the entry would take it past the seal. An empty output never seals, so an
+ * entry is never refused for size alone.
  *
- * Copying is the one moment damage can be laundered: the output's parity
- * and CRC are computed afresh over whatever bytes it holds, so a damaged
- * byte copied as it stands is protected from then on as if it were right,
- * and the old pack - the only thing that could still have corrected it - is
- * about to be deleted. Damage beyond parity is copied as it is, noted in the
- * gc stats so the job fails (OWN-31), and logged;
- * it was lost before the copy, and the hash still exposes it.
- */
-static status_t pack_rw_copy_repaired(FILE *out, off_t out_pay, FILE *src, off_t src_pay,
-                                      const entry_parity_t *ep,
-                                      const pack_dat_entry_hdr_t *ehdr,
-                                      pack_gc_stats_t *stats)
-{
-    const size_t groups  = parity_window_groups();
-    const size_t win     = groups * EP_GROUP_DATA;
-    const size_t par_cap = groups * EP_GROUP_PAR;
-    uint8_t *buf = malloc(win);
-    uint8_t *par = malloc(par_cap);
-    status_t st = OK;
-    uint64_t bad = 0;
-    int64_t  fixed = 0;
-
-    if (!buf || !par) { st = set_error(ERR_NOMEM, "pack rewrite: parity window"); goto out; }
-    if (fseeko(src, src_pay, SEEK_SET) != 0 || fseeko(out, out_pay, SEEK_SET) != 0) {
-        st = set_error_errno(ERR_IO, "pack rewrite: seek to repair an entry"); goto out;
-    }
-    for (uint64_t o = 0; o < ehdr->compressed_size; ) {
-        uint64_t left = ehdr->compressed_size - o;
-        size_t want = left < win ? (size_t)left : win;
-        if (fread_full(buf, want, src) != 0) {
-            st = set_error(ERR_CORRUPT, "pack rewrite: short entry"); goto out;
-        }
-        int64_t fx = entry_repair_buf(fileno(src), ep, o, buf, want, par, par_cap, &bad);
-        if (fx < 0) { st = set_error_errno(ERR_IO, "pack rewrite: cannot read parity"); goto out; }
-        fixed += fx;
-        if (fwrite_full(buf, want, out) != 0) {
-            st = set_error_errno(ERR_IO, "pack rewrite: write entry payload"); goto out;
-        }
-        o += want;
-    }
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(ehdr->hash, hex);
-    if (bad > 0) {
-        log_warn("pack rewrite: %s is damaged beyond its parity (%llu group(s)); "
-                 "copied as it is", hex, (unsigned long long)bad);
-        parity_stats_add_uncorrectable(1);
-        note_damaged(stats, ehdr->hash);
-    } else if (fixed > 0) {
-        log_warn("pack rewrite: %s corrected from parity while copying (%lld byte(s))",
-                 hex, (long long)fixed);
-        parity_stats_add_repaired(1);
-    }
-
-out:
-    free(buf);
-    free(par);
-    return st;
-}
-
-/*
- * Copy one entry, whose header has been read from src and whose payload
- * follows at src's position, into the open output - sealing it first if the
- * entry would take it past the seal. An empty output never seals, so an
- * entry larger than the seal is written alone rather than refused. The
- * payload is streamed through chunk, never held whole.
+ * The entry is fetched whole (every entry is bounded) and corrected from the
+ * source's parity before it is written. Copying is the one moment damage can
+ * be laundered: the output's parity is computed afresh over whatever bytes
+ * it holds, so a damaged byte copied as it stands would be protected from
+ * then on as if it were right, and the old pack - the only thing that could
+ * still have corrected it - is about to be deleted. Damage beyond parity is
+ * copied as it is, noted in the gc stats so the job fails (OWN-31), and
+ * logged; it was lost before the copy, and the name still exposes it.
  *
- * src_index is the entry's position in src, which its parity is indexed by.
- * The header is checked against its parity record and the payload's CRC
- * against the trailer as the bytes go by; a mismatch rewrites the payload
- * corrected (pack_rw_copy_repaired), so a clean entry is still read once.
+ * src_index is the entry's position in the source, which its CRC is indexed
+ * by; len_hint its stored size as the walk of the source found it.
  */
-static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_t *ehdr_in,
-                             uint32_t src_index, char *chunk, size_t chunk_sz)
+static status_t pack_rw_copy(pack_rw_t *rw, int src_fd, const pack_trailer_t *t,
+                             uint64_t off, uint32_t src_index, uint64_t len_hint)
 {
     if (rw->kept >= rw->ents_cap)
         return set_error(ERR_CORRUPT, "pack rewrite: more entries than the headers said");
 
-    pack_dat_entry_hdr_t hdr_copy = *ehdr_in;
-    const pack_dat_entry_hdr_t *ehdr = &hdr_copy;
-    off_t src_pay = ftello(src);
-    if (src_pay < 0) return set_error_errno(ERR_IO, "pack rewrite: ftello");
-    entry_parity_t ep;
-    int have_parity = locate_entry_parity(src, src_index, &ep) == 0;
-    if (have_parity) {
-        int hrc = parity_record_check(&hdr_copy, sizeof(hdr_copy), &ep.hdr_par);
-        if (hrc == 1) {
-            log_warn("pack rewrite: repaired an entry header via parity while copying");
-            parity_stats_add_repaired(1);
-        } else if (hrc < 0) {
-            log_warn("pack rewrite: entry header parity uncorrectable");
-            parity_stats_add_uncorrectable(1);
-        }
-        /* No size cap (OWN-25): the entry only has to fit before the
-         * trailer. Compared by subtraction so a damaged, huge size cannot
-         * overflow the sum and slip past. */
-        if ((off_t)ep.trailer_start < src_pay ||
-            hdr_copy.compressed_size > (uint64_t)((off_t)ep.trailer_start - src_pay))
-            return set_error(ERR_CORRUPT, "pack rewrite: entry runs into the parity trailer");
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    int64_t fixed = 0;
+    int damaged = 0;
+    int fr = entry_fetch(src_fd, t, off, src_index, len_hint, &buf, &len, &fixed, &damaged);
+    if (fr == -1 && errno == ENOMEM) return set_error(ERR_NOMEM, "pack rewrite: entry buffer");
+    if (fr == -1) return set_error_errno(ERR_IO, "pack rewrite: read an entry");
+    if (fr == -3) return set_error(ERR_CORRUPT, "pack rewrite: entry at %llu is damaged "
+                                   "beyond parity in its header", (unsigned long long)off);
+    if (fr != 0) return set_error(ERR_CORRUPT, "pack rewrite: entry at %llu is not an entry",
+                                  (unsigned long long)off);
+    pack_dat_entry_hdr_t ehdr;
+    memcpy(&ehdr, buf, sizeof(ehdr));
+    int hv = hdr_fields_valid(&ehdr, 1);
+    if (hv != 0) {
+        free(buf);
+        return entry_hdr_error(hv, "pack rewrite: bad entry header at %llu",
+                               (unsigned long long)off);
     }
-    if (fseeko(src, src_pay, SEEK_SET) != 0)
-        return set_error_errno(ERR_IO, "pack rewrite: seek back to the payload");
+    note_parity_outcome(ehdr.hash, fixed, damaged, "pack rewrite");
+    if (damaged) note_damaged(rw->stats, ehdr.hash);
 
-    uint64_t entry_total = sizeof(*ehdr) + ehdr->compressed_size;
-
-    if (rw->cur && rw->cur_n > 0 && rw->body + entry_total > pack_seal_bytes()) {
+    if (rw->cur && rw->cur_n > 0 && rw->body + len > pack_seal_bytes()) {
         status_t st = pack_rw_seal(rw);
-        if (st != OK) return st;
+        if (st != OK) { free(buf); return st; }
     }
     if (!rw->cur) {
         status_t st = open_new_pack(rw->store, 0, &rw->cur, rw->cur_tmp, &rw->hdr);
-        if (st != OK) { rw->cur = NULL; rw->cur_tmp[0] = '\0'; return st; }
+        if (st != OK) { free(buf); rw->cur = NULL; rw->cur_tmp[0] = '\0'; return st; }
         rw->body = 0;
         rw->cur_first = rw->kept;
         rw->cur_n = 0;
     }
 
-    if (fwrite(ehdr, sizeof(*ehdr), 1, rw->cur) != 1)
-        return set_error_errno(ERR_IO, "pack rewrite: write entry header");
-    off_t out_pay = ftello(rw->cur);
-    if (out_pay < 0) return set_error_errno(ERR_IO, "pack rewrite: ftello");
-    uint64_t remaining = ehdr->compressed_size;
-    uint32_t crc = 0;
-    while (remaining > 0) {
-        size_t want = remaining < chunk_sz ? (size_t)remaining : chunk_sz;
-        if (fread_full(chunk, want, src) != 0)
-            return set_error(ERR_CORRUPT, "pack rewrite: short entry");
-        if (have_parity) crc = crc32c_update(crc, chunk, want);
-        if (fwrite_full(chunk, want, rw->cur) != 0)
-            return set_error_errno(ERR_IO, "pack rewrite: write entry payload");
-        remaining -= want;
-    }
-    if (have_parity && ep.rs_sz > 0 && ehdr->compressed_size > 0 && crc != ep.payload_crc) {
-        status_t st = pack_rw_copy_repaired(rw->cur, out_pay, src, src_pay, &ep, ehdr,
-                                            rw->stats);
-        if (st != OK) return st;
-    }
+    int wr = fwrite_full(buf, len, rw->cur);
+    free(buf);
+    if (wr != 0) return set_error_errno(ERR_IO, "pack rewrite: write entry");
 
     pack_idx_disk_entry_t *e = &rw->ents[rw->kept];
     memset(e, 0, sizeof(*e));
-    memcpy(e->hash, ehdr->hash, OBJECT_HASH_SIZE);
+    memcpy(e->hash, ehdr.hash, OBJECT_HASH_SIZE);
     e->dat_offset        = sizeof(rw->hdr) + rw->body;
-    /* Position in this output, which is what its parity trailer is indexed
-     * by - not the position in the source pack, and not the index after
+    /* Position in this output, which is what its CRC table is indexed by -
+     * not the position in the source pack, and not the index after
      * seal_pack_file sorts the slice by hash. */
     e->entry_index       = rw->cur_n;
-    e->type              = ehdr->type;
-    e->compression       = ehdr->compression;
-    e->encryption        = ehdr->encryption;
-    e->uncompressed_size = ehdr->uncompressed_size;
-    e->compressed_size   = ehdr->compressed_size;
+    e->type              = ehdr.type;
+    e->compression       = ehdr.compression;
+    e->encryption        = ehdr.encryption;
+    e->uncompressed_size = ehdr.uncompressed_size;
+    e->compressed_size   = ehdr.compressed_size;
     rw->kept++;
     rw->cur_n++;
-    rw->body += entry_total;
+    rw->body += len;
     return OK;
 }
 
@@ -2856,14 +2922,6 @@ static status_t maybe_coalesce_packs(store_t *store,
     rw.stats = stats;
     if (rc != OK) { free(cand); return rc; }
 
-    const size_t CHUNK = 128 * 1024;
-    char *chunk = malloc(CHUNK);
-    if (!chunk) {
-        pack_rw_free(&rw);
-        free(cand);
-        return set_error(ERR_NOMEM, "maybe_coalesce_packs: copy buffer");
-    }
-
     for (size_t ci = 0; rc == OK && ci < n_cand; ci++) {
         char dat_path[PATH_MAX];
         if (pack_dat_path_resolve(dat_path, sizeof(dat_path), store_root(store),
@@ -2876,9 +2934,7 @@ static status_t maybe_coalesce_packs(store_t *store,
         if (!datf) { rc = set_error_errno(ERR_IO, "pack-coalesce: open pack %u", cand[ci].num); break; }
 
         pack_dat_hdr_t chdr;
-        if (fread(&chdr, sizeof(chdr), 1, datf) != 1 ||
-            chdr.magic != PACK_DAT_MAGIC ||
-            chdr.version != PACK_VERSION ||
+        if (pack_hdr_read_file(datf, &chdr) != 0 ||
             chdr.count != cand[ci].count) {
             fclose(datf);
             rc = set_error(ERR_CORRUPT, "pack-coalesce: pack %u header changed or is bad",
@@ -2899,27 +2955,18 @@ static status_t maybe_coalesce_packs(store_t *store,
             rc = set_error(ERR_CORRUPT, "pack-coalesce: cannot walk pack %u", cand[ci].num);
             break;
         }
+        pack_trailer_t tr;
+        int have_tr = pack_trailer_read(fileno(datf), &tr) == 0;
 
         for (uint32_t i = 0; rc == OK && i < chdr.count; i++) {
             if (!bsearch(disk_idx[i].hash, refs, refs_cnt, OBJECT_HASH_SIZE, ref_cmp)) continue;
-            if (fseeko(datf, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) {
-                rc = set_error_errno(ERR_IO, "pack-coalesce: seek in pack %u", cand[ci].num);
-                break;
-            }
-            pack_dat_entry_hdr_t ehdr;
-            int ehrc = read_entry_hdr(datf, &ehdr, 1);
-            if (ehrc != 0) {
-                rc = entry_hdr_error(ehrc, "pack-coalesce: bad entry header in pack %u",
-                                     cand[ci].num);
-                break;
-            }
-            rc = pack_rw_copy(&rw, datf, &ehdr, i, chunk, CHUNK);
+            rc = pack_rw_copy(&rw, fileno(datf), have_tr ? &tr : NULL,
+                              disk_idx[i].dat_offset, i, disk_idx[i].compressed_size);
         }
 
         free(disk_idx);
         fclose(datf);
     }
-    free(chunk);
 
     uint32_t total_live = rw.kept;
     if (rc != OK || total_live == 0) {
@@ -2949,37 +2996,29 @@ static status_t maybe_coalesce_packs(store_t *store,
     free(cand);
     return rc;
 }
+
 /*
- * Repair a packed entry in place, from its own parity, in bounded memory.
+ * Repair a packed entry in place, from the pack's striped parity.
  *
- * Parity is per entry and per group, applied a window of groups at a time.
- * The CRC and parity cover the stored bytes, so no key is needed and nothing
- * is decompressed.
- *
- * Three passes over the payload, the last two only for a damaged entry:
- *
- *   1. CRC the stored bytes. Equal to the trailer's: nothing to do, and a
- *      clean entry pays one read.
- *   2. Correct every window in memory and CRC the result, writing nothing.
- *      Only a result that matches the trailer's CRC proves the corrections
- *      right; RS can miscorrect a group damaged past its capacity into some
- *      other valid codeword, and writing that back would replace damage that
- *      verify reports with damage that it cannot see.
- *   3. Correct again and pwrite each window that changed.
+ * The entry is fetched whole and checked against its CRC; a clean entry
+ * pays one read. A damaged one is corrected a group at a time (at most the
+ * two groups at its ends reach outside it) and the result proven against
+ * the CRC before anything is written: RS can miscorrect a group damaged past
+ * its capacity into another valid codeword, and writing that back would
+ * replace damage verify reports with damage it cannot see. Only the entry's
+ * own bytes are written - never a neighbour's, even one the same group
+ * corrected - and, when it was the CRC table rather than the entry that was
+ * damaged, the entry's four table bytes.
  *
  * In place rather than through pack_rw_replace, because in place is the
  * safer of the two here. Each pwrite puts back the bytes the entry was
- * written with, at their own offsets, and touches nothing else: not the
- * parity, not the CRC, not any other entry, not the index. A crash or a torn
- * write in the middle leaves every byte either as it was (damaged, and
- * already covered by parity) or as it should be, so the errors left are a
- * subset of those found, still within capacity, and a rerun finishes the job.
- * pack_rw_replace would copy the whole pack - up to the seal, or any size for
- * a pack written before the seal - under new numbers to fix a few bytes, and
- * would need that much free space on a disk that is already failing.
+ * written with, at their own offsets, and touches nothing else, so a crash
+ * or a torn write leaves every byte either as it was or as it should be, and
+ * a rerun finishes the job. No key is needed: parity and CRC cover stored
+ * bytes.
  *
- * Returns the bytes corrected (header and payload), 0 when the entry is
- * clean, -1 when it cannot be repaired or the repair cannot be written.
+ * Returns the bytes corrected, 0 when the entry is clean, -1 when it cannot
+ * be repaired or the repair cannot be written.
  */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t found;
@@ -2993,112 +3032,76 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
                               store_root(store), found.pack_num) != 0)
         return -1;
 
-    FILE *f = fopen(dat_path, "rb");
-    if (!f) return -1;
+    int fd = open(dat_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -1;
+    pack_trailer_t t;
+    if (pack_trailer_read(fd, &t) != 0) { close(fd); return -1; }
 
-    entry_parity_t ep;
-    if (locate_entry_parity(f, found.entry_index, &ep) != 0) {
-        fclose(f);
-        return -1;
-    }
-
-    pack_dat_entry_hdr_t ehdr;
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0 ||
-        fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        fclose(f);
-        return -1;
-    }
-
-    int      rfd = fileno(f);
-    int      wfd = -1;      /* opened only once there is something to write */
-    int64_t  fixed = 0;
-    int      failed = 0;
     uint8_t *buf = NULL;
-    uint8_t *par = NULL;
-
-    /* Header first: every payload offset below depends on compressed_size. */
-    int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
-    if (hrc < 0) { failed = 1; goto out; }
-    if (hrc == 1) {
-        wfd = open(dat_path, O_WRONLY);
-        if (wfd < 0 ||
-            pwrite_full(wfd, &ehdr, sizeof(ehdr), (off_t)found.dat_offset) != 0) {
-            failed = 1; goto out;
-        }
-        fixed++;
-    }
-
-    off_t    pay_off = (off_t)(found.dat_offset + sizeof(ehdr));
-    uint64_t csize   = ehdr.compressed_size;
-    if ((uint64_t)pay_off + csize > (uint64_t)ep.trailer_start) { failed = 1; goto out; }
-    if (csize == 0 || ep.rs_sz == 0) goto out;
-
-    const size_t groups  = parity_window_groups();
-    const size_t win     = groups * EP_GROUP_DATA;
-    const size_t par_cap = groups * EP_GROUP_PAR;
-    buf = malloc(win);
-    par = malloc(par_cap);
-    if (!buf || !par) { failed = 1; goto out; }
-
-    /* Pass 1: is anything wrong at all? */
-    uint32_t crc = 0;
-    for (uint64_t o = 0; o < csize; ) {
-        size_t want = csize - o < win ? (size_t)(csize - o) : win;
-        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
-        crc = crc32c_update(crc, buf, want);
-        o += want;
-    }
-    if (crc == ep.payload_crc) goto out;
-
-    /* Pass 2: correct in memory and prove the result before writing any of it. */
-    uint64_t bad = 0;
-    uint32_t fixed_crc = 0;
-    int64_t  payload_fixed = 0;
-    for (uint64_t o = 0; o < csize; ) {
-        size_t want = csize - o < win ? (size_t)(csize - o) : win;
-        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
-        int64_t fx = entry_repair_buf(rfd, &ep, o, buf, want, par, par_cap, &bad);
-        if (fx < 0) { failed = 1; goto out; }
-        payload_fixed += fx;
-        fixed_crc = crc32c_update(fixed_crc, buf, want);
-        o += want;
-    }
-    if (bad > 0 || fixed_crc != ep.payload_crc || payload_fixed == 0) {
+    size_t len = 0;
+    int64_t fixed = 0;
+    int damaged = 0;
+    int fr = entry_fetch(fd, &t, found.dat_offset, found.entry_index, found.comp_size,
+                         &buf, &len, &fixed, &damaged);
+    if (fr != 0) { close(fd); return -1; }
+    if (damaged) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         object_hash_to_hex(hash, hex);
-        log_warn("pack: %s in pack-%010u.dat is damaged beyond its parity "
-                 "(%llu group(s) uncorrectable); nothing written",
-                 hex, found.pack_num, (unsigned long long)bad);
-        failed = 1;
-        goto out;
+        log_warn("pack: %s in pack-%010u.dat is damaged beyond its parity; nothing written",
+                 hex, found.pack_num);
+        free(buf);
+        close(fd);
+        return -1;
     }
 
-    /* Pass 3: write back each window that changed. */
-    if (wfd < 0) {
-        wfd = open(dat_path, O_WRONLY);
-        if (wfd < 0) { failed = 1; goto out; }
-    }
-    for (uint64_t o = 0; o < csize; ) {
-        size_t want = csize - o < win ? (size_t)(csize - o) : win;
-        uint64_t bad3 = 0;
-        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
-        int64_t fx = entry_repair_buf(rfd, &ep, o, buf, want, par, par_cap, &bad3);
-        if (fx < 0 || bad3 > 0) { failed = 1; goto out; }
-        if (fx > 0 && pwrite_full(wfd, buf, want, pay_off + (off_t)o) != 0) {
-            failed = 1; goto out;
-        }
-        o += want;
-    }
-    fixed += payload_fixed;
+    int failed = 0;
+    if (fixed > 0 && pwrite_full(fd, buf, len, (off_t)found.dat_offset) != 0) failed = 1;
 
-out:
+    /* The entry is right now; is its table slot? A slot that disagrees was
+     * the damage (or part of it), and the entry's own CRC is the fix. */
+    uint32_t want = crc32c(buf, len);
+    uint32_t want_h = crc32c(buf, sizeof(pack_dat_entry_hdr_t));
+    uint32_t slot = 0, slot_h = 0;
+    if (!failed && entry_table_slot(fd, &t, found.entry_index, 0, &slot, &slot_h) == 0 &&
+        (slot != want || slot_h != want_h)) {
+        uint8_t b[SLOT];
+        put_le32(b, want);
+        put_le32(b + 4, want_h);
+        if (pwrite_full(fd, b, SLOT, (off_t)(t.tab_off + SLOT * (uint64_t)found.entry_index)) != 0)
+            failed = 1;
+        else
+            fixed += (int64_t)SLOT;
+    }
     free(buf);
-    free(par);
-    fclose(f);
-    if (wfd >= 0) {
-        if (fixed > 0 && fsync(wfd) != 0) failed = 1;
-        close(wfd);
+
+    /* The pack's own structure, while the pack is open for writing: a tail
+     * copy that failed and a pack header that did not match are rewritten
+     * from what proved right, so the next damage has both again. */
+    if (!failed && t.tails_bad) {
+        pack_tail_t tl = {
+            .magic = PACK_TAIL_MAGIC, .version = PACK_TAIL_VERSION, .body_len = t.body_len,
+            .count = t.count, .trailer_size = (uint32_t)trailer_size_for(t.body_len, t.count),
+            .reserved = 0,
+        };
+        tl.crc = crc32c(&tl, offsetof(pack_tail_t, crc));
+        uint64_t fsz = t.body_len + tl.trailer_size;
+        for (unsigned copy = 1; copy <= 2 && !failed; copy++) {
+            if (!(t.tails_bad & (1u << (copy - 1)))) continue;
+            if (pwrite_full(fd, &tl, sizeof(tl), (off_t)(fsz - copy * PACK_TAIL_BYTES)) != 0)
+                failed = 1;
+            else
+                fixed += (int64_t)sizeof(tl);
+        }
     }
+    pack_dat_hdr_t ph;
+    int ph_fixed = 0;
+    if (!failed && pack_hdr_get(fd, &t, &ph, &ph_fixed) == 0 && ph_fixed) {
+        if (pwrite_full(fd, &ph, sizeof(ph), 0) != 0) failed = 1;
+        else fixed += (int64_t)sizeof(ph);
+    }
+
+    if (fixed > 0 && !failed && fsync(fd) != 0) failed = 1;
+    close(fd);
     /* Open .dat handles may hold the damaged bytes in their stdio buffers. */
     if (fixed > 0) pack_cache_invalidate(store);
     if (failed) return -1;
@@ -3129,7 +3132,6 @@ out:
 static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_path,
                                 const pack_idx_disk_entry_t *disk_idx, uint32_t count,
                                 const uint8_t *refs, size_t refs_cnt,
-                                char *chunk, size_t chunk_sz,
                                 uint32_t *out_kept, uint32_t *out_dropped,
                                 uint32_t *out_written, pack_gc_stats_t *stats)
 {
@@ -3139,6 +3141,8 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
 
     FILE *old = fopen(dat_path, "rb");
     if (!old) return set_error_errno(ERR_IO, "pack_gc: cannot open pack %u", pnum);
+    pack_trailer_t tr;
+    int have_tr = pack_trailer_read(fileno(old), &tr) == 0;
 
     pack_rw_t rw;
     status_t st = pack_rw_init(&rw, store, count);
@@ -3151,19 +3155,9 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
             dropped++;
             continue;
         }
-        if (fseeko(old, (off_t)disk_idx[i].dat_offset, SEEK_SET) != 0) {
-            st = set_error_errno(ERR_IO, "pack_gc: seek in pack %u", pnum);
-            break;
-        }
-        pack_dat_entry_hdr_t ehdr;
-        int ehrc = read_entry_hdr(old, &ehdr, 1);
-        if (ehrc != 0) {
-            st = entry_hdr_error(ehrc, "pack_gc: bad entry header at %llu in pack %u",
-                                 (unsigned long long)disk_idx[i].dat_offset, pnum);
-            break;
-        }
         size_t sealed = rw.nouts;
-        st = pack_rw_copy(&rw, old, &ehdr, i, chunk, chunk_sz);
+        st = pack_rw_copy(&rw, fileno(old), have_tr ? &tr : NULL,
+                          disk_idx[i].dat_offset, i, disk_idx[i].compressed_size);
         /* A rewrite of a large pack can run for hours. Just after an output
          * seals is a clean place to stop: nothing is installed yet. */
         if (st == OK && rw.nouts != sealed && store_cancelled(store))
@@ -3233,10 +3227,6 @@ status_t pack_gc_stats(store_t *store,
     uint32_t *pack_nums = gc_cpn.nums;
     npack = gc_cpn.cnt;
 
-    /* Fixed-size buffer for chunked entry copy (no per-object realloc) */
-    const size_t GC_CHUNK = 128 * 1024;
-    char *gc_chunk = malloc(GC_CHUNK);
-    if (!gc_chunk) { free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: gc_chunk alloc failed"); }
 
     int gc_cancelled = 0;
     for (size_t pi = 0; pi < npack; pi++) {
@@ -3253,18 +3243,20 @@ status_t pack_gc_stats(store_t *store,
         FILE *gcidxf = fopen(dat_path, "rb");
         if (!gcidxf) continue;
         pack_dat_hdr_t ghdr;
-        if (fread(&ghdr, sizeof(ghdr), 1, gcidxf) != 1 ||
-            ghdr.magic != PACK_DAT_MAGIC ||
-            ghdr.version != PACK_VERSION) {
+        if (pack_hdr_read_file(gcidxf, &ghdr) != 0) {
             fclose(gcidxf); continue;
         }
         uint32_t count = ghdr.count;
         if (count > PACK_MAX_ENTRIES) {
-            fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
+            fclose(gcidxf); free(pack_nums); return set_error(ERR_CORRUPT, "pack_gc: entry count too large (%u) in pack %u", count, pnum);
         }
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
-        if (!disk_idx) { fclose(gcidxf); free(gc_chunk); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
+        if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
         if (build_disk_idx_from_dat(gcidxf, count, disk_idx) != 0) {
+            /* Damaged past what parity can restore: rewriting it
+             * would guess at offsets and liveness. Left whole and said so;
+             * verify names the objects. */
+            log_warn("pack_gc: pack %u cannot be walked; left as it is", pnum);
             free(disk_idx); fclose(gcidxf); continue;
         }
         fclose(gcidxf);
@@ -3296,7 +3288,7 @@ status_t pack_gc_stats(store_t *store,
 
         uint32_t kept = 0, dropped = 0, written = 0;
         status_t st = gc_rewrite_pack(store, pnum, dat_path, disk_idx, count,
-                                      refs, refs_cnt, gc_chunk, GC_CHUNK,
+                                      refs, refs_cnt,
                                       &kept, &dropped, &written, stats);
         free(disk_idx);
         if (st == ERR_BUSY) {
@@ -3307,7 +3299,6 @@ status_t pack_gc_stats(store_t *store,
             break;
         }
         if (st != OK) {
-            free(gc_chunk);
             free(pack_nums);
             if (out_kept)    *out_kept    = total_kept;
             if (out_deleted) *out_deleted = total_deleted;
@@ -3318,7 +3309,7 @@ status_t pack_gc_stats(store_t *store,
         total_deleted += dropped;
         stats->packs_rewritten++;
     }
-    free(gc_chunk);
+   
 
     if (gc_cancelled) {
         if (total_deleted > 0) pack_cache_invalidate(store);
@@ -3420,6 +3411,27 @@ status_t store_scan_packs(store_t *st, store_index_add_fn add, void *ctx)
     return st_rc;
 }
 
+typedef struct {
+    pack_dat_entry_cb cb;
+    void             *ctx;
+} enum_ctx_t;
+
+static void enum_step(void *ctx, uint32_t i, uint64_t off, const pack_dat_entry_hdr_t *h)
+{
+    const enum_ctx_t *ec = ctx;
+    pack_entry_info_t info;
+    memcpy(info.hash, h->hash, OBJECT_HASH_SIZE);
+    info.type              = h->type;
+    info.compression       = h->compression;
+    info.encryption        = h->encryption;
+    info.uncompressed_size = h->uncompressed_size;
+    info.compressed_size   = h->compressed_size;
+    info.payload_offset    = off + sizeof(*h);
+    info.entry_offset      = off;
+    info.entry_index       = i;
+    ec->cb(&info, ec->ctx);
+}
+
 status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                              uint32_t *out_version, uint32_t *out_count,
                              pack_dat_entry_cb cb, void *ctx)
@@ -3433,17 +3445,22 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
     FILE *f = fopen(path, "rb");
     if (!f) return set_error_errno(ERR_IO, "pack_enumerate_dat: open %s", dat_name);
 
+    int fd = fileno(f);
+    pack_trailer_t t;
+    int have_t = pack_trailer_read(fd, &t) == 0;
+
     pack_dat_hdr_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != PACK_DAT_MAGIC) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "pack_enumerate_dat: bad header in %s", dat_name);
-    }
-    if (hdr.version != PACK_VERSION) {
+    int hrc = pack_hdr_get(fd, have_t ? &t : NULL, &hdr, NULL);
+    if (hrc == 1) {
         fclose(f);
         return set_error(ERR_CORRUPT,
                          "pack_enumerate_dat: %s is pack version %u, this build "
                          "reads only version %u - rebuild the repository",
                          dat_name, hdr.version, PACK_VERSION);
+    }
+    if (hrc != 0) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, "pack_enumerate_dat: bad header in %s", dat_name);
     }
 
     /*
@@ -3451,17 +3468,17 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
      * every entry costs at least a header on the wire. A 750-byte file
      * claiming 582 million entries is not a file to start walking.
      */
-    if (fseeko(f, 0, SEEK_END) != 0) {
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
         fclose(f);
-        return set_error_errno(ERR_IO, "pack_enumerate_dat: seek %s", dat_name);
+        return set_error_errno(ERR_IO, "pack_enumerate_dat: stat %s", dat_name);
     }
-    off_t end = ftello(f);
-    if (end < (off_t)sizeof(hdr)) {
+    uint64_t file_size = (uint64_t)sb.st_size;
+    if (file_size < sizeof(hdr)) {
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_enumerate_dat: %s is truncated", dat_name);
     }
-    uint64_t file_size = (uint64_t)end;
-    uint64_t body      = file_size - sizeof(hdr);
+    uint64_t body = file_size - sizeof(hdr);
     if (file_size > PACK_MAX_FILE_BYTES || hdr.count > PACK_MAX_ENTRIES) {
         fclose(f);
         return set_error(ERR_CORRUPT,
@@ -3474,51 +3491,25 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
                          "pack_enumerate_dat: %s claims %u entries in %llu bytes",
                          dat_name, hdr.count, (unsigned long long)body);
     }
-    if (fseeko(f, (off_t)sizeof(hdr), SEEK_SET) != 0) {
-        fclose(f);
-        return set_error_errno(ERR_IO, "pack_enumerate_dat: rewind %s", dat_name);
-    }
 
     if (out_version) *out_version = hdr.version;
     if (out_count)   *out_count   = hdr.count;
 
     if (!cb) { fclose(f); return OK; }
 
-    uint64_t offset = sizeof(hdr);
-    for (uint32_t i = 0; i < hdr.count; i++) {
-        pack_entry_info_t info;
-
-        pack_dat_entry_hdr_t eh;
-        if (fread(&eh, sizeof(eh), 1, f) != 1) break;
-        memcpy(info.hash, eh.hash, OBJECT_HASH_SIZE);
-        info.type              = eh.type;
-        info.compression       = eh.compression;
-        info.encryption        = eh.encryption;
-        info.uncompressed_size = eh.uncompressed_size;
-        info.compressed_size   = eh.compressed_size;
-        info.payload_offset    = offset + sizeof(eh);
-        info.entry_offset      = offset;
-        info.entry_index       = i;
-        /*
-         * Where the next entry starts, computed so a corrupt length cannot
-         * send us backwards. This was a bare addition on a caller-controlled
-         * uint64: a large enough compressed_size wrapped the sum, the seek
-         * landed earlier in the file than it started, and the loop read the
-         * same bytes forever - a pinned core, in the enumerator that GC,
-         * coalescing and reindex all walk with. Found by a fuzzer as a
-         * timeout rather than a crash, which is the only way it would ever
-         * have shown up.
-         */
-        if (eh.compressed_size > file_size - offset - sizeof(eh)) {
-            /* Claims a payload that runs past the end of the file. */
-            break;
-        }
-        offset += sizeof(eh) + eh.compressed_size;
-        if (fseeko(f, (off_t)offset, SEEK_SET) != 0) break;
-
-        cb(&info, ctx);
+    /*
+     * Tolerant on purpose: a pack whose walk cannot be made whole still has
+     * its entries before the break enumerated, so reindex keeps what it can.
+     * The walk checks every size against what is left of the body before
+     * stepping, so a corrupt length can neither run off the end nor wrap
+     * the offset backwards - which once pinned a core in this loop, found by
+     * a fuzzer as a timeout.
+     */
+    enum_ctx_t ec = { .cb = cb, .ctx = ctx };
+    if (pack_walk(fd, have_t ? &t : NULL, hdr.count, file_size, enum_step, &ec) < 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_enumerate_dat: read %s", dat_name);
     }
-
     fclose(f);
     return OK;
 }

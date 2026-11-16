@@ -479,10 +479,9 @@ static void test_short_buffer_repair_still_works(void **state)
     assert_memory_equal(data, want, sizeof(want));
 }
 
-static void test_parity_footer_size(void **state)
+static void test_parity_record_size(void **state)
 {
     (void)state;
-    assert_int_equal(sizeof(parity_footer_t), 12);
     assert_int_equal(sizeof(parity_record_t), 260);
 }
 
@@ -535,39 +534,26 @@ static void test_parity_shorter_than_data_is_refused(void **state)
     free(data);
 }
 
-/* ---- Format 3: the bounds that keep the trailer's 32-bit sizes whole ---- */
-
-/* The real per-entry parity block, field by field: header parity, then
- * payload CRC, deprecated rs_data_len and the block size word. */
-#define ENTRY_FIXED  (sizeof(parity_record_t) + 4 + 4 + 4)
+/* ---- Format 3: the bounds that keep the trailer's 32-bit size whole ---- */
 
 /*
- * Format 3 keeps the trailer's size fields 32-bit and bounds what can be
- * written instead. These check the bounds against the layouts and against
- * rs_parity_size itself, rather than against the constants they were
- * derived from, so a change to either side shows up here.
+ * Pack version 7 keeps the tail's trailer_size 32-bit and bounds what can
+ * be written instead. These check the bound against the layout and against
+ * rs_parity_size itself, rather than against the constants it was derived
+ * from, so a change to either side shows up here.
  */
 static void test_format_bounds_fit_the_trailer_fields(void **state)
 {
     (void)state;
-    /* The per-entry term PACK_TRAILER_MAX_BYTES charges is the real block. */
-    assert_int_equal(ENTRY_FIXED, 272);
-
-    /* One maximal entry's parity block fits its size word. */
-    uint64_t one = (uint64_t)rs_parity_size((size_t)OBJECT_MAX_STORED_BYTES);
-    assert_true(one + ENTRY_FIXED <= UINT32_MAX);
-
-    /* The RS term of the trailer bound covers a maximal body in one entry
-     * and in many: ceil rounding costs at most one group per entry. */
+    /* The stripe term is exactly rs_parity_size over the largest body, and
+     * the table term rs_parity_size over the largest crc table: striped
+     * parity has no per-entry rounding to bound. */
     uint64_t body_rs = (uint64_t)rs_parity_size((size_t)PACK_MAX_BYTES);
-    assert_true(body_rs <= (PACK_MAX_BYTES / PARITY_GROUP_DATA + 1u) * PARITY_GROUP_PAR);
-    uint64_t split = 0;
-    const uint64_t pieces = 1000;
-    for (uint64_t k = 0; k < pieces; k++)
-        split += (uint64_t)rs_parity_size((size_t)(PACK_MAX_BYTES / pieces));
-    assert_true(split <= (PACK_MAX_BYTES / PARITY_GROUP_DATA + pieces) * PARITY_GROUP_PAR);
+    uint64_t tab_rs  = (uint64_t)rs_parity_size((size_t)(8u * (uint64_t)PACK_MAX_ENTRIES));
+    assert_true(PACK_TRAILER_MAX_BYTES ==
+                body_rs + 8u * (uint64_t)PACK_MAX_ENTRIES + tab_rs + 2u * PACK_TAIL_BYTES);
 
-    /* And the whole worst case fits the footer's trailer_size. */
+    /* And the whole worst case fits the tail's trailer_size. */
     assert_true(PACK_TRAILER_MAX_BYTES <= (uint64_t)UINT32_MAX);
     assert_true(PACK_MAX_FILE_BYTES == PACK_MAX_BYTES + PACK_TRAILER_MAX_BYTES);
     assert_true(PACK_MAX_BYTES >= PACK_MAX_MULTI_BYTES + 51u + OBJECT_MAX_STORED_BYTES);
@@ -603,7 +589,7 @@ int main(void)
         /* Footer struct */
         cmocka_unit_test(test_record_naming_a_column_past_the_data),
         cmocka_unit_test(test_short_buffer_repair_still_works),
-        cmocka_unit_test(test_parity_footer_size),
+        cmocka_unit_test(test_parity_record_size),
         cmocka_unit_test(test_format_bounds_fit_the_trailer_fields),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

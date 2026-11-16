@@ -16,6 +16,8 @@ _Thread_local int fault_fread_at   = -1;
 _Thread_local int fault_fwrite_at  = -1;
 _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
+_Thread_local int fault_pread_at   = -1;
+_Thread_local int fault_pwrite_at  = -1;
 _Thread_local size_t fault_malloc_peak = 0;
 _Thread_local long long fault_fwrite_bytes_left = -1;
 _Thread_local long long fault_fwrite_bytes_seen = 0;
@@ -46,6 +48,20 @@ void *__wrap_realloc(void *ptr, size_t size) {
     if (fault_malloc_at == 0) { fault_malloc_at = -1; errno = ENOMEM; return NULL; }
     fault_malloc_at--;
     return __real_realloc(ptr, size);
+}
+
+ssize_t __wrap_pread(int fd, void *buf, size_t n, off_t off) {
+    if (fault_pread_at < 0) return __real_pread(fd, buf, n, off);
+    if (fault_pread_at == 0) { fault_pread_at = -1; errno = EIO; return -1; }
+    fault_pread_at--;
+    return __real_pread(fd, buf, n, off);
+}
+
+ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
+    if (fault_pwrite_at < 0) return __real_pwrite(fd, buf, n, off);
+    if (fault_pwrite_at == 0) { fault_pwrite_at = -1; errno = EIO; return -1; }
+    fault_pwrite_at--;
+    return __real_pwrite(fd, buf, n, off);
 }
 
 size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {

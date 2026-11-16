@@ -36,19 +36,21 @@ trailer:
   stripe parity      ceil(body_len / 15,296) groups x 1,024 B
                      group g protects body bytes [g * 15,296, (g+1) * 15,296),
                      the last group shorter; RS(255,239), 64 codewords deep
-  crc table          count x u32: CRC-32C of each entry's header and payload,
-                     in entry order (indexed by entry_index)
+  crc table          count x 8 B, in entry order (indexed by entry_index):
+                     CRC-32C of the entry's header and payload u32 |
+                     CRC-32C of its 51-byte header alone u32
   table parity       RS over the crc table, the same group geometry
   tail (32 B), twice: magic "PKT7" | version 1 | body_len u64 | count u32 |
                      trailer_size u32 | reserved u32 | crc32c u32 of the 28
                      bytes before it
 ```
 
-- **Overhead** is the RS rate over the body, plus 4 bytes an entry for the
+- **Overhead** is the RS rate over the body, plus 8 bytes an entry for the
   CRC table and its own 6.7%, plus at most one short group and 64 bytes of
-  tails per pack. Projected for the three shapes above: 0.0709 (1.06x the
-  rate), 0.0670 and 0.0669. A 1 KiB entry now costs about 76 bytes of
-  parity instead of 1,304.
+  tails per pack. Measured for the three shapes above: 0.0746 (1.12x the
+  rate), 0.0670 and 0.0670. A 1 KiB entry now costs about 80 bytes of
+  parity instead of 1,304. Four of those bytes are the header CRC, added
+  for B119 (below); without it the small-file figure was 0.0709.
 - **The entry header is ordinary body.** The 260-byte header record per
   entry is gone; a damaged header is corrected by the stripe like any other
   byte, before anything in it is trusted.
@@ -60,12 +62,13 @@ trailer:
   codewords they belong to, so damage there is corrected (or counted) like
   data damage. The CRC table has its own RS parity. The tail, the only
   fixed-position structure, is written twice with a CRC each; a reader takes
-  the last copy that verifies and cross-checks body_len and count against
-  the pack header and the trailer size. The pack header itself is body.
+  the last copy that verifies and checks body_len, count and trailer_size
+  against the file size. The pack header itself is body.
 - **Bounds.** body_len is at most `PACK_MAX_BYTES` and count at most
-  `PACK_MAX_ENTRIES`, so the trailer is at most 18.2 MiB of stripe parity,
-  3.8 MiB of CRC table and its parity: about 23 MB against the 4 GiB of the
-  32-bit trailer_size field. The static assertion in `pack.h` follows.
+  `PACK_MAX_ENTRIES`, so the trailer is at most 19,094,528 bytes of stripe
+  parity, 8,000,000 of CRC table, 536,576 of table parity and 64 of tails:
+  27,631,168 bytes against the 4 GiB of the 32-bit trailer_size field. The
+  static assertion in `pack.h` follows.
 
 ## Writing
 
@@ -74,7 +77,7 @@ gc's rewrite and coalescing) appends header and payload and nothing else.
 Sealing reads the body back sequentially a window of groups at a time (64
 groups, 979 KiB, and its 64 KiB of parity), computes each group's RS parity
 and each entry's CRC in the same pass, and writes the trailer. Memory is the
-window plus the CRC table (4 bytes an entry, 3.8 MiB at the entry bound),
+window plus the CRC table (8 bytes an entry, 7.6 MiB at the entry bound),
 whatever the pack's size. The body was just written, so the read normally
 comes from the page cache.
 
@@ -89,13 +92,46 @@ A reader holds an entry's index location (offset, entry index, stored size):
    bytes that fall inside the entry. CRC again.
 3. Still unequal: decode the CRC table's own group for this entry and check
    against the corrected table value (a damaged table entry, not damaged
-   data).
+   data). If the slot is beyond the table's parity but every codeword under
+   the entry decoded clean, the entry is taken as intact: the stripe is the
+   stronger witness, and a lost CRC must not lose the entry.
 4. Still unequal: damage beyond parity. The reader refuses the entry
    (stored reads report it damaged, OWN-31), naming the object.
 
 Repair (`pack_object_repair`, verify with repair on) does the same and then
 writes back only the entry's own corrected bytes, and only once they match
 the CRC, so a miscorrection elsewhere in a shared group is never written.
+While the pack is open it also rewrites the entry's CRC slot, a tail copy
+that failed and a pack header that was wrong, each from what verified.
+
+## Headers are never a single point of failure (B119)
+
+On format 2, two damaged bytes in a loose object's header lost the object,
+though its payload and parity were intact: the 260-byte header record
+corrected one column. Version 6's pack entries had the same record. In
+version 7 every header is covered by redundancy that corrects multi-byte
+damage or derives the header outright:
+
+| Header | Redundancy | Who uses it |
+|--------|------------|-------------|
+| Entry header (51 B) | stripe data, 8 bytes per codeword per group; its own CRC in the table | every reader corrects it with the entry; `object_get_info` and `object_physical_size` correct it alone when it is not what the index expects; a walk (gc, coalescing, reindex, the built-in index) checks every header against its header CRC and corrects it from the stripe |
+| Pack header (12 B) | stripe data; derivable from a verified tail (constant magic and version, the tail's count) | the walk, gc and coalescing planning |
+| Tail (32 B) | written twice with a CRC each; with both gone, derived: count from the pack header, body_len from a walk of the entries, the file size as the check | every reader locating the trailer |
+| CRC table | its own RS parity; a slot lost beyond it does not lose an entry whose codewords decode clean | entry checks |
+
+The walk was the real exposure. Every entry offset after a header depends
+on that header's size field, and gc and coalescing decide liveness by the
+name in it, so before the header CRC a damaged name made gc drop a live
+object as dead and a damaged size sent the rest of the walk astray. The
+header CRC is why the table slot is 8 bytes, not 4: it lets a walk check
+each header from the table alone, reading no payload and no parity on a
+clean pack. A pack whose headers cannot be restored is not rewritten by gc
+or coalescing (it is left whole and logged; verify names its objects),
+rather than rewritten on a guess.
+
+`tests/test_pack_stripe.c` damages 2, 4 and 16 bytes of an entry header, of
+the pack header and of the tail (one copy, then both), and checks that
+every reader, the walk and repair restore the file byte for byte.
 
 ## Repair granularity: what changes for an operator
 
@@ -119,5 +155,13 @@ more than two groups beyond the entry.
 
 ## Measured
 
-See the table in `PERF.md` ("OWN-44: striped pack parity") for the figures
-after the change, from the same test.
+The same test on pack version 7 (`tests/test_pack_parity_ratio.c`, which
+now asserts these ratios):
+
+| Shape | Objects | Data | Parity | Parity / data | x RS rate |
+|-------|--------:|-----:|-------:|--------------:|----------:|
+| small files, 100 B to 2 KiB | 12,000 | 13,482,498 | 1,006,400 | 0.0746 | 1.12 |
+| mixed tree | 1,000 | 152,692,883 | 10,231,680 | 0.0670 | 1.00 |
+| chunks | 64 | 98,395,232 | 6,588,992 | 0.0670 | 1.00 |
+
+`PERF.md` ("Striped pack parity (OWN-44)") has these with the seal's cost.

@@ -6,6 +6,46 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Striped pack parity (OWN-44)
+
+Pack version 7 stripes Reed-Solomon over each pack body as one stream, with
+an 8-byte CRC slot per entry, instead of giving every entry its own parity
+rounded up to whole groups and a 260-byte header record
+(`docs/pack-parity.md`). Parity against data, from
+`tests/test_pack_parity_ratio.c` (random content; "data" is the pack body):
+
+| Shape | Objects | v6 parity / data | v7 parity / data | v7 x RS rate |
+|---|---:|---:|---:|---:|
+| small files, 100 B to 2 KiB | 12,000 | 1.1606 | **0.0746** | 1.12 |
+| mixed tree, 64 B to 1 MiB, 1% 4 MiB | 1,000 | 0.0734 | **0.0670** | 1.00 |
+| chunks, 512 KiB to 8 MiB | 64 | 0.0674 | **0.0670** | 1.00 |
+
+Four of the small-file case's eight bytes an entry are the header CRC that
+lets a walk check every entry header without reading payload (B119); with
+a 4-byte slot it was 0.0709.
+
+`bench_phases -n 20000 -l 3 -t 0 -m 16` (20,000 small files averaging 4 KiB
+plus three 16 MiB files) on btrfs over LVM on NVMe, base = origin/v3
+015fee8, alternating, two rounds:
+
+| Build | First backup | Written | Parity | Incremental | Restore |
+|---|---|---:|---:|---|---|
+| v6 | 2.237 s, 2.140 s | 130.1 MiB | 28.3 MiB | 0.959 s, 0.913 s | 2.587 s, 2.430 s |
+| v7 | 2.122 s, 2.089 s | 108.8 MiB | 7.0 MiB | 0.986 s, 0.942 s | 2.532 s, 2.479 s |
+
+Writing 75% less parity makes the small-file first backup a little faster,
+not slower, although the seal now reads each pack back to compute it.
+Incremental and restore are unchanged within noise: a clean read touches no
+parity in either version.
+
+Large incompressible files (`-n 0 -l 24 -t 0 -m 16 -R`, 384 MiB, two rounds):
+v6 0.630 s and 0.633 s, v7 0.651 s and 0.659 s, both writing 25.7 MiB of
+parity. The 3-4% is the seal: v6 computed each entry's parity on the pack
+writer's worker threads as it went, v7 encodes the whole body at the seal,
+on one thread, from the page cache. Moving the stripe encode back onto the
+workers (each window of groups is independent) would recover it if it ever
+matters; at 600 MiB/s of backup it does not today.
+
 ## 2026-11-15 - Restore renames verified files in synced batches (OWN-36)
 
 Restore now writes each file to a temporary file and renames it into place

@@ -6,15 +6,16 @@
  * the readers a restore actually uses. They start from a location the
  * daemon supplied - a pack number, a byte offset and an entry index, all of
  * them rows in a database that is a derived index and can therefore be
- * wrong - and from there they read an entry header, locate that entry's
- * block in the parity trailer, check a CRC, run Reed-Solomon repair,
- * decrypt, and decompress. Every step derives an offset or a length from
- * bytes the step before it has not verified, and the hash that would catch
- * any of it being wrong is checked last.
+ * wrong - and from there they locate the trailer from its tails (or derive
+ * it from the body), read the entry, check its CRC against the table, run
+ * Reed-Solomon over the stripe groups it overlaps, decrypt, and decompress.
+ * Every step derives an offset or a length from bytes the step before it
+ * has not verified, and the hash that would catch any of it being wrong is
+ * checked last.
  *
- * The trailer arithmetic is the sharp edge. A block's size is the distance
- * to the next entry's parity offset, which is a subtraction of two unsigned
- * values read straight out of the file.
+ * The trailer arithmetic is the sharp edge: the tail's body length and
+ * count place every other part of it, and the derivation walks entry
+ * sizes read straight out of the file.
  *
  * Input layout: dat_offset(4 LE) + entry_index(4 LE) + the .dat file.
  * The two control words are what the resolver hands back, so the fuzzer

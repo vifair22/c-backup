@@ -3,9 +3,9 @@
 /*
  * Verify: prove the repository still holds what it claims to.
  *
- * Every object carries a parity trailer (XOR over the header, CRC32C plus
- * Reed-Solomon over the payload) and the load path already uses it to correct
- * damage. But it corrects in memory, only for objects something happens to
+ * Every object sits in a pack under Reed-Solomon parity striped over the
+ * pack's body, with a CRC per entry, and the load path already uses it to
+ * correct damage. But it corrects in memory, only for objects something happens to
  * read, and never writes the correction back. Rot in a pack nobody has touched
  * since it was written is invisible, and stays invisible until a restore needs
  * it. This is the operation that goes looking.

@@ -177,7 +177,7 @@ static void test_load_fread_fail(void **state)
     (void)state;
     for (int n = 0; n < 10; n++) {
         fault_reset_all();
-        fault_fread_at = n;
+        fault_pread_at = n;
         void *data = NULL;
         size_t len = 0;
         status_t st = pack_object_load(store, hashes[0], &data, &len, NULL);
@@ -190,14 +190,15 @@ static void test_load_fread_fail(void **state)
     assert_all_readable();
 }
 
-/* The stored-form reader (replication's) under the same faults. */
+/* The stored-form reader (replication's) under read faults. It reads by
+ * offset (pread), as every pack reader now does. */
 static void test_read_stored_fread_fail(void **state)
 {
     (void)state;
     int failed = 0;
     for (int n = 0; n < 10; n++) {
         fault_reset_all();
-        fault_fread_at = n;
+        fault_pread_at = n;
         void *payload = NULL;
         size_t len = 0;
         status_t st = pack_object_read_stored(store, hashes[0], NULL, NULL, NULL, NULL,
@@ -288,6 +289,48 @@ static void test_pack_finalize_fsync_fail(void **state)
     assert_int_equal(fill_store(), OK);
     assert_int_equal(object_store_flush(store), OK);
     assert_all_readable();
+}
+
+/*
+ * The seal reads the body back (pread) and writes the trailer (pwrite).
+ * Either failing must discard the staged pack whole, exactly like a failed
+ * fwrite of an entry: nothing installed, nothing announced, nothing left in
+ * tmp/. Every call position is tried until the seal gets past its last.
+ */
+static void seal_fault_case(int is_write)
+{
+    int found = 0;
+    for (int n = 0; n < 40; n++) {
+        assert_int_equal(fill_store(), OK);
+        fault_reset_all();
+        if (is_write) fault_pwrite_at = n;
+        else          fault_pread_at = n;
+        status_t st = object_store_flush(store);
+        fault_reset_all();
+        if (st == OK) break;   /* past the seal's last call */
+        found = 1;
+        err_clear();
+        assert_true(tmp_is_empty());
+        assert_int_equal((int)fake_index_count(), 0);
+    }
+    assert_true(found);
+
+    fault_reset_all();
+    assert_int_equal(fill_store(), OK);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_all_readable();
+}
+
+static void test_pack_seal_pread_fail(void **state)
+{
+    (void)state;
+    seal_fault_case(0);
+}
+
+static void test_pack_seal_pwrite_fail(void **state)
+{
+    (void)state;
+    seal_fault_case(1);
 }
 
 /*
@@ -390,6 +433,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_load_fread_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_read_stored_fread_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_write_fwrite_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_seal_pread_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_seal_pwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_backwards_parity_offsets_do_not_allocate, setup_packed, teardown),

@@ -4,10 +4,10 @@
  * Packed object parity, for both payload codecs, and the bounds every pack
  * reader enforces.
  *
- * Objects inside a pack are protected by the pack's parity trailer: a XOR
- * record over each entry header and Reed-Solomon parity over each payload,
+ * Objects inside a pack are protected by the pack's parity trailer:
+ * Reed-Solomon striped over the whole body, and a table of entry CRCs
  * indexed by the entry's position in the pack. That indexing is the fragile
- * part - a wrong entry index reads the wrong parity and silently disables
+ * part - a wrong entry index checks the wrong CRC and silently disables
  * repair - so each codec is exercised through both the decoding reader
  * (object_load) and the stored-form reader (object_read_stored).
  *
@@ -46,6 +46,8 @@
 #define LARGE_SIZE (6u * 1024u * 1024u)
 
 static store_t *store;
+
+static void strip_parity(void);
 
 static void cleanup(void)
 {
@@ -286,7 +288,7 @@ static void test_payload_corruption_repaired_on_stored_read(void **state)
 /*
  * Entry-header damage is the case with the worst failure mode: a corrupted
  * compressed_size would make the reader consume the wrong number of bytes and
- * walk into the next entry. The XOR record has to catch it.
+ * walk into the next entry. The stripe has to catch it.
  */
 static void test_entry_header_corruption_is_repaired(void **state)
 {
@@ -345,10 +347,11 @@ static void test_large_entry_reads_clean(void **state)
 }
 
 /*
- * Correction is done a parity window at a time, so the memory it takes is
- * fixed by the window rather than the entry. A four-group window over an
- * incompressible multi-MiB entry puts the damage many windows in, which is
- * where an off-by-one in the window's group offset would show.
+ * Sealing computes the stripe a window of groups at a time, so its memory
+ * is fixed by the window rather than the pack. A four-group window over an
+ * incompressible multi-MiB entry seals it across many windows, and damage
+ * many windows in is where an off-by-one in a window's group offset would
+ * show: the read would correct against the wrong parity.
  */
 static void test_large_entry_corruption_is_repaired_across_windows(void **state)
 {
@@ -358,9 +361,9 @@ static void test_large_entry_corruption_is_repaired_across_windows(void **state)
     fill_random(data, LARGE_SIZE, 0x0D15EA5Eu);
 
     uint8_t hash[OBJECT_HASH_SIZE];
+    pack_test_set_parity_window(4);
     pack_one(data, LARGE_SIZE, hash);
 
-    pack_test_set_parity_window(4);
     uint64_t pay = entry_offset(hash) + sizeof(pack_dat_entry_hdr_t);
     flip_pack_byte((off_t)(pay + 128));
     flip_pack_byte((off_t)(pay + 5u * 1024u * 1024u + 77u));
@@ -370,7 +373,7 @@ static void test_large_entry_corruption_is_repaired_across_windows(void **state)
     assert_true(parity_stats_get().repaired > 0);
     assert_int_equal((int)parity_stats_get().uncorrectable, 0);
 
-    /* And repair writes it back through the same small window. */
+    /* And repair writes it back, a group at a time. */
     assert_true(pack_object_repair(store, hash) > 0);
     assert_int_equal(pack_object_repair(store, hash), 0);
     parity_stats_reset();
@@ -470,11 +473,17 @@ static void test_absurd_entry_count_is_refused(void **state)
 
     pack_cache_invalidate(store);
 
-    /* Must refuse rather than start walking. If this regresses the suite
-     * does not fail, it hangs - which is itself the signal. */
+    /* With parity the count disagrees with the tail, and the header is
+     * restored from it (B119). */
     uint32_t version = 0, count = 0;
     char name[64];
     snprintf(name, sizeof(name), "%s", strrchr(path, '/') + 1);
+    assert_int_equal(pack_enumerate_dat(store, name, &version, &count, NULL, NULL), OK);
+    assert_int_equal(count, 1);
+
+    /* Without it, must refuse rather than start walking. If this regresses
+     * the suite does not fail, it hangs - which is itself the signal. */
+    strip_parity();
     assert_int_not_equal(pack_enumerate_dat(store, name, &version, &count, NULL, NULL), OK);
 }
 
@@ -518,6 +527,7 @@ static void test_entry_header_beyond_file_is_refused(void **state)
     assert_int_equal(pwrite(fd, &eh, sizeof(eh), (off_t)off), (ssize_t)sizeof(eh));
     close(fd);
     pack_cache_invalidate(store);
+    strip_parity();   /* with parity, both fields would be put back */
 
     void  *out = NULL;
     size_t got = 0;
@@ -761,15 +771,15 @@ static struct rlimit cap_address_space(uint64_t headroom)
  *
  * Two forgeries, each in a pack long enough to hold what it claims so the
  * file-size check cannot be what stops it: a raw entry whose stored bytes
- * are a GiB, and an LZ4 entry of 64 stored bytes claiming a GiB of
- * plaintext - the decompression bomb. The address space is capped below a
- * GiB of headroom while they are read, so a reader that sized a buffer from
+ * are 256 MiB, and an LZ4 entry of 64 stored bytes claiming 256 MiB of
+ * plaintext - the decompression bomb. The address space is capped to 128
+ * MiB of headroom while they are read, so a reader that sized a buffer from
  * either header fails with ERR_NOMEM; the bound makes it ERR_CORRUPT.
  */
 static void test_entry_past_object_bound_is_refused_on_read(void **state)
 {
     (void)state;
-    const uint64_t claim = (uint64_t)1 << 30;
+    const uint64_t claim = (uint64_t)256 << 20;   /* inside the pack bound */
     static const uint8_t lz4_bytes[64] = { 0x1f };
 
     raw_entry_t ents[2];
@@ -803,7 +813,7 @@ static void test_entry_past_object_bound_is_refused_on_read(void **state)
         assert_int_equal(pack_resolve_location(store, ents[i].hdr.hash, &pnum, &off), OK);
     }
 
-    struct rlimit old = cap_address_space((uint64_t)512 * 1024 * 1024);
+    struct rlimit old = cap_address_space((uint64_t)128 * 1024 * 1024);
     status_t got[2][3];
     void *outs[2] = { NULL, NULL };
     for (size_t i = 0; i < 2; i++) {
@@ -866,13 +876,30 @@ static void set_pack_byte(off_t off, uint8_t v)
     pack_cache_invalidate(store);
 }
 
+/* Take the pack's parity away: both tails broken, and a byte appended so
+ * the trailer cannot be derived from the body either. */
+static void strip_parity(void)
+{
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    off_t end = lseek(fd, 0, SEEK_END);
+    uint8_t z = 0;
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)PACK_TAIL_BYTES), 1);
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)(2 * PACK_TAIL_BYTES)), 1);
+    assert_int_equal(ftruncate(fd, end + 1), 0);
+    close(fd);
+    pack_cache_invalidate(store);
+}
+
 #define UNKNOWN_TYPE_MSG \
     "object type 9 is not known to this build; written by a newer c-backup?"
 
 /*
  * A pack entry of a type this build does not know is refused by name, by
- * every reader, rather than handed to restore as file bytes. The footer is
- * broken too so the entry has no parity: with parity, header repair would
+ * every reader, rather than handed to restore as file bytes. The parity is
+ * taken away too: with parity, repair would
  * (rightly) put the original type back, which is the next test.
  */
 static void test_unknown_entry_type_is_refused(void **state)
@@ -884,7 +911,7 @@ static void test_unknown_entry_type_is_refused(void **state)
     pack_one(data, sizeof(data), hash);
 
     set_pack_byte((off_t)(entry_offset(hash) + offsetof(pack_dat_entry_hdr_t, type)), 9);
-    set_pack_byte(-(off_t)sizeof(parity_footer_t), 0);   /* footer magic */
+    strip_parity();
 
     void *out = NULL;
     size_t len = 0;
@@ -906,7 +933,7 @@ static void test_unknown_entry_type_is_refused(void **state)
 }
 
 /* One flipped bit that lands the type outside the known set is damage, and the entry
- * header parity still repairs it on both reads. */
+ * parity still repairs it on both reads. */
 static void test_damaged_entry_type_byte_is_repaired(void **state)
 {
     (void)state;
@@ -937,7 +964,7 @@ static void test_damaged_entry_type_byte_is_repaired(void **state)
 
 /* A flipped bit in a size or codec field makes the header nonsense on its
  * face (past the bound, an unknown codec, sizes inconsistent with the
- * codec); header parity runs before any of that is judged, so the entry is
+ * codec); parity runs before any of that is judged, so the entry is
  * repaired on read rather than refused. */
 static void test_damaged_size_and_codec_fields_are_repaired_on_read(void **state)
 {

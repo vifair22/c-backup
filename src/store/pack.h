@@ -31,8 +31,13 @@
  * cover the type byte, entries are bounded and encrypted entries carry
  * type || name as associated data, so a version 5 pack copied in by hand
  * would fail every name check. Refusing it at its header says why.
+ *
+ * 7 replaces per-entry parity with striped parity over the whole body
+ * (docs/pack-parity.md): one stream of RS groups, a CRC per entry and a
+ * doubled tail. Per-entry parity rounded every entry up to a whole group,
+ * which cost 17x the RS rate on a tree of small files.
  */
-#define PACK_VERSION     6u
+#define PACK_VERSION     7u
 
 /*
  * Where pack n lives: packs/<shard>/pack-<n>.dat, the shard being n >> 8 so
@@ -59,14 +64,10 @@
 /*
  * Entries per pack, at most. Every writer rolls over on it as well as on
  * bytes (the *_full predicates), and every reader refuses a pack claiming
- * more, so no writer can produce a pack its own reader refuses.
- *
- * Chosen for the trailer, not the body: each entry costs 280 fixed trailer
- * bytes plus up to one parity group of rounding (1,024 bytes) whatever its
- * size, so a pack of a million one-byte entries has a 1.3 GB trailer. The
- * assertion below holds it under the trailer's 32-bit size field. A million
- * entries at the seal is a 268-byte mean entry; real packs roll over on
- * bytes long before.
+ * more, so no writer can produce a pack its own reader refuses. Each entry
+ * costs eight trailer bytes (its CRCs) plus their share of table parity;
+ * a million entries at the seal is a 268-byte mean entry, and real packs
+ * roll over on bytes long before.
  */
 #define PACK_MAX_ENTRIES 1000000u
 
@@ -81,35 +82,42 @@
  */
 #define PACK_MAX_BYTES (PACK_MAX_MULTI_BYTES + PACK_ENTRY_MAX_BYTES)
 
+/* The tail that locates the trailer, written twice at the end of the file. */
+#define PACK_TAIL_BYTES 32u
+
+/* One entry's slot in the crc table: the CRC-32C of the whole entry, then
+ * of its header alone, so a walk can check each header without reading
+ * the payload behind it. */
+#define PACK_CRC_SLOT_BYTES 8u
+
+#define PACK_PARITY_GROUPS(n) \
+    (((uint64_t)(n) + PARITY_GROUP_DATA - 1u) / PARITY_GROUP_DATA)
+
 /*
- * The largest parity trailer such a body can carry, every term at its worst:
+ * The largest parity trailer such a body can carry:
  *
- *   4                         file header CRC
- *   + n * (260 + 4 + 4 + 4)   per entry: header parity, CRC, two size words
- *   + n * 8                   the offsets table
- *   + 4 + 12                  entry count and footer
- *   + RS parity               ceil(C_i / 15,296) * 1,024 per entry, at most
- *                             (body / 15,296 + n) * 1,024 in total
+ *   stripe parity   ceil(body / 15,296) * 1,024
+ *   crc table       8 * n
+ *   table parity    ceil(8n / 15,296) * 1,024
+ *   tail            2 * 32
  */
-#define PACK_TRAILER_MAX_BYTES                                                    \
-    ((uint64_t)4 + (uint64_t)PACK_MAX_ENTRIES * (260u + 12u + 8u) + 16u +         \
-     (PACK_MAX_BYTES / PARITY_GROUP_DATA + 1u + (uint64_t)PACK_MAX_ENTRIES) *    \
-         PARITY_GROUP_PAR)
+#define PACK_TRAILER_MAX_BYTES                                                \
+    (PACK_PARITY_GROUPS(PACK_MAX_BYTES) * PARITY_GROUP_PAR +                  \
+     (uint64_t)PACK_CRC_SLOT_BYTES * PACK_MAX_ENTRIES +                       \
+     PACK_PARITY_GROUPS((uint64_t)PACK_CRC_SLOT_BYTES * PACK_MAX_ENTRIES) *   \
+         PARITY_GROUP_PAR +                                                   \
+     2u * PACK_TAIL_BYTES)
 
 /* The largest pack file there can be. A reader refuses anything larger. */
 #define PACK_MAX_FILE_BYTES (PACK_MAX_BYTES + PACK_TRAILER_MAX_BYTES)
 
 /*
- * Format 3 keeps the trailer's sizes 32-bit (the footer's trailer_size and
- * each block's size word) and makes wrapping impossible instead: no pack a
- * writer can produce has a trailer, or a parity block, past UINT32_MAX. If
- * a constant above moves, this decides whether the format still holds.
+ * The tail's trailer_size is 32-bit, and wrapping is made impossible rather
+ * than handled: no pack a writer can produce has a trailer past UINT32_MAX.
+ * If a constant above moves, this decides whether the format still holds.
  */
 _Static_assert(PACK_TRAILER_MAX_BYTES <= (uint64_t)UINT32_MAX,
                "a maximal pack's parity trailer must fit its 32-bit size field");
-_Static_assert(OBJECT_MAX_STORED_BYTES / PARITY_GROUP_DATA * PARITY_GROUP_PAR +
-               PARITY_GROUP_PAR + 272u <= (uint64_t)UINT32_MAX,
-               "a maximal entry's parity block must fit its 32-bit size word");
 
 /* --- used by object.c -------------------------------------------- */
 
@@ -283,9 +291,10 @@ status_t pack_resolve_location(store_t *store,
                                uint64_t *out_dat_offset);
 
 /*
- * Attempt to repair a packed object's entry in-place via pwrite(), at any
- * entry size and codec, in memory bounded by the parity window. Writes only
- * once the corrected payload matches the trailer's CRC.
+ * Attempt to repair a packed object's entry in place via pwrite(), from the
+ * pack's striped parity, one group at a time. Writes only the entry's own
+ * bytes (and its CRC slot, when that was the damage), and only once they
+ * match the entry's CRC.
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error or
  * damage beyond parity.
  */
@@ -293,9 +302,8 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /*
  * Test hook: how many RS groups (15,296 data bytes, 1,024 parity bytes each)
- * a packed-entry reader or repair holds at once. 0 restores the default of
- * 1,096 groups (16 MiB of data). Lowering it lets a test push an entry of a
- * few MiB through many windows and measure that memory stays bounded.
+ * sealing a pack reads back and encodes at once. 0 restores the default of
+ * 64 groups. Lowering it lets a test push a small pack through many windows.
  */
 void pack_test_set_parity_window(size_t groups);
 

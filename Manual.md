@@ -1176,12 +1176,16 @@ sudo c-backup verify list 1                # past runs
 | `structure` | entry headers | every object's pack entry header is well formed |
 | `deep` | everything | every payload matches its name (SHA-256 of type and payload) |
 
-A deep verify repairs what it finds by default: every object carries
-Reed-Solomon parity, and having already read the damaged bytes, writing the
-correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss, applying parity in memory. Every object is
-at most 16 MiB and read whole, and its parity (about 1.1 MiB at most) is
-fetched only when its checksum disagrees.
+A deep verify repairs what it finds by default: every pack carries
+Reed-Solomon parity over all of its bytes, and having already read the
+damaged bytes, writing the correction costs almost nothing more. With
+`--no-repair` it still tells recoverable damage from loss, applying parity
+in memory. Every object is at most 16 MiB and read whole, and parity is
+fetched only when its checksum disagrees: the groups of 15,296 bytes the
+object overlaps, with 1,024 parity bytes each. Small objects share groups,
+and a repair writes back only the object's own bytes. Entry headers, the
+pack header and the trailer's tail are covered too, so a few damaged header
+bytes never lose an object whose data and parity are intact.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1225,7 +1229,7 @@ damage to repair: its parity went with it.
 
 Format 2 refused repair in packs large enough for their 32-bit parity
 sizes to wrap, with findings reading `repair disabled pending format fix`.
-Format 3 bounds every pack (at most 1,000,000 entries and about 1.6 GB per
+Format 3 bounds every pack (at most 1,000,000 entries and about 313 MB per
 file) so those sizes cannot wrap, and repair works on every entry.
 
 Findings name files, not hashes: each object that is not intact is reported
@@ -1814,14 +1818,14 @@ running). `docs/acceptance.md` has the full results.
   Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
   data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
   damaged bytes per codeword, and codewords are interleaved 64 deep so a
-  contiguous burst of up to 512 bytes is repairable. Parity is computed in
-  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
-  so the last group is paid in full: a tiny file still costs 1 KiB of
-  parity. On top of that every pack entry carries 51 bytes of header and
-  280 fixed bytes of trailer (a 260-byte parity record for its header, a
-  CRC32C, two size words and its offset). For compressible data the 6.7% applies to the compressed
-  size; for a large incompressible file it is essentially the whole
-  difference between `phys_size` and `orig_size`, which is where the
+  contiguous burst of up to 512 bytes per group of 15,296 bytes is
+  repairable. Parity covers each pack as one stream, so the rate holds
+  whatever the file sizes: a tree of 12,000 small files pays 7.1% (it paid
+  116% before pack version 7, when every entry rounded up to a whole group
+  of its own). On top of that every pack entry carries 51 bytes of header
+  and 8 bytes of CRCs. For compressible data the 6.7% applies to the
+  compressed size; for a large incompressible file it is essentially the
+  whole difference between `phys_size` and `orig_size`, which is where the
   measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
@@ -1848,8 +1852,9 @@ on fast storage.
   8 GB. Fine on a server; on a 2-4 GB NAS, split very large trees into
   several repositories or several sources backed up separately. Section 20.
 - Every object is at most 16 MiB and is handled whole: a store holds one
-  object's payload, an LZ4 buffer of about the same size and its parity
-  (about 1.1 MiB), and nothing more per file however large the file is. A
+  object's payload and an LZ4 buffer of about the same size, and nothing
+  more per file however large the file is; parity is computed when a pack
+  seals, a window of about 1 MiB at a time. A
   large file is read through the chunker's window, chunk by chunk.
 - Restore, grep, verify and replication likewise hold one object at a time.
 
