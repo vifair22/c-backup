@@ -945,18 +945,23 @@ Under option A every row of the second table becomes possible.
 | uid / gid | a fixed non-root uid, `cbackup` (990 by default, configurable). Not uid 0: a uid-0 process with every capability dropped still owns every root-owned file, so it passes owner checks on them (it can write root's 0600 files in any read-write mount and read them without `CAP_DAC_READ_SEARCH`), and in Unraid's Docker (no user-namespace remapping) container uid 0 is host uid 0 |
 | effective capabilities, normally | `CAP_DAC_READ_SEARCH` only: read any file and search any directory in its mounts. Enough for every backup |
 | permitted, raised only by restore threads | `CAP_DAC_OVERRIDE` (write into directories others own), `CAP_CHOWN` (restore owners), `CAP_FOWNER` (modes, times, xattrs and ACLs on files it does not own), `CAP_FSETID` (keep setuid/setgid across `chown`), `CAP_MKNOD` (device nodes, an LXC rootfs's `/dev`) |
-| everything else | not in the bounding set: no `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_NET_ADMIN`, and no `CAP_SETUID` after start |
+| at startup only | `CAP_SETUID`, `CAP_SETGID` and `CAP_SETPCAP`: the container must add them, because the daemon performs its own drop (SETPCAP to empty the bounding set of everything but the six, SETGID for `setgroups`/`setresgid`, SETUID for `setresuid`). All three are out of every set once the uid change is done |
+| everything else | not in the bounding set: no `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_NET_ADMIN`, and no `CAP_SETUID`, `CAP_SETGID` or `CAP_SETPCAP` after start |
 | namespaces | its own pid and network namespaces (a published TCP port for the API); no `--pid=host`, no `--privileged` |
 | devices and sockets | none: no `/dev/zfs`, no Docker socket, no libvirt socket; only the helper socket and the NBD/export socket directory |
 | mounts | sources read-only (`rslave`, for snapshot visibility); repository and state read-write, owned by 990; restore staging directories read-write (below) |
 
 How it gets there: Docker gives a non-root `--user` none of the capabilities
 added with `--cap-add` (it sets no ambient capabilities), so the container
-starts as root with `--cap-drop ALL` plus the six capabilities above, and
-c-backupd drops privilege itself before it opens anything:
-`prctl(PR_SET_KEEPCAPS)`, `setresgid`/`setresuid` to 990, `capset` to
-effective = `CAP_DAC_READ_SEARCH` and permitted = the six, then
-`PR_SET_NO_NEW_PRIVS`. The uid is the new config key
+starts as root with `--cap-drop ALL` plus the six capabilities above and
+`CAP_SETUID`, `CAP_SETGID` and `CAP_SETPCAP` (without which the drop
+cannot happen), and c-backupd drops privilege itself before it serves
+anything: every capability but the six out of the bounding set,
+`prctl(PR_SET_KEEPCAPS)`, `setgroups`, `setresgid`/`setresuid` to 990,
+`capset` to effective = `CAP_DAC_READ_SEARCH` and permitted = the six
+(SETUID, SETGID and SETPCAP gone), then `PR_SET_NO_NEW_PRIVS`. AppGuard has
+already opened the config and `state.db` by then, so the state volume is
+owned by 990. The uid is the new config key
 `security.run_as_uid` (default 0, meaning no drop, so existing
 deployments behave as today; the Docker image for workload backup sets
 990). Restore worker threads raise the five restore
