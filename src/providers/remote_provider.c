@@ -11,12 +11,14 @@
 #include <cutils/log.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define REMOTE_MAX 4
@@ -40,6 +42,39 @@ static atomic_long    g_req_id;
 
 const remote_hello_t *remote_last_hello(void) { return &g_hello; }
 
+/* The supervised link (remote_start). */
+static struct {
+    pthread_mutex_t    mu;
+    pthread_cond_t     cv;
+    pthread_t          th;
+    int                running, stop, wake;
+    char               daemon8[16];
+    remote_backoff_t   bo;
+    remote_link_info_t info;
+} g_link = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+/* The helper went away under a request: say so at once and wake the
+ * reconnect thread, rather than waiting for its next health check. */
+static void link_lost(const char *sock, const char *why)
+{
+    pthread_mutex_lock(&g_link.mu);
+    if (g_link.info.configured && strcmp(g_link.info.socket, sock) == 0) {
+        if (g_link.info.state == REMOTE_CONNECTED) {
+            /* Only the transition wakes the thread: while it is already
+             * retrying, its backoff decides when to try next. */
+            log_warn("helper: lost %s: %s", sock, why);
+            g_link.wake = 1;
+            pthread_cond_broadcast(&g_link.cv);
+        }
+        if (g_link.info.state != REMOTE_DISCONNECTED) {
+            g_link.info.state = REMOTE_DISCONNECTED;
+            g_link.info.since = time(NULL);
+        }
+        snprintf(g_link.info.last_error, sizeof(g_link.info.last_error), "%s", why);
+    }
+    pthread_mutex_unlock(&g_link.mu);
+}
+
 /* ------------------------------------------------------------------ */
 /* One call                                                            */
 /* ------------------------------------------------------------------ */
@@ -53,7 +88,8 @@ static status_t map_error(const char *code, const char *msg)
     return set_error(st, "helper: %s: %.400s", helper_err_name(e), msg ? msg : "");
 }
 
-static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, int *recv_fd)
+static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, int *recv_fd,
+                         int *transport)
 {
     long id = atomic_fetch_add(&g_req_id, 1) + 1;
     cJSON *o = cJSON_CreateObject();
@@ -67,12 +103,12 @@ static status_t exchange(int fd, const char *op, cJSON *args, cJSON **result, in
     if (!txt) return set_error(ERR_NOMEM, "helper: request");
     status_t st = helper_send(fd, txt, strlen(txt), -1);
     cJSON_free(txt);
-    if (st != OK) return st;
+    if (st != OK) { *transport = 1; return st; }
     char *buf = malloc(HELPER_PACKET_MAX + 2);
     if (!buf) return set_error(ERR_NOMEM, "helper: response");
     size_t got = 0;
     st = helper_recv(fd, buf, HELPER_PACKET_MAX + 2, &got, recv_fd);
-    if (st != OK) { free(buf); return st; }
+    if (st != OK) { *transport = st != ERR_TOO_LARGE; free(buf); return st; }
     cJSON *r = cJSON_ParseWithLength(buf, got);
     free(buf);
     const cJSON *rid = cJSON_GetObjectItemCaseSensitive(r, "id");
@@ -107,7 +143,8 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
-        status_t st = set_error_errno(ERR_IO, "helper: connect %s", sock);
+        status_t st = set_error_errno(ERR_IO, "helper at %s is unreachable: connect", sock);
+        link_lost(sock, err_msg());
         close(fd);
         cJSON_Delete(args);
         return st;
@@ -115,11 +152,19 @@ static status_t rcall(const char *sock, const char *op, cJSON *args, cJSON **res
     cJSON *hargs = cJSON_CreateObject();
     if (hargs) cJSON_AddNumberToObject(hargs, "client_version", HELPER_PROTO_VERSION);
     cJSON *hres = NULL;
-    status_t st = exchange(fd, "hello", hargs, &hres, NULL);
+    int transport = 0;
+    status_t st = exchange(fd, "hello", hargs, &hres, NULL, &transport);
     cJSON_Delete(hres);
-    if (st == OK) st = exchange(fd, op, args, result, NULL);
+    if (st == OK) st = exchange(fd, op, args, result, NULL, &transport);
     else cJSON_Delete(args);
     close(fd);
+    if (st != OK && transport) {
+        /* Not the helper refusing: the helper gone mid-request. */
+        char why[512];
+        snprintf(why, sizeof(why), "%.400s", err_msg());
+        link_lost(sock, why);
+        set_error(st, "helper at %s: %s", sock, why);
+    }
     return st;
 }
 
@@ -430,10 +475,11 @@ static status_t r_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_
 static sp_provider_ops_t g_ops[REMOTE_MAX];
 static char              g_names[REMOTE_MAX][SP_PROVIDER_MAX];
 
-status_t remote_attach(const char *socket_path, const char *daemon8, remote_hello_t *out)
+int remote_is_remote(const sp_provider_ops_t *ops) { return ops && ops->init == r_init; }
+
+/* One hello; enable any provider offered that is not enabled yet. */
+static status_t attach_once(const char *socket_path, const char *daemon8, remote_hello_t *out)
 {
-    if (!socket_path || !*socket_path || strlen(socket_path) >= 108)
-        return set_error(ERR_INVALID, "helper: socket path empty or too long");
     cJSON *a = cJSON_CreateObject();
     if (a) cJSON_AddNumberToObject(a, "client_version", HELPER_PROTO_VERSION);
     cJSON *res = NULL;
@@ -455,8 +501,13 @@ status_t remote_attach(const char *socket_path, const char *daemon8, remote_hell
             strcat(h.providers, p->valuestring);
         }
         if (sp_registry_enabled(p->valuestring)) {
-            log_warn("helper: provider %s is already enabled in-process; not attaching it", p->valuestring);
-            continue;
+            const sp_provider_ops_t *have = NULL;
+            sp_ctx_t *hc = NULL;
+            if (sp_registry_get(p->valuestring, &have, &hc) == OK && !remote_is_remote(have))
+                log_warn("helper: provider %s is already enabled in-process; not attaching it",
+                         p->valuestring);
+            err_clear();
+            continue;       /* already behind the helper: back in use as it is */
         }
         /* A slot whose provider is not enabled any more (the registry was
          * shut down and the helper attached again) is reused. */
@@ -482,9 +533,162 @@ status_t remote_attach(const char *socket_path, const char *daemon8, remote_hell
     }
     cJSON_Delete(res);
     if (st != OK) return st;
+    if (g_hello.policy[0] && strcmp(g_hello.policy, h.policy) != 0)
+        log_warn("helper: its policy changed (%.16s to %.16s) while this daemon ran",
+                 g_hello.policy, h.policy);
     g_hello = h;
     log_info("helper: %s, version %d, daemon %s, policy %.16s, providers %s", socket_path,
              h.version, h.daemon_id, h.policy, h.providers[0] ? h.providers : "none");
     if (out) *out = h;
     return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* The supervised link                                                 */
+/* ------------------------------------------------------------------ */
+
+static void link_set(remote_state_t s, const char *err, const remote_hello_t *h)
+{
+    pthread_mutex_lock(&g_link.mu);
+    if (g_link.info.state != s) {
+        if (s == REMOTE_CONNECTED && g_link.info.state == REMOTE_DISCONNECTED) g_link.info.reconnects++;
+        g_link.info.state = s;
+        g_link.info.since = time(NULL);
+    }
+    if (err) snprintf(g_link.info.last_error, sizeof(g_link.info.last_error), "%s", err);
+    if (h) g_link.info.hello = *h;
+    pthread_mutex_unlock(&g_link.mu);
+}
+
+/* Wait up to ms, or until woken or stopped. Caller holds mu. */
+static void link_wait(unsigned ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(ms / 1000);
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    while (!g_link.stop && !g_link.wake)
+        if (pthread_cond_timedwait(&g_link.cv, &g_link.mu, &ts) != 0) break;
+    g_link.wake = 0;
+}
+
+static void *link_main(void *arg)
+{
+    (void)arg;
+    unsigned delay = g_link.bo.initial_ms;
+    pthread_mutex_lock(&g_link.mu);
+    while (!g_link.stop) {
+        int connected = g_link.info.state == REMOTE_CONNECTED;
+        char sock[108], d8[16];
+        snprintf(sock, sizeof(sock), "%s", g_link.info.socket);
+        snprintf(d8, sizeof(d8), "%s", g_link.daemon8);
+        link_wait(connected ? g_link.bo.health_ms : delay);
+        if (g_link.stop) break;
+        pthread_mutex_unlock(&g_link.mu);
+        remote_hello_t h;
+        status_t st = attach_once(sock, d8, &h);
+        if (st == OK) {
+            int was = 0;
+            pthread_mutex_lock(&g_link.mu);
+            was = g_link.info.state;
+            pthread_mutex_unlock(&g_link.mu);
+            if (was != REMOTE_CONNECTED) log_info("helper: connected to %s", sock);
+            link_set(REMOTE_CONNECTED, NULL, &h);
+            delay = g_link.bo.initial_ms;
+        } else {
+            char why[256];
+            snprintf(why, sizeof(why), "%.250s", err_msg());
+            err_clear();
+            link_set(REMOTE_DISCONNECTED, why, NULL);
+            /* Bounded backoff while it stays away. */
+            delay = delay * 2 > g_link.bo.max_ms ? g_link.bo.max_ms : delay * 2;
+        }
+        pthread_mutex_lock(&g_link.mu);
+    }
+    pthread_mutex_unlock(&g_link.mu);
+    return NULL;
+}
+
+status_t remote_start(const char *socket_path, const char *daemon8, const remote_backoff_t *bo)
+{
+    if (!socket_path || !*socket_path || strlen(socket_path) >= 108)
+        return set_error(ERR_INVALID, "helper: socket path empty or too long");
+    remote_stop();
+    pthread_mutex_lock(&g_link.mu);
+    memset(&g_link.info, 0, sizeof(g_link.info));
+    g_link.info.configured = 1;
+    snprintf(g_link.info.socket, sizeof(g_link.info.socket), "%s", socket_path);
+    g_link.info.state = REMOTE_NEVER;
+    g_link.info.since = time(NULL);
+    snprintf(g_link.daemon8, sizeof(g_link.daemon8), "%s", daemon8 ? daemon8 : "");
+    g_link.bo.initial_ms = bo && bo->initial_ms ? bo->initial_ms : 500;
+    g_link.bo.max_ms = bo && bo->max_ms ? bo->max_ms : 30000;
+    g_link.bo.health_ms = bo && bo->health_ms ? bo->health_ms : 15000;
+    g_link.stop = 0;
+    g_link.wake = 0;
+    pthread_mutex_unlock(&g_link.mu);
+
+    remote_hello_t h;
+    status_t st = attach_once(socket_path, daemon8, &h);
+    char why[256] = "";
+    if (st != OK) snprintf(why, sizeof(why), "%.250s", err_msg());
+    link_set(st == OK ? REMOTE_CONNECTED : REMOTE_DISCONNECTED, st == OK ? NULL : why,
+             st == OK ? &h : NULL);
+    pthread_mutex_lock(&g_link.mu);
+    if (pthread_create(&g_link.th, NULL, link_main, NULL) == 0) g_link.running = 1;
+    pthread_mutex_unlock(&g_link.mu);
+    if (st != OK) set_error(st, "%s", why);
+    return st;
+}
+
+void remote_stop(void)
+{
+    pthread_mutex_lock(&g_link.mu);
+    int run = g_link.running;
+    g_link.stop = 1;
+    pthread_cond_broadcast(&g_link.cv);
+    pthread_mutex_unlock(&g_link.mu);
+    if (run) pthread_join(g_link.th, NULL);
+    pthread_mutex_lock(&g_link.mu);
+    g_link.running = 0;
+    pthread_mutex_unlock(&g_link.mu);
+}
+
+status_t remote_attach(const char *socket_path, const char *daemon8, remote_hello_t *out)
+{
+    status_t st = remote_start(socket_path, daemon8, NULL);
+    if (st == OK && out) *out = g_hello;
+    return st;
+}
+
+void remote_link_info(remote_link_info_t *out)
+{
+    pthread_mutex_lock(&g_link.mu);
+    *out = g_link.info;
+    pthread_mutex_unlock(&g_link.mu);
+}
+
+int remote_unusable(const char *provider, char *why, size_t wsz)
+{
+    remote_link_info_t li;
+    remote_link_info(&li);
+    if (!li.configured) return 0;
+    const sp_provider_ops_t *ops = NULL;
+    sp_ctx_t *c = NULL;
+    int enabled = sp_registry_get(provider, &ops, &c) == OK;
+    err_clear();
+    if (enabled && !remote_is_remote(ops)) return 0;       /* in-process */
+    if (enabled && li.state == REMOTE_CONNECTED) return 0;
+    char when[32] = "";
+    struct tm tm;
+    if (localtime_r(&li.since, &tm)) strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
+    if (li.state == REMOTE_CONNECTED)
+        snprintf(why, wsz, "provider %s is not offered by the helper at %s (it offers: %s)",
+                 provider, li.socket, li.hello.providers[0] ? li.hello.providers : "none");
+    else
+        snprintf(why, wsz, "provider %s is behind the helper at %s, which is unreachable "
+                 "since %s: %s", provider, li.socket, when,
+                 li.last_error[0] ? li.last_error : "never connected");
+    return 1;
 }

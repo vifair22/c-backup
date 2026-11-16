@@ -150,11 +150,12 @@ static status_t start_units(cutils_db_t *db, cutils_config_t *cfg, const char *d
     }
 
     /* Through the helper: it holds the sockets, the caps and the holds. A
-     * helper that is not up yet is not fatal; units say their provider is
-     * not enabled until the daemon is restarted with it reachable. */
+     * helper that is not up yet is not fatal: the link keeps trying with a
+     * bounded backoff and enables its providers when it answers, and a unit
+     * job meanwhile fails naming the socket (remote_provider.h). */
     const char *hs = config_get_str(cfg, "units.helper_socket");
-    if (hs && *hs && remote_attach(hs, units_daemon8(), NULL) != OK) {
-        log_error("units: %s; providers behind the helper are not enabled", err_msg());
+    if (hs && *hs && remote_start(hs, units_daemon8(), NULL) != OK) {
+        log_warn("units: %s; retrying in the background", err_msg());
         err_clear();
     }
 
@@ -523,6 +524,7 @@ int main(int argc, char *argv[])
     job_manager_stop(jm);
     /* After the jobs: none is in a session any more. */
     units_shutdown();
+    remote_stop();
     sp_registry_shutdown();
     repo_purge_stop();
     repo_locks_shutdown();

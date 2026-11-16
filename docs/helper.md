@@ -105,9 +105,20 @@ Notes that matter:
 - **Ownership.** The state volume and repositories must be owned by 990:
   AppGuard opens the config and `state.db` before the drop, so a database
   created as root would be unwritable by the daemon after it.
-- **Start order** does not have to be strict: a daemon whose helper is not
-  reachable at start logs it and runs with units disabled; restart the
-  daemon once the helper is up.
+- **Start order** does not matter, and neither does a helper restart. The
+  daemon's link to the helper retries with a bounded backoff (0.5 s
+  doubling to 30 s) while the helper is away, says hello again when it
+  answers (logging a policy whose digest changed), and enables its
+  providers then, with no daemon restart. While connected it checks every
+  15 s. A request that finds the helper gone marks the link down at once.
+- **A unit job while the helper is away fails and alerts**, scheduled or
+  not, with the socket path and the reason in the error, the journal and
+  the push alert; it is never skipped quietly. A job in flight when the
+  helper restarts fails cleanly (no snapshot, the helper's own start-up
+  sweep releases what the old process held), and the next one reconnects.
+  `GET /providers` shows the link (`helper.state`: `connected`,
+  `disconnected` or `never-connected`, `since`, `last_error`,
+  `reconnects`) and, per provider behind it, `connection.state`.
 
 ## The policy
 

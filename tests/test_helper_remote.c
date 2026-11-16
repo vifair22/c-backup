@@ -8,7 +8,9 @@
  * is read on the daemon's side, as source-providers.md 11.1 lays out.
  */
 
+#include <pthread.h>
 #include <setjmp.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -56,6 +58,50 @@ static long long scalar(const char *sql)
     return v;
 }
 
+static int helper_up(void)
+{
+    helper_server_cfg_t cfg = { &pol, fk, 1, 50 };
+    return helper_server_start(&cfg, &srv) == OK ? 0 : -1;
+}
+
+static void helper_down(void)
+{
+    helper_server_stop(srv);
+    srv = NULL;
+}
+
+/* Everything but the helper and the link. */
+static int setup_base(void)
+{
+    hf_rmrf(HF_DIR);
+    sp_config_t pc = { NULL, "0badf00d" };
+    if (fake_provider_ops.init(&pc, &fk) != OK) return -1;
+    hf_units(fk);
+    char text[4096];
+    hf_policy_text(text, sizeof(text), (unsigned)getuid(), 30, 86400, 1000, 1);
+    if (helper_policy_parse(text, &pol) != OK) return -1;
+    if (db_open(&db, DB_PATH) != 0 || db_run_lib_migrations(db) != 0 ||
+        db_run_compiled_migrations(db, app_migrations) != 0) return -1;
+    if (repo_register(db, REPO, "t", &repo_id) != OK) return -1;
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    if (repo_store_open(REPO, NULL, &store) != OK) return -1;
+    if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
+    units_config_t uc = { "", 2, 10, 30, 1 };
+    return units_init(db, NULL, &uc) == OK ? 0 : -1;
+}
+
+static const remote_backoff_t k_fast = { 50, 200, 200 };
+
+static int setup_late(void **state)
+{
+    (void)state;
+    if (setup_base() != 0) return -1;
+    /* No helper yet: the first attempt fails, the link keeps trying. */
+    if (remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK) return -1;
+    err_clear();
+    return 0;
+}
+
 static int setup(void **state)
 {
     (void)state;
@@ -77,13 +123,14 @@ static int setup(void **state)
     if (store_index_bind(store, db, repo_id, &idx) != OK) return -1;
     units_config_t uc = { "", 2, 10, 30, 1 };
     if (units_init(db, NULL, &uc) != OK) return -1;
-    return remote_attach(HF_SOCK, units_daemon8(), NULL) == OK ? 0 : -1;
+    return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
 
 static int teardown(void **state)
 {
     (void)state;
     units_shutdown();
+    remote_stop();
     sp_registry_shutdown();
     store_index_free(idx);
     store_close(store);
@@ -207,9 +254,99 @@ static void test_failure_through_helper(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
 }
 
+/* Wait up to 5 s for the link to be connected with fake enabled. */
+static int wait_connected(void)
+{
+    for (int i = 0; i < 500; i++) {
+        remote_link_info_t li;
+        remote_link_info(&li);
+        if (li.state == REMOTE_CONNECTED && sp_registry_enabled("fake")) return 1;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* The daemon first, the helper later: providers come up with no restart. */
+static void test_starts_before_helper(void **state)
+{
+    (void)state;
+    remote_link_info_t li;
+    remote_link_info(&li);
+    assert_true(li.configured);
+    assert_int_equal(li.state, REMOTE_DISCONNECTED);
+    assert_false(sp_registry_enabled("fake"));
+    /* A job now fails, naming the socket. */
+    unit_backup_result_t res;
+    assert_int_not_equal(backup_one("cbk-uat-one", &res), OK);
+    assert_non_null(strstr(err_msg(), HF_SOCK));
+    assert_non_null(strstr(err_msg(), "unreachable"));
+    unit_backup_result_free(&res);
+    char why[512];
+    assert_true(remote_unusable("fake", why, sizeof(why)));
+
+    assert_int_equal(helper_up(), 0);
+    assert_true(wait_connected());
+    assert_false(remote_unusable("fake", why, sizeof(why)));
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    assert_true(res.units[0].snapshot_id > 0);
+    unit_backup_result_free(&res);
+}
+
+typedef struct { status_t st; char err[512]; } job_t;
+
+static void *bg_backup(void *arg)
+{
+    job_t *j = arg;
+    unit_backup_result_t res;
+    j->st = backup_one("cbk-uat-one", &res);
+    snprintf(j->err, sizeof(j->err), "%s", err_msg());
+    unit_backup_result_free(&res);
+    return NULL;
+}
+
+/* The helper restarts under a running job: the job fails cleanly, the link
+ * notices, and the next job, after the helper is back, succeeds. */
+static void test_helper_restarts_mid_job(void **state)
+{
+    (void)state;
+    fake_fail_set(fk, "u1", FAKE_HANG_IN_HOLD, 1500);
+    job_t j;
+    memset(&j, 0, sizeof(j));
+    pthread_t th;
+    assert_int_equal(pthread_create(&th, NULL, bg_backup, &j), 0);
+    struct timespec ts = { 0, 300 * 1000000L };
+    nanosleep(&ts, NULL);
+    helper_down();
+    pthread_join(th, NULL);
+    fake_fail_clear(fk);
+    assert_int_not_equal(j.st, OK);
+    assert_non_null(strstr(j.err, "helper"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 0);
+    remote_link_info_t li;
+    remote_link_info(&li);
+    assert_int_equal(li.state, REMOTE_DISCONNECTED);
+
+    assert_int_equal(helper_up(), 0);
+    assert_true(wait_connected());
+    remote_link_info(&li);
+    assert_true(li.reconnects >= 1);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    unit_backup_result_free(&res);
+    /* The restarted helper's start-up sweep released what the old one
+     * held, and the session the second job took is released too. */
+    fake_stats_t st;
+    fake_stats(fk, &st);
+    assert_int_equal(st.holds_now, 0);
+    assert_int_equal(helper_server_holds(srv), 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
+        cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

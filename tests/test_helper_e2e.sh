@@ -83,12 +83,6 @@ OUT=$("$HELPER" --policy "$WORK/policy.ini" --check); RC=$?
 check    "--check accepts the policy" 0 "$RC"
 contains "and prints its digest" '"policy":"' "$OUT"
 
-"$HELPER" --policy "$WORK/policy.ini" > "$WORK/helper.log" 2>&1 &
-HELPER_PID=$!
-for _ in $(seq 1 50); do [ -S "$HSOCK" ] && break; sleep 0.1; done
-if [ ! -S "$HSOCK" ]; then echo "helper did not start"; cat "$WORK/helper.log"; exit 1; fi
-check "the socket is 0660" 660 "$(stat -c %a "$HSOCK")"
-
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -108,16 +102,54 @@ DAEMON_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; exit 1; fi
 
+echo "daemon first, helper not up yet"
+OUT=$(cb unit providers)
+contains "the daemon starts without its helper" '"state":"' "$OUT"
+contains "and says the helper is not connected" '"connection":{"state":"disconnected"' "$OUT"
+contains "naming the socket" "\"socket\":\"$HSOCK\"" "$OUT"
+contains "repo add" '"id":1' "$(cb repo add "$WORK/repo" main)"
+OUT=$(cb unit backup 1 --provider fake cbk-uat-a 2>&1); RC=$?
+check    "a unit job with the helper away fails" 1 "$RC"
+contains "and names the socket" "$HSOCK" "$OUT"
+# A schedule firing meanwhile fails too, and alerts, never a quiet skip.
+OUT=$(cb schedule add 1 units 1 --provider fake --all)
+contains "a units schedule is accepted while the helper is away" '"id"' "$OUT"
+SID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 150); do
+    [ "$(grep -c "failure notification for job .*units of main" "$WORK/daemon.log")" -ge 2 ] && break
+    sleep 0.1
+done
+ALERT=$(grep -A8 "failure notification for job .*units of main" "$WORK/daemon.log" | tr "\n" " ")
+contains "the scheduled job's alert names the helper socket" "$HSOCK" "$ALERT"
+N_ALERTS=$(grep -c "failure notification for job .*units of main" "$WORK/daemon.log")
+if [ "$N_ALERTS" -ge 2 ]; then ok "the scheduled run alerted as well as the API one ($N_ALERTS)"; else bad "the scheduled run alerted" ">= 2 alerts" "$N_ALERTS"; fi
+contains "the job came from the schedule" "\"origin\":\"schedule\"" "$(cb jobs --limit 5)"
+contains "and the job failed" '"state":"failed"' "$(cb jobs --limit 5)"
+cb schedule remove 1 "$SID" >/dev/null
+
+echo "the helper arrives"
+"$HELPER" --policy "$WORK/policy.ini" > "$WORK/helper.log" 2>&1 &
+HELPER_PID=$!
+for _ in $(seq 1 50); do [ -S "$HSOCK" ] && break; sleep 0.1; done
+if [ ! -S "$HSOCK" ]; then echo "helper did not start"; cat "$WORK/helper.log"; exit 1; fi
+check "the socket is 0660" 660 "$(stat -c %a "$HSOCK")"
+# The daemon reconnects on its own, within its backoff (at most 30 s).
+for _ in $(seq 1 400); do
+    cb unit providers | grep -q '"state":"connected"' && break
+    sleep 0.1
+done
+
 echo "through the helper"
 OUT=$(cb unit providers)
-contains "the helper is shown" '"helper":{"version":1' "$OUT"
+contains "the daemon connected without a restart" '"state":"connected"' "$OUT"
+contains "the helper is shown" '"helper":{"socket"' "$OUT"
+contains "with its version" '"version":1' "$OUT"
 contains "with the daemon id it serves" '"daemon_id":"0badf00d"' "$OUT"
 contains "fake is enabled, through it" '"enabled":true' "$OUT"
 contains "and probes through the socket" "through the helper at" "$OUT"
 OUT=$(cb unit list fake)
 contains "enumeration crosses the helper" 'cbk-uat-a' "$OUT"
 lacks    "and the helper's policy filters it" 'prod-db' "$OUT"
-contains "repo add" '"id":1' "$(cb repo add "$WORK/repo" main)"
 OUT=$(cb unit backup 1 --provider fake cbk-uat-a)
 contains "a unit backup through the helper completes" '"state":"completed"' "$OUT"
 contains "at the level the helper's session reached" '"consistency":"quiesced"' "$OUT"

@@ -15,6 +15,9 @@
 #include "error.h"
 #include "provider.h"
 
+#include <stddef.h>
+#include <time.h>
+
 typedef struct {
     int  version;
     char daemon_id[16];
@@ -22,7 +25,59 @@ typedef struct {
     char providers[128];        /* comma separated */
 } remote_hello_t;
 
+/*
+ * The link to the helper. A daemon may start before its helper (container
+ * start order is not guaranteed), and a helper may restart under a running
+ * daemon. So the link is supervised: remote_start makes one attempt at
+ * once and leaves a thread that retries with bounded backoff while the
+ * helper is unreachable, says hello again whenever it comes back (logging a
+ * policy whose digest changed), enables any provider it offers that is not
+ * enabled yet, and checks the helper is still there every health_ms while
+ * connected. A request that finds the helper gone marks the link
+ * disconnected at once and wakes the thread.
+ *
+ * Providers once enabled stay enabled while the helper is away: a unit job
+ * then fails with the helper's socket and the reason, through the ordinary
+ * job failure and its alert, rather than quietly finding no provider.
+ */
+typedef struct {
+    unsigned initial_ms;     /* first retry; 0: 500 */
+    unsigned max_ms;         /* cap; 0: 30000 */
+    unsigned health_ms;      /* while connected; 0: 15000 */
+} remote_backoff_t;
+
+typedef enum { REMOTE_NEVER = 0, REMOTE_CONNECTED = 1, REMOTE_DISCONNECTED = 2 } remote_state_t;
+
+typedef struct {
+    int            configured;
+    char           socket[108];
+    remote_state_t state;
+    time_t         since;            /* of the current state */
+    char           last_error[256];
+    remote_hello_t hello;            /* the last good hello */
+    unsigned       reconnects;       /* times it came back after being lost */
+} remote_link_info_t;
+
+/* Start the link. Returns the first attempt's status; the link keeps
+ * trying whatever it was. backoff may be NULL. */
+status_t remote_start(const char *socket_path, const char *daemon8,
+                      const remote_backoff_t *backoff);
+void     remote_stop(void);
+
+/* remote_start with the default backoff, returning the first attempt's
+ * hello in *out when it succeeded. */
 status_t remote_attach(const char *socket_path, const char *daemon8, remote_hello_t *out);
+
+void     remote_link_info(remote_link_info_t *out);
+/* Whether ops is a provider behind the helper. */
+int      remote_is_remote(const sp_provider_ops_t *ops);
+
+/*
+ * When a helper is configured and provider is not usable through it right
+ * now (never offered yet, or the link is down), 1 with the reason in why,
+ * naming the socket; else 0.
+ */
+int      remote_unusable(const char *provider, char *why, size_t wsz);
 
 /* The last hello, for GET /providers; empty before an attach. */
 const remote_hello_t *remote_last_hello(void);

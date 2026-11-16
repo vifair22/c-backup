@@ -133,6 +133,24 @@ static api_response_t providers_list(void)
         int on = sp_registry_get(all[i]->name, &ops, &ctx) == OK;
         err_clear();
         cJSON_AddBoolToObject(o, "enabled", on);
+        remote_link_info_t li;
+        remote_link_info(&li);
+        if (on && ops && !remote_is_remote(ops)) {
+            cJSON_AddStringToObject(o, "via", "in-process");
+        } else if (li.configured) {
+            /* Behind the helper: connected or not, since when, and why. */
+            char why[512];
+            int down = remote_unusable(all[i]->name, why, sizeof(why));
+            cJSON_AddStringToObject(o, "via", "helper");
+            cJSON *c = cJSON_AddObjectToObject(o, "connection");
+            if (c) {
+                cJSON_AddStringToObject(c, "state", down ? "disconnected" : "connected");
+                cJSON_AddNumberToObject(c, "since", (double)li.since);
+                cJSON_AddStringToObject(c, "socket", li.socket);
+                if (down) cJSON_AddStringToObject(c, "last_error", why);
+            }
+            if (down) continue;
+        }
         if (!on || !ops) continue;
         sp_probe_t pr;
         if (ops->probe && ops->probe(ctx, &pr) == OK) {
@@ -152,14 +170,21 @@ static api_response_t providers_list(void)
         cJSON_AddStringToObject(root, "allow", units_config()->allow ? units_config()->allow : "");
         cJSON_AddNumberToObject(root, "holds_open", (double)units_intents_open(g_db, NULL));
         /* The helper, as its hello said (source-providers.md 11.2). */
-        const remote_hello_t *h = remote_last_hello();
-        if (h->version > 0) {
+        remote_link_info_t li;
+        remote_link_info(&li);
+        if (li.configured) {
             cJSON *ho = cJSON_AddObjectToObject(root, "helper");
             if (ho) {
-                cJSON_AddNumberToObject(ho, "version", h->version);
-                cJSON_AddStringToObject(ho, "daemon_id", h->daemon_id);
-                cJSON_AddStringToObject(ho, "policy", h->policy);
-                cJSON_AddStringToObject(ho, "providers", h->providers);
+                static const char *const k_state[] = { "never-connected", "connected", "disconnected" };
+                cJSON_AddStringToObject(ho, "socket", li.socket);
+                cJSON_AddStringToObject(ho, "state", k_state[li.state]);
+                cJSON_AddNumberToObject(ho, "since", (double)li.since);
+                cJSON_AddStringToObject(ho, "last_error", li.last_error);
+                cJSON_AddNumberToObject(ho, "reconnects", li.reconnects);
+                cJSON_AddNumberToObject(ho, "version", li.hello.version);
+                cJSON_AddStringToObject(ho, "daemon_id", li.hello.daemon_id);
+                cJSON_AddStringToObject(ho, "policy", li.hello.policy);
+                cJSON_AddStringToObject(ho, "providers", li.hello.providers);
             }
         }
         cJSON_AddBoolToObject(root, "privileges_dropped", privs_dropped());
@@ -817,7 +842,11 @@ static status_t submit_units(int64_t repo_id, const char *body, size_t len,
         *http = 400;
         return set_error(ERR_INVALID, "%s", why);
     }
-    if (!sp_registry_enabled(j->provider)) {
+    /* A provider behind an unreachable helper is accepted: the job runs,
+     * fails naming the helper's socket, and alerts, where refusing here
+     * would leave a schedule failing with only a log line to show. */
+    char hwhy[512];
+    if (!sp_registry_enabled(j->provider) && !remote_unusable(j->provider, hwhy, sizeof(hwhy))) {
         status_t st = sp_registry_get(j->provider, NULL, NULL);
         units_job_free(j);
         free(canon);
