@@ -221,6 +221,11 @@ export interface WireGrepRun {
   /* Files read only as far as the per-file hit cap. Absent from a daemon
    * older than the column. */
   files_capped?: number
+  /* Files not searched because they did not read back authentic and
+   * whole, and the first one with its reason. Absent from a daemon older
+   * than the columns. */
+  files_skipped?: number
+  skip_reason?: string | null
 }
 
 export interface WireGrepHit {

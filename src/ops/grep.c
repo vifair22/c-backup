@@ -34,6 +34,13 @@
 /* How much of a matching line is kept for the report. */
 #define GREP_EXCERPT_MAX 200
 
+/* One matching line, held until the file it came from has read back
+ * authentic (OWN-36). */
+typedef struct {
+    uint64_t line_no;
+    char     excerpt[GREP_EXCERPT_MAX + 1];
+} grep_pending_t;
+
 typedef struct {
     cutils_db_t *db;
     int64_t      repo_id;
@@ -52,6 +59,10 @@ typedef struct {
     /* Per-file state, reset for each object. */
     uint64_t     line_no;
     uint32_t     file_hits;
+    /* This file's hits, held until its read has authenticated. Sized to
+     * the per-file cap, so a few KiB at the default and 2 MiB at the
+     * largest cap the API accepts. */
+    grep_pending_t *pending;
     int          is_binary;
     int          binary_decided;
     int          file_done;    /* nothing more worth reading in this file */
@@ -233,34 +244,58 @@ static int line_matches(const regex_t *re, char *s, size_t len)
  * matches" once; a text file stops at the per-file cap; and the search
  * stops at the total cap, reporting itself truncated.
  */
-static void record_hit(grep_ctx_t *g, const char *node_id, const char *path,
-                       uint64_t line_no, const char *line, size_t len)
+static void record_hit(grep_ctx_t *g, uint64_t line_no, const char *line, size_t len)
 {
     if (g->file_done || g->stop_all) return;
-    g->res->hits++;
-    g->file_hits++;
+    grep_pending_t *h = &g->pending[g->file_hits++];
+    h->line_no = line_no;
 
-    char excerpt[GREP_EXCERPT_MAX + 1];
     if (g->is_binary) {
-        snprintf(excerpt, sizeof(excerpt), "(binary file matches)");
+        snprintf(h->excerpt, sizeof(h->excerpt), "(binary file matches)");
         g->file_done = 1;
     } else {
-        excerpt_of(line, len, excerpt, sizeof(excerpt));
+        excerpt_of(line, len, h->excerpt, sizeof(h->excerpt));
         if (g->file_hits >= g->per_file_cap) { g->file_done = 1; g->file_capped = 1; }
     }
-    if (g->res->hits >= g->total_cap) { g->stop_all = 1; g->file_done = 1; }
+    if (g->res->hits + g->file_hits >= g->total_cap) { g->stop_all = 1; g->file_done = 1; }
+}
 
-    char repo[32], run[32], ln[32];
+/* The file read back authentic: its held hits become the run's. */
+static void flush_hits(grep_ctx_t *g, const char *node_id, const char *path)
+{
+    char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)g->repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)g->run_id);
-    snprintf(ln,   sizeof(ln),   "%llu", (unsigned long long)line_no);
+    for (uint32_t i = 0; i < g->file_hits; i++) {
+        char ln[32];
+        snprintf(ln, sizeof(ln), "%llu", (unsigned long long)g->pending[i].line_no);
+        if (db_execute_non_query(g->db,
+                "INSERT INTO grep_hits (run_id, repo_id, node_id, path, line_no, excerpt)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (const char *[]){ run, repo, node_id, path, ln,
+                                  g->pending[i].excerpt, NULL },
+                NULL) != 0)
+            log_warn("grep: cannot record hit for %s", path);
+    }
+    g->res->hits += g->file_hits;
+}
 
-    if (db_execute_non_query(g->db,
-            "INSERT INTO grep_hits (run_id, repo_id, node_id, path, line_no, excerpt)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (const char *[]){ run, repo, node_id, path, ln, excerpt, NULL },
-            NULL) != 0)
-        log_warn("grep: cannot record hit for %s", path);
+/*
+ * The file did not read back authentic and whole, or is not file content:
+ * whatever matched came from bytes that are not the file, so none of it is
+ * recorded, and the file is counted skipped with the first such reason
+ * kept for the run. A total-cap stop this file's matches caused is undone
+ * too, since those matches no longer count.
+ */
+static void discard_file(grep_ctx_t *g, const char *path, const char *why)
+{
+    log_warn("grep: %s not searched: %s", path, why);
+    g->res->files_skipped++;
+    if (!g->res->skip_reason[0])
+        snprintf(g->res->skip_reason, sizeof(g->res->skip_reason), "%s: %s", path, why);
+    g->file_hits = 0;
+    g->file_capped = 0;
+    g->stop_all = 0;
 }
 
 /*
@@ -272,8 +307,7 @@ static void record_hit(grep_ctx_t *g, const char *node_id, const char *path,
  * trade against buffering a line of unbounded length, and it only applies to
  * lines longer than 64 KiB.
  */
-static void scan_buffer(grep_ctx_t *g, const char *node_id, const char *path,
-                        const char *buf, size_t len,
+static void scan_buffer(grep_ctx_t *g, const char *buf, size_t len,
                         char *carry, size_t *carry_len)
 {
     if (!g->binary_decided) {
@@ -293,7 +327,7 @@ static void scan_buffer(grep_ctx_t *g, const char *node_id, const char *path,
             if (*carry_len) {
                 carry[*carry_len] = '\0';
                 if (line_matches(g->re, carry, *carry_len))
-                    record_hit(g, node_id, path, g->line_no, carry, *carry_len);
+                    record_hit(g, g->line_no, carry, *carry_len);
                 *carry_len = 0;
             }
             seg = seg > GREP_LINE_MAX ? GREP_LINE_MAX : seg;
@@ -307,7 +341,7 @@ static void scan_buffer(grep_ctx_t *g, const char *node_id, const char *path,
             carry[*carry_len] = '\0';
             g->line_no++;
             if (line_matches(g->re, carry, *carry_len))
-                record_hit(g, node_id, path, g->line_no, carry, *carry_len);
+                record_hit(g, g->line_no, carry, *carry_len);
             *carry_len = 0;
             i++;   /* consume the newline */
         }
@@ -318,19 +352,36 @@ struct stream_arg {
     store_t       *store;
     const uint8_t *hash;
     int            wfd;
+    status_t       rc;
+    uint8_t        type;
+    char           msg[ERR_MSG_MAX];
 };
 
 static void *stream_worker(void *a)
 {
     struct stream_arg *arg = a;
     uint64_t sz = 0;
-    uint8_t  type = 0;
-    (void)object_load_stream(arg->store, arg->hash, arg->wfd, &sz, &type);
+    err_clear();
+    arg->rc = object_load_stream(arg->store, arg->hash, arg->wfd, &sz, &arg->type);
+    /* The error buffer is thread-local, so the reason dies with this
+     * thread unless it is carried back by hand. */
+    if (arg->rc != OK) snprintf(arg->msg, sizeof(arg->msg), "%s", err_msg());
     close(arg->wfd);
     return NULL;
 }
 
-/* Search one object. Returns 1 if the file matched at least once. */
+/*
+ * Search one object. Returns 1 if the file matched at least once.
+ *
+ * Matches are held, not recorded, until the object has read back OK:
+ * authenticated, hash-checked and, for an object of type FILE or SPARSE,
+ * actually file content (OWN-36, OWN-39). A streamed object is therefore
+ * always read to its end, even once a binary match or the hit caps say
+ * nothing more is worth scanning, because the tag and the hash are only
+ * checked there. Stopping early, as this used to, recorded matches from
+ * bytes nothing had verified and did not count the file as skipped when
+ * they turned out to be damaged or tampered with.
+ */
 static int scan_object(grep_ctx_t *g, store_t *store,
                        const uint8_t hash[OBJECT_HASH_SIZE], uint64_t size,
                        const char *node_id, const char *path)
@@ -343,20 +394,26 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     g->file_capped = 0;
 
     char *carry = malloc(GREP_LINE_MAX + 1);
-    if (!carry) return 0;
+    if (!carry) { discard_file(g, path, "out of memory"); return 0; }
     size_t carry_len = 0;
+
+    status_t lst = OK;
+    uint8_t  type = 0;
+    char     why[ERR_MSG_MAX] = "";
+    int      cancelled = 0;
 
     if (size <= GREP_INMEM_MAX) {
         void  *data = NULL;
         size_t len  = 0;
-        if (object_load(store, hash, &data, &len, NULL) != OK) {
+        err_clear();
+        lst = object_load(store, hash, &data, &len, &type);
+        if (lst == OK) {
+            scan_buffer(g, data, len, carry, &carry_len);
+            g->res->bytes_scanned += len;
+        } else {
+            snprintf(why, sizeof(why), "%s", err_msg());
             err_clear();
-            free(carry);
-            g->res->files_skipped++;
-            return 0;
         }
-        scan_buffer(g, node_id, path, data, len, carry, &carry_len);
-        g->res->bytes_scanned += len;
         free(data);
     } else {
         /*
@@ -364,13 +421,21 @@ static int scan_object(grep_ctx_t *g, store_t *store,
          * pipe rather than a buffer. The same shape sparse restore uses.
          */
         int pfd[2];
-        if (pipe(pfd) != 0) { free(carry); g->res->files_skipped++; return 0; }
-        struct stream_arg arg = { store, hash, pfd[1] };
+        if (pipe(pfd) != 0) {
+            free(carry);
+            discard_file(g, path, "cannot create a pipe");
+            return 0;
+        }
+        struct stream_arg arg;
+        memset(&arg, 0, sizeof(arg));
+        arg.store = store;
+        arg.hash  = hash;
+        arg.wfd   = pfd[1];
         pthread_t tid;
         if (pthread_create(&tid, NULL, stream_worker, &arg) != 0) {
             close(pfd[0]); close(pfd[1]);
             free(carry);
-            g->res->files_skipped++;
+            discard_file(g, path, "cannot start a reader thread");
             return 0;
         }
         char *buf = malloc(256 * 1024);
@@ -383,33 +448,59 @@ static int scan_object(grep_ctx_t *g, store_t *store,
                  * the 65 seconds it took to read it - which from the outside
                  * is indistinguishable from cancel being broken.
                  */
-                if (cancel_requested(g->cancel)) break;
-                if (g->file_done) break;   /* closing the pipe stops the writer */
+                if (cancel_requested(g->cancel)) { cancelled = 1; break; }
                 ssize_t n = read(pfd[0], buf, 256 * 1024);
                 if (n <= 0) break;
-                scan_buffer(g, node_id, path, buf, (size_t)n, carry, &carry_len);
+                /* Past a binary match or a cap the rest is only read, for
+                 * the tag and hash at the end; nothing more is matched. */
+                if (g->file_done) continue;
+                scan_buffer(g, buf, (size_t)n, carry, &carry_len);
                 g->res->bytes_scanned += (uint64_t)n;
             }
             free(buf);
         }
         /*
          * Closing while the writer still has bytes to push makes its next
-         * write fail with EPIPE, which is how it learns to stop. That is
-         * only survivable because the daemon ignores SIGPIPE; the default
+         * write fail with EPIPE, which is how it learns to stop: on a
+         * cancel, or when the buffer could not be had. That is only
+         * survivable because the daemon ignores SIGPIPE; the default
          * disposition would end the process here.
          */
         close(pfd[0]);
         pthread_join(tid, NULL);
+        lst  = buf ? arg.rc : ERR_NOMEM;
+        type = arg.type;
+        snprintf(why, sizeof(why), "%s", buf ? arg.msg : "out of memory");
     }
 
     /* A final line with no trailing newline still counts. */
-    if (carry_len) {
+    if (lst == OK && !cancelled && carry_len) {
         carry[carry_len] = '\0';
         g->line_no++;
         if (line_matches(g->re, carry, carry_len))
-            record_hit(g, node_id, path, g->line_no, carry, carry_len);
+            record_hit(g, g->line_no, carry, carry_len);
     }
     free(carry);
+
+    if (cancelled) {
+        /* Not verified, and not a finding about the file either: the
+         * search stops and the run says it did not complete. */
+        g->file_hits = 0;
+        g->file_capped = 0;
+        g->stop_all = 0;
+        return 0;
+    }
+    if (lst != OK) {
+        if (!why[0]) snprintf(why, sizeof(why), "could not be read (status %d)", (int)lst);
+        discard_file(g, path, why);
+        return 0;
+    }
+    if (type != OBJECT_TYPE_FILE && type != OBJECT_TYPE_SPARSE) {
+        snprintf(why, sizeof(why), "object is of type %u, not file content", type);
+        discard_file(g, path, why);
+        return 0;
+    }
+    flush_hits(g, node_id, path);
     return g->file_hits > 0;
 }
 
@@ -547,6 +638,13 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     g.per_file_cap = opts->max_hits_per_file ? opts->max_hits_per_file
                                              : GREP_DEFAULT_HITS_PER_FILE;
     g.total_cap = opts->max_hits ? opts->max_hits : GREP_DEFAULT_MAX_HITS;
+    /* record_hit stops a file at per_file_cap, so this always has room. */
+    g.pending = malloc((size_t)g.per_file_cap * sizeof(*g.pending));
+    if (!g.pending) {
+        db_result_free(objs);
+        regfree(&re);
+        return set_error(ERR_NOMEM, "grep: hit buffer");
+    }
     status_t st = OK;
     uint64_t total = (uint64_t)objs->nrows;
 
@@ -591,6 +689,7 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_free(objs);
     regfree(&re);
+    free(g.pending);
 
     char fin[32], scanned[32], matched[32], skipped[32], bytes[32], hits[32], run[32];
     /* files_capped on the run record as well as the job result: a run
@@ -609,10 +708,11 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     if (db_execute_non_query(db,
             "UPDATE grep_runs SET finished_at = ?, files_scanned = ?,"
             " files_matched = ?, files_skipped = ?, bytes_scanned = ?, hits = ?,"
-            " files_capped = ?, truncated = ?, completed = ? WHERE id = ?",
+            " files_capped = ?, truncated = ?, completed = ?,"
+            " skip_reason = NULLIF(?, '') WHERE id = ?",
             (const char *[]){ fin, scanned, matched, skipped, bytes, hits, capped,
                               res.truncated ? "1" : "0", st == OK ? "1" : "0",
-                              run, NULL }, NULL) != 0)
+                              res.skip_reason, run, NULL }, NULL) != 0)
         log_warn("grep: cannot close run record %s", run);
 
     /* Filled on a cancel too: the run record exists and is closed, and a

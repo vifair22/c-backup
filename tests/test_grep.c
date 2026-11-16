@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64
 
 /*
  * Content search across a snapshot.
@@ -27,10 +28,13 @@
 
 #include "backup.h"
 #include "grep.h"
+#include "object.h"
 #include "pack.h"
 #include "repo.h"
+#include "repo_key.h"
 #include "store.h"
 #include "store_index.h"
+#include "types.h"
 
 #define TEST_DIR  "/tmp/c_backup_test_grep"
 #define TEST_DB   TEST_DIR "/state.db"
@@ -573,6 +577,128 @@ static void test_very_long_line_does_not_buffer_without_bound(void **state)
     assert_int_equal(res.files_matched, 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* Matches only from verified bytes (OWN-36)                           */
+/* ------------------------------------------------------------------ */
+
+/* Over GREP_INMEM_MAX, so it is loose and streamed through the pipe, with
+ * the needle on its first line: a reader that stops at its hit cap never
+ * reaches the tag or hash at the end. */
+#define BIG_TEXT ((size_t)20 * 1024 * 1024)
+
+static void write_big_text(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fputs("the needle is on the first line\n", f);
+    size_t n = 32;
+    unsigned i = 0;
+    while (n < BIG_TEXT) {
+        int w = fprintf(f, "filler line %u with nothing worth finding\n", i++);
+        assert_true(w > 0);
+        n += (size_t)w;
+    }
+    fclose(f);
+}
+
+static void damage_object_of(const char *name, off_t from_end)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?",
+        (const char *[]){ repo, name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    char path[600];
+    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO,
+             r->rows[0][0], r->rows[0][0] + 2);
+    db_result_free(r);
+
+    FILE *f = fopen(path, "r+b");
+    assert_non_null(f);
+    object_header_t hdr;
+    assert_int_equal(fread(&hdr, sizeof(hdr), 1, f), 1);
+    off_t off = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size - from_end;
+    assert_int_equal(fseeko(f, off, SEEK_SET), 0);
+    int c = fgetc(f);
+    assert_true(c != EOF);
+    assert_int_equal(fseeko(f, off, SEEK_SET), 0);
+    assert_int_not_equal(fputc(c ^ 0x5a, f), EOF);
+    fclose(f);
+}
+
+static void check_damaged_large_object_is_skipped(int keyed)
+{
+    repo_key_t key;
+    if (keyed) {
+        assert_int_equal(repo_key_generate(&key), OK);
+        store_set_key(store, &key);
+    }
+    write_big_text(TEST_SRC "/big.txt");
+    int64_t snap = run_backup();
+    /* Near the end: far past where the hit cap used to stop the read. */
+    damage_object_of("big.txt", 100);
+
+    grep_opts_t o = opts_for("needle|swordfish");
+    o.max_hits_per_file = 1;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+
+    char *text = hits_text(res.run_id);
+    assert_null(strstr(text, "big.txt"));
+    assert_non_null(strstr(text, "notes.txt"));
+    free(text);
+    assert_int_equal(res.files_skipped, 1);
+    assert_int_equal(res.hits, 2);
+    assert_non_null(strstr(res.skip_reason, "big.txt"));
+
+    char run[32];
+    snprintf(run, sizeof(run), "%lld", (long long)res.run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT files_skipped, skip_reason FROM grep_runs WHERE id = ?",
+        (const char *[]){ run, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "1");
+    assert_non_null(strstr(r->rows[0][1], "big.txt"));
+    db_result_free(r);
+    if (keyed) store_set_key(store, NULL);
+}
+
+/* A large plaintext object damaged near its end records no match from its
+ * first line and is reported skipped, with the reason on the run. */
+static void test_damaged_large_object_records_no_matches(void **state)
+{
+    (void)state;
+    check_damaged_large_object_is_skipped(0);
+}
+
+/* The same for a tag failure: matches decrypted from tampered ciphertext
+ * are not the file's, and were recorded before the tag was ever read. */
+static void test_tampered_encrypted_object_records_no_matches(void **state)
+{
+    (void)state;
+    check_damaged_large_object_is_skipped(1);
+}
+
+/* An undamaged large object still matches, and is not skipped, though it
+ * is now read to the end after its first hit. */
+static void test_intact_large_object_still_matches(void **state)
+{
+    (void)state;
+    write_big_text(TEST_SRC "/big.txt");
+    int64_t snap = run_backup();
+    grep_opts_t o = opts_for("needle");
+    o.max_hits_per_file = 1;
+    grep_result_t res;
+    assert_int_equal(grep_run(store, db, repo_id, snap, &o, NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.hits, 1);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.skip_reason[0], '\0');
+    assert_int_equal(run_column(res.run_id, "files_capped"), 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -595,6 +721,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_duplicate_content_is_scanned_once, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_marks_the_run_incomplete, setup, teardown),
         cmocka_unit_test_setup_teardown(test_very_long_line_does_not_buffer_without_bound, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_large_object_records_no_matches, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_tampered_encrypted_object_records_no_matches, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_intact_large_object_still_matches, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

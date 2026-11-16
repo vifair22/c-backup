@@ -192,6 +192,24 @@ static status_t src_read_xform(void *vctx, void *vbuf, size_t n)
  * Set up the transform. On success *info and *len describe what the sink
  * will receive: the encryption it carries now and its stored length.
  */
+/*
+ * Re-encryption streams: decrypt a chunk under the source key, encrypt it
+ * under the target's, hand it on. The source tag is checked only once the
+ * last chunk is through (src_body_done), so for a moment the target's
+ * staging pack holds bytes nothing has authenticated yet - and, into a
+ * plaintext target, holds them as plaintext.
+ *
+ * That is accepted, not overlooked (OWN-36). A tag failure fails the
+ * object, and the stored writer cuts a failed object back out of the
+ * staging pack, so nothing unverified is ever installed, indexed or named
+ * by a snapshot record. The bytes sit, briefly, in the target's tmp/
+ * staging file, which is the operator's own repository on the operator's
+ * storage; a plaintext target already holds every verified object in the
+ * clear. Holding a whole object back until its tag verified would mean
+ * buffering or double-writing objects of any size, against design
+ * constraints 1 and 2, to protect bytes from the one party who already has
+ * the plaintext.
+ */
 static status_t src_xform_begin(send_src_t *s, const store_t *store,
                                 const replica_sink_t *sink,
                                 object_stored_info_t *info, uint64_t *len)
