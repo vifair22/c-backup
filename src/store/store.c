@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
 #include "repo_key.h"
+#include "object_crypt.h"
+#include "pack.h"
 
 #include <openssl/crypto.h>
 #include <cutils/log.h>
@@ -48,24 +50,38 @@ typedef struct {
     FILE    *fp;         /* NULL = empty slot */
 } dat_cache_slot_t;
 
+typedef struct {
+    int              used;
+    uint8_t          hash[OBJECT_HASH_SIZE];
+    store_location_t loc;
+} bidx_slot_t;
+
 struct store {
     char   *path;
     int     dirfd;
-    int     obj_dirfd;        /* cached objects/ dir fd, -1 until first use */
     /* Dynamic .dat file handle cache (open-addressing hash table) */
     dat_cache_slot_t *dat_cache;
     uint32_t          dat_cache_mask;   /* power-of-2 - 1 */
     uint32_t          dat_cache_count;  /* occupied slots */
-    /* In-memory hash set of loose object hashes (open-addressing, 32-byte keys) */
-    uint8_t         *loose_set;       /* NULL until built */
-    uint32_t         loose_set_mask;  /* capacity - 1 */
-    uint32_t         loose_set_cnt;
-    pthread_mutex_t  loose_set_mu;    /* protects inserts during parallel store */
-    int              loose_set_ready;
+
+    /* Built-in index, used only without a resolver (store_scan_packs). */
+    bidx_slot_t     *bidx;
+    uint32_t         bidx_mask;       /* capacity - 1, or 0 when unbuilt */
+    uint32_t         bidx_cnt;
+    int              bidx_built;
+    pthread_mutex_t  bidx_mu;
+
+    /* The store's own pack writer (object_store_ex) and its closer. */
+    void            *implicit;
+    void           (*implicit_close)(store_t *, void *);
+    pthread_mutex_t  implicit_mu;
+
+    /* Highest pack number this handle has handed out, plus one. */
+    _Atomic uint32_t next_pack;
 
     store_config_t        cfg;
-    /* Set by the daemon. NULL in tests and benchmarks, where only loose
-     * objects exist and no resolution is needed. */
+    /* Set by the daemon. NULL in tests and benchmarks, which use the
+     * built-in index instead. */
     store_locate_fn       locate_cb;
     void                 *locate_user;
     store_pack_commit_fn  commit_cb;
@@ -76,6 +92,7 @@ struct store {
     /* Repository key, copied in. has_key is separate from a zero check
      * because an all-zero key is a valid key, just an unlucky one. */
     repo_key_t            key;
+    object_aead_key_t     aead;
     int                   has_key;
     /* The marker said encrypted. Independent of has_key: a scrub of an
      * offsite copy is encrypted with no key, and must still work. */
@@ -86,7 +103,7 @@ struct store {
 
     /* Bytes written, by category; see store_count_write. Starts zeroed
      * with the calloc in store_open. Updated with __atomic builtins from
-     * the backup thread, the large-file workers and the pack workers. */
+     * whichever threads write through the handle. */
     uint64_t            written[STORE_WR__COUNT];
 };
 
@@ -115,7 +132,17 @@ static int dir_is_empty(const char *path) {
 void store_set_key(store_t *st, const struct repo_key *key)
 {
     if (!st) return;
-    if (!key) { OPENSSL_cleanse(&st->key, sizeof(st->key)); st->has_key = 0; return; }
+    OPENSSL_cleanse(&st->key, sizeof(st->key));
+    object_aead_key_wipe(&st->aead);
+    st->has_key = 0;
+    if (!key) return;
+    /* The derivation cannot fail short of OpenSSL lacking HKDF; if it does,
+     * the store stays keyless, so an encrypted repository refuses to write
+     * rather than writing under a key nobody can derive again. */
+    if (object_aead_key_derive(key, &st->aead) != OK) {
+        log_error("store: cannot derive the object key: %s", err_msg());
+        return;
+    }
     st->key = *key;
     st->has_key = 1;
 }
@@ -123,6 +150,11 @@ void store_set_key(store_t *st, const struct repo_key *key)
 const struct repo_key *store_key(const store_t *st)
 {
     return (st && st->has_key) ? &st->key : NULL;
+}
+
+const struct object_aead_key *store_aead_key(const store_t *st)
+{
+    return (st && st->has_key) ? &st->aead : NULL;
 }
 
 void store_set_encrypted(store_t *st, int encrypted)
@@ -166,7 +198,6 @@ status_t store_init_dirs(const char *path) {
      * Gone with the one-shot CLI: format and HEAD (identity now lives in
      * .cbackup, written by the daemon), refs/ (the snapshot pointer is a
      * repos row), and logs/ (the journal is a table). */
-    if ((st = mkdir_at(repofd, "objects"))   != OK) goto done;
     if ((st = mkdir_at(repofd, "packs"))     != OK) goto done;
     if ((st = mkdir_at(repofd, "snapshots")) != OK) goto done;
     if ((st = mkdir_at(repofd, "tmp"))       != OK) goto done;
@@ -209,7 +240,7 @@ done:
 static int is_engine_tmp_name(const char *name)
 {
     static const char *const prefixes[] = {
-        "obj.", "pack-dat.", "pack-idx.", "snap.", "par.", "tags.",
+        "pack-dat.", "snap.", "snapids.", "deleting.", "tags.",
     };
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
         if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
@@ -336,11 +367,6 @@ void store_count_write(store_t *st, store_write_cat_t cat, uint64_t bytes)
     __atomic_fetch_add(&st->written[cat], bytes, __ATOMIC_RELAXED);
 }
 
-uint64_t *store_write_counter(store_t *st, store_write_cat_t cat)
-{
-    if (!st || (unsigned)cat >= STORE_WR__COUNT) return NULL;
-    return &st->written[cat];
-}
 
 void store_write_stats(const store_t *st, store_write_stats_t *out)
 {
@@ -383,7 +409,6 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->path           = strdup(path);
     if (!r->path) { close(fd); free(r); return set_error(ERR_NOMEM, "store_open: strdup failed"); }
     r->dirfd          = fd;
-    r->obj_dirfd      = -1;
     r->dat_cache       = calloc(DAT_CACHE_MIN_SLOTS, sizeof(dat_cache_slot_t));
     r->dat_cache_mask  = DAT_CACHE_MIN_SLOTS - 1;
     r->dat_cache_count = 0;
@@ -391,10 +416,6 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
         close(fd); free(r->path); free(r);
         return set_error(ERR_NOMEM, "store_open: dat_cache alloc failed");
     }
-    r->loose_set       = NULL;
-    r->loose_set_mask  = 0;
-    r->loose_set_cnt   = 0;
-    r->loose_set_ready = 0;
     r->cfg             = cfg ? *cfg : (store_config_t){ 0 };
     r->locate_cb       = NULL;
     r->locate_user     = NULL;
@@ -403,7 +424,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
-    pthread_mutex_init(&r->loose_set_mu, NULL);
+    pthread_mutex_init(&r->bidx_mu, NULL);
+    pthread_mutex_init(&r->implicit_mu, NULL);
 
     /* tmp/ is where every staging and spill file goes, and nothing outside
      * the repository is used for either, so a repository whose tmp/ was
@@ -422,19 +444,176 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
 void store_close(store_t *st) {
     if (!st) return;
 
+    /* Whatever object_store_ex staged is sealed before the handle goes:
+     * a store that was written through is durable once it is closed. */
+    if (st->implicit && st->implicit_close) st->implicit_close(st, st->implicit);
+    st->implicit = NULL;
+
     /* The key does not outlive the handle that used it. */
     OPENSSL_cleanse(&st->key, sizeof(st->key));
+    object_aead_key_wipe(&st->aead);
     st->has_key = 0;
 
     store_dat_cache_flush(st);
     free(st->dat_cache);
     st->dat_cache = NULL;
-    if (st->obj_dirfd >= 0) close(st->obj_dirfd);
     close(st->dirfd);
     free(st->path);
-    pthread_mutex_destroy(&st->loose_set_mu);
-    free(st->loose_set);
+    pthread_mutex_destroy(&st->bidx_mu);
+    pthread_mutex_destroy(&st->implicit_mu);
+    free(st->bidx);
     free(st);
+}
+
+uint32_t store_reserve_pack_num(store_t *st, uint32_t scanned)
+{
+    uint32_t cur = atomic_load(&st->next_pack);
+    for (;;) {
+        uint32_t n = scanned > cur ? scanned : cur;
+        if (atomic_compare_exchange_weak(&st->next_pack, &cur, n + 1u)) return n;
+    }
+}
+
+void store_implicit_lock(store_t *st)   { pthread_mutex_lock(&st->implicit_mu); }
+void store_implicit_unlock(store_t *st) { pthread_mutex_unlock(&st->implicit_mu); }
+void *store_implicit_get(store_t *st)   { return st->implicit; }
+
+void store_implicit_set(store_t *st, void *writer, void (*close_fn)(store_t *, void *))
+{
+    st->implicit = writer;
+    st->implicit_close = close_fn;
+}
+
+/* ------------------------------------------------------------------ */
+/* Built-in index                                                      */
+/* ------------------------------------------------------------------ */
+
+static uint32_t bidx_slot(const uint8_t *hash, uint32_t mask)
+{
+    uint32_t v;
+    memcpy(&v, hash, sizeof(v));   /* the name is a digest: already uniform */
+    return v & mask;
+}
+
+/*
+ * Insert without growing. Caller holds bidx_mu. With replace set (a pack
+ * this handle just committed) the new location wins: a rewrite announces
+ * its new pack before removing the old one, and keeping the old location
+ * would lose the object the moment that removal dropped it. Without it (the
+ * scan) the first copy found wins; either is valid.
+ */
+static void bidx_put(bidx_slot_t *tbl, uint32_t mask, uint32_t *cnt,
+                     const uint8_t hash[OBJECT_HASH_SIZE], const store_location_t *loc,
+                     int replace)
+{
+    uint32_t i = bidx_slot(hash, mask);
+    while (tbl[i].used) {
+        if (memcmp(tbl[i].hash, hash, OBJECT_HASH_SIZE) == 0) {
+            if (replace) tbl[i].loc = *loc;
+            return;
+        }
+        i = (i + 1u) & mask;
+    }
+    tbl[i].used = 1;
+    memcpy(tbl[i].hash, hash, OBJECT_HASH_SIZE);
+    tbl[i].loc = *loc;
+    (*cnt)++;
+}
+
+/* Rehash into a table of new_cap slots, dropping pack `drop` (UINT64_MAX:
+ * none). Caller holds bidx_mu. -1 on allocation failure, table unchanged. */
+static int bidx_rehash(store_t *st, uint32_t new_cap, uint64_t drop)
+{
+    bidx_slot_t *nt = calloc(new_cap, sizeof(*nt));
+    if (!nt) return -1;
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; st->bidx && i <= st->bidx_mask; i++)
+        if (st->bidx[i].used && st->bidx[i].loc.pack_id != drop)
+            bidx_put(nt, new_cap - 1u, &cnt, st->bidx[i].hash, &st->bidx[i].loc, 0);
+    free(st->bidx);
+    st->bidx = nt;
+    st->bidx_mask = new_cap - 1u;
+    st->bidx_cnt = cnt;
+    return 0;
+}
+
+static void bidx_add_locked(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE], int replace,
+                            const store_location_t *loc)
+{
+    /* At most half full, so probes stay short and always end. */
+    if (!st->bidx || (st->bidx_cnt + 1u) * 2u > st->bidx_mask + 1u) {
+        uint32_t cap = st->bidx ? (st->bidx_mask + 1u) * 2u : 1024u;
+        if (bidx_rehash(st, cap, UINT64_MAX) != 0) return;
+    }
+    bidx_put(st->bidx, st->bidx_mask, &st->bidx_cnt, hash, loc, replace);
+}
+
+static void bidx_scan_add(void *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
+                          const store_location_t *loc)
+{
+    bidx_add_locked(ctx, hash, 0, loc);
+}
+
+static status_t bidx_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
+                            store_location_t *out)
+{
+    pthread_mutex_lock(&st->bidx_mu);
+    if (!st->bidx_built) {
+        status_t sst = store_scan_packs(st, bidx_scan_add, st);
+        if (sst != OK) { pthread_mutex_unlock(&st->bidx_mu); return sst; }
+        st->bidx_built = 1;
+    }
+    status_t rc = ERR_NOT_FOUND;
+    if (st->bidx) {
+        uint32_t i = bidx_slot(hash, st->bidx_mask);
+        while (st->bidx[i].used) {
+            if (memcmp(st->bidx[i].hash, hash, OBJECT_HASH_SIZE) == 0) {
+                *out = st->bidx[i].loc;
+                rc = OK;
+                break;
+            }
+            i = (i + 1u) & st->bidx_mask;
+        }
+    }
+    pthread_mutex_unlock(&st->bidx_mu);
+    return rc == OK ? OK : set_error(ERR_NOT_FOUND, "store_locate: object not found");
+}
+
+static void bidx_commit(store_t *st, const pack_commit_info_t *info)
+{
+    pthread_mutex_lock(&st->bidx_mu);
+    /* Unbuilt: the scan on first lookup will find this pack on disk. */
+    if (st->bidx_built) {
+        for (uint32_t i = 0; i < info->entry_count; i++) {
+            store_location_t loc = {
+                .in_pack      = 1,
+                .pack_id      = info->pack_id,
+                .offset       = info->entries[i].offset,
+                .comp_size    = info->entries[i].comp_size,
+                .orig_size    = info->entries[i].orig_size,
+                .pack_version = PACK_VERSION,
+                .entry_index  = info->entries[i].entry_index,
+            };
+            bidx_add_locked(st, info->entries[i].hash, 1, &loc);
+        }
+    }
+    pthread_mutex_unlock(&st->bidx_mu);
+}
+
+static void bidx_removed(store_t *st, uint64_t pack_id)
+{
+    pthread_mutex_lock(&st->bidx_mu);
+    if (st->bidx_built && st->bidx &&
+        bidx_rehash(st, st->bidx_mask + 1u, pack_id) != 0) {
+        /* No memory to rebuild: forget everything and scan again next time
+         * rather than keep a location in a pack that is gone. */
+        free(st->bidx);
+        st->bidx = NULL;
+        st->bidx_mask = 0;
+        st->bidx_cnt = 0;
+        st->bidx_built = 0;
+    }
+    pthread_mutex_unlock(&st->bidx_mu);
 }
 
 int store_fd(const store_t *st) {
@@ -443,202 +622,6 @@ int store_fd(const store_t *st) {
 
 const char *store_root(const store_t *st) {
     return st->path;
-}
-
-/* Several object writers may ask at once, so the first open wins and a loser
- * closes its own rather than leaking it or overwriting the winner. */
-int store_objects_fd(store_t *st) {
-    int cur = __atomic_load_n(&st->obj_dirfd, __ATOMIC_ACQUIRE);
-    if (cur >= 0) return cur;
-    int fd = openat(st->dirfd, "objects", O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return -1;
-    int expected = cur;
-    if (__atomic_compare_exchange_n(&st->obj_dirfd, &expected, fd, 0,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        return fd;
-    close(fd);
-    return expected;
-}
-
-/* ------------------------------------------------------------------ */
-/* In-memory loose object hash set                                     */
-/* ------------------------------------------------------------------ */
-
-#define LOOSE_SET_HASH_SIZE 32
-
-/* Slot layout: LOOSE_SET_HASH_SIZE bytes per slot.  All-zero = empty. */
-static uint32_t loose_set_slot(const uint8_t *hash, uint32_t mask) {
-    uint64_t k;
-    memcpy(&k, hash, sizeof(k));  /* first 8 bytes, native endian */
-    return (uint32_t)(k & (uint64_t)mask);
-}
-
-static const uint8_t loose_set_empty[LOOSE_SET_HASH_SIZE]; /* all zeros */
-
-static int loose_set_is_empty(const uint8_t *slot) {
-    return memcmp(slot, loose_set_empty, LOOSE_SET_HASH_SIZE) == 0;
-}
-
-static int hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static int hex_to_bin(const char *hex, uint8_t *out, size_t out_len) {
-    for (size_t i = 0; i < out_len; i++) {
-        int hi = hex_nibble(hex[i * 2]);
-        int lo = hex_nibble(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return -1;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return 0;
-}
-
-status_t store_build_loose_set(store_t *st) {
-    if (st->loose_set_ready) return OK;
-
-    int objfd = store_objects_fd(st);
-    if (objfd == -1) { st->loose_set_ready = 1; return OK; }
-
-    /* First pass: count loose objects */
-    uint32_t count = 0;
-    char subdir[3];
-    for (unsigned i = 0; i < 256; i++) {
-        snprintf(subdir, sizeof(subdir), "%02x", i);
-        int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-        if (subfd == -1) continue;
-        DIR *d = fdopendir(subfd);
-        if (!d) { close(subfd); continue; }
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            count++;
-        }
-        closedir(d);  /* also closes subfd */
-    }
-
-    /* Allocate at 50% load factor, minimum 256 slots */
-    uint32_t cap = 256;
-    while (cap < count * 2) cap *= 2;
-    st->loose_set = calloc(cap, LOOSE_SET_HASH_SIZE);
-    if (!st->loose_set) return set_error(ERR_NOMEM, "loose_set alloc");
-    st->loose_set_mask = cap - 1;
-    st->loose_set_cnt = 0;
-
-    /* Second pass: populate */
-    for (unsigned i = 0; i < 256; i++) {
-        snprintf(subdir, sizeof(subdir), "%02x", i);
-        int subfd = openat(objfd, subdir, O_RDONLY | O_DIRECTORY);
-        if (subfd == -1) continue;
-        DIR *d = fdopendir(subfd);
-        if (!d) { close(subfd); continue; }
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            /* Reconstruct full hash from bucket prefix + filename */
-            size_t nlen = strlen(de->d_name);
-            if (nlen != (LOOSE_SET_HASH_SIZE * 2 - 2)) continue;  /* 62 hex chars */
-            char hex[LOOSE_SET_HASH_SIZE * 2 + 1];
-            snprintf(hex, sizeof(hex), "%02x%s", i, de->d_name);
-            /* Parse hex to binary */
-            uint8_t hash[LOOSE_SET_HASH_SIZE];
-            if (hex_to_bin(hex, hash, LOOSE_SET_HASH_SIZE) != 0) continue;
-            /* Insert */
-            store_loose_set_insert(st, hash);
-        }
-        closedir(d);
-    }
-
-    st->loose_set_ready = 1;
-    return OK;
-}
-
-/* Under the same lock as inserts: an insert that grows the table frees the
- * one a lock-free reader would still be probing, and parallel large-file
- * stores (B086) insert while other workers look up. */
-int store_loose_set_contains(store_t *st, const uint8_t *hash) {
-    pthread_mutex_lock(&st->loose_set_mu);
-    int found = 0;
-    if (st->loose_set_ready && st->loose_set) {
-        uint32_t mask = st->loose_set_mask;
-        uint32_t cap = mask + 1;
-        uint32_t idx = loose_set_slot(hash, mask);
-        /* Bounded probe: if every slot is non-empty and none match, the table
-         * is full, so treat it as a miss rather than spinning forever. */
-        for (uint32_t i = 0; i < cap; i++) {
-            const uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
-            if (loose_set_is_empty(slot)) break;
-            if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) { found = 1; break; }
-            idx = (idx + 1) & mask;
-        }
-    }
-    pthread_mutex_unlock(&st->loose_set_mu);
-    return found;
-}
-
-/* Grow the loose-set table to 2x capacity and rehash. Caller must hold
- * loose_set_mu. Best-effort — on alloc failure the old table is kept. */
-static void loose_set_grow_locked(store_t *st) {
-    uint32_t old_cap = st->loose_set_mask + 1;
-    uint32_t new_cap = old_cap * 2;
-    uint8_t *new_tbl = calloc(new_cap, LOOSE_SET_HASH_SIZE);
-    if (!new_tbl) return;
-    uint32_t new_mask = new_cap - 1;
-    for (uint32_t i = 0; i < old_cap; i++) {
-        uint8_t *src = st->loose_set + (size_t)i * LOOSE_SET_HASH_SIZE;
-        if (loose_set_is_empty(src)) continue;
-        uint32_t idx = loose_set_slot(src, new_mask);
-        while (!loose_set_is_empty(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE))
-            idx = (idx + 1) & new_mask;
-        memcpy(new_tbl + (size_t)idx * LOOSE_SET_HASH_SIZE, src, LOOSE_SET_HASH_SIZE);
-    }
-    free(st->loose_set);
-    st->loose_set = new_tbl;
-    st->loose_set_mask = new_mask;
-}
-
-void store_loose_set_insert(store_t *st, const uint8_t *hash) {
-    /* All-zero hash is our empty sentinel — never insert it */
-    if (loose_set_is_empty(hash)) return;
-
-    pthread_mutex_lock(&st->loose_set_mu);
-    if (!st->loose_set) { pthread_mutex_unlock(&st->loose_set_mu); return; }
-    /* Grow at 75% load to keep open addressing efficient and to guarantee a
-     * free slot exists. */
-    uint32_t cap = st->loose_set_mask + 1;
-    if (st->loose_set_cnt * 4 >= cap * 3)
-        loose_set_grow_locked(st);
-
-    uint32_t mask = st->loose_set_mask;
-    cap = mask + 1;
-    uint32_t idx = loose_set_slot(hash, mask);
-    for (uint32_t i = 0; i < cap; i++) {
-        uint8_t *slot = st->loose_set + (size_t)idx * LOOSE_SET_HASH_SIZE;
-        if (loose_set_is_empty(slot)) {
-            memcpy(slot, hash, LOOSE_SET_HASH_SIZE);
-            st->loose_set_cnt++;
-            break;
-        }
-        if (memcmp(slot, hash, LOOSE_SET_HASH_SIZE) == 0) break;  /* already present */
-        idx = (idx + 1) & mask;
-    }
-    pthread_mutex_unlock(&st->loose_set_mu);
-}
-
-void store_clear_loose_set(store_t *st) {
-    pthread_mutex_lock(&st->loose_set_mu);
-    free(st->loose_set);
-    st->loose_set      = NULL;
-    st->loose_set_mask = 0;
-    st->loose_set_cnt  = 0;
-    st->loose_set_ready = 0;
-    pthread_mutex_unlock(&st->loose_set_mu);
-}
-
-int store_loose_set_ready(const store_t *st) {
-    return st->loose_set_ready;
 }
 
 static inline uint32_t dat_cache_hash(uint32_t pack_num) {
@@ -697,7 +680,7 @@ void store_dat_cache_return(store_t *st, uint32_t pack_num, FILE *fp) {
         dat_cache_grow(st);
 
     /*
-     * Bounded, like the loose set's probe beside it. The grow above
+     * Bounded. The grow above
      * guarantees a free slot - but only when it succeeds, and it returns
      * silently on an allocation failure by design ("best effort - keep old
      * table"). With a full table and no room to grow, an unbounded probe
@@ -753,15 +736,13 @@ void store_set_locate_cb(store_t *st, store_locate_fn cb, void *user) {
 }
 
 /*
- * With no resolver the engine can only see loose objects. That is the right
- * answer for tests and benchmarks, and it is a hard error in the daemon,
- * which always registers one.
+ * With no resolver the store answers from its built-in index. The daemon
+ * always registers one, so it never pays for the scan.
  */
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out) {
     if (!st || !out) return set_error(ERR_INVALID, "store_locate: null argument");
-    if (!st->locate_cb)
-        return set_error(ERR_NOT_FOUND, "store_locate: no resolver registered");
+    if (!st->locate_cb) return bidx_locate(st, hash, out);
     return st->locate_cb(st->locate_user, hash, out);
 }
 
@@ -772,8 +753,9 @@ void store_set_pack_commit_cb(store_t *st, store_pack_commit_fn cb, void *user) 
 }
 
 void store_emit_pack_commit(store_t *st, const pack_commit_info_t *info) {
-    if (!st || !st->commit_cb || !info) return;
-    st->commit_cb(st->commit_user, info);
+    if (!st || !info) return;
+    if (!st->locate_cb) bidx_commit(st, info);
+    if (st->commit_cb) st->commit_cb(st->commit_user, info);
 }
 
 void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user) {
@@ -783,6 +765,7 @@ void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user
 }
 
 void store_emit_pack_removed(store_t *st, uint64_t pack_id) {
-    if (!st || !st->removed_cb) return;
-    st->removed_cb(st->removed_user, pack_id);
+    if (!st) return;
+    if (!st->locate_cb) bidx_removed(st, pack_id);
+    if (st->removed_cb) st->removed_cb(st->removed_user, pack_id);
 }

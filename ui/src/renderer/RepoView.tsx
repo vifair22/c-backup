@@ -143,11 +143,11 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
   const spaceSaved = totalUncomp - totalComp
 
   // Storage bar percentages
-  const looseBytes = 0 /* the daemon reports loose as a count, not bytes */
+  const stagedBytes = 0 /* the daemon reports staged objects as a count, not bytes */
   const packBytes = summary?.phys_size ?? 0
   const totalBytes = summary?.phys_size ?? 1
-  const loosePct = Math.round((looseBytes / totalBytes) * 100)
-  const packPct = 100 - loosePct
+  const stagedPct = Math.round((stagedBytes / totalBytes) * 100)
+  const packPct = 100 - stagedPct
 
   const QBtn = ({ onClick, children }: { onClick: () => void; children: React.ReactNode }) => (
     <button onClick={onClick}
@@ -185,11 +185,11 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
         >
           <div className="flex h-1.5 rounded-full overflow-hidden mt-2 bg-surface-tertiary">
             {packPct > 0 && <div className="bg-accent" style={{ width: `${packPct}%` }} />}
-            {loosePct > 0 && <div className="bg-status-warning" style={{ width: `${loosePct}%` }} />}
+            {stagedPct > 0 && <div className="bg-status-warning" style={{ width: `${stagedPct}%` }} />}
           </div>
           <div className="flex justify-between text-[10px] text-text-muted mt-1">
             <span>Packed {fmtSize(packBytes)}</span>
-            <span>Loose {fmtSize(looseBytes)}</span>
+            <span>Staged {fmtSize(stagedBytes)}</span>
           </div>
         </StatCard>
         <StatCard
@@ -219,7 +219,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
         <div className="border-l border-border-default h-4 mx-0.5" />
 
         {/* Debug */}
-        {onLooseObjects && <QBtn onClick={onLooseObjects}>Loose</QBtn>}
+        {onLooseObjects && <QBtn onClick={onLooseObjects}>Objects</QBtn>}
         {onPackBrowser && <QBtn onClick={onPackBrowser}>Packs</QBtn>}
         {onHashLookup && <QBtn onClick={onHashLookup}>Lookup</QBtn>}
         {onViewJournal && <QBtn onClick={onViewJournal}>Journal</QBtn>}
@@ -262,9 +262,9 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
          * there is no bucket breakdown to read, so the panel is the parts
          * that are real rather than the old layout with invented numbers.
          */
-        const packedCount = Math.max(0, summary.objects - summary.loose)
-        const looseCount = summary.loose
-        const totalObjCount = packedCount + looseCount
+        const packedCount = Math.max(0, summary.objects - summary.staged)
+        const stagedCount = summary.staged
+        const totalObjCount = packedCount + stagedCount
         const typeBytes = repoStats.per_type.reduce((a, t) => a + t.orig_size, 0)
         const typeColors: Record<number, string> = {
           1: 'bg-blue-500', 2: 'bg-orange-500', 3: 'bg-green-500',
@@ -303,8 +303,8 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
                 {packedCount > 0 && (
                   <div className="bg-accent" style={{ width: `${pct(packedCount, totalObjCount)}%` }} />
                 )}
-                {looseCount > 0 && (
-                  <div className="bg-status-warning" style={{ width: `${pct(looseCount, totalObjCount)}%` }} />
+                {stagedCount > 0 && (
+                  <div className="bg-status-warning" style={{ width: `${pct(stagedCount, totalObjCount)}%` }} />
                 )}
               </div>
               <div className="flex gap-3 text-xs text-text-muted">
@@ -314,7 +314,7 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
                 </span>
                 <span>
                   <span className="inline-block w-2 h-2 rounded-full bg-status-warning mr-1" />
-                  Loose {fmtNum(looseCount)}
+                  Staged {fmtNum(stagedCount)}
                 </span>
                 <span className="ml-auto">{fmtNum(summary.packs)} pack files</span>
               </div>
@@ -403,7 +403,6 @@ export function RepoView({ connName, repoPath, title, onSelectSnapshot, onViewAl
         <ContextMenu x={opsMenu.x} y={opsMenu.y} onClose={() => setOpsMenu(null)}
           items={[
             { label: 'Verify', onClick: () => onRunOperation('verify') },
-            { label: 'Pack', onClick: () => onRunOperation('pack') },
             { label: 'Garbage Collect', onClick: () => onRunOperation('gc') },
             { label: 'Apply Retention', onClick: () => onRunOperation('gfs') },
             { label: 'Reindex', onClick: () => onRunOperation('reindex') },

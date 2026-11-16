@@ -97,13 +97,6 @@ static const config_key_t app_file_keys[] = {
       "Unchanged-file detection: auto, strict or relaxed",
       CFG_STORE_FILE, 0 },
 
-    /* Threads one backup stores large files on (B086). 0 sizes the pool
-     * from the CPUs and memory available; 1 stores them one at a time on
-     * the backup thread. See store_pool_plan. */
-    { "backup.store_workers", CFG_INT, "0",
-      "Threads storing large files at once: 0 automatic, 1 serial, up to 64",
-      CFG_STORE_FILE, 0 },
-
     /* What a retention pass keeps for a repository that has not set its own
      * with the policy API (retention.* policy keys override these). */
     { "retention.keep_snaps",   CFG_INT, "1",  "Newest snapshots always kept, whatever their tier", CFG_STORE_FILE, 0 },
@@ -130,9 +123,6 @@ static const config_section_t app_sections[] = {
  * one repository serialise anyway, so more than this buys nothing. */
 #define APP_MAX_PARALLEL_JOBS 256
 
-/* Upper bound on backup.store_workers, the ceiling store_pool_plan applies
- * to any request. */
-#define APP_MAX_STORE_WORKERS 64
 
 /* Ranges, enumerations and the bind address, checked during config init
  * alongside c-utils' own checks (app_config.c). */

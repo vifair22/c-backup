@@ -32,14 +32,9 @@
  * is why this is the sink worth having first - and it needs no network, so
  * it is also the one the engine's tests can drive.
  *
- * Objects arrive already compressed and already encrypted, so they are
- * written into a pack rather than as loose files. Not an optimisation: a
- * loose object header carries a compression field but every loose reader
- * refuses anything but COMPRESS_NONE, on the correct grounds that only
- * packing compresses. Since backup packs on completion, essentially every
- * object in a real repository carries a codec - so writing them loose
- * produced a replica that received every byte intact and could not be
- * opened, with nothing in the transfer to say so.
+ * Objects arrive already compressed and already encrypted, and are written
+ * into the target's packs exactly as they arrive, as every object in a
+ * repository is.
  *
  * object_store is not used for the same reason it cannot be: it would
  * decrypt (needing a key this end is not supposed to have) and re-encrypt
@@ -295,17 +290,12 @@ static status_t local_put_object(void *vctx, const replica_object_t *obj)
         if (st != OK) return st;
     }
 
-    /*
-     * Streamed in a chunk at a time (design constraint 2): an object larger
-     * than the seal arrives alone in a pack of its own, at any size, without
-     * ever being held whole. A failure part-way - the source unreadable,
-     * the link gone, the target full - is cut back out of the pack by the
-     * writer, so the staged pack still holds only whole entries and a
-     * later seal or close installs nothing torn.
-     */
-    return pack_stored_add_stream(c->w, obj->hash, obj->type, obj->compression,
-                                  obj->encryption, obj->uncompressed_size,
-                                  obj->payload_len, obj->read, obj->read_ctx);
+    /* A failed write is cut back out of the pack by the writer, so the
+     * staged pack still holds only whole entries and a later seal or close
+     * installs nothing torn. */
+    return pack_stored_add(c->w, obj->hash, obj->type, obj->compression,
+                           obj->encryption, obj->uncompressed_size,
+                           obj->payload, (size_t)obj->payload_len);
 }
 
 /*

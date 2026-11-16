@@ -89,7 +89,8 @@ static void test_register_creates_missing_dir(void **state)
     assert_true(strlen(m.uuid) > 0);
 
     struct stat sb;
-    assert_int_equal(stat(TEST_ROOT "/fresh/objects", &sb), 0);
+    assert_int_not_equal(stat(TEST_ROOT "/fresh/objects", &sb), 0);   /* no loose objects in format 3 */
+    assert_int_equal(stat(TEST_ROOT "/fresh/snapshot-ids", &sb), 0);
     assert_int_equal(stat(TEST_ROOT "/fresh/packs", &sb), 0);
     assert_int_equal(count_repos(), 1);
 }
@@ -386,7 +387,7 @@ static void test_deregister_removes_row(void **state)
 
     /* The data directory survives: deregistering is not deleting. */
     struct stat sb;
-    assert_int_equal(stat(TEST_ROOT "/gone/objects", &sb), 0);
+    assert_int_equal(stat(TEST_ROOT "/gone/packs", &sb), 0);
 }
 
 /* ---------- locking ---------- */
@@ -847,21 +848,20 @@ static void test_open_attaches_the_repository_key(void **state)
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
+    /* Closing seals the store's pack; the first pack is number 0. */
+    store_close(store);
     char obj[640];
-    snprintf(obj, sizeof(obj), "%s/enc/objects/%.2s/%s", TEST_ROOT, hex, hex + 2);
+    snprintf(obj, sizeof(obj), "%s/enc/packs/000000/pack-0000000000.dat", TEST_ROOT);
     FILE *f = fopen(obj, "rb");
     assert_non_null(f);
     char blob[4096];
     size_t n = fread(blob, 1, sizeof(blob), f);
     fclose(f);
+    assert_true(n > strlen(data));
     int legible = 0;
     for (size_t i = 0; i + strlen(data) <= n; i++)
         if (memcmp(blob + i, data, strlen(data)) == 0) { legible = 1; break; }
     assert_false(legible);
-
-    store_close(store);
 }
 
 /*

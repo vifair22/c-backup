@@ -295,57 +295,53 @@ static void test_failed_compaction_leaves_repo_usable(void **state)
 }
 
 /*
- * The pack job, which the tester asked about by name: a large loose object
- * that compresses is read, compressed and written into a pack whose entry
- * is still big enough for its parity to spill. Half random, half zeros, so
- * the probe accepts it and the stored entry stays several MiB.
+ * The store's own pack writer, which the tester asked about by name (it was
+ * the pack job when objects were stored loose first): an object that
+ * compresses is staged, and sealing it writes an entry still big enough for
+ * its parity to spill. Half random, half zeros, so the probe accepts it and
+ * the stored entry stays several MiB.
  */
-static void test_pack_without_system_tmp(void **state)
+static void test_store_seal_without_system_tmp(void **state)
 {
     (void)state;
-    const char *path = TEST_SRC "/halfzero";
-    FILE *f = fopen(path, "wb");
-    assert_non_null(f);
+    const size_t len = 2u * BIG_SIZE;
+    uint64_t *data = malloc(len);
+    assert_non_null(data);
     uint64_t x = 0x243F6A8885A308D3ull;
-    static uint64_t buf[1024];
-    for (size_t done = 0; done < 4u * BIG_SIZE; done += 2 * sizeof(buf)) {
-        for (size_t i = 0; i < sizeof(buf) / sizeof(buf[0]); i++) {
+    const size_t run = 1024;
+    for (size_t w = 0; w < len / sizeof(uint64_t); w += 2 * run) {
+        for (size_t i = 0; i < run; i++) {
             x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-            buf[i] = x;
+            data[w + i] = x;
         }
-        assert_int_equal(fwrite(buf, 1, sizeof(buf), f), sizeof(buf));
-        memset(buf, 0, sizeof(buf));
-        assert_int_equal(fwrite(buf, 1, sizeof(buf), f), sizeof(buf));
+        memset(&data[w + run], 0, run * sizeof(uint64_t));
     }
-    fclose(f);
 
-    int fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-    uint8_t hash[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store_file(store, fd, 4u * BIG_SIZE, hash), OK);
-    close(fd);
     unsigned packs_before = count_packs(TEST_REPO);
-
     confine_tmp();
-    pack_report_t pr;
-    memset(&pr, 0, sizeof(pr));
-    status_t st = repo_pack_report(store, &pr, NULL, NULL);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    int is_new = 0;
+    uint64_t phys = 0;
+    status_t st = object_store_ex(store, OBJECT_TYPE_FILE, data, len, hash,
+                                  &is_new, &phys);
+    if (st == OK) st = object_store_flush(store);
     release_tmp();
     assert_int_equal(st, OK);
     assert_int_equal(fault_tmp_refused, 0);
-    assert_true(pr.packed >= 1);
+    assert_true(is_new);
+    /* Compressed, but still past the point where its parity spills. */
+    assert_true(phys < len);
+    assert_true(phys > BIG_SIZE / 2);
     assert_true(count_packs(TEST_REPO) > packs_before);
 
-    /* And it reads back from the pack, streamed: it is past what a whole
-     * load will buffer. */
-    const char *out = TEST_DIR "/halfzero.out";
-    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    assert_true(ofd >= 0);
-    uint64_t got = 0;
-    assert_int_equal(object_load_stream(store, hash, ofd, &got, NULL), OK);
-    close(ofd);
-    assert_int_equal(got, 4u * BIG_SIZE);
-    assert_true(files_equal(path, out));
+    /* And it reads back from the pack. */
+    void *back = NULL;
+    size_t got = 0;
+    assert_int_equal(object_load(store, hash, &back, &got, NULL), OK);
+    assert_int_equal(got, len);
+    assert_memory_equal(back, data, len);
+    free(back);
+    free(data);
 }
 
 /* A repository whose tmp/ was removed gets it back on open. */
@@ -376,7 +372,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_rewrites_and_coalesces_without_system_tmp, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replicate_without_system_tmp, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_compaction_leaves_repo_usable, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_pack_without_system_tmp, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_store_seal_without_system_tmp, setup, teardown),
         cmocka_unit_test_setup_teardown(test_store_open_recreates_tmp, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -19,11 +19,9 @@ static const char *const phase_names[PHASE__COUNT] = {
     [PHASE_TREES]        = "trees",
     [PHASE_INDEX_NODES]  = "index-nodes",
     [PHASE_CACHE_SWEEP]  = "cache-sweep",
-    [PHASE_STORE_WAIT]   = "large-file-wait",
     [PHASE_SETUP]        = "setup",
     [PHASE_PACK_SEAL]    = "pack-seal",
     [PHASE_SNAPSHOT]     = "snapshot-record",
-    [PHASE_PACK_SWEEP]   = "pack-sweep",
     [PHASE_TXN_WAIT]     = "txn-wait",
     [PHASE_TXN_COMMIT]   = "txn-commit",
     [PHASE_PROGRESS]     = "progress-cb",
@@ -31,23 +29,6 @@ static const char *const phase_names[PHASE__COUNT] = {
     [PHASE_COMMIT_TREES] = "  commit:trees",
     [PHASE_COMMIT_INDEX] = "  commit:index",
     [PHASE_COMMIT_PACK]  = "  commit:pack",
-    [PHASE_SWEEP_SCAN]   = "  sweep:scan+probe",
-    [PHASE_SWEEP_PACK]   = "  sweep:pack",
-    [PHASE_OBJ_SETUP]    = "  obj:setup",
-    [PHASE_OBJ_IO]       = "  obj:io-loop",
-    [PHASE_OBJ_FINISH]   = "  obj:finish",
-    [PHASE_OBJ_SYNC]     = "  obj:sync",
-    [PHASE_OBJ_INSTALL]  = "  obj:install",
-    [PHASE_OBJ_CLOSE]    = "    inst:close",
-    [PHASE_OBJ_MKDIR]    = "    inst:mkdir+open",
-    [PHASE_OBJ_RENAME]   = "    inst:rename",
-    [PHASE_OBJ_LOOSESET] = "    inst:loose-set",
-    [PHASE_STORE_WORKERS] = "  large-files",
-    [PHASE_IO_READ]      = "    io:read cpu",
-    [PHASE_IO_HASH]      = "    io:hash cpu",
-    [PHASE_IO_ENCRYPT]   = "    io:encrypt cpu",
-    [PHASE_IO_WRITE]     = "    io:write cpu",
-    [PHASE_IO_PARITY]    = "    io:parity cpu",
 };
 
 void phase_merge(phase_timers_t *dst, const phase_timers_t *src)
@@ -123,20 +104,6 @@ void phase_report(const phase_timers_t *t, const char *what, uint64_t total_ns)
                  (unsigned long long)rows[i].count, per_call_us);
     }
 
-    /*
-     * Said once rather than left for the reader to infer: with parallel
-     * workers the obj:* and large-files rows are summed across threads and
-     * can each exceed the wall clock, and the io:* rows are CPU time. The
-     * backup thread's own wait for the workers is large-file-wait, which is
-     * what the percentages above count.
-     */
-    if (t->store_threads > 1)
-        log_info("  (large files stored on %u threads: large-files and obj:* are "
-                 "wall time summed over them, io:* is thread CPU time)",
-                 t->store_threads);
-    else if (t->ns[PHASE_IO_HASH] || t->ns[PHASE_IO_READ])
-        log_info("  (io:* is thread CPU time over the reader, hasher and writer "
-                 "threads of each object; obj:* is wall time)");
 
     if (total_ns > accounted) {
         double gap = (double)(total_ns - accounted) / 1e9;

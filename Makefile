@@ -612,9 +612,6 @@ $(BINS)/bench_micro: $(BENCH)/micro.c $(REL_LIB_OBJS) | $(BINS)
 $(BINS)/bench_phases: $(BENCH)/phases.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
 
-$(BINS)/bench_fuse_xfer: $(BENCH)/fuse_xfer.c $(REL_LIB_OBJS) | $(BINS)
-	$(CC) $(BENCH_CFLAGS) $^ -o $@ -flto=auto $(LDFLAGS)
-
 $(BINS)/bench_browse: $(BENCH)/browse.c $(BENCH)/bench_common.h $(REL_LIB_OBJS) | $(BINS)
 	$(CC) $(BENCH_CFLAGS) $(filter %.c %.o,$^) -o $@ -flto=auto $(LDFLAGS)
 

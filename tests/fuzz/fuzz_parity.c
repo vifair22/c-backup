@@ -3,9 +3,10 @@
  *
  * These run on damaged data by definition - that is the whole point of them
  * - so they are the code most certain to be handed bytes nobody intended.
- * A decoder that reads out of bounds while trying to repair a corrupt object
+ * A decoder that reads out of bounds while trying to repair a corrupt entry
  * turns recoverable damage into a crash, which is the opposite of the job.
  */
+#include "pack.h"
 #include "parity.h"
 #include "types.h"
 
@@ -53,9 +54,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     }
     free(payload);
 
-    /* The header record, on a header the fuzzer wrote. */
-    if (size >= sizeof(object_header_t) + sizeof(parity_record_t)) {
-        object_header_t h;
+    /* The header record, on a pack entry header the fuzzer wrote: the record
+     * every pack entry carries for its 51-byte header. */
+    if (size >= sizeof(pack_dat_entry_hdr_t) + sizeof(parity_record_t)) {
+        pack_dat_entry_hdr_t h;
         parity_record_t rec;
         memcpy(&h, data, sizeof(h));
         memcpy(&rec, data + sizeof(h), sizeof(rec));

@@ -154,19 +154,18 @@ static void test_roundtrip_is_identical(void **state)
 }
 
 /*
- * A sparse file comes back with its holes.
+ * A file with holes comes back with the right bytes.
  *
- * Every file goes through SEEK_DATA/SEEK_HOLE at backup, and one with holes
- * is stored as a region table plus its data. Restore has a separate reader
- * for that, restore_sparse_streaming, and nothing exercised it: a file with
- * holes is common (VM images, databases, core dumps) and this is the only
- * path that writes one back. Reading it linearly would produce a file with
- * the right bytes and every hole filled in, which diff would not notice, so
- * the allocation is checked too.
+ * Holes at the start, in the middle and at the end. The sparse object type
+ * and its region walk are gone: a file with holes is an ordinary FILE object
+ * whose holes read as zeroes, so the stored object carries the logical size
+ * and restore writes those zeroes back.
  *
- * Holes at the start, in the middle and at the end, because each one is a
- * different branch of the region walk. Restored once from the loose object
- * and once after packing, since the two load through different readers.
+ * TODO(CDC): this used to check the restored allocation too, because writing
+ * every zero back gives a file with the right bytes and every hole filled
+ * in, which diff does not notice. Holes are the chunker's to keep again
+ * (content_restore_fd leaves them unwritten); when it lands the allocation
+ * assertions belong back here and in the all-hole test below.
  */
 #define SPARSE_SIZE  (4u * 1024 * 1024)
 #define SPARSE_CHUNK (64u * 1024)
@@ -186,26 +185,27 @@ static int make_sparse(const char *path)
     close(fd);
 
     /* A filesystem that does not report holes stores the file whole, and
-     * then there is nothing sparse to restore. */
+     * then there are no holes to read as zeroes. */
     struct stat sb;
     assert_int_equal(stat(path, &sb), 0);
     return (uint64_t)sb.st_blocks * 512 < SPARSE_SIZE;
 }
 
-static void check_sparse_restore(int64_t snap)
+/* The named file's object: a FILE of the logical size, holes included. */
+static void assert_stored_dense(const char *name, uint64_t size)
 {
-    rmrf(TEST_DST);
-    restore_result_t rr;
-    assert_int_equal(restore_run(store, db, repo_id, snap, TEST_DST, NULL, &rr), OK);
-    assert_int_equal(rr.failed, 0);
-    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
-
-    char path[600];
-    snprintf(path, sizeof(path), "%s/sparse.img", restored_root());
-    struct stat sb;
-    assert_int_equal(stat(path, &sb), 0);
-    assert_int_equal((uint64_t)sb.st_size, SPARSE_SIZE);
-    assert_true((uint64_t)sb.st_blocks * 512 < SPARSE_SIZE / 2);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT o.type, o.orig_size FROM nodes n JOIN objects o"
+        " ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
+        " WHERE n.repo_id = ? AND n.name = ?",
+        (const char *[]){ repo, name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_int_equal(strtoull(r->rows[0][0], NULL, 10), OBJECT_TYPE_FILE);
+    assert_int_equal(strtoull(r->rows[0][1], NULL, 10), size);
+    db_result_free(r);
 }
 
 static void test_sparse_file_round_trips_with_its_holes(void **state)
@@ -216,21 +216,28 @@ static void test_sparse_file_round_trips_with_its_holes(void **state)
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
-    check_sparse_restore(br.snapshot_id);
+    assert_stored_dense("sparse.img", SPARSE_SIZE);
 
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    check_sparse_restore(br.snapshot_id);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/sparse.img", restored_root());
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal((uint64_t)sb.st_size, SPARSE_SIZE);
 }
 
 /*
- * A file that is nothing but a hole restores with nothing allocated.
+ * A file that is nothing but a hole restores at its size, as zeroes.
  *
- * SEEK_DATA on such a file fails with ENXIO, which the store used to read as
- * "this filesystem does not report holes" and so stored the file whole. The
- * restore then wrote every zero: `truncate -s 100M` came back as 204,800
- * allocated blocks. Comparing contents cannot catch that, since the bytes
- * are identical; only the block count says the restore inflated the file.
+ * SEEK_DATA on such a file fails with ENXIO, which the store once read as
+ * "this filesystem does not report holes". Now every file is read whole and
+ * the holes are zeroes, which compress to almost nothing: the stored entry
+ * is a sliver of the logical size, which is what keeps a `truncate -s` file
+ * from costing the repository its size.
  */
 static void test_file_that_is_all_hole_round_trips(void **state)
 {
@@ -242,16 +249,11 @@ static void test_file_that_is_all_hole_round_trips(void **state)
     assert_int_equal(ftruncate(fd, size), 0);
     close(fd);
 
-    struct stat sb;
-    assert_int_equal(stat(src, &sb), 0);
-    if (sb.st_blocks != 0) {
-        /* The fixture is already dense here, so there is nothing to keep. */
-        skip();
-    }
-
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    assert_stored_dense("hole.bin", (uint64_t)size);
+    assert_true(br.bytes_stored < (uint64_t)size / 16);
 
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
@@ -259,10 +261,10 @@ static void test_file_that_is_all_hole_round_trips(void **state)
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
 
     char dst[512];
+    struct stat sb;
     snprintf(dst, sizeof(dst), "%s/hole.bin", restored_root());
     assert_int_equal(stat(dst, &sb), 0);
     assert_int_equal(sb.st_size, size);
-    assert_int_equal(sb.st_blocks, 0);
 }
 
 /* Warnings the restore logs, collected so a test can read what an operator
@@ -1176,11 +1178,8 @@ static void test_gc_compacts_packs(void **state)
     backup_result_t dead_br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &dead_br), OK);
 
-    /* The backup packed as it went, so this finds nothing left loose. What
-     * matters to compaction is that the packs exist, not who wrote them. */
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 0);
+    /* Every object is in a pack once the backup returns; what matters to
+     * compaction is that the packs exist. */
     uint64_t bytes_before = pack_bytes_on_disk();
     assert_true(bytes_before > 0);
 
@@ -1644,9 +1643,9 @@ static void test_reindex_handles_multiple_snapshots(void **state)
 /* Read safety: only verified bytes reach a final path (OWN-36, -37, -39) */
 /* ------------------------------------------------------------------ */
 
-/* Larger than STREAM_LOAD_MAX, so backup leaves it loose and restore can
- * only stream it, across more than one read window. */
-#define BIG_SIZE ((size_t)40 * 1024 * 1024)
+/* Several MiB of incompressible content: one object, well inside the
+ * bound, whose entry spans many parity groups. */
+#define BIG_SIZE ((size_t)6 * 1024 * 1024)
 
 static void write_random_file(const char *path, size_t size, uint32_t seed)
 {
@@ -1699,11 +1698,52 @@ static void node_hash_hex(const char *name, char out[OBJECT_HASH_SIZE * 2 + 1])
     db_result_free(r);
 }
 
-static void loose_path_of(const char *hex, char *out, size_t outsz)
+/* Where an object's entry sits on disk. */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    int      found;
+    uint32_t cur, pack_num;
+    uint64_t entry_offset, payload_offset, stored;
+    uint8_t  encryption;
+} entry_loc_t;
+
+static void entry_loc_cb(const pack_entry_info_t *info, void *ctx)
 {
-    snprintf(out, outsz, "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
-    struct stat sb;
-    assert_int_equal(stat(out, &sb), 0);   /* large objects stay loose */
+    entry_loc_t *el = ctx;
+    if (el->found || memcmp(info->hash, el->hash, OBJECT_HASH_SIZE) != 0) return;
+    el->found = 1;
+    el->pack_num = el->cur;
+    el->entry_offset = info->entry_offset;
+    el->payload_offset = info->payload_offset;
+    el->stored = info->compressed_size;
+    el->encryption = info->encryption;
+}
+
+static void entry_loc_pack(uint32_t pack_num, void *ctx)
+{
+    entry_loc_t *el = ctx;
+    if (el->found) return;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", pack_num);
+    el->cur = pack_num;
+    uint32_t ver = 0, cnt = 0;
+    assert_int_equal(pack_enumerate_dat(store, name, &ver, &cnt, entry_loc_cb, el), OK);
+}
+
+/* Find hex's pack entry; *path gets its pack's .dat. */
+static entry_loc_t pack_entry_of(const char *hex, char *path, size_t pathsz)
+{
+    entry_loc_t el;
+    memset(&el, 0, sizeof(el));
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(hex + 2 * i, "%2x", &v), 1);
+        el.hash[i] = (uint8_t)v;
+    }
+    assert_int_equal(pack_list(store, entry_loc_pack, &el), OK);
+    assert_true(el.found);
+    assert_int_equal(pack_dat_path_resolve(path, pathsz, TEST_REPO, el.pack_num), 0);
+    return el;
 }
 
 static void flip_file_byte(const char *path, off_t off)
@@ -1718,12 +1758,12 @@ static void flip_file_byte(const char *path, off_t off)
 }
 
 /*
- * OWN-37, end to end: an encrypted loose object with a flipped payload byte
+ * OWN-37, end to end: an encrypted object with a flipped payload byte
  * restores correct, and a deep verify counts it recoverable rather than
  * lost. Before the fix the tag failure ended the read with the parity
  * unused, so the restore failed the file and verify reported loss.
  */
-static void test_encrypted_loose_flip_restores_and_verifies(void **state)
+static void test_encrypted_flip_restores_and_verifies(void **state)
 {
     (void)state;
     repo_key_t key;
@@ -1737,14 +1777,12 @@ static void test_encrypted_loose_flip_restores_and_verifies(void **state)
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
     node_hash_hex("big.bin", hex);
-    loose_path_of(hex, path, sizeof(path));
-    object_header_t hdr;
-    int fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
-    close(fd);
-    assert_int_equal(hdr.encryption, ENCRYPT_CHACHA20);
-    flip_file_byte(path, (off_t)sizeof(hdr) + (20 << 20));
+    entry_loc_t el = pack_entry_of(hex, path, sizeof(path));
+    assert_int_equal(el.encryption, ENCRYPT_CHACHA20);
+    assert_true(el.stored > (uint64_t)(4 << 20));
+    flip_file_byte(path, (off_t)el.payload_offset + (4 << 20));
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
 
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
@@ -1932,19 +1970,21 @@ static void test_unknown_object_type_is_refused_by_restore(void **state)
 
     char hex[OBJECT_HASH_SIZE * 2 + 1], path[600];
     node_hash_hex("big.bin", hex);
-    loose_path_of(hex, path, sizeof(path));
+    entry_loc_t el = pack_entry_of(hex, path, sizeof(path));
     int fd = open(path, O_RDWR);
     assert_true(fd >= 0);
-    object_header_t hdr;
-    assert_int_equal(pread(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
-    hdr.type = 9;
-    parity_record_t rec;
-    parity_record_compute(&hdr, sizeof(hdr), &rec);
-    assert_int_equal(pwrite(fd, &hdr, sizeof(hdr), 0), (ssize_t)sizeof(hdr));
-    assert_int_equal(pwrite(fd, &rec, sizeof(rec),
-                            (off_t)sizeof(hdr) + (off_t)hdr.compressed_size),
-                     (ssize_t)sizeof(rec));
+    uint8_t t = 9;
+    assert_int_equal(pwrite(fd, &t, 1, (off_t)(el.entry_offset +
+                                offsetof(pack_dat_entry_hdr_t, type))), 1);
+    /* Break the footer too, so the pack has no parity: with it, header
+     * repair would (rightly) put the original type back. */
+    uint8_t z = 0;
+    off_t end = lseek(fd, 0, SEEK_END);
+    assert_true(end > (off_t)sizeof(parity_footer_t));
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)sizeof(parity_footer_t)), 1);
     close(fd);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
 
     captured_log[0] = '\0';
     int h = log_stream_register(capture_log, NULL);
@@ -1999,7 +2039,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_after_reindex_is_identical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_handles_multiple_snapshots, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_encrypted_loose_flip_restores_and_verifies, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_encrypted_flip_restores_and_verifies, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_killed_mid_file_leaves_no_partial_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resume_keeps_a_file_that_is_not_the_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_object_leaves_no_file_and_no_partial, setup, teardown),

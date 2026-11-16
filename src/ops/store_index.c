@@ -141,13 +141,11 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
             failed = 1;
 
         /*
-         * The object moved from loose to packed, so both its location and its
-         * footprint change. phys_size becomes the bytes it occupies inside the
-         * pack; the pack's own headers and parity trailer are charged to
-         * packs.size rather than split across its entries, so total bytes on
-         * disk is sum(packs.size) plus phys_size of everything still loose.
-         * Updating location alone left every packed object still claiming the
-         * loose footprint it no longer has.
+         * The object moved from staged to installed, so its location and
+         * footprint become the pack's. phys_size is the bytes it occupies
+         * inside the pack; the pack's own headers and parity trailer are
+         * charged to packs.size rather than split across its entries, so total
+         * bytes on disk is sum(packs.size).
          */
         if (!failed && db_execute_non_query(idx->db,
                 "UPDATE objects SET location = ?, phys_size = ?, orig_size = ?"
@@ -246,11 +244,28 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
                            uint64_t phys_size, uint64_t orig_size,
                            const char *location);
 
-status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
+status_t store_index_put_packed(cutils_db_t *db, int64_t repo_id,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                uint8_t type, uint64_t phys_size, uint64_t orig_size)
 {
-    return put_object(db, repo_id, hash, type, phys_size, orig_size, "loose");
+    /* The location and sizes are the pack's, as the commit that installed
+     * it recorded them; the caller's figures describe nothing new. */
+    (void)phys_size;
+    (void)orig_size;
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    hash_to_hex(hash, hex);
+    char repo[32], t[8];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(t, sizeof(t), "%u", type);
+    if (db_execute_non_query(db,
+            "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
+            "                     location, type)"
+            " SELECT repo_id, hash, 0, comp_size, orig_size, CAST(pack_id AS TEXT), ?"
+            " FROM pack_objects WHERE repo_id = ? AND hash = ?"
+            " ON CONFLICT(repo_id, hash) DO NOTHING",
+            (const char *[]){ t, repo, hex, NULL }, NULL) != 0)
+        return set_error(ERR_IO, "cannot record object");
+    return OK;
 }
 
 status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
@@ -290,9 +305,9 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
      * Content-addressed: seeing the same hash twice is dedup working, not an
      * error, so an existing row is left alone rather than overwritten - with
      * one exception. A row recorded as zero bytes for an object at the same
-     * location is the B060 bug's leftover (a dedup against a loose file from
-     * an interrupted run used to report no size), and no stored object is
-     * zero bytes: every one has a header and a parity trailer. Taking the
+     * location is a dedup against an object whose size was not known when
+     * the row was written, and no stored object is zero bytes: every entry
+     * has a header. Taking the
      * real size when it is offered repairs those rows on the next backup
      * that meets them, and cannot touch a correct one.
      */

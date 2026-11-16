@@ -14,11 +14,9 @@
 #include "pack.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
-#include "store_pool.h"
 
 #include <cutils/log.h>
 
-#include <openssl/sha.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -92,13 +90,8 @@ typedef struct {
      * the store's byte-progress hook can let it go mid-file when a writer
      * queues. Only one phase runs at a time, and each starts it zeroed. */
     batch_t        batch;
-    /*
-     * Every object this run produces goes into this pack. There is no second
-     * mode: the loose path is what objects fall back to when the pack format
-     * cannot take them - a file with holes, or one too large to hash before
-     * its entry header is written - and those are packed afterwards by the
-     * ordinary auto-pack, as they always were.
-     */
+    /* Every object this run produces goes into this pack writer: content,
+     * metadata blobs and trees alike. There is no other place for one. */
     pack_backup_writer_t *pack_w;
     /* Regular-file bytes handled and expected, for opts->bytes_cb. */
     uint64_t       bytes_done, bytes_total;
@@ -112,13 +105,6 @@ typedef struct {
      * time, which is slower and still right. */
     struct { dev_t dev; unsigned ignore; } fs_seen[16];
     unsigned       n_fs_seen;
-    /* Large files go to this pool when there is one (B086); NULL stores
-     * every file on this thread. See store_pool.h. */
-    store_pool_t  *pool;
-    /* Hashes the pool reported as newly written this run. Two identical
-     * large files stored at once both find the object absent and both
-     * install it; the second one to be taken back is not new. */
-    hashset_t      pool_new;
 } pipeline_t;
 
 /*
@@ -244,7 +230,7 @@ static void report(pipeline_t *p, const char *phase, uint64_t done, uint64_t tot
     uint64_t _tp = phase_now();
     if (p->opts->bytes_cb)
         p->opts->bytes_cb(p->opts->progress_ctx,
-                          p->bytes_done + p->file_bytes + store_pool_bytes(p->pool),
+                          p->bytes_done + p->file_bytes,
                           p->bytes_total);
     p->opts->progress_cb(phase, done, total, p->opts->progress_ctx);
     phase_add_nested(p->timers, PHASE_PROGRESS, _tp);
@@ -357,7 +343,7 @@ static int scan_path_cmp(const void *a, const void *b)
  */
 /*
  * Record a stored object in the index: staged when it went into the open
- * pack, loose when it went to its own file. See store_index_put_staged for
+ * pack, packed when the repository already held it. See store_index_put_staged for
  * why the difference decides whether a crash can lose data silently.
  */
 static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
@@ -365,10 +351,10 @@ static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE
 {
     return pack_backup_holds(p->pack_w, hash)
         ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
-        : store_index_put_loose(p->db, p->repo_id, hash, type, phys, orig);
+        : store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
 }
 
-static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
+static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *path,
                                 const uint8_t *data, size_t len,
                                 uint8_t out_hash[OBJECT_HASH_SIZE])
 {
@@ -377,17 +363,28 @@ static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type,
         return OK;
     }
 
-    SHA256(data, len, out_hash);
+    /* The memo is keyed by the object's own name, type included, so it
+     * matches what the store files the blob under. */
+    object_name(obj_type, data, len, out_hash);
     if (hashset_contains(&p->meta_seen, out_hash)) return OK;
 
-    int is_new = 0;
-    uint64_t phys = 0;
-    object_write_t ow;
+    object_write_t ow = { 0 };
     status_t st = object_store_packed(p->store, obj_type, data, len,
                                       p->pack_w, out_hash, &ow);
-    is_new = ow.is_new;
-    phys   = ow.phys_bytes;
+    if (st == ERR_TOO_LARGE) {
+        /* A blob past the object bound (a pathological xattr set) is not
+         * stored: the file is backed up without it, and the operator is
+         * told, rather than the backup failing for metadata. */
+        log_warn("backup: %s: %s of %zu bytes is past the object bound; backed "
+                 "up without it", path, obj_type == OBJECT_TYPE_XATTR
+                 ? "extended attribute set" : "ACL set", len);
+        err_clear();
+        memset(out_hash, 0, OBJECT_HASH_SIZE);
+        return OK;
+    }
     if (st != OK) return st;
+    int is_new = ow.is_new;
+    uint64_t phys = ow.phys_bytes;
     if (is_new) {
         p->res->objects_new++;
         st = record_object(p, out_hash, obj_type, phys, len);
@@ -425,10 +422,10 @@ static void scan_progress(uint32_t scanned, void *ctx)
  * commits for a 1,605-file backup, about 60 s on the UAT host's storage, all
  * of it unattributed. Now the backup asks (db_txn_waiters) at every point
  * that can: every entry, every read of a file being stored, every slice of a
- * wait on the large-file workers, every tree.
+ * tree.
  *
  *   - Nobody waiting: the batch ends at BATCH_ENTRIES entries, as it did
- *     before B107, and is held across large files and pool waits.
+ *     before B107, and is held across large files.
  *   - A writer queues: the batch ends at the next check, so it waits for
  *     one entry or one read at most, and the batch becomes contended for
  *     BATCH_CONTENDED_MS from the last time a waiter was seen.
@@ -499,150 +496,14 @@ static void batch_count(pipeline_t *p, batch_t *b)
     else batch_yield(p, b);
 }
 
-/*
- * Record a large file a pool worker has finished, exactly as the serial path
- * below records one it stored itself: the same warning and skip for a file
- * that could not be stored, the same counters, index row and cache row. Runs
- * on the backup thread, inside the batch pool_drain opened for it.
- */
-static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
-{
-    scan_entry_t *e = &p->scan->entries[j->index];
-    /* Counted whole here rather than as the loop moved past it, since the
-     * loop moved past it long before the file was read. */
-    p->bytes_done += e->node.size;
-
-    if (j->st != OK) {
-        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
-        log_warn("backup: cannot store %s: %s", e->path, j->err);
-        return OK;
-    }
-
-    memcpy(e->node.content_hash, j->hash, OBJECT_HASH_SIZE);
-    /*
-     * Two identical large files on two workers can both find the object
-     * absent and both write it; the second rename replaces the first with
-     * the same bytes, so the repository holds one copy. Count it once, as
-     * the serial path would have.
-     */
-    int is_new = j->w.is_new;
-    if (is_new) {
-        if (hashset_contains(&p->pool_new, j->hash)) is_new = 0;
-        else hashset_add(&p->pool_new, j->hash);
-    }
-    if (is_new) {
-        p->res->objects_new++;
-        p->res->bytes_stored += j->w.phys_bytes;
-    }
-    p->res->files++;
-    p->res->bytes_logical += e->node.size;
-
-    uint64_t _ti = phase_now();
-    status_t st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
-                                j->w.phys_bytes, j->w.payload_size);
-    phase_add(p->timers, PHASE_INDEX_PUT, _ti);
-    if (st != OK) return st;
-
-    uint64_t _tp = phase_now();
-    file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                   e->node.content_hash, p->cache_stamp);
-    phase_add(p->timers, PHASE_CACHE_PUT, _tp);
-    return OK;
-}
-
-/*
- * How long one wait on the workers lasts while a batch is held. An
- * uncontended batch stays open across the wait now (OWN-16), so this is how
- * long a writer that queues during one can be kept waiting before it is
- * noticed.
- */
-#define POOL_WAIT_HELD_MS 50
-
-/*
- * Take back and record every finished large file, waiting up to wait_ms for
- * one first when asked. The wait is the backup thread idle on the workers,
- * which is what large-file-wait reports. The batch is held across it unless
- * somebody wants the lock, in slices short enough to notice when they do.
- */
-static status_t pool_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
-{
-    if (!p->pool) return OK;
-    if (wait_ms) {
-        batch_yield(p, b);
-        if (batch_contended(b)) batch_close(p, b);
-        if (b->in_txn && wait_ms > POOL_WAIT_HELD_MS) wait_ms = POOL_WAIT_HELD_MS;
-        uint64_t _tw = phase_now();
-        store_pool_wait(p->pool, wait_ms);
-        phase_add(p->timers, PHASE_STORE_WAIT, _tw);
-        batch_yield(p, b);
-    }
-    store_pool_job_t *j;
-    while ((j = store_pool_take(p->pool)) != NULL) {
-        batch_open(p, b);
-        status_t st = pool_record(p, j);
-        store_pool_job_free(j);
-        if (st != OK) return st;
-        batch_count(p, b);
-    }
-    return OK;
-}
-
-/* How long the backup thread waits on the pool between progress reports. */
-#define POOL_WAIT_MS 250
-
 static status_t store_content_loop(pipeline_t *p);
 
-/*
- * Content, with large files on a pool when it pays (B086).
- *
- * The pool only exists for the length of this phase, and whatever way the
- * loop ends it is stopped and joined here before anything else runs: on
- * success every result has already been taken; on failure or cancel the
- * workers abandon their files, which removes their temp files, and the
- * backup fails exactly as it would have serially.
- */
+/* Content: every regular file the cache cannot vouch for, into the pack. */
 static status_t store_content(pipeline_t *p)
 {
-    uint64_t n_large = 0;
-    for (uint32_t i = 0; i < p->count; i++) {
-        const scan_entry_t *e = &p->scan->entries[i];
-        if (e->node.type == NODE_TYPE_REG && e->node.size > PACK_STREAM_THRESHOLD)
-            n_large++;
-    }
-
-    unsigned workers = 1;
-    size_t parity_cap = 0;
-    store_pool_plan(p->opts->store_workers, n_large, &workers, &parity_cap);
-    if (workers > 1) {
-        if (store_pool_start(p->store, workers, parity_cap, 1, &p->pool) == OK) {
-            log_info("backup: %llu file(s) over %llu MiB, stored on up to %u "
-                     "threads (RS parity held in memory: %zu MiB each)",
-                     (unsigned long long)n_large,
-                     (unsigned long long)(PACK_STREAM_THRESHOLD >> 20),
-                     workers, parity_cap >> 20);
-        } else {
-            /* Slower, not wrong: every file can still be stored here. */
-            log_warn("backup: cannot start large-file workers, storing "
-                     "serially: %s", err_msg());
-            err_clear();
-            workers = 1;
-        }
-    }
-    p->res->store_workers = workers;
-
+    p->res->store_workers = 1;
     p->timers->txn_site = PHASE_COMMIT_STORE;
-    status_t st = store_content_loop(p);
-
-    char why[ERR_MSG_MAX];
-    snprintf(why, sizeof(why), "%s", err_msg());
-    store_pool_finish(p->pool, st != OK, p->timers);
-    p->pool = NULL;
-    hashset_free(&p->pool_new);
-    /* Joining can run a worker's error path on this thread's buffer only in
-     * principle - each thread has its own - but the backup's message is the
-     * one the caller must see, so it is put back regardless. */
-    if (st != OK) set_error(st, "%s", why);
-    return st;
+    return store_content_loop(p);
 }
 
 static status_t store_content_loop(pipeline_t *p)
@@ -670,26 +531,14 @@ static status_t store_content_loop(pipeline_t *p)
         if (S_ISREG(p->scan->entries[i].st.st_mode))
             p->bytes_total += p->scan->entries[i].node.size;
 
-    /* The entry before this one went to the pool, which counts its bytes
-     * when the result comes back. */
-    int prev_pooled = 0;
-
     for (uint32_t i = 0; i < p->count; i++) {
         /* The previous entry is finished, whichever way it went: stored,
          * vouched for by the cache, or skipped as unreadable. */
-        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode) && !prev_pooled)
+        if (i > 0 && S_ISREG(p->scan->entries[i - 1].st.st_mode))
             p->bytes_done += p->scan->entries[i - 1].node.size;
-        prev_pooled = 0;
         if (cancelled(p)) {
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
-        }
-
-        /* Results come back between entries. */
-        status_t dst = pool_drain(p, b, 0);
-        if (dst != OK) {
-            batch_close(p, b);
-            return dst;
         }
 
         scan_entry_t *e = &p->scan->entries[i];
@@ -699,11 +548,11 @@ static status_t store_content_loop(pipeline_t *p)
          * stored before the type branches below skip non-regular entries.
          * The hashes land in the node and travel into the manifest. */
         uint64_t _tm = phase_now();
-        status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR,
+        status_t mst = store_meta_blob(p, OBJECT_TYPE_XATTR, e->path,
                                        e->xattr_data, e->xattr_len,
                                        e->node.xattr_hash);
         if (mst == OK)
-            mst = store_meta_blob(p, OBJECT_TYPE_ACL,
+            mst = store_meta_blob(p, OBJECT_TYPE_ACL, e->path,
                                   e->acl_data, e->acl_len,
                                   e->node.acl_hash);
         phase_add(p->timers, PHASE_META_BLOB, _tm);
@@ -726,11 +575,11 @@ static status_t store_content_loop(pipeline_t *p)
          * loop, and every packed file it read went into one pack however
          * large that grew. Committing for a seal costs one sync per 256 MiB.
          *
-         * The headroom is what the next entry might need. Checking after the
-         * fact instead would let one file push the pack past its seal, which
-         * is harmless for a 14 KiB file and is not for a 16 MiB one.
+         * The headroom is the largest entry there can be, so no object this
+         * entry produces (its content and the metadata blobs before it) can
+         * take the pack past PACK_MAX_BYTES, which pack_backup_add refuses.
          */
-        #define PACK_ROLLOVER_HEADROOM PACK_STREAM_THRESHOLD
+        #define PACK_ROLLOVER_HEADROOM PACK_ENTRY_MAX_BYTES
         if (pack_backup_full(p->pack_w, PACK_ROLLOVER_HEADROOM)) {
             batch_close(p, b);
             uint64_t _ts = phase_now(), _tsn = phase_nested(p->timers);
@@ -776,27 +625,9 @@ static status_t store_content_loop(pipeline_t *p)
             continue;
         }
 
-        /*
-         * A large file goes to the pool once there is room for it; the
-         * backup thread carries on with the entries after it. Waiting for
-         * room holds the batch only while nobody else wants the lock
-         * (pool_drain).
-         */
-        int to_pool = p->pool && e->node.size > PACK_STREAM_THRESHOLD;
-        while (to_pool &&
-               store_pool_outstanding(p->pool) >= store_pool_capacity(p->pool)) {
-            status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
-                                        : pool_drain(p, b, POOL_WAIT_MS);
-            if (wst != OK) {
-                batch_close(p, b);
-                return wst;
-            }
-            report(p, "store", i, p->count);
-        }
-
         /* Contended, a large read on this thread is done with the batch let
          * go, as B107 did; uncontended it is held (batch_t). */
-        if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
+        if (e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
             batch_close(p, b);
 
         /* Open is part of reading: over NFS it is a round trip per file. */
@@ -816,16 +647,6 @@ static status_t store_content_loop(pipeline_t *p)
         if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
             log_warn("backup: %s is no longer a regular file, skipping", e->path);
             close(fd);
-            continue;
-        }
-
-        if (to_pool) {
-            status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
-            if (sst != OK) {
-                batch_close(p, b);
-                return sst;
-            }
-            prev_pooled = 1;
             continue;
         }
 
@@ -852,6 +673,18 @@ static status_t store_content_loop(pipeline_t *p)
             batch_close(p, b);
             return set_error(ERR_BUSY, "backup cancelled");
         }
+        if (st == ERR_TOO_LARGE) {
+            /*
+             * TODO(CDC): a file larger than one object is stored as a chunk
+             * list by the chunker, which is not wired in yet. Until it is,
+             * such a file fails the backup outright: skipping it with a
+             * warning would report a backup that does not hold the file.
+             */
+            char why[ERR_MSG_MAX];
+            snprintf(why, sizeof(why), "%s", err_msg());
+            batch_close(p, b);
+            return set_error(ERR_TOO_LARGE, "backup: cannot store %s: %s", e->path, why);
+        }
         if (st != OK) {
             log_warn("backup: cannot store %s: %s", e->path, err_msg());
             err_clear();
@@ -870,19 +703,8 @@ static status_t store_content_loop(pipeline_t *p)
         p->res->files++;
         p->res->bytes_logical += e->node.size;
 
-        /*
-         * The object's payload length, not the file's logical size.
-         *
-         * They differ only for a sparse file, whose payload is its region
-         * table plus the bytes that are not holes. Recording the logical size
-         * here disagreed with the object header, and a pack rewrites this
-         * column from that header, so stats and summary reported one total
-         * before a pack and a smaller one after - on a repository that had
-         * changed nothing. The logical size is not lost: it is the node's,
-         * in nodes.size and snapshots.size, and restore reads it from there.
-         * It could not live here anyway, because two files with the same data
-         * and different trailing holes share a payload and so share a hash.
-         */
+        /* The object's payload length. For a chunk list that is the list,
+         * not the file; the logical size is the node's (nodes.size). */
         uint64_t _ti = phase_now();
         st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
                            w.phys_bytes, w.payload_size);
@@ -896,20 +718,6 @@ static status_t store_content_loop(pipeline_t *p)
         file_cache_put(p->db, p->repo_id, e->path, &e->st,
                        e->node.content_hash, p->cache_stamp);
         phase_add(p->timers, PHASE_CACHE_PUT, _tp);
-    }
-
-    /* The large files still out. Progress keeps moving while they finish:
-     * their bytes through the pool's counter, the entry count by how many
-     * are left. */
-    while (p->pool && store_pool_outstanding(p->pool) > 0) {
-        status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
-                                    : pool_drain(p, b, POOL_WAIT_MS);
-        if (wst != OK) {
-            batch_close(p, b);
-            return wst;
-        }
-        unsigned left = store_pool_outstanding(p->pool);
-        report(p, "store", p->count > left ? p->count - left : 0, p->count);
     }
 
     batch_close(p, b);
@@ -1604,20 +1412,6 @@ status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     return st;
 }
 
-/* The pack pass reports through the backup's own progress callback. */
-typedef struct {
-    const backup_opts_t *opts;
-} sweep_bridge_t;
-
-static void sweep_progress(uint64_t current, uint64_t total, const char *phase, void *ctx)
-{
-    sweep_bridge_t *b = ctx;
-    if (!b || !b->opts->progress_cb) return;
-    uint64_t _tp = phase_now();
-    b->opts->progress_cb(phase ? phase : "pack", current, total, b->opts->progress_ctx);
-    phase_add_nested(phase_current, PHASE_PROGRESS, _tp);
-}
-
 /* One line saying where the bytes went, next to the profile saying where the
  * time went. Ratios are of bytes_logical, the regular-file content this run
  * covered, so an incremental that reads nothing new still reads sensibly. */
@@ -1628,15 +1422,9 @@ static void log_written(const backup_result_t *r)
     double ratio = r->bytes_logical
                  ? (double)r->written_total / (double)r->bytes_logical : 0.0;
     log_info("backup: wrote %.1f MiB for %.1f MiB of content (%.3fx): "
-             "loose %.1f + parity %.1f, packs %.1f + parity %.1f, "
-             "parity spill %.1f, discarded duplicates %.1f, "
-             "abandoned pack entries %.1f; pack pass %.1f MiB",
+             "packs %.1f + parity %.1f",
              (double)r->written_total / mib, (double)r->bytes_logical / mib, ratio,
-             (double)w[STORE_WR_LOOSE] / mib, (double)w[STORE_WR_LOOSE_PARITY] / mib,
-             (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib,
-             (double)w[STORE_WR_PARITY_SPILL] / mib, (double)w[STORE_WR_LOOSE_DISCARD] / mib,
-             (double)w[STORE_WR_PACK_ABANDONED] / mib,
-             (double)r->written_sweep / mib);
+             (double)w[STORE_WR_PACK] / mib, (double)w[STORE_WR_PACK_PARITY] / mib);
 }
 
 static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
@@ -1866,36 +1654,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         }
     }
 
-    /*
-     * The pack pass, inside the profile. Run from the job after this
-     * function had reported, it was 70-100 s of UAT's first backup that no
-     * row accounted for. It holds no transaction of ours: the snapshot row
-     * is committed and the pack commit callback takes its own.
-     */
-    store_write_stats_t w_pre_sweep;
-    store_write_stats(store, &w_pre_sweep);
-    if (st == OK && opts->pack_after) {
-        sweep_bridge_t sb = { opts };
-        pack_report_t pr;
-        memset(&pr, 0, sizeof(pr));
-        uint64_t _tpk = phase_now(), _tpkn = phase_nested(&timers);
-        status_t pst = repo_pack_report(store, &pr, sweep_progress, &sb);
-        phase_add_excl(&timers, PHASE_PACK_SWEEP, _tpk, _tpkn);
-        if (pst != OK) {
-            log_warn("backup: snapshot %lld committed but packing failed: %s",
-                     (long long)snap_id, err_msg());
-            err_clear();
-        } else {
-            res.sweep_packed = pr.packed;
-            if (pr.packed > 0)
-                log_info("pack: %llu object(s) packed in repo %lld",
-                         (unsigned long long)pr.packed, (long long)repo_id);
-        }
-    }
     store_write_stats_t w_end;
     store_write_stats(store, &w_end);
     res.written_total = store_write_stats_diff(&w_end, &w_start, &res.written);
-    res.written_sweep = store_write_stats_diff(&w_end, &w_pre_sweep, NULL);
 
     phase_current = NULL;
     res.snapshot_id = snap_id;

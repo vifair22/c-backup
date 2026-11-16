@@ -24,7 +24,7 @@ type RawPolicy = WirePolicyEntry
 
 /*
  * A policy value as the form edits it. The daemon types each value by its
- * key - a count is a number, auto_pack a boolean - and null is a value
+ * key - a count is a number - and null is a value
  * stored before validation that the daemon ignores, which has nothing to
  * show. The inputs are text, so everything becomes the string the PUT
  * accepts as readily as the typed value.
@@ -197,7 +197,7 @@ export function PolicyEditor({ connName, repoPath, onBack }: Props): React.React
             <div style={{ maxWidth: '38rem' }}>
               <div className="text-xs text-text-secondary mb-1">Other stored values</div>
               <div className="text-xs text-text-muted mb-2">
-                Set from the CLI, such as maintenance.auto_pack. Listed so
+                Set from the CLI or left by an earlier build. Listed so
                 nothing stored here is invisible.
               </div>
               <table className="w-full text-xs">

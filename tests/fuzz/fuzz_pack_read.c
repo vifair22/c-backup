@@ -123,20 +123,16 @@ static void read_every_way(void)
     if (pack_object_load(g_store, g_hash, &out, &len, &type) == OK) free(out);
     err_clear();
 
+    /* The stored form replication moves: corrected from parity, neither
+     * decrypted nor decompressed, so it reaches the parity arithmetic
+     * without the codec checks in front of it. */
     out = NULL; len = 0;
-    uint64_t full = 0;
-    if (pack_object_load_prefix(g_store, g_hash, 4096, &out, &len, &full,
-                                &type) == OK)
+    uint8_t comp = 0, enc = 0;
+    int damaged = 0;
+    if (pack_object_read_stored(g_store, g_hash, &type, &comp, &enc, &usize,
+                                &out, &len, &damaged) == OK)
         free(out);
     err_clear();
-
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) {
-        uint64_t sz = 0;
-        pack_object_load_stream(g_store, g_hash, devnull, &sz, &type);
-        err_clear();
-        close(devnull);
-    }
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);

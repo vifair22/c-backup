@@ -2,20 +2,15 @@
 #define _XOPEN_SOURCE 700
 
 /*
- * Two identical large files, both stored as new, every time (B086).
+ * Two identical files in one backup: one object, counted once (B086).
  *
- * On the worker pool two files with the same content can be hashed on two
- * workers at once, both find the object absent, and both install it. The
- * second rename replaces the first with the same bytes, so the repository is
- * right either way, but the counters are only right because the backup
- * thread counts the second one as not new. Left to timing that case ran about
- * one time in three, which made the correction close to untested.
- *
- * Here it is forced. The fault injector's rename gate holds the first
- * install of the twins' object until a second install of it arrives, so by
- * the time either rename happens both workers are past their existence
- * check. If the second never arrives the gate times out and the test fails
- * on the arrival count, rather than passing on a run that never raced.
+ * This suite used to force a race between two store workers installing the
+ * same loose object. The worker pool and loose installs are gone; every
+ * object now goes through the backup's one pack writer. What survives is the
+ * accounting the race existed to protect: the second twin must be found in
+ * the writer that is still open (not yet sealed), stored zero times more,
+ * counted as not new, and leave exactly one entry in the packs and one index
+ * row. A writer that only checked installed packs would store it twice.
  */
 
 #include <setjmp.h>
@@ -26,7 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -35,9 +29,9 @@
 #include <cutils/db.h>
 #include <openssl/evp.h>
 
-#include "fault_inject.h"
 #include "backup.h"
 #include "object.h"
+#include "pack.h"
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
@@ -47,7 +41,7 @@
 #define TEST_SRC  TEST_DIR "/src"
 #define TEST_ENVS TEST_TMP "/c_backup_test_twins_envs"
 #define MIB (1u << 20)
-#define TWIN_MIB 20u
+#define TWIN_MIB 4u
 
 extern const db_migration_t app_migrations[];
 
@@ -91,8 +85,8 @@ static void env_close(env_t *e)
 }
 
 /* Incompressible content from a seed, so two calls with one seed are twins.
- * Returns the content's SHA-256, which is the object's identity in an
- * unencrypted repository. */
+ * Returns the content's SHA-256; the object's name is not this digest but
+ * the one over the type byte and the content. */
 static void write_random(const char *path, unsigned mib, uint64_t seed,
                          uint8_t sha[32])
 {
@@ -118,27 +112,34 @@ static void write_random(const char *path, unsigned mib, uint64_t seed,
     close(fd);
 }
 
-static int loose_objects(const env_t *e)
+typedef struct {
+    store_t       *store;
+    const uint8_t *hash;
+    int            n;
+} count_ctx_t;
+
+static void count_entry(const pack_entry_info_t *info, void *ctx)
 {
-    char objs[PATH_MAX + 32];
-    snprintf(objs, sizeof(objs), "%s/objects", e->repo);
-    DIR *d = opendir(objs);
-    if (!d) return -1;
-    int n = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        char sub[PATH_MAX + 64];
-        snprintf(sub, sizeof(sub), "%s/%s", objs, de->d_name);
-        DIR *s = opendir(sub);
-        if (!s) continue;
-        struct dirent *f;
-        while ((f = readdir(s)) != NULL)
-            if (f->d_name[0] != '.') n++;
-        closedir(s);
-    }
-    closedir(d);
-    return n;
+    count_ctx_t *c = ctx;
+    if (memcmp(info->hash, c->hash, OBJECT_HASH_SIZE) == 0) c->n++;
+}
+
+static void count_pack(uint32_t pack_num, void *ctx)
+{
+    count_ctx_t *c = ctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", pack_num);
+    uint32_t ver = 0, cnt = 0;
+    assert_int_equal(pack_enumerate_dat(c->store, name, &ver, &cnt,
+                                        count_entry, c), OK);
+}
+
+/* Entries in the repository's packs carrying this object name. */
+static int pack_entries_of(const env_t *e, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    count_ctx_t c = { e->store, hash, 0 };
+    assert_int_equal(pack_list(e->store, count_pack, &c), OK);
+    return c.n;
 }
 
 static int setup(void **state)
@@ -153,13 +154,20 @@ static int setup(void **state)
 static int teardown(void **state)
 {
     (void)state;
-    fault_rename_gate_set(NULL, 0);
     rmrf(TEST_DIR);
     rmrf(TEST_ENVS);
     return 0;
 }
 
-static void test_twins_both_stored_as_new_count_once(void **state)
+static void write_small(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fputs("small\n", f);
+    fclose(f);
+}
+
+static void test_twins_stored_once_counted_once(void **state)
 {
     (void)state;
     assert_int_equal(mkdir(TEST_SRC, 0700), 0);
@@ -167,52 +175,61 @@ static void test_twins_both_stored_as_new_count_once(void **state)
     write_random(TEST_SRC "/twin1.bin", TWIN_MIB, 7, sha);
     write_random(TEST_SRC "/twin2.bin", TWIN_MIB, 7, sha2);
     assert_memory_equal(sha, sha2, 32);
-    FILE *f = fopen(TEST_SRC "/small.txt", "w");
-    assert_non_null(f);
-    fputs("small\n", f);
-    fclose(f);
+    write_small(TEST_SRC "/small.txt");
 
-    static const char *paths[] = { TEST_SRC };
+    /* The control: one copy of the content, and the small file. */
+    const char *solo = TEST_DIR "/solo";
+    assert_int_equal(mkdir(solo, 0700), 0);
+    uint8_t sha3[32];
+    write_random(TEST_DIR "/solo/twin1.bin", TWIN_MIB, 7, sha3);
+    write_small(TEST_DIR "/solo/small.txt");
+
     backup_opts_t o;
     memset(&o, 0, sizeof(o));
-    o.paths = paths;
     o.n_paths = 1;
 
-    /* Serially, the second twin finds the first one's object. */
     env_t a;
-    env_open(&a, "serial");
-    o.store_workers = 1;
+    env_open(&a, "solo");
+    const char *solo_paths[] = { solo };
+    o.paths = solo_paths;
     backup_result_t ra;
     assert_int_equal(backup_run(a.store, a.db, a.repo_id, &o, &ra), OK);
-    assert_int_equal(ra.store_workers, 1);
+    assert_int_equal(ra.files, 2);
 
-    /* On two workers, both reach the install before either completes it. */
     env_t b;
-    env_open(&b, "pooled");
-    char hex[65];
-    for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", sha[i]);
-    char dst[PATH_MAX + 128];
-    snprintf(dst, sizeof(dst), "%s/objects/%.2s/%s", b.repo, hex, hex + 2);
-    fault_rename_gate_set(dst, 2);
-    o.store_workers = 2;
+    env_open(&b, "twins");
+    static const char *paths[] = { TEST_SRC };
+    o.paths = paths;
     backup_result_t rb;
     assert_int_equal(backup_run(b.store, b.db, b.repo_id, &o, &rb), OK);
-    int arrived = fault_rename_gate_arrivals();
-    fault_rename_gate_set(NULL, 0);
-    assert_int_equal(rb.store_workers, 2);
-    /* The race happened: two installs of the one object. */
-    assert_int_equal(arrived, 2);
-
-    /* And it is counted as the serial run counted it. */
-    assert_int_equal(rb.files, ra.files);
+    assert_int_equal(rb.store_workers, 1);
     assert_int_equal(rb.files, 3);
+    assert_int_equal(rb.bytes_logical,
+                     ra.bytes_logical + (uint64_t)TWIN_MIB * MIB);
+
+    /* The second twin added nothing: the same new objects and stored bytes
+     * as the backup that held one copy. */
     assert_int_equal(rb.objects_new, ra.objects_new);
     assert_int_equal(rb.bytes_stored, ra.bytes_stored);
-    assert_int_equal(rb.bytes_logical, ra.bytes_logical);
-    assert_int_equal(loose_objects(&a), 1);
-    assert_int_equal(loose_objects(&b), 1);
 
-    /* One index row for it, with the size the serial run recorded. */
+    uint8_t name[OBJECT_HASH_SIZE];
+    {
+        int fd = open(TEST_SRC "/twin1.bin", O_RDONLY);
+        assert_true(fd >= 0);
+        size_t len = (size_t)TWIN_MIB * MIB;
+        uint8_t *buf = malloc(len);
+        assert_non_null(buf);
+        assert_int_equal(read(fd, buf, len), (ssize_t)len);
+        close(fd);
+        object_name(OBJECT_TYPE_FILE, buf, len, name);
+        free(buf);
+    }
+    assert_int_equal(pack_entries_of(&a, name), 1);
+    assert_int_equal(pack_entries_of(&b, name), 1);
+
+    /* One index row for it, with the size the control recorded. */
+    char hex[65];
+    object_hash_to_hex(name, hex);
     char q[256];
     snprintf(q, sizeof(q), "SELECT phys_size, orig_size FROM objects"
              " WHERE hash = '%s'", hex);
@@ -226,28 +243,17 @@ static void test_twins_both_stored_as_new_count_once(void **state)
     db_result_free(r1);
     db_result_free(r2);
 
-    /* The installed object reads back as the twins' content. */
-    char out[PATH_MAX + 16];
-    snprintf(out, sizeof(out), "%s/restored", b.dir);
-    int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    assert_true(ofd >= 0);
-    uint64_t got = 0;
-    assert_int_equal(object_load_stream(b.store, sha, ofd, &got, NULL), OK);
-    close(ofd);
-    assert_int_equal(got, (uint64_t)TWIN_MIB * MIB);
-    int ifd = open(out, O_RDONLY);
-    assert_true(ifd >= 0);
-    EVP_MD_CTX *md = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(md, EVP_sha256(), NULL);
-    char *buf = malloc(MIB);
-    ssize_t n;
-    while ((n = read(ifd, buf, MIB)) > 0) EVP_DigestUpdate(md, buf, (size_t)n);
-    free(buf);
-    close(ifd);
+    /* The stored object reads back as the twins' content. */
+    void *data = NULL;
+    size_t got = 0;
+    uint8_t type = 0;
+    assert_int_equal(object_load(b.store, name, &data, &got, &type), OK);
+    assert_int_equal(type, OBJECT_TYPE_FILE);
+    assert_int_equal(got, (size_t)TWIN_MIB * MIB);
     uint8_t back[32];
     unsigned hl = 0;
-    EVP_DigestFinal_ex(md, back, &hl);
-    EVP_MD_CTX_free(md);
+    EVP_Digest(data, got, back, &hl, EVP_sha256(), NULL);
+    free(data);
     assert_memory_equal(back, sha, 32);
 
     env_close(&a);
@@ -257,7 +263,7 @@ static void test_twins_both_stored_as_new_count_once(void **state)
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_setup_teardown(test_twins_both_stored_as_new_count_once,
+        cmocka_unit_test_setup_teardown(test_twins_stored_once_counted_once,
                                         setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

@@ -79,7 +79,7 @@ static int setup(void **state)
         if (object_store(store, OBJECT_TYPE_FILE, buf, sizes[i], hashes[i]) != OK)
             return -1;
     }
-    if (repo_pack(store, NULL, NULL, NULL) != OK) return -1;
+    if (object_store_flush(store) != OK) return -1;
     return 0;
 }
 

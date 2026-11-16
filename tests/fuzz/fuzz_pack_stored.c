@@ -205,9 +205,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uint64_t usize = 0;
         void    *payload = NULL;
         size_t   len = 0;
+        int      damaged = 0;
         if (pack_object_read_stored(g_store, g_sent[i].hash, &type, &comp, &enc,
-                                    &usize, &payload, &len) != OK)
+                                    &usize, &payload, &len, &damaged) != OK)
             abort();
+        /* Written a moment ago and never touched: its parity must agree. */
+        if (damaged) abort();
         free(payload);
     }
 

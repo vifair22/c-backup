@@ -78,7 +78,7 @@ static int setup(void **state)
 static int setup_packed(void **state)
 {
     if (setup(state) != 0) return -1;
-    if (repo_pack(store, NULL, NULL, NULL) != OK) return -1;
+    if (object_store_flush(store) != OK) return -1;
     return 0;
 }
 
@@ -190,22 +190,23 @@ static void test_load_fread_fail(void **state)
     assert_all_readable();
 }
 
-static void test_stream_fread_fail(void **state)
+/* The stored-form reader (replication's) under the same faults. */
+static void test_read_stored_fread_fail(void **state)
 {
     (void)state;
-    char out[] = TEST_TMP "/c_backup_pack_fault_stream.XXXXXX";
-    int fd = mkstemp(out);
-    assert_true(fd >= 0);
-
+    int failed = 0;
     for (int n = 0; n < 10; n++) {
         fault_reset_all();
         fault_fread_at = n;
-        status_t st = pack_object_load_stream(store, hashes[0], fd, NULL, NULL);
+        void *payload = NULL;
+        size_t len = 0;
+        status_t st = pack_object_read_stored(store, hashes[0], NULL, NULL, NULL, NULL,
+                                              &payload, &len, NULL);
         fault_reset_all();
-        if (st != OK) { err_clear(); break; }
+        if (st == OK) free(payload);
+        else { assert_null(payload); failed = 1; err_clear(); break; }
     }
-    close(fd);
-    unlink(out);
+    assert_true(failed);
 
     reopen();
     assert_all_readable();
@@ -215,43 +216,77 @@ static void test_stream_fread_fail(void **state)
 /* Write side                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Is the store's staging directory empty? */
+static int tmp_is_empty(void)
+{
+    FILE *p = popen("find '" TEST_REPO "/tmp' -type f | wc -l", "r");
+    assert_non_null(p);
+    int n = -1;
+    assert_int_equal(fscanf(p, "%d", &n), 1);
+    pclose(p);
+    return n == 0;
+}
+
 /*
- * A write failure mid-pack is the dangerous one: the loose objects are the
- * only copy until the pack is complete, so a partial pack must not be treated
- * as authoritative. The assertion is that after the fault clears, packing
- * succeeds and nothing was lost.
+ * A write failure while sealing is the dangerous one: the staged pack is the
+ * only copy of what it holds until it installs, so a partial pack must never
+ * be installed or indexed. A failed seal discards it whole - nothing left in
+ * tmp/, nothing announced - and the caller stores again. The assertion is
+ * that after the fault clears, storing and sealing succeed and nothing is
+ * lost.
  */
 static void test_pack_write_fwrite_fail(void **state)
 {
     (void)state;
     int found = 0;
-    for (int n = 0; n < 20 && !found; n++) {
+    for (int n = 0; n < 40 && !found; n++) {
+        assert_int_equal(fill_store(), OK);
         fault_reset_all();
         fault_fwrite_at = n;
-        status_t st = repo_pack(store, NULL, NULL, NULL);
+        status_t st = object_store_flush(store);
         fault_reset_all();
-        if (st != OK) { found = 1; err_clear(); }
-        else break;  /* pack completed; nothing loose left to fail on */
+        if (st != OK) {
+            found = 1;
+            err_clear();
+            assert_true(tmp_is_empty());
+            assert_int_equal((int)fake_index_count(), 0);
+        } else {
+            break;  /* the seal completed: past its last write */
+        }
     }
+    assert_true(found);
 
     fault_reset_all();
-    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    assert_int_equal(fill_store(), OK);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal((int)fake_index_count(), NOBJ);
     assert_all_readable();
 }
 
 static void test_pack_finalize_fsync_fail(void **state)
 {
     (void)state;
-    for (int n = 0; n < 10; n++) {
+    int found = 0;
+    for (int n = 0; n < 10 && !found; n++) {
+        assert_int_equal(fill_store(), OK);
         fault_reset_all();
         fault_fsync_at = n;
-        status_t st = repo_pack(store, NULL, NULL, NULL);
+        status_t st = object_store_flush(store);
         fault_reset_all();
-        if (st != OK) { err_clear(); break; }
+        if (st != OK) {
+            found = 1;
+            err_clear();
+            assert_true(tmp_is_empty());
+            assert_int_equal((int)fake_index_count(), 0);
+        } else {
+            break;
+        }
     }
+    assert_true(found);
 
     fault_reset_all();
-    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    assert_int_equal(fill_store(), OK);
+    assert_int_equal(object_store_flush(store), OK);
     assert_all_readable();
 }
 
@@ -353,7 +388,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_load_fseeko_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_load_malloc_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_load_fread_fail, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_stream_fread_fail, setup_packed, teardown),
+        cmocka_unit_test_setup_teardown(test_read_stored_fread_fail, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_write_fwrite_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_finalize_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_malloc_fail, setup_packed, teardown),

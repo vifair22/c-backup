@@ -97,7 +97,7 @@ static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
 
     if (db_execute_non_query(ctx->db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
-            " VALUES (?, ?, 0, 'loose', ?)"
+            " VALUES (?, ?, 0, 'absent', ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
             (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
         return set_error(ERR_IO, "reindex: cannot record object");
@@ -680,54 +680,21 @@ static status_t fill_object_sizes(store_t *store, cutils_db_t *db, int64_t repo_
         return set_error(ERR_IO, "reindex: cannot size packed objects");
     }
 
-    /* Whatever is left is loose, and a loose object's size is a stat and a
-     * header read: no index lookup, no pack to open. */
+    /* Every object lives in a pack, so whatever is still unsized is
+     * referenced by a tree and held by no pack: absent. The row stays, so
+     * verify reports it missing, and the count is said here. */
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT hash FROM objects WHERE repo_id = ? AND phys_size IS NULL",
-            (const char *[]){ repo, NULL }, &r) != 0) {
-        db_result_free(r);
-        db_txn_rollback(db);
-        return set_error(ERR_IO, "reindex: cannot list unsized objects");
-    }
-
-    status_t st = OK;
-    for (int i = 0; i < (r ? r->nrows : 0); i++) {
-        const char *hex = r->rows[i][0];
-        uint8_t hash[OBJECT_HASH_SIZE];
-        hex_to_hash(hex, hash);
-
-        uint64_t phys = 0, orig = 0;
-        uint8_t  type = 0;
-        if (object_physical_size(store, hash, &phys, NULL) != OK ||
-            object_get_info(store, hash, &orig, &type) != OK) {
-            /* Referenced but absent. Leaving the row unsized rather than
-             * inventing a number keeps the gap visible to a verify pass. */
-            log_warn("reindex: object %.16s referenced but unreadable: %s",
-                     hex, err_msg());
-            err_clear();
-            continue;
-        }
-
-        char pbuf[32], obuf[32], tbuf[8];
-        snprintf(pbuf, sizeof(pbuf), "%llu", (unsigned long long)phys);
-        snprintf(obuf, sizeof(obuf), "%llu", (unsigned long long)orig);
-        snprintf(tbuf, sizeof(tbuf), "%u", type);
-        if (db_execute_non_query(db,
-                "UPDATE objects SET phys_size = ?, orig_size = ?, type = ?,"
-                " location = 'loose' WHERE repo_id = ? AND hash = ?",
-                (const char *[]){ pbuf, obuf, tbuf, repo, hex, NULL },
-                NULL) != 0) {
-            st = set_error(ERR_IO, "reindex: cannot size object");
-            break;
-        }
+            "SELECT COUNT(*) FROM objects WHERE repo_id = ? AND phys_size IS NULL",
+            (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1) {
+        long long absent = strtoll(r->rows[0][0], NULL, 10);
+        if (absent > 0)
+            log_warn("reindex: %lld referenced object(s) are in no pack; "
+                     "verify will report them missing", absent);
     }
     db_result_free(r);
+    (void)store;
 
-    if (st != OK) {
-        db_txn_rollback(db);
-        return st;
-    }
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "reindex: cannot commit object sizes");
     return OK;

@@ -48,19 +48,6 @@ void routes_backup_set_file_cache_match(int mode)
     g_file_cache_match = mode;
 }
 
-/* backup.store_workers, read once at start. */
-static unsigned g_store_workers;
-
-void routes_backup_set_store_workers(unsigned n)
-{
-    g_store_workers = n;
-}
-
-unsigned routes_backup_store_workers(void)
-{
-    return g_store_workers;
-}
-
 /* Everything one backup job needs, owned by the job manager for its lifetime. */
 typedef struct {
     cutils_db_t *db;
@@ -164,8 +151,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         repo_unlock(j->repo_id);
         return st;
     }
-    /* For the auto-pack below as much as the backup: packing a 2 GiB loose
-     * object is as long as storing it was. */
+    /* So a cancel lands inside a file being read, not after it. */
     store_set_cancel(store, cancel);
 
     /* backup_opts_t takes const char **, and casting char ** straight to it
@@ -202,7 +188,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
     o.n_exclude      = j->n_excludes;
     o.one_filesystem = j->one_filesystem;
     o.file_cache_match = g_file_cache_match;
-    o.store_workers    = g_store_workers;
     o.label        = j->label;
     o.cancel       = cancel;
     o.progress_cb  = progress;
@@ -238,32 +223,6 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
         db_result_free(kr);
     }
 
-    /*
-     * Packing finishes the backup rather than waiting for someone to ask.
-     *
-     * Compression only happens at pack time, so a backup that stops here has
-     * written more bytes than it read and left one file per object behind.
-     * Treating packing as a separate operation meant the common case - back
-     * up and walk away - produced a repository that never compressed anything
-     * at all. It runs inside this job, under the same write lock, so nothing
-     * can interleave between the snapshot landing and its objects being
-     * consolidated.
-     *
-     * A pack failure does not fail the backup: the snapshot is committed and
-     * its objects are readable loose. backup_run logs it and carries on.
-     *
-     * This pass is all maintenance.auto_pack controls (B111). Objects up to
-     * PACK_STREAM_THRESHOLD went into a pack as backup_run wrote them, key or
-     * no key, so what the pass finds is a sparse file's object and anything
-     * larger. Writing small objects loose when the key is off would honour
-     * the old wording at the cost of an inode and an uncompressed copy per
-     * object, which is what direct-to-pack removed.
-     *
-     * backup_run runs it, rather than this function after it returns, so
-     * its time is in the backup's profile and its writes in bytes_written
-     * (B086): on UAT FS2 it was 70-100 s that neither accounted for.
-     */
-    o.pack_after = routes_policy_flag(j->db, j->repo_id, "maintenance.auto_pack", 1);
 
     backup_result_t res;
     memset(&res, 0, sizeof(res));
@@ -273,20 +232,15 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
      * did not, so a client saw only "completed". Every field is numeric. */
     if (res.snapshot_id > 0) {
         const uint64_t *w = res.written.bytes;
-        char rj[1536];
+        char rj[1024];
         snprintf(rj, sizeof(rj),
                  "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
                  "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
                  "\"objects_new\":%llu,\"bytes_stored\":%llu,"
                  "\"trees_new\":%llu,\"trees_reused\":%llu,"
                  "\"store_workers\":%u,"
-                 "\"bytes_written\":%llu,\"bytes_written_loose\":%llu,"
-                 "\"bytes_written_loose_parity\":%llu,"
-                 "\"bytes_written_loose_discarded\":%llu,"
-                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
-                 "\"bytes_written_parity_spill\":%llu,"
-                 "\"bytes_written_pack_abandoned\":%llu,"
-                 "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu}",
+                 "\"bytes_written\":%llu,"
+                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu}",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -297,15 +251,8 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)res.trees_reused,
                  res.store_workers,
                  (unsigned long long)res.written_total,
-                 (unsigned long long)w[STORE_WR_LOOSE],
-                 (unsigned long long)w[STORE_WR_LOOSE_PARITY],
-                 (unsigned long long)w[STORE_WR_LOOSE_DISCARD],
                  (unsigned long long)w[STORE_WR_PACK],
-                 (unsigned long long)w[STORE_WR_PACK_PARITY],
-                 (unsigned long long)w[STORE_WR_PARITY_SPILL],
-                 (unsigned long long)w[STORE_WR_PACK_ABANDONED],
-                 (unsigned long long)res.written_sweep,
-                 (unsigned long long)res.sweep_packed);
+                 (unsigned long long)w[STORE_WR_PACK_PARITY]);
         job_set_result(progress_ctx, rj);
     }
 

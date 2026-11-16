@@ -59,12 +59,9 @@ static char *repo_path_of(int64_t repo_id)
 /*
  * Open a repository with its index attached.
  *
- * A bare store_open leaves the locate callback unset, so the store can only
- * find loose objects. That was invisible while nothing packed anything: every
- * object was loose and every handler worked. The moment packing became
- * reachable, layout, content and diff would all have started reporting
- * packed objects as missing, and diff worst of all, because the manifest
- * trees it walks get packed like any other object.
+ * A bare store_open leaves the locate callback unset, so the store would
+ * answer from its own index, built by scanning every pack on the first
+ * lookup. The daemon's index already knows where everything is.
  */
 static status_t open_bound_store(int64_t repo_id, store_t **out_store,
                                  store_index_t **out_idx)
@@ -115,22 +112,26 @@ static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 /* ---------- statistics ---------- */
 
 /*
- * Per-type counts and sizes. `?scope=loose` narrows to unpacked objects,
- * which is what the loose-object panel wants; the default covers everything.
+ * Per-type counts and sizes. `?scope=staged` narrows to objects staged in a
+ * pack a running backup has not sealed yet; the default covers everything.
  */
 api_response_t introspect_stats(const api_request_t *req, int64_t repo_id)
 {
     const char *scope = api_query_param(req, "scope");
-    int loose_only = scope && strcmp(scope, "loose") == 0;
+    /* Any other scope is refused rather than answered unscoped: a filter
+     * that silently filters nothing reads as an empty answer. */
+    if (scope && strcmp(scope, "staged") != 0)
+        return api_error(400, "scope must be staged");
+    int staged_only = scope != NULL;
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
     db_result_t *r = NULL;
-    int rc = loose_only
+    int rc = staged_only
         ? db_execute(g_db,
             "SELECT type, COUNT(*), COALESCE(SUM(phys_size),0), COALESCE(SUM(orig_size),0)"
-            "  FROM objects WHERE repo_id = ? AND location = 'loose'"
+            "  FROM objects WHERE repo_id = ? AND location = 'staged'"
             " GROUP BY type ORDER BY type",
             (const char *[]){ repo, NULL }, &r)
         : db_execute(g_db,
@@ -185,7 +186,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     /*
      * One pass over objects, not four.
      *
-     * The count, both size sums and the loose count were four separate
+     * The count, both size sums and the staged count were four separate
      * subqueries against the same rows, so drawing a dashboard scanned the
      * objects table four times. On a repository of 159k objects that measured
      * 366 ms - the slowest interactive call in the whole surface, and the
@@ -199,14 +200,14 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
             "  SELECT COUNT(*) AS n,"
             "         COALESCE(SUM(phys_size),0) AS phys,"
             "         COALESCE(SUM(orig_size),0) AS orig,"
-            "         COALESCE(SUM(location = 'loose'),0) AS loose"
+            "         COALESCE(SUM(location = 'staged'),0) AS staged"
             "    FROM objects WHERE repo_id = ?"
             ")"
             "SELECT"
             " (SELECT COUNT(*) FROM snapshots WHERE repo_id = ?),"
             " o.n, o.phys, o.orig,"
             " (SELECT COUNT(*) FROM packs      WHERE repo_id = ?),"
-            " o.loose,"
+            " o.staged,"
             " (SELECT COUNT(*) FROM tags       WHERE repo_id = ?),"
             " (SELECT MAX(ts) FROM snapshots WHERE repo_id = ?)"
             "  FROM o",
@@ -221,7 +222,7 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
     static const jcol_t cols[] = {
         { "snapshots", 0, JCOL_INT }, { "objects", 1, JCOL_INT },
         { "phys_size", 2, JCOL_INT }, { "orig_size", 3, JCOL_INT },
-        { "packs", 4, JCOL_INT }, { "loose", 5, JCOL_INT },
+        { "packs", 4, JCOL_INT }, { "staged", 5, JCOL_INT },
         { "tags", 6, JCOL_INT }, { "last_snapshot_ts", 7, JCOL_INT },
     };
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
@@ -235,8 +236,10 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
 /* ---------- objects ---------- */
 
 /*
- * Where an object is, as a client sees it: "loose", "staged" or "packed",
- * with the pack's number in pack_id (null otherwise).
+ * Where an object is, as a client sees it: "staged" (in a pack a running
+ * backup has not sealed), "absent" (referenced, in no pack: reindex found
+ * it missing) or "packed", with the pack's number in pack_id (null
+ * otherwise).
  *
  * The column holds the pack number itself for a packed object, so serving
  * it as it is made location a string that was sometimes a word and
@@ -244,14 +247,14 @@ api_response_t introspect_summary(const api_request_t *req, int64_t repo_id)
  * had to know to parse it.
  */
 #define OBJ_LOCATION_EXPR \
-    "CASE WHEN location IN ('loose', 'staged') THEN location ELSE 'packed' END"
+    "CASE WHEN location IN ('staged', 'absent') THEN location ELSE 'packed' END"
 #define OBJ_LOCATION_COLS \
     OBJ_LOCATION_EXPR "," \
-    " CASE WHEN location IN ('loose', 'staged') THEN NULL" \
+    " CASE WHEN location IN ('staged', 'absent') THEN NULL" \
     "      ELSE CAST(location AS INTEGER) END"
 
 /*
- * Paginated object listing. `?location=loose` or `?location=pack` narrows it.
+ * Paginated object listing. `?location=staged` or `?location=pack` narrows it.
  *
  * This is what replaces loose_list, global_pack_index and all_pack_entries:
  * three actions that each read a different part of the .idx sidecar are one
@@ -263,9 +266,9 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     /* Anything else used to fall through to the unfiltered listing, so
      * `--location nowhere` answered with every object: a filter that
      * silently filtered nothing. */
-    if (loc && strcmp(loc, "loose") != 0 && strcmp(loc, "pack") != 0 &&
+    if (loc && strcmp(loc, "staged") != 0 && strcmp(loc, "pack") != 0 &&
         strcmp(loc, "packed") != 0 && strcmp(loc, "all") != 0)
-        return api_error(400, "location must be loose, pack (or packed), or all");
+        return api_error(400, "location must be staged, pack (or packed), or all");
     int limit = 0, offset = 0;
     api_response_t page_err;
     if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, &offset, &page_err) != 0) return page_err;
@@ -276,11 +279,11 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
 
     db_result_t *r = NULL;
     int rc;
-    if (loc && strcmp(loc, "loose") == 0) {
+    if (loc && strcmp(loc, "staged") == 0) {
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects"
-            " WHERE repo_id = ? AND location = 'loose'"
+            " WHERE repo_id = ? AND location = 'staged'"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     /* Both spellings. The CLI's own help says "packed" and the route only
@@ -291,7 +294,7 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
         rc = db_execute(g_db,
             "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects"
-            " WHERE repo_id = ? AND location NOT IN ('loose', 'staged')"
+            " WHERE repo_id = ? AND location NOT IN ('staged', 'absent')"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else {
@@ -488,13 +491,7 @@ api_response_t introspect_object_layout(const api_request_t *req, int64_t repo_i
 
     if (st != OK) return api_error(404, "no such object");
 
-    /*
-     * The header this object actually has, not the one a loose object would.
-     * physical_size counts whichever header the object sits behind, and this
-     * reported sizeof(object_header_t) unconditionally - so for a packed
-     * object the two described different layouts and their difference was
-     * 13 bytes of nothing.
-     */
+    /* header_size is the 51-byte pack entry header physical_size counts. */
     char *body = NULL;
     int n = asprintf(&body,
         "{\"hash\":\"%s\",\"type\":%u,\"uncompressed_size\":%llu,"

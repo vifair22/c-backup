@@ -256,9 +256,8 @@ static void test_gc_clears_pack_locations_for_swept_objects(void **state)
     backup_result_t first;
     assert_int_equal(backup_run(store, db, repo_id, &o, &first), OK);
 
-    /* The backup packs as it goes, so pack_objects is already populated;
-     * repo_pack is here to sweep up anything the pack format could not take. */
-    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    /* Every object is written into a pack, so the backup alone populates
+     * pack_objects. */
     assert_true(count("SELECT COUNT(*) FROM pack_objects WHERE repo_id = ?") > 0);
 
     write_file(TEST_SRC "/keep.txt", "content that displaces the first\n");
@@ -405,8 +404,8 @@ static void test_gc_removes_stale_staging_files(void **state)
     clock_gettime(CLOCK_REALTIME, &past[0]);
     past[0].tv_sec -= 30;
     past[1] = past[0];
-    write_file(TEST_REPO "/tmp/obj.Kk33Ll", "a killed writer's object");
-    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/obj.Kk33Ll", past, 0), 0);
+    write_file(TEST_REPO "/tmp/pack-dat.Kk33Ll", "a killed pack writer's half-written pack");
+    assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/pack-dat.Kk33Ll", past, 0), 0);
     /* The tag mirror stages there too, and its orphans are the engine's. */
     write_file(TEST_REPO "/tmp/tags.Mm44Nn", "{\"version\":1,\"tags\":[]}");
     assert_int_equal(utimensat(AT_FDCWD, TEST_REPO "/tmp/tags.Mm44Nn", past, 0), 0);
@@ -417,12 +416,12 @@ static void test_gc_removes_stale_staging_files(void **state)
     gc_result_t g;
     assert_int_equal(gc_run(store, db, repo_id, 1, NULL, &g), OK);
     assert_int_equal(g.tmp_files_removed, 0);
-    assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), 0);
+    assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Kk33Ll", &sb), 0);
 
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
     assert_int_equal(g.tmp_files_removed, 2);
     assert_true(g.tmp_bytes_removed > 0);
-    assert_int_equal(stat(TEST_REPO "/tmp/obj.Kk33Ll", &sb), -1);
+    assert_int_equal(stat(TEST_REPO "/tmp/pack-dat.Kk33Ll", &sb), -1);
     assert_int_equal(stat(TEST_REPO "/tmp/tags.Mm44Nn", &sb), -1);
     assert_int_equal(stat(TEST_REPO "/tmp/mine.txt", &sb), 0);
 }

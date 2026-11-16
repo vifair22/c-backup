@@ -849,7 +849,6 @@ typedef enum {
     SNAP_JOB_REINDEX,
     SNAP_JOB_GC,
     SNAP_JOB_GFS,
-    SNAP_JOB_PACK,
     SNAP_JOB_VERIFY,
     SNAP_JOB_GREP,
     SNAP_JOB_REPLICATE,
@@ -888,77 +887,6 @@ static void snap_job_free(void *p)
     free(j);
 }
 
-/*
- * pack.c predates the job manager and takes its progress callback with the
- * counters first. Adapting here keeps that older signature out of the job
- * plumbing rather than churning every caller of it.
- */
-typedef struct {
-    void (*progress)(const char *, uint64_t, uint64_t, void *);
-    void  *ctx;
-} pack_progress_bridge_t;
-
-static void pack_progress_adapter(uint64_t current, uint64_t total,
-                                  const char *phase, void *ctx)
-{
-    pack_progress_bridge_t *b = ctx;
-    if (b && b->progress) b->progress(phase ? phase : "pack", current, total, b->ctx);
-}
-
-status_t routes_run_pack(struct store *store, int64_t repo_id,
-                         atomic_int *cancel,
-                         void (*progress)(const char *, uint64_t, uint64_t, void *),
-                         void *progress_ctx, struct pack_report *out)
-{
-    /* repo_pack takes no flag of its own; it reads the store's, which is
-     * how a cancel reaches the middle of packing one large object. */
-    if (cancel) store_set_cancel((store_t *)store, cancel);
-    pack_progress_bridge_t bridge = { progress, progress_ctx };
-    pack_report_t rep;
-    status_t st = repo_pack_report((store_t *)store, &rep, pack_progress_adapter, &bridge);
-    if (st == OK && rep.packed > 0)
-        log_info("pack: %llu object(s) packed in repo %lld",
-                 (unsigned long long)rep.packed, (long long)repo_id);
-    if (out) *out = rep;
-    return st;
-}
-
-/*
- * What a pack job did. It recorded no result at all, so a run that packed
- * nothing - every loose object skip-marked as incompressible - read as a
- * bare "completed" and the reason was only in the daemon log (B099).
- * "reason" is null when something was packed.
- */
-static void pack_job_report(void *progress_ctx, const pack_report_t *pr)
-{
-    char js[384];
-    if (pr->reason)
-        snprintf(js, sizeof(js),
-                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
-                 "\"incompressible\":%llu,\"reason\":\"%s\"}",
-                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
-                 (unsigned long long)pr->skip_marked,
-                 (unsigned long long)pr->incompressible, pr->reason);
-    else
-        snprintf(js, sizeof(js),
-                 "{\"loose\":%llu,\"packed\":%llu,\"skip_marked\":%llu,"
-                 "\"incompressible\":%llu,\"reason\":null}",
-                 (unsigned long long)pr->loose, (unsigned long long)pr->packed,
-                 (unsigned long long)pr->skip_marked,
-                 (unsigned long long)pr->incompressible);
-    job_set_result(progress_ctx, js);
-
-    char msg[256];
-    uint64_t left = pr->skip_marked + pr->incompressible;
-    if (pr->reason)
-        snprintf(msg, sizeof(msg), "nothing packed: %s", pr->reason);
-    else
-        snprintf(msg, sizeof(msg),
-                 "packed %llu object%s; %llu left loose as incompressible",
-                 (unsigned long long)pr->packed, pr->packed == 1 ? "" : "s",
-                 (unsigned long long)left);
-    job_set_summary(progress_ctx, msg);
-}
 
 /* How many ids a gfs journal message names before it summarises the rest.
  * The job result carries all of them; the journal is a one-line log. */
@@ -1248,14 +1176,6 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)rx.tags_restored, (unsigned long long)rx.tags_skipped,
                  (long long)rx.snapshot_mark, rx.snapshot_ids_repaired ? "true" : "false");
         job_set_result(progress_ctx, rj);
-    } else if (j->kind == SNAP_JOB_PACK) {
-        /* Loose objects are one file each, and compression only happens at
-         * pack time, so an unpacked repository stores more than its source
-         * and keeps one inode per object. */
-        pack_report_t pr;
-        memset(&pr, 0, sizeof(pr));
-        st = routes_run_pack(store, j->repo_id, cancel, progress, progress_ctx, &pr);
-        pack_job_report(progress_ctx, &pr);
     } else if (j->kind == SNAP_JOB_GREP) {
         grep_opts_t go;
         memset(&go, 0, sizeof(go));
@@ -1714,7 +1634,6 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                        : kind == SNAP_JOB_REINDEX ? "reindex"
                        : kind == SNAP_JOB_GC      ? "gc"
                        : kind == SNAP_JOB_GFS     ? "gfs"
-                       : kind == SNAP_JOB_PACK    ? "pack"
                        : kind == SNAP_JOB_REPLICATE ? "replicate"
                                                   : "restore";
     status_t st = job_submit(g_ctx.jm, repo_id, action,
@@ -2016,7 +1935,6 @@ api_response_t snapshots_route_post(const api_request_t *req, int64_t repo_id,
     if (strcmp(rest, "/reindex") == 0) return submit_snap_job(repo_id, 0, req, SNAP_JOB_REINDEX);
     if (strcmp(rest, "/gc") == 0)      return submit_snap_job(repo_id, 0, req, SNAP_JOB_GC);
     if (strcmp(rest, "/gfs") == 0)     return submit_snap_job(repo_id, 0, req, SNAP_JOB_GFS);
-    if (strcmp(rest, "/pack") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_PACK);
     if (strcmp(rest, "/verify") == 0)  return submit_snap_job(repo_id, 0, req, SNAP_JOB_VERIFY);
     if (strcmp(rest, "/grep") == 0)    return submit_snap_job(repo_id, 0, req, SNAP_JOB_GREP);
     if (strcmp(rest, "/replicate") == 0) return submit_snap_job(repo_id, 0, req, SNAP_JOB_REPLICATE);
@@ -2124,7 +2042,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 int routes_action_is_schedulable(const char *action)
 {
     static const char *ok[] = {
-        "backup", "verify", "grep", "gc", "gfs", "reindex", "pack", "replicate",
+        "backup", "verify", "grep", "gc", "gfs", "reindex", "replicate",
     };
     for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
         if (strcmp(action, ok[i]) == 0) return 1;
@@ -2150,7 +2068,6 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
     else if (strcmp(action, "gc") == 0)      kind = SNAP_JOB_GC;
     else if (strcmp(action, "gfs") == 0)     kind = SNAP_JOB_GFS;
     else if (strcmp(action, "reindex") == 0) kind = SNAP_JOB_REINDEX;
-    else if (strcmp(action, "pack") == 0)    kind = SNAP_JOB_PACK;
     else if (strcmp(action, "replicate") == 0) kind = SNAP_JOB_REPLICATE;
     else return set_error(ERR_INVALID, "no scheduled job for action '%s'", action);
 

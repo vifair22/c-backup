@@ -6,11 +6,11 @@
  * to sit above it, which is the point of the boundary: the engine should be
  * testable knowing only a directory path.
  *
- * The locate-callback cases matter most. Deleting the .idx sidecar removed
- * the engine's only index, so packed reads now depend entirely on a resolver
- * the daemon supplies. If that contract breaks, loose objects keep working
- * and packed ones quietly stop being findable, which is exactly the kind of
- * failure that hides until a restore needs an old object.
+ * The locate cases matter most. Every object lives in a pack, so every read
+ * goes through a resolver: the daemon's, or the store's built-in index when
+ * none is registered. If either breaks, objects quietly stop being findable,
+ * which is exactly the kind of failure that hides until a restore needs an
+ * old object.
  */
 
 #include <setjmp.h>
@@ -29,6 +29,7 @@
 
 #include "store.h"
 #include "object.h"
+#include "pack.h"
 #include "types.h"
 #include "test_tmp.h"
 
@@ -66,7 +67,6 @@ static void test_open_close(void **state)
     store_t *st = fresh_store();
     assert_non_null(store_root(st));
     assert_true(store_fd(st) >= 0);
-    assert_true(store_objects_fd(st) >= 0);
     done(st);
 }
 
@@ -162,40 +162,39 @@ static void test_incompressible_bailout(void **state)
     done(st);
 }
 
-/* Streaming read must not require the payload to fit anywhere but the pipe. */
-static void test_large_object_streaming(void **state)
+/*
+ * OBJECT_MAX_BYTES is a hard bound on both sides: an object of exactly the
+ * bound round-trips, and one byte more is refused before anything is staged,
+ * so nothing past the bound can ever reach a pack.
+ */
+static void test_object_bound(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
 
-    size_t n = 4 * 1024 * 1024;
-    uint8_t *buf = malloc(n);
+    size_t n = (size_t)OBJECT_MAX_BYTES;
+    uint8_t *buf = malloc(n + 1);
     assert_non_null(buf);
-    for (size_t i = 0; i < n; i++) buf[i] = (uint8_t)(i * 7);
+    for (size_t i = 0; i < n + 1; i++) buf[i] = (uint8_t)(i * 7);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(object_store(st, OBJECT_TYPE_FILE, buf, n, hash), OK);
 
-    char outpath[] = TEST_TMP "/c_backup_test_store_out.XXXXXX";
-    int fd = mkstemp(outpath);
-    assert_true(fd >= 0);
+    void *out = NULL; size_t out_len = 0;
+    assert_int_equal(object_load(st, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(out_len, n);
+    assert_memory_equal(out, buf, n);
+    free(out);
 
-    uint64_t size = 0; uint8_t type = 0;
-    assert_int_equal(object_load_stream(st, hash, fd, &size, &type), OK);
-    assert_int_equal(size, n);
-
-    struct stat sb;
-    assert_int_equal(fstat(fd, &sb), 0);
-    assert_int_equal((size_t)sb.st_size, n);
-    close(fd);
-    unlink(outpath);
+    uint8_t big[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, buf, n + 1, big), ERR_TOO_LARGE);
     free(buf);
 
     done(st);
 }
 
-/* Sparse files keep their holes: a restored file must not silently become a
- * dense one, which would turn a 1 GiB sparse file into 1 GiB of zeros. */
+/* A file with holes is stored, for now, as an ordinary FILE object whose
+ * holes read back as zeroes: its name is the dense content's. */
 static void test_sparse_file_roundtrip(void **state)
 {
     (void)state;
@@ -217,11 +216,27 @@ static void test_sparse_file_roundtrip(void **state)
     assert_true(lseek(fd, 0, SEEK_SET) >= 0);
 
     uint8_t hash[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store_file(st, fd, fsize, hash), OK);
+    object_write_t info;
+    assert_int_equal(object_store_file_packed(st, fd, fsize, NULL, hash, &info), OK);
     close(fd);
     unlink(src);
+    assert_int_equal(info.is_new, 1);
+    assert_int_equal(info.payload_size, fsize);
 
-    assert_true(object_exists(st, hash));
+    uint8_t *dense = calloc(1, (size_t)fsize);
+    assert_non_null(dense);
+    memcpy(dense, head, strlen(head));
+    memcpy(dense + 8 * 1024 * 1024, tail, strlen(tail));
+    uint8_t want[OBJECT_HASH_SIZE];
+    object_name(OBJECT_TYPE_FILE, dense, (size_t)fsize, want);
+    assert_memory_equal(hash, want, OBJECT_HASH_SIZE);
+
+    void *out = NULL; size_t out_len = 0;
+    assert_int_equal(object_load(st, hash, &out, &out_len, NULL), OK);
+    assert_int_equal(out_len, (size_t)fsize);
+    assert_memory_equal(out, dense, (size_t)fsize);
+    free(out);
+    free(dense);
 
     done(st);
 }
@@ -251,8 +266,8 @@ static status_t probe_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
 }
 
 /*
- * With no resolver the engine must report not-found rather than inventing an
- * answer or reaching for an index that no longer exists.
+ * With no resolver the built-in index answers, and for a hash in no pack it
+ * must say not-found rather than invent a location.
  */
 static void test_locate_without_resolver(void **state)
 {
@@ -296,10 +311,13 @@ static void test_locate_with_resolver(void **state)
 }
 
 /*
- * A loose object must be readable whether or not a resolver is registered.
- * The resolver answers for packed objects; loose lookups are direct.
+ * A registered resolver is authoritative: it replaces the built-in index
+ * rather than sitting in front of it. A staged object is still visible to
+ * object_exists (the store's writer holds it), but once a read seals the
+ * pack the location has to come from the resolver, and this one knows
+ * nothing.
  */
-static void test_loose_read_ignores_resolver(void **state)
+static void test_resolver_replaces_builtin_index(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
@@ -308,15 +326,16 @@ static void test_loose_read_ignores_resolver(void **state)
     probe.answer_in_pack = 0;
     store_set_locate_cb(st, probe_locate, &probe);
 
-    const char *payload = "loose object content";
+    const char *payload = "an object only the built-in index could find";
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(object_store(st, OBJECT_TYPE_FILE, payload,
                                   strlen(payload), hash), OK);
+    assert_true(object_exists(st, hash));
 
     void *out = NULL; size_t len = 0;
-    assert_int_equal(object_load(st, hash, &out, &len, NULL), OK);
-    assert_int_equal(len, strlen(payload));
-    free(out);
+    assert_int_equal(object_load(st, hash, &out, &len, NULL), ERR_NOT_FOUND);
+    assert_null(out);
+    assert_true(probe.calls > 0);
 
     done(st);
 }
@@ -418,177 +437,288 @@ static void test_store_config_is_kept(void **state)
 }
 
 /* ------------------------------------------------------------------ */
-/* The in-memory loose-object set                                      */
+/* The built-in index                                                  */
 /*                                                                     */
-/* object_exists consults this before touching the filesystem, so a    */
-/* wrong answer is not a performance problem. A false positive means   */
-/* backup decides an object is already stored and does not write it,   */
-/* and nothing anywhere reports a failure - the snapshot completes and */
-/* the bytes are simply absent. It had no direct tests at all.         */
+/* A store opened with nothing but a path answers lookups from an      */
+/* index of its own, read off the packs and kept current by its own    */
+/* commits and removals. Tests, tools and benchmarks all read through  */
+/* it, so a stale or missing entry turns into objects that are on disk */
+/* and cannot be found, or locations in a pack that is gone.           */
 /* ------------------------------------------------------------------ */
 
-static void fill_hash(uint8_t h[OBJECT_HASH_SIZE], unsigned seed)
+/* Distinct seeds give distinct payloads, so nothing in a test dedups by
+ * accident. */
+static void fill_payload(char *buf, size_t n, unsigned seed)
 {
-    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++)
-        h[i] = (uint8_t)(seed * 31u + i * 7u + 1u);
+    uint32_t x = seed * 2654435761u + 1u;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        buf[i] = (char)('a' + x % 26u);
+    }
 }
 
-static void test_loose_set_finds_what_was_written(void **state)
+static void assert_loads(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
+                         const char *want, size_t want_len)
+{
+    void *out = NULL; size_t len = 0;
+    assert_int_equal(object_load(st, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, want_len);
+    assert_memory_equal(out, want, want_len);
+    free(out);
+}
+
+static void count_pack_cb(uint32_t pack_num, void *ctx)
+{
+    (void)pack_num;
+    (*(unsigned *)ctx)++;
+}
+
+static unsigned count_packs(store_t *st)
+{
+    unsigned n = 0;
+    assert_int_equal(pack_list(st, count_pack_cb, &n), OK);
+    return n;
+}
+
+enum { BIDX_N = 50, BIDX_LEN = 200 };
+
+static void test_builtin_index_finds_flushed_objects(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
 
-    uint8_t hash[OBJECT_HASH_SIZE];
-    const char *body = "loose object body";
-    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
+    static char bodies[BIDX_N][BIDX_LEN];
+    uint8_t hashes[BIDX_N][OBJECT_HASH_SIZE];
+    for (unsigned i = 0; i < BIDX_N; i++) {
+        fill_payload(bodies[i], BIDX_LEN, i);
+        assert_int_equal(object_store(st, OBJECT_TYPE_FILE, bodies[i], BIDX_LEN,
+                                      hashes[i]), OK);
+    }
+    /* Nothing is on disk as a pack until the writer is sealed. */
+    assert_int_equal(count_packs(st), 0);
+    assert_int_equal(object_store_flush(st), OK);
+    assert_int_equal(count_packs(st), 1);
 
-    /* A fresh store's set is built lazily; nothing is ready until asked. */
-    store_clear_loose_set(st);
-    assert_false(store_loose_set_ready(st));
-    /* Before the build, contains answers no rather than guessing. */
-    assert_false(store_loose_set_contains(st, hash));
+    for (unsigned i = 0; i < BIDX_N; i++) {
+        store_location_t loc;
+        assert_int_equal(store_locate(st, hashes[i], &loc), OK);
+        assert_int_equal(loc.in_pack, 1);
+        assert_int_equal(loc.pack_version, PACK_VERSION);
+        assert_loads(st, hashes[i], bodies[i], BIDX_LEN);
+    }
 
-    assert_int_equal(store_build_loose_set(st), OK);
-    assert_true(store_loose_set_ready(st));
-    assert_true(store_loose_set_contains(st, hash));
-
-    /* Something never written is absent. The reconstruction reads the first
-     * byte from the bucket directory name and the rest from the filename, so
-     * a hash differing only in its first byte is the case that catches a
-     * prefix that was ignored. */
-    uint8_t other[OBJECT_HASH_SIZE];
-    memcpy(other, hash, sizeof(other));
-    other[0] = (uint8_t)(other[0] ^ 0xff);
-    assert_false(store_loose_set_contains(st, other));
+    /* A flush with nothing staged is a no-op, not an empty pack. */
+    assert_int_equal(object_store_flush(st), OK);
+    assert_int_equal(count_packs(st), 1);
 
     done(st);
 }
 
-static void test_loose_set_survives_growing(void **state)
+/* Objects written after the index was built are added by this handle's own
+ * commit, not by a rescan: the index is built once and then kept. */
+static void test_builtin_index_follows_later_commits(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
-    assert_int_equal(store_build_loose_set(st), OK);
 
-    /*
-     * The table starts at 256 slots and doubles at 75% load, rehashing as it
-     * goes. A rehash that drops entries is the classic way this breaks, and
-     * it breaks silently: the set simply starts answering no. 5000 crosses
-     * several doublings.
-     */
-    enum { N = 5000 };
-    for (unsigned i = 0; i < N; i++) {
-        uint8_t h[OBJECT_HASH_SIZE];
-        fill_hash(h, i);
-        store_loose_set_insert(st, h);
-    }
-    for (unsigned i = 0; i < N; i++) {
-        uint8_t h[OBJECT_HASH_SIZE];
-        fill_hash(h, i);
-        assert_true(store_loose_set_contains(st, h));
-    }
+    char a[BIDX_LEN], b[BIDX_LEN];
+    fill_payload(a, sizeof(a), 1);
+    fill_payload(b, sizeof(b), 2);
+    uint8_t ha[OBJECT_HASH_SIZE], hb[OBJECT_HASH_SIZE];
 
-    /* Re-inserting a member must not grow the set a second time; if it did,
-     * the load factor would be wrong and the table would keep doubling. */
-    for (unsigned i = 0; i < 100; i++) {
-        uint8_t h[OBJECT_HASH_SIZE];
-        fill_hash(h, i);
-        store_loose_set_insert(st, h);
-        assert_true(store_loose_set_contains(st, h));
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, a, sizeof(a), ha), OK);
+    assert_int_equal(object_store_flush(st), OK);
+    assert_loads(st, ha, a, sizeof(a));          /* builds the index */
+
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, b, sizeof(b), hb), OK);
+    assert_int_equal(object_store_flush(st), OK);
+    assert_int_equal(count_packs(st), 2);
+
+    store_location_t la, lb;
+    assert_int_equal(store_locate(st, ha, &la), OK);
+    assert_int_equal(store_locate(st, hb, &lb), OK);
+    assert_int_not_equal(la.pack_id, lb.pack_id);
+    assert_loads(st, hb, b, sizeof(b));
+
+    done(st);
+}
+
+/* What a store wrote is durable once it is closed, and a fresh handle on the
+ * same directory finds all of it by scanning the packs. */
+static void test_builtin_index_survives_reopen(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
+
+    static char bodies[BIDX_N][BIDX_LEN];
+    uint8_t hashes[BIDX_N][OBJECT_HASH_SIZE];
+    for (unsigned i = 0; i < BIDX_N; i++) {
+        fill_payload(bodies[i], BIDX_LEN, i + 100u);
+        assert_int_equal(object_store(st, OBJECT_TYPE_FILE, bodies[i], BIDX_LEN,
+                                      hashes[i]), OK);
+        /* Half sealed by a flush, half left for store_close to seal. */
+        if (i == BIDX_N / 2) assert_int_equal(object_store_flush(st), OK);
+    }
+    store_close(st);
+
+    st = NULL;
+    store_config_t cfg = { 0 };
+    assert_int_equal(store_open(TEST_ROOT, &cfg, &st), OK);
+    assert_int_equal(count_packs(st), 2);
+    for (unsigned i = 0; i < BIDX_N; i++) {
+        assert_true(object_exists(st, hashes[i]));
+        assert_loads(st, hashes[i], bodies[i], BIDX_LEN);
     }
 
     done(st);
 }
 
-static void test_loose_set_refuses_the_empty_sentinel(void **state)
+/*
+ * Two packs for gc to work on: pack one holds keep and drop, pack two holds
+ * doomed alone. The index is built before gc runs, so what the callers test
+ * is its upkeep rather than a fresh scan.
+ */
+typedef struct {
+    char    keep[BIDX_LEN], drop[BIDX_LEN], doomed[BIDX_LEN];
+    uint8_t hk[OBJECT_HASH_SIZE], hd[OBJECT_HASH_SIZE], hx[OBJECT_HASH_SIZE];
+    store_location_t before;
+} gc_fixture_t;
+
+static store_t *gc_fixture(gc_fixture_t *f)
+{
+    store_t *st = fresh_store();
+    fill_payload(f->keep, sizeof(f->keep), 7);
+    fill_payload(f->drop, sizeof(f->drop), 8);
+    fill_payload(f->doomed, sizeof(f->doomed), 9);
+
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, f->keep, sizeof(f->keep), f->hk), OK);
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, f->drop, sizeof(f->drop), f->hd), OK);
+    assert_int_equal(object_store_flush(st), OK);
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, f->doomed, sizeof(f->doomed), f->hx), OK);
+    assert_int_equal(object_store_flush(st), OK);
+
+    assert_int_equal(store_locate(st, f->hk, &f->before), OK);
+    assert_true(object_exists(st, f->hd));
+    assert_true(object_exists(st, f->hx));
+
+    uint32_t kept = 0, deleted = 0;
+    assert_int_equal(pack_gc(st, f->hk, 1, &kept, &deleted), OK);
+    assert_int_equal(kept, 1);
+    assert_int_equal(deleted, 2);
+    assert_int_equal(count_packs(st), 1);
+    return st;
+}
+
+/*
+ * pack_gc removes packs, and the index has to forget what was in them. A
+ * pack with every entry dead is deleted; one with some live entries is
+ * rewritten without the dead ones. A stale entry would hand out a location
+ * in a file that no longer exists.
+ */
+static void test_builtin_index_forgets_gc_removed_packs(void **state)
 {
     (void)state;
-    store_t *st = fresh_store();
-    assert_int_equal(store_build_loose_set(st), OK);
+    gc_fixture_t f;
+    store_t *st = gc_fixture(&f);
 
-    /*
-     * An all-zero slot is how the table spells "empty", so an all-zero hash
-     * cannot be stored in it. Inserting one anyway would write a value
-     * indistinguishable from an empty slot and truncate every probe that
-     * lands on it - turning one bad insert into arbitrary false negatives
-     * elsewhere in the table.
-     */
-    uint8_t zero[OBJECT_HASH_SIZE];
-    memset(zero, 0, sizeof(zero));
-    store_loose_set_insert(st, zero);
-    assert_false(store_loose_set_contains(st, zero));
+    assert_false(object_exists(st, f.hd));
+    assert_false(object_exists(st, f.hx));
+    void *out = NULL; size_t len = 0;
+    assert_int_equal(object_load(st, f.hd, &out, &len, NULL), ERR_NOT_FOUND);
+    assert_int_equal(object_load(st, f.hx, &out, &len, NULL), ERR_NOT_FOUND);
 
-    uint8_t real[OBJECT_HASH_SIZE];
-    fill_hash(real, 12345);
-    store_loose_set_insert(st, real);
-    assert_true(store_loose_set_contains(st, real));
+    /* A fresh scan agrees, and finds the survivor in its new pack. */
+    store_close(st);
+    st = NULL;
+    store_config_t cfg = { 0 };
+    assert_int_equal(store_open(TEST_ROOT, &cfg, &st), OK);
+    assert_false(object_exists(st, f.hd));
+    assert_false(object_exists(st, f.hx));
+    store_location_t after;
+    assert_int_equal(store_locate(st, f.hk, &after), OK);
+    assert_int_not_equal(after.pack_id, f.before.pack_id);
+    assert_loads(st, f.hk, f.keep, sizeof(f.keep));
 
     done(st);
 }
 
-static void test_loose_set_ignores_junk_in_the_object_tree(void **state)
+/*
+ * The survivors of a rewrite move to a new pack, which is installed and
+ * announced before the old one is removed. The index has to follow them
+ * there on the same handle: dropping the old pack must not drop an object
+ * whose live copy is in the new one.
+ */
+static void test_builtin_index_follows_gc_rewrite(void **state)
 {
     (void)state;
-    store_t *st = fresh_store();
+    gc_fixture_t f;
+    store_t *st = gc_fixture(&f);
 
-    uint8_t hash[OBJECT_HASH_SIZE];
-    const char *body = "a real object";
-    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, body, strlen(body), hash), OK);
-
-    /*
-     * Editors, rsync and interrupted writes all leave files in a directory.
-     * A name of the wrong length or with a non-hex character must be skipped
-     * rather than parsed into a hash that names nothing.
-     */
-    char path[512];
-    snprintf(path, sizeof(path), "%s/objects/ab", TEST_ROOT);
-    (void)mkdir(path, 0755);
-    const char *junk[] = {
-        "short",
-        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", /* 62, not hex */
-        "0123456789012345678901234567890123456789012345678901234567890",  /* 61 */
-    };
-    for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); i++) {
-        char f[768];
-        snprintf(f, sizeof(f), "%s/%s", path, junk[i]);
-        FILE *fp = fopen(f, "w");
-        assert_non_null(fp);
-        fputs("not an object", fp);
-        fclose(fp);
-    }
-
-    store_clear_loose_set(st);
-    assert_int_equal(store_build_loose_set(st), OK);
-    /* The real object is still found, and nothing crashed on the way. */
-    assert_true(store_loose_set_contains(st, hash));
+    store_location_t after;
+    assert_int_equal(store_locate(st, f.hk, &after), OK);
+    assert_int_not_equal(after.pack_id, f.before.pack_id);
+    assert_loads(st, f.hk, f.keep, sizeof(f.keep));
 
     done(st);
 }
 
-static void test_loose_set_clear_forces_a_rebuild(void **state)
+/* ------------------------------------------------------------------ */
+/* Pack number reservation                                             */
+/* ------------------------------------------------------------------ */
+
+static void test_reserve_pack_num_never_repeats(void **state)
 {
     (void)state;
     store_t *st = fresh_store();
-    assert_int_equal(store_build_loose_set(st), OK);
 
-    uint8_t h[OBJECT_HASH_SIZE];
-    fill_hash(h, 99);
-    store_loose_set_insert(st, h);
-    assert_true(store_loose_set_contains(st, h));
+    /* The directory scan is the floor; the handle's own grants are the other. */
+    assert_int_equal(store_reserve_pack_num(st, 0), 0);
+    assert_int_equal(store_reserve_pack_num(st, 0), 1);
+    assert_int_equal(store_reserve_pack_num(st, 10), 10);
+    assert_int_equal(store_reserve_pack_num(st, 3), 11);
+    assert_int_equal(store_reserve_pack_num(st, 11), 12);
 
-    /* gc calls this after deleting objects: the set is a cache of what is on
-     * disk, and stale membership after a delete is a false positive. */
-    store_clear_loose_set(st);
-    assert_false(store_loose_set_ready(st));
-    assert_false(store_loose_set_contains(st, h));
+    done(st);
+}
 
-    /* Clearing twice is not a double free. */
-    store_clear_loose_set(st);
+/*
+ * A backup's writer and the store's own writer open on one handle at once.
+ * A staging pack is not named until it installs, so both scan the same free
+ * number; without the reservation the second install collides with the
+ * first and its objects are lost.
+ */
+static void test_two_writers_on_one_handle_get_distinct_packs(void **state)
+{
+    (void)state;
+    store_t *st = fresh_store();
 
-    /* A build after a clear starts from the filesystem again, so the
-     * hand-inserted hash - which was never written - stays absent. */
-    assert_int_equal(store_build_loose_set(st), OK);
-    assert_false(store_loose_set_contains(st, h));
+    pack_backup_writer_t *w = NULL;
+    assert_int_equal(pack_backup_open(st, &w), OK);
+
+    char a[BIDX_LEN], b[BIDX_LEN];
+    fill_payload(a, sizeof(a), 21);
+    fill_payload(b, sizeof(b), 22);
+    uint8_t ha[OBJECT_HASH_SIZE], hb[OBJECT_HASH_SIZE];
+    int is_new = 0;
+
+    assert_int_equal(pack_backup_add(w, OBJECT_TYPE_FILE, a, sizeof(a), ha,
+                                     &is_new, NULL, NULL), OK);
+    assert_int_equal(is_new, 1);
+    assert_int_equal(object_store(st, OBJECT_TYPE_FILE, b, sizeof(b), hb), OK);
+
+    /* Install in the opposite order to opening. */
+    assert_int_equal(object_store_flush(st), OK);
+    uint32_t packed = 0;
+    assert_int_equal(pack_backup_finish(w, &packed), OK);
+    assert_int_equal(packed, 1);
+
+    assert_int_equal(count_packs(st), 2);
+    store_location_t la, lb;
+    assert_int_equal(store_locate(st, ha, &la), OK);
+    assert_int_equal(store_locate(st, hb, &lb), OK);
+    assert_int_not_equal(la.pack_id, lb.pack_id);
+    assert_loads(st, ha, a, sizeof(a));
+    assert_loads(st, hb, b, sizeof(b));
 
     done(st);
 }
@@ -637,10 +767,10 @@ static void test_dat_cache_survives_growing(void **state)
     store_t *st = fresh_store();
 
     /*
-     * Same shape as the loose set: doubling at 75% load with a rehash. A
-     * dropped entry here leaks a FILE handle rather than losing data, which
-     * on a repository with thousands of packs is a descriptor exhaustion
-     * that looks like an unrelated failure much later.
+     * Doubling at 75% load with a rehash. A dropped entry here leaks a
+     * FILE handle rather than losing data, which on a repository with
+     * thousands of packs is a descriptor exhaustion that looks like an
+     * unrelated failure much later.
      */
     enum { N = 400 };
     FILE *handles[N];
@@ -740,21 +870,23 @@ int main(void)
         cmocka_unit_test(test_dedup_is_content_addressed),
         cmocka_unit_test(test_missing_object),
         cmocka_unit_test(test_incompressible_bailout),
-        cmocka_unit_test(test_large_object_streaming),
+        cmocka_unit_test(test_object_bound),
         cmocka_unit_test(test_sparse_file_roundtrip),
         cmocka_unit_test(test_locate_without_resolver),
         cmocka_unit_test(test_locate_with_resolver),
-        cmocka_unit_test(test_loose_read_ignores_resolver),
+        cmocka_unit_test(test_resolver_replaces_builtin_index),
         cmocka_unit_test(test_pack_commit_cb_registration),
         cmocka_unit_test(test_pack_commit_without_cb),
         cmocka_unit_test(test_pack_removed_cb_registration),
         cmocka_unit_test(test_pack_removed_without_cb),
         cmocka_unit_test(test_store_config_is_kept),
-        cmocka_unit_test(test_loose_set_finds_what_was_written),
-        cmocka_unit_test(test_loose_set_survives_growing),
-        cmocka_unit_test(test_loose_set_refuses_the_empty_sentinel),
-        cmocka_unit_test(test_loose_set_ignores_junk_in_the_object_tree),
-        cmocka_unit_test(test_loose_set_clear_forces_a_rebuild),
+        cmocka_unit_test(test_builtin_index_finds_flushed_objects),
+        cmocka_unit_test(test_builtin_index_follows_later_commits),
+        cmocka_unit_test(test_builtin_index_survives_reopen),
+        cmocka_unit_test(test_builtin_index_forgets_gc_removed_packs),
+        cmocka_unit_test(test_builtin_index_follows_gc_rewrite),
+        cmocka_unit_test(test_reserve_pack_num_never_repeats),
+        cmocka_unit_test(test_two_writers_on_one_handle_get_distinct_packs),
         cmocka_unit_test(test_dat_cache_checkout_is_a_handoff),
         cmocka_unit_test(test_dat_cache_survives_growing),
         cmocka_unit_test(test_dat_cache_return_ignores_null),

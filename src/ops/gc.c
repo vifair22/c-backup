@@ -183,19 +183,6 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return OK;
     }
 
-    /* Loose objects are unlinked here; packed ones only lose their rows, and
-     * their bytes are reclaimed later by pack compaction. Unlinking a pack
-     * because one object inside it died would take the live ones with it. */
-    for (int i = 0; i < (dead ? dead->nrows : 0); i++) {
-        if (strcmp(dead->rows[i][2], "loose") != 0) continue;
-        const char *hex = dead->rows[i][0];
-        char path[PATH_MAX];
-        if (snprintf(path, sizeof(path), "%s/objects/%.2s/%s",
-                     store_root(store), hex, hex + 2) >= (int)sizeof(path))
-            continue;
-        if (unlink(path) != 0 && errno != ENOENT)
-            log_warn("gc: cannot unlink %s: %s", path, strerror(errno));
-    }
     db_result_free(dead);
 
     /* Packed objects keep their bytes until compaction, but they must stop
@@ -220,10 +207,6 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "gc: commit");
-
-    /* The in-memory loose set predates the sweep and now lists files that are
-     * gone; dropping it forces a rebuild on next use. */
-    store_clear_loose_set(store);
 
     /*
      * Second half of the sweep: the bytes. A dead packed object lost its

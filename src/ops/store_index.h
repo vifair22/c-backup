@@ -25,12 +25,12 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
 void     store_index_free(store_index_t *idx);
 
 /*
- * An object staged in a pack that is still open is recorded as 'staged', not
- * 'loose'. Its bytes are in a temporary file that only becomes the pack when
- * it is sealed, and the seal's commit callback rewrites the location to the
- * pack. Until then the row is a promise, not a fact.
+ * An object staged in a pack that is still open is recorded as 'staged'. Its
+ * bytes are in a temporary file that only becomes the pack when it is
+ * sealed, and the seal's commit callback rewrites the location to the pack.
+ * Until then the row is a promise, not a fact.
  *
- * Recording it as loose made a crash mid-backup unsafe in a way nothing
+ * Recording it as present made a crash mid-backup unsafe in a way nothing
  * reported. The rows committed in batches while the pack was open; the pack
  * died with the process; and the next backup's file cache found the paths
  * unchanged, found their objects "present", and wrote a snapshot referencing
@@ -49,9 +49,10 @@ status_t store_index_put_staged(cutils_db_t *db, int64_t repo_id,
  * repository when repo_id is 0. Only safe when no backup is running on it. */
 status_t store_index_drop_staged(cutils_db_t *db, int64_t repo_id);
 
-/* Record a loose object. Called by the backup pipeline after a successful
- * write, so the object is findable before any snapshot references it. */
-status_t store_index_put_loose(cutils_db_t *db, int64_t repo_id,
+/* Record an object the repository already holds in an installed pack, as a
+ * backup meets one it deduplicated against. A row already there is left as
+ * it is; the pack commit is what set its size. */
+status_t store_index_put_packed(cutils_db_t *db, int64_t repo_id,
                                const uint8_t hash[OBJECT_HASH_SIZE],
                                uint8_t type, uint64_t phys_size, uint64_t orig_size);
 

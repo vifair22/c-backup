@@ -26,8 +26,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#include <sys/resource.h>
-
 #include <cmocka.h>
 
 #include "fake_index.h"
@@ -86,7 +84,7 @@ static int setup(void **state)
 static int setup_packed(void **state)
 {
     if (setup(state) != 0) return -1;
-    if (repo_pack(store, NULL, NULL, NULL) != OK) return -1;
+    if (object_store_flush(store) != OK) return -1;
     return 0;
 }
 
@@ -136,69 +134,24 @@ static int corrupt_pack_byte(long offset)
 /* ------------------------------------------------------------------ */
 
 /*
- * Packing does not stop at the process's file descriptor limit.
- *
- * The classification pass used to open every loose object and hold the
- * descriptor, so a repository with more loose objects than the process had
- * descriptors ran out partway through - and the failure was invisible.
- * open() returning EMFILE hit a `continue` commented as "deleted between
- * collect and now", so every object past the limit was dropped from the
- * pack, the run reported success, and the rest stayed loose for ever.
- *
- * Found on a real 622,000-file source: a 40,960 descriptor limit packed
- * exactly 40,948 of 230,595 objects and said nothing about the other
- * 189,647. The arithmetic is what gave it away - packed plus the daemon's
- * dozen other descriptors is the limit exactly.
- *
- * Reproduced here by lowering the limit rather than by making a repository
- * big enough to hit the real one: the bug is about the ratio, not the size.
+ * object_store stages into the store's own writer, and nothing is a pack -
+ * on disk or in the index - until it is sealed. One flush seals all of it.
  */
-static void test_pack_is_not_bounded_by_the_fd_limit(void **state)
+static void test_flush_seals_staged_objects(void **state)
 {
     (void)state;
+    assert_int_equal(count_files(TEST_REPO "/packs"), 0);
+    assert_int_equal((int)fake_index_count(), 0);
+    for (int i = 0; i < NOBJ; i++)
+        assert_true(object_exists(store, hashes[i]));
 
-    struct rlimit orig;
-    assert_int_equal(getrlimit(RLIMIT_NOFILE, &orig), 0);
-
-    /* Comfortably fewer descriptors than there are objects to classify. */
-    struct rlimit tight = orig;
-    tight.rlim_cur = 64;
-    if (tight.rlim_max < 64) tight.rlim_cur = tight.rlim_max;
-    assert_int_equal(setrlimit(RLIMIT_NOFILE, &tight), 0);
-
-    uint32_t packed = 0;
-    status_t st = repo_pack(store, &packed, NULL, NULL);
-
-    assert_int_equal(setrlimit(RLIMIT_NOFILE, &orig), 0);
-
-    assert_int_equal(st, OK);
-    /* Every object, not as many as there were descriptors. */
-    assert_int_equal((int)packed, NOBJ);
-    assert_int_equal(count_files(TEST_REPO "/objects"), 0);
-
-    /* And they are all readable, so this is a real pack rather than a
-     * bookkeeping change. */
-    for (int i = 0; i < NOBJ; i++) {
-        void *data = NULL; size_t len = 0; uint8_t type = 0;
-        assert_int_equal(object_load(store, hashes[i], &data, &len, &type), OK);
-        assert_int_equal(len, sizes[i]);
-        free(data);
-    }
-}
-
-static void test_pack_moves_objects(void **state)
-{
-    (void)state;
-    assert_true(count_files(TEST_REPO "/objects") >= NOBJ);
-
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_true(packed > 0);
+    assert_int_equal(object_store_flush(store), OK);
 
     /* Every object announced through the commit callback is what the daemon
      * would have written to pack_objects. */
-    assert_true(fake_index_count() > 0);
-    assert_true(count_files(TEST_REPO "/packs") > 0);
+    assert_int_equal((int)fake_index_count(), NOBJ);
+    assert_int_equal(count_files(TEST_REPO "/packs"), 1);
+    assert_int_equal(count_files(TEST_REPO "/tmp"), 0);
 }
 
 static void test_every_packed_object_reads_back(void **state)
@@ -217,21 +170,28 @@ static void test_every_packed_object_reads_back(void **state)
     }
 }
 
-/* Reading a packed object with no resolver must fail rather than fall back to
- * scanning packs: the fallback is what .idx existed to avoid. */
-static void test_packed_read_requires_a_resolver(void **state)
+/*
+ * A store opened with no resolver reads packed objects through its built-in
+ * index, built by scanning the packs: every object lives in a pack, so
+ * without it a bare store could read nothing at all.
+ */
+static void test_packed_read_without_resolver_uses_builtin_index(void **state)
 {
     (void)state;
     store_t *bare = NULL;
     assert_int_equal(store_open(TEST_REPO, NULL, &bare), OK);
 
-    /* Loose copies were unlinked by packing, so with no resolver the object
-     * is genuinely unreachable. */
-    void *out = NULL;
-    size_t len = 0;
-    assert_int_not_equal(object_load(bare, hashes[0], &out, &len, NULL), OK);
+    uint8_t buf[8192];
+    for (int i = 0; i < NOBJ; i++) {
+        void *out = NULL;
+        size_t len = 0;
+        assert_int_equal(object_load(bare, hashes[i], &out, &len, NULL), OK);
+        size_t n = make_payload(i, buf, sizeof(buf));
+        assert_int_equal(len, n);
+        assert_memory_equal(out, buf, len);
+        free(out);
+    }
     store_close(bare);
-    err_clear();
 }
 
 static void test_pack_object_exists(void **state)
@@ -325,41 +285,6 @@ static void test_repair_of_unknown_object_errors(void **state)
     err_clear();
 }
 
-/* A loose object gets the same treatment. */
-static void test_parity_repairs_a_loose_object(void **state)
-{
-    (void)state;
-    uint8_t payload[1024];
-    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = (uint8_t)(i * 31);
-
-    uint8_t hash[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, payload,
-                                  sizeof(payload), hash), OK);
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    object_hash_to_hex(hash, hex);
-    char path[512];
-    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO, hex, hex + 2);
-
-    int fd = open(path, O_RDWR);
-    assert_true(fd >= 0);
-    uint8_t b = 0;
-    assert_int_equal(pread(fd, &b, 1, 100), 1);
-    b = (uint8_t)(b ^ 0xFF);
-    assert_int_equal(pwrite(fd, &b, 1, 100), 1);
-    close(fd);
-
-    int rc = object_repair(store, hash);
-    assert_true(rc >= 0);
-
-    void *out = NULL;
-    size_t len = 0;
-    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
-    assert_int_equal(len, sizeof(payload));
-    assert_memory_equal(out, payload, len);
-    free(out);
-}
-
 /*
  * GC keeps referenced objects and drops the rest. The refs array is sorted
  * hashes, which is what the caller is expected to supply. hash_cmp comes from
@@ -393,7 +318,7 @@ static void test_pack_gc_keeps_referenced_objects(void **state)
     for (size_t i = 0; i < keep; i++) {
         void *out = NULL;
         size_t len = 0;
-        if (object_load(store, hashes[i], &out, &len, NULL) != OK) { err_clear(); continue; }
+        assert_int_equal(object_load(store, hashes[i], &out, &len, NULL), OK);
         size_t n = make_payload((int)i, buf, sizeof(buf));
         assert_int_equal(len, n);
         assert_memory_equal(out, buf, len);
@@ -408,75 +333,38 @@ static void test_pack_gc_with_no_refs(void **state)
     (void)state;
     uint32_t kept = 0, deleted = 0;
     assert_int_equal(pack_gc(store, NULL, 0, &kept, &deleted), OK);
+    /* Everything dead is reported as deleted, not dropped unannounced. */
+    assert_int_equal(kept, 0);
+    assert_int_equal(deleted, NOBJ);
+    for (int i = 0; i < NOBJ; i++)
+        assert_false(pack_object_exists(store, hashes[i]));
 }
 
-/* Streaming a packed object out to a file descriptor, for payloads too large
- * to hold in memory. */
-static void test_packed_object_streams(void **state)
+/* Flushing with nothing staged writes no pack: an empty pack is a file every
+ * later enumeration would have to open to learn it holds nothing. */
+static void test_flush_is_idempotent(void **state)
 {
     (void)state;
-    char out[] = TEST_TMP "/c_backup_pack_pressure_stream.XXXXXX";
-    int fd = mkstemp(out);
-    assert_true(fd >= 0);
-
-    uint64_t size = 0;
-    uint8_t type = 0;
-    assert_int_equal(object_load_stream(store, hashes[9], fd, &size, &type), OK);
-    assert_int_equal(size, sizes[9]);
-
-    struct stat sb;
-    assert_int_equal(fstat(fd, &sb), 0);
-    assert_int_equal((size_t)sb.st_size, sizes[9]);
-    close(fd);
-    unlink(out);
-}
-
-/* A prefix read must not have to materialise the whole object. */
-static void test_packed_prefix_read(void **state)
-{
-    (void)state;
-    void *data = NULL;
-    size_t got = 0;
-    uint64_t full_size = 0;
-    uint8_t type = 0;
-    assert_int_equal(object_load_prefix(store, hashes[11], 64, &data, &got,
-                                        &full_size, &type), OK);
-    assert_int_equal(full_size, sizes[11]);
-    assert_true(got > 0 && got <= 64);
-
-    uint8_t full[8192];
-    make_payload(11, full, sizeof(full));
-    assert_memory_equal(data, full, got);
-    free(data);
-}
-
-/* Packing twice must be idempotent: the second call has nothing loose to do. */
-static void test_repack_is_idempotent(void **state)
-{
-    (void)state;
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 0);
+    int before = count_files(TEST_REPO "/packs");
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal(count_files(TEST_REPO "/packs"), before);
+    assert_int_equal((int)fake_index_count(), NOBJ);
 }
 
 int main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_setup_teardown(test_pack_is_not_bounded_by_the_fd_limit, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_pack_moves_objects, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_flush_seals_staged_objects, setup, teardown),
         cmocka_unit_test_setup_teardown(test_every_packed_object_reads_back, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_packed_read_requires_a_resolver, setup_packed, teardown),
+        cmocka_unit_test_setup_teardown(test_packed_read_without_resolver_uses_builtin_index, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_object_exists, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_packed_info_and_size, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_location_resolves, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_parity_repairs_a_corrupted_pack, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_repair_of_unknown_object_errors, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_parity_repairs_a_loose_object, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_keeps_referenced_objects, setup_packed, teardown),
         cmocka_unit_test_setup_teardown(test_pack_gc_with_no_refs, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_packed_object_streams, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_packed_prefix_read, setup_packed, teardown),
-        cmocka_unit_test_setup_teardown(test_repack_is_idempotent, setup_packed, teardown),
+        cmocka_unit_test_setup_teardown(test_flush_is_idempotent, setup_packed, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -63,7 +63,7 @@ export interface WireSearchResult {
   hash: string | null
 }
 
-export type WireLocation = 'loose' | 'staged' | 'packed'
+export type WireLocation = 'staged' | 'absent' | 'packed'
 
 /* Object type is a different code set from node type: 1 file content,
  * 2 xattrs, 3 ACL, 4 sparse, 5 manifest tree. */
@@ -127,7 +127,7 @@ export interface WireSummary {
   phys_size: number
   orig_size: number
   packs: number
-  loose: number
+  staged: number
   tags: number
   last_snapshot_ts: number | null
 }
@@ -178,7 +178,7 @@ export interface WireTag {
   snap_id: number
 }
 
-/* Typed by key: a count is a number, maintenance.auto_pack a boolean. A
+/* Typed by key: every policy key today is a count, so a number. A
  * value stored before validation, which the daemon ignores, is null. */
 export interface WirePolicyEntry {
   key: string

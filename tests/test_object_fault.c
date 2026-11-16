@@ -1,5 +1,8 @@
 /*
- * Fault injection tests for object.c error paths.
+ * Fault injection tests for object.c error paths, and the store's own pack
+ * writer behind it: object_store stages into a pack, and the pack is
+ * written out and synced when it is sealed (object_store_flush, a read, or
+ * store_close).
  * Linked with --wrap=malloc,calloc,realloc,fread,fwrite,fseeko,fsync
  */
 #define _POSIX_C_SOURCE 200809L
@@ -61,18 +64,17 @@ static status_t store_test_object(uint8_t hash[OBJECT_HASH_SIZE]) {
 
 /*
  * Test 1: malloc failure during object_store
- * Targets the RS parity buffer allocation in write_object (line ~166).
- * The first several mallocs are for path buffers, mkstemp, etc.
- * We try progressively later failures to find one that hits the store path.
+ * The first object opens the store's writer (its state and compression
+ * buffer) and staging a payload allocates its parity; walk the failure point
+ * forward across all of them.
  */
 static void test_store_malloc_fail(void **state) {
     (void)state;
     const char *data = "malloc fault test payload data";
     uint8_t hash[OBJECT_HASH_SIZE];
 
-    /* Try failing malloc at various points during store.
-     * The write_object path uses malloc for RS parity buffers.
-     * We search a wider range because some calls may go to calloc/realloc. */
+    /* Some of the calls along the way are calloc/realloc, so the range is
+     * wider than the malloc count alone. */
     int found_failure = 0;
     for (int n = 0; n < 80; n++) {
         fault_reset_all();
@@ -107,32 +109,62 @@ static void test_store_malloc_fail(void **state) {
     assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
 }
 
+/* Is the store's staging directory empty? A failed seal must not leave a
+ * pack-sized file behind. */
+static int tmp_is_empty(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "find '%s/tmp' -type f | wc -l", TEST_REPO);
+    FILE *f = popen(cmd, "r");
+    assert_non_null(f);
+    int n = -1;
+    assert_int_equal(fscanf(f, "%d", &n), 1);
+    pclose(f);
+    return n == 0;
+}
+
 /*
- * Test 2: fsync failure during object_store
- * Targets write_object: fsync at line 200
+ * Test 2: fsync failure while sealing the store's pack
+ * Staging does not sync; the seal does, and a seal that cannot make the pack
+ * durable must fail rather than install it. What it staged is gone with it,
+ * so storing the same content again writes it again rather than trusting a
+ * dedup answer from a pack that never landed.
  */
 static void test_store_fsync_fail(void **state) {
     (void)state;
     const char *data = "fsync fault test data";
     uint8_t hash[OBJECT_HASH_SIZE];
 
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
     fault_fsync_at = 0;  /* fail the first fsync */
-    status_t st = object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash);
+    status_t st = object_store_flush(store);
     fault_reset_all();
     assert_true(st != OK);  /* should fail with ERR_IO */
+    err_clear();
+    assert_true(tmp_is_empty());
+    assert_false(object_exists(store, hash));
 
     /* Verify recovery */
-    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, strlen(data), hash), OK);
+    int is_new = 0;
+    assert_int_equal(object_store_ex(store, OBJECT_TYPE_FILE, data, strlen(data), hash,
+                                     &is_new, NULL), OK);
+    assert_int_equal(is_new, 1);
+    assert_int_equal(object_store_flush(store), OK);
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, strlen(data));
+    free(out);
 }
 
 /*
  * Test 3: malloc failure during object_load
- * Targets the cpayload allocation in object_load (line ~760)
+ * Targets the payload buffer the pack reader allocates.
  */
 static void test_load_malloc_fail(void **state) {
     (void)state;
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(store_test_object(hash), OK);
+    assert_int_equal(object_store_flush(store), OK);
 
     void *data = NULL;
     size_t len = 0;
@@ -160,63 +192,68 @@ static void test_load_malloc_fail(void **state) {
     free(data);
 }
 
-/*
- * Test 4: fsync failure during store_file (streaming path)
- * The streaming file store uses fsync near the end.
- */
-static void test_store_file_fsync_fail(void **state) {
-    (void)state;
-    /* Create a small test file */
-    char path[256];
-    snprintf(path, sizeof(path), "%s/testfile.bin", TEST_SRC);
+static void write_src_file(const char *path, char fill, size_t len) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     assert_true(fd >= 0);
     char buf[4096];
-    memset(buf, 'A', sizeof(buf));
-    write(fd, buf, sizeof(buf));
-    close(fd);
-
-    fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-
-    uint8_t hash[OBJECT_HASH_SIZE];
-    /* Fail fsync during store; the first fsync is from the object write */
-    fault_fsync_at = 0;
-    status_t st = object_store_file(store, fd, 4096, hash);
-    fault_reset_all();
-    close(fd);
-    assert_true(st != OK);
-
-    /* Verify recovery */
-    fd = open(path, O_RDONLY);
-    assert_true(fd >= 0);
-    assert_int_equal(object_store_file(store, fd, 4096, hash), OK);
+    memset(buf, fill, sizeof(buf));
+    for (size_t done = 0; done < len; ) {
+        size_t n = len - done < sizeof(buf) ? len - done : sizeof(buf);
+        assert_int_equal(write(fd, buf, n), (ssize_t)n);
+        done += n;
+    }
     close(fd);
 }
 
 /*
- * Test 5: malloc failure during streaming store
- * Targets buffer allocations in write_object_file_stream
+ * Test 4: fsync failure sealing a pack that holds a stored file
  */
-static void test_store_file_stream_malloc_fail(void **state) {
+static void test_store_file_fsync_fail(void **state) {
+    (void)state;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/testfile.bin", TEST_SRC);
+    write_src_file(path, 'A', 4096);
+
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store_file_packed(store, fd, 4096, NULL, hash, NULL), OK);
+    close(fd);
+
+    fault_fsync_at = 0;
+    status_t st = object_store_flush(store);
+    fault_reset_all();
+    assert_true(st != OK);
+    err_clear();
+    assert_true(tmp_is_empty());
+
+    /* Verify recovery */
+    fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(object_store_file_packed(store, fd, 4096, NULL, hash, NULL), OK);
+    close(fd);
+    assert_int_equal(object_store_flush(store), OK);
+    assert_true(object_exists(store, hash));
+}
+
+/*
+ * Test 5: malloc failure storing a file
+ * The file is read whole into one buffer before it is staged.
+ */
+static void test_store_file_malloc_fail(void **state) {
     (void)state;
     char path[256];
     snprintf(path, sizeof(path), "%s/streamtest.bin", TEST_SRC);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    assert_true(fd >= 0);
-    char buf[8192];
-    memset(buf, 'B', sizeof(buf));
-    write(fd, buf, sizeof(buf));
-    close(fd);
+    write_src_file(path, 'B', 8192);
 
     uint8_t hash[OBJECT_HASH_SIZE];
     int found_failure = 0;
     for (int n = 0; n < 30; n++) {
-        fd = open(path, O_RDONLY);
+        int fd = open(path, O_RDONLY);
         assert_true(fd >= 0);
         fault_reset_all();
         fault_malloc_at = n;
-        status_t st = object_store_file(store, fd, 8192, hash);
+        status_t st = object_store_file_packed(store, fd, 8192, NULL, hash, NULL);
         fault_reset_all();
         close(fd);
         if (st == ERR_NOMEM) {
@@ -225,83 +262,61 @@ static void test_store_file_stream_malloc_fail(void **state) {
         }
     }
     assert_true(found_failure);
+    err_clear();
 
     /* Verify recovery */
-    fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY);
     assert_true(fd >= 0);
-    assert_int_equal(object_store_file(store, fd, 8192, hash), OK);
+    assert_int_equal(object_store_file_packed(store, fd, 8192, NULL, hash, NULL), OK);
     close(fd);
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, 8192);
+    free(out);
 }
 
 /*
- * Test 6: malloc failure during object_load_stream
- * Targets allocations in the streaming load path.
- */
-static void test_load_stream_malloc_fail(void **state) {
-    (void)state;
-    /* Store a small object first */
-    uint8_t hash[OBJECT_HASH_SIZE];
-    assert_int_equal(store_test_object(hash), OK);
-
-    int pfd[2];
-    assert_int_equal(pipe(pfd), 0);
-
-    uint64_t sz = 0;
-    uint8_t type = 0;
-
-    /* object_load_stream for small objects may just call object_load internally
-     * so try malloc failures there too */
-    int found_failure = 0;
-    for (int n = 0; n < 20; n++) {
-        fault_reset_all();
-        fault_malloc_at = n;
-        status_t st = object_load_stream(store, hash, pfd[1], &sz, &type);
-        fault_reset_all();
-        if (st == ERR_NOMEM) {
-            found_failure = 1;
-            break;
-        }
-    }
-    close(pfd[0]);
-    close(pfd[1]);
-    /* This may not always find a failure depending on code path, but the test
-     * exercises the code with fault injection active which increases coverage */
-    (void)found_failure;
-}
-
-/*
- * Test 7: malloc failure during repo_pack.
+ * Test 7: malloc failure while sealing the store's pack.
  *
- * This replaced a test that drove the pre-daemon backup pipeline. Packing is
- * the allocation-heaviest thing the storage engine does on its own (worker
- * buffers, compression scratch, the entry table), so it is the right target
- * now that the pipeline lives above the engine.
+ * Sealing is the allocation-heaviest thing the storage engine does on its
+ * own (the entry table, the parity trailer, the commit), so it is the right
+ * target now that the pipeline lives above the engine.
  */
-static void test_pack_malloc_fail(void **state) {
-    (void)state;
-    /* Enough distinct objects that packing has real work to allocate for. */
+static void stage_pack_fault_objects(void) {
+    /* Enough distinct objects that sealing has real work to allocate for. */
     for (int i = 0; i < 32; i++) {
         char data[128];
         int n = snprintf(data, sizeof(data), "pack malloc fault payload %d", i);
         uint8_t h[OBJECT_HASH_SIZE];
         assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, (size_t)n, h), OK);
     }
+}
 
-    /* Walk the fault point forward. A failing allocation must surface as a
-     * status, never as a crash or a half-written pack. */
-    for (int n = 0; n < 60; n++) {
+static void test_pack_malloc_fail(void **state) {
+    (void)state;
+
+    /* Walk the fault point forward, staging afresh each time: a failed seal
+     * discards what it held. A failing allocation must surface as a status,
+     * never as a crash or a half-written pack. */
+    int failures = 0;
+    for (int n = 0; n < 200; n++) {
+        stage_pack_fault_objects();
         fault_reset_all();
         fault_malloc_at = n;
-        status_t st = repo_pack(store, NULL, NULL, NULL);
+        status_t st = object_store_flush(store);
         fault_reset_all();
-        if (st == OK) break;   /* packing completed; nothing loose left to fail on */
+        if (st == OK) break;   /* the seal completed: past the last allocation */
+        failures++;
         err_clear();
+        assert_true(tmp_is_empty());
     }
+    assert_true(failures > 0);
 
     /* Whatever happened, the store must still be usable and every object
      * still readable. */
     fault_reset_all();
-    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+    assert_int_equal(object_store_flush(store), OK);
     for (int i = 0; i < 32; i++) {
         char data[128];
         int n = snprintf(data, sizeof(data), "pack malloc fault payload %d", i);
@@ -347,9 +362,8 @@ static void test_store_load_roundtrip_after_faults(void **state) {
 
 /*
  * Test 9: fwrite failure during object_store
- * Exercises write_object error paths for header, payload, and parity writes.
- * (object.c L145-196: write header, payload, parity header, RS parity, CRC,
- *  rs_data_len, parity footer)
+ * Exercises the staging writer's error paths: the pack header when the pack
+ * opens, then each entry header and payload.
  */
 static void test_store_fwrite_fail(void **state) {
     (void)state;
@@ -383,42 +397,48 @@ static void test_store_fwrite_fail(void **state) {
 }
 
 /*
- * Test 10: fwrite failure during streaming file store
- * Exercises write_object_file_stream error paths (object.c L341-410).
+ * Test 10: fwrite failure while sealing a pack that holds a stored file
+ * Exercises the seal's writes: the parity trailer after the entries.
  */
 static void test_store_file_fwrite_fail(void **state) {
     (void)state;
     char path[256];
     snprintf(path, sizeof(path), "%s/fwrite_stream.bin", TEST_SRC);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    assert_true(fd >= 0);
-    /* Write enough data to use the streaming path (>64 KiB triggers double-buffer) */
-    char buf[4096];
-    memset(buf, 'X', sizeof(buf));
-    for (int i = 0; i < 20; i++) write(fd, buf, sizeof(buf));  /* 80 KiB */
-    close(fd);
+    write_src_file(path, 'X', 80 * 1024);
 
-    int exercised = 0;
-    for (int n = 0; n < 10; n++) {
-        fd = open(path, O_RDONLY);
+    int failed = 0;
+    for (int n = 0; n < 40 && !failed; n++) {
+        int fd = open(path, O_RDONLY);
         assert_true(fd >= 0);
         uint8_t hash[OBJECT_HASH_SIZE];
+        assert_int_equal(object_store_file_packed(store, fd, 80 * 1024, NULL, hash, NULL), OK);
+        close(fd);
         fault_reset_all();
         fault_fwrite_at = n;
-        status_t st = object_store_file(store, fd, 80 * 1024, hash);
+        status_t st = object_store_flush(store);
         fault_reset_all();
-        close(fd);
-        exercised = 1;
-        if (st != OK) break;
+        if (st != OK) {
+            failed = 1;
+            err_clear();
+            assert_true(tmp_is_empty());
+            assert_false(object_exists(store, hash));
+        } else {
+            break;
+        }
     }
-    assert_true(exercised);
+    assert_true(failed);
 
     /* Verify recovery */
-    fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY);
     assert_true(fd >= 0);
     uint8_t hash[OBJECT_HASH_SIZE];
-    assert_int_equal(object_store_file(store, fd, 80 * 1024, hash), OK);
+    assert_int_equal(object_store_file_packed(store, fd, 80 * 1024, NULL, hash, NULL), OK);
     close(fd);
+    void *out = NULL;
+    size_t len = 0;
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), OK);
+    assert_int_equal(len, 80 * 1024);
+    free(out);
 }
 
 int main(void) {
@@ -428,8 +448,7 @@ int main(void) {
         cmocka_unit_test_setup_teardown(test_store_fsync_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_load_malloc_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_store_file_fsync_fail, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_store_file_stream_malloc_fail, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_load_stream_malloc_fail, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_store_file_malloc_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_pack_malloc_fail, setup, teardown),
         cmocka_unit_test_setup_teardown(test_store_load_roundtrip_after_faults, setup, teardown),
         cmocka_unit_test_setup_teardown(test_store_fwrite_fail, setup, teardown),

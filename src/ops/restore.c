@@ -5,7 +5,6 @@
 #include "metablob.h"
 
 #include "object.h"
-#include "sparse_restore.h"
 #include "util.h"
 
 #include <cutils/log.h>
@@ -355,8 +354,8 @@ static void report(const restore_opts_t *o, const char *phase,
  *
  * Without it a restore's byte count moved only between files, and one large
  * file held the job at a single value for as long as it took (B089). Capped
- * at the file's size: a sparse object is streamed once as its payload before
- * being laid out with its holes, and that second pass must not count again.
+ * at the file's size, so a count that overshoots never reports more than
+ * the file holds.
  */
 typedef struct {
     const restore_opts_t *opts;
@@ -639,33 +638,35 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
     int fd = make_partial(full, tmp, tmpsz);
     if (fd == -1) return ERR_IO;
 
+    /*
+     * The object is loaded, decrypted and checked against its name whole
+     * before a byte of it is written: every object is bounded, so nothing
+     * unverified ever reaches the file.
+     *
+     * TODO(CDC): a CHUNKLIST content hash is restored with
+     * content_restore_fd (leaves written at their offsets, holes left as
+     * holes), which the chunker's readers provide; until they land such a
+     * file fails here and is named.
+     */
+    (void)size;
     uint64_t sz = 0;
     uint8_t  otype = 0;
-    status_t st = object_load_stream(store, hash, fd, &sz, &otype);
+    void    *data = NULL;
+    size_t   len = 0;
+    status_t st = object_load(store, hash, &data, &len, &otype);
     /* The type is checked against what a file can be: an object of any
      * other type is not file content, whatever its bytes say (OWN-39). */
-    if (st == OK && otype != OBJECT_TYPE_FILE && otype != OBJECT_TYPE_SPARSE)
+    if (st == OK && otype != OBJECT_TYPE_FILE)
         st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
-
-    if (st == OK && otype == OBJECT_TYPE_SPARSE) {
-        /*
-         * What was just written is the verified payload, a region table
-         * plus data; writing that linearly would turn holes into zeros.
-         * It is laid out from there into a second temporary file, and the
-         * payload is dropped as soon as that exists.
-         */
-        char tmp2[PATH_MAX];
-        int fd2 = make_partial(full, tmp2, sizeof(tmp2));
-        if (fd2 == -1) {
-            st = ERR_IO;
-        } else {
-            st = restore_sparse_from_fd(fd, fd2, size, full);
-            close(fd);
-            unlink(tmp);
-            fd = fd2;
-            snprintf(tmp, tmpsz, "%s", tmp2);
+    if (st == OK) {
+        if (len && io_write_full(fd, data, len) != 0)
+            st = set_error_errno(ERR_IO, "restore: cannot write %s", full);
+        else {
+            sz = len;
+            store_io_progress(store, len);
         }
     }
+    free(data);
 
     /* Metadata goes on before the rename, so the file is final the moment
      * it has its name: the resume rule relies on the mtime being right. */

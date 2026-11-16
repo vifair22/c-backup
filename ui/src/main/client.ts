@@ -190,8 +190,6 @@ export function toEndpoint(req: ApiRequest): Endpoint {
         method: 'POST',
         path: `/repos/${req.repoId}/gfs${qs({ dry_run: req.dryRun ? 1 : undefined })}`,
       }
-    case 'pack':
-      return { method: 'POST', path: `/repos/${req.repoId}/pack` }
     case 'reindex':
       return { method: 'POST', path: `/repos/${req.repoId}/reindex` }
 

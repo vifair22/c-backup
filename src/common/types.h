@@ -13,26 +13,52 @@
  * - The default Linux stack limit (typically 8 MiB) is assumed sufficient.
  */
 
+/*
+ * Objects (repository format 3, docs/repo-format.md).
+ *
+ * An object's name is SHA-256(type || payload): the one type byte, then the
+ * payload. Including the type means equal bytes stored as two types are two
+ * objects, so a file whose content happens to be a valid tree serialisation
+ * cannot be confused with that tree (OWN-38). object_name in object.h is the
+ * one implementation; nothing else computes a name.
+ */
 #define OBJECT_HASH_SIZE 32
 #define OBJECT_TYPE_FILE    1
 #define OBJECT_TYPE_XATTR   2
 #define OBJECT_TYPE_ACL     3
-#define OBJECT_TYPE_SPARSE  4   /* sparse file: region table prepended to data */
+/* 4 was OBJECT_TYPE_SPARSE (a region table in front of the data). Retired in
+ * format 3, where holes are gaps in a chunk list; the number is not reused. */
 /* Manifest tree: one directory's entries, content-addressed like any other
  * object so it inherits compression, parity and dedup. GC's mark phase needs
  * to recognise these to know what to parse and recurse into. See section 5.4. */
 #define OBJECT_TYPE_TREE    5
+/* An ordered list of other objects covering a byte span: a file larger than
+ * one content-defined chunk, or a directory whose tree is split into
+ * fragments (OWN-34). Lists nest, so no list object exceeds a fixed bound
+ * however large the file. Format in src/store/chunklist.h and
+ * docs/repo-format.md. */
+#define OBJECT_TYPE_CHUNKLIST 6
 
 /*
- * Every object header reader refuses a type outside 1-5 (OWN-39). A reader
- * that passed the byte through let restore treat any non-sparse object as
- * raw file bytes, so a type this build does not know would have been
- * written out as a file's content. A new type is a format change, and an
- * older build has to say so rather than guess.
+ * The largest payload any object may have, of any type: 16 MiB. Content-
+ * defined chunks are at most 8 MiB, chunk lists and tree fragments far less,
+ * so a larger object is never produced. Every writer refuses one and every
+ * reader treats one as corrupt, which is what lets every object be hashed,
+ * compressed, encrypted and parity-protected in memory and in one shot.
+ */
+#define OBJECT_MAX_BYTES ((uint64_t)16 * 1024 * 1024)
+
+/*
+ * Every object reader refuses a type this build does not know (OWN-39). A
+ * reader that passed the byte through let restore treat any unknown object
+ * as raw file bytes. A new type is a format change, and an older build has
+ * to say so rather than guess.
  */
 static inline int object_type_known(unsigned type)
 {
-    return type >= OBJECT_TYPE_FILE && type <= OBJECT_TYPE_TREE;
+    return type == OBJECT_TYPE_FILE || type == OBJECT_TYPE_XATTR ||
+           type == OBJECT_TYPE_ACL  || type == OBJECT_TYPE_TREE ||
+           type == OBJECT_TYPE_CHUNKLIST;
 }
 #define OBJECT_TYPE_UNKNOWN_FMT \
     "object type %u is not known to this build; written by a newer c-backup?"
@@ -61,25 +87,21 @@ static inline int object_type_known(unsigned type)
  */
 #define ENCRYPT_NONE       0
 #define ENCRYPT_CHACHA20   1
+/* What ENCRYPT_CHACHA20 adds to a payload: a 12-byte nonce and a 16-byte
+ * tag (object_crypt.h asserts the two agree). */
+#define OBJECT_AEAD_OVERHEAD 28u
 
+/* Per-object codecs. LZ4's one-shot block API only: every payload is under
+ * OBJECT_MAX_BYTES, so nothing needs the frame format or a stream. */
 #define COMPRESS_NONE      0
-#define COMPRESS_LZ4       1  /* single-call block API, payload ≤ INT_MAX */
-#define COMPRESS_LZ4_FRAME 2  /* LZ4 frame streaming API, arbitrary size  */
+#define COMPRESS_LZ4       1
 
-#define OBJECT_MAGIC        0x42434F4Au  /* "BCOJ" */
 /*
- * One header layout, 64 bytes, and readers accept only this.
- *
- * There is no format compatibility to preserve: no repository written by an
- * older build exists anywhere. Carrying version-dependent header sizes to
- * protect repositories that do not exist would mean every one of the places
- * that derives a payload offset needing to ask which version wrote it, and
- * each of those is silently wrong rather than loudly broken when it gets the
- * answer wrong. The eight reserved bytes are so the next field to arrive does
- * not reopen the question.
+ * The most a stored entry can hold. A compressed payload is kept only when
+ * it is smaller than the plaintext, so stored bytes never exceed the payload
+ * bound plus the AEAD's nonce and tag.
  */
-#define OBJECT_HDR_VERSION  3u
-#define PROBER_VERSION      1u
+#define OBJECT_MAX_STORED_BYTES (OBJECT_MAX_BYTES + OBJECT_AEAD_OVERHEAD)
 
 #define NODE_TYPE_REG   1
 #define NODE_TYPE_DIR   2
@@ -88,24 +110,6 @@ static inline int object_type_known(unsigned type)
 #define NODE_TYPE_FIFO  5
 #define NODE_TYPE_CHR   6
 #define NODE_TYPE_BLK   7
-
-/* ---------- object store ---------- */
-
-typedef struct {
-    uint32_t magic;
-    uint8_t  version;
-    uint8_t  type;
-    uint8_t  compression;
-    uint8_t  pack_skip_ver;     /* 0=unevaluated; N=skip by prober vN */
-    uint64_t uncompressed_size;
-    uint64_t compressed_size;
-    uint8_t  hash[OBJECT_HASH_SIZE];
-    uint8_t  encryption;   /* ENCRYPT_* */
-    uint8_t  reserved[7];
-} __attribute__((packed)) object_header_t;  /* 64 bytes */
-/* On-disk format, and quoted in docs/api.md and docs/repo-format.md, which
- * once said 56. A field added here changes every loose object. */
-_Static_assert(sizeof(object_header_t) == 64, "object_header_t is 64 bytes on disk");
 
 /* ---------- snapshot ---------- */
 
@@ -141,17 +145,3 @@ typedef struct {
     uint16_t name_len;
     /* followed by name_len bytes of name */
 } __attribute__((packed)) dirent_rec_t;
-
-/* ---------- sparse file payload ---------- */
-
-#define SPARSE_MAGIC 0x53505253u  /* "SPRS" */
-
-typedef struct {
-    uint32_t magic;
-    uint32_t region_count;
-} __attribute__((packed)) sparse_hdr_t;
-
-typedef struct {
-    uint64_t offset;
-    uint64_t length;
-} __attribute__((packed)) sparse_region_t;

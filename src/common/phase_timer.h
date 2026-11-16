@@ -34,24 +34,15 @@ typedef enum {
     PHASE_SCAN = 0,      /* lstat walk, xattr and ACL collection */
     PHASE_CACHE_LOOKUP,  /* file_cache SELECT, plus the objects existence check */
     PHASE_READ_HASH,     /* open, read, SHA-256, and the object write itself */
-    PHASE_INDEX_PUT,     /* store_index_put_loose */
+    PHASE_INDEX_PUT,     /* store_index_put_packed */
     PHASE_CACHE_PUT,     /* file_cache_put */
     PHASE_META_BLOB,     /* xattr and ACL blobs */
     PHASE_TREES,         /* build_trees: manifest serialisation and dedup */
     PHASE_INDEX_NODES,   /* nodes and node_fts inserts */
     PHASE_CACHE_SWEEP,   /* dropping cache rows for paths the scan no longer sees */
-    PHASE_STORE_WAIT,    /* the backup thread blocked on the large-file workers */
     PHASE_SETUP,         /* dropping stale staged rows, opening the backup pack */
     PHASE_PACK_SEAL,     /* sealing a full backup pack, and the last one */
     PHASE_SNAPSHOT,      /* snapshot id, the record file and its row */
-    /*
-     * The pack run a backup job ends with (maintenance.auto_pack): what is
-     * loose after the store phase - files over PACK_STREAM_THRESHOLD and
-     * sparse files - probed, and the compressible ones rewritten into packs.
-     * It ran after the profile was reported, so on UAT FS2 70-100 s of a
-     * first backup was in no row at all (B086).
-     */
-    PHASE_PACK_SWEEP,
     /*
      * Nested spans: recorded from inside whichever phase is running, and
      * subtracted from it by phase_add_excl, so the top-level rows stay
@@ -72,50 +63,12 @@ typedef enum {
     PHASE_COMMIT_TREES,
     PHASE_COMMIT_INDEX,
     PHASE_COMMIT_PACK,
-    /* Inside pack-sweep. */
-    PHASE_SWEEP_SCAN,    /* listing loose objects, reading headers, the 64 KiB probes */
-    PHASE_SWEEP_PACK,    /* the pack workers: read, compress, write, parity, seal */
-    /* Inside PHASE_READ_HASH, which on real storage is 82% of a full backup
-     * and far too coarse to act on. These break that bucket apart. */
-    PHASE_OBJ_SETUP,     /* mkstemp, header write, parity stream init */
-    PHASE_OBJ_IO,        /* the read -> hash -> write -> parity pipeline, to its join */
-    PHASE_OBJ_FINISH,    /* parity finish and trailer write */
-    PHASE_OBJ_SYNC,      /* payload fadvise and async_writeback: both start writeback */
-    PHASE_OBJ_INSTALL,   /* rename into objects/, and the existence check */
-    /* Inside obj:install, which turned out to be 59% of a full backup. */
-    PHASE_OBJ_CLOSE,     /* close of the written temp file */
-    PHASE_OBJ_MKDIR,     /* mkdirat + openat of the fanout directory */
-    PHASE_OBJ_RENAME,    /* rename into place */
-    PHASE_OBJ_LOOSESET,  /* store_loose_set_insert */
-    /*
-     * The large-file workers (B086): wall time per file, summed over every
-     * worker, so with N of them it can approach N times the wall clock. On a
-     * single-threaded store this bucket is empty and those files are in
-     * read+hash+write as before.
-     */
-    PHASE_STORE_WORKERS,
-    /*
-     * Inside obj:io-loop, by pipeline stage. These are thread CPU time
-     * (CLOCK_THREAD_CPUTIME_ID), not wall, summed over every thread that ran
-     * the stage: the reader, the hasher and the writer of each object, on
-     * every worker. A stage that waits on I/O or on its neighbour shows the
-     * work it did, not how long it took. There is no compression probe here:
-     * loose objects are always stored uncompressed and probed at pack time.
-     */
-    PHASE_IO_READ,       /* read(2) of the source, page-cache copy included */
-    PHASE_IO_HASH,       /* SHA-256 over the plaintext */
-    PHASE_IO_ENCRYPT,    /* ChaCha20 in place, encrypted repositories only */
-    PHASE_IO_WRITE,      /* write(2) of the payload into the temp file */
-    PHASE_IO_PARITY,     /* CRC-32C and the Reed-Solomon stream */
     PHASE__COUNT
 } phase_id_t;
 
 typedef struct {
     uint64_t ns[PHASE__COUNT];
     uint64_t count[PHASE__COUNT];
-    /* How many threads stored large files concurrently; 0 or 1 means the
-     * obj:* figures are this thread's wall time and nothing was summed. */
-    unsigned store_threads;
     /* Total of every nested span so far (PHASE_TXN_*, PHASE_PROGRESS); a
      * top-level span subtracts what accrued while it ran. */
     uint64_t nested_ns;

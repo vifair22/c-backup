@@ -75,7 +75,6 @@ const ACTIONS: { value: 'backup' | MaintenanceOp; label: string; hint: string }[
   { value: 'verify',  label: 'Verify',          hint: 'Prove stored objects still read back' },
   { value: 'gfs',     label: 'Apply retention', hint: 'Drop snapshots the policy no longer keeps' },
   { value: 'gc',      label: 'Garbage collect', hint: 'Reclaim space from unreferenced objects' },
-  { value: 'pack',    label: 'Pack',            hint: 'Coalesce loose objects' },
   { value: 'reindex', label: 'Reindex',         hint: 'Rebuild the index from the repository' },
 ]
 

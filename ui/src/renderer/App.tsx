@@ -472,7 +472,6 @@ export function App(): React.ReactElement {
    */
   const OP_LABELS: Record<MaintenanceOp, string> = {
     verify: 'Verify',
-    pack: 'Pack',
     gc: 'Garbage Collect',
     gfs: 'Apply Retention',
     reindex: 'Reindex',

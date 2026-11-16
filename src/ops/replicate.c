@@ -28,6 +28,10 @@ typedef struct {
     atomic_int       *cancel;
     replicate_result_t *res;
 
+    /* A re-encrypting sink's target key, derived once for the run. */
+    object_aead_key_t   dst_key;
+    int                 have_dst_key;
+
     /*
      * Hashes waiting to be asked about.
      *
@@ -78,197 +82,77 @@ static int hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 }
 
 /*
- * One object on its way across: the source's stored bytes, and for a
- * re-encrypting sink the transform that swaps their encryption layer.
+ * One object on its way across: the source's stored bytes, whole. Every
+ * object is bounded (OBJECT_MAX_STORED_BYTES), so it is read in one piece
+ * and handed over in one piece.
  *
- * Streamed, never loaded. The sink pulls pieces into a buffer of its own
- * and this fills them straight from the source file, so nothing here holds
- * more than the nonce and tag, whatever the object's size. Re-encryption
- * works in that same buffer, in place.
- *
- * Only the outermost layer changes when re-encrypting. The payload is
+ * For a re-encrypting sink only the outermost layer changes. The payload is
  * compress-then-encrypt, so removing the encryption leaves exactly the
- * compressed bytes the source stored, and those are what get encrypted
- * again; nothing is decompressed, and the uncompressed size in the header
- * stays true. Output is nonce, ciphertext, tag - the layout object_encrypt
- * writes - and the source's tag is verified the moment its last ciphertext
- * byte has been read, before the target's tag is produced, so a source that
- * does not authenticate fails the read and the sink discards the entry.
+ * compressed bytes the source stored, and those are encrypted again under
+ * the target's key; nothing is decompressed, and the uncompressed size in
+ * the header stays true. The associated data is the same type and name on
+ * both sides, since the object keeps its name. The source's tag is checked
+ * before anything is encrypted for the target, so bytes that do not
+ * authenticate never reach the sink at all (OWN-36).
  */
-typedef struct {
-    object_stored_reader_t *r;
-    const uint8_t          *hash;      /* for messages */
-    atomic_int             *cancel;    /* checked per chunk: one object can take hours */
-
-    int                     xform;     /* re-encrypting at all */
-    object_crypt_stream_t  *dec;       /* source encrypted */
-    object_crypt_stream_t  *enc;       /* target encrypted */
-    uint64_t                body_left; /* ciphertext (or plaintext) still to read */
-    uint8_t                 nonce_out[OBJECT_CRYPT_NONCE_BYTES];
-    size_t                  nonce_sent;
-    uint8_t                 tag_out[OBJECT_CRYPT_TAG_BYTES];
-    size_t                  tag_sent;
-} send_src_t;
-
-static status_t src_read_plain(void *vctx, void *buf, size_t n)
-{
-    send_src_t *s = vctx;
-    if (cancel_requested(s->cancel))
-        return set_error(ERR_BUSY, "replicate: cancelled");
-    return object_stored_read(s->r, buf, n);
-}
-
-/* The source body has been read in full: settle both AEADs. */
-static status_t src_body_done(send_src_t *s)
+static status_t reencrypt(const walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE],
+                          object_stored_info_t *info, uint8_t **io_payload, size_t *io_len)
 {
     char hex[OBJECT_HASH_SIZE * 2 + 1];
-    if (s->dec) {
-        uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
-        status_t st = object_stored_read(s->r, tag, sizeof(tag));
-        if (st == OK) st = object_crypt_stream_finish(s->dec, NULL, tag);
-        if (st != OK) {
-            hash_hex(s->hash, hex);
-            return set_error(st, "replicate: object %s does not decrypt with the "
-                             "source key", hex);
-        }
-    }
-    if (s->enc) {
-        status_t st = object_crypt_stream_finish(s->enc, s->tag_out, NULL);
-        if (st != OK) {
-            hash_hex(s->hash, hex);
-            return set_error(st, "replicate: cannot encrypt object %s for the target",
-                             hex);
-        }
-    }
-    return OK;
-}
-
-static status_t src_read_xform(void *vctx, void *vbuf, size_t n)
-{
-    send_src_t *s = vctx;
-    uint8_t *p = vbuf;
-    if (cancel_requested(s->cancel))
-        return set_error(ERR_BUSY, "replicate: cancelled");
-
-    while (n > 0) {
-        if (s->enc && s->nonce_sent < sizeof(s->nonce_out)) {
-            size_t k = sizeof(s->nonce_out) - s->nonce_sent;
-            if (k > n) k = n;
-            memcpy(p, s->nonce_out + s->nonce_sent, k);
-            s->nonce_sent += k; p += k; n -= k;
-            continue;
-        }
-        if (s->body_left > 0) {
-            size_t k = s->body_left < (uint64_t)n ? (size_t)s->body_left : n;
-            status_t st = object_stored_read(s->r, p, k);
-            if (st == OK && s->dec) st = object_crypt_stream_update(s->dec, p, k, p);
-            if (st == OK && s->enc) st = object_crypt_stream_update(s->enc, p, k, p);
-            if (st != OK) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1];
-                hash_hex(s->hash, hex);
-                char why[256];
-                snprintf(why, sizeof(why), "%s", err_msg());
-                return set_error(st, "replicate: re-encrypting object %s: %s", hex, why);
-            }
-            s->body_left -= k; p += k; n -= k;
-            if (s->body_left == 0) {
-                st = src_body_done(s);
-                if (st != OK) return st;
-            }
-            continue;
-        }
-        if (s->enc && s->tag_sent < sizeof(s->tag_out)) {
-            size_t k = sizeof(s->tag_out) - s->tag_sent;
-            if (k > n) k = n;
-            memcpy(p, s->tag_out + s->tag_sent, k);
-            s->tag_sent += k; p += k; n -= k;
-            continue;
-        }
-        return set_error(ERR_INVALID, "replicate: sink read past the end of an object");
-    }
-    return OK;
-}
-
-/*
- * Set up the transform. On success *info and *len describe what the sink
- * will receive: the encryption it carries now and its stored length.
- */
-/*
- * Re-encryption streams: decrypt a chunk under the source key, encrypt it
- * under the target's, hand it on. The source tag is checked only once the
- * last chunk is through (src_body_done), so for a moment the target's
- * staging pack holds bytes nothing has authenticated yet - and, into a
- * plaintext target, holds them as plaintext.
- *
- * That is accepted, not overlooked (OWN-36). A tag failure fails the
- * object, and the stored writer cuts a failed object back out of the
- * staging pack, so nothing unverified is ever installed, indexed or named
- * by a snapshot record. The bytes sit, briefly, in the target's tmp/
- * staging file, which is the operator's own repository on the operator's
- * storage; a plaintext target already holds every verified object in the
- * clear. Holding a whole object back until its tag verified would mean
- * buffering or double-writing objects of any size, against design
- * constraints 1 and 2, to protect bytes from the one party who already has
- * the plaintext.
- */
-static status_t src_xform_begin(send_src_t *s, const store_t *store,
-                                const replica_sink_t *sink,
-                                object_stored_info_t *info, uint64_t *len)
-{
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    s->xform = 1;
-    s->body_left = *len;
+    uint8_t *buf = *io_payload;
+    size_t   len = *io_len;
 
     if (info->encryption != ENCRYPT_NONE) {
-        const repo_key_t *sk = store_key(store);
-        hash_hex(s->hash, hex);
+        const object_aead_key_t *sk = store_aead_key(c->store);
+        hash_hex(hash, hex);
         if (!sk)
             return set_error(ERR_INVALID,
                              "replicate: object %s is encrypted and the source key "
                              "is not loaded", hex);
-        if (*len < OBJECT_CRYPT_OVERHEAD)
+        if (len < OBJECT_CRYPT_OVERHEAD)
             return set_error(ERR_CORRUPT,
                              "replicate: object %s is shorter than its nonce and tag", hex);
-        uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
-        status_t st = object_stored_read(s->r, nonce, sizeof(nonce));
-        if (st == OK) st = object_crypt_stream_begin(&s->dec, sk, nonce, 0);
-        if (st != OK) return st;
-        s->body_left = *len - OBJECT_CRYPT_OVERHEAD;
+        len -= OBJECT_CRYPT_OVERHEAD;
+        if (object_decrypt(sk, info->type, hash, buf, len, buf) != OK)
+            return set_error(ERR_CORRUPT, "replicate: object %s does not decrypt with "
+                             "the source key", hex);
     }
 
-    uint64_t plen = s->body_left;
     uint8_t enc = ENCRYPT_NONE;
-    if (sink->dst_key) {
-        status_t st = object_crypt_stream_begin(&s->enc, sink->dst_key, s->nonce_out, 1);
-        if (st != OK) return st;
+    if (c->have_dst_key) {
+        uint8_t *out = malloc(len + OBJECT_CRYPT_OVERHEAD);
+        if (!out) return set_error(ERR_NOMEM, "replicate: ciphertext buffer");
+        status_t st = object_encrypt(&c->dst_key, info->type, hash, buf, len, out);
+        if (st != OK) {
+            free(out);
+            hash_hex(hash, hex);
+            return set_error(st, "replicate: cannot encrypt object %s for the target", hex);
+        }
+        free(buf);
+        buf = out;
+        len += OBJECT_CRYPT_OVERHEAD;
         enc = ENCRYPT_CHACHA20;
-        plen += OBJECT_CRYPT_OVERHEAD;
-    }
-
-    /* An empty body has no last read to settle the AEADs on. */
-    if (s->body_left == 0) {
-        status_t st = src_body_done(s);
-        if (st != OK) return st;
     }
 
     info->encryption = enc;
-    *len = plen;
+    *io_payload = buf;
+    *io_len = len;
     return OK;
 }
 
-/* Hand one object over, streamed from the source as stored. */
+/* Hand one object over, as stored. */
 static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
 {
-    /* Zeroed: gcc cannot see that object_stored_open fills it on OK. */
+    if (cancel_requested(c->cancel))
+        return set_error(ERR_BUSY, "replicate: cancelled");
+
     object_stored_info_t info;
     memset(&info, 0, sizeof(info));
-    uint64_t len = 0;
-    send_src_t s;
-    memset(&s, 0, sizeof(s));
-    s.hash = hash;
-    s.cancel = c->cancel;
+    void  *payload = NULL;
+    size_t len = 0;
+    int    damaged = 0;
 
-    status_t st = object_stored_open(c->store, hash, &info, &len, &s.r);
+    status_t st = object_read_stored(c->store, hash, &info, &payload, &len, &damaged);
     if (st != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1];
         hash_hex(hash, hex);
@@ -276,8 +160,9 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         snprintf(why, sizeof(why), "%s", err_msg());
         return set_error(st, "replicate: cannot read object %s: %s", hex, why);
     }
+    uint8_t *buf = payload;
     if (c->sink->reencrypt)
-        st = src_xform_begin(&s, c->store, c->sink, &info, &len);
+        st = reencrypt(c, hash, &info, &buf, &len);
 
     if (st == OK) {
         replica_object_t obj = {
@@ -286,15 +171,15 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
             .encryption        = info.encryption,
             .uncompressed_size = info.uncompressed_size,
             .payload_len       = len,
-            .read              = s.xform ? src_read_xform : src_read_plain,
-            .read_ctx          = &s,
+            .payload           = buf,
         };
         memcpy(obj.hash, hash, OBJECT_HASH_SIZE);
         st = c->sink->v->put_object(c->sink->ctx, &obj);
     }
+    free(buf);
 
     /* Sent with damage parity could not carry: counted, not fatal here. */
-    if (st == OK && object_stored_damaged(s.r)) {
+    if (st == OK && damaged) {
         replicate_result_t *res = c->res;
         if (res->damaged_listed < REPLICATE_DAMAGED_LIST_MAX) {
             memcpy(res->damaged[res->damaged_listed].hash, hash, OBJECT_HASH_SIZE);
@@ -307,17 +192,12 @@ static status_t send_one(walk_ctx_t *c, const uint8_t hash[OBJECT_HASH_SIZE])
         log_error("replicate: object %s was sent damaged beyond its parity; the "
                   "replica holds it as damaged", hex);
     }
-
-    object_crypt_stream_free(s.dec);
-    object_crypt_stream_free(s.enc);
-    object_stored_close(s.r);
     if (st != OK) return st;
 
     c->res->objects_sent++;
     c->res->bytes_sent += len;
     return OK;
 }
-
 /*
  * Ask about everything queued and send what is missing.
  *
@@ -433,7 +313,16 @@ status_t replicate_tree(store_t *store, replica_sink_t *sink,
     memset(&res, 0, sizeof(res));
 
     walk_ctx_t c = { .store = store, .sink = sink, .cancel = cancel, .res = &res };
-    status_t st = walk_tree(&c, root_tree_hash, 0);
+    status_t st = OK;
+    if (sink->reencrypt && sink->dst_key) {
+        st = object_aead_key_derive(sink->dst_key, &c.dst_key);
+        c.have_dst_key = (st == OK);
+    }
+    /* Objects this handle staged through object_store_ex are sealed first,
+     * so the walk can read every one it reaches. */
+    if (st == OK) st = object_store_flush(store);
+    if (st == OK) st = walk_tree(&c, root_tree_hash, 0);
+    object_aead_key_wipe(&c.dst_key);
 
     /* Report what was transferred even on failure: a caller deciding whether
      * to retry wants to know how far it got. */

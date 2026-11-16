@@ -360,21 +360,28 @@ static void test_max_files_stops_early(void **state)
 }
 
 /*
- * Packed content is not a special case, it is the only case: a backup writes
- * its objects into packs as it produces them.
+ * Packed content is not a special case, it is the only case: there are no
+ * loose objects, and a backup writes every object into a pack.
  *
- * This used to back up, then call repo_pack and assert it had work to do. It
- * has none now, and that is the assertion worth making instead - a repo_pack
- * immediately after a backup should find nothing loose to collect, because
- * nothing was written loose.
+ * This used to call repo_pack after the backup and assert it found nothing
+ * loose. The assertion that replaces it is the index's: every object the
+ * backup recorded is located in a pack, and the search reads it from there.
  */
 static void test_searches_packed_content(void **state)
 {
     (void)state;
     int64_t snap = run_backup();
-    uint32_t packed = 0;
-    assert_int_equal(repo_pack(store, &packed, NULL, NULL), OK);
-    assert_int_equal(packed, 0);
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM objects o WHERE o.repo_id = ? AND NOT EXISTS"
+        " (SELECT 1 FROM pack_objects po"
+        "  WHERE po.repo_id = o.repo_id AND po.hash = o.hash)",
+        (const char *[]){ repo, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "0");
+    db_result_free(r);
 
     grep_opts_t o = opts_for("swordfish");
     grep_result_t res;
@@ -582,10 +589,11 @@ static void test_very_long_line_does_not_buffer_without_bound(void **state)
 /* Matches only from verified bytes (OWN-36)                           */
 /* ------------------------------------------------------------------ */
 
-/* Over GREP_INMEM_MAX, so it is loose and streamed through the pipe, with
- * the needle on its first line: a reader that stops at its hit cap never
- * reaches the tag or hash at the end. */
-#define BIG_TEXT ((size_t)20 * 1024 * 1024)
+/* Several MiB, with the needle on its first line: a reader that matched
+ * as it went, and stopped at its hit cap, would record that hit without
+ * ever reaching the damage near the end. Grep loads the object whole and
+ * checks it first, so the damage must cost the match. */
+#define BIG_TEXT ((size_t)4 * 1024 * 1024)
 
 static void write_big_text(const char *path)
 {
@@ -602,6 +610,44 @@ static void write_big_text(const char *path)
     fclose(f);
 }
 
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    int      found;
+    uint32_t pack_num;
+    uint32_t cur;
+    uint64_t payload_offset;
+    uint64_t stored;
+} find_entry_t;
+
+static void find_entry_cb(const pack_entry_info_t *info, void *ctx)
+{
+    find_entry_t *fe = ctx;
+    if (fe->found || memcmp(info->hash, fe->hash, OBJECT_HASH_SIZE) != 0) return;
+    fe->found = 1;
+    fe->pack_num = fe->cur;
+    fe->payload_offset = info->payload_offset;
+    fe->stored = info->compressed_size;
+}
+
+static void find_pack_cb(uint32_t pack_num, void *ctx)
+{
+    find_entry_t *fe = ctx;
+    if (fe->found) return;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-" PACK_NUM_FMT ".dat", pack_num);
+    fe->cur = pack_num;
+    uint32_t ver = 0, cnt = 0;
+    assert_int_equal(pack_enumerate_dat(store, name, &ver, &cnt, find_entry_cb, fe), OK);
+}
+
+/* Bytes flipped in one run: well past what one parity group corrects
+ * (512 contiguous bytes), so the damage outlives correction. */
+#define DAMAGE_SPAN 8192u
+
+/*
+ * Damage the stored bytes of the file named `name`, in a run ending
+ * from_end bytes before the end of its pack entry's payload.
+ */
 static void damage_object_of(const char *name, off_t from_end)
 {
     char repo[32];
@@ -611,22 +657,35 @@ static void damage_object_of(const char *name, off_t from_end)
         "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?",
         (const char *[]){ repo, name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
-    char path[600];
-    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", TEST_REPO,
-             r->rows[0][0], r->rows[0][0] + 2);
+    find_entry_t fe;
+    memset(&fe, 0, sizeof(fe));
+    const char *hex = r->rows[0][0];
+    assert_int_equal(strlen(hex), OBJECT_HASH_SIZE * 2);
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(hex + 2 * i, "%2x", &v), 1);
+        fe.hash[i] = (uint8_t)v;
+    }
     db_result_free(r);
 
+    assert_int_equal(object_store_flush(store), OK);
+    assert_int_equal(pack_list(store, find_pack_cb, &fe), OK);
+    assert_true(fe.found);
+    assert_true(fe.stored > (uint64_t)from_end + DAMAGE_SPAN);
+
+    char path[PATH_MAX];
+    assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, fe.pack_num), 0);
     FILE *f = fopen(path, "r+b");
     assert_non_null(f);
-    object_header_t hdr;
-    assert_int_equal(fread(&hdr, sizeof(hdr), 1, f), 1);
-    off_t off = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size - from_end;
+    off_t off = (off_t)(fe.payload_offset + fe.stored) - from_end - (off_t)DAMAGE_SPAN;
+    static uint8_t buf[DAMAGE_SPAN];
     assert_int_equal(fseeko(f, off, SEEK_SET), 0);
-    int c = fgetc(f);
-    assert_true(c != EOF);
+    assert_int_equal(fread(buf, 1, sizeof(buf), f), sizeof(buf));
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] ^= 0x5a;
     assert_int_equal(fseeko(f, off, SEEK_SET), 0);
-    assert_int_not_equal(fputc(c ^ 0x5a, f), EOF);
+    assert_int_equal(fwrite(buf, 1, sizeof(buf), f), sizeof(buf));
     fclose(f);
+    store_dat_cache_flush(store);
 }
 
 static void check_damaged_large_object_is_skipped(int keyed)
@@ -684,7 +743,7 @@ static void test_tampered_encrypted_object_records_no_matches(void **state)
 }
 
 /* An undamaged large object still matches, and is not skipped, though it
- * is now read to the end after its first hit. */
+ * is loaded and checked whole before its first hit is taken. */
 static void test_intact_large_object_still_matches(void **state)
 {
     (void)state;

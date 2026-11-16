@@ -208,6 +208,7 @@ status_t repo_format_check(const char *path, const repo_marker_t *m)
 
 status_t repo_marker_read(const char *path, repo_marker_t *out)
 {
+    if (out) memset(out, 0, sizeof(*out));
     char mp[PATH_MAX];
     if (marker_path(mp, sizeof(mp), path) != 0)
         return set_error(ERR_INVALID, "repo path too long: %s", path);

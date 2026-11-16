@@ -520,24 +520,20 @@ static void test_replica_carries_the_source_identity(void **state)
 }
 
 /*
- * A source whose objects have been packed.
+ * A source whose objects have been compressed and sealed into a pack.
  *
- * This is the normal state of a repository, not an edge case: backup packs
- * on completion. Compression only happens at pack time, so every object in
- * a packed repository carries a codec, and those are the bytes replication
- * moves. The replica has to read them back - a copy that arrives intact and
- * cannot be opened is not a backup, and nothing about the transfer itself
- * would say so.
- *
- * Every other test here replicates a source whose objects are still loose,
- * which is why they all passed while this did not work at all.
+ * Every object lives in a pack and carries whatever codec the packer chose,
+ * and those stored bytes are what replication moves. The replica has to
+ * read them back - a copy that arrives intact and cannot be opened is not a
+ * backup, and nothing about the transfer itself would say so. The flush
+ * makes the source read sealed packs rather than its open writer.
  */
 static void test_packed_source_replicates_readably(void **state)
 {
     (void)state;
 
     /* Compressible, so the packer actually applies a codec rather than
-     * storing it raw and accidentally satisfying the loose-object rule. */
+     * storing it raw, and the replica has to undo it to read the bytes. */
     char body[16384];
     memset(body, 'a', sizeof(body));
     uint8_t blob[OBJECT_HASH_SIZE];
@@ -547,7 +543,7 @@ static void test_packed_source_replicates_readably(void **state)
     manifest_entry_t e[1] = { mk_file("big.txt", blob, sizeof(body)) };
     assert_int_equal(manifest_write_tree(src, e, 1, root), OK);
 
-    assert_int_equal(repo_pack(src, NULL, NULL, NULL), OK);
+    assert_int_equal(object_store_flush(src), OK);
     pack_cache_invalidate(src);
 
     replica_sink_t sink;

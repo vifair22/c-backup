@@ -39,24 +39,6 @@ typedef struct {
      * counts crawl through large files and say little about how far a
      * backup has to go; bytes do. */
     void (*bytes_cb)(void *ctx, uint64_t done, uint64_t total);
-
-    /*
-     * Threads storing large files (over PACK_STREAM_THRESHOLD) concurrently,
-     * B086. 0 picks a number from the CPUs and memory available
-     * (store_pool_plan); 1 stores every file on the backup thread, one after
-     * another, as before. The snapshot is byte-identical either way.
-     */
-    unsigned     store_workers;
-
-    /*
-     * Run a pack pass (repo_pack_report) once the snapshot is committed, as
-     * the daemon's backup job does under maintenance.auto_pack. It is part of
-     * the backup the user waits for, so it runs inside the profile and the
-     * write counters rather than after them (B086). A failure here does not
-     * fail the backup: the snapshot is committed and its objects readable
-     * loose, so it is logged and left for the next run.
-     */
-    int          pack_after;
 } backup_opts_t;
 
 typedef struct {
@@ -71,10 +53,11 @@ typedef struct {
     uint64_t files_unchanged;
     uint64_t trees_new;
     uint64_t trees_reused;
-    /* Bytes this run added to the repository for new file content, before
-     * packing compresses them. Everything else was already there. */
+    /* Stored bytes (compressed, encrypted) this run added to the repository
+     * for new file content. Everything else was already there. */
     uint64_t bytes_stored;
-    /* Threads that stored large files: 1 when they were stored serially. */
+    /* Threads that stored file content: 1 until the chunker's workers are
+     * wired in. */
     unsigned store_workers;
     /*
      * Index transactions committed, by the phase that held them: the store
@@ -86,16 +69,12 @@ typedef struct {
     uint32_t commits_store, commits_trees, commits_index, commits_pack;
     /*
      * Bytes the run wrote into the repository, by category (store.h,
-     * store_write_cat_t), the pack pass included when pack_after was set.
-     * written_total is their sum, and the figure to divide by bytes read to
-     * get the write amplification a write-bound disk pays for (B086).
-     * written_sweep is the pack pass's share of written_total.
+     * store_write_cat_t). written_total is their sum, and the figure to
+     * divide by bytes read to get the write amplification a write-bound
+     * disk pays for (B086). Every object is written once, into a pack.
      */
     store_write_stats_t written;
     uint64_t written_total;
-    uint64_t written_sweep;
-    /* Objects the pack pass packed; 0 when it did not run or found nothing. */
-    uint64_t sweep_packed;
 } backup_result_t;
 
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
