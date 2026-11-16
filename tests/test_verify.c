@@ -31,6 +31,8 @@
 #include <cutils/db.h>
 
 #include "backup.h"
+#include "gc.h"
+#include "prune.h"
 #include "object.h"
 #include "pack.h"
 #include "parity.h"
@@ -916,6 +918,170 @@ static void test_header_and_payload_damage_repaired_in_one_run(void **state)
     free(orig);
 }
 
+/* ------------------------------------------------------------------ */
+/* A pack gc cannot walk (B119 follow-up)                              */
+/* ------------------------------------------------------------------ */
+
+#define UNW_FILES   300
+#define UNW_DELETED 50
+
+static int64_t snap_count_of(int64_t snap, const char *hex)
+{
+    char s[32];
+    snprintf(s, sizeof(s), "%lld", (long long)snap);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM nodes WHERE snap_id = ? AND content_hash = ?",
+        (const char *[]){ s, hex, NULL }, &r), 0);
+    int64_t n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+static int64_t verify_finding_count(const char *hash, const char *status)
+{
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT COUNT(*) FROM verify_findings WHERE hash = ? AND status = ?"
+        "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
+        (const char *[]){ hash, status, NULL }, &r), 0);
+    int64_t n = strtoll(r->rows[0][0], NULL, 10);
+    db_result_free(r);
+    return n;
+}
+
+/*
+ * Every entry header in one parity group overwritten - more damage than the
+ * group's parity carries, payloads untouched - leaves a pack whose headers
+ * cannot be walked: gc must not rewrite it on a guess. That has to be heard:
+ * gc fails naming the pack (the job failure is what alerts), every verify
+ * level reports it and fails, and a repairing verify rebuilds the headers
+ * from the index and the table's CRCs, after which verify passes and gc
+ * compacts the pack like any other.
+ */
+static void test_unwalkable_pack_is_reported_until_repaired(void **state)
+{
+    (void)state;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/many", TEST_SRC);
+    assert_int_equal(mkdir(dir, 0700), 0);
+    for (int i = 0; i < UNW_FILES; i++) {
+        char p[PATH_MAX + 32], body[200];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        int n = snprintf(body, sizeof(body), "file %03d:", i);
+        unsigned x = 0x9E3779B9u * (unsigned)(i + 1);
+        while (n < 150) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            body[n++] = (char)('A' + x % 52);
+        }
+        body[n] = '\0';
+        write_file(p, body);
+    }
+    int64_t s1 = run_backup();
+    for (int i = 0; i < UNW_DELETED; i++) {
+        char p[PATH_MAX + 32];
+        snprintf(p, sizeof(p), "%s/f%03d", dir, i);
+        assert_int_equal(unlink(p), 0);
+    }
+    int64_t s2 = run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("f200", hex);
+    entry_at_t e = entry_of(hex);
+    uint8_t h200[OBJECT_HASH_SIZE];
+    hash_of_hex(hex, h200);
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    assert_int_equal(pack_resolve_location(store, h200, &pnum, &off), OK);
+    uint64_t g = e.entry / PARITY_GROUP_DATA;
+
+    /* The headers in f200's group, every one of a file still in snapshot 2,
+     * so the index keeps a row for each through the first gc's sweep. */
+    char pk[32];
+    snprintf(pk, sizeof(pk), "%u", pnum);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, offset FROM pack_objects WHERE pack_id = ? ORDER BY offset",
+        (const char *[]){ pk, NULL }, &r), 0);
+    int fd = open(e.path, O_RDWR);
+    assert_true(fd >= 0);
+    size_t damaged_bytes = 0;
+    for (int i = 0; i < r->nrows; i++) {
+        uint64_t o = strtoull(r->rows[i][1], NULL, 10);
+        if (o / PARITY_GROUP_DATA != g ||
+            (o + sizeof(pack_dat_entry_hdr_t) - 1) / PARITY_GROUP_DATA != g)
+            continue;
+        assert_true(snap_count_of(s2, r->rows[i][0]) > 0);
+        uint8_t b[sizeof(pack_dat_entry_hdr_t)];
+        assert_int_equal(pread(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        for (size_t k = 0; k < sizeof(b); k++) b[k] ^= 0x5A;
+        assert_int_equal(pwrite(fd, b, sizeof(b), (off_t)o), (ssize_t)sizeof(b));
+        damaged_bytes += sizeof(b);
+    }
+    close(fd);
+    db_result_free(r);
+    /* Far past the 512 bytes a group corrects. */
+    assert_true(damaged_bytes > 2048);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+
+    /* gc: the pack is left whole, and the job fails naming it. */
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    err_clear();
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), pname));
+    assert_int_equal(gr.packs_unwalkable, 1);
+    assert_int_equal(gr.unwalkable_listed, 1);
+    assert_int_equal(gr.unwalkable[0].pack, pnum);
+    assert_non_null(strstr(gr.unwalkable[0].reason, "beyond parity"));
+    err_clear();
+
+    /* Every level, without repair: a finding and a failed run. */
+    const verify_level_t levels[3] = { VERIFY_LEVEL_INDEX, VERIFY_LEVEL_STRUCTURE,
+                                       VERIFY_LEVEL_DEEP };
+    for (int l = 0; l < 3; l++) {
+        verify_result_t vr;
+        memset(&vr, 0, sizeof(vr));
+        assert_int_equal(verify_run(store, db, repo_id, levels[l], 0, NULL, NULL, NULL, &vr),
+                         ERR_CORRUPT);
+        err_clear();
+        assert_int_equal(vr.packs_unwalkable, 1);
+        assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 1);
+    }
+
+    /* A repairing run restores the headers from the index. */
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_restored, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 0);
+    assert_int_equal(verify_finding_count(pname, "repaired"), 1);
+
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+
+    /* And gc now compacts it: snapshot 1's files are dead in it. */
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), OK);
+    assert_int_equal(gr.packs_unwalkable, 0);
+    assert_true(gr.packs_rewritten >= 1);
+    assert_true(gr.pack_entries_dropped >= UNW_DELETED);
+
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0, NULL, NULL, NULL, &vr),
+                     OK);
+    assert_int_equal(vr.unrecoverable + vr.missing + vr.recoverable, 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -936,6 +1102,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_failed_restore_leaves_no_plausible_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_grown_header_size_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_header_and_payload_damage_repaired_in_one_run, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unwalkable_pack_is_reported_until_repaired, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

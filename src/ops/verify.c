@@ -270,6 +270,81 @@ static int pack_file_missing(store_t *store, int64_t pack_id)
     return errno == ENOENT || errno == ENOTDIR;
 }
 
+/*
+ * Every pack the index names, walked whole: header, and every entry header
+ * to the end of the body. A pack that cannot be walked even with parity is
+ * one gc leaves as it is and reports, so verify reports it too, at every
+ * level, until it is repaired - a finding named after the pack, and a
+ * failed run. A repairing run rebuilds the damaged headers from the index
+ * (pack_restore_headers proves each against the table's CRCs before
+ * writing it) and walks again.
+ */
+static status_t verify_packs(store_t *store, cutils_db_t *db, int64_t repo_id,
+                             int repair, verify_result_t *res)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *packs = NULL;
+    if (db_execute(db, "SELECT DISTINCT pack_id FROM pack_objects WHERE repo_id = ?"
+                       " ORDER BY pack_id",
+                   (const char *[]){ repo, NULL }, &packs) != 0 || !packs) {
+        db_result_free(packs);
+        return set_error(ERR_IO, "verify: cannot list packs");
+    }
+    for (int p = 0; p < packs->nrows; p++) {
+        int64_t pid = strtoll(packs->rows[p][0], NULL, 10);
+        if (pid < 0 || pid > (int64_t)UINT32_MAX) continue;
+        if (pack_file_missing(store, pid)) continue;   /* the object walk says missing */
+        uint32_t pnum = (uint32_t)pid;
+        char why[PACK_UNWALKABLE_REASON_MAX];
+        if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) continue;
+        err_clear();
+
+        char name[32];
+        snprintf(name, sizeof(name), "pack-%010u", pnum);
+        if (repair) {
+            db_result_t *r = NULL;
+            char pk[32];
+            snprintf(pk, sizeof(pk), "%u", pnum);
+            if (db_execute(db,
+                    "SELECT po.hash, po.offset, po.comp_size, po.orig_size, po.entry_index,"
+                    "       COALESCE(o.type, 0)"
+                    "  FROM pack_objects po LEFT JOIN objects o"
+                    "    ON o.repo_id = po.repo_id AND o.hash = po.hash"
+                    " WHERE po.repo_id = ? AND po.pack_id = ? ORDER BY po.offset",
+                    (const char *[]){ repo, pk, NULL }, &r) == 0 && r && r->nrows > 0) {
+                pack_hdr_hint_t *hints = calloc((size_t)r->nrows, sizeof(*hints));
+                if (hints) {
+                    for (int i = 0; i < r->nrows; i++) {
+                        hex_to_hash(r->rows[i][0], hints[i].hash);
+                        hints[i].offset      = strtoull(r->rows[i][1], NULL, 10);
+                        hints[i].comp_size   = strtoull(r->rows[i][2], NULL, 10);
+                        hints[i].orig_size   = strtoull(r->rows[i][3], NULL, 10);
+                        hints[i].entry_index = (uint32_t)strtoul(r->rows[i][4], NULL, 10);
+                        hints[i].type        = (uint8_t)strtoul(r->rows[i][5], NULL, 10);
+                    }
+                    (void)pack_restore_headers(store, pnum, hints, (size_t)r->nrows);
+                    free(hints);
+                }
+            }
+            db_result_free(r);
+            if (pack_walk_check(store, pnum, why, sizeof(why)) == OK) {
+                log_warn("verify: %s.dat could not be walked; its headers were restored "
+                         "from the index", name);
+                res->packs_restored++;
+                record_finding(db, repo_id, res->run_id, name, "repaired");
+                continue;
+            }
+            err_clear();
+        }
+        log_error("verify: %s.dat cannot be walked (%s); gc leaves it as it is", name, why);
+        res->packs_unwalkable++;
+        record_finding(db, repo_id, res->run_id, name, "unwalkable pack");
+    }
+    db_result_free(packs);
+    return OK;
+}
+
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     verify_level_t level, int repair, atomic_int *cancel,
                     void (*progress)(const char *phase, uint64_t done,
@@ -357,7 +432,8 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     uint64_t total = (uint64_t)objs->nrows;
-    status_t st = OK;
+    status_t st = verify_packs(store, db, repo_id, repair, &res);
+    if (st != OK) { db_result_free(objs); return st; }
 
     /* Rows arrive grouped by pack, so remembering the last pack's answer
      * stats each pack file once rather than once per object. */
@@ -521,6 +597,10 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     if (st != OK) return st;
 
+    if (res.packs_unwalkable)
+        log_error("verify (%s%s): %llu pack(s) cannot be walked",
+                  level_name(level), repair ? "" : ", check only",
+                  (unsigned long long)res.packs_unwalkable);
     if (res.unrecoverable || res.missing)
         log_error("verify (%s%s): %llu checked, %llu repaired, %llu recoverable, "
                   "%llu UNRECOVERABLE, %llu MISSING, affecting %llu file(s)",
@@ -563,5 +643,10 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                          (unsigned long long)res.missing,
                          (unsigned long long)res.affected_files,
                          (unsigned long long)res.affected_snapshots);
+    if (res.packs_unwalkable)
+        return set_error(ERR_CORRUPT,
+                         "verify run %lld found %llu pack(s) that cannot be walked; "
+                         "run verify with repair",
+                         (long long)res.run_id, (unsigned long long)res.packs_unwalkable);
     return OK;
 }

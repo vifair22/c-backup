@@ -53,6 +53,12 @@ typedef struct {
      * paths, and distinct snapshots holding any of them. */
     uint64_t affected_files;
     uint64_t affected_snapshots;
+    /* Packs whose entry headers cannot be walked even with parity, which gc
+     * leaves untouched and reports (B119): a finding at every level, and a
+     * failed run, until a repairing run restores them from the index. */
+    uint64_t packs_unwalkable;
+    /* Packs a repairing run made walkable again. */
+    uint64_t packs_restored;
     int64_t  run_id;
 } verify_result_t;
 
@@ -61,7 +67,7 @@ typedef struct {
  * write lock when it does, and may hold only the read lock when it does not.
  *
  * Returns ERR_CORRUPT when the walk finished but found unrecoverable or
- * missing objects. The run record and findings are written first, and *out
+ * missing objects, or a pack that cannot be walked. The run record and findings are written first, and *out
  * is filled, exactly as for a clean run.
  */
 status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,

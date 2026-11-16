@@ -869,12 +869,13 @@ static int walk_pass(int fd, const pack_trailer_t *t, uint32_t count, uint64_t l
  * first that failed), -1 on I/O error.
  */
 static int pack_walk(int fd, const pack_trailer_t *t, uint32_t count, uint64_t lim,
-                     walk_fn fn, void *ctx)
+                     walk_fn fn, void *ctx, uint32_t *walked)
 {
     uint32_t n = 0, fixed = 0;
     uint64_t end = 0;
     if (t && lim > t->body_len) lim = t->body_len;
     if (walk_pass(fd, t, count, lim, fn, ctx, &n, &end, &fixed) != 0) return -1;
+    if (walked) *walked = n;
     if (fixed) {
         log_warn("pack: %u entry header(s) corrected from parity while walking the pack", fixed);
         parity_stats_add_repaired(fixed);
@@ -903,6 +904,139 @@ static int pack_hdr_get(int fd, const pack_trailer_t *t, pack_dat_hdr_t *out, in
     log_warn("pack: pack header damaged; restored from the trailer");
     parity_stats_add_repaired(1);
     return 0;
+}
+
+/*
+ * Whether a pack can be walked whole - its header read, and every entry
+ * header stepped over to the end of the body - and, when not, why, for the
+ * alert and the verify finding. Returns 0 walkable, 1 not (reason set), -1
+ * on an I/O error.
+ */
+static int pack_walk_whole(int fd, char *reason, size_t cap)
+{
+    pack_trailer_t t;
+    int have_t = pack_trailer_read(fd, &t) == 0;
+    pack_dat_hdr_t h;
+    int hr = pack_hdr_get(fd, have_t ? &t : NULL, &h, NULL);
+    if (hr == 1) {
+        snprintf(reason, cap, "pack version %u; this build reads %u", h.version, PACK_VERSION);
+        return 1;
+    }
+    if (hr != 0) {
+        snprintf(reason, cap, "pack header unreadable, and no usable trailer to restore it");
+        return 1;
+    }
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) return -1;
+    uint32_t n = 0;
+    int w = pack_walk(fd, have_t ? &t : NULL, h.count, (uint64_t)sb.st_size, NULL, NULL, &n);
+    if (w < 0) return -1;
+    if (w == 1) {
+        snprintf(reason, cap, "entry header %u of %u is damaged beyond parity%s", n, h.count,
+                 have_t ? "" : " and the pack has no usable trailer");
+        return 1;
+    }
+    return 0;
+}
+
+status_t pack_walk_check(store_t *store, uint32_t pack_num, char *reason, size_t cap)
+{
+    if (reason && cap) reason[0] = '\0';
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pack_num) != 0)
+        return set_error(ERR_IO, "pack %u: path too long", pack_num);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return set_error_errno(ERR_IO, "pack %u: open", pack_num);
+    char why[PACK_UNWALKABLE_REASON_MAX];
+    int w = pack_walk_whole(fd, why, sizeof(why));
+    close(fd);
+    if (w < 0) return set_error_errno(ERR_IO, "pack %u: read", pack_num);
+    if (w == 0) return OK;
+    if (reason && cap) snprintf(reason, cap, "%s", why);
+    return set_error(ERR_CORRUPT, "pack-%010u.dat cannot be walked: %s", pack_num, why);
+}
+
+/*
+ * Restore entry headers damaged beyond parity from what the index knows.
+ *
+ * Every field of an entry header is derivable: the name, the type and both
+ * sizes are index rows, and compression and encryption are each one of two
+ * values. Each candidate is checked against the entry's header CRC, and the
+ * winner then against the CRC of the whole entry, header and payload, so a
+ * header is written only when the table proves it is the one the writer
+ * wrote. A header the stripe can still correct is written back as
+ * corrected; one already right is left alone. Returns how many headers were
+ * written, or -1 when the pack has no usable trailer to prove anything
+ * against or a write fails.
+ */
+int pack_restore_headers(store_t *store, uint32_t pack_num,
+                         const pack_hdr_hint_t *hints, size_t n)
+{
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pack_num) != 0) return -1;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -1;
+    pack_trailer_t t;
+    if (pack_trailer_read(fd, &t) != 0) { close(fd); return -1; }
+
+    static const uint8_t comps[2] = { COMPRESS_NONE, COMPRESS_LZ4 };
+    static const uint8_t encs[2]  = { ENCRYPT_NONE, ENCRYPT_CHACHA20 };
+    int written = 0, failed = 0;
+    for (size_t k = 0; k < n && !failed; k++) {
+        const pack_hdr_hint_t *hi = &hints[k];
+        if (hi->entry_index >= t.count || hi->offset < sizeof(pack_dat_hdr_t) ||
+            hi->offset > t.body_len ||
+            t.body_len - hi->offset < sizeof(pack_dat_entry_hdr_t) ||
+            hi->comp_size > t.body_len - hi->offset - sizeof(pack_dat_entry_hdr_t) ||
+            hi->comp_size > OBJECT_MAX_STORED_BYTES)
+            continue;
+        uint32_t want_e = 0, want_h = 0;
+        if (entry_table_slot(fd, &t, hi->entry_index, 1, &want_e, &want_h) != 0) continue;
+        pack_dat_entry_hdr_t raw, h;
+        if (pread_full(fd, &raw, sizeof(raw), (off_t)hi->offset) != 0) { failed = 1; break; }
+        if (crc32c(&raw, sizeof(raw)) == want_h) continue;
+        if (hdr_at(fd, &t, hi->offset, 1, &h) != 0) { failed = 1; break; }
+        int found = crc32c(&h, sizeof(h)) == want_h;
+        for (unsigned ty = 0; ty < 256 && !found; ty++) {
+            if (!object_type_known(ty) || (hi->type && ty != hi->type)) continue;
+            for (int c = 0; c < 2 && !found; c++)
+                for (int e = 0; e < 2 && !found; e++) {
+                    pack_dat_entry_hdr_t cand;
+                    memset(&cand, 0, sizeof(cand));
+                    memcpy(cand.hash, hi->hash, OBJECT_HASH_SIZE);
+                    cand.type              = (uint8_t)ty;
+                    cand.compression       = comps[c];
+                    cand.encryption        = encs[e];
+                    cand.uncompressed_size = hi->orig_size;
+                    cand.compressed_size   = hi->comp_size;
+                    if (crc32c(&cand, sizeof(cand)) != want_h) continue;
+                    h = cand;
+                    found = 1;
+                }
+        }
+        if (!found) continue;
+        /* The header CRC says this is the header; the entry CRC says it
+         * belongs with these payload bytes. */
+        uint8_t *pay = malloc(h.compressed_size ? (size_t)h.compressed_size : 1);
+        if (!pay) { failed = 1; break; }
+        int ok = h.compressed_size == hi->comp_size &&
+                 pread_full(fd, pay, (size_t)h.compressed_size,
+                            (off_t)(hi->offset + sizeof(h))) == 0;
+        uint32_t crc = ok ? crc32c_update(crc32c(&h, sizeof(h)), pay, (size_t)h.compressed_size)
+                          : 0;
+        free(pay);
+        if (!ok || crc != want_e) continue;
+        if (pwrite_full(fd, &h, sizeof(h), (off_t)hi->offset) != 0) { failed = 1; break; }
+        written++;
+    }
+    if (written > 0 && !failed && fsync(fd) != 0) failed = 1;
+    close(fd);
+    if (written > 0) {
+        log_warn("pack: restored %d entry header(s) in pack-%010u.dat from the index",
+                 written, pack_num);
+        pack_cache_invalidate(store);
+    }
+    return failed ? -1 : written;
 }
 
 /*
@@ -2470,7 +2604,7 @@ static int build_disk_idx_from_dat(FILE *f, uint32_t count, pack_idx_disk_entry_
     pack_trailer_t t;
     int have_t = pack_trailer_read(fd, &t) == 0;
     return pack_walk(fd, have_t ? &t : NULL, count, (uint64_t)sb.st_size,
-                     disk_idx_fill, out) == 0 ? 0 : -1;
+                     disk_idx_fill, out, NULL) == 0 ? 0 : -1;
 }
 
 /* A pack's header through pack_hdr_get: 0 when it is a usable pack header
@@ -2882,6 +3016,10 @@ static status_t maybe_coalesce_packs(store_t *store,
         if (meta[i].num + 1 >= max_num) continue;
         if (meta[i].dat_bytes >= PACK_COALESCE_SMALL_BYTES) continue;
         if (cand_bytes + meta[i].dat_bytes > budget) break;
+        /* A pack that cannot be walked is not merged: gc's own pass over
+         * every pack has already reported it, and it stays as it is until
+         * a repair makes it walkable. */
+        if (pack_walk_check(store, meta[i].num, NULL, 0) != OK) { err_clear(); continue; }
         cand[n_cand++] = meta[i];
         cand_bytes += meta[i].dat_bytes;
     }
@@ -3193,6 +3331,21 @@ status_t pack_gc(store_t *store,
     return pack_gc_stats(store, refs, refs_cnt, out_kept, out_deleted, NULL);
 }
 
+/* A pack gc could not walk: logged, counted and listed with its reason. */
+static void note_unwalkable(pack_gc_stats_t *stats, uint32_t pnum, int fd)
+{
+    char why[PACK_UNWALKABLE_REASON_MAX];
+    if (pack_walk_whole(fd, why, sizeof(why)) != 1)
+        snprintf(why, sizeof(why), "pack cannot be read");
+    log_error("pack_gc: pack-%010u.dat cannot be walked (%s); left as it is", pnum, why);
+    stats->packs_unwalkable++;
+    if (stats->unwalkable_listed < PACK_UNWALKABLE_LIST_MAX) {
+        pack_unwalkable_t *u = &stats->unwalkable[stats->unwalkable_listed++];
+        u->pack = pnum;
+        snprintf(u->reason, sizeof(u->reason), "%s", why);
+    }
+}
+
 status_t pack_gc_stats(store_t *store,
                        const uint8_t *refs, size_t refs_cnt,
                        uint32_t *out_kept, uint32_t *out_deleted,
@@ -3244,6 +3397,7 @@ status_t pack_gc_stats(store_t *store,
         if (!gcidxf) continue;
         pack_dat_hdr_t ghdr;
         if (pack_hdr_read_file(gcidxf, &ghdr) != 0) {
+            note_unwalkable(stats, pnum, fileno(gcidxf));
             fclose(gcidxf); continue;
         }
         uint32_t count = ghdr.count;
@@ -3253,10 +3407,11 @@ status_t pack_gc_stats(store_t *store,
         pack_idx_disk_entry_t *disk_idx = malloc(count * sizeof(*disk_idx));
         if (!disk_idx) { fclose(gcidxf); free(pack_nums); return set_error(ERR_NOMEM, "pack_gc: disk_idx alloc failed for pack %u", pnum); }
         if (build_disk_idx_from_dat(gcidxf, count, disk_idx) != 0) {
-            /* Damaged past what parity can restore: rewriting it
-             * would guess at offsets and liveness. Left whole and said so;
-             * verify names the objects. */
-            log_warn("pack_gc: pack %u cannot be walked; left as it is", pnum);
+            /* Damaged past what parity can restore: rewriting it would
+             * guess at offsets and liveness, so it is left whole - and that
+             * is a finding, not a log line: the caller fails the job, and
+             * verify reports the pack until a repair restores it. */
+            note_unwalkable(stats, pnum, fileno(gcidxf));
             free(disk_idx); fclose(gcidxf); continue;
         }
         fclose(gcidxf);
@@ -3506,7 +3661,7 @@ status_t pack_enumerate_dat(store_t *store, const char *dat_name,
      * a fuzzer as a timeout.
      */
     enum_ctx_t ec = { .cb = cb, .ctx = ctx };
-    if (pack_walk(fd, have_t ? &t : NULL, hdr.count, file_size, enum_step, &ec) < 0) {
+    if (pack_walk(fd, have_t ? &t : NULL, hdr.count, file_size, enum_step, &ec, NULL) < 0) {
         fclose(f);
         return set_error_errno(ERR_IO, "pack_enumerate_dat: read %s", dat_name);
     }

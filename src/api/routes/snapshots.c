@@ -1009,8 +1009,8 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[512];
-    snprintf(js, sizeof(js),
+    char js[512 + PACK_UNWALKABLE_LIST_MAX * (PACK_UNWALKABLE_REASON_MAX + 48)];
+    int jn = snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
@@ -1025,14 +1025,24 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              gr->packs_rewritten, gr->packs_deleted,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed);
+    /* Packs compaction could not walk, each with why. Reasons are built by
+     * the pack layer from fixed text and numbers, so need no escaping. */
+    size_t n = jn > 0 ? (size_t)jn : 0;
+    if (n < sizeof(js))
+        n += (size_t)snprintf(js + n, sizeof(js) - n, ",\"packs_unwalkable\":%u,\"unwalkable\":[",
+                              gr->packs_unwalkable);
+    for (uint32_t i = 0; i < gr->unwalkable_listed && n < sizeof(js); i++)
+        n += (size_t)snprintf(js + n, sizeof(js) - n, "%s{\"pack\":%u,\"reason\":\"%s\"}",
+                              i ? "," : "", gr->unwalkable[i].pack, gr->unwalkable[i].reason);
+    if (n < sizeof(js)) snprintf(js + n, sizeof(js) - n, "]");
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
                               gr->damaged_listed, gc_hash_at, NULL, gr);
     if (full) {
         job_set_result(progress_ctx, full);
         free(full);
     } else {
-        size_t n = strlen(js);
-        if (n + 1 < sizeof(js)) { js[n] = '}'; js[n + 1] = '\0'; }
+        size_t e = strlen(js);
+        if (e + 1 < sizeof(js)) { js[e] = '}'; js[e + 1] = '\0'; }
         job_set_result(progress_ctx, js);
     }
 
@@ -1052,10 +1062,15 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
                  gr->packs_deleted,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
-        size_t n = strlen(msg);
-        snprintf(msg + n, sizeof(msg) - n, "; %llu entr%s copied damaged beyond parity",
+        size_t m = strlen(msg);
+        snprintf(msg + m, sizeof(msg) - m, "; %llu entr%s copied damaged beyond parity",
                  (unsigned long long)gr->pack_entries_damaged,
                  gr->pack_entries_damaged == 1 ? "y" : "ies");
+    }
+    if (gr->packs_unwalkable > 0) {
+        size_t m = strlen(msg);
+        snprintf(msg + m, sizeof(msg) - m, "; %u pack%s could not be walked",
+                 gr->packs_unwalkable, gr->packs_unwalkable == 1 ? "" : "s");
     }
     job_set_summary(progress_ctx, msg);
 }
@@ -1225,12 +1240,15 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[160];
+        char vj[200];
         snprintf(vj, sizeof(vj),
-                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"packs_unwalkable\":%llu,\"packs_restored\":%llu}",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
-                 j->dry_run ? "true" : "false");
+                 j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.packs_unwalkable,
+                 (unsigned long long)vr.packs_restored);
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*

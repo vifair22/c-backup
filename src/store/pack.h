@@ -354,6 +354,15 @@ void pack_resume_removals(store_t *store);
  * deleted outright because every entry was dead. Coalescing is not counted. */
 #define PACK_DAMAGED_LIST_MAX 100u
 
+/* Packs gc found it could not walk, listed with why (at most this many). */
+#define PACK_UNWALKABLE_LIST_MAX   16u
+#define PACK_UNWALKABLE_REASON_MAX 96u
+
+typedef struct {
+    uint32_t pack;
+    char     reason[PACK_UNWALKABLE_REASON_MAX];
+} pack_unwalkable_t;
+
 typedef struct {
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
@@ -368,7 +377,46 @@ typedef struct {
     uint64_t entries_damaged;
     uint32_t damaged_listed;
     uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
+    /*
+     * Packs whose entry headers could not be walked even with parity: gc
+     * left them exactly as they were, since rewriting one would guess at
+     * offsets and at which entries are live. Like damage, a failure the
+     * caller must report, not a log line; verify reports the same packs
+     * until a repair restores their headers.
+     */
+    uint32_t packs_unwalkable;
+    uint32_t unwalkable_listed;
+    pack_unwalkable_t unwalkable[PACK_UNWALKABLE_LIST_MAX];
 } pack_gc_stats_t;
+
+/*
+ * Can this pack be walked whole: its header read and every entry header
+ * stepped over to the end of the body, with parity's help where needed?
+ * OK, or ERR_CORRUPT with the reason in reason (and the error message).
+ * This is what gc needs of a pack before it will rewrite it.
+ */
+status_t pack_walk_check(store_t *store, uint32_t pack_num, char *reason, size_t cap);
+
+/* What the index knows of one entry: enough to rebuild its header. type 0
+ * means unknown (every known type is tried). */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t offset;
+    uint64_t comp_size;
+    uint64_t orig_size;
+    uint32_t entry_index;
+    uint8_t  type;
+} pack_hdr_hint_t;
+
+/*
+ * Rewrite entry headers damaged beyond parity from the index's rows, each
+ * only once its header CRC and its whole-entry CRC prove it right. This is
+ * what makes a pack gc could not walk walkable again: verify with repair
+ * calls it. Returns headers written, or -1 when the pack has no usable
+ * trailer or a write fails.
+ */
+int pack_restore_headers(store_t *store, uint32_t pack_num,
+                         const pack_hdr_hint_t *hints, size_t n);
 
 /* pack_gc, also reporting which packs it rewrote or deleted. stats may be
  * NULL, which is what pack_gc passes. */

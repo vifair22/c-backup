@@ -1303,6 +1303,21 @@ the alert goes out and `c-backup gc` exits 1. The result adds
 `pack_entries_damaged`, `damaged` (the first 100 hashes) and
 `damaged_listed`.
 
+A pack whose entry headers cannot be walked, even with parity, is not
+rewritten: every later offset and the liveness of every entry depend on
+those headers, and gc does not guess. It is left exactly as it is, and the
+job **fails** with `gc: N pack(s) could not be walked and were left as they
+are (first: pack-NNNNNNNNNN.dat, <reason>); run verify with repair`, so the
+alert goes out like any other failure. The result adds `packs_unwalkable`
+and `unwalkable` (pack number and reason, the first 16). Every verify level
+reports such a pack as a finding (`pack-NNNNNNNNNN`, `unwalkable pack`) and
+fails until it is repaired. A verify with repair rebuilds the damaged
+headers from the index - names, types and sizes are index rows, and each
+rebuilt header is written only once the pack's own header and entry CRCs
+prove it - after which verify passes and gc compacts the pack normally.
+Checking every pack's headers costs index and structure verifies a read of
+each entry header (8 bytes of CRC table each, no payloads).
+
 **Compaction rewrites a pack without its dead entries.** A pack holding any
 entry no snapshot names is copied, live entries only, into new packs that
 seal at 256 MiB like a backup's, and the old pack is deleted once the new

@@ -125,9 +125,11 @@ name in it, so before the header CRC a damaged name made gc drop a live
 object as dead and a damaged size sent the rest of the walk astray. The
 header CRC is why the table slot is 8 bytes, not 4: it lets a walk check
 each header from the table alone, reading no payload and no parity on a
-clean pack. A pack whose headers cannot be restored is not rewritten by gc
-or coalescing (it is left whole and logged; verify names its objects),
-rather than rewritten on a guess.
+clean pack. A pack whose headers parity cannot restore is not rewritten by
+gc or coalescing on a guess: it is left whole, gc fails naming it, every
+verify level reports it, and a repairing verify rebuilds its headers from
+the index, each proven against its header and entry CRCs before it is
+written.
 
 `tests/test_pack_stripe.c` damages 2, 4 and 16 bytes of an entry header, of
 the pack header and of the tail (one copy, then both), and checks that

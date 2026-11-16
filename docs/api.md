@@ -627,8 +627,15 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,
+ "packs_unwalkable":0,"packs_restored":0}
 ```
+
+`packs_unwalkable` counts packs whose entry headers cannot be walked even
+with parity (the packs gc leaves as they are); each is a finding named
+`pack-NNNNNNNNNN` with status `unwalkable pack`, at every level, and fails
+the run. `packs_restored` counts those a repairing run made walkable again
+by rebuilding their headers from the index; each is a `repaired` finding.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -864,7 +871,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `packs_unwalkable`, `unwalkable` (first 16, `{"pack","reason"}`), `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` or `packs_unwalkable` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | reindex | `snapshots`, `snapshots_failed`, `files`, `objects`, `packs_unreadable`, `tags_restored`, `tags_skipped`, `snapshot_mark` (the snapshot-id high-water mark the index now holds), `snapshot_ids_repaired` (`true` when `<repo>/snapshot-ids` was missing, damaged, from another repository or behind, and was rewritten) |
 
