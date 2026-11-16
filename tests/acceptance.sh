@@ -53,7 +53,10 @@ CLI="$(realpath "$BIN/c-backup")"
 # The socket path has to fit in sun_path, which a deep work dir would not.
 SOCK_DIR="$(mktemp -d /tmp/cbacc.XXXXXX)"
 SOCK="$SOCK_DIR/s"
-PORT=$((20000 + $$ % 10000))
+# Chosen by the kernel, so a run beside another suite on this host cannot
+# land on its port (FLAKE-13); it was derived from the pid.
+. "$(dirname "$0")/free_port.sh"
+PORT=$(free_ports 1 "$SOCK_DIR") || { echo "cannot choose a TCP port" >&2; exit 1; }
 PASSWORD="acceptance-$$-password"
 
 PASS=0; FAIL=0
