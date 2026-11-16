@@ -47,6 +47,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 /* Files at most this large are batched; larger ones keep their paths. */
 #define SMALL_FILE_MAX     ((uint64_t)1024 * 1024)
@@ -73,11 +74,19 @@ typedef struct {
     uint32_t     index;         /* the scan entry */
     const char  *path;          /* the scan entry's, valid for the backup */
     uint64_t     size;          /* the scan's size */
+    const struct stat *scan_st; /* the scan's stat, valid for the backup */
     /* Out */
     int          ran;           /* a worker got to it (not cancelled first) */
     status_t     st;
-    int          skipped;       /* opened or found changed: warn, not fail */
+    /* Left out (B118): could not be opened, no longer a regular file, or
+     * never settled (OWN-45). err is the reason alone, without the path. */
+    int          skipped;
     char         err[ERR_MSG_MAX];
+    /* Stored as read rather than as scanned (OWN-45): st_read is the
+     * version stored, changed says it differed from the scan. */
+    struct stat  st_read;
+    int          changed;
+    int          unsettled;     /* never settled; stored flagged (OWN-45-LIVE) */
     uint8_t      hash[OBJECT_HASH_SIZE];
     small_obj_t *objs;
     size_t       nobjs, capobjs;
@@ -109,7 +118,7 @@ status_t small_pool_start(store_t *store, const cdc_params_t *cp, unsigned n,
 small_batch_t *small_batch_new(void);
 /* Add one file. Returns 1 when the batch is full and should be submitted. */
 int  small_batch_add(small_batch_t *b, uint32_t index, const char *path,
-                     uint64_t size);
+                     uint64_t size, const struct stat *scan_st);
 void small_batch_free(small_batch_t *b);
 
 /* Hand a batch over; the pool owns it until small_pool_take returns it. */

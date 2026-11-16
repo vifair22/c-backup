@@ -32,6 +32,7 @@
 
 #include <cmocka.h>
 #include <cutils/db.h>
+#include <cutils/log.h>
 
 #include "job_manager.h"
 #include "lock.h"
@@ -1311,6 +1312,133 @@ static void test_a_stream_on_dst_cannot_starve_a_set(void **state)
     pthread_mutex_unlock(&g_mu);
 }
 
+/*
+ * A job that succeeds with a warning alerts through the failure path, at
+ * WARN and titled as completed, and stays completed. One without a warning
+ * sends nothing. B118: a backup that left files out reported completed and
+ * told nobody unless they opened the job's result.
+ */
+static char g_alert_log[2048];
+static pthread_mutex_t g_alert_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void capture_alert(const char *ts, const char *level, const char *func,
+                          const char *message, void *ud)
+{
+    (void)ts; (void)func; (void)ud;
+    if (!strstr(message, "notification for job")) return;
+    pthread_mutex_lock(&g_alert_mu);
+    size_t have = strlen(g_alert_log);
+    snprintf(g_alert_log + have, sizeof(g_alert_log) - have, "%s %s\n", level, message);
+    pthread_mutex_unlock(&g_alert_mu);
+}
+
+static status_t warning_job(void *arg, atomic_int *cancel,
+                            void (*progress)(const char *, uint64_t, uint64_t, void *),
+                            void *progress_ctx)
+{
+    (void)cancel; (void)progress;
+    if (arg) job_set_warning(progress_ctx, (const char *)arg);
+    pthread_mutex_lock(&g_mu);
+    g_completed++;
+    pthread_mutex_unlock(&g_mu);
+    return OK;
+}
+
+/* Wait for the job to end and, since the alert is sent after the state is
+ * written, for the log to settle a little longer. */
+static void wait_ended(int64_t id)
+{
+    char sql[128];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM jobs WHERE id = %lld AND state = 'completed'",
+             (long long)id);
+    for (int i = 0; i < 400 && db_count(sql) != 1; i++) usleep(25000);
+    assert_int_equal(db_count(sql), 1);
+}
+
+/* Run one clean and one warned job with alerts on or off, and return what
+ * the log said about notifications. */
+static void run_warned_pair(int alerts_on, int64_t *clean, int64_t *warned,
+                            char *got, size_t got_sz)
+{
+    job_manager_set_alerts(jm, alerts_on);
+    g_alert_log[0] = '\0';
+    int h = log_stream_register(capture_alert, NULL);
+    assert_true(h >= 0);
+
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, warning_job, NULL, NULL,
+                                clean), OK);
+    wait_ended(*clean);
+    assert_int_equal(job_submit(jm, 3, "backup", NULL, warning_job,
+                                "1 file(s) could not be read; first: /d/x",
+                                NULL, warned), OK);
+    wait_ended(*warned);
+
+    /* The line follows the completed state, so it is waited for. */
+    char want[96];
+    snprintf(want, sizeof(want), "warning notification for job %lld",
+             (long long)*warned);
+    int seen = 0;
+    for (int i = 0; i < 200 && !seen; i++) {
+        pthread_mutex_lock(&g_alert_mu);
+        seen = strstr(g_alert_log, want) != NULL;
+        pthread_mutex_unlock(&g_alert_mu);
+        if (!seen) usleep(10000);
+    }
+    log_stream_unregister(h);
+    pthread_mutex_lock(&g_alert_mu);
+    snprintf(got, got_sz, "%s", g_alert_log);
+    pthread_mutex_unlock(&g_alert_mu);
+    job_manager_set_alerts(jm, 0);
+    if (!seen) fail_msg("no warning alert line for job %lld:\n%s", (long long)*warned, got);
+
+    assert_non_null(strstr(got, "c-backup: backup of docs completed with a warning"));
+    assert_non_null(strstr(got, "1 file(s) could not be read; first: /d/x"));
+    assert_null(strstr(got, "failure notification"));
+    /* The clean job alerts nobody either way. */
+    snprintf(want, sizeof(want), "notification for job %lld", (long long)*clean);
+    assert_null(strstr(got, want));
+}
+
+static void test_a_warning_is_alerted_and_the_job_completes(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (3, 'u-3', '/srv/repos/docs', 'docs', 0)", NULL, NULL), 0);
+    char got[sizeof(g_alert_log)], want[128];
+    int64_t clean = 0, warned = 0;
+
+    /* With Pushover configured: sent, at warning level. */
+    run_warned_pair(1, &clean, &warned, got, sizeof(got));
+    snprintf(want, sizeof(want), "warning sending warning notification for job %lld:",
+             (long long)warned);
+    assert_non_null(strstr(got, want));
+
+    /* Without: still logged at warning, and never called "sending"
+     * (NIT-11's rule for the failure alert). */
+    run_warned_pair(0, &clean, &warned, got, sizeof(got));
+    snprintf(want, sizeof(want), "warning warning notification for job %lld not sent, "
+             "Pushover is not configured: ", (long long)warned);
+    assert_non_null(strstr(got, want));
+    assert_null(strstr(got, "sending warning notification"));
+}
+
+static void test_warning_alert_text(void **state)
+{
+    (void)state;
+    assert_int_equal(db_execute_non_query(db,
+        "INSERT INTO repos (id, uuid, path, label, added_at)"
+        " VALUES (7, 'u-7', '/srv/repos/photos', 'photos', 0)", NULL, NULL), 0);
+    char title[250], body[1024];
+    job_warning_compose(db, 7, 44, "backup", "2 file(s) could not be read",
+                        title, sizeof(title), body, sizeof(body));
+    assert_string_equal(title, "c-backup: backup of photos completed with a warning");
+    assert_non_null(strstr(body, "Repository photos (id 7) at /srv/repos/photos"));
+    assert_non_null(strstr(body, "Job 44 (backup) completed with a warning: "
+                                 "2 file(s) could not be read"));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1330,6 +1458,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_shutdown_never_starts_a_queued_job, setup, teardown),
         cmocka_unit_test_setup_teardown(test_full_queue_refuses_and_spares_running_jobs, setup, teardown),
         cmocka_unit_test_setup_teardown(test_alert_names_repository_and_error, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_a_warning_is_alerted_and_the_job_completes, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_warning_alert_text, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_job_waits_for_a_request_holding_the_repo, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_running_job_still_refuses_requests, setup, teardown),
         cmocka_unit_test_setup_teardown(test_a_deferred_job_can_be_cancelled, setup, teardown),

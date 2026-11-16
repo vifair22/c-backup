@@ -884,20 +884,26 @@ status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
                       const obj_sink_t *sink, const cdc_opts_t *opts,
                       cdc_result_t *out)
 {
-    fd_src_t f;
-    memset(&f, 0, sizeof(f));
-    f.fd = fd;
-    f.sp.fd = fd;
-    f.sp.size = size;
+    /*
+     * On the heap: the read-ahead ring holds an error message per slot, and
+     * at ERR_MSG_MAX (8 KiB since B121) eight of them alone took this frame
+     * past the 64 KiB stack limit (make analyze).
+     */
+    fd_src_t *f = calloc(1, sizeof(*f));
+    if (!f) return set_error(ERR_NOMEM, "cdc: file source");
+    f->fd = fd;
+    f->sp.fd = fd;
+    f->sp.size = size;
     if (size >= CDC_HOLE_MIN) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     /* Memory-backed: every read is a copy already, and read-ahead would add
      * another one for nothing (a quarter slower, measured on tmpfs). */
     struct statfs sfs;
-    f.ra_ok = !(fstatfs(fd, &sfs) == 0 &&
-                (sfs.f_type == TMPFS_MAGIC || sfs.f_type == RAMFS_MAGIC));
-    cdc_source_t src = { .next_span = fd_next_span, .read = fd_read, .ctx = &f };
+    f->ra_ok = !(fstatfs(fd, &sfs) == 0 &&
+                 (sfs.f_type == TMPFS_MAGIC || sfs.f_type == RAMFS_MAGIC));
+    cdc_source_t src = { .next_span = fd_next_span, .read = fd_read, .ctx = f };
     status_t st = cdc_store_source(p, &src, size, sink, opts, out);
-    ra_stop(&f);
+    ra_stop(f);
+    free(f);
     return st;
 }
 

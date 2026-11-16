@@ -159,8 +159,9 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
         return api_error(400, "request body required");
 
     cutils_json_req_t *jr = NULL;
-    if (json_req_parse(req->body, req->body_len, &jr) != 0 || !jr)
-        return api_error(400, "body is not valid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     /*
      * Each field is read for its type as well as its presence. A label of
@@ -422,10 +423,9 @@ static int repo_exists(void *ud, int64_t repo_id)
 static int64_t split_repo_url(const char *url, const char **rest)
 {
     if (strncmp(url, "/repos/", 7) != 0) return -1;
-    const char *p = url + 7;
-    char *end = NULL;
-    long long id = strtoll(p, &end, 10);
-    if (id <= 0 || !end) return -1;
+    int64_t id = 0;
+    const char *end = NULL;
+    if (routes_path_id(url + 7, 1, &id, &end) != 1) return -1;
     if (rest) *rest = end;
     return id;
 }
@@ -445,9 +445,38 @@ static int64_t snap_suffix(const char *rest, const char *suffix)
  * pointer past it, or NULL. */
 static const char *skip_id(const char *p)
 {
-    if (*p < '1' || *p > '9') return NULL;
-    while (*p >= '0' && *p <= '9') p++;
-    return p;
+    int64_t id = 0;
+    const char *end = NULL;
+    return routes_path_id(p, 1, &id, &end) == 1 ? end : NULL;
+}
+
+/*
+ * The id segments under /repos/<id>, and what an unreadable one is called.
+ * Checked before the route table, so a segment that is not an id is a 400
+ * naming the kind of id rather than whatever the table made of it: a
+ * 20-digit snapshot id was a 405 and 1e999 a 404 (NIT-8).
+ */
+static int repo_path_bad_id(const char *rest, api_response_t *out)
+{
+    static const struct { const char *prefix; int64_t min; const char *msg; } ids[] = {
+        { "/snapshots/", 1, "invalid snapshot id" },
+        { "/schedules/", 1, "invalid schedule id" },
+        { "/grep/",      1, "invalid grep run id" },
+        { "/verify/",    1, "invalid verify run id" },
+        /* Pack numbers start at 0, unlike every other id here. */
+        { "/packs/",     0, "invalid pack id" },
+    };
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        size_t n = strlen(ids[i].prefix);
+        if (strncmp(rest, ids[i].prefix, n) != 0) continue;
+        int64_t id = 0;
+        if (routes_path_id(rest + n, ids[i].min, &id, NULL) < 0) {
+            *out = api_error(400, ids[i].msg);
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 /*
@@ -502,11 +531,10 @@ static const char *repo_path_allow(const char *rest)
     if (strncmp(rest, "/verify/", 8) == 0 &&
         (e = skip_id(rest + 8)) && *e == '\0') return "GET";
     /* Pack numbers start at 0, unlike every other id here. */
-    if (strncmp(rest, "/packs/", 7) == 0 && rest[7] >= '0' && rest[7] <= '9') {
-        e = rest + 7;
-        while (*e >= '0' && *e <= '9') e++;
-        if (strcmp(e, "/entries") == 0) return "GET";
-    }
+    int64_t pnum = 0;
+    if (strncmp(rest, "/packs/", 7) == 0 &&
+        routes_path_id(rest + 7, 0, &pnum, &e) == 1 && strcmp(e, "/entries") == 0)
+        return "GET";
     if (strncmp(rest, "/objects/", 9) == 0 && rest[9] && rest[9] != '/') {
         const char *slash = strchr(rest + 9, '/');
         if (!slash || strcmp(slash, "/refs") == 0 || strcmp(slash, "/layout") == 0 ||
@@ -540,6 +568,7 @@ static int allow_has(const char *allow, const char *method)
 static int repo_path_refused(const char *rest, const char *method,
                              api_response_t *out)
 {
+    if (repo_path_bad_id(rest, out)) return 1;
     const char *allow = repo_path_allow(rest);
     if (!allow) { *out = api_error(404, "not found"); return 1; }
     if (!allow_has(allow, method)) { *out = api_method_not_allowed(allow); return 1; }
@@ -631,8 +660,9 @@ static api_response_t key_import(const api_request_t *req, int64_t repo_id)
         return api_error(400, "key is required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *jr = NULL;
-    if (json_req_parse(req->body, req->body_len, &jr) != 0 || !jr)
-        return api_error(400, "body is not valid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &jr, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     char *hex = NULL;
     jreq_err_t je;

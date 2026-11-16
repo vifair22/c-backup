@@ -30,11 +30,12 @@
  * breaking - see the note on manifest_serialise.
  */
 #define MANIFEST_TREE_MAGIC   0x52544243u   /* "CBTR" little-endian */
-#define MANIFEST_TREE_VERSION 2u
+/* 3: a flags byte ends each entry's fixed part (MANIFEST_FLAG_*). */
+#define MANIFEST_TREE_VERSION 3u
 
 /* Fixed-width part of one entry. */
 #define MANIFEST_FIXED (2u + 2u + 1u + 4u + 4u + 4u + 8u + 8u + 8u + 8u \
-                        + 4u + 4u + 3u * OBJECT_HASH_SIZE)
+                        + 4u + 4u + 3u * OBJECT_HASH_SIZE + 1u)
 
 typedef struct {
     uint8_t *buf;
@@ -206,9 +207,44 @@ static void serialise_run(sbuf_t *b, const manifest_entry_t *entries,
         put_bytes(b, e->target_hash, OBJECT_HASH_SIZE);
         put_bytes(b, e->xattr_hash,  OBJECT_HASH_SIZE);
         put_bytes(b, e->acl_hash,    OBJECT_HASH_SIZE);
+        put_u8 (b, e->flags);
         if (e->name_len) put_bytes(b, e->name, e->name_len);
         if (e->link_target_len) put_bytes(b, e->link_target, e->link_target_len);
     }
+}
+
+/*
+ * A regular file with no content is a file no restore can produce, and a
+ * tree is permanent: once written, every snapshot naming it carries the
+ * hole, and verify passed over it because nothing it reads is damaged
+ * (B118). Backup leaves an unreadable file out of the tree instead; this is
+ * the backstop for any writer that forgets to. Every regular file names a
+ * FILE object or a CHUNKLIST, an empty one included (the chunker stores an
+ * empty FILE object for it), so an all-zero hash is never one; which of the
+ * two it names is verify's to check, since only the store knows.
+ */
+static status_t refuse_contentless(const manifest_entry_t *entries, uint32_t count)
+{
+    static const uint8_t zero[OBJECT_HASH_SIZE] = { 0 };
+    for (uint32_t i = 0; i < count; i++) {
+        if (entries[i].type == NODE_TYPE_REG &&
+            memcmp(entries[i].target_hash, zero, OBJECT_HASH_SIZE) == 0)
+            return set_error(ERR_INVALID,
+                             "manifest: file entry '%.*s' has no content hash; "
+                             "refusing to write a tree that cannot be restored",
+                             (int)entries[i].name_len,
+                             entries[i].name ? entries[i].name : "");
+        /* What manifest_parse would refuse is never written. */
+        if ((entries[i].flags & ~MANIFEST_FLAGS_KNOWN) != 0 ||
+            (entries[i].flags && entries[i].type != NODE_TYPE_REG))
+            return set_error(ERR_INVALID,
+                             "manifest: entry '%.*s' carries flags 0x%02x its "
+                             "type %u cannot have",
+                             (int)entries[i].name_len,
+                             entries[i].name ? entries[i].name : "",
+                             entries[i].flags, entries[i].type);
+    }
+    return OK;
 }
 
 status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
@@ -216,6 +252,9 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
 {
     if (!out_buf || !out_len) return set_error(ERR_INVALID, "manifest_serialise: null out");
     if (count > 0 && !entries) return set_error(ERR_INVALID, "manifest_serialise: null entries");
+
+    status_t rst = refuse_contentless(entries, count);
+    if (rst != OK) return rst;
 
     qsort(entries, count, sizeof(*entries), entry_cmp);
 
@@ -259,6 +298,8 @@ status_t manifest_store_tree(manifest_entry_t *entries, uint32_t count,
         return set_error(ERR_INVALID, "manifest_store_tree: bad arguments");
     if (count > 0 && !entries)
         return set_error(ERR_INVALID, "manifest_store_tree: null entries");
+    status_t rst = refuse_contentless(entries, count);
+    if (rst != OK) return rst;
     manifest_store_stats_t local;
     memset(&local, 0, sizeof(local));
     if (!stats) stats = &local;
@@ -407,6 +448,17 @@ status_t manifest_parse(const void *buf, size_t len,
         memcpy(e->target_hash, p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->xattr_hash,  p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
         memcpy(e->acl_hash,    p + off, OBJECT_HASH_SIZE); off += OBJECT_HASH_SIZE;
+        e->flags           = p[off];          off += 1;
+        /* Canonical form: no bit this build does not know, and none on
+         * anything but a regular file, so one entry has one encoding. */
+        if ((e->flags & ~MANIFEST_FLAGS_KNOWN) != 0 ||
+            (e->flags && e->type != NODE_TYPE_REG)) {
+            /* Read before the entries, e among them, are freed. */
+            unsigned bad_flags = e->flags, bad_type = e->type;
+            manifest_free_entries(out, count);
+            return set_error(ERR_CORRUPT, "manifest_parse: entry flags 0x%02x "
+                             "on type %u are not valid", bad_flags, bad_type);
+        }
 
         /* Both lengths are 16-bit and off is size_t, so this cannot wrap. */
         if (off + e->name_len + e->link_target_len > len) goto corrupt;

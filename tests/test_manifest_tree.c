@@ -97,6 +97,87 @@ static void test_roundtrip(void **state)
     manifest_free_entries(out, n);
 }
 
+/*
+ * B118's backstop: a regular file with no content is refused, never written.
+ * A tree is permanent and every snapshot naming it would carry an entry no
+ * restore can produce. Other types legitimately have a zero target: a
+ * symlink's payload is its target string, a device node's its numbers.
+ */
+/*
+ * OWN-45-LIVE: the "never settled, may be torn" flag is a byte at the end
+ * of an entry's fixed part. It round-trips, sits where the format says,
+ * changes the tree's bytes (it is a property of what was stored), and only
+ * a regular file may carry it, on write and on read.
+ */
+static void test_unsettled_flag_round_trips_and_is_canonical(void **state)
+{
+    (void)state;
+    manifest_entry_t e[2] = { mk("calm", NODE_TYPE_REG, 1), mk("torn", NODE_TYPE_REG, 2) };
+    e[1].flags = MANIFEST_FLAG_UNSETTLED;
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    assert_int_equal(manifest_serialise(e, 2, &buf, &len), OK);
+
+    /* header 10 bytes; the flags byte closes the fixed part, before the
+     * name. Entries sort by name, so "calm" is first. */
+    const size_t fixed = 2 + 2 + 1 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 3 * OBJECT_HASH_SIZE + 1;
+    assert_int_equal(buf[10 + fixed - 1], 0);
+    assert_int_equal(buf[10 + fixed + 4 + fixed - 1], MANIFEST_FLAG_UNSETTLED);
+
+    manifest_entry_t *out = NULL;
+    uint32_t n = 0;
+    assert_int_equal(manifest_parse(buf, len, &out, &n), OK);
+    assert_int_equal(n, 2);
+    assert_int_equal(out[0].flags, 0);
+    assert_int_equal(out[1].flags, MANIFEST_FLAG_UNSETTLED);
+    manifest_free_entries(out, n);
+
+    /* The same entries without the flag are a different tree. */
+    uint8_t *plain = NULL;
+    size_t plen = 0;
+    e[1].flags = 0;
+    assert_int_equal(manifest_serialise(e, 2, &plain, &plen), OK);
+    assert_int_equal(plen, len);
+    assert_memory_not_equal(plain, buf, len);
+    free(plain);
+
+    /* A bit nobody knows, or a flag on a directory, is not canonical: read
+     * as corrupt, and never written. */
+    buf[10 + fixed + 4 + fixed - 1] = 0x80;
+    assert_int_equal(manifest_parse(buf, len, &out, &n), ERR_CORRUPT);
+    free(buf);
+    manifest_entry_t d = mk("dir", NODE_TYPE_DIR, 0);
+    d.flags = MANIFEST_FLAG_UNSETTLED;
+    err_clear();
+    assert_int_equal(manifest_serialise(&d, 1, &buf, &len), ERR_INVALID);
+    e[1].flags = 0x02;
+    assert_int_equal(manifest_serialise(e, 2, &buf, &len), ERR_INVALID);
+    err_clear();
+}
+
+static void test_file_entry_without_content_is_refused(void **state)
+{
+    (void)state;
+    manifest_entry_t e[2] = { mk("ok", NODE_TYPE_REG, 1), mk("hole", NODE_TYPE_REG, 2) };
+    memset(e[1].target_hash, 0, OBJECT_HASH_SIZE);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    err_clear();
+    assert_int_equal(manifest_serialise(e, 2, &buf, &len), ERR_INVALID);
+    assert_null(buf);
+    assert_non_null(strstr(err_msg(), "'hole' has no content hash"));
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(manifest_write_tree(store, e, 2, h), ERR_INVALID);
+    err_clear();
+
+    manifest_entry_t s = mk("link", NODE_TYPE_SYMLINK, 4);
+    memset(s.target_hash, 0, OBJECT_HASH_SIZE);
+    s.link_target = "dest";
+    s.link_target_len = 4;
+    assert_int_equal(manifest_serialise(&s, 1, &buf, &len), OK);
+    free(buf);
+}
+
 /* The same directory serialised twice must be byte-identical. */
 static void test_serialisation_is_stable(void **state)
 {
@@ -605,6 +686,8 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_serialisation_is_stable, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_entry_without_content_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_unsettled_flag_round_trips_and_is_canonical, setup, teardown),
         cmocka_unit_test_setup_teardown(test_mtime_is_signed_without_changing_the_bytes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_input_order_does_not_matter, setup, teardown),
         cmocka_unit_test_setup_teardown(test_duplicate_names_still_order_deterministically, setup, teardown),

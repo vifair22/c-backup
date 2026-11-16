@@ -127,6 +127,8 @@ typedef struct {
     uint8_t  acl_hash[OBJECT_HASH_SIZE];
     uint32_t link_count;
     uint64_t inode_identity;
+    /* MANIFEST_FLAG_* for the tree entry; set by the backup, never the scan. */
+    uint8_t  flags;
     union {
         struct {
             uint32_t major;

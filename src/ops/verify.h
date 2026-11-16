@@ -53,6 +53,9 @@ typedef struct {
      * paths, and distinct snapshots holding any of them. */
     uint64_t affected_files;
     uint64_t affected_snapshots;
+    /* File entries stored while still changing (OWN-45-LIVE), reported as a
+     * notice finding. Not loss: they never fail the run. */
+    uint64_t unsettled_files;
     int64_t  run_id;
 } verify_result_t;
 

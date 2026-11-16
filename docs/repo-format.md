@@ -429,7 +429,7 @@ through explicit helpers:
 | Field | Type | Bound |
 |-------|------|-------|
 | magic | u32 | `CBTR` |
-| version | u16 | 2 |
+| version | u16 | 3 (a reader refuses any other) |
 | count | u32 | entries in this directory or fragment |
 | per entry: name_len, link_len | u16 each | NAME_MAX 255; readlink buffer 4,095 |
 | type | u8 | NODE_TYPE_* |
@@ -440,6 +440,18 @@ through explicit helpers:
 | inode_identity | u64 | FNV-1a of (st_dev, st_ino): hard-link identity |
 | dev_major, dev_minor | u32 each | device nodes only |
 | target, xattr, acl | 32-byte names | content (or subtree) name, blob names |
+| flags | u8 | `MANIFEST_FLAG_*`; regular files only, unknown bits refused |
+| name, link target | name_len, link_len bytes | |
+
+`flags` bit 0, `MANIFEST_FLAG_UNSETTLED`, means the file was still changing
+on the backup's second read of it and was stored as that read found it
+(OWN-45-LIVE, `backup.unsettled: store`, the default): the bytes are all
+bytes the file held, but may mix two versions of it, so restore warns for
+it and verify reports it as a notice. It is a property of what was stored
+under the entry, not of the snapshot, and the index carries it as
+`nodes.flags`, so a reindex brings it back. Version 3 added the byte; a
+version 2 tree is refused, as format 3 is not frozen and no released build
+wrote one.
 
 XATTR record: name_len u16 (including NUL), name, value_len u32, value; one
 per attribute, sorted by name. ACL record: kind u8, text_len u32 (including
@@ -467,6 +479,10 @@ The rules exist for that reason:
   indexer and live only in the database.
 - `inode_identity` stays, because hard-link identity is not the same as
   identical content, and it is stable across backups of the same filesystem.
+- `flags` describes the stored content, so it is deterministic too: the same
+  bytes stored the same way serialise identically. A file flagged as
+  unsettled in one snapshot and stored cleanly in the next is two entries,
+  and its directory two trees, which is the truth.
 
 `tests/test_manifest_tree.c` asserts that writing the same tree twice stores
 zero new objects. That test is the canary for the entire scheme.
@@ -632,6 +648,16 @@ separate path: it is the chunk list with one entry and no holes, stored as
 that entry.
 
 `OBJECT_TYPE_SPARSE` (4) is retired in format 3. Its number is not reused.
+
+**Every file entry has content.** A regular-file entry always names a
+`FILE` object or a `CHUNKLIST` with `FILE` leaves, an empty file included
+(an empty `FILE` object), so its hash is never all zeroes. The tree writer
+refuses an entry that breaks that, on both paths (`manifest_serialise` and
+`manifest_store_tree`), and a backup leaves a file it could not read out of
+the tree instead (B118). Verify reports a file entry whose hash names
+nothing, or names an object of another type, as `missing: file entry has no
+content`; restore fails such an entry by name. Symlinks, device nodes,
+FIFOs and sockets have no content object and carry a zero hash by design.
 
 ### Holes
 

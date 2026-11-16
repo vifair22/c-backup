@@ -57,6 +57,14 @@ typedef struct {
      */
     uint8_t *hashes;
     size_t   stride;
+    /*
+     * Optional: where entry i's skip flag lives, skipped + i * stride (the
+     * same stride as hashes), non-zero for an entry to leave out of every
+     * tree. A backup sets it for a regular file it could not read (B118):
+     * an entry with no content is a file no restore can produce. NULL
+     * leaves nothing out.
+     */
+    const int *skipped;
 } tree_build_ops_t;
 
 typedef struct {
