@@ -201,7 +201,9 @@ multi-gigabyte file in progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
 restart; a backup skips what it already stored, a restore skips the files it
-finished and redoes the one it was inside. `c-backup jobs cancel <id>` is the
+finished and redoes the one it was inside (a stop renames every file the
+restore has verified into place before the job ends, so finished means
+verified). `c-backup jobs cancel <id>` is the
 same cancellation for one job, and prints the job record with `"cancel_requested":true`. A job still
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
@@ -215,6 +217,14 @@ those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup or gc, which hold the repository's write
 lock and so know nothing else is writing there; opening a repository also
 removes any an hour old.
+
+A restore killed this way redoes more than the file it was inside. Verified
+files wait under temporary names (`.c-backup-partial.XXXXXX`) until one
+`syncfs` makes a batch of them durable and they are renamed into place, a
+batch being up to 512 files or 256 MiB; a kill before that leaves the batch
+under its temporary names. The rerun removes them and restores those files
+again, so it can redo up to a whole batch of files that had finished. What
+it never does is leave a right-named file with the wrong contents.
 
 ### 2.3 Docker
 
