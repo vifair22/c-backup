@@ -2446,6 +2446,81 @@ status_t object_read_stored(store_t *store,
     return OK;
 }
 
+struct object_stored_reader {
+    FILE    *f;          /* positioned at the next payload byte */
+    uint64_t remaining;
+};
+
+status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                            object_stored_info_t *out_info, uint64_t *out_len,
+                            object_stored_reader_t **out)
+{
+    if (!store || !hash || !out_info || !out_len || !out)
+        return set_error(ERR_INVALID, "object_stored_open: null argument");
+
+    object_stored_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "object_stored_open: alloc");
+
+    char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
+    hash_to_path(hash, subdir, fname);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/objects/%s/%s", store_root(store), subdir, fname);
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        status_t st = pack_object_open_stored(store, hash, &out_info->type,
+                                              &out_info->compression,
+                                              &out_info->encryption,
+                                              &out_info->uncompressed_size,
+                                              &r->remaining, &r->f);
+        if (st != OK) { free(r); return st; }
+        *out_len = r->remaining;
+        *out = r;
+        return OK;
+    }
+
+    /* read_object_header refuses a payload longer than the file, so the
+     * reads below cannot be sent past the object. */
+    object_header_t hdr;
+    status_t hst = read_object_header(fd, &hdr);
+    if (hst != OK) { close(fd); free(r); return hst; }
+
+    r->f = fdopen(fd, "rb");
+    if (!r->f) {
+        close(fd);
+        free(r);
+        return set_error_errno(ERR_IO, "object_stored_open: fdopen(%s)", path);
+    }
+    r->remaining = hdr.compressed_size;
+
+    out_info->type              = hdr.type;
+    out_info->compression       = hdr.compression;
+    out_info->encryption        = hdr.encryption;
+    out_info->uncompressed_size = hdr.uncompressed_size;
+    *out_len = r->remaining;
+    *out = r;
+    return OK;
+}
+
+status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n)
+{
+    if (!r || (!buf && n)) return set_error(ERR_INVALID, "object_stored_read: null argument");
+    if ((uint64_t)n > r->remaining)
+        return set_error(ERR_INVALID, "object_stored_read: %zu bytes asked for, %llu left",
+                         n, (unsigned long long)r->remaining);
+    if (n && fread(buf, 1, n, r->f) != n)
+        return set_error(ERR_CORRUPT, "object_stored_read: short read");
+    r->remaining -= n;
+    return OK;
+}
+
+void object_stored_close(object_stored_reader_t *r)
+{
+    if (!r) return;
+    if (r->f) fclose(r->f);
+    free(r);
+}
+
 status_t object_get_info(store_t *store,
                          const uint8_t hash[OBJECT_HASH_SIZE],
                          uint64_t *out_size, uint8_t *out_type) {

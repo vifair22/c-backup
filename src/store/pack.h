@@ -4,6 +4,7 @@
 #include "store.h"
 #include "object.h"
 #include "progress.h"
+#include <stdio.h>
 #include <stdint.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
@@ -138,6 +139,19 @@ status_t pack_object_read_stored(store_t *store,
                                  void **out_payload, size_t *out_len);
 
 /*
+ * Open a packed object's entry for reading as stored, without loading it.
+ * On OK, *out_f is positioned at the first payload byte and holds *out_len
+ * of them; the caller reads and fcloses it. object_stored_open is the
+ * caller and the only one that should be.
+ */
+status_t pack_object_open_stored(store_t *store,
+                                 const uint8_t hash[OBJECT_HASH_SIZE],
+                                 uint8_t *out_type, uint8_t *out_compression,
+                                 uint8_t *out_encryption,
+                                 uint64_t *out_uncompressed_size,
+                                 uint64_t *out_len, FILE **out_f);
+
+/*
  * Write a pack out of objects that are already in stored form.
  *
  * Everything repo_pack does on the way in - decrypt, probe, compress,
@@ -165,6 +179,39 @@ status_t pack_stored_add(pack_stored_writer_t *w,
                          uint8_t type, uint8_t compression, uint8_t encryption,
                          uint64_t uncompressed_size,
                          const void *payload, size_t len);
+
+/*
+ * The same entry, with its len stored bytes pulled through read in bounded
+ * chunks instead of handed over in one buffer.
+ *
+ * This is the form replication uses, because an object can be larger than
+ * the memory of the machine moving it (design constraint 2): the writer
+ * holds one chunk at a time, never the payload. rd must fill exactly the
+ * n bytes it is asked for or fail; it is never asked for more than len in
+ * total. Its buffer is the writer's and may be transformed in place.
+ *
+ * A failure part-way - read returning an error, or a short write - takes
+ * the entry back out: the staging file is cut back to where the entry
+ * began, so the writer stays usable and a later finish installs only whole
+ * entries. If even that cut fails, the writer refuses everything after,
+ * and finish fails instead of installing a pack with a torn entry in it.
+ * rd's own error message is left as the one reported.
+ */
+typedef status_t (*pack_stored_read_fn)(void *ctx, void *buf, size_t n);
+
+status_t pack_stored_add_stream(pack_stored_writer_t *w,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint8_t type, uint8_t compression,
+                                uint8_t encryption, uint64_t uncompressed_size,
+                                uint64_t len, pack_stored_read_fn rd,
+                                void *rd_ctx);
+
+/* The most pack_stored_add_stream holds of an entry at once. */
+#define PACK_STORED_CHUNK_DEFAULT ((size_t)1024 * 1024)
+
+/* Test hook: lower the chunk so a few-MiB object crosses many chunk
+ * boundaries. 0 restores the default. Process-wide; not for production. */
+void pack_stored_set_chunk(size_t bytes);
 
 /* Has this writer already staged that hash in the current pack? Objects not
  * yet finalised are invisible to any lookup that reads the repository. */

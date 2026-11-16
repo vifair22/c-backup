@@ -95,15 +95,30 @@
  * exactly what a loose object header and a pack entry header both carry -
  * the two on-disk forms differ in layout, not in content, so a target can
  * store what it receives in whichever form it likes.
+ *
+ * The payload is pulled, not handed over. An object can be larger than the
+ * memory of either machine (design constraint 2), so a sink that takes it
+ * calls read for as many pieces as it likes, each filled exactly or
+ * failed, until payload_len bytes have arrived - and holds one piece at a
+ * time, never the object. read may be called only from inside put_object
+ * and never for more than payload_len in total. A sink that already holds
+ * the hash returns without reading at all.
+ *
+ * A read failure is the transfer failing part-way: the sink must discard
+ * what it took of that object and pass the status up, so the snapshot
+ * gets no record.
  */
+typedef status_t (*replica_read_fn)(void *ctx, void *buf, size_t n);
+
 typedef struct {
-    uint8_t     hash[OBJECT_HASH_SIZE];
-    uint8_t     type;
-    uint8_t     compression;
-    uint8_t     encryption;
-    uint64_t    uncompressed_size;
-    const void *payload;      /* compressed then encrypted, tag included */
-    size_t      payload_len;
+    uint8_t         hash[OBJECT_HASH_SIZE];
+    uint8_t         type;
+    uint8_t         compression;
+    uint8_t         encryption;
+    uint64_t        uncompressed_size;
+    uint64_t        payload_len;  /* compressed then encrypted, tag included */
+    replica_read_fn read;
+    void           *read_ctx;
 } replica_object_t;
 
 /*
