@@ -25,6 +25,13 @@ typedef struct {
     uint8_t *acl_data;
     size_t   acl_len;
     struct stat st;             /* original stat result */
+    /* Where the content is read from when that is not `path`: a unit's
+     * TREE item read through a filesystem snapshot and recorded at its
+     * original path (scan_tree_as). NULL for every ordinary entry. */
+    char    *read_path;
+    /* An entry with no file behind it (scan_add_synthetic): its content
+     * comes from the caller, never from the filesystem. */
+    int      synthetic;
 } scan_entry_t;
 
 typedef struct {
@@ -73,5 +80,31 @@ typedef struct {
  */
 status_t scan_tree(const char *root, scan_imap_t *imap,
                    const scan_opts_t *opts, scan_result_t **out);
+
+/*
+ * scan_tree reading under read_root and recording every entry under
+ * record_root instead (source-providers.md 4.3): a container volume read
+ * from a filesystem snapshot is recorded at the path the container binds.
+ * Each entry's path is the record path and its read_path the real one; the
+ * ancestors synthesised above the root are record_root's, taken from the
+ * host where they exist and made up (0755, root, mtime 0) where they do
+ * not. Excludes match the paths as read. Both roots absolute.
+ */
+status_t scan_tree_as(const char *read_root, const char *record_root,
+                      scan_imap_t *imap, const scan_opts_t *opts,
+                      scan_result_t **out);
+
+/*
+ * Append an entry with no file behind it: a unit snapshot's metadata under
+ * .cbackup-unit/ (source-providers.md 7.2). path is absolute; node gives
+ * type, mode, owner, size and mtime (node_id and inode_identity are
+ * assigned here, inode_identity 0 so no two synthetic files are taken for
+ * hard links). Missing ancestor directories are synthesised as 0700, root,
+ * mtime 0, so the serialised trees are the same every session. *res may be
+ * NULL and is created. *out_index (may be NULL) gets the entry's index.
+ */
+status_t scan_add_synthetic(scan_result_t **res, scan_imap_t *imap,
+                            const char *path, const node_t *node,
+                            uint32_t *out_index);
 status_t scan_entry_collect_metadata(scan_entry_t *e);
 void     scan_result_free(scan_result_t *res);

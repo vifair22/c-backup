@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "scan.h"
+#include "reserved.h"
 #include "util.h"
 #include <cutils/log.h>
 
@@ -411,6 +412,15 @@ status_t scan_entry_collect_metadata(scan_entry_t *e) {
  * part of the options.
  */
 
+/*
+ * The directory being walked whose recorded path is `/`, if any: `/` itself
+ * for an ordinary scan, the read root for scan_tree_as onto `/`. Children of
+ * it with a reserved name (reserved.h) are dropped. Thread-local and set
+ * around one walk, rather than threaded through the recursion or stored in
+ * scan_opts_t, which is input only (CLAUDE.md, the root_dev trap).
+ */
+static _Thread_local const char *tl_top_read;
+
 /* Forward declaration */
 static status_t scan_dir(const char *path, uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
@@ -698,6 +708,19 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         memcpy(child, path, plen);
         child[plen] = '/';
         memcpy(child + plen + 1, batch[i].name, nlen + 1);
+        /* A source of `/` walks into every top-level name, including the
+         * ones reserved for the daemon (reserved.h). A file snapshot must
+         * never carry them, or data could pass for a unit's metadata. */
+        if (tl_top_read && strcmp(path, tl_top_read) == 0 &&
+            reserved_top_name(batch[i].name)) {
+            char msg[PATH_MAX + 128];
+            snprintf(msg, sizeof(msg), "refusing /%s: the name is reserved for the "
+                     "daemon in every snapshot root; it is not backed up",
+                     batch[i].name);
+            scan_warn(res, msg);
+            log_error("%s", msg);
+            continue;
+        }
         if (is_excluded(child, opts)) continue;
         st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts,
                            root_dev, res);
@@ -706,8 +729,12 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
     return st;
 }
 
-status_t scan_tree(const char *root, scan_imap_t *imap,
-                   const scan_opts_t *opts, scan_result_t **out) {
+/* record: whose ancestors are synthesised above the root; root itself for
+ * an ordinary scan. The entries are rewritten to it by scan_tree_as. */
+static status_t scan_tree_impl(const char *root, const char *record,
+                               scan_imap_t *imap, const scan_opts_t *opts,
+                               scan_result_t **out) {
+    int as = strcmp(root, record) != 0;
     scan_result_t *res = calloc(1, sizeof(*res));
     if (!res) return set_error(ERR_NOMEM, "scan_tree: alloc result failed");
 
@@ -737,8 +764,8 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     dev_t root_dev = (opts && opts->one_filesystem) ? root_st.st_dev : 0;
 
     uint64_t root_parent_id = 0;
-    if (root[0] == '/' && strip_prefix_len == 1) {
-        const char *rel = root + 1; /* no leading slash */
+    if (record[0] == '/' && strip_prefix_len == 1) {
+        const char *rel = record + 1; /* no leading slash */
         size_t len = strlen(rel);
         while (len > 1 && rel[len - 1] == '/') len--;
 
@@ -763,7 +790,15 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
                 break;
 
             struct stat st;
-            if (lstat(abs_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            if (lstat(abs_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                if (!as) continue;
+                /* A recorded root's ancestors need not exist here: the
+                 * data was read from somewhere else. Made up, the same
+                 * every time, so the trees above it serialise alike. */
+                memset(&st, 0, sizeof(st));
+                st.st_mode = S_IFDIR | 0755;
+                st.st_nlink = 2;
+            }
 
             scan_entry_t e = {0};
             e.path = strdup(abs_path);
@@ -819,11 +854,119 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     }
 
     uint32_t before = res->count;
+    const char *prev_top = tl_top_read;
+    tl_top_read = strcmp(record, "/") == 0 ? root : NULL;
     status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts,
                                 root_dev, res);
+    tl_top_read = prev_top;
     if (st != OK) { scan_result_free(res); return st; }
     res->root_entries = res->count - before;
+
+    /* Every entry the walk produced moves to the record root; the path it
+     * was found at is kept for reading. */
+    if (as) {
+        size_t rlen = strlen(root), clen = strlen(record);
+        while (rlen > 1 && root[rlen - 1] == '/') rlen--;
+        while (clen > 1 && record[clen - 1] == '/') clen--;
+        for (uint32_t i = before; i < res->count; i++) {
+            scan_entry_t *e = &res->entries[i];
+            if (strncmp(e->path, root, rlen) != 0) continue;
+            const char *tail = e->path + rlen;
+            size_t tl = strlen(tail);
+            /* Onto `/`: the tail already starts with the separator. */
+            size_t cl = (clen == 1 && tl > 0) ? 0 : clen;
+            char *np = malloc(cl + tl + 1);
+            if (!np) { scan_result_free(res); return set_error(ERR_NOMEM, "scan_tree_as: path"); }
+            memcpy(np, record, cl);
+            memcpy(np + cl, tail, tl + 1);
+            e->read_path = e->path;
+            e->path = np;
+        }
+    }
     *out = res;
+    return OK;
+}
+
+status_t scan_tree(const char *root, scan_imap_t *imap,
+                   const scan_opts_t *opts, scan_result_t **out) {
+    return scan_tree_impl(root, root, imap, opts, out);
+}
+
+status_t scan_tree_as(const char *read_root, const char *record_root,
+                      scan_imap_t *imap, const scan_opts_t *opts,
+                      scan_result_t **out) {
+    if (!read_root || !record_root || read_root[0] != '/' || record_root[0] != '/')
+        return set_error(ERR_INVALID, "scan_tree_as: roots must be absolute");
+    return scan_tree_impl(read_root, record_root, imap, opts, out);
+}
+
+status_t scan_add_synthetic(scan_result_t **resp, scan_imap_t *imap,
+                            const char *path, const node_t *node,
+                            uint32_t *out_index) {
+    if (!path || path[0] != '/' || !path[1] || !node)
+        return set_error(ERR_INVALID, "scan_add_synthetic: bad path");
+    scan_result_t *res = *resp;
+    if (!res) {
+        if (!(res = calloc(1, sizeof(*res))))
+            return set_error(ERR_NOMEM, "scan_add_synthetic: result");
+        *resp = res;
+    }
+
+    /* Ancestors, through the same map ordinary roots use, so a synthetic
+     * directory is created once however many entries live under it. */
+    uint64_t parent = 0;
+    const char *rel = path + 1;
+    size_t len = strlen(rel);
+    for (size_t i = 0; i < len; i++) {
+        if (rel[i] != '/') continue;
+        char prel[PATH_MAX];
+        if (i == 0 || i >= sizeof(prel)) return set_error(ERR_INVALID, "scan_add_synthetic: bad path");
+        memcpy(prel, rel, i);
+        prel[i] = '\0';
+        uint64_t have = dirmap_get(imap, prel);
+        if (have) { parent = have; continue; }
+        scan_entry_t e = {0};
+        char abs_path[PATH_MAX + 2];
+        if (snprintf(abs_path, sizeof(abs_path), "/%s", prel) >= (int)sizeof(abs_path))
+            return set_error(ERR_INVALID, "scan_add_synthetic: path too long");
+        if (!(e.path = strdup(abs_path))) return set_error(ERR_NOMEM, "scan_add_synthetic");
+        e.parent_node_id = parent;
+        e.strip_prefix_len = 1;
+        e.synthetic = 1;
+        e.st.st_mode = S_IFDIR | 0700;
+        e.st.st_nlink = 2;
+        e.node.node_id = imap->next_node_id++;
+        e.node.type = NODE_TYPE_DIR;
+        e.node.mode = S_IFDIR | 0700;
+        e.node.link_count = 2;
+        status_t st = result_append(res, &e, NULL);
+        if (st != OK) { free(e.path); return st; }
+        if (dirmap_set(imap, prel, e.node.node_id) != 0)
+            return set_error(ERR_NOMEM, "scan_add_synthetic: dirmap");
+        parent = e.node.node_id;
+    }
+
+    scan_entry_t e = {0};
+    if (!(e.path = strdup(path))) return set_error(ERR_NOMEM, "scan_add_synthetic");
+    e.parent_node_id = parent;
+    e.strip_prefix_len = 1;
+    e.synthetic = 1;
+    e.node = *node;
+    e.node.node_id = imap->next_node_id++;
+    e.node.inode_identity = 0;
+    e.node.link_count = 1;
+    e.st.st_mode = (mode_t)node->mode;
+    e.st.st_uid = (uid_t)node->uid;
+    e.st.st_gid = (gid_t)node->gid;
+    e.st.st_size = (off_t)node->size;
+    e.st.st_nlink = 1;
+    e.st.st_mtim.tv_sec = (time_t)node->mtime_sec;
+    e.st.st_mtim.tv_nsec = (long)node->mtime_nsec;
+    status_t st = result_append(res, &e, NULL);
+    if (st != OK) { free(e.path); return st; }
+    if (node->type == NODE_TYPE_DIR && dirmap_set(imap, rel, e.node.node_id) != 0)
+        return set_error(ERR_NOMEM, "scan_add_synthetic: dirmap");
+    if (out_index) *out_index = res->count - 1;
     return OK;
 }
 
@@ -834,6 +977,7 @@ void scan_result_free(scan_result_t *res) {
         free(res->entries[i].symlink_target);
         free(res->entries[i].xattr_data);
         free(res->entries[i].acl_data);
+        free(res->entries[i].read_path);
     }
     free(res->entries);
     for (uint32_t i = 0; i < res->warn_count; i++) free(res->warnings[i]);

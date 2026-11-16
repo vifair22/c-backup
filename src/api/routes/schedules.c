@@ -3,6 +3,7 @@
 
 #include "routes.h"
 
+#include "reserved.h"
 #include "scheduler.h"
 #include "trigger.h"
 #include "json_row.h"
@@ -438,6 +439,11 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             if (paths[i][0] != '/') {
                 jreq_strv_free(paths, npaths);
                 return api_error(400, "backup source paths must be absolute");
+            }
+            char rwhy[PATH_MAX + 160];
+            if (reserved_source_refused(paths[i], rwhy, sizeof(rwhy)) != 0) {
+                jreq_strv_free(paths, npaths);
+                return api_error(400, rwhy);
             }
             /* A bare string, which is what the route's own body holds and
              * what the parser on the other side iterates. The element

@@ -21,6 +21,7 @@
 #include "snap_record.h"
 #include "snapshot_ids.h"
 #include "tree_build.h"
+#include "reserved.h"
 
 #include <cutils/log.h>
 
@@ -62,6 +63,8 @@ typedef struct {
     /* Stored although it never settled (OWN-45-LIVE): flagged in the tree,
      * and given no file cache row, so the next backup reads it again. */
     int      unsettled;
+    /* opts->synth index + 1 for a synthetic entry, else 0. */
+    size_t   synth;
 } node_link_t;
 
 /*
@@ -1081,7 +1084,8 @@ static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
     if (!p->sbatch && !(p->sbatch = small_batch_new()))
         return set_error(ERR_NOMEM, "backup: small-file batch");
     const scan_entry_t *e = &p->scan->entries[index];
-    if (small_batch_add(p->sbatch, index, e->path, e->node.size, &e->st))
+    if (small_batch_add(p->sbatch, index, e->read_path ? e->read_path : e->path,
+                        e->node.size, &e->st))
         return small_submit(p, b);
     return OK;
 }
@@ -1138,6 +1142,110 @@ static status_t store_file_cdc(pipeline_t *p, batch_t *b, int fd, uint64_t size,
 }
 
 static status_t store_content_loop(pipeline_t *p);
+
+/*
+ * Synthetic content (a unit's metadata and disks): store_file_cdc over a
+ * chunker source instead of a file. No settling, because there is no file
+ * to change under the read: a disk is read from a point in time the
+ * provider holds, a blob is bytes in memory.
+ */
+static status_t store_source_cdc(pipeline_t *p, batch_t *b, const cdc_source_t *src,
+                                 uint64_t size, cdc_result_t *out)
+{
+    const cdc_params_t *cp = store_cdc(p->store);
+    if (!cp)
+        return set_error(ERR_INVALID, "repository is encrypted and no key is "
+                         "loaded: its chunk boundaries need the key");
+    int large = size > OBJECT_MAX_BYTES;
+    int may_seal = large &&
+        pack_backup_full(p->pack_w, size + size / 4096 + OBJECT_MAX_BYTES);
+    if (may_seal) batch_close(p, b);
+    obj_sink_t sink = { .put = bsink_put, .ctx = p->sink };
+    cdc_opts_t o = {
+        .workers = large ? p->cdc_w : NULL,
+        .cancel = p->opts ? p->opts->cancel : NULL,
+        .cancelled = store_cancelled_cb,
+        .cancelled_ctx = p->store,
+        .progress = store_bytes,
+        .progress_ctx = p,
+    };
+    p->sink->may_rollover = may_seal;
+    status_t st = cdc_store_source(cp, src, size, &sink, &o, out);
+    p->sink->may_rollover = 0;
+    return st;
+}
+
+/*
+ * Every synthetic entry, in the order the caller gave them, before any
+ * regular file: the caller's last entry (unit.json) describes what the
+ * ones before it read, so it is produced after them.
+ */
+static status_t store_synth_all(pipeline_t *p)
+{
+    const backup_opts_t *o = p->opts;
+    if (!o->n_synth) return OK;
+    batch_t *b = &p->batch;
+    memset(b, 0, sizeof(*b));
+    /* One pass to find them: a unit's trees can hold millions of entries. */
+    uint32_t *at = malloc(o->n_synth * sizeof(*at));
+    if (!at) return set_error(ERR_NOMEM, "backup: synthetic entries");
+    for (size_t k = 0; k < o->n_synth; k++) at[k] = UINT32_MAX;
+    for (uint32_t i = 0; i < p->count; i++)
+        if (p->links[i].synth) at[p->links[i].synth - 1] = i;
+    status_t st = OK;
+    for (size_t k = 0; k < o->n_synth && st == OK; k++) {
+        uint32_t i = at[k];
+        if (i == UINT32_MAX) { st = set_error(ERR_INVALID, "backup: synthetic entry lost"); break; }
+        scan_entry_t *e = &p->scan->entries[i];
+        if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
+
+        if (pack_backup_full(p->pack_w, PACK_ENTRY_MAX_BYTES)) {
+            batch_close(p, b);
+            p->timers->txn_site = PHASE_COMMIT_PACK;
+            st = pack_backup_rollover(p->pack_w);
+            p->timers->txn_site = PHASE_COMMIT_STORE;
+            if (st != OK) break;
+        }
+
+        cdc_source_t src;
+        memset(&src, 0, sizeof(src));
+        uint64_t size = 0;
+        st = o->synth_ops->open(o->synth_ops->ctx, k, &src, &size);
+        if (st != OK) break;
+        e->node.size = size;
+        e->st.st_size = (off_t)size;
+
+        cdc_result_t cr;
+        memset(&cr, 0, sizeof(cr));
+        batch_open(p, b);
+        p->file_bytes = 0;
+        p->file_size = size;
+        p->file_index = i;
+        st = store_source_cdc(p, b, &src, size, &cr);
+        p->file_bytes = 0;
+        p->res->objects_new  += cr.chunks_new + cr.lists.lists_new;
+        p->res->bytes_stored += cr.phys_new;
+        if (o->synth_ops->close) o->synth_ops->close(o->synth_ops->ctx, k, st, &cr);
+        if (st != OK) break;
+        memcpy(e->node.content_hash, cr.hash, OBJECT_HASH_SIZE);
+        p->res->files++;
+        p->res->bytes_logical += size;
+        batch_open(p, b);
+        st = bsink_flush(p->sink, 0);
+    }
+    free(at);
+    if (st != OK) {
+        /* Rows of whatever was staged go in with the trees' batch, as a
+         * failed file's do; the caller discards the pack. */
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        batch_close(p, b);
+        set_error(st, "%s", why);
+        return st;
+    }
+    batch_close(p, b);
+    return OK;
+}
 
 /*
  * Content (format 3): every regular file cut into content-defined chunks
@@ -1243,7 +1351,8 @@ static status_t store_content(pipeline_t *p)
     p->sink = sink;
 
     p->timers->txn_site = PHASE_COMMIT_STORE;
-    status_t st = store_content_loop(p);
+    status_t st = store_synth_all(p);
+    if (st == OK) st = store_content_loop(p);
 
     char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", err_msg());
@@ -1356,6 +1465,13 @@ static status_t store_content_loop(pipeline_t *p)
         scan_entry_t *e = &p->scan->entries[i];
         report(p, "store", i, p->count);
 
+        /* Stored before this loop (store_synth_all), or a made-up
+         * directory with nothing to store. */
+        if (e->synthetic) {
+            if (e->node.type == NODE_TYPE_DIR) p->res->dirs++;
+            continue;
+        }
+
         /* Every node type can carry xattrs and ACLs, so their blobs are
          * stored before the type branches below skip non-regular entries.
          * The hashes land in the node and travel into the manifest. */
@@ -1424,9 +1540,13 @@ static status_t store_content_loop(pipeline_t *p)
          * answer instead.
          */
         uint64_t _tc = phase_now();
+        /* Read through a filesystem snapshot: a new device number every
+         * time, the same inodes and times (source-providers.md 4.3). */
+        const char *rpath = e->read_path ? e->read_path : e->path;
+        unsigned ignore = cache_ignore_for(p, rpath, &e->st) |
+                          (e->read_path ? FILE_CACHE_IGNORE_DEV : 0u);
         int cache_hit = file_cache_lookup(p->db, p->repo_id, e->path, &e->st,
-                                          cache_ignore_for(p, e->path, &e->st),
-                                          e->node.content_hash);
+                                          ignore, e->node.content_hash);
         phase_add(p->timers, PHASE_CACHE_LOOKUP, _tc);
         if (cache_hit) {
             /* Nothing is written here on purpose. A hit has to be free, or
@@ -1472,7 +1592,7 @@ static status_t store_content_loop(pipeline_t *p)
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
         /* Never through a symlink (B128): one swapped in for the file
          * since the scan was followed, and stored whatever it named. */
-        int fd = open(e->path, SETTLE_OPEN_FLAGS);
+        int fd = open(rpath, SETTLE_OPEN_FLAGS);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
              * filesystem; it is a warning, not a failed backup. */
@@ -2056,11 +2176,31 @@ static status_t index_nodes(pipeline_t *p, int64_t snap_id)
  */
 static status_t check_sources(const backup_opts_t *opts)
 {
+    /* Synthetic entries live under the unit directory and nowhere else,
+     * and only the unit assembler may ask for them. */
+    if (opts->n_synth && (!opts->unit_snapshot || !opts->synth || !opts->synth_ops ||
+                          !opts->synth_ops->open))
+        return set_error(ERR_INVALID, "synthetic entries are for unit snapshots only");
+    static const char unit_prefix[] = "/" RESERVED_UNIT_DIR "/";
+    for (size_t i = 0; i < opts->n_synth; i++)
+        if (!opts->synth[i].path ||
+            strncmp(opts->synth[i].path, unit_prefix, sizeof(unit_prefix) - 1) != 0 ||
+            strstr(opts->synth[i].path, "/../") || strstr(opts->synth[i].path, "/./"))
+            return set_error(ERR_INVALID, "synthetic entry %s is not under /%s",
+                             opts->synth[i].path ? opts->synth[i].path : "(null)",
+                             RESERVED_UNIT_DIR);
+
     for (int i = 0; i < opts->n_paths; i++) {
-        const char *src = opts->paths[i];
+        const char *rec = opts->paths[i];
+        const char *src = (opts->read_paths && opts->read_paths[i]) ? opts->read_paths[i] : rec;
         struct stat sb;
-        if (!src || !*src)
+        if (!src || !*src || !rec || !*rec)
             return set_error(ERR_INVALID, "source %d is empty; no snapshot written", i + 1);
+        /* The reserved names (reserved.h): whatever reads the data, what
+         * is recorded can never be one of them. */
+        char why[PATH_MAX + 160];
+        if (reserved_source_refused(rec, why, sizeof(why)) != 0)
+            return set_error(ERR_INVALID, "%s; no snapshot written", why);
         if (lstat(src, &sb) != 0)
             return set_error(ERR_INVALID, "source %s cannot be read (%s); "
                              "no snapshot written", src, strerror(errno));
@@ -2087,7 +2227,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 status_t backup_run(store_t *store, cutils_db_t *db, int64_t repo_id,
                     const backup_opts_t *opts, backup_result_t *out)
 {
-    if (!store || !db || !opts || opts->n_paths < 1)
+    if (!store || !db || !opts || (opts->n_paths < 1 && opts->n_synth == 0))
         return set_error(ERR_INVALID, "backup_run: missing store, db or paths");
     /* The routes and the CLI refuse a bad label first, with a 400; this is
      * the engine's own guard, so no caller can reach the record writer or
@@ -2186,7 +2326,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     uint64_t from_sources = 0;
     for (int i = 0; i < opts->n_paths; i++) {
         scan_result_t *part = NULL;
-        st = scan_tree(opts->paths[i], imap, &sopts, &part);
+        const char *rd = (opts->read_paths && opts->read_paths[i]) ? opts->read_paths[i] : NULL;
+        st = (rd && strcmp(rd, opts->paths[i]) != 0)
+            ? scan_tree_as(rd, opts->paths[i], imap, &sopts, &part)
+            : scan_tree(opts->paths[i], imap, &sopts, &part);
         if (st != OK) { scan_result_free(part); break; }
         /* scan_tree always sets part on OK; said here so the contract is
          * checked rather than assumed (gcc's LTO -Wnull-dereference could
@@ -2212,8 +2355,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
             scan_result_free(part);
         }
     }
-    scan_imap_free(imap);
-    if (st != OK) { scan_result_free(scan); return st; }
+    if (st != OK) { scan_imap_free(imap); scan_result_free(scan); return st; }
     /*
      * Count what the sources gave, not what the scan holds. The scan also
      * carries the ancestors of each root (/a and /a/b for a source of
@@ -2221,7 +2363,8 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * leave a few synthesised directories behind and write a snapshot of
      * nothing that reported success. Nothing is written before this.
      */
-    if (!scan || scan->count == 0 || from_sources == 0) {
+    if (opts->n_paths > 0 && (!scan || scan->count == 0 || from_sources == 0)) {
+        scan_imap_free(imap);
         scan_result_free(scan);
         return set_error(ERR_INVALID,
                          "nothing to back up: every source was excluded or "
@@ -2229,15 +2372,42 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                          opts->n_paths, opts->n_paths == 1 ? "" : "s");
     }
 
+    /* Synthetic entries go in after every source, so their directories are
+     * made up only where no source supplied them. */
+    uint32_t *synth_at = NULL;
+    if (opts->n_synth) {
+        synth_at = calloc(opts->n_synth, sizeof(*synth_at));
+        if (!synth_at) st = set_error(ERR_NOMEM, "backup_run: synthetic entries");
+        for (size_t i = 0; st == OK && i < opts->n_synth; i++) {
+            node_t nd;
+            memset(&nd, 0, sizeof(nd));
+            nd.type = NODE_TYPE_REG;
+            nd.mode = S_IFREG | (opts->synth[i].perm & 07777u);
+            nd.uid = opts->synth[i].uid;
+            nd.gid = opts->synth[i].gid;
+            nd.size = opts->synth[i].size;
+            nd.mtime_sec = opts->synth[i].mtime_sec;
+            st = scan_add_synthetic(&scan, imap, opts->synth[i].path, &nd, &synth_at[i]);
+        }
+    }
+    scan_imap_free(imap);
+    if (st != OK || !scan) {
+        free(synth_at);
+        scan_result_free(scan);
+        return st != OK ? st : set_error(ERR_INVALID, "nothing to back up");
+    }
+
     phase_add(&timers, PHASE_SCAN, _tscan);
 
     node_link_t *links = calloc(scan->count, sizeof(*links));
-    if (!links) { scan_result_free(scan); return set_error(ERR_NOMEM, "backup_run: links"); }
+    if (!links) { free(synth_at); scan_result_free(scan); return set_error(ERR_NOMEM, "backup_run: links"); }
     for (uint32_t i = 0; i < scan->count; i++) {
         links[i].node_id    = scan->entries[i].node.node_id;
         links[i].parent_id  = scan->entries[i].parent_node_id;
         links[i].scan_index = i;
     }
+    for (size_t i = 0; i < opts->n_synth; i++) links[synth_at[i]].synth = i + 1;
+    free(synth_at);
 
     pipeline_t p;
     memset(&p, 0, sizeof(p));
@@ -2347,19 +2517,36 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         snprintf(bytes, sizeof(bytes), "%llu", (unsigned long long)res.bytes_logical);
         hash_hex(root_hash, rhex);
 
-        if (db_execute_non_query(db,
+        /* With a hook, the derived rows it writes go in the same
+         * transaction: a unit snapshot must never be visible as a file
+         * snapshot, which retention would judge by the wrong calendar. */
+        int txn = 0;
+        if (opts->index_hook) {
+            if (db_txn_begin(db) == OK) txn = 1;
+            else st = set_error(ERR_IO, "backup_run: cannot begin the snapshot row");
+        }
+        if (st == OK && db_execute_non_query(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
                 " total_size, completed_at, root_tree_hash, nodes_materialized)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 (const char *[]){ repo, snap, ts, opts->label ? opts->label : "",
                                   files, bytes, ts, rhex, NULL }, NULL) != 0)
             st = set_error(ERR_IO, "backup_run: cannot record snapshot");
+        if (st == OK && txn) st = opts->index_hook(opts->index_hook_ctx, db, snap_id);
+        if (txn) {
+            if (st != OK) db_txn_rollback(db);
+            else if (db_txn_commit(db) != OK)
+                st = set_error(ERR_IO, "backup_run: cannot commit the snapshot row");
+        }
     }
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
 
     /* Paths the scan no longer sees keep their cache rows otherwise, and the
-     * cache would grow for every file that ever existed under this repo. */
-    if (st == OK) {
+     * cache would grow for every file that ever existed under this repo.
+     * Not after a unit snapshot: it sees one unit's paths, and sweeping
+     * against them would drop every other unit's rows and the file
+     * backups', making each of their next runs read everything. */
+    if (st == OK && !opts->unit_snapshot) {
         const char **seen = malloc(scan->count * sizeof(*seen));
         if (seen) {
             size_t n_seen = 0;
@@ -2367,6 +2554,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
              * rather than vouching for content this snapshot lacks. */
             for (uint32_t i = 0; i < scan->count; i++)
                 if (scan->entries[i].node.type == NODE_TYPE_REG &&
+                    !scan->entries[i].synthetic &&
                     !links[i].skipped && !links[i].unsettled)
                     seen[n_seen++] = scan->entries[i].path;
             qsort(seen, n_seen, sizeof(*seen), scan_path_cmp);

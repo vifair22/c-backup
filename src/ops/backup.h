@@ -9,11 +9,41 @@
  * that makes it queryable.
  */
 
+#include "cdc.h"
 #include "error.h"
 #include "store.h"
 
 #include <cutils/db.h>
 #include <stdint.h>
+
+/*
+ * A regular file in the snapshot with no file behind it: a unit snapshot's
+ * metadata and disks (source-providers.md 7.2). Its ancestors are made up as
+ * 0700 directories owned by root with mtime 0, and so should it be, unless
+ * it has real metadata to carry, so that an unchanged one serialises to the
+ * same tree every session.
+ */
+typedef struct {
+    const char *path;        /* absolute, under /.cbackup-unit/ */
+    uint32_t    perm;        /* permission bits; S_IFREG is added */
+    uint32_t    uid, gid;
+    int64_t     mtime_sec;
+    uint64_t    size;        /* expected; open() says what it really is */
+} backup_synth_t;
+
+/*
+ * Where synthetic content comes from. open is called once per entry, in
+ * array order, after every other entry has been scanned and before any
+ * regular file is stored; it fills a chunker source valid until close.
+ * close is called after the content is stored or failed, with the result.
+ * A failure fails the whole backup: a unit snapshot is committed only when
+ * every item stored.
+ */
+typedef struct {
+    status_t (*open)(void *ctx, size_t index, cdc_source_t *src, uint64_t *size);
+    void     (*close)(void *ctx, size_t index, status_t st, const cdc_result_t *cr);
+    void      *ctx;
+} backup_synth_ops_t;
 
 typedef struct {
     const char **paths;      /* absolute source roots */
@@ -48,6 +78,28 @@ typedef struct {
      * snapshot is byte-identical either way.
      */
     unsigned     store_workers;
+
+    /*
+     * Unit snapshots (src/units/unit_backup.c); file backups leave all of
+     * these zero.
+     *
+     * read_paths, when set, is parallel to paths: source i is read under
+     * read_paths[i] (NULL: under paths[i]) and recorded under paths[i]. The
+     * file cache is keyed by the recorded path and ignores device numbers
+     * for such entries, since a filesystem snapshot gets a new one each
+     * time while keeping inodes and times.
+     */
+    const char         **read_paths;
+    const backup_synth_t *synth;
+    size_t               n_synth;
+    const backup_synth_ops_t *synth_ops;
+    /* Only the unit assembler sets this; synthetic entries are refused
+     * without it, so nothing else can write /.cbackup-unit. */
+    int                  unit_snapshot;
+    /* Called inside the transaction that inserts the snapshot's row, so a
+     * derived row (snapshot_units) lands with it or not at all. */
+    status_t           (*index_hook)(void *ctx, cutils_db_t *db, int64_t snap_id);
+    void                *index_hook_ctx;
 } backup_opts_t;
 
 /* One file the backup left out, and why. */
