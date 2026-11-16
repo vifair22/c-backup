@@ -295,6 +295,47 @@ static void test_btrfs_capture(void **state)
     assert_int_equal(stat(POOL "/system/.cbackup-snapshots/cbk-0badf00d-30-0", &sb), 0);
 }
 
+static int fake_subvol(const snap_ctx_t *c, const char *path)
+{
+    (void)c;
+    return strcmp(path, POOL "/appdata/vm") == 0;
+}
+
+/* A nested subvolume is its own domain (the top-level snapshot shows it
+ * empty), snapshotted into the pool's directory, and counts as a second
+ * instant. */
+static void test_btrfs_nested(void **state)
+{
+    (void)state;
+    sh("mkdir -p '" POOL "/appdata/vm'");
+    put(POOL "/appdata/vm/disk", "vm-v1");
+    FILE *f = fopen(STATE "/subvols", "a");
+    assert_non_null(f);
+    fprintf(f, "%s\tsub-uuid\t-\tfalse\n", POOL "/appdata/vm");
+    fclose(f);
+    ctx.is_subvol = fake_subvol;
+    snap_dom_t a, b;
+    assert_int_equal(snap_domain_of(&ctx, POOL "/appdata/vm/disk", &a), OK);
+    assert_int_equal(a.kind, SNAP_BTRFS);
+    assert_string_equal(a.root, POOL "/appdata/vm");
+    assert_string_equal(a.pool, POOL);
+    assert_int_equal(snap_domain_of(&ctx, POOL "/appdata/x", &b), OK);
+    assert_string_equal(b.root, POOL);
+    snap_set_t s;
+    memset(&s, 0, sizeof(s));
+    assert_int_equal(snap_set_add(&s, &a), OK);
+    assert_int_equal(snap_set_add(&s, &b), OK);
+    assert_int_equal(snap_instants(s.doms, s.n), 2);
+    assert_int_equal(snap_take(&ctx, &s, "0badf00d", 12, &holds), OK);
+    char rp[PATH_MAX], want[PATH_MAX];
+    assert_int_equal(snap_read_path(&ctx, &s, POOL "/appdata/vm/disk", rp, sizeof(rp)), OK);
+    snprintf(want, sizeof(want), POOL "/system/.cbackup-snapshots/%s/disk", s.names[0]);
+    assert_string_equal(rp, want);
+    assert_true(has(rp, "vm-v1"));
+    assert_int_equal(snap_release(&ctx, &s, "0badf00d", &holds), OK);
+    assert_int_equal(holds_open, 0);
+}
+
 static void test_exported_share_refused(void **state)
 {
     (void)state;
@@ -323,6 +364,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_zfs_capture, setup, teardown),
         cmocka_unit_test_setup_teardown(test_zfs_failure_and_sweep, setup, teardown),
         cmocka_unit_test_setup_teardown(test_btrfs_capture, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_btrfs_nested, setup, teardown),
         cmocka_unit_test_setup_teardown(test_exported_share_refused, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

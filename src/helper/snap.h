@@ -12,7 +12,9 @@
  *           dataset of that pool at one instant. Read through
  *           <mountpoint>/.zfs/snapshot/<name>.
  *   btrfs   domain = a pool root the policy's btrfs_domains lists (the
- *           top-level subvolume, 8.2). `btrfs subvolume snapshot -r` into
+ *           top-level subvolume, 8.2), or the innermost nested subvolume
+ *           holding the path, which the top-level snapshot would show
+ *           empty. `btrfs subvolume snapshot -r` into
  *           the snapshot directory inside that pool. Read through
  *           <snapdir>/<name>/<path below the pool root>.
  *   dir     the policy's dir_domains: no snapshot at all (a test backend,
@@ -35,14 +37,19 @@ typedef enum { SNAP_NONE = 0, SNAP_ZFS = 1, SNAP_BTRFS = 2 } snap_kind_t;
 typedef struct {
     snap_kind_t kind;
     char        dataset[256];         /* ZFS: pool/fs; btrfs: "" */
-    char        root[PATH_MAX];       /* the domain's mountpoint / pool root */
+    char        root[PATH_MAX];       /* the domain's mountpoint, pool root or
+                                         nested subvolume */
+    char        pool[PATH_MAX];       /* btrfs: the policy's pool root holding it */
 } snap_dom_t;
 
-typedef struct {
+typedef struct snap_ctx {
     const host_tools_t    *tools;
     const helper_policy_t *pol;
     char  btrfs_snapdir[PATH_MAX];    /* "" : <btrfs root>/system/.cbackup-snapshots */
     char  boot_config[PATH_MAX];      /* Unraid's /boot/config, for share exports */
+    /* Whether a directory is a btrfs subvolume root (inode 256 on btrfs).
+     * NULL: stat through host_root. Tests replace it. */
+    int (*is_subvol)(const struct snap_ctx *c, const char *path);
 } snap_ctx_t;
 
 /* Host tools and a snapshot context from the policy's [host] and

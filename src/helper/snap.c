@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/magic.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 
 #define SNAP_TOOL_TIMEOUT_S 120
@@ -49,6 +51,16 @@ void snap_host_setup(const helper_policy_t *pol, host_tools_t *t, snap_ctx_t *c)
     snprintf(c->boot_config, sizeof(c->boot_config), "%s", pol->boot_config);
 }
 
+static int is_subvol(const snap_ctx_t *c, const char *path)
+{
+    if (c->is_subvol) return c->is_subvol(c, path);
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    struct stat sb;
+    struct statfs fs;
+    if (host_path(c->tools, path, hp, sizeof(hp)) != 0 || lstat(hp, &sb) != 0 || !S_ISDIR(sb.st_mode)) return 0;
+    return sb.st_ino == 256 && statfs(hp, &fs) == 0 && fs.f_type == BTRFS_SUPER_MAGIC;
+}
+
 status_t snap_domain_of(const snap_ctx_t *c, const char *real_path, snap_dom_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -60,6 +72,19 @@ status_t snap_domain_of(const snap_ctx_t *c, const char *real_path, snap_dom_t *
             out->kind = SNAP_BTRFS;
             out->dataset[0] = '\0';
             snprintf(out->root, sizeof(out->root), "%s", r);
+            snprintf(out->pool, sizeof(out->pool), "%s", r);
+        }
+    }
+    if (out->kind == SNAP_BTRFS) {
+        /* A nested subvolume appears empty in its parent's snapshot, so the
+         * innermost one over the path is the domain (8.2). */
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", real_path);
+        while (strlen(dir) > strlen(out->pool)) {
+            if (is_subvol(c, dir)) { snprintf(out->root, sizeof(out->root), "%s", dir); break; }
+            char *slash = strrchr(dir, '/');
+            if (!slash || slash == dir) break;
+            *slash = '\0';
         }
     }
     if (c->pol->n_zfs == 0) return OK;
@@ -224,8 +249,8 @@ status_t snap_take(const snap_ctx_t *c, snap_set_t *s, const char *daemon8, int6
     for (size_t i = 0; i < s->n && st == OK; i++) {
         if (s->doms[i].kind != SNAP_BTRFS || s->taken[i]) continue;
         char dir[PATH_MAX], dst[PATH_MAX + 80], hdir[PATH_MAX + HOST_TOOL_PATH_MAX];
-        btrfs_snapdir(c, s->doms[i].root, dir, sizeof(dir));
-        if ((st = snap_check_snapdir(c, s->doms[i].root)) != OK) break;
+        btrfs_snapdir(c, s->doms[i].pool, dir, sizeof(dir));
+        if ((st = snap_check_snapdir(c, s->doms[i].pool)) != OK) break;
         snprintf(dst, sizeof(dst), "%s/%s", dir, s->names[i]);
         if (host_path(c->tools, dir, hdir, sizeof(hdir)) != 0 ||
             (mkdir(hdir, 0700) != 0 && errno != EEXIST)) {
@@ -268,7 +293,7 @@ status_t snap_read_path(const snap_ctx_t *c, const snap_set_t *s, const char *re
                      s->names[at], rest);
     } else {
         char dir[PATH_MAX];
-        btrfs_snapdir(c, s->doms[at].root, dir, sizeof(dir));
+        btrfs_snapdir(c, s->doms[at].pool, dir, sizeof(dir));
         n = snprintf(buf, sz, "%s/%s%s", dir, s->names[at], rest);
     }
     if (n < 0 || (size_t)n >= sz) return set_error(ERR_INVALID, "snap: read path too long");
@@ -362,8 +387,16 @@ static status_t btrfs_destroy(const snap_ctx_t *c, const char *path, const char 
     line_value(b, "UUID:", top, sizeof(top));
     free(a);
     free(b);
-    if (!parent[0] || strcmp(parent, top) != 0)
-        return set_error(ERR_INVALID, "snap: %s is not a snapshot of %s (parent %s); left alone",
+    int parent_ok = parent[0] && strcmp(parent, "-") != 0 && strcmp(parent, top) == 0;
+    if (!parent_ok && parent[0] && strcmp(parent, "-") != 0) {
+        /* A nested subvolume's snapshot: its parent must be a subvolume of
+         * this same pool. */
+        const char *byu[] = { c->tools->btrfs, "subvolume", "show", "-u", parent, root, NULL };
+        if (host_run(c->tools, 0, byu, SNAP_TOOL_TIMEOUT_S, NULL, 0) == OK) parent_ok = 1;
+        else err_clear();
+    }
+    if (!parent_ok)
+        return set_error(ERR_INVALID, "snap: %s is not a snapshot of a subvolume of %s (parent %s); left alone",
                          path, root, parent[0] ? parent : "none");
     const char *del[] = { c->tools->btrfs, "subvolume", "delete", path, NULL };
     return host_run(c->tools, 0, del, SNAP_TOOL_TIMEOUT_S, NULL, 0);
@@ -388,7 +421,7 @@ status_t snap_release(const snap_ctx_t *c, snap_set_t *s, const char *daemon8,
             snprintf(detail, sizeof(detail), "zfs:%s@%s", s->doms[i].dataset, s->names[i]);
         } else {
             char dir[PATH_MAX];
-            btrfs_snapdir(c, s->doms[i].root, dir, sizeof(dir));
+            btrfs_snapdir(c, s->doms[i].pool, dir, sizeof(dir));
             snprintf(detail, sizeof(detail), "btrfs:%s/%s", dir, s->names[i]);
         }
         status_t st = snap_release_detail(c, detail, daemon8);

@@ -29,6 +29,10 @@ case "$1 $2" in
     grep -q "^$src	" "$S/subvols" || printf '%s\t%s\t-\tfalse\n' "$src" "$puuid" >> "$S/subvols"
     printf '%s\tsnap-%s\t%s\ttrue\n' "$dst" "$RANDOM$RANDOM" "$puuid" >> "$S/subvols" ;;
 "subvolume show")
+    if [ "$3" = "-u" ]; then
+        awk -F'\t' -v u="$4" '$2 == u { f = 1 } END { exit !f }' "$S/subvols" || { echo "ERROR: no subvolume with uuid $4" >&2; exit 1; }
+        exit 0
+    fi
     p=$3
     u=$(field "$p" 2)
     if [ -z "$u" ]; then
