@@ -74,6 +74,7 @@ static int start(const char *extra_policy)
     if (system("rm -rf '" D "' && mkdir -p '" STATE "' '" APPS "/web/db' '" APPS "/web/www' "
                "'" MNT "/user/appdata' '" MNT "/media/lib' '" MNT "/disk1/slow' '" D "/tmpl' '" D "/proj'") != 0) return -1;
     put(APPS "/web/db/pg", "db-v1");
+    if (mkdir(APPS "/web/www/cache", 0700) != 0) return -1;
     put(APPS "/web/www/index", "www-v1");
     put(MNT "/media/lib/a", "media-v1");
     put(MNT "/disk1/slow/s", "slow-v1");
@@ -200,6 +201,9 @@ static void test_list_and_describe(void **state)
     free(data);
     assert_int_equal(be.blob_data(be.ctx, "compose:web", mj->id, &data, &len), OK);
     assert_non_null(memmem(data, len, "excluded:system", 15));
+    /* Offered, not applied: the cache directory is still inside the tree. */
+    assert_non_null(memmem(data, len, APPS "/web/www/cache", strlen(APPS "/web/www/cache")));
+    assert_non_null(memmem(data, len, "suggested_excludes", 18));
     assert_non_null(memmem(data, len, "excluded:remote-volume", 22));
     assert_non_null(memmem(data, len, "\"outcome\":\t\"snapshot\"", 21));
     free(data);

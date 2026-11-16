@@ -468,6 +468,50 @@ static void prog_bytes(void *ctx, uint64_t done, uint64_t total)
 /* One unit                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The unit's enrolled exclusions (unit_policy capture.exclude, one pattern
+ * per line), never applied unless enrolled (container-backup.md 4.2, C7).
+ * Patterns name recorded paths; the scan walks read roots (a snapshot), so
+ * a pattern under a tree's recorded path is rewritten onto its read root.
+ * Patterns without a leading '/' match anywhere and pass as they are.
+ */
+#define UNIT_EXCLUDE_MAX 64
+
+static size_t unit_excludes(cutils_db_t *db, int64_t repo_id, const char *key,
+                            const char *const *paths, const char *const *rpaths, size_t nt,
+                            char **out)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    size_t n = 0;
+    if (db_execute(db, "SELECT value FROM unit_policy WHERE repo_id = ? AND unit_key = ?"
+                       " AND key = 'capture.exclude'",
+                   (const char *[]){ repo, key, NULL }, &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return 0;
+    }
+    char *copy = strdup(r->rows[0][0]);
+    db_result_free(r);
+    char *save = NULL;
+    for (char *pat = copy ? strtok_r(copy, "\n", &save) : NULL; pat && n < UNIT_EXCLUDE_MAX;
+         pat = strtok_r(NULL, "\n", &save)) {
+        if (!*pat) continue;
+        const char *base = NULL, *rest = NULL;
+        for (size_t i = 0; i < nt && !base; i++) {
+            size_t l = strlen(paths[i]);
+            if (strncmp(pat, paths[i], l) == 0 && (pat[l] == '/' || pat[l] == '\0')) { base = rpaths[i]; rest = pat + l; }
+        }
+        size_t need = (base ? strlen(base) + strlen(rest) : strlen(pat)) + 1;
+        if (!(out[n] = malloc(need))) break;
+        if (base) snprintf(out[n], need, "%s%s", base, rest);
+        else snprintf(out[n], need, "%s", pat);
+        n++;
+    }
+    free(copy);
+    return n;
+}
+
 static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
                         const unit_backup_opts_t *o, const sp_provider_ops_t *ops,
                         sp_ctx_t *pctx, const listed_t *lu, size_t index, size_t total,
@@ -576,6 +620,8 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     int64_t snap = 0;
+    char *excl[UNIT_EXCLUDE_MAX];
+    size_t n_excl = 0;
     if (st == OK) {
         prog_t pg;
         memset(&pg, 0, sizeof(pg));
@@ -588,6 +634,12 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
         bo.paths = paths;
         bo.n_paths = (int)nt;
         bo.read_paths = rpaths;
+        n_excl = unit_excludes(db, repo_id, key, paths, rpaths, nt, excl);
+        if (n_excl) {
+            bo.exclude = (const char **)(void *)excl;
+            bo.n_exclude = (int)n_excl;
+            log_info("unit %s: %zu enrolled exclusion(s)", key, n_excl);
+        }
         bo.synth = syn;
         bo.n_synth = ns;
         bo.synth_ops = &sops;
@@ -643,6 +695,7 @@ static status_t run_one(store_t *store, cutils_db_t *db, int64_t repo_id,
     for (size_t i = 0; synpath && i < n_synth; i++) free(synpath[i]);
     free(synpath);
     for (size_t i = 0; rbuf && i < n_trees; i++) free(rbuf[i]);
+    for (size_t i = 0; i < n_excl; i++) free(excl[i]);
     free(rbuf);
     free(paths);
     free(rpaths);

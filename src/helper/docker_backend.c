@@ -335,8 +335,24 @@ static status_t host_file(struct sp_ctx *c, const char *path, char **data, size_
     return OK;
 }
 
+/* Directories that are usually re-creatable, offered as exclusions and
+ * never applied unless enrolled (4.2, C7). */
+static void suggest(struct sp_ctx *c, const mount_class_t *mc, cJSON *out)
+{
+    static const char *const names[] = { "cache", "Cache", "ml_cache", "Codecs", "Transcode",
+                                         "transcode", "logs", "log", "tmp" };
+    for (size_t i = 0; out && i < sizeof(names) / sizeof(names[0]); i++) {
+        char p[PATH_MAX + 32], hp[PATH_MAX + HOST_TOOL_PATH_MAX + 32];
+        snprintf(p, sizeof(p), "%s/%s", mc->real, names[i]);
+        struct stat sb;
+        if (host_path(&c->tools, p, hp, sizeof(hp)) != 0 || lstat(hp, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+        snprintf(p, sizeof(p), "%s/%s", mc->recorded, names[i]);
+        cJSON_AddItemToArray(out, cJSON_CreateString(p));
+    }
+}
+
 static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit, const member_t *m,
-                                cJSON *mounts_out, int *compose_done)
+                                cJSON *mounts_out, cJSON *suggest_out, int *compose_done)
 {
     char path[256], id[SP_ITEM_ID_MAX], tp[PATH_MAX];
     snprintf(path, sizeof(path), "/containers/%.79s/json", m->id);
@@ -449,6 +465,7 @@ static status_t describe_member(struct sp_ctx *c, dbuild_t *b, const char *unit,
             item_id(id, sizeof(id), "mnt:", mc.recorded);
             if ((st = add_item(b, SP_ITEM_TREE, id, mc.recorded, mc.real, 0,
                                dom.kind != SNAP_NONE ? SP_CAP_SNAPSHOT : 0)) != OK) goto out;
+            suggest(c, &mc, suggest_out);
         }
         cJSON *o = cJSON_CreateObject();
         if (!o) { st = set_error(ERR_NOMEM, "docker: mounts"); goto out; }
@@ -482,10 +499,12 @@ static status_t d_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
     d->caps = SP_CAP_PAUSE;
     dbuild_t b = { d, 0 };
     drop_blobs(c, unit_id);
-    cJSON *mounts = cJSON_CreateArray();
+    cJSON *doc = cJSON_CreateObject();
+    cJSON *mounts = doc ? cJSON_AddArrayToObject(doc, "mounts") : NULL;
+    cJSON *sugg = doc ? cJSON_AddArrayToObject(doc, "suggested_excludes") : NULL;
     int compose_done = 0;
     if (!d->name || !mounts) st = set_error(ERR_NOMEM, "docker: describe");
-    for (size_t i = 0; st == OK && i < n; i++) st = describe_member(c, &b, unit_id, &m[i], mounts, &compose_done);
+    for (size_t i = 0; st == OK && i < n; i++) st = describe_member(c, &b, unit_id, &m[i], mounts, sugg, &compose_done);
     /* The unit's hooks: a log for each, a STREAM for each dump (6.6). Dumps
      * come before their logs, so a dump's log is read after it ends. */
     char key[HELPER_UNIT_KEY_MAX + 1];
@@ -508,11 +527,11 @@ static status_t d_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **ou
         else free(empty);
     }
     if (st == OK) {
-        char *txt = cJSON_Print(mounts);
+        char *txt = cJSON_Print(doc);
         st = txt ? blob(&b, c, unit_id, "mounts", CFG_DIR "/mounts.json", txt, strlen(txt))
                  : set_error(ERR_NOMEM, "docker: mounts");
     }
-    cJSON_Delete(mounts);
+    cJSON_Delete(doc);
     if (st != OK) { drop_blobs(c, unit_id); sp_unit_desc_free(d); return st; }
     *out = d;
     return OK;

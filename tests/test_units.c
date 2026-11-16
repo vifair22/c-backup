@@ -321,6 +321,30 @@ static void test_streams(void **state)
     assert_non_null(strstr(buf, "\"stream\""));
 }
 
+/* Exclusions apply only when enrolled, and name recorded paths although
+ * the scan walks the snapshot. */
+static void test_enrolled_exclusions(void **state)
+{
+    (void)state;
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    assert_int_equal(db_execute_non_query(db, "INSERT INTO unit_policy (repo_id, unit_key, key, value)"
+                                              " VALUES (?, 'fake:u1', 'capture.exclude', ?)",
+                                          (const char *[]){ repo, LIVEDIR "/sub\n*.nothing", NULL }, NULL), 0);
+    const char *names[] = { "cbk-uat-one" };
+    unit_backup_result_t res;
+    assert_int_equal(run_units(names, 1, 0, &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, snap, DEST, &ro, &rr), OK);
+    struct stat sb;
+    assert_int_equal(stat(DEST LIVEDIR "/a.txt", &sb), 0);
+    assert_int_not_equal(stat(DEST LIVEDIR "/sub", &sb), 0);
+}
+
 static void test_one_snapshot_per_unit(void **state)
 {
     (void)state;
@@ -752,6 +776,7 @@ int main(void)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_one_unit_roundtrip, setup, teardown),
         cmocka_unit_test_setup_teardown(test_streams, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_enrolled_exclusions, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_snapshot_per_unit, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failures_leave_nothing, setup, teardown),
         cmocka_unit_test_setup_teardown(test_end_failure_swept, setup, teardown),

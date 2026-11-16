@@ -589,10 +589,28 @@ static api_response_t unit_policy_put(const api_request_t *req, int64_t repo_id,
     if (!o || !cJSON_IsObject(o)) { cJSON_Delete(o); return api_error(400, "body must be a JSON object"); }
     const cJSON *e;
     cJSON_ArrayForEach(e, o) {
+        /* Enrolled exclusions: patterns on recorded paths, one per line,
+         * applied to this unit only (container-backup.md 4.2). */
+        if (e->string && strcmp(e->string, "capture.exclude") == 0) {
+            if (cJSON_IsNull(e)) continue;
+            int bad = !cJSON_IsString(e) || strlen(e->valuestring) > 64 * 1024;
+            unsigned lines = 0;
+            for (const char *q = bad ? "" : e->valuestring; *q; ) {
+                size_t l = strcspn(q, "\n");
+                if (l > 1024 || memchr(q, '\r', l)) bad = 1;
+                if (l) lines++;
+                q += l + (q[l] == '\n');
+            }
+            if (bad || lines > 64) {
+                cJSON_Delete(o);
+                return api_error(400, "capture.exclude is up to 64 patterns, one per line, 1024 bytes each");
+            }
+            continue;
+        }
         gfs_retention_t probe;
         if (!e->string || !ret_field(&probe, e->string)) {
             char msg[160];
-            snprintf(msg, sizeof(msg), "unknown unit policy key '%.100s'; use retention.keep_*",
+            snprintf(msg, sizeof(msg), "unknown unit policy key '%.100s'; use retention.keep_* or capture.exclude",
                      e->string ? e->string : "");
             cJSON_Delete(o);
             return api_error(400, msg);
