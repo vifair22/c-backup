@@ -1780,6 +1780,14 @@ format 2 build and back it up again into a new repository. For a repository
 from before the daemon rewrite, the `pre-daemon-rewrite` tag builds a binary
 that reads it.
 
+The daemon's database starts again with format 3 too: its schema is one
+baseline, and a `state.db` written by an earlier build does not open (the
+daemon stops at start with a migration error naming a table that already
+exists). Move it aside, start the daemon, register each repository again
+(`c-backup repo add <path>`) and run `c-backup reindex <id>`. Snapshots,
+tags and the snapshot-id mark come back from the repositories; schedules,
+notes, job history and sessions do not.
+
 ---
 
 ## 18. Capacity planning and performance

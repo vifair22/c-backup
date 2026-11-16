@@ -132,7 +132,7 @@ Rules (`src/meta/snapshot_ids.h`):
 4. Prune and delete never touch it.
 
 Why it exists: ids are never reissued, but the mark that guaranteed it
-lived only in the daemon's database (migration 023). After the database
+lived only in the daemon's database (snapshot_id_seq). After the database
 was lost, a reindex numbered from the highest record still present, so an
 id pruned from the top came back, and anything outside the repository still
 naming it - a tag, a note, a client, a replica - moved to a different tree.

@@ -245,8 +245,8 @@ succeeds, and the answer carries `key_loaded: false` and a `warning` saying
 Repository ids are never reused. Removing the newest repository used to
 make its id the next one handed out, and the new repository inherited the
 old one's schedules, history and index rows, which deregistering does not
-delete. Migration 019 rebuilt `repos` with `AUTOINCREMENT`, starting above
-every id any table still refers to.
+delete. `repos` uses `AUTOINCREMENT`, so a new id is above every id ever
+handed out.
 
 No other id the API hands out is reused either: job ids, schedule ids,
 search and verify run ids, and snapshot ids within a repository. Job,
@@ -254,11 +254,11 @@ schedule and run ids came round again when the newest rows were deleted
 (by the purge after `DELETE /repos/<id>`, the 30-day job cleanup, or
 deleting a schedule), so job 312 of a removed repository was followed by a
 job 312 on another one, and a client still holding the old id read an
-unrelated job (B113). Migration 023 rebuilt those tables with
+unrelated job (B113). Those tables use
 `AUTOINCREMENT`. Snapshot ids were one more than the highest present, so
 deleting the newest snapshot gave its id to the next backup; the daemon
-now keeps a per-repository high-water mark. Ids reused before 023 stay
-reused. The mark is kept in the repository too, in `<repo>/snapshot-ids`,
+now keeps a per-repository high-water mark.
+The mark is kept in the repository too, in `<repo>/snapshot-ids`,
 raised before each snapshot record is written, so after a database loss a
 reindex restores it from there rather than resuming above whatever record
 happens to be highest, which would hand an id pruned from the top to the

@@ -1033,7 +1033,7 @@ static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZ
  * snapshots present did hand them out twice: deleting the newest snapshot
  * gave its id to the next backup, and a tag, note, search run or client
  * still naming the old one silently moved to a different tree. The
- * high-water mark in snapshot_id_seq (migration 023) remembers ids whose
+ * high-water mark in snapshot_id_seq remembers ids whose
  * rows are gone; MAX(id) still counts, for snapshots a reindex inserted.
  *
  * A record file already at the candidate is skipped too. A backup that
