@@ -2082,7 +2082,13 @@ static void pb_compress(const uint8_t *in, uint64_t len,
                                   sample_len, cs->cap);
     if (sc <= 0 || (double)sc / (double)sample_len > PACK_PROBE_RATIO) return;
 
-    int csz = LZ4_compress_default((const char *)in, (char *)cs->buf,
+    /* An object no larger than the probe was compressed whole by it, so the
+     * probe's output is the result. Compressing it again was a second LZ4
+     * pass over every small file: half the codec's time on a tree of them
+     * (PERF.md, 2026-11-16). Same input, same function, same bytes. */
+    int csz = (uint64_t)sample_len == len
+            ? sc
+            : LZ4_compress_default((const char *)in, (char *)cs->buf,
                                    (int)len, cs->cap);
     if (csz <= 0 || (uint64_t)csz >= len) return;
 
