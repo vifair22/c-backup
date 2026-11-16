@@ -316,7 +316,7 @@ contains "naming the source" "no-such-dir" "$OUT"
 # row nothing will finish holds the stream open for as long as the test
 # needs, so the assertion is on what arrived, not on a race with real work.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
         progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
         'store')"
     "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
@@ -324,7 +324,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     sleep 1
     contains "jobs watch prints a running job at once" '"state":"running"' \
         "$(cat "$WORK/watch.out")"
-    sqlite3 "$WORK/state.db" "UPDATE jobs SET state = 'completed',
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "UPDATE jobs SET state = 'completed',
         ended = strftime('%s','now') WHERE id = 9999"
     for _ in $(seq 1 50); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
     if kill -0 "$WPID" 2>/dev/null; then
