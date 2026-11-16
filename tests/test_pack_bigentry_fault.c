@@ -37,8 +37,9 @@
 #include "pack.h"
 #include "parity.h"
 #include "store.h"
+#include "test_tmp.h"
 
-#define TEST_DIR   "/tmp/c_backup_test_pack_bigentry_fault"
+#define TEST_DIR   TEST_TMP "/c_backup_test_pack_bigentry_fault"
 #define TEST_REPO  TEST_DIR "/repo"
 #define PACK_PATH  TEST_REPO "/packs/0000/pack-00000001.dat"
 #define GIB        ((uint64_t)1 << 30)

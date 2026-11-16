@@ -35,8 +35,9 @@
 #include "parity.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_parity"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_parity"
 
 /* Above the block-codec threshold, so the frame codec is used. */
 #define FRAME_SIZE (17u * 1024u * 1024u)
@@ -135,7 +136,7 @@ static void assert_buffered_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
 static void assert_stream_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
                                        const uint8_t *expect, size_t len)
 {
-    char out[] = "/tmp/c_backup_pack_parity_stream.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_parity_stream.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 
@@ -374,7 +375,7 @@ static void test_frame_codec_damage_beyond_parity_is_not_repaired(void **state)
         pack_cache_invalidate(store);
     }
 
-    char out[] = "/tmp/c_backup_pack_parity_frame.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_parity_frame.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 
@@ -764,7 +765,7 @@ static void test_unknown_entry_type_is_refused(void **state)
     assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
     assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
 
-    char tmp[] = "/tmp/c_backup_pack_type.XXXXXX";
+    char tmp[] = TEST_TMP "/c_backup_pack_type.XXXXXX";
     int fd = mkstemp(tmp);
     assert_true(fd >= 0);
     err_clear();

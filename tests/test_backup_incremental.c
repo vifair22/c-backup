@@ -35,8 +35,9 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_incr"
+#define TEST_DIR  TEST_TMP "/c_backup_test_incr"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"
@@ -76,7 +77,17 @@ static void write_file(const char *path, const char *content)
  * O(changed dirs + depth), and it is a fixed cost per snapshot rather than
  * one that grows with the size of the tree.
  */
-#define ANCESTOR_TREES 3   /* /tmp, /tmp/c_backup_test_incr, and src itself */
+/* Each component of the scratch directory (TEST_TMP: /tmp is one, a cache
+ * directory several), then c_backup_test_incr, then src itself. */
+static int ancestor_trees(void)
+{
+    const char *base = TEST_TMP;
+    int n = 0;
+    for (const char *p = base; *p; p++)
+        if (*p != '/' && (p == base || p[-1] == '/')) n++;
+    return n + 2;
+}
+#define ANCESTOR_TREES ancestor_trees()
 #define ROOT_TREES     1   /* the synthetic root joining all source paths */
 static int setup(void **state)
 {

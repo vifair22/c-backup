@@ -13,8 +13,9 @@
 #include "store.h"
 #include "object.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_repo"
+#define TEST_REPO TEST_TMP "/c_backup_test_repo"
 
 static store_t *store;
 
@@ -92,8 +93,8 @@ static void test_object_exists(void **state) {
 
 static void test_repo_init_requires_empty_dir(void **state) {
     (void)state;
-    const char *path = "/tmp/c_backup_nonempty_repo";
-    int rc = system("rm -rf /tmp/c_backup_nonempty_repo");
+    const char *path = TEST_TMP "/c_backup_nonempty_repo";
+    int rc = system("rm -rf '" TEST_TMP "/c_backup_nonempty_repo'");
     (void)rc;
     assert_int_equal(mkdir(path, 0755), 0);
 
@@ -106,7 +107,7 @@ static void test_repo_init_requires_empty_dir(void **state) {
 
     assert_int_not_equal(store_init_dirs(path), OK);
 
-    rc = system("rm -rf /tmp/c_backup_nonempty_repo");
+    rc = system("rm -rf '" TEST_TMP "/c_backup_nonempty_repo'");
     (void)rc;
 }
 
@@ -223,7 +224,7 @@ static void test_object_load_rejects_none_size_mismatch(void **state) {
 
 static void test_object_store_file_sparse_roundtrip(void **state) {
     (void)state;
-    const char *path = "/tmp/c_backup_sparse_file.bin";
+    const char *path = TEST_TMP "/c_backup_sparse_file.bin";
     int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
     assert_true(fd >= 0);
 

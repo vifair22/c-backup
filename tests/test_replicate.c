@@ -44,9 +44,10 @@
 #include "snap_record.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define SRC_REPO "/tmp/c_backup_test_repl_src"
-#define DST_REPO "/tmp/c_backup_test_repl_dst"
+#define SRC_REPO TEST_TMP "/c_backup_test_repl_src"
+#define DST_REPO TEST_TMP "/c_backup_test_repl_dst"
 
 static store_t      *src;
 static repo_marker_t src_marker;

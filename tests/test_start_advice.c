@@ -20,6 +20,7 @@
 #include <cmocka.h>
 
 #include "start_advice.h"
+#include "test_tmp.h"
 
 static int has(const char *s, const char *needle) { return strstr(s, needle) != NULL; }
 
@@ -76,7 +77,7 @@ static void mkdirs(const char *root, const char *rel)
 static void test_probe_reads_the_tree(void **state)
 {
     (void)state;
-    char root[] = "/tmp/cb_advice_XXXXXX";
+    char root[] = TEST_TMP "/cb_advice_XXXXXX";
     assert_non_null(mkdtemp(root));
     unsetenv("container");
 
@@ -109,7 +110,7 @@ static void test_probe_reads_the_tree(void **state)
                             "/lib/systemd/system/c-backupd.service",
                             "/usr/local/lib/systemd/system/c-backupd.service" };
     for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
-        char r[] = "/tmp/cb_advice_XXXXXX";
+        char r[] = TEST_TMP "/cb_advice_XXXXXX";
         assert_non_null(mkdtemp(r));
         touch(r, units[i]);
         touch(r, "/run/.containerenv");
@@ -120,7 +121,7 @@ static void test_probe_reads_the_tree(void **state)
         assert_int_equal(system(cmd), 0);
     }
 
-    char r[] = "/tmp/cb_advice_XXXXXX";
+    char r[] = TEST_TMP "/cb_advice_XXXXXX";
     assert_non_null(mkdtemp(r));
     setenv("container", "podman", 1);
     host_facts_probe(r, &f);

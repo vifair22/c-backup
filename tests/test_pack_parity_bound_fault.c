@@ -39,8 +39,9 @@
 #include "parity.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_parity_bound"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_parity_bound"
 
 #define GROUP_DATA  ((size_t)RS_K * RS_INTERLEAVE)    /* 15,296 */
 #define GROUP_PAR   ((size_t)RS_2T * RS_INTERLEAVE)   /* 1,024 */
@@ -151,7 +152,7 @@ static void flip(const char *dat, off_t off)
 static size_t stream_and_compare(const uint8_t hash[OBJECT_HASH_SIZE],
                                  const uint8_t *expect, size_t len)
 {
-    char out[] = "/tmp/c_backup_pack_parity_bound.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_parity_bound.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
     fault_malloc_peak = 0;

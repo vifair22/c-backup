@@ -15,7 +15,8 @@
 # Two ways out, cheapest first:
 #
 #   1. Some path in the container may already support holes even when the
-#      build directory does not. /dev/shm and /var/tmp are on different
+#      build directory does not. The scratch directory (C_BACKUP_TEST_DIR)
+#      is tried first, so the fixtures count against the scratch guard. /dev/shm and /var/tmp are on different
 #      mounts than /builds and cost nothing to try.
 #
 #   2. A loopback ext4 image, which works wherever it can be mounted and
@@ -63,7 +64,7 @@ _sparse_adopt() {
 
 _sparse_setup() {
     local d
-    for d in "$PWD/build" /var/tmp /dev/shm /tmp; do
+    for d in ${C_BACKUP_TEST_DIR:+"$C_BACKUP_TEST_DIR"} "$PWD/build" /var/tmp /dev/shm /tmp; do
         if _sparse_probe "$d"; then
             _sparse_adopt "$d" "already reports holes"
             return 0
@@ -112,7 +113,7 @@ _sparse_setup() {
 # Report what every candidate did, so a run that ends up skipping says why
 # rather than going quiet.
 echo "--- sparse filesystem probe ---"
-for _d in "$PWD/build" /var/tmp /dev/shm /tmp; do
+for _d in ${C_BACKUP_TEST_DIR:+"$C_BACKUP_TEST_DIR"} "$PWD/build" /var/tmp /dev/shm /tmp; do
     if _sparse_probe "$_d"; then _r="holes"; else _r="no holes"; fi
     printf '  %-24s %-9s %s\n' "$_d" "$_r" "$(df -T "$_d" 2>/dev/null | awk 'NR==2{print $2}')"
 done

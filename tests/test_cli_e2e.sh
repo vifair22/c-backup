@@ -11,7 +11,11 @@ set -u
 
 DAEMON="${1:-build/bins/c-backupd}"
 CLI="${2:-build/bins/c-backup}"
-WORK="$(mktemp -d /tmp/c_backup_cli_e2e.XXXXXX)"
+# Scratch goes where the Makefile says (C_BACKUP_TEST_DIR), and on disk when
+# run by hand: /tmp is often a tmpfs, so dense scratch there is RAM.
+TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
+mkdir -p "$TEST_ROOT"
+WORK="$(mktemp -d "$TEST_ROOT/c_backup_cli_e2e.XXXXXX")"
 # Ports per run, so concurrent suites (CI jobs on one runner, parallel
 # worktrees) never reach each other's daemons.
 PORTBASE=$((20000 + ($$ % 15000) * 3))
@@ -35,6 +39,10 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+# A signal would otherwise end the script without the EXIT trap: the scratch
+# guard stops an over-budget suite with SIGTERM and still wants it gone.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"; }

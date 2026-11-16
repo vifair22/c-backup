@@ -45,6 +45,28 @@ make coverage   # gcovr; fails under 80% whole-repo, or the src/store floor
 make bench      # microbenchmarks and browse-path benchmarks
 ```
 
+### Test scratch
+
+The suites write their scratch under one directory, `C_BACKUP_TEST_DIR`.
+By default it is `$XDG_CACHE_HOME/c-backup-test-<checksum of the checkout
+path>` (`~/.cache/...` when `XDG_CACHE_HOME` is unset): on disk, because
+`/tmp` is often a tmpfs and dense scratch there is RAM, and per checkout, so
+two worktrees can test at once. CI points it at the job directory. Keep the
+path short; two suites put unix sockets in it, and a socket path holds at
+most 108 bytes.
+
+```sh
+make test C_BACKUP_TEST_DIR=/mnt/scratch/cbt   # somewhere else
+make test C_BACKUP_SCRATCH_BUDGET=4G           # a tighter budget
+```
+
+`make test`, `make coverage`, `make test-asan` and the fuzz targets run every
+suite under `tests/scratch-guard.sh`. It prints each suite's name and start
+time as it begins and its peak scratch as it ends, stops a suite that holds
+more than `C_BACKUP_SCRATCH_BUDGET` (default `10G`) at once and fails it by
+name, and removes and fails on anything a suite leaves behind. The C suites
+have the directory compiled in, so changing it relinks them.
+
 Build dependencies on Debian:
 
 ```sh

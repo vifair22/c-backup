@@ -33,8 +33,9 @@
 #include "gfs.h"
 #include "repo.h"
 #include "store.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_gfs"
+#define TEST_DIR  TEST_TMP "/c_backup_test_gfs"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 

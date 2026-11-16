@@ -48,8 +48,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT   "/tmp/c_backup_fuzz_pack_write"
+#define FUZZ_ROOT   TEST_TMP "/c_backup_fuzz_pack_write"
 #define MAX_OBJECTS 6
 #define MAX_EACH    (128u << 10)
 

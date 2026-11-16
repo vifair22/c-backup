@@ -30,8 +30,9 @@
 #include "store.h"
 #include "object.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_ROOT "/tmp/c_backup_test_store"
+#define TEST_ROOT TEST_TMP "/c_backup_test_store"
 
 static void rmrf(const char *p)
 {
@@ -175,7 +176,7 @@ static void test_large_object_streaming(void **state)
     uint8_t hash[OBJECT_HASH_SIZE];
     assert_int_equal(object_store(st, OBJECT_TYPE_FILE, buf, n, hash), OK);
 
-    char outpath[] = "/tmp/c_backup_test_store_out.XXXXXX";
+    char outpath[] = TEST_TMP "/c_backup_test_store_out.XXXXXX";
     int fd = mkstemp(outpath);
     assert_true(fd >= 0);
 
@@ -200,7 +201,7 @@ static void test_sparse_file_roundtrip(void **state)
     (void)state;
     store_t *st = fresh_store();
 
-    char src[] = "/tmp/c_backup_test_store_sparse.XXXXXX";
+    char src[] = TEST_TMP "/c_backup_test_store_sparse.XXXXXX";
     int fd = mkstemp(src);
     assert_true(fd >= 0);
 
