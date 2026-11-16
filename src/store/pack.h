@@ -272,6 +272,34 @@ status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t
                                   int *out_is_new, uint64_t *out_phys_bytes);
 void     pack_prepared_free(pack_prepared_t *p);
 
+/*
+ * Writers staging into one repository at once (a backup's file workers and
+ * its own writer) cannot see each other's unsealed entries, so a chunk two
+ * of them meet before either pack commits would be stored by both: the same
+ * name twice on disk, one index row pointing at either copy (OWN-46).
+ *
+ * A claim set shared by those writers prevents it. A writer claims a name
+ * before writing it; a writer that finds the name claimed by another
+ * treats it as stored and writes nothing (the object is referenced, and is
+ * in the repository once the owner's pack commits, which is before any
+ * snapshot naming it can be). The owner's claims clear when its pack
+ * commits, after which the index answers for the name.
+ *
+ * If an owner's pack never commits (it aborts, or its seal fails), its
+ * claims are dropped and counted as abandoned: anything that referenced
+ * those names on the strength of the claim refers to bytes that never
+ * landed, and the caller must not commit a snapshot (pack_claims_abandoned).
+ */
+typedef struct pack_claims pack_claims_t;
+pack_claims_t *pack_claims_new(void);
+void           pack_claims_free(pack_claims_t *c);
+/* Names claimed by writers whose packs did not commit. */
+uint64_t       pack_claims_abandoned(const pack_claims_t *c);
+/* Names another writer was found to be storing, and so were not stored. */
+uint64_t       pack_claims_deferred(const pack_claims_t *c);
+/* Join w to c; c must outlive w. */
+void           pack_backup_share_claims(pack_backup_writer_t *w, pack_claims_t *c);
+
 /* Would staging an object of this size push the open pack past its seal? */
 int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes);
 
@@ -517,6 +545,30 @@ status_t pack_gc_stats(store_t *store,
                        const uint8_t *refs, size_t refs_cnt,
                        uint32_t *out_kept, uint32_t *out_deleted,
                        pack_gc_stats_t *stats);
+
+/*
+ * Where the index says each referenced object lives: pack 0 for none.
+ * locs[i] is refs[i]'s.
+ */
+typedef struct {
+    uint32_t pack;
+    uint64_t offset;     /* entry offset, header included (pack_objects.offset) */
+} pack_gc_loc_t;
+
+/*
+ * pack_gc_stats that also reclaims duplicate copies (OWN-22): an entry
+ * whose name is referenced but which is not the copy the index points at
+ * is dropped - but only once the indexed copy has been read and found to be
+ * that name at that offset, in bounds. If the indexed copy cannot be
+ * confirmed (its pack is gone, damaged, or holds something else there) the
+ * entry is kept: a duplicate costs space, and dropping the one good copy
+ * would cost the object. locs may be NULL, which is pack_gc_stats.
+ */
+status_t pack_gc_stats_loc(store_t *store,
+                           const uint8_t *refs, const pack_gc_loc_t *locs,
+                           size_t refs_cnt,
+                           uint32_t *out_kept, uint32_t *out_deleted,
+                           pack_gc_stats_t *stats);
 
 /* ------------------------------------------------------------------ */
 /* On-disk pack structures (shared between pack.c and json_api.c)      */

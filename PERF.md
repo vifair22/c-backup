@@ -6,6 +6,21 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - OWN-44 on v3 with small-file workers and the claim set
+
+After merging origin/v3 b59db42 (small files on workers, OWN-46's claim set
+and gc reclaim), the same comparison, v6 = origin/v3 b59db42, five rounds,
+`bench_phases -n 0 -l 48 -t 0 -m 16 -R` and `-n 20000 -l 0 -t 0 -R`:
+
+| Shape | v6 first backup | v7 first backup | v6 mean | v7 mean |
+|---|---|---|---:|---:|
+| large, 768 MiB | 1.131, 1.086, 1.098, 1.061, 1.066 s | 0.994, 1.002, 1.003, 0.978, 0.990 s | 1.088 s | **0.993 s** |
+| 20,000 small | 1.708, 1.570, 1.602, 1.544, 1.541 s | 1.555, 1.539, 1.556, 1.519, 1.540 s | 1.593 s | **1.542 s** |
+
+The small-file workers took both builds' small-file backup from about 1.9 s
+to about 1.6 s; v7 stays ahead with them, its workers computing each entry's
+CRC and AEAD and no parity.
+
 ## 2026-11-16 - Pack writers within the buffer budget, one encoder pool (OWN-44)
 
 Review of the encode-as-you-write change found writer memory unbudgeted: a
@@ -96,6 +111,46 @@ writer's worker threads as it went, v7 encodes the whole body at the seal,
 on one thread, from the page cache. Moving the stripe encode back onto the
 workers (each window of groups is independent) would recover it if it ever
 matters; at 600 MiB/s of backup it does not today.
+## 2026-11-16 - Small files on workers (many-small profile, proposal 5)
+
+Small files were stored one at a time on the backup thread: open, read,
+SHA-256, the LZ4 probe and compression, parity, then the pack append and
+the rows. Files of at most 1 MiB the cache cannot vouch for now go to up to
+four workers in batches of 256 files or 4 MiB (`src/ops/small_files.c`),
+which read, chunk and prepare them; the backup thread appends their objects
+in file order and writes the rows and cache entries, as before.
+
+`feat/v3-cdc` at 4269bc1 plus this change, c-utils v1.6.0 (the pinned
+version: no statement cache, no pragmas), `bench_phases -n 100000 -l 0 -t 0
+-R` (100,000 files of 2-6 KiB), `-w 1` (serial, as before) against `-w 0`
+(automatic: 21 chunk workers on this machine, 4 small-file workers),
+alternating, three pairs each, in `bench.slice`. NVMe is `~/.cache` with
+`-c` (source evicted, trailing sync timed); tmpfs is `/dev/shm`, warm.
+
+| First backup | `-w 1` | `-w 0` | Change |
+|---|---|---|---:|
+| tmpfs | 7.99 / 8.04 / 8.10 s | 6.13 / 6.31 / 6.12 s | -24% |
+| NVMe, cold | 17.60 / 18.26 / 17.00 s | 10.57 / 11.93 / 10.58 s | -38% |
+
+The read+hash+write row on the backup thread, which is now the append
+alone, falls from 2.5 s to 0.93 s on tmpfs and from 7.1 s to 1.3 s on NVMe;
+the workers are busy 1.8 s together on tmpfs (5.8 s on NVMe, where they
+wait on the disk in parallel instead of the backup thread waiting in
+series) and the backup thread waits for them for 0.0-0.1 s in all. What is
+left on the backup thread is the database: pack-seal 1.3 s, index-nodes
+1.2 s, index-put 1.0 s, cache-put 0.7 s, cache-lookup 0.35 s on tmpfs,
+which the statement cache and pragmas (proposals 1 and 2) address.
+
+Two things tried and not kept:
+
+- Asking the index whether an object exists on the workers rather than in
+  the append, to take that statement off the backup thread: every worker
+  then queued on the one database handle's mutex behind the backup
+  thread's own statements, the backup thread's statements slowed by about
+  70%, and the first backup went from 6.2 to 6.9 s.
+- One small-file worker per chunk worker (21 here): no faster than four,
+  since the backup thread is the limit; four it is (`SMALL_POOL_MAX`).
+
 ## 2026-11-16 - Tree building is linear in entries (OWN-43)
 
 `build_one_tree` found a directory's children by scanning every scan entry,

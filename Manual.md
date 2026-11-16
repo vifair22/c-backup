@@ -112,7 +112,8 @@ These hold everywhere and decide many of the behaviours below.
    the file.
 3. **Millions of inodes.** Traversal and change detection are linear in the
    number of entries.
-4. **Fast incompressible bailout.** A 64 KiB probe decides compression.
+4. **Fast incompressible bailout.** At most 128 KiB of LZ4 samples, spread
+   across each chunk, decide its compression, chunk by chunk.
 
 Section 20 records the one place 1.0 falls short of constraint 3 on small
 hosts: the scan's memory.
@@ -358,7 +359,7 @@ are different: they live in the database and change through the policy API
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
 | `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
-| `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
+| `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
 | `retention.keep_snaps` | `1` | Newest snapshots always kept |
 | `retention.keep_daily` | `7` | Daily snapshots kept |
 | `retention.keep_weekly` | `4` | Weekly snapshots kept |
@@ -1371,12 +1372,14 @@ gc or reindex. Merging small packs (coalescing), which gc does after
 compaction and nothing else does, follows the same steps and leaves the same
 states.
 
-**Large incompressible files.** Each chunk is probed on its own: if its
-first 64 KiB does not compress (video, audio, disk images, encrypted or
-already-compressed archives) it is stored as it is, having cost LZ4 on
-64 KiB. A file whose head compresses and whose body does not (a container
-header or a thumbnail in front of compressed media) costs compression on the
-head's chunks only. Nothing is ever left outside a pack, and nothing is
+**Large incompressible files.** Each chunk is probed on its own: if none
+of four 32 KiB samples spread across it compresses (video, audio, encrypted
+or already-compressed archives) it is stored as it is, having cost LZ4 on
+128 KiB. A file whose head compresses and whose body does not (a
+container header or a thumbnail in front of compressed media) costs
+compression on the head's chunks only, and a disk image that alternates
+compressible and incompressible regions is compressed wherever it pays:
+no verdict is remembered from one chunk to the next or between backups. Nothing is ever left outside a pack, and nothing is
 written twice.
 
 **What `phys_size` counts.** The stored payload only, after compression and

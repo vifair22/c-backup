@@ -228,13 +228,20 @@ and decrypted and checked whole before any of it is released.
 
 ### Compression
 
-Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1). A
-64 KiB probe decides first: a payload whose first 64 KiB does not compress
-to under 98% of itself is stored as it is, having cost LZ4 on 64 KiB
-rather than on the whole object, so video, audio, archives and databases
-bail out at once (design constraint 4). A compressed result is kept only
+Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1).
+Probes decide first, on at most 128 KiB: the first 64 KiB of a payload of
+128 KiB or less, and four 32 KiB samples at 0, 1/3, 2/3 and the end of a
+larger one. A payload none of whose samples compresses to under 98% of
+itself is stored as it is, so video, audio, archives and databases bail
+out at once (design constraint 4). Sampling across the object catches the
+chunk a file changes character in: zeros after an incompressible region run
+to the chunker's maximum in the chunk where they start, and a chunk can be
+compressible only in its middle. A compressed result is kept only
 when it is smaller than the input, and payloads under 4 KiB are never
-compressed. Because every large file is chunked, the bail-out is per chunk.
+compressed. Because every large file is chunked, the decision is per
+chunk, and it is recorded nowhere: no skip mark, no cache column, no
+per-file or per-backup state, so one chunk's verdict never decides another
+chunk's or the next backup's (B124; `pb_compress` in `src/store/pack.c`).
 
 ### Encryption
 
@@ -389,7 +396,19 @@ applied.
   with its codec).
 - the **rewriter** in gc and coalescing: live entries of old packs copied,
   corrected from parity on the way, into new packs; the old ones removed
-  only once the new ones are installed, synced and announced.
+  only once the new ones are installed, synced and announced. An entry is
+  live when its name is referenced and it is the copy `pack_objects` names.
+  Another copy of a referenced name (a duplicate, OWN-22) is dropped only
+  after the named copy has been read and found to be that name at that
+  offset, within its pack, with its payload passing its CRC after parity;
+  when it cannot be confirmed, the duplicate is kept, since it may be the
+  only good copy (`pack_gc_stats_loc`). If that duplicate is proven -
+  header, name, and payload decoded and checked against the name - the
+  index row moves to it in one transaction (the store's relocate callback)
+  and gc logs it; a first pass does any such moves before a pack is
+  rewritten, so a pack holding a bad named copy cannot take the object's
+  only row with it. The next gc drops the bad copy as an unnamed
+  duplicate.
 
 Every writer appends entries and nothing else. The plaintext writer
 encodes the stripe as the body grows, a group at a time on a small pool,
@@ -844,8 +863,30 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    and seals its own packs. Pack numbers come from one allocator on the
    store handle (`store_alloc_pack_num`), since writers staging at once
    cannot see each other's packs in `tmp/`. Writers do not see each other's
+<<<<<<< HEAD
+   unsealed entries either, so they share a claim set (`pack_claims_t`,
+   OWN-46): a writer claims a name before writing it, a writer that finds
+   it claimed references it without writing it, and the claims clear when
+   the owner's pack commits, after which the index answers. A claim whose
+   pack never commits is counted as abandoned and fails the backup, since a
+   reference may have been made on its strength. Without it, identical
+   files on two workers were stored once each: 22 names twice and twice the
+   payload on the twins fixture in `test_cdc_backup`.
+=======
    unsealed entries either, so a chunk two of them stage at the same moment
    is stored twice; readers take the first and gc counts the other dead.
+   Many small files at once. Files of at most 1 MiB the cache cannot
+   vouch for are collected into batches of up to 256 files or 4 MiB and
+   read, chunked and prepared (name, probe, LZ4, encryption, CRC, parity)
+   by up to four small-file workers (`src/ops/small_files.c`). The backup
+   thread takes the batches back in submission order and appends their
+   objects, writes their rows and cache entries, so packs, rows and the
+   cache stay on one thread and the objects reach the pack in file order,
+   as when it stored them itself. Batches in flight are capped at twice
+   the workers and hold their bytes of the read budget, at most half of
+   it. Used when there are at least two batches' worth of small files and
+   more than one worker.
+>>>>>>> origin/v3
 5. Index rows. A pack's commit creates the object row of every entry that
    has none (`db_pack_commit` upserts with the entry's type), in the same
    transaction as the pack's own rows, so no writer races its own seal: a

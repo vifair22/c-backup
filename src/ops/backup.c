@@ -13,6 +13,8 @@
 #include "scan.h"
 #include "store_index.h"
 #include "store_pool.h"
+#include "small_files.h"
+#include "read_budget.h"
 #include "db_txn.h"
 #include "phase_timer.h"
 #include "pack.h"
@@ -122,6 +124,15 @@ typedef struct {
     store_pool_t  *pool;
     /* Where every object the backup produces goes; see bsink_t. */
     struct bsink  *sink;
+    /* Names being written, shared by this thread's writer and the file
+     * workers' while they run, so no two store one chunk (OWN-46). */
+    pack_claims_t *claims;
+    /* Small files read, chunked and sealed on workers, many to a batch
+     * (small_files.h); NULL stores them on this thread. sbatch is the batch
+     * being filled, spool_taken the read budget the submitted ones hold. */
+    small_pool_t  *spool;
+    small_batch_t *sbatch;
+    uint64_t       spool_taken;
 } pipeline_t;
 
 /*
@@ -542,6 +553,9 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
     return st;
 }
 
+static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
+                                   int *out_is_new, uint64_t *out_phys);
+
 static status_t bsink_put(void *ctx, uint8_t type, const void *data, size_t len,
                           obj_put_t *out)
 {
@@ -553,14 +567,31 @@ static status_t bsink_put(void *ctx, uint8_t type, const void *data, size_t len,
     memcpy(out->hash, pp.hash, OBJECT_HASH_SIZE);
 
     (void)p;
+    int is_new = 0;
+    uint64_t phys = 0;
+    st = bsink_add_prepared(s, &pp, &is_new, &phys);
+    pack_prepared_free(&pp);
+    out->is_new = is_new;
+    out->phys_bytes = phys;
+    return st;
+}
+
+/*
+ * The locked half of bsink_put, for an object prepared elsewhere: a chunk
+ * worker's, or a small-file worker's (small_files.h).
+ */
+static status_t bsink_add_prepared(bsink_t *s, const pack_prepared_t *pp,
+                                   int *out_is_new, uint64_t *out_phys)
+{
+    status_t st = OK;
     pthread_mutex_lock(&s->mu);
-    if (s->may_rollover && pack_backup_full(s->pw, pp.payload_len)) {
+    if (s->may_rollover && pack_backup_full(s->pw, pp->payload_len)) {
         st = bsink_flush(s, 1);
         if (st == OK) st = pack_backup_rollover(s->pw);
     }
     int is_new = 0;
     uint64_t phys = 0;
-    if (st == OK) st = pack_backup_add_prepared(s->pw, &pp, &is_new, &phys);
+    if (st == OK) st = pack_backup_add_prepared(s->pw, pp, &is_new, &phys);
     /*
      * A row for every object met, not only new ones: one already in the
      * repository with no row (an index that lost it) gets its row back, as
@@ -577,16 +608,15 @@ static status_t bsink_put(void *ctx, uint8_t type, const void *data, size_t len,
         }
         if (st == OK) {
             pending_row_t *r = &s->rows[s->n++];
-            memcpy(r->hash, pp.hash, OBJECT_HASH_SIZE);
-            r->type = type;
+            memcpy(r->hash, pp->hash, OBJECT_HASH_SIZE);
+            r->type = pp->type;
             r->phys = phys;
-            r->orig = len;
+            r->orig = pp->len;
         }
     }
     pthread_mutex_unlock(&s->mu);
-    pack_prepared_free(&pp);
-    out->is_new = is_new;
-    out->phys_bytes = phys;
+    *out_is_new = is_new;
+    *out_phys = phys;
     return st;
 }
 
@@ -607,9 +637,10 @@ static int store_cancelled_cb(void *ctx)
  * a wait behind the backup thread's batch: a mixed tree on NVMe took twice
  * as long as the format 2 writer.
  *
- * Writers do not see each other's unsealed packs, so a chunk two workers
- * stage at once is stored twice; readers take the first, and gc counts the
- * other as dead weight. The B086 write-once proposal accepted the same.
+ * Writers do not see each other's unsealed packs, so they share a claim
+ * set (pack_claims_t): a chunk one writer is storing is referenced, not
+ * stored again, by the others. Without it twins on two workers were stored
+ * once each, the same name twice on disk (OWN-46).
  */
 typedef struct {
     pipeline_t           *p;
@@ -634,6 +665,7 @@ static status_t fpool_begin(void *ctx, void **wstate)
     if (!w->sink) { pack_backup_abort(w->pw); free(w); return set_error(ERR_NOMEM, "backup: sink"); }
     w->sink->may_rollover = 1;
     w->sink->no_rows = 1;
+    pack_backup_share_claims(w->pw, p->claims);
     *wstate = w;
     return OK;
 }
@@ -732,6 +764,141 @@ static status_t pool_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
 
 #define POOL_WAIT_MS 250
 
+/* Seal the open pack if it has filled; the batch is let go first, since
+ * sealing begins a transaction. The headroom is the largest entry there
+ * can be, so no object the next entry produces can take the pack past
+ * PACK_MAX_BYTES, which pack_backup_add refuses. */
+static status_t maybe_rollover(pipeline_t *p, batch_t *b)
+{
+    if (!pack_backup_full(p->pack_w, PACK_ENTRY_MAX_BYTES)) return OK;
+    batch_close(p, b);
+    uint64_t _ts = phase_now(), _tsn = phase_nested(p->timers);
+    p->timers->txn_site = PHASE_COMMIT_PACK;
+    status_t rst = pack_backup_rollover(p->pack_w);
+    p->timers->txn_site = PHASE_COMMIT_STORE;
+    phase_add_excl(p->timers, PHASE_PACK_SEAL, _ts, _tsn);
+    return rst;
+}
+
+/*
+ * Append a batch of small files the workers prepared, in file order: the
+ * objects into the pack (dedup happens here), then each file's rows and
+ * cache entry, exactly as the serial path records one file.
+ */
+static status_t small_apply(pipeline_t *p, batch_t *b, small_batch_t *sb)
+{
+    status_t st = OK;
+    for (uint32_t i = 0; i < sb->n && st == OK; i++) {
+        small_file_t *f = &sb->files[i];
+        scan_entry_t *e = &p->scan->entries[f->index];
+        p->bytes_done += e->node.size;
+        if (!f->ran) {
+            /* Stopped before this file: the batch was cancelled. */
+            st = set_error(ERR_BUSY, "backup cancelled");
+            break;
+        }
+        if (f->skipped) {
+            log_warn("backup: %s", f->err);
+            continue;
+        }
+        if (f->st != OK) {
+            if (cancelled(p)) { st = set_error(ERR_BUSY, "backup cancelled"); break; }
+            log_warn("backup: cannot store %s: %s", e->path, f->err);
+            continue;
+        }
+        st = maybe_rollover(p, b);
+        if (st != OK) break;
+        batch_open(p, b);
+        /* The append: dedup against the repository and the open pack, and
+         * the write. Rows and the cache entry below have rows of their own. */
+        uint64_t _ta = phase_now();
+        for (size_t k = 0; k < f->nobjs && st == OK; k++) {
+            int is_new = 0;
+            uint64_t phys = 0;
+            st = bsink_add_prepared(p->sink, &f->objs[k].pp, &is_new, &phys);
+            if (st == OK && is_new) {
+                p->res->objects_new++;
+                p->res->bytes_stored += phys;
+            }
+        }
+        phase_add(p->timers, PHASE_READ_HASH, _ta);
+        if (st != OK) break;
+        memcpy(e->node.content_hash, f->hash, OBJECT_HASH_SIZE);
+        p->res->files++;
+        p->res->bytes_logical += e->node.size;
+        st = bsink_flush(p->sink, 0);
+        if (st != OK) break;
+        uint64_t _tp = phase_now();
+        file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                       e->node.content_hash, p->cache_stamp);
+        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        /* Not counted into the batch again: the loop counted the entry when
+         * it queued it. */
+    }
+    p->spool_taken -= sb->taken;
+    small_batch_free(sb);
+    return st;
+}
+
+/* Apply every finished batch at the head of the queue; with wait_ms, wait
+ * that long for the oldest first. */
+static status_t small_drain(pipeline_t *p, batch_t *b, unsigned wait_ms)
+{
+    if (!p->spool) return OK;
+    if (wait_ms) {
+        batch_yield(p, b);
+        if (batch_contended(b)) batch_close(p, b);
+        if (b->in_txn && wait_ms > POOL_WAIT_HELD_MS) wait_ms = POOL_WAIT_HELD_MS;
+    }
+    for (;;) {
+        uint64_t _tw = phase_now();
+        small_batch_t *sb = small_pool_take(p->spool, wait_ms);
+        if (wait_ms) phase_add(p->timers, PHASE_STORE_WAIT, _tw);
+        wait_ms = 0;
+        if (!sb) return OK;
+        status_t st = small_apply(p, b, sb);
+        if (st != OK) return st;
+    }
+}
+
+/*
+ * Submit the batch being filled. Room first: batches in flight are capped
+ * in number, and what they hold of the read budget is kept to half of it,
+ * so this thread's own chunk reads on the serial path never wait for a
+ * slot only one of its batches could free.
+ */
+static status_t small_submit(pipeline_t *p, batch_t *b)
+{
+    small_batch_t *sb = p->sbatch;
+    if (!sb || sb->n == 0) return OK;
+    uint64_t total = read_budget_total();
+    uint64_t want = sb->bytes ? sb->bytes : 1;
+    while (small_pool_outstanding(p->spool) >= small_pool_capacity(p->spool) ||
+           (total && small_pool_outstanding(p->spool) > 0 &&
+            p->spool_taken + want > total / 2)) {
+        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+        status_t st = small_drain(p, b, POOL_WAIT_MS);
+        if (st != OK) return st;
+    }
+    p->sbatch = NULL;
+    sb->taken = read_budget_acquire(want);
+    read_budget_handoff(sb->taken);
+    p->spool_taken += sb->taken;
+    small_pool_submit(p->spool, sb);
+    return OK;
+}
+
+/* Queue one small file, submitting the batch when it fills. */
+static status_t small_queue(pipeline_t *p, batch_t *b, uint32_t index)
+{
+    if (!p->sbatch && !(p->sbatch = small_batch_new()))
+        return set_error(ERR_NOMEM, "backup: small-file batch");
+    const scan_entry_t *e = &p->scan->entries[index];
+    if (small_batch_add(p->sbatch, index, e->path, e->node.size))
+        return small_submit(p, b);
+    return OK;
+}
+
 /*
  * Store one regular file's content (format 3): content-defined chunks into
  * the backup pack, and a chunk list when there is more than one chunk or a
@@ -787,12 +954,15 @@ static status_t store_content_loop(pipeline_t *p);
  */
 static status_t store_content(pipeline_t *p)
 {
-    uint64_t n_large = 0;
+    uint64_t n_large = 0, n_small = 0;
     for (uint32_t i = 0; i < p->count; i++) {
         const scan_entry_t *e = &p->scan->entries[i];
-        if (e->node.type == NODE_TYPE_REG && e->node.size > OBJECT_MAX_BYTES)
-            n_large++;
+        if (e->node.type != NODE_TYPE_REG) continue;
+        if (e->node.size > OBJECT_MAX_BYTES) n_large++;
+        else if (e->node.size <= SMALL_FILE_MAX) n_small++;
     }
+    /* Enough small files to fill a batch or two is worth threads for. */
+    int small_par = n_small >= 2 * (uint64_t)SMALL_BATCH_FILES;
 
     /*
      * Chunk workers when there are files over one object's bound. The plan
@@ -800,8 +970,9 @@ static status_t store_content(pipeline_t *p)
      * number); each worker holds at most a few max-size chunk buffers.
      */
     unsigned workers = 1;
-    store_pool_plan(p->opts->store_workers, n_large ? UINT32_MAX : 0, &workers);
-    if (workers > 1) {
+    store_pool_plan(p->opts->store_workers,
+                    (n_large || small_par) ? UINT32_MAX : 0, &workers);
+    if (workers > 1 && n_large) {
         if (cdc_workers_start(workers, &p->cdc_w) == OK) {
             log_info("backup: %llu file(s) over %llu MiB, their chunks stored "
                      "on %u threads", (unsigned long long)n_large,
@@ -814,6 +985,28 @@ static status_t store_content(pipeline_t *p)
             workers = 1;
         }
     }
+    /*
+     * Small-file workers: the same number, idle while large files are cut
+     * (each holds at most one batch of a few MiB, against a chunk worker's
+     * few 8 MiB buffers). Twice as many batches in flight as workers keeps
+     * every worker busy while the backup thread appends.
+     */
+    if (workers > 1 && small_par) {
+        const cdc_params_t *scp = store_cdc(p->store);
+        unsigned sw = workers > SMALL_POOL_MAX ? SMALL_POOL_MAX : workers;
+        if (scp && small_pool_start(p->store, scp, sw, sw * 2,
+                                    p->opts ? p->opts->cancel : NULL,
+                                    &p->spool) == OK) {
+            log_info("backup: small files stored on %u threads, up to %u to a batch",
+                     sw, SMALL_BATCH_FILES);
+        } else {
+            log_warn("backup: cannot start small-file workers, storing serially: %s",
+                     err_msg());
+            err_clear();
+            p->spool = NULL;
+        }
+    }
+    if (!p->cdc_w && !p->spool) workers = 1;
     p->res->store_workers = workers;
     p->res->file_workers = 1;
 
@@ -843,6 +1036,11 @@ static status_t store_content(pipeline_t *p)
                      (unsigned long long)files, fw);
             fw = (unsigned)files;
         }
+    }
+    if (fw >= 2 && p->cdc_w) {
+        p->claims = pack_claims_new();
+        if (p->claims) pack_backup_share_claims(p->pack_w, p->claims);
+        else fw = 0;     /* no claim set: one file at a time, never twice */
     }
     if (fw >= 2 && p->cdc_w) {
         store_pool_ops_t ops = {
@@ -878,9 +1076,39 @@ static status_t store_content(pipeline_t *p)
      * the chunk workers, so those stop after. */
     status_t pst = store_pool_finish(p->pool, st != OK, p->timers);
     p->pool = NULL;
+    if (p->spool) {
+        p->timers->ns[PHASE_STORE_WORKERS]    += small_pool_busy_ns(p->spool);
+        p->timers->count[PHASE_STORE_WORKERS] += 1;
+        small_pool_stop(p->spool);
+        p->spool = NULL;
+        p->spool_taken = 0;
+    }
+    small_batch_free(p->sbatch);
+    p->sbatch = NULL;
     if (st == OK && pst != OK) {
         st = pst;
         snprintf(why, sizeof(why), "%s", err_msg());
+    }
+    /*
+     * Every file worker's packs are committed or abandoned by now. A claim
+     * that was abandoned may have been referenced by another writer as
+     * stored, so a snapshot made from this run could name a chunk that never
+     * landed: the run fails instead. This thread's writer leaves the set;
+     * its own staged names are known to it, and nothing else is writing.
+     */
+    if (p->claims) {
+        uint64_t lost = pack_claims_abandoned(p->claims);
+        if (pack_claims_deferred(p->claims))
+            log_info("backup: %llu chunk(s) met by two writers at once, stored once",
+                     (unsigned long long)pack_claims_deferred(p->claims));
+        pack_backup_share_claims(p->pack_w, NULL);
+        pack_claims_free(p->claims);
+        p->claims = NULL;
+        if (st == OK && lost) {
+            st = set_error(ERR_IO, "backup: %llu chunk(s) another writer was storing "
+                           "were never committed", (unsigned long long)lost);
+            snprintf(why, sizeof(why), "%s", err_msg());
+        }
     }
     cdc_workers_stop(p->cdc_w);
     p->cdc_w = NULL;
@@ -943,6 +1171,7 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Results come back between entries. */
         status_t dst = pool_drain(p, b, 0);
+        if (dst == OK) dst = small_drain(p, b, 0);
         if (dst != OK) {
             batch_close(p, b);
             return dst;
@@ -1029,6 +1258,18 @@ static status_t store_content_loop(pipeline_t *p)
             p->res->files++;
             p->res->bytes_logical += e->node.size;
             p->res->files_unchanged++;
+            continue;
+        }
+
+        /* A small file goes to a batch for the small-file workers; it is
+         * recorded when its batch comes back. */
+        if (p->spool && e->node.size <= SMALL_FILE_MAX) {
+            status_t qst = small_queue(p, b, i);
+            if (qst != OK) {
+                batch_close(p, b);
+                return qst;
+            }
+            prev_pooled = 1;
             continue;
         }
 
@@ -1135,6 +1376,20 @@ static status_t store_content_loop(pipeline_t *p)
         file_cache_put(p->db, p->repo_id, e->path, &e->st,
                        e->node.content_hash, p->cache_stamp);
         phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+    }
+
+    /* The small files still out. */
+    if (p->spool) {
+        status_t sst = small_submit(p, b);
+        while (sst == OK && small_pool_outstanding(p->spool) > 0) {
+            sst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled")
+                               : small_drain(p, b, POOL_WAIT_MS);
+            if (sst == OK) report(p, "store", p->count, p->count);
+        }
+        if (sst != OK) {
+            batch_close(p, b);
+            return sst;
+        }
     }
 
     /* The large files still out. */

@@ -299,6 +299,20 @@ typedef void (*store_pack_removed_fn)(void *user, uint64_t pack_id);
 void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user);
 void store_emit_pack_removed(store_t *st, uint64_t pack_id);
 
+/*
+ * Point an object's index row at another copy of it (OWN-22): gc found the
+ * copy the index named unreadable as that name, and proved this one - header,
+ * name, and payload decoded and checked against the name. The entry is
+ * described as a commit describes it. OK once the row names the new copy;
+ * ERR_INVALID when nothing is bound to do it (a store indexing its own
+ * packs, or a test's fake index), which gc treats as "keep both".
+ */
+typedef status_t (*store_pack_relocate_fn)(void *user, uint64_t pack_id,
+                                           const pack_commit_entry_t *e);
+void     store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *user);
+status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,
+                                  const pack_commit_entry_t *e);
+
 /* ---------- internals used by object.c and pack.c ---------- */
 
 int         store_fd(const store_t *st);
