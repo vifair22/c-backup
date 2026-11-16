@@ -33,11 +33,14 @@ so it does not. **No route returns a whole snapshot.**
 or more. Something that is not a whole number (`+5`, `lots`, `1.5`) is a
 400 `<param> must be a whole number`; one below the minimum (`-1`, `0` for
 a limit) is a 400 naming the range, which for `limit` is the route's:
-`limit is out of range; it must be from 1 to 1000 (a larger one is reduced
-to 1000)`. They used
+`limit is out of range; it must be from 1 to 1000 (a larger one, up to
+9007199254740992, is reduced to 1000)`. They used
 to be replaced by the defaults, which answered a request the server had not
 understood as if it had. A `limit` above a route's maximum is clamped to it,
-however many digits it has; an `offset` past the last row is an empty page. The same goes for filters with a
+and an `offset` past the last row is an empty page, up to 2^53
+(9007199254740992); a number past that cannot be represented exactly
+(`99999999999999999999`, `1e999`) and is out of range, as it is everywhere
+else. The same goes for filters with a
 fixed set of values: `objects?location=` takes `loose`, `pack` (or
 `packed`) or `all`, and anything else is a 400 rather than an unfiltered
 listing.
@@ -102,6 +105,21 @@ unrepresentable one (`1e999`) is `<param> is out of range; it must be from
 overflowing id used to be clamped and answered 404, as though it were
 merely unknown.
 
+An id in the path (`/repos/<id>`, `/jobs/<id>`, `/repos/<id>/snapshots/<sid>`,
+a schedule, grep or verify run id, a pack number) is decimal digits from 1
+(0 for a pack) to 2^53. Anything else in that place - `-1`, `0`, `1e999`,
+`1.5`, `abc`, `99999999999999999999` - is a 400 `invalid <kind> id`
+(`invalid repo id`, `invalid job id`, `invalid snapshot id`, `invalid
+schedule id`, `invalid grep run id`, `invalid verify run id`, `invalid pack
+id`). These were routed rather than parsed, so the same mistake was a 400,
+a 404 or a 405 depending on where it was made.
+
+A body that is not JSON is a 400 `invalid JSON` on every route. A member
+name that appears twice in one object is refused too, naming it and where
+it is: `invalid JSON: duplicate key 'seconds' in object 'trigger'`, or `at
+the top level`. `POST /repos` used to say `body is not valid JSON` and no
+route named the key.
+
 A request body field is either absent or of its documented type. A field
 that is present with the wrong type is a 400 naming it and the type it
 must be, and nothing is changed:
@@ -115,6 +133,7 @@ must be, and nothing is changed:
 | A whole-number field holds a fraction | `<field> must be a whole number` |
 | A number outside the field's range, negative where it cannot be, or too large to represent (`1e999`) | `<field> is out of range; it must be from <min> to <max>` |
 | A list of strings is not a list, or an entry is not a string | `<field> must be a list of strings` (with the entry's position) |
+| A string holds a NUL (`\u0000`), in the body or as `%00` in the query | `<field> must not contain a NUL character`; a `label` gets the label rule, `label must be at most 256 bytes of printable text` |
 
 `null` is a value of the wrong type, not a way of leaving a field out: omit
 a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
@@ -122,6 +141,10 @@ a field to leave it unset. Flags that also accepted `0`/`1` (`ignore_case`,
 field is named by its path, as in `interval trigger: trigger.seconds must
 be a number`. Integers are exact only up to 2^53, so a field whose type
 allows more is limited to that, and the range in the message says so.
+
+A NUL used to cut the string short without a word: the daemon is C, and
+`"label":"nul\u0000here"` stored the label `nul` and answered 202. No
+field in this API can hold one, so the request is refused instead.
 
 Each of these used to read as absent: an array `label` registered a
 repository with no label and answered 201, `"one_filesystem":true` was
@@ -212,7 +235,7 @@ host always has a way in.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/repos` | List |
-| POST | `/repos` | Register: `{path, label}` |
+| POST | `/repos` | Register: `{path, label}`; `label` follows the snapshot label rule (at most 256 bytes of printable UTF-8) |
 | GET | `/repos/<id>` | One repository, the same object as each entry of the list |
 | DELETE | `/repos/<id>` | Deregister; the data directory is left alone. Index rows are deleted in the background. 409 while a job runs against it. `{"removed":true,"id"}` |
 
@@ -538,9 +561,11 @@ are encrypted, the only side that can read one.
 
 Matching is POSIX extended regular expressions, line by line, over every
 distinct object in the snapshot. Distinct, not every path: a file present
-under several names is one object, so it is read once and reported once
-rather than re-read per copy. Objects are visited in pack order for the same
-reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
+under several names is one object, so it is read once rather than re-read
+per copy. A match in it is still reported under every name, in the searched
+snapshot and inside `path_prefix` when one is given, with the same hits:
+the other names come from the index, not from reading the content again.
+Objects are visited in pack order for the same reason verify is. A file with a NUL byte in its first 8 KiB is a binary: it
 gets one hit, excerpt `(binary file matches)`, and is not read further, the
 way `grep(1)` reports one. Three limits bound the rest:
 
@@ -554,6 +579,17 @@ A value out of range is a 400, not clamped. These exist because hits were
 counted without limit: one 10 MiB binary produced 40,776 hits and one
 20 MiB log 806,597, every one of them read and matched for nothing.
 `hits` counts what was recorded, so it never exceeds `max_hits`.
+
+`files_scanned`, `files_matched`, `files_skipped` and `files_capped` count
+files, meaning paths, not objects: content held under three names is read
+once, counts as three files, and its match is recorded three times. The
+caps treat each name as a matching file of its own. `max_files` 2 against
+those three names records two and stops, `truncated`; a name that would
+take the hit count past `max_hits` gets the hits that are left, and the
+search stops there, `truncated`. A name over its `max_hits_per_file` is in
+`files_capped`, as the first one is. `files_matched` used to count objects
+and the hits named only the first path, so three identical logs holding a
+match showed one file.
 
 The run's `truncated` is `true` when `max_files` or `max_hits` stopped the
 search, so a caller can tell "no more matches" from "stopped looking". A file
@@ -854,7 +890,7 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `packs_coalesced` (small packs merged by the coalescing pass) and `packs_removed_by_coalesce` (how many fewer pack files that left: 20 merged into 3 is 20 and 17), `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
 | replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
@@ -949,6 +985,18 @@ includes the parity trailer. A packed object that reports `phys_size`
 | GET | `/repos/<id>/packs/<pid>/entries` | Contents of one pack, paginated |
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
 | GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
+
+An object's `refcount` is the number of references to it as the last `gc`
+or `reindex` counted them, not a live count: a backup records the objects it
+writes with `refcount` 0 and does not count them, and deleting a snapshot
+does not take its references away. So right after a first backup every
+object reads 0, which does not mean unreferenced, and after a prune a count
+can be too high until the next `gc`. GC does not trust the column either -
+it zeroes it and re-marks from the snapshots' trees on every run, which is
+what makes the count exact afterwards - and `/objects/<hash>/refs` is the
+live answer for one object. Keeping it exact through every backup and
+prune would mean adjusting it on every path that adds or drops a
+reference, which is the drift mark-and-sweep exists to avoid (`gc.h`).
 
 An object's `location` is `loose`, `staged` or `packed`, and `pack_id` is
 the pack's number or `null`. The index stores the pack number in place of

@@ -620,6 +620,21 @@ static int already_restored(const struct stat *sb, uint64_t size, int64_t mtime_
 }
 
 /*
+ * What is at a path already_restored turned down, for the log line that
+ * says it was kept. The line always said "size or mtime differ", including
+ * when the thing there was a directory (NIT-9), which sends the operator
+ * comparing sizes of something that is not a file at all.
+ */
+static const char *kept_reason(const struct stat *sb, uint64_t size)
+{
+    if (S_ISDIR(sb->st_mode)) return "a directory is there, not the file";
+    if (S_ISLNK(sb->st_mode)) return "a symbolic link is there, not the file";
+    if (!S_ISREG(sb->st_mode)) return "something other than a regular file is there";
+    if ((uint64_t)sb->st_size != size) return "a file of a different size is there";
+    return "a file with a different modification time is there";
+}
+
+/*
  * Restore one regular file's content and metadata under a temporary name.
  * On OK the verified file is complete at `tmp` (closed), waiting for the
  * batch below to make it durable and rename it into place; on any failure
@@ -1187,8 +1202,8 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                     res.skipped++;
                 } else {
                     log_warn("restore: %s already exists and is not the "
-                             "snapshot's version (size or mtime differ); kept, "
-                             "since overwrite is off", full);
+                             "snapshot's version (%s); kept, since overwrite "
+                             "is off", full, kept_reason(&sb, nsize));
                     res.kept++;
                 }
                 continue;

@@ -168,6 +168,26 @@ static void test_register_requires_absolute_path(void **state)
     assert_int_not_equal(repo_register(db, "relative/path", NULL, &id), OK);
 }
 
+/* B116: a repository label follows the snapshot label rule, on a first
+ * registration and on a relabel alike, and a refusal creates nothing. */
+static void test_register_checks_the_label(void **state)
+{
+    (void)state;
+    char long_label[258];
+    memset(long_label, 'a', 257);
+    long_label[257] = '\0';
+    int64_t id = 0;
+    struct stat sb;
+    assert_int_equal(repo_register(db, TEST_ROOT "/lbl", long_label, &id), ERR_INVALID);
+    assert_int_equal(repo_register(db, TEST_ROOT "/lbl", "a\nb", &id), ERR_INVALID);
+    assert_int_not_equal(stat(TEST_ROOT "/lbl", &sb), 0);
+
+    long_label[256] = '\0';
+    assert_int_equal(repo_register(db, TEST_ROOT "/lbl", long_label, &id), OK);
+    int64_t again = 0;
+    assert_int_equal(repo_register(db, TEST_ROOT "/lbl", "x\x7fy", &again), ERR_INVALID);
+}
+
 /*
  * B014: the path was stored exactly as typed, so a trailing slash made
  * "/srv/backup/r/" and "/srv/backup/r" two strings for one directory.
@@ -865,6 +885,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_register_adopts_unknown_uuid, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_refuses_foreign_dir, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_requires_absolute_path, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_register_checks_the_label, setup, teardown),
         cmocka_unit_test_setup_teardown(test_path_normalize, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_stores_normalised_path, setup, teardown),
         cmocka_unit_test_setup_teardown(test_register_creates_missing_parents, setup, teardown),

@@ -1096,12 +1096,13 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[512];
+    char js[640];
     snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
-             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
+             "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
@@ -1110,6 +1111,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_kept,
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
+             gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed);
     char *full = with_damaged(js, "pack_entries_damaged", gr->pack_entries_damaged,
@@ -1132,11 +1134,13 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
     else
         snprintf(msg, sizeof(msg),
                  "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
-                 "%u deleted; %u stale temp file%s removed",
+                 "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,
                  gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
                  gr->packs_deleted,
+                 gr->packs_coalesced,
+                 gr->packs_coalesced - gr->packs_removed_by_coalesce,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
         size_t n = strlen(msg);
@@ -1514,9 +1518,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "pattern is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /* A field of the wrong type is refused by name. path_prefix and
          * max_files used to be dropped when they were, so the search ran
@@ -1584,9 +1589,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         int rc = jreq_str(body, "dest", &j->dest, &je);
@@ -1613,9 +1619,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /*
          * Every field is read for its type before any is acted on.
@@ -2069,7 +2076,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     prune_info_t info;
     st = prune_snapshot_checked(store, g_ctx.db, repo_id, snap_id, force, &info);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    char why[512];
+    char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
     store_close(store);
     repo_unlock(repo_id);
@@ -2079,7 +2086,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
     if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
 
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     if (st != OK) {
         snprintf(msg, sizeof(msg), "snapshot %lld: %s", (long long)snap_id, why);
         journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "failed", took_ms, msg);

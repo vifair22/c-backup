@@ -1781,7 +1781,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
          * cancelled backup should leave the index as it found it. The error
          * is the backup's; a failure here is only logged.
          */
-        char why[256];
+        char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         if (store_index_drop_staged(db, repo_id) != OK)
             log_warn("backup: cannot drop staged rows after: %s", why);

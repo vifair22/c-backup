@@ -161,8 +161,9 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body) return api_error(400, "request body required");
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *name = NULL;
     uint32_t snap = 0;
@@ -230,7 +231,7 @@ api_response_t metadata_tags_post(const api_request_t *req, int64_t repo_id)
         db_txn_rollback(g_db);
         return api_error(500, "cannot set tag");
     }
-    char merr[PATH_MAX + 128];
+    char merr[ERR_MSG_MAX + 64];
     if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
         db_txn_rollback(g_db);
         return api_error(500, merr);
@@ -262,7 +263,7 @@ api_response_t metadata_tags_delete(const api_request_t *req, int64_t repo_id,
         db_txn_rollback(g_db);
         return api_error(404, "no such tag");
     }
-    char merr[PATH_MAX + 128];
+    char merr[ERR_MSG_MAX + 64];
     if (tags_mirror(repo_id, merr, sizeof(merr)) != 0) {
         db_txn_rollback(g_db);
         return api_error(500, merr);
@@ -310,8 +311,9 @@ api_response_t metadata_note_put(const api_request_t *req, int64_t repo_id,
 {
     if (!req->body) return api_error(400, "request body required");
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *text = NULL;
     jreq_err_t je;
@@ -475,8 +477,9 @@ api_response_t metadata_sources_put(const api_request_t *req, int64_t repo_id)
         return api_error(400, "a body with sources is required");
 
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -710,8 +713,9 @@ api_response_t metadata_policy_put(const api_request_t *req, int64_t repo_id)
 {
     if (!req->body) return api_error(400, "request body required");
     CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-    if (json_req_parse(req->body, req->body_len, &body) != 0)
-        return api_error(400, "invalid JSON");
+    jreq_err_t pje;
+    if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK)
+        return api_error(400, pje.msg);
 
     CUTILS_AUTOFREE char *key = NULL;
     CUTILS_AUTOFREE char *value = NULL;

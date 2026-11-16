@@ -345,9 +345,10 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
      * about that before anything about the repository's state (B112). */
     if (req->body && req->body_len) {
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             backup_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         if (backup_opts_from_json(body, j, &je) != 0) {
@@ -627,26 +628,36 @@ static const char *jobs_allow_for_url(const char *url, void *ud)
     if (strncmp(url, "/jobs/", 6) != 0) return NULL;
     const char *p = url + 6;
     if (strncmp(p, "stream/", 7) == 0) p += 7;
-    char *end = NULL;
-    long long id = strtoll(p, &end, 10);
-    if (id <= 0 || !end || end == p || *p < '1' || *p > '9') return NULL;
+    int64_t id = 0;
+    const char *end = NULL;
+    if (routes_path_id(p, 1, &id, &end) != 1) return NULL;
     if (*end == '\0') return "GET";
     if (p == url + 6 && strcmp(end, "/cancel") == 0) return "POST";
     return NULL;
 }
 
+/*
+ * The job id in /jobs/<id>[/...], or -1 when that segment is not one. Such
+ * a path was a 404, while /repos/-1 was a 400 "invalid repo id"; both are
+ * a 400 now, in the same words (NIT-8).
+ */
+static int64_t job_path_id(const char *url)
+{
+    int64_t id = 0;
+    return routes_path_id(url + strlen("/jobs/"), 1, &id, NULL) == 1 ? id : -1;
+}
+
 static api_response_t get_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    int64_t id = job_path_id(req->url);
+    if (id < 0) return api_error(400, "invalid job id");
     const char *allow = jobs_allow_for_url(req->url, NULL);
     if (!allow) return api_error(404, "not found");
     if (strcmp(allow, "GET") != 0) return api_method_not_allowed(allow);
-    const char *tail = req->url + strlen("/jobs/");
-    char *end = NULL;
-    long long id = strtoll(tail, &end, 10);
 
     char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%lld", id);
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
     db_result_t *r = NULL;
     if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
                    (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
@@ -661,12 +672,11 @@ static api_response_t get_job(const api_request_t *req, void *ud)
 static api_response_t cancel_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    int64_t id = job_path_id(req->url);
+    if (id < 0) return api_error(400, "invalid job id");
     const char *allow = jobs_allow_for_url(req->url, NULL);
     if (!allow) return api_error(404, "not found");
     if (strcmp(allow, "POST") != 0) return api_method_not_allowed(allow);
-    const char *tail = req->url + strlen("/jobs/");
-    char *end = NULL;
-    long long id = strtoll(tail, &end, 10);
 
     status_t st = job_cancel(ctx->jm, id);
     if (st != OK) return api_error(404, "job is not running");
@@ -679,7 +689,7 @@ static api_response_t cancel_job(const api_request_t *req, void *ud)
      * landed, and the job's own record says when it stops.
      */
     char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%lld", id);
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
     db_result_t *r = NULL;
     cJSON *j = NULL;
     if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",

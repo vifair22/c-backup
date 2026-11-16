@@ -84,7 +84,16 @@ struct job_manager {
      * lock keeps them from interleaving mid-transaction with a job's own
      * writes. */
     pthread_mutex_t db_mu;
+    /* Whether a failure alert goes anywhere: Pushover has a token and a
+     * user (job_manager_set_alerts). push_send accepts and drops a message
+     * when it has not, so this is only what the log line may claim. */
+    atomic_int      alerts;
 };
+
+void job_manager_set_alerts(job_manager_t *jm, int enabled)
+{
+    if (jm) atomic_store(&jm->alerts, enabled ? 1 : 0);
+}
 
 /*
  * One journal entry for a job that ended.
@@ -102,7 +111,7 @@ static void journal_job(cutils_db_t *db, int64_t repo_id, int64_t schedule_id,
         journal_record(db, repo_id, "api", action, outcome, took_ms, message);
         return;
     }
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     snprintf(msg, sizeof(msg), "schedule %lld%s%s", (long long)schedule_id,
              message && *message ? ": " : "", message ? message : "");
     journal_record(db, repo_id, "schedule", action, outcome, took_ms, msg);
@@ -176,12 +185,12 @@ void job_alert_compose(cutils_db_t *db, int64_t repo_id, int64_t job_id,
                  (long long)repo_id);
 
     if (path[0])
-        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %s",
+        snprintf(body, body_sz, "Repository %s (id %lld) at %s\nJob %lld (%s) failed: %.900s",
                  label[0] ? label : "(no label)", (long long)repo_id, path,
                  (long long)job_id, what, why);
     else
         snprintf(body, body_sz, "Repository %lld (no longer registered)\n"
-                 "Job %lld (%s) failed: %s",
+                 "Job %lld (%s) failed: %.900s",
                  (long long)repo_id, (long long)job_id, what, why);
 }
 
@@ -643,12 +652,20 @@ static void *worker_main(void *arg)
             pthread_mutex_unlock(&jm->db_mu);
             /* c-utils logs a send only when it is rejected, and then only
              * the title, so the log never said an alert went out or what
-             * it said. */
-            log_info("sending failure notification for job %lld: %s: %s",
-                     (long long)slot.job_id, title, body);
-            if (push_send(title, body) != 0)
-                log_warn("cannot queue failure notification for job %lld",
-                         (long long)slot.job_id);
+             * it said. Nor does it say when it drops one for want of
+             * credentials, and this line said "sending" after push_init
+             * had logged that Pushover is not configured (NIT-11). */
+            if (atomic_load(&jm->alerts)) {
+                log_info("sending failure notification for job %lld: %s: %s",
+                         (long long)slot.job_id, title, body);
+                if (push_send(title, body) != 0)
+                    log_warn("cannot queue failure notification for job %lld",
+                             (long long)slot.job_id);
+            } else {
+                log_info("failure notification for job %lld not sent, Pushover "
+                         "is not configured: %s: %s",
+                         (long long)slot.job_id, title, body);
+            }
         }
         if (st != OK && outcome[0] == 'f') err_clear();
 
