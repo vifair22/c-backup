@@ -442,7 +442,7 @@ int main(int argc, char *argv[])
     api_server_set_after_write(srv, after_write, NULL);
 
     if (api_server_start(srv) != 0) {
-        log_error("cannot start API server");
+        log_error("cannot start API server: %s", api_server_error());
         goto out_srv;
     }
 

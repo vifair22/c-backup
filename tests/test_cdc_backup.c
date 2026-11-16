@@ -570,6 +570,9 @@ static void test_gc_moves_the_index_off_a_damaged_payload(void **state)
     gc_result_t g;
     memset(&g, 0, sizeof(g));
     assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    /* The move is counted and reported (B138). */
+    assert_int_equal(g.index_relocated, 1);
+    assert_int_equal(g.dups_dropped, 0);
     uint32_t p2 = 0;
     uint64_t o2 = 0;
     assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
@@ -1573,6 +1576,71 @@ static void test_replicate_same_key_copies(void **state)
     free(data);
 }
 
+
+/* Where a copy of hash sits other than in pack `not`: its pack and index. */
+typedef struct {
+    const uint8_t *hash;
+    uint32_t       not_pack, cur, found_pack, found_index;
+    int            found;
+} copy_find_t;
+
+static void copy_find_entry(const pack_entry_info_t *info, void *ctx)
+{
+    copy_find_t *f = ctx;
+    if (f->cur == f->not_pack || memcmp(info->hash, f->hash, OBJECT_HASH_SIZE) != 0) return;
+    f->found = 1;
+    f->found_pack = f->cur;
+    f->found_index = info->entry_index;
+}
+
+static void copy_find_pack(uint32_t num, void *ctx)
+{
+    copy_find_t *f = ctx;
+    char name[64];
+    snprintf(name, sizeof(name), "pack-%010u.dat", num);
+    f->cur = num;
+    (void)pack_enumerate_dat(store, name, NULL, NULL, copy_find_entry, f);
+}
+
+/*
+ * The same repoint with the good copy deep in its pack rather than its
+ * first entry: proving it reads its own CRCs, at its own position. The
+ * walk once handed gc every entry as position 0, so a copy anywhere else
+ * was never proven, the row stayed on the damaged copy until a rewrite
+ * happened to carry the good one, and the move was neither made nor
+ * counted (B138).
+ */
+static void test_gc_repoints_to_a_copy_deep_in_its_pack(void **state)
+{
+    (void)state;
+    for (int i = 0; i < 6; i++) {
+        char p[600];
+        snprintf(p, sizeof(p), TEST_SRC "/a%d.bin", i);
+        uint8_t *d = rand_buf(40 * 1024, 900 + (uint64_t)i);
+        write_buf(p, d, 40 * 1024);
+        free(d);
+    }
+    uint8_t hash[OBJECT_HASH_SIZE];
+    uint32_t pnum = 0;
+    uint64_t off = 0;
+    plant_duplicate(hash, &pnum, &off);
+    copy_find_t f = { hash, pnum, 0, 0, 0, 0 };
+    assert_int_equal(pack_list(store, copy_find_pack, &f), OK);
+    assert_true(f.found);
+    assert_true(f.found_index > 0);
+    ruin(pnum, off + sizeof(pack_dat_entry_hdr_t) + 1024, 64 * 1024);
+
+    gc_result_t g;
+    memset(&g, 0, sizeof(g));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &g), OK);
+    assert_int_equal(g.index_relocated, 1);
+    uint32_t p2 = 0;
+    uint64_t o2 = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &p2, &o2), OK);
+    assert_true(p2 != pnum);
+    restore_and_diff(latest_snapshot());
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1581,6 +1649,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_gc_reclaims_a_duplicate_copy, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_ruined_header, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_moves_the_index_off_a_damaged_payload, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_gc_repoints_to_a_copy_deep_in_its_pack, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_files_on_workers_match_serial, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
