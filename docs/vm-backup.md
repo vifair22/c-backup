@@ -575,14 +575,78 @@ one or two chunks.
 
 Each session records `resync_bytes` (bytes re-read beyond the changed
 ranges) in the job result and `unit.json`; the bench measures its
-distribution on real images (section 9.4).
+distribution on real images (section 11).
 
 **The amplification to expect.** Bitmap granularity is 64 KiB and the mean
-chunk 1.16 MiB, so scattered small writes cost about 18 times their size in
-reads: 10,000 isolated dirty granules (640 MiB) read about 11.6 GiB. This
-is inherent to any chunk-granular dedup (a 4 MiB fixed-block scheme pays 64
-times), it is still bounded by the allocated size, and it costs reads, not
+chunk 1.16 MiB, so an isolated dirty granule costs about one whole chunk of
+reading: about 18 times its size. This is inherent to any chunk-granular
+dedup (a 4 MiB fixed-block scheme pays 64 times), and it costs reads, not
 writes: only the changed chunks are new.
+
+**Worst case against a full read.** Let `F` be the data bytes of the disk
+(the sum of `P`'s leaf lengths: everything a full read would read), `L` the
+number of leaves, `mu = F / L` the disk's own mean chunk, `g` the bitmap
+granularity, and `d` the dirty fraction of `F`. If `n = d F / g` granules
+are dirty and scattered uniformly, the fraction of leaves touched is about
+`1 - exp(-n / L) = 1 - exp(-d mu / g)`, and an incremental reads about that
+fraction of `F` (plus about 5% for granules straddling a boundary and the
+64 KiB lookbehind):
+
+| Dirty fraction `d` (scattered 64 KiB granules) | Incremental reads, as a fraction of a full read | Amplification over dirty bytes |
+|---:|---:|---:|
+| 0.1% | 1.8% | 18x |
+| 0.5% | 8.9% | 18x |
+| 1% | 17% | 17x |
+| 2% | 31% | 16x |
+| 5% | 60% | 12x |
+| 7.5% | 75% | 10x |
+| 10% | 84% | 8x |
+| 20% | 98% | 5x |
+| 50% | 100% | 2x |
+
+The worst case is one dirty granule in every leaf: the incremental reads
+every data byte, exactly what a full read reads, plus the cost of walking
+`P` (seconds per TiB) and the lookbehind reads. It is never meaningfully
+worse than a full read, and clustered writes (the common case: a database
+file, a log, an upgrade) sit far below the scattered curve, at about the
+dirty bytes plus one chunk per cluster.
+
+**The fallback rule.** Before reading any data, the provider computes the
+incremental's read estimate `E` exactly from `P` and `D`, with no I/O on the
+disk:
+
+```
+for each merged changed range [ds, de):
+    r = restart point (as above)
+    e = end of the leaf of P containing byte de - 1,
+        or de if that byte lies in a hole of P
+clusters = the intervals [r, e), merged where they overlap or touch
+E = sum over clusters of (e - r)  minus the bytes of P's holes inside them
+F = sum of P's leaf lengths
+```
+
+`e` is where the re-chunk resyncs in the common case (the next old boundary
+after the change), so `E` is what the incremental reads unless a divergent
+cut extends a cluster by a chunk or two; it is a slight underestimate, never
+an overestimate. If
+
+```
+100 x E > vm.delta_full_pct x F      (default 75)
+```
+
+the disk is read in full instead (`read_mode: full`, reason
+`delta-too-costly`), still under the new checkpoint, so the chain continues.
+At the default this switches at about 7.5% scattered dirty data. The
+threshold is below 100% because `E` underestimates, because the full read
+avoids the walk and the per-cluster restarts, and because a full read with
+a valid bitmap in hand is a free audit (5.4): the provider runs the audit's
+checks on it, so an expensive incremental is replaced by a verification.
+`0` disables incrementals for the unit; `100` switches only when the
+estimate reaches a full read. (A percentage, because the config format
+takes whole numbers.)
+
+`E`, `F`, the cluster count and the threshold are recorded per disk in
+`unit.json`, so the decision is visible in the history.
 
 **Cost of the walk.** Feeding the builder every leaf of `P` is O(leaves):
 about 900,000 per TiB of data, about 220 list objects to load and verify
@@ -900,6 +964,7 @@ phase (`--attach <vm>`), because it modifies that VM's live definition.
 | `vm.nbd_queue_depth` | `8` | Reads in flight per disk, 1 to 64 |
 | `vm.nbd_timeout_s` | `120` | Per-request timeout |
 | `vm.trust_zero_status` | `1` | Skip reading extents reported zero |
+| `vm.delta_full_pct` | `75` | Read a disk in full when the incremental's read estimate exceeds this percentage of a full read (5.3); 0 to 100 |
 | `vm.audit_days` | `30` | Days between audit reads per unit; 0 disables (not recommended) |
 | `vm.qemu_nbd` | `qemu-nbd` | Binary for offline qcow2 reads and qcow2 restore |
 | `vm.export_dir` | `/run/c-backupd/exports` | Export sockets; same-path rule as `nbd_dir` |
@@ -1093,6 +1158,11 @@ section 13's fake provider:
 - **Resync statistics**: distribution of `resync_bytes` for isolated small
   writes; asserted below a bound (for example, mean under 2 MiB at the
   default chunk sizes) so a regression in the restart rule shows.
+- **Read estimate and fallback**: `E` computed before reading equals or
+  slightly undercounts the bytes the delta actually reads, across clustered
+  and scattered patterns; above `vm.delta_full_pct` the disk is read in
+  full with reason `delta-too-costly`, the audit checks run on that read,
+  and the root is the same either way.
 - **Zero-run rule**: canonical lists for the same content presented with
   different allocation maps (all data, `ZERO` extents, a mix).
 - **Lifecycle faults**: freeze timeout (watchdog thaw before and after begin

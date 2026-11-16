@@ -451,7 +451,7 @@ A bounded vocabulary, so they can label a metric without exploding its
 cardinality: `first`, `no-incremental-support` (raw disk, plain directory
 tree), `no-base`, `base-pruned`, `token-missing`, `token-invalid`,
 `item-new`, `item-resized`, `item-source-changed`, `unit-redefined`,
-`audit`, `forced`, `unchanged-offline`, `incremental`.
+`audit`, `delta-too-costly`, `forced`, `unchanged-offline`, `incremental`.
 
 ### 6.5 One unit, one session at a time
 
@@ -766,38 +766,241 @@ options:
 | Option | What | For | Against |
 |--------|------|-----|---------|
 | A. All in the daemon | Mount the sockets and devices into the c-backupd container, add the caps | One component; simplest to ship | A bug in the HTTP-facing daemon, or a stolen admin token, is host root |
-| **B. Host helper** (recommended) | `c-backup-helper`: a small static binary on the host, no network listener, speaking a fixed verb protocol over a unix socket shared into the daemon's container. It holds the sockets, tools and caps; the daemon holds none of them | The network-facing process is no longer root-equivalent; the helper uses the host's own `zfs`, `lxc-*` and libvirt, so no userland version skew; the helper owns the watchdogs, so a dead daemon cannot leave a guest frozen or a container paused | A second artefact to build, ship, start at boot and version; an RPC layer to test |
+| **B. Host helper** (recommended) | `c-backup-helper`: a small privileged sidecar with no network, speaking a fixed, typed operation protocol over a unix socket shared into the daemon's container (11.1 to 11.5). It holds the sockets, tools and caps; the daemon holds none of them | The network-facing process is no longer root-equivalent; the helper uses the host's own `zfs`, `lxc-*` and libvirt, so no userland version skew; the helper owns the watchdogs, so a dead daemon cannot leave a guest frozen or a container paused | A second artefact to build, ship, start at boot and version; an RPC layer to test |
 | C. Daemon on the host | Run c-backupd natively, not in Docker | No socket plumbing | Root anyway; on Unraid there is no supported native install path |
 
-The helper's protocol is the control half of the vtable and nothing else:
-`list`, `describe`, `begin`, `end`, `sweep`, `define`, with arguments
-checked against a host-side allowlist (`/boot/config/c-backup-helper.ini`
-on Unraid: which units, which datasets and subvolumes, which hook commands).
-Data never crosses it: the daemon reads NBD sockets, snapshot directories
-and image files directly through its own read-only mounts. On Unraid the
-root filesystem is RAM, so nothing installed on the host survives a reboot;
-the helper is therefore a privileged sidecar container (`--pid=host
---network=none`) that runs the host's own tools through `nsenter`, autostarted
-by Docker (`container-backup.md` section 9.2). Estimated size:
-1,500 to 2,500 lines of C, most of it the providers' control code compiled
-twice (in-process for tests and development, behind the helper for
-deployment), so the providers are written once against the split.
+### 11.1 The helper
 
-Hooks make the decision sharper. A hook is a command run in a container
-(`docker exec`) or on the host. If hooks can be set through the API, the API
-can run commands as root. Under option B, hooks are named in the helper's
-allowlist and the API can only select among them; under option A the
-config file must carry `units.allow_host_hooks: 0` and container hooks
-must still be treated as root in that container.
+The helper is the control half of the vtable and nothing else. Data never
+crosses it: the daemon reads NBD sockets, snapshot directories and image
+files directly through its own read-only mounts. On Unraid the root
+filesystem is RAM, so nothing installed on the host survives a reboot; the
+helper is therefore a privileged sidecar container (`--privileged
+--pid=host --network=none`) that runs the host's own tools through
+`nsenter`, autostarted by Docker (`container-backup.md` section 9.2).
+Estimated size: 1,500 to 2,500 lines of C, most of it the providers'
+control code compiled twice (in-process for tests and development, behind
+the helper for deployment), so the providers are written once against the
+split. It is built with the same flags, analysers and fuzzing as the
+daemon; its request parser is a fuzz target.
+
+### 11.2 Wire protocol
+
+- **Transport.** `AF_UNIX`, `SOCK_SEQPACKET`, at
+  `/run/c-backup-helper/helper.sock`. The directory is `0750
+  root:<daemon gid>`, the socket `0660`. On every connection the helper
+  reads `SO_PEERCRED` and refuses any peer whose uid is not the configured
+  `daemon_uid`; the socket is mounted into the daemon's container and
+  nowhere else. Sequenced packets keep message boundaries, so there is no
+  framing to get wrong.
+- **Messages.** One request, one response, each a single packet of at most
+  64 KiB holding one UTF-8 JSON object:
+
+  ```json
+  {"v":1,"id":17,"op":"capture.begin","args":{"units":["docker:compose:immich"],"pause":false}}
+  {"id":17,"ok":true,"result":{"capture":"c-5f0e...","read_roots":{...},"snapshot_ms":212}}
+  {"id":17,"ok":false,"error":{"code":"denied","msg":"unit docker:Plex-Mover is not in the policy"}}
+  ```
+
+  Error codes are a closed set: `denied`, `invalid`, `busy`, `timeout`,
+  `failed`, `unsupported`. Requests on one connection are handled in
+  order; the daemon may hold a few connections for concurrent jobs.
+- **File descriptors** travel only as `SCM_RIGHTS` ancillary data, and in
+  1.0 only on one response: `hook.run` for a dump hook (the read end of a
+  pipe the helper fills with the hook's demultiplexed stdout). Bulk data
+  never travels in messages.
+- **Handshake.** The first request must be `hello`; the helper answers
+  with its version, the daemon id it is configured for, and a digest of
+  its policy, which the daemon logs and shows in `GET /providers`.
+
+### 11.3 Operations
+
+The complete list for 1.0. Anything else is `denied`. There is **no**
+operation that runs a command, takes a shell string, a path to execute, a
+snapshot name, raw XML for libvirt, or a raw create body for Docker.
+
+| Operation | Arguments (typed) | What the helper does |
+|---|---|---|
+| `hello` | `client_version` int | handshake |
+| `units.list` | `provider` enum | enumerate, filtered by the policy's unit allowlist |
+| `units.describe` | `unit` unit key | inspect / domain XML / LXC config, templates and compose files, read by the helper and returned as data |
+| `capture.begin` | `units` 1 to 32 unit keys; `pause` bool | resolves every included mount itself, computes snapshot domains itself and intersects them with the policy's domains; pauses or freezes members if asked, `syncfs`, one atomic snapshot per pool with names it generates, unpauses; returns an opaque capture token, the read root of each mount, timings and per-member outcomes. Holds a lease with a deadline |
+| `capture.end` | `capture` token | destroys that capture's snapshots |
+| `hook.run` | `unit` unit key; `hook` name | runs the named hook from the policy, inside the unit's container (`container-backup.md` 6.6); returns a run token and, for a dump, a pipe fd |
+| `hook.wait` | `run` token | exit status, timed-out flag, log (capped) |
+| `vm.backup_begin` | `unit`; `disks` list of {`target` string, `mode` enum full/incremental}; `base` checkpoint name or null; `freeze` enum | builds the backup and checkpoint XML itself from these fields and its own configured socket and scratch paths; accepts `base` only if it is a checkpoint the helper created for this daemon id; freeze, begin, thaw with its own watchdog; returns socket, export and bitmap names, level, `freeze_ms` |
+| `vm.backup_end` | `session` token; `outcome` enum | aborts the job, settles checkpoints (keep or delete the new one, delete the retired base) |
+| `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint |
+| `restore.stage` | `unit`; `mount` (a source path as recorded); `job` int | creates `<dataset root>/.cbackup-restore/<job>/` for that mount, owned by the daemon uid; returns a staging token and the path |
+| `restore.swap` | `staging` token | with the unit stopped, renames the staged restore into place and moves the old data aside (11.6); never deletes |
+| `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore` |
+| `unit.define` | `unit`; `definition` (the snapshot's inspect, template, compose files, or domain XML) | policy `allow_define` only. The helper parses the definition field by field, rejects privileged settings unless `allow_privileged_define`, rewrites names, UUIDs and MACs itself, and serialises its own document; the daemon's bytes are never passed through |
+| `lease.release` | `capture` or `session` token | early release |
+| `sweep` | none | releases everything its own records say is held; destroys its own leftover artefacts |
+
+Offline VM reads need no operation: the daemon spawns `qemu-nbd
+--read-only` itself over image files it can already read.
+
+### 11.4 Validation, on the helper side
+
+- **Schema.** Exactly the keys listed for the operation. An unknown or
+  missing key, a wrong JSON type, an integer out of range, or an enum value
+  outside its set is `invalid`. Strings are bounded (unit keys 160 bytes,
+  names 64, paths 4,096), valid UTF-8, with no NUL or control characters.
+- **Identifiers.** A unit key is `<provider>:<id>`, the provider from the
+  enum and the id matched against that provider's grammar (Docker
+  container names `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, compose projects
+  `[a-z0-9][a-z0-9_-]{0,63}`, libvirt UUIDs, LXC names), then against the
+  policy's unit globs.
+- **Paths** are never trusted from the daemon. Mount sources come from the
+  helper's own inspect, snapshot names from its own generator, read roots
+  from its own snapshots. The one path the daemon names, `restore.stage`'s
+  `mount`, must equal a mount source of that unit in the helper's current
+  inspect.
+- **Execution.** Every external tool runs through `posix_spawn` with an argv
+  the helper builds (`nsenter -t 1 -m -- zfs snapshot -o
+  com.cbackup:owner=<id> <ds>@<name> ...`); there is no shell anywhere.
+- **Tokens** (capture, session, run, staging) are 128-bit random values the
+  helper issues and records; an unknown token is `invalid`.
+- **Rates and bounds.** Pause and freeze leases are capped at
+  `max_pause_s` and released by the helper's own watchdog; captures are
+  rate-limited (`max_captures_per_hour`, default 60) and expire at
+  `capture_max_s` (default 24 h), when the helper destroys their snapshots
+  itself.
+
+The policy is on the flash, root-owned, and the helper refuses to start if
+it is group- or world-writable:
+
+```ini
+[helper]
+daemon_uid = 990
+daemon_id = 7f3a09c1
+max_pause_s = 30
+max_captures_per_hour = 60
+capture_max_s = 86400
+allow_restore = 1
+allow_define = 0
+allow_privileged_define = 0
+
+[units]
+allow = docker:compose:immich, docker:compose:gitlab_server, docker:Grafana, docker:cbk-uat-*, libvirt:cbk-uat-*, lxc:cbk-uat-*
+
+[snapshot]
+zfs_domains = cache/appdata, cache/Photos, cache/system, cache/lxc
+btrfs_domains =
+
+[hook immich-pg_dumpall]
+unit = docker:compose:immich
+kind = dump
+phase = pre
+container = immich_postgres
+argv.0 = pg_dumpall
+argv.1 = --clean
+argv.2 = --if-exists
+argv.3 = -U
+argv.4 = postgres
+timeout_s = 900
+on_fail = continue
+```
+
+### 11.5 What a compromised daemon can still do
+
+Assume an attacker runs code in the daemon (a parser bug, a stolen admin
+session token).
+
+| Can | Bound |
+|---|---|
+| read everything the daemon's mounts expose (appdata, images, repositories, keys) | unchanged by any option: reading is the daemon's job. Encrypted repositories' keys are in its state volume |
+| pause or freeze allowed units | at most `max_pause_s` each and `max_captures_per_hour` per hour: a nuisance, bounded |
+| create snapshots of allowed domains | names chosen by the helper; expired after `capture_max_s` |
+| start VM backups of allowed domains | copy-before-write load and scratch space, bounded by the scratch reserve check |
+| run hooks | only those named in the policy, with their fixed argv, inside the unit's own containers |
+| stop units and swap restored data in (`allow_restore`) | only allowed units; the previous data is moved aside, never deleted, so the operator can reverse it |
+| define units (`allow_define`, off by default) | never privileged ones unless `allow_privileged_define` |
+
+| Cannot |
+|---|
+| run any command of its choosing, on the host or in a container |
+| name a path, dataset, snapshot or checkpoint for the helper to act on |
+| touch a unit, dataset or subvolume outside the policy |
+| delete a snapshot or checkpoint the helper did not create |
+| mount anything, reach the host network, or talk to dockerd or libvirtd directly |
+| change the policy (a root-owned file on the flash, read at helper start) |
+
+Under option A every row of the second table becomes possible.
+
+### 11.6 The daemon's real capability set
+
+"Unprivileged" means exactly this:
+
+| | Value |
+|---|---|
+| uid / gid | a fixed non-root uid, `cbackup` (990 by default, configurable). Not uid 0: a uid-0 process with every capability dropped still owns every root-owned file, so it passes owner checks on them (it can write root's 0600 files in any read-write mount and read them without `CAP_DAC_READ_SEARCH`), and in Unraid's Docker (no user-namespace remapping) container uid 0 is host uid 0 |
+| effective capabilities, normally | `CAP_DAC_READ_SEARCH` only: read any file and search any directory in its mounts. Enough for every backup |
+| permitted, raised only by restore threads | `CAP_DAC_OVERRIDE` (write into directories others own), `CAP_CHOWN` (restore owners), `CAP_FOWNER` (modes, times, xattrs and ACLs on files it does not own), `CAP_FSETID` (keep setuid/setgid across `chown`), `CAP_MKNOD` (device nodes, an LXC rootfs's `/dev`) |
+| everything else | not in the bounding set: no `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_NET_ADMIN`, and no `CAP_SETUID` after start |
+| namespaces | its own pid and network namespaces (a published TCP port for the API); no `--pid=host`, no `--privileged` |
+| devices and sockets | none: no `/dev/zfs`, no Docker socket, no libvirt socket; only the helper socket and the NBD/export socket directory |
+| mounts | sources read-only (`rslave`, for snapshot visibility); repository and state read-write, owned by 990; restore staging directories read-write (below) |
+
+How it gets there: Docker gives a non-root `--user` none of the capabilities
+added with `--cap-add` (it sets no ambient capabilities), so the container
+starts as root with `--cap-drop ALL` plus the six capabilities above, and
+c-backupd drops privilege itself before it opens anything:
+`prctl(PR_SET_KEEPCAPS)`, `setresgid`/`setresuid` to 990, `capset` to
+effective = `CAP_DAC_READ_SEARCH` and permitted = the six, then
+`PR_SET_NO_NEW_PRIVS`. The uid is the new config key
+`security.run_as_uid` (default 0, meaning no drop, so existing
+deployments behave as today; the Docker image for workload backup sets
+990). Restore worker threads raise the five restore
+capabilities into their own effective set (capabilities are per thread on
+Linux) and drop them when the job ends; backup threads never hold them.
+That guards against bugs, not against an attacker with code execution, who
+can raise anything in the permitted set. Against that attacker the
+boundary is the mounts.
+
+**Restore's needs.** Writing and `chown`ing restored files is root over
+whatever the daemon can write, so the daemon never gets a read-write mount
+of live appdata. A restore into place goes through `restore.stage`: the
+helper creates `<dataset root>/.cbackup-restore/<job>/` on the same dataset
+as the target, which the daemon sees read-write through a single mount of
+`<dataset root>/.cbackup-restore`. The daemon restores into it with full
+ownership, modes, xattrs and device nodes, and the helper then swaps it into
+place with `restore.swap` while the unit is stopped: a rename within one
+dataset, instant, with the previous data moved aside. A restore to a new
+location (`--dest`) needs a read-write mount the operator adds for it.
+Under option A, restore needs read-write mounts of the targets themselves.
+
+**What the drop costs.** Without `CAP_SYS_ADMIN`, `trusted.*` extended
+attributes cannot be read; they are skipped with one warning per
+filesystem (appdata does not use them, and overlay2's `trusted.overlay.*`
+lives in image layers, which are not backed up). `O_NOATIME` needs owner or
+`CAP_FOWNER`, so the scanner opens without it when refused. Everything else
+a backup captures (content, modes, owners, times, `user.*` and `security.*`
+xattrs, POSIX ACLs, device numbers) is readable with
+`CAP_DAC_READ_SEARCH`.
+
+Under option A the same daemon would need `CAP_SYS_ADMIN`, `/dev/zfs`, the
+Docker and libvirt sockets and `--pid=host`: in practice `--privileged`.
+
+### 11.7 Hooks and define
+
+Hooks run inside the unit's containers (`docker exec`, `lxc-attach`),
+never on the host; there are no host hooks in 1.0 (`container-backup.md`
+6.6). Under option B their definitions live in the helper's policy and the
+daemon can only name them. Under option A they live in enrolment, so the
+API can run commands as root inside those containers, which is one more
+reason for B.
 
 Restore-and-define is the other root-equivalent operation: re-creating a
 domain or container from a snapshot can bring back `privileged: true`, host
 device passthrough or a bind of `/`. `restore_preflight` lists every such
 setting and the API refuses to define without
-`"accept_privileged": true` when any is present. An unencrypted repository
-is not authenticated (content addressing detects damage, not a forger who
-rewrites names), so on such a repository define is refused unless the
-config sets `units.define_from_unencrypted: 1`.
+`"accept_privileged": true` when any is present; under option B the helper
+enforces its own `allow_privileged_define` as well. An unencrypted
+repository is not authenticated (content addressing detects damage, not a
+forger who rewrites names), so on such a repository define is refused
+unless the config sets `units.define_from_unencrypted: 1`.
 
 **Asked of the user:** choose A or B for 1.0. The recommendation is B,
 built in phase 1 of the container work, because LXC and host-version ZFS

@@ -278,23 +278,54 @@ A unit any of whose included mounts fell back to a live read is
 `inconsistent` for those mounts, and the unit's level is the lowest of its
 mounts'.
 
-### 6.4 What the pause buys
+### 6.4 When a pause adds anything
 
-A single atomic snapshot of one dataset is already a crash-consistent
-point in time for everything in it, pause or not. The pause adds:
+This is the basis for open question C1.
 
-1. **atomicity across snapshot domains that cannot be snapshotted together**:
-   ZFS datasets in different pools, a btrfs snapshot plus anything else,
-   and above all the fallback mounts of section 7;
-2. a **quiet instant** between hooks and capture, so a pre hook's effect
-   (a dump finished, a flush done) is not undone by writes in between;
-3. **predictable `syncfs` time**: nothing new is dirtied during the flush.
+**What one atomic snapshot already gives.** `zfs snapshot a@s b@s c@s`
+with every dataset in one pool is a single transaction-group operation:
+all of them are taken at the same instant, or none is. Every write the
+kernel completed before that instant is in it, and none after. That is
+crash consistency across every file in those datasets, with the
+applications' own write ordering kept, which is exactly what a power cut
+leaves and what PostgreSQL, SQLite, Prometheus and OpenSearch are built to
+recover from. A pause adds nothing to it. Neither does the pre-snapshot
+`syncfs`: data still dirty in the page cache is not in the snapshot, but
+it is not on disk after a power cut either, and the applications that
+matter `fsync` what they need. (The `syncfs` stays, outside any pause, for
+the predictability of the snapshot's own commit time.)
 
-On FS1, where nearly everything is in `cache/appdata`, (1) rarely applies.
-`containers.pause: always` is the default per the user's call;
-`pause: auto` (pause only when the unit spans more than one snapshot
-domain, or has fallback mounts or hooks that ask for it) is offered as an
-option that would make most FS1 units pause-free. Open question C1.
+**When a pause does add something:**
+
+| Situation | Without a pause | With a pause |
+|---|---|---|
+| all of the unit's included mounts are in datasets of **one ZFS pool**, taken by one `zfs snapshot` command | crash-consistent | the same; the pause adds nothing |
+| datasets in **more than one ZFS pool** | one snapshot per pool, each its own transaction group: two instants, milliseconds to a second apart. Writes in between that span both pools (a database in one, its blobs in the other) are torn | one instant for the unit as far as the application can tell: nothing it does happens between the snapshots |
+| **btrfs, one subvolume** (FS2 today: only the top-level subvolume exists) | the snapshot is atomic for that subvolume: crash-consistent | the same; the pause adds nothing |
+| **btrfs, more than one subvolume** | btrfs has no multi-subvolume snapshot. Each `BTRFS_IOC_SNAP_CREATE_V2` snapshots exactly one subvolume (nested subvolumes appear as empty directories inside it), and there is no user interface to take several in one transaction. So a unit spanning subvolumes gets several instants, as with several pools | one instant, as above |
+| a **ZFS and a btrfs** domain, or a snapshot domain plus anything else | several instants | one |
+| any **mount that cannot be snapshotted** (array disk, unassigned device, split share; section 7) | read live while the application writes: `inconsistent` | the pause covers the fallback's second pass: `crash` |
+| a **pre hook whose effect must hold until the capture** (an application told to flush and stop writing, a lock taken and held) | the application may write again between the hook returning and the snapshot | nothing runs between the hook's end and the snapshot. A hook that only produces its own consistent artefact (a `pg_dumpall` dump hook) does not need this |
+
+So `containers.pause: auto` pauses a unit exactly when its capture plan
+contains more than one snapshot instant, a fallback mount, or a hook
+marked `needs_quiesce: true`; otherwise it takes the atomic snapshot with
+the workload running.
+
+**On FS1 that means almost no pauses.** Every production container's
+included mounts are in the `cache` pool (`cache/appdata`, plus
+`cache/Photos` and `cache/system` for Immich), which one `zfs snapshot`
+command covers atomically. GitLab's four containers, Immich's four, and
+every standalone container would be captured with no pause at all, and be
+exactly as consistent as with one. Only units with opted-in fallback
+mounts (frigate's `/mnt/disks/NVR`) would pause. On FS2, with no
+subvolumes, the single top-level snapshot is likewise atomic.
+
+`pause: always` (the user's call, the current default) remains correct and
+costs about a second per unit (6.1); `pause: auto` is the proposal behind
+C1, now with the reasoning above. A pause never makes a capture worse, so
+`always` is the safe choice if there is doubt; `auto` is the one that never
+touches a workload it does not need to.
 
 ### 6.5 Failure handling
 
@@ -309,27 +340,76 @@ option that would make most FS1 units pause-free. Open question C1.
 
 ### 6.6 Hooks
 
-Hooks run **outside** the pause: pre hooks while the workload is live,
-before the pause; post hooks after the unpause and after the snapshot. A
-paused container cannot run anything, and nobody should wait for a dump
-inside the window.
+**Where they run.** Inside the unit's own containers, never on the host:
+`docker exec` into a member container (Engine API `POST
+/containers/<id>/exec`, then `POST /exec/<id>/start` with the stream
+attached), or `lxc-attach -P <lxcpath> -n <name> -- <argv>` for an LXC
+unit. The process runs with the container's namespaces, filesystem and
+privileges, so a hook can do nothing the container could not already do
+to itself. There are **no host hooks in 1.0**: a host command is root on
+the host, and nothing about database dumps needs one.
 
-Two kinds:
+**When.** Outside the pause: pre hooks while the workload is live, before
+the pause; post hooks after the unpause and after the snapshot. A paused
+container cannot run anything, and nobody should wait for a dump inside
+the window. Hooks of one unit run one at a time, in their configured order.
 
-- `exec`: a command run in a member container (`POST
-  /containers/<id>/exec` with a fixed argv, a user, a timeout); its output
-  is kept as `hooks/<name>.log`, truncated at 1 MiB.
-- `dump`: the same, but its **stdout is the backup**: streamed from the
-  exec attach stream (Docker's multiplexed frames, stderr split off to the
-  log) straight into `cdc_store_source` as `hooks/<name>.dump`. No temporary
-  file in the volume, no size limit, memory bounded like any file. A dump
-  is consistent by itself (it is the database's own export), at its own
-  instant, seconds before the snapshot.
+**Definition.** A hook is a fixed argv, never a shell string assembled by
+c-backup (a hook that wants a shell says `["sh","-c","..."]` itself, and
+that string is the operator's, written once in the policy):
 
-Configured per unit through enrolment, in JSON. Under the host helper
-option, hooks are defined in the helper's allowlist and enrolment can only
-refer to them by name (`source-providers.md` section 11); under option A,
-`units.allow_host_hooks` stays 0 and only `exec`/`dump` in containers exist.
+| Field | Meaning |
+|---|---|
+| `name` | `[a-z0-9_-]{1,32}`, unique in the unit; names the output files |
+| `kind` | `exec` or `dump` |
+| `phase` | `pre` or `post` |
+| `container` | a member of the unit (checked against the unit's members at run time; anything else is refused) |
+| `argv` | 1 to 64 strings, each at most 4 KiB, no NUL |
+| `user` | optional, as `docker exec --user` |
+| `timeout_s` | 1 to 86400; default `containers.hook_timeout_s` (600) |
+| `on_fail` | `abort` or `continue` |
+| `needs_quiesce` | `true` if the hook's effect must hold until the capture (forces a pause under `pause: auto`, 6.4) |
+
+Under option B the definitions live in the helper's policy file and
+enrolment can only list hook names (`source-providers.md` 11.3); under
+option A they live in enrolment.
+
+**Timeout.** The Engine API has no call to kill an exec. At the deadline
+the provider reads the exec's host pid (`GET /exec/<id>/json`, `Pid`) and
+sends `SIGTERM`, then `SIGKILL` 10 s later, to that pid in the host's pid
+namespace (the helper runs with `--pid=host` for this); for `lxc-attach`
+it signals the attach process group. A timed-out hook counts as failed with
+exit status `timeout`.
+
+**Exit-code policy, per hook.** Exit 0 is success. Anything else (or a
+timeout, or a signal) is failure, and `on_fail` decides:
+
+| `on_fail` | pre hook fails | post hook fails |
+|---|---|---|
+| `abort` | the unit fails before any pause or snapshot; nothing is stored for it; later units continue | the snapshot is already committed and is kept; the job reports the failure and the unit's result is `ok_with_errors` |
+| `continue` | warning; the level drops from `application` to `crash` (the capture still happens) | warning |
+
+The level is `application` only when every pre hook exited 0.
+
+**Output.**
+
+- `exec`: stdout and stderr, demultiplexed from Docker's stream framing,
+  interleaved in arrival order into `hooks/<name>.log`. Capped at
+  `containers.hook_log_max_kb` (default 1024): the first half and the last
+  half of the cap are kept, with a line saying how many bytes were dropped
+  between them, so both the start and the error at the end survive. The
+  log is stored whatever the exit status.
+- `dump`: **stdout is the backup**. It streams from the exec's attach
+  stream straight into `cdc_store_source` as `hooks/<name>.dump` in the
+  unit's snapshot: no temporary file in any volume, no size limit, memory
+  bounded like any file read. Under option B the helper passes the daemon
+  one end of a pipe (`SCM_RIGHTS`, 11.2 of `source-providers.md`) and
+  copies the demultiplexed stdout into it, so the bytes never pass through
+  an RPC message. stderr goes to `hooks/<name>.log` with the same cap. If
+  the hook fails, the dump's tree entry is not written (a truncated dump
+  looks valid and is worse than none); the chunks already stored are
+  unreferenced and gc reclaims them. A dump is consistent by itself (the
+  database's own export, at its own instant, seconds before the snapshot).
 
 Examples for the FS1 workloads:
 
@@ -557,16 +637,43 @@ It runs host tools as `nsenter -t 1 -m -- zfs ...` and
 `nsenter -t 1 -m -n -- lxc-freeze ...`, so it always uses the host's own
 `zfs` 2.4.4 and `lxc-*`, with no version skew. `--network=none` means it
 has no network listener at all; its only interface is the socket in
-`/run/c-backup-helper`, mode 0600. Its policy file on the flash names the
-units, datasets, subvolumes and hook commands it will act on; anything else
-is refused whatever the daemon asks. The alternative packaging, an Unraid
-plugin (`.plg`) that installs a static binary at boot and starts it on the
-array-started event, is more Unraid-native but more to build.
+`/run/c-backup-helper` (0660, peer uid checked). Its policy file on the
+flash names the units, snapshot domains and hooks it will act on; anything
+else is refused whatever the daemon asks. The wire protocol, the complete
+operation list, the validation rules and what a compromised daemon can
+still do are specified in `source-providers.md` sections 11.2 to 11.5:
+typed operations only, no command or shell-string passthrough, every path,
+snapshot name and XML document built by the helper itself. The alternative
+packaging, an Unraid plugin (`.plg`) that installs a static binary at boot
+and starts it on the array-started event, is more Unraid-native but more to
+build.
 
-The main daemon then runs with the image's existing cap set
-(`DAC_READ_SEARCH` and the restore caps), read-only pool mounts with
-`rslave`, the helper socket and its repository mounts: no Docker socket, no
-libvirt socket, no `/dev/zfs`, no `CAP_SYS_ADMIN`.
+The main daemon then runs as a non-root uid (990) with effective
+`CAP_DAC_READ_SEARCH` only and the five restore capabilities permitted but
+raised only by restore threads (`source-providers.md` 11.6). Its mounts:
+the pools read-only with `rslave`, the helper socket, its repository and
+state, and one read-write mount of each dataset's `.cbackup-restore`
+staging directory for restores into place. No Docker socket, no libvirt
+socket, no `/dev/zfs`, no `CAP_SYS_ADMIN`, no host pid or network
+namespace.
+
+```sh
+docker run -d --name c-backupd-fs1 --restart unless-stopped \
+  --cap-drop ALL --cap-add DAC_READ_SEARCH --cap-add DAC_OVERRIDE \
+  --cap-add CHOWN --cap-add FOWNER --cap-add FSETID --cap-add MKNOD \
+  --read-only -v /run/c-backupd:/run/c-backupd \
+  -e C_BACKUP_SECURITY_RUN_AS_UID=990 \
+  -v /mnt/cache:/mnt/cache:ro,rslave \
+  -v /mnt/cache/appdata/.cbackup-restore:/mnt/cache/appdata/.cbackup-restore \
+  -v /run/c-backup-helper:/run/c-backup-helper \
+  -v /mnt/cache/appdata/c-backupd:/var/lib/c-backupd \
+  -v /mnt/disk3/cbackup:/mnt/disk3/cbackup \
+  -p 127.0.0.1:8765:8765 <image>
+```
+
+(The container starts as root only so the daemon can drop to uid 990
+keeping exactly those capabilities; Docker gives a non-root `--user` none
+of them.)
 
 **Asked of the user:** A or B. Recommendation: B, as the sidecar.
 
@@ -732,6 +839,7 @@ unprivileged containers keep their shifted ids; `lxc-start` only if asked.
 | `containers.fallback_on_deadline` | `keep` | `keep` (flagged) or `fail` |
 | `containers.btrfs_snapshot_dir` | `<pool>/system/.cbackup-snapshots` | Where btrfs snapshots go (8.2) |
 | `containers.hook_timeout_s` | `600` | Default hook timeout |
+| `containers.hook_log_max_kb` | `1024` | Cap on each hook log (head and tail kept) |
 | `lxc.enabled` | `0` | Load the LXC provider |
 | `lxc.path` | `/mnt/cache/lxc` | The LXC path (`-P`) |
 
@@ -867,8 +975,11 @@ replacing the Appdata Backup plugin on FS1 needs.
 ## 16. Open questions for the user
 
 1. **C1.** `containers.pause: always` (your call, the default) or `auto`,
-   which skips the pause for units entirely inside one dataset where the
-   snapshot alone is already crash-consistent?
+   which pauses only when the capture has more than one snapshot instant
+   (several pools, several btrfs subvolumes), a fallback mount, or a hook
+   that needs the application quiesced (6.4)? Under `auto` no production
+   unit on FS1 would pause: all their data is in one pool, which one
+   `zfs snapshot` captures atomically.
 2. **C2.** Fallback default `pause-read` with a 30-second cap, keeping a
    flagged `inconsistent` snapshot when the cap is hit (proposed)?
 3. **C3.** Restore pulls by digest by default and needs `allow_tag` to fall
