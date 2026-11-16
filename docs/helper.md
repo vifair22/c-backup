@@ -82,6 +82,16 @@ services:
 
 Notes that matter:
 
+- **Restore staging stays out of sight.** An in-place restore stages in
+  the mount's own domain and swaps by rename. The directory is the first
+  `[snapshot] restore_staging_dirs` entry inside the domain; with none, a
+  whole-pool domain (FS2's `/mnt/cache`) stages in
+  `<pool>/system/.cbackup-restore`, beside the snapshot directory, and a
+  share domain in `<domain>/.cbackup-restore`. Either way it is refused at
+  the top of a pool or in a share exported over SMB or NFS, and refused
+  when it is on another filesystem from the mount (a btrfs subvolume or
+  another dataset), since the swap could not be a rename.
+
 - **The policy lives on the flash** (`/boot/config/`), root-owned, mode 0600
   or 0644. The helper refuses to start on a file anybody but its owner can
   write, an unknown section or key, or a value out of range. Unraid's root
@@ -222,6 +232,7 @@ Enabled by the policy, never by the daemon (`docs/container-backup.md`):
 zfs_domains = cache/appdata, cache/system, cache/Photos, cache/lxc
 btrfs_domains = /mnt/cache                 ; FS2: the pool's top level
 btrfs_snapshot_dir = /mnt/cache/system/.cbackup-snapshots
+; restore_staging_dirs = /mnt/cache/system/.cbackup-restore   ; per domain, see below
 
 [host]
 nsenter = 1                ; zfs, btrfs, lxc-* run as the host's binaries

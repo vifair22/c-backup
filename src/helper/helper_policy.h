@@ -68,6 +68,12 @@ typedef struct {
     size_t   n_dir;
 
     char     btrfs_snapshot_dir[4096];
+    /* Where restore.stage stages, per domain: the first of these inside the
+     * mount's domain. With none, a pool-top domain stages in
+     * <pool>/system/.cbackup-restore (beside the snapshot directory) and any
+     * other in <domain>/.cbackup-restore. */
+    char    *restore_staging_dirs[POLICY_LIST_MAX];
+    size_t   n_staging;
 
     /* [host]: how host tools run (host_tool.h); "" keeps the default. */
     int      host_nsenter;           /* default 1 */

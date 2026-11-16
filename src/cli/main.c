@@ -1209,6 +1209,7 @@ static int h_schedule_add(const args_t *a)
      * less --exclude globs) or each --unit by name. */
     const char *uprov = args_value(a, "--provider");
     const char *ureq  = args_value(a, "--require");
+    const char *uscope = args_value(a, "--pause-scope");
     int uall = args_flag(a, "--all");
 
     /* An interval and a calendar are two triggers, and either one alone.
@@ -1258,6 +1259,7 @@ static int h_schedule_add(const args_t *a)
     if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
     if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
     if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
+    if (uscope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, uscope); }
     if (uall)  sb_puts(&b, ",\"all\":true");
     if (args_multi_count(a, "--unit") > 0) {
         sb_puts(&b, ",\"units\":");
@@ -1360,6 +1362,7 @@ static int h_unit_backup(const args_t *a)
 {
     const char *prov = args_value(a, "--provider");
     const char *req  = args_value(a, "--require");
+    const char *scope = args_value(a, "--pause-scope");
     int all     = args_flag(a, "--all");
     int no_wait = args_flag(a, "--no-wait");
     if (!prov) return refuse(a, "--provider is required");
@@ -1378,6 +1381,7 @@ static int h_unit_backup(const args_t *a)
         sb_puts(&b, "]");
     }
     if (req) { sb_puts(&b, ",\"require\":"); sb_json_str(&b, req); }
+    if (scope) { sb_puts(&b, ",\"pause_scope\":"); sb_json_str(&b, scope); }
     sb_puts(&b, "}");
     sbuf_t p = { 0 };
     sb_puts(&p, "/repos/"); sb_path_seg(&p, a->pos[0]); sb_puts(&p, "/units/backup");
@@ -1733,13 +1737,15 @@ static const arg_opt_t O_SCHED_ADD[] = {
     { "--unit",        NULL, ARG_MULTI, "NAME" },
     { "--exclude",     NULL, ARG_MULTI, "GLOB" },
     { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_END,
 };
 static const arg_opt_t O_UNIT_BACKUP[] = {
-    { "--provider", NULL, ARG_VALUE, "P" },
-    { "--all",      NULL, ARG_FLAG,  NULL },
-    { "--exclude",  NULL, ARG_MULTI, "GLOB" },
-    { "--require",  NULL, ARG_VALUE, "LEVEL" },
+    { "--provider",    NULL, ARG_VALUE, "P" },
+    { "--all",         NULL, ARG_FLAG,  NULL },
+    { "--exclude",     NULL, ARG_MULTI, "GLOB" },
+    { "--require",     NULL, ARG_VALUE, "LEVEL" },
+    { "--pause-scope", NULL, ARG_VALUE, "unit|group|job" },
     OPT_NOWAIT, OPT_END,
 };
 static const arg_opt_t O_UNIT_HISTORY[] = {

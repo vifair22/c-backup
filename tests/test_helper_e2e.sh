@@ -51,6 +51,8 @@ cat > "$WORK/units.json" <<EOF
   "blobs":[{"id":"domain.xml","path":".cbackup-unit/config/domain.xml","text":"<domain>a</domain>"}],
   "disks":[{"id":"vda","size":4194304,"runs":[{"off":0,"len":1048576,"kind":"data","seed":3}]}],
   "trees":[{"id":"vol","read_root":"$WORK/snap","path":"$WORK/pool/app/a"}]},
+ {"id":"c","name":"cbk-uat-c","state":"running","caps":["quiesce"],
+  "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"c"}]},
  {"id":"p","name":"prod-db","state":"running",
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
@@ -193,6 +195,29 @@ contains "its warning is in the journal" "fake define" "$(cb journal 1)"
 OUT=$(cb unit restore 1 1 --define --replace)
 contains "an in-place restore completes" '"state":"completed"' "$OUT"
 check    "the data is back in place" alpha "$(cat "$WORK/pool/app/a/a.txt")"
+
+echo "a scheduled pause scope"
+# pause_scope used to be dropped from a units schedule's parameters, so a
+# scheduled job scope ran unit by unit, accepted and not honoured.
+OUT=$(cb schedule add 1 units 1 --provider fake --unit cbk-uat-a --unit cbk-uat-c --pause-scope job)
+SID2=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+contains "a units schedule keeps its pause scope" 'pause_scope' "$(cb schedule list 1)"
+for _ in $(seq 1 100); do
+    grep -q "2 unit(s) in one capture" "$WORK/daemon.log" && break; sleep 0.1
+done
+contains "and its run captures both units in one capture" "2 unit(s) in one capture" "$(cat "$WORK/daemon.log")"
+cb schedule remove 1 "$SID2" >/dev/null
+for _ in $(seq 1 100); do
+    case "$(cb jobs --limit 3)" in *'"state":"running"'*|*'"state":"queued"'*) sleep 0.1 ;; *) break ;; esac
+done
+if command -v curl >/dev/null 2>&1; then
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/schedules \
+          -d '{"action":"units","trigger":{"type":"interval","seconds":3600},"provider":"fake","all":true,"pause_scop":"job"}')
+    contains "an unknown key in a schedule is refused" "unknown key 'pause_scop'" "$OUT"
+    OUT=$(curl -s --unix-socket "$SOCK" -X POST http://x/repos/1/units/backup \
+          -d '{"provider":"fake","all":true,"pausescope":"job"}')
+    contains "and in a units job" "unknown key 'pausescope'" "$OUT"
+fi
 
 echo "helper gone"
 kill "$HELPER_PID"; wait "$HELPER_PID" 2>/dev/null; HELPER_PID=

@@ -1135,6 +1135,89 @@ static int mkdir_owned(const char *path, uid_t uid)
     return 0;
 }
 
+/* Is a under (or equal to) b, on a component boundary? */
+static int path_under(const char *a, const char *b)
+{
+    size_t n = strlen(b);
+    while (n > 1 && b[n - 1] == '/') n--;
+    return strncmp(a, b, n) == 0 && (a[n] == '\0' || a[n] == '/');
+}
+
+/* How many components p has below root, or -1 when it is not under it. */
+static int depth_below(const char *p, const char *root)
+{
+    if (!path_under(p, root)) return -1;
+    const char *rest = p + strlen(root);
+    int d = 0;
+    for (const char *c = rest; *c; c++) if (*c == '/' && c[1] && c[1] != '/') d++;
+    return d;
+}
+
+/*
+ * Where restore.stage stages for a mount in domain dom (Manual review item
+ * 4). On FS2 the domain is the whole pool, and <domain>/.cbackup-restore
+ * was a dot directory at the pool's top, the placement the snapshot
+ * directory avoids: anything at the top of a pool, or in an exported share,
+ * is visible over the network. So: the first restore_staging_dirs entry
+ * inside the domain; else, for a pool-top domain (mnt_root/<pool>),
+ * <pool>/system/.cbackup-restore, beside the snapshot directory; else
+ * <domain>/.cbackup-restore. Then, wherever it came from, it is refused at
+ * the top of a pool or in a share exported over SMB or NFS
+ * (<boot_config>/shares/<share>.cfg). -1 with why on a refusal.
+ */
+static int staging_base(const helper_server_t *s, const char *dom, char *out, size_t sz,
+                        char *why, size_t wsz)
+{
+    const helper_policy_t *p = s->pol;
+    out[0] = '\0';
+    for (size_t i = 0; i < p->n_staging && !out[0]; i++)
+        if (path_under(p->restore_staging_dirs[i], dom) && strcmp(p->restore_staging_dirs[i], dom) != 0)
+            snprintf(out, sz, "%s", p->restore_staging_dirs[i]);
+    if (!out[0]) {
+        int pool_top = depth_below(dom, p->mnt_root) == 1;
+        if (snprintf(out, sz, pool_top ? "%s/system/.cbackup-restore" : "%s/.cbackup-restore", dom) >= (int)sz) {
+            snprintf(why, wsz, "path too long");
+            return -1;
+        }
+    }
+    int d = depth_below(out, p->mnt_root);
+    if (d < 0) return 0;                       /* not an Unraid pool path: nothing exports it */
+    if (d < 3) {
+        snprintf(why, wsz, "restore staging %.300s would sit at the top of a pool, visible over the "
+                 "network; set [snapshot] restore_staging_dirs to a directory inside a share", out);
+        return -1;
+    }
+    /* mnt_root/<pool>/<share>/...: the share is the second component. */
+    const char *rest = out + strlen(p->mnt_root) + 1;
+    const char *sh = strchr(rest, '/');
+    if (!sh) return 0;
+    sh++;
+    size_t k = strcspn(sh, "/");
+    char cfg[PATH_MAX + 512];
+    if (snprintf(cfg, sizeof(cfg), "%s%s/shares/%.*s.cfg", p->host_root, p->boot_config, (int)k, sh) >= (int)sizeof(cfg))
+        return 0;
+    FILE *f = fopen(cfg, "re");
+    if (!f) return 0;                          /* not an Unraid share */
+    char line[512];
+    int exported = 0;
+    while (!exported && fgets(line, sizeof(line), f)) {
+        const char *keys[] = { "shareExport=", "shareExportNFS=" };
+        for (size_t i = 0; i < 2 && !exported; i++) {
+            if (strncmp(line, keys[i], strlen(keys[i])) != 0) continue;
+            const char *v = line + strlen(keys[i]);
+            if (*v == '"') v++;
+            exported = *v && *v != '-' && *v != '"' && *v != '\n';
+        }
+    }
+    fclose(f);
+    if (exported) {
+        snprintf(why, wsz, "restore staging %.300s is in share %.*s, which is exported over the network; "
+                 "set [snapshot] restore_staging_dirs to a directory in a share that is not", out, (int)k, sh);
+        return -1;
+    }
+    return 0;
+}
+
 static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
 {
     if (!s->pol->allow_restore) return resp_error(r->id, HELPER_E_DENIED, "the policy does not allow restore");
@@ -1159,12 +1242,40 @@ static char *op_restore_stage(helper_server_t *s, const helper_req_t *r)
     }
     if (!dom || strcmp(dom, r->mount) == 0)
         return resp_error(r->id, HELPER_E_DENIED, "%.300s is in no snapshot domain of the policy", r->mount);
-    char base[PATH_MAX], path[PATH_MAX];
-    if (snprintf(base, sizeof(base), "%s/.cbackup-restore", dom) >= (int)sizeof(base) ||
-        snprintf(path, sizeof(path), "%s/%lld", base, (long long)r->job) >= (int)sizeof(path))
+    char base[PATH_MAX], path[PATH_MAX], swhy[512];
+    if (staging_base(s, dom, base, sizeof(base), swhy, sizeof(swhy)) != 0)
+        return resp_error(r->id, HELPER_E_DENIED, "%s", swhy);
+    if (snprintf(path, sizeof(path), "%s/%lld", base, (long long)r->job) >= (int)sizeof(path))
         return resp_error(r->id, HELPER_E_INVALID, "path too long");
+    /* Made down to the staging base, which may be a share directory not
+     * there yet (system/), each level the helper's own except the last. */
+    {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s", base);
+        for (char *c = p + strlen(dom) + 1; *c; c++) {
+            if (*c != '/') continue;
+            *c = '\0';
+            if (mkdir(p, 0755) != 0 && errno != EEXIST)
+                return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", p, strerror(errno));
+            *c = '/';
+        }
+    }
     if (mkdir_owned(base, s->pol->daemon_uid) != 0 || mkdir_owned(path, s->pol->daemon_uid) != 0)
         return resp_error(r->id, HELPER_E_FAILED, "cannot create %s: %s", path, strerror(errno));
+    /* The swap is a rename: the staging must be on the mount's filesystem
+     * (a btrfs subvolume or another dataset would be EXDEV at the swap,
+     * after the whole restore was written). */
+    {
+        char parent[PATH_MAX];
+        if (snprintf(parent, sizeof(parent), "%.4000s", r->mount) >= (int)sizeof(parent)) parent[0] = '\0';
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) *sl = '\0';
+        struct stat a1, a2;
+        if (stat(path, &a1) == 0 && stat(parent, &a2) == 0 && a1.st_dev != a2.st_dev)
+            return resp_error(r->id, HELPER_E_DENIED, "restore staging %.300s is on another filesystem "
+                              "from %.300s, so the swap could not be a rename; set [snapshot] "
+                              "restore_staging_dirs to a directory on its filesystem", base, r->mount);
+    }
     pthread_mutex_lock(&s->mu);
     staging_t *slot = NULL;
     for (size_t i = 0; i < STAGINGS_MAX && !slot; i++) if (!s->stages[i].used) slot = &s->stages[i];

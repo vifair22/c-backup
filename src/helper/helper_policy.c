@@ -24,6 +24,7 @@ void helper_policy_free(helper_policy_t *p)
     for (size_t i = 0; i < p->n_never_pause; i++) free(p->never_pause[i]);
     for (size_t i = 0; i < p->n_btrfs; i++) free(p->btrfs_domains[i]);
     for (size_t i = 0; i < p->n_dir; i++) free(p->dir_domains[i]);
+    for (size_t i = 0; i < p->n_staging; i++) free(p->restore_staging_dirs[i]);
     for (size_t h = 0; h < p->n_hooks; h++)
         for (int i = 0; i < p->hooks[h].argc; i++) free(p->hooks[h].argv[i]);
     memset(p, 0, sizeof(*p));
@@ -266,6 +267,8 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
             int rc = strcmp(k, "zfs_domains") == 0   ? to_list(v, out->zfs_domains, &out->n_zfs, dataset_ok)
                    : strcmp(k, "btrfs_domains") == 0 ? to_list(v, out->btrfs_domains, &out->n_btrfs, dir_ok)
                    : strcmp(k, "dir_domains") == 0   ? to_list(v, out->dir_domains, &out->n_dir, dir_ok)
+                   : strcmp(k, "restore_staging_dirs") == 0
+                         ? to_list(v, out->restore_staging_dirs, &out->n_staging, dir_ok)
                    : -2;
             if (rc == -2) { st = bad(line, "unknown key in [snapshot]", k); break; }
             if (rc) { st = bad(line, "bad domain list", v); break; }
