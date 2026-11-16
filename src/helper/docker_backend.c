@@ -1488,6 +1488,7 @@ static status_t write_host_file(struct sp_ctx *c, const char *path, const char *
  *    "name": "", "target_root": "", "replace": false, "start": false,
  *    "pin_digest": false}
  */
+__attribute__((noinline))
 static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
                                const helper_policy_t *pol, cJSON **result)
 {
@@ -1561,8 +1562,9 @@ static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
     }
     const char *argv[64];
     size_t na = 0;
-    char fpaths[16][PATH_MAX + 160];
+    char (*fpaths)[PATH_MAX + 160] = calloc(16, sizeof(*fpaths));     /* heap: 64 KiB of paths */
     size_t nf = 0;
+    if (!fpaths) { cJSON_Delete(res); return set_error(ERR_NOMEM, "docker: define"); }
     argv[na++] = c->tools.docker;
     argv[na++] = "compose";
     argv[na++] = "-p";
@@ -1640,6 +1642,7 @@ static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
                            "as [host] docker names it?): %s", why);
         }
     }
+    free(fpaths);
     if (st == OK) {
         cJSON_AddStringToObject(res, "project", project);
         cJSON_AddStringToObject(res, "working_dir", wd);
