@@ -96,6 +96,14 @@ static int start(const char *extra_policy)
         "{\"Type\":\"bind\",\"Source\":\"" MNT "/media/lib\",\"Destination\":\"/m\"}]");
     fake_docker_add(&fdk, "cccc01", "slowpoke", "running", NULL,
         "[{\"Type\":\"bind\",\"Source\":\"" MNT "/disk1/slow\",\"Destination\":\"/s\"}]");
+    fake_docker_add(&fdk, "eeee01", "pair-a", "running", "pair",
+        "[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/a\"}]");
+    fake_docker_add(&fdk, "eeee02", "pair-b", "running", "pair",
+        "[{\"Type\":\"bind\",\"Source\":\"" MNT "/media/lib\",\"Destination\":\"/b\"}]");
+    fake_docker_add(&fdk, "ffff01", "jam-ok", "running", "jam",
+        "[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/a\"}]");
+    fake_docker_add(&fdk, "ffff02", "jam-stuck", "running", "jam",
+        "[{\"Type\":\"bind\",\"Source\":\"" MNT "/media/lib\",\"Destination\":\"/b\"}]");
     fake_docker_add(&fdk, "dddd01", "parked", "exited", NULL,
         "[{\"Type\":\"bind\",\"Source\":\"" APPS "/web/db\",\"Destination\":\"/d\"}]");
 
@@ -134,7 +142,7 @@ static int teardown(void **state)
     return 0;
 }
 
-typedef struct { char ids[8][SP_UNIT_ID_MAX]; int st[8]; int n; } seen_t;
+typedef struct { char ids[16][SP_UNIT_ID_MAX]; int st[16]; int n; } seen_t;
 
 static status_t on_unit(void *ctx, const char *id, const char *name, int state)
 {
@@ -158,10 +166,10 @@ static void test_list_and_describe(void **state)
     seen_t s;
     memset(&s, 0, sizeof(s));
     assert_int_equal(be.ops->list_units(be.ctx, on_unit, &s), OK);
-    assert_int_equal(s.n, 4);
+    assert_int_equal(s.n, 6);
     assert_string_equal(s.ids[0], "compose:web");
     assert_string_equal(s.ids[1], "solo");
-    assert_int_equal(s.st[3], SP_STATE_STOPPED);
+    assert_int_equal(s.st[5], SP_STATE_STOPPED);
 
     sp_unit_desc_t *d = NULL;
     assert_int_equal(be.ops->describe(be.ctx, "compose:web", &d), OK);
@@ -266,6 +274,31 @@ static void test_two_instants_pause(void **state)
     be.ops->desc_free(d);
 }
 
+/* Members paused together, all of them released; a member that will not
+ * pause leaves none paused and fails a unit spanning two instants. */
+static void test_parallel_pause(void **state)
+{
+    (void)state;
+    sp_session_t *s = NULL;
+    const sp_session_info_t *info = NULL;
+    sp_unit_desc_t *d = NULL;
+    assert_int_equal(capture("compose:pair", SP_CONSIST_CRASH, &s, &info, &d), OK);
+    assert_int_equal(fdk.pauses, 2);
+    assert_int_equal(fdk.unpauses, 2);
+    assert_true(info->consist_flags & SP_CF_PAUSED);
+    assert_int_equal(be.ops->end(s, SP_END_COMMITTED, 1), OK);
+    be.ops->desc_free(d);
+    assert_int_equal(holds_open, 0);
+
+    assert_int_not_equal(capture("compose:jam", SP_CONSIST_CRASH, &s, &info, &d), OK);
+    assert_non_null(strstr(err_msg(), "did not pause"));
+    err_clear();
+    assert_int_equal(fdk.pauses, 3);
+    assert_int_equal(fdk.unpauses, 3);       /* jam-ok was released again */
+    assert_string_equal(fdk.c[4].state, "running");
+    assert_int_equal(holds_open, 0);
+}
+
 /* A mount on no snapshot domain is read live, and the level says so. */
 static void test_fallback_flagged(void **state)
 {
@@ -366,6 +399,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_list_and_describe, setup, teardown),
         cmocka_unit_test_setup_teardown(test_one_instant_no_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_two_instants_pause, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),

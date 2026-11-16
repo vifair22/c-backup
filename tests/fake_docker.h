@@ -21,7 +21,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define FD_MAX 8
+#define FD_MAX 16
 
 typedef struct {
     char id[65], name[64], state[16], project[64], image[72], config_files[512], working_dir[256];
@@ -133,6 +133,7 @@ static void fd_serve(fake_docker_t *f, int fd)
         if (!c) fd_reply(fd, 404, "{\"message\":\"No such container\"}");
         else if (strcmp(verb, "pause") == 0) {
             if (strcmp(c->state, "running") != 0) fd_reply(fd, 409, "{\"message\":\"not running\"}");
+            else if (strstr(c->name, "stuck")) fd_reply(fd, 500, "{\"message\":\"freezer timed out\"}");
             else { snprintf(c->state, sizeof(c->state), "paused"); f->pauses++; fd_reply(fd, 204, ""); }
         } else if (strcmp(verb, "unpause") == 0) {
             if (strcmp(c->state, "paused") != 0) fd_reply(fd, 409, "{\"message\":\"Container is not paused\"}");
@@ -218,6 +219,7 @@ static void fake_docker_stop(fake_docker_t *f)
 static void fake_docker_add(fake_docker_t *f, const char *id, const char *name, const char *state,
                             const char *project, const char *mounts)
 {
+    if (f->n >= FD_MAX) { fprintf(stderr, "fake docker: more than %d containers\n", FD_MAX); abort(); }
     fd_container_t *c = &f->c[f->n++];
     memset(c, 0, sizeof(*c));
     snprintf(c->id, sizeof(c->id), "%s", id);

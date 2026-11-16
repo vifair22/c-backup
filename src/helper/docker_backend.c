@@ -734,6 +734,22 @@ static status_t pause_one(struct sp_ctx *c, const member_t *m, int pause)
     return docker_call(&a, "POST", path, NULL, 409, NULL, NULL);
 }
 
+typedef struct {
+    struct sp_ctx  *c;
+    const member_t *m;
+    status_t        st;
+    char            why[256];
+} pause_job_t;
+
+static void *pause_main(void *arg)
+{
+    pause_job_t *j = arg;
+    j->st = pause_one(j->c, j->m, 1);
+    if (j->st != OK) snprintf(j->why, sizeof(j->why), "%.250s", err_msg());
+    err_clear();
+    return NULL;
+}
+
 static void syncfs_root(struct sp_ctx *c, const char *root)
 {
     char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
@@ -819,18 +835,36 @@ static status_t d_begin(sp_ctx_t *c, const sp_unit_desc_t *unit, const sp_begin_
     /* Pre-flush outside any pause, so the snapshot's own commit is short. */
     for (size_t i = 0; i < s->snaps.n; i++) syncfs_root(c, s->snaps.doms[i].root);
     uint64_t t0 = ms_now();
+    /* Journal every pause first, then pause the members together: the
+     * window is the slowest member's freeze, not the sum (6.1). */
+    pause_job_t jobs[MEMBERS_MAX];
+    pthread_t th[MEMBERS_MAX];
+    int started[MEMBERS_MAX] = { 0 };
     for (size_t i = 0; want && !pause_failed && i < s->n_members; i++) {
         member_t *m = &s->members[i];
         if (!m->running || m->paused || m->never) continue;
+        jobs[i] = (pause_job_t){ c, m, ERR_IO, "not attempted" };
         char detail[128];
         snprintf(detail, sizeof(detail), "docker:%s", m->id);
         if (s->has_holds && s->holds.record(s->holds.ctx, SP_HOLD_PAUSE, detail, &hold[i]) != OK) {
+            snprintf(jobs[i].why, sizeof(jobs[i].why), "%.250s", err_msg());
+            err_clear();
             pause_failed = 1;
-            break;
         }
-        if (pause_one(c, m, 1) == OK) { paused[i] = 1; continue; }
-        log_warn("docker: %s did not pause: %s", m->name, err_msg());
-        err_clear();
+    }
+    for (size_t i = 0; want && !pause_failed && i < s->n_members; i++) {
+        member_t *m = &s->members[i];
+        if (!m->running || m->paused || m->never) continue;
+        if (pthread_create(&th[i], NULL, pause_main, &jobs[i]) == 0) started[i] = 1;
+        else { jobs[i].st = ERR_IO; snprintf(jobs[i].why, sizeof(jobs[i].why), "cannot start a thread"); }
+    }
+    for (size_t i = 0; want && i < s->n_members; i++) {
+        member_t *m = &s->members[i];
+        if (!m->running || m->paused || m->never) continue;
+        if (started[i]) pthread_join(th[i], NULL);
+        /* Whatever paused is recorded, so unpause_all releases it. */
+        if (started[i] && jobs[i].st == OK) { paused[i] = 1; continue; }
+        log_warn("docker: %s did not pause: %s", m->name, jobs[i].why);
         if (s->has_holds && hold[i] && s->holds.clear(s->holds.ctx, hold[i]) != OK) err_clear();
         hold[i] = 0;
         pause_failed = 1;
