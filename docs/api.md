@@ -646,7 +646,7 @@ plus missing), `cbackup_verify_repaired_objects`,
 A backup writes every object of 16 MiB or less straight into a pack, and
 ends with a pack sweep for what it could not: a sparse file's object and an
 object over 16 MiB are written loose and uncompressed, and the sweep packs
-them and coalesces small packs, as this endpoint does. The policy key
+them, as this endpoint does. Neither merges small packs; gc does that. The policy key
 `maintenance.auto_pack` set to `false` skips that sweep and nothing else;
 small objects are packed during the backup either way, so a backup of small
 files leaves nothing loose and a pack after it reports `loose` 0. With the
@@ -829,6 +829,7 @@ repository, in bytes:
 | `bytes_written_pack` | Sealed pack files, without their parity trailers: the backup's own packs and any the pack pass wrote |
 | `bytes_written_pack_parity` | The parity trailers of those packs |
 | `bytes_written_parity_spill` | Reed-Solomon parity over its memory cap, written to `tmp/` and then copied into its trailer, so these bytes are written twice |
+| `bytes_written_pack_abandoned` | Entries the pack pass began writing and then truncated off the pack again, because the file's head compressed and its body did not; the object stays loose and skip-marked. Usually under 100 bytes even then (the entry header): an entry abandoned before its compressed output passes 16 MiB never reaches the pack |
 | `bytes_written_pack_pass` | Of `bytes_written`, the share of the pack pass the job ends with (`maintenance.auto_pack`) |
 | `pack_pass_packed` | Objects that pass packed; `0` when it is off or found nothing |
 

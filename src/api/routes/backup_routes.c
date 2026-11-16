@@ -272,7 +272,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
      * did not, so a client saw only "completed". Every field is numeric. */
     if (res.snapshot_id > 0) {
         const uint64_t *w = res.written.bytes;
-        char rj[1024];
+        char rj[1536];
         snprintf(rj, sizeof(rj),
                  "{\"snapshot_id\":%lld,\"files\":%llu,\"dirs\":%llu,"
                  "\"files_unchanged\":%llu,\"bytes_logical\":%llu,"
@@ -284,6 +284,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  "\"bytes_written_loose_discarded\":%llu,"
                  "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
                  "\"bytes_written_parity_spill\":%llu,"
+                 "\"bytes_written_pack_abandoned\":%llu,"
                  "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu}",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
@@ -301,6 +302,7 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PACK],
                  (unsigned long long)w[STORE_WR_PACK_PARITY],
                  (unsigned long long)w[STORE_WR_PARITY_SPILL],
+                 (unsigned long long)w[STORE_WR_PACK_ABANDONED],
                  (unsigned long long)res.written_sweep,
                  (unsigned long long)res.sweep_packed);
         job_set_result(progress_ctx, rj);
