@@ -194,6 +194,7 @@ static api_response_t create_repo(const api_request_t *req, void *userdata)
     repo_enc_request_t enc;
     memset(&enc, 0, sizeof(enc));
     enc.key_dir = repo_key_dir();
+    enc.mode_given = encstr != NULL;
     if (repo_enc_resolve(encstr, passphrase, &enc.mode) != OK) {
         api_response_t bad = api_error(400, err_msg());
         free(path); free(label); free(encstr); free(passphrase);

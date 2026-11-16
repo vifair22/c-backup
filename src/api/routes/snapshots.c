@@ -1425,6 +1425,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
     return st;
 }
 
+/*
+ * A boolean query parameter: 1/true or 0/false, or absent, which leaves
+ * *out holding the caller's default. Anything else is -1 for a 400. These
+ * parameters are safety switches (dry_run, repair=0, force), and reading an
+ * unrecognised value as the default turned a typo into the destructive
+ * choice.
+ */
+static int query_bool(const api_request_t *req, const char *name, int *out)
+{
+    const char *v = api_query_param(req, name);
+    if (!v) return 0;
+    if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0)  { *out = 1; return 0; }
+    if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0) { *out = 0; return 0; }
+    return -1;
+}
+
 static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
                                       const api_request_t *req,
                                       snap_job_kind_t kind)
@@ -1452,9 +1468,14 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
     j->repo_path = repo_path;
     j->kind = kind;
 
-    {
-        const char *dry = api_query_param(req, "dry_run");
-        j->dry_run = dry && (strcmp(dry, "1") == 0 || strcmp(dry, "true") == 0);
+    /*
+     * dry_run is the safety catch, so anything but a recognised value is
+     * refused: "dry_run=yes" or "dry_run=" used to read as off and ran the
+     * real gc or retention pass, deleting what the caller meant to preview.
+     */
+    if (query_bool(req, "dry_run", &j->dry_run) != 0) {
+        snap_job_free(j);
+        return api_error(400, "dry_run must be 1, true, 0 or false");
     }
 
     /*
@@ -1472,9 +1493,12 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             snap_job_free(j);
             return api_error(400, "level must be index, structure or deep");
         }
-        const char *rep = api_query_param(req, "repair");
-        if (rep && (strcmp(rep, "0") == 0 || strcmp(rep, "false") == 0))
-            j->verify_repair = 0;
+        /* "repair=no" used to mean repair on: a check the caller asked not
+         * to write, writing. */
+        if (query_bool(req, "repair", &j->verify_repair) != 0) {
+            snap_job_free(j);
+            return api_error(400, "repair must be 1, true, 0 or false");
+        }
         /* A dry run is a check that must not write, whatever else was
          * asked for. */
         if (j->dry_run) j->verify_repair = 0;
@@ -2021,12 +2045,8 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
                                       int64_t snap_id)
 {
     int force = 0;
-    const char *fv = api_query_param(req, "force");
-    if (fv) {
-        if (strcmp(fv, "1") == 0 || strcmp(fv, "true") == 0) force = 1;
-        else if (strcmp(fv, "0") == 0 || strcmp(fv, "false") == 0) force = 0;
-        else return api_error(400, "force must be 1 or 0");
-    }
+    if (query_bool(req, "force", &force) != 0)
+        return api_error(400, "force must be 1 or 0");
 
     char *repo_path = repo_path_for(g_ctx.db, repo_id);
     if (!repo_path) return api_error(404, "no such repo");

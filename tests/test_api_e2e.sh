@@ -291,6 +291,14 @@ if [ -n "$TOKEN" ]; then ok "login returns a token"; else bad "login returns a t
 check "bearer accepted" 200 "$(tcp_code /repos -H "Authorization: Bearer $TOKEN")"
 check "bare token accepted" 200 "$(tcp_code /repos -H "Authorization: $TOKEN")"
 check "bad token refused" 401 "$(tcp_code /repos -H "Authorization: Bearer nonesuch")"
+# B127 follow-up: no empty or wrongly typed credential gets anywhere.
+check "an empty bearer token is refused" 401 "$(tcp_code /repos -H "Authorization: Bearer ")"
+check "an empty cookie is refused" 401 "$(tcp_code /repos -b "auth=")"
+check "an empty password does not log in" 401 \
+    "$(tcp_code /api/auth/login -X POST -d '{"password":""}')"
+check "a numeric password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":1}')"
+check "a null password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{"password":null}')"
+check "a missing password is a 400" 400 "$(tcp_code /api/auth/login -X POST -d '{}')"
 check "cookie accepted" 200 "$(tcp_code /repos -b "auth=$TOKEN")"
 # B082: the key was read into the route context and then cleared when the
 # routes registered, so the flag was parsed and never honoured.
@@ -1719,6 +1727,96 @@ SCH=$(sock_send POST /repos/1/schedules \
     "{\"action\":\"backup\",\"paths\":[\"$R/src\"],\"label\":\"$LBL_JSON\",\"trigger\":{\"type\":\"interval\",\"seconds\":86400}}")
 contains "a labelled backup schedule is created" ' 201' "$SCH"
 contains "and stores the label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/schedules)"
+
+echo "no silent security downgrade (B127)"
+# An explicit field carries a valid value or is a 400 naming it. Empty or
+# unrecognised never means "none" or "off": "encrypt":"" and
+# "passphrase":"" each registered an unencrypted repository with a 201.
+# Every refusal must leave nothing behind.
+dg_state() {
+    sock_body /repos; sock_body /repos/1/snapshots
+    sock_body '/jobs?limit=1' | grep -o '"id":[0-9]*' | head -1
+    find "$R/keys" -type f -exec sha256sum {} + 2>/dev/null | sort
+}
+DG_BEFORE=$(dg_state)
+dg() {  # dg <name> <expected error> <path> [extra JSON members]
+    local out
+    out=$(sock_send POST /repos "{\"path\":\"$3\"${4:+,$4}}")
+    check "$1" "{\"error\":\"$2\"} 400" "$out"
+}
+ENC_BAD='encrypt must be none, system or passphrase'
+PASS_EMPTY='passphrase must not be empty; leave it out for a repository without one'
+DG="$R/dgrepo"
+dg "encrypt empty"            "$ENC_BAD" "$DG" '"encrypt":""'
+dg "encrypt unknown"          "$ENC_BAD" "$DG" '"encrypt":"aes"'
+dg "encrypt in capitals"      "$ENC_BAD" "$DG" '"encrypt":"SYSTEM"'
+dg "encrypt with a space"     "$ENC_BAD" "$DG" '"encrypt":" system"'
+dg "encrypt empty, with a passphrase" "$ENC_BAD" "$DG" '"encrypt":"","passphrase":"correct horse"'
+dg "encrypt null"             'encrypt must be a string' "$DG" '"encrypt":null'
+dg "encrypt true"             'encrypt must be a string' "$DG" '"encrypt":true'
+dg "encrypt as a list"        'encrypt must be a string' "$DG" '"encrypt":["system"]'
+dg "passphrase empty"         "$PASS_EMPTY" "$DG" '"passphrase":""'
+dg "passphrase empty, encrypt passphrase" "$PASS_EMPTY" "$DG" '"encrypt":"passphrase","passphrase":""'
+dg "passphrase empty, encrypt none" "$PASS_EMPTY" "$DG" '"encrypt":"none","passphrase":""'
+dg "passphrase as a number"   'passphrase must be a string' "$DG" '"passphrase":12345678'
+dg "passphrase null"          'passphrase must be a string' "$DG" '"passphrase":null'
+check "no refused request created the directory" "absent" \
+    "$([ -e "$DG" ] && echo present || echo absent)"
+check "or changed anything" "$DG_BEFORE" "$(dg_state)"
+# Absent is still the documented default.
+contains "encrypt left out is accepted" ' 201' \
+    "$(sock_send POST /repos "{\"path\":\"$R/plainrepo\",\"label\":\"plain\"}")"
+contains "as an unencrypted repository" '"encryption":"none"' \
+    "$(sock_body /repos | tr '}' '\n' | grep plainrepo)"
+
+# Re-registering: the marker decides, and a request naming a different mode,
+# "none" included, is refused rather than read as "not asked".
+ENC_OUT=$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"enc\",\"encrypt\":\"system\"}")
+contains "an encrypted repository is created" ' 201' "$ENC_OUT"
+ENC_ID=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ENC_KEY=$(printf '%s' "$ENC_OUT" | sed -n 's/.*"key":"\([0-9a-fA-F]*\)".*/\1/p')
+DG_BEFORE=$(dg_state)
+contains "re-register saying encrypt none is refused" \
+    "already a repository with encryption system" \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\",\"label\":\"x\",\"encrypt\":\"none\"}")"
+dg "re-register with encrypt empty"   "$ENC_BAD"    "$R/encrepo" '"label":"x","encrypt":""'
+dg "re-register with passphrase empty" "$PASS_EMPTY" "$R/encrepo" '"label":"x","passphrase":""'
+check "and the repository is unchanged, label included" "$DG_BEFORE" "$(dg_state)"
+contains "a plain re-register still works" '"already_registered":true' \
+    "$(sock_send POST /repos "{\"path\":\"$R/encrepo\"}")"
+
+# Key import: exactly 64 hex characters, or a 400.
+ki() { sock_send POST "/repos/$ENC_ID/key/import" "$1"; }
+for body in '{"key":""}' '{"key":"zz"}' "{\"key\":\"${ENC_KEY}00\"}" \
+            "{\"key\":\"+${ENC_KEY:1}\"}" "{\"key\":\"0x${ENC_KEY:2}\"}" \
+            '{"key":1}' '{"key":null}' '{"key":["k"]}' '{}'; do
+    contains "key import refuses $body" ' 400' "$(ki "$body")"
+done
+check "and no key file changed" "$DG_BEFORE" "$(dg_state)"
+contains "the right key is still accepted" '{"ok":true} 200' "$(ki "{\"key\":\"$ENC_KEY\"}")"
+
+# Replicate: reencrypt is true or false, dest a path.
+rp() { sock_send POST /repos/1/replicate "$1"; }
+for v in '"true"' '1' 'null' '""'; do
+    check "reencrypt $v is refused" '{"error":"reencrypt must be true or false"} 400' \
+        "$(rp "{\"dest\":\"$R/encrepo\",\"reencrypt\":$v}")"
+done
+contains "an empty dest is refused" ' 400' "$(rp '{"dest":"","reencrypt":true}')"
+contains "a non-string dest is refused" 'dest must be a string' "$(rp '{"dest":1}')"
+
+# Safety switches in the query: an unrecognised value used to read as off,
+# so "dry_run=yes" ran the real pass and "repair=no" repaired.
+check "gc dry_run=yes is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gc?dry_run=yes')"
+check "gfs dry_run= is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/gfs?dry_run=')"
+check "verify repair=no is refused" '{"error":"repair must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?repair=no')"
+check "verify dry_run=on is refused" '{"error":"dry_run must be 1, true, 0 or false"} 400' \
+    "$(sock_send POST '/repos/1/verify?dry_run=on')"
+check "snapshot delete force= is refused" '{"error":"force must be 1 or 0"} 400' \
+    "$(sock_send DELETE '/repos/1/snapshots/1?force=')"
+check "none of them started a job or removed anything" "$DG_BEFORE" "$(dg_state)"
 
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
