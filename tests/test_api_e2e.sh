@@ -403,7 +403,8 @@ contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
 contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
 contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0,' "$JOB_BODY"
-contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0}' "$JOB_BODY"
+contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0,' "$JOB_BODY"
+contains "and saw nothing change under it" '"files_changed":0,"changed":[],"changed_listed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1687,7 +1688,7 @@ if [ "$(id -u)" != 0 ]; then
     contains "a backup with an unreadable file still completes" '"state":"completed"' "$SBODY"
     contains "and counts it" '"files_skipped":1,' "$SBODY"
     contains "and names it, with the reason" \
-        "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1}" \
+        "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1," \
         "$SBODY"
     contains "and the journal says so" \
         "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \

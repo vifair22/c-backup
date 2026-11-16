@@ -52,6 +52,9 @@ typedef struct {
     /* A regular file the store could not read. It is left out of the trees
      * and the index entirely; see skip_file. */
     int      skipped;
+    /* Seen to change since the scan before going to a pool worker; the
+     * result is counted when the worker's read comes back stable. */
+    int      changed;
 } node_link_t;
 
 /*
@@ -169,6 +172,31 @@ void backup_result_free(backup_result_t *r)
     free(r->skipped);
     r->skipped = NULL;
     r->skipped_listed = 0;
+    for (uint32_t i = 0; i < r->changed_listed; i++) free(r->changed[i]);
+    free(r->changed);
+    r->changed = NULL;
+    r->changed_listed = 0;
+}
+
+/*
+ * A file stored as it was when it was read, not as the scan saw it: its
+ * size or times had moved on (OWN-45). What is stored is one real version
+ * of the file, read whole between two identical fstats, and the node says
+ * that version's size and mtime. Counted and listed so the result says the
+ * snapshot is not the moment of the scan for these files.
+ */
+static void note_changed(pipeline_t *p, uint32_t i)
+{
+    backup_result_t *r = p->res;
+    r->files_changed++;
+    if (r->changed_listed >= BACKUP_SKIPPED_LIST_MAX) return;
+    if (!r->changed) {
+        r->changed = calloc(BACKUP_SKIPPED_LIST_MAX, sizeof(*r->changed));
+        if (!r->changed) return;
+    }
+    char *path = strdup(p->scan->entries[i].path);
+    if (!path) return;
+    r->changed[r->changed_listed++] = path;
 }
 
 /*
@@ -549,6 +577,14 @@ static void batch_count(pipeline_t *p, batch_t *b)
     else batch_yield(p, b);
 }
 
+static int stat_same(const struct stat *a, const struct stat *b);
+static void adopt_stat(scan_entry_t *e, const struct stat *st);
+static status_t record_discarded(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
+                                 const object_write_t *w);
+static status_t store_file_serial(pipeline_t *p, uint32_t i, int fd,
+                                  const struct stat *pre, int attempt, int changed);
+#define CHANGED_TWICE "changed while it was being read, and again on a second read"
+
 /*
  * Record a large file a pool worker has finished, exactly as the serial path
  * below records one it stored itself: the same warning and skip for a file
@@ -562,8 +598,35 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
      * loop moved past it long before the file was read. */
     p->bytes_done += e->node.size;
 
+    /*
+     * The worker's read, checked as the serial path checks its own: the
+     * file the same at the end as when it was submitted, or read again
+     * here, once, on this thread (OWN-45). A read that failed because the
+     * file shrank under it is a change, not a read error.
+     */
+    if (j->st != OK && cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
+    if (!j->post_ok || !stat_same(&j->post, &e->st)) {
+        if (j->st == OK) {
+            status_t rst = record_discarded(p, j->hash, &j->w);
+            if (rst != OK) return rst;
+        }
+        log_warn("backup: %s changed while it was being read; reading it again",
+                 e->path);
+        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        struct stat fst;
+        if (fd == -1 || fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+            if (fd != -1) close(fd);
+            skip_file(p, j->index, "changed while it was being read, and "
+                                   "could not be opened again as a regular file");
+            return OK;
+        }
+        adopt_stat(e, &fst);
+        status_t sst = store_file_serial(p, j->index, fd, &fst, 1, 1);
+        close(fd);
+        return sst;
+    }
+
     if (j->st != OK) {
-        if (cancelled(p)) return set_error(ERR_BUSY, "backup cancelled");
         char why[ERR_MSG_MAX + 32];
         snprintf(why, sizeof(why), "cannot read: %s",
                  j->err[0] ? j->err : "no detail recorded");
@@ -572,6 +635,7 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
     }
 
     memcpy(e->node.content_hash, j->hash, OBJECT_HASH_SIZE);
+    if (p->links[j->index].changed) note_changed(p, j->index);
     /*
      * Two identical large files on two workers can both find the object
      * absent and both write it; the second rename replaces the first with
@@ -601,6 +665,182 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
                    e->node.content_hash, p->cache_stamp);
     phase_add(p->timers, PHASE_CACHE_PUT, _tp);
     return OK;
+}
+
+/*
+ * Did the file change between two looks at it? Size, mtime and ctime, and
+ * the inode in case the path now names another file. ctime is the one that
+ * cannot be faked: any write or truncate moves it, even one that leaves the
+ * size and mtime as they were (touch -r, a tool restoring timestamps).
+ */
+static int stat_same(const struct stat *a, const struct stat *b)
+{
+    return a->st_size == b->st_size &&
+           a->st_ino  == b->st_ino  && a->st_dev == b->st_dev &&
+           a->st_mtim.tv_sec  == b->st_mtim.tv_sec &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_ctim.tv_sec  == b->st_ctim.tv_sec &&
+           a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+/*
+ * Make the entry describe the file as it is being read, not as the scan saw
+ * it. The size is the one that matters: the store reads exactly that many
+ * bytes, so the scan's size meant a file that had grown was cut short and
+ * one that had shrunk was padded out with zeros - its sparse probe found a
+ * "hole" where the file now ended (OWN-45). The rest follows so the node,
+ * the tree and the file cache all describe the same version.
+ */
+static void adopt_stat(scan_entry_t *e, const struct stat *st)
+{
+    e->st         = *st;
+    e->node.size  = (uint64_t)st->st_size;
+    e->node.mode  = (uint32_t)st->st_mode;
+    e->node.uid   = (uint32_t)st->st_uid;
+    e->node.gid   = (uint32_t)st->st_gid;
+    e->node.mtime_sec  = (int64_t)st->st_mtim.tv_sec;
+    e->node.mtime_nsec = (uint64_t)st->st_mtim.tv_nsec;
+}
+
+/*
+ * An object a read produced and the backup then discarded, because the file
+ * changed while it was being read. It is in the open pack or installed
+ * loose either way, so it is recorded like any other object: an entry in a
+ * pack with no row is exactly the stale-index state the pack bookkeeping
+ * exists to prevent. Nothing references it; gc sweeps it.
+ */
+static status_t record_discarded(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
+                                 const object_write_t *w)
+{
+    if (!w->is_new) return OK;
+    p->res->objects_new++;
+    p->res->bytes_stored += w->phys_bytes;
+    batch_open(p, &p->batch);
+    return record_object(p, hash, OBJECT_TYPE_FILE, w->phys_bytes, w->payload_size);
+}
+
+/*
+ * Store one regular file on the backup thread, from an open fd whose fstat
+ * is *pre, and record it. A file that changes while it is read is read once
+ * more; a second change leaves it out (skip_file). attempt is 1 when the
+ * first read already happened elsewhere (a pool worker), so only one more
+ * is allowed. changed says the file was already seen to change since the
+ * scan. Returns OK when the entry is finished - stored or skipped - and an
+ * error only for what fails the backup: a cancel, an index write.
+ *
+ * Why re-read and then skip, rather than tar's "file changed as we read it"
+ * and keep what was read: bytes read across a change are a mix of two
+ * versions, a file that never existed, and restoring it is the bug OWN-45
+ * is about in another form. rsync re-sends a file that fails its check once
+ * and then reports it; this does the same. A file read whole between two
+ * identical fstats is one version of the file, whichever moment it was.
+ */
+static status_t store_file_serial(pipeline_t *p, uint32_t i, int fd,
+                                  const struct stat *pre, int attempt, int changed)
+{
+    scan_entry_t *e = &p->scan->entries[i];
+    struct stat before = *pre;
+
+    for (;; attempt++) {
+        object_write_t w;
+        memset(&w, 0, sizeof(w));
+        uint8_t hash[OBJECT_HASH_SIZE];
+        p->file_bytes = 0;
+        p->file_size  = e->node.size;
+        p->file_index = i;
+        store_io_fn prev_io;
+        void *prev_io_ctx;
+        uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
+        store_get_io_progress(p->store, &prev_io, &prev_io_ctx);
+        store_set_io_progress(p->store, store_bytes, p);
+        status_t st = lseek(fd, 0, SEEK_SET) == (off_t)-1
+                    ? set_error_errno(ERR_IO, "store: rewind")
+                    : object_store_file_packed(p->store, fd, e->node.size,
+                                               p->pack_w, hash, &w);
+        store_set_io_progress(p->store, prev_io, prev_io_ctx);
+        /* The whole file is counted into bytes_done when the loop moves on. */
+        p->file_bytes = 0;
+        phase_add_excl(p->timers, PHASE_READ_HASH, _tr, _trn);
+        if (st != OK && cancelled(p))
+            /* Stopped inside the file, not unreadable: no warning, and no
+             * moving on to the next one. */
+            return set_error(ERR_BUSY, "backup cancelled");
+
+        /*
+         * The same file from start to end of the read, or not. A read that
+         * failed counts too: a file that shrank under the reader comes up
+         * short, and that is a change, not a read error.
+         */
+        struct stat after;
+        int stable = fstat(fd, &after) == 0 && stat_same(&after, &before);
+        if (!stable) {
+            char why[ERR_MSG_MAX];
+            snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
+            err_clear();
+            if (st == OK) {
+                status_t rst = record_discarded(p, hash, &w);
+                if (rst != OK) return rst;
+            }
+            if (attempt >= 1 || fstat(fd, &after) != 0) {
+                skip_file(p, i, CHANGED_TWICE);
+                return OK;
+            }
+            log_warn("backup: %s changed while it was being read; reading it again%s%s%s",
+                     e->path, why[0] ? " (" : "", why[0] ? why : "", why[0] ? ")" : "");
+            before = after;
+            adopt_stat(e, &after);
+            changed = 1;
+            continue;
+        }
+
+        if (st != OK) {
+            char why[ERR_MSG_MAX + 32];
+            snprintf(why, sizeof(why), "cannot read: %s",
+                     err_msg()[0] ? err_msg() : "no detail recorded");
+            err_clear();
+            skip_file(p, i, why);
+            return OK;
+        }
+
+        memcpy(e->node.content_hash, hash, OBJECT_HASH_SIZE);
+        if (changed) note_changed(p, i);
+
+        /* Its rows go in a transaction of the backup's own: a statement
+         * issued outside one joins whatever transaction another thread has
+         * open on the shared handle, and goes with it if that rolls back. */
+        batch_open(p, &p->batch);
+        if (w.is_new) {
+            p->res->objects_new++;
+            p->res->bytes_stored += w.phys_bytes;
+        }
+        p->res->files++;
+        p->res->bytes_logical += e->node.size;
+
+        /*
+         * The object's payload length, not the file's logical size.
+         *
+         * They differ only for a sparse file, whose payload is its region
+         * table plus the bytes that are not holes. Recording the logical size
+         * here disagreed with the object header, and a pack rewrites this
+         * column from that header, so stats and summary reported one total
+         * before a pack and a smaller one after - on a repository that had
+         * changed nothing. The logical size is not lost: it is the node's,
+         * in nodes.size and snapshots.size, and restore reads it from there.
+         * It could not live here anyway, because two files with the same data
+         * and different trailing holes share a payload and so share a hash.
+         */
+        uint64_t _ti = phase_now();
+        st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
+                           w.phys_bytes, w.payload_size);
+        phase_add(p->timers, PHASE_INDEX_PUT, _ti);
+        if (st != OK) return st;
+
+        uint64_t _tp = phase_now();
+        file_cache_put(p->db, p->repo_id, e->path, &e->st,
+                       e->node.content_hash, p->cache_stamp);
+        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
+        return OK;
+    }
 }
 
 /*
@@ -852,8 +1092,6 @@ static status_t store_content_loop(pipeline_t *p)
         if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
             batch_close(p, b);
 
-        /* Open is part of reading: over NFS it is a round trip per file. */
-        uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
         /* O_NONBLOCK so a FIFO put where the file was cannot hang the
          * backup in open; it is refused just below like anything else that
          * is not a regular file. It changes nothing for a regular file. */
@@ -881,86 +1119,32 @@ static status_t store_content_loop(pipeline_t *p)
             continue;
         }
 
+        /* The file as it is now, not as the scan saw it (OWN-45). */
+        int changed = 0;
+        if (!stat_same(&fst, &e->st)) {
+            log_info("backup: %s changed since the scan; storing it as it is now",
+                     e->path);
+            adopt_stat(e, &fst);
+            changed = 1;
+        }
+
         if (to_pool) {
             status_t sst = store_pool_submit(p->pool, i, fd, e->node.size);
             if (sst != OK) {
                 batch_close(p, b);
                 return sst;
             }
+            if (changed) p->links[i].changed = 1;
             prev_pooled = 1;
             continue;
         }
 
-        object_write_t w;
-        p->file_bytes = 0;
-        p->file_size  = e->node.size;
-        p->file_index = i;
-        store_io_fn prev_io;
-        void *prev_io_ctx;
-        store_get_io_progress(p->store, &prev_io, &prev_io_ctx);
-        store_set_io_progress(p->store, store_bytes, p);
-        status_t st = object_store_file_packed(p->store, fd, e->node.size,
-                                               p->pack_w,
-                                               e->node.content_hash, &w);
-        store_set_io_progress(p->store, prev_io, prev_io_ctx);
-        /* The whole file is counted into bytes_done when the loop moves on. */
-        p->file_bytes = 0;
-        phase_add_excl(p->timers, PHASE_READ_HASH, _tr, _trn);
-        int is_new = w.is_new;
+        status_t sst = store_file_serial(p, i, fd, &fst, 0, changed);
         close(fd);
-        if (st != OK && cancelled(p)) {
-            /* Stopped inside the file, not unreadable: no warning, and no
-             * moving on to the next one. */
+        if (sst != OK) {
             batch_close(p, b);
-            return set_error(ERR_BUSY, "backup cancelled");
+            return sst;
         }
-        if (st != OK) {
-            char why[ERR_MSG_MAX + 32];
-            snprintf(why, sizeof(why), "cannot read: %s",
-                     err_msg()[0] ? err_msg() : "no detail recorded");
-            err_clear();
-            skip_file(p, i, why);
-            continue;
-        }
-
-        /* Its rows go in a transaction of the backup's own: a statement
-         * issued outside one joins whatever transaction another thread has
-         * open on the shared handle, and goes with it if that rolls back. */
-        batch_open(p, b);
-
-        if (is_new) {
-            p->res->objects_new++;
-            p->res->bytes_stored += w.phys_bytes;
-        }
-        p->res->files++;
-        p->res->bytes_logical += e->node.size;
-
-        /*
-         * The object's payload length, not the file's logical size.
-         *
-         * They differ only for a sparse file, whose payload is its region
-         * table plus the bytes that are not holes. Recording the logical size
-         * here disagreed with the object header, and a pack rewrites this
-         * column from that header, so stats and summary reported one total
-         * before a pack and a smaller one after - on a repository that had
-         * changed nothing. The logical size is not lost: it is the node's,
-         * in nodes.size and snapshots.size, and restore reads it from there.
-         * It could not live here anyway, because two files with the same data
-         * and different trailing holes share a payload and so share a hash.
-         */
-        uint64_t _ti = phase_now();
-        st = record_object(p, e->node.content_hash, OBJECT_TYPE_FILE,
-                           w.phys_bytes, w.payload_size);
-        phase_add(p->timers, PHASE_INDEX_PUT, _ti);
-        if (st != OK) {
-            batch_close(p, b);
-            return st;
-        }
-
-        uint64_t _tp = phase_now();
-        file_cache_put(p->db, p->repo_id, e->path, &e->st,
-                       e->node.content_hash, p->cache_stamp);
-        phase_add(p->timers, PHASE_CACHE_PUT, _tp);
     }
 
     /* The large files still out. Progress keeps moving while they finish:

@@ -152,28 +152,45 @@ static void backup_job_free(void *p)
  */
 static char *with_skipped(const char *base, const backup_result_t *res)
 {
+    /* Changed files (OWN-45) are stored, so they are paths alone. */
+    cJSON *chg = cJSON_CreateArray();
+    if (!chg) return NULL;
+    for (uint32_t i = 0; i < res->changed_listed; i++) {
+        cJSON *str = cJSON_CreateString(res->changed[i]);
+        if (!str) { cJSON_Delete(chg); return NULL; }
+        cJSON_AddItemToArray(chg, str);
+    }
+    char *clist = cJSON_PrintUnformatted(chg);
+    cJSON_Delete(chg);
+    if (!clist) return NULL;
+
     cJSON *arr = cJSON_CreateArray();
-    if (!arr) return NULL;
+    if (!arr) { cJSON_free(clist); return NULL; }
     for (uint32_t i = 0; i < res->skipped_listed; i++) {
         cJSON *o = cJSON_CreateObject();
-        if (!o) { cJSON_Delete(arr); return NULL; }
+        if (!o) { cJSON_Delete(arr); cJSON_free(clist); return NULL; }
         cJSON_AddItemToArray(arr, o);
         if (!cJSON_AddStringToObject(o, "path", res->skipped[i].path) ||
             !cJSON_AddStringToObject(o, "reason", res->skipped[i].reason)) {
             cJSON_Delete(arr);
+            cJSON_free(clist);
             return NULL;
         }
     }
     char *list = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
-    if (!list) return NULL;
+    if (!list) { cJSON_free(clist); return NULL; }
 
-    size_t cap = strlen(base) + strlen(list) + 64;
+    size_t cap = strlen(base) + strlen(list) + strlen(clist) + 160;
     char *js = malloc(cap);
     if (js)
-        snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u}",
-                 base, list, res->skipped_listed);
+        snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u,"
+                 "\"files_changed\":%llu,\"changed\":%s,\"changed_listed\":%u}",
+                 base, list, res->skipped_listed,
+                 (unsigned long long)res->files_changed, clist,
+                 res->changed_listed);
     cJSON_free(list);
+    cJSON_free(clist);
     return js;
 }
 

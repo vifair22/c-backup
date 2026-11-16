@@ -922,11 +922,16 @@ failed partway. The job still completes (Manual section 6.3), and says so:
 | `files_skipped` | Every file left out. Always present; `0` on a clean run |
 | `skipped` | The first 100 of them, in scan order, each `{"path","reason"}`; `[]` when none |
 | `skipped_listed` | How many `skipped` holds; less than `files_skipped` when more than 100 were left out |
+| `files_changed` | Files whose size or times had changed by the time they were read (since the scan, or during a read that was then repeated) and that were stored as read: one whole version, its size and mtime in the snapshot. Always present |
+| `changed` | The first 100 of them, as paths; `[]` when none |
+| `changed_listed` | How many `changed` holds |
 
 `reason` reads `cannot open: it no longer exists`, `cannot open:
 Permission denied` (or another errno text), `no longer a regular file (now
-a directory)`, `no longer a regular file`, or `cannot read: ` followed by
-the store's error. Each is also a `WARN` line in the daemon log, `backup:
+a directory)`, `no longer a regular file`, `changed while it was being
+read, and again on a second read` (a file still changing when read a second
+time; Manual section 6.3), or `cannot read: ` followed by the store's
+error. Each is also a `WARN` line in the daemon log, `backup:
 skipping <path>, it is not in this snapshot: <reason>`, followed by one
 summary line, and the job's journal entry reads `snapshot N: F files, S
 skipped (not in the snapshot); first: <path>: <reason>`. A clean backup

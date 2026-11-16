@@ -146,4 +146,14 @@ int  fault_rename_gate_arrivals(void);
  */
 extern const char *volatile fault_read_eio_path;
 extern volatile int fault_read_refused;
+
+/*
+ * Run something at a read of one file: when both are set, every read() on
+ * a descriptor open on exactly fault_read_hook_path calls the hook first,
+ * on whatever thread is reading. This is how a test changes a file while a
+ * pool worker is part way through reading it. The hook decides how often
+ * it acts. NULL disables it.
+ */
+extern const char *volatile fault_read_hook_path;
+extern void (*volatile fault_read_hook)(const char *path);
 extern ssize_t __real_read(int, void *, size_t);
