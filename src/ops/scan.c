@@ -226,15 +226,31 @@ static void put_le32(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)((v >> (8 * i)) & 0xFF);
 }
 
-static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len) {
+/*
+ * follow is set only for a /proc/self/fd/N path, where following lands on
+ * the inode that fd holds and nothing else (see meta_path); every other
+ * path is read with the l-variants, which never follow the last component.
+ */
+static ssize_t xlist(const char *path, char *buf, size_t sz, int follow) {
+    return follow ? listxattr(path, buf, sz) : llistxattr(path, buf, sz);
+}
+
+static ssize_t xget(const char *path, const char *name, void *buf, size_t sz,
+                    int follow) {
+    return follow ? getxattr(path, name, buf, sz) : lgetxattr(path, name, buf, sz);
+}
+
+/* shown is the path for messages; path may be a /proc/self/fd one. */
+static status_t collect_xattrs(const char *path, int follow, const char *shown,
+                              uint8_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
-    ssize_t list_sz_s = llistxattr(path, NULL, 0);
+    ssize_t list_sz_s = xlist(path, NULL, 0, follow);
     if (list_sz_s <= 0) return OK;
     size_t list_sz = (size_t)list_sz_s;
 
     char *names = malloc(list_sz);
     if (!names) return set_error(ERR_NOMEM, "collect_xattrs: alloc failed");
-    if (llistxattr(path, names, list_sz) < 0) { free(names); return set_error_errno(ERR_IO, "llistxattr(%s)", path); }
+    if (xlist(path, names, list_sz, follow) < 0) { free(names); return set_error_errno(ERR_IO, "listxattr(%s)", shown); }
 
     /* Collect name pointers, dropping the excluded ones, then sort. */
     size_t attr_count = 0;
@@ -256,13 +272,13 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
     const size_t XATTR_MAX_TOTAL = 64u * 1024u * 1024u; /* 64 MiB cap */
     size_t total = 0;
     for (idx = 0; idx < attr_count; idx++) {
-        ssize_t vsz = lgetxattr(path, attrs[idx], NULL, 0);
+        ssize_t vsz = xget(path, attrs[idx], NULL, 0, follow);
         sizes[idx] = vsz;
         if (vsz >= 0) {
             size_t inc = sizeof(uint16_t) + strlen(attrs[idx]) + 1 + sizeof(uint32_t) + (size_t)vsz;
             if (inc > XATTR_MAX_TOTAL - total) {
                 free(attrs); free(sizes); free(names);
-                return set_error(ERR_CORRUPT, "collect_xattrs: total xattr size exceeds limit for '%s'", path);
+                return set_error(ERR_CORRUPT, "collect_xattrs: total xattr size exceeds limit for '%s'", shown);
             }
             total += inc;
         }
@@ -287,7 +303,7 @@ static status_t collect_xattrs(const char *path, uint8_t **out, size_t *out_len)
         p += sizeof(uint32_t);
         uint32_t actual_vlen = 0;
         if (sizes[idx] > 0) {
-            ssize_t got = lgetxattr(path, n, p, (size_t)sizes[idx]);
+            ssize_t got = xget(path, n, p, (size_t)sizes[idx], follow);
             if (got < 0) {
                 actual_vlen = 0;
             } else if ((size_t)got > (size_t)sizes[idx]) {
@@ -382,25 +398,84 @@ static status_t collect_acl(const char *path, int is_dir,
     return OK;
 }
 
+/* Whether /proc/self/fd can stand in for a path (meta_at). Checked once. */
+static int proc_fd_usable(void) {
+    static _Atomic int known = -1;
+    int v = known;
+    if (v < 0) {
+        v = access("/proc/self/fd", X_OK) == 0;
+        known = v;
+    }
+    return v;
+}
+
+/*
+ * Extended attributes and ACLs of the entry `name` in directory dirfd
+ * (AT_FDCWD with a full path for a source root), which the scan has just
+ * lstat'd as *st.
+ *
+ * By path, an entry swapped for a symlink between the lstat and these reads
+ * was followed: acl_get_file always follows, so the scan recorded the
+ * target's ACL under the entry's name, and a parent swapped for a symlink
+ * redirected the l-variants too (B128). So a non-symlink is pinned first,
+ * with an O_PATH | O_NOFOLLOW open checked against the lstat, and read
+ * through /proc/self/fd/N: following that magic link reaches the pinned
+ * inode and nothing else. An entry that is no longer what the lstat saw
+ * gets no metadata; if it is a file the store refuses it on the same
+ * inode test. A symlink, which has no ACL, is read with the l-variants
+ * through its pinned parent.
+ *
+ * Without /proc the path is used as before, which is the old exposure for
+ * metadata only; content never depends on this.
+ */
+static status_t meta_at(int dirfd, const char *name, const char *path,
+                        const struct stat *st, uint32_t type,
+                        uint8_t **xd, size_t *xl, uint8_t **ad, size_t *al) {
+    char xpath[PATH_MAX + 64];
+    int follow = 0, ofd = -1;
+    const char *use = path;
+
+    if (proc_fd_usable()) {
+        if (type == NODE_TYPE_SYMLINK) {
+            if (dirfd != AT_FDCWD &&
+                snprintf(xpath, sizeof(xpath), "/proc/self/fd/%d/%s", dirfd, name)
+                    < (int)sizeof(xpath))
+                use = xpath;
+        } else {
+            ofd = openat(dirfd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            struct stat now;
+            if (ofd == -1 || fstat(ofd, &now) != 0 ||
+                (now.st_mode & S_IFMT) != (st->st_mode & S_IFMT) ||
+                now.st_dev != st->st_dev || now.st_ino != st->st_ino) {
+                if (ofd != -1) close(ofd);
+                return OK;   /* changed under the scan: no metadata */
+            }
+            snprintf(xpath, sizeof(xpath), "/proc/self/fd/%d", ofd);
+            use = xpath;
+            follow = 1;
+        }
+    }
+
+    status_t rc = collect_xattrs(use, follow, path, xd, xl);
+    /* No ACL for symlinks: acl_get_file follows the link, so what it returns
+     * is the target's ACL wearing the symlink's name. */
+    if (rc == OK && type != NODE_TYPE_SYMLINK) {
+        rc = collect_acl(use, type == NODE_TYPE_DIR, ad, al);
+        if (rc != OK) {
+            free(*xd);
+            *xd = NULL;
+            *xl = 0;
+        }
+    }
+    if (ofd != -1) close(ofd);
+    return rc;
+}
+
 status_t scan_entry_collect_metadata(scan_entry_t *e) {
     if (!e || !e->path) return set_error(ERR_INVALID, "scan_entry_collect_metadata: null entry");
     if (e->xattr_data || e->xattr_len || e->acl_data || e->acl_len) return OK;
-
-    status_t st = collect_xattrs(e->path, &e->xattr_data, &e->xattr_len);
-    if (st != OK) return st;
-    /* No ACL for symlinks: acl_get_file follows the link, so what it returns
-     * is the target's ACL wearing the symlink's name. */
-    if (e->node.type != NODE_TYPE_SYMLINK) {
-        st = collect_acl(e->path, e->node.type == NODE_TYPE_DIR,
-                         &e->acl_data, &e->acl_len);
-        if (st != OK) {
-            free(e->xattr_data);
-            e->xattr_data = NULL;
-            e->xattr_len = 0;
-            return st;
-        }
-    }
-    return OK;
+    return meta_at(AT_FDCWD, e->path, e->path, &e->st, e->node.type,
+                   &e->xattr_data, &e->xattr_len, &e->acl_data, &e->acl_len);
 }
 
 /*
@@ -411,18 +486,36 @@ status_t scan_entry_collect_metadata(scan_entry_t *e) {
  * part of the options.
  */
 
-/* Forward declaration */
-static status_t scan_dir(const char *path, uint64_t dir_node_id,
+/*
+ * The walk is relative to directory fds, never by path below a source root.
+ *
+ * By path, a directory swapped for a symlink between its lstat and its
+ * opendir was followed, and so was one swapped while its children were
+ * being lstat'd: the scan walked /etc and recorded what it found there
+ * under the source's names, regular files the store then read as listed
+ * (B128). Each directory is now opened O_NOFOLLOW from its parent's fd and
+ * checked against the lstat that classified it, and every child is
+ * fstatat'd relative to that fd, so nothing below a root is reached through
+ * a symlink. `path` is still built alongside: it is the entry's name in the
+ * snapshot, and what the store opens later (with its own checks).
+ *
+ * dirfd is AT_FDCWD for a source root, whose own path is the operator's to
+ * choose and may run through symlinks.
+ */
+static status_t scan_dir(int dirfd, const char *name, const char *path,
+                         const struct stat *dst,
+                         uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
                          const scan_opts_t *opts, dev_t root_dev,
                          scan_result_t *res);
 
-static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
+static status_t scan_entry_at(int dirfd, const char *name, const char *path,
+                                uint64_t parent_node_id,
                                 size_t strip_prefix_len, imap_t *imap,
                                 const scan_opts_t *opts, dev_t root_dev,
                                 scan_result_t *res) {
     struct stat st;
-    if (lstat(path, &st) == -1) {
+    if (fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
         char msg[PATH_MAX + 96];
@@ -476,12 +569,7 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
         nd->device.minor = (uint32_t)minor(st.st_rdev);
     } else if (nd->type == NODE_TYPE_SYMLINK) {
         char target[4096];
-        /* Use O_PATH|O_NOFOLLOW fd to avoid TOCTOU between lstat and readlink */
-        int sym_fd = open(path, O_PATH | O_NOFOLLOW);
-        ssize_t tlen = (sym_fd >= 0)
-            ? readlinkat(sym_fd, "", target, sizeof(target) - 1)
-            : readlink(path, target, sizeof(target) - 1);
-        if (sym_fd >= 0) close(sym_fd);
+        ssize_t tlen = readlinkat(dirfd, name, target, sizeof(target) - 1);
         if (tlen > 0) {
             target[tlen] = '\0';
             nd->symlink.target_len = (uint32_t)tlen + 1;
@@ -491,17 +579,10 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
 
     status_t st2;
     int collect_meta = (!opts || opts->collect_meta);
-    if (collect_meta) {
-        if ((st2 = collect_xattrs(path, &e.xattr_data, &e.xattr_len)) != OK) {
-            free(e.path); free(e.symlink_target); return st2;
-        }
-        /* No ACL for symlinks: acl_get_file follows the link and would
-         * record the target's ACL under the symlink's name. */
-        if (nd->type != NODE_TYPE_SYMLINK &&
-            (st2 = collect_acl(path, nd->type == NODE_TYPE_DIR,
-                               &e.acl_data, &e.acl_len)) != OK) {
-            free(e.path); free(e.xattr_data); free(e.symlink_target); return st2;
-        }
+    if (collect_meta &&
+        (st2 = meta_at(dirfd, name, path, &st, nd->type, &e.xattr_data,
+                       &e.xattr_len, &e.acl_data, &e.acl_len)) != OK) {
+        free(e.path); free(e.symlink_target); return st2;
     }
 
     uint64_t this_node_id = nd->node_id;
@@ -517,8 +598,8 @@ static status_t scan_entry_at(const char *path, uint64_t parent_node_id,
     }
 
     if (S_ISDIR(st.st_mode))
-        return scan_dir(path, this_node_id, strip_prefix_len, imap, opts,
-                        root_dev, res);
+        return scan_dir(dirfd, name, path, &st, this_node_id, strip_prefix_len,
+                        imap, opts, root_dev, res);
     return OK;
 }
 
@@ -636,16 +717,47 @@ static int scan_dirent_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static status_t scan_dir(const char *path, uint64_t dir_node_id,
+static status_t scan_dir(int dirfd, const char *name, const char *path,
+                         const struct stat *dst,
+                         uint64_t dir_node_id,
                          size_t strip_prefix_len, imap_t *imap,
                          const scan_opts_t *opts, dev_t root_dev,
                          scan_result_t *res) {
-    DIR *d = opendir(path);
-    if (!d) {
+    /* Held while the children are walked, so each is reached from this
+     * directory and not by its path: one fd per level of depth. */
+    int dfd = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    const char *why = NULL;
+    char errbuf[128] = "";
+    struct stat now;
+    if (dfd == -1) {
+        /* O_DIRECTORY | O_NOFOLLOW on a symlink fails ENOTDIR on Linux, not
+         * ELOOP, so look at what is there to say which. */
+        int err = errno;
+        struct stat lst;
+        if (err == ENOTDIR || err == ELOOP)
+            why = fstatat(dirfd, name, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode)
+                ? "it is now a symlink, not followed" : "it is no longer a directory";
+        else { snprintf(errbuf, sizeof(errbuf), "%s", strerror(err)); why = errbuf; }
+    } else if (fstat(dfd, &now) != 0 || now.st_dev != dst->st_dev ||
+               now.st_ino != dst->st_ino) {
+        why = "it was replaced during the scan";
+    }
+    DIR *d = NULL;
+    if (!why) {
+        int rfd = dup(dfd);
+        d = rfd == -1 ? NULL : fdopendir(rfd);
+        if (!d) {
+            snprintf(errbuf, sizeof(errbuf), "%s", strerror(errno));
+            why = errbuf;
+            if (rfd != -1) close(rfd);
+        }
+    }
+    if (why) {
+        if (dfd != -1) close(dfd);
         if (opts && opts->progress_clear_cb)
             opts->progress_clear_cb(opts->progress_ctx);
-        char msg[PATH_MAX + 96];
-        snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)", path, strerror(errno));
+        char msg[PATH_MAX + 160];
+        snprintf(msg, sizeof(msg), "cannot open directory: %s (%s)", path, why);
         scan_warn(res, msg);
         log_warn("%s", msg);
         return OK;
@@ -654,7 +766,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
     /* Phase 1: batch all directory entries */
     size_t cap = 256, cnt = 0;
     scan_dirent_t *batch = malloc(cap * sizeof(*batch));
-    if (!batch) { closedir(d); return set_error(ERR_NOMEM, "scan_dir: dirent batch alloc"); }
+    if (!batch) { closedir(d); close(dfd); return set_error(ERR_NOMEM, "scan_dir: dirent batch alloc"); }
 
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
@@ -665,7 +777,7 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         if (cnt == cap) {
             size_t nc = cap * 2;
             scan_dirent_t *tmp = realloc(batch, nc * sizeof(*tmp));
-            if (!tmp) { free(batch); closedir(d); return set_error(ERR_NOMEM, "scan_dir: dirent batch realloc"); }
+            if (!tmp) { free(batch); closedir(d); close(dfd); return set_error(ERR_NOMEM, "scan_dir: dirent batch realloc"); }
             batch = tmp;
             cap = nc;
         }
@@ -699,10 +811,12 @@ static status_t scan_dir(const char *path, uint64_t dir_node_id,
         child[plen] = '/';
         memcpy(child + plen + 1, batch[i].name, nlen + 1);
         if (is_excluded(child, opts)) continue;
-        st = scan_entry_at(child, dir_node_id, strip_prefix_len, imap, opts,
+        st = scan_entry_at(dfd, batch[i].name, child, dir_node_id,
+                           strip_prefix_len, imap, opts,
                            root_dev, res);
     }
     free(batch);
+    close(dfd);
     return st;
 }
 
@@ -819,7 +933,8 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
     }
 
     uint32_t before = res->count;
-    status_t st = scan_entry_at(root, root_parent_id, strip_prefix_len, imap, opts,
+    status_t st = scan_entry_at(AT_FDCWD, root, root, root_parent_id,
+                                strip_prefix_len, imap, opts,
                                 root_dev, res);
     if (st != OK) { scan_result_free(res); return st; }
     res->root_entries = res->count - before;

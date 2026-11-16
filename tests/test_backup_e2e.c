@@ -648,7 +648,14 @@ static void test_unreadable_source_fails_but_unreadable_file_does_not(void **sta
  * log never named. A read that fails partway through is the third way to
  * skip, and test_backup_skip_fault.c makes one.
  */
-typedef enum { RACE_DELETE, RACE_TO_DIR } race_t;
+typedef enum { RACE_DELETE, RACE_TO_DIR, RACE_TO_SYMLINK, RACE_TO_FIFO } race_t;
+
+/*
+ * B128's stand-in for /etc/shadow: a file outside the source that a symlink
+ * swapped in would reach. Its content must never reach the repository.
+ */
+#define SECRET_PATH TEST_DIR "/shadow"
+#define SECRET_BODY "root:$6$notarealhash$:19000:0:99999:7:::\n"
 
 typedef struct {
     race_t      kind;
@@ -674,6 +681,15 @@ static void race_at_store(const char *phase, uint64_t done, uint64_t total, void
             snprintf(inner, sizeof(inner), "%s/inside.txt", r->path);
             write_file(inner, "not part of this backup");
         }
+        break;
+    case RACE_TO_SYMLINK:
+        write_file(SECRET_PATH, SECRET_BODY);
+        assert_int_equal(unlink(r->path), 0);
+        assert_int_equal(symlink(SECRET_PATH, r->path), 0);
+        break;
+    case RACE_TO_FIFO:
+        assert_int_equal(unlink(r->path), 0);
+        assert_int_equal(mkfifo(r->path, 0600), 0);
         break;
     }
 }
@@ -709,6 +725,12 @@ static void expect_left_out(race_t kind, const char *name, const char *reason_ha
     assert_string_equal(res.skipped[0].path, path);
     if (!strstr(res.skipped[0].reason, reason_has))
         fail_msg("reason '%s' lacks '%s'", res.skipped[0].reason, reason_has);
+    /* Skipped, never "changed since the scan; storing it as it is now",
+     * which is how B128 stored a symlink's target. */
+    assert_int_equal(res.files_changed, 0);
+    char secret_len[16];
+    snprintf(secret_len, sizeof(secret_len), "%zu", strlen(SECRET_BODY));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE size = ?", secret_len), 0);
 
     /* Not in the index, and no file row anywhere without content. */
     assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", name), 0);
@@ -774,6 +796,84 @@ static void test_file_replaced_by_a_directory_is_left_out(void **state)
 {
     (void)state;
     expect_left_out(RACE_TO_DIR, "becomes-dir.txt", "now a directory");
+}
+
+/*
+ * B128: a file swapped for a symlink between the scan and the store was
+ * followed. The daemon runs as root, so `ln -s /etc/shadow` inside a source
+ * put the host's shadow file into the snapshot under the file's name,
+ * reported as "changed", readable by restore and grep.
+ */
+static void test_file_replaced_by_a_symlink_is_left_out(void **state)
+{
+    (void)state;
+    expect_left_out(RACE_TO_SYMLINK, "becomes-link.bin", "no longer a regular file (now a symlink)");
+}
+
+static void test_file_replaced_by_a_fifo_is_left_out(void **state)
+{
+    (void)state;
+    expect_left_out(RACE_TO_FIFO, "becomes-fifo.bin", "no longer a regular file (now a FIFO)");
+}
+
+/*
+ * B128, one level up: the file's directory swapped for a symlink to a
+ * directory outside the source that holds a file of the same name.
+ * O_NOFOLLOW guards only the last component, so the open lands on the
+ * outside file; it is a regular file, but not the inode the scan listed,
+ * and that is what refuses it.
+ */
+static void swap_dir_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    int *fired = ctx;
+    if (*fired || strcmp(phase, "store") != 0 || done != 0) return;
+    *fired = 1;
+    assert_int_equal(mkdir(TEST_DIR "/outside", 0700), 0);
+    write_file(TEST_DIR "/outside/gamma.txt", SECRET_BODY);
+    assert_int_equal(rename(TEST_SRC "/sub", TEST_DIR "/sub.aside"), 0);
+    assert_int_equal(symlink(TEST_DIR "/outside", TEST_SRC "/sub"), 0);
+}
+
+static void test_directory_replaced_by_a_symlink_is_not_followed(void **state)
+{
+    (void)state;
+    int fired = 0;
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = swap_dir_at_store;
+    o.progress_ctx = &fired;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(fired);
+
+    assert_int_equal(res.files, 2);
+    assert_int_equal(res.files_skipped, 1);
+    assert_int_equal(res.files_changed, 0);
+    assert_string_equal(res.skipped[0].path, TEST_SRC "/sub/gamma.txt");
+    if (!strstr(res.skipped[0].reason, "replaced by another file"))
+        fail_msg("reason '%s'", res.skipped[0].reason);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", "gamma.txt"), 0);
+    char secret_len[16];
+    snprintf(secret_len, sizeof(secret_len), "%zu", strlen(SECRET_BODY));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE size = ?", secret_len), 0);
+
+    /* Put the tree back so the restore below has a clean destination. */
+    assert_int_equal(unlink(TEST_SRC "/sub"), 0);
+    assert_int_equal(rename(TEST_DIR "/sub.aside", TEST_SRC "/sub"), 0);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot_id(),
+                                 TEST_DIR "/restore-dirswap", &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(rr.files, 2);
+    struct stat sb;
+    assert_int_not_equal(lstat(TEST_DIR "/restore-dirswap" TEST_SRC "/sub/gamma.txt", &sb), 0);
+    /* The directory itself was a directory at the scan, and stays one. */
+    assert_int_equal(lstat(TEST_DIR "/restore-dirswap" TEST_SRC "/sub", &sb), 0);
+    assert_true(S_ISDIR(sb.st_mode));
+    backup_result_free(&res);
 }
 
 /*
@@ -1909,6 +2009,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unreadable_source_fails_but_unreadable_file_does_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_deleted_between_scan_and_store_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_replaced_by_a_directory_is_left_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_replaced_by_a_symlink_is_left_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_replaced_by_a_fifo_is_left_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_directory_replaced_by_a_symlink_is_not_followed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_skipped_list_is_bounded_and_the_count_is_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_shrinks_is_stored_as_read, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_grows_is_stored_as_read, setup, teardown),

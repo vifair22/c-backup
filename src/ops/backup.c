@@ -162,6 +162,86 @@ static void skip_file(pipeline_t *p, uint32_t i, const char *reason)
     r->skipped_listed++;
 }
 
+/* What a path names now, for a skip reason. */
+static const char *file_kind(mode_t m)
+{
+    if (S_ISLNK(m))  return "a symlink";
+    if (S_ISDIR(m))  return "a directory";
+    if (S_ISFIFO(m)) return "a FIFO";
+    if (S_ISSOCK(m)) return "a socket";
+    if (S_ISCHR(m))  return "a character device";
+    if (S_ISBLK(m))  return "a block device";
+    return "something other than a regular file";
+}
+
+/*
+ * Open scan entry i for its content, as the file the scan listed and
+ * nothing else; or skip it (skip_file) and return -1.
+ *
+ * The scan saw a regular file through lstat; the store reads it by path,
+ * later. Whoever can write inside a source can put a symlink where the
+ * file was in between, and a plain open followed it: the daemon, running
+ * as root, stored /etc/shadow under the file's name, and restore and grep
+ * handed it to anyone with rights to those (B128). Three checks close it:
+ *
+ *  - O_NOFOLLOW, so a symlink at the final component is refused (ELOOP)
+ *    rather than followed;
+ *  - fstat on the fd says S_ISREG, so a directory, FIFO or device put there
+ *    is refused (O_NONBLOCK keeps a FIFO from hanging the open itself);
+ *  - the fd's st_dev/st_ino are the scan's. O_NOFOLLOW covers only the last
+ *    component: a parent directory swapped for a symlink to /etc still
+ *    resolves, onto a regular file that is not the one scanned. The inode
+ *    check refuses that. It also refuses a file replaced by rename (an
+ *    editor's save): a different file from the one the scan recorded, whose
+ *    hardlink grouping the scan never saw. It is skipped, and the next
+ *    backup takes it.
+ *
+ * The same inode changed in size or times is still stored as it is now
+ * (OWN-45); that is the caller's business.
+ */
+static int open_scanned(pipeline_t *p, uint32_t i, struct stat *fst)
+{
+    const scan_entry_t *e = &p->scan->entries[i];
+    char why[200];
+    int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (fd == -1) {
+        int err = errno;
+        struct stat lst;
+        if (err == ELOOP && lstat(e->path, &lst) == 0 && S_ISLNK(lst.st_mode))
+            snprintf(why, sizeof(why), "no longer a regular file (now a symlink)");
+        else
+            /* A file that vanished between scan and store is normal on a
+             * live filesystem; it is a warning, not a failed backup. */
+            snprintf(why, sizeof(why), "cannot open: %s",
+                     err == ENOENT ? "it no longer exists" : strerror(err));
+        skip_file(p, i, why);
+        return -1;
+    }
+    /* A directory opens read-only without complaint, and on btrfs SEEK_DATA
+     * on it answers ENXIO, "no data from here on": the sparse probe took
+     * that for a file that is one hole and stored the scan's size in
+     * zeros. */
+    if (fstat(fd, fst) != 0) {
+        snprintf(why, sizeof(why), "cannot open: fstat: %s", strerror(errno));
+        close(fd);
+        skip_file(p, i, why);
+        return -1;
+    }
+    if (!S_ISREG(fst->st_mode)) {
+        snprintf(why, sizeof(why), "no longer a regular file (now %s)",
+                 file_kind(fst->st_mode));
+        close(fd);
+        skip_file(p, i, why);
+        return -1;
+    }
+    if (fst->st_dev != e->st.st_dev || fst->st_ino != e->st.st_ino) {
+        close(fd);
+        skip_file(p, i, "replaced by another file since the scan");
+        return -1;
+    }
+    return fd;
+}
+
 void backup_result_free(backup_result_t *r)
 {
     if (!r) return;
@@ -612,14 +692,10 @@ static status_t pool_record(pipeline_t *p, const store_pool_job_t *j)
         }
         log_warn("backup: %s changed while it was being read; reading it again",
                  e->path);
-        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        /* Opened as the first read was: the same file, never a symlink. */
         struct stat fst;
-        if (fd == -1 || fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
-            if (fd != -1) close(fd);
-            skip_file(p, j->index, "changed while it was being read, and "
-                                   "could not be opened again as a regular file");
-            return OK;
-        }
+        int fd = open_scanned(p, j->index, &fst);
+        if (fd == -1) return OK;
         adopt_stat(e, &fst);
         status_t sst = store_file_serial(p, j->index, fd, &fst, 1, 1);
         close(fd);
@@ -1092,32 +1168,11 @@ static status_t store_content_loop(pipeline_t *p)
         if (!to_pool && e->node.size >= BATCH_YIELD_BYTES && batch_contended(b))
             batch_close(p, b);
 
-        /* O_NONBLOCK so a FIFO put where the file was cannot hang the
-         * backup in open; it is refused just below like anything else that
-         * is not a regular file. It changes nothing for a regular file. */
-        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd == -1) {
-            /* A file that vanished between scan and store is normal on a live
-             * filesystem; it is a warning, not a failed backup. */
-            char why[160];
-            snprintf(why, sizeof(why), "cannot open: %s",
-                     errno == ENOENT ? "it no longer exists" : strerror(errno));
-            skip_file(p, i, why);
-            continue;
-        }
-        /* Replaced by something else since the scan. A directory opens
-         * read-only without complaint, and on btrfs SEEK_DATA on it answers
-         * ENXIO, "no data from here on": the sparse probe took that for a
-         * file that is one hole and stored the scan's size in zeros. */
+        /* Never followed if it is a symlink now, and refused if it is
+         * anything but the regular file the scan listed (open_scanned). */
         struct stat fst;
-        int fst_ok = fstat(fd, &fst) == 0;
-        if (!fst_ok || !S_ISREG(fst.st_mode)) {
-            int was_dir = fst_ok && S_ISDIR(fst.st_mode);
-            close(fd);
-            skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
-                                    : "no longer a regular file");
-            continue;
-        }
+        int fd = open_scanned(p, i, &fst);
+        if (fd == -1) continue;
 
         /* The file as it is now, not as the scan saw it (OWN-45). */
         int changed = 0;

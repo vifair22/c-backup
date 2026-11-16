@@ -771,10 +771,12 @@ A file inside a source that cannot be read is logged and skipped; the backup
 continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
-may not open, one replaced by a directory or anything else that is not a
-regular file, one whose read fails partway (an I/O error), and one still
-changing on a second read (below). A backup
-with skipped files still ends `completed`, but not silently:
+may not open, one replaced by a symlink, a directory or anything else that
+is not a regular file, one replaced by a different file (renamed over, or
+reached through a directory that has since become a symlink), one whose
+read fails partway (an I/O error), and one still changing on a second read
+(below). A backup with skipped files still ends `completed`, but not
+silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping
   /data/x, it is not in this snapshot: cannot open: Permission denied`,
@@ -791,9 +793,9 @@ under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
 is read, never as the scan saw it: its size, times and content all come
 from that read, so it is not cut short when it grew and not padded with
-zeros when it shrank. Change is detected by size, mtime and ctime (and
-inode), compared between the scan and the open, and again between the
-start and end of the read:
+zeros when it shrank. Change is detected by size, mtime and ctime,
+compared between the scan and the open, and again between the start and
+end of the read:
 
 - changed since the scan, steady while read: stored as read, logged at
   `info`, and counted;
@@ -811,6 +813,20 @@ the first 100 in `changed`; the snapshot holds those files as they were a
 moment after the scan, not at it. A file that is always being written (a
 live database, a busy log) may be skipped on every run: back it up from a
 snapshot of its filesystem, or with its application's own dump.
+
+**Symlinks inside a source are never followed.** A file is opened with
+`O_NOFOLLOW` and must still be the same inode (device and inode number)
+the scan listed, and the scan walks each directory from its parent's
+descriptor, refusing one that has become a symlink. So a file or directory
+swapped for a symlink between the scan and the read is skipped with
+`no longer a regular file (now a symlink)` or `replaced by another file
+since the scan`, never stored with the content of whatever the link points
+at. The daemon runs as root; without this, anyone able to write inside a
+source could have `ln -s /etc/shadow` put the host's shadow file into the
+snapshot. A file replaced by rename, as editors save, is the same case: a
+different inode, skipped this run and taken by the next. Extended
+attributes and ACLs are read through the same pinned descriptor (via
+`/proc/self/fd`, so `/proc` must be mounted for that guarantee).
 
 The next backup tries every skipped file again. Before 1.0.0's fix for
 B118 a skipped file stayed in the snapshot with no content: the backup
