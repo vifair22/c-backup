@@ -64,6 +64,8 @@ struct api_server {
     int                nallow;
     api_auth_fn        auth_fn;
     void              *auth_ud;
+    api_after_write_fn after_write_fn;
+    void              *after_write_ud;
     void              *_tcp_cls;   /* mhd_cls_t for TCP daemon */
     void              *_unix_cls;  /* mhd_cls_t for unix daemon */
     /* Held for the daemon's lifetime: MHD keeps the pointer it is given
@@ -670,6 +672,12 @@ static enum MHD_Result request_handler(void *cls,
 
         api_response_t resp = route->handler.buffered(&req, route->userdata);
 
+        /* A request that changed something is durable before it is
+         * answered (api_server_set_after_write). */
+        if (api_method != API_GET && resp.status >= 200 && resp.status < 300 &&
+            srv->after_write_fn)
+            srv->after_write_fn(srv->after_write_ud);
+
         enum MHD_Result ret = send_response_full(conn, resp.status,
             resp.content_type ? resp.content_type : "application/json",
             resp.body, resp.set_cookie, resp.retry_after, resp.allow);
@@ -840,6 +848,12 @@ void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata)
 {
     srv->auth_fn = fn;
     srv->auth_ud = userdata;
+}
+
+void api_server_set_after_write(api_server_t *srv, api_after_write_fn fn, void *userdata)
+{
+    srv->after_write_fn = fn;
+    srv->after_write_ud = userdata;
 }
 
 /*

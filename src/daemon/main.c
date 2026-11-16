@@ -111,6 +111,16 @@ static status_t startup_reindex(int64_t repo_id, void *ctx, int64_t *out_job_id)
     return routes_submit_startup_reindex(ctx, repo_id, out_job_id);
 }
 
+/* Every API request that changed something - a tag, a note, a policy, a
+ * registered repository - is durable before its answer is sent: one WAL
+ * sync, where synchronous=NORMAL would otherwise leave it for the next
+ * once-a-second flush (B139, B140). */
+static void after_write(void *userdata)
+{
+    (void)userdata;
+    state_db_sync_now();
+}
+
 static void tighten_umask(void)
 {
     umask(0077);
@@ -212,6 +222,7 @@ int main(int argc, char *argv[])
         goto out_guard;
     }
     int sync_normal = strcmp(tuning.synchronous, "normal") == 0;
+    state_db_set_path(db_path);
     log_info("state database: synchronous=%s, cache %d MiB, checkpoint every %d pages",
              tuning.synchronous, tuning.cache_mb, tuning.wal_autocheckpoint);
 
@@ -351,7 +362,7 @@ int main(int argc, char *argv[])
         if (index_reconcile(db, startup_reindex, jm, &rr) != OK) {
             log_warn("reconcile: %s", err_msg());
             err_clear();
-        } else if (rr.repos_missing == 0) {
+        } else if (rr.repos_missing == 0 && rr.tags_restored == 0) {
             log_info("reconcile: %u repositor%s checked, index complete",
                      rr.repos_checked, rr.repos_checked == 1 ? "y" : "ies");
         }
@@ -370,6 +381,7 @@ int main(int argc, char *argv[])
     /* The unix socket bypasses this entirely; see auth_check. Filesystem
      * permissions on the socket are the access control there. */
     api_server_set_auth(srv, auth_check, db);
+    api_server_set_after_write(srv, after_write, NULL);
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server");

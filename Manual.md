@@ -224,8 +224,8 @@ A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on
 its next start, and journals each such job then, since the killed process
 could not. A power cut can also cost the database about its last second of
-edits; the next start puts back any snapshot that went with them on its own
-(section 17.5). Either way the repository is consistent: a backup's partial pack
+the daemon's own writes (never an edit the API had answered); the next start
+puts back any snapshot or tag that went with them on its own (section 17.5). Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
 those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup, gc or reindex, by registering the
@@ -369,7 +369,7 @@ are different: they live in the database and change through the policy API
 | Key | Default | Meaning |
 |---|---|---|
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
-| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the database's log is synced once a second, so a power cut can lose about the last second of edits to it (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
+| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: anything changed through the API is synced before the API answers, and the daemon's own writes (backup index rows, job records, the journal) once a second, so a power cut can lose about their last second (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
 | `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
 | `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) written to its log between checkpoints, each of which costs two syncs. 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
@@ -2126,16 +2126,24 @@ snapshot record is the last thing it writes there. Nothing in this section
 affects repository data.
 
 `state.db` is a SQLite database in WAL mode with `db.synchronous: normal`
-(section 3). A commit is written to the database's log at once and synced
-with the next once-a-second flush; a checkpoint, or a clean stop, syncs it
-too. A power cut can therefore lose about the last second of edits to the
-database, and never corrupts it. `db.synchronous: full` syncs every commit
-instead, so nothing acknowledged is lost, at the cost section 18.2
+(section 3), which never corrupts it on a power cut. Two kinds of write
+reach the disk at different times:
+
+- **Anything changed through the API** - registering or removing a
+  repository, a tag, a note, a policy value, sources, a schedule, a
+  password - is synced to disk before the request is answered. Once the
+  CLI or the app reports success, a power cut cannot take it.
+- **The daemon's own writes** - a backup's index rows, job records and
+  progress, journal entries - are synced by a once-a-second flush (and by
+  checkpoints and a clean stop). A power cut can lose about the last second
+  of them.
+
+`db.synchronous: full` syncs every commit instead, at the cost section 18.2
 measures.
 
-What that second can cost depends on what lives where:
+Where each kind of state lives decides what such a loss can cost:
 
-| In the repository (survives; a reindex rebuilds the index from it) | Only in `state.db` (the last second of edits can be lost) |
+| In the repository (survives; a reindex rebuilds the index from it) | Only in `state.db` |
 |---|---|
 | Objects, packs, manifest trees | Registered repositories: path, label, key escrow flag |
 | Snapshot records | Schedules |
@@ -2172,10 +2180,19 @@ the key and run `c-backup reindex <id>`. A repository that cannot be read
 at start (an unmounted disk) is skipped with a warning and checked again at
 the next start.
 
-A tag set in the last second before a power cut is already in the
-repository's tag list, and comes back with the next reindex; if no reindex
-runs, set it again. Any other edit from that second (a schedule, a note, a
-policy value) is simply not there after the restart: make it again.
+Tags are checked at every start too. The repository's tag list (`tags`,
+mode 0600 like the rest of the repository) is written, synced and renamed
+into place before a tag change is answered, so it holds every tag the
+operator was told was set. Any tag in it that the index lacks is put back
+at start, with a warning:
+
+```
+reconcile: repo 1 (/srv/backup/main): 1 tag(s) missing from the index were restored from the repository's tag list
+```
+
+A tag already in the index is never replaced from the list. An API request
+still in flight when the power went - one whose answer never arrived - may
+or may not have taken effect: check, and make it again if not.
 
 ---
 

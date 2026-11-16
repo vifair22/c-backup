@@ -62,6 +62,19 @@ typedef struct {
 status_t state_db_tune(cutils_db_t *db, const state_db_tuning_t *t);
 
 /*
+ * Make every commit so far durable, now: one fdatasync of the WAL, as
+ * synchronous=FULL would have done for the last commit. For the edits an
+ * operator is told succeeded - every API request that changes something
+ * (api_server_set_after_write) - so the second NORMAL may lose never
+ * includes one of them. A no-op until state_db_set_path names the database
+ * (unit tests open databases without it). Safe from any thread.
+ */
+void state_db_set_path(const char *db_path);
+void state_db_sync_now(void);
+/* Syncs state_db_sync_now has issued; for tests. */
+unsigned long state_db_sync_now_count(void);
+
+/*
  * The once-a-second WAL sync described above. db_path is the database file;
  * its WAL is "<db_path>-wal". Only one flusher runs per process. stop waits
  * for the thread and syncs once more, so an orderly shutdown loses nothing.

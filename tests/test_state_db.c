@@ -153,6 +153,31 @@ static void test_flusher_syncs_changes_only(void **state)
     state_db_flusher_stop();
 }
 
+/* Sync now: a no-op until the database is named, then one WAL sync per
+ * call once there is a WAL; cleared again with NULL. */
+static void test_sync_now(void **state)
+{
+    (void)state;
+    state_db_tuning_t t = { "normal", 8, 16384 };
+    assert_int_equal(state_db_tune(db, &t), OK);
+    assert_int_equal(db_exec_raw(db, "CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)"), 0);
+
+    unsigned long before = state_db_sync_now_count();
+    state_db_sync_now();
+    assert_int_equal(state_db_sync_now_count(), before);
+
+    state_db_set_path(TEST_DB);
+    state_db_sync_now();
+    assert_int_equal(state_db_sync_now_count(), before + 1);
+    assert_int_equal(db_exec_raw(db, "INSERT INTO t VALUES (2)"), 0);
+    state_db_sync_now();
+    assert_int_equal(state_db_sync_now_count(), before + 2);
+
+    state_db_set_path(NULL);
+    state_db_sync_now();
+    assert_int_equal(state_db_sync_now_count(), before + 2);
+}
+
 static void test_flusher_bad_arguments(void **state)
 {
     (void)state;
@@ -170,6 +195,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_not_wal_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_flusher_syncs_changes_only, setup, teardown),
         cmocka_unit_test_setup_teardown(test_flusher_bad_arguments, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_sync_now, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
