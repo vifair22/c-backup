@@ -229,13 +229,14 @@ and decrypted and checked whole before any of it is released.
 ### Compression
 
 Per object, LZ4's block API only (`COMPRESS_NONE` 0, `COMPRESS_LZ4` 1).
-Probes decide first: a payload whose first 64 KiB, and for one over
-128 KiB whose last 64 KiB too, do not compress to under 98% of themselves
-is stored as it is, having cost LZ4 on at most 128 KiB rather than on the
-whole object, so video, audio, archives and databases bail out at once
-(design constraint 4). The tail probe catches the chunk a file changes
-character in: zeros after an incompressible region run to the chunker's
-maximum in the chunk where they start. A compressed result is kept only
+Probes decide first, on at most 128 KiB: the first 64 KiB of a payload of
+128 KiB or less, and four 32 KiB samples at 0, 1/3, 2/3 and the end of a
+larger one. A payload none of whose samples compresses to under 98% of
+itself is stored as it is, so video, audio, archives and databases bail
+out at once (design constraint 4). Sampling across the object catches the
+chunk a file changes character in: zeros after an incompressible region run
+to the chunker's maximum in the chunk where they start, and a chunk can be
+compressible only in its middle. A compressed result is kept only
 when it is smaller than the input, and payloads under 4 KiB are never
 compressed. Because every large file is chunked, the decision is per
 chunk, and it is recorded nowhere: no skip mark, no cache column, no
