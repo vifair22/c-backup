@@ -26,6 +26,7 @@ docker run -d --name c-backup-helper --restart unless-stopped \
   -v /mnt/cache/system/c-backup-helper:/mnt/cache/system/c-backup-helper \
   -v /run/c-backup-helper:/run/c-backup-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /mnt/cache:/mnt/cache:rshared \
   --label net.cbackup.role=helper \
   --entrypoint /usr/local/bin/c-backup-helper \
   c-backup:latest --policy /etc/c-backup-helper.ini
@@ -288,6 +289,63 @@ btrfs snapshot directory are visible to it; the file scanner never enters
 `.zfs` or `.cbackup-snapshots` itself, so a file backup of a pool does not
 read capture snapshots.
 
+### Hooks: logs and dumps
+
+Every policy hook of a unit becomes `.cbackup-unit/hooks/<name>.log` in
+its snapshot: stdout and stderr, capped at 1 MiB with the first and last
+halves kept around a line counting what was dropped, and the exit status
+appended. A `kind = dump` hook also becomes `.cbackup-unit/hooks/<name>.dump`:
+its stdout streams from `hook.run`'s pipe straight into the repository, any
+size, no temporary file. When the hook exits non-zero or times out, the
+dump is not stored (a truncated dump looks valid); its log says why and
+the unit carries a warning. A dump runs while the unit is read, after the
+snapshot, rather than with the pre hooks: a dump is consistent at its own
+instant, and running it then lets its bytes stream with nothing held.
+
+### Exclusions
+
+Nothing is excluded unless enrolled (C7). `mounts.json` in each snapshot
+lists `suggested_excludes` (directories such as `cache`, `ml_cache`,
+`Codecs`, `transcode`, `logs` found in an included mount). To apply some:
+
+```sh
+curl --unix-socket /run/c-backupd/api.sock -X PUT \
+  http://localhost/repos/1/units/docker/compose:immich/policy \
+  -d '{"capture.exclude": "/mnt/cache/appdata/Immich/ml_cache"}'
+```
+
+Up to 64 patterns, one per line, naming the paths as the container binds
+them; `null` or `""` removes them.
+
+### Pausing
+
+Members of a unit are paused together (each pause journalled first), so
+the window is the slowest member's freeze. A member that will not pause
+within `pause_timeout_s` leaves every other member unpaused again; a unit
+spanning more than one snapshot instant then fails. A nested btrfs
+subvolume (inode 256) is its own snapshot domain, snapshotted into the
+pool's capture directory and counted as one more instant.
+
+### Restore staging and define
+
+`restore.stage` creates `<domain>/.cbackup-restore/<job>` inside the
+mount's snapshot domain and `restore.swap` renames the old directory to
+`<mount>.cbackup-old-<job>` and the staged one into place: never a delete.
+The helper does this itself, so it needs the pools at their host paths in
+its own mount namespace, which `-v /mnt/cache:/mnt/cache:rshared` above
+provides (add one per pool). The daemon writes into the staging directory
+through its own read-write mount of each dataset's `.cbackup-restore`
+(see the daemon's `docker run` in the design, 9.2).
+
+`unit.define` re-creates a unit from its recorded definition: for Docker
+the inspect, image record and template, built into a create body by the
+helper, the image pulled by digest and by tag with a warning when the
+registry no longer has the digest (`pin_digest` refuses that), the
+template written back; for LXC the config with its name, rootfs path and
+MAC addresses rewritten. A name in use is refused unless `replace`, which
+needs the container stopped and moves the old one aside (renamed, or its
+config renamed). Privileged settings need `allow_privileged_define`.
+
 ## Testing
 
 The unit suites run everything above against stand-ins: `tests/fake_host`
@@ -374,12 +432,10 @@ journal rows after every fault (`GET /providers` `holds_open` 0, helper
   policy (`pause`, `pause_always`) instead.
 - Not built yet (container-backup.md): the fallback's second, paused pass
   (`pause-read`; a non-snapshot mount is read live and flagged
-  `inconsistent`); `dump` hooks streamed into `hooks/<name>.dump` and hook
-  logs stored as files (an `exec` hook's tail goes to the session's
-  warnings); restore `define` (Engine API create, digest pull with tag
-  fallback, templates, compose up) and the LXC define; enrolment
-  (per-unit exclusions, pause scope `group`/`job`); btrfs nested
-  subvolumes; members paused in parallel.
+  `inconsistent`); pause scope `group` and `job`; define for compose
+  projects (`docker compose up` through the helper); the daemon's
+  `mode: unit` restore that stages each mount, swaps it in and then calls
+  `unit.define` (the helper side is built and tested).
 - `restore.stage` and `restore.swap` act on host paths directly, so for a
   container provider they need the helper to see the pools at their host
   paths (bind them in as well as using `host_root`).
