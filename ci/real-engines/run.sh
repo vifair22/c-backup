@@ -559,13 +559,10 @@ job_ok "files restore of the solo snapshot" "$OUT_R"
 check "the solo tree restores byte for byte" "$MAN_SOLO" "$(manifest "$R$SOLO")"
 check "the dump hook's stream is stored exactly" "$(sha256sum < "$SOLO/dump-source.bin")" "$(sha256sum < "$R/.cbackup-unit/hooks/solo-dump.dump" 2>/dev/null)"
 contains "the pre hook's log holds its output" "pre-hook-ran" "$(cat "$R/.cbackup-unit/hooks/solo-pre.log" 2>/dev/null)"
-# Known bug, found by this job: through the helper a dump hook's log is
-# stored empty. The log is written when the dump's stream closes, after
-# units.describe has already sealed the BLOB memfd it travels in, so a
-# failed dump no longer says why it was not stored (docs/helper.md says
-# it does). XPASS fails the run so the marker goes when the fix lands.
-known_bug "a dump hook's log is stored empty through the helper" \
-    contains "the dump hook's log records its exit status" "exit status 0" "$(cat "$R/.cbackup-unit/hooks/solo-dump.log" 2>/dev/null)"
+# Through the helper the dump hook's log travels in a BLOB memfd; it was
+# once stored empty because the memfd was sealed before the dump's stream
+# closed (B141), so a failed dump no longer said why.
+contains "the dump hook's log records its exit status" "exit status 0" "$(cat "$R/.cbackup-unit/hooks/solo-dump.log" 2>/dev/null)"
 contains "the container's inspect is stored" '"Name"' "$(head -c 100000 "$R/.cbackup-unit/config/containers/cbk-uat-solo/inspect.json" 2>/dev/null)"
 contains "mounts.json lists the bind as snapshotted" "snapshot" "$(cat "$R/.cbackup-unit/config/mounts.json" 2>/dev/null)"
 
