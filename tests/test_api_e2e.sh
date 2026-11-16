@@ -1852,8 +1852,15 @@ wait_job "$PT_JOB"
 contains "with allow_plaintext it runs" '"state":"completed"' "$(sock_body "/jobs/$PT_JOB")"
 PT_MSG="replicated encrypted repo $ENC_ID into plaintext at $R/ptarget"
 for _ in $(seq 1 50); do grep -q "$PT_MSG" "$R/daemon.log" && break; sleep 0.1; done
-# Not a terminal, so the level is the syslog prefix: <4> is warning.
-contains "and logs a warning" "<4>" "$(grep "$PT_MSG" "$R/daemon.log")"
+# The level, without depending on the log format: plain output carries no
+# level marker, and the <4> prefix appears only when the daemon finds a
+# journal (JOURNAL_STREAM under a systemd scope, not in CI). This daemon
+# runs at log.level warn, so the line being there at all means warning or
+# above - and the run's info-level summary being absent shows the filter is
+# what decided it.
+contains "and logs a warning" "$PT_MSG" "$(cat "$R/daemon.log")"
+check "at warning level: the info-level summary of the same run is filtered" 0 \
+    "$(grep -c "replicate: repo $ENC_ID -> $R/ptarget:" "$R/daemon.log")"
 contains "and journals it" "\"message\":\"$PT_MSG\"" "$(sock_body "/repos/$ENC_ID/journal")"
 # Unencrypted to unencrypted drops nothing, so it needs no flag.
 P2_OUT=$(sock_send POST /repos "{\"path\":\"$R/ptarget2\",\"label\":\"pt2\"}")
