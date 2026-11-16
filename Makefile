@@ -171,7 +171,7 @@ else
 endif
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint
+.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint check-conflict-markers
 
 all:
 	$(MAKE) BUILD_TYPE=release _build
@@ -541,7 +541,17 @@ fuzz-regress: fuzz
 ANALYZE_CFLAGS := -std=c11 -pthread -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
-analyze: | $(BUILD)
+# A merge that commits both sides of a conflict builds and passes tests when
+# the markers land in prose (docs/repo-format.md did, in the OWN-46 merge), so
+# look for them in every tracked file. Only the seven-character opening and
+# closing markers count: a line of '=' is a legitimate Markdown heading rule.
+check-conflict-markers:
+	@echo "=== conflict markers ==="
+	@if git grep -nE '^(<{7}|>{7})( |$$)' -- . ; then \
+	    echo "conflict markers: FAIL"; exit 1; fi
+	@echo "conflict markers: OK"
+
+analyze: check-conflict-markers | $(BUILD)
 	@echo "=== stack-usage ==="
 	@mkdir -p $(BUILD)/analyze
 	@for f in $(SRCS); do \
