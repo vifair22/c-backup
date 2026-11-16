@@ -855,11 +855,10 @@ else
 fi
 
 # B111: maintenance.auto_pack decides whether a backup ends with a pack
-# sweep, not whether objects are packed at all. Objects up to 16 MiB go into
-# a pack as the backup writes them whatever the key says; what the sweep
-# picks up is what cannot: a sparse file's object and anything over 16 MiB.
-# Off, the sparse file's object is still loose after the backup; on, the
-# next backup's sweep packs it.
+# sweep, not whether objects are packed at all. In format 3 every object a
+# backup writes goes into a pack as it is written - a sparse file is a chunk
+# list with its holes as gaps, a large file is chunks - so with the key off
+# or on nothing is left loose for the sweep.
 mkdir -p "$WORK/apsrc"
 for i in $(seq 1 16); do echo "auto-pack small $i" > "$WORK/apsrc/s$i.txt"; done
 head -c 65536 /dev/urandom > "$WORK/apsrc/sparse.bin"
@@ -868,12 +867,12 @@ AP_ID=$(cb repo add "$WORK/aprepo" ap | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 cb policy set "$AP_ID" maintenance.auto_pack false > /dev/null
 cb backup "$AP_ID" "$WORK/apsrc" > /dev/null
 AP_LOOSE=$(cb objects "$AP_ID" --location loose --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')
-check "auto_pack off: the small files are packed anyway, the sparse one is loose" 1 "$AP_LOOSE"
+check "auto_pack off: everything is packed anyway, the sparse file too" 0 "$AP_LOOSE"
 cb policy set "$AP_ID" maintenance.auto_pack true > /dev/null
 echo "auto-pack on" > "$WORK/apsrc/on.txt"
 cb backup "$AP_ID" "$WORK/apsrc" > /dev/null
 AP_LOOSE=$(cb objects "$AP_ID" --location loose --limit 100 | grep -o '"hash"' | wc -l | tr -d ' ')
-check "auto_pack on: the backup's sweep packs it" 0 "$AP_LOOSE"
+check "auto_pack on: nothing loose either" 0 "$AP_LOOSE"
 
 # Job commands wait by default and exit non-zero when the job fails.
 OUT=$(cb pack "$ENC_ID"); RC=$?
@@ -1410,7 +1409,13 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 # The failure path is the job manager's: it marks the job failed and sends
 # the alert, and the line it logs as it sends is the evidence.
 alerted() {  # alerted <job-id>
-    grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+    # The notification is logged after the job's failure is recorded, on
+    # another thread, so the CLI can see the failure first. Up to 5 s.
+    for _ in $(seq 1 50); do
+        grep -q "sending failure notification for job $1:" "$WORK/daemon.log" && return 0
+        sleep 0.1
+    done
+    return 1
 }
 job_of() {  # job_of <failed job document>: its id, the first "id" in it
     printf '%s' "$1" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2

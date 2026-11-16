@@ -151,6 +151,23 @@ static void root_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
     db_result_free(r);
 }
 
+/* The source directory's own tree in a snapshot. The snapshot root also
+ * covers the source path's ancestors, whose metadata other processes on
+ * the machine change between runs; the source's tree is what the backup
+ * made from the files. */
+static void src_tree_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%lld", (long long)snap);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT subtree_hash FROM nodes WHERE snap_id = ?"
+                                " AND name = 'src' AND type = 2",
+                                (const char *[]){ id, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
+    db_result_free(r);
+}
+
 static int scalar(const char *sql)
 {
     char repo[32];
@@ -206,8 +223,8 @@ static void test_workers_do_not_change_the_snapshot(void **state)
     assert_int_equal(b.objects_new, 0);
 
     char ra[OBJECT_HASH_SIZE * 2 + 1], rb[OBJECT_HASH_SIZE * 2 + 1];
-    root_of(a.snapshot_id, ra);
-    root_of(b.snapshot_id, rb);
+    src_tree_of(a.snapshot_id, ra);
+    src_tree_of(b.snapshot_id, rb);
     assert_string_equal(ra, rb);
 
     /* The twins name one list, held once. */

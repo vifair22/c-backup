@@ -1459,7 +1459,12 @@ SW=$(job_id "$(sock_post /repos/2/backup "{\"paths\":[\"$R/big\"]}")")
 wait_job "$SW"
 SW_BODY=$(sock_body "/jobs/$SW")
 contains "store_workers from config sizes the pool" '"store_workers":2,' "$SW_BODY"
-contains "and the backup stores all three" '"objects_new":3,' "$SW_BODY"
+# Format 3: each is content-defined chunks in the backup pack, so the count
+# is of chunks and lists, not files; what holds is all three stored and
+# nothing written loose or left for the pack pass.
+contains "and the backup stores all three" '"files":3,' "$SW_BODY"
+contains "as chunks in packs, nothing loose" '"bytes_written_loose":0,' "$SW_BODY"
+contains "and nothing for the pack pass" '"pack_pass_packed":0' "$SW_BODY"
 contains "large random files are written loose once" '"bytes_written_loose_discarded":0,' "$SW_BODY"
 contains "and the pack pass probes them and writes nothing" '"bytes_written_pack_pass":0,' "$SW_BODY"
 rm -f "$R/big/f1" "$R/big/f2" "$R/big/f3"
