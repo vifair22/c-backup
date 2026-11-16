@@ -1528,7 +1528,7 @@ check "other jobs journal as they did" 4 "$(sock_body '/repos/1/journal?limit=10
 # read as atoi's 0, which for a tier means unlimited. Written straight into
 # the database, since the route refuses it now.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "INSERT INTO policy_values (repo_id, key, value)
                            VALUES (1, 'retention.keep_daily', 'banana')" 2>/dev/null
     BAD=$(job_id "$(sock_post '/repos/1/gfs?dry_run=1')")
     wait_job "$BAD"
@@ -1545,7 +1545,7 @@ fi
 # Sunday is that year's last daily, weekly, monthly and yearly: 15. Read
 # back through the listing, which is what clients see.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "UPDATE snapshots SET ts = 1735387200 WHERE repo_id = 1 AND id = 3;
                            UPDATE snapshots SET ts = 1735473600 WHERE repo_id = 1 AND id = 4"
     TIERS=$(job_id "$(sock_post /repos/1/gfs)")
     wait_job "$TIERS"
@@ -1567,7 +1567,7 @@ sock_post /repos "{\"path\":\"$R/repo2\",\"label\":\"q\\\"u\\\\o\"}" > /dev/null
 contains "the staler of two is named" \
     'cbackup_stalest_snapshot_repo_info{repo_id="1",label="r"} 1' "$(sock_body /metrics)"
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "UPDATE repos SET added_at = 0 WHERE id = 2"
     METRICS=$(sock_body /metrics)
     contains "and it moves when another becomes staler, label escaped" \
         'cbackup_stalest_snapshot_repo_info{repo_id="2",label="q\"u\\o"} 1' "$METRICS"
@@ -1663,7 +1663,7 @@ contains "an escaped label is listed intact" "\"id\":$LSID,\"ts\":" "$(sock_body
 contains "with its label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/snapshots)"
 contains "the record holds it escaped" "\"label\":\"$LBL_OUT\"}" "$(cat "$R/repo/snapshots/$LSID")"
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$R/state.db" "DELETE FROM nodes WHERE repo_id = 1;
+    sqlite3 -cmd ".timeout 10000" "$R/state.db" "DELETE FROM nodes WHERE repo_id = 1;
                            DELETE FROM node_fts WHERE repo_id = 1;
                            DELETE FROM snapshots WHERE repo_id = 1"
     check "no snapshots listed once the rows are gone" 0 \
