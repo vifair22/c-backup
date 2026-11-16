@@ -33,11 +33,14 @@ typedef struct worker {
     int                started;
     phase_timers_t     timers;
     store_pool_job_t  *job;     /* the file this worker is storing, or NULL */
+    void              *wstate;  /* the ops' per-worker state */
+    status_t           begin_st, end_st;
+    char               begin_err[ERR_MSG_MAX], end_err[ERR_MSG_MAX];
 } worker_t;
 
 struct store_pool {
     store_t        *store;
-    size_t          parity_cap;
+    store_pool_ops_t ops;
     int             timed;
 
     pthread_mutex_t mu;
@@ -205,6 +208,10 @@ static void *worker_main(void *arg)
     store_set_io_progress(pool->store, pool_io, wk);
     phase_current = pool->timed ? &wk->timers : NULL;
 
+    err_clear();
+    wk->begin_st = pool->ops.begin ? pool->ops.begin(pool->ops.ctx, &wk->wstate) : OK;
+    if (wk->begin_st != OK) snprintf(wk->begin_err, sizeof(wk->begin_err), "%s", err_msg());
+
     for (;;) {
         pthread_mutex_lock(&pool->mu);
         while (!pool->q_head && !pool->shutdown)
@@ -222,8 +229,10 @@ static void *worker_main(void *arg)
         } else {
             err_clear();
             uint64_t t0 = phase_now();
-            j->st = object_store_file_loose(pool->store, j->fd, j->size,
-                                            pool->parity_cap, j->hash, &j->w);
+            j->out_free = pool->ops.out_free;
+            j->st = wk->begin_st != OK
+                    ? set_error(wk->begin_st, "%s", wk->begin_err)
+                    : pool->ops.store(pool->ops.ctx, wk->wstate, j);
             phase_add(phase_current, PHASE_STORE_WORKERS, t0);
         }
         if (j->st != OK) snprintf(j->err, sizeof(j->err), "%s", err_msg());
@@ -236,6 +245,13 @@ static void *worker_main(void *arg)
         pool->d_tail = j;
         pthread_cond_signal(&pool->cv_done);
         pthread_mutex_unlock(&pool->mu);
+    }
+
+    if (wk->begin_st == OK && pool->ops.end) {
+        err_clear();
+        int abort = atomic_load_explicit(&pool->stop, memory_order_relaxed) != 0;
+        wk->end_st = pool->ops.end(pool->ops.ctx, wk->wstate, abort);
+        if (wk->end_st != OK) snprintf(wk->end_err, sizeof(wk->end_err), "%s", err_msg());
     }
 
     /* Thread-locals outlive nothing here, but leaving phase_current aimed at
@@ -251,6 +267,7 @@ static void free_list(store_pool_job_t *j)
     while (j) {
         store_pool_job_t *next = j->next;
         if (j->fd >= 0) close(j->fd);
+        if (j->out && j->out_free) j->out_free(j->out);
         free(j);
         j = next;
     }
@@ -277,19 +294,20 @@ static void pool_join(store_pool_t *pool)
         if (pool->workers[i].started) pthread_join(pool->workers[i].tid, NULL);
 }
 
-status_t store_pool_start(store_t *store, unsigned workers, size_t parity_cap,
-                          int timed, store_pool_t **out)
+status_t store_pool_start(store_t *store, unsigned workers,
+                          const store_pool_ops_t *ops, int timed,
+                          store_pool_t **out)
 {
     *out = NULL;
-    if (!store || workers < 1)
-        return set_error(ERR_INVALID, "store_pool_start: no store or no workers");
+    if (!store || workers < 1 || !ops || !ops->store)
+        return set_error(ERR_INVALID, "store_pool_start: no store, ops or workers");
 
     store_pool_t *pool = calloc(1, sizeof(*pool));
     if (!pool) return set_error(ERR_NOMEM, "store pool");
     pool->workers = calloc(workers, sizeof(*pool->workers));
     if (!pool->workers) { free(pool); return set_error(ERR_NOMEM, "store pool workers"); }
     pool->store      = store;
-    pool->parity_cap = parity_cap;
+    pool->ops        = *ops;
     pool->timed      = timed;
     pool->n_workers  = workers;
     pthread_mutex_init(&pool->mu, NULL);
@@ -364,6 +382,7 @@ store_pool_job_t *store_pool_take(store_pool_t *pool)
 
 void store_pool_job_free(store_pool_job_t *job)
 {
+    if (job && job->out && job->out_free) job->out_free(job->out);
     if (!job) return;
     if (job->fd >= 0) close(job->fd);
     free(job);
@@ -389,9 +408,9 @@ uint64_t store_pool_bytes(const store_pool_t *pool)
     return pool ? __atomic_load_n(&pool->bytes, __ATOMIC_RELAXED) : 0;
 }
 
-void store_pool_finish(store_pool_t *pool, int abort, phase_timers_t *timers)
+status_t store_pool_finish(store_pool_t *pool, int abort, phase_timers_t *timers)
 {
-    if (!pool) return;
+    if (!pool) return OK;
     if (abort) {
         atomic_store_explicit(&pool->stop, 1, memory_order_relaxed);
         /* Queued files are never started: close them now rather than let
@@ -410,5 +429,10 @@ void store_pool_finish(store_pool_t *pool, int abort, phase_timers_t *timers)
         if (pool->n_workers > timers->store_threads)
             timers->store_threads = pool->n_workers;
     }
+    status_t st = OK;
+    for (unsigned i = 0; i < pool->n_workers && st == OK; i++)
+        if (pool->workers[i].end_st != OK)
+            st = set_error(pool->workers[i].end_st, "%s", pool->workers[i].end_err);
     pool_destroy(pool);
+    return st;
 }

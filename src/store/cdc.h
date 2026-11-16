@@ -148,6 +148,10 @@ typedef struct {
     size_t         inflight_max;
     /* Consulted between reads; set means stop with ERR_BUSY. May be NULL. */
     atomic_int    *cancel;
+    /* Also consulted, when set: a backup passes store_cancelled, which sees
+     * the per-thread flag a pool worker is stopped with as well. */
+    int          (*cancelled)(void *ctx);
+    void          *cancelled_ctx;
     /* Cut chunks take their size from the read budget (read_budget.h)
      * unless this is set: re-chunking reads from objects that already hold
      * their slot, and taking a second would be nested acquisition. */

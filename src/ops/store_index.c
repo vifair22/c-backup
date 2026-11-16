@@ -141,18 +141,31 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
             failed = 1;
 
         /*
-         * The object moved from loose to packed, so both its location and its
-         * footprint change. phys_size becomes the bytes it occupies inside the
-         * pack; the pack's own headers and parity trailer are charged to
-         * packs.size rather than split across its entries, so total bytes on
-         * disk is sum(packs.size) plus phys_size of everything still loose.
-         * Updating location alone left every packed object still claiming the
-         * loose footprint it no longer has.
+         * The object moved from loose to packed, or arrived packed, so both
+         * its location and its footprint are this pack's. phys_size becomes
+         * the bytes it occupies inside the pack; the pack's own headers and
+         * parity trailer are charged to packs.size rather than split across
+         * its entries, so total bytes on disk is sum(packs.size) plus
+         * phys_size of everything still loose. Updating location alone left
+         * every packed object still claiming the loose footprint it no
+         * longer has.
+         *
+         * Inserted when there is no row yet (format 3). A row written after
+         * the commit would stay 'staged', be dropped by the next backup, and
+         * leave an object compaction reads as dead; creating it here, in the
+         * same transaction as the pack's rows, means no writer has to win a
+         * race against its own seal. An existing row keeps its type and
+         * refcount.
          */
+        char t[8];
+        snprintf(t, sizeof(t), "%u", info->entries[i].type);
         if (!failed && db_execute_non_query(idx->db,
-                "UPDATE objects SET location = ?, phys_size = ?, orig_size = ?"
-                " WHERE repo_id = ? AND hash = ?",
-                (const char *[]){ pack, comp, orig, repo, hex, NULL }, NULL) != 0)
+                "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
+                "                     location, type)"
+                " VALUES (?, ?, 0, ?, ?, ?, ?)"
+                " ON CONFLICT(repo_id, hash) DO UPDATE SET location = excluded.location,"
+                "   phys_size = excluded.phys_size, orig_size = excluded.orig_size",
+                (const char *[]){ repo, hex, comp, orig, pack, t, NULL }, NULL) != 0)
             failed = 1;
     }
 

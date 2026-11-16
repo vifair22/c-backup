@@ -3,29 +3,25 @@
 /*
  * Large files stored on worker threads, so one backup is not one core (B086).
  *
- * A file's SHA-256 is inherently serial: the object identity is the hash of
- * the whole plaintext, and splitting it would need a tree hash, which is a
- * format change. So one file can go no faster than one core hashes. What the
- * pool buys is several files at once. On the tester's machine the eight 2 GiB
- * files of a 16 GiB backup were stored strictly one after another at about
- * 203 MB/s each, with eleven of twelve threads idle.
+ * Format 3 cuts every file into content-defined chunks whose CPU work runs
+ * on chunk workers (cdc.h), but one file is still bound by the thread that
+ * reads it and finds its boundaries. What this pool buys is several files
+ * at once: on the tester's machine the eight 2 GiB files of a 16 GiB backup
+ * were stored strictly one after another, with most threads idle.
  *
  * The split of work is deliberate and narrow:
  *
  *   - the backup thread opens each file over PACK_STREAM_THRESHOLD that the
  *     file cache could not vouch for, and hands the descriptor over;
- *   - a worker stores it loose with object_store_file_loose, which is what
- *     the serial path does for a file that size anyway, and closes it;
+ *   - a worker stores it through the caller's ops (store_pool_ops_t): a
+ *     backup's cut it into a pack writer of the worker's own and seal that
+ *     writer's packs, whose commits create the objects' index rows;
  *   - the backup thread takes the result back and does everything else:
- *     the index row, the cache row, the counters, the entry's hash.
+ *     the cache row, the counters, the entry's hash.
  *
- * Small files, the backup pack, and every write to the database stay on the
- * backup thread, inside the transaction it already holds. The one database
- * access a worker makes is the store's existence check after hashing, which
- * goes through the resolver: a single indexed read per large file, on the
- * shared handle's mutex, with no transaction of its own. Forwarding it to the
- * backup thread would have meant servicing a request channel from every
- * point at which that thread can block.
+ * Small files, the backup's own pack, and every other database write stay
+ * on the backup thread, inside the transaction it already holds; it lets
+ * that go whenever a worker's seal waits for the write lock.
  *
  * Nothing about the repository depends on which worker finishes first. A
  * result lands in the scan entry it came from, and trees are only built once
@@ -49,17 +45,35 @@ typedef struct store_pool_job {
     int      fd;
     uint64_t size;
 
-    /* Out: set by the worker, read only after store_pool_take returns it. */
+    /* Out: set by the worker, read only after store_pool_take returns it.
+     * out is whatever the store hook made of the file; the pool frees it
+     * with the ops' out_free. */
     status_t       st;
-    object_write_t w;
-    uint8_t        hash[OBJECT_HASH_SIZE];
+    void          *out;
     char           err[ERR_MSG_MAX];
     /* Bytes this file added to the pool's running count; the taker
      * subtracts them when it counts the whole file instead. */
     uint64_t       reported;
 
+    void         (*out_free)(void *);
     struct store_pool_job *next;
 } store_pool_job_t;
+
+/*
+ * What each worker does (format 3: a backup's large files, chunked, each
+ * worker into its own pack writer). begin runs on the worker thread before
+ * its first file and end after its last, with abort set when the pool is
+ * being stopped; store runs per file. All three run on the worker thread,
+ * with the pool's cancel flag as that thread's (store_set_thread_cancel)
+ * and the store's byte-progress hook counting into the pool.
+ */
+typedef struct {
+    status_t (*begin)(void *ctx, void **wstate);
+    status_t (*store)(void *ctx, void *wstate, store_pool_job_t *job);
+    status_t (*end)(void *ctx, void *wstate, int abort);
+    void     (*out_free)(void *out);
+    void      *ctx;
+} store_pool_ops_t;
 
 /*
  * How many workers to run and how much RS parity each may hold in memory.
@@ -119,8 +133,9 @@ uint64_t store_pool_read_memory_max(const char *path);
  * worker attributes to its own phase_timers_t, folded into the caller's by
  * store_pool_finish.
  */
-status_t store_pool_start(store_t *store, unsigned workers, size_t parity_cap,
-                          int timed, store_pool_t **out);
+status_t store_pool_start(store_t *store, unsigned workers,
+                          const store_pool_ops_t *ops, int timed,
+                          store_pool_t **out);
 
 /* Jobs that may be outstanding (queued, running, or finished and not yet
  * taken) before store_pool_submit has to wait: two per worker, so a worker
@@ -157,6 +172,7 @@ unsigned store_pool_workers(const store_pool_t *pool);
  * Without it every outstanding job must already have been taken.
  *
  * Joins every thread before returning and, when `timers` is given, folds
- * the workers' phases into it. NULL is a no-op.
+ * the workers' phases into it. Returns the first failure of a worker's
+ * end hook (its last pack's seal, for a backup); OK for NULL.
  */
-void store_pool_finish(store_pool_t *pool, int abort, phase_timers_t *timers);
+status_t store_pool_finish(store_pool_t *pool, int abort, phase_timers_t *timers);

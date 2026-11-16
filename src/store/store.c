@@ -93,6 +93,11 @@ struct store {
     /* Chunking parameters (format 3): the repository's constants and its
      * keyed gear table. NULL until store_set_cdc; see store_cdc. Owned. */
     cdc_params_t       *cdc;
+
+    /* Pack numbers handed out to writers open at once; see
+     * store_alloc_pack_num. 0 until the first allocation. */
+    pthread_mutex_t     pack_num_mu;
+    uint32_t            pack_num_next;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -409,6 +414,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_user    = NULL;
     r->cancel          = NULL;
     r->cdc             = NULL;
+    r->pack_num_next   = 0;
+    pthread_mutex_init(&r->pack_num_mu, NULL);
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     /* tmp/ is where every staging and spill file goes, and nothing outside
@@ -445,6 +452,7 @@ void store_close(store_t *st) {
     close(st->dirfd);
     free(st->path);
     pthread_mutex_destroy(&st->loose_set_mu);
+    pthread_mutex_destroy(&st->pack_num_mu);
     free(st->loose_set);
     free(st);
 }
@@ -830,4 +838,13 @@ const cdc_params_t *store_cdc(const store_t *st)
     if (st->encrypted) return NULL;
     pthread_once(&g_cdc_once, store_cdc_init_defaults);
     return &g_cdc_defaults;
+}
+
+uint32_t store_alloc_pack_num(store_t *st, uint32_t floor)
+{
+    pthread_mutex_lock(&st->pack_num_mu);
+    if (st->pack_num_next < floor) st->pack_num_next = floor;
+    uint32_t n = st->pack_num_next++;
+    pthread_mutex_unlock(&st->pack_num_mu);
+    return n;
 }

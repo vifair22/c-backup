@@ -528,40 +528,55 @@ Recommended for format 3 instead:
 ### Backup write path
 
 1. Every regular file the cache cannot vouch for goes through
-   `cdc_store_fd`: its data spans are walked with `SEEK_DATA`/`SEEK_HOLE`
-   and read straight into the buffer of the chunk being cut (8 MiB,
-   recycled), 256 KiB a read; at a cut only the read-ahead past it is
-   copied. One chunk and no holes is the file; otherwise a list.
-2. A chunk's CPU work, `pack_backup_prepare` (name, 64 KiB probe, LZ4), runs
-   on a chunk worker for a file over 16 MiB and on the backup thread
-   otherwise. The prepared entry is appended under the backup sink's lock by
-   `pack_backup_add_prepared` (dedup against the repository and the open
-   pack, encryption, parity, write). Chunks in flight per file are capped at
-   three per worker and `8 * max` bytes.
+   `cdc_store_fd`. Its data spans are walked with `SEEK_DATA`/`SEEK_HOLE`
+   (skipped for a file under 64 KiB, which cannot hold a hole that counts)
+   and read into the buffer of the chunk being cut, sized to the span up to
+   8 MiB and recycled when full-size; at a cut only what was read past it
+   is copied. For a span of 16 MiB or more on a disk (not tmpfs or ramfs) a
+   read-ahead thread fills a ring of 1 MiB slots ahead of the cutter, so the
+   disk and the boundary scan overlap; read data is released from the page
+   cache behind. One chunk and no holes is the file; otherwise a list.
+2. A chunk's CPU work, `pack_backup_prepare` (name, 64 KiB probe, LZ4,
+   encryption, CRC, Reed-Solomon parity), runs on a chunk worker for a file
+   over 16 MiB and on the reading thread otherwise. The prepared entry is
+   appended under the sink's lock by `pack_backup_add_prepared`, which is
+   left the dedup check, the write and its bookkeeping. Chunks in flight per
+   file are capped at three per worker and `8 * max` bytes. The pack writer
+   starts writeback every 8 MiB appended (`sync_file_range`), so dirty pages
+   do not pile up until a seal's fsync writes a whole pack at once.
 3. Results are taken back in submission order and appended to the file's
    list builder, which stores sub-lists and the root through the same sink.
    Order, not completion, decides the list, so the snapshot is identical for
    any worker count (`test_cdc_backup`).
-4. Index rows. Every object the sink meets - new or already present, so an
-   index that lost a chunk's row gets it back - queues a pending row. A row
-   must exist before its pack commits: the commit turns staged rows into
-   packed ones, and a row written after it would stay staged, be dropped by
-   the next backup, and leave a chunk compaction reads as dead. The backup
-   thread writes the pending rows inside its batch once the file is stored;
-   the sink writes them in a transaction of its own just before it seals a
-   full pack.
-5. Sealing. The sink seals mid-file only when the open pack cannot take the
-   file, and the backup thread lets its batch go first, because sealing
-   begins a transaction and the write lock is not recursive. A file that
-   fits keeps the batch, so a backup nobody waits on commits no more often
-   than before (OWN-16). Smaller files are stored with the batch held inside
-   the loop's 16 MiB rollover headroom, as before.
-6. Directories: `manifest_store_tree` through the same sink, fragmenting
-   above 256 KiB serialised. The tree phase never seals, as before.
+4. Several large files at once. One file is bound by its reading thread, so
+   when there are two or more files over 16 MiB a pool of file workers (a
+   quarter of the chunk workers, at most one per such file) each reads and
+   cuts its files into a pack writer of its own, sharing the chunk workers,
+   and seals its own packs. Pack numbers come from one allocator on the
+   store handle (`store_alloc_pack_num`), since writers staging at once
+   cannot see each other's packs in `tmp/`. Writers do not see each other's
+   unsealed entries either, so a chunk two of them stage at the same moment
+   is stored twice; readers take the first and gc counts the other dead.
+5. Index rows. A pack's commit creates the object row of every entry that
+   has none (`db_pack_commit` upserts with the entry's type), in the same
+   transaction as the pack's own rows, so no writer races its own seal: a
+   row written after the commit would stay staged, be dropped by the next
+   backup, and leave a chunk compaction reads as dead. File workers write no
+   rows of their own. The backup thread's sink still records a staged row
+   for every object a smaller file meets, new or already present, so an
+   index that lost a chunk's row gets it back.
+6. Sealing on the backup thread happens mid-file only when the open pack
+   cannot take the file, with the batch let go first (sealing begins a
+   transaction and the write lock is not recursive). A file that fits keeps
+   the batch, so a backup nobody waits on commits no more often than before
+   (OWN-16). File workers seal when their pack fills; the backup thread lets
+   its batch go whenever a writer waits.
+7. Directories: `manifest_store_tree` through the backup thread's sink,
+   fragmenting above 256 KiB serialised. The tree phase never seals.
 
 Crash safety is the backup pack's, unchanged: staging in `tmp/`, install by
-rename, rows after install, sweep of staging and staged rows at the next
-start. Nothing is written loose and the pack pass finds nothing to do.
+rename, rows with or after install, sweep of staging and staged rows at the
+next start. Nothing is written loose and the pack pass finds nothing to do.
 
 ### Readers
 

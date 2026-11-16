@@ -306,10 +306,18 @@ typedef struct {
     const void    *payload;      /* data, or owned when compressed */
     uint64_t       payload_len;
     uint8_t       *owned;
+    /* Encrypted under the store's key, with CRC and parity, when prepared
+     * with a store: the append is then a write and nothing more. */
+    void          *sealed;
 } pack_prepared_t;
 
-status_t pack_backup_prepare(uint8_t type, const void *data, size_t len,
-                             pack_prepared_t *out);
+/* Name, probe, compress; then encrypt and compute CRC and parity for
+ * store's repository, all on the calling thread. */
+status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
+                             size_t len, pack_prepared_t *out);
+/* The same without sealing: pack_backup_add_prepared seals under its lock. */
+status_t pack_backup_prepare_plain(uint8_t type, const void *data, size_t len,
+                                   pack_prepared_t *out);
 status_t pack_backup_add_prepared(pack_backup_writer_t *w, const pack_prepared_t *pp,
                                   int *out_is_new, uint64_t *out_phys_bytes);
 void     pack_prepared_free(pack_prepared_t *p);

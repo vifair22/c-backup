@@ -6,10 +6,13 @@
 #include "types.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
 #include <unistd.h>
 
 #include <openssl/core_names.h>
@@ -228,6 +231,7 @@ typedef struct cdc_job {
     obj_put_t         put;
     status_t          st;
     int               done;
+    size_t            cap;      /* data's allocated size, for the pool */
     uint64_t          taken;    /* read budget, given back by the worker */
     char              err[ERR_MSG_MAX];
 } cdc_job_t;
@@ -257,11 +261,14 @@ struct cdc_workers {
  * bytes, since every buffer in flight is max_size. */
 #define CDC_JOBS_PER_WORKER 3u
 
-static uint8_t *buf_get(cdc_workers_t *w, size_t size)
+/* poolable: a full max_size buffer, the one size the pool keeps. Smaller
+ * ones (a span shorter than max_size) are allocated and freed as needed. */
+static uint8_t *buf_get(cdc_workers_t *w, size_t size, int poolable)
 {
     uint8_t *b = NULL;
-    if (w) {
+    if (w && poolable) {
         pthread_mutex_lock(&w->mu);
+        if (!w->pool_size) w->pool_size = size;
         if (w->npool && w->pool_size == size) b = w->pool[--w->npool];
         pthread_mutex_unlock(&w->mu);
     }
@@ -273,7 +280,6 @@ static void buf_put(cdc_workers_t *w, uint8_t *b, size_t size)
     if (!b) return;
     if (w) {
         pthread_mutex_lock(&w->mu);
-        if (w->npool == 0) w->pool_size = size;
         int kept = w->pool_size == size && w->npool < w->pool_cap;
         if (kept) w->pool[w->npool++] = b;
         pthread_mutex_unlock(&w->mu);
@@ -397,6 +403,10 @@ static status_t next_span(spans_t *sp, uint64_t *s, uint64_t *e, int *got)
 {
     *got = 0;
     if (sp->done || sp->pos >= sp->size) { sp->done = 1; return OK; }
+    /* A file shorter than CDC_HOLE_MIN cannot hold a hole that counts, so
+     * it is one span by definition and the probes are skipped: two
+     * syscalls per file is most of what a small file costs. */
+    if (sp->pos == 0 && sp->size < CDC_HOLE_MIN) sp->no_seek = 1;
     if (sp->no_seek) {
         *s = sp->pos; *e = sp->size; *got = 1;
         sp->pos = sp->size; sp->done = 1;
@@ -471,6 +481,7 @@ typedef struct {
     uint64_t            first_off, first_len;
     /* Parallel: this file's jobs in submission order. */
     cdc_job_t          *ohead, *otail;
+    size_t              cur_cap, spare_cap;   /* the reader's two buffers */
     size_t              inflight, inflight_max;
     unsigned            jobs, jobs_max;
     status_t            err;            /* first failure, sticky */
@@ -537,7 +548,7 @@ static void drain(drv_t *d, size_t keep_bytes, unsigned keep_jobs)
             status_t st = consume(d, j->offset, j->len, &j->put);
             if (st != OK) drv_fail(d, st, err_msg());
         }
-        buf_put(w, j->data, d->p->max_size);
+        buf_put(w, j->data, j->cap);
         free(j);
         pthread_mutex_lock(&w->mu);
     }
@@ -578,6 +589,7 @@ static status_t emit_chunk(drv_t *d, uint8_t **bufp, size_t len,
     }
     j->sink = d->sink;
     j->data = *bufp;
+    j->cap = d->cur_cap;
     *bufp = NULL;
     j->len = len;
     j->offset = offset;
@@ -637,16 +649,27 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
     size_t blen = 0, scanned = 0;
     uint64_t pos = s, chunk_abs = s;
 
-    if (!*cur && !(*cur = buf_get(d->w, max)))
-        return set_error(ERR_NOMEM, "cdc: chunk buffer");
+    /* No chunk of this span can be longer than the span: a small file gets
+     * a small buffer, not a max_size mapping made and torn down for it. */
+    size_t need = (e - s) < (uint64_t)max ? (size_t)(e - s) : max;
+    if (*cur && d->cur_cap < need) {
+        buf_put(d->w, *cur, d->cur_cap);
+        *cur = NULL;
+    }
+    if (!*cur) {
+        if (!(*cur = buf_get(d->w, need, need == max)))
+            return set_error(ERR_NOMEM, "cdc: chunk buffer");
+        d->cur_cap = need;
+    }
 
     for (;;) {
         if (scanned == blen) {
             if (pos == e) break;
-            if (d->o && cancel_requested(d->o->cancel))
+            if (d->o && (cancel_requested(d->o->cancel) ||
+                         (d->o->cancelled && d->o->cancelled(d->o->cancelled_ctx))))
                 return set_error(ERR_BUSY, "cancelled");
-            /* No cut yet means blen < max, so there is room. */
-            size_t n = max - blen;
+            /* No cut yet means blen < max and < the span, so there is room. */
+            size_t n = d->cur_cap - blen;
             if (n > CDC_READ_STEP) n = CDC_READ_STEP;
             if ((uint64_t)n > e - pos) n = (size_t)(e - pos);
             status_t st = src->read(src->ctx, *cur + blen, n, pos);
@@ -661,14 +684,24 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
         if (!cut) continue;
 
         size_t spill = blen - scanned;
-        if (!*spare && !(*spare = buf_get(d->w, max)))
-            return set_error(ERR_NOMEM, "cdc: chunk buffer");
+        if (*spare && d->spare_cap < need) {
+            buf_put(d->w, *spare, d->spare_cap);
+            *spare = NULL;
+        }
+        if (!*spare) {
+            if (!(*spare = buf_get(d->w, need, need == max)))
+                return set_error(ERR_NOMEM, "cdc: chunk buffer");
+            d->spare_cap = need;
+        }
         memcpy(*spare, *cur + scanned, spill);
         status_t st = emit_chunk(d, cur, scanned, chunk_abs);
         if (st != OK) return st;
         uint8_t *t = *cur;          /* NULL when the job took it */
+        size_t tc = d->cur_cap;
         *cur = *spare;
+        d->cur_cap = d->spare_cap;
         *spare = t;
+        d->spare_cap = t ? tc : 0;
         chunk_abs += scanned;
         blen = spill;
         scanned = 0;
@@ -678,20 +711,173 @@ static status_t chunk_span(drv_t *d, const cdc_source_t *src,
     return OK;
 }
 
-/* The file source: SEEK_DATA spans and pread. */
+/*
+ * The file source: SEEK_DATA spans, and reads that a thread of its own has
+ * usually already made.
+ *
+ * Reads on the cutting thread are synchronous, so on a cold disk each one
+ * waited its full latency while nothing else happened, and a file read at
+ * half the disk's speed. For a span of 16 MiB or more a read-ahead thread
+ * fills a ring of 1 MiB slots in order ahead of the cutter, which copies out
+ * of them: the disk and the scan overlap, as object.c's reader thread made
+ * them for the format 2 writer. Smaller spans are read directly. What has
+ * been read is released from the page cache behind, as that writer did, so
+ * a backup does not push the machine's working set out.
+ */
+#define RA_MIN    ((uint64_t)16 * 1024 * 1024)
+#define RA_SLOTS  8u
+#define RA_SLOT   ((size_t)1024 * 1024)
+
 typedef struct {
-    spans_t sp;
-    int     fd;
+    uint8_t *buf;
+    uint64_t off;
+    size_t   len;
+    int      state;        /* 0 free, 1 filling, 2 ready */
+    status_t st;
+    char     err[ERR_MSG_MAX];
+} ra_slot_t;
+
+typedef struct {
+    spans_t  sp;
+    int      fd;
+    uint64_t dropped;      /* page cache released below here */
+
+    /* Read-ahead for the current span, when it is long enough and the
+     * file is on something that has a latency to hide. */
+    int             ra_ok;
+    int             ra_on;
+    pthread_t       ra_th;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    ra_slot_t       slot[RA_SLOTS];
+    uint64_t        ra_next, ra_end;   /* the thread's next read, span end */
+    unsigned        ra_fill;           /* slot it fills next */
+    int             ra_stop;
 } fd_src_t;
+
+static void *ra_main(void *arg)
+{
+    fd_src_t *f = arg;
+    pthread_mutex_lock(&f->mu);
+    for (;;) {
+        ra_slot_t *sl = &f->slot[f->ra_fill];
+        while (!f->ra_stop && (sl->state != 0 || f->ra_next >= f->ra_end))
+            pthread_cond_wait(&f->cv, &f->mu);
+        if (f->ra_stop) break;
+        uint64_t off = f->ra_next;
+        size_t n = f->ra_end - off < RA_SLOT ? (size_t)(f->ra_end - off) : RA_SLOT;
+        sl->state = 1;
+        sl->off = off;
+        sl->len = n;
+        f->ra_next += n;
+        f->ra_fill = (f->ra_fill + 1) % RA_SLOTS;
+        pthread_mutex_unlock(&f->mu);
+        err_clear();
+        status_t st = read_full_at(f->fd, sl->buf, n, off);
+        pthread_mutex_lock(&f->mu);
+        sl->st = st;
+        if (st != OK) snprintf(sl->err, sizeof(sl->err), "%s", err_msg());
+        sl->state = 2;
+        pthread_cond_broadcast(&f->cv);
+    }
+    pthread_mutex_unlock(&f->mu);
+    return NULL;
+}
+
+static void ra_stop(fd_src_t *f)
+{
+    if (!f->ra_on) return;
+    pthread_mutex_lock(&f->mu);
+    f->ra_stop = 1;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+    pthread_join(f->ra_th, NULL);
+    for (unsigned i = 0; i < RA_SLOTS; i++) {
+        free(f->slot[i].buf);
+        f->slot[i].buf = NULL;
+    }
+    pthread_cond_destroy(&f->cv);
+    pthread_mutex_destroy(&f->mu);
+    f->ra_on = 0;
+}
+
+static status_t ra_start(fd_src_t *f, uint64_t s, uint64_t e)
+{
+    memset(f->slot, 0, sizeof(f->slot));
+    for (unsigned i = 0; i < RA_SLOTS; i++)
+        if (!(f->slot[i].buf = malloc(RA_SLOT))) {
+            for (unsigned k = 0; k < i; k++) free(f->slot[k].buf);
+            return ERR_NOMEM;   /* read directly instead */
+        }
+    pthread_mutex_init(&f->mu, NULL);
+    pthread_cond_init(&f->cv, NULL);
+    f->ra_next = s;
+    f->ra_end = e;
+    f->ra_fill = 0;
+    f->ra_stop = 0;
+    if (pthread_create(&f->ra_th, NULL, ra_main, f) != 0) {
+        for (unsigned i = 0; i < RA_SLOTS; i++) free(f->slot[i].buf);
+        pthread_cond_destroy(&f->cv);
+        pthread_mutex_destroy(&f->mu);
+        return ERR_IO;
+    }
+    f->ra_on = 1;
+    return OK;
+}
 
 static status_t fd_next_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
 {
-    return next_span(&((fd_src_t *)ctx)->sp, s, e, got);
+    fd_src_t *f = ctx;
+    ra_stop(f);
+    status_t st = next_span(&f->sp, s, e, got);
+    if (st == OK && *got && f->ra_ok && *e - *s >= RA_MIN) (void)ra_start(f, *s, *e);
+    return st;
+}
+
+static void drop_behind(fd_src_t *f, uint64_t off)
+{
+    if (off > f->dropped + 2 * RA_MIN) {
+        (void)posix_fadvise(f->fd, (off_t)f->dropped, (off_t)(off - f->dropped),
+                            POSIX_FADV_DONTNEED);
+        f->dropped = off;
+    }
 }
 
 static status_t fd_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
 {
-    return read_full_at(((fd_src_t *)ctx)->fd, buf, n, off);
+    fd_src_t *f = ctx;
+    if (!f->ra_on) {
+        status_t st = read_full_at(f->fd, buf, n, off);
+        if (st == OK) drop_behind(f, off);
+        return st;
+    }
+    /* The cutter reads in order, so the slot it wants is the oldest one;
+     * a slot is given back once it has been read to its end. */
+    pthread_mutex_lock(&f->mu);
+    status_t st = OK;
+    while (n > 0 && st == OK) {
+        ra_slot_t *sl = NULL;
+        for (unsigned i = 0; i < RA_SLOTS; i++) {
+            ra_slot_t *c = &f->slot[i];
+            if (c->state != 0 && off >= c->off && off < c->off + c->len) { sl = c; break; }
+        }
+        if (!sl || sl->state != 2) {
+            pthread_cond_wait(&f->cv, &f->mu);
+            continue;
+        }
+        if (sl->st != OK) { st = set_error(sl->st, "%s", sl->err); break; }
+        size_t k = (size_t)(sl->off + sl->len - off);
+        if (k > n) k = n;
+        memcpy(buf, sl->buf + (off - sl->off), k);
+        buf += k; n -= k; off += k;
+        if (off >= sl->off + sl->len) {
+            sl->state = 0;
+            pthread_cond_broadcast(&f->cv);
+        }
+    }
+    pthread_mutex_unlock(&f->mu);
+    if (st == OK) drop_behind(f, off);
+    return st;
 }
 
 status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
@@ -703,8 +889,16 @@ status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
     f.fd = fd;
     f.sp.fd = fd;
     f.sp.size = size;
+    if (size >= CDC_HOLE_MIN) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    /* Memory-backed: every read is a copy already, and read-ahead would add
+     * another one for nothing (a quarter slower, measured on tmpfs). */
+    struct statfs sfs;
+    f.ra_ok = !(fstatfs(fd, &sfs) == 0 &&
+                (sfs.f_type == TMPFS_MAGIC || sfs.f_type == RAMFS_MAGIC));
     cdc_source_t src = { .next_span = fd_next_span, .read = fd_read, .ctx = &f };
-    return cdc_store_source(p, &src, size, sink, opts, out);
+    status_t st = cdc_store_source(p, &src, size, sink, opts, out);
+    ra_stop(&f);
+    return st;
 }
 
 status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
@@ -772,8 +966,8 @@ status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
         if (st == OK && d.err != OK) st = set_error(d.err, "%s", d.errmsg);
         else if (st != OK) set_error(st, "%s", keep);
     }
-    buf_put(d.w, cur, p->max_size);
-    buf_put(d.w, spare, p->max_size);
+    buf_put(d.w, cur, d.cur_cap);
+    buf_put(d.w, spare, d.spare_cap);
 
     if (st == OK && whole && out->chunks == 1) {
         /* One chunk, no holes: the chunk is the file. Nothing was stored

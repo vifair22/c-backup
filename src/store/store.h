@@ -108,6 +108,15 @@ const struct repo_key *store_key(const store_t *st);
  * the unkeyed format defaults for a bare unencrypted store, or NULL for an
  * encrypted store whose key was not loaded (nothing may be written there).
  */
+/*
+ * A pack number no other writer on this handle has been given. floor is the
+ * next free number by directory scan (next_pack_num), which alone cannot
+ * see a pack another writer is still staging in tmp/: two writers open at
+ * once (a backup's chunk workers each seal their own packs) would scan the
+ * same number and the second install would be refused.
+ */
+uint32_t store_alloc_pack_num(store_t *st, uint32_t floor);
+
 struct cdc_params;
 status_t store_set_cdc(store_t *st, const struct cdc_params *p);
 const struct cdc_params *store_cdc(const store_t *st);
@@ -257,6 +266,10 @@ typedef struct {
      * over. Recording the array position instead makes every parity lookup
      * read the wrong offsets and silently disables repair. */
     uint32_t entry_index;
+    /* The object's type, so the commit can create the object's index row
+     * when nothing recorded one before the pack was sealed (format 3: a
+     * backup's file workers record no rows of their own). */
+    uint8_t  type;
 } pack_commit_entry_t;
 
 typedef struct {
