@@ -186,8 +186,16 @@ int api_server_route_allow(api_server_t *srv, const char *pattern,
 typedef int (*api_auth_fn)(const api_request_t *req, const char *url, void *userdata);
 void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata);
 
-/* Start serving (non-blocking - runs in background threads via libmicrohttpd). */
+/* Start serving (non-blocking - runs in background threads via libmicrohttpd).
+ * On failure, api_server_error says what failed, on which address or path,
+ * and why. */
 int api_server_start(api_server_t *srv);
+
+/* The message of the last api_server_start failure on this thread. The
+ * server keeps it in c-utils' error buffer; this reads it for callers that
+ * use the application's own (src/common/error.h), where the two set_error
+ * macros cannot both be included. */
+const char *api_server_error(void);
 
 /* Stop the server and free resources. */
 void api_server_stop(api_server_t *srv);
