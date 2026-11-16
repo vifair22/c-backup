@@ -144,6 +144,10 @@ static int setup_dumps(void **state)
     if (helper_policy_parse(text, &pol) != OK) return -1;
     if (fake_stream_add(fk, "u1", "dump:pgdump", ".cbackup-unit/hooks/pgdump.dump", 0, 1) != OK ||
         fake_stream_add(fk, "u1", "dump:baddump", ".cbackup-unit/hooks/baddump.dump", 0, 1) != OK) return -1;
+    /* Each dump's log, as the container providers describe them: empty at
+     * describe, filled once the hook has run. */
+    if (fake_blob_add(fk, "u1", "log:pgdump", ".cbackup-unit/hooks/pgdump.log", "", 0) != OK ||
+        fake_blob_add(fk, "u1", "log:baddump", ".cbackup-unit/hooks/baddump.log", "", 0) != OK) return -1;
     if (helper_up() != 0) return -1;
     return remote_start(HF_SOCK, units_daemon8(), &k_fast) == OK ? 0 : -1;
 }
@@ -324,6 +328,17 @@ static void test_large_blob(void **state)
 
 /* Dump hooks through the helper: hook.run's pipe stored, hook.wait's exit
  * deciding; the failed one never lands. */
+static int file_has(const char *path, const char *text)
+{
+    char buf[8192] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, text) != NULL;
+}
+
 static void test_dumps_through_helper(void **state)
 {
     (void)state;
@@ -343,19 +358,15 @@ static void test_dumps_through_helper(void **state)
     assert_string_equal(buf, "DUMP-ok");
     struct stat sb;
     assert_int_not_equal(stat(DEST "/.cbackup-unit/hooks/baddump.dump", &sb), 0);
+    /* B141: the failed dump is not stored, and its log says why: what it
+     * wrote to stderr and how it exited. It used to be stored empty. */
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/baddump.log", "broke"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/baddump.log", "exit status 3"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pgdump.log", "noise"));
+    assert_true(file_has(DEST "/.cbackup-unit/hooks/pgdump.log", "exit status 0"));
     assert_int_equal(helper_server_holds(srv), 0);
 }
 
-static int file_has(const char *path, const char *text)
-{
-    char buf[8192] = "";
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    buf[n] = '\0';
-    return strstr(buf, text) != NULL;
-}
 
 /* mode unit: the refusals, a new name under target_root that leaves the
  * original untouched, and in place with replace through stage and swap. */
