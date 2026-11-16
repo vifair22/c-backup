@@ -10,6 +10,8 @@
 #include "helper_server.h"
 #include "test_tmp.h"
 
+#include <errno.h>
+#include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,27 @@ static inline void hf_rmrf(const char *p)
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", p);
     int rc = system(cmd); (void)rc;
+}
+
+/*
+ * CI runs the suites as root. The helper refuses daemon_uid 0 by design and
+ * checks every peer's uid against daemon_uid, and these suites name their
+ * own uid and connect from their own process, so as root they run as a
+ * fixed non-root uid instead, as a deployment's daemon does: the scratch
+ * directory is made that uid's and the process drops to it for good. Call
+ * first in main. Elsewhere nothing changes.
+ */
+#define HF_UNROOT_UID 990u
+static inline int hf_unroot(void)
+{
+    if (geteuid() != 0) return 0;
+    hf_rmrf(HF_DIR);
+    if (mkdir(TEST_TMP, 0755) != 0 && errno != EEXIST) return -1;
+    if (chown(TEST_TMP, HF_UNROOT_UID, HF_UNROOT_UID) != 0) return -1;
+    if (setgroups(0, NULL) != 0) return -1;
+    if (setresgid(HF_UNROOT_UID, HF_UNROOT_UID, HF_UNROOT_UID) != 0) return -1;
+    if (setresuid(HF_UNROOT_UID, HF_UNROOT_UID, HF_UNROOT_UID) != 0) return -1;
+    return 0;
 }
 
 static inline void hf_write(const char *path, const char *text)

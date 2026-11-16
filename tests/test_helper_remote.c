@@ -344,6 +344,7 @@ static void test_helper_restarts_mid_job(void **state)
 
 int main(void)
 {
+    if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_starts_before_helper, setup_late, teardown),
         cmocka_unit_test_setup_teardown(test_helper_restarts_mid_job, setup, teardown),

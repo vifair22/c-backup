@@ -615,6 +615,7 @@ static void test_socket(void **state)
 
 int main(void)
 {
+    if (hf_unroot() != 0) { perror("cannot leave root for the helper suites"); return 1; }
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_policy),
         cmocka_unit_test(test_unit_key_grammar),
