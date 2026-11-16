@@ -151,6 +151,21 @@ int main(int argc, char *argv[])
     if (!guard)
         return 1;
 
+    /*
+     * Startup acquires in order and teardown releases in reverse, through
+     * one ladder of labels: every failure jumps to the label that undoes
+     * exactly what was set up before it, and a clean shutdown falls through
+     * the whole ladder. Each early return used to carry its own hand-written
+     * list, and they drifted: a port that could not be bound returned with
+     * the scheduler open and the job manager's workers still running (B132),
+     * and none of them released the lock table. Everything is declared here
+     * so no jump passes an initialisation.
+     */
+    int rc = 1;
+    job_manager_t *jm = NULL;
+    scheduler_t *sched = NULL;
+    api_server_t *srv = NULL;
+
     /* Pin both version stamps into the journal at startup so a misbehaving
      * host can be identified without grepping the binary. */
     log_info("c-backupd %s", VERSION_STRING);
@@ -166,8 +181,7 @@ int main(int argc, char *argv[])
 
     if (!db) {
         log_error("database handle unavailable after init");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_guard;
     }
 
     pin_sqlite_temp_dir(db_path);
@@ -188,14 +202,12 @@ int main(int argc, char *argv[])
 
     if (repo_locks_init() != OK) {
         log_error("cannot initialise repo locks");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_guard;
     }
 
     if (auth_init(db) != 0) {
         log_error("cannot initialise auth");
-        appguard_shutdown(guard);
-        return 1;
+        goto out_locks;
     }
     /* Nothing is running yet, so any staged object rows belong to a backup
      * that died with the last process, along with the pack they were in. */
@@ -204,7 +216,8 @@ int main(int argc, char *argv[])
 
     /* Removed repositories whose rows are not all gone yet, including any
      * an earlier build left behind; the thread resumes them in the
-     * background and waits for the next removal. */
+     * background and waits for the next removal. Not fatal, and
+     * repo_purge_stop is a no-op for a thread that never started. */
     if (repo_purge_start(db) != OK)
         log_warn("%s; removed repositories keep their index rows until next start",
                  err_msg());
@@ -213,13 +226,10 @@ int main(int argc, char *argv[])
         log_warn("no admin password set: TCP serves only the health probes "
                  "until one is, with 'c-backup auth setup' on this host");
 
-    job_manager_t *jm = NULL;
     int max_parallel = config_get_int(cfg, "jobs.max_parallel", 2);
     if (job_manager_start(db, max_parallel, &jm) != OK) {
         log_error("cannot start job manager");
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_purge;
     }
     /* The same test push_init makes before it starts its worker: without
      * both, push_send drops every message. */
@@ -234,7 +244,6 @@ int main(int argc, char *argv[])
      * it: firing a schedule and executing it are different concerns, and
      * keeping them apart means a slow job cannot delay the next tick.
      */
-    scheduler_t *sched = NULL;
     /* Before the scheduler computes due times from rows the route would no
      * longer accept, and with the scheduler off as well, so the list is
      * right whichever way it is configured. */
@@ -242,10 +251,7 @@ int main(int argc, char *argv[])
     if (config_get_int(cfg, "scheduler.enabled", 1)) {
         if (scheduler_open(db, schedule_dispatch, jm, &sched) != OK) {
             log_error("cannot create scheduler");
-            job_manager_stop(jm);
-            repo_purge_stop();
-            appguard_shutdown(guard);
-            return 1;
+            goto out_jm;
         }
         scheduler_set_canceller(sched, schedule_cancel);
     } else {
@@ -259,12 +265,10 @@ int main(int argc, char *argv[])
     /* static_dir is NULL: the daemon serves an API, not a web UI. The
      * lifted server retains its static-file path so it stays diffable
      * against airies-ups, but nothing reaches it here. */
-    api_server_t *srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
+    srv = api_server_create(tcp_port, bind_addr, socket_path, NULL);
     if (!srv) {
         log_error("cannot create API server");
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_sched;
     }
 
     routes_auth_set_config(cfg);
@@ -300,10 +304,7 @@ int main(int argc, char *argv[])
         routes_register_metrics(srv, db) != 0 ||
         routes_register_stream(srv, db) != 0) {
         log_error("cannot register routes");
-        api_server_stop(srv);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
     }
 
     /* The unix socket bypasses this entirely; see auth_check. Filesystem
@@ -312,21 +313,13 @@ int main(int argc, char *argv[])
 
     if (api_server_start(srv) != 0) {
         log_error("cannot start API server");
-        api_server_stop(srv);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
     }
 
     log_info("listening on %s and port %d", socket_path ? socket_path : "(no socket)", tcp_port);
     if (sched && scheduler_run(sched) != OK) {
         log_error("cannot start scheduler loop");
-        api_server_stop(srv);
-        scheduler_stop(sched);
-        job_manager_stop(jm);
-        repo_purge_stop();
-        appguard_shutdown(guard);
-        return 1;
+        goto out_srv;
     }
     log_info("c-backupd ready");
     /* Only now: api_server_start returns with the unix socket and the TCP
@@ -343,18 +336,27 @@ int main(int argc, char *argv[])
     /*
      * Outside in: stop taking requests, stop firing schedules, then cancel
      * and join running jobs - they stop between files and record how they
-     * ended, which needs the database AppGuard closes last.
+     * ended, which needs the database AppGuard closes last. That is the
+     * ladder below, which a failed startup enters part way down.
      */
     log_info("shutting down");
     /* Joining running jobs can take a while; STOPPING=1 lets systemctl show
      * "deactivating" for it rather than a service that looks healthy. */
     if (sd_notify_state("STOPPING=1") != OK)
         log_warn("cannot notify the service manager: %s", err_msg());
+    rc = 0;
+
+out_srv:
     api_server_stop(srv);
-    if (sched) scheduler_stop(sched);
+out_sched:
+    scheduler_stop(sched);      /* NULL when disabled by config */
+out_jm:
     job_manager_stop(jm);
+out_purge:
     repo_purge_stop();
+out_locks:
     repo_locks_shutdown();
+out_guard:
     appguard_shutdown(guard);
-    return 0;
+    return rc;
 }
