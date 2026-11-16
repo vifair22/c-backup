@@ -95,6 +95,8 @@ struct store {
     void                 *removed_user;
     store_pack_relocate_fn relocate_cb;
     void                 *relocate_user;
+    store_index_sync_fn   sync_cb;
+    void                 *sync_user;
 
     /* Repository key, copied in. has_key is separate from a zero check
      * because an all-zero key is a valid key, just an unlucky one. */
@@ -501,6 +503,8 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->relocate_cb     = NULL;
     r->relocate_user   = NULL;
+    r->sync_cb         = NULL;
+    r->sync_user       = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
     r->cdc             = NULL;
@@ -864,6 +868,17 @@ void store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *us
     if (!st) return;
     st->relocate_cb = cb;
     st->relocate_user = user;
+}
+
+void store_set_index_sync_cb(store_t *st, store_index_sync_fn cb, void *user) {
+    if (!st) return;
+    st->sync_cb = cb;
+    st->sync_user = user;
+}
+
+status_t store_emit_index_sync(store_t *st) {
+    if (!st || !st->sync_cb) return OK;
+    return st->sync_cb(st->sync_user);
 }
 
 status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,

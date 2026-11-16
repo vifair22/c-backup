@@ -324,6 +324,19 @@ void store_emit_pack_removed(store_t *st, uint64_t pack_id);
  */
 typedef status_t (*store_pack_relocate_fn)(void *user, uint64_t pack_id,
                                            const pack_commit_entry_t *e);
+
+/*
+ * Make every index change so far durable (B142). The pack layer calls it
+ * before it removes a pack whose contents an index commit has moved
+ * elsewhere, or declared dead: the commit must be on disk before the only
+ * other copy goes, or a power cut can bring the commit back and leave the
+ * index naming a pack that is gone. OK when nothing is bound (a store that
+ * indexes its own packs reads them from disk at open, so has nothing to
+ * lose); the bound index's error otherwise, and then nothing is removed.
+ */
+typedef status_t (*store_index_sync_fn)(void *user);
+void     store_set_index_sync_cb(store_t *st, store_index_sync_fn cb, void *user);
+status_t store_emit_index_sync(store_t *st);
 void     store_set_pack_relocate_cb(store_t *st, store_pack_relocate_fn cb, void *user);
 status_t store_emit_pack_relocate(store_t *st, uint64_t pack_id,
                                   const pack_commit_entry_t *e);

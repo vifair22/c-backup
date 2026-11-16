@@ -181,6 +181,14 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
  * Ordering mirrors the commit side: pack_objects first, then the packs row,
  * so nothing ever references a pack row that is already gone.
  */
+/* Before a pack is removed: the commits that moved its contents, durable. */
+static status_t index_sync(void *user)
+{
+    store_index_t *idx = user;
+    if (!idx) return OK;
+    return db_txn_make_durable(idx->db);
+}
+
 static void pack_removed(void *user, uint64_t pack_id)
 {
     store_index_t *idx = user;
@@ -281,6 +289,7 @@ status_t store_index_bind(store_t *store, cutils_db_t *db, int64_t repo_id,
     store_set_pack_commit_cb(store, db_pack_commit, idx);
     store_set_pack_removed_cb(store, pack_removed, idx);
     store_set_pack_relocate_cb(store, pack_relocate, idx);
+    store_set_index_sync_cb(store, index_sync, idx);
     *out = idx;
     return OK;
 }
