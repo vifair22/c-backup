@@ -120,6 +120,20 @@ typedef struct {
     status_t (*next_span)(void *ctx, uint64_t *s, uint64_t *e, int *got);
     status_t (*read)(void *ctx, uint8_t *buf, size_t n, uint64_t off);
     void      *ctx;
+    /*
+     * Optional, and used instead of next_span when set: a span handed over
+     * in pieces, for a source that cannot know where a span ends until it
+     * has read up to there. A VM disk's spans end at the next zero run of
+     * CDC_HOLE_MIN or more (docs/vm-backup.md 5.2), which can be terabytes
+     * away; finding it first would mean reading the span twice or holding
+     * it all. *more is set on every piece of a span but its last, the next
+     * piece then starts exactly where this one ended, and the chunker
+     * carries its state across, so the cuts are those of one span of the
+     * same bytes. The last piece may be empty (*s == *e) when the end of
+     * the span is only known once its bytes have all been handed over.
+     */
+    status_t (*next_piece)(void *ctx, uint64_t *s, uint64_t *e, int *got,
+                           int *more);
 } cdc_source_t;
 
 /* ------------------------------------------------------------------ */
