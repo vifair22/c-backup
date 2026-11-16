@@ -1492,6 +1492,16 @@ contains "unknown repo reports status" "HTTP 404" "$OUT"
 OUT=$(cb backup 2>&1); RC=$?
 check    "missing arguments exit non-zero" 1 "$RC"
 contains "missing arguments show usage" "usage:" "$OUT"
+# NIT-8: an argument a command does not take was ignored, so this listed
+# repository 1's runs and exited 0.
+OUT=$(cb grep runs 1 2 2>&1); RC=$?
+check    "a stray positional exits non-zero" 1 "$RC"
+contains "and names it" "unexpected argument '2'; usage: c-backup grep runs" "$OUT"
+OUT=$(cb summary 1 --bogus 2>&1); RC=$?
+check    "an unknown option exits non-zero" 1 "$RC"
+contains "and names it too" "unexpected argument '--bogus'" "$OUT"
+OUT=$(cb grep runs 1 --limit 1 2>&1); RC=$?
+check    "options are still taken" 0 "$RC"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

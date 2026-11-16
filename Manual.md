@@ -1962,6 +1962,10 @@ JSON, one document per command, on stdout (a remove prints what it removed,
 that prints several: one document per line until the job ends. The exit
 status is 0 on success and 1 otherwise. Flags may appear anywhere after the
 command. Commands that start a job wait for it unless given `--no-wait`.
+The listing and lookup commands refuse an argument they do not take, a
+stray positional or an unknown option, with `unexpected argument` and their
+usage, rather than ignore it: `grep runs 1 2` is an error, not repository
+1's runs.
 
 | Command | Purpose |
 |---|---|

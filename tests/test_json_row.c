@@ -21,6 +21,7 @@
 #include <cutils/json.h>
 
 #include "json_row.h"
+#include "routes.h"
 
 /* One element under "a", serialised, so a test compares JSON text. */
 static char *elem_json(const jcol_t *cols, size_t n, char **row)
@@ -477,6 +478,31 @@ static void test_body_nul(void **state)
     expect_body(BODY("{\"label\":"), JREQ_BAD, "invalid JSON");
     expect_body(BODY("{\"a\":1}x"), JREQ_BAD, "invalid JSON");
     expect_body(BODY("{\"a\":1}\0"), JREQ_BAD, "invalid JSON");
+    /* NIT-8: a repeated key is named, in one wording for every route. */
+    expect_body(BODY("{\"a\":1,\"a\":2}"), JREQ_BAD,
+                "invalid JSON: duplicate key 'a' at the top level");
+}
+
+/* NIT-8: a path id is digits up to the next slash, from min to 2^53. */
+static void test_path_ids(void **state)
+{
+    (void)state;
+    int64_t v = -7;
+    const char *end = NULL;
+    assert_int_equal(routes_path_id("42/tree", 1, &v, &end), 1);
+    assert_int_equal(v, 42);
+    assert_string_equal(end, "/tree");
+    assert_int_equal(routes_path_id("9007199254740992", 1, &v, &end), 1);
+    assert_int_equal(v, (int64_t)1 << 53);
+    assert_int_equal(routes_path_id("0", 0, &v, NULL), 1);
+    assert_int_equal(v, 0);
+    assert_int_equal(routes_path_id("", 1, &v, NULL), 0);
+    assert_int_equal(routes_path_id("/x", 1, &v, NULL), 0);
+    static const char *bad[] = { "0", "-1", "+1", "1e999", "1.5", "abc", "1a",
+                                 "9007199254740993", "99999999999999999999",
+                                 "123456789012345678901234567890" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        assert_int_equal(routes_path_id(bad[i], 1, &v, NULL), -1);
 }
 
 int main(void)
@@ -499,6 +525,7 @@ int main(void)
         cmocka_unit_test(test_request_string_lists),
         cmocka_unit_test(test_query_numbers),
         cmocka_unit_test(test_body_nul),
+        cmocka_unit_test(test_path_ids),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

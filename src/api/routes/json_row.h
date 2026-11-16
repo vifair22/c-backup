@@ -174,7 +174,8 @@ int jquery_i64(const char *text, const char *name, int64_t min, int64_t max,
  *    one sent (B115). Nothing in this API can hold a NUL, so the request
  *    is refused naming the field; a label gets the label rule's words,
  *    since NUL is a control character like the ones it already refuses.
- *  - malformed JSON: "invalid JSON", in the same words on every route.
+ *  - malformed JSON: "invalid JSON", in the same words on every route, and
+ *    for a repeated member name "invalid JSON: duplicate key '<name>' ...".
  */
 int jreq_parse_body(const char *body, size_t len, cutils_json_req_t **out,
                     jreq_err_t *err);

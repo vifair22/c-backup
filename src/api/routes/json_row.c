@@ -501,6 +501,13 @@ int jreq_parse_body(const char *body, size_t len, cutils_json_req_t **out,
     if (json_req_parse(body, len, out) != 0 || !*out) {
         json_req_free(*out);
         *out = NULL;
+        /* A repeated member name is valid JSON syntax that this API still
+         * refuses, so "invalid JSON" alone sent the client looking for a
+         * syntax error that was not there (NIT-8). c-utils names the key
+         * and where it is; if it rewords that, the bare message remains. */
+        const char *why = cutils_get_error();
+        if (why && strncmp(why, "duplicate key", 13) == 0)
+            return jreq_bad(err, "invalid JSON: %s", why);
         return jreq_bad(err, "invalid JSON");
     }
     return JREQ_OK;

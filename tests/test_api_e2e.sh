@@ -694,6 +694,19 @@ case "$(sock_body /repos/1/schedules)" in
     *'"action"'*) bad "and no schedule was created" "none" "$(sock_body /repos/1/schedules)" ;;
     *) ok "and no schedule was created" ;;
 esac
+# NIT-8: one wording on every route, and it names the problem. POST /repos
+# said "body is not valid JSON", the rest "invalid JSON", neither the key.
+check "a duplicate repo key is named" \
+    "{\"error\":\"invalid JSON: duplicate key 'path' at the top level\"} 400" \
+    "$(sock_send POST /repos "{\"path\":\"$WORK/junkrepo\",\"path\":\"$WORK/junkrepo2\"}")"
+check "a duplicate key in a trigger is named, with where it is" \
+    "{\"error\":\"invalid JSON: duplicate key 'seconds' in object 'trigger'\"} 400" \
+    "$(sched '{"action":"gc","trigger":{"type":"interval","seconds":60,"seconds":3600}}')"
+check "a duplicate backup key is named" \
+    "{\"error\":\"invalid JSON: duplicate key 'label' at the top level\"} 400" \
+    "$(sock_send POST /repos/1/backup '{"label":"a","label":"b"}')"
+check "malformed JSON on POST /repos says invalid JSON" '{"error":"invalid JSON"} 400' \
+    "$(sock_send POST /repos '{"path":')"
 
 echo "restore"
 # A snapshot that does not exist is refused up front, not queued as a job
@@ -810,7 +823,7 @@ check "a large limit is clamped, not refused" 200 "$(sock_code '/repos/1/snapsho
 check "an overflowing limit is clamped too" 200 "$(sock_code '/jobs?limit=99999999999')"
 check "an overflowing offset is an empty page" 200 "$(sock_code '/jobs?offset=99999999999')"
 check "a bad limit names the range" \
-    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one is reduced to 1000)"}' \
+    '{"error":"limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)"}' \
     "$(sock_body '/jobs?limit=0')"
 # B112: every numeric query parameter reads numbers the same way and words
 # a refusal the way a body field does. An overflowing id used to be clamped
@@ -820,9 +833,42 @@ check "a non-numeric limit says whole number" '{"error":"limit must be a whole n
 check "a fractional limit says whole number" '{"error":"limit must be a whole number"} 400' \
     "$(sock_send GET '/jobs?limit=1.5')"
 check "a negative offset is out of range" \
-    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one is past every row)"} 400' \
+    '{"error":"offset is out of range; it must be from 0 to 2147483647 (a larger one, up to 9007199254740992, is past every row)"} 400' \
     "$(sock_send GET '/jobs?offset=-5')"
-check "a huge limit in exponent form is clamped too" 200 "$(sock_code '/jobs?limit=1e999')"
+# NIT-8: a number too large to represent is out of range, as it is in a
+# body; these were read as the maximum and answered 200.
+LRANGE='limit is out of range; it must be from 1 to 1000 (a larger one, up to 9007199254740992, is reduced to 1000)'
+for v in 1e999 99999999999999999999 9007199254740994; do
+    check "limit=$v is out of range" "{\"error\":\"$LRANGE\"} 400" "$(sock_send GET "/jobs?limit=$v")"
+done
+check "limit=9007199254740992 is still clamped" 200 "$(sock_code '/jobs?limit=9007199254740992')"
+check "an unrepresentable offset is out of range" 400 "$(sock_code '/jobs?offset=1e999')"
+# NIT-8: an id in the path is parsed, not routed. These were a 405, a 404
+# and a 404, while /repos/-1 was already a 400.
+for v in 99999999999999999999 1e999 -1 0 1.5 abc; do
+    check "snapshot id $v is invalid" '{"error":"invalid snapshot id"} 400' \
+        "$(sock_send DELETE "/repos/1/snapshots/$v")"
+done
+check "and under a suffix too" '{"error":"invalid snapshot id"} 400' \
+    "$(sock_send GET /repos/1/snapshots/1e999/tree)"
+for v in 99999999999999999999 1e999 -1 0; do
+    check "repo id $v is invalid" '{"error":"invalid repo id"} 400' "$(sock_send GET "/repos/$v")"
+    check "job id $v is invalid" '{"error":"invalid job id"} 400' "$(sock_send GET "/jobs/$v")"
+done
+check "a cancel with a bad job id" '{"error":"invalid job id"} 400' \
+    "$(sock_send POST /jobs/-1/cancel)"
+check "a stream with a bad job id" 400 "$(sock_code /jobs/stream/99999999999999999999)"
+check "a schedule id is parsed" '{"error":"invalid schedule id"} 400' \
+    "$(sock_send DELETE /repos/1/schedules/1e999)"
+check "a grep run id is parsed" '{"error":"invalid grep run id"} 400' \
+    "$(sock_send GET /repos/1/grep/-1)"
+check "a verify run id is parsed" '{"error":"invalid verify run id"} 400' \
+    "$(sock_send GET /repos/1/verify/99999999999999999999)"
+check "a pack id is parsed" '{"error":"invalid pack id"} 400' \
+    "$(sock_send GET /repos/1/packs/-1/entries)"
+check "an unknown valid snapshot id is still a 404" 404 \
+    "$(sock_code /repos/1/snapshots/999999/tree)"
+check "an unknown valid job id is still a 404" 404 "$(sock_code /jobs/999999)"
 check "a leading zero still reads" 200 "$(sock_code '/jobs?limit=010')"
 SRANGE='snapshot is out of range; it must be from 1 to 4294967295'
 for v in 1e999 -1 0 99999999999999999999; do
