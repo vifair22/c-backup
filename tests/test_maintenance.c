@@ -313,7 +313,10 @@ static int64_t node_rows_for(int64_t snap)
     snprintf(sn,   sizeof(sn),   "%lld", (long long)snap);
     db_result_t *r = NULL;
     int64_t n = -1;
-    if (db_execute(db, "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = ?",
+    /* A snapshot's entries: its directories' trees' rows (docs/index-reuse.md). */
+    if (db_execute(db, "SELECT COUNT(*) FROM snap_dirs d JOIN nodes n"
+                       " ON n.repo_id = d.repo_id AND n.tree_hash = d.tree_hash"
+                       " WHERE d.repo_id = ? AND d.snap_id = ?",
                    (const char *[]){ repo, sn, NULL }, &r) == 0 && r && r->nrows == 1)
         n = strtoll(r->rows[0][0], NULL, 10);
     db_result_free(r);

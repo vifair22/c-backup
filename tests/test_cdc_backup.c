@@ -147,7 +147,7 @@ static void root_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)snap);
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db, "SELECT root_tree_hash FROM snapshots WHERE id = ?",
+    assert_int_equal(db_execute(db, "SELECT lower(hex(root_tree_hash)) FROM snapshots WHERE id = ?",
                                 (const char *[]){ id, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
@@ -163,8 +163,8 @@ static void src_tree_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)snap);
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db, "SELECT subtree_hash FROM nodes WHERE snap_id = ?"
-                                " AND name = 'src' AND type = 2",
+    assert_int_equal(db_execute(db, "SELECT lower(hex(tree_hash)) FROM snap_dirs"
+                                " WHERE snap_id = ? AND name = 'src'",
                                 (const char *[]){ id, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
@@ -233,10 +233,10 @@ static void test_workers_do_not_change_the_snapshot(void **state)
     /* The twins name one list, held once. */
     assert_int_equal(scalar("SELECT COUNT(DISTINCT content_hash) FROM nodes"
                             " WHERE repo_id = ? AND name IN ('big.bin', 'twin.bin')"), 1);
-    assert_int_equal(scalar("SELECT COUNT(*) FROM pack_objects p JOIN nodes n"
-                            "  ON n.repo_id = p.repo_id AND n.content_hash = p.hash"
-                            " WHERE p.repo_id = ? AND n.name = 'twin.bin'"
-                            "   AND n.snap_id = (SELECT MIN(snap_id) FROM nodes)"), 1);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM pack_objects p"
+                            " WHERE p.repo_id = ? AND p.hash ="
+                            "  (SELECT content_hash FROM nodes WHERE name = 'twin.bin'"
+                            "    LIMIT 1)"), 1);
 
     /* The large file is a list, and every object is in a pack. */
     assert_true(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND type = 6") >= 1);
@@ -498,7 +498,7 @@ static void test_huge_directory(void **state)
 
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db, "SELECT subtree_hash FROM nodes WHERE name = 'many'",
+    assert_int_equal(db_execute(db, "SELECT lower(hex(subtree_hash)) FROM nodes WHERE name = 'many'",
                                 NULL, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(hex, sizeof(hex), "%s", r->rows[0][0]);

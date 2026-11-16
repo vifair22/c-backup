@@ -196,7 +196,7 @@ static void test_root_tree_is_walkable(void **state)
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     assert_int_equal(db_execute(db,
-        "SELECT root_tree_hash FROM snapshots WHERE repo_id = ? AND id = 1",
+        "SELECT lower(hex(root_tree_hash)) FROM snapshots WHERE repo_id = ? AND id = 1",
         (const char *[]){ repo, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
 
@@ -226,7 +226,7 @@ static void test_search_finds_backed_up_files(void **state)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT node_id FROM node_fts WHERE name MATCH 'lpha'", NULL, &r), 0);
+        "SELECT rowid FROM node_fts WHERE name MATCH 'lpha'", NULL, &r), 0);
     assert_true(r->nrows >= 1);
     db_result_free(r);
 }
@@ -266,7 +266,7 @@ static void test_phys_size_matches_bytes_on_disk(void **state)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT hash, phys_size, location FROM objects WHERE repo_id = ?",
+        "SELECT lower(hex(hash)), phys_size, location FROM objects WHERE repo_id = ?",
         (const char *[]){ "1", NULL }, &r), 0);
     assert_non_null(r);
     assert_true(r->nrows > 0);
@@ -369,7 +369,7 @@ static void test_pack_does_not_change_orig_size(void **state)
     db_result_t *r = NULL;
     const char *params[] = { "1", NULL };
     assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes"
+        "SELECT lower(hex(content_hash)) FROM nodes"
         " WHERE repo_id = ? AND name = 'sparse.bin'", params, &r), 0);
     assert_non_null(r);
     assert_int_equal(r->nrows, 1);
@@ -391,7 +391,7 @@ static void test_pack_does_not_change_orig_size(void **state)
 
     const char *hp[] = { "1", hex, NULL };
     assert_int_equal(db_execute(db,
-        "SELECT orig_size, location FROM objects WHERE repo_id = ? AND hash = ?",
+        "SELECT orig_size, location FROM objects WHERE repo_id = ? AND hash = unhex(?)",
         hp, &r), 0);
     assert_non_null(r);
     assert_int_equal(r->nrows, 1);
@@ -849,27 +849,27 @@ static void test_object_left_by_an_interrupted_run_keeps_its_size(void **state)
 
     char sql[256];
     snprintf(sql, sizeof(sql),
-             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+             "SELECT phys_size FROM objects WHERE hash = X'%s'", hex);
     assert_int_equal(scalar(sql, NULL), (int)stored);
 
     /* The row's sizes are the pack's, as its commit recorded them, whatever
      * figures the caller passes: a caller that dedups against an object it
      * did not write has nothing true to say about its size. */
-    snprintf(sql, sizeof(sql), "DELETE FROM objects WHERE hash = '%s'", hex);
+    snprintf(sql, sizeof(sql), "DELETE FROM objects WHERE hash = X'%s'", hex);
     assert_int_equal(db_execute_non_query(db, sql, NULL, NULL), 0);
     assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
                                            0, 1), OK);
     snprintf(sql, sizeof(sql),
-             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+             "SELECT phys_size FROM objects WHERE hash = X'%s'", hex);
     assert_int_equal(scalar(sql, NULL), (int)stored);
     snprintf(sql, sizeof(sql),
-             "SELECT orig_size FROM objects WHERE hash = '%s'", hex);
+             "SELECT orig_size FROM objects WHERE hash = X'%s'", hex);
     assert_int_equal(scalar(sql, NULL), 256 * 1024);
     /* And an existing row is left as it stands. */
     assert_int_equal(store_index_put_packed(db, repo_id, hash, OBJECT_TYPE_FILE,
                                            1, 1), OK);
     snprintf(sql, sizeof(sql),
-             "SELECT phys_size FROM objects WHERE hash = '%s'", hex);
+             "SELECT phys_size FROM objects WHERE hash = X'%s'", hex);
     assert_int_equal(scalar(sql, NULL), (int)stored);
 }
 
@@ -1192,7 +1192,10 @@ static void test_no_waiter_means_no_extra_commits(void **state)
     /* Batches end at files 2,000 and 4,000, and the last at the end. B107
      * added one per large file and one per 200 ms on top. */
     assert_int_equal(res.commits_store, 3);
-    assert_int_equal(res.commits_trees, 1);
+    /* The trees batch carries new trees' entry rows too (index reuse), and
+     * commits between trees once past 2,000 rows: after the 4,500-entry
+     * directory, and at the end. */
+    assert_int_equal(res.commits_trees, 2);
     /* 25 MiB packed: no seal in the loop, one at the end. */
     assert_int_equal(res.commits_pack, 1);
 }

@@ -62,6 +62,12 @@ typedef struct {
     uint64_t files_unchanged;
     uint64_t trees_new;
     uint64_t trees_reused;
+    /* Node index work (docs/index-reuse.md): entry rows written for trees
+     * the index did not hold yet, which follows what changed, and the
+     * snapshot's directory rows, which follow its directory count. A
+     * no-change incremental writes no entry rows at all. */
+    uint64_t index_rows;
+    uint64_t index_dirs;
     /* Stored bytes (compressed, encrypted) this run added to the repository
      * for new file content. Everything else was already there. */
     uint64_t bytes_stored;
@@ -70,7 +76,8 @@ typedef struct {
     unsigned store_workers;
     /*
      * Index transactions committed, by the phase that held them: the store
-     * phase's batches, the trees batch, index_nodes' batches, and the pack
+     * phase's batches, the trees batch (which carries new trees' entry
+     * rows), the directory skeleton's batches, and the pack
      * commit each seal runs. Every one is a WAL sync, which on slow storage
      * is the cost to watch (OWN-16). With nobody else writing, the store
      * phase commits once per 2,000 files plus once per pack seal.

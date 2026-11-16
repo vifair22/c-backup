@@ -18,6 +18,8 @@
 #include "snap_record.h"
 #include "snapshot_ids.h"
 #include "tree_build.h"
+#include "node_index.h"
+#include "db_typed.h"
 
 #include <cutils/log.h>
 
@@ -343,16 +345,26 @@ static int scan_path_cmp(const void *a, const void *b)
  * few bytes locally and remembering the answer makes repeats free.
  */
 /*
- * Record a stored object in the index: staged when it went into the open
- * pack, packed when the repository already held it. See store_index_put_staged for
- * why the difference decides whether a crash can lose data silently.
+ * Record a stored object in the index, once.
+ *
+ * An object that went into the open pack gets no row here: the seal's
+ * commit callback writes it, with the pack's location and sizes, in the
+ * transaction that records the pack. This wrote a 'staged' row first and
+ * the seal then upserted the same row, two writes per object and the
+ * largest single statement count in a first backup (PERF.md, #7). The pool
+ * workers have always relied on the seal alone. Nothing between the two
+ * reads the staged row: a crash before the seal leaves no row, which is
+ * what the staged row was dropped back to anyway, and the file cache
+ * already refuses a hash with no row (store_index_put_staged).
+ *
+ * An object the repository already held is recorded as packed: an index
+ * that lost its row gets it back.
  */
 static status_t record_object(pipeline_t *p, const uint8_t hash[OBJECT_HASH_SIZE],
                               uint8_t type, uint64_t phys, uint64_t orig)
 {
-    return pack_backup_holds(p->pack_w, hash)
-        ? store_index_put_staged(p->db, p->repo_id, hash, type, phys, orig)
-        : store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
+    if (pack_backup_holds(p->pack_w, hash)) return OK;
+    return store_index_put_packed(p->db, p->repo_id, hash, type, phys, orig);
 }
 
 static status_t store_meta_blob(pipeline_t *p, uint8_t obj_type, const char *path,
@@ -527,9 +539,10 @@ static status_t bsink_flush(bsink_t *s, int own_txn)
     uint64_t _ti = phase_now();
     for (size_t i = 0; i < s->n && st == OK; i++) {
         const pending_row_t *r = &s->rows[i];
-        st = pack_backup_holds(s->pw, r->hash)
-            ? store_index_put_staged(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig)
-            : store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
+        /* Written once, by the seal, when it is in this writer's open pack:
+         * see record_object. */
+        if (pack_backup_holds(s->pw, r->hash)) continue;
+        st = store_index_put_packed(p->db, p->repo_id, r->hash, r->type, r->phys, r->orig);
     }
     phase_add(p->timers, PHASE_INDEX_PUT, _ti);
     if (own_txn) {
@@ -1197,10 +1210,28 @@ static status_t tree_put(void *ctx, uint32_t index, manifest_entry_t *entries,
     if (ms.objects_new) p->res->trees_new++;
     else                p->res->trees_reused++;
 
-    if (index != TREE_BUILD_ROOT) {
+    /*
+     * The tree's entry rows, unless the index already has them complete
+     * (docs/index-reuse.md). That is the whole of what an unchanged
+     * directory costs the index now: one lookup. They are written here, in
+     * the trees batch, rather than after the snapshot record, because the
+     * rows describe the tree and not the snapshot: a run that stops after
+     * this leaves complete trees no snapshot reaches, which the next backup
+     * reuses and gc sweeps otherwise. A batch commits only between trees,
+     * so a tree's rows and its completion mark land together.
+     */
+    uint64_t _tix = phase_now(), rows = 0;
+    st = node_index_put_tree(p->db, p->repo_id, out_hash, entries, count, 0, &rows);
+    phase_add_nested(p->timers, PHASE_INDEX_NODES, _tix);
+    if (st != OK) return st;
+    p->res->index_rows += rows;
+
+    if (index != TREE_BUILD_ROOT)
         p->links[index].hash_ready = 1;
-        batch_count(p, &p->batch);
-    }
+    /* Weighted by rows, so a batch of wide new directories still commits at
+     * about BATCH_ENTRIES statements. */
+    p->batch.since_commit += (uint32_t)(rows < UINT32_MAX / 2 ? rows : UINT32_MAX / 2);
+    batch_count(p, &p->batch);
     return OK;
 }
 
@@ -1257,12 +1288,6 @@ static status_t build_trees(pipeline_t *p, uint8_t root_hash[OBJECT_HASH_SIZE])
 /* ------------------------------------------------------------------ */
 /* Phase 3: snapshot record + index                                    */
 /* ------------------------------------------------------------------ */
-
-static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
-{
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) if (h[i]) return 0;
-    return 1;
-}
 
 static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
 {
@@ -1411,168 +1436,225 @@ static status_t write_snapshot_record(store_t *store, int64_t snap_id,
     return OK;
 }
 
-static status_t index_nodes(pipeline_t *p, int64_t snap_id)
+/*
+ * The snapshot's directory skeleton: one snap_dirs row per directory the
+ * snapshot reaches, the synthetic root included (docs/index-reuse.md).
+ *
+ * The entry rows were written with the trees, keyed by tree and shared with
+ * every other snapshot holding the same directory, so what is left is the
+ * part that belongs to this snapshot alone: each directory's own id, its
+ * parent, its name and its path. Linear in directories, not files.
+ *
+ * Committed in batches, as everything per-entry is: a lock held across a
+ * whole snapshot would block every tag, note and sources write behind it.
+ * The batches run under a recovery_state marker. The snapshots row and the
+ * marker's removal share the last transaction (record_snapshot_row), so a
+ * run that stops between them leaves a marker naming a partial skeleton,
+ * which the next backup of the repository drops (drop_partial_skeletons).
+ * The authoritative snapshot record is already in the repository by now,
+ * so nothing is lost that a reindex could not rebuild.
+ */
+#define SKELETON_BATCH 2000
+
+static void pending_key(int64_t snap_id, char *out, size_t outsz)
 {
+    snprintf(out, outsz, "index-pending-%lld", (long long)snap_id);
+}
+
+static status_t index_skeleton(pipeline_t *p, int64_t snap_id,
+                               const uint8_t root_hash[OBJECT_HASH_SIZE])
+{
+    uint32_t n = p->count;
+    uint32_t *parent = malloc((size_t)n * sizeof(*parent));
+    /* Per entry: 0 unknown, 1 reached from the root, 2 not. */
+    uint8_t  *reach  = calloc(n ? n : 1, 1);
+    int64_t  *dir_id = calloc(n ? n : 1, sizeof(*dir_id));
+    char    **path   = calloc(n ? n : 1, sizeof(*path));
+    if (!parent || !reach || !dir_id || !path) {
+        free(parent); free(reach); free(dir_id); free(path);
+        return set_error(ERR_NOMEM, "backup: directory skeleton");
+    }
+    status_t st = tree_build_parents(p->scan, parent);
+
+    /*
+     * Only directories whose chain reaches the root belong to the snapshot:
+     * tree_build gives every directory a tree, including one whose parent
+     * names nothing in the scan, but only the root's descendants are in the
+     * snapshot's graph, and only those can be found by walking it.
+     */
+    uint32_t ndirs = 0;
+    for (uint32_t i = 0; st == OK && i < n; i++) {
+        if (p->scan->entries[i].node.type != NODE_TYPE_DIR) continue;
+        /* Walk up to something already decided, then mark the chain. */
+        uint32_t cur = i, depth = 0;
+        uint8_t verdict = 0;
+        while (verdict == 0) {
+            if (reach[cur]) { verdict = reach[cur]; break; }
+            uint32_t up = parent[cur];
+            if (up == TREE_BUILD_ROOT) { verdict = 1; break; }
+            if (up == TREE_BUILD_NONE || ++depth > n) { verdict = 2; break; }
+            cur = up;
+        }
+        for (cur = i; reach[cur] == 0; ) {
+            reach[cur] = verdict;
+            uint32_t up = parent[cur];
+            if (up == TREE_BUILD_ROOT || up == TREE_BUILD_NONE) break;
+            cur = up;
+        }
+        if (verdict == 1 && p->links[i].hash_ready) ndirs++;
+    }
+
+    char key[64];
+    pending_key(snap_id, key, sizeof(key));
     char repo[32], snap[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)p->repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
-    /*
-     * Node ids are unique per repository, and there are two things that
-     * allocate them: this, from the scan's own numbering, and reindex, from
-     * MAX(id) in the table. They disagreed, and the insert below was INSERT
-     * OR REPLACE, so a backup after a reindex quietly overwrote an older
-     * snapshot's rows with its own - that snapshot kept nodes_materialized=1
-     * and had nothing left to browse or restore. The manifest trees were
-     * fine, so nothing was lost that a reindex could not rebuild, and nothing
-     * said a word.
-     *
-     * Starting past whatever the repository already holds makes the two
-     * agree. They are an index artifact: nothing in the repo refers to them,
-     * which is what lets the database be rebuilt without preserving them.
-     */
-    uint64_t id_base = 0;
-    {
-        db_result_t *r = NULL;
-        if (db_execute(p->db, "SELECT COALESCE(MAX(id), 0) FROM nodes WHERE repo_id = ?",
-                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-            id_base = strtoull(r->rows[0][0], NULL, 10);
-        db_result_free(r);
-    }
-
-    /*
-     * Committed in batches, for the same reason store_content is.
-     *
-     * This used to be one transaction spanning every node and its FTS row -
-     * 1.2M inserts on a 622,000-file tree, minutes of wall clock. That was
-     * survivable while writers raced, because a writer that could not begin
-     * failed instead of waiting. Now they queue behind the write lock, and a
-     * lock held for minutes would block every tag, note, policy and sources
-     * write for the length of a backup: a worse bug than the one it replaced.
-     *
-     * Splitting it is safe here. The authoritative snapshot record is already
-     * in the repository, written by write_snapshot_record before this runs,
-     * and the snapshots row that marks nodes_materialized is not inserted
-     * until every batch has landed. An interrupted run therefore leaves node
-     * rows that no snapshot claims - index garbage a reindex rebuilds, which
-     * is the state eviction already produces deliberately.
-     */
-    #define NODE_BATCH 2000
-    uint32_t since_commit = 0;
     p->timers->txn_site = PHASE_COMMIT_INDEX;
-    status_t bst = db_txn_begin(p->db);
-    if (bst != OK) return bst;
+    if (st == OK) st = db_txn_begin(p->db);
+    int in_txn = (st == OK);
 
-    for (uint32_t i = 0; i < p->count; i++) {
-        scan_entry_t *e = &p->scan->entries[i];
-        const char *name = basename_of(e->path);
+    /* Reserved inside the transaction: a statement outside one joins
+     * whatever another thread has open on the shared handle, and a
+     * reservation rolled back with someone else's work would hand the same
+     * ids out twice. */
+    int64_t base = 0;
+    if (st == OK) st = node_ids_reserve(p->db, (uint64_t)ndirs + 1, &base);
+    int64_t root_id = base;
 
-        char id[32], parent[32], mode[16], uid[16], gid[16], mtime[32], size[32];
-        /* Both offset, and together: parent_node_id refers to one of these
-         * ids. A root's parent stays 0, which is not an id. */
-        snprintf(id,     sizeof(id),     "%llu",
-                 (unsigned long long)(e->node.node_id + id_base));
-        snprintf(parent, sizeof(parent), "%llu",
-                 (unsigned long long)(p->links[i].parent_id
-                                      ? p->links[i].parent_id + id_base : 0));
-        snprintf(mode,   sizeof(mode),   "%u",   e->node.mode);
-        snprintf(uid,    sizeof(uid),    "%u",   e->node.uid);
-        snprintf(gid,    sizeof(gid),    "%u",   e->node.gid);
-        snprintf(mtime,  sizeof(mtime),  "%lld",
-                 (long long)time_to_ns(e->node.mtime_sec,
-                                       (int64_t)e->node.mtime_nsec));
-        snprintf(size,   sizeof(size),   "%llu", (unsigned long long)e->node.size);
+    /* Ids in scan order, so a parent's id is known whichever comes first. */
+    int64_t next = base + 1;
+    for (uint32_t i = 0; st == OK && i < n; i++)
+        if (p->scan->entries[i].node.type == NODE_TYPE_DIR && reach[i] == 1 &&
+            p->links[i].hash_ready)
+            dir_id[i] = next++;
+    if (st == OK && db_execute_non_query(p->db,
+            "INSERT OR REPLACE INTO recovery_state (repo_id, key, value) VALUES (?, ?, ?)",
+            (const char *[]){ repo, key, snap, NULL }, NULL) != 0)
+        st = set_error(ERR_IO, "backup: cannot mark the skeleton pending");
+    if (st == OK)
+        st = node_index_put_dir(p->db, p->repo_id, snap_id, root_id, 0, "", "", root_hash);
 
-        char chex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.content_hash, chex);
-        char shex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(p->links[i].tree_hash, shex);
-        char xhex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.xattr_hash, xhex);
-        char ahex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->node.acl_hash, ahex);
-        int is_dir = (e->node.type == NODE_TYPE_DIR);
-
-        char ntype[8];
-        snprintf(ntype, sizeof(ntype), "%u", e->node.type);
-
+    uint32_t since = 1;
+    for (uint32_t i = 0; st == OK && i < n; i++) {
+        if (dir_id[i] == 0) continue;
         /*
-         * One statement with every column bound, "" standing for absent and
-         * NULLIF turning it back into a real NULL in the row.
-         *
-         * The arity has to be fixed because the params array is
-         * NULL-terminated: a conditional NULL value silently truncates the
-         * list and unbinds every column after it. But the stored value has to
-         * be NULL rather than "", because queries elsewhere ask
-         * "content_hash IS NOT NULL" to mean "this node has content", and an
-         * empty string satisfies that while matching no object.
+         * Its path, from its parent's. Memoised, and a parent comes before
+         * its children in scan order, so this is normally one step; when it
+         * is not, the highest ancestor whose parent is known is built first
+         * and the loop goes round again. Every chain reaches the root
+         * (reach[] said so), so each round makes progress.
          */
-        const char *ltarget = e->symlink_target ? e->symlink_target : "";
-        /*
-         * Signed, deliberately. inode_identity is a 64-bit hash, so about
-         * half of all values exceed INT64_MAX; written as unsigned decimal
-         * SQLite cannot fit them in an INTEGER column and falls back to REAL,
-         * which loses precision and collapses distinct inodes onto the same
-         * value. Restoring then hardlinked unrelated files together. The bit
-         * pattern round-trips through int64 exactly, so signed is lossless.
-         */
-        char hgroup[32];
-        snprintf(hgroup, sizeof(hgroup), "%lld",
-                 (long long)e->node.inode_identity);
-
-        /* Union again: only a device node has a device pair. */
-        int is_dev = (e->node.type == NODE_TYPE_CHR || e->node.type == NODE_TYPE_BLK);
-        char dmaj[16], dmin[16];
-        snprintf(dmaj, sizeof(dmaj), "%u", is_dev ? e->node.device.major : 0u);
-        snprintf(dmin, sizeof(dmin), "%u", is_dev ? e->node.device.minor : 0u);
-
-        int rc = db_execute_non_query(p->db,
-                "INSERT INTO nodes"
-                " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-                "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-                "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-                "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
-                (const char *[]){ repo, id, snap, parent, name, ntype, mode, uid,
-                                  gid, mtime, size,
-                                  /* A symlink or device node has no content
-                                   * object, so its hash is zero. Storing that
-                                   * rather than NULL leaves a row claiming
-                                   * content that matches no object, which is
-                                   * exactly what an index consistency check
-                                   * is looking for. */
-                                  (is_dir || hash_is_zero(e->node.content_hash))
-                                      ? "" : chex,
-                                  is_dir ? shex : "",
-                                  ltarget, hgroup,
-                                  hash_is_zero(e->node.xattr_hash) ? "" : xhex,
-                                  hash_is_zero(e->node.acl_hash)   ? "" : ahex,
-                                  dmaj, dmin, NULL }, NULL);
-        if (rc != 0) {
-            db_txn_rollback(p->db);
-            return set_error(ERR_IO, "index_nodes: insert failed");
+        while (st == OK && !path[i]) {
+            uint32_t d = i;
+            while (parent[d] != TREE_BUILD_ROOT && !path[parent[d]]) d = parent[d];
+            uint32_t up = parent[d];
+            const char *pp = (up == TREE_BUILD_ROOT) ? "" : path[up];
+            if (asprintf(&path[d], "%s/%s", pp, basename_of(p->scan->entries[d].path)) < 0) {
+                path[d] = NULL;
+                st = set_error(ERR_NOMEM, "backup: directory path");
+            }
         }
+        if (st != OK) break;
 
-        if (db_execute_non_query(p->db,
-                "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
-                " VALUES (?, ?, ?, ?)",
-                (const char *[]){ name, id, snap, repo, NULL }, NULL) != 0) {
-            db_txn_rollback(p->db);
-            return set_error(ERR_IO, "index_nodes: fts insert failed");
-        }
-
-        if (++since_commit >= NODE_BATCH) {
-            status_t cst = db_txn_commit(p->db);
-            if (cst != OK) return cst;
-            since_commit = 0;
-            cst = db_txn_begin(p->db);
-            if (cst != OK) return cst;
+        uint32_t up = parent[i];
+        st = node_index_put_dir(p->db, p->repo_id, snap_id, dir_id[i],
+                                up == TREE_BUILD_ROOT ? root_id : dir_id[up],
+                                basename_of(p->scan->entries[i].path), path[i],
+                                p->links[i].tree_hash);
+        if (st == OK && ++since >= SKELETON_BATCH) {
+            since = 0;
+            in_txn = 0;
+            st = db_txn_commit(p->db);
+            if (st == OK) { st = db_txn_begin(p->db); in_txn = (st == OK); }
         }
     }
+    if (in_txn) {
+        if (st == OK) st = db_txn_commit(p->db);
+        else db_txn_rollback(p->db);
+    }
+    if (st == OK) p->res->index_dirs = (uint64_t)ndirs + 1;
 
-    #undef NODE_BATCH
-    return db_txn_commit(p->db);
+    for (uint32_t i = 0; i < n; i++) free(path[i]);
+    free(path);
+    free(dir_id);
+    free(reach);
+    free(parent);
+    return st;
+}
+
+/* The snapshots row, and the end of the skeleton's pending marker, at once. */
+static status_t record_snapshot_row(pipeline_t *p, int64_t snap_id, time_t now,
+                                    const uint8_t root_hash[OBJECT_HASH_SIZE])
+{
+    char key[64];
+    pending_key(snap_id, key, sizeof(key));
+    const char *label = p->opts->label ? p->opts->label : "";
+    db_param_t sp[] = {
+        DB_INT64(p->repo_id), DB_INT64(snap_id), DB_INT64((int64_t)now), DB_TEXT(label),
+        DB_INT64((int64_t)p->res->files), DB_INT64((int64_t)p->res->bytes_logical),
+        DB_INT64((int64_t)now), DB_HASH(root_hash),
+    };
+    db_param_t mp[] = { DB_INT64(p->repo_id), DB_TEXT(key) };
+    if (db_txn_begin(p->db) != OK) return set_error(ERR_IO, "backup_run: cannot begin");
+    if (db_execute_non_query_typed(p->db,
+            "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
+            " total_size, completed_at, root_tree_hash, nodes_materialized)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            sp, DB_NPARAMS(sp), NULL) != 0 ||
+        db_execute_non_query_typed(p->db,
+            "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+            mp, DB_NPARAMS(mp), NULL) != 0) {
+        db_txn_rollback(p->db);
+        return set_error(ERR_IO, "backup_run: cannot record snapshot");
+    }
+    if (db_txn_commit(p->db) != OK) return set_error(ERR_IO, "backup_run: cannot commit snapshot");
+    return OK;
+}
+
+/*
+ * Skeletons a stopped run left without their snapshots row. They name trees,
+ * so left alone they would keep those trees' rows alive for ever; the trees
+ * themselves stay (release 0), because this backup is about to need most of
+ * them, and gc sweeps any it does not.
+ */
+static status_t drop_partial_skeletons(cutils_db_t *db, int64_t repo_id)
+{
+    db_param_t p[] = { DB_INT64(repo_id) };
+    db_result_t *r = NULL;
+    if (db_execute_typed(db,
+            "SELECT key, value FROM recovery_state"
+            " WHERE repo_id = ? AND key LIKE 'index-pending-%'",
+            p, DB_NPARAMS(p), &r) != 0) {
+        db_result_free(r);
+        return set_error(ERR_IO, "backup: cannot read pending skeletons");
+    }
+    status_t st = OK;
+    for (int i = 0; r && i < r->nrows && st == OK; i++) {
+        int64_t snap = strtoll(r->rows[i][1], NULL, 10);
+        if (db_txn_begin(db) != OK) { st = set_error(ERR_IO, "backup: begin"); break; }
+        /* A snapshot with a row has a complete skeleton (a reindex rebuilt
+         * it since): only the marker goes. */
+        db_param_t sp[] = { DB_INT64(repo_id), DB_INT64(snap) };
+        db_result_t *e = NULL;
+        if (db_execute_typed(db, "SELECT 1 FROM snapshots WHERE repo_id = ? AND id = ?",
+                             sp, DB_NPARAMS(sp), &e) != 0 || !e)
+            st = set_error(ERR_IO, "backup: cannot check a pending skeleton");
+        int has_row = (st == OK && e) ? e->nrows > 0 : 0;
+        db_result_free(e);
+        if (st == OK && !has_row) st = node_index_drop_snapshot(db, repo_id, snap, 0);
+        db_param_t k[] = { DB_INT64(repo_id), DB_TEXT(r->rows[i][0]) };
+        if (st == OK && db_execute_non_query_typed(db,
+                "DELETE FROM recovery_state WHERE repo_id = ? AND key = ?",
+                k, DB_NPARAMS(k), NULL) != 0)
+            st = set_error(ERR_IO, "backup: cannot clear a pending skeleton");
+        if (st != OK) { db_txn_rollback(db); break; }
+        if (db_txn_commit(db) != OK) st = set_error(ERR_IO, "backup: commit");
+        else log_info("backup: dropped the partial index of interrupted snapshot %lld",
+                      (long long)snap);
+    }
+    db_result_free(r);
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1796,6 +1878,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * can be staging now. */
     uint64_t _tsu = phase_now(), _tsun = phase_nested(&timers);
     st = store_index_drop_staged(db, repo_id);
+    if (st == OK) st = drop_partial_skeletons(db, repo_id);
     if (st == OK) st = pack_backup_open(store, &p.pack_w);
     phase_add_excl(&timers, PHASE_SETUP, _tsu, _tsun);
     if (st != OK) { free(links); scan_result_free(scan); return st; }
@@ -1820,7 +1903,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
      * takes to finish - and for ever if it does not.
      *
      * This is also the last moment at which no transaction is open. Sealing
-     * emits the commit callback, which begins one, and index_nodes below
+     * emits the commit callback, which begins one, and index_skeleton below
      * holds one across each of its batches.
      */
     if (st == OK) {
@@ -1857,8 +1940,6 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     /* Snapshot ids are per repo and never reused (snapshot_id_seq). */
     uint64_t _tsr = phase_now(), _tsrn = phase_nested(&timers);
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     int64_t snap_id = 0;
     st = allocate_snapshot_id(db, store, repo_id, &snap_id);
 
@@ -1866,29 +1947,14 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     if (st == OK) st = write_snapshot_record(store, snap_id, root_hash, now, opts->label);
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
     uint64_t _tin = phase_now(), _tinn = phase_nested(&timers);
-    if (st == OK) st = index_nodes(&p, snap_id);
+    if (st == OK) st = index_skeleton(&p, snap_id, root_hash);
     timers.txn_site = 0;
     phase_add_excl(&timers, PHASE_INDEX_NODES, _tin, _tinn);
     clock_gettime(CLOCK_MONOTONIC, &t3);
 
     _tsr = phase_now();
     _tsrn = phase_nested(&timers);
-    if (st == OK) {
-        char snap[32], ts[32], files[32], bytes[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
-        snprintf(snap,  sizeof(snap),  "%lld", (long long)snap_id);
-        snprintf(ts,    sizeof(ts),    "%lld", (long long)now);
-        snprintf(files, sizeof(files), "%llu", (unsigned long long)res.files);
-        snprintf(bytes, sizeof(bytes), "%llu", (unsigned long long)res.bytes_logical);
-        hash_hex(root_hash, rhex);
-
-        if (db_execute_non_query(db,
-                "INSERT INTO snapshots (repo_id, id, ts, label, file_count,"
-                " total_size, completed_at, root_tree_hash, nodes_materialized)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
-                (const char *[]){ repo, snap, ts, opts->label ? opts->label : "",
-                                  files, bytes, ts, rhex, NULL }, NULL) != 0)
-            st = set_error(ERR_IO, "backup_run: cannot record snapshot");
-    }
+    if (st == OK) st = record_snapshot_row(&p, snap_id, now, root_hash);
     phase_add_excl(&timers, PHASE_SNAPSHOT, _tsr, _tsrn);
 
     /* Paths the scan no longer sees keep their cache rows otherwise, and the
@@ -1935,12 +2001,15 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
                  (double)(t3.tv_sec - t2.tv_sec) + (double)(t3.tv_nsec - t2.tv_nsec) / 1e9);
         phase_report(&timers, "backup", phase_now() - _tscan);
         log_info("backup: snapshot %lld, %llu files (%llu unchanged, not read), "
-                 "%llu new objects, %llu new trees, %llu reused",
+                 "%llu new objects, %llu new trees, %llu reused; "
+                 "index: %llu entry rows, %llu directories",
                  (long long)snap_id, (unsigned long long)res.files,
                  (unsigned long long)res.files_unchanged,
                  (unsigned long long)res.objects_new,
                  (unsigned long long)res.trees_new,
-                 (unsigned long long)res.trees_reused);
+                 (unsigned long long)res.trees_reused,
+                 (unsigned long long)res.index_rows,
+                 (unsigned long long)res.index_dirs);
         log_written(&res);
     }
     return st;

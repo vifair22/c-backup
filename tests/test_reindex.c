@@ -183,7 +183,8 @@ static void test_unreadable_snapshot_fails_the_run_and_keeps_its_rows(void **sta
     backup_once();
     write_file(TEST_SRC "/top.txt", "second version\n");
     backup_once();
-    long long nodes2 = scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 2");
+    long long nodes2 = scalar("SELECT COUNT(*) FROM snap_dirs d JOIN nodes n ON n.repo_id = d.repo_id"
+                            " AND n.tree_hash = d.tree_hash WHERE d.repo_id = ? AND d.snap_id = 2");
     assert_true(nodes2 > 0);
 
     /* Snapshot 2's record now names a tree that does not exist. */
@@ -199,7 +200,8 @@ static void test_unreadable_snapshot_fails_the_run_and_keeps_its_rows(void **sta
     assert_int_equal(rx.snapshots, 1);
     assert_int_equal(rx.snapshots_failed, 1);
 
-    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = 2"),
+    assert_int_equal(scalar("SELECT COUNT(*) FROM snap_dirs d JOIN nodes n ON n.repo_id = d.repo_id"
+                            " AND n.tree_hash = d.tree_hash WHERE d.repo_id = ? AND d.snap_id = 2"),
                      nodes2);
     assert_int_equal(scalar("SELECT COUNT(*) FROM snapshots WHERE repo_id = ?"), 2);
 }
@@ -308,7 +310,7 @@ static void gc_marked_refcounts(char *out, size_t outsz)
     assert_int_equal(g.swept, 0);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT group_concat(hash || ':' || refcount, ',') FROM"
+        "SELECT group_concat(lower(hex(hash)) || ':' || refcount, ',') FROM"
         " (SELECT hash, refcount FROM objects WHERE repo_id = ? ORDER BY hash)",
         (const char *[]){ repo, NULL }, &r), 0);
     snprintf(out, outsz, "%s", r->rows[0][0]);
@@ -347,7 +349,7 @@ static void test_reindex_counts_refs_and_gc_after_it_keeps_live_objects(void **s
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT group_concat(hash || ':' || refcount, ',') FROM"
+        "SELECT group_concat(lower(hex(hash)) || ':' || refcount, ',') FROM"
         " (SELECT hash, refcount FROM objects WHERE repo_id = ? ORDER BY hash)",
         (const char *[]){ repo, NULL }, &r), 0);
     assert_string_equal(r->rows[0][0], expect);

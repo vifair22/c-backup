@@ -4,15 +4,15 @@
  * Measures what a file browser costs the daemon while a user navigates a
  * snapshot: listing one directory level a page at a time, resolving a path
  * name by name, switching snapshots, and filename search. All of it is
- * answered from the nodes table and the node_fts trigram index, and none of
- * it reads the repository.
+ * answered from the node index (shared entry rows, each snapshot's
+ * directory skeleton, the node_fts trigram index), and none of it reads the
+ * repository.
  *
- * The queries are the routes' own SQL, copied from src/api/routes/snapshots.c
- * (list_tree, subpath_exists, search_nodes) and run through c-utils'
- * db_execute exactly as the routes run them. What is left out is the JSON
- * serialisation and the HTTP hop, and the ancestor walk search_nodes does to
- * turn each hit into a path. If those queries change, change them here too:
- * a benchmark of SQL the daemon no longer issues measures nothing.
+ * The queries are the routes' own SQL, from src/common/node_queries.h and
+ * node_index.c, which the routes (list_tree, subpath_exists, search_nodes)
+ * execute too. What is left out is the JSON serialisation and the HTTP hop;
+ * search_all_snaps_common_placed adds the lookup that places each match in
+ * its snapshots.
  *
  * The snapshot is a real one: a generated tree backed up with backup_run,
  * then backed up again unchanged so several snapshots are resident, the way
@@ -45,6 +45,9 @@
 #include <cutils/log.h>
 
 #include "backup.h"
+#include "node_index.h"
+#include "node_queries.h"
+#include "db_typed.h"
 
 #define FANOUT        40
 #define SMALL_ENTRIES 40
@@ -71,25 +74,29 @@ static uint64_t    g_sink;
 
 /* ---------- the routes' queries ---------- */
 
-/* list_tree in snapshots.c. Returns the row count, or -1. */
+/*
+ * list_tree in snapshots.c: the directory's tree from the snapshot's
+ * skeleton (parent 0 is the root), then one page of its entries. Returns
+ * the row count, or -1.
+ */
 static int q_list(cutils_db_t *db, int64_t snap, int64_t parent, int limit, int offset)
 {
-    char snap_s[32], par_s[32], lim[16], off[16];
-    snprintf(snap_s, sizeof(snap_s), "%lld", (long long)snap);
-    snprintf(par_s,  sizeof(par_s),  "%lld", (long long)parent);
-    snprintf(lim,    sizeof(lim),    "%d", limit);
-    snprintf(off,    sizeof(off),    "%d", offset);
+    int64_t dir = parent;
+    uint8_t tree[OBJECT_HASH_SIZE];
+    if (parent == 0) {
+        if (node_index_root(db, g_e.repo_id, snap, &dir, tree) != 1) return -1;
+    } else {
+        db_param_t dp[] = { DB_INT64(parent), DB_INT64(g_e.repo_id), DB_INT64(snap) };
+        db_result_t *pr = NULL;
+        int ok = db_execute_typed(db, NODE_SQL_DIR_IN_SNAP, dp, DB_NPARAMS(dp), &pr) == 0 &&
+                 pr && pr->nrows == 1 && node_hex_to_hash(pr->rows[0][0], tree) == 0;
+        db_result_free(pr);
+        if (!ok) return -1;
+    }
+    db_param_t lp[] = { DB_INT64(dir), DB_INT64(g_e.repo_id), DB_HASH(tree),
+                        DB_INT64(limit), DB_INT64(offset) };
     db_result_t *r = NULL;
-    if (db_execute(db,
-            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
-            "       mtime_ns % 1000000000, content_hash,"
-            "       EXISTS (SELECT 1 FROM nodes c"
-            "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id"
-            "                  AND c.parent_node_id = n.id)"
-            "  FROM nodes n"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?"
-            " ORDER BY n.name LIMIT ? OFFSET ?",
-            (const char *[]){ g_e.repo_id_s, snap_s, par_s, lim, off, NULL }, &r) != 0) {
+    if (db_execute_typed(db, NODE_SQL_LIST_DIR, lp, DB_NPARAMS(lp), &r) != 0) {
         db_result_free(r);
         return -1;
     }
@@ -100,89 +107,55 @@ static int q_list(cutils_db_t *db, int64_t snap, int64_t parent, int limit, int 
 }
 
 /*
- * subpath_exists in snapshots.c, returning the node it reaches: one indexed
- * lookup per path component, from the snapshot root (parent 0) down. 0 when
- * the path is not in the snapshot.
+ * subpath_exists in snapshots.c, returning the node it reaches (a
+ * directory's own id, or a file's entry id): one indexed lookup per path
+ * component. 0 when the path is not in the snapshot.
  */
 static int64_t q_resolve(int64_t snap, const char *path)
 {
-    char snap_s[32], parent[32] = "0";
-    snprintf(snap_s, sizeof(snap_s), "%lld", (long long)snap);
-    const char *p = path;
-    while (*p) {
-        while (*p == '/') p++;
-        if (!*p) break;
-        const char *s = p;
-        while (*p && *p != '/') p++;
-        char name[NAME_MAX + 1];
-        size_t n = (size_t)(p - s);
-        if (n > NAME_MAX) return 0;
-        memcpy(name, s, n);
-        name[n] = '\0';
-
-        db_result_t *r = NULL;
-        if (db_execute(g_e.db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
-                (const char *[]){ g_e.repo_id_s, snap_s, parent, name, NULL }, &r) != 0 ||
-            !r || r->nrows < 1) {
-            db_result_free(r);
-            return 0;
-        }
-        snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
-        db_result_free(r);
-    }
-    return strtoll(parent, NULL, 10);
+    node_ref_t ref;
+    if (node_index_resolve(g_e.db, g_e.repo_id, snap, path, &ref) != 1) return 0;
+    return ref.is_dir ? ref.dir_id : ref.node_id;
 }
 
-/* search_nodes in snapshots.c: the query, quoted as fts_quote does, with its
- * scan limit. snap 0 searches every snapshot. Returns rows read, or -1. */
-static int q_search(int64_t snap, const char *needle)
+/*
+ * search_nodes in snapshots.c: the query, quoted as fts_quote does, with its
+ * scan limit. snap 0 searches every snapshot. With place set, each row read
+ * is also placed in the snapshots holding it, the lookup the all-snapshot
+ * route makes per distinct tree. Returns rows read, or -1.
+ */
+static int q_search(int64_t snap, const char *needle, int place)
 {
-    char mq[256], lim[16], snap_s[32];
+    char mq[256];
     snprintf(mq, sizeof(mq), "\"%s\"", needle);
-    snprintf(lim, sizeof(lim), "%d", snap ? PAGE : PAGE * SEARCH_SCAN_FACTOR);
-    snprintf(snap_s, sizeof(snap_s), "%lld", (long long)snap);
-    const char *repo = g_e.repo_id_s;
-    /* snapshot_in_older_half, as the route decides it. */
-    int oldest_first = 0;
-    if (snap) {
-        db_result_t *h = NULL;
-        if (db_execute(g_e.db,
-                "SELECT (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id > ?)"
-                "     > (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id < ?)",
-                (const char *[]){ repo, snap_s, repo, snap_s, NULL }, &h) == 0 &&
-            h && h->nrows == 1)
-            oldest_first = strcmp(h->rows[0][0], "1") == 0;
-        db_result_free(h);
-    }
+    int64_t lim = snap ? PAGE : PAGE * SEARCH_SCAN_FACTOR;
     db_result_t *r = NULL;
-    int rc = snap
-        ? db_execute(g_e.db, oldest_first
-            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid ASC LIMIT ?"
-            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid DESC LIMIT ?",
-            (const char *[]){ repo, repo, mq, snap_s, lim, NULL }, &r)
-        : db_execute(g_e.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ?"
-            " ORDER BY f.rowid DESC LIMIT ?",
-            (const char *[]){ repo, repo, mq, lim, NULL }, &r);
+    int rc;
+    if (snap) {
+        db_param_t p[] = { DB_INT64(snap), DB_INT64(g_e.repo_id), DB_TEXT(mq),
+                           DB_INT64(g_e.repo_id), DB_INT64(lim) };
+        rc = db_execute_typed(g_e.db, NODE_SQL_SEARCH_SNAP, p, DB_NPARAMS(p), &r);
+    } else {
+        db_param_t p[] = { DB_INT64(g_e.repo_id), DB_TEXT(mq), DB_INT64(g_e.repo_id),
+                           DB_INT64(lim) };
+        rc = db_execute_typed(g_e.db, NODE_SQL_SEARCH_ALL, p, DB_NPARAMS(p), &r);
+    }
     if (rc != 0) { db_result_free(r); return -1; }
     int n = r ? r->nrows : 0;
+    if (place && !snap) {
+        const char *held = NULL;
+        for (int i = 0; i < n; i++) {
+            if (held && strcmp(held, r->rows[i][5]) == 0) continue;
+            held = r->rows[i][5];
+            uint8_t th[OBJECT_HASH_SIZE];
+            if (node_hex_to_hash(held, th) != 0) continue;
+            db_param_t hp[] = { DB_INT64(g_e.repo_id), DB_HASH(th) };
+            db_result_t *h = NULL;
+            if (db_execute_typed(g_e.db, NODE_SQL_HOLDERS, hp, DB_NPARAMS(hp), &h) == 0 && h)
+                g_sink += (uint64_t)h->nrows;
+            db_result_free(h);
+        }
+    }
     db_result_free(r);
     return n;
 }
@@ -293,12 +266,13 @@ static int build(void)
     char last[32];
     snprintf(last, sizeof(last), "%lld", (long long)g_snap_last);
     int64_t rows  = scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ?", NULL);
-    int64_t per   = scalar("SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND snap_id = ?", last);
+    int64_t per   = scalar("SELECT COUNT(*) FROM snap_dirs WHERE repo_id = ? AND snap_id = ?", last);
     char dbp[4096];
     snprintf(dbp, sizeof(dbp), "%s/state.db", g_o.work);
     struct stat sb;
     double db_mib = stat(dbp, &sb) == 0 ? (double)sb.st_size / (1024.0 * 1024.0) : 0.0;
-    printf("  %" PRIu64 " snapshot(s) in %.2fs: %lld node rows, %lld per snapshot, "
+    printf("  %" PRIu64 " snapshot(s) in %.2fs: %lld entry rows (shared), "
+           "%lld directory rows per snapshot, "
            "state.db %.1f MiB (excluding WAL)\n",
            g_o.snaps, bench_now() - t0, (long long)rows, (long long)per, db_mib);
     return 0;
@@ -445,18 +419,26 @@ static void b_switch(void)
 static void b_search(const char *name, int64_t snap, const char *needle)
 {
     int n = 0;
-    TIME_OP(name, n = q_search(snap, needle));
+    TIME_OP(name, n = q_search(snap, needle, 0));
     printf("      (\"%s\", %d rows read)\n", needle, n);
 }
 
 static void b_search_rare_one(void)   { b_search("search_one_snap_rare",   g_snap_last, "probe_017"); }
 static void b_search_common_one(void) { b_search("search_one_snap_common", g_snap_last, "file_"); }
-/* The same query against the oldest snapshot. The snapshot filter is on the
- * joined nodes row, not in the index, so FTS hands back matches from every
- * snapshot in rowid order and the newest is reached last. */
+/* The same query against the oldest snapshot. Entry rows are shared, so the
+ * match reads distinct entries whichever snapshot is asked for; this used to
+ * walk every newer snapshot's matches first. */
 static void b_search_common_old(void) { b_search("search_one_snap_common_oldest", g_snap_first, "file_"); }
 static void b_search_rare_all(void)   { b_search("search_all_snaps_rare",  0, "probe_017"); }
 static void b_search_common_all(void) { b_search("search_all_snaps_common", 0, "file_"); }
+/* The all-snapshot search with each row placed in its snapshots, which the
+ * route does per distinct tree and the ancestor walk used to do per hit. */
+static void b_search_common_all_placed(void)
+{
+    int n = 0;
+    TIME_OP("search_all_snaps_common_placed", n = q_search(0, "file_", 1));
+    printf("      (\"file_\", %d rows read and placed)\n", n);
+}
 
 static const bench_t g_benches[] = {
     { "cold_open_first_listing",       b_cold_open },
@@ -473,6 +455,7 @@ static const bench_t g_benches[] = {
     { "search_one_snap_common_oldest", b_search_common_old },
     { "search_all_snaps_rare",         b_search_rare_all },
     { "search_all_snaps_common",       b_search_common_all },
+    { "search_all_snaps_common_placed", b_search_common_all_placed },
 };
 #define N_BENCHES (sizeof(g_benches) / sizeof(g_benches[0]))
 

@@ -8,6 +8,7 @@
 #include "chunklist.h"
 #include "read_budget.h"
 #include "util.h"
+#include "db_typed.h"
 
 #include <cutils/log.h>
 
@@ -814,17 +815,42 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
      * Directories first, then everything else. A file cannot be written
      * before its directory exists, and ordering by type is cheaper than
      * sorting by depth or creating parents ad hoc per file.
+     *
+     * The snapshot is its directory skeleton joined to the shared entry rows
+     * of each directory's tree (docs/index-reuse.md). A directory's row is
+     * its skeleton id with its metadata from the entry in its parent's tree;
+     * everything else is an entry of the tree its directory holds. Parents
+     * are skeleton ids, unique within the snapshot, and a directory at the
+     * top has parent 0, as the path table expects. An entry id can repeat
+     * (two identical directories share their rows) but nothing looks an
+     * entry up by its id: only directories are parents.
      */
     db_result_t *r = NULL;
-    if (db_execute(db,
-            "SELECT id, name, mode, uid, gid, mtime_ns, size, content_hash, type,"
-            "       COALESCE(link_target,''), COALESCE(hardlink_group_id, 0),"
-            "       COALESCE(xattr_hash,''), COALESCE(acl_hash,''),"
-            "       COALESCE(dev_major, 0), COALESCE(dev_minor, 0),"
-            "       COALESCE(parent_node_id, 0)"
-            "  FROM nodes WHERE repo_id = ? AND snap_id = ?"
-            " ORDER BY CASE WHEN type = 2 THEN 0 ELSE 1 END, id",
-            (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
+    db_param_t rp[] = { DB_INT64(repo_id), DB_INT64(snap_id) };
+    if (db_execute_typed(db,
+            "SELECT d.id AS nid, d.name, n.mode, n.uid, n.gid, n.mtime_ns, n.size,"
+            "       lower(hex(n.content_hash)), n.type,"
+            "       COALESCE(n.link_target,''), COALESCE(n.hardlink_group_id, 0),"
+            "       lower(hex(n.xattr_hash)), lower(hex(n.acl_hash)),"
+            "       n.dev_major, n.dev_minor,"
+            "       CASE WHEN p.parent_id = 0 THEN 0 ELSE p.id END, 0 AS ord"
+            "  FROM snap_dirs d"
+            "  JOIN snap_dirs p ON p.id = d.parent_id"
+            "  JOIN nodes n ON n.repo_id = d.repo_id AND n.tree_hash = p.tree_hash"
+            "              AND n.name = d.name"
+            " WHERE d.repo_id = ?1 AND d.snap_id = ?2"
+            " UNION ALL"
+            " SELECT n.id, n.name, n.mode, n.uid, n.gid, n.mtime_ns, n.size,"
+            "       lower(hex(n.content_hash)), n.type,"
+            "       COALESCE(n.link_target,''), COALESCE(n.hardlink_group_id, 0),"
+            "       lower(hex(n.xattr_hash)), lower(hex(n.acl_hash)),"
+            "       n.dev_major, n.dev_minor,"
+            "       CASE WHEN d.parent_id = 0 THEN 0 ELSE d.id END, 1"
+            "  FROM snap_dirs d"
+            "  JOIN nodes n ON n.repo_id = d.repo_id AND n.tree_hash = d.tree_hash"
+            " WHERE d.repo_id = ?1 AND d.snap_id = ?2 AND n.type <> 2"
+            " ORDER BY ord, nid",
+            rp, DB_NPARAMS(rp), &r) != 0 || !r) {
         db_result_free(r);
         return set_error(ERR_IO, "restore: cannot read snapshot nodes");
     }

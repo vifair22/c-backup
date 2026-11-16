@@ -6,6 +6,85 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Index reuse: node rows keyed by tree, written once (#3, NIT-12, #7)
+
+Every snapshot used to write a `nodes` row and a `node_fts` row for every
+entry it held, changed or not, so the index cost a no-change incremental
+4.4 s of 5.9 s while every tree was reused. Entry rows are now keyed by tree
+hash and shared by every snapshot holding the tree; a snapshot adds only its
+directory skeleton (`snap_dirs`, one row per directory). Design, cost model
+and the options weighed: `docs/index-reuse.md`. In the same change, every
+hash column holds a raw 32-byte BLOB (it held 64 hex characters), and each
+object row is written once, at its pack's seal (it was written staged, then
+upserted at the seal).
+
+Branch `feat/v3-index-reuse` on `feat/v3-cdc` 4269bc1, `bench_phases -n
+100000 -l 0 -t 0` (100,000 files of 2-6 KiB, 1,008 directories, restore
+included), NVMe (`~/.cache`, btrfs on LVM on LUKS), page cache warm, every
+run in `bench.slice` at nice 19. Median of three, all three in brackets.
+c-utils is still 1.6.0: statements are prepared per call, so these numbers
+are before the statement cache and the pragmas measured by the many-small
+profile on `perf/many-small-profile`.
+
+| | Before | After |
+|---|---:|---:|
+| First backup | 12.61 s [12.36 12.61 13.77] | 9.17 s [8.96 9.17 9.17] |
+| No-change incremental | 5.29 s [5.24 5.29 5.89] | 1.58 s [1.58 1.58 1.59] |
+| Restore | 12.98 s [12.86 12.98 13.55] | 12.41 s [12.35 12.41 13.37] |
+| Incremental write_bytes (/proc/self/io) | 875 MiB | 0.9 MiB |
+| First backup write_bytes | 1,475 MiB | 836 MiB |
+
+The incremental profile (median run) is now cache-lookup 1.14 s (two
+SELECTs per file, untouched here), scan 0.25 s, trees 0.06 s, and the index
+0.02 s: 1,010 tree lookups, 1,009 skeleton rows, one commit. It wrote 0
+entry rows (`index_rows`, new in `backup_result_t`).
+
+In the first backup, index-put (the staged object rows) is gone, 1.66 s
+before; pack-seal fell from 1.75 s to 1.34 s because its upserts became
+inserts; index-nodes is 1.48 s, now spent in the trees phase as each new
+tree is indexed. The database writes 44% fewer bytes: one row per object
+instead of two, and 32-byte keys in every hash index instead of 64.
+
+`bench_browse` (100,000 bulk files, a 10,000-entry directory, 4 snapshots;
+the queries are the routes', now shared through `src/common/node_queries.h`).
+After: the listing and resolve rows are from a run after the two fixes
+below, the search rows from the run before them (the search queries did not
+change between the two):
+
+| | Before (us) | After (us) |
+|---|---:|---:|
+| index after 4 snapshots | 450,304 node rows, 232.8 MiB | 112,576 entry rows + 2,536 dir rows/snapshot, 93.6 MiB |
+| cold_open_first_listing | 223.5 | 235.4 |
+| list_snapshot_root | 22.8 | 23.8 |
+| expand_40child_dir | 55.3 | 50.1 |
+| expand_wide_first_page | 182.9 | 158.2 |
+| expand_wide_last_page | 456.6 | 433.3 |
+| expand_wide_all_pages | 16,325 | 15,130 |
+| resolve_path_deep (33 components) | 153.2 | 170.2 |
+| resolve_path_bulk_file | 46.6 | 58.2 |
+| snapshot_switch(resolve+list) | 97.9 | 97.4 |
+| search_one_snap_rare | 447.5 | 165.9 |
+| search_one_snap_common | 472.4 | 452.7 |
+| search_one_snap_common_oldest | 359.4 | 447.7 |
+| search_all_snaps_rare | 434.7 | 157.6 |
+| search_all_snaps_common | 2,367.5 | 2,082.9 |
+| search_all_snaps_common_placed (new) | - | 2,488.2 |
+
+Two regressions were found and fixed on the way, both in the first browse
+run: the directory page joined `snap_dirs` to map subdirectories to their
+ids, and SQLite probed that join for every row OFFSET skipped (last page
+1,267 us, all pages 37.6 ms); as a result-column subquery it runs only for
+returned rows. Path resolution looked up the entry row as well as the
+skeleton row for every directory component (314 us deep); a directory now
+costs one lookup. The resolve rows above are still slightly slower than
+before, because a path's last component is a file and costs two lookups,
+and the deep chain's skeleton rows are wider than the old node rows.
+`search_all_snaps_common_placed` adds what the old benchmark left out: each
+match placed in the snapshots holding it, one `snap_dirs_by_tree` lookup per
+distinct tree, which replaced the per-hit ancestor walk.
+
+---
+
 ## 2026-11-16 - Tree building is linear in entries (OWN-43)
 
 `build_one_tree` found a directory's children by scanning every scan entry,

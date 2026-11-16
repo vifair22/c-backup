@@ -621,7 +621,7 @@ static void damage_chunk_of(const char *name, int which)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = ?",
+        "SELECT lower(hex(content_hash)) FROM nodes WHERE repo_id = ? AND name = ?",
         (const char *[]){ repo, name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     uint8_t root[OBJECT_HASH_SIZE];

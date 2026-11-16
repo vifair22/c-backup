@@ -2,22 +2,13 @@
 
 #include "file_cache.h"
 #include "util.h"
+#include "db_typed.h"
 
 #include <cutils/log.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
-{
-    static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        out[i * 2]     = d[(h[i] >> 4) & 0xF];
-        out[i * 2 + 1] = d[h[i] & 0xF];
-    }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
-}
 
 static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 {
@@ -75,7 +66,7 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT dev, inode, size, mtime_ns, ctime_ns, content_hash"
+            "SELECT dev, inode, size, mtime_ns, ctime_ns, lower(hex(content_hash))"
             "  FROM file_cache WHERE repo_id = ? AND path = ?",
             (const char *[]){ repo, path, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
@@ -111,15 +102,18 @@ int file_cache_lookup(cutils_db_t *db, int64_t repo_id, const char *path,
      * Trusting the cache alone would write a snapshot referencing an object
      * that does not exist, and nothing would notice until a restore.
      */
+    uint8_t hb[OBJECT_HASH_SIZE];
+    hex_to_hash(hex, hb);
+    db_param_t op[] = { DB_TEXT(repo), DB_HASH(hb) };
     db_result_t *o = NULL;
-    int present = db_execute(db,
+    int present = db_execute_typed(db,
             "SELECT 1 FROM objects WHERE repo_id = ? AND hash = ?"
             " AND location <> 'staged'",
-            (const char *[]){ repo, hex, NULL }, &o) == 0 && o && o->nrows == 1;
+            op, DB_NPARAMS(op), &o) == 0 && o && o->nrows == 1;
     db_result_free(o);
     if (!present) return 0;
 
-    hex_to_hash(hex, out_hash);
+    memcpy(out_hash, hb, OBJECT_HASH_SIZE);
     return 1;
 }
 
@@ -128,9 +122,6 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
                     const uint8_t hash[OBJECT_HASH_SIZE], int64_t seen_at)
 {
     if (!db || !path || !st || !hash) return;
-
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_hex(hash, hex);
 
     char repo[32], dev[32], ino[32], size[32], mt[32], ct[32], seen[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
@@ -141,7 +132,10 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
     snprintf(ct,   sizeof(ct),   "%lld", (long long)ctime_ns_of(st));
     snprintf(seen, sizeof(seen), "%lld", (long long)seen_at);
 
-    if (db_execute_non_query(db,
+    db_param_t p[] = { DB_TEXT(repo), DB_TEXT(path), DB_TEXT(dev), DB_TEXT(ino),
+                       DB_TEXT(size), DB_TEXT(mt), DB_TEXT(ct), DB_HASH(hash),
+                       DB_TEXT(seen) };
+    if (db_execute_non_query_typed(db,
             "INSERT INTO file_cache"
             " (repo_id, path, dev, inode, size, mtime_ns, ctime_ns,"
             "  content_hash, seen_at)"
@@ -152,8 +146,7 @@ void file_cache_put(cutils_db_t *db, int64_t repo_id, const char *path,
             "   ctime_ns = excluded.ctime_ns,"
             "   content_hash = excluded.content_hash,"
             "   seen_at = excluded.seen_at",
-            (const char *[]){ repo, path, dev, ino, size, mt, ct, hex, seen, NULL },
-            NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         log_warn("file cache: cannot record %s", path);
 }
 

@@ -330,7 +330,7 @@ static void test_unreadable_object_is_named_in_the_warning(void **state)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT content_hash FROM nodes WHERE repo_id = ? AND name = 'top.txt'",
+        "SELECT lower(hex(content_hash)) FROM nodes WHERE repo_id = ? AND name = 'top.txt'",
         (const char *[]){ repo, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     char hex[OBJECT_HASH_SIZE * 2 + 1];
@@ -1038,20 +1038,11 @@ static void insert_device_node(int64_t snap_id, const char *name,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
 
-    /* Hang it off the scanned source directory. */
+    /* An entry of the scanned source directory's tree. */
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT id FROM nodes WHERE repo_id = ? AND snap_id = ? AND name = 'src'",
-        (const char *[]){ repo, snap, NULL }, &r), 0);
-    assert_int_equal(r->nrows, 1);
-    char parent[32];
-    snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
-    db_result_free(r);
-
-    r = NULL;
-    assert_int_equal(db_execute(db,
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM nodes WHERE repo_id = ?",
-        (const char *[]){ repo, NULL }, &r), 0);
+        "UPDATE node_id_seq SET last_id = last_id + 1 RETURNING last_id",
+        NULL, &r), 0);
     char id[32];
     snprintf(id, sizeof(id), "%s", r->rows[0][0]);
     db_result_free(r);
@@ -1063,10 +1054,12 @@ static void insert_device_node(int64_t snap_id, const char *name,
     snprintf(ntype, sizeof(ntype), "%u", NODE_TYPE_CHR);
 
     assert_int_equal(db_execute_non_query(db,
-        "INSERT INTO nodes (repo_id, id, snap_id, parent_node_id, name, type,"
+        "INSERT INTO nodes (repo_id, id, tree_hash, name, type,"
         " mode, uid, gid, mtime_ns, size, hardlink_group_id, dev_major, dev_minor)"
-        " VALUES (?, ?, ?, ?, ?, ?, 8630, 0, 0, 0, 0, 0, ?, ?)",
-        (const char *[]){ repo, id, snap, parent, name, ntype, maj, min, NULL },
+        " VALUES (?1, ?2, (SELECT tree_hash FROM snap_dirs WHERE repo_id = ?1"
+        "                   AND snap_id = ?3 AND name = 'src'),"
+        "         ?4, ?5, 8630, 0, 0, 0, 0, 0, ?6, ?7)",
+        (const char *[]){ repo, id, snap, name, ntype, maj, min, NULL },
         NULL), 0);
 }
 
@@ -1349,9 +1342,9 @@ static void src_subtree_hash(int64_t snap_id, char *out, size_t out_sz)
     snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT hex(n.subtree_hash) FROM nodes n"
-        " JOIN nodes p ON p.repo_id = n.repo_id AND p.id = n.parent_node_id"
-        " WHERE n.snap_id = ? AND n.name = 'src'"
+        "SELECT hex(d.tree_hash) FROM snap_dirs d"
+        " JOIN snap_dirs p ON p.id = d.parent_id"
+        " WHERE d.snap_id = ? AND d.name = 'src'"
         " AND p.name = 'c_backup_test_restore'",
         (const char *[]){ snap, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
@@ -1670,8 +1663,9 @@ static void test_reindex_handles_multiple_snapshots(void **state)
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     assert_int_equal(db_execute(db,
-        "SELECT COUNT(DISTINCT snap_id), COUNT(*), COUNT(DISTINCT id)"
-        " FROM nodes WHERE repo_id = ?",
+        "SELECT (SELECT COUNT(DISTINCT snap_id) FROM snap_dirs WHERE repo_id = ?1),"
+        "       COUNT(*), COUNT(DISTINCT id)"
+        " FROM nodes WHERE repo_id = ?1",
         (const char *[]){ repo, NULL }, &r), 0);
     assert_int_equal(atoi(r->rows[0][0]), 2);
     assert_int_equal(atoi(r->rows[0][1]), atoi(r->rows[0][2]));
@@ -1752,7 +1746,7 @@ static void whole_object_of(const char *name, char hex_out[OBJECT_HASH_SIZE * 2 
                                             w.phys_bytes, len), OK);
     object_hash_to_hex(hash, hex_out);
     assert_int_equal(db_execute_non_query(db,
-        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        "UPDATE nodes SET content_hash = unhex(?) WHERE name = ?",
         (const char *[]){ hex_out, name, NULL }, NULL), 0);
 }
 
@@ -1990,14 +1984,13 @@ static void test_file_entry_naming_a_tree_is_refused(void **state)
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
 
-    char repo[32], snap[32];
+    char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)br.snapshot_id);
     assert_int_equal(db_execute_non_query(db,
         "UPDATE nodes SET content_hash = (SELECT subtree_hash FROM nodes"
-        "  WHERE repo_id = ? AND snap_id = ? AND name = 'nested')"
-        " WHERE repo_id = ? AND snap_id = ? AND name = 'top.txt'",
-        (const char *[]){ repo, snap, repo, snap, NULL }, NULL), 0);
+        "  WHERE repo_id = ? AND name = 'nested' LIMIT 1)"
+        " WHERE repo_id = ? AND name = 'top.txt'",
+        (const char *[]){ repo, repo, NULL }, NULL), 0);
 
     captured_log[0] = '\0';
     int h = log_stream_register(capture_log, NULL);

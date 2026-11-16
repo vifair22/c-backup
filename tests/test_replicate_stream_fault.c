@@ -655,7 +655,7 @@ static void chunk_hash(const char *name, int which, uint8_t out[OBJECT_HASH_SIZE
                        uint64_t *len)
 {
     db_result_t *r = NULL;
-    assert_int_equal(db_execute(db, "SELECT content_hash FROM nodes WHERE name = ?",
+    assert_int_equal(db_execute(db, "SELECT lower(hex(content_hash)) FROM nodes WHERE name = ?",
                                 (const char *[]){ name, NULL }, &r), 0);
     assert_true(r->nrows >= 1);
     uint8_t root[OBJECT_HASH_SIZE];

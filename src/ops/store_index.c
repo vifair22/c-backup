@@ -4,6 +4,7 @@
 
 #include "pack.h"   /* PACK_VERSION: the format new packs are written in */
 #include "db_txn.h"
+#include "db_typed.h"
 
 #include <cutils/log.h>
 
@@ -16,20 +17,8 @@ struct store_index {
     int64_t      repo_id;
 };
 
-/* SQLite's C API takes blobs, but c-utils' db layer binds string parameters,
- * so hashes travel as lowercase hex and the schema's BLOB columns are written
- * through X'..' literals. Hex costs 64 bytes per hash instead of 32; the
- * alternative is a second binding path through the whole db layer for one
- * column type. */
-static void hash_to_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
-{
-    static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        out[i * 2]     = d[(h[i] >> 4) & 0xF];
-        out[i * 2 + 1] = d[h[i] & 0xF];
-    }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
-}
+/* Hashes are bound as raw 32-byte BLOBs (db_typed.h): every hash column in
+ * the schema holds the raw name, never hex text (NIT-12). */
 
 /* ------------------------------------------------------------------ */
 /* locate: the engine's only way to find a packed object                */
@@ -39,20 +28,15 @@ static status_t db_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
                           store_location_t *out)
 {
     store_index_t *idx = user;
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_to_hex(hash, hex);
-
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)idx->repo_id);
-
+    db_param_t p[] = { DB_INT64(idx->repo_id), DB_HASH(hash) };
     db_result_t *r = NULL;
-    int rc = db_execute(idx->db,
+    int rc = db_execute_typed(idx->db,
         "SELECT po.pack_id, po.offset, po.comp_size, po.orig_size,"
         "       po.entry_index, p.version"
         "  FROM pack_objects po"
         "  JOIN packs p ON p.repo_id = po.repo_id AND p.id = po.pack_id"
         " WHERE po.repo_id = ? AND po.hash = ?",
-        (const char *[]){ repo, hex, NULL }, &r);
+        p, DB_NPARAMS(p), &r);
 
     if (rc != 0 || !r || r->nrows != 1) {
         db_result_free(r);
@@ -124,20 +108,16 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
         failed = 1;
 
     for (uint32_t i = 0; !failed && i < info->entry_count; i++) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_to_hex(info->entries[i].hash, hex);
-        char off[32], comp[32], orig[32], eidx[16];
-        snprintf(off,  sizeof(off),  "%llu", (unsigned long long)info->entries[i].offset);
-        snprintf(comp, sizeof(comp), "%llu", (unsigned long long)info->entries[i].comp_size);
-        snprintf(orig, sizeof(orig), "%llu", (unsigned long long)info->entries[i].orig_size);
-        snprintf(eidx, sizeof(eidx), "%u", info->entries[i].entry_index);
-
-        if (db_execute_non_query(idx->db,
+        const pack_commit_entry_t *en = &info->entries[i];
+        db_param_t pp[] = { DB_INT64(idx->repo_id), DB_HASH(en->hash),
+                            DB_INT64((int64_t)info->pack_id), DB_INT64((int64_t)en->offset),
+                            DB_INT64((int64_t)en->comp_size), DB_INT64((int64_t)en->orig_size),
+                            DB_INT64(en->entry_index) };
+        if (db_execute_non_query_typed(idx->db,
                 "INSERT OR REPLACE INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ repo, hex, pack, off, comp, orig, eidx, NULL },
-                NULL) != 0)
+                pp, DB_NPARAMS(pp), NULL) != 0)
             failed = 1;
 
         /*
@@ -154,15 +134,16 @@ static void db_pack_commit(void *user, const pack_commit_info_t *info)
          * against its own seal (a backup's file workers record no rows of
          * their own). An existing row keeps its type and refcount.
          */
-        char t[8];
-        snprintf(t, sizeof(t), "%u", info->entries[i].type);
-        if (!failed && db_execute_non_query(idx->db,
+        db_param_t op[] = { DB_INT64(idx->repo_id), DB_HASH(en->hash),
+                            DB_INT64((int64_t)en->comp_size), DB_INT64((int64_t)en->orig_size),
+                            DB_TEXT(pack), DB_INT64(en->type) };
+        if (!failed && db_execute_non_query_typed(idx->db,
                 "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
                 "                     location, type)"
                 " VALUES (?, ?, 0, ?, ?, ?, ?)"
                 " ON CONFLICT(repo_id, hash) DO UPDATE SET location = excluded.location,"
                 "   phys_size = excluded.phys_size, orig_size = excluded.orig_size",
-                (const char *[]){ repo, hex, comp, orig, pack, t, NULL }, NULL) != 0)
+                op, DB_NPARAMS(op), NULL) != 0)
             failed = 1;
     }
 
@@ -264,18 +245,14 @@ status_t store_index_put_packed(cutils_db_t *db, int64_t repo_id,
      * it recorded them; the caller's figures describe nothing new. */
     (void)phys_size;
     (void)orig_size;
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_to_hex(hash, hex);
-    char repo[32], t[8];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(t, sizeof(t), "%u", type);
-    if (db_execute_non_query(db,
+    db_param_t p[] = { DB_INT64(type), DB_INT64(repo_id), DB_HASH(hash) };
+    if (db_execute_non_query_typed(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " SELECT repo_id, hash, 0, comp_size, orig_size, CAST(pack_id AS TEXT), ?"
             " FROM pack_objects WHERE repo_id = ? AND hash = ?"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
-            (const char *[]){ t, repo, hex, NULL }, NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         return set_error(ERR_IO, "cannot record object");
     return OK;
 }
@@ -305,13 +282,8 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
                            uint64_t phys_size, uint64_t orig_size,
                            const char *location)
 {
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_to_hex(hash, hex);
-    char repo[32], phys[32], orig[32], t[8];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(phys, sizeof(phys), "%llu", (unsigned long long)phys_size);
-    snprintf(orig, sizeof(orig), "%llu", (unsigned long long)orig_size);
-    snprintf(t,    sizeof(t),    "%u",   type);
+    db_param_t p[] = { DB_INT64(repo_id), DB_HASH(hash), DB_INT64((int64_t)phys_size),
+                       DB_INT64((int64_t)orig_size), DB_TEXT(location), DB_INT64(type) };
 
     /*
      * Content-addressed: seeing the same hash twice is dedup working, not an
@@ -323,14 +295,14 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
      * real size when it is offered repairs those rows on the next backup
      * that meets them, and cannot touch a correct one.
      */
-    if (db_execute_non_query(db,
+    if (db_execute_non_query_typed(db,
             "INSERT INTO objects (repo_id, hash, refcount, phys_size, orig_size,"
             "                     location, type)"
             " VALUES (?, ?, 0, ?, ?, ?, ?)"
             " ON CONFLICT(repo_id, hash) DO UPDATE SET phys_size = excluded.phys_size"
             " WHERE objects.phys_size = 0 AND excluded.phys_size > 0"
             "   AND objects.location = excluded.location",
-            (const char *[]){ repo, hex, phys, orig, location, t, NULL }, NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         return set_error(ERR_IO, "cannot record object");
     return OK;
 }
@@ -338,15 +310,11 @@ static status_t put_object(cutils_db_t *db, int64_t repo_id,
 status_t store_index_addref(cutils_db_t *db, int64_t repo_id,
                             const uint8_t hash[OBJECT_HASH_SIZE])
 {
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_to_hex(hash, hex);
-    char repo[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-
-    if (db_execute_non_query(db,
+    db_param_t p[] = { DB_INT64(repo_id), DB_HASH(hash) };
+    if (db_execute_non_query_typed(db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ?",
-            (const char *[]){ repo, hex, NULL }, NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         return set_error(ERR_IO, "cannot addref object");
     return OK;
 }

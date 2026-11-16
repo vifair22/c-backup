@@ -9,6 +9,8 @@
 #include "object.h"
 #include "pack.h"
 #include "db_txn.h"
+#include "db_typed.h"
+#include "node_index.h"
 #include "repo_tags.h"
 #include "snap_record.h"
 #include "snapshot_ids.h"
@@ -26,24 +28,104 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+ * Trees this run has rebuilt, so each distinct tree is read and indexed once
+ * however many snapshots hold it (docs/index-reuse.md). A snapshot that
+ * fails rolls its transaction back, and with it the rows of every tree it
+ * rebuilt, so those trees leave the memo too: `keys` holds them in insertion
+ * order and `committed` marks how many survived the last commit; the table
+ * is rebuilt from the survivors.
+ */
+typedef struct {
+    uint8_t  *keys;       /* n * OBJECT_HASH_SIZE, insertion order */
+    size_t    n, cap, committed;
+    uint32_t *slots;      /* index + 1 into keys, 0 empty */
+    uint32_t  mask;
+} tree_memo_t;
+
+static uint32_t memo_slot(const tree_memo_t *m, const uint8_t h[OBJECT_HASH_SIZE])
+{
+    uint32_t v;
+    memcpy(&v, h, sizeof(v));
+    return v & m->mask;
+}
+
+static int memo_has(const tree_memo_t *m, const uint8_t h[OBJECT_HASH_SIZE])
+{
+    if (!m->slots) return 0;
+    for (uint32_t i = memo_slot(m, h); m->slots[i]; i = (i + 1) & m->mask)
+        if (memcmp(m->keys + (size_t)(m->slots[i] - 1) * OBJECT_HASH_SIZE, h,
+                   OBJECT_HASH_SIZE) == 0)
+            return 1;
+    return 0;
+}
+
+static int memo_rehash(tree_memo_t *m, uint32_t want)
+{
+    uint32_t cap = 64;
+    while (cap < want * 2) cap <<= 1;
+    uint32_t *s = calloc(cap, sizeof(*s));
+    if (!s) return -1;
+    free(m->slots);
+    m->slots = s;
+    m->mask = cap - 1;
+    for (size_t k = 0; k < m->n; k++) {
+        uint32_t i = memo_slot(m, m->keys + k * OBJECT_HASH_SIZE);
+        while (m->slots[i]) i = (i + 1) & m->mask;
+        m->slots[i] = (uint32_t)k + 1;
+    }
+    return 0;
+}
+
+static int memo_add(tree_memo_t *m, const uint8_t h[OBJECT_HASH_SIZE])
+{
+    if (m->n == m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 256;
+        uint8_t *k = realloc(m->keys, nc * OBJECT_HASH_SIZE);
+        if (!k) return -1;
+        m->keys = k;
+        m->cap = nc;
+    }
+    memcpy(m->keys + m->n * OBJECT_HASH_SIZE, h, OBJECT_HASH_SIZE);
+    m->n++;
+    if (!m->slots || m->n * 2 > (size_t)m->mask + 1)
+        return memo_rehash(m, (uint32_t)m->n);
+    uint32_t i = memo_slot(m, h);
+    while (m->slots[i]) i = (i + 1) & m->mask;
+    m->slots[i] = (uint32_t)m->n;
+    return 0;
+}
+
+static void memo_commit(tree_memo_t *m) { m->committed = m->n; }
+
+static void memo_rollback(tree_memo_t *m)
+{
+    if (m->n == m->committed) return;
+    m->n = m->committed;
+    if (memo_rehash(m, (uint32_t)(m->n ? m->n : 1)) != 0) {
+        /* Without a table nothing is remembered, which costs a reread of
+         * trees already rebuilt and is never wrong. */
+        free(m->slots);
+        m->slots = NULL;
+        m->n = m->committed = 0;
+    }
+}
+
+static void memo_free(tree_memo_t *m)
+{
+    free(m->keys);
+    free(m->slots);
+    memset(m, 0, sizeof(*m));
+}
+
 typedef struct {
     store_t     *store;
     cutils_db_t *db;
     int64_t      repo_id;
     int64_t      snap_id;
-    int64_t      next_node_id;
     reindex_result_t *res;
+    tree_memo_t *memo;
 } reindex_ctx_t;
-
-static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
-{
-    static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        out[i * 2]     = d[(h[i] >> 4) & 0xF];
-        out[i * 2 + 1] = d[h[i] & 0xF];
-    }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
-}
 
 static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 {
@@ -64,14 +146,6 @@ static int hash_is_zero(const uint8_t h[OBJECT_HASH_SIZE])
 }
 
 /*
- * Depth-first walk of one tree, inserting a node row per entry.
- *
- * Node ids are minted fresh here. Nothing in the repository refers to them,
- * which is precisely what allows the index to be thrown away and rebuilt:
- * had they been written into the trees, a rebuild would have to preserve
- * them and the trees would stop being content-addressable.
- */
-/*
  * Record an object in the registry.
  *
  * Sizes are deliberately left NULL here and filled in one pass afterwards.
@@ -90,17 +164,12 @@ static status_t note_object(reindex_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
 {
     if (hash_is_zero(hash)) return OK;
 
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_hex(hash, hex);
-    char repo[32], t[8];
-    snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
-    snprintf(t, sizeof(t), "%u", type);
-
-    if (db_execute_non_query(ctx->db,
+    db_param_t p[] = { DB_INT64(ctx->repo_id), DB_HASH(hash), DB_INT64(type) };
+    if (db_execute_non_query_typed(ctx->db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
             " VALUES (?, ?, 0, 'absent', ?)"
             " ON CONFLICT(repo_id, hash) DO NOTHING",
-            (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         return set_error(ERR_IO, "reindex: cannot record object");
 
     ctx->res->objects++;
@@ -121,15 +190,34 @@ static void note_dir_object(void *arg, const uint8_t hash[OBJECT_HASH_SIZE], uin
     if (d->st == OK) d->st = note_object(d->ctx, hash, type);
 }
 
-static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
-                          int64_t parent_node_id)
+/* A subdirectory to descend into: its name and tree. */
+typedef struct {
+    char    *name;
+    uint8_t  tree[OBJECT_HASH_SIZE];
+} subdir_t;
+
+static void subdirs_free(subdir_t *s, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) free(s[i].name);
+    free(s);
+}
+
+/*
+ * Read one tree from the repository, record every object it names, and
+ * rebuild its entry rows. Returns its subdirectories and file totals.
+ *
+ * Node ids are minted fresh. Nothing in the repository refers to them,
+ * which is precisely what allows the index to be thrown away and rebuilt:
+ * had they been written into the trees, a rebuild would have to preserve
+ * them and the trees would stop being content-addressable.
+ */
+static status_t rebuild_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
+                             subdir_t **out_dirs, uint32_t *out_ndirs)
 {
     /*
      * The directory's objects are recorded as the iterator loads them. The
      * tree is an object too, and nothing else will record it: no entry
      * points at its own directory. Miss it and GC sweeps the manifest.
-     * The entries themselves are read whole: every one becomes a node row
-     * in the transaction this walk runs in anyway.
      */
     dir_note_t dn = { ctx, OK };
     obj_loader_t ld = obj_loader_store(ctx->store);
@@ -165,116 +253,128 @@ static status_t walk_tree(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HAS
     if (st != OK) { manifest_free_entries(entries, count); return st; }
     ctx->res->trees_read++;
 
-    char repo[32], snap[32], parent[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)ctx->repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)ctx->snap_id);
-    snprintf(parent, sizeof(parent), "%lld", (long long)parent_node_id);
+    /* Rebuilt, not trusted: whatever rows the index held for this tree are
+     * replaced by what the repository says. */
+    uint64_t rows = 0;
+    st = node_index_put_tree(ctx->db, ctx->repo_id, tree_hash, entries, count, 1, &rows);
+    ctx->res->nodes += rows;
 
+    subdir_t *dirs = NULL;
+    uint32_t ndirs = 0;
     for (uint32_t i = 0; i < count && st == OK; i++) {
         manifest_entry_t *e = &entries[i];
-        int64_t node_id = ctx->next_node_id++;
-
-        char id[32], mode[16], uid[16], gid[16], mtime[32], size[32];
-        snprintf(id,    sizeof(id),    "%lld", (long long)node_id);
-        snprintf(mode,  sizeof(mode),  "%u", e->mode);
-        snprintf(uid,   sizeof(uid),   "%u", e->uid);
-        snprintf(gid,   sizeof(gid),   "%u", e->gid);
-        snprintf(mtime, sizeof(mtime), "%lld",
-                 (long long)time_to_ns(e->mtime_sec, (int64_t)e->mtime_nsec));
-        snprintf(size,  sizeof(size),  "%llu", (unsigned long long)e->size);
-
         int is_dir = (e->type == NODE_TYPE_DIR);
-        char thex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->target_hash, thex);
         int have_target = !hash_is_zero(e->target_hash);
 
-        char ntype[8];
-        snprintf(ntype, sizeof(ntype), "%u", e->type);
-
-        /*
-         * One statement with every column bound, "" for absent, matching the
-         * backup path. A NULL in the params array is a terminator rather than
-         * a value, so a conditional NULL silently unbinds every column after
-         * it.
-         *
-         * NULLIF keeps absent columns genuinely NULL while the parameter
-         * list stays a fixed length, since a NULL parameter would terminate
-         * the array rather than bind a value.
-         *
-         * link_target and hardlink_group_id are the reason a repository can
-         * outlive its index: the trees have always carried them, so a rebuild
-         * restores symlinks and hardlink identity that the index never had.
-         */
-        /* Signed for the same reason as the backup path: an unsigned
-         * 64-bit hash does not fit SQLite's INTEGER and degrades to REAL. */
-        char hgroup[32];
-        snprintf(hgroup, sizeof(hgroup), "%lld",
-                 (long long)e->inode_identity);
-        const char *ltarget = e->link_target ? e->link_target : "";
-
-        char xhex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->xattr_hash, xhex);
-        char ahex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(e->acl_hash, ahex);
-
-        char dmaj[16], dmin[16];
-        snprintf(dmaj, sizeof(dmaj), "%u", e->dev_major);
-        snprintf(dmin, sizeof(dmin), "%u", e->dev_minor);
-
-        int rc = db_execute_non_query(ctx->db,
-            "INSERT OR REPLACE INTO nodes"
-            " (repo_id, id, snap_id, parent_node_id, name, type, mode, uid,"
-            "  gid, mtime_ns, size, content_hash, subtree_hash, link_target,"
-            "  hardlink_group_id, xattr_hash, acl_hash, dev_major, dev_minor)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            "         NULLIF(?,''), NULLIF(?,''), NULLIF(?,''), ?,"
-            "         NULLIF(?,''), NULLIF(?,''), ?, ?)",
-            (const char *[]){ repo, id, snap, parent, e->name, ntype, mode,
-                              uid, gid, mtime, size,
-                              (have_target && !is_dir) ? thex : "",
-                              (have_target && is_dir) ? thex : "",
-                              ltarget, hgroup,
-                              hash_is_zero(e->xattr_hash) ? "" : xhex,
-                              hash_is_zero(e->acl_hash)   ? "" : ahex,
-                              dmaj, dmin, NULL }, NULL);
-        if (rc != 0) {
-            st = set_error(ERR_IO, "reindex: cannot insert node");
-            break;
-        }
-
-        if (db_execute_non_query(ctx->db,
-                "INSERT INTO node_fts (name, node_id, snap_id, repo_id)"
-                " VALUES (?, ?, ?, ?)",
-                (const char *[]){ e->name, id, snap, repo, NULL }, NULL) != 0) {
-            st = set_error(ERR_IO, "reindex: cannot index name");
-            break;
-        }
-
-        ctx->res->nodes++;
-        if (e->type == NODE_TYPE_REG) {
-            ctx->res->files++;
-            /* What backup records as total_size: the logical size of every
-             * regular file. Left out, a rebuilt snapshot listed "size":"". */
-            ctx->res->bytes += e->size;
-        }
-
-        /* Subtree hashes are recorded by the recursion below, so only content
-         * needs noting here. */
-        if (have_target && !is_dir) {
-            st = note_object(ctx, e->target_hash, OBJECT_TYPE_FILE);
-            if (st != OK) break;
-        }
-        if (!hash_is_zero(e->xattr_hash))
+        /* Subtree objects are recorded when the subtree is read, so only
+         * content needs noting here. */
+        if (have_target && !is_dir) st = note_object(ctx, e->target_hash, OBJECT_TYPE_FILE);
+        if (st == OK && !hash_is_zero(e->xattr_hash))
             st = note_object(ctx, e->xattr_hash, OBJECT_TYPE_XATTR);
         if (st == OK && !hash_is_zero(e->acl_hash))
             st = note_object(ctx, e->acl_hash, OBJECT_TYPE_ACL);
-        if (st != OK) break;
+        if (st != OK || !is_dir || !have_target) continue;
 
-        if (is_dir && have_target)
-            st = walk_tree(ctx, e->target_hash, node_id);
+        if (!dirs) {
+            dirs = calloc(count, sizeof(*dirs));
+            if (!dirs) { st = set_error(ERR_NOMEM, "reindex: subdirectories"); break; }
+        }
+        dirs[ndirs].name = strdup(e->name);
+        memcpy(dirs[ndirs].tree, e->target_hash, OBJECT_HASH_SIZE);
+        if (!dirs[ndirs++].name) st = set_error(ERR_NOMEM, "reindex: subdirectories");
     }
-
     manifest_free_entries(entries, count);
+    if (st != OK) { subdirs_free(dirs, ndirs); return st; }
+    *out_dirs = dirs;
+    *out_ndirs = ndirs;
+    return OK;
+}
+
+/* A tree this run already rebuilt: its subdirectories from its rows. */
+static status_t indexed_subdirs(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
+                                subdir_t **out_dirs, uint32_t *out_ndirs)
+{
+    db_param_t p[] = { DB_INT64(ctx->repo_id), DB_HASH(tree_hash) };
+    db_result_t *r = NULL;
+    if (db_execute_typed(ctx->db,
+            "SELECT name, lower(hex(subtree_hash)) FROM nodes"
+            " WHERE repo_id = ? AND tree_hash = ? AND type = 2"
+            "   AND subtree_hash IS NOT NULL",
+            p, DB_NPARAMS(p), &r) != 0 || !r) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: cannot read a tree's subdirectories");
+    }
+    subdir_t *dirs = r->nrows ? calloc((size_t)r->nrows, sizeof(*dirs)) : NULL;
+    if (r->nrows && !dirs) { db_result_free(r); return set_error(ERR_NOMEM, "reindex: subdirectories"); }
+    uint32_t n = 0;
+    status_t st = OK;
+    for (int i = 0; i < r->nrows && st == OK; i++) {
+        dirs[n].name = strdup(r->rows[i][0]);
+        hex_to_hash(r->rows[i][1], dirs[n].tree);
+        if (!dirs[n++].name) st = set_error(ERR_NOMEM, "reindex: subdirectories");
+    }
+    db_result_free(r);
+    if (st != OK) { subdirs_free(dirs, n); return st; }
+    *out_dirs = dirs;
+    *out_ndirs = n;
+    return OK;
+}
+
+/* The regular files directly in a tree and their logical bytes, as the
+ * tree's completion row recorded them. */
+static status_t tree_totals(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE])
+{
+    db_param_t p[] = { DB_INT64(ctx->repo_id), DB_HASH(tree_hash) };
+    db_result_t *r = NULL;
+    if (db_execute_typed(ctx->db,
+            "SELECT files, bytes FROM trees WHERE repo_id = ? AND hash = ?",
+            p, DB_NPARAMS(p), &r) != 0 || !r || r->nrows != 1) {
+        db_result_free(r);
+        return set_error(ERR_IO, "reindex: a rebuilt tree has no totals");
+    }
+    ctx->res->files += strtoull(r->rows[0][0], NULL, 10);
+    ctx->res->bytes += strtoull(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    return OK;
+}
+
+/*
+ * One directory of the snapshot: its tree rebuilt if this run has not
+ * rebuilt it yet, then a skeleton row for each subdirectory and the walk
+ * into it. dir_id is this directory's own skeleton row.
+ */
+static status_t walk_dir(reindex_ctx_t *ctx, const uint8_t tree_hash[OBJECT_HASH_SIZE],
+                         int64_t dir_id, const char *path, int depth)
+{
+    if (depth > 4096)
+        return set_error(ERR_CORRUPT, "reindex: directory chain deeper than 4096 at %s", path);
+    subdir_t *dirs = NULL;
+    uint32_t ndirs = 0;
+    status_t st;
+    if (memo_has(ctx->memo, tree_hash)) {
+        st = indexed_subdirs(ctx, tree_hash, &dirs, &ndirs);
+    } else {
+        st = rebuild_tree(ctx, tree_hash, &dirs, &ndirs);
+        if (st == OK && memo_add(ctx->memo, tree_hash) != 0)
+            st = set_error(ERR_NOMEM, "reindex: tree memo");
+    }
+    if (st == OK) st = tree_totals(ctx, tree_hash);
+
+    int64_t first = 0;
+    if (st == OK) st = node_ids_reserve(ctx->db, ndirs, &first);
+    for (uint32_t i = 0; i < ndirs && st == OK; i++) {
+        char *sub = NULL;
+        if (asprintf(&sub, "%s/%s", path, dirs[i].name) < 0) {
+            st = set_error(ERR_NOMEM, "reindex: path");
+            break;
+        }
+        int64_t id = first + (int64_t)i;
+        st = node_index_put_dir(ctx->db, ctx->repo_id, ctx->snap_id, id, dir_id,
+                                dirs[i].name, sub, dirs[i].tree);
+        if (st == OK) st = walk_dir(ctx, dirs[i].tree, id, sub, depth + 1);
+        free(sub);
+    }
+    subdirs_free(dirs, ndirs);
     return st;
 }
 
@@ -361,7 +461,7 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
                               int count);
 
 static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
-                                       int64_t snap_id, int lists,
+                                       int64_t snap_id, int lists, tree_memo_t *memo,
                                        reindex_result_t *out);
 
 /*
@@ -373,11 +473,15 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
 status_t reindex_snapshot(store_t *store, cutils_db_t *db, int64_t repo_id,
                           int64_t snap_id, reindex_result_t *out)
 {
-    return reindex_snapshot_inner(store, db, repo_id, snap_id, 1, out);
+    tree_memo_t memo;
+    memset(&memo, 0, sizeof(memo));
+    status_t st = reindex_snapshot_inner(store, db, repo_id, snap_id, 1, &memo, out);
+    memo_free(&memo);
+    return st;
 }
 
 static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t repo_id,
-                                       int64_t snap_id, int lists,
+                                       int64_t snap_id, int lists, tree_memo_t *memo,
                                        reindex_result_t *out)
 {
     uint8_t root[OBJECT_HASH_SIZE];
@@ -389,53 +493,36 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
     reindex_result_t res;
     memset(&res, 0, sizeof(res));
 
-    char repo[32], snap[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-
     if (db_txn_begin(db) != OK) {
         free(label);
         return set_error(ERR_IO, "reindex: begin");
     }
 
-    /* Replacing, not merging: a half-reindexed snapshot mixed with stale rows
-     * would be worse than either state on its own. */
-    int failed = db_execute_non_query(db,
-        "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
-        (const char *[]){ repo, snap, NULL }, NULL) != 0;
-    if (!failed)
-        failed = db_execute_non_query(db,
-            "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
-            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+    /*
+     * Replacing, not merging: the snapshot's skeleton is rebuilt from its
+     * record, in one transaction, so a failure leaves the old one. Trees it
+     * no longer reaches keep their rows until the sweep at the end of a full
+     * reindex (or the next gc), since another snapshot rebuilt later in the
+     * run may well need them.
+     */
+    st = node_index_drop_snapshot(db, repo_id, snap_id, 0);
 
-    reindex_ctx_t ctx = { store, db, repo_id, snap_id, 0, &res };
-    if (!failed) {
-        /* Continue the id space rather than restarting it, so ids stay unique
-         * per repo across snapshots as the schema's primary key requires. */
-        db_result_t *r = NULL;
-        if (db_execute(db, "SELECT COALESCE(MAX(id), 0) + 1 FROM nodes WHERE repo_id = ?",
-                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-            ctx.next_node_id = strtoll(r->rows[0][0], NULL, 10);
-        else
-            ctx.next_node_id = 1;
-        db_result_free(r);
+    reindex_ctx_t ctx = { store, db, repo_id, snap_id, &res, memo };
+    int64_t root_id = 0;
+    if (st == OK) st = node_ids_reserve(db, 1, &root_id);
+    if (st == OK) st = node_index_put_dir(db, repo_id, snap_id, root_id, 0, "", "", root);
+    if (st == OK) st = walk_dir(&ctx, root, root_id, "", 0);
 
-        st = walk_tree(&ctx, root, 0);
-        if (st != OK) failed = 1;
-    }
-
-    if (!failed) {
-        char tsbuf[32], files[32], bytes[32], rhex[OBJECT_HASH_SIZE * 2 + 1];
-        snprintf(tsbuf, sizeof(tsbuf), "%lld", (long long)ts);
-        snprintf(files, sizeof(files), "%llu", (unsigned long long)res.files);
-        snprintf(bytes, sizeof(bytes), "%llu", (unsigned long long)res.bytes);
-        hash_hex(root, rhex);
+    if (st == OK) {
         /* An upsert, not INSERT OR REPLACE: REPLACE deletes the row and
          * inserts a fresh one, which reset gfs_flags to its default of 0, so
          * a reindex quietly stripped every snapshot of the tiers the last
          * retention pass gave it. Everything the walk derives is
          * overwritten; what it cannot derive is kept. */
-        if (db_execute_non_query(db,
+        db_param_t sp[] = { DB_INT64(repo_id), DB_INT64(snap_id), DB_INT64(ts),
+                            DB_TEXT(label ? label : ""), DB_INT64((int64_t)res.files),
+                            DB_INT64((int64_t)res.bytes), DB_INT64(ts), DB_HASH(root) };
+        if (db_execute_non_query_typed(db,
                 "INSERT INTO snapshots (repo_id, id, ts, label,"
                 " file_count, total_size, completed_at, root_tree_hash,"
                 " nodes_materialized)"
@@ -447,20 +534,22 @@ static status_t reindex_snapshot_inner(store_t *store, cutils_db_t *db, int64_t 
                 "  completed_at = excluded.completed_at,"
                 "  root_tree_hash = excluded.root_tree_hash,"
                 "  nodes_materialized = 1",
-                (const char *[]){ repo, snap, tsbuf, label ? label : "",
-                                  files, bytes, tsbuf, rhex, NULL }, NULL) != 0)
-            failed = 1;
+                sp, DB_NPARAMS(sp), NULL) != 0)
+            st = set_error(ERR_IO, "reindex: snapshot %lld failed", (long long)snap_id);
     }
 
     free(label);
 
-    if (failed) {
+    if (st != OK) {
         db_txn_rollback(db);
-        return st != OK ? st : set_error(ERR_IO, "reindex: snapshot %lld failed",
-                                         (long long)snap_id);
+        memo_rollback(memo);
+        return st;
     }
-    if (db_txn_commit(db) != OK)
+    if (db_txn_commit(db) != OK) {
+        memo_rollback(memo);
         return set_error(ERR_IO, "reindex: commit");
+    }
+    memo_commit(memo);
 
     /* Standalone callers fault a single cold snapshot back in and get a
      * complete registry for it. Called from reindex_repo this is nearly a
@@ -575,19 +664,14 @@ static void pack_num_seen(uint32_t pack_num, void *vctx)
     }
     for (size_t i = 0; i < ec.n; i++) {
         const pack_row_t *r = &ec.rows[i];
-        char hex[OBJECT_HASH_SIZE * 2 + 1];
-        hash_hex(r->hash, hex);
-        char off[32], comp[32], orig[32], eidx[16];
-        snprintf(off,  sizeof(off),  "%llu", (unsigned long long)r->offset);
-        snprintf(comp, sizeof(comp), "%llu", (unsigned long long)r->comp);
-        snprintf(orig, sizeof(orig), "%llu", (unsigned long long)r->orig);
-        snprintf(eidx, sizeof(eidx), "%u",   r->eidx);
-        if (db_execute_non_query(c->db,
+        db_param_t pp[] = { DB_TEXT(c->repo), DB_HASH(r->hash), DB_INT64(pack_num),
+                            DB_INT64((int64_t)r->offset), DB_INT64((int64_t)r->comp),
+                            DB_INT64((int64_t)r->orig), DB_INT64(r->eidx) };
+        if (db_execute_non_query_typed(c->db,
                 "INSERT OR REPLACE INTO pack_objects"
                 " (repo_id, hash, pack_id, offset, comp_size, orig_size, entry_index)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (const char *[]){ c->repo, hex, pid, off, comp, orig, eidx, NULL },
-                NULL) != 0) {
+                pp, DB_NPARAMS(pp), NULL) != 0) {
             free(ec.rows);
             c->failed = 1;
             return;
@@ -790,22 +874,20 @@ static status_t note_inner(cutils_db_t *db, const char *repo,
                            const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type,
                            int count, int64_t *out_refs)
 {
-    char hex[OBJECT_HASH_SIZE * 2 + 1], t[8];
-    hash_hex(hash, hex);
-    snprintf(t, sizeof(t), "%u", type);
     *out_refs = 0;
-    if (db_execute_non_query(db,
+    db_param_t p[] = { DB_TEXT(repo), DB_HASH(hash), DB_INT64(type) };
+    if (db_execute_non_query_typed(db,
             "INSERT INTO objects (repo_id, hash, refcount, location, type)"
             " VALUES (?, ?, 0, 'loose', ?)"
             " ON CONFLICT(repo_id, hash) DO UPDATE SET type = excluded.type",
-            (const char *[]){ repo, hex, t, NULL }, NULL) != 0)
+            p, DB_NPARAMS(p), NULL) != 0)
         return set_error(ERR_IO, "reindex: cannot record object");
     if (!count) return OK;
     db_result_t *r = NULL;
-    if (db_execute(db,
+    if (db_execute_typed(db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ? RETURNING refcount",
-            (const char *[]){ repo, hex, NULL }, &r) != 0) {
+            p, 2, &r) != 0) {
         db_result_free(r);
         return set_error(ERR_IO, "reindex: cannot count object");
     }
@@ -842,7 +924,7 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "SELECT DISTINCT n.content_hash FROM nodes n"
+            "SELECT DISTINCT lower(hex(n.content_hash)) FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
             " WHERE n.repo_id = ? AND n.type = 1 AND o.type IN (1, 6)"
             "   AND (o.orig_size IS NULL OR o.orig_size != n.size OR o.type = 6)",
@@ -876,11 +958,10 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     r = NULL;
     if (st == OK && count &&
         db_execute(db,
-            "SELECT DISTINCT o.hash FROM objects o WHERE o.repo_id = ?1 AND o.type = 6"
-            "   AND (EXISTS (SELECT 1 FROM nodes n WHERE n.repo_id = ?1"
-            "                 AND n.subtree_hash = o.hash)"
-            "        OR EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = ?1"
-            "                    AND s.root_tree_hash = o.hash))",
+            "SELECT DISTINCT lower(hex(o.hash)) FROM objects o"
+            " WHERE o.repo_id = ?1 AND o.type = 6"
+            "   AND EXISTS (SELECT 1 FROM snap_dirs d WHERE d.repo_id = ?1"
+            "                AND d.tree_hash = o.hash)",
             (const char *[]){ repo, NULL }, &r) != 0) {
         st = set_error(ERR_IO, "reindex: cannot list tree lists");
     }
@@ -907,10 +988,11 @@ static status_t reindex_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
  *
  * The count is the one GC's mark produces: one per visit of a tree,
  * reaching it as a snapshot root or as a directory's subtree, plus one per
- * entry for its content, xattr and ACL objects. A tree shared by ten
- * snapshots counts ten. Every node row carries exactly those hashes, so the
- * count is a single grouped pass over the rows just written rather than a
- * second walk of the trees.
+ * entry for its content, xattr and ACL objects, per visit. A tree shared by
+ * ten snapshots counts ten. Every visit is a skeleton row (snap_dirs), and a
+ * tree's entries are its rows in nodes, so the count is the skeleton's
+ * instances per tree times what each tree's entries name: one grouped pass,
+ * not a second walk of the trees.
  */
 static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
 {
@@ -923,18 +1005,21 @@ static status_t recompute_refcounts(cutils_db_t *db, int64_t repo_id)
         db_execute_non_query(db, "UPDATE objects SET refcount = 0 WHERE repo_id = ?",
                              (const char *[]){ repo, NULL }, NULL) != 0 ||
         db_execute_non_query(db,
-            "WITH refs(hash) AS ("
-            "  SELECT root_tree_hash FROM snapshots"
-            "   WHERE repo_id = ?1 AND root_tree_hash IS NOT NULL"
-            "  UNION ALL SELECT content_hash FROM nodes"
-            "   WHERE repo_id = ?1 AND content_hash IS NOT NULL"
-            "  UNION ALL SELECT subtree_hash FROM nodes"
-            "   WHERE repo_id = ?1 AND subtree_hash IS NOT NULL"
-            "  UNION ALL SELECT xattr_hash FROM nodes"
-            "   WHERE repo_id = ?1 AND xattr_hash IS NOT NULL"
-            "  UNION ALL SELECT acl_hash FROM nodes"
-            "   WHERE repo_id = ?1 AND acl_hash IS NOT NULL),"
-            " counts(hash, n) AS (SELECT hash, COUNT(*) FROM refs GROUP BY hash)"
+            "WITH inst(h, k) AS ("
+            "  SELECT tree_hash, COUNT(*) FROM snap_dirs WHERE repo_id = ?1"
+            "   GROUP BY tree_hash),"
+            " refs(hash, k) AS ("
+            "  SELECT h, k FROM inst"
+            "  UNION ALL SELECT n.content_hash, inst.k FROM inst"
+            "   JOIN nodes n ON n.repo_id = ?1 AND n.tree_hash = inst.h"
+            "   WHERE n.content_hash IS NOT NULL"
+            "  UNION ALL SELECT n.xattr_hash, inst.k FROM inst"
+            "   JOIN nodes n ON n.repo_id = ?1 AND n.tree_hash = inst.h"
+            "   WHERE n.xattr_hash IS NOT NULL"
+            "  UNION ALL SELECT n.acl_hash, inst.k FROM inst"
+            "   JOIN nodes n ON n.repo_id = ?1 AND n.tree_hash = inst.h"
+            "   WHERE n.acl_hash IS NOT NULL),"
+            " counts(hash, n) AS (SELECT hash, SUM(k) FROM refs GROUP BY hash)"
             " UPDATE objects SET refcount = counts.n FROM counts"
             " WHERE objects.repo_id = ?1 AND objects.hash = counts.hash",
             (const char *[]){ repo, NULL }, NULL) != 0;
@@ -1001,6 +1086,30 @@ static status_t restore_snapshot_mark(store_t *store, cutils_db_t *db, int64_t r
     return OK;
 }
 
+/*
+ * A backup that stopped while writing its skeleton leaves a marker naming
+ * the snapshot (backup.c, index_skeleton). A reindex has just rebuilt every
+ * snapshot whose record exists, so a marker for one of those now names a
+ * complete skeleton: left behind, the next backup would drop it. Markers
+ * for snapshots with no row are left for that backup, which drops the
+ * partial skeleton they name.
+ */
+static status_t drop_pending_markers(cutils_db_t *db, int64_t repo_id)
+{
+    db_param_t p[] = { DB_INT64(repo_id) };
+    if (db_txn_begin(db) != OK) return set_error(ERR_IO, "reindex: begin");
+    if (db_execute_non_query_typed(db,
+            "DELETE FROM recovery_state WHERE repo_id = ?1"
+            "   AND key LIKE 'index-pending-%'"
+            "   AND EXISTS (SELECT 1 FROM snapshots s WHERE s.repo_id = ?1"
+            "                AND s.id = CAST(recovery_state.value AS INTEGER))",
+            p, DB_NPARAMS(p), NULL) != 0) {
+        db_txn_rollback(db);
+        return set_error(ERR_IO, "reindex: cannot clear pending skeleton markers");
+    }
+    return db_txn_commit(db) == OK ? OK : set_error(ERR_IO, "reindex: commit");
+}
+
 status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
                       atomic_int *cancel, reindex_result_t *out)
 {
@@ -1024,6 +1133,11 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
     reindex_result_t total;
     memset(&total, 0, sizeof(total));
     status_t st = OK;
+    /* Each distinct tree is rebuilt once per run, whichever snapshot meets
+     * it first; the rest of the snapshots holding it only add skeleton
+     * rows. */
+    tree_memo_t memo;
+    memset(&memo, 0, sizeof(memo));
     long long first_failed = 0;
     long long highest_record = 0;
     char first_err[256] = "";
@@ -1046,7 +1160,7 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         reindex_result_t one;
         memset(&one, 0, sizeof(one));
-        status_t one_st = reindex_snapshot_inner(store, db, repo_id, id, 0, &one);
+        status_t one_st = reindex_snapshot_inner(store, db, repo_id, id, 0, &memo, &one);
         if (one_st != OK) {
             /* One unreadable snapshot must not abandon the rest: partial
              * recovery of a damaged repository is the whole point. Its old
@@ -1070,6 +1184,15 @@ status_t reindex_repo(store_t *store, cutils_db_t *db, int64_t repo_id,
         total.trees_read += one.trees_read;
     }
     closedir(d);
+    memo_free(&memo);
+    if (st != OK) return st;
+
+    /* Trees no snapshot's skeleton reaches any more, and anything a stopped
+     * run left half-written. Skeletons of snapshots whose rebuild failed
+     * keep theirs, and with them the trees they need. */
+    st = node_index_sweep(db, repo_id, NULL);
+    if (st != OK) return st;
+    st = drop_pending_markers(db, repo_id);
     if (st != OK) return st;
 
     /* Every snapshot has contributed its hashes by now, so each distinct

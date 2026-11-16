@@ -9,6 +9,7 @@
 #include "store.h"
 #include "store_index.h"
 #include "json_row.h"
+#include "db_typed.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -281,7 +282,7 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
     int rc;
     if (loc && strcmp(loc, "staged") == 0) {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
+            "SELECT lower(hex(hash)), type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects"
             " WHERE repo_id = ? AND location = 'staged'"
             " ORDER BY hash LIMIT ? OFFSET ?",
@@ -292,14 +293,14 @@ api_response_t introspect_objects(const api_request_t *req, int64_t repo_id)
      * did nothing. */
     } else if (loc && (strcmp(loc, "pack") == 0 || strcmp(loc, "packed") == 0)) {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
+            "SELECT lower(hex(hash)), type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects"
             " WHERE repo_id = ? AND location NOT IN ('staged', 'absent')"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
     } else {
         rc = db_execute(g_db,
-            "SELECT hash, type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
+            "SELECT lower(hex(hash)), type, refcount, COALESCE(phys_size,0), COALESCE(orig_size,0),"
             "       " OBJ_LOCATION_COLS " FROM objects WHERE repo_id = ?"
             " ORDER BY hash LIMIT ? OFFSET ?",
             (const char *[]){ repo, lim, off, NULL }, &r);
@@ -349,15 +350,18 @@ api_response_t introspect_object_locate(const api_request_t *req, int64_t repo_i
     char repo[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
 
+    uint8_t hb[OBJECT_HASH_SIZE];
+    hex_to_hash(hex, hb);
+    db_param_t lp[] = { DB_INT64(repo_id), DB_HASH(hb) };
     db_result_t *r = NULL;
-    if (db_execute(g_db,
+    if (db_execute_typed(g_db,
             "SELECT o.type, o.refcount, COALESCE(o.phys_size,0), COALESCE(o.orig_size,0),"
             "       " OBJ_LOCATION_EXPR ", po.pack_id, po.offset, po.entry_index"
             "  FROM objects o"
             "  LEFT JOIN pack_objects po"
             "    ON po.repo_id = o.repo_id AND po.hash = o.hash"
             " WHERE o.repo_id = ? AND o.hash = ?",
-            (const char *[]){ repo, hex, NULL }, &r) != 0 || !r || r->nrows != 1) {
+            lp, DB_NPARAMS(lp), &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return api_error(404, "no such object");
     }
@@ -393,38 +397,26 @@ api_response_t introspect_object_refs(const api_request_t *req, int64_t repo_id,
     int limit = 0;
     api_response_t page_err;
     if (routes_paging(req, PAGE_DEFAULT, PAGE_MAX, &limit, NULL, &page_err) != 0) return page_err;
-    char repo[32], lim[16];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", limit);
-
     /*
-     * The full path of each referencing node, climbed in SQL one primary-key
-     * lookup per level. A bare name ("config.yaml") does not say which of
-     * the many files of that name holds the object, which was the question.
-     * A chain that breaks before the root (a partly faulted-in snapshot)
-     * leaves the path empty rather than dropping the reference.
+     * The full path of each referencing node in each snapshot: entry rows
+     * are shared between snapshots, and the snapshot's directory skeleton
+     * places them (docs/index-reuse.md), so a reference is an entry joined
+     * to every directory holding its tree, and its path is that
+     * directory's plus its name. A bare name ("config.yaml") does not say
+     * which of the many files of that name holds the object, which was the
+     * question.
      */
+    uint8_t hb[OBJECT_HASH_SIZE];
+    hex_to_hash(hex, hb);
+    db_param_t rp[] = { DB_INT64(repo_id), DB_HASH(hb), DB_INT64(limit) };
     db_result_t *r = NULL;
-    if (db_execute(g_db,
-            "WITH RECURSIVE"
-            " refs(snap_id, nid) AS ("
-            "   SELECT snap_id, id FROM nodes"
-            "    WHERE repo_id = ? AND content_hash = ?"
-            "    ORDER BY snap_id, id LIMIT ?),"
-            " up(nid, parent, path, depth) AS ("
-            "   SELECT n.id, n.parent_node_id, n.name, 0"
-            "     FROM refs JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
-            "   UNION ALL"
-            "   SELECT up.nid, p.parent_node_id, p.name || '/' || up.path, up.depth + 1"
-            "     FROM up JOIN nodes p ON p.repo_id = ? AND p.id = up.parent"
-            "    WHERE up.parent IS NOT NULL AND up.parent <> 0 AND up.depth < 256)"
-            " SELECT refs.snap_id, refs.nid, n.name, COALESCE('/' || up.path, '')"
-            "   FROM refs"
-            "   JOIN nodes n ON n.repo_id = ? AND n.id = refs.nid"
-            "   LEFT JOIN up ON up.nid = refs.nid"
-            "             AND (up.parent IS NULL OR up.parent = 0)"
-            "  ORDER BY refs.snap_id, refs.nid",
-            (const char *[]){ repo, hex, lim, repo, repo, repo, NULL }, &r) != 0) {
+    if (db_execute_typed(g_db,
+            "SELECT d.snap_id, n.id, n.name, d.path || '/' || n.name"
+            "  FROM nodes n"
+            "  JOIN snap_dirs d ON d.repo_id = n.repo_id AND d.tree_hash = n.tree_hash"
+            " WHERE n.repo_id = ? AND n.content_hash = ?"
+            " ORDER BY d.snap_id, n.id, d.id LIMIT ?",
+            rp, DB_NPARAMS(rp), &r) != 0) {
         db_result_free(r);
         return api_error(500, "cannot read object references");
     }
@@ -676,7 +668,7 @@ api_response_t introspect_pack_entries(const api_request_t *req, int64_t repo_id
 
     r = NULL;
     if (db_execute(g_db,
-            "SELECT hash, offset, comp_size, orig_size, entry_index"
+            "SELECT lower(hex(hash)), offset, comp_size, orig_size, entry_index"
             "  FROM pack_objects WHERE repo_id = ? AND pack_id = ?"
             " ORDER BY offset LIMIT ? OFFSET ?",
             (const char *[]){ repo, pid, lim, off, NULL }, &r) != 0) {
@@ -729,7 +721,7 @@ api_response_t introspect_fanout(const api_request_t *req, int64_t repo_id)
 
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT substr(hash, 1, 2) AS prefix, COUNT(*)"
+            "SELECT lower(hex(substr(hash, 1, 1))) AS prefix, COUNT(*)"
             "  FROM objects WHERE repo_id = ?"
             " GROUP BY prefix ORDER BY prefix",
             (const char *[]){ repo, NULL }, &r) != 0) {
@@ -935,7 +927,7 @@ static int root_hash_of(int64_t repo_id, const char *snap, uint8_t out[OBJECT_HA
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
     if (db_execute(g_db,
-            "SELECT root_tree_hash FROM snapshots WHERE repo_id = ? AND id = ?",
+            "SELECT lower(hex(root_tree_hash)) FROM snapshots WHERE repo_id = ? AND id = ?",
             (const char *[]){ repo, snap, NULL }, &r) != 0 || !r || r->nrows != 1) {
         db_result_free(r);
         return -1;

@@ -253,10 +253,13 @@ in-run memo of already-ensured hashes keeps repeats from costing a
 resolver query each - a quarter-million of those per incremental would be
 the tight-loop-on-the-shared-DB-handle pattern again.
 
-Each newly stored object gets a row in `objects` with `location = 'staged'`
-while its pack is still open (`store_index_put_staged`), `phys_size` the
-stored bytes and `orig_size` the payload size. The pack-commit callback
-turns `staged` into the pack's id when the pack is installed. An object the
+A newly stored object gets its row in `objects` once, from the pack-commit
+callback when its pack is installed: the pack's id as its location,
+`phys_size` the stored bytes and `orig_size` the payload size, in the
+transaction that records the pack. Until then it has no row, which is what
+the file cache needs: a crash before the seal leaves nothing claiming the
+object exists. (This wrote a `staged` row first and upserted it at the
+seal, two writes per object; PERF.md has the measurement.) An object the
 repository already holds in a pack is recorded with that pack's location
 (`store_index_put_packed`). Seeing the same name twice leaves the existing
 row alone.
@@ -301,7 +304,7 @@ most 1 MiB under a `CHUNKLIST` with `TREE` leaves (OWN-34), so a directory of
 any size is bounded objects and adding a file to a huge directory stores the
 one fragment it lands in plus the list.
 
-### 1.5 Phase 3: seal, snapshot record and index (`write_snapshot_record`, `index_nodes`)
+### 1.5 Phase 3: seal, snapshot record and index (`write_snapshot_record`, `index_skeleton`)
 
 Every pack the backup wrote is sealed, installed and announced through the
 commit callback before anything names its objects, so a snapshot record
@@ -311,24 +314,34 @@ The snapshot record `snapshots/<id>` is a one-line JSON file (id,
 timestamp, root tree name, label) written mkstemp-fsync-rename. This file
 is what makes the repository self-describing: reindex starts from these.
 
-Then the whole scan list is indexed into `nodes` in one transaction: one
-row per entry with parent pointer, name, type, mode, ownership, mtime,
-size, `content_hash`, `subtree_hash` (directories), `link_target`
-(symlinks) and `hardlink_group_id`, plus an FTS row per name. Two
-c-utils-specific rules apply here and everywhere else in the daemon:
+The node index is keyed by tree, not by snapshot (docs/index-reuse.md).
+During phase 2, each tree the index does not already hold gets one `nodes`
+row per entry (its `tree_hash`, name, type, mode, ownership, mtime, size,
+`content_hash`, `subtree_hash` for directories, `link_target`,
+`hardlink_group_id`, xattr and ACL hashes, device numbers), an FTS row per
+name, and a `trees` row marking it complete, all in one batch, so an
+unchanged directory costs one lookup and a no-change backup writes no entry
+rows at all. After the record, `index_skeleton` writes the snapshot's own
+part: one `snap_dirs` row per directory (its id, parent, name, path and
+tree), in batches under a `recovery_state` marker that the `snapshots` row
+clears in its transaction. Two binding rules apply here and everywhere else
+in the daemon:
 
-- The params array is NULL-terminated, so a conditional NULL *value* would
-  silently truncate the bind list. Absent values travel as `""` and
-  `NULLIF(?,'')` turns them back into real SQL NULLs, because reader
-  queries ask `content_hash IS NOT NULL` to mean "has content".
-- `hardlink_group_id` is the 64-bit `inode_identity` written as a *signed*
-  decimal. Unsigned, half of all values exceed `INT64_MAX`, SQLite falls
-  back to REAL, precision collapses distinct inodes onto one value, and
-  restore hardlinks unrelated files together. The bit pattern round-trips
-  exactly through int64.
+- Parameters go through the typed calls (`db_typed.h`): a hash binds as a
+  raw 32-byte BLOB and an absent value as a real NULL. c-utils 1.6's string
+  params could do neither (a NULL ended the list), which is why hash
+  columns used to hold hex text; every hash column now holds 32 raw bytes
+  and is read back as `lower(hex(col))`.
+- `hardlink_group_id` is the 64-bit `inode_identity` bound *signed*.
+  Unsigned, half of all values exceed `INT64_MAX`, SQLite falls back to
+  REAL, precision collapses distinct inodes onto one value, and restore
+  hardlinks unrelated files together. The bit pattern round-trips exactly
+  through int64.
 
 Node ids are an index artifact: nothing in the repository refers to them,
 which is what lets reindex rebuild the database without preserving them.
+They come from `node_id_seq`, shared by `nodes` and `snap_dirs`, and are
+never reissued while the database lives.
 
 Snapshot ids are per repository and never reissued. A backup numbers its
 snapshot one past the highest of the index's mark, the index's highest id
@@ -373,7 +386,7 @@ sidecar; a pack is one atomic rename. Only after the file is durably in
 place does the store emit `store_emit_pack_commit` with every entry's name,
 offset, sizes and `entry_index`. The daemon-side handler
 (`src/ops/store_index.c`) writes the `packs` row, all `pack_objects` rows,
-and moves each `objects` row from `staged` to the pack's id - one
+and creates each object's `objects` row with the pack's id - one
 transaction per pack, serialised by a mutex because SQLite has no nested
 transactions on the shared handle. `entry_index` is the *on-disk* entry
 position (the array was sorted by name first); it is what lets a reader
@@ -385,7 +398,7 @@ commit callback, which begins one, and the write lock is not recursive. In
 
 Crash ordering is: staging file in `tmp/`, install by rename, then rows,
 then the snapshot record. A crash before the rename leaves a staging file
-the next start sweeps, along with any `staged` rows; a crash after it
+the next start sweeps, and no object rows; a crash after it
 leaves an installed pack the index may not know, which a reindex picks up.
 Either way no snapshot names an object the repository does not hold,
 because the record is written after every seal.
@@ -638,9 +651,12 @@ never outlive their pack.
   recoverable" from "gone" without writing anything. With repair on, damage
   that parity covers is written back to disk via `pack_object_repair`, the
   only caller it has. Damage beyond parity is reported with its blast radius
-  resolved through `nodes.content_hash`: which files, which snapshots.
+  resolved through `nodes.content_hash` and the snapshots' `snap_dirs`:
+  which files, which snapshots.
 - **Prune / GFS** (`src/ops/prune.c`, `gfs.c`): retention deletes snapshot
-  records and node rows; the objects they referenced become GC's problem,
+  records, the snapshot's `snap_dirs` rows, and the entry rows of every tree
+  no other snapshot's skeleton still names; the objects they referenced
+  become GC's problem,
   which is the correct division - prune decides *what* is dead, GC decides
   *when* bytes go.
 - **Reindex** (`src/ops/reindex.c`): the recovery direction. Walks

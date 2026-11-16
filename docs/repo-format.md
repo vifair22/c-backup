@@ -828,9 +828,10 @@ about 2^32 encryptions per key, which at the measured mean chunk is about
    transaction as the pack's own rows, so no writer races its own seal: a
    row written after the commit would stay staged, be dropped by the next
    backup, and leave a chunk compaction reads as dead. File workers write no
-   rows of their own. The backup thread's sink still records a staged row
-   for every object a smaller file meets, new or already present, so an
-   index that lost a chunk's row gets it back.
+   rows of their own, and neither does the backup thread for an object in
+   its own open pack: every object row is written once, by its seal. For an
+   object the repository already held, the backup thread's sink records a
+   packed row, so an index that lost a chunk's row gets it back.
 6. Sealing on the backup thread happens mid-file only when the open pack
    cannot take the file, with the batch let go first (sealing begins a
    transaction and the write lock is not recursive). A file that fits keeps

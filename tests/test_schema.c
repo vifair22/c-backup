@@ -72,7 +72,8 @@ static void test_migrations_apply(void **state)
 
     const char *tables[] = {
         "repos", "repo_purge_pending", "schedules", "jobs", "sessions",
-        "auth_config", "snapshots", "snapshot_id_seq", "nodes", "node_fts",
+        "auth_config", "snapshots", "snapshot_id_seq", "node_id_seq", "nodes",
+        "trees", "snap_dirs", "node_fts",
         "objects", "packs", "pack_objects", "tags", "notes",
         "policy_values", "repo_backup_paths", "journal", "recovery_state",
         "file_cache", "verify_runs", "verify_findings", "grep_runs",
@@ -137,12 +138,14 @@ static void test_migrations_are_idempotent(void **state)
 }
 
 /*
- * The child index must carry name as its trailing column. Without it,
+ * The directory index must carry name as its trailing column. Without it,
  * ORDER BY name cannot be served from the index and SQLite sorts every child
  * before LIMIT applies: 1650 us for the first 500 of a 10k-entry directory
  * against 93 us with name included (PERF.md 2026-08-19). Directory listings
  * are name-ordered by definition, so losing this column is a silent 17x
- * regression on the most common query in the product.
+ * regression on the most common query in the product. A directory's
+ * entries are its tree's rows (docs/index-reuse.md), so the index leads
+ * with the tree.
  */
 static void test_child_index_includes_name(void **state)
 {
@@ -152,13 +155,12 @@ static void test_child_index_includes_name(void **state)
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
         "SELECT sql FROM sqlite_master WHERE type='index'"
-        " AND name='nodes_by_snap_parent'", NULL, &r), CUTILS_OK);
+        " AND name='nodes_by_tree'", NULL, &r), CUTILS_OK);
     assert_int_equal(r->nrows, 1);
 
     const char *ddl = r->rows[0][0];
     assert_non_null(ddl);
-    assert_non_null(strstr(ddl, "parent_node_id"));
-    assert_non_null(strstr(ddl, "name"));
+    assert_non_null(strstr(ddl, "tree_hash, name"));
     db_result_free(r);
 
     db_close(db);
@@ -179,17 +181,17 @@ static void test_fts_search_works(void **state)
     assert_true(object_exists(db, "table", "node_fts"));
 
     assert_int_equal(db_execute_non_query(db,
-        "INSERT INTO node_fts(name,node_id,snap_id,repo_id)"
-        " VALUES ('quarterly_report.pdf',1,1,1)", NULL, NULL), CUTILS_OK);
+        "INSERT INTO node_fts(rowid,name,repo_id)"
+        " VALUES (1,'quarterly_report.pdf',1)", NULL, NULL), CUTILS_OK);
     assert_int_equal(db_execute_non_query(db,
-        "INSERT INTO node_fts(name,node_id,snap_id,repo_id)"
-        " VALUES ('holiday_photo.jpg',2,1,1)", NULL, NULL), CUTILS_OK);
+        "INSERT INTO node_fts(rowid,name,repo_id)"
+        " VALUES (2,'holiday_photo.jpg',1)", NULL, NULL), CUTILS_OK);
 
     /* Substring, not prefix: the whole reason for trigram tokenisation. */
     assert_int_equal(count_rows(db,
-        "SELECT node_id FROM node_fts WHERE name MATCH 'terly_rep'"), 1);
+        "SELECT rowid FROM node_fts WHERE name MATCH 'terly_rep'"), 1);
     assert_int_equal(count_rows(db,
-        "SELECT node_id FROM node_fts WHERE name MATCH 'nothinghere'"), 0);
+        "SELECT rowid FROM node_fts WHERE name MATCH 'nothinghere'"), 0);
 
     db_close(db);
     unlink_db();

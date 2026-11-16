@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "verify.h"
+#include "db_typed.h"
 
 #include "chunklist.h"
 #include "read_budget.h"
@@ -58,21 +59,15 @@ static const char *level_name(verify_level_t l)
  * every component prefixed with '/', from the snapshot root down, the same
  * shape grep hits and name search use.
  *
- * The seed rows differ per caller; the walk up the parents is shared. Each
- * step is a primary-key lookup, and the depth bound stops a corrupt parent
- * cycle from recursing forever. A chain that breaks before reaching a root
- * drops that row rather than reporting a partial path as if it were whole.
+ * Entry rows are shared between snapshots and placed by the snapshot
+ * directory skeleton (docs/index-reuse.md), so a referencing entry's paths
+ * are its directory's path in each snapshot that holds the directory, plus
+ * its name: one join, no walk up the parents.
  *
  * ?1 is the repo id in both.
  */
-#define VERIFY_PATH_WALK                                                    \
-    "  UNION ALL"                                                           \
-    "  SELECT up.snap, p.parent_node_id, '/' || p.name || up.path,"          \
-    "         up.depth + 1"                                                 \
-    "    FROM up JOIN nodes p ON p.repo_id = ?1 AND p.id = up.parent"        \
-    "   WHERE up.depth < 256)"
-
-#define VERIFY_ROOTED " FROM up WHERE COALESCE(up.parent, 0) = 0"
+#define VERIFY_PLACED                                                       \
+    " JOIN snap_dirs d ON d.repo_id = n.repo_id AND d.tree_hash = n.tree_hash"
 
 /* Example paths per finding, and snapshot ids listed per finding. Both are
  * samples; the counts beside them are exact. */
@@ -105,6 +100,9 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     char repo[32], run[32];
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     snprintf(run,  sizeof(run),  "%lld", (long long)run_id);
+    uint8_t hb[OBJECT_HASH_SIZE];
+    hex_to_hash(hex, hb);
+    db_param_t fp[] = { DB_INT64(repo_id), DB_HASH(hb) };
 
     /* A handful of example paths, not all of them: a pack entry shared by
      * ten thousand nodes would otherwise write a row nobody can read. The
@@ -115,15 +113,12 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     uint64_t n_files = 0, n_versions = 0;
 
     db_result_t *r = NULL;
-    if (db_execute(db,
-            "WITH RECURSIVE up(snap, parent, path, depth) AS ("
-            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
-            "    FROM nodes n WHERE n.repo_id = ?1 AND n.content_hash = ?2"
-            VERIFY_PATH_WALK
-            " SELECT path, COUNT(*) OVER (), SUM(COUNT(*)) OVER ()"
-            VERIFY_ROOTED
+    if (db_execute_typed(db,
+            "SELECT path, COUNT(*) OVER (), SUM(COUNT(*)) OVER () FROM"
+            " (SELECT d.path || '/' || n.name AS path FROM nodes n" VERIFY_PLACED
+            "   WHERE n.repo_id = ?1 AND n.content_hash = ?2)"
             " GROUP BY path ORDER BY path LIMIT " VERIFY_STR(FINDING_SAMPLE_PATHS),
-            (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
+            fp, DB_NPARAMS(fp), &r) == 0 && r && r->nrows > 0) {
         n_files    = strtoull(r->rows[0][1], NULL, 10);
         n_versions = strtoull(r->rows[0][2], NULL, 10);
         for (int i = 0; i < r->nrows && i < FINDING_SAMPLE_PATHS; i++) {
@@ -142,12 +137,12 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     snaps[0] = '\0';
     uint64_t n_snaps = 0;
     r = NULL;
-    if (db_execute(db,
+    if (db_execute_typed(db,
             "SELECT snap_id, COUNT(*) OVER () FROM"
-            " (SELECT DISTINCT snap_id FROM nodes"
-            "   WHERE repo_id = ? AND content_hash = ?)"
+            " (SELECT DISTINCT d.snap_id FROM nodes n" VERIFY_PLACED
+            "   WHERE n.repo_id = ?1 AND n.content_hash = ?2)"
             " ORDER BY snap_id LIMIT " VERIFY_STR(FINDING_SNAPSHOT_IDS),
-            (const char *[]){ repo, hex, NULL }, &r) == 0 && r && r->nrows > 0) {
+            fp, DB_NPARAMS(fp), &r) == 0 && r && r->nrows > 0) {
         n_snaps = strtoull(r->rows[0][1], NULL, 10);
         size_t so = 0;
         for (int i = 0; i < r->nrows && i < FINDING_SNAPSHOT_IDS; i++) {
@@ -164,15 +159,16 @@ static void record_finding(cutils_db_t *db, int64_t repo_id, int64_t run_id,
     snprintf(nv, sizeof(nv), "%llu", (unsigned long long)n_versions);
     snprintf(ns, sizeof(ns), "%llu", (unsigned long long)n_snaps);
     const char *trunc = n_snaps > FINDING_SNAPSHOT_IDS ? "1" : "0";
-    if (db_execute_non_query(db,
+    db_param_t ip[] = { DB_TEXT(run), DB_TEXT(repo), DB_HASH(hb), DB_TEXT(status),
+                        DB_TEXT(nf), DB_TEXT(paths), DB_TEXT(snaps), DB_TEXT(nv),
+                        DB_TEXT(ns), DB_TEXT(trunc) };
+    if (db_execute_non_query_typed(db,
             "INSERT INTO verify_findings"
             " (run_id, repo_id, hash, status, affected_files, sample_paths,"
             "  affected_snapshots, affected_versions, affected_snapshot_count,"
             "  snapshots_truncated)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (const char *[]){ run, repo, hex, status, nf, paths, snaps,
-                              nv, ns, trunc, NULL },
-            NULL) != 0)
+            ip, DB_NPARAMS(ip), NULL) != 0)
         log_warn("verify: cannot record finding for %s", hex);
 
     /* A tree object has no node row pointing at it, so the query above finds
@@ -210,15 +206,12 @@ static void run_blast_radius(cutils_db_t *db, int64_t repo_id, int64_t run_id,
 
     db_result_t *r = NULL;
     if (db_execute(db,
-            "WITH RECURSIVE lost(h) AS ("
+            "WITH lost(h) AS ("
             "  SELECT DISTINCT hash FROM verify_findings"
-            "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable')),"
-            " up(snap, parent, path, depth) AS ("
-            "  SELECT n.snap_id, n.parent_node_id, '/' || n.name, 0"
-            "    FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.content_hash = lost.h"
-            VERIFY_PATH_WALK
-            " SELECT COUNT(DISTINCT path), COUNT(DISTINCT snap)"
-            VERIFY_ROOTED,
+            "   WHERE run_id = ?2 AND status NOT IN ('repaired', 'recoverable'))"
+            " SELECT COUNT(DISTINCT d.path || '/' || n.name), COUNT(DISTINCT d.snap_id)"
+            "   FROM lost JOIN nodes n ON n.repo_id = ?1 AND n.content_hash = lost.h"
+            VERIFY_PLACED,
             (const char *[]){ repo, run, NULL }, &r) == 0 && r && r->nrows == 1) {
         *out_files = strtoull(r->rows[0][0], NULL, 10);
         *out_snaps = strtoull(r->rows[0][1], NULL, 10);
@@ -329,7 +322,7 @@ static status_t verify_lists(store_t *store, cutils_db_t *db, int64_t repo_id,
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *roots = NULL;
     if (db_execute(db,
-            "SELECT DISTINCT n.content_hash FROM nodes n"
+            "SELECT DISTINCT lower(hex(n.content_hash)) FROM nodes n"
             "  JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
             " WHERE n.repo_id = ? AND o.type = 6",
             (const char *[]){ repo, NULL }, &roots) != 0) {
@@ -431,7 +424,7 @@ status_t verify_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      */
     db_result_t *objs = NULL;
     if (db_execute(db,
-            "SELECT o.hash, o.location, COALESCE(po.pack_id, -1),"
+            "SELECT lower(hex(o.hash)), o.location, COALESCE(po.pack_id, -1),"
             "       COALESCE(po.offset, 0), COALESCE(o.orig_size, 0)"
             "  FROM objects o"
             "  LEFT JOIN pack_objects po"

@@ -343,10 +343,14 @@ collapsed: one result per (path, content hash), carrying the newest
 snapshot it was seen in (`snap_id`, `node_id`) and how many snapshots hold
 it (`snapshots`). A file unchanged across thirty snapshots used to come back
 thirty times. A file whose content changed is a different hash and a
-separate result, so the versions of a file stay visible. To keep a page
-cheap the search reads at most eight matching rows per result asked for
-(8,000 at most) and does not sort; when it stopped there, `partial` is
-`true` and the counts cover what was read. With `snapshot=<sid>` only that
+separate result, so the versions of a file stay visible. A name is indexed
+once however many snapshots hold it, so a matching row is a distinct entry
+and its snapshot count is exact; rows come most recently indexed first. To
+keep a page cheap the search reads at most eight matching rows per result
+asked for (8,000 at most) and does not sort; when it stopped there,
+`partial` is `true` and the counts cover what was read. A file's `node_id`
+is shared by every snapshot holding it in an unchanged directory; a
+directory's (in `tree` and in results) is its own in each snapshot. With `snapshot=<sid>` only that
 snapshot is searched (`snapshots` is 1); one that does not exist is a 404.
 The CLI is `search <id> <text> [--snapshot N]`.
 
@@ -910,8 +914,9 @@ What is actually inside a repository, as opposed to what it can do.
 | GET | `/repos/<id>/stats` | Object counts and sizes by type; `?scope=staged` narrows to objects in a pack a running backup has not sealed yet |
 
 `/summary` carries `snapshots`, `objects`, `phys_size`, `orig_size`,
-`packs`, `staged` (objects in packs not yet sealed: 0 unless a backup is
-running) and `tags`, plus `last_snapshot_ts`.
+`packs`, `staged` (object rows ahead of their pack's seal: 0, since a
+backup writes an object's row only when its pack is sealed) and `tags`,
+plus `last_snapshot_ts`.
 
 Size fields on the object endpoints are `orig_size`, the logical bytes that
 went in, and `phys_size`, the bytes the object itself is charged for: the
@@ -941,8 +946,10 @@ header_size`, which equals `phys_size`. An object that reports `phys_size`
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
 | GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
 
-An object's `location` is `packed`, `staged` (in a pack a running backup
-has not sealed yet) or `absent` (named by a snapshot's trees but held by no
+An object's `location` is `packed`, `staged` (an object row written ahead
+of its pack's seal; a backup no longer writes these, since every object's
+row is written once, when its pack is sealed, so this filter is normally
+empty) or `absent` (named by a snapshot's trees but held by no
 pack, as a reindex found it; verify reports it `missing`), and `pack_id` is
 the pack's number or `null`. The index stores the pack number in place of
 the location, and serving it as stored made `location` a word for some

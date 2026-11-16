@@ -6,6 +6,8 @@
 #include "chunklist.h"
 #include "read_budget.h"
 #include "object.h"
+#include "node_index.h"
+#include "db_typed.h"
 
 #include <cutils/log.h>
 
@@ -70,119 +72,17 @@ typedef struct {
 } grep_ctx_t;
 
 /*
- * Rebuild a node's path by walking parent links, the same way restore does.
- * Kept local rather than shared with restore.c because the two want different
- * failure behaviour: a restore that cannot place a file must skip it, while a
- * search can fall back to the bare name and still be useful.
- */
-#define GREP_MAX_DEPTH 256
-
-/*
- * Resolve a path prefix to the node it names, once.
- *
- * The prefix used to be checked after the fact: every distinct object in the
- * snapshot was enumerated, and each candidate then cost a query for its
- * referencing nodes plus a parent walk per node to rebuild a path, only to
- * be discarded. That made a broad prefix slower than no prefix at all -
- * measured at over 110 seconds against 29 for the same unscoped search,
- * because scoping to everything excluded nothing and added a path rebuild
- * per object.
- *
- * Resolving it here instead turns the prefix into a node id, which the
- * driving query can descend from. One indexed lookup per path segment
- * against nodes_by_snap_parent, which is the same index the browse path
- * uses to list a directory.
+ * A path prefix is resolved to the directory or file it names once, before
+ * anything is enumerated, by node_index_resolve: one indexed lookup per
+ * segment against the snapshot's directory skeleton. The prefix used to be
+ * checked after the fact, every distinct object in the snapshot enumerated
+ * and each paying for its path before being discarded, which made a broad
+ * prefix slower than no prefix at all (110 s against 29 s).
  *
  * Leading and trailing slashes are both accepted. Search results carry an
- * absolute path and grep hits do not, so somebody copying a path from one
- * screen into the other would otherwise get silence.
+ * absolute path and grep hits do too, so a path copied from one screen into
+ * the other works either way.
  */
-static status_t grep_resolve_prefix(cutils_db_t *db, const char *repo,
-                                    const char *snap, const char *prefix,
-                                    char *out_id, size_t out_sz)
-{
-    char cur[32];
-    snprintf(cur, sizeof(cur), "0");
-
-    const char *p = prefix;
-    while (*p == '/') p++;
-
-    while (*p) {
-        const char *slash = strchr(p, '/');
-        size_t seg_len = slash ? (size_t)(slash - p) : strlen(p);
-        if (seg_len == 0) { p = slash + 1; continue; }
-        if (seg_len >= PATH_MAX)
-            return set_error(ERR_INVALID, "grep: path segment too long");
-
-        char seg[PATH_MAX];
-        memcpy(seg, p, seg_len);
-        seg[seg_len] = '\0';
-
-        db_result_t *r = NULL;
-        if (db_execute(db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
-                (const char *[]){ repo, snap, cur, seg, NULL }, &r) != 0
-            || !r || r->nrows != 1) {
-            db_result_free(r);
-            return set_error(ERR_NOT_FOUND,
-                             "grep: no such path in this snapshot: %s", prefix);
-        }
-        snprintf(cur, sizeof(cur), "%s", r->rows[0][0]);
-        db_result_free(r);
-
-        if (!slash) break;
-        p = slash + 1;
-    }
-
-    snprintf(out_id, out_sz, "%s", cur);
-    return OK;
-}
-
-static status_t grep_node_path(cutils_db_t *db, const char *repo, const char *snap,
-                               const char *node_id, char *out, size_t outsz)
-{
-    char *parts[GREP_MAX_DEPTH];
-    int   n = 0;
-
-    char cur[32];
-    snprintf(cur, sizeof(cur), "%s", node_id);
-
-    while (n < GREP_MAX_DEPTH) {
-        db_result_t *r = NULL;
-        if (db_execute(db,
-                "SELECT name, parent_node_id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND id = ?",
-                (const char *[]){ repo, snap, cur, NULL }, &r) != 0 ||
-            !r || r->nrows != 1) {
-            db_result_free(r);
-            break;
-        }
-        parts[n] = strdup(r->rows[0][0]);
-        char parent[32];
-        snprintf(parent, sizeof(parent), "%s",
-                 r->rows[0][1] && r->rows[0][1][0] ? r->rows[0][1] : "0");
-        db_result_free(r);
-        if (!parts[n]) break;
-        n++;
-        if (strcmp(parent, "0") == 0) break;
-        snprintf(cur, sizeof(cur), "%s", parent);
-    }
-
-    size_t off = 0;
-    out[0] = '\0';
-    for (int i = n - 1; i >= 0; i--) {
-        /* Absolute, as name search and the browser give it: a hit is
-         * something to look up there, and a path that differed by its
-         * leading slash had to be fixed up by whoever read it. */
-        int w = snprintf(out + off, outsz - off, "/%s", parts[i]);
-        if (w < 0 || (size_t)w >= outsz - off) { off = 0; break; }
-        off += (size_t)w;
-    }
-    for (int i = 0; i < n; i++) free(parts[i]);
-    return off ? OK : set_error(ERR_IO, "grep: cannot rebuild path");
-}
 
 static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 {
@@ -502,57 +402,63 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /*
      * A prefix restricts what is enumerated, rather than what is kept.
      *
-     * The subtree is walked from the resolved node through
-     * nodes_by_snap_parent - an indexed step per level - so the candidate
-     * set is proportional to the subtree instead of the snapshot. Scoping a
-     * search to a directory of three files now reads three files; it used to
-     * enumerate every object in the snapshot and rebuild a path for each one
-     * before discarding it.
+     * The subtree is walked from the resolved directory through the
+     * snapshot's skeleton - an indexed step per directory - and each
+     * directory's files are the entries of its tree, so the candidate set is
+     * proportional to the subtree instead of the snapshot. Without a prefix
+     * the walk starts at the root. A prefix naming a file rather than a
+     * directory covers that one file: the walk stays in its directory and
+     * keeps only its entry.
      *
-     * A prefix naming a file rather than a directory works too: the walk
-     * finds no children and the search covers that one file.
+     * Each distinct object comes back once, with the first place it was
+     * found (lowest directory id, then entry id) as the path its hits are
+     * reported under, and how many places hold it.
      */
-    char prefix_id[32];
+    node_ref_t ref;
     int scoped = opts->path_prefix && *opts->path_prefix;
-    if (scoped) {
-        status_t pst = grep_resolve_prefix(db, repo, snap, opts->path_prefix,
-                                           prefix_id, sizeof(prefix_id));
-        if (pst != OK) { regfree(&re); return pst; }
+    int rr = node_index_resolve(db, repo_id, snap_id,
+                                scoped ? opts->path_prefix : "", &ref);
+    if (rr == 0 || (rr < 0 && scoped)) {
+        regfree(&re);
+        return set_error(ERR_NOT_FOUND, "grep: no such path in this snapshot: %s",
+                         opts->path_prefix);
     }
 
     db_result_t *objs = NULL;
-    int qrc = scoped
-        ? db_execute(db,
+    int qrc = 0;
+    if (rr == 1) {
+        db_param_t qp[] = { DB_INT64(repo_id), DB_INT64(ref.dir_id),
+                            DB_INT64(ref.is_dir ? 0 : ref.node_id) };
+        qrc = db_execute_typed(db,
             "WITH RECURSIVE sub(id) AS ("
-            "  SELECT CAST(? AS INTEGER)"
+            "  SELECT ?2"
             "  UNION ALL"
-            "  SELECT n.id FROM nodes n JOIN sub ON n.parent_node_id = sub.id"
-            "   WHERE n.repo_id = ? AND n.snap_id = ?"
+            "  SELECT c.id FROM snap_dirs c JOIN sub ON c.parent_id = sub.id"
+            "   WHERE ?3 = 0"
+            "),"
+            " f AS ("
+            "  SELECT n.content_hash AS h, n.id AS nid, d.path || '/' || n.name AS path,"
+            "         COUNT(*) OVER (PARTITION BY n.content_hash) AS cnt,"
+            "         ROW_NUMBER() OVER (PARTITION BY n.content_hash"
+            "                            ORDER BY d.id, n.id) AS rn"
+            "    FROM sub JOIN snap_dirs d ON d.id = sub.id"
+            "    JOIN nodes n ON n.repo_id = d.repo_id AND n.tree_hash = d.tree_hash"
+            "   WHERE n.repo_id = ?1 AND n.type = 1 AND n.content_hash IS NOT NULL"
+            "     AND (?3 = 0 OR n.id = ?3)"
             ")"
-            "SELECT n.content_hash, MIN(n.id), COUNT(*),"
-            "       COALESCE(o.orig_size, 0)"
-            "  FROM nodes n"
-            "  JOIN sub ON sub.id = n.id"
-            "  LEFT JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            "  LEFT JOIN pack_objects po ON po.repo_id = n.repo_id AND po.hash = n.content_hash"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.type = 1"
-            "   AND n.content_hash IS NOT NULL"
-            " GROUP BY n.content_hash"
-            " ORDER BY CASE WHEN MIN(po.pack_id) IS NULL THEN 1 ELSE 0 END,"
-            "          MIN(po.pack_id), MIN(po.offset)",
-            (const char *[]){ prefix_id, repo, snap, repo, snap, NULL }, &objs)
-        : db_execute(db,
-            "SELECT n.content_hash, MIN(n.id), COUNT(*),"
-            "       COALESCE(o.orig_size, 0)"
-            "  FROM nodes n"
-            "  LEFT JOIN objects o ON o.repo_id = n.repo_id AND o.hash = n.content_hash"
-            "  LEFT JOIN pack_objects po ON po.repo_id = n.repo_id AND po.hash = n.content_hash"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.type = 1"
-            "   AND n.content_hash IS NOT NULL"
-            " GROUP BY n.content_hash"
-            " ORDER BY CASE WHEN MIN(po.pack_id) IS NULL THEN 1 ELSE 0 END,"
-            "          MIN(po.pack_id), MIN(po.offset)",
-            (const char *[]){ repo, snap, NULL }, &objs);
+            " SELECT lower(hex(f.h)), f.nid, f.cnt, COALESCE(o.orig_size, 0), f.path"
+            "   FROM f"
+            "   LEFT JOIN objects o ON o.repo_id = ?1 AND o.hash = f.h"
+            "   LEFT JOIN pack_objects po ON po.repo_id = ?1 AND po.hash = f.h"
+            "  WHERE f.rn = 1"
+            "  ORDER BY CASE WHEN po.pack_id IS NULL THEN 1 ELSE 0 END,"
+            "           po.pack_id, po.offset",
+            qp, DB_NPARAMS(qp), &objs);
+    } else {
+        /* Unscoped over a snapshot that is not resident: nothing to read,
+         * as a snapshot with no rows always answered. */
+        qrc = db_execute(db, "SELECT 1 WHERE 0", NULL, &objs);
+    }
     if (qrc != 0 || !objs) {
         db_result_free(objs);
         regfree(&re);
@@ -599,18 +505,13 @@ status_t grep_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
         /*
          * Every candidate is in scope by construction now - the query only
-         * enumerates the subtree - so there is no filtering left to do here.
-         * The path is rebuilt once, for reporting the hit, and only for
-         * files that are actually going to be read.
+         * enumerates the subtree - so there is no filtering left to do here,
+         * and its path came with it: the directory's path from the skeleton
+         * and the entry's name.
          */
         uint8_t hash[OBJECT_HASH_SIZE];
         hex_to_hash(hex, hash);
-
-        char rel[PATH_MAX];
-        if (grep_node_path(db, repo, snap, node_id, rel, sizeof(rel)) != OK) {
-            err_clear();
-            snprintf(rel, sizeof(rel), "%s", hex);
-        }
+        const char *rel = objs->rows[i][4];
 
         res.files_scanned++;
         if (scan_object(&g, store, hash, size, node_id, rel))

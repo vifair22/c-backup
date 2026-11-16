@@ -73,3 +73,15 @@ typedef struct {
 status_t tree_build(const scan_result_t *scan, const tree_build_ops_t *ops,
                     uint8_t root_hash[OBJECT_HASH_SIZE],
                     tree_build_stats_t *stats);
+
+/* An entry whose parent names nothing in the scan, or names something that
+ * is not a directory: it belongs to no tree. */
+#define TREE_BUILD_NONE (UINT32_MAX - 1)
+
+/*
+ * Each entry's parent as a scan index: TREE_BUILD_ROOT for an entry at the
+ * top (parent id 0), TREE_BUILD_NONE for one that belongs to no tree. parent
+ * holds scan->count values. The grouping tree_build applies, for a caller
+ * that needs the directory structure again after the build.
+ */
+status_t tree_build_parents(const scan_result_t *scan, uint32_t *parent);

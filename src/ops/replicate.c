@@ -598,7 +598,7 @@ status_t replicate_run(store_t *store, cutils_db_t *db, int64_t repo_id,
 
     db_result_t *snaps = NULL;
     if (db_execute(db,
-            "SELECT id, ts, label, root_tree_hash, file_count, total_size"
+            "SELECT id, ts, label, lower(hex(root_tree_hash)), file_count, total_size"
             " FROM snapshots WHERE repo_id = ? AND completed_at IS NOT NULL"
             " ORDER BY id",
             (const char *[]){ repo, NULL }, &snaps) != 0)

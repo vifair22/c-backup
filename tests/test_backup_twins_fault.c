@@ -218,7 +218,7 @@ static void test_twins_stored_once_counted_once(void **state)
     uint8_t name[OBJECT_HASH_SIZE];
     {
         db_result_t *r = NULL;
-        assert_int_equal(db_execute(b.db, "SELECT DISTINCT content_hash FROM nodes"
+        assert_int_equal(db_execute(b.db, "SELECT DISTINCT lower(hex(content_hash)) FROM nodes"
                                     " WHERE name IN ('twin1.bin', 'twin2.bin')",
                                     NULL, &r), 0);
         assert_int_equal(r->nrows, 1);
@@ -237,7 +237,7 @@ static void test_twins_stored_once_counted_once(void **state)
     object_hash_to_hex(name, hex);
     char q[256];
     snprintf(q, sizeof(q), "SELECT phys_size, orig_size FROM objects"
-             " WHERE hash = '%s'", hex);
+             " WHERE hash = X'%s'", hex);
     db_result_t *r1 = NULL, *r2 = NULL;
     assert_int_equal(db_execute(a.db, q, NULL, &r1), 0);
     assert_int_equal(db_execute(b.db, q, NULL, &r2), 0);

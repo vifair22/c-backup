@@ -3,6 +3,7 @@
 #include "prune.h"
 #include "db_txn.h"
 #include "repo_tags.h"
+#include "node_index.h"
 
 #include <cutils/log.h>
 
@@ -97,14 +98,11 @@ static status_t prune_core(store_t *store, cutils_db_t *db, int64_t repo_id,
             " VALUES (?, ?, ?)",
             (const char *[]){ repo, marker, snap, NULL }, NULL) != 0;
 
+    /* Its directory skeleton, and the rows of every tree no other snapshot
+     * reaches. A tree another snapshot holds keeps its rows: they are
+     * shared, not this snapshot's (docs/index-reuse.md). */
     if (!failed)
-        failed = db_execute_non_query(db,
-            "DELETE FROM nodes WHERE repo_id = ? AND snap_id = ?",
-            (const char *[]){ repo, snap, NULL }, NULL) != 0;
-    if (!failed)
-        failed = db_execute_non_query(db,
-            "DELETE FROM node_fts WHERE repo_id = ? AND snap_id = ?",
-            (const char *[]){ repo, snap, NULL }, NULL) != 0;
+        failed = node_index_drop_snapshot(db, repo_id, snap_id, 1) != OK;
     if (!failed)
         failed = db_execute_non_query(db,
             "DELETE FROM snapshots WHERE repo_id = ? AND id = ?",

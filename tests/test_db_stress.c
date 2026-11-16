@@ -346,11 +346,14 @@ static void test_writes_during_a_backup_all_land(void **state)
     assert_int_equal(bst, OK);
     assert_int_equal(res.snapshot_id, 2);
     assert_int_equal((int)res.files, N_FILES);
-    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE snap_id = 2"
-                            " AND type = 1", NULL), N_FILES);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes n JOIN snap_dirs d"
+                            " ON d.repo_id = n.repo_id AND d.tree_hash = n.tree_hash"
+                            " WHERE d.snap_id = 2 AND n.type = 1", NULL), N_FILES);
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE location = 'staged'",
                             NULL), 0);
-    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes n WHERE n.snap_id = 2"
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes n JOIN snap_dirs d"
+                            " ON d.repo_id = n.repo_id AND d.tree_hash = n.tree_hash"
+                            " WHERE d.snap_id = 2"
                             " AND n.content_hash IS NOT NULL AND NOT EXISTS"
                             " (SELECT 1 FROM objects o WHERE o.hash = n.content_hash)",
                             NULL), 0);

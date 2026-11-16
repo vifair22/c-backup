@@ -148,11 +148,32 @@ CREATE TABLE snapshot_id_seq (
     last_id INTEGER NOT NULL
 );
 
+-- Every hash column in this database holds a raw 32-byte BLOB (NIT-12).
+-- Hex text stored there doubled every hash index and compared unequal to
+-- the same name stored raw; tests/test_schema.c asserts length() = 32 on
+-- every hash column after backup, gc and reindex.
+
+-- One sequence for nodes and snap_dirs ids, database-wide: the two kinds
+-- appear side by side in a directory listing, so they must never collide;
+-- a nodes id is also its node_fts rowid, so it must be unique across
+-- repositories; and an id a client has seen must never name something else
+-- later (deleting the newest rows must not hand their ids out again).
+CREATE TABLE node_id_seq (
+    one     INTEGER PRIMARY KEY CHECK (one = 1),
+    last_id INTEGER NOT NULL
+);
+INSERT INTO node_id_seq (one, last_id) VALUES (1, 0);
+
+-- The entries of each distinct manifest tree, once per repository however
+-- many snapshots hold the tree (docs/index-reuse.md). A snapshot reaches
+-- these rows through its directory skeleton in snap_dirs; nothing here
+-- names a snapshot or a parent, because a tree can sit at several paths
+-- and in any number of snapshots.
 CREATE TABLE nodes (
+    id                INTEGER PRIMARY KEY,
     repo_id           INTEGER NOT NULL,
-    id                INTEGER NOT NULL,
-    snap_id           INTEGER NOT NULL,
-    parent_node_id    INTEGER,
+    -- The tree this entry belongs to.
+    tree_hash         BLOB NOT NULL,
     name              TEXT NOT NULL,
     -- NODE_TYPE_*. Explicit rather than inferred from which hash column is
     -- populated: a directory with no children and a file with no content
@@ -166,28 +187,65 @@ CREATE TABLE nodes (
     size              INTEGER NOT NULL,
     content_hash      BLOB,
     hardlink_group_id INTEGER,
-    -- Directories only: name of this directory's tree object. Lets a backup
-    -- reuse an unchanged subtree without re-serialising it, and lets GC walk
-    -- the graph from the DB rather than from disk.
+    -- Directories only: the tree object holding this directory's entries,
+    -- which is also the tree_hash of its children's rows.
     subtree_hash      BLOB,
     link_target       TEXT,
-    xattr_hash        TEXT,
-    acl_hash          TEXT,
+    xattr_hash        BLOB,
+    acl_hash          BLOB,
     -- Character and block devices: the pair of numbers is the whole file.
     dev_major         INTEGER NOT NULL DEFAULT 0,
     dev_minor         INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (repo_id, id),
     FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
 );
-CREATE INDEX nodes_by_snap_parent ON nodes (repo_id, snap_id, parent_node_id, name);
+-- A directory's page in name order, without a sort.
+CREATE INDEX nodes_by_tree ON nodes (repo_id, tree_hash, name);
 CREATE INDEX nodes_by_hash ON nodes (repo_id, content_hash);
 
+-- A tree whose rows in nodes are complete. Rows are trusted, and reused by
+-- the next backup, only once this row exists: a tree indexed half-way when
+-- a run stopped is rewritten, never reused. files and bytes are the regular
+-- files directly in the tree and their logical size, so a reindex can total
+-- a snapshot from its skeleton without reading entries it has seen.
+CREATE TABLE trees (
+    repo_id INTEGER NOT NULL,
+    hash    BLOB NOT NULL,
+    files   INTEGER NOT NULL,
+    bytes   INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, hash),
+    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+);
+
+-- Each snapshot's directories: one row per directory instance, the
+-- synthetic root included (parent_id 0, name and path empty). The one
+-- per-snapshot table, linear in directories rather than files. It gives a
+-- directory an id of its own in each snapshot, a single parent and a path,
+-- which is what browse, search, restore, grep and verify need from a tree
+-- whose rows are shared. A snapshot with no rows here is not resident.
+CREATE TABLE snap_dirs (
+    id        INTEGER PRIMARY KEY,
+    repo_id   INTEGER NOT NULL,
+    snap_id   INTEGER NOT NULL,
+    parent_id INTEGER NOT NULL,
+    name      TEXT NOT NULL,
+    -- '/'-joined from the root, '' for the root itself: an entry's path is
+    -- its directory's path, '/', and its name.
+    path      TEXT NOT NULL,
+    tree_hash BLOB NOT NULL,
+    FOREIGN KEY (repo_id) REFERENCES repos(id) ON DELETE CASCADE
+);
+CREATE INDEX snap_dirs_by_snap ON snap_dirs (repo_id, snap_id, parent_id);
+CREATE INDEX snap_dirs_by_parent ON snap_dirs (parent_id, name);
+-- Which snapshots, at which paths, hold a tree: a search hit's expansion,
+-- and the check that a tree is still referenced before its rows go.
+CREATE INDEX snap_dirs_by_tree ON snap_dirs (repo_id, tree_hash, snap_id);
+
 -- Name search across every snapshot. Trigram, so a substring anywhere in a
--- name matches, not only a word at its start.
+-- name matches, not only a word at its start. The rowid is the nodes id:
+-- one row per distinct entry, so a name is indexed once however many
+-- snapshots hold it, and deleting a tree's rows is a rowid lookup.
 CREATE VIRTUAL TABLE node_fts USING fts5(
     name,
-    node_id  UNINDEXED,
-    snap_id  UNINDEXED,
     repo_id  UNINDEXED,
     tokenize='trigram'
 );
@@ -341,7 +399,7 @@ CREATE TABLE verify_findings (
     id                      INTEGER PRIMARY KEY,
     run_id                  INTEGER NOT NULL REFERENCES verify_runs(id) ON DELETE CASCADE,
     repo_id                 INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-    hash                    TEXT NOT NULL,
+    hash                    BLOB NOT NULL,
     status                  TEXT NOT NULL,
     affected_files          INTEGER NOT NULL DEFAULT 0,
     sample_paths            TEXT,

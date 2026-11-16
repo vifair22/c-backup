@@ -169,9 +169,9 @@ static void test_unchanged_rebackup_writes_nothing(void **state)
      * the two runs (see scratch_ancestors.h); the source tree may not. */
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT COUNT(DISTINCT hex(n.subtree_hash)), COUNT(*) FROM nodes n"
-        " JOIN nodes p ON p.repo_id = n.repo_id AND p.id = n.parent_node_id"
-        " WHERE n.name = 'src' AND p.name = 'c_backup_test_incr'",
+        "SELECT COUNT(DISTINCT hex(d.tree_hash)), COUNT(*) FROM snap_dirs d"
+        " JOIN snap_dirs p ON p.id = d.parent_id"
+        " WHERE d.name = 'src' AND p.name = 'c_backup_test_incr'",
         NULL, &r), 0);
     assert_string_equal(r->rows[0][0], "1");
     assert_string_equal(r->rows[0][1], "2");
@@ -289,8 +289,9 @@ static void test_snapshots_are_independent(void **state)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT snap_id, COUNT(*) FROM nodes WHERE repo_id = ?"
-        " GROUP BY snap_id ORDER BY snap_id",
+        "SELECT d.snap_id, COUNT(*) FROM snap_dirs d JOIN nodes n"
+        "  ON n.repo_id = d.repo_id AND n.tree_hash = d.tree_hash"
+        " WHERE d.repo_id = ? GROUP BY d.snap_id ORDER BY d.snap_id",
         (const char *[]){ repo, NULL }, &r), 0);
     assert_int_equal(r->nrows, 2);
     assert_true(atoi(r->rows[0][1]) > 0);
@@ -362,7 +363,7 @@ static void test_backup_after_a_crash_restores_what_the_crash_lost(void **state)
     snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT location FROM objects WHERE repo_id = ? AND hash = ?",
+        "SELECT location FROM objects WHERE repo_id = ? AND hash = unhex(?)",
         (const char *[]){ repo, hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     assert_string_not_equal(r->rows[0][0], "staged");

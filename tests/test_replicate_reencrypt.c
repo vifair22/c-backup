@@ -189,7 +189,7 @@ static void dest_entry_encryption(int *n_plain, int *n_enc)
     db_result_t *r = NULL;
     char id[32];
     snprintf(id, sizeof(id), "%lld", (long long)src_id);
-    assert_int_equal(db_execute(db, "SELECT hash FROM objects WHERE repo_id = ?",
+    assert_int_equal(db_execute(db, "SELECT lower(hex(hash)) FROM objects WHERE repo_id = ?",
                                 (const char *[]){ id, NULL }, &r), 0);
     assert_non_null(r);
     assert_true(r->nrows > 0);

@@ -240,11 +240,25 @@ static void snap_rows_load(env_t *e, int64_t snap, snap_rows_t *out)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(e->db,
-        "SELECT id, parent_node_id, name, type, mode, uid, gid, mtime_ns, size,"
-        "       hex(content_hash), hex(subtree_hash), link_target,"
-        "       hardlink_group_id, hex(xattr_hash), hex(acl_hash), dev_major,"
-        "       dev_minor"
-        "  FROM nodes WHERE snap_id = ?",
+        /* A snapshot's entries: each directory from its parent's tree
+         * under its own id, everything else from its directory's tree
+         * (docs/index-reuse.md). */
+        "SELECT d.id, d.parent_id, n.name, n.type, n.mode, n.uid, n.gid,"
+        "       n.mtime_ns, n.size, hex(n.content_hash), hex(n.subtree_hash),"
+        "       n.link_target, n.hardlink_group_id, hex(n.xattr_hash),"
+        "       hex(n.acl_hash), n.dev_major, n.dev_minor"
+        "  FROM snap_dirs d JOIN snap_dirs p ON p.id = d.parent_id"
+        "  JOIN nodes n ON n.repo_id = d.repo_id AND n.tree_hash = p.tree_hash"
+        "             AND n.name = d.name"
+        " WHERE d.snap_id = ?1"
+        " UNION ALL"
+        " SELECT n.id, d.id, n.name, n.type, n.mode, n.uid, n.gid,"
+        "       n.mtime_ns, n.size, hex(n.content_hash), hex(n.subtree_hash),"
+        "       n.link_target, n.hardlink_group_id, hex(n.xattr_hash),"
+        "       hex(n.acl_hash), n.dev_major, n.dev_minor"
+        "  FROM snap_dirs d JOIN nodes n ON n.repo_id = d.repo_id"
+        "   AND n.tree_hash = d.tree_hash"
+        " WHERE d.snap_id = ?1 AND n.type <> 2",
         (const char *[]){ id, NULL }, &r), 0);
     int n = r->nrows;
     out->n = n;

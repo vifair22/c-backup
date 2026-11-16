@@ -19,6 +19,9 @@
 #include "store_index.h"
 #include "util.h"
 #include "json_row.h"
+#include "node_index.h"
+#include "node_queries.h"
+#include "db_typed.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -113,25 +116,6 @@ static int64_t newest_snapshot(int64_t repo_id)
 }
 
 /* Does this repository have a snapshot with this id? */
-/* Are more of this repository's snapshots newer than snap_id than older?
- * A count over the snapshots table, which holds one row per snapshot. */
-static int snapshot_in_older_half(int64_t repo_id, int64_t snap_id)
-{
-    char repo[32], snap[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    db_result_t *r = NULL;
-    int older = 0;
-    if (db_execute(g_ctx.db,
-            "SELECT (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id > ?)"
-            "     > (SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND id < ?)",
-            (const char *[]){ repo, snap, repo, snap, NULL }, &r) == 0 &&
-        r && r->nrows == 1)
-        older = strcmp(r->rows[0][0], "1") == 0;
-    db_result_free(r);
-    return older;
-}
-
 static int snapshot_exists(int64_t repo_id, int64_t snap_id)
 {
     char repo[32], snap[32];
@@ -257,54 +241,19 @@ static char *dest_inside_repo(const char *dest)
 
 /*
  * Does `subpath` (normalised, absolute, not "/") name anything in the
- * snapshot? One indexed lookup per component against nodes_by_snap_parent,
- * so asking costs the depth of the path, not the size of the snapshot.
+ * snapshot? One indexed lookup per component against the snapshot's
+ * directory skeleton and the entries of the directory it reaches, so asking
+ * costs the depth of the path, not the size of the snapshot.
  *
  * Returns 1 when it does, 0 when it does not, and -1 when the index cannot
- * say: a snapshot whose nodes are not resident (evicted, or never
- * materialised) has no rows to walk, and the restore job reports that case
+ * say: a snapshot whose skeleton is not resident (evicted, or never
+ * materialised) has nothing to walk, and the restore job reports that case
  * with its own message rather than this one guessing.
  */
 static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 {
-    char repo[32], snap[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-
-    db_result_t *r = NULL;
-    int resident = db_execute(g_ctx.db,
-            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
-            (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
-    db_result_free(r);
-    if (!resident) return -1;
-
-    char parent[32] = "0";
-    const char *p = subpath;
-    while (*p) {
-        while (*p == '/') p++;
-        if (!*p) break;
-        const char *s = p;
-        while (*p && *p != '/') p++;
-        char name[NAME_MAX + 1];
-        size_t n = (size_t)(p - s);
-        if (n > NAME_MAX) return 0;
-        memcpy(name, s, n);
-        name[n] = '\0';
-
-        r = NULL;
-        if (db_execute(g_ctx.db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
-                (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
-            !r || r->nrows < 1) {
-            db_result_free(r);
-            return 0;
-        }
-        snprintf(parent, sizeof(parent), "%s", r->rows[0][0]);
-        db_result_free(r);
-    }
-    return 1;
+    node_ref_t ref;
+    return node_index_resolve(g_ctx.db, repo_id, snap_id, subpath, &ref);
 }
 
 /* ---------- listing ---------- */
@@ -378,8 +327,13 @@ static api_response_t list_snapshots(const api_request_t *req, int64_t repo_id)
 
 /*
  * One directory level, name-ordered and paged. The ordering is not cosmetic:
- * nodes_by_snap_parent carries name as its trailing column precisely so this
- * query is an index range scan rather than a sort of every child.
+ * nodes_by_tree carries name as its trailing column precisely so this query
+ * is an index range scan rather than a sort of every child.
+ *
+ * A directory's entries are the rows of its tree, shared by every snapshot
+ * holding that tree (docs/index-reuse.md). What makes the listing this
+ * snapshot's is the directory id: each subdirectory is shown with its own
+ * skeleton id in this snapshot, which is what `parent` takes next.
  */
 static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
                                 int64_t snap_id)
@@ -401,49 +355,75 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     jreq_err_t je;
     if (parent && jquery_i64(parent, "parent", 0, INT64_MAX, &pid, &je) != JREQ_OK)
         return api_error(400, je.msg);
-    /* Bound as the id read, not the text sent: "1e2" is node 100. */
-    char pidbuf[32];
-    snprintf(pidbuf, sizeof(pidbuf), "%lld", (long long)pid);
-    parent = pidbuf;
-    if (pid > 0) {
-        char rb[32], sb[32];
-        snprintf(rb, sizeof(rb), "%lld", (long long)repo_id);
-        snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
+
+    int64_t dir_id = 0;
+    uint8_t tree[OBJECT_HASH_SIZE];
+    int listable = 1;
+    if (pid == 0) {
+        int rr = node_index_root(g_ctx.db, repo_id, snap_id, &dir_id, tree);
+        if (rr < 0) return api_error(500, "cannot list directory");
+        /* Not resident: nothing to list, as a snapshot with no rows always
+         * answered. `materialized` in the snapshot list says why. */
+        listable = (rr == 1);
+    } else {
+        db_param_t dp[] = { DB_INT64(pid), DB_INT64(repo_id), DB_INT64(snap_id) };
         db_result_t *pr = NULL;
-        int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
-                (const char *[]){ rb, sb, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
+        if (db_execute_typed(g_ctx.db,
+                NODE_SQL_DIR_IN_SNAP, dp, DB_NPARAMS(dp), &pr) != 0 || !pr) {
+            db_result_free(pr);
+            return api_error(500, "cannot list directory");
+        }
+        int found = pr->nrows == 1 && node_hex_to_hash(pr->rows[0][0], tree) == 0;
         db_result_free(pr);
-        if (!found) return api_error(404, "no such directory in this snapshot");
+        if (found) {
+            dir_id = pid;
+        } else {
+            /*
+             * Not one of this snapshot's directories. A file of the
+             * snapshot is still a node of it, with no children, which is
+             * what it always answered; and an entry row of a directory
+             * stands for that directory here. Anything else is not in
+             * this snapshot.
+             */
+            pr = NULL;
+            db_param_t ep[] = { DB_INT64(snap_id), DB_INT64(pid), DB_INT64(repo_id) };
+            if (db_execute_typed(g_ctx.db, NODE_SQL_ENTRY_IN_SNAP,
+                                 ep, DB_NPARAMS(ep), &pr) != 0 || !pr) {
+                db_result_free(pr);
+                return api_error(500, "cannot list directory");
+            }
+            if (pr->nrows < 1) {
+                db_result_free(pr);
+                return api_error(404, "no such directory in this snapshot");
+            }
+            int is_dir = strtol(pr->rows[0][0], NULL, 10) == NODE_TYPE_DIR;
+            int64_t holder = strtoll(pr->rows[0][1], NULL, 10);
+            char *name = strdup(pr->rows[0][2]);
+            db_result_free(pr);
+            if (!name) return api_error(500, "out of memory");
+            listable = 0;
+            if (is_dir) {
+                pr = NULL;
+                db_param_t cp[] = { DB_INT64(holder), DB_TEXT(name) };
+                if (db_execute_typed(g_ctx.db, NODE_SQL_CHILD_DIR, cp, DB_NPARAMS(cp), &pr) == 0 &&
+                    pr && pr->nrows == 1 && node_hex_to_hash(pr->rows[0][1], tree) == 0) {
+                    dir_id = strtoll(pr->rows[0][0], NULL, 10);
+                    listable = 1;
+                }
+                db_result_free(pr);
+            }
+            free(name);
+        }
     }
 
-    char repo[32], snap[32], lim[16], off[16];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
-    snprintf(lim,  sizeof(lim),  "%d", limit);
-    snprintf(off,  sizeof(off),  "%d", offset);
-
     db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
-            "       mtime_ns % 1000000000, content_hash,"
-            /* Whether this directory has anything in it. A browser needs it
-             * to decide which rows get an expander, and the alternative is a
-             * round trip per directory to find out it is empty. EXISTS and
-             * not COUNT: this runs once per row returned, and counting the
-             * children of a directory holding 10k files to learn that the
-             * answer is "yes" would turn one page into a full scan. It is an
-             * index seek against nodes_by_snap_parent either way. */
-            "       EXISTS (SELECT 1 FROM nodes c"
-            "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id"
-            "                  AND c.parent_node_id = n.id)"
-            "  FROM nodes n"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?"
-            " ORDER BY n.name LIMIT ? OFFSET ?",
-            (const char *[]){ repo, snap, parent ? parent : "0", lim, off, NULL },
-            &r) != 0) {
-        db_result_free(r);
-        return api_error(500, "cannot list directory");
+    if (listable) {
+        db_param_t lp[] = { DB_INT64(dir_id), DB_INT64(repo_id), DB_HASH(tree),
+                            DB_INT64(limit), DB_INT64(offset) };
+        if (db_execute_typed(g_ctx.db, NODE_SQL_LIST_DIR, lp, DB_NPARAMS(lp), &r) != 0) {
+            db_result_free(r);
+            return api_error(500, "cannot list directory");
+        }
     }
 
     CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
@@ -524,128 +504,69 @@ static char *fts_quote(const char *q)
 }
 
 /*
- * Ancestor cache for path building.
+ * Search results, one per (path, content).
  *
- * A search result is a name and a node id, which is not something anybody
- * can act on: the answer to "where is a.txt" is a path. Building one means
- * walking parent_node_id to the root, and doing that per hit would re-walk
- * the same directories for every file in them - which, for a search, is most
- * of the results.
- *
- * So each (snap_id, node_id) is resolved once into its name and parent and
- * kept. A page of a thousand hits from one tree costs the depth of that
- * tree in lookups, not a thousand times it.
+ * Each keeps the newest snapshot it was seen in and counts the snapshots,
+ * so "in 30 snapshots, newest 41" replaces thirty identical lines. A changed
+ * file is a new hash and stays a separate result, which is the version
+ * history a search is often after. Results stay in first-seen order.
  */
 typedef struct {
-    int64_t  snap_id;
-    int64_t  node_id;   /* 0 marks an empty slot */
-    int64_t  parent_id;
+    char    *key;       /* path, \x01, content hash */
+    char    *path;
     char    *name;
-} anc_slot_t;
+    char    *hash;
+    int64_t  node_id;   /* entry id, or the directory's own id */
+    int64_t  dir_id;    /* holding directory in the newest snapshot */
+    int64_t  snap;
+    int      type;
+    char    *size;
+    uint32_t count;
+} hit_t;
 
-typedef struct {
-    anc_slot_t *slots;
-    size_t      mask;
-    cutils_db_t *db;
-    int64_t     repo_id;
-} anc_cache_t;
-
-static size_t anc_hash(int64_t snap_id, int64_t node_id)
+static void hits_free(hit_t *h, int n)
 {
-    uint64_t h = (uint64_t)snap_id * 0x9E3779B97F4A7C15ull;
-    h ^= (uint64_t)node_id + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-    return (size_t)(h ^ (h >> 29));
+    for (int k = 0; k < n; k++) {
+        free(h[k].key); free(h[k].path); free(h[k].name);
+        free(h[k].hash); free(h[k].size);
+    }
+    free(h);
 }
 
-static int anc_init(anc_cache_t *c, cutils_db_t *db, int64_t repo_id, int rows)
+/* Add count sightings of one entry at one path, newest in snap (directory
+ * dir). Returns -1 on allocation failure. */
+static int hits_add(hit_t *hits, int *nhits, int limit, const char *dirpath,
+                    char **row, int64_t snap, int64_t dir, uint32_t count,
+                    int name_col, int type_col, int size_col, int hash_col)
 {
-    size_t want = 64;
-    /* Four slots per hit, so the table stays sparse enough that linear
-     * probing does not degrade even when every hit has a distinct chain. */
-    while (want < (size_t)rows * 4u && want < (1u << 20)) want <<= 1;
-    c->slots = calloc(want, sizeof(*c->slots));
-    if (!c->slots) return -1;
-    c->mask = want - 1;
-    c->db = db;
-    c->repo_id = repo_id;
-    return 0;
-}
-
-static void anc_free(anc_cache_t *c)
-{
-    if (!c->slots) return;
-    for (size_t i = 0; i <= c->mask; i++) free(c->slots[i].name);
-    free(c->slots);
-    c->slots = NULL;
-}
-
-/* Returns the slot for a node, reading it from the database on a miss.
- * NULL means the node does not exist, which ends a walk. */
-static const anc_slot_t *anc_get(anc_cache_t *c, int64_t snap_id, int64_t node_id)
-{
-    size_t i = anc_hash(snap_id, node_id) & c->mask;
-    for (size_t probe = 0; probe <= c->mask; probe++, i = (i + 1) & c->mask) {
-        anc_slot_t *sl = &c->slots[i];
-        if (sl->node_id == node_id && sl->snap_id == snap_id) return sl;
-        if (sl->node_id != 0) continue;
-
-        char repo[32], nid[32];
-        snprintf(repo, sizeof(repo), "%lld", (long long)c->repo_id);
-        snprintf(nid,  sizeof(nid),  "%lld", (long long)node_id);
-        db_result_t *r = NULL;
-        if (db_execute(c->db,
-                "SELECT name, COALESCE(parent_node_id, 0) FROM nodes"
-                " WHERE repo_id = ? AND id = ?",
-                (const char *[]){ repo, nid, NULL }, &r) != 0
-            || !r || r->nrows != 1) {
-            db_result_free(r);
-            return NULL;
+    char *path = NULL, *key = NULL;
+    if (asprintf(&path, "%s/%s", dirpath, row[name_col]) < 0) return -1;
+    if (asprintf(&key, "%s%c%s", path, '\x01', row[hash_col]) < 0) { free(path); return -1; }
+    for (int k = 0; k < *nhits; k++) {
+        if (strcmp(hits[k].key, key) != 0) continue;
+        hits[k].count += count;
+        if (snap > hits[k].snap) {
+            hits[k].snap = snap;
+            hits[k].dir_id = dir;
+            hits[k].node_id = strtoll(row[0], NULL, 10);
         }
-        sl->name = strdup(r->rows[0][0] ? r->rows[0][0] : "");
-        sl->parent_id = strtoll(r->rows[0][1], NULL, 10);
-        db_result_free(r);
-        if (!sl->name) return NULL;
-        sl->snap_id = snap_id;
-        sl->node_id = node_id;
-        return sl;
+        free(path); free(key);
+        return 0;
     }
-    return NULL;  /* full, which the sizing above makes unreachable */
-}
-
-/*
- * The absolute path of a node, or NULL if it cannot be resolved. Built from
- * the root down, so the walk collects names in reverse and then writes them
- * out forwards.
- */
-static char *anc_path(anc_cache_t *c, int64_t snap_id, int64_t node_id)
-{
-    /* scan_tree records absolute paths, so a chain is as deep as the source
-     * root plus the tree under it. This is a sanity bound, not a limit
-     * anybody should reach. */
-    enum { MAX_DEPTH = 256 };
-    const char *parts[MAX_DEPTH];
-    size_t n = 0, total = 0;
-
-    for (int64_t id = node_id; id != 0 && n < MAX_DEPTH; ) {
-        const anc_slot_t *sl = anc_get(c, snap_id, id);
-        if (!sl) break;
-        parts[n++] = sl->name;
-        total += strlen(sl->name) + 1;
-        id = sl->parent_id;
-    }
-    if (n == 0) return NULL;
-
-    char *out = malloc(total + 2);
-    if (!out) return NULL;
-    char *w = out;
-    for (size_t i = n; i-- > 0; ) {
-        *w++ = '/';
-        size_t len = strlen(parts[i]);
-        memcpy(w, parts[i], len);
-        w += len;
-    }
-    *w = '\0';
-    return out;
+    if (*nhits >= limit) { free(path); free(key); return 0; }
+    hit_t *h = &hits[(*nhits)++];
+    memset(h, 0, sizeof(*h));
+    h->key = key;
+    h->path = path;
+    h->name = strdup(row[name_col]);
+    h->hash = strdup(row[hash_col]);
+    h->size = strdup(row[size_col]);
+    h->node_id = strtoll(row[0], NULL, 10);
+    h->dir_id = dir;
+    h->snap = snap;
+    h->type = (int)strtol(row[type_col], NULL, 10);
+    h->count = count;
+    return (h->name && h->hash && h->size) ? 0 : -1;
 }
 
 static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
@@ -683,157 +604,137 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     char *mq = fts_quote(q);
     if (!mq) return api_error(500, "out of memory");
     /*
-     * Without a snapshot, identical (path, content) rows across snapshots
-     * collapse into one result, so more rows are read than results returned.
-     * Bounded, because the alternative is reading every match in the
-     * repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows per
-     * result stops and says the counts are partial.
+     * Without a snapshot, identical (path, content) rows can still come from
+     * different entry rows (a file unchanged in a directory that changed is
+     * a new row of the new tree), so more rows are read than results
+     * returned. Bounded, because the alternative is reading every match in
+     * the repository to fill one page: a scan past SEARCH_SCAN_FACTOR rows
+     * per result stops and says the counts are partial.
      */
     enum { SEARCH_SCAN_FACTOR = 8, SEARCH_SCAN_MAX = 8000 };
     int scan = only_snap ? limit : limit * SEARCH_SCAN_FACTOR;
     if (scan > SEARCH_SCAN_MAX) scan = SEARCH_SCAN_MAX;
     if (scan < limit) scan = limit;
 
-    char repo[32], lim[16], snap[32];
-    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
-    snprintf(lim,  sizeof(lim),  "%d", scan);
-    snprintf(snap, sizeof(snap), "%lld", (long long)only_snap);
-
     /*
      * Through the trigram index, not LIKE: a scan of the nodes table loses to
      * the pre-rewrite implementation, while this beats it by ~50x. Ordered by
      * the index's own rowid only, which costs nothing: any other ORDER BY
-     * would read every match to return the first page.
+     * would read every match to return the first page. Newest first, which
+     * is the order entries were indexed in: the most recently changed
+     * directories come first.
      *
-     * The direction is what makes a one-snapshot search fast. Index rows are
-     * written as each snapshot is indexed, so rowid order is snapshot order,
-     * and the snapshot filter applies after the match: a page from the newest
-     * snapshot, read oldest first, walked every older snapshot's matches
-     * before reaching its own (231 ms against 0.27 ms for the oldest, growing
-     * with retention). Newest first by default, which is also the copy a
-     * collapsed result should keep; oldest first only for a snapshot in the
-     * older half. A reindexed snapshot is rewritten at the high end, which
-     * makes it slower to find this way, never wrong.
+     * A name is indexed once however many snapshots hold it, so the match
+     * reads distinct entries; the snapshot filter is a join on the
+     * snapshot's directories, applied as the matches are read.
      */
-    int oldest_first = only_snap && snapshot_in_older_half(repo_id, only_snap);
     db_result_t *r = NULL;
     int rc;
-    if (only_snap)
-        rc = db_execute(g_ctx.db, oldest_first
-            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid ASC LIMIT ?"
-            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid DESC LIMIT ?",
-            (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
-    else
-        rc = db_execute(g_ctx.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ?"
-            " ORDER BY f.rowid DESC LIMIT ?",
-            (const char *[]){ repo, repo, mq, lim, NULL }, &r);
+    if (only_snap) {
+        db_param_t p[] = { DB_INT64(only_snap), DB_INT64(repo_id), DB_TEXT(mq),
+                           DB_INT64(repo_id), DB_INT64(scan) };
+        rc = db_execute_typed(g_ctx.db, NODE_SQL_SEARCH_SNAP, p, DB_NPARAMS(p), &r);
+    } else {
+        db_param_t p[] = { DB_INT64(repo_id), DB_TEXT(mq), DB_INT64(repo_id),
+                           DB_INT64(scan) };
+        rc = db_execute_typed(g_ctx.db, NODE_SQL_SEARCH_ALL, p, DB_NPARAMS(p), &r);
+    }
     free(mq);
     if (rc != 0) {
         db_result_free(r);
         return api_error(400, "search failed (check the query syntax)");
     }
 
-    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
-    if (json_resp_new(&resp) != 0) { db_result_free(r); return api_error(500, "out of memory"); }
-    /* Create the array up front. json_resp_array_append_begin makes it
-     * lazily on first append, so a query with no rows omitted the key
-     * entirely and the response came back as {} - a second shape every
-     * client had to handle, and only when a collection happened to be
-     * empty. */
-    if (json_resp_ensure_array(resp, "results") != 0) {
-        /* Only fails on allocation trouble. Carrying on leaves the
-         * key absent, which is what every response did before, so
-         * there is nothing to unwind and nothing worth failing the
-         * request over. */
-    }
     int nrows = r ? r->nrows : 0;
-    anc_cache_t anc;
-    int have_anc = (r && anc_init(&anc, g_ctx.db, repo_id, nrows) == 0);
-
-    /*
-     * One result per (path, content). Each keeps the row of the newest
-     * snapshot it was seen in and counts the snapshots, so "in 30 snapshots,
-     * newest 41" replaces thirty identical lines. A changed file is a new
-     * hash and stays a separate result, which is the version history a
-     * search is often after. Results stay in first-seen order.
-     */
-    typedef struct { char *key; int row; int64_t snap; uint32_t count; } hit_t;
     hit_t *hits = calloc((size_t)limit, sizeof(*hits));
-    char **paths = calloc((size_t)(nrows > 0 ? nrows : 1), sizeof(*paths));
-    int nhits = 0;
-    if (!hits || !paths) {
-        free(hits); free(paths);
-        if (have_anc) anc_free(&anc);
-        db_result_free(r);
-        return api_error(500, "out of memory");
-    }
+    if (!hits) { db_result_free(r); return api_error(500, "out of memory"); }
+    int nhits = 0, oom = 0;
 
-    for (int i = 0; i < nrows; i++) {
-        int64_t nid = strtoll(r->rows[i][0], NULL, 10);
-        int64_t sid = strtoll(r->rows[i][1], NULL, 10);
-        paths[i] = have_anc ? anc_path(&anc, sid, nid) : NULL;
-        /* A row with no path cannot be compared, so it stands alone. */
-        char *key = NULL;
-        if (paths[i] && asprintf(&key, "%s%c%s", paths[i], '\x01', r->rows[i][5]) < 0)
-            key = NULL;
-        int found = -1;
-        for (int k = 0; key && k < nhits; k++)
-            if (hits[k].key && strcmp(hits[k].key, key) == 0) { found = k; break; }
-        if (found >= 0) {
-            hits[found].count++;
-            if (sid > hits[found].snap) { hits[found].snap = sid; hits[found].row = i; }
-            free(key);
-        } else if (nhits < limit) {
-            hits[nhits++] = (hit_t){ key, i, sid, 1 };
-        } else {
-            free(key);
+    if (only_snap) {
+        for (int i = 0; i < nrows && !oom; i++) {
+            char **row = r->rows[i];
+            oom = hits_add(hits, &nhits, limit, row[6], row,
+                           strtoll(row[1], NULL, 10), strtoll(row[7], NULL, 10), 1,
+                           2, 3, 4, 5) != 0;
         }
+    } else {
+        /*
+         * Each match placed in every snapshot holding its directory: one
+         * lookup on snap_dirs_by_tree per distinct tree. Rows come in the
+         * order trees were indexed, so a tree's entries are adjacent and
+         * its placement is read once for all of them.
+         */
+        db_result_t *holders = NULL;
+        const char *held_tree = NULL;
+        for (int i = 0; i < nrows && !oom; i++) {
+            char **row = r->rows[i];
+            if (!held_tree || strcmp(held_tree, row[5]) != 0) {
+                db_result_free(holders);
+                holders = NULL;
+                held_tree = row[5];
+                uint8_t th[OBJECT_HASH_SIZE];
+                if (node_hex_to_hash(row[5], th) != 0) continue;
+                db_param_t hp[] = { DB_INT64(repo_id), DB_HASH(th) };
+                if (db_execute_typed(g_ctx.db, NODE_SQL_HOLDERS, hp, DB_NPARAMS(hp),
+                                     &holders) != 0) {
+                    db_result_free(holders);
+                    holders = NULL;
+                }
+            }
+            /* An entry no snapshot reaches (a tree a stopped run left, not
+             * yet swept) is not a result. */
+            for (int k = 0; holders && k < holders->nrows && !oom; k++) {
+                char **h = holders->rows[k];
+                oom = hits_add(hits, &nhits, limit, h[0], row,
+                               strtoll(h[2], NULL, 10), strtoll(h[3], NULL, 10),
+                               (uint32_t)strtoul(h[1], NULL, 10), 1, 2, 3, 4) != 0;
+            }
+        }
+        db_result_free(holders);
     }
     int partial = !only_snap && nrows == scan;
+    db_result_free(r);
+    if (oom) { hits_free(hits, nhits); return api_error(500, "out of memory"); }
+
+    CUTILS_AUTO_JSON_RESP cutils_json_resp_t *resp = NULL;
+    if (json_resp_new(&resp) != 0) { hits_free(hits, nhits); return api_error(500, "out of memory"); }
+    /* Created up front so a search with no results is {"results":[]}, not
+     * {}: one shape for clients, empty or not. */
+    if (json_resp_ensure_array(resp, "results") != 0) { /* alloc only */ }
 
     for (int k = 0; k < nhits; k++) {
-        char **row = r->rows[hits[k].row];
+        hit_t *h = &hits[k];
+        /* A directory result carries its own id in the newest snapshot
+         * holding it, so `tree?parent=` opens it, as it always did. */
+        if (h->type == NODE_TYPE_DIR) {
+            db_param_t cp[] = { DB_INT64(h->dir_id), DB_TEXT(h->name) };
+            db_result_t *c = NULL;
+            if (db_execute_typed(g_ctx.db, NODE_SQL_CHILD_DIR, cp, DB_NPARAMS(cp), &c) == 0 &&
+                c && c->nrows == 1)
+                h->node_id = strtoll(c->rows[0][0], NULL, 10);
+            db_result_free(c);
+        }
         cutils_json_elem_t e;
         if (json_resp_array_append_begin(resp, "results", &e) != 0) break;
-        int bad = jrow_elem_add(&e, "node_id", JCOL_INT, row[0]) != 0
-               || jrow_elem_add(&e, "snap_id", JCOL_INT, row[1]) != 0
-               || json_elem_add_u32(&e, "snapshots", hits[k].count) != 0
-               || json_elem_add_str(&e, "name",    row[2]) != 0
-               /* Empty when the chain is broken, which a partially faulted-in
-                * snapshot can produce. A hit without a path is still a hit;
-                * it is the navigation that is unavailable, not the result. */
-               || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
-               || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
-               || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
-               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0;
+        char nid[32], sid[32], ty[16];
+        snprintf(nid, sizeof(nid), "%lld", (long long)h->node_id);
+        snprintf(sid, sizeof(sid), "%lld", (long long)h->snap);
+        snprintf(ty,  sizeof(ty),  "%d", h->type);
+        int bad = jrow_elem_add(&e, "node_id", JCOL_INT, nid) != 0
+               || jrow_elem_add(&e, "snap_id", JCOL_INT, sid) != 0
+               || json_elem_add_u32(&e, "snapshots", h->count) != 0
+               || json_elem_add_str(&e, "name", h->name) != 0
+               || json_elem_add_str(&e, "path", h->path) != 0
+               || jrow_elem_add(&e, "type", JCOL_INT, ty) != 0
+               || jrow_elem_add(&e, "size", JCOL_INT, h->size) != 0
+               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, h->hash) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
     /* More matches exist than were read: the results and their snapshot
      * counts cover the rows read, not necessarily the whole repository. */
     if (json_resp_add_bool(resp, "partial", partial) != 0) { /* alloc only */ }
-
-    for (int k = 0; k < nhits; k++) free(hits[k].key);
-    for (int i = 0; i < nrows; i++) free(paths[i]);
-    free(hits);
-    free(paths);
-    if (have_anc) anc_free(&anc);
-    db_result_free(r);
+    hits_free(hits, nhits);
 
     char *body = NULL; size_t blen = 0;
     if (json_resp_finalize(resp, &body, &blen) != 0)
@@ -1855,7 +1756,7 @@ static api_response_t verify_findings_get(const api_request_t *req, int64_t repo
 
     db_result_t *r = NULL;
     if (db_execute(g_ctx.db,
-            "SELECT hash, status, affected_files, sample_paths, affected_snapshots,"
+            "SELECT lower(hex(hash)), status, affected_files, sample_paths, affected_snapshots,"
             "       affected_versions, affected_snapshot_count, snapshots_truncated"
             "  FROM verify_findings WHERE repo_id = ? AND run_id = ?"
             " ORDER BY id LIMIT ? OFFSET ?",

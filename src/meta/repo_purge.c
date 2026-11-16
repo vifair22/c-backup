@@ -15,13 +15,14 @@
 #define PURGE_BATCH "2000"
 
 /*
- * Tables whose primary key leads with repo_id, so `WHERE repo_id = ?` is an
- * index range and each batch costs what it deletes. Order does not matter
+ * Tables whose primary key, or an index (snap_dirs_by_snap, nodes_by_tree),
+ * leads with repo_id, so `WHERE repo_id = ?` is an index range and each
+ * batch costs what it deletes. Order does not matter
  * for correctness, since nothing reads a deregistered id; children first
  * keeps a purge interrupted half way looking like a smaller repository.
  */
 static const char *const keyed_tables[] = {
-    "nodes",
+    "snap_dirs", "nodes", "trees",
     "pack_objects", "packs", "objects", "file_cache",
     "tags", "notes", "snapshots", "policy_values", "recovery_state",
     "journal", "repo_backup_paths", "snapshot_id_seq",
@@ -74,7 +75,8 @@ static status_t purge_one(cutils_db_t *db, const char *repo, atomic_int *stop)
         "DELETE FROM schedules WHERE repo_id = ?",
         "DELETE FROM jobs WHERE repo_id = ?",
         /* A full scan of the trigram index, once per removed repository. */
-        "DELETE FROM node_fts WHERE repo_id = ?",
+        /* Stored as an integer: a text parameter would match nothing. */
+        "DELETE FROM node_fts WHERE repo_id = CAST(? AS INTEGER)",
         NULL
     };
     for (int i = 0; by_run[i]; i++) {

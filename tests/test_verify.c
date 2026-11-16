@@ -134,7 +134,7 @@ static void content_hash_of(const char *name, char *hex_out)
 {
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT DISTINCT content_hash FROM nodes"
+        "SELECT DISTINCT lower(hex(content_hash)) FROM nodes"
         " WHERE name = ? AND content_hash IS NOT NULL",
         (const char *[]){ name, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
@@ -170,7 +170,7 @@ static void whole_object_of(const char *name, const char *src, char *hex_out)
                                             w.phys_bytes, len), OK);
     object_hash_to_hex(hash, hex_out);
     assert_int_equal(db_execute_non_query(db,
-        "UPDATE nodes SET content_hash = ? WHERE name = ?",
+        "UPDATE nodes SET content_hash = unhex(?) WHERE name = ?",
         (const char *[]){ hex_out, name, NULL }, NULL), 0);
 }
 
@@ -231,7 +231,7 @@ static void finding_status_of(const char *hex, char *out, size_t outsz)
 {
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT status FROM verify_findings WHERE hash = ?"
+        "SELECT status FROM verify_findings WHERE hash = unhex(?)"
         "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
         (const char *[]){ hex, NULL }, &r), 0);
     assert_true(r->nrows <= 1);
@@ -383,7 +383,7 @@ static void test_unrecoverable_damage_names_the_affected_files(void **state)
     assert_int_equal(db_execute(db,
         "SELECT status, affected_files, sample_paths, affected_versions,"
         "       affected_snapshot_count FROM verify_findings"
-        " WHERE hash = ?", (const char *[]){ hex, NULL }, &r), 0);
+        " WHERE hash = unhex(?)", (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     assert_string_equal(r->rows[0][1], "1");
     /* The whole path, as restore would recreate it, not the basename. */
@@ -405,7 +405,7 @@ static int delete_pack_of(const char *name)
 
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT pack_id FROM pack_objects WHERE hash = ?",
+        "SELECT pack_id FROM pack_objects WHERE hash = unhex(?)",
         (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     char pack[32];
@@ -518,7 +518,7 @@ static void test_findings_count_paths_not_versions(void **state)
     assert_int_equal(db_execute(db,
         "SELECT affected_files, affected_versions, sample_paths,"
         "       affected_snapshots, affected_snapshot_count, snapshots_truncated"
-        "  FROM verify_findings WHERE hash = ?",
+        "  FROM verify_findings WHERE hash = unhex(?)",
         (const char *[]){ hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     assert_string_equal(r->rows[0][0], "3");
@@ -1052,7 +1052,7 @@ static void test_chunk_damage_repaired_and_attributed(void **state)
     content_hash_of("big.bin", root_hex);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db,
-        "SELECT status, sample_paths FROM verify_findings WHERE hash = ?"
+        "SELECT status, sample_paths FROM verify_findings WHERE hash = unhex(?)"
         "   AND run_id = (SELECT MAX(id) FROM verify_runs)",
         (const char *[]){ root_hex, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);

@@ -362,3 +362,19 @@ status_t tree_build(const scan_result_t *scan, const tree_build_ops_t *ops,
     children_free(&c);
     return st;
 }
+
+status_t tree_build_parents(const scan_result_t *scan, uint32_t *parent)
+{
+    idmap_t map;
+    if (idmap_build(&map, scan) != 0)
+        return set_error(ERR_NOMEM, "tree_build_parents: id map");
+    for (uint32_t i = 0; i < scan->count; i++) {
+        uint64_t pid = scan->entries[i].parent_node_id;
+        if (pid == 0) { parent[i] = TREE_BUILD_ROOT; continue; }
+        uint32_t pi = idmap_get(&map, pid);
+        parent[i] = (pi != UINT32_MAX &&
+                     scan->entries[pi].node.type == NODE_TYPE_DIR) ? pi : TREE_BUILD_NONE;
+    }
+    idmap_free(&map);
+    return OK;
+}

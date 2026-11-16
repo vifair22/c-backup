@@ -9,6 +9,8 @@
 #include "object.h"
 #include "pack.h"
 #include "db_txn.h"
+#include "db_typed.h"
+#include "node_index.h"
 
 #include <cutils/log.h>
 
@@ -19,16 +21,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-static void hash_hex(const uint8_t h[OBJECT_HASH_SIZE], char out[OBJECT_HASH_SIZE * 2 + 1])
-{
-    static const char *d = "0123456789abcdef";
-    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
-        out[i * 2]     = d[(h[i] >> 4) & 0xF];
-        out[i * 2 + 1] = d[h[i] & 0xF];
-    }
-    out[OBJECT_HASH_SIZE * 2] = '\0';
-}
 
 static void hex_to_hash(const char *hex, uint8_t out[OBJECT_HASH_SIZE])
 {
@@ -65,13 +57,12 @@ static status_t mark_object_ex(mark_ctx_t *ctx, const uint8_t hash[OBJECT_HASH_S
     if (out_count) *out_count = 0;
     if (out_type) *out_type = 0;
     if (hash_is_zero(hash)) return OK;
-    char hex[OBJECT_HASH_SIZE * 2 + 1];
-    hash_hex(hash, hex);
+    db_param_t p[] = { DB_TEXT(ctx->repo), DB_HASH(hash) };
     db_result_t *r = NULL;
-    if (db_execute(ctx->db,
+    if (db_execute_typed(ctx->db,
             "UPDATE objects SET refcount = refcount + 1"
             " WHERE repo_id = ? AND hash = ? RETURNING refcount, type",
-            (const char *[]){ ctx->repo, hex, NULL }, &r) != 0)
+            p, DB_NPARAMS(p), &r) != 0)
         return set_error(ERR_IO, "gc: cannot mark object");
     if (r && r->nrows > 0) {
         /* An empty string is c-utils' NULL (CLAUDE.md); strtoll gives 0. */
@@ -263,7 +254,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     }
 
     db_result_t *snaps = NULL;
-    if (db_execute(db, "SELECT id, root_tree_hash FROM snapshots WHERE repo_id = ?",
+    if (db_execute(db, "SELECT id, lower(hex(root_tree_hash)) FROM snapshots WHERE repo_id = ?",
                    (const char *[]){ repo, NULL }, &snaps) != 0) {
         db_txn_rollback(db);
         return set_error(ERR_IO, "gc: cannot list snapshots");
@@ -286,7 +277,7 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     /* Count and size what would go, before deciding whether to act. */
     db_result_t *dead = NULL;
     if (db_execute(db,
-            "SELECT hash, COALESCE(phys_size, 0), location FROM objects"
+            "SELECT lower(hex(hash)), COALESCE(phys_size, 0), location FROM objects"
             " WHERE repo_id = ? AND refcount = 0",
             (const char *[]){ repo, NULL }, &dead) != 0) {
         db_txn_rollback(db);
@@ -332,6 +323,16 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
         return set_error(ERR_IO, "gc: commit");
 
     /*
+     * Node index rows of trees no snapshot reaches: what a backup or reindex
+     * that stopped part way leaves. Deleting a snapshot already releases
+     * the trees only it held (prune), so on a healthy repository this finds
+     * nothing. Here because gc is the pass that is allowed to be linear in
+     * the repository; nothing in it is something a restore would need.
+     */
+    status_t swst = node_index_sweep(db, repo_id, NULL);
+    if (swst != OK) return swst;
+
+    /*
      * Second half of the sweep: the bytes. A dead packed object lost its
      * rows above, but its bytes sit inside a pack that live objects share,
      * so reclaiming them means rewriting those packs without the dead
@@ -341,15 +342,15 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
      *
      * The reference list is every surviving object row: the sweep just
      * deleted everything unreachable, so surviving is the definition of
-     * referenced. Hashes travel as lowercase hex, which sorts in the same
-     * order as the raw bytes, so ORDER BY hash hands pack_gc the sorted
-     * array its bsearch needs without a second sort here.
+     * referenced. Hashes are stored raw and read as lowercase hex; ORDER BY
+     * the raw column is byte order, which is what pack_gc's bsearch needs,
+     * without a second sort here.
      */
     if (cancel_requested(cancel))
         return set_error(ERR_BUSY, "gc cancelled");
 
     db_result_t *live = NULL;
-    if (db_execute(db, "SELECT hash FROM objects WHERE repo_id = ? ORDER BY hash",
+    if (db_execute(db, "SELECT lower(hex(hash)) FROM objects WHERE repo_id = ? ORDER BY hash",
                    (const char *[]){ repo, NULL }, &live) != 0)
         return set_error(ERR_IO, "gc: cannot list live objects for compaction");
 
