@@ -20,6 +20,10 @@ extern _Thread_local int fault_fread_at;
 extern _Thread_local int fault_fwrite_at;
 extern _Thread_local int fault_fseeko_at;
 extern _Thread_local int fault_fsync_at;
+/* pread and pwrite: the pack reader and the seal work by offset, not
+ * through stdio, so these are where their I/O can fail. */
+extern _Thread_local int fault_pread_at;
+extern _Thread_local int fault_pwrite_at;
 
 /*
  * Largest single allocation seen since the last reset, across every
@@ -59,6 +63,8 @@ extern int     __real_fseeko(FILE *, off_t, int);
 extern int     __real_fsync(int);
 extern int     __real_fdatasync(int);
 extern int     __real_sync_file_range(int, off_t, off_t, unsigned int);
+extern ssize_t __real_pread(int, void *, size_t, off_t);
+extern ssize_t __real_pwrite(int, const void *, size_t, off_t);
 
 static inline void fault_reset_all(void) {
     fault_malloc_at = -1;
@@ -66,6 +72,8 @@ static inline void fault_reset_all(void) {
     fault_fwrite_at = -1;
     fault_fseeko_at = -1;
     fault_fsync_at  = -1;
+    fault_pread_at  = -1;
+    fault_pwrite_at = -1;
     fault_malloc_peak = 0;
     fault_fwrite_bytes_left = -1;
     fault_fwrite_bytes_seen = 0;

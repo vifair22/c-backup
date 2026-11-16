@@ -77,6 +77,10 @@ typedef struct {
     /* Chunk workers the run used for files over 16 MiB: 1 when every chunk
      * was stored on the backup thread. */
     unsigned store_workers;
+    /* Large files stored at once, each by a worker with a pack writer of its
+     * own: 1 when they went one at a time. Bounded by the chunk workers and
+     * by how many pack writers the buffer budget covers. */
+    unsigned file_workers;
     /*
      * Index transactions committed, by the phase that held them: the store
      * phase's batches, the trees batch, index_nodes' batches, and the pack

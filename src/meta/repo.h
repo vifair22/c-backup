@@ -245,6 +245,17 @@ status_t repo_register(cutils_db_t *db, const char *path, const char *label,
     "import it with c-backup repo key import <repo-id> <key-hex>, or unlock it " \
     "with c-backup repo add <path> --passphrase <passphrase>"
 
+/*
+ * For a pack that cannot be walked and has no trailer left: salvage checks
+ * each object by decrypting it, so it needs the key. Said wherever that
+ * case is reported, so it reads as a step to take, not as loss. Kept short
+ * enough to fit the 256-byte error buffer after its prefix.
+ */
+#define REPO_SALVAGE_NEEDS_KEY \
+    "salvage needs the repository key, not loaded here (nothing lost yet): " \
+    "c-backup repo key import <repo-id> <key-hex>, or repo add <path> " \
+    "--passphrase <pass>, then verify again"
+
 /* Encrypted per the marker and no keyfile for it in the key directory. */
 int repo_key_is_missing(const char *path);
 

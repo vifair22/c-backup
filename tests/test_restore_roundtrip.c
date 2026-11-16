@@ -2128,12 +2128,15 @@ static void test_unknown_object_type_is_refused_by_restore(void **state)
     uint8_t t = 9;
     assert_int_equal(pwrite(fd, &t, 1, (off_t)(el.entry_offset +
                                 offsetof(pack_dat_entry_hdr_t, type))), 1);
-    /* Break the footer too, so the pack has no parity: with it, header
-     * repair would (rightly) put the original type back. */
+    /* Take the parity away too - both tails broken, and a byte appended so
+     * the trailer cannot be derived from the body: with parity, repair
+     * would (rightly) put the original type back. */
     uint8_t z = 0;
     off_t end = lseek(fd, 0, SEEK_END);
-    assert_true(end > (off_t)sizeof(parity_footer_t));
-    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)sizeof(parity_footer_t)), 1);
+    assert_true(end > (off_t)(2 * PACK_TAIL_BYTES));
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)PACK_TAIL_BYTES), 1);
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)(2 * PACK_TAIL_BYTES)), 1);
+    assert_int_equal(ftruncate(fd, end + 1), 0);
     close(fd);
     pack_cache_invalidate(store);
     store_dat_cache_flush(store);

@@ -395,16 +395,14 @@ static void test_store_file_is_parity_protected(void **state) {
     char path[512];
     assert_int_equal(pack_dat_path_resolve(path, sizeof(path), TEST_REPO, pnum), 0);
 
-    /* The footer is the last thing in the file, and it has to be there. */
+    /* The tail is the last thing in the file, and it has to be there. */
     int pfd = open(path, O_RDWR);
     assert_true(pfd >= 0);
     off_t end = lseek(pfd, 0, SEEK_END);
-    parity_footer_t pftr;
-    assert_int_equal(pread(pfd, &pftr, sizeof(pftr), end - (off_t)sizeof(pftr)),
-                     (ssize_t)sizeof(pftr));
-    assert_int_equal(pftr.magic, PARITY_FOOTER_MAGIC);
-    assert_int_equal(pftr.version, PARITY_VERSION);
-    assert_true(pftr.trailer_size > sizeof(pftr));
+    uint32_t magic = 0;
+    assert_int_equal(pread(pfd, &magic, sizeof(magic), end - (off_t)PACK_TAIL_BYTES),
+                     (ssize_t)sizeof(magic));
+    assert_int_equal(magic, 0x37544B50u);   /* "PKT7" */
 
     /* And a flipped payload byte has to come back repaired. */
     unsigned char b = 0;
@@ -546,6 +544,22 @@ static void put_entry(int fd, off_t off, const pack_dat_entry_hdr_t *hdr) {
 }
 
 /*
+ * Take the pack's parity away, so a damaged header reaches the readers' own
+ * checks as it stands: both tails broken, and one byte appended so the
+ * trailer cannot be derived from the body either. With parity intact the
+ * stripe would put any of these few bytes back, which is the parity suite's
+ * business; these tests are about what a reader refuses.
+ */
+static void put_entry_unprotected(int fd, off_t off, const pack_dat_entry_hdr_t *hdr) {
+    off_t end = lseek(fd, 0, SEEK_END);
+    uint8_t z[4] = {0};
+    assert_int_equal(pwrite(fd, z, sizeof(z), end - 32), (ssize_t)sizeof(z));
+    assert_int_equal(pwrite(fd, z, sizeof(z), end - 64), (ssize_t)sizeof(z));
+    assert_int_equal(ftruncate(fd, end + 1), 0);
+    put_entry(fd, off, hdr);
+}
+
+/*
  * An entry header that claims a payload larger than the file holding it.
  *
  * The guard against an oversized in-memory load once applied only to
@@ -566,11 +580,11 @@ static void test_header_claiming_more_than_the_file_is_refused(void **state) {
     pack_dat_entry_hdr_t hdr;
     int fd = open_entry(hash, &off, &hdr);
     /* Absurd payload size, and a codec that is not one of ours - which is
-     * how the original slipped past the size guard. Two fields, so header
-     * parity cannot put it back. */
+     * how the original slipped past the size guard, in a pack with no
+     * usable parity so nothing puts it back. */
     hdr.compressed_size = 0x3252e50000000001ull;
     hdr.compression     = 0xb0;
-    put_entry(fd, off, &hdr);
+    put_entry_unprotected(fd, off, &hdr);
 
     void *out = NULL;
     size_t len = 0;
@@ -582,7 +596,7 @@ static void test_header_claiming_more_than_the_file_is_refused(void **state) {
 }
 
 /* An unknown codec is refused too, rather than reaching a decompressor that
- * does not exist. A second damaged byte puts it beyond header parity. */
+ * does not exist, in a pack with no usable parity to put it back. */
 static void test_unknown_codec_is_refused(void **state) {
     (void)state;
     const char *data = "another short object";
@@ -594,7 +608,7 @@ static void test_unknown_codec_is_refused(void **state) {
     int fd = open_entry(hash, &off, &hdr);
     hdr.compression = 99;
     hdr.hash[OBJECT_HASH_SIZE - 1] ^= 0x01;
-    put_entry(fd, off, &hdr);
+    put_entry_unprotected(fd, off, &hdr);
 
     void *out = NULL;
     size_t len = 0;
@@ -602,7 +616,7 @@ static void test_unknown_codec_is_refused(void **state) {
     assert_null(out);
 }
 
-/* A single damaged type byte is what header parity is for: the type is
+/* A single damaged type byte is what parity is for: the type is
  * checked only after parity has had its chance, so the object still loads,
  * as its real type. */
 static void test_damaged_type_byte_is_repaired(void **state) {

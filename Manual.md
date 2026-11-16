@@ -381,7 +381,7 @@ are different: they live in the database and change through the policy API
 | `pushover.token`, `pushover.user` | empty | Pushover credentials for failure alerts. Empty disables them |
 | `scheduler.enabled` | `1` | `0` stops schedules firing. Manual jobs still run. `0` or `1` |
 | `jobs.max_parallel` | `2` | Jobs running at once, across all repositories. 1 to 256 |
-| `jobs.read_budget_mb` | `256` | MiB of object buffers every job together may hold while reading. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, so this caps that memory whatever runs at once. 16 to 1048576; under 16 stops the daemon at start, since an object that size could never be read |
+| `jobs.read_budget_mb` | `256` | MiB of object and pack-writer buffers every job together may hold. Each object is read whole and its authentication tag checked before any of it is used, a chunk at most 8 MiB and any object at most 16 MiB, and each backup pack writer holds about 26.3 MiB while its pack is open (section 18.3), so this caps that memory whatever runs at once. 48 to 1048576; under 48 stops the daemon at start, since one object and one writer must fit |
 | `backup.file_cache_match` | `auto` | How a backup recognises a file it need not read again: `auto`, `strict` or `relaxed` (section 6.3). Any other value stops the daemon at start |
 | `backup.unsettled` | `store` | A file still changing on the backup's second read of it: `store` keeps that read and flags it as possibly torn, `skip` leaves it out of the snapshot (section 6.3). Applies on every store path. Any other value stops the daemon at start |
 | `backup.store_workers` | `0` | Threads the chunks of one large file (over 16 MiB) are named and compressed on, 0 to 64. `0` picks two thirds of the CPUs the daemon may use, fewer when an eighth of RAM, or of the container's cgroup memory limit if that is smaller, cannot give each 40 MiB; `1` stores every chunk on the backup thread. Files of 1 MiB or less are read and prepared, many to a batch, on up to four of them. The snapshot is identical either way: chunk boundaries are found by one sequential scan |
@@ -1331,12 +1331,16 @@ sudo c-backup verify list 1                # past runs
 | `structure` | entry headers | every object's pack entry header is well formed |
 | `deep` | everything | every payload matches its name (SHA-256 of type and payload) |
 
-A deep verify repairs what it finds by default: every object carries
-Reed-Solomon parity, and having already read the damaged bytes, writing the
-correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss, applying parity in memory. Every object is
-at most 16 MiB and read whole, and its parity (about 1.1 MiB at most) is
-fetched only when its checksum disagrees.
+A deep verify repairs what it finds by default: every pack carries
+Reed-Solomon parity over all of its bytes, and having already read the
+damaged bytes, writing the correction costs almost nothing more. With
+`--no-repair` it still tells recoverable damage from loss, applying parity
+in memory. Every object is at most 16 MiB and read whole, and parity is
+fetched only when its checksum disagrees: the groups of 15,296 bytes the
+object overlaps, with 1,024 parity bytes each. Small objects share groups,
+and a repair writes back only the object's own bytes. Entry headers, the
+pack header and the trailer's tail are covered too, so a few damaged header
+bytes never lose an object whose data and parity are intact.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1380,7 +1384,7 @@ damage to repair: its parity went with it.
 
 Format 2 refused repair in packs large enough for their 32-bit parity
 sizes to wrap, with findings reading `repair disabled pending format fix`.
-Format 3 bounds every pack (at most 1,000,000 entries and about 1.6 GB per
+Format 3 bounds every pack (at most 1,000,000 entries and about 313 MB per
 file) so those sizes cannot wrap, and repair works on every entry.
 
 Findings name files, not hashes: each object that is not intact is reported
@@ -1465,6 +1469,46 @@ with `gc: N pack entr(ies) damaged beyond parity were copied as damaged`,
 the alert goes out and `c-backup gc` exits 1. The result adds
 `pack_entries_damaged`, `damaged` (the first 100 hashes) and
 `damaged_listed`.
+
+A pack whose entry headers cannot be walked, even with parity, is not
+rewritten: every later offset and the liveness of every entry depend on
+those headers, and gc does not guess. It is left exactly as it is, and the
+job **fails** with `gc: N pack(s) could not be walked and were left as they
+are (first: pack-NNNNNNNNNN.dat, <reason>); run verify with repair`, so the
+alert goes out like any other failure. The result adds `packs_unwalkable`
+and `unwalkable` (pack number and reason, the first 16). Every verify level
+reports such a pack as a finding (`pack-NNNNNNNNNN`, `unwalkable pack`) and
+fails until it is repaired. A verify with repair rebuilds the damaged
+headers from the index - names, types and sizes are index rows, and each
+rebuilt header is written only once the pack's own header and entry CRCs
+prove it - after which verify passes and gc compacts the pack normally.
+
+When a damaged header has no index row to rebuild it from (it belonged to
+an entry gc had already swept), the repairing verify **salvages** the pack
+instead: every entry the index still names is copied, by its indexed offset,
+into a new pack through the same path gc's rewrite uses, and the old pack is
+removed. Nothing live is dropped. What is left behind is every byte no index
+row covers - the swept, unreferenced entries - reported as
+`unreferenced_dropped_bytes`, `unreferenced_dropped_ranges` and
+`unreferenced_dropped` (pack, offset and length in the old pack, the first
+16), with a `salvaged` finding for the pack. A live entry that is itself
+damaged beyond parity is carried into the new pack as it is: the pack stops
+being unwalkable, and verify goes on reporting that object as
+`unrecoverable` with its files, exactly as for damage beyond parity
+anywhere, so what remains on the report is the real loss and nothing else.
+A pack with no usable trailer is salvaged too: without its CRCs each live
+entry is checked the way a deep verify checks it - decrypted, so AEAD
+authenticates its type and name, or decompressed and hashed against its
+name - nothing corrected, and kept clean or carried as lost accordingly.
+That costs a read of the pack's live payloads. An encrypted repository needs
+its key loaded for it; without one the pack stays reported as unwalkable, and
+the finding (`unwalkable pack: salvage needs the repository key`), the
+verify error and the gc error all say so and give the step: `repo key
+import` (or `repo add --passphrase`), then verify again.
+A pack overwritten wholesale therefore ends as what it is: every object in
+it `unrecoverable`, with its files, and no pack left that nothing can walk.
+Checking every pack's headers costs index and structure verifies a read of
+each entry header (8 bytes of CRC table each, no payloads).
 
 **Compaction rewrites a pack without its dead entries.** A pack holding any
 entry no snapshot names is copied, live entries only, into new packs that
@@ -2077,14 +2121,14 @@ running). `docs/acceptance.md` has the full results.
   Payloads are protected by Reed-Solomon RS(255,239): every 239 bytes of
   data carry 16 bytes of parity, 16/239 = 6.69%, which corrects up to 8
   damaged bytes per codeword, and codewords are interleaved 64 deep so a
-  contiguous burst of up to 512 bytes is repairable. Parity is computed in
-  whole interleave groups of 15,296 data bytes carrying 1,024 parity bytes,
-  so the last group is paid in full: a tiny file still costs 1 KiB of
-  parity. On top of that every pack entry carries 51 bytes of header and
-  280 fixed bytes of trailer (a 260-byte parity record for its header, a
-  CRC32C, two size words and its offset). For compressible data the 6.7% applies to the compressed
-  size; for a large incompressible file it is essentially the whole
-  difference between `phys_size` and `orig_size`, which is where the
+  contiguous burst of up to 512 bytes per group of 15,296 bytes is
+  repairable. Parity covers each pack as one stream, so the rate holds
+  whatever the file sizes: a tree of 12,000 small files pays 7.1% (it paid
+  116% before pack version 7, when every entry rounded up to a whole group
+  of its own). On top of that every pack entry carries 51 bytes of header
+  and 8 bytes of CRCs. For compressible data the 6.7% applies to the
+  compressed size; for a large incompressible file it is essentially the
+  whole difference between `phys_size` and `orig_size`, which is where the
   measured +6.7% comes from. The rate is not configurable in 1.0.
 
 ### 18.2 Where state.db goes
@@ -2120,12 +2164,26 @@ on fast storage.
   8 GB. Fine on a server; on a 2-4 GB NAS, split very large trees into
   several repositories or several sources backed up separately. Section 20.
 - Every object is at most 16 MiB and is handled whole: a store holds one
-  object's payload, an LZ4 buffer of about the same size and its parity
-  (about 1.1 MiB), and nothing more per file however large the file is. A
-  large file is read through the chunker's window, chunk by chunk.
+  object's payload and an LZ4 buffer of about the same size, and nothing
+  more per file however large the file is. A large file is read through
+  the chunker's window, chunk by chunk.
+- **Each backup pack writer holds about 26.3 MiB while it has a pack
+  open**: parity for a pack at its bound, encoded as the pack is written
+  (19.1 MiB, only the part written touched), nine groups of body in flight
+  and an 8 MiB write buffer. A backup has one writer, plus one per large
+  file stored at once. The writers' share comes out of the same
+  `jobs.read_budget_mb` as object reads, taken when a writer opens and
+  given back when its pack seals, and never past the 17 MiB always left
+  for readers: a backup stores no more large files at once than the
+  budget has writers for, and a writer that cannot get its share works
+  without it, sealing by reading its pack back (slower, the same bytes).
+  At the default 256 MiB that is up to nine writers across all jobs. The
+  parity encoding itself runs on one process-wide pool of at most four
+  threads (fewer on smaller machines), whatever the number of writers.
 - Restore, grep, verify and replication likewise hold one object at a time.
 
-So peak memory is the scan's share plus a few tens of MiB of object buffers.
+So peak memory is the scan's share plus `jobs.read_budget_mb` of object and
+writer buffers.
 As a format 2 reference, a first backup of 66,218 entries and 417 GB of
 mostly large media files peaked at 723 MiB resident (VmHWM) on a 12-core
 host, most of it large-file and pack-pass buffers format 3 no longer has.

@@ -15,6 +15,7 @@ typedef struct {
     uint64_t offset;
     uint32_t pack_version;
     uint32_t entry_index;
+    uint64_t comp_size;
 } row_t;
 
 static row_t  g_rows[FAKE_INDEX_MAX];
@@ -41,6 +42,7 @@ static void fake_commit(void *user, const pack_commit_info_t *info)
         g_rows[slot].offset       = info->entries[i].offset;
         g_rows[slot].pack_version = PACK_VERSION;
         g_rows[slot].entry_index  = info->entries[i].entry_index;
+        g_rows[slot].comp_size    = info->entries[i].comp_size;
         if (slot == g_count) g_count++;
     }
 }
@@ -69,6 +71,7 @@ static status_t fake_locate(void *user, const uint8_t hash[OBJECT_HASH_SIZE],
         out->offset       = g_rows[i].offset;
         out->pack_version = g_rows[i].pack_version;
         out->entry_index  = g_rows[i].entry_index;
+        out->comp_size    = g_rows[i].comp_size;
         return OK;
     }
     return ERR_NOT_FOUND;
