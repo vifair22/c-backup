@@ -412,6 +412,12 @@ static void test_contentless_file_is_named_by_restore_and_verify(void **state)
     st = verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr);
     assert_int_equal(st, ERR_CORRUPT);
     assert_int_equal(vr.missing, 1);
+    /* NIT-17: the summary adds up and ok excludes the failure. It read
+     * "checked 52, ok 52" with 2 missing. */
+    assert_true(vr.ok < vr.checked);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
+    assert_non_null(strstr(err_msg(), "ok, 0 unrecoverable and 1 missing"));
     assert_int_equal(vr.affected_files, 1);
     assert_int_equal(vr.affected_snapshots, 1);
     char run[32];

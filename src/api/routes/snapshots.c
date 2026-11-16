@@ -1273,12 +1273,22 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[160];
+        /* The counts too, so the job says what the run found without a
+         * second request, and in the same terms as the run record: ok
+         * excludes every failure, and `failed` states the verdict. */
+        char vj[512];
         snprintf(vj, sizeof(vj),
-                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"checked\":%llu,\"ok\":%llu,\"repaired\":%llu,"
+                 "\"recoverable\":%llu,\"unrecoverable\":%llu,\"missing\":%llu,"
+                 "\"failed\":%s}",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
-                 j->dry_run ? "true" : "false");
+                 j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.checked, (unsigned long long)vr.ok,
+                 (unsigned long long)vr.repaired, (unsigned long long)vr.recoverable,
+                 (unsigned long long)vr.unrecoverable, (unsigned long long)vr.missing,
+                 vr.unrecoverable || vr.missing ? "true" : "false");
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*

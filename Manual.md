@@ -1329,13 +1329,19 @@ What a run counts:
 
 | Count | Meaning |
 |---|---|
+| `checked` | Everything examined: each indexed object, and each regular-file entry that names no content. Always the sum of the five counts below |
+| `ok` | Intact. Never includes a failure, so a run with anything missing or unrecoverable shows `ok` below `checked` |
 | `repaired` | Corrected from parity and written back. Always 0 with `--no-repair` or `--dry-run` |
 | `recoverable` | Readable only through parity and still wrong on disk. Run a repairing verify |
 | `unrecoverable` | Beyond what parity can rebuild. **Data loss** |
 | `missing` | Indexed but absent, including every object in a pack file that has gone, and every index entry of a regular file that names no content at all. **Data loss** |
 
 **Loss fails the verify.** Any `unrecoverable` or `missing` object ends the
-job `failed`, with an error naming the run and the counts, and
+job `failed`, with an error naming the run and the counts (`verify run 7
+found data loss: 52 of 54 checked ok, 0 unrecoverable and 2 missing,
+affecting 2 file(s) in 1 snapshot(s)`; the log line starts `verify (deep)
+FAILED:`), and the job `result` carries the same counts with
+`"failed":true`, and
 `c-backup verify` exits 1, so a scheduler or script that checks the exit
 status sees it. The run and its findings are still recorded and still
 printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
@@ -1369,8 +1375,8 @@ object. A backup by a c-backup older than 1.0.0 recorded a file it skipped
 that way: the snapshot listed the file, no restore could produce it, and
 every object check passed because no object was damaged. These are one
 finding, status `missing: file entry has no content` with an empty hash,
-naming the files and snapshots; each counts in `missing` and fails the
-run. Such a snapshot restores everything else; delete it once a newer one
+naming the files and snapshots; each counts once in `checked` and once in
+`missing`, and fails the run. Such a snapshot restores everything else; delete it once a newer one
 covers the files, or keep it and expect its restore to report them.
 
 A checking verify takes the read lock; a repairing one takes the write lock.

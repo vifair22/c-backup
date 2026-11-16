@@ -654,8 +654,13 @@ plain verify, with the same counts on a healthy repository. The job's
 `result` says which kind of run it was, since the run record does not:
 
 ```json
-{"run_id":12,"level":"deep","repair":false,"dry_run":true}
+{"run_id":12,"level":"deep","repair":false,"dry_run":true,"checked":52,
+ "ok":52,"repaired":0,"recoverable":0,"unrecoverable":0,"missing":0,
+ "failed":false}
 ```
+
+The counts are the run's (table below), and `failed` is true exactly when
+`unrecoverable` or `missing` is non-zero, which is when the job fails.
 
 `run_id` is null when the walk did not finish (cancelled or aborted); the
 partial run is still in `GET /repos/<id>/verify`, with `completed` false.
@@ -674,8 +679,8 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 
 | Field | Meaning |
 |---|---|
-| `checked` | Objects examined |
-| `ok` | Intact on disk |
+| `checked` | Items examined: every indexed object, plus every regular-file entry that names no content. Always `ok + repaired + recoverable + unrecoverable + missing` |
+| `ok` | Intact on disk. Never counts a failure: a run with anything missing or unrecoverable has `ok` below `checked` |
 | `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
 | `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
@@ -713,8 +718,8 @@ object: a file a snapshot lists and no restore can produce. Backups by a
 c-backup older than 1.0.0 recorded a file that was skipped during the store
 phase that way. These are one finding with `hash` `""` and `status` `missing: file
 entry has no content`, its `affected_*` fields and `sample_paths` naming
-the files and snapshots, and each such row counts once in `missing`, so
-the run fails. A backup no longer writes such an entry (see the backup
+the files and snapshots, and each such row counts once in `checked` and
+once in `missing`, so the run fails and `ok` stays below `checked`. A backup no longer writes such an entry (see the backup
 `result` below), and the tree writer refuses one.
 
 `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
