@@ -54,6 +54,7 @@ typedef struct {
     uint32_t pack_version;  /* always PACK_VERSION; kept so a stale cache entry is caught */
     uint32_t entry_index;   /* position in .dat entry order: indexes the CRC table */
     uint64_t comp_size;     /* stored size, as the index records it (0: unknown) */
+    uint64_t orig_size;     /* plaintext size, as the index records it (0: unknown) */
 } pack_cache_entry_t;
 
 typedef struct {
@@ -411,6 +412,7 @@ static status_t pack_find_entry(store_t *store,
     out_found->pack_version = loc.pack_version;
     out_found->entry_index  = loc.entry_index;
     out_found->comp_size    = loc.comp_size;
+    out_found->orig_size    = loc.orig_size;
     return OK;
 }
 
@@ -534,6 +536,9 @@ typedef struct {
     uint32_t tails_bad;  /* bit 0: the last tail copy failed, bit 1: the first */
 } pack_trailer_t;
 
+static int hdr_from_index(int fd, const pack_trailer_t *t, const pack_hdr_hint_t *hi,
+                          pack_dat_entry_hdr_t *out);
+
 static uint64_t groups_for(uint64_t n) { return (n + GROUP_DATA - 1) / GROUP_DATA; }
 
 /* Everything after the body, for a body of body_len bytes holding count
@@ -580,6 +585,33 @@ static int tail_valid(const pack_tail_t *t, uint64_t file_size)
 }
 
 typedef void (*walk_fn)(void *ctx, uint32_t i, uint64_t off, const pack_dat_entry_hdr_t *h);
+static int hdr_fields_valid(const pack_dat_entry_hdr_t *h, int check_type);
+
+/*
+ * The body's end and entry count with no tail and no pack header to say
+ * them (B136: a pack header and both tails damaged at once). Entries are
+ * stepped over from the end of the pack header, and after each the file
+ * size is compared with the trailer that many entries and that much body
+ * would carry. That size grows strictly with every entry, so at most one
+ * step can match, and the match is the body's end. Each header stepped over
+ * must be one a writer produces. Returns 0 with *count and *end, or -1.
+ */
+static int body_end_by_size(int fd, uint64_t fsz, uint32_t *count, uint64_t *end)
+{
+    uint64_t off = sizeof(pack_dat_hdr_t);
+    for (uint32_t n = 0; n <= PACK_MAX_ENTRIES; n++) {
+        uint64_t want = off + trailer_size_for(off, n);
+        if (want == fsz) { *count = n; *end = off; return 0; }
+        if (want > fsz || off + sizeof(pack_dat_entry_hdr_t) > fsz) return -1;
+        pack_dat_entry_hdr_t h;
+        if (pread_full(fd, &h, sizeof(h), (off_t)off) != 0) return -1;
+        if (hdr_fields_valid(&h, 0) != 0 ||
+            h.compressed_size > fsz - off - sizeof(h))
+            return -1;
+        off += sizeof(h) + h.compressed_size;
+    }
+    return -1;
+}
 static int walk_pass(int fd, const pack_trailer_t *t, uint32_t count, uint64_t lim,
                      walk_fn fn, void *ctx, uint32_t *walked, uint64_t *end, uint32_t *fixed);
 
@@ -622,14 +654,18 @@ static int pack_trailer_read(int fd, pack_trailer_t *out)
         pack_dat_hdr_t h;
         uint32_t n = 0;
         uint64_t end = 0;
-        if (pread_full(fd, &h, sizeof(h), 0) != 0 || h.magic != PACK_DAT_MAGIC ||
-            h.version != PACK_VERSION || h.count > PACK_MAX_ENTRIES)
+        if (pread_full(fd, &h, sizeof(h), 0) != 0) return -1;
+        if (h.magic == PACK_DAT_MAGIC && h.version == PACK_VERSION &&
+            h.count <= PACK_MAX_ENTRIES) {
+            if (walk_pass(fd, NULL, h.count, fsz, NULL, NULL, &n, &end, NULL) != 0 ||
+                n != h.count || end > PACK_MAX_BYTES ||
+                end + trailer_size_for(end, h.count) != fsz)
+                return -1;
+        } else if (body_end_by_size(fd, fsz, &n, &end) != 0) {
             return -1;
-        if (walk_pass(fd, NULL, h.count, fsz, NULL, NULL, &n, &end, NULL) != 0 || n != h.count ||
-            end > PACK_MAX_BYTES || end + trailer_size_for(end, h.count) != fsz)
-            return -1;
+        }
         out->body_len = end;
-        out->count    = h.count;
+        out->count    = n;
     }
     out->par_off  = out->body_len;
     out->tab_off  = out->par_off + groups_for(out->body_len) * GROUP_PAR;
@@ -1040,6 +1076,184 @@ int pack_restore_headers(store_t *store, uint32_t pack_num,
     return failed ? -1 : written;
 }
 
+/* Entry offsets and stored sizes from a walk, for rebuilding CRC slots. */
+typedef struct {
+    uint64_t *off;
+    uint64_t *len;   /* header and payload */
+} slot_src_t;
+
+static void slot_src_fill(void *ctx, uint32_t i, uint64_t off, const pack_dat_entry_hdr_t *h)
+{
+    slot_src_t *s = ctx;
+    s->off[i] = off;
+    s->len[i] = sizeof(*h) + h->compressed_size;
+}
+
+/*
+ * Rebuild the slots of one CRC-table group that its parity cannot correct,
+ * from the entries themselves: each entry is read, corrected from the
+ * stripe, and its CRCs taken only when every codeword under it decoded
+ * (the stripe vouches for it). grp holds the group's table bytes, slots
+ * [first, first + n). Returns 1 when every slot was rebuilt, 0 when some
+ * entry could not be vouched for, -1 on an I/O error.
+ */
+static int rebuild_table_group(int fd, const pack_trailer_t *t, const slot_src_t *src,
+                               uint32_t first, uint32_t n, uint8_t *grp)
+{
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = first + k;
+        if (src->len[i] > sizeof(pack_dat_entry_hdr_t) + OBJECT_MAX_STORED_BYTES) return 0;
+        uint8_t *buf = malloc((size_t)src->len[i]);
+        if (!buf) return -1;
+        if (pread_full(fd, buf, (size_t)src->len[i], (off_t)src->off[i]) != 0) {
+            free(buf);
+            return -1;
+        }
+        int64_t fx = 0;
+        uint64_t bad = 0;
+        if (stripe_correct(fd, 0, t->body_len, t->par_off, src->off[i], buf,
+                           (size_t)src->len[i], &fx, &bad) != 0) {
+            free(buf);
+            return -1;
+        }
+        if (bad) { free(buf); return 0; }
+        put_le32(grp + SLOT * k, crc32c(buf, (size_t)src->len[i]));
+        put_le32(grp + SLOT * k + 4u, crc32c(buf, sizeof(pack_dat_entry_hdr_t)));
+        free(buf);
+    }
+    return 1;
+}
+
+/*
+ * Check a pack's own structures against their redundancy, and with repair
+ * rewrite what disagrees (B136): the pack header (stripe data, and
+ * derivable from a verified tail), both tail copies (each against its CRC
+ * and the file), and the CRC table (against its RS parity; a group past it
+ * is rebuilt from the entries the stripe vouches for). Damage in any of
+ * these used to be corrected in memory by every reader and never written
+ * back, so it accumulated until a pack header and both tails together made
+ * the pack unwalkable. Entries are not this function's business; the
+ * object pass checks them.
+ */
+status_t pack_check_structure(store_t *store, uint32_t pack_num, int repair,
+                              pack_struct_check_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    char path[PATH_MAX];
+    if (pack_dat_path_resolve(path, sizeof(path), store_root(store), pack_num) != 0)
+        return set_error(ERR_IO, "pack %u: path too long", pack_num);
+    int fd = open(path, (repair ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+    if (fd < 0) return set_error_errno(ERR_IO, "pack %u: open", pack_num);
+    pack_trailer_t t;
+    if (pack_trailer_read(fd, &t) != 0) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "pack-%010u.dat: no usable trailer to check against",
+                         pack_num);
+    }
+    status_t st = OK;
+    int wrote = 0, unresolved = 0;
+
+    out->tails_bad = t.tails_bad;
+    pack_dat_hdr_t ph;
+    int ph_fixed = 0;
+    if (pack_hdr_get(fd, &t, &ph, &ph_fixed) == 0 && ph_fixed) out->header_bad = 1;
+
+    /* The table, a group at a time against its parity. */
+    uint64_t tab_len = SLOT * (uint64_t)t.count;
+    uint8_t grp[GROUP_DATA], cor[GROUP_DATA], par[GROUP_PAR];
+    slot_src_t src = { NULL, NULL };
+    for (uint64_t gs = 0; gs < tab_len && st == OK; gs += GROUP_DATA) {
+        size_t glen = tab_len - gs < GROUP_DATA ? (size_t)(tab_len - gs) : GROUP_DATA;
+        uint64_t g = gs / GROUP_DATA;
+        if (pread_full(fd, grp, glen, (off_t)(t.tab_off + gs)) != 0 ||
+            pread_full(fd, par, GROUP_PAR, (off_t)(t.tpar_off + g * GROUP_PAR)) != 0) {
+            st = set_error_errno(ERR_IO, "pack-%010u.dat: read the crc table", pack_num);
+            break;
+        }
+        memcpy(cor, grp, glen);
+        int rc = rs_parity_decode(cor, glen, par, GROUP_PAR);
+        if (rc == 0) continue;
+        if (rc > 0) {
+            out->table_bytes_fixed += (uint64_t)rc;
+            if (repair) {
+                if (pwrite_full(fd, cor, glen, (off_t)(t.tab_off + gs)) != 0) {
+                    st = set_error_errno(ERR_IO, "pack-%010u.dat: write the crc table",
+                                         pack_num);
+                    break;
+                }
+                wrote = 1;
+            } else {
+                unresolved = 1;
+            }
+            continue;
+        }
+        out->table_groups_bad++;
+        if (!repair) { unresolved = 1; continue; }
+        if (!src.off) {
+            src.off = malloc((t.count ? t.count : 1) * sizeof(*src.off));
+            src.len = malloc((t.count ? t.count : 1) * sizeof(*src.len));
+            if (!src.off || !src.len) { st = set_error(ERR_NOMEM, "pack check: offsets"); break; }
+            if (pack_walk(fd, &t, t.count, t.body_len, slot_src_fill, &src, NULL) != 0) {
+                unresolved = 1;
+                continue;
+            }
+        }
+        int rb = rebuild_table_group(fd, &t, &src, (uint32_t)(gs / SLOT),
+                                     (uint32_t)(glen / SLOT), grp);
+        if (rb < 0) { st = set_error_errno(ERR_IO, "pack-%010u.dat: rebuild", pack_num); break; }
+        if (rb == 0) { unresolved = 1; continue; }
+        rs_parity_encode(grp, glen, par);
+        if (pwrite_full(fd, grp, glen, (off_t)(t.tab_off + gs)) != 0 ||
+            pwrite_full(fd, par, GROUP_PAR, (off_t)(t.tpar_off + g * GROUP_PAR)) != 0) {
+            st = set_error_errno(ERR_IO, "pack-%010u.dat: write the crc table", pack_num);
+            break;
+        }
+        out->table_slots_rebuilt += glen / SLOT;
+        wrote = 1;
+    }
+    free(src.off);
+    free(src.len);
+
+    if (st == OK && (out->header_bad || out->tails_bad)) {
+        if (!repair) {
+            unresolved = 1;
+        } else {
+            if (out->header_bad) {
+                if (pwrite_full(fd, &ph, sizeof(ph), 0) != 0)
+                    st = set_error_errno(ERR_IO, "pack-%010u.dat: write header", pack_num);
+                else
+                    wrote = 1;
+            }
+            if (st == OK && out->tails_bad) {
+                pack_tail_t tl = {
+                    .magic = PACK_TAIL_MAGIC, .version = PACK_TAIL_VERSION,
+                    .body_len = t.body_len, .count = t.count,
+                    .trailer_size = (uint32_t)trailer_size_for(t.body_len, t.count),
+                    .reserved = 0,
+                };
+                tl.crc = crc32c(&tl, offsetof(pack_tail_t, crc));
+                uint64_t fsz = t.body_len + tl.trailer_size;
+                for (unsigned copy = 1; copy <= 2 && st == OK; copy++) {
+                    if (!(out->tails_bad & (1u << (copy - 1)))) continue;
+                    if (pwrite_full(fd, &tl, sizeof(tl),
+                                    (off_t)(fsz - copy * PACK_TAIL_BYTES)) != 0)
+                        st = set_error_errno(ERR_IO, "pack-%010u.dat: write tail", pack_num);
+                    else
+                        wrote = 1;
+                }
+            }
+        }
+    }
+    if (wrote && st == OK && fsync(fd) != 0)
+        st = set_error_errno(ERR_IO, "pack-%010u.dat: sync", pack_num);
+    close(fd);
+    if (wrote) pack_cache_invalidate(store);
+    out->found = out->header_bad || out->tails_bad || out->table_bytes_fixed ||
+                 out->table_groups_bad;
+    out->repaired = out->found && repair && st == OK && !unresolved;
+    return st;
+}
+
 /*
  * An entry's header alone, for the readers that want nothing else (size,
  * type). Read raw, and corrected from the stripe when it is not the header
@@ -1064,6 +1278,20 @@ static int entry_hdr_checked(int fd, const pack_cache_entry_t *found,
         if (pack_trailer_read(fd, &t) == 0) {
             if (hdr_at(fd, &t, off, 1, out) != 0) return -1;
             lim = t.body_len;
+            /* Past the stripe too: the index knows every field, and the
+             * header CRC says which candidate is the header (B137). */
+            uint32_t want_h = 0;
+            if (entry_table_slot(fd, &t, found->entry_index, 1, NULL, &want_h) == 0 &&
+                crc32c(out, sizeof(*out)) != want_h) {
+                pack_hdr_hint_t hint;
+                memset(&hint, 0, sizeof(hint));
+                memcpy(hint.hash, hash, OBJECT_HASH_SIZE);
+                hint.comp_size   = found->comp_size;
+                hint.orig_size   = found->orig_size;
+                hint.entry_index = found->entry_index;
+                pack_dat_entry_hdr_t cand;
+                if (hdr_from_index(fd, &t, &hint, &cand)) *out = cand;
+            }
         }
     }
     int hv = hdr_fields_valid(out, 1);
@@ -1139,8 +1367,41 @@ static size_t parity_window_groups(void)
  * so there is nothing coherent to hand back; nothing is allocated on any
  * of them.
  */
+/*
+ * An entry header rebuilt from what the index knows of it - name, plaintext
+ * and stored size; type, codec and encryption each tried - proven by the
+ * entry's header CRC. Returns 1 with *out, 0 when no candidate matches or
+ * the CRC cannot be read.
+ */
+static int hdr_from_index(int fd, const pack_trailer_t *t, const pack_hdr_hint_t *hi,
+                          pack_dat_entry_hdr_t *out)
+{
+    if (!hi || !hi->comp_size || !hi->orig_size) return 0;
+    uint32_t want_h = 0;
+    if (entry_table_slot(fd, t, hi->entry_index, 1, NULL, &want_h) != 0) return 0;
+    static const uint8_t comps[2] = { COMPRESS_NONE, COMPRESS_LZ4 };
+    static const uint8_t encs[2]  = { ENCRYPT_NONE, ENCRYPT_CHACHA20 };
+    for (unsigned ty = 0; ty < 256; ty++) {
+        if (!object_type_known(ty) || (hi->type && ty != hi->type)) continue;
+        for (int c = 0; c < 2; c++)
+            for (int e = 0; e < 2; e++) {
+                pack_dat_entry_hdr_t cand;
+                memset(&cand, 0, sizeof(cand));
+                memcpy(cand.hash, hi->hash, OBJECT_HASH_SIZE);
+                cand.type              = (uint8_t)ty;
+                cand.compression       = comps[c];
+                cand.encryption        = encs[e];
+                cand.uncompressed_size = hi->orig_size;
+                cand.compressed_size   = hi->comp_size;
+                if (crc32c(&cand, sizeof(cand)) == want_h) { *out = cand; return 1; }
+            }
+    }
+    return 0;
+}
+
 static int entry_fetch(int fd, const pack_trailer_t *t, uint64_t off, uint32_t idx,
-                       uint64_t len_hint, uint8_t **out_buf, size_t *out_len,
+                       uint64_t len_hint, const pack_hdr_hint_t *hint,
+                       uint8_t **out_buf, size_t *out_len,
                        int64_t *fixed, int *damaged)
 {
     *out_buf = NULL;
@@ -1175,6 +1436,31 @@ static int entry_fetch(int fd, const pack_trailer_t *t, uint64_t off, uint32_t i
         int64_t fx = 0;
         int r = t ? entry_verify(fd, t, off, idx, buf, len, &fx) : 0;
         if (r < 0) { free(buf); return -1; }
+        /*
+         * Damaged past the stripe, but the index knows every field of the
+         * header: if the header its CRC proves, with the payload as
+         * corrected, matches the entry's CRC, only the header was lost and
+         * it is back (B137). A dry run then sees recoverable damage, and a
+         * repair writes the header with the entry.
+         */
+        if (r == 1 && hint && hint->comp_size == stored) {
+            pack_dat_entry_hdr_t cand;
+            uint32_t want_e = 0;
+            if (hdr_from_index(fd, t, hint, &cand) &&
+                entry_table_slot(fd, t, idx, 1, &want_e, NULL) == 0) {
+                pack_dat_entry_hdr_t was;
+                memcpy(&was, buf, sizeof(was));
+                memcpy(buf, &cand, sizeof(cand));
+                if (crc32c(buf, len) == want_e) {
+                    for (size_t k = 0; k < sizeof(cand); k++)
+                        if (((const uint8_t *)&was)[k] != ((const uint8_t *)&cand)[k]) fx++;
+                    if (fx == 0) fx = 1;
+                    r = 0;
+                } else {
+                    memcpy(buf, &was, sizeof(was));
+                }
+            }
+        }
         pack_dat_entry_hdr_t h;
         memcpy(&h, buf, sizeof(h));
         if (h.compressed_size != stored && attempt == 0 && t && len_hint == 0) {
@@ -1268,8 +1554,15 @@ static status_t entry_read_at(store_t *store, const uint8_t hash[OBJECT_HASH_SIZ
     size_t len = 0;
     int64_t fixed = 0;
     int damaged = 0;
+    pack_hdr_hint_t hint;
+    memset(&hint, 0, sizeof(hint));
+    memcpy(hint.hash, hash, OBJECT_HASH_SIZE);
+    hint.offset      = found.dat_offset;
+    hint.comp_size   = found.comp_size;
+    hint.orig_size   = found.orig_size;
+    hint.entry_index = found.entry_index;
     int fr = entry_fetch(fd, have_parity ? &t : NULL, found.dat_offset, found.entry_index,
-                         found.comp_size, &buf, &len, &fixed, &damaged);
+                         found.comp_size, &hint, &buf, &len, &fixed, &damaged);
     if (fr != 0) {
         int saved = errno;
         fclose(f);
@@ -3517,8 +3810,16 @@ static void disk_idx_fill(void *ctx, uint32_t i, uint64_t off, const pack_dat_en
     pack_idx_disk_entry_t *e = &((pack_idx_disk_entry_t *)ctx)[i];
     memset(e, 0, sizeof(*e));
     memcpy(e->hash, h->hash, OBJECT_HASH_SIZE);
-    e->dat_offset      = off;
-    e->compressed_size = h->compressed_size;
+    e->dat_offset        = off;
+    /* The entry's position, which its CRCs are filed under: gc proves a
+     * copy against them and moves index rows to it, and a copy proven
+     * against entry 0's CRCs instead was never proven (B138). */
+    e->entry_index       = i;
+    e->type              = h->type;
+    e->compression       = h->compression;
+    e->encryption        = h->encryption;
+    e->uncompressed_size = h->uncompressed_size;
+    e->compressed_size   = h->compressed_size;
 }
 
 /*
@@ -3748,7 +4049,8 @@ static status_t pack_rw_copy(pack_rw_t *rw, int src_fd, const pack_trailer_t *t,
     size_t len = 0;
     int64_t fixed = 0;
     int damaged = 0;
-    int fr = entry_fetch(src_fd, t, off, src_index, len_hint, &buf, &len, &fixed, &damaged);
+    int fr = entry_fetch(src_fd, t, off, src_index, len_hint, NULL, &buf, &len, &fixed,
+                         &damaged);
     if (fr == -1 && errno == ENOMEM) return set_error(ERR_NOMEM, "pack rewrite: entry buffer");
     if (fr == -1) return set_error_errno(ERR_IO, "pack rewrite: read an entry");
     if (fr == -3) return set_error(ERR_CORRUPT, "pack rewrite: entry at %llu is damaged "
@@ -4235,6 +4537,23 @@ status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *
     struct stat sb;
     if (fstat(fd, &sb) != 0) { close(fd); return set_error_errno(ERR_IO, "pack salvage: stat"); }
     uint64_t body_end = have_t ? tr.body_len : (uint64_t)sb.st_size;
+    if (!have_t) {
+        /* Where the body ended, so the old trailer is not counted with the
+         * unreferenced bytes (NIT-24): with the pack header's count, the
+         * one body length whose trailer fills the rest of the file. The
+         * file size grows strictly with the body, so a bisection finds it. */
+        pack_dat_hdr_t ph;
+        if (pread_full(fd, &ph, sizeof(ph), 0) == 0 && ph.magic == PACK_DAT_MAGIC &&
+            ph.version == PACK_VERSION && ph.count <= PACK_MAX_ENTRIES) {
+            uint64_t fsz = (uint64_t)sb.st_size, lo = sizeof(pack_dat_hdr_t), hi = fsz;
+            while (lo < hi) {
+                uint64_t mid = lo + (hi - lo) / 2;
+                if (mid + trailer_size_for(mid, ph.count) < fsz) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo + trailer_size_for(lo, ph.count) == fsz) body_end = lo;
+        }
+    }
     int keyed = store_needs_key(store) || store_key(store) != NULL;
     if (!have_t && store_needs_key(store)) {
         close(fd);
@@ -4395,7 +4714,14 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     size_t len = 0;
     int64_t fixed = 0;
     int damaged = 0;
-    int fr = entry_fetch(fd, &t, found.dat_offset, found.entry_index, found.comp_size,
+    pack_hdr_hint_t hint;
+    memset(&hint, 0, sizeof(hint));
+    memcpy(hint.hash, hash, OBJECT_HASH_SIZE);
+    hint.offset      = found.dat_offset;
+    hint.comp_size   = found.comp_size;
+    hint.orig_size   = found.orig_size;
+    hint.entry_index = found.entry_index;
+    int fr = entry_fetch(fd, &t, found.dat_offset, found.entry_index, found.comp_size, &hint,
                          &buf, &len, &fixed, &damaged);
     if (fr != 0) { close(fd); return -1; }
     if (damaged) {
@@ -4740,6 +5066,9 @@ status_t pack_gc_stats_loc(store_t *store,
     }
 
     status_t coalesce_st = maybe_coalesce_packs(store, &live, stats);
+    stats->dups_dropped    = live.dups_dropped;
+    stats->dups_kept       = live.dups_kept;
+    stats->index_relocated = live.relocated;
     if (live.dups_dropped || live.dups_kept || live.relocated)
         log_info("pack-gc: %llu duplicate cop%s dropped, %llu kept because the "
                  "indexed copy could not be confirmed, %llu index row(s) moved to a proven copy",

@@ -392,6 +392,9 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.damaged_listed       = pstats.damaged_listed;
     memcpy(res.damaged, pstats.damaged, sizeof(res.damaged));
     res.packs_unwalkable  = pstats.packs_unwalkable;
+    res.dups_dropped      = pstats.dups_dropped;
+    res.dups_kept         = pstats.dups_kept;
+    res.index_relocated   = pstats.index_relocated;
     res.unwalkable_listed = pstats.unwalkable_listed;
     memcpy(res.unwalkable, pstats.unwalkable, sizeof(res.unwalkable));
     /* The sweep is committed whatever compaction did, so a caller reporting
