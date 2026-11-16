@@ -26,6 +26,7 @@
 
 #include <cmocka.h>
 
+#include "disk_stream.h"
 #include "nbd_client.h"
 #include "nbd_test_server.h"
 #include "test_tmp.h"
@@ -281,6 +282,90 @@ static void test_qemu_nbd(void **state)
     free(want);
 }
 
+/* Read a whole stream as block_source does: extents forward, data read. */
+static status_t drain(sp_block_stream_t *b, uint64_t size, int write_at_half, const char *path)
+{
+    uint8_t *buf = malloc(M);
+    assert_non_null(buf);
+    status_t st = OK;
+    uint64_t at = 0;
+    while (st == OK && at < size) {
+        sp_ext_type_t t;
+        uint64_t len = 0;
+        int done = 0;
+        st = b->extent(b->ctx, at, &t, &len, &done);
+        if (st != OK || done) break;
+        if (len > size - at) len = size - at;
+        for (uint64_t o = at; st == OK && t == SP_EXT_DATA && o < at + len; o += M) {
+            uint64_t n = at + len - o < M ? at + len - o : M;
+            if (write_at_half && o >= size / 2) {
+                write_at_half = 0;
+                int fd = open(path, O_WRONLY);
+                assert_true(fd >= 0);
+                assert_int_equal(pwrite(fd, "X", 1, 0), 1);
+                close(fd);
+            }
+            st = b->read(b->ctx, buf, (size_t)n, o);
+        }
+        /* The image written after the first half has gone, before the
+         * extents that follow are asked for. */
+        if (write_at_half && at + len >= size / 2) {
+            write_at_half = 0;
+            int fd = open(path, O_WRONLY);
+            assert_true(fd >= 0);
+            assert_int_equal(pwrite(fd, "X", 1, 0), 1);
+            close(fd);
+        }
+        at += len;
+    }
+    free(buf);
+    return st;
+}
+
+/*
+ * A shut-off VM's raw image read offline: unchanged, the read succeeds;
+ * written mid-read (the VM started), the read fails at its end, so the disk
+ * and its unit fail rather than store a torn image as consistent. The same
+ * image read as a running VM's would be (offline 0) is not held to it.
+ */
+static void test_offline_image_changed(void **state)
+{
+    (void)state;
+    const char *img = D "/raw.img";
+    int fd = open(img, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    uint8_t blk[4096];
+    memset(blk, 7, sizeof(blk));
+    for (uint64_t o = 0; o < 8 * M; o += 2 * M) assert_int_equal(pwrite(fd, blk, sizeof(blk), (off_t)o), (ssize_t)sizeof(blk));
+    /* Data at the very end too, so the last read is what checks. */
+    assert_int_equal(pwrite(fd, blk, sizeof(blk), (off_t)(8 * M - sizeof(blk))), (ssize_t)sizeof(blk));
+    close(fd);
+
+    sp_block_stream_t b;
+    assert_int_equal(disk_stream_file(img, 8 * M, 1, &b), OK);
+    assert_int_equal(drain(&b, 8 * M, 0, img), OK);
+    b.close(b.ctx);
+
+    assert_int_equal(disk_stream_file(img, 8 * M, 1, &b), OK);
+    struct timespec ts = { 0, 20 * 1000000L };
+    nanosleep(&ts, NULL);       /* a distinct mtime even on coarse clocks */
+    assert_int_not_equal(drain(&b, 8 * M, 1, img), OK);
+    assert_non_null(strstr(err_msg(), "changed while it was read offline"));
+    b.close(b.ctx);
+
+    /* A trailing hole: the zero extent reaching the end is what checks. */
+    assert_int_equal(truncate(img, 16 * M), 0);
+    assert_int_equal(disk_stream_file(img, 16 * M, 1, &b), OK);
+    nanosleep(&ts, NULL);
+    assert_int_not_equal(drain(&b, 16 * M, 1, img), OK);
+    b.close(b.ctx);
+
+    assert_int_equal(disk_stream_file(img, 16 * M, 0, &b), OK);
+    nanosleep(&ts, NULL);
+    assert_int_equal(drain(&b, 16 * M, 1, img), OK);
+    b.close(b.ctx);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -290,6 +375,7 @@ int main(void)
         cmocka_unit_test_setup(test_faults, setup),
         cmocka_unit_test_setup(test_fuzz, setup),
         cmocka_unit_test_setup(test_qemu_nbd, setup),
+        cmocka_unit_test_setup(test_offline_image_changed, setup),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

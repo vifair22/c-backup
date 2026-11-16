@@ -31,6 +31,9 @@ typedef struct {
      * returns non-zero. */
     status_t (*extents)(void *reader, uint64_t off, uint64_t len, nbd_extent_fn fn, void *fctx);
     void     (*close)(void *reader);
+    /* Optional: the connection has had no request for a second; let go of
+     * anything cached. */
+    void     (*idle)(void *reader);
     void     *ctx;
 } nbd_reader_ops_t;
 

@@ -20,13 +20,16 @@
 
 #include <stdint.h>
 
-/* A raw image at path, expected to be size bytes. */
-status_t disk_stream_file(const char *path, uint64_t size, sp_block_stream_t *out);
+/* A raw image at path, expected to be size bytes. offline: the image must
+ * not change while it is read; a change fails the read at its end. */
+status_t disk_stream_file(const char *path, uint64_t size, int offline, sp_block_stream_t *out);
 
 /* The NBD reads in flight per disk and their size in KiB (vm.nbd_queue_depth,
  * vm.nbd_request_kb); 0 keeps the default (8, 256). */
 void disk_stream_nbd_tuning(unsigned depth, unsigned request_kb);
 
-/* An NBD export on a unix socket, expected to be size bytes. */
+/* An NBD export on a unix socket, expected to be size bytes. watch: the
+ * image behind it (an offline qemu-nbd), held to the same rule as an
+ * offline file; NULL for a running VM's export. */
 status_t disk_stream_nbd(const char *socket, const char *export_name, uint64_t size,
-                         sp_block_stream_t *out);
+                         const char *watch, sp_block_stream_t *out);

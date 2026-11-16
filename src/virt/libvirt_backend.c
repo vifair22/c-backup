@@ -738,13 +738,18 @@ static status_t v_block_where(sp_session_t *s, const sp_item_desc_t *item, cJSON
     for (size_t i = 0; i < s->n; i++) {
         vread_t *r = &s->reads[i];
         if (strcmp(r->item, item->id) != 0) continue;
+        /* Offline, the daemon holds the image to not changing while it is
+         * read and fails the disk if it did (disk_stream.c), so a VM
+         * started mid-read never leaves a torn image stored as consistent. */
         if (r->nbd) {
             cJSON_AddStringToObject(obj, "kind", "nbd");
             cJSON_AddStringToObject(obj, "socket", r->socket);
             cJSON_AddStringToObject(obj, "export", r->export_name);
+            if (!s->online && r->path[0]) cJSON_AddStringToObject(obj, "watch", r->path);
         } else {
             cJSON_AddStringToObject(obj, "kind", "file");
             cJSON_AddStringToObject(obj, "path", r->path);
+            if (!s->online) cJSON_AddTrueToObject(obj, "offline");
         }
         return OK;
     }
@@ -768,15 +773,9 @@ static status_t v_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapsho
     }
     for (size_t i = 0; i < s->n; i++) {
         vread_t *r = &s->reads[i];
-        if (!r->nbd && !s->online && r->path[0]) {
-            /* A VM that started while its raw image was read: detected, not
-             * prevented (2.4). */
-            char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
-            struct stat after;
-            if (host_path(&s->c->tools, r->path, hp, sizeof(hp)) == 0 && stat(hp, &after) == 0 &&
-                (after.st_mtime != r->before.st_mtime || after.st_size != r->before.st_size || after.st_ctime != r->before.st_ctime))
-                log_warn("libvirt: %s changed during the offline read (the VM started?)", r->path);
-        }
+        /* A change to an image read offline is caught by the daemon as the
+         * read ends (disk_stream.c) and fails that disk; nothing to do
+         * here. */
         kill_qemu_nbd(r);
         if (s->has_holds && r->hold && s->holds.clear(s->holds.ctx, r->hold) != OK) err_clear();
     }

@@ -524,7 +524,15 @@ c-backup vm unexport 9
 ```
 
 `vm.export_dir` must be the same path on the host and in a container.
-The export pins its snapshot and defers gc until it closes.
+The export pins its snapshot, and gc waits in the queue until it closes.
+
+A shut-off VM's disk is read with nothing to stop the VM starting
+meanwhile. The daemon records the image's size, mtime and ctime as the read
+begins and checks them once the last byte is read (a qcow2's too, behind
+its qemu-nbd); if anything wrote the image, that disk and its unit fail
+with "changed while it was read offline", and nothing torn is stored as
+consistent. Run the backup again once the VM is shut off, or back it up
+running.
 
 The NVRAM and TPM state are staged by the daemon under `staging_root`
 (writable by the daemon), and disk staging sits in

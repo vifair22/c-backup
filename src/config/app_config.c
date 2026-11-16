@@ -52,6 +52,27 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
         config_check_int_range(chk, "jobs.read_budget_mb", APP_MIN_READ_BUDGET_MB,
                                APP_MAX_READ_BUDGET_MB);
 
+    config_check_int_range(chk, "vm.nbd_queue_depth", 1, 64);
+    config_check_int_range(chk, "vm.nbd_request_kb", 64, 32768);
+    config_check_int_range(chk, "vm.export_ttl_s", 60, 604800);
+    config_check_int_range(chk, "vm.export_idle_s", 1, 86400);
+    config_check_int_range(chk, "vm.export_max_conns", 0, 64);
+    /* Every export connection may hold one object, up to 16 MiB, of the
+     * read budget for as long as it reads (content_reader_t); the jobs
+     * still need their own floor beside them. */
+    {
+        int conns = config_get_int(cfg, "vm.export_max_conns", 4);
+        int budget = config_get_int(cfg, "jobs.read_budget_mb", 256);
+        if (conns > 0 && budget >= APP_MIN_READ_BUDGET_MB &&
+            budget < APP_MIN_READ_BUDGET_MB + conns * 16)
+            config_check_fail(chk, "vm.export_max_conns",
+                              "'%d' connections can hold %d MiB of jobs.read_budget_mb "
+                              "(%d MiB), which leaves less than the %d MiB a job needs; "
+                              "raise jobs.read_budget_mb to %d or lower this (0 turns "
+                              "exports off)", conns, conns * 16, budget,
+                              APP_MIN_READ_BUDGET_MB, APP_MIN_READ_BUDGET_MB + conns * 16);
+    }
+
     static const char *const retention[] = {
         "retention.keep_snaps", "retention.keep_daily", "retention.keep_weekly",
         "retention.keep_monthly", "retention.keep_yearly", NULL

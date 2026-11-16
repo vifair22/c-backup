@@ -522,9 +522,10 @@ static status_t r_block_open(sp_session_t *s, const sp_item_desc_t *item, sp_blo
     if (rp) {
         const char *kind = jstr(rp, "kind");
         if (strcmp(kind, "file") == 0 && jstr(rp, "path")[0] == '/')
-            return disk_stream_file(jstr(rp, "path"), item->size, out);
+            return disk_stream_file(jstr(rp, "path"), item->size, cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rp, "offline")), out);
         if (strcmp(kind, "nbd") == 0 && jstr(rp, "socket")[0] == '/')
-            return disk_stream_nbd(jstr(rp, "socket"), jstr(rp, "export"), item->size, out);
+            return disk_stream_nbd(jstr(rp, "socket"), jstr(rp, "export"), item->size,
+                                   jstr(rp, "watch")[0] == '/' ? jstr(rp, "watch") : NULL, out);
         return set_error(ERR_IO, "helper: no usable read path for disk %s", item->id);
     }
     if (strcmp(s->ctx->provider, "fake") != 0)

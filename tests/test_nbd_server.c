@@ -23,6 +23,7 @@
 #include <cmocka.h>
 
 #include "chunklist.h"
+#include "read_budget.h"
 #include "nbd_client.h"
 #include "nbd_server.h"
 #include "object.h"
@@ -100,7 +101,7 @@ static nbd_server_t *start_mem(unsigned max_conns)
 {
     unlink(SOCK);
     nbd_server_opts_t o = { SOCK, NAME, MEM_SIZE,
-                            { mem_open, mem_read, mem_extents, mem_close, NULL }, max_conns };
+                            { mem_open, mem_read, mem_extents, mem_close, NULL, NULL }, max_conns };
     nbd_server_t *s = NULL;
     assert_int_equal(nbd_server_start(&o, &s), OK);
     return s;
@@ -332,6 +333,7 @@ static status_t cr_extents(void *reader, uint64_t off, uint64_t len, nbd_extent_
     return content_reader_extents(reader, off, len, fn, fctx);
 }
 static void cr_close(void *reader) { content_reader_close(reader); }
+static void cr_idle(void *reader) { content_reader_drop(reader); }
 
 typedef struct { uint64_t pos; const uint8_t *hole; int bad; unsigned runs; } ext_check_t;
 
@@ -384,6 +386,10 @@ static void test_content_reader(void **state)
     chunklist_builder_free(b);
     assert_true(ls.lists > 2);          /* sub-lists, so the descent is real */
 
+    /* Under a real budget: the reader holds at most one leaf of it, never
+     * two slots at once, and nothing once dropped. */
+    assert_int_equal(read_budget_init(READ_BUDGET_MIN), OK);
+    read_budget_reset_stats();
     content_reader_t *r = NULL;
     uint64_t size = 0;
     assert_int_equal(content_reader_open(store, root, &r, &size), OK);
@@ -402,18 +408,25 @@ static void test_content_reader(void **state)
         assert_memory_equal(got, want + off, len);
     }
     assert_int_not_equal(content_reader_read(r, total - 1, got, 2), OK);
+    assert_true(content_reader_cache_bytes(r) <= LEAF);
+    assert_int_equal(read_budget_in_use(), content_reader_cache_bytes(r));
+    assert_int_equal(read_budget_nested(), 0);
+    content_reader_drop(r);
+    assert_int_equal(content_reader_cache_bytes(r), 0);
+    assert_int_equal(read_budget_in_use(), 0);
     ext_check_t ec = { 0, hole, 0, 0 };
     assert_int_equal(content_reader_extents(r, 0, total, check_run, &ec), OK);
     assert_false(ec.bad);
     assert_int_equal(ec.pos, total);
     assert_true(ec.runs > 100);
     content_reader_close(r);
+    assert_int_equal(read_budget_in_use(), 0);
 
     /* Served: the native client reads it back whole. */
     cr_ctx_t cx = { store, { 0 } };
     memcpy(cx.hash, root, OBJECT_HASH_SIZE);
     unlink(SOCK);
-    nbd_server_opts_t o = { SOCK, NAME, total, { cr_open, cr_read, cr_extents, cr_close, &cx }, 0 };
+    nbd_server_opts_t o = { SOCK, NAME, total, { cr_open, cr_read, cr_extents, cr_close, cr_idle, &cx }, 0 };
     nbd_server_t *s = NULL;
     assert_int_equal(nbd_server_start(&o, &s), OK);
     nbd_client_t *c = connect_as(NAME, 8);
@@ -421,6 +434,9 @@ static void test_content_reader(void **state)
     memset(got, 0xEE, total);
     assert_int_equal(nbd_read(c, 0, got, (size_t)total), OK);
     assert_memory_equal(got, want, total);
+    /* A connection that goes quiet lets go of its leaf, and its budget. */
+    for (int i = 0; i < 40 && read_budget_in_use() > 0; i++) usleep(100000);
+    assert_int_equal(read_budget_in_use(), 0);
     nbd_close(c);
 
     /* And QEMU's client, where it is installed: a sparse copy, byte for
@@ -444,6 +460,9 @@ static void test_content_reader(void **state)
         print_message("qemu-img not installed: QEMU interop not checked\n");
     }
     nbd_server_stop(s);
+    assert_int_equal(read_budget_in_use(), 0);
+    assert_int_equal(read_budget_nested(), 0);
+    read_budget_init(0);
     free(got);
     free(want);
     free(hole);

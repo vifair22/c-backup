@@ -448,7 +448,12 @@ int main(int argc, char *argv[])
     routes_schedules_init(db, sched);
     routes_exports_init(db, config_get_str(cfg, "vm.export_dir"),
                         (unsigned)config_get_int(cfg, "vm.export_ttl_s", 14400),
-                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800));
+                        (unsigned)config_get_int(cfg, "vm.export_idle_s", 1800),
+                        (unsigned)config_get_int(cfg, "vm.export_max_conns", 4));
+    /* gc moves objects between packs under a reader: it waits in the queue
+     * while an export is open on its repository. The export's ttl bounds
+     * the wait (vm.export_ttl_s, at most 7 days). */
+    job_manager_set_gate(jm, "gc", exports_repo_open, JOB_PHASE_EXPORT_OPEN);
     if (routes_register_health(srv, db) != 0 ||
         routes_register_auth(srv, db) != 0 ||
         routes_register_repos(srv, db) != 0 ||

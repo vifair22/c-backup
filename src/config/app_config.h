@@ -190,6 +190,12 @@ static const config_key_t app_file_keys[] = {
     { "vm.export_ttl_s", CFG_INT, "14400",
       "Default lifetime of an NBD export, seconds (60 to 604800)",
       CFG_STORE_FILE, 0 },
+    /* Each connection keeps at most one chunk (16 MiB at most) under the
+     * read budget; app_config_check refuses a budget that cannot cover
+     * them beside one job's own floor. 0 turns exports off. */
+    { "vm.export_max_conns", CFG_INT, "4",
+      "NBD export connections open at once across every export (0 to 64; 0: off)",
+      CFG_STORE_FILE, 0 },
     { "vm.export_idle_s", CFG_INT, "1800",
       "An export with no connection for this long is closed, seconds",
       CFG_STORE_FILE, 0 },
