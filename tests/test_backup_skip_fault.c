@@ -195,11 +195,81 @@ static void test_read_error_on_a_pool_worker(void **state)
     expect_read_failure_left_out(TEST_SRC "/big-bad.bin", "big-bad.bin", 2, 3);
 }
 
+/*
+ * OWN-45 on the pool: a large file that grows while a worker reads it is
+ * read again on the backup thread, and the snapshot holds the second
+ * read's version, whole, at its size. The worker reads exactly the size it
+ * was given, so before the fix the growth was simply cut off.
+ */
+static volatile int g_grew;
+
+static void grow_once(const char *path)
+{
+    if (__atomic_exchange_n(&g_grew, 1, __ATOMIC_SEQ_CST)) return;
+    int fd = open(path, O_WRONLY | O_APPEND);
+    assert_true(fd >= 0);
+    char tail[4096];
+    memset(tail, 'T', sizeof(tail));
+    assert_int_equal(write(fd, tail, sizeof(tail)), (ssize_t)sizeof(tail));
+    close(fd);
+}
+
+static void test_file_that_grows_under_a_pool_worker_is_read_again(void **state)
+{
+    (void)state;
+    write_file(TEST_SRC "/big-ok.bin", 17, 'k');
+    write_file(TEST_SRC "/big-grows.bin", 17, 'g');
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 2;
+
+    g_grew = 0;
+    fault_read_hook_path = TEST_SRC "/big-grows.bin";
+    fault_read_hook = grow_once;
+    backup_result_t res;
+    status_t st = backup_run(store, db, repo_id, &o, &res);
+    fault_read_hook = NULL;
+    fault_read_hook_path = NULL;
+    assert_int_equal(st, OK);
+    assert_true(g_grew);
+    assert_true(res.store_workers > 1);
+
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_string_equal(res.changed[0], TEST_SRC "/big-grows.bin");
+    char want_sz[32];
+    snprintf(want_sz, sizeof(want_sz), "%llu",
+             (unsigned long long)(17ull * MIB + 4096));
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT size FROM nodes WHERE name = 'big-grows.bin'",
+                                NULL, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], want_sz);
+    db_result_free(r);
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, res.snapshot_id,
+                                 TEST_DIR "/dst", &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    /* Byte for byte what the file held when it was read the second time. */
+    char cmd[PATH_MAX * 2 + 32];
+    snprintf(cmd, sizeof(cmd), "cmp -s '%s' '%s'", TEST_SRC "/big-grows.bin",
+             TEST_DIR "/dst" TEST_SRC "/big-grows.bin");
+    assert_int_equal(system(cmd), 0);
+    backup_result_free(&res);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_read_error_on_the_backup_thread, setup, teardown),
         cmocka_unit_test_setup_teardown(test_read_error_on_a_pool_worker, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_grows_under_a_pool_worker_is_read_again, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

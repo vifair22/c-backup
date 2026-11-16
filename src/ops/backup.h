@@ -117,6 +117,18 @@ typedef struct {
     uint64_t       files_skipped;
     backup_skip_t *skipped;
     uint32_t       skipped_listed;
+    /*
+     * Regular files whose size or times had changed by the time they were
+     * read, since the scan or during the read itself, and that were then
+     * stored as read (OWN-45): one whole version of the file, read between
+     * two identical fstats, with the node's size and mtime that version's.
+     * A file still changing on a second read is skipped instead and counted
+     * above. The first BACKUP_SKIPPED_LIST_MAX paths, heap-owned like
+     * skipped; backup_result_free releases both.
+     */
+    uint64_t       files_changed;
+    char         **changed;
+    uint32_t       changed_listed;
 } backup_result_t;
 
 /*

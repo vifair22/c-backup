@@ -759,7 +759,8 @@ continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
 may not open, one replaced by a directory or anything else that is not a
-regular file, and one whose read fails partway (an I/O error). A backup
+regular file, one whose read fails partway (an I/O error), and one still
+changing on a second read (below). A backup
 with skipped files still ends `completed`, but not silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping
@@ -771,6 +772,32 @@ with skipped files still ends `completed`, but not silently:
   and Pushover when configured (section 16.3);
 - the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
   skipped (not in the snapshot); first: /data/x: ...`.
+
+**A file that changes while it is backed up.** A live filesystem changes
+under a backup, and a file can be a different size by the time it is read
+than when the scan listed it. The backup stores the file as it is when it
+is read, never as the scan saw it: its size, times and content all come
+from that read, so it is not cut short when it grew and not padded with
+zeros when it shrank. Change is detected by size, mtime and ctime (and
+inode), compared between the scan and the open, and again between the
+start and end of the read:
+
+- changed since the scan, steady while read: stored as read, logged at
+  `info`, and counted;
+- changed during the read: read once more from the start. If the second
+  read is steady, that version is stored, logged at `warning`, and counted;
+- changed during the second read too: left out, as a skipped file with the
+  reason `changed while it was being read, and again on a second read`.
+
+The rule is rsync's rather than tar's. tar keeps what it read and warns
+"file changed as we read it"; but bytes read across a change are a mix of
+two versions, a file that never existed, and restoring it is as wrong as
+padding. A file read whole between two identical looks is one real version
+of it. The job `result` counts the stored ones in `files_changed` and lists
+the first 100 in `changed`; the snapshot holds those files as they were a
+moment after the scan, not at it. A file that is always being written (a
+live database, a busy log) may be skipped on every run: back it up from a
+snapshot of its filesystem, or with its application's own dump.
 
 The next backup tries every skipped file again. Before 1.0.0's fix for
 B118 a skipped file stayed in the snapshot with no content: the backup

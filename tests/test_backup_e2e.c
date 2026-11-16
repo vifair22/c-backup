@@ -817,6 +817,262 @@ static void test_skipped_list_is_bounded_and_the_count_is_not(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name LIKE 'many-%'", NULL), 0);
 }
 
+/*
+ * OWN-45: a file whose size changes between the scan and the read is stored
+ * as it is read, never cut to the scan's size and never padded out to it.
+ *
+ * The store read exactly the scan's size. A file that had shrunk came back
+ * with zeros where the file now ended - the sparse probe found a "hole"
+ * there - and one truncated to nothing came back as the scan's size of
+ * zeros. A file that had grown was cut short. Restore produced content the
+ * file never had, and nothing said a word.
+ */
+
+/* Read a whole file into a malloc'd buffer; *len its length. */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t *buf = NULL;
+    size_t cap = 0, n = 0;
+    for (;;) {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 65536;
+            uint8_t *g = realloc(buf, cap);
+            if (!g) { free(buf); fclose(f); return NULL; }
+            buf = g;
+        }
+        size_t r = fread(buf + n, 1, cap - n, f);
+        n += r;
+        if (r == 0) break;
+    }
+    fclose(f);
+    *len = n;
+    return buf;
+}
+
+/* `n` bytes of `c` at path, replacing what is there. */
+static void write_fill(const char *path, size_t n, char c, const char *mode)
+{
+    FILE *f = fopen(path, mode);
+    assert_non_null(f);
+    char buf[65536];
+    memset(buf, c, sizeof(buf));
+    while (n > 0) {
+        size_t k = n < sizeof(buf) ? n : sizeof(buf);
+        assert_int_equal(fwrite(buf, 1, k, f), k);
+        n -= k;
+    }
+    fclose(f);
+}
+
+typedef enum { TORN_SHRINK, TORN_GROW, TORN_EMPTY } torn_t;
+
+typedef struct {
+    torn_t      kind;
+    const char *path;
+    int         done;
+} torn_ctx_t;
+
+static void torn_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    torn_ctx_t *t = ctx;
+    if (t->done || strcmp(phase, "store") != 0 || done != 0) return;
+    t->done = 1;
+    switch (t->kind) {
+    case TORN_SHRINK: assert_int_equal(truncate(t->path, 3), 0); break;
+    case TORN_GROW:   write_fill(t->path, 4, 'G', "ab");          break;
+    case TORN_EMPTY:  assert_int_equal(truncate(t->path, 0), 0); break;
+    }
+}
+
+/* Restore the newest snapshot and compare one file with what the source
+ * held when it was read, byte for byte. */
+static void expect_restored_as(const char *src_path, const uint8_t *want, size_t want_len,
+                               const char *tag)
+{
+    char dest[PATH_MAX];
+    snprintf(dest, sizeof(dest), TEST_DIR "/restore-%s", tag);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot_id(), dest, &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    char got_path[PATH_MAX * 2];
+    snprintf(got_path, sizeof(got_path), "%s%s", dest, src_path);
+    size_t got_len = 0;
+    uint8_t *got = slurp(got_path, &got_len);
+    assert_non_null(got);
+    assert_int_equal(got_len, want_len);
+    if (want_len) assert_memory_equal(got, want, want_len);
+    free(got);
+}
+
+static void expect_stored_as_read(torn_t kind, const char *name)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), TEST_SRC "/sub/%s", name);
+    write_fill(path, 8191, 'r', "wb");
+
+    torn_ctx_t tc = { kind, path, 0 };
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = torn_at_store;
+    o.progress_ctx = &tc;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(tc.done);
+
+    /* What the file held when it was read. */
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_non_null(want);
+
+    /* Stored, not skipped, and reported as changed. */
+    assert_int_equal(res.files, 4);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_int_equal(res.changed_listed, 1);
+    assert_string_equal(res.changed[0], path);
+
+    /* The node says the size that was read, not the scan's. */
+    char want_sz[32];
+    snprintf(want_sz, sizeof(want_sz), "%zu", want_len);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT size FROM nodes WHERE name = ?",
+                                (const char *[]){ name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], want_sz);
+    db_result_free(r);
+
+    expect_restored_as(path, want, want_len, name);
+    free(want);
+
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    backup_result_free(&res);
+    assert_null(res.changed);
+}
+
+static void test_file_that_shrinks_is_stored_as_read(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_SHRINK, "shrinks.txt");
+}
+
+static void test_file_that_grows_is_stored_as_read(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_GROW, "grows.txt");
+}
+
+static void test_file_truncated_to_nothing_is_stored_empty(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_EMPTY, "emptied.txt");
+}
+
+/*
+ * A file that changes while it is being read. The source is one file, so it
+ * is the last entry and every per-read progress report gets through the
+ * throttle: the first report for it is the loop reaching it, the ones after
+ * are reads inside it. Changing it at a read is a change mid-read.
+ */
+typedef enum { MID_GROW_ONCE, MID_SHRINK_ONCE, MID_KEEPS_CHANGING } mid_t;
+
+typedef struct {
+    mid_t       kind;
+    const char *path;
+    uint64_t    file_index;
+    int         seen;      /* reports for the file so far */
+    int         changes;
+} mid_ctx_t;
+
+static void change_mid_read(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    mid_ctx_t *m = ctx;
+    if (strcmp(phase, "store") != 0 || total == 0 || done + 1 != total) return;
+    if (++m->seen < 2) return;   /* the loop arriving, not a read */
+    if (m->kind != MID_KEEPS_CHANGING && m->changes > 0) return;
+    m->changes++;
+    switch (m->kind) {
+    case MID_GROW_ONCE:      write_fill(m->path, 1 << 20, 'g', "ab");      break;
+    case MID_SHRINK_ONCE:    assert_int_equal(truncate(m->path, 1 << 20), 0); break;
+    case MID_KEEPS_CHANGING: write_fill(m->path, 16, 'k', "ab");          break;
+    }
+}
+
+static void run_mid_read(mid_t kind, backup_result_t *res, const char *path)
+{
+    write_fill(path, (size_t)3 << 20, 'm', "wb");
+    static const char *one[1];
+    one[0] = path;
+    mid_ctx_t m = { kind, path, 0, 0, 0 };
+    backup_opts_t o = basic_opts();
+    o.paths = one;
+    o.n_paths = 1;
+    o.progress_cb  = change_mid_read;
+    o.progress_ctx = &m;
+    assert_int_equal(backup_run(store, db, repo_id, &o, res), OK);
+    assert_true(m.changes >= 1);
+}
+
+static void test_file_that_grows_mid_read_is_read_again(void **state)
+{
+    (void)state;
+    const char *path = TEST_DIR "/mid-grow.bin";
+    backup_result_t res;
+    run_mid_read(MID_GROW_ONCE, &res, path);
+    assert_int_equal(res.files, 1);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_string_equal(res.changed[0], path);
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_int_equal(want_len, (size_t)4 << 20);   /* the second read's version */
+    expect_restored_as(path, want, want_len, "mid-grow");
+    free(want);
+    backup_result_free(&res);
+}
+
+static void test_file_that_shrinks_mid_read_is_read_again(void **state)
+{
+    (void)state;
+    const char *path = TEST_DIR "/mid-shrink.bin";
+    backup_result_t res;
+    run_mid_read(MID_SHRINK_ONCE, &res, path);
+    assert_int_equal(res.files, 1);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_int_equal(want_len, (size_t)1 << 20);
+    expect_restored_as(path, want, want_len, "mid-shrink");
+    free(want);
+    backup_result_free(&res);
+}
+
+static void test_file_that_keeps_changing_is_left_out(void **state)
+{
+    (void)state;
+    const char *path = TEST_DIR "/mid-busy.bin";
+    backup_result_t res;
+    run_mid_read(MID_KEEPS_CHANGING, &res, path);
+    assert_int_equal(res.files, 0);
+    assert_int_equal(res.files_changed, 0);
+    assert_int_equal(res.files_skipped, 1);
+    assert_string_equal(res.skipped[0].path, path);
+    assert_non_null(strstr(res.skipped[0].reason, "again on a second read"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", "mid-busy.bin"), 0);
+    /* The reads it threw away are recorded objects, so gc can find them;
+     * nothing in the index names bytes the repository does not hold. */
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    backup_result_free(&res);
+}
+
 /* A non-sparse file of `mib` MiB, filled with a pattern rather than zeroes
  * so nothing along the way can mistake it for a hole. */
 static void write_big(const char *path, int mib)
@@ -1654,6 +1910,12 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_file_deleted_between_scan_and_store_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_replaced_by_a_directory_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_skipped_list_is_bounded_and_the_count_is_not, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_shrinks_is_stored_as_read, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_grows_is_stored_as_read, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_truncated_to_nothing_is_stored_empty, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_grows_mid_read_is_read_again, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_shrinks_mid_read_is_read_again, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_keeps_changing_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),

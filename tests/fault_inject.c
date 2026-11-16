@@ -181,7 +181,21 @@ int __wrap_rename(const char *from, const char *to) {
 const char *volatile fault_read_eio_path = NULL;
 volatile int fault_read_refused = 0;
 
+const char *volatile fault_read_hook_path = NULL;
+void (*volatile fault_read_hook)(const char *path) = NULL;
+
 ssize_t __wrap_read(int fd, void *buf, size_t count) {
+    const char *hook_path = fault_read_hook_path;
+    void (*hook)(const char *) = fault_read_hook;
+    if (hook_path && hook) {
+        char link[64], target[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t len = readlink(link, target, sizeof(target) - 1);
+        if (len > 0) {
+            target[len] = '\0';
+            if (strcmp(target, hook_path) == 0) hook(target);
+        }
+    }
     const char *want = fault_read_eio_path;
     if (want) {
         char link[64], target[PATH_MAX];
