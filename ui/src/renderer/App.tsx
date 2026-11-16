@@ -747,7 +747,12 @@ export function App(): React.ReactElement {
               />
             )}
             {currentView.view === 'snapshot-browser' && (
-              <SnapshotBrowser connName={activeRepo.conn} repoPath={String(activeRepo.id)}
+              /* Keyed by snapshot so a different snapshot is a fresh browser:
+               * its selection, highlight and open file card belong to the
+               * snapshot they were made in, and a restore from a stale card
+               * would act on the wrong one. */
+              <SnapshotBrowser key={`${activeRepo.conn}/${activeRepo.id}/${currentView.snapId}`}
+                connName={activeRepo.conn} repoPath={String(activeRepo.id)}
                 snapId={currentView.snapId}
                 initialPath={currentView.path}
                 onBack={navBack}
