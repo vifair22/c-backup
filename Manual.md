@@ -1145,6 +1145,10 @@ Actions: `backup`, `verify`, `grep`, `gc`, `gfs`, `reindex`, `pack`,
 `replicate`. A schedule whose action cannot run is refused when created, not
 when it first fires.
 
+A schedule has one trigger: an interval in seconds, or a calendar with
+`--every`. Giving both, or `--at`, `--on`, `--on-day` or `--on-month`
+without `--every`, is refused by the CLI rather than one half being dropped.
+
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
 
@@ -2069,31 +2073,52 @@ command, or `C_BACKUP_SOCKET`, overrides the default. Output is the daemon's
 JSON, one document per command, on stdout (a remove prints what it removed,
 `{"removed":true,...}`); errors go to stderr. `jobs watch` is the one command
 that prints several: one document per line until the job ends. The exit
-status is 0 on success and 1 otherwise. Flags may appear anywhere after the
-command. Commands that start a job wait for it unless given `--no-wait`.
-The listing and lookup commands refuse an argument they do not take, a
-stray positional or an unknown option, with `unexpected argument` and their
-usage, rather than ignore it: `grep runs 1 2` is an error, not repository
-1's runs.
+status is 0 on success and 1 otherwise. Commands that start a job wait for
+it unless given `--no-wait`.
+
+Arguments follow one set of rules for every command, checked before
+anything is sent to the daemon:
+
+- Options may appear anywhere after the command. A value option is written
+  `--name VALUE` or `--name=VALUE`.
+- `--` ends the options: everything after it is a positional, even if it
+  starts with `-`. That is how to pass a label, pattern or note that starts
+  with a dash: `repo add /srv/backup/x -- -scratch`. A value that starts
+  with a dash uses the `=` form: `backup 1 --label=-nightly`.
+- A value option needs a value. One at the end of the line, one followed by
+  another option (`--encrypt --passphrase ...`) and an empty one
+  (`--encrypt=`) are all refused, naming the option. Before 1.0 a missing
+  `--encrypt` value created an unencrypted repository labelled
+  `--encrypt` (B127).
+- An option the command does not take is refused with `unknown option`, and
+  a positional past the ones it takes with `unexpected argument`:
+  `grep runs 1 2` is an error, not repository 1's runs.
+- Only `--exclude` and `--source` repeat. Any other option given twice is
+  refused rather than one copy being picked.
+
+Each refusal prints the reason and the command's usage to stderr and exits
+1; nothing reaches the daemon. `c-backup <command> --help` (or `-h`, before
+any `--`) prints the usage without running anything, and `c-backup help`
+lists every command with all of its arguments.
 
 | Command | Purpose |
 |---|---|
 | `repo list` | Registered repositories |
-| `repo add <path> [label] [--encrypt system\|passphrase] [--passphrase TEXT]` | Create or register |
+| `repo add <path> [label] [--encrypt system\|passphrase\|none] [--passphrase TEXT]` | Create or register |
 | `repo show <id>` | One repository |
 | `repo remove <id>` | Deregister; the directory is kept |
 | `repo key export\|ack <id>`, `repo key import <id> <key-hex>` | Encryption key escrow and recovery |
-| `sources list <id>`, `sources set <id> <path>... [--exclude PAT]...` | What a repository backs up |
+| `sources list <id>`, `sources set <id> [path...] [--exclude PAT]...` | What a repository backs up; `set` with no paths clears the list |
 | `backup <id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT]` | Back up |
 | `restore <id> <snapshot> <dest> [--subpath PATH] [--overwrite]` | Restore |
 | `snapshots <id> [--limit N] [--offset N]` | List snapshots |
 | `snapshot delete <id> <snapshot> [--force]` | Delete one; a tagged one only with `--force` (section 12) |
 | `snapshot note <id> <snapshot> [text]` | Read or write a note |
-| `ls <id> <snapshot> [node-id]`, `snapshot tree <id> <snapshot> [node-id] [--limit N] [--offset N]` | One directory level; the root when no node is given |
-| `search <id> <text> [--snapshot N] [--limit N]` | File names, one result per path and content |
+| `ls <id> <snapshot> [node-id] [--limit N] [--offset N]`, `snapshot tree` (the same) | One directory level; the root when no node is given |
+| `search <id> <text> [--snapshot N] [--limit N] [--offset N]` | File names, one result per path and content |
 | `grep <id> <pattern> [--snapshot N] [--path-prefix PATH] [--limit N] [--max-hits-per-file N] [--max-hits N] [-i]` | File contents |
 | `grep runs <id> [--limit N] [--offset N]`, `grep show <id> <run> [--limit N] [--offset N]` | Past content searches, and one search's hits |
-| `diff <id> <from> <to>` | Compare two snapshots |
+| `diff <id> <from> <to> [--limit N] [--offset N]` | Compare two snapshots |
 | `verify <id> [--level index\|structure\|deep] [--no-repair] [--dry-run]`, `verify list <id> [--limit N] [--offset N]`, `verify show <id> <run> [--limit N] [--offset N]` | Integrity |
 | `gc <id> [--dry-run]` | Garbage collection |
 | `gfs <id> [--dry-run]` | Retention |
@@ -2101,8 +2126,8 @@ usage, rather than ignore it: `grep runs 1 2` is an error, not repository
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
-| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
-| `packs <id> [pack-id]` | Packs |
+| `objects <id> [--location loose\|packed] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |
 | `journal <id> [--limit N] [--result STATE]` | Operation history |
@@ -2112,7 +2137,7 @@ usage, rather than ignore it: `grep runs 1 2` is an error, not repository
 | `auth setup\|password` | Set or change the admin password (prompts) |
 | `auth logout --all` | Revoke every remote session (section 4.3) |
 | `health [live]`, `metrics`, `version` | The daemon |
-| `help` | This list, from the binary |
+| `help [command] [subcommand]` | This list, from the binary; with a command, its usage |
 
 Policy keys: `retention.keep_snaps`, `retention.keep_daily`,
 `retention.keep_weekly`, `retention.keep_monthly`, `retention.keep_yearly`,
