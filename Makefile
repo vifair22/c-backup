@@ -735,7 +735,12 @@ COV_E2E_TIMEOUT  := 900
 # coverage run. The racy counters used to lose most of those increments,
 # which is the only reason CI stayed under the line. 2^40 still catches a
 # counter that wrapped or was garbage, which reads near 2^64.
-GCOVR_FLAGS := --gcov-suspicious-hits-threshold 1099511627776
+#
+# The check and its flag arrived in gcovr 8; Debian trixie ships 7.2, which
+# has neither and refuses the unknown flag, so pass it only when the
+# installed gcovr knows it.
+GCOVR_FLAGS := $(shell gcovr --help 2>/dev/null | grep -q -- --gcov-suspicious-hits-threshold \
+                 && echo --gcov-suspicious-hits-threshold 1099511627776)
 
 # The whole-repo summary prints last, on purpose. GitLab's coverage regex keeps
 # the last "lines:" in the log, and printing the store gate second made every
