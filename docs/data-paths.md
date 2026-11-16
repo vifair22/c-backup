@@ -476,9 +476,25 @@ Every load verifies before it trusts:
   payload, RS-repairs on mismatch), decompresses (`COMPRESS_NONE` or LZ4
   block for pack entries; loose is always `COMPRESS_NONE`), and re-hashes
   the result against the requested hash. LZ4-frame entries must stream.
-- `object_load_stream`: streams to a caller fd in 16 MiB chunks, hashing
-  as it goes; this is the restore path's workhorse and the only correct
-  path for arbitrary-size objects.
+- `object_load_stream`: streams to a caller fd in windows of whole RS
+  groups (just under 16 MiB), decrypting and hashing as it goes; this is
+  the restore path's workhorse and the only correct path for
+  arbitrary-size objects. The tag and the hash are checked only at the
+  end, so the caller has emitted bytes before it knows they are right: a
+  caller that must not act on unverified bytes writes somewhere it can
+  discard (restore's temporary file, grep's held matches). A failure that
+  says the stored bytes are wrong - a tag that does not verify, a hash
+  mismatch, a truncation - rewinds a rewindable destination (a regular
+  file, to where the object began; `/dev/null`) and runs a second pass
+  that corrects each window from parity first, then decrypts and
+  authenticates again. A failed tag used to end the read before parity
+  was considered, so an encrypted loose object with one flipped byte was
+  unreadable (OWN-37). A pipe cannot be rewound, so a damaged loose object
+  streamed into one fails and a repairing verify fixes it on disk.
+- Every header reader refuses an object type outside 1-5 with "object type
+  N is not known to this build; written by a newer c-backup?" (OWN-39),
+  after header parity has had its chance: a damaged type byte is
+  repairable, an unknown one is not.
 - `object_load_prefix`: bounded prefix for previews and probes, LZ4
   partial decode for packed entries, no hash verification (a prefix
   cannot be hash-checked).
@@ -561,12 +577,18 @@ flowchart TD
     HL -->|no| CH{content hash present?}
     CP --> CH
     CH -->|null or zero| SKIP2[skip; warn if unexpected type]
-    CH -->|yes| ST[object_load_stream to dest fd]
+    CH -->|yes| EX{path exists, overwrite off?}
+    EX -->|size + mtime match| SKIP3[skipped: already restored]
+    EX -->|anything else| KEPT[kept: left alone]
+    EX -->|no| SW[first file in this directory this run:<br>remove .c-backup-partial.* leftovers]
+    SW --> ST[object_load_stream into<br>.c-backup-partial.XXXXXX]
+    ST -->|not OK, or type not FILE/SPARSE| DEL[unlink temp; failed]
     ST --> SP{OBJECT_TYPE_SPARSE?}
-    SP -->|yes| SCAT[reopen + scatter regions via<br>restore_sparse_streaming]
-    SP -->|no| META[apply mode/owner/mtime]
+    SP -->|yes| SCAT[scatter regions from the verified<br>payload into a second temp file]
+    SP -->|no| META[mode/owner/mtime, xattrs, ACLs<br>on the temp file]
     SCAT --> META
-    META --> REM[first of a hardlink group:<br>remember path for later members]
+    META --> REN[fdatasync, rename over the final path]
+    REN --> REM[first of a hardlink group:<br>remember path for later members]
 ```
 
 Type-specific behaviour, spelled out:
@@ -589,22 +611,40 @@ Type-specific behaviour, spelled out:
   to it, preserving the shared inode. If the link fails (cross-device
   destination, filesystem without hardlinks) the member falls through to
   a full content copy, correct but larger.
-- **Regular files**: content streams straight from the store to the
-  destination fd, then metadata, then xattrs, then ACLs - the ACL last
-  because its base entries carry the definitive permissions and must win
-  over chmod. Later hardlink members share the first member's inode, so
-  the attributes applied there are already theirs. All of it is best
-  effort with warnings: an unprivileged restore cannot set `security.*`
-  or `trusted.*` attributes, and that must not fail a file whose content
-  just restored correctly. If the object turns out to be `OBJECT_TYPE_SPARSE`, the
-  linear bytes just written are a region-table serialisation, not file
-  content, so the file is reopened and `restore_sparse_streaming` scatters
-  each region to its recorded offset through a pipe from
-  `object_load_stream` - holes are never materialised and RAM stays
-  bounded no matter the logical size.
-- **Overwrite**: with `overwrite` off, an existing destination file is
-  skipped; with it on, symlink/hardlink sites `unlink` first and regular
-  files are `O_TRUNC`ed.
+- **Regular files** (OWN-36): content streams from the store into a
+  temporary file, `.c-backup-partial.XXXXXX` from `mkostemp` (O_EXCL, mode
+  0600), in the destination's own directory so the final rename is atomic.
+  The streaming read emits as it goes and learns whether the bytes are
+  right only at the end, from the AEAD tag and the SHA-256, so nothing it
+  writes may sit at the final path before it returns OK. Then metadata,
+  xattrs and ACLs go onto the temporary file - the ACL last because its
+  base entries carry the definitive permissions and must win over chmod -
+  then `fdatasync`, then `rename` over the final path. Later hardlink
+  members share the first member's inode, so the attributes applied there
+  are already theirs. Metadata is best effort with warnings: an
+  unprivileged restore cannot set `security.*` or `trusted.*` attributes,
+  and that must not fail a file whose content restored correctly. The
+  object must be `OBJECT_TYPE_FILE` or `OBJECT_TYPE_SPARSE` (OWN-39); any
+  other type fails the file. If it is `OBJECT_TYPE_SPARSE`, what was just
+  written is the verified region-table serialisation, not file content, so
+  `restore_sparse_from_fd` scatters each region to its recorded offset in
+  a second temporary file and the first is dropped - holes are never
+  materialised, RAM stays bounded, the payload is read from the repository
+  once, and a damaged loose payload is corrected from parity on the way,
+  which the old second read through a pipe could not do.
+- **Interruption**: a daemon killed mid-file leaves only a temporary file.
+  Before the first file restored into a directory in a run, that
+  directory's `.c-backup-partial.` + six-character regular files are
+  removed, so a resumed restore cleans up exactly where it goes back to
+  work, at one `readdir` per directory written into.
+- **Overwrite**: with `overwrite` off, an existing regular file whose size
+  matches and whose mtime is within two seconds of the node's is skipped as
+  already restored (the final name only ever appears after verification
+  and metadata, so such a file is complete); anything else at the path is
+  kept and counted in `kept`. The hardlink pre-pass anchors a group only on
+  a member that passes the same rule. With `overwrite` on, symlink/hardlink
+  sites `unlink` first and regular files are replaced by the rename, which
+  replaces a symlink at the path rather than writing through it.
 - **FIFOs and device nodes**: recreated by `mkfifo`/`mknod`, then metadata,
   xattrs and ACLs like any other node. Neither has a content object; for a
   device the major/minor pair is the whole file, which is why the manifest
@@ -615,9 +655,9 @@ Type-specific behaviour, spelled out:
   Sockets are scanned but have no meaningful restore and are skipped.
 
 Per-file failures (unreadable object, unwritable destination) are counted
-as skips and logged; the restore completes and reports
-files/dirs/symlinks/hardlinks/skipped so partial success is visible rather
-than binary.
+in `failed` and logged; the restore completes and reports
+files/dirs/symlinks/hardlinks/specials/skipped/kept/failed so partial
+success is visible rather than binary, and any failure fails the job.
 
 ---
 
