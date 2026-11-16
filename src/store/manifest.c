@@ -172,6 +172,43 @@ static int entry_cmp(const void *a, const void *b)
 
 #undef CMP_SCALAR
 
+static size_t entry_wire_size(const manifest_entry_t *e)
+{
+    return MANIFEST_FIXED + (size_t)e->name_len + (size_t)e->link_target_len;
+}
+
+#define MANIFEST_HDR_BYTES 10u
+
+/* One TREE object from a run of already-sorted entries. */
+static void serialise_run(sbuf_t *b, const manifest_entry_t *entries,
+                          uint32_t count)
+{
+    put_u32(b, MANIFEST_TREE_MAGIC);
+    put_u16(b, MANIFEST_TREE_VERSION);
+    put_u32(b, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const manifest_entry_t *e = &entries[i];
+        put_u16(b, e->name_len);
+        put_u16(b, e->link_target_len);
+        put_u8 (b, e->type);
+        put_u32(b, e->mode);
+        put_u32(b, e->uid);
+        put_u32(b, e->gid);
+        put_u64(b, e->size);
+        put_u64(b, i64_to_u64(e->mtime_sec));
+        put_u64(b, e->mtime_nsec);
+        put_u64(b, e->inode_identity);
+        put_u32(b, e->dev_major);
+        put_u32(b, e->dev_minor);
+        put_bytes(b, e->target_hash, OBJECT_HASH_SIZE);
+        put_bytes(b, e->xattr_hash,  OBJECT_HASH_SIZE);
+        put_bytes(b, e->acl_hash,    OBJECT_HASH_SIZE);
+        if (e->name_len) put_bytes(b, e->name, e->name_len);
+        if (e->link_target_len) put_bytes(b, e->link_target, e->link_target_len);
+    }
+}
+
 status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
                             uint8_t **out_buf, size_t *out_len)
 {
@@ -181,31 +218,7 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
     qsort(entries, count, sizeof(*entries), entry_cmp);
 
     sbuf_t b = { 0 };
-    put_u32(&b, MANIFEST_TREE_MAGIC);
-    put_u16(&b, MANIFEST_TREE_VERSION);
-    put_u32(&b, count);
-
-    for (uint32_t i = 0; i < count; i++) {
-        const manifest_entry_t *e = &entries[i];
-        put_u16(&b, e->name_len);
-        put_u16(&b, e->link_target_len);
-        put_u8 (&b, e->type);
-        put_u32(&b, e->mode);
-        put_u32(&b, e->uid);
-        put_u32(&b, e->gid);
-        put_u64(&b, e->size);
-        put_u64(&b, i64_to_u64(e->mtime_sec));
-        put_u64(&b, e->mtime_nsec);
-        put_u64(&b, e->inode_identity);
-        put_u32(&b, e->dev_major);
-        put_u32(&b, e->dev_minor);
-        put_bytes(&b, e->target_hash, OBJECT_HASH_SIZE);
-        put_bytes(&b, e->xattr_hash,  OBJECT_HASH_SIZE);
-        put_bytes(&b, e->acl_hash,    OBJECT_HASH_SIZE);
-        if (e->name_len) put_bytes(&b, e->name, e->name_len);
-        if (e->link_target_len) put_bytes(&b, e->link_target, e->link_target_len);
-    }
-
+    serialise_run(&b, entries, count);
     if (b.oom) {
         free(b.buf);
         return set_error(ERR_NOMEM, "manifest_serialise: out of memory");
@@ -215,20 +228,113 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
     return OK;
 }
 
+/* Store one fragment (or the whole directory) and account for it. */
+static status_t put_run(const obj_sink_t *sink, sbuf_t *b,
+                        const manifest_entry_t *entries, uint32_t count,
+                        obj_put_t *put, manifest_store_stats_t *stats)
+{
+    b->len = 0;
+    serialise_run(b, entries, count);
+    if (b->oom) return set_error(ERR_NOMEM, "manifest: out of memory");
+    memset(put, 0, sizeof(*put));
+    status_t st = sink->put(sink->ctx, OBJECT_TYPE_TREE, b->buf, b->len, put);
+    if (st != OK) return st;
+    stats->objects++;
+    stats->fragments++;
+    if (put->is_new) {
+        stats->objects_new++;
+        stats->phys_new += put->phys_bytes;
+    }
+    return OK;
+}
+
+status_t manifest_store_tree(manifest_entry_t *entries, uint32_t count,
+                             const cdc_params_t *cp, const obj_sink_t *sink,
+                             uint8_t out_hash[OBJECT_HASH_SIZE],
+                             manifest_store_stats_t *stats)
+{
+    if (!cp || !sink || !sink->put || !out_hash)
+        return set_error(ERR_INVALID, "manifest_store_tree: bad arguments");
+    if (count > 0 && !entries)
+        return set_error(ERR_INVALID, "manifest_store_tree: null entries");
+    manifest_store_stats_t local;
+    memset(&local, 0, sizeof(local));
+    if (!stats) stats = &local;
+    memset(stats, 0, sizeof(*stats));
+
+    /* Goes through the ordinary object path: an unchanged directory, or an
+     * unchanged fragment of one, produces identical bytes, so the store
+     * recognises it and writes nothing. That is the whole mechanism. */
+    qsort(entries, count, sizeof(*entries), entry_cmp);
+
+    size_t total = MANIFEST_HDR_BYTES;
+    for (uint32_t i = 0; i < count; i++) total += entry_wire_size(&entries[i]);
+
+    sbuf_t b = { 0 };
+    obj_put_t put;
+    status_t st;
+    if (total <= MANIFEST_FRAG_MIN) {
+        /* No cut can fall before MANIFEST_FRAG_MIN, so this is exactly what
+         * the cutting below would produce, without hashing a name. */
+        st = put_run(sink, &b, entries, count, &put, stats);
+        if (st == OK) memcpy(out_hash, put.hash, OBJECT_HASH_SIZE);
+        free(b.buf);
+        return st;
+    }
+
+    chunklist_builder_t *cl = NULL;
+    st = chunklist_builder_new(OBJECT_TYPE_TREE, sink, &cl);
+    if (st != OK) return st;
+
+    uint8_t first[OBJECT_HASH_SIZE] = { 0 };
+    uint64_t pos = 0;           /* offset in the fragments' concatenation */
+    uint32_t start = 0;
+    while (start < count) {
+        size_t frag = MANIFEST_HDR_BYTES;
+        uint32_t end = start;
+        while (end < count) {
+            size_t esz = entry_wire_size(&entries[end]);
+            if (end > start && frag + esz > MANIFEST_FRAG_MAX) break;
+            frag += esz;
+            end++;
+            if (frag >= MANIFEST_FRAG_MIN &&
+                cdc_name_hash(cp, entries[end - 1].name,
+                              entries[end - 1].name_len) % MANIFEST_FRAG_DIV == 0)
+                break;
+        }
+        st = put_run(sink, &b, entries + start, end - start, &put, stats);
+        if (st != OK) break;
+        if (stats->fragments == 1) memcpy(first, put.hash, OBJECT_HASH_SIZE);
+        st = chunklist_builder_add(cl, pos, b.len, put.hash);
+        if (st != OK) break;
+        pos += b.len;
+        start = end;
+    }
+
+    if (st == OK && stats->fragments == 1) {
+        memcpy(out_hash, first, OBJECT_HASH_SIZE);
+    } else if (st == OK) {
+        st = chunklist_builder_finish(cl, pos, out_hash);
+        if (st == OK) {
+            chunklist_stats_t cs;
+            chunklist_builder_stats(cl, &cs);
+            stats->objects += cs.lists;
+            stats->objects_new += cs.lists_new;
+            stats->phys_new += cs.phys_new;
+        }
+    }
+    chunklist_builder_free(cl);
+    free(b.buf);
+    return st;
+}
+
 status_t manifest_write_tree(store_t *store, manifest_entry_t *entries,
                              uint32_t count, uint8_t out_hash[OBJECT_HASH_SIZE])
 {
-    uint8_t *buf = NULL;
-    size_t len = 0;
-    status_t st = manifest_serialise(entries, count, &buf, &len);
-    if (st != OK) return st;
-
-    /* Goes through the ordinary object path: an unchanged directory produces
-     * identical bytes, so the store recognises it and writes nothing. That is
-     * the whole mechanism. */
-    st = object_store(store, OBJECT_TYPE_TREE, buf, len, out_hash);
-    free(buf);
-    return st;
+    cdc_params_t cp;
+    cdc_params_default(&cp);
+    obj_sink_t sink = obj_sink_store(store);
+    return manifest_store_tree(entries, count, &cp, &sink, out_hash, NULL);
 }
 
 /*
@@ -332,27 +438,253 @@ oom:
     return set_error(ERR_NOMEM, "manifest_parse: alloc");
 }
 
+/* ------------------------------------------------------------------ */
+/* Reading a directory of any size                                     */
+/* ------------------------------------------------------------------ */
+
+struct manifest_iter {
+    obj_loader_t       loader;
+    manifest_object_fn on_object;
+    void              *ctx;
+    chunklist_iter_t  *cl;          /* NULL for a single TREE object */
+    uint64_t           total;       /* the list's length */
+    uint64_t           expect;      /* where the next fragment must start */
+    manifest_entry_t  *ents;        /* the fragment being handed out */
+    uint32_t           n, idx;
+    int                steal;       /* strings belong to the caller */
+    int                any;         /* a fragment has been read */
+    uint16_t           last_len;    /* the previous fragment's last name */
+    char               last[UINT16_MAX + 1];
+};
+
+static void free_entry_strings(const manifest_entry_t *e);
+
+/* With steal set, entries before idx belong to the caller; the rest are
+ * still the iterator's. */
+static void drop_fragment(manifest_iter_t *it)
+{
+    if (!it->ents) return;
+    if (it->steal) {
+        for (uint32_t i = it->idx; i < it->n; i++) free_entry_strings(&it->ents[i]);
+        free(it->ents);
+    } else {
+        manifest_free_entries(it->ents, it->n);
+    }
+    it->ents = NULL;
+    it->n = it->idx = 0;
+}
+
+static int name_cmp(const char *a, uint16_t al, const char *b, uint16_t bl)
+{
+    size_t n = al < bl ? al : bl;
+    int c = memcmp(a, b, n);
+    if (c) return c;
+    return al == bl ? 0 : (al < bl ? -1 : 1);
+}
+
+static status_t load_tree_object(manifest_iter_t *it,
+                                 const uint8_t hash[OBJECT_HASH_SIZE],
+                                 void **out_data, size_t *out_len,
+                                 uint8_t *out_type)
+{
+    return it->loader.load(it->loader.ctx, hash, out_data, out_len, out_type);
+}
+
+/* Parse a fragment and hold it to the list entry that named it. */
+static status_t take_fragment(manifest_iter_t *it, const chunklist_item_t *x)
+{
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    if (x->offset != it->expect) {
+        object_hash_to_hex(x->hash, hex);
+        return set_error(ERR_CORRUPT, "tree fragment %s: at %llu, expected %llu",
+                         hex, (unsigned long long)x->offset,
+                         (unsigned long long)it->expect);
+    }
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = load_tree_object(it, x->hash, &data, &len, &type);
+    if (st != OK) return st;
+    if (type != OBJECT_TYPE_TREE || (uint64_t)len != x->length) {
+        free(data);
+        object_hash_to_hex(x->hash, hex);
+        return set_error(ERR_CORRUPT, "tree fragment %s: type %u and %zu bytes, "
+                         "list says a tree of %llu", hex, type, len,
+                         (unsigned long long)x->length);
+    }
+    st = manifest_parse(data, len, &it->ents, &it->n);
+    free(data);
+    if (st != OK) return st;
+    it->idx = 0;
+    if (it->n == 0) {
+        object_hash_to_hex(x->hash, hex);
+        drop_fragment(it);
+        return set_error(ERR_CORRUPT, "tree fragment %s is empty", hex);
+    }
+    if (it->any && name_cmp(it->ents[0].name, it->ents[0].name_len,
+                            it->last, it->last_len) <= 0) {
+        object_hash_to_hex(x->hash, hex);
+        drop_fragment(it);
+        return set_error(ERR_CORRUPT, "tree fragment %s is out of order", hex);
+    }
+    const manifest_entry_t *l = &it->ents[it->n - 1];
+    memcpy(it->last, l->name, l->name_len);
+    it->last_len = l->name_len;
+    it->any = 1;
+    it->expect += x->length;
+    if (it->on_object) it->on_object(it->ctx, x->hash, OBJECT_TYPE_TREE);
+    return OK;
+}
+
+status_t manifest_iter_open(const obj_loader_t *loader,
+                            const uint8_t hash[OBJECT_HASH_SIZE],
+                            manifest_object_fn on_object, void *ctx,
+                            manifest_iter_t **out)
+{
+    if (!loader || !loader->load || !hash || !out)
+        return set_error(ERR_INVALID, "manifest_iter_open: bad arguments");
+    manifest_iter_t *it = calloc(1, sizeof(*it));
+    if (!it) return set_error(ERR_NOMEM, "manifest_iter_open");
+    it->loader = *loader;
+    it->on_object = on_object;
+    it->ctx = ctx;
+
+    void *data = NULL;
+    size_t len = 0;
+    uint8_t type = 0;
+    status_t st = load_tree_object(it, hash, &data, &len, &type);
+    if (st != OK) { free(it); return st; }
+
+    if (type == OBJECT_TYPE_TREE) {
+        st = manifest_parse(data, len, &it->ents, &it->n);
+        free(data);
+        if (st != OK) { free(it); return st; }
+        if (on_object) on_object(ctx, hash, OBJECT_TYPE_TREE);
+        *out = it;
+        return OK;
+    }
+    free(data);
+    if (type != OBJECT_TYPE_CHUNKLIST) {
+        free(it);
+        return set_error(ERR_CORRUPT, "manifest: object type %u is not a tree",
+                         type);
+    }
+    /* Loaded again by the list reader; a fragmented directory is rare
+     * enough that the second read of its root costs nothing worth keeping. */
+    chunklist_hdr_t h;
+    memset(&h, 0, sizeof(h));
+    st = chunklist_iter_open(loader, hash, OBJECT_TYPE_TREE, 1, &h, &it->cl);
+    if (st != OK) { free(it); return st; }
+    it->total = h.total_len;
+    if (on_object) on_object(ctx, hash, OBJECT_TYPE_CHUNKLIST);
+    *out = it;
+    return OK;
+}
+
+status_t manifest_iter_next(manifest_iter_t *it, const manifest_entry_t **out,
+                            int *done)
+{
+    if (!it || !out || !done)
+        return set_error(ERR_INVALID, "manifest_iter_next: null");
+    *done = 0;
+    for (;;) {
+        if (it->idx < it->n) {
+            *out = &it->ents[it->idx++];
+            return OK;
+        }
+        drop_fragment(it);
+        if (!it->cl) { *done = 1; return OK; }
+
+        chunklist_item_t x;
+        int end = 0;
+        status_t st = chunklist_iter_next(it->cl, &x, &end);
+        if (st != OK) return st;
+        if (end) {
+            if (it->expect != it->total)
+                return set_error(ERR_CORRUPT, "tree list covers %llu bytes, "
+                                 "its fragments %llu",
+                                 (unsigned long long)it->total,
+                                 (unsigned long long)it->expect);
+            *done = 1;
+            return OK;
+        }
+        if (x.is_list) {
+            if (it->on_object) it->on_object(it->ctx, x.hash, OBJECT_TYPE_CHUNKLIST);
+            continue;
+        }
+        st = take_fragment(it, &x);
+        if (st != OK) return st;
+    }
+}
+
+void manifest_iter_close(manifest_iter_t *it)
+{
+    if (!it) return;
+    drop_fragment(it);
+    chunklist_iter_close(it->cl);
+    free(it);
+}
+
+static void free_borrowed(const void *p);
+
+static void free_entry_strings(const manifest_entry_t *e)
+{
+    free_borrowed(e->name);
+    free_borrowed(e->link_target);
+}
+
 status_t manifest_read_tree(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                             manifest_entry_t **out_entries, uint32_t *out_count)
 {
     if (!out_entries || !out_count)
         return set_error(ERR_INVALID, "manifest_read_tree: null out");
+    *out_entries = NULL;
+    *out_count = 0;
 
-    void *data = NULL;
-    size_t len = 0;
-    uint8_t type = 0;
-    status_t st = object_load(store, hash, &data, &len, &type);
-    if (st != OK) return st;
+    obj_loader_t ld = obj_loader_store(store);
+    manifest_iter_t *it = NULL;
+    status_t st = manifest_iter_open(&ld, hash, NULL, NULL, &it);
+    if (st != OK || !it) return st != OK ? st : set_error(ERR_NOMEM, "manifest_read_tree");
+    /* Entries move into the result as they come; the iterator frees only
+     * its arrays, never the strings it handed over. */
+    it->steal = 1;
 
-    if (type != OBJECT_TYPE_TREE) {
-        free(data);
-        return set_error(ERR_CORRUPT,
-                         "manifest_read_tree: object type %u is not a tree", type);
+    manifest_entry_t *all = NULL;
+    uint32_t n = 0, cap = 0;
+    for (;;) {
+        const manifest_entry_t *e = NULL;
+        int done = 0;
+        st = manifest_iter_next(it, &e, &done);
+        if (st != OK || done) break;
+        if (n == cap) {
+            uint32_t nc = cap ? cap * 2 : 64;
+            manifest_entry_t *tmp = nc > cap ? realloc(all, (size_t)nc * sizeof(*all))
+                                             : NULL;
+            if (!tmp) {
+                /* The entry in hand is ours now and in no array yet. */
+                manifest_free_entries(all, n);
+                all = NULL;
+                n = 0;
+                free_entry_strings(e);
+                st = set_error(ERR_NOMEM, "manifest_read_tree: alloc");
+                break;
+            }
+            all = tmp;
+            cap = nc;
+        }
+        all[n++] = *e;
     }
-
-    st = manifest_parse(data, len, out_entries, out_count);
-    free(data);
-    return st;
+    if (st != OK) {
+        /* What the iterator still holds it frees; what it handed over is
+         * in `all`. */
+        manifest_iter_close(it);
+        manifest_free_entries(all, n);
+        return st;
+    }
+    manifest_iter_close(it);
+    *out_entries = all;
+    *out_count = n;
+    return OK;
 }
 
 /*

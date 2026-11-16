@@ -12,6 +12,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -341,6 +342,102 @@ static void bench_lz4_decompress_16m(double *tp)
     report("lz4_decompress_16M", "MiB/s", *tp, iters, elapsed);
 }
 REGISTER_BENCH("lz4_decompress_16M", "MiB/s", bench_lz4_decompress_16m)
+
+/* ------------------------------------------------------------------ */
+/* Content-defined chunking (format 3)                                 */
+/* ------------------------------------------------------------------ */
+
+#include <sys/mman.h>
+#include <unistd.h>
+#include "cdc.h"
+
+/* Boundary detection alone, on random data. This is the sequential part of
+ * storing one file; everything after a cut runs on the workers. */
+static void bench_cdc_scan_16m(double *tp)
+{
+    cdc_params_t p;
+    cdc_params_default(&p);
+    uint64_t iters = 0;
+    size_t cuts = 0;
+    double t0 = now_sec(), elapsed;
+    do {
+        cdc_state_t s;
+        cdc_reset(&s);
+        size_t pos = 0;
+        while (pos < g_buf_sz) {
+            int cut = 0;
+            pos += cdc_scan(&p, &s, g_buf + pos, g_buf_sz - pos, &cut);
+            cuts += (size_t)cut;
+        }
+        iters++;
+        elapsed = now_sec() - t0;
+    } while (elapsed < BENCH_MIN_SECS);
+    *tp = ((double)iters * (double)g_buf_sz) / (1024.0 * 1024.0) / elapsed;
+    report("cdc_scan_16M", "MiB/s", *tp, iters, elapsed);
+    printf("    (%.0f KiB mean chunk)\n", (double)iters * (double)g_buf_sz / 1024.0 / (double)(cuts ? cuts : 1));
+}
+REGISTER_BENCH("cdc_scan_16M", "MiB/s", bench_cdc_scan_16m)
+
+/*
+ * One 256 MiB file through cdc_store_fd with a sink that does a chunk's CPU
+ * work and stores nothing: SHA-256 of the chunk, and the 64 KiB LZ4 probe
+ * that decides whether it is worth compressing (random data: it is not).
+ * The figure is what one file can go at when the disk is not the limit,
+ * which before CDC was one core's SHA-256.
+ */
+static _Thread_local char t_probe[LZ4_COMPRESSBOUND(65536)];
+
+static status_t cpu_put(void *ctx, uint8_t type, const void *data, size_t len,
+                        obj_put_t *out)
+{
+    (void)ctx; (void)type;
+    unsigned int mdlen = 0;
+    EVP_Digest(data, len, out->hash, &mdlen, EVP_sha256(), NULL);
+    int probe = len < 65536 ? (int)len : 65536;
+    (void)LZ4_compress_default(data, t_probe, probe, (int)sizeof(t_probe));
+    out->is_new = 1;
+    out->phys_bytes = len;
+    return OK;
+}
+
+static void bench_cdc_store(double *tp, unsigned workers, const char *name)
+{
+    const size_t n = (size_t)256 * 1024 * 1024;
+    int fd = memfd_create("cdc-bench", 0);
+    if (fd < 0) { *tp = 0; return; }
+    for (size_t off = 0; off < n; off += g_buf_sz) {
+        /* Shift each copy so chunks do not repeat (the sink dedups nothing,
+         * but the boundaries should look like real data's). */
+        g_buf[0] ^= (uint8_t)(off >> 24);
+        if (write(fd, g_buf, g_buf_sz) != (ssize_t)g_buf_sz) { close(fd); *tp = 0; return; }
+    }
+    cdc_params_t p;
+    cdc_params_default(&p);
+    cdc_workers_t *w = NULL;
+    if (workers > 1 && cdc_workers_start(workers, &w) != OK) { close(fd); *tp = 0; return; }
+    obj_sink_t sink = { .put = cpu_put, .ctx = NULL };
+    cdc_opts_t o = { .workers = w };
+    uint64_t iters = 0;
+    double t0 = now_sec(), elapsed;
+    do {
+        cdc_result_t r;
+        if (cdc_store_fd(&p, fd, n, &sink, &o, &r) != OK) break;
+        iters++;
+        elapsed = now_sec() - t0;
+    } while (elapsed < BENCH_MIN_SECS);
+    elapsed = now_sec() - t0;
+    cdc_workers_stop(w);
+    close(fd);
+    *tp = ((double)iters * (double)n) / (1024.0 * 1024.0) / elapsed;
+    report(name, "MiB/s", *tp, iters, elapsed);
+}
+
+static void bench_cdc_store_w1(double *tp) { bench_cdc_store(tp, 1, "cdc_store_256M_serial"); }
+static void bench_cdc_store_w4(double *tp) { bench_cdc_store(tp, 4, "cdc_store_256M_4workers"); }
+static void bench_cdc_store_w8(double *tp) { bench_cdc_store(tp, 8, "cdc_store_256M_8workers"); }
+REGISTER_BENCH("cdc_store_256M_serial", "MiB/s", bench_cdc_store_w1)
+REGISTER_BENCH("cdc_store_256M_4workers", "MiB/s", bench_cdc_store_w4)
+REGISTER_BENCH("cdc_store_256M_8workers", "MiB/s", bench_cdc_store_w8)
 
 /* ------------------------------------------------------------------ */
 /* Main: filter by name, run matching benchmarks                       */

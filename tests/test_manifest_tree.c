@@ -385,6 +385,220 @@ static void test_rejects_non_tree_object(void **state)
     assert_int_not_equal(manifest_read_tree(store, hash, &out, &n), OK);
 }
 
+/* ------------------------------------------------------------------ */
+/* Directories of any size (OWN-34)                                    */
+/* ------------------------------------------------------------------ */
+
+#define BIG_N 120000u
+
+/* BIG_N entries named f0000000..., every third with a symlink target so the
+ * entries are not all one size. Names live in one block. */
+static manifest_entry_t *big_dir(uint32_t n, char **names_out)
+{
+    char *names = malloc((size_t)n * 16);
+    manifest_entry_t *e = calloc(n, sizeof(*e));
+    assert_non_null(names);
+    assert_non_null(e);
+    for (uint32_t i = 0; i < n; i++) {
+        char *nm = names + (size_t)i * 16;
+        snprintf(nm, 16, "f%07u", i * 2);
+        e[i] = mk(nm, (i % 3) ? NODE_TYPE_REG : NODE_TYPE_SYMLINK, i);
+        if (!(i % 3)) {
+            e[i].link_target = "../some/where/else";
+            e[i].link_target_len = 18;
+        }
+        e[i].target_hash[0] = (uint8_t)i;
+        e[i].target_hash[1] = (uint8_t)(i >> 8);
+    }
+    *names_out = names;
+    return e;
+}
+
+typedef struct {
+    unsigned trees, lists;
+    uint64_t largest;
+} objs_t;
+
+static void count_object(void *ctx, const uint8_t hash[OBJECT_HASH_SIZE], uint8_t type)
+{
+    objs_t *o = ctx;
+    if (type == OBJECT_TYPE_TREE) o->trees++; else o->lists++;
+    uint64_t size = 0;
+    uint8_t t = 0;
+    assert_int_equal(object_get_info(store, hash, &size, &t), OK);
+    assert_int_equal(t, type);
+    if (size > o->largest) o->largest = size;
+}
+
+static void test_large_directory_fragments(void **state)
+{
+    (void)state;
+    char *names = NULL;
+    manifest_entry_t *e = big_dir(BIG_N, &names);
+    cdc_params_t cp;
+    cdc_params_default(&cp);
+    obj_sink_t sink = obj_sink_store(store);
+    uint8_t h[OBJECT_HASH_SIZE];
+    manifest_store_stats_t ms;
+    assert_int_equal(manifest_store_tree(e, BIG_N, &cp, &sink, h, &ms), OK);
+    printf("%u entries: %llu fragments, %llu objects\n", BIG_N,
+           (unsigned long long)ms.fragments, (unsigned long long)ms.objects);
+    assert_true(ms.fragments > 1);
+
+    uint64_t size = 0;
+    uint8_t type = 0;
+    assert_int_equal(object_get_info(store, h, &size, &type), OK);
+    assert_int_equal(type, OBJECT_TYPE_CHUNKLIST);
+
+    /* Read back one fragment at a time, every object bounded */
+    obj_loader_t ld = obj_loader_store(store);
+    manifest_iter_t *it = NULL;
+    objs_t o;
+    memset(&o, 0, sizeof(o));
+    assert_int_equal(manifest_iter_open(&ld, h, count_object, &o, &it), OK);
+    uint32_t n = 0;
+    for (;;) {
+        const manifest_entry_t *x = NULL;
+        int done = 0;
+        assert_int_equal(manifest_iter_next(it, &x, &done), OK);
+        if (done) break;
+        char want[16];
+        snprintf(want, sizeof(want), "f%07u", n * 2);
+        assert_string_equal(x->name, want);
+        assert_true(x->size == n);
+        n++;
+    }
+    manifest_iter_close(it);
+    assert_int_equal(n, BIG_N);
+    assert_true(o.trees == ms.fragments);
+    assert_true(o.largest <= MANIFEST_FRAG_MAX);
+
+    /* And whole, for the callers that want an array */
+    manifest_entry_t *all = NULL;
+    uint32_t cnt = 0;
+    assert_int_equal(manifest_read_tree(store, h, &all, &cnt), OK);
+    assert_int_equal(cnt, BIG_N);
+    assert_string_equal(all[BIG_N - 1].name, e[BIG_N - 1].name);
+    manifest_free_entries(all, cnt);
+
+    free(e);
+    free(names);
+}
+
+static void test_large_directory_change_rewrites_one_fragment(void **state)
+{
+    (void)state;
+    char *names = NULL;
+    manifest_entry_t *e = big_dir(BIG_N + 1, &names);
+    cdc_params_t cp;
+    cdc_params_default(&cp);
+    obj_sink_t sink = obj_sink_store(store);
+    uint8_t h1[OBJECT_HASH_SIZE], h2[OBJECT_HASH_SIZE], h3[OBJECT_HASH_SIZE];
+    manifest_store_stats_t ms;
+
+    /* Without the middle entry, then with it, then identical again */
+    manifest_entry_t mid = e[BIG_N / 2];
+    e[BIG_N / 2] = e[BIG_N];
+    assert_int_equal(manifest_store_tree(e, BIG_N, &cp, &sink, h1, &ms), OK);
+    uint64_t frags = ms.fragments;
+
+    e[BIG_N] = mid;
+    assert_int_equal(manifest_store_tree(e, BIG_N + 1, &cp, &sink, h2, &ms), OK);
+    printf("one entry added to %u: %llu of %llu objects new\n", BIG_N,
+           (unsigned long long)ms.objects_new, (unsigned long long)ms.objects);
+    assert_memory_not_equal(h1, h2, OBJECT_HASH_SIZE);
+    assert_true(ms.objects_new <= 4);
+    assert_true(frags > 4);
+
+    assert_int_equal(manifest_store_tree(e, BIG_N + 1, &cp, &sink, h3, &ms), OK);
+    assert_memory_equal(h2, h3, OBJECT_HASH_SIZE);
+    assert_int_equal(ms.objects_new, 0);
+
+    free(e);
+    free(names);
+}
+
+static void test_small_directory_is_one_tree(void **state)
+{
+    (void)state;
+    manifest_entry_t e[3] = { mk("c", NODE_TYPE_REG, 1), mk("a", NODE_TYPE_REG, 2),
+                              mk("b", NODE_TYPE_DIR, 0) };
+    uint8_t h[OBJECT_HASH_SIZE];
+    assert_int_equal(manifest_write_tree(store, e, 3, h), OK);
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    assert_int_equal(manifest_serialise(e, 3, &buf, &len), OK);
+    void *got = NULL;
+    size_t got_len = 0;
+    uint8_t type = 0;
+    assert_int_equal(object_load(store, h, &got, &got_len, &type), OK);
+    assert_int_equal(type, OBJECT_TYPE_TREE);
+    assert_int_equal(got_len, len);
+    assert_memory_equal(got, buf, len);
+    free(got);
+    free(buf);
+}
+
+/* Fragments out of order, or a list of files where a directory is
+ * expected, are refused: either would hand a reader a directory that is
+ * not what was written. */
+static void test_fragment_list_validated(void **state)
+{
+    (void)state;
+    manifest_entry_t a[1] = { mk("aaa", NODE_TYPE_REG, 1) };
+    manifest_entry_t b[1] = { mk("bbb", NODE_TYPE_REG, 2) };
+    uint8_t *ba = NULL, *bb = NULL;
+    size_t la = 0, lb = 0;
+    assert_int_equal(manifest_serialise(a, 1, &ba, &la), OK);
+    assert_int_equal(manifest_serialise(b, 1, &bb, &lb), OK);
+    uint8_t ha[OBJECT_HASH_SIZE], hb[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_TREE, ba, la, ha), OK);
+    assert_int_equal(object_store(store, OBJECT_TYPE_TREE, bb, lb, hb), OK);
+
+    chunklist_entry_t ent[2];
+    memcpy(ent[0].hash, hb, OBJECT_HASH_SIZE);
+    ent[0].offset = 0; ent[0].length = lb;
+    memcpy(ent[1].hash, ha, OBJECT_HASH_SIZE);
+    ent[1].offset = lb; ent[1].length = la;
+    chunklist_hdr_t hdr = { .level = 0, .leaf_type = OBJECT_TYPE_TREE,
+                            .count = 2, .total_len = la + lb };
+    uint8_t lbuf[CHUNKLIST_HDR_BYTES + 2 * CHUNKLIST_ENTRY_BYTES];
+    size_t n = chunklist_serialise(&hdr, ent, lbuf);
+    uint8_t root[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_CHUNKLIST, lbuf, n, root), OK);
+    manifest_entry_t *out = NULL;
+    uint32_t cnt = 0;
+    assert_int_equal(manifest_read_tree(store, root, &out, &cnt), ERR_CORRUPT);
+
+    /* In order it reads */
+    memcpy(ent[0].hash, ha, OBJECT_HASH_SIZE);
+    ent[0].length = la;
+    memcpy(ent[1].hash, hb, OBJECT_HASH_SIZE);
+    ent[1].offset = la; ent[1].length = lb;
+    n = chunklist_serialise(&hdr, ent, lbuf);
+    assert_int_equal(object_store(store, OBJECT_TYPE_CHUNKLIST, lbuf, n, root), OK);
+    assert_int_equal(manifest_read_tree(store, root, &out, &cnt), OK);
+    assert_int_equal(cnt, 2);
+    manifest_free_entries(out, cnt);
+
+    /* A gap between fragments */
+    ent[1].offset = la + 1;
+    hdr.total_len = la + lb + 1;
+    n = chunklist_serialise(&hdr, ent, lbuf);
+    assert_int_equal(object_store(store, OBJECT_TYPE_CHUNKLIST, lbuf, n, root), OK);
+    assert_int_equal(manifest_read_tree(store, root, &out, &cnt), ERR_CORRUPT);
+
+    /* A file list is not a directory */
+    hdr.leaf_type = OBJECT_TYPE_FILE;
+    hdr.total_len = la + lb;
+    ent[1].offset = la;
+    n = chunklist_serialise(&hdr, ent, lbuf);
+    assert_int_equal(object_store(store, OBJECT_TYPE_CHUNKLIST, lbuf, n, root), OK);
+    assert_int_equal(manifest_read_tree(store, root, &out, &cnt), ERR_CORRUPT);
+    free(ba);
+    free(bb);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -401,6 +615,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_symlink_target_survives, setup, teardown),
         cmocka_unit_test_setup_teardown(test_device_numbers_affect_the_hash, setup, teardown),
         cmocka_unit_test_setup_teardown(test_rejects_non_tree_object, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_directory_fragments, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_large_directory_change_rewrites_one_fragment, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_small_directory_is_one_tree, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_fragment_list_validated, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

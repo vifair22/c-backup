@@ -22,6 +22,12 @@
  * object so it inherits compression, parity and dedup. GC's mark phase needs
  * to recognise these to know what to parse and recurse into. See section 5.4. */
 #define OBJECT_TYPE_TREE    5
+/* An ordered list of other objects covering a byte span: a file larger than
+ * one content-defined chunk, or a directory whose tree is split into
+ * fragments (OWN-34). Lists nest, so no list object exceeds a fixed bound
+ * however large the file. Format in src/store/chunklist.h and
+ * docs/repo-format.md. */
+#define OBJECT_TYPE_CHUNKLIST 6
 
 /*
  * Metadata blob wire formats. Both blobs are stored as content-addressed
