@@ -787,10 +787,9 @@ continues. Skipped means left out: the file is not in the snapshot's trees
 or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
 may not open, one replaced by a symlink, a directory or anything else that
-is not a regular file, one replaced by a different file (renamed over, or
-reached through a directory that has since become a symlink), one whose
-read fails partway (an I/O error), and one still changing on a second read
-(below). A backup with skipped files still ends `completed`, but not
+is not a regular file, one whose path now runs through a symlink or (for a
+one-filesystem backup) a mount point, one whose read fails partway (an I/O
+error), and one still changing on a second read (below). A backup with skipped files still ends `completed`, but not
 silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping
@@ -808,9 +807,10 @@ under a backup, and a file can be a different size by the time it is read
 than when the scan listed it. The backup stores the file as it is when it
 is read, never as the scan saw it: its size, times and content all come
 from that read, so it is not cut short when it grew and not padded with
-zeros when it shrank. Change is detected by size, mtime and ctime,
+zeros when it shrank. Change is detected by size, mtime, ctime and inode,
 compared between the scan and the open, and again between the start and
-end of the read:
+end of the read. A file replaced by rename, as editors save, is a change
+like any other:
 
 - changed since the scan, steady while read: stored as read, logged at
   `info`, and counted;
@@ -829,19 +829,28 @@ moment after the scan, not at it. A file that is always being written (a
 live database, a busy log) may be skipped on every run: back it up from a
 snapshot of its filesystem, or with its application's own dump.
 
-**Symlinks inside a source are never followed.** A file is opened with
-`O_NOFOLLOW` and must still be the same inode (device and inode number)
-the scan listed, and the scan walks each directory from its parent's
-descriptor, refusing one that has become a symlink. So a file or directory
-swapped for a symlink between the scan and the read is skipped with
-`no longer a regular file (now a symlink)` or `replaced by another file
-since the scan`, never stored with the content of whatever the link points
-at. The daemon runs as root; without this, anyone able to write inside a
-source could have `ln -s /etc/shadow` put the host's shadow file into the
-snapshot. A file replaced by rename, as editors save, is the same case: a
-different inode, skipped this run and taken by the next. Extended
-attributes and ACLs are read through the same pinned descriptor (via
-`/proc/self/fd`, so `/proc` must be mounted for that guarantee).
+**Symlinks inside a source are never followed.** The daemon runs as root;
+without this, anyone able to write inside a source could have `ln -s
+/etc/shadow` put the host's shadow file into the snapshot. Each source is
+opened once at the start of the store phase and must still be the
+directory the scan saw (its own path may run through symlinks: it is
+yours). Every file is then opened beneath it with `openat2`
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, plus `RESOLVE_NO_XDEV` for a
+one-filesystem backup, and `O_NOFOLLOW | O_NONBLOCK`; it must be a regular
+file. A file swapped for a symlink is skipped with `no longer a regular
+file (now a symlink)`; one whose directory became a symlink with `a
+directory on its path is now a symlink; not followed`; one behind a mount
+that appeared with `its path now crosses a mount point or leaves the
+source; not followed`. The link's target is never opened. On a kernel
+without `openat2` (before 5.6, or a container whose seccomp profile
+predates it) the same rules are applied one path component at a time.
+Files are opened beneath the source rather than from a descriptor held
+for each directory, because that would hold one descriptor per directory
+of the tree for the whole store phase. The scan walks the same way, each
+directory opened from its parent's descriptor and refused if it has become
+a symlink, and reads extended attributes and ACLs through a pinned
+descriptor (via `/proc/self/fd`, so `/proc` must be mounted for that
+guarantee).
 
 The next backup tries every skipped file again. Before 1.0.0 a skipped
 file stayed in the snapshot with no content: the backup

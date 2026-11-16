@@ -938,6 +938,12 @@ status_t scan_tree(const char *root, scan_imap_t *imap,
                                 root_dev, res);
     if (st != OK) { scan_result_free(res); return st; }
     res->root_entries = res->count - before;
+    /* Every path below was built as root + "/" + name..., so the root is
+     * exactly this many bytes at the head of each. */
+    size_t rlen = strlen(root);
+    if (rlen > UINT32_MAX) rlen = 0;   /* cannot happen: PATH_MAX */
+    for (uint32_t i = before; i < res->count; i++)
+        res->entries[i].root_len = (uint32_t)rlen;
     *out = res;
     return OK;
 }

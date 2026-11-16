@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE   /* unshare, CLONE_NEW*, for the mount-swap test */
 
 /*
  * Backup pipeline, end to end.
@@ -24,7 +25,10 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
 
 #include <cmocka.h>
 #include <cutils/db.h>
@@ -818,10 +822,12 @@ static void test_file_replaced_by_a_fifo_is_left_out(void **state)
 
 /*
  * B128, one level up: the file's directory swapped for a symlink to a
- * directory outside the source that holds a file of the same name.
- * O_NOFOLLOW guards only the last component, so the open lands on the
- * outside file; it is a regular file, but not the inode the scan listed,
- * and that is what refuses it.
+ * directory outside the source that holds something of the same name.
+ * O_NOFOLLOW guards only the last component, so an open by path landed
+ * outside the tree. The store resolves beneath the source root with no
+ * symlink allowed on the way, so it never gets there. The outside entry is
+ * a FIFO on purpose: had the open reached it, the reason would say "now a
+ * FIFO", so the reason proves the target was never opened.
  */
 static void swap_dir_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
 {
@@ -830,7 +836,7 @@ static void swap_dir_at_store(const char *phase, uint64_t done, uint64_t total, 
     if (*fired || strcmp(phase, "store") != 0 || done != 0) return;
     *fired = 1;
     assert_int_equal(mkdir(TEST_DIR "/outside", 0700), 0);
-    write_file(TEST_DIR "/outside/gamma.txt", SECRET_BODY);
+    assert_int_equal(mkfifo(TEST_DIR "/outside/gamma.txt", 0600), 0);
     assert_int_equal(rename(TEST_SRC "/sub", TEST_DIR "/sub.aside"), 0);
     assert_int_equal(symlink(TEST_DIR "/outside", TEST_SRC "/sub"), 0);
 }
@@ -850,7 +856,7 @@ static void test_directory_replaced_by_a_symlink_is_not_followed(void **state)
     assert_int_equal(res.files_skipped, 1);
     assert_int_equal(res.files_changed, 0);
     assert_string_equal(res.skipped[0].path, TEST_SRC "/sub/gamma.txt");
-    if (!strstr(res.skipped[0].reason, "replaced by another file"))
+    if (!strstr(res.skipped[0].reason, "a directory on its path is now a symlink; not followed"))
         fail_msg("reason '%s'", res.skipped[0].reason);
     assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", "gamma.txt"), 0);
     char secret_len[16];
@@ -874,6 +880,138 @@ static void test_directory_replaced_by_a_symlink_is_not_followed(void **state)
     assert_int_equal(lstat(TEST_DIR "/restore-dirswap" TEST_SRC "/sub", &sb), 0);
     assert_true(S_ISDIR(sb.st_mode));
     backup_result_free(&res);
+}
+
+/*
+ * A regular file replaced by rename between the scan and the store - how
+ * editors save - is a different inode at the same path inside the tree.
+ * That is a change like any other: stored as read, under the OWN-45 rules,
+ * and listed as changed, not skipped.
+ */
+static void rename_over_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    int *fired = ctx;
+    if (*fired || strcmp(phase, "store") != 0 || done != 0) return;
+    *fired = 1;
+    write_file(TEST_SRC "/sub/.gamma.swp", "gamma, saved again by an editor");
+    assert_int_equal(rename(TEST_SRC "/sub/.gamma.swp", TEST_SRC "/sub/gamma.txt"), 0);
+}
+
+static void test_file_replaced_by_rename_is_stored_as_changed(void **state)
+{
+    (void)state;
+    struct stat before;
+    assert_int_equal(stat(TEST_SRC "/sub/gamma.txt", &before), 0);
+    int fired = 0;
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = rename_over_at_store;
+    o.progress_ctx = &fired;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(fired);
+    struct stat after;
+    assert_int_equal(stat(TEST_SRC "/sub/gamma.txt", &after), 0);
+    assert_true(after.st_ino != before.st_ino);   /* really another inode */
+
+    assert_int_equal(res.files, 3);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_int_equal(res.changed_listed, 1);
+    assert_string_equal(res.changed[0], TEST_SRC "/sub/gamma.txt");
+
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot_id(),
+                                 TEST_DIR "/restore-renamed", &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    FILE *f = fopen(TEST_DIR "/restore-renamed" TEST_SRC "/sub/gamma.txt", "r");
+    assert_non_null(f);
+    char buf[128] = "";
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    assert_string_equal(buf, "gamma, saved again by an editor");
+    backup_result_free(&res);
+}
+
+/*
+ * A one-filesystem backup must not cross a mount that appeared on a file's
+ * path after the scan: the scan stayed on the root's device, and the store
+ * resolves with RESOLVE_NO_XDEV. Mounting needs privilege, so the backup
+ * runs in a child inside its own user and mount namespace, where it may
+ * mount a tmpfs; where namespaces are not allowed (CI containers, hardened
+ * kernels) the test is skipped. The child reports through its exit status.
+ */
+typedef struct { int fired; int mounted; } mount_ctx_t;
+
+static void mount_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    mount_ctx_t *m = ctx;
+    if (m->fired || strcmp(phase, "store") != 0 || done != 0) return;
+    m->fired = 1;
+    if (mount("cbtest", TEST_SRC "/sub", "tmpfs", 0, "size=1m") != 0) return;
+    write_file(TEST_SRC "/sub/gamma.txt", SECRET_BODY);
+    m->mounted = 1;
+}
+
+static int write_proc(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd == -1) return -1;
+    ssize_t w = write(fd, text, strlen(text));
+    close(fd);
+    return w == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+static void test_one_filesystem_refuses_a_mount_swapped_in(void **state)
+{
+    (void)state;
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    pid_t pid = fork();
+    assert_true(pid >= 0);
+    if (pid == 0) {
+        char map[64];
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(77);
+        snprintf(map, sizeof(map), "0 %u 1", (unsigned)uid);
+        if (write_proc("/proc/self/uid_map", map) != 0) _exit(77);
+        if (write_proc("/proc/self/setgroups", "deny") != 0) _exit(77);
+        snprintf(map, sizeof(map), "0 %u 1", (unsigned)gid);
+        if (write_proc("/proc/self/gid_map", map) != 0) _exit(77);
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) _exit(77);
+
+        mount_ctx_t m = { 0, 0 };
+        backup_opts_t o = basic_opts();
+        o.one_filesystem = 1;
+        o.progress_cb  = mount_at_store;
+        o.progress_ctx = &m;
+        backup_result_t res;
+        if (backup_run(store, db, repo_id, &o, &res) != OK) _exit(1);
+        if (!m.mounted) _exit(77);
+        int ok = res.files == 2 && res.files_skipped == 1 && res.files_changed == 0 &&
+                 res.skipped_listed == 1 &&
+                 strcmp(res.skipped[0].path, TEST_SRC "/sub/gamma.txt") == 0 &&
+                 strstr(res.skipped[0].reason, "crosses a mount point") != NULL;
+        if (!ok) {
+            fprintf(stderr, "mount swap: files %u skipped %u changed %u reason '%s'\n",
+                    (unsigned)res.files, (unsigned)res.files_skipped,
+                    (unsigned)res.files_changed,
+                    res.skipped_listed ? res.skipped[0].reason : "(none)");
+            _exit(2);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    assert_int_equal(waitpid(pid, &status, 0), pid);
+    assert_true(WIFEXITED(status));
+    if (WEXITSTATUS(status) == 77) { skip(); return; }
+    assert_int_equal(WEXITSTATUS(status), 0);
+    char secret_len[16];
+    snprintf(secret_len, sizeof(secret_len), "%zu", strlen(SECRET_BODY));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE size = ?", secret_len), 0);
 }
 
 /*
@@ -2012,6 +2150,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_file_replaced_by_a_symlink_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_replaced_by_a_fifo_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_directory_replaced_by_a_symlink_is_not_followed, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_replaced_by_rename_is_stored_as_changed, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_one_filesystem_refuses_a_mount_swapped_in, setup, teardown),
         cmocka_unit_test_setup_teardown(test_skipped_list_is_bounded_and_the_count_is_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_shrinks_is_stored_as_read, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_grows_is_stored_as_read, setup, teardown),
