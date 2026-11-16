@@ -55,9 +55,22 @@ cat > "$WORK/units.json" <<EOF
   "blobs":[{"id":"x","path":".cbackup-unit/config/x","text":"secret"}]}
 ]}
 EOF
+# The helper refuses daemon_uid 0 by design, and CI runs as root. There the
+# daemon is started as a fixed non-root uid, which the policy names, and the
+# work tree is that uid's; anywhere else both are the current user. (Started
+# as that uid rather than dropping with security.run_as_uid, because the
+# drop comes after the state database is opened, which would leave it
+# root's.)
+if [ "$(id -u)" = 0 ]; then
+    DUID=990
+    AS_DAEMON=(setpriv --reuid="$DUID" --regid="$DUID" --clear-groups --)
+else
+    DUID=$(id -u)
+    AS_DAEMON=()
+fi
 cat > "$WORK/policy.ini" <<EOF
 [helper]
-daemon_uid = $(id -u)
+daemon_uid = $DUID
 daemon_id = 0badf00d
 max_pause_s = 30
 capture_max_s = 3600
@@ -97,7 +110,9 @@ security:
 units:
   helper_socket: $HSOCK
 EOF
-C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
+# The policy stays root's: the helper refuses one another uid owns.
+[ "$(id -u)" = 0 ] && chown -R "$DUID" "$WORK" && chown 0 "$WORK/policy.ini"
+C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "${AS_DAEMON[@]}" "$DAEMON" > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 if [ ! -S "$SOCK" ]; then echo "daemon did not start"; cat "$WORK/daemon.log"; exit 1; fi
