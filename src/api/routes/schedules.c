@@ -3,6 +3,7 @@
 
 #include "routes.h"
 
+#include "registry.h"
 #include "reserved.h"
 #include "scheduler.h"
 #include "trigger.h"
@@ -176,7 +177,7 @@ static int one_of(const char *v, const char *const *set)
 static const char *const k_overlap[] = { "skip", "queue", "cancel_running", NULL };
 static const char *const k_catchup[] = { "skip", "run_once", NULL };
 
-#define SCHEDULABLE_ACTIONS "backup, verify, grep, gc, gfs, reindex or replicate"
+#define SCHEDULABLE_ACTIONS "backup, units, verify, grep, gc, gfs, reindex or replicate"
 
 /*
  * What is wrong with a stored schedule by the rules the route applies to a
@@ -271,6 +272,10 @@ static const struct {
     { "path_prefix", "grep"      },
     { "ignore_case", "grep"      },
     { "max_files",   "grep"      },
+    { "provider",    "units"     },
+    { "all",         "units"     },
+    { "units",       "units"     },
+    { "require",     "units"     },
 };
 
 /*
@@ -489,6 +494,40 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             json_resp_finalize(pr, &pbuf, &plen) != 0)
             return api_error(500, "cannot encode schedule parameters");
         params = pbuf;
+    }
+
+    /*
+     * A units schedule: the unit set, held in the canonical form the job
+     * takes. With all, units are enumerated when it fires, so a unit added
+     * later is included (source-providers.md 8.2). The provider has to be
+     * enabled now, or the schedule could only ever fail.
+     */
+    if (strcmp(action, "units") == 0) {
+        cJSON *in = cJSON_ParseWithLength(req->body, req->body_len);
+        cJSON *p = cJSON_CreateObject();
+        static const char *const keys[] = { "provider", "all", "exclude", "units", "require" };
+        for (size_t k = 0; in && p && k < sizeof(keys) / sizeof(keys[0]); k++) {
+            cJSON *v = cJSON_GetObjectItemCaseSensitive(in, keys[k]);
+            if (v) cJSON_AddItemToObject(p, keys[k], cJSON_Duplicate(v, 1));
+        }
+        char *ptxt = p ? cJSON_PrintUnformatted(p) : NULL;
+        cJSON_Delete(in);
+        cJSON_Delete(p);
+        if (!ptxt) return api_error(500, "cannot encode schedule parameters");
+        char why[256];
+        char *canon = NULL;
+        int rc = routes_units_params_check(ptxt, &canon, why, sizeof(why));
+        cJSON_free(ptxt);
+        if (rc != 0) return api_error(400, why);
+        cJSON *c = cJSON_Parse(canon);
+        const char *prov = c ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(c, "provider")) : NULL;
+        int on = prov && sp_registry_enabled(prov);
+        cJSON_Delete(c);
+        if (!on) {
+            free(canon);
+            return api_error(400, "that provider is not enabled in this daemon");
+        }
+        params = canon;
     }
 
     /* A grep schedule with no pattern was accepted and then ran a search

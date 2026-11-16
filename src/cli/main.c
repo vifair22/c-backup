@@ -1429,6 +1429,25 @@ static int cmd_schedule(int argc, char **argv)
                             sizeof(src) / sizeof(src[0]));
             src[n_src++] = sp;
         }
+        /* A units schedule: a provider, and --all (enumerated when it
+         * fires, less --exclude globs) or each --unit by name. */
+        const char *uprov = take_opt(&a, v, "--provider");
+        const char *ureq  = take_opt(&a, v, "--require");
+        int uall = take_flag(&a, v, "--all");
+        const char *uunits[64], *uexcl[64];
+        int n_uunits = 0, n_uexcl = 0;
+        for (;;) {
+            const char *u = take_opt_multi(&a, v, "--unit");
+            if (!u) break;
+            if (n_uunits == 64) return fail("too many --unit names (max 64)");
+            uunits[n_uunits++] = u;
+        }
+        for (;;) {
+            const char *x = take_opt_multi(&a, v, "--exclude");
+            if (!x) break;
+            if (n_uexcl == 64) return fail("too many --exclude globs (max 64)");
+            uexcl[n_uexcl++] = x;
+        }
         if (a < 3) return fail("usage: schedule add <repo-id> <action> <seconds> | "
                                "schedule add <repo-id> <action> --every day|week|month|year "
                                "--at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N] "
@@ -1453,6 +1472,19 @@ static int cmd_schedule(int argc, char **argv)
         if (pattern) { sb_puts(&b, ",\"pattern\":");     sb_json_str(&b, pattern); }
         if (gprefix) { sb_puts(&b, ",\"path_prefix\":"); sb_json_str(&b, gprefix); }
         if (gicase)  sb_puts(&b, ",\"ignore_case\":true");
+        if (uprov) { sb_puts(&b, ",\"provider\":"); sb_json_str(&b, uprov); }
+        if (ureq)  { sb_puts(&b, ",\"require\":");  sb_json_str(&b, ureq); }
+        if (uall)  sb_puts(&b, ",\"all\":true");
+        if (n_uunits) {
+            sb_puts(&b, ",\"units\":[");
+            for (int i = 0; i < n_uunits; i++) { if (i) sb_puts(&b, ","); sb_json_str(&b, uunits[i]); }
+            sb_puts(&b, "]");
+        }
+        if (n_uexcl) {
+            sb_puts(&b, ",\"exclude\":[");
+            for (int i = 0; i < n_uexcl; i++) { if (i) sb_puts(&b, ","); sb_json_str(&b, uexcl[i]); }
+            sb_puts(&b, "]");
+        }
         if (n_src > 0) {
             sb_puts(&b, ",\"paths\":[");
             for (int i = 0; i < n_src; i++) {
@@ -1525,6 +1557,161 @@ static int cmd_schedule(int argc, char **argv)
     }
 
     return fail("unknown schedule subcommand '%s'", argv[0]);
+}
+
+/*
+ * Units: VMs and containers through a source provider
+ * (docs/source-providers.md 10). Each subcommand is one route; the output
+ * is the daemon's JSON, as everywhere else.
+ */
+#define UNIT_USAGE \
+    "unit providers | unit list <provider> [--limit N] [--offset N] | " \
+    "unit show <provider> <unit> | " \
+    "unit backup <repo-id> --provider P (<unit>... | --all [--exclude GLOB]...) " \
+    "[--require LEVEL] [--no-wait] | " \
+    "unit history <repo-id> [--provider P <unit>] [--limit N] [--offset N] | " \
+    "unit restore <repo-id> <snapshot-id> <dest> [--item ID] [--overwrite] [--no-wait] | " \
+    "unit policy <show|set> <repo-id> --provider P <unit> [key value]"
+
+/* /repos/<id>/units/<p>/<u>/<suffix> */
+static void unit_path(sbuf_t *p, const char *repo, const char *prov, const char *unit,
+                      const char *suffix)
+{
+    sb_puts(p, "/repos/"); sb_path_seg(p, repo);
+    sb_puts(p, "/units/"); sb_path_seg(p, prov);
+    sb_puts(p, "/");       sb_path_seg(p, unit);
+    sb_puts(p, suffix);
+}
+
+static int cmd_unit(int argc, char **argv)
+{
+    if (argc < 1) return fail("usage: %s", UNIT_USAGE);
+    const char *sub = argv[0];
+    argc--; argv++;
+
+    if (strcmp(sub, "providers") == 0) return call("GET", "/providers", NULL);
+
+    if (strcmp(sub, "list") == 0) {
+        sbuf_t q = { 0 };
+        paging(&argc, argv, &q);
+        if (argc != 1) { free(q.buf); return fail("usage: unit list <provider> [--limit N] [--offset N]"); }
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/providers/"); sb_path_seg(&p, argv[0]); sb_puts(&p, "/units");
+        if (q.len) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+        free(q.buf);
+        return call_path_sb("GET", &p, NULL);
+    }
+
+    if (strcmp(sub, "show") == 0) {
+        if (argc != 2) return fail("usage: unit show <provider> <unit>");
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/providers/"); sb_path_seg(&p, argv[0]);
+        sb_puts(&p, "/units/");     sb_path_seg(&p, argv[1]);
+        return call_path_sb("GET", &p, NULL);
+    }
+
+    if (strcmp(sub, "backup") == 0) {
+        const char *prov = take_opt(&argc, argv, "--provider");
+        const char *req  = take_opt(&argc, argv, "--require");
+        int all     = take_flag(&argc, argv, "--all");
+        int no_wait = take_flag(&argc, argv, "--no-wait");
+        const char *excl[64];
+        int n_excl = 0;
+        for (;;) {
+            const char *e = take_opt_multi(&argc, argv, "--exclude");
+            if (!e) break;
+            if (n_excl == (int)(sizeof(excl) / sizeof(excl[0])))
+                return fail("too many --exclude globs (max %zu)", sizeof(excl) / sizeof(excl[0]));
+            excl[n_excl++] = e;
+        }
+        if (argc < 1 || !prov || (all ? argc != 1 : argc < 2))
+            return fail("usage: unit backup <repo-id> --provider P (<unit>... | --all "
+                        "[--exclude GLOB]...) [--require LEVEL] [--no-wait]");
+        sbuf_t b = { 0 };
+        sb_puts(&b, "{\"provider\":"); sb_json_str(&b, prov);
+        if (all) {
+            sb_puts(&b, ",\"all\":true,\"exclude\":[");
+            for (int i = 0; i < n_excl; i++) { if (i) sb_puts(&b, ","); sb_json_str(&b, excl[i]); }
+            sb_puts(&b, "]");
+        } else {
+            if (n_excl) { free(b.buf); return fail("--exclude applies only with --all"); }
+            sb_puts(&b, ",\"units\":[");
+            for (int i = 1; i < argc; i++) { if (i > 1) sb_puts(&b, ","); sb_json_str(&b, argv[i]); }
+            sb_puts(&b, "]");
+        }
+        if (req) { sb_puts(&b, ",\"require\":"); sb_json_str(&b, req); }
+        sb_puts(&b, "}");
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/repos/"); sb_path_seg(&p, argv[0]); sb_puts(&p, "/units/backup");
+        if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+        int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
+        free(p.buf); free(b.buf);
+        return rc;
+    }
+
+    if (strcmp(sub, "history") == 0) {
+        const char *prov = take_opt(&argc, argv, "--provider");
+        sbuf_t q = { 0 };
+        paging(&argc, argv, &q);
+        if (argc < 1 || argc > 2 || (argc == 2) != (prov != NULL)) {
+            free(q.buf);
+            return fail("usage: unit history <repo-id> [--provider P <unit>] [--limit N] [--offset N]");
+        }
+        sbuf_t p = { 0 };
+        if (argc == 1) {
+            sb_puts(&p, "/repos/"); sb_path_seg(&p, argv[0]); sb_puts(&p, "/units");
+        } else {
+            unit_path(&p, argv[0], prov, argv[1], "/snapshots");
+        }
+        if (q.len) { sb_puts(&p, "?"); sb_puts(&p, q.buf); }
+        free(q.buf);
+        return call_path_sb("GET", &p, NULL);
+    }
+
+    if (strcmp(sub, "restore") == 0) {
+        const char *item = take_opt(&argc, argv, "--item");
+        int overwrite = take_flag(&argc, argv, "--overwrite");
+        int no_wait   = take_flag(&argc, argv, "--no-wait");
+        if (argc != 3)
+            return fail("usage: unit restore <repo-id> <snapshot-id> <dest> [--item ID] "
+                        "[--overwrite] [--no-wait]");
+        sbuf_t b = { 0 };
+        sb_puts(&b, item ? "{\"mode\":\"item\",\"format\":\"raw\",\"item\":" : "{\"mode\":\"files\"");
+        if (item) sb_json_str(&b, item);
+        sb_puts(&b, ",\"dest\":"); sb_json_str(&b, argv[2]);
+        if (overwrite) sb_puts(&b, ",\"overwrite\":true");
+        sb_puts(&b, "}");
+        sbuf_t p = { 0 };
+        sb_puts(&p, "/repos/");     sb_path_seg(&p, argv[0]);
+        sb_puts(&p, "/snapshots/"); sb_path_seg(&p, argv[1]);
+        sb_puts(&p, "/unit/restore");
+        if (p.oom || b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+        int rc = job_run("POST", p.buf, b.buf, no_wait, 0, NULL);
+        free(p.buf); free(b.buf);
+        return rc;
+    }
+
+    if (strcmp(sub, "policy") == 0) {
+        const char *prov = take_opt(&argc, argv, "--provider");
+        if (argc < 3 || !prov)
+            return fail("usage: unit policy <show|set> <repo-id> --provider P <unit> [key value]");
+        sbuf_t p = { 0 };
+        unit_path(&p, argv[1], prov, argv[2], "/policy");
+        if (strcmp(argv[0], "show") == 0 && argc == 3) return call_path_sb("GET", &p, NULL);
+        if (strcmp(argv[0], "set") == 0 && argc == 5) {
+            sbuf_t b = { 0 };
+            sb_puts(&b, "{"); sb_json_str(&b, argv[3]); sb_puts(&b, ":"); sb_json_str(&b, argv[4]);
+            sb_puts(&b, "}");
+            if (b.oom) { free(p.buf); free(b.buf); return fail("request too large"); }
+            int rc = call_path_sb("PUT", &p, b.buf);
+            free(b.buf);
+            return rc;
+        }
+        free(p.buf);
+        return fail("usage: unit policy <show|set> <repo-id> --provider P <unit> [key value]");
+    }
+
+    return fail("unknown unit subcommand '%s'; usage: %s", sub, UNIT_USAGE);
 }
 
 /*
@@ -1669,6 +1856,7 @@ static const struct {
     { "sources",   cmd_sources,   "sources <list|set> <repo-id> [path...] [--exclude PAT]..." },
     { "backup",    cmd_backup,    "backup <repo-id> [path...] [--exclude PAT]... [--one-filesystem] [--label TEXT] [--no-wait]" },
     { "restore",   cmd_restore,   "restore <repo-id> <snapshot-id> <dest> [--subpath PATH] [--overwrite] [--no-wait]" },
+    { "unit",      cmd_unit,      UNIT_USAGE },
     { "snapshots", cmd_snapshots, "snapshots <repo-id> [--limit N] [--offset N]" },
     { "snapshot",  cmd_snapshot,  "snapshot <delete|note|tree> <repo-id> <snapshot-id> [note-text | --force]" },
     { "ls",        cmd_ls,        "ls <repo-id> <snapshot-id> [parent-node-id]" },
@@ -1689,7 +1877,7 @@ static const struct {
     { "policy",    cmd_policy,    "policy <list|set> <repo-id> [key value]" },
     { "tag",       cmd_tag,       "tag <list|set|remove> <repo-id> [name [snapshot-id] [--move]]" },
     { "journal",   cmd_journal,   "journal <repo-id> [--limit N] [--result STATE]" },
-    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]])" },
+    { "schedule",  cmd_schedule,  "schedule <list|add|remove|enable|disable> <repo-id> [args]  (add: <action> <seconds> | <action> --every day|week|month|year --at HH:MM [--on WEEKDAY] [--on-day N] [--on-month N]; [--on-overlap MODE] [--catchup MODE] [--source PATH]... [--dest PATH] [--pattern REGEX [--path-prefix PATH] [-i]] [--provider P (--all [--exclude GLOB]... | --unit NAME...) [--require LEVEL]])" },
     { "jobs",      cmd_jobs,      "jobs [--limit N] [--offset N] | jobs <job-id> | jobs cancel <job-id> | jobs watch <job-id>" },
     { "auth",      cmd_auth,      "auth <status|setup|password|logout --all> (prompts for passwords; logout --all revokes every remote session)" },
     { "metrics",   cmd_metrics,   "metrics" },

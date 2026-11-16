@@ -147,6 +147,32 @@ static const config_key_t app_file_keys[] = {
     { "retention.keep_monthly", CFG_INT, "12", "Default monthly snapshots to keep", CFG_STORE_FILE, 0 },
     { "retention.keep_yearly",  CFG_INT, "3",  "Default yearly snapshots to keep",  CFG_STORE_FILE, 0 },
 
+    /*
+     * Units: VMs and containers through a source provider
+     * (docs/source-providers.md). units.allow lives here, in the root-owned
+     * file, and not behind any route, so a session token cannot widen it.
+     */
+    { "units.allow", CFG_STRING, "",
+      "Comma-separated globs of unit names the daemon may touch at all; empty allows all",
+      CFG_STORE_FILE, 0 },
+    { "units.unit_wait_s", CFG_INT, "3600",
+      "Seconds a job waits for a unit another job is backing up (1 to 86400)",
+      CFG_STORE_FILE, 0 },
+    /* Test-only: a JSON file of fake units (src/providers/fake_provider.h).
+     * Empty, as every production config leaves it, keeps the fake off. */
+    { "units.fake_spec", CFG_STRING, "",
+      "Test only: JSON file of fake units; enables the fake provider",
+      CFG_STORE_FILE, 0 },
+    { "vm.freeze_timeout_s", CFG_INT, "10",
+      "Watchdog bound on a guest freeze, seconds (1 to 600)",
+      CFG_STORE_FILE, 0 },
+    { "vm.trust_zero_status", CFG_INT, "1",
+      "Skip reading disk extents reported as zero (0 reads them too)",
+      CFG_STORE_FILE, 0 },
+    { "containers.max_pause_s", CFG_INT, "30",
+      "Watchdog bound on a container pause, seconds (1 to 600)",
+      CFG_STORE_FILE, 0 },
+
     { NULL, 0, NULL, NULL, 0, 0 }
 };
 
@@ -158,6 +184,9 @@ static const config_section_t app_sections[] = {
     { "scheduler",  "Scheduler" },
     { "jobs",       "Job Manager" },
     { "retention",  "Default Retention" },
+    { "units",      "Units (VMs and containers)" },
+    { "vm",         "Virtual Machines" },
+    { "containers", "Containers" },
     { NULL, NULL }
 };
 

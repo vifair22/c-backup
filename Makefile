@@ -289,6 +289,12 @@ test-api: all
 test-cli: all
 	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
+# Units through the API and the CLI, with the fake provider enabled by its
+# test-only config key: routes, the job, units.allow, restore, schedules.
+.PHONY: test-units
+test-units: all
+	@$(SCRATCH_GUARD) test_units_e2e.sh ./$(TESTS)/test_units_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
+
 # The shell suites each start a daemon and poll jobs on a wall-clock budget,
 # so anything running beside them under -j competes for CPU and disk and makes
 # them fail on timing rather than on behaviour. analyze is the worst offender
@@ -298,7 +304,8 @@ test-cli: all
 # suite's leftovers from another's live files, when one runs at a time.
 test-api: analyze
 test-cli: test-api
-test-ui: test-cli
+test-units: test-cli
+test-ui: test-units
 
 # || exit 1, because without it a failing unit suite is invisible: cmocka
 # exits non-zero, the loop swallows it, make reports success, and every gate
@@ -324,7 +331,7 @@ test-ui: all
 	    echo "ui contract: skipped (no node)"; \
 	fi
 
-test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-ui
+test: all $(TEST_BINS) $(FAULT_BINS) analyze test-api test-cli test-units test-ui
 	@for t in $(TEST_BINS) $(FAULT_BINS); do $(SCRATCH_GUARD) $$(basename $$t) $$t || exit 1; done
 
 # ---- ASAN tests -------------------------------------------------------

@@ -1357,18 +1357,37 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         }
         db_result_free(r);
 
-        uint32_t head = 0;
-        r = NULL;
-        if (db_execute(j->db, "SELECT COALESCE(MAX(id), 0) FROM snapshots WHERE repo_id = ?",
-                       (const char *[]){ repo, NULL }, &r) == 0 && r && r->nrows == 1)
-            head = (uint32_t)strtoul(r->rows[0][0], NULL, 10);
-        db_result_free(r);
-
-        /* Every pass reconsiders the whole history. */
+        /*
+         * Every pass reconsiders the whole history, one retention group at
+         * a time (source-providers.md 8.1): the file snapshots, then each
+         * unit's, each with its own head that is never pruned and its own
+         * policy - the unit's unit_policy rows over the repository's.
+         */
         gfs_result_t gr = { 0, NULL };
-        st = head ? gfs_run(store, j->db, j->repo_id, &ret, head,
-                            j->dry_run, 1, &gr)
-                  : OK;
+        st = gfs_run_group(store, j->db, j->repo_id, &ret, NULL, j->dry_run, 1, &gr);
+        db_result_t *groups = NULL;
+        if (st == OK && db_execute(j->db,
+                "SELECT DISTINCT unit_key FROM snapshot_units WHERE repo_id = ?"
+                " ORDER BY unit_key", (const char *[]){ repo, NULL }, &groups) != 0)
+            st = set_error(ERR_IO, "gfs: cannot list the unit groups");
+        for (int g = 0; st == OK && groups && g < groups->nrows; g++) {
+            gfs_retention_t ur = ret;
+            routes_unit_policy(j->db, j->repo_id, groups->rows[g][0], &ur);
+            gfs_result_t one = { 0, NULL };
+            st = gfs_run_group(store, j->db, j->repo_id, &ur, groups->rows[g][0],
+                               j->dry_run, 1, &one);
+            if (st == OK && one.pruned) {
+                uint32_t *grown = realloc(gr.ids, (gr.pruned + one.pruned) * sizeof(*grown));
+                if (!grown) st = set_error(ERR_NOMEM, "gfs: result");
+                else {
+                    memcpy(grown + gr.pruned, one.ids, one.pruned * sizeof(*grown));
+                    gr.ids = grown;
+                    gr.pruned += one.pruned;
+                }
+            }
+            gfs_result_free(&one);
+        }
+        db_result_free(groups);
         if (st == OK) gfs_report(progress_ctx, j->dry_run, &ret, &gr);
         gfs_result_free(&gr);
     } else {
@@ -2070,7 +2089,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
 int routes_action_is_schedulable(const char *action)
 {
     static const char *ok[] = {
-        "backup", "verify", "grep", "gc", "gfs", "reindex", "replicate",
+        "backup", "units", "verify", "grep", "gc", "gfs", "reindex", "replicate",
     };
     for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
         if (strcmp(action, ok[i]) == 0) return 1;
@@ -2089,6 +2108,8 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
      */
     if (strcmp(action, "backup") == 0)
         return routes_submit_backup(jm, repo_id, params, schedule_id, out_job_id);
+    if (strcmp(action, "units") == 0)
+        return routes_submit_units(jm, repo_id, params, schedule_id, out_job_id);
 
     snap_job_kind_t kind;
     if      (strcmp(action, "verify") == 0)  kind = SNAP_JOB_VERIFY;
