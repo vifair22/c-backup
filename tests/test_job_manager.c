@@ -188,8 +188,8 @@ static void test_queued_jobs_all_complete(void **state)
     (void)state;
     for (int i = 0; i < 4; i++) submit(1, "gc");
     wait_for(4);
-    /* Give the manager a moment to record the final states. */
-    usleep(200000);
+    /* The worker records each final state after the job function returns. */
+    wait_db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'", 4);
 
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'completed'"), 4);
     assert_int_equal(db_count("SELECT COUNT(*) FROM jobs WHERE state = 'failed'"), 0);
@@ -301,7 +301,10 @@ static void test_throttled_progress_keeps_the_last_tick(void **state)
     int64_t id = 0;
     assert_int_equal(job_submit(jm, 1, "gc", NULL, chatty_job, NULL, NULL, &id), OK);
     wait_for(1);
-    usleep(200000);
+    /* The final count is written before the final state, so a job seen
+     * finished must already show it. */
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM jobs WHERE id = 1"
+                                   " AND state = 'completed'", 1), 1);
     assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 5000);
 }
 
@@ -329,7 +332,9 @@ static void test_final_progress_is_the_last_report(void **state)
     int64_t id = 0;
     assert_int_equal(job_submit(jm, 1, "backup", NULL, short_phase_job, NULL, NULL, &id), OK);
     wait_for(1);
-    usleep(200000);
+    /* As above: finished means the final report is already recorded. */
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM jobs WHERE id = 1"
+                                   " AND state = 'completed'", 1), 1);
     assert_int_equal(db_count("SELECT progress_current FROM jobs WHERE id = 1"), 170);
     assert_int_equal(db_count("SELECT progress_total FROM jobs WHERE id = 1"), 171);
 }
@@ -399,7 +404,8 @@ static void test_journal_source_says_who_asked(void **state)
     wait_for(1);
     submit(1, "gc");
     wait_for(2);
-    usleep(200000);
+    /* Each journal entry is written after its job function returns. */
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM journal", 2), 2);
 
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'daemon'"), 0);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'schedule'"
@@ -432,7 +438,7 @@ static void test_startup_jobs_say_startup(void **state)
     assert_int_equal(job_submit_scheduled(jm, 1, "gc", NULL, -1, probe_job,
                                           (void *)(intptr_t)1, NULL, &id), OK);
     wait_for(2);
-    usleep(200000);
+    assert_int_equal(wait_db_count("SELECT COUNT(*) FROM journal", 2), 2);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'startup'"
                               " AND operation = 'reindex'"), 1);
     assert_int_equal(db_count("SELECT COUNT(*) FROM journal WHERE source = 'api'"
@@ -598,7 +604,11 @@ static void test_cancelling_a_queued_job_is_immediate(void **state)
 
     g_gate_open = 1;
     wait_for(2);
-    usleep(200000);
+    /* The third is queued behind the cancelled one, so once it is recorded
+     * finished the cancelled one has had every chance to run wrongly. */
+    snprintf(q, sizeof(q), "SELECT COUNT(*) FROM jobs WHERE id = %lld"
+             " AND state = 'completed'", (long long)third);
+    assert_int_equal(wait_db_count(q, 1), 1);
     /* The first and third ran; the cancelled one never did. */
     assert_int_equal(g_gated_runs, 2);
     snprintf(q, sizeof(q), "SELECT state FROM jobs WHERE id = %lld", (long long)third);
