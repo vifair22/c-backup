@@ -178,6 +178,17 @@ The rules exist for that reason:
 `tests/test_manifest_tree.c` asserts that writing the same tree twice stores
 zero new objects. That test is the canary for the entire scheme.
 
+### Every file entry has content
+
+A regular-file entry always names its content object; the writer refuses a
+tree containing one with an all-zero hash. A file the backup could not read
+is left out of the tree instead (B118). Before that fix such a file was
+written with a zero hash, and a tree is permanent, so repositories from
+earlier 1.0.0 builds can still hold one: restore fails that entry by name,
+and verify reports it as `missing: file entry has no content`. Symlinks,
+device nodes, FIFOs and sockets have no content object and carry a zero
+hash by design.
+
 ## Recovery
 
 Because the trees are in the repository, the database can be rebuilt:

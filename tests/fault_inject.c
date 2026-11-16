@@ -6,6 +6,7 @@
  */
 
 #include "fault_inject.h"
+#include <limits.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -175,4 +176,25 @@ int __wrap_rename(const char *from, const char *to) {
         }
     }
     return __real_rename(from, to);
+}
+
+const char *volatile fault_read_eio_path = NULL;
+volatile int fault_read_refused = 0;
+
+ssize_t __wrap_read(int fd, void *buf, size_t count) {
+    const char *want = fault_read_eio_path;
+    if (want) {
+        char link[64], target[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t len = readlink(link, target, sizeof(target) - 1);
+        if (len > 0) {
+            target[len] = '\0';
+            if (strcmp(target, want) == 0) {
+                __atomic_add_fetch(&fault_read_refused, 1, __ATOMIC_SEQ_CST);
+                errno = EIO;
+                return -1;
+            }
+        }
+    }
+    return __real_read(fd, buf, count);
 }

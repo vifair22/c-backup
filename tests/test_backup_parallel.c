@@ -742,6 +742,12 @@ static void test_failing_file_is_skipped_as_it_is_serially(void **state)
     assert_int_equal(r[1].objects_new, r[0].objects_new);
     assert_int_equal(r[1].bytes_logical, r[0].bytes_logical);
     assert_same_snapshot(&e[0], r[0].snapshot_id, &e[1], r[1].snapshot_id, TEST_SRC);
+    /* B118: counted and named the same way on both paths. */
+    assert_int_equal(r[0].files_skipped, 1);
+    assert_int_equal(r[1].files_skipped, 1);
+    assert_string_equal(r[0].skipped[0].path, r[1].skipped[0].path);
+    backup_result_free(&r[0]);
+    backup_result_free(&r[1]);
     env_close(&e[0]);
     env_close(&e[1]);
 }

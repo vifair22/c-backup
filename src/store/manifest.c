@@ -180,6 +180,24 @@ status_t manifest_serialise(manifest_entry_t *entries, uint32_t count,
     if (!out_buf || !out_len) return set_error(ERR_INVALID, "manifest_serialise: null out");
     if (count > 0 && !entries) return set_error(ERR_INVALID, "manifest_serialise: null entries");
 
+    /*
+     * A regular file with no content is a file no restore can produce, and
+     * a tree is permanent: once written, every snapshot naming it carries
+     * the hole, and verify passed over it because nothing it reads is
+     * damaged (B118). Backup leaves an unreadable file out of the tree
+     * instead; this is the backstop for any writer that forgets to.
+     */
+    static const uint8_t zero[OBJECT_HASH_SIZE] = { 0 };
+    for (uint32_t i = 0; i < count; i++)
+        if (entries[i].type == NODE_TYPE_REG &&
+            memcmp(entries[i].target_hash, zero, OBJECT_HASH_SIZE) == 0)
+            return set_error(ERR_INVALID,
+                             "manifest_serialise: file entry '%.*s' has no "
+                             "content hash; refusing to write a tree that "
+                             "cannot be restored",
+                             (int)entries[i].name_len,
+                             entries[i].name ? entries[i].name : "");
+
     qsort(entries, count, sizeof(*entries), entry_cmp);
 
     sbuf_t b = { 0 };

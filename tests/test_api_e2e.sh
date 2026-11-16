@@ -402,7 +402,8 @@ contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
 # backup's pack and nothing is left loose for the pack pass.
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
 contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
-contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0}' "$JOB_BODY"
+contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0,' "$JOB_BODY"
+contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1672,6 +1673,45 @@ wait_job "$RX"
 contains "the reindex succeeds" '"state":"completed"' "$(sock_body "/jobs/$RX")"
 contains "and the label comes back from the record" "\"label\":\"$LBL_OUT\"" \
     "$(sock_body /repos/1/snapshots)"
+
+# B118: a file the backup cannot read is left out, counted and named, in
+# the result and in the journal. It used to stay in the snapshot with no
+# content, and the job said nothing. Root reads through mode 000.
+if [ "$(id -u)" != 0 ]; then
+    echo "locked" > "$R/src/locked.txt"
+    chmod 000 "$R/src/locked.txt"
+    SJ=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")
+    wait_job "$SJ"
+    chmod 600 "$R/src/locked.txt"
+    SBODY=$(sock_body "/jobs/$SJ")
+    contains "a backup with an unreadable file still completes" '"state":"completed"' "$SBODY"
+    contains "and counts it" '"files_skipped":1,' "$SBODY"
+    contains "and names it, with the reason" \
+        "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1}" \
+        "$SBODY"
+    contains "and the journal says so" \
+        "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(sock_body '/repos/1/journal?limit=1')"
+    # And alerted, as a warning, without anyone opening the job. The worker
+    # writes the line after the state, so it is waited for. No Pushover is
+    # configured here, so the line must say it was not sent (NIT-11).
+    WLINE="warning notification for job $SJ not sent, Pushover is not configured: "
+    for _ in $(seq 1 100); do
+        grep -q "$WLINE" "$R/daemon.log" && break
+        sleep 0.1
+    done
+    contains "and the operator is alerted, naming the count and the first path" \
+        "completed with a warning: 1 file(s) could not be read and are not in snapshot" \
+        "$(grep -A1 "$WLINE" "$R/daemon.log")"
+    contains "the alert names the file" "first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(grep -A1 "$WLINE" "$R/daemon.log")"
+    check "and does not claim it was sent" 0 \
+        "$(grep -c "sending warning notification for job $SJ:" "$R/daemon.log")"
+    rm -f "$R/src/locked.txt"
+fi
+# A clean backup alerts nobody: the label backup above skipped nothing.
+check "a clean backup sends no warning" 0 \
+    "$(grep -c "warning notification for job $LJ" "$R/daemon.log")"
 
 # A backup schedule carries its label, checked when it is made.
 SCH=$(sock_send POST /repos/1/schedules \

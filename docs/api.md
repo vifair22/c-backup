@@ -509,7 +509,10 @@ A restore job's `result` is `files`, `dirs`, `symlinks`, `hardlinks`,
 regular file already at its path with the snapshot's size and an mtime
 within two seconds of the snapshot's counts as `skipped` (an earlier run
 restored it); anything else there is left alone and counted as `kept`.
-Neither fails the job; any `failed` entry does. Each file is written under a
+Neither fails the job; any `failed` entry does, with the error
+`restore incomplete: N entries could not be restored (M written); see the
+log for each; first: <path>: <reason>`. Every failed entry is logged as
+`restore: <path> not restored: <reason>`. Each file is written under a
 temporary `.c-backup-partial.*` name and renamed into place only once its
 object has read back verified, so a file at its final path is always
 complete (Manual section 8).
@@ -668,7 +671,7 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 | `repaired` | Damaged, corrected from parity, and the correction written to disk. Always 0 with `repair=0` |
 | `recoverable` | Damaged, readable only through parity, and still wrong on disk: repair was off, or the write-back failed |
 | `unrecoverable` | Damaged beyond what parity can rebuild. Data loss |
-| `missing` | Indexed but absent: no loose file, no pack entry, or a pack file that has gone. Data loss |
+| `missing` | Indexed but absent: no loose file, no pack entry, or a pack file that has gone. Also each index row of a regular file that names no content at all (see below). Data loss |
 | `affected_files` | Distinct file paths referencing a lost object |
 | `affected_snapshots` | Distinct snapshots holding any of those files |
 
@@ -696,6 +699,15 @@ section 11). Each finding also carries:
 
 An object no file references - a manifest tree, or one from an evicted
 snapshot - reports zero files; that is not a claim the loss is harmless.
+
+Every level also checks the index for regular files that name no content
+object: a file a snapshot lists and no restore can produce. Backups before
+the B118 fix recorded a file that was skipped during the store phase that
+way. These are one finding with `hash` `""` and `status` `missing: file
+entry has no content`, its `affected_*` fields and `sample_paths` naming
+the files and snapshots, and each such row counts once in `missing`, so
+the run fails. A backup no longer writes such an entry (see the backup
+`result` below), and the tree writer refuses one.
 
 `/metrics` exposes `cbackup_last_verify_age_seconds` alongside
 `cbackup_last_snapshot_age_seconds` - between them, an alert can tell that
@@ -896,8 +908,32 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
 `files_unchanged`, `bytes_logical`, `objects_new`, `bytes_stored`,
-`trees_new`, `trees_reused`, `store_workers`) and what it wrote into the
-repository, in bytes:
+`trees_new`, `trees_reused`, `store_workers`), the files it left out, and
+what it wrote into the repository, in bytes.
+
+A regular file the scan found and the store could not read is left out of
+the snapshot entirely: not in its trees, not in the index, not in `files`.
+That is a file that vanished before it was read, one the daemon may not
+open, one replaced by a directory or other non-file, or one whose read
+failed partway. The job still completes (Manual section 6.3), and says so:
+
+| Field | What |
+|---|---|
+| `files_skipped` | Every file left out. Always present; `0` on a clean run |
+| `skipped` | The first 100 of them, in scan order, each `{"path","reason"}`; `[]` when none |
+| `skipped_listed` | How many `skipped` holds; less than `files_skipped` when more than 100 were left out |
+
+`reason` reads `cannot open: it no longer exists`, `cannot open:
+Permission denied` (or another errno text), `no longer a regular file (now
+a directory)`, `no longer a regular file`, or `cannot read: ` followed by
+the store's error. Each is also a `WARN` line in the daemon log, `backup:
+skipping <path>, it is not in this snapshot: <reason>`, followed by one
+summary line, and the job's journal entry reads `snapshot N: F files, S
+skipped (not in the snapshot); first: <path>: <reason>`. A clean backup
+journals no message, as before. A backup that skipped anything also sends a
+warning alert (Manual section 16.3); the job stays `completed`.
+
+What it wrote:
 
 | Field | What |
 |---|---|

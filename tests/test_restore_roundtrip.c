@@ -358,6 +358,81 @@ static void test_unreadable_object_is_named_in_the_warning(void **state)
 }
 
 /*
+ * B118: every entry a restore cannot produce is logged with its path and
+ * the reason, and the error quotes the first.
+ *
+ * The error has always ended "see the log for which", and for a regular
+ * file with no content hash - what a backup that skipped a file used to
+ * record - the log said nothing: it was counted failed in silence. Such a
+ * snapshot is made here the way older builds made it, by clearing the hash
+ * on the index row, since backup no longer writes one.
+ *
+ * Verify has to call the same row loss. It walks objects, and an entry that
+ * names no object has nothing to find damaged, so it passed.
+ */
+static void test_contentless_file_is_named_by_restore_and_verify(void **state)
+{
+    (void)state;
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    assert_int_equal(br.files_skipped, 0);
+
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)br.snapshot_id);
+    assert_int_equal(db_execute_non_query(db,
+        "UPDATE nodes SET content_hash = NULL"
+        " WHERE repo_id = ? AND snap_id = ? AND name = 'mid.txt'",
+        (const char *[]){ repo, snap, NULL }, NULL), 0);
+
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
+    restore_result_t rr;
+    status_t st = restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr);
+    log_stream_unregister(h);
+
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    /* The log names the entry and says why. */
+    if (!strstr(captured_log, "nested/mid.txt not restored: regular file has no content"))
+        fail_msg("no line names the failed entry:\n%s", captured_log);
+    /* And so does the error, so the job record carries it too. */
+    assert_non_null(strstr(err_msg(), "restore incomplete: 1 entry"));
+    assert_non_null(strstr(err_msg(), "first: "));
+    assert_non_null(strstr(err_msg(), "nested/mid.txt"));
+    assert_non_null(strstr(rr.first_failure, "nested/mid.txt: regular file"));
+    /* Everything else still came back. */
+    assert_true(rr.files >= 2);
+    err_clear();
+
+    /* Verify fails on it at the cheapest level, and names it. */
+    verify_result_t vr;
+    st = verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr);
+    assert_int_equal(st, ERR_CORRUPT);
+    assert_int_equal(vr.missing, 1);
+    assert_int_equal(vr.affected_files, 1);
+    assert_int_equal(vr.affected_snapshots, 1);
+    char run[32];
+    snprintf(run, sizeof(run), "%lld", (long long)vr.run_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT hash, status, affected_files, sample_paths, affected_snapshots"
+        "  FROM verify_findings WHERE run_id = ?",
+        (const char *[]){ run, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], "");
+    assert_string_equal(r->rows[0][1], "missing: file entry has no content");
+    assert_string_equal(r->rows[0][2], "1");
+    assert_non_null(strstr(r->rows[0][3], "/nested/mid.txt"));
+    assert_string_equal(r->rows[0][4], snap);
+    db_result_free(r);
+    err_clear();
+    backup_result_free(&br);
+}
+
+/*
  * A live unix socket in the source must not fail the restore.
  *
  * stat_to_node_type has no case for a socket and returns 0, so backup records
@@ -2029,6 +2104,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_sparse_file_round_trips_with_its_holes, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_that_is_all_hole_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unreadable_object_is_named_in_the_warning, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_contentless_file_is_named_by_restore_and_verify, setup, teardown),
         cmocka_unit_test_setup_teardown(test_socket_in_source_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restores_a_zero_zero_device_node, setup, teardown),
         cmocka_unit_test_setup_teardown(test_restore_preserves_modes, setup, teardown),
