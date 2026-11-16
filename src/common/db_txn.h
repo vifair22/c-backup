@@ -75,6 +75,27 @@ void db_txn_rollback(cutils_db_t *db);
 unsigned db_txn_waiters(void);
 
 /*
+ * Make every commit so far durable before returning (B142).
+ *
+ * state.db runs synchronous=NORMAL: a commit is in the WAL but not synced,
+ * and the flusher syncs it within about a second. That is fine for edits
+ * whose loss the next start repairs, and fatal for a commit that something
+ * irreversible then depends on: gc committed rows moving objects into the
+ * packs it wrote, unlinked the packs they came from, synced the directory
+ * so the unlinks stuck - and a power cut inside that second took the rows
+ * back, leaving the index naming packs that were gone. Anything that is
+ * about to remove the only other copy of what a commit describes calls
+ * this first.
+ *
+ * A full WAL checkpoint, under the write lock so no transaction is open on
+ * the shared connection: SQLite syncs the WAL before copying it into the
+ * database and syncs the database after. ERR_IO when the checkpoint could
+ * not complete, which callers treat as "do not remove anything yet". Must
+ * not be called while this thread holds the write lock.
+ */
+status_t db_txn_make_durable(cutils_db_t *db);
+
+/*
  * Time spent in this module is attributed to the calling thread's phase
  * timers (phase_timer.h), when it has any: lock wait and BEGIN as txn-wait,
  * COMMIT and ROLLBACK, WAL sync included, as txn-commit. Both are recorded as
