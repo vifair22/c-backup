@@ -22,8 +22,9 @@
 #include <cmocka.h>
 
 #include "repo_key.h"
+#include "test_tmp.h"
 
-#define TEST_DIR "/tmp/c_backup_test_repokey"
+#define TEST_DIR TEST_TMP "/c_backup_test_repokey"
 #define TEST_UUID "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
 static void rmrf(const char *p)

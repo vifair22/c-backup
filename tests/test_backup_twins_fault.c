@@ -41,10 +41,11 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_twins"
+#define TEST_DIR  TEST_TMP "/c_backup_test_twins"
 #define TEST_SRC  TEST_DIR "/src"
-#define TEST_ENVS "/tmp/c_backup_test_twins_envs"
+#define TEST_ENVS TEST_TMP "/c_backup_test_twins_envs"
 #define MIB (1u << 20)
 #define TWIN_MIB 20u
 

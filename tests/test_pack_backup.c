@@ -28,8 +28,9 @@
 #include "object.h"
 #include "store.h"
 #include "fake_index.h"
+#include "test_tmp.h"
 
-#define TEST_ROOT "/tmp/c_backup_test_pack_backup"
+#define TEST_ROOT TEST_TMP "/c_backup_test_pack_backup"
 
 static void rmrf(const char *p)
 {

@@ -11,9 +11,9 @@
  * file, which read_entry_hdr checks.
  *
  * Proved without a 128 GiB file: a sparse pack whose live entry claims
- * 129 GiB, and an injected read failure that stops gc's copy once it has
+ * 129 GiB, and an injected full disk that stops gc's copy once it has
  * begun - past the point where the cap used to refuse it. A fault suite for
- * fault_fread_at.
+ * fault_fwrite_bytes_left.
  */
 
 #include <setjmp.h>
@@ -37,8 +37,9 @@
 #include "pack.h"
 #include "parity.h"
 #include "store.h"
+#include "test_tmp.h"
 
-#define TEST_DIR   "/tmp/c_backup_test_pack_bigentry_fault"
+#define TEST_DIR   TEST_TMP "/c_backup_test_pack_bigentry_fault"
 #define TEST_REPO  TEST_DIR "/repo"
 #define PACK_PATH  TEST_REPO "/packs/0000/pack-00000001.dat"
 #define GIB        ((uint64_t)1 << 30)
@@ -125,11 +126,21 @@ static void write_sparse_pack(uint64_t live_size, uint64_t file_payload,
 /*
  * A live 129 GiB entry, in a pack gc has to rewrite because its other entry
  * is dead. gc used to stop at the entry header with "bad entry header";
- * now it gets as far as copying the payload, where the injected read
- * failure stops it - the copy streams, so that is the only place size
- * could matter, and it does not. The rewrite is discarded, the old pack is
- * left as it was, and nothing is staged.
+ * now it gets as far as copying the payload, where a full disk stops it -
+ * the copy streams, so that is the only place size could matter, and it
+ * does not. The rewrite is discarded, the old pack is left as it was, and
+ * nothing is staged.
+ *
+ * The stop is a byte budget on fwrite, not a countdown of reads. It was
+ * fault_fread_at = 4, and once the OWN-29 parity lookup added reads ahead
+ * of the copy that fault fired somewhere harmless: gc copied the whole
+ * sparse entry into a staging pack, densely, 129 GiB of zeros, and failed
+ * only at the seal. On CI that filled the runner's disk. Now the staging
+ * file cannot pass COPY_BUDGET however the calls are arranged, and the
+ * error has to be the payload write, which is what shows the copy began.
  */
+#define COPY_BUDGET ((long long)64 << 20)
+
 static void test_gc_takes_an_entry_past_128_gib(void **state)
 {
     (void)state;
@@ -139,26 +150,25 @@ static void test_gc_takes_an_entry_past_128_gib(void **state)
     uint64_t big = 129 * GIB;
     write_sparse_pack(big, big, dead, live);
 
-    /* fread: the pack header, the two entry headers walked for offsets, the
-     * live entry's header re-read for the copy; the fifth is its payload. */
-    fault_fread_at = 4;
+    fault_fwrite_bytes_left = COPY_BUDGET;
     err_clear();
     uint32_t kept = 0, deleted = 0;
     status_t st = pack_gc(store, live, 1, &kept, &deleted);
-    int fired = fault_fread_at == -1;
+    long long written = fault_fwrite_bytes_seen;
     fault_reset_all();
-    assert_true(fired);
     assert_int_not_equal(st, OK);
-    /* Where the injected read lands depends on how many reads the copy
-     * makes (the OWN-29 CRC pass added some), so any failure inside the
-     * rewrite proves the point: the entry got past the header into the
-     * copy. What must never appear is a refusal of the header itself. */
-    if (!strstr(err_msg(), "pack rewrite:")) fail_msg("err: %s", err_msg());
+    if (!strstr(err_msg(), "pack rewrite: write entry payload"))
+        fail_msg("err: %s", err_msg());
     assert_null(strstr(err_msg(), "bad entry header"));
+    /* Into the payload, and no further than the budget. */
+    assert_true(written > (long long)(sizeof(pack_dat_hdr_t) + sizeof(pack_dat_entry_hdr_t)));
+    assert_true(written <= COPY_BUDGET);
 
     struct stat sb;
     assert_int_equal(stat(PACK_PATH, &sb), 0);
     assert_true((uint64_t)sb.st_size > big);
+    /* Still sparse: the source pack is only ever read. */
+    assert_true((uint64_t)sb.st_blocks * 512u < (uint64_t)COPY_BUDGET);
     assert_int_equal(count_files(TEST_REPO "/packs"), 1);
     assert_int_equal(count_files(TEST_REPO "/tmp"), 0);
 }

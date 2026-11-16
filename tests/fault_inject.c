@@ -17,6 +17,8 @@ _Thread_local int fault_fwrite_at  = -1;
 _Thread_local int fault_fseeko_at  = -1;
 _Thread_local int fault_fsync_at   = -1;
 _Thread_local size_t fault_malloc_peak = 0;
+_Thread_local long long fault_fwrite_bytes_left = -1;
+_Thread_local long long fault_fwrite_bytes_seen = 0;
 
 static void note_alloc(size_t size) {
     if (size > fault_malloc_peak) fault_malloc_peak = size;
@@ -54,6 +56,12 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t __wrap_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (fault_fwrite_bytes_left >= 0) {
+        long long want = (long long)(size * nmemb);
+        if (want > fault_fwrite_bytes_left) { errno = ENOSPC; return 0; }
+        fault_fwrite_bytes_left -= want;
+        fault_fwrite_bytes_seen += want;
+    }
     if (fault_fwrite_at < 0) return __real_fwrite(ptr, size, nmemb, stream);
     if (fault_fwrite_at == 0) { fault_fwrite_at = -1; errno = EIO; return 0; }
     fault_fwrite_at--;

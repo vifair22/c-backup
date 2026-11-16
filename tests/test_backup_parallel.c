@@ -46,12 +46,13 @@
 #include "store.h"
 #include "store_index.h"
 #include "store_pool.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_parallel"
+#define TEST_DIR  TEST_TMP "/c_backup_test_parallel"
 #define TEST_SRC  TEST_DIR "/src"
 /* Repositories live apart from the source, so creating one does not touch
  * a directory the next backup scans. */
-#define TEST_ENVS "/tmp/c_backup_test_parallel_envs"
+#define TEST_ENVS TEST_TMP "/c_backup_test_parallel_envs"
 #define MIB (1u << 20)
 
 extern const db_migration_t app_migrations[];

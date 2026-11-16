@@ -41,8 +41,9 @@
 #include "verify.h"
 #include "gc.h"
 #include "prune.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_verify_packed_large"
+#define TEST_DIR  TEST_TMP "/c_backup_test_verify_packed_large"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"

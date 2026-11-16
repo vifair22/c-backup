@@ -36,8 +36,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT   "/tmp/c_backup_fuzz_pack_stored"
+#define FUZZ_ROOT   TEST_TMP "/c_backup_fuzz_pack_stored"
 #define MAX_ENTRIES 24
 #define MAX_PAYLOAD (64u * 1024u)
 

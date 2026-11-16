@@ -161,6 +161,14 @@ status_t object_load_stream(store_t *store,
                              uint8_t *out_type);
 
 /*
+ * Test hook: the stored size at and above which a loose object's parity is
+ * not applied by a streamed read, because its 32-bit trailer size may have
+ * wrapped (OWN-30; about 59.75 GiB). 0 restores the default. Lowering it
+ * lets a test show a damaged object past it is refused, not corrected.
+ */
+void object_test_set_parity_fit_limit(uint64_t bytes);
+
+/*
  * Load at most max_bytes of an object's uncompressed content.
  * Avoids decompressing the entire payload for large objects.
  * *out_full_size receives the total uncompressed size.

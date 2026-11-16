@@ -29,8 +29,9 @@
 #include "repo_purge.h"
 #include "store.h"
 #include "store_index.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_purge"
+#define TEST_DIR  TEST_TMP "/c_backup_test_purge"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_SRC  TEST_DIR "/src"
 

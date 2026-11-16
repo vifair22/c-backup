@@ -18,8 +18,9 @@
 
 #include "parity.h"
 #include "parity_stream.h"
+#include "test_tmp.h"
 
-#define TMP_DIR  "/tmp/c_backup_ps_test"
+#define TMP_DIR  TEST_TMP "/c_backup_ps_test"
 
 /* RS group constants for readability */
 #define GROUP_DATA  ((size_t)(RS_K * RS_INTERLEAVE))   /* 15296 */

@@ -124,26 +124,19 @@ static status_t read_pipe_full(int fd, void *buf, size_t n) {
     return OK;
 }
 
-status_t restore_sparse_streaming(store_t *store,
-                                         const uint8_t hash[OBJECT_HASH_SIZE],
-                                         int out_fd, uint64_t file_size,
-                                         const char *full) {
-    int pfd[2];
-    if (pipe(pfd) == -1) return set_error_errno(ERR_IO, "restore sparse: pipe");
-
-    struct sparse_stream_arg arg = { .store = store, .hash = hash,
-                                     .pipe_wfd = pfd[1], .rc = OK };
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, sparse_stream_worker, &arg) != 0) {
-        close(pfd[0]); close(pfd[1]);
-        return set_error_errno(ERR_IO, "restore sparse: pthread_create");
-    }
-
+/*
+ * Lay a sparse payload - header, region table, then the bytes of each
+ * region in order - out into out_fd with its holes. in_fd is read
+ * sequentially with read(), so it may be a pipe or a file.
+ */
+static status_t sparse_scatter(int in_fd, int out_fd, uint64_t file_size,
+                               const char *full)
+{
     status_t st = OK;
     sparse_region_t *rgns = NULL;
     uint8_t *buf = NULL;
     sparse_hdr_t shdr;
-    if (read_pipe_full(pfd[0], &shdr, sizeof(shdr)) != OK) {
+    if (read_pipe_full(in_fd, &shdr, sizeof(shdr)) != OK) {
         st = set_error(ERR_CORRUPT, "restore sparse: short header for %s", full);
         goto done;
     }
@@ -154,7 +147,7 @@ status_t restore_sparse_streaming(store_t *store,
     /* An all-hole file has an empty table, and malloc(0) may return NULL. */
     rgns = malloc(rt_sz ? rt_sz : 1);
     if (!rgns) { st = set_error(ERR_NOMEM, "restore sparse: regions"); goto done; }
-    if (read_pipe_full(pfd[0], rgns, rt_sz) != OK) {
+    if (read_pipe_full(in_fd, rgns, rt_sz) != OK) {
         st = set_error(ERR_CORRUPT, "restore sparse: short regions for %s", full);
         goto done;
     }
@@ -175,9 +168,9 @@ status_t restore_sparse_streaming(store_t *store,
         uint64_t rem = rgns[r].length;
         while (rem > 0) {
             size_t want = (rem > SP_BUF) ? SP_BUF : (size_t)rem;
-            ssize_t got = read(pfd[0], buf, want);
+            ssize_t got = read(in_fd, buf, want);
             if (got == 0) { st = set_error(ERR_CORRUPT, "restore sparse: short data for %s", full); break; }
-            if (got < 0) { if (errno == EINTR) continue; st = set_error_errno(ERR_IO, "restore sparse: read pipe"); break; }
+            if (got < 0) { if (errno == EINTR) continue; st = set_error_errno(ERR_IO, "restore sparse: read payload"); break; }
             if (io_write_full(out_fd, buf, (size_t)got) != 0) {
                 st = set_error_errno(ERR_IO, "restore sparse: write(%s)", full); break;
             }
@@ -188,6 +181,34 @@ status_t restore_sparse_streaming(store_t *store,
 done:
     free(buf);
     free(rgns);
+    return st;
+}
+
+status_t restore_sparse_from_fd(int payload_fd, int out_fd, uint64_t file_size,
+                                const char *full)
+{
+    if (lseek(payload_fd, 0, SEEK_SET) == (off_t)-1)
+        return set_error_errno(ERR_IO, "restore sparse: rewind payload for %s", full);
+    return sparse_scatter(payload_fd, out_fd, file_size, full);
+}
+
+status_t restore_sparse_streaming(store_t *store,
+                                         const uint8_t hash[OBJECT_HASH_SIZE],
+                                         int out_fd, uint64_t file_size,
+                                         const char *full) {
+    int pfd[2];
+    if (pipe(pfd) == -1) return set_error_errno(ERR_IO, "restore sparse: pipe");
+
+    struct sparse_stream_arg arg = { .store = store, .hash = hash,
+                                     .pipe_wfd = pfd[1], .rc = OK };
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, sparse_stream_worker, &arg) != 0) {
+        close(pfd[0]); close(pfd[1]);
+        return set_error_errno(ERR_IO, "restore sparse: pthread_create");
+    }
+
+    status_t st = sparse_scatter(pfd[0], out_fd, file_size, full);
+
     /* Drain pipe so the writer thread can finish cleanly. */
     uint8_t drain[4096];
     while (read(pfd[0], drain, sizeof(drain)) > 0) {}

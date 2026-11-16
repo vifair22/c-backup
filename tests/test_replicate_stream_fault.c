@@ -58,8 +58,9 @@
 #include "store.h"
 #include "store_index.h"
 #include "verify.h"
+#include "test_tmp.h"
 
-#define TEST_DIR   "/tmp/c_backup_test_replicate_stream"
+#define TEST_DIR   TEST_TMP "/c_backup_test_replicate_stream"
 #define TEST_DB    TEST_DIR "/state.db"
 #define TEST_RDB   TEST_DIR "/replica-state.db"
 #define TEST_REPO  TEST_DIR "/repo"

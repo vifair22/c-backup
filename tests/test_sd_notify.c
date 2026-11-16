@@ -32,6 +32,7 @@
 #include <cmocka.h>
 
 #include "sd_notify.h"
+#include "test_tmp.h"
 
 #define DAEMON_BIN  "build/bins/c-backupd"
 #define DAEMON_PORT 18741
@@ -71,7 +72,7 @@ static ssize_t recv_within(int fd, char *buf, size_t cap, int ms)
 
 static void tmp_path(char *out, size_t cap, const char *tag)
 {
-    snprintf(out, cap, "/tmp/cb_sdn_%ld_%s", (long)getpid(), tag);
+    snprintf(out, cap, TEST_TMP "/cb_sdn_%ld_%s", (long)getpid(), tag);
 }
 
 static void test_unset_is_a_silent_no_op(void **state)
@@ -193,7 +194,7 @@ static void test_daemon_ready_after_bind(void **state)
         skip();
     }
 
-    char dir[] = "/tmp/cb_sdn_daemon_XXXXXX";
+    char dir[] = TEST_TMP "/cb_sdn_daemon_XXXXXX";
     assert_non_null(mkdtemp(dir));
     char cfg[256], db[256], sock[256], keys[256], ntf[256];
     snprintf(cfg, sizeof(cfg), "%s/config.yaml", dir);

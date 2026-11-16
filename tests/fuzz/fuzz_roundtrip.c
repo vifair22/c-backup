@@ -40,8 +40,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../test_tmp.h"
 
-#define FUZZ_ROOT  "/tmp/c_backup_fuzz_roundtrip"
+#define FUZZ_ROOT  TEST_TMP "/c_backup_fuzz_roundtrip"
 #define CTRL_BYTES 3
 
 /*
