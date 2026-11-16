@@ -885,7 +885,8 @@ the store's error. Each is also a `WARN` line in the daemon log, `backup:
 skipping <path>, it is not in this snapshot: <reason>`, followed by one
 summary line, and the job's journal entry reads `snapshot N: F files, S
 skipped (not in the snapshot); first: <path>: <reason>`. A clean backup
-journals no message, as before.
+journals no message, as before. A backup that skipped anything also sends a
+warning alert (Manual section 16.3); the job stays `completed`.
 
 What it wrote:
 

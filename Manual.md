@@ -767,6 +767,8 @@ with skipped files still ends `completed`, but not silently:
   and one closing line counts them;
 - the job `result` carries `files_skipped` and the first 100 as `skipped`,
   each with its path and reason (`docs/api.md`);
+- a warning alert goes out through the failure-alert path, the log line
+  and Pushover when configured (section 16.3);
 - the journal entry, the permanent record, reads `snapshot 12: 50 files, 1
   skipped (not in the snapshot); first: /data/x: ...`.
 
@@ -1731,6 +1733,24 @@ c-backup: backup of photos failed
 Repository photos (id 3) at /mnt/backup/photos
 Job 118 (backup) failed: cannot read /data/photos/2024: Permission denied
 ```
+
+A backup that completed but left files out (section 6.3: a file that
+vanished, could not be opened or read, or stopped being a regular file)
+sends a warning the same way. The job stays `completed`; the title says so,
+and the body gives the count and the first file with its reason:
+
+```
+c-backup: backup of photos completed with a warning
+
+Repository photos (id 3) at /mnt/backup/photos
+Job 119 (backup) completed with a warning: 2 file(s) could not be read and are not in snapshot 41; first: /data/photos/locked.jpg: cannot open: Permission denied
+```
+
+The daemon logs every alert before it is sent, a failure as `sending
+failure notification for job N: ...` (beside the job's own `failed` line)
+and a warning at `warning` level as `sending warning notification for job
+N: ...`, so the log carries them with or without Pushover configured. A clean backup sends
+nothing.
 
 A notification that cannot be delivered is retried for 24 hours unless
 Pushover rejects it outright (a wrong token or user key), in which case it is

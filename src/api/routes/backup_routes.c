@@ -369,6 +369,16 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                      (unsigned long long)res.files_skipped,
                      res.skipped[0].path, res.skipped[0].reason);
             job_set_summary(progress_ctx, msg);
+            /* And alerted: a snapshot that lacks files is something to
+             * hear about without opening the job, though the job did what
+             * it could and stays completed. */
+            snprintf(msg, sizeof(msg),
+                     "%llu file(s) could not be read and are not in snapshot "
+                     "%lld; first: %s: %s",
+                     (unsigned long long)res.files_skipped,
+                     (long long)res.snapshot_id,
+                     res.skipped[0].path, res.skipped[0].reason);
+            job_set_warning(progress_ctx, msg);
         } else if (res.files_skipped) {
             snprintf(msg, sizeof(msg),
                      "snapshot %lld: %llu files, %llu skipped (not in the "
@@ -376,6 +386,12 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                      (long long)res.snapshot_id, (unsigned long long)res.files,
                      (unsigned long long)res.files_skipped);
             job_set_summary(progress_ctx, msg);
+            snprintf(msg, sizeof(msg),
+                     "%llu file(s) could not be read and are not in snapshot "
+                     "%lld; see the log",
+                     (unsigned long long)res.files_skipped,
+                     (long long)res.snapshot_id);
+            job_set_warning(progress_ctx, msg);
         }
     }
     backup_result_free(&res);

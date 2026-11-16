@@ -1562,8 +1562,22 @@ if [ "$(id -u)" != 0 ]; then
     contains "and the journal says so" \
         "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \
         "$(sock_body '/repos/1/journal?limit=1')"
+    # And alerted, as a warning, without anyone opening the job. The worker
+    # writes the line after the state, so it is waited for.
+    for _ in $(seq 1 50); do
+        grep -q "sending warning notification for job $SJ:" "$R/daemon.log" && break
+        sleep 0.1
+    done
+    contains "and the operator is alerted, naming the count and the first path" \
+        "completed with a warning: 1 file(s) could not be read and are not in snapshot" \
+        "$(grep -A1 "sending warning notification for job $SJ:" "$R/daemon.log")"
+    contains "the alert names the file" "first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(grep -A1 "sending warning notification for job $SJ:" "$R/daemon.log")"
     rm -f "$R/src/locked.txt"
 fi
+# A clean backup alerts nobody: the label backup above skipped nothing.
+check "a clean backup sends no warning" 0 \
+    "$(grep -c "sending warning notification for job $LJ:" "$R/daemon.log")"
 
 # A backup schedule carries its label, checked when it is made.
 SCH=$(sock_send POST /repos/1/schedules \
