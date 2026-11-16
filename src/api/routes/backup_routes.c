@@ -142,6 +142,42 @@ static void backup_job_free(void *p)
     free(j);
 }
 
+/*
+ * The skipped files, appended to the backup's result document as
+ * ,"skipped":[{"path","reason"}...],"skipped_listed":N}. base is the
+ * document so far without its closing brace, files_skipped included. The
+ * list is the result's, already bounded by BACKUP_SKIPPED_LIST_MAX, so the
+ * document never grows with the number skipped; files_skipped is the exact
+ * count. Paths go through cJSON because, unlike every other field here,
+ * they are not numbers. Returns a malloc'd document, or NULL.
+ */
+static char *with_skipped(const char *base, const backup_result_t *res)
+{
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    for (uint32_t i = 0; i < res->skipped_listed; i++) {
+        cJSON *o = cJSON_CreateObject();
+        if (!o) { cJSON_Delete(arr); return NULL; }
+        cJSON_AddItemToArray(arr, o);
+        if (!cJSON_AddStringToObject(o, "path", res->skipped[i].path) ||
+            !cJSON_AddStringToObject(o, "reason", res->skipped[i].reason)) {
+            cJSON_Delete(arr);
+            return NULL;
+        }
+    }
+    char *list = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    if (!list) return NULL;
+
+    size_t cap = strlen(base) + strlen(list) + 64;
+    char *js = malloc(cap);
+    if (js)
+        snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u}",
+                 base, list, res->skipped_listed);
+    cJSON_free(list);
+    return js;
+}
+
 static status_t backup_job_run(void *arg, atomic_int *cancel,
                                void (*progress)(const char *, uint64_t, uint64_t, void *),
                                void *progress_ctx)
@@ -286,7 +322,8 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
                  "\"bytes_written_parity_spill\":%llu,"
                  "\"bytes_written_pack_abandoned\":%llu,"
-                 "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu}",
+                 "\"bytes_written_pack_pass\":%llu,\"pack_pass_packed\":%llu,"
+                 "\"files_skipped\":%llu",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -305,9 +342,43 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  (unsigned long long)w[STORE_WR_PARITY_SPILL],
                  (unsigned long long)w[STORE_WR_PACK_ABANDONED],
                  (unsigned long long)res.written_sweep,
-                 (unsigned long long)res.sweep_packed);
-        job_set_result(progress_ctx, rj);
+                 (unsigned long long)res.sweep_packed,
+                 (unsigned long long)res.files_skipped);
+        char *full = with_skipped(rj, &res);
+        if (full) {
+            job_set_result(progress_ctx, full);
+            free(full);
+        } else {
+            /* Out of memory for the list: the counts still go out, and the
+             * log names every skipped file. */
+            size_t n = strlen(rj);
+            if (n + 1 < sizeof(rj)) { rj[n] = '}'; rj[n + 1] = '\0'; }
+            job_set_result(progress_ctx, rj);
+        }
+
+        /* The journal is the permanent record, and a snapshot that lacks
+         * files has to say so there too, not only in a job row that is
+         * deleted after 30 days. A clean backup journals as it always has,
+         * with no message. */
+        char msg[768];
+        if (res.files_skipped && res.skipped_listed) {
+            snprintf(msg, sizeof(msg),
+                     "snapshot %lld: %llu files, %llu skipped (not in the "
+                     "snapshot); first: %s: %s",
+                     (long long)res.snapshot_id, (unsigned long long)res.files,
+                     (unsigned long long)res.files_skipped,
+                     res.skipped[0].path, res.skipped[0].reason);
+            job_set_summary(progress_ctx, msg);
+        } else if (res.files_skipped) {
+            snprintf(msg, sizeof(msg),
+                     "snapshot %lld: %llu files, %llu skipped (not in the "
+                     "snapshot); see the log",
+                     (long long)res.snapshot_id, (unsigned long long)res.files,
+                     (unsigned long long)res.files_skipped);
+            job_set_summary(progress_ctx, msg);
+        }
     }
+    backup_result_free(&res);
 
     free(cpaths);
     free(cexcl);

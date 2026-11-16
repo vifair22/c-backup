@@ -1410,7 +1410,14 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
 # The failure path is the job manager's: it marks the job failed and sends
 # the alert, and the line it logs as it sends is the evidence.
 alerted() {  # alerted <job-id>
-    grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+    # The worker marks the job failed, journals it, and only then logs the
+    # alert, so the CLI can see the failure before the line is written.
+    # Waited for rather than read once, which lost that race under load.
+    for _ in $(seq 1 50); do
+        grep -q "sending failure notification for job $1:" "$WORK/daemon.log" && return 0
+        sleep 0.1
+    done
+    return 1
 }
 job_of() {  # job_of <failed job document>: its id, the first "id" in it
     printf '%s' "$1" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2

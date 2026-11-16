@@ -402,7 +402,8 @@ contains "no large files, no store pool" '"store_workers":1,' "$JOB_BODY"
 # backup's pack and nothing is left loose for the pack pass.
 contains "backup result counts bytes written" '"bytes_written":' "$JOB_BODY"
 contains "small files are written into packs, not loose" '"bytes_written_loose":0,' "$JOB_BODY"
-contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0}' "$JOB_BODY"
+contains "and the pack pass has nothing to do" '"bytes_written_pack_pass":0,"pack_pass_packed":0,' "$JOB_BODY"
+contains "and a clean backup left nothing out" '"files_skipped":0,"skipped":[],"skipped_listed":0}' "$JOB_BODY"
 contains "job reports bytes" '"bytes_total":' "$JOB_BODY"
 contains "job reports when it started" '"started":1' "$JOB_BODY"
 contains "job ids are numbers" "\"id\":$BACKUP_JOB," "$JOB_BODY"
@@ -1542,6 +1543,27 @@ wait_job "$RX"
 contains "the reindex succeeds" '"state":"completed"' "$(sock_body "/jobs/$RX")"
 contains "and the label comes back from the record" "\"label\":\"$LBL_OUT\"" \
     "$(sock_body /repos/1/snapshots)"
+
+# B118: a file the backup cannot read is left out, counted and named, in
+# the result and in the journal. It used to stay in the snapshot with no
+# content, and the job said nothing. Root reads through mode 000.
+if [ "$(id -u)" != 0 ]; then
+    echo "locked" > "$R/src/locked.txt"
+    chmod 000 "$R/src/locked.txt"
+    SJ=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"]}")")
+    wait_job "$SJ"
+    chmod 600 "$R/src/locked.txt"
+    SBODY=$(sock_body "/jobs/$SJ")
+    contains "a backup with an unreadable file still completes" '"state":"completed"' "$SBODY"
+    contains "and counts it" '"files_skipped":1,' "$SBODY"
+    contains "and names it, with the reason" \
+        "\"skipped\":[{\"path\":\"$R/src/locked.txt\",\"reason\":\"cannot open: Permission denied\"}],\"skipped_listed\":1}" \
+        "$SBODY"
+    contains "and the journal says so" \
+        "1 skipped (not in the snapshot); first: $R/src/locked.txt: cannot open: Permission denied" \
+        "$(sock_body '/repos/1/journal?limit=1')"
+    rm -f "$R/src/locked.txt"
+fi
 
 # A backup schedule carries its label, checked when it is made.
 SCH=$(sock_send POST /repos/1/schedules \

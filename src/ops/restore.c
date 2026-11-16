@@ -12,6 +12,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -337,6 +338,36 @@ static const char *status_reason(status_t st)
     case ERR_BUSY:      return "busy";
     }
     return "unknown error";
+}
+
+/*
+ * One entry that could not be restored: counted, logged with its path and
+ * the reason, and kept as the first failure if it is one.
+ *
+ * The error at the end of a restore says "see the log for which", and the
+ * log did not always say: a regular file with no content hash was counted
+ * failed in silence, so a restore of a B118 snapshot failed naming two
+ * entries and the log named neither. Every failure goes through here so the
+ * promise holds by construction rather than by each site remembering.
+ */
+static void restore_fail(restore_result_t *res, const char *path,
+                         const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+static void restore_fail(restore_result_t *res, const char *path,
+                         const char *fmt, ...)
+{
+    char why[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    log_warn("restore: %s not restored: %s", path, why);
+    /* A long path truncates the copy, never the log line above. */
+    if (res->failed == 0 &&
+        snprintf(res->first_failure, sizeof(res->first_failure), "%s: %s",
+                 path, why) >= (int)sizeof(res->first_failure))
+        memcpy(res->first_failure + sizeof(res->first_failure) - 4, "...", 4);
+    res->failed++;
 }
 
 static int cancelled(const restore_opts_t *o)
@@ -742,13 +773,12 @@ static void batch_flush(rename_batch_t *b, restore_result_t *res)
     for (uint32_t i = 0; i < b->n; i++) {
         pending_file_t *p = &b->items[i];
         if (!synced) {
-            log_warn("restore: %s not restored: its data could not be synced", p->full);
+            restore_fail(res, p->full, "its data could not be synced");
             batch_discard(b, i);
-            res->failed++;
         } else if (rename(p->tmp, p->full) != 0) {
-            log_warn("restore: cannot rename %s into place: %s", p->full, strerror(errno));
+            restore_fail(res, p->full, "cannot rename it into place: %s",
+                         strerror(errno));
             batch_discard(b, i);
-            res->failed++;
         } else {
             res->files++;
             res->bytes += p->bytes;
@@ -989,8 +1019,11 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
         char rel[PATH_MAX];
         if (pt_rel(&paths, i, rel, sizeof(rel), 0) != OK) {
-            log_warn("restore: cannot reconstruct the path of node %s", r->rows[i][0]);
-            res.failed++;
+            char what[600];
+            snprintf(what, sizeof(what), "node %s (named '%s')",
+                     r->rows[i][0], r->rows[i][1]);
+            restore_fail(&res, what, "its path cannot be reconstructed: %s",
+                         err_msg()[0] ? err_msg() : "a parent is missing");
             err_clear();
             /* Without a subpath it is in work_total, and it is finished. */
             if (!opts->subpath) matched++;
@@ -1004,8 +1037,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
 
         char full[PATH_MAX];
         if (snprintf(full, sizeof(full), "%s/%s", dest, rel) >= (int)sizeof(full)) {
-            log_warn("restore: destination path too long for %s", rel);
-            res.failed++;
+            restore_fail(&res, rel, "the destination path is too long");
             continue;
         }
 
@@ -1036,15 +1068,14 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          */
         if (ntype == NODE_TYPE_SYMLINK) {
             if (!ltarget || !ltarget[0]) {
-                log_warn("restore: symlink %s has no recorded target, skipping", rel);
-                res.failed++;
+                restore_fail(&res, rel, "symlink has no recorded target");
                 continue;
             }
             if (make_parents(full) != OK) { st = ERR_IO; break; }
             if (opts->overwrite) unlink(full);
             if (symlink(ltarget, full) != 0 && errno != EEXIST) {
-                log_warn("restore: cannot create symlink %s: %s", full, strerror(errno));
-                res.failed++;
+                restore_fail(&res, full, "cannot create symlink: %s",
+                             strerror(errno));
                 continue;
             }
             /* Mode is not applied: a symlink's own permissions are ignored by
@@ -1163,9 +1194,11 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
                 continue;
             }
             if (ntype != NODE_TYPE_REG)
-                log_warn("restore: %s is an unsupported node type %u, skipping",
-                         rel, ntype);
-            res.failed++;
+                restore_fail(&res, rel, "unsupported node type %u", ntype);
+            else
+                restore_fail(&res, rel, "regular file has no content in the "
+                             "snapshot (a backup recorded a file it could not "
+                             "read; B118)");
             continue;
         }
 
@@ -1229,10 +1262,9 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
              * paths return a bare status, and this line used to read
              * "cannot write <path>: " - pointing an operator at a disk that
              * was fine. */
-            log_warn("restore: %s: object %s could not be read or repaired: %s",
-                     full, chash, err_msg()[0] ? err_msg() : status_reason(lst));
+            restore_fail(&res, full, "object %s could not be read or repaired: %s",
+                         chash, err_msg()[0] ? err_msg() : status_reason(lst));
             err_clear();
-            res.failed++;
             continue;
         }
 
@@ -1240,8 +1272,7 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
          * Later members share this inode, so the attributes restore_file
          * set are already theirs; the link() sites need no reapply. */
         if (batch_add(batch, tmp, full, sz, &res) != 0) {
-            log_warn("restore: %s not restored: out of memory", full);
-            res.failed++;
+            restore_fail(&res, full, "out of memory");
             continue;
         }
         if (hgroup != 0) hardlink_remember(&hlinks, hgroup, full);
@@ -1317,10 +1348,12 @@ static status_t restore_run_inner(store_t *store, cutils_db_t *db, int64_t repo_
     if (res.failed)
         return set_error(ERR_CORRUPT,
                          "restore incomplete: %llu entr%s could not be restored "
-                         "(%llu written); see the log for which",
+                         "(%llu written); see the log for %s; first: %s",
                          (unsigned long long)res.failed,
                          res.failed == 1 ? "y" : "ies",
                          (unsigned long long)(res.files + res.dirs + res.symlinks
-                                              + res.hardlinks + res.specials));
+                                              + res.hardlinks + res.specials),
+                         res.failed == 1 ? "it" : "each",
+                         res.first_failure);
     return OK;
 }
