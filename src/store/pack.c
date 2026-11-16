@@ -647,8 +647,9 @@ static size_t parity_window_groups(void)
  * would write a wrong correction with full confidence. A pack file below
  * this size cannot hold enough parity to wrap, so the file size is the test.
  *
- * TODO(OWN-30): switch to the shared parity_fields_fit helper from
- * fix/own30-repair-guard when it lands; this is the equivalent check.
+ * Kept as a cheap first test on every parity lookup, by file size alone.
+ * Repair also asks pack_parity_fields_fit (below), which is exact for the
+ * pack's entry count; both go away when the format bump widens the fields.
  */
 #define PARITY_FIT_LIMIT_DEFAULT \
     ((uint64_t)((UINT64_C(1) << 32) / EP_GROUP_PAR) * (uint64_t)EP_GROUP_DATA)
@@ -660,7 +661,7 @@ void pack_test_set_parity_fit_limit(uint64_t bytes)
                           memory_order_relaxed);
 }
 
-static int parity_fields_fit(uint64_t pack_bytes)
+static int pack_file_parity_fits(uint64_t pack_bytes)
 {
     return pack_bytes < atomic_load_explicit(&parity_fit_limit, memory_order_relaxed);
 }
@@ -668,7 +669,7 @@ static int parity_fields_fit(uint64_t pack_bytes)
 /* Locate a pack entry's parity in the .dat parity trailer: reads the header
  * parity record and the payload CRC, and only finds the RS parity.
  * Returns 0 on success, -1 if parity is unavailable - including for a pack
- * whose 32-bit trailer sizes may have wrapped (parity_fields_fit), so every
+ * whose 32-bit trailer sizes may have wrapped (pack_file_parity_fits), so every
  * reader, repair and copy treats such an entry as having no parity and
  * nothing is ever corrected or written from it. */
 static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *out) {
@@ -683,7 +684,7 @@ static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *ou
 
     off_t file_end = ftello(f);
     if (file_end < 0) return -1;
-    if (!parity_fields_fit((uint64_t)file_end)) {
+    if (!pack_file_parity_fits((uint64_t)file_end)) {
         log_warn("pack: %llu-byte pack is past where its 32-bit parity sizes can be "
                  "trusted; parity not applied (OWN-30)", (unsigned long long)file_end);
         return -1;
@@ -2216,6 +2217,22 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
     return OK;
 }
 
+/*
+ * OWN-30: the pack trailer's size goes into a uint32 footer field and each
+ * entry's block size into another. Past the limit they wrap and repair
+ * refuses the whole pack, so say so when the pack is written. The write
+ * itself goes ahead - design constraint 1 is arbitrary size.
+ */
+static void warn_if_pack_parity_unusable(uint64_t blocks_end, uint32_t packed)
+{
+    uint64_t total = blocks_end + sizeof(packed) + (uint64_t)packed * sizeof(uint64_t)
+                   + sizeof(parity_footer_t);
+    if (total <= parity_trailer_limit()) return;
+    log_warn("pack: parity trailer of %llu bytes (%u entries) is too large for "
+             "32-bit parity fields; parity in this pack cannot be used for repair "
+             "until the format is fixed", (unsigned long long)total, packed);
+}
+
 /* Write parity trailer for a .dat file.  The dat file must be open and
  * seekable; the current position is at the end of data entries.  Reads
  * entries back from the file (still in page cache) to compute parity.
@@ -2376,6 +2393,7 @@ static status_t write_dat_parity(store_t *store, FILE *dat_f,
     }
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -2447,6 +2465,7 @@ static status_t write_dat_parity_precomputed(FILE *dat_f,
         return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_count failed");
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -5328,6 +5347,40 @@ static status_t maybe_coalesce_packs(store_t *store,
 }
 
 /*
+ * OWN-30 stopgap. load_entry_parity finds the trailer through the footer's
+ * uint32 trailer_size, and in a pack whose trailer outgrew it that points
+ * into the wrong bytes - for every entry, not just a large one, since an
+ * old unsealed pack can hold any amount. The bound is taken from the file
+ * size and the larger of the two entry counts, never an entry header,
+ * because a header is what repair may be about to rewrite.
+ *
+ * An unreadable count says nothing about size, so it passes here and
+ * load_entry_parity, which reads the same bytes, refuses on its own terms.
+ */
+int pack_parity_fields_fit(FILE *f)
+{
+    struct stat sb;
+    if (fstat(fileno(f), &sb) != 0) return 1;
+    uint64_t fsize = (uint64_t)sb.st_size;
+    if (fsize <= parity_trailer_limit()) return 1;
+
+    pack_dat_hdr_t dh;
+    uint32_t tail_count = 0;
+    if (pread(fileno(f), &dh, sizeof(dh), 0) != (ssize_t)sizeof(dh) ||
+        pread(fileno(f), &tail_count, sizeof(tail_count), (off_t)(fsize - 16))
+            != (ssize_t)sizeof(tail_count))
+        return 1;
+    uint64_t n = dh.count > tail_count ? dh.count : tail_count;
+
+    return parity_trailer_fits_file(fsize, n,
+        sizeof(pack_dat_hdr_t), sizeof(pack_dat_entry_hdr_t),
+        /* header CRC, entry_count, footer */
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(parity_footer_t),
+        /* header parity, CRC, rs_data_len, block size, offset table slot */
+        sizeof(parity_record_t) + 3 * sizeof(uint32_t) + sizeof(uint64_t));
+}
+
+/*
  * Repair a packed entry in place, from its own parity, in bounded memory.
  *
  * This used to stop at PACK_STREAM_THRESHOLD: past 16 MiB it read the whole
@@ -5377,6 +5430,13 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
 
     FILE *f = fopen(dat_path, "rb");
     if (!f) return -1;
+
+    if (!pack_parity_fields_fit(f)) {
+        log_warn("pack %u: not repaired: pack is " PARITY_TOO_LARGE_REASON,
+                 found.pack_num);
+        fclose(f);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
+    }
 
     entry_parity_t ep;
     if (locate_entry_parity(f, found.entry_index, &ep) != 0) {

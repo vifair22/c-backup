@@ -51,6 +51,27 @@ static void hash_to_path(const uint8_t hash[OBJECT_HASH_SIZE],
     fname[OBJECT_HASH_SIZE * 2 - 2] = '\0';
 }
 
+/* A loose trailer's bytes besides the RS parity: header parity record,
+ * payload CRC, the deprecated rs_data_len and the footer. */
+#define LOOSE_TRAILER_FIXED \
+    (sizeof(parity_record_t) + 2 * sizeof(uint32_t) + sizeof(parity_footer_t))
+_Static_assert(LOOSE_TRAILER_FIXED <= PARITY_TRAILER_FIXED_MAX,
+               "the loose trailer must sit under the shared threshold");
+
+/*
+ * The write is never refused - design constraint 1 is arbitrary size - but
+ * an object whose trailer_size wraps has parity no repair will use, and the
+ * operator should hear that when it is written rather than when it is
+ * damaged. `what` names the writer, since the hash is not always known yet.
+ */
+static void warn_if_parity_unusable(uint64_t stored_size, const char *what)
+{
+    if (parity_fields_fit(stored_size)) return;
+    log_warn("%s: stored size %llu is too large for 32-bit parity fields; "
+             "its parity cannot be used for repair until the format is fixed",
+             what, (unsigned long long)stored_size);
+}
+
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf) {
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
@@ -321,6 +342,7 @@ static status_t write_object(store_t *store, uint8_t type,
     }
 
     size_t rs_sz = rs_parity_size(payload_size);
+    warn_if_parity_unusable(payload_size, "write_object");
     uint8_t *rs_buf = NULL;
     if (rs_sz > 0) {
         rs_buf = malloc(rs_sz);
@@ -1108,6 +1130,7 @@ done:
         }
 
         size_t rs_sz = rs_parity_stream_total(&ps);
+        warn_if_parity_unusable(hdr.compressed_size, "stream");
 
         if (rs_sz > 0) {
             if (rs_parity_stream_replay_fd(&ps, tfd) != 0) {
@@ -1539,6 +1562,7 @@ sp_done:
         return set_error_errno(ERR_IO, "sparse_stream: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "sparse_stream");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "sparse_stream: write rs parity");
@@ -3017,6 +3041,7 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
         return set_error_errno(ERR_IO, "store_fd: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "store_fd");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "store_fd: write rs parity");
@@ -3071,6 +3096,25 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
     return OK;
 }
 
+/*
+ * Whether a header that parity has just reconstructed describes this file.
+ * Parity only promises the bytes match the CRC it recorded; this is the
+ * check that the result is also an object header for these bytes, before
+ * it is written over the old one.
+ */
+static int repaired_header_fits(const object_header_t *h,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint64_t stored_size)
+{
+    return h->magic == OBJECT_MAGIC &&
+           h->version == OBJECT_HDR_VERSION &&
+           (h->compression == COMPRESS_NONE || h->compression == COMPRESS_LZ4 ||
+            h->compression == COMPRESS_LZ4_FRAME) &&
+           (h->encryption == ENCRYPT_NONE || h->encryption == ENCRYPT_CHACHA20) &&
+           h->compressed_size == stored_size &&
+           memcmp(h->hash, hash, OBJECT_HASH_SIZE) == 0;
+}
+
 int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
@@ -3080,37 +3124,79 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     int fd = open(path, O_RDWR);
     if (fd == -1) return -1;  /* not a loose object or not writable */
 
+    /*
+     * The header is read raw, not through read_object_header. Its fields
+     * are what this function may be about to rewrite, so none of them is
+     * allowed to decide whether or where repair looks: a damaged magic,
+     * version or compressed_size used to end the repair before it began,
+     * and a compressed_size that grew past the trailer's start was refused
+     * by the sanity check meant to protect it (OWN-32).
+     */
     object_header_t hdr;
-    if (read_object_header(fd, &hdr) != OK) { err_clear(); close(fd); return -1; }
-    /* Version 1 has no parity to repair from. */
-    if (hdr.version < 2) { close(fd); return 0; }
+    if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) { close(fd); return -1; }
 
-    /* Read parity footer */
+    /* Read parity footer. A file without one (a version 1 object) has no
+     * parity to repair from. */
     parity_footer_t pftr;
     off_t file_end = lseek(fd, 0, SEEK_END);
-    if (file_end < (off_t)sizeof(pftr)) { close(fd); return 0; }
+    if (file_end < (off_t)(sizeof(hdr) + LOOSE_TRAILER_FIXED)) { close(fd); return 0; }
     if (pread(fd, &pftr, sizeof(pftr), file_end - (off_t)sizeof(pftr))
         != (ssize_t)sizeof(pftr) ||
         pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) {
         close(fd); return 0;
     }
 
+    /*
+     * OWN-30 stopgap: past the threshold trailer_size has wrapped, so the
+     * trailer_start computed below points into the wrong bytes and every
+     * "correction" read from there would be written into user data. Judged
+     * from the file size alone, which is exact for one object and does not
+     * depend on a header this function may rewrite.
+     */
+    if (!parity_trailer_fits_file((uint64_t)file_end, 1, sizeof(hdr), 0,
+                                  LOOSE_TRAILER_FIXED, 0)) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        log_warn("object %s: not repaired: %lld-byte file (header claims "
+                 "%llu stored) is " PARITY_TOO_LARGE_REASON, hex,
+                 (long long)file_end, (unsigned long long)hdr.compressed_size);
+        close(fd);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
+    }
+
+    /*
+     * The layout comes from the file size and the footer: the trailer is
+     * the last trailer_size bytes, the payload is everything between the
+     * header and it, and the trailer must then be exactly what a payload of
+     * that size is given. A footer that disagrees is itself damaged, and
+     * nothing located through it is safe to write from.
+     */
     off_t trailer_start = file_end - (off_t)pftr.trailer_size;
-    if (trailer_start < (off_t)(sizeof(hdr) + hdr.compressed_size)) {
+    if (trailer_start < (off_t)sizeof(hdr)) { close(fd); return 0; }
+    uint64_t stored_size = (uint64_t)trailer_start - sizeof(hdr);
+    if ((uint64_t)pftr.trailer_size
+        != LOOSE_TRAILER_FIXED + (uint64_t)rs_parity_size((size_t)stored_size)) {
         close(fd); return 0;
     }
 
     int total_fixed = 0;
 
-    /* Header: XOR parity repair and write back */
+    /* Header: XOR parity repair, written back only when the result is a
+     * header for this file. */
     parity_record_t hdr_par;
     if (pread(fd, &hdr_par, sizeof(hdr_par), trailer_start) == (ssize_t)sizeof(hdr_par)) {
         object_header_t hdr_copy = hdr;
         int hrc = parity_record_check(&hdr_copy, sizeof(hdr_copy), &hdr_par);
         if (hrc == 1) {
-            /* Write corrected header back */
-            if (pwrite(fd, &hdr_copy, sizeof(hdr_copy), 0) == (ssize_t)sizeof(hdr_copy))
-                total_fixed++;
+            if (repaired_header_fits(&hdr_copy, hash, stored_size)) {
+                if (pwrite(fd, &hdr_copy, sizeof(hdr_copy), 0) == (ssize_t)sizeof(hdr_copy))
+                    total_fixed++;
+            } else {
+                char hex[OBJECT_HASH_SIZE * 2 + 1];
+                object_hash_to_hex(hash, hex);
+                log_warn("object %s: header parity produced a header that does "
+                         "not describe the file; header left as it is", hex);
+            }
         }
     }
 
@@ -3125,8 +3211,11 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
      * exactly where it was most needed. Groups are independent, so
      * correcting one at a time costs a 15 KiB buffer whatever the size.
      */
-    if (hdr.compressed_size > 0) {
-        size_t   csize = (size_t)hdr.compressed_size;
+    /* Sized from the file, never from the header: the header may be the
+     * damaged part, and the old code repaired it on disk and then walked
+     * the payload with the damaged copy's length anyway (OWN-32). */
+    if (stored_size > 0) {
+        size_t   csize = (size_t)stored_size;
         size_t   rs_sz = rs_parity_size(csize);
         uint32_t stored_crc = 0;
         off_t crc_off = file_end - (off_t)sizeof(pftr)

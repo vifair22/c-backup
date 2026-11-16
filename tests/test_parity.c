@@ -533,6 +533,95 @@ static void test_parity_shorter_than_data_is_refused(void **state)
     free(data);
 }
 
+/* ---- OWN-30: where the 32-bit size fields wrap ---- */
+
+/* The real trailers, field by field, so the threshold is checked against the
+ * layouts rather than against the constant it was derived from. */
+#define LOOSE_FIXED  (sizeof(parity_record_t) + 4 + 4 + sizeof(parity_footer_t))
+#define ENTRY_FIXED  (sizeof(parity_record_t) + 4 + 4 + 4)
+#define SOLO_FIXED   (4 + ENTRY_FIXED + 8 + 4 + sizeof(parity_footer_t))
+
+static void test_threshold_is_where_the_fields_wrap(void **state)
+{
+    (void)state;
+    parity_fields_set_test_limit(0);
+    const uint64_t max = PARITY_FIELDS_MAX_STORED;
+    assert_int_equal(max, 64156058688ull);
+
+    /* At the threshold every layout still fits a uint32 ... */
+    uint64_t rs = (uint64_t)rs_parity_size((size_t)max);
+    assert_true(rs + LOOSE_FIXED <= UINT32_MAX);
+    assert_true(rs + ENTRY_FIXED <= UINT32_MAX);
+    assert_true(rs + SOLO_FIXED  <= UINT32_MAX);
+    /* ... and one byte more wraps every one of them. */
+    uint64_t rs1 = (uint64_t)rs_parity_size((size_t)(max + 1));
+    assert_true(rs1 + LOOSE_FIXED > UINT32_MAX);
+    assert_true(rs1 + ENTRY_FIXED > UINT32_MAX);
+    assert_true(rs1 + SOLO_FIXED  > UINT32_MAX);
+
+    assert_int_equal(parity_fields_fit(0), 1);
+    assert_int_equal(parity_fields_fit(max), 1);
+    assert_int_equal(parity_fields_fit(max + 1), 0);
+    assert_int_equal(parity_fields_fit(UINT64_MAX / 2), 0);
+}
+
+/* For one entry the file-size bound is the trailer itself, so it agrees with
+ * parity_fields_fit to the byte, header untrusted. */
+static void test_file_bound_is_exact_for_one_object(void **state)
+{
+    (void)state;
+    parity_fields_set_test_limit(0);
+    const uint64_t hdr = 64;
+    const uint64_t sizes[] = {
+        1, 15295, 15296, 15297, 1000000,
+        PARITY_FIELDS_MAX_STORED - 1, PARITY_FIELDS_MAX_STORED,
+        PARITY_FIELDS_MAX_STORED + 1, PARITY_FIELDS_MAX_STORED + 15296,
+    };
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        uint64_t s = sizes[i];
+        uint64_t trailer = LOOSE_FIXED + (uint64_t)rs_parity_size((size_t)s);
+        uint64_t file = hdr + s + trailer;
+        assert_int_equal(parity_trailer_bound(file, 1, hdr, 0, LOOSE_FIXED, 0), trailer);
+        assert_int_equal(parity_trailer_fits_file(file, 1, hdr, 0, LOOSE_FIXED, 0),
+                         parity_fields_fit(s));
+    }
+}
+
+/* With several entries the bound may overstate by up to n - 1 groups but must
+ * never understate, or a wrapped pack would pass. */
+static void test_file_bound_never_understates(void **state)
+{
+    (void)state;
+    uint32_t seed = 12345;
+    for (int trial = 0; trial < 2000; trial++) {
+        uint64_t n = 1 + (uint64_t)(trial % 40);
+        uint64_t body = 12 + 51 * n, trailer = 20 + 280 * n;
+        for (uint64_t e = 0; e < n; e++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            uint64_t c = seed % 200000;
+            body += c;
+            trailer += (uint64_t)rs_parity_size((size_t)c);
+        }
+        uint64_t b = parity_trailer_bound(body + trailer, n, 12, 51, 20, 280);
+        assert_true(b >= trailer);
+        assert_true(b <= trailer + (n - 1) * PARITY_GROUP_PAR);
+    }
+}
+
+/* The test hook moves the threshold to a group boundary and back. */
+static void test_test_limit_moves_the_threshold(void **state)
+{
+    (void)state;
+    parity_fields_set_test_limit(4u * 1024 * 1024);
+    uint64_t edge = ((4u * 1024 * 1024 + PARITY_GROUP_DATA - 1) / PARITY_GROUP_DATA)
+                  * PARITY_GROUP_DATA;
+    assert_int_equal(parity_fields_fit(edge), 1);
+    assert_int_equal(parity_fields_fit(edge + 1), 0);
+    parity_fields_set_test_limit(0);
+    assert_int_equal(parity_trailer_limit(), UINT32_MAX);
+    assert_int_equal(parity_fields_fit(edge + 1), 1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -564,6 +653,10 @@ int main(void)
         cmocka_unit_test(test_record_naming_a_column_past_the_data),
         cmocka_unit_test(test_short_buffer_repair_still_works),
         cmocka_unit_test(test_parity_footer_size),
+        cmocka_unit_test(test_threshold_is_where_the_fields_wrap),
+        cmocka_unit_test(test_file_bound_is_exact_for_one_object),
+        cmocka_unit_test(test_file_bound_never_understates),
+        cmocka_unit_test(test_test_limit_moves_the_threshold),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

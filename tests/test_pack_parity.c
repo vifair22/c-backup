@@ -653,6 +653,152 @@ static void test_damaged_entry_type_byte_is_repaired(void **state)
     assert_true(parity_stats_get().repaired > 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* OWN-30: repair refuses a pack whose 32-bit parity fields may wrap    */
+/* ------------------------------------------------------------------ */
+
+static uint8_t *slurp_pack(size_t *out_len)
+{
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    assert_int_equal(fseeko(f, 0, SEEK_END), 0);
+    off_t len = ftello(f);
+    assert_true(len > 0);
+    rewind(f);
+    uint8_t *buf = malloc((size_t)len);
+    assert_non_null(buf);
+    assert_int_equal(fread(buf, 1, (size_t)len, f), (size_t)len);
+    fclose(f);
+    *out_len = (size_t)len;
+    return buf;
+}
+
+#define TOO_LARGE_BYTES (2u * 1024u * 1024u)
+
+/*
+ * A pack past the threshold must come out of repair byte-for-byte as it
+ * went in: its footer's trailer_size has wrapped, so whatever it would have
+ * written was read from the wrong place. The test hook moves the threshold
+ * under a 2 MiB entry; the same pack with the same damage is then repaired
+ * normally once the real limit is back, which is what shows the refusal is
+ * the guard and not some other failure.
+ */
+static void test_too_large_pack_is_not_repaired(void **state)
+{
+    (void)state;
+    uint8_t *data = malloc(TOO_LARGE_BYTES);
+    assert_non_null(data);
+    fill_random(data, TOO_LARGE_BYTES, 0x0D15EA5Eu);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, TOO_LARGE_BYTES, hash);
+    flip_pack_byte((off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 1000));
+    /* And the header, the other thing repair writes. */
+    flip_pack_byte((off_t)(entry_offset(hash) + 40));
+
+    size_t before_len = 0;
+    uint8_t *before = slurp_pack(&before_len);
+
+    parity_fields_set_test_limit(1024u * 1024u);
+    assert_int_equal(pack_object_repair(store, hash), PARITY_REPAIR_REFUSED_TOO_LARGE);
+    parity_fields_set_test_limit(0);
+
+    size_t after_len = 0;
+    uint8_t *after = slurp_pack(&after_len);
+    assert_int_equal(after_len, before_len);
+    assert_memory_equal(after, before, before_len);
+    free(after);
+
+    /* Below the threshold the same damage is repaired as before. */
+    assert_true(pack_object_repair(store, hash) > 0);
+    pack_cache_invalidate(store);
+    parity_stats_reset();
+    assert_buffered_read_matches(hash, data, TOO_LARGE_BYTES);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+
+    free(before);
+    free(data);
+}
+
+/* The bound the guard uses, against real trailers. */
+static uint64_t pack_bound_of(FILE *f, uint32_t *out_trailer_size)
+{
+    assert_int_equal(fseeko(f, 0, SEEK_END), 0);
+    uint64_t fsize = (uint64_t)ftello(f);
+    parity_footer_t pftr;
+    assert_int_equal(fseeko(f, -(off_t)sizeof(pftr), SEEK_END), 0);
+    assert_int_equal(fread(&pftr, sizeof(pftr), 1, f), 1);
+    pack_dat_hdr_t dh;
+    rewind(f);
+    assert_int_equal(fread(&dh, sizeof(dh), 1, f), 1);
+    *out_trailer_size = pftr.trailer_size;
+    return parity_trailer_bound(fsize, dh.count,
+        sizeof(pack_dat_hdr_t), sizeof(pack_dat_entry_hdr_t),
+        4 + 4 + sizeof(parity_footer_t),
+        sizeof(parity_record_t) + 12 + 8);
+}
+
+/* One entry: the bound is the trailer, so the guard's threshold is exact. */
+static void test_pack_guard_is_exact_for_one_entry(void **state)
+{
+    (void)state;
+    const size_t len = 300000;   /* not a whole number of groups */
+    uint8_t *data = malloc(len);
+    assert_non_null(data);
+    fill_random(data, len, 0x5EED5EEDu);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, len, hash);
+    free(data);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    uint32_t ts = 0;
+    uint64_t b = pack_bound_of(f, &ts);
+    assert_int_equal(b, ts);
+
+    pack_dat_entry_hdr_t eh;
+    assert_int_equal(fseeko(f, (off_t)entry_offset(hash), SEEK_SET), 0);
+    assert_int_equal(fread(&eh, sizeof(eh), 1, f), 1);
+
+    parity_fields_set_test_limit(eh.compressed_size);
+    assert_int_equal(pack_parity_fields_fit(f), 1);
+    parity_fields_set_test_limit(eh.compressed_size - PARITY_GROUP_DATA);
+    assert_int_equal(pack_parity_fields_fit(f), 0);
+    parity_fields_set_test_limit(0);
+    assert_int_equal(pack_parity_fields_fit(f), 1);
+    fclose(f);
+}
+
+/* Several entries: the bound may overstate, never understate. */
+static void test_pack_guard_bound_covers_many_entries(void **state)
+{
+    (void)state;
+    const size_t sizes[] = { 1, 100, 15296, 15297, 40000, 70001, 123457 };
+    uint8_t *data = malloc(123457);
+    assert_non_null(data);
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        uint8_t hash[OBJECT_HASH_SIZE];
+        fill_random(data, sizes[i], 0x1000u + (uint32_t)i);
+        assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, sizes[i], hash), OK);
+    }
+    free(data);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    uint32_t ts = 0;
+    uint64_t b = pack_bound_of(f, &ts);
+    assert_true(b >= ts);
+    assert_true(b <= (uint64_t)ts + 6 * PARITY_GROUP_PAR);
+    fclose(f);
+}
+
 int main(void)
 {
     rs_init();
@@ -672,6 +818,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_entry_header_beyond_file_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stored_writer_refuses_what_no_reader_opens, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_too_large_pack_is_not_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_guard_is_exact_for_one_entry, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_guard_bound_covers_many_entries, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
