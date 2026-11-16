@@ -624,7 +624,11 @@ header`, `uncorrectable parity`, `recoverable` or `repaired`. Parity is
 applied in memory at every object size, so `unrecoverable` means the same
 with repair off as with it on. (Before 1.0 a large streamed object with
 repair off was reported `damaged (run with repair to attempt recovery)`;
-that status is gone.) Each finding also carries:
+that status is gone.) Two more carry the reason repair declined to write:
+`unrecoverable: too large for 32-bit parity fields; repair disabled pending
+format fix` and `recoverable, not written back: ` followed by the same
+reason, for an object or pack past the parity format's size limit (Manual
+section 11). Each finding also carries:
 
 | Field | Meaning |
 |---|---|

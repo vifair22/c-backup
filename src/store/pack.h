@@ -6,6 +6,7 @@
 #include "progress.h"
 #include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
@@ -365,6 +366,13 @@ void pack_test_set_parity_window(size_t groups);
  * such a pack and writes nothing.
  */
 void pack_test_set_parity_fit_limit(uint64_t bytes);
+
+/*
+ * 1 when the pack open on f cannot have a parity trailer whose uint32 size
+ * fields wrapped, 0 when repair must leave it alone (OWN-30). Exposed for
+ * the tests that pin it against real trailers.
+ */
+int pack_parity_fields_fit(FILE *f);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
