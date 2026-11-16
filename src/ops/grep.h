@@ -43,6 +43,11 @@ typedef struct {
 #define GREP_DEFAULT_HITS_PER_FILE 100u
 #define GREP_DEFAULT_MAX_HITS      10000u
 
+/*
+ * The files_* counts are files, meaning paths in the searched scope, not
+ * objects: content held under three names is read once and counts three
+ * times, and a match in it is recorded under all three (B117).
+ */
 typedef struct {
     uint64_t files_scanned;
     /* Not searched: unreadable, damaged beyond parity, failing

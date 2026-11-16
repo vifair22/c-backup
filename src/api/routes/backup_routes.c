@@ -141,6 +141,131 @@ static void backup_job_free(void *p)
     free(j);
 }
 
+/*
+ * The skipped files, appended to the backup's result document as
+ * ,"skipped":[{"path","reason"}...],"skipped_listed":N}. base is the
+ * document so far without its closing brace, files_skipped included. The
+ * list is the result's, already bounded by BACKUP_SKIPPED_LIST_MAX, so the
+ * document never grows with the number skipped; files_skipped is the exact
+ * count. Paths go through cJSON because, unlike every other field here,
+ * they are not numbers. Returns a malloc'd document, or NULL.
+ */
+/* A JSON array, printed: the paths alone, or {"path"} objects. */
+static char *paths_json(char *const *paths, uint32_t n, int as_objects)
+{
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        cJSON *item;
+        if (as_objects) {
+            item = cJSON_CreateObject();
+            if (item && !cJSON_AddStringToObject(item, "path", paths[i])) {
+                cJSON_Delete(item);
+                item = NULL;
+            }
+        } else {
+            item = cJSON_CreateString(paths[i]);
+        }
+        if (!item) { cJSON_Delete(arr); return NULL; }
+        cJSON_AddItemToArray(arr, item);
+    }
+    char *out = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    return out;
+}
+
+static char *with_skipped(const char *base, const backup_result_t *res)
+{
+    /* Changed files (OWN-45) are stored, so they are paths alone; files
+     * that never settled (OWN-45-LIVE) are {"path"} objects. */
+    char *clist = paths_json(res->changed, res->changed_listed, 0);
+    char *ulist = paths_json(res->unsettled, res->unsettled_listed, 1);
+
+    cJSON *arr = cJSON_CreateArray();
+    char *list = NULL;
+    if (arr && clist && ulist) {
+        int ok = 1;
+        for (uint32_t i = 0; ok && i < res->skipped_listed; i++) {
+            cJSON *o = cJSON_CreateObject();
+            if (!o) { ok = 0; break; }
+            cJSON_AddItemToArray(arr, o);
+            if (!cJSON_AddStringToObject(o, "path", res->skipped[i].path) ||
+                !cJSON_AddStringToObject(o, "reason", res->skipped[i].reason))
+                ok = 0;
+        }
+        if (ok) list = cJSON_PrintUnformatted(arr);
+    }
+    cJSON_Delete(arr);
+
+    char *js = NULL;
+    if (list && clist && ulist) {
+        size_t cap = strlen(base) + strlen(list) + strlen(clist) + strlen(ulist) + 256;
+        js = malloc(cap);
+        if (js)
+            snprintf(js, cap, "%s,\"skipped\":%s,\"skipped_listed\":%u,"
+                     "\"files_changed\":%llu,\"changed\":%s,\"changed_listed\":%u,"
+                     "\"changed_unsettled\":%llu,\"unsettled\":%s,"
+                     "\"unsettled_listed\":%u}",
+                     base, list, res->skipped_listed,
+                     (unsigned long long)res->files_changed, clist,
+                     res->changed_listed,
+                     (unsigned long long)res->changed_unsettled, ulist,
+                     res->unsettled_listed);
+    }
+    cJSON_free(list);
+    cJSON_free(clist);
+    cJSON_free(ulist);
+    return js;
+}
+
+/*
+ * What the journal and the alert say about a backup that left files out
+ * (B118) or kept files that never settled (OWN-45-LIVE). Empty when it did
+ * neither: a clean backup journals no message and alerts nobody.
+ */
+void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
+                                   size_t ssz, char *warning, size_t wsz)
+{
+    char skip_s[PATH_MAX * 2 + 128] = "", skip_w[PATH_MAX * 2 + 160] = "";
+    char uns_s[PATH_MAX + 128] = "", uns_w[PATH_MAX + 192] = "";
+    if (res->files_skipped && res->skipped_listed) {
+        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); first: %s: %s",
+                 (unsigned long long)res->files_skipped,
+                 res->skipped[0].path, res->skipped[0].reason);
+        snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
+                 "in snapshot %lld; first: %s: %s",
+                 (unsigned long long)res->files_skipped, (long long)res->snapshot_id,
+                 res->skipped[0].path, res->skipped[0].reason);
+    } else if (res->files_skipped) {
+        snprintf(skip_s, sizeof(skip_s), "%llu skipped (not in the snapshot); see the log",
+                 (unsigned long long)res->files_skipped);
+        snprintf(skip_w, sizeof(skip_w), "%llu file(s) could not be read and are not "
+                 "in snapshot %lld; see the log",
+                 (unsigned long long)res->files_skipped, (long long)res->snapshot_id);
+    }
+    if (res->changed_unsettled && res->unsettled_listed) {
+        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
+                 "torn); first: %s",
+                 (unsigned long long)res->changed_unsettled, res->unsettled[0]);
+        snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
+                 "snapshot %lld as read, flagged as possibly torn; first: %s",
+                 (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id,
+                 res->unsettled[0]);
+    } else if (res->changed_unsettled) {
+        snprintf(uns_s, sizeof(uns_s), "%llu stored while still changing (may be "
+                 "torn); see the log", (unsigned long long)res->changed_unsettled);
+        snprintf(uns_w, sizeof(uns_w), "%llu file(s) were still changing and are in "
+                 "snapshot %lld as read, flagged as possibly torn; see the log",
+                 (unsigned long long)res->changed_unsettled, (long long)res->snapshot_id);
+    }
+    summary[0] = warning[0] = '\0';
+    if (!skip_s[0] && !uns_s[0]) return;
+    snprintf(summary, ssz, "snapshot %lld: %llu files, %s%s%s",
+             (long long)res->snapshot_id, (unsigned long long)res->files,
+             skip_s, skip_s[0] && uns_s[0] ? "; " : "", uns_s);
+    snprintf(warning, wsz, "%s%s%s", skip_w, skip_w[0] && uns_w[0] ? "; " : "", uns_w);
+}
+
 static status_t backup_job_run(void *arg, atomic_int *cancel,
                                void (*progress)(const char *, uint64_t, uint64_t, void *),
                                void *progress_ctx)
@@ -248,7 +373,8 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  "\"trees_new\":%llu,\"trees_reused\":%llu,"
                  "\"store_workers\":%u,"
                  "\"bytes_written\":%llu,"
-                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu}",
+                 "\"bytes_written_pack\":%llu,\"bytes_written_pack_parity\":%llu,"
+                 "\"files_skipped\":%llu",
                  (long long)res.snapshot_id,
                  (unsigned long long)res.files, (unsigned long long)res.dirs,
                  (unsigned long long)res.files_unchanged,
@@ -260,9 +386,37 @@ static status_t backup_job_run(void *arg, atomic_int *cancel,
                  res.store_workers,
                  (unsigned long long)res.written_total,
                  (unsigned long long)w[STORE_WR_PACK],
-                 (unsigned long long)w[STORE_WR_PACK_PARITY]);
-        job_set_result(progress_ctx, rj);
+                 (unsigned long long)w[STORE_WR_PACK_PARITY],
+                 (unsigned long long)res.files_skipped);
+        char *full = with_skipped(rj, &res);
+        if (full) {
+            job_set_result(progress_ctx, full);
+            free(full);
+        } else {
+            /* Out of memory for the list: the counts still go out, and the
+             * log names every skipped file. */
+            size_t n = strlen(rj);
+            if (n + 1 < sizeof(rj)) { rj[n] = '}'; rj[n + 1] = '\0'; }
+            job_set_result(progress_ctx, rj);
+        }
+
+        /* The journal is the permanent record, and a snapshot that lacks
+         * files, or holds files that may be torn, has to say so there too,
+         * not only in a job row deleted after 30 days. And alerted, through
+         * the failure path at warning level: the job did what it could and
+         * stays completed. A clean backup journals no message, as always. */
+        char *summary = malloc(PATH_MAX * 4);
+        char *warning = malloc(PATH_MAX * 4);
+        if (summary && warning) {
+            routes_backup_describe_doubts(&res, summary, PATH_MAX * 4,
+                                          warning, PATH_MAX * 4);
+            if (summary[0]) job_set_summary(progress_ctx, summary);
+            if (warning[0]) job_set_warning(progress_ctx, warning);
+        }
+        free(summary);
+        free(warning);
     }
+    backup_result_free(&res);
 
     free(cpaths);
     free(cexcl);
@@ -306,9 +460,10 @@ api_response_t backup_route_post(const api_request_t *req, int64_t repo_id,
      * about that before anything about the repository's state (B112). */
     if (req->body && req->body_len) {
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             backup_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         if (backup_opts_from_json(body, j, &je) != 0) {
@@ -589,26 +744,36 @@ static const char *jobs_allow_for_url(const char *url, void *ud)
     if (strncmp(url, "/jobs/", 6) != 0) return NULL;
     const char *p = url + 6;
     if (strncmp(p, "stream/", 7) == 0) p += 7;
-    char *end = NULL;
-    long long id = strtoll(p, &end, 10);
-    if (id <= 0 || !end || end == p || *p < '1' || *p > '9') return NULL;
+    int64_t id = 0;
+    const char *end = NULL;
+    if (routes_path_id(p, 1, &id, &end) != 1) return NULL;
     if (*end == '\0') return "GET";
     if (p == url + 6 && strcmp(end, "/cancel") == 0) return "POST";
     return NULL;
 }
 
+/*
+ * The job id in /jobs/<id>[/...], or -1 when that segment is not one. Such
+ * a path was a 404, while /repos/-1 was a 400 "invalid repo id"; both are
+ * a 400 now, in the same words (NIT-8).
+ */
+static int64_t job_path_id(const char *url)
+{
+    int64_t id = 0;
+    return routes_path_id(url + strlen("/jobs/"), 1, &id, NULL) == 1 ? id : -1;
+}
+
 static api_response_t get_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    int64_t id = job_path_id(req->url);
+    if (id < 0) return api_error(400, "invalid job id");
     const char *allow = jobs_allow_for_url(req->url, NULL);
     if (!allow) return api_error(404, "not found");
     if (strcmp(allow, "GET") != 0) return api_method_not_allowed(allow);
-    const char *tail = req->url + strlen("/jobs/");
-    char *end = NULL;
-    long long id = strtoll(tail, &end, 10);
 
     char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%lld", id);
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
     db_result_t *r = NULL;
     if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",
                    (const char *[]){ idbuf, NULL }, &r) != 0 || !r || r->nrows != 1) {
@@ -623,12 +788,11 @@ static api_response_t get_job(const api_request_t *req, void *ud)
 static api_response_t cancel_job(const api_request_t *req, void *ud)
 {
     backup_ctx_t *ctx = ud;
+    int64_t id = job_path_id(req->url);
+    if (id < 0) return api_error(400, "invalid job id");
     const char *allow = jobs_allow_for_url(req->url, NULL);
     if (!allow) return api_error(404, "not found");
     if (strcmp(allow, "POST") != 0) return api_method_not_allowed(allow);
-    const char *tail = req->url + strlen("/jobs/");
-    char *end = NULL;
-    long long id = strtoll(tail, &end, 10);
 
     status_t st = job_cancel(ctx->jm, id);
     if (st != OK) return api_error(404, "job is not running");
@@ -641,7 +805,7 @@ static api_response_t cancel_job(const api_request_t *req, void *ud)
      * landed, and the job's own record says when it stops.
      */
     char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%lld", id);
+    snprintf(idbuf, sizeof(idbuf), "%lld", (long long)id);
     db_result_t *r = NULL;
     cJSON *j = NULL;
     if (db_execute(ctx->db, JOB_COLUMNS " WHERE id = ?",

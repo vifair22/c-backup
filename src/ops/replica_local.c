@@ -379,7 +379,7 @@ static status_t local_put_object(void *vctx, const replica_object_t *obj)
         uint32_t packed = 0;
         status_t st = seal_pack(c, &packed);
         if (st != OK) {
-            char why[256];
+            char why[ERR_MSG_MAX];
             snprintf(why, sizeof(why), "%s", err_msg());
             return set_error(st, "replica: cannot install a full pack in %s: %s",
                              c->root, why);
@@ -464,7 +464,7 @@ static status_t local_commit_snapshot(void *vctx, const replica_snapshot_t *snap
     c->plain_sealed = 0;
     if (pst != OK) {
         /* Copied first: err_msg() is the buffer set_error writes into. */
-        char why[256];
+        char why[ERR_MSG_MAX];
         snprintf(why, sizeof(why), "%s", err_msg());
         return set_error(pst, "replica: cannot install the pack for snapshot %lld "
                          "in %s, so its record was not written: %s",
@@ -695,9 +695,9 @@ status_t replica_sink_local_open(const char *path,
         if (st != OK) { free(c); return st; }
         if (strcmp(m.uuid, source_marker->uuid) != 0) {
             free(c);
-            /* The path last: the message buffer is 256 bytes, and with the
-             * path first a long one cut off the advice, which is the part
-             * that says what to do. */
+            /* The path last, so the advice reads first. The message buffer
+             * was 256 bytes and cut a long path mid-way (B121); it holds a
+             * PATH_MAX path now (ERR_MSG_MAX). */
             return set_error(ERR_INVALID,
                              "replica belongs to repository %s, not %s; to "
                              "copy into a different repository under its own "

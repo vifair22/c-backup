@@ -6,6 +6,7 @@
  */
 
 #include "fault_inject.h"
+#include <limits.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
@@ -175,4 +176,43 @@ int __wrap_rename(const char *from, const char *to) {
         }
     }
     return __real_rename(from, to);
+}
+
+const char *volatile fault_read_eio_path = NULL;
+volatile int fault_read_refused = 0;
+
+const char *volatile fault_read_hook_path = NULL;
+void (*volatile fault_read_hook)(const char *path) = NULL;
+
+/* The hook and the EIO path for one read of fd, whichever call it is: the
+ * 1.0.0 store reads with read(), the format 3 chunker with pread(). Returns
+ * -1 with errno set when the read is to fail. */
+static int fault_read_gate(int fd)
+{
+    const char *hook_path = fault_read_hook_path;
+    void (*hook)(const char *) = fault_read_hook;
+    const char *want = fault_read_eio_path;
+    if (!(hook_path && hook) && !want) return 0;
+    char link[64], target[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(link, target, sizeof(target) - 1);
+    if (len <= 0) return 0;
+    target[len] = '\0';
+    if (hook_path && hook && strcmp(target, hook_path) == 0) hook(target);
+    if (want && strcmp(target, want) == 0) {
+        __atomic_add_fetch(&fault_read_refused, 1, __ATOMIC_SEQ_CST);
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+ssize_t __wrap_read(int fd, void *buf, size_t count) {
+    if (fault_read_gate(fd) != 0) return -1;
+    return __real_read(fd, buf, count);
+}
+
+ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t off) {
+    if (fault_read_gate(fd) != 0) return -1;
+    return __real_pread(fd, buf, count, off);
 }

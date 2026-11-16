@@ -60,7 +60,19 @@ typedef struct {
     uint8_t     acl_hash[OBJECT_HASH_SIZE];
     const char *link_target;            /* symlinks only; NULL otherwise */
     uint16_t    link_target_len;
+    /* MANIFEST_FLAG_*. A property of what was stored under this entry,
+     * never of the snapshot, so the tree stays a function of the content. */
+    uint8_t     flags;
 } manifest_entry_t;
+
+/*
+ * The file never settled while the backup read it (OWN-45-LIVE): it was
+ * still changing on the second read, which is what was stored. Those bytes
+ * may mix two versions of the file, so restore warns and verify notes it.
+ * Regular files only; the only flag there is.
+ */
+#define MANIFEST_FLAG_UNSETTLED 0x01u
+#define MANIFEST_FLAGS_KNOWN    MANIFEST_FLAG_UNSETTLED
 
 /*
  * Directories of any size (OWN-34).

@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include "error.h"
+#include "backup.h"
 
 /*
  * Route registration.
@@ -30,6 +31,15 @@ void routes_repos_set_key_dir(const char *dir);
 /* How strictly backups recognise an unchanged file (file_cache_match_t,
  * from backup.file_cache_match). Set from config at startup. */
 void routes_backup_set_file_cache_match(int mode);
+
+/*
+ * The journal message and the warning alert text for a backup that left
+ * files out (B118) or kept files that never settled (OWN-45-LIVE); both
+ * empty for a clean backup. Exposed for its test; the backup job is the
+ * only caller.
+ */
+void routes_backup_describe_doubts(const backup_result_t *res, char *summary,
+                                   size_t ssz, char *warning, size_t wsz);
 /* Chunk workers per backup (backup.store_workers): 0 automatic, 1 serial.
  * Set from config at startup. */
 void routes_backup_set_store_workers(unsigned n);
@@ -91,6 +101,20 @@ int routes_policy_count(const char *text, int *out);
  */
 int routes_paging(const api_request_t *req, int def_limit, int max_limit,
                   int *limit, int *offset, api_response_t *bad);
+
+/*
+ * An id from the URL path: the segment at p, up to the next '/' or the
+ * end. Returns 1 with *out set and *end just past it when the segment is
+ * decimal digits with a value from min to 2^53; 0 when it is empty; -1 for
+ * anything else - a sign, a fraction, an exponent, letters, or too many
+ * digits - which the caller answers with a 400 "invalid <kind> id".
+ *
+ * Ids were read with strtoll and whatever it made of the segment decided
+ * the route, so /repos/1/snapshots/99999999999999999999 clamped to
+ * LLONG_MAX and was a 405, 1e999 read as 1 followed by junk and was a 404,
+ * and /jobs/-1 was a 404 where /repos/-1 was a 400 (NIT-8).
+ */
+int routes_path_id(const char *p, int64_t min, int64_t *out, const char **end);
 
 /*
  * Can repository repo_id replicate to dest? Refuses a relative dest, and one

@@ -385,6 +385,8 @@ status_t gc_run(store_t *store, cutils_db_t *db, int64_t repo_id,
     res.pack_entries_dropped = dropped;
     res.packs_rewritten      = pstats.packs_rewritten;
     res.packs_deleted        = pstats.packs_deleted;
+    res.packs_coalesced      = pstats.packs_coalesced;
+    res.packs_removed_by_coalesce = pstats.packs_removed_by_coalesce;
     res.pack_entries_damaged = pstats.entries_damaged;
     res.damaged_listed       = pstats.damaged_listed;
     memcpy(res.damaged, pstats.damaged, sizeof(res.damaged));

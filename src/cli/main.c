@@ -49,6 +49,20 @@ static int fail(const char *fmt, ...)
     return 1;
 }
 
+/*
+ * Whitelist the positionals: once a command has taken its options, more
+ * than n arguments left means one it does not take - a stray positional,
+ * or an option it does not know. They used to be ignored, so `grep runs 1
+ * 2` listed repository 1's runs and exited 0 as though 2 meant something
+ * (NIT-8). Returns 1, having said so with the usage, or 0.
+ */
+static int too_many(int argc, char **argv, int n, const char *usage)
+{
+    if (argc <= n) return 0;
+    fail("unexpected argument '%s'; usage: c-backup %s", argv[n], usage);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Text handling                                                       */
 /* ------------------------------------------------------------------ */
@@ -466,6 +480,8 @@ static int cmd_repo(int argc, char **argv)
         if (a < 2)
             return fail("usage: repo add <path> [label] "
                         "[--encrypt system|passphrase|none] [--passphrase TEXT]");
+        if (a > 2 && snapshot_label_check(v[2]) != 0)
+            return fail("%s", SNAPSHOT_LABEL_RULE);
         sbuf_t b = { 0 };
         sb_puts(&b, "{\"path\":");
         sb_json_str(&b, v[1]);
@@ -514,12 +530,14 @@ static int cmd_repo(int argc, char **argv)
 
     if (strcmp(argv[0], "show") == 0) {
         if (argc < 2) return fail("usage: repo show <id>");
+        if (too_many(argc, argv, 2, "repo show <id>")) return 1;
         return get_repo_scoped(argv[1], "", NULL);
     }
 
     if (strcmp(argv[0], "remove") == 0) {
         /* Deregisters. The repository directory stays where it is. */
         if (argc < 2) return fail("usage: repo remove <id>");
+        if (too_many(argc, argv, 2, "repo remove <id>")) return 1;
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/");
         sb_puts(&p, argv[1]);
@@ -619,6 +637,10 @@ static int cmd_snapshots(int argc, char **argv)
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
     if (argc < 1) { free(q.buf); return fail("usage: snapshots <repo-id> [--limit N] [--offset N]"); }
+    if (too_many(argc, argv, 1, "snapshots <repo-id> [--limit N] [--offset N]")) {
+        free(q.buf);
+        return 1;
+    }
     int rc = get_repo_scoped(argv[0], "/snapshots", q.buf);
     free(q.buf);
     return rc;
@@ -682,6 +704,10 @@ static int cmd_ls(int argc, char **argv)
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
     if (argc < 2) { free(q.buf); return fail("usage: ls <repo-id> <snapshot-id> [parent-node-id]"); }
+    if (too_many(argc, argv, 3, "ls <repo-id> <snapshot-id> [parent-node-id]")) {
+        free(q.buf);
+        return 1;
+    }
     sb_puts(&q, q.len ? "&parent=" : "parent=");
     sb_query_val(&q, argc > 2 ? argv[2] : "0");
 
@@ -706,6 +732,10 @@ static int cmd_search(int argc, char **argv)
         free(q.buf);
         return fail("usage: search <repo-id> <query> [--snapshot N] [--limit N]");
     }
+    if (too_many(argc, argv, 2, "search <repo-id> <query> [--snapshot N] [--limit N]")) {
+        free(q.buf);
+        return 1;
+    }
     sb_puts(&q, q.len ? "&q=" : "q=");
     sb_query_val(&q, argv[1]);
 
@@ -721,6 +751,10 @@ static int cmd_diff(int argc, char **argv)
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
     if (argc < 3) { free(q.buf); return fail("usage: diff <repo-id> <from-snapshot> <to-snapshot>"); }
+    if (too_many(argc, argv, 3, "diff <repo-id> <from-snapshot> <to-snapshot>")) {
+        free(q.buf);
+        return 1;
+    }
     sb_puts(&q, q.len ? "&from=" : "from=");
     sb_query_val(&q, argv[1]);
     sb_puts(&q, "&to=");
@@ -751,6 +785,10 @@ static int cmd_grep(int argc, char **argv)
         sbuf_t q = { 0 };
         paging(&argc, argv, &q);
         if (argc < 2) { free(q.buf); return fail("usage: grep runs <repo-id> [--limit N] [--offset N]"); }
+        if (too_many(argc, argv, 2, "grep runs <repo-id> [--limit N] [--offset N]")) {
+            free(q.buf);
+            return 1;
+        }
         int rc = get_repo_scoped(argv[1], "/grep", q.buf);
         free(q.buf);
         return rc;
@@ -761,6 +799,10 @@ static int cmd_grep(int argc, char **argv)
         if (argc < 3) {
             free(q.buf);
             return fail("usage: grep show <repo-id> <run-id> [--limit N] [--offset N]");
+        }
+        if (too_many(argc, argv, 3, "grep show <repo-id> <run-id> [--limit N] [--offset N]")) {
+            free(q.buf);
+            return 1;
         }
         sbuf_t p = { 0 };
         sb_puts(&p, "/grep/"); sb_puts(&p, argv[2]);
@@ -887,6 +929,7 @@ static int cmd_jobs(int argc, char **argv)
 {
     if (argc >= 1 && strcmp(argv[0], "cancel") == 0) {
         if (argc < 2) return fail("usage: jobs cancel <job-id>");
+        if (too_many(argc, argv, 2, "jobs cancel <job-id>")) return 1;
         sbuf_t p = { 0 };
         sb_puts(&p, "/jobs/"); sb_puts(&p, argv[1]); sb_puts(&p, "/cancel");
         return call_path_sb("POST", &p, NULL);
@@ -894,6 +937,7 @@ static int cmd_jobs(int argc, char **argv)
     /* Server-sent progress for a running job: the one command that does not
      * return promptly, by design. */
     if (argc >= 2 && strcmp(argv[0], "watch") == 0) {
+        if (too_many(argc, argv, 2, "jobs watch <job-id>")) return 1;
         sbuf_t p = { 0 };
         sb_puts(&p, "/jobs/stream/"); sb_puts(&p, argv[1]);
         if (p.oom) { free(p.buf); return fail("request path too large"); }
@@ -919,6 +963,10 @@ static int cmd_jobs(int argc, char **argv)
      * read its first 50 (B084 audit). */
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
+    if (too_many(argc, argv, 1, "jobs [--limit N] [--offset N] | jobs <job-id>")) {
+        free(q.buf);
+        return 1;
+    }
     if (argc >= 1) {
         free(q.buf);
         sbuf_t p = { 0 };
@@ -1090,7 +1138,9 @@ static int cmd_verify(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[0], "list") == 0) {
         sbuf_t q = { 0 };
         paging(&argc, argv, &q);
-        int rc = argc >= 2 ? get_repo_scoped(argv[1], "/verify", q.buf)
+        int rc = too_many(argc, argv, 2, "verify list <repo-id> [--limit N] [--offset N]")
+               ? 1
+               : argc >= 2 ? get_repo_scoped(argv[1], "/verify", q.buf)
                            : fail("usage: verify list <repo-id> [--limit N] [--offset N]");
         free(q.buf);
         return rc;
@@ -1103,6 +1153,10 @@ static int cmd_verify(int argc, char **argv)
         if (argc < 3) {
             free(q.buf);
             return fail("usage: verify show <repo-id> <run-id> [--limit N] [--offset N]");
+        }
+        if (too_many(argc, argv, 3, "verify show <repo-id> <run-id> [--limit N] [--offset N]")) {
+            free(q.buf);
+            return 1;
         }
         sbuf_t p = { 0 };
         sb_puts(&p, "/verify/"); sb_puts(&p, argv[2]);
@@ -1182,12 +1236,14 @@ static int cmd_stats(int argc, char **argv)
 static int cmd_summary(int argc, char **argv)
 {
     if (argc < 1) return fail("usage: summary <repo-id>");
+    if (too_many(argc, argv, 1, "summary <repo-id>")) return 1;
     return get_repo_scoped(argv[0], "/summary", NULL);
 }
 
 static int cmd_fanout(int argc, char **argv)
 {
     if (argc < 1) return fail("usage: fanout <repo-id>");
+    if (too_many(argc, argv, 1, "fanout <repo-id>")) return 1;
     return get_repo_scoped(argv[0], "/fanout", NULL);
 }
 
@@ -1198,6 +1254,10 @@ static int cmd_objects(int argc, char **argv)
     paging(&argc, argv, &q);
     if (loc) { sb_puts(&q, q.len ? "&location=" : "location="); sb_query_val(&q, loc); }
     if (argc < 1) { free(q.buf); return fail("usage: objects <repo-id> [--location staged|packed]"); }
+    if (too_many(argc, argv, 1, "objects <repo-id> [--location staged|packed]")) {
+        free(q.buf);
+        return 1;
+    }
     int rc = get_repo_scoped(argv[0], "/objects", q.buf);
     free(q.buf);
     return rc;
@@ -1226,6 +1286,10 @@ static int cmd_packs(int argc, char **argv)
     sbuf_t q = { 0 };
     paging(&argc, argv, &q);
     if (argc < 1) { free(q.buf); return fail("usage: packs <repo-id> [pack-id]"); }
+    if (too_many(argc, argv, 2, "packs <repo-id> [pack-id]")) {
+        free(q.buf);
+        return 1;
+    }
     if (argc >= 2) {
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[0]);
@@ -1243,8 +1307,10 @@ static int cmd_packs(int argc, char **argv)
 static int cmd_policy(int argc, char **argv)
 {
     if (argc < 2) return fail("usage: policy <list|set> <repo-id> [key value]");
-    if (strcmp(argv[0], "list") == 0)
+    if (strcmp(argv[0], "list") == 0) {
+        if (too_many(argc, argv, 2, "policy list <repo-id>")) return 1;
         return get_repo_scoped(argv[1], "/policy", NULL);
+    }
     if (strcmp(argv[0], "set") == 0) {
         if (argc < 4) return fail("usage: policy set <repo-id> <key> <value>");
         sbuf_t b = { 0 };
@@ -1293,6 +1359,7 @@ static int cmd_tag(int argc, char **argv)
 
     if (strcmp(argv[0], "remove") == 0) {
         if (argc < 3) return fail("usage: tag remove <repo-id> <name>");
+        if (too_many(argc, argv, 3, "tag remove <repo-id> <name>")) return 1;
         sbuf_t p = { 0 };
         sb_puts(&p, "/repos/"); sb_puts(&p, argv[1]);
         sb_puts(&p, "/tags/"); sb_path_seg(&p, argv[2]);
@@ -1311,6 +1378,10 @@ static int cmd_journal(int argc, char **argv)
         sb_query_val(&q, result);
     }
     if (argc < 1) { free(q.buf); return fail("usage: journal <repo-id> [--limit N] [--result STATE]"); }
+    if (too_many(argc, argv, 1, "journal <repo-id> [--limit N] [--result STATE]")) {
+        free(q.buf);
+        return 1;
+    }
     int rc = get_repo_scoped(argv[0], "/journal", q.buf);
     free(q.buf);
     return rc;

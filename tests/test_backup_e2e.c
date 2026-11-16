@@ -38,6 +38,8 @@
 #include "object.h"
 #include "repo.h"
 #include "restore.h"
+#include "settle.h"
+#include "verify.h"
 #include "store.h"
 #include "store_index.h"
 #include "test_tmp.h"
@@ -582,6 +584,457 @@ static void test_unreadable_source_fails_but_unreadable_file_does_not(void **sta
     assert_int_equal(chmod(TEST_SRC "/secret.txt", 0600), 0);
     assert_int_equal(st, OK);
     assert_int_equal(res.files, 3);   /* alpha, beta, gamma; not secret */
+    /* B118: counted, named, and not in the snapshot at all. It used to be
+     * in the tree and the index with no content hash, so every full
+     * restore of the snapshot failed. */
+    assert_int_equal(res.files_skipped, 1);
+    assert_int_equal(res.skipped_listed, 1);
+    assert_string_equal(res.skipped[0].path, TEST_SRC "/secret.txt");
+    assert_non_null(strstr(res.skipped[0].reason, "Permission denied"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", "secret.txt"), 0);
+    backup_result_free(&res);
+}
+
+/*
+ * B118: a file that changes between the scan and the store is left out of
+ * the snapshot, counted, and named.
+ *
+ * The race is made deterministic with the progress callback. The store
+ * phase's first report arrives after the scan has listed every entry and
+ * before the first file is opened, so changing the tree there is exactly a
+ * change between scan and store. Before the fix both cases below left the
+ * file in its tree and its index row with no content hash: the backup said
+ * completed, verify passed, and every full restore failed on entries the
+ * log never named. A read that fails partway through is the third way to
+ * skip, and test_backup_skip_fault.c makes one.
+ */
+typedef enum { RACE_DELETE, RACE_TO_DIR } race_t;
+
+typedef struct {
+    race_t      kind;
+    const char *path;
+    int         done;
+} race_ctx_t;
+
+static void race_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    race_ctx_t *r = ctx;
+    if (r->done || strcmp(phase, "store") != 0 || done != 0) return;
+    r->done = 1;
+    switch (r->kind) {
+    case RACE_DELETE:
+        assert_int_equal(unlink(r->path), 0);
+        break;
+    case RACE_TO_DIR:
+        assert_int_equal(unlink(r->path), 0);
+        assert_int_equal(mkdir(r->path, 0700), 0);
+        {
+            char inner[PATH_MAX];
+            snprintf(inner, sizeof(inner), "%s/inside.txt", r->path);
+            write_file(inner, "not part of this backup");
+        }
+        break;
+    }
+}
+
+static int64_t only_snapshot_id(void)
+{
+    return scalar("SELECT MAX(id) FROM snapshots", NULL);
+}
+
+static void expect_left_out(race_t kind, const char *name, const char *reason_has)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), TEST_SRC "/sub/%s", name);
+    /* Large enough to be read rather than inlined anywhere, small enough
+     * for the serial path. */
+    char body[8192];
+    memset(body, 'r', sizeof(body) - 1);
+    body[sizeof(body) - 1] = '\0';
+    write_file(path, body);
+
+    race_ctx_t rc = { kind, path, 0 };
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = race_at_store;
+    o.progress_ctx = &rc;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(rc.done);
+
+    /* The result counts it and names it, with the reason. */
+    assert_int_equal(res.files, 3);
+    assert_int_equal(res.files_skipped, 1);
+    assert_int_equal(res.skipped_listed, 1);
+    assert_string_equal(res.skipped[0].path, path);
+    if (!strstr(res.skipped[0].reason, reason_has))
+        fail_msg("reason '%s' lacks '%s'", res.skipped[0].reason, reason_has);
+
+    /* Not in the index, and no file row anywhere without content. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", name), 0);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE type = 1"
+                            " AND content_hash IS NULL", NULL), 0);
+    assert_int_equal(scalar("SELECT file_count FROM snapshots WHERE id ="
+                            " (SELECT MAX(id) FROM snapshots)", NULL), 3);
+
+    /* Not in the tree: sub's manifest names gamma.txt and nothing else. */
+    char snap[32];
+    snprintf(snap, sizeof(snap), "%lld", (long long)res.snapshot_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db,
+        "SELECT subtree_hash FROM nodes WHERE snap_id = ? AND name = 'sub'",
+        (const char *[]){ snap, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    uint8_t sub_hash[OBJECT_HASH_SIZE];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned v = 0;
+        assert_int_equal(sscanf(r->rows[0][0] + i * 2, "%2x", &v), 1);
+        sub_hash[i] = (uint8_t)v;
+    }
+    db_result_free(r);
+    manifest_entry_t *ents = NULL;
+    uint32_t n = 0;
+    assert_int_equal(manifest_read_tree(store, sub_hash, &ents, &n), OK);
+    assert_int_equal(n, 1);
+    assert_memory_equal(ents[0].name, "gamma.txt", 9);
+    manifest_free_entries(ents, n);
+
+    /* A full restore succeeds, without the file. */
+    char dest[PATH_MAX];
+    snprintf(dest, sizeof(dest), TEST_DIR "/restore-%d", (int)kind);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot_id(), dest, &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    assert_int_equal(rr.files, 3);
+    char gone[PATH_MAX * 2];
+    snprintf(gone, sizeof(gone), "%s" TEST_SRC "/sub/%s", dest, name);
+    struct stat sb;
+    assert_int_not_equal(lstat(gone, &sb), 0);
+
+    /* And verify is clean, at the cheapest level and the deepest. */
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    assert_int_equal(vr.missing, 0);
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    assert_int_equal(vr.missing + vr.unrecoverable, 0);
+    backup_result_free(&res);
+}
+
+static void test_file_deleted_between_scan_and_store_is_left_out(void **state)
+{
+    (void)state;
+    expect_left_out(RACE_DELETE, "doomed.txt", "no longer exists");
+}
+
+static void test_file_replaced_by_a_directory_is_left_out(void **state)
+{
+    (void)state;
+    expect_left_out(RACE_TO_DIR, "becomes-dir.txt", "now a directory");
+}
+
+/*
+ * The bounded list: every skipped file is counted, the first
+ * BACKUP_SKIPPED_LIST_MAX are named.
+ */
+typedef struct { int done; unsigned n; } mass_ctx_t;
+
+static void delete_all_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    mass_ctx_t *m = ctx;
+    if (m->done || strcmp(phase, "store") != 0 || done != 0) return;
+    m->done = 1;
+    for (unsigned i = 0; i < m->n; i++) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), TEST_SRC "/sub/many-%03u", i);
+        assert_int_equal(unlink(p), 0);
+    }
+}
+
+static void test_skipped_list_is_bounded_and_the_count_is_not(void **state)
+{
+    (void)state;
+    mass_ctx_t m = { 0, BACKUP_SKIPPED_LIST_MAX + 20 };
+    for (unsigned i = 0; i < m.n; i++) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), TEST_SRC "/sub/many-%03u", i);
+        write_file(p, "x");
+    }
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = delete_all_at_store;
+    o.progress_ctx = &m;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_int_equal(res.files, 3);
+    assert_int_equal(res.files_skipped, m.n);
+    assert_int_equal(res.skipped_listed, BACKUP_SKIPPED_LIST_MAX);
+    backup_result_free(&res);
+    assert_null(res.skipped);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name LIKE 'many-%'", NULL), 0);
+}
+
+/*
+ * OWN-45: a file whose size changes between the scan and the read is stored
+ * as it is read, never cut to the scan's size and never padded out to it.
+ *
+ * The store read exactly the scan's size. A file that had shrunk came back
+ * with zeros where the file now ended - the sparse probe found a "hole"
+ * there - and one truncated to nothing came back as the scan's size of
+ * zeros. A file that had grown was cut short. Restore produced content the
+ * file never had, and nothing said a word.
+ */
+
+/* Read a whole file into a malloc'd buffer; *len its length. */
+static uint8_t *slurp(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t *buf = NULL;
+    size_t cap = 0, n = 0;
+    for (;;) {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 65536;
+            uint8_t *g = realloc(buf, cap);
+            if (!g) { free(buf); fclose(f); return NULL; }
+            buf = g;
+        }
+        size_t r = fread(buf + n, 1, cap - n, f);
+        n += r;
+        if (r == 0) break;
+    }
+    fclose(f);
+    *len = n;
+    return buf;
+}
+
+/* `n` bytes of `c` at path, replacing what is there. */
+static void write_fill(const char *path, size_t n, char c, const char *mode)
+{
+    FILE *f = fopen(path, mode);
+    assert_non_null(f);
+    char buf[65536];
+    memset(buf, c, sizeof(buf));
+    while (n > 0) {
+        size_t k = n < sizeof(buf) ? n : sizeof(buf);
+        assert_int_equal(fwrite(buf, 1, k, f), k);
+        n -= k;
+    }
+    fclose(f);
+}
+
+typedef enum { TORN_SHRINK, TORN_GROW, TORN_EMPTY } torn_t;
+
+typedef struct {
+    torn_t      kind;
+    const char *path;
+    int         done;
+} torn_ctx_t;
+
+static void torn_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    torn_ctx_t *t = ctx;
+    if (t->done || strcmp(phase, "store") != 0 || done != 0) return;
+    t->done = 1;
+    switch (t->kind) {
+    case TORN_SHRINK: assert_int_equal(truncate(t->path, 3), 0); break;
+    case TORN_GROW:   write_fill(t->path, 4, 'G', "ab");          break;
+    case TORN_EMPTY:  assert_int_equal(truncate(t->path, 0), 0); break;
+    }
+}
+
+/* Restore the newest snapshot and compare one file with what the source
+ * held when it was read, byte for byte. */
+static void expect_restored_as(const char *src_path, const uint8_t *want, size_t want_len,
+                               const char *tag)
+{
+    char dest[PATH_MAX];
+    snprintf(dest, sizeof(dest), TEST_DIR "/restore-%s", tag);
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, only_snapshot_id(), dest, &ro, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    char got_path[PATH_MAX * 2];
+    snprintf(got_path, sizeof(got_path), "%s%s", dest, src_path);
+    size_t got_len = 0;
+    uint8_t *got = slurp(got_path, &got_len);
+    assert_non_null(got);
+    assert_int_equal(got_len, want_len);
+    if (want_len) assert_memory_equal(got, want, want_len);
+    free(got);
+}
+
+static void expect_stored_as_read(torn_t kind, const char *name)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), TEST_SRC "/sub/%s", name);
+    write_fill(path, 8191, 'r', "wb");
+
+    torn_ctx_t tc = { kind, path, 0 };
+    backup_opts_t o = basic_opts();
+    o.progress_cb  = torn_at_store;
+    o.progress_ctx = &tc;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(tc.done);
+
+    /* What the file held when it was read. */
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_non_null(want);
+
+    /* Stored, not skipped, and reported as changed. */
+    assert_int_equal(res.files, 4);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_int_equal(res.changed_listed, 1);
+    assert_string_equal(res.changed[0], path);
+
+    /* The node says the size that was read, not the scan's. */
+    char want_sz[32];
+    snprintf(want_sz, sizeof(want_sz), "%zu", want_len);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT size FROM nodes WHERE name = ?",
+                                (const char *[]){ name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    assert_string_equal(r->rows[0][0], want_sz);
+    db_result_free(r);
+
+    expect_restored_as(path, want, want_len, name);
+    free(want);
+
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    backup_result_free(&res);
+    assert_null(res.changed);
+}
+
+static void test_file_that_shrinks_is_stored_as_read(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_SHRINK, "shrinks.txt");
+}
+
+static void test_file_that_grows_is_stored_as_read(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_GROW, "grows.txt");
+}
+
+static void test_file_truncated_to_nothing_is_stored_empty(void **state)
+{
+    (void)state;
+    expect_stored_as_read(TORN_EMPTY, "emptied.txt");
+}
+
+/*
+ * A file that changes while it is being read. The source is one file, so it
+ * is the last entry and every per-read progress report gets through the
+ * throttle: the first report for it is the loop reaching it, the ones after
+ * are reads inside it. Changing it at a read is a change mid-read.
+ */
+typedef enum { MID_GROW_ONCE, MID_SHRINK_ONCE, MID_KEEPS_CHANGING } mid_t;
+
+typedef struct {
+    mid_t       kind;
+    const char *path;
+    uint64_t    file_index;
+    int         seen;      /* reports for the file so far */
+    int         changes;
+} mid_ctx_t;
+
+static void change_mid_read(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    mid_ctx_t *m = ctx;
+    if (strcmp(phase, "store") != 0 || total == 0 || done + 1 != total) return;
+    if (++m->seen < 2) return;   /* the loop arriving, not a read */
+    if (m->kind != MID_KEEPS_CHANGING && m->changes > 0) return;
+    m->changes++;
+    switch (m->kind) {
+    case MID_GROW_ONCE:      write_fill(m->path, 1 << 20, 'g', "ab");      break;
+    case MID_SHRINK_ONCE:    assert_int_equal(truncate(m->path, 1 << 20), 0); break;
+    case MID_KEEPS_CHANGING: write_fill(m->path, 16, 'k', "ab");          break;
+    }
+}
+
+static void run_mid_read(mid_t kind, backup_result_t *res, const char *path)
+{
+    write_fill(path, (size_t)3 << 20, 'm', "wb");
+    static const char *one[1];
+    one[0] = path;
+    mid_ctx_t m = { kind, path, 0, 0, 0 };
+    backup_opts_t o = basic_opts();
+    o.paths = one;
+    o.n_paths = 1;
+    o.progress_cb  = change_mid_read;
+    o.progress_ctx = &m;
+    assert_int_equal(backup_run(store, db, repo_id, &o, res), OK);
+    assert_true(m.changes >= 1);
+}
+
+static void test_file_that_grows_mid_read_is_read_again(void **state)
+{
+    (void)state;
+    const char *path = TEST_DIR "/mid-grow.bin";
+    backup_result_t res;
+    run_mid_read(MID_GROW_ONCE, &res, path);
+    assert_int_equal(res.files, 1);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    assert_string_equal(res.changed[0], path);
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_int_equal(want_len, (size_t)4 << 20);   /* the second read's version */
+    expect_restored_as(path, want, want_len, "mid-grow");
+    free(want);
+    backup_result_free(&res);
+}
+
+static void test_file_that_shrinks_mid_read_is_read_again(void **state)
+{
+    (void)state;
+    const char *path = TEST_DIR "/mid-shrink.bin";
+    backup_result_t res;
+    run_mid_read(MID_SHRINK_ONCE, &res, path);
+    assert_int_equal(res.files, 1);
+    assert_int_equal(res.files_skipped, 0);
+    assert_int_equal(res.files_changed, 1);
+    size_t want_len = 0;
+    uint8_t *want = slurp(path, &want_len);
+    assert_int_equal(want_len, (size_t)1 << 20);
+    expect_restored_as(path, want, want_len, "mid-shrink");
+    free(want);
+    backup_result_free(&res);
+}
+
+static void test_file_that_keeps_changing_is_left_out(void **state)
+{
+    (void)state;
+    /* backup.unsettled = skip; the default stores it flagged instead
+     * (test_settle_fault). */
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_SKIP);
+    const char *path = TEST_DIR "/mid-busy.bin";
+    backup_result_t res;
+    run_mid_read(MID_KEEPS_CHANGING, &res, path);
+    settle_set_unsettled_policy(SETTLE_UNSETTLED_STORE_FLAGGED);
+    assert_int_equal(res.files, 0);
+    assert_int_equal(res.files_changed, 0);
+    assert_int_equal(res.files_skipped, 1);
+    assert_string_equal(res.skipped[0].path, path);
+    assert_non_null(strstr(res.skipped[0].reason, "again on a second read"));
+    assert_int_equal(scalar("SELECT COUNT(*) FROM nodes WHERE name = ?", "mid-busy.bin"), 0);
+    /* The reads it threw away are recorded objects, so gc can find them;
+     * nothing in the index names bytes the repository does not hold. */
+    verify_result_t vr;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 0,
+                                NULL, NULL, NULL, &vr), OK);
+    backup_result_free(&res);
 }
 
 static int dir_entries(const char *path)
@@ -1401,6 +1854,15 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unreadable_source_fails_but_unreadable_file_does_not, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_past_the_object_bound_round_trips, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_at_the_object_bound_round_trips, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_deleted_between_scan_and_store_is_left_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_replaced_by_a_directory_is_left_out, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_skipped_list_is_bounded_and_the_count_is_not, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_shrinks_is_stored_as_read, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_grows_is_stored_as_read, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_truncated_to_nothing_is_stored_empty, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_grows_mid_read_is_read_again, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_shrinks_mid_read_is_read_again, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_file_that_keeps_changing_is_left_out, setup, teardown),
         cmocka_unit_test_setup_teardown(test_cancel_lands_inside_a_large_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_metadata_write_is_not_held_by_a_slow_batch, setup, teardown),
         cmocka_unit_test_setup_teardown(test_no_waiter_means_no_extra_commits, setup, teardown),

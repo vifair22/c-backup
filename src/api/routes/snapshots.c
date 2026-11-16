@@ -19,6 +19,7 @@
 #include "store_index.h"
 #include "util.h"
 #include "json_row.h"
+#include "node_queries.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
@@ -273,7 +274,7 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
     db_result_t *r = NULL;
     int resident = db_execute(g_ctx.db,
-            "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? LIMIT 1",
+            NODE_SQL_SNAP_RESIDENT,
             (const char *[]){ repo, snap, NULL }, &r) == 0 && r && r->nrows == 1;
     db_result_free(r);
     if (!resident) return -1;
@@ -293,9 +294,7 @@ static int subpath_exists(int64_t repo_id, int64_t snap_id, const char *subpath)
 
         r = NULL;
         if (db_execute(g_ctx.db,
-                "SELECT id FROM nodes"
-                " WHERE repo_id = ? AND snap_id = ? AND parent_node_id = ?"
-                "   AND name = ?",
+                NODE_SQL_PATH_STEP,
                 (const char *[]){ repo, snap, parent, name, NULL }, &r) != 0 ||
             !r || r->nrows < 1) {
             db_result_free(r);
@@ -411,7 +410,7 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
         snprintf(sb, sizeof(sb), "%lld", (long long)snap_id);
         db_result_t *pr = NULL;
         int found = db_execute(g_ctx.db,
-                "SELECT 1 FROM nodes WHERE repo_id = ? AND snap_id = ? AND id = ?",
+                NODE_SQL_DIR_IN_SNAP,
                 (const char *[]){ rb, sb, pidbuf, NULL }, &pr) == 0 && pr && pr->nrows == 1;
         db_result_free(pr);
         if (!found) return api_error(404, "no such directory in this snapshot");
@@ -424,22 +423,9 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
     snprintf(off,  sizeof(off),  "%d", offset);
 
     db_result_t *r = NULL;
-    if (db_execute(g_ctx.db,
-            "SELECT id, name, type, mode, size, mtime_ns / 1000000000,"
-            "       mtime_ns % 1000000000, content_hash,"
-            /* Whether this directory has anything in it. A browser needs it
-             * to decide which rows get an expander, and the alternative is a
-             * round trip per directory to find out it is empty. EXISTS and
-             * not COUNT: this runs once per row returned, and counting the
-             * children of a directory holding 10k files to learn that the
-             * answer is "yes" would turn one page into a full scan. It is an
-             * index seek against nodes_by_snap_parent either way. */
-            "       EXISTS (SELECT 1 FROM nodes c"
-            "                WHERE c.repo_id = n.repo_id AND c.snap_id = n.snap_id"
-            "                  AND c.parent_node_id = n.id)"
-            "  FROM nodes n"
-            " WHERE n.repo_id = ? AND n.snap_id = ? AND n.parent_node_id = ?"
-            " ORDER BY n.name LIMIT ? OFFSET ?",
+    /* nodes_by_snap_parent serves the filter and the name order; see
+     * node_queries.h for why the EXISTS is not a COUNT. */
+    if (db_execute(g_ctx.db, NODE_SQL_LIST_DIR,
             (const char *[]){ repo, snap, parent ? parent : "0", lim, off, NULL },
             &r) != 0) {
         db_result_free(r);
@@ -480,6 +466,9 @@ static api_response_t list_tree(const api_request_t *req, int64_t repo_id,
             { "size", 4, JCOL_INT }, { "mtime", 5, JCOL_INT },
             { "mtime_nsec", 6, JCOL_INT }, { "hash", 7, JCOL_STR_NULL },
             { "has_children", 8, JCOL_BOOL },
+            /* Stored while still changing; the bytes may mix two versions
+             * of the file (OWN-45-LIVE). False for everything else. */
+            { "may_be_torn", 9, JCOL_BOOL },
         };
         int bad = jrow_elem_add_row(&e, cols, JROW_N(cols), r->rows[i]) != 0;
         if (bad) break;
@@ -594,8 +583,7 @@ static const anc_slot_t *anc_get(anc_cache_t *c, int64_t snap_id, int64_t node_i
         snprintf(nid,  sizeof(nid),  "%lld", (long long)node_id);
         db_result_t *r = NULL;
         if (db_execute(c->db,
-                "SELECT name, COALESCE(parent_node_id, 0) FROM nodes"
-                " WHERE repo_id = ? AND id = ?",
+                NODE_SQL_ANCESTOR,
                 (const char *[]){ repo, nid, NULL }, &r) != 0
             || !r || r->nrows != 1) {
             db_result_free(r);
@@ -720,27 +708,10 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
     int rc;
     if (only_snap)
         rc = db_execute(g_ctx.db, oldest_first
-            ? "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid ASC LIMIT ?"
-            : "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-              "       COALESCE(n.content_hash, '')"
-              "  FROM node_fts f"
-              "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-              " WHERE f.repo_id = ? AND f.name MATCH ? AND n.snap_id = ?"
-              " ORDER BY f.rowid DESC LIMIT ?",
+            ? NODE_SQL_SEARCH_SNAP_OLDEST : NODE_SQL_SEARCH_SNAP_NEWEST,
             (const char *[]){ repo, repo, mq, snap, lim, NULL }, &r);
     else
-        rc = db_execute(g_ctx.db,
-            "SELECT f.node_id, f.snap_id, f.name, n.type, n.size,"
-            "       COALESCE(n.content_hash, '')"
-            "  FROM node_fts f"
-            "  JOIN nodes n ON n.repo_id = ? AND n.id = f.node_id"
-            " WHERE f.repo_id = ? AND f.name MATCH ?"
-            " ORDER BY f.rowid DESC LIMIT ?",
+        rc = db_execute(g_ctx.db, NODE_SQL_SEARCH_ALL,
             (const char *[]){ repo, repo, mq, lim, NULL }, &r);
     free(mq);
     if (rc != 0) {
@@ -820,7 +791,8 @@ static api_response_t search_nodes(const api_request_t *req, int64_t repo_id)
                || json_elem_add_str(&e, "path",    paths[hits[k].row] ? paths[hits[k].row] : "") != 0
                || jrow_elem_add(&e, "type", JCOL_INT, row[3]) != 0
                || jrow_elem_add(&e, "size", JCOL_INT, row[4]) != 0
-               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0;
+               || jrow_elem_add(&e, "hash", JCOL_STR_NULL, row[5]) != 0
+               || jrow_elem_add(&e, "may_be_torn", JCOL_BOOL, row[6]) != 0;
         if (bad) break;
         json_elem_commit(&e);
     }
@@ -1100,12 +1072,13 @@ static int64_t repl_snap_at(const void *list, uint32_t i)
 
 static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
 {
-    char js[512];
+    char js[640];
     snprintf(js, sizeof(js),
              "{\"dry_run\":%s,\"reachable\":%llu,\"objects_swept\":%llu,"
              "\"bytes_freed\":%llu,\"pack_entries_kept\":%llu,"
              "\"pack_entries_dropped\":%llu,\"packs_rewritten\":%u,"
-             "\"packs_deleted\":%u,\"tmp_files_removed\":%u,"
+             "\"packs_deleted\":%u,\"packs_coalesced\":%u,"
+             "\"packs_removed_by_coalesce\":%u,\"tmp_files_removed\":%u,"
              "\"tmp_bytes_removed\":%llu,\"content_missing\":%llu",
              dry_run ? "true" : "false",
              (unsigned long long)gr->reachable,
@@ -1114,6 +1087,7 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
              (unsigned long long)gr->pack_entries_kept,
              (unsigned long long)gr->pack_entries_dropped,
              gr->packs_rewritten, gr->packs_deleted,
+             gr->packs_coalesced, gr->packs_removed_by_coalesce,
              gr->tmp_files_removed,
              (unsigned long long)gr->tmp_bytes_removed,
              (unsigned long long)gr->content_missing);
@@ -1137,11 +1111,13 @@ static void gc_report(void *progress_ctx, int dry_run, const gc_result_t *gr)
     else
         snprintf(msg, sizeof(msg),
                  "swept %llu object%s (%llu bytes); %u pack%s rewritten, "
-                 "%u deleted; %u stale temp file%s removed",
+                 "%u deleted, %u coalesced into %u; %u stale temp file%s removed",
                  (unsigned long long)gr->swept, gr->swept == 1 ? "" : "s",
                  (unsigned long long)gr->bytes_freed,
                  gr->packs_rewritten, gr->packs_rewritten == 1 ? "" : "s",
                  gr->packs_deleted,
+                 gr->packs_coalesced,
+                 gr->packs_coalesced - gr->packs_removed_by_coalesce,
                  gr->tmp_files_removed, gr->tmp_files_removed == 1 ? "" : "s");
     if (gr->pack_entries_damaged > 0) {
         size_t n = strlen(msg);
@@ -1300,12 +1276,14 @@ static status_t snap_job_run(void *arg, atomic_int *cancel,
         char rid[32];
         if (vr.run_id > 0) snprintf(rid, sizeof(rid), "%lld", (long long)vr.run_id);
         else               snprintf(rid, sizeof(rid), "null");
-        char vj[160];
+        char vj[224];
         snprintf(vj, sizeof(vj),
-                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s}",
+                 "{\"run_id\":%s,\"level\":\"%s\",\"repair\":%s,\"dry_run\":%s,"
+                 "\"unsettled_files\":%llu}",
                  rid, lvl,
                  j->verify_repair ? "true" : "false",
-                 j->dry_run ? "true" : "false");
+                 j->dry_run ? "true" : "false",
+                 (unsigned long long)vr.unsettled_files);
         job_set_result(progress_ctx, vj);
     } else if (j->kind == SNAP_JOB_REPLICATE) {
         /*
@@ -1487,9 +1465,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "pattern is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /* A field of the wrong type is refused by name. path_prefix and
          * max_files used to be dropped when they were, so the search ran
@@ -1557,9 +1536,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         jreq_err_t je;
         int rc = jreq_str(body, "dest", &j->dest, &je);
@@ -1586,9 +1566,10 @@ static api_response_t submit_snap_job(int64_t repo_id, int64_t snap_id,
             return api_error(400, "dest is required");
         }
         CUTILS_AUTO_JSON_REQ cutils_json_req_t *body = NULL;
-        if (json_req_parse(req->body, req->body_len, &body) != 0) {
+        jreq_err_t pje;
+        if (jreq_parse_body(req->body, req->body_len, &body, &pje) != JREQ_OK) {
             snap_job_free(j);
-            return api_error(400, "invalid JSON");
+            return api_error(400, pje.msg);
         }
         /*
          * Every field is read for its type before any is acted on.
@@ -2038,7 +2019,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     prune_info_t info;
     st = prune_snapshot_checked(store, g_ctx.db, repo_id, snap_id, force, &info);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    char why[512];
+    char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", st == OK ? "" : err_msg());
     store_close(store);
     repo_unlock(repo_id);
@@ -2048,7 +2029,7 @@ api_response_t snapshots_route_delete(const api_request_t *req, int64_t repo_id,
     if (st == ERR_NOT_FOUND) return api_error(404, "no such snapshot");
     if (st == ERR_INVALID && info.ntags > 0) return api_error(409, why);
 
-    char msg[640];
+    char msg[ERR_MSG_MAX + 64];
     if (st != OK) {
         snprintf(msg, sizeof(msg), "snapshot %lld: %s", (long long)snap_id, why);
         journal_record(g_ctx.db, repo_id, "api", "snapshot-delete", "failed", took_ms, msg);

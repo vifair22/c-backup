@@ -105,6 +105,14 @@ static const config_key_t app_file_keys[] = {
       "Unchanged-file detection: auto, strict or relaxed",
       CFG_STORE_FILE, 0 },
 
+    /* A file still changing on the backup's second read of it (OWN-45):
+     * "store" keeps that read and flags the entry as possibly torn, which
+     * restore and verify report; "skip" leaves the file out of the
+     * snapshot. Every store path honours it (src/ops/settle.c). */
+    { "backup.unsettled", CFG_STRING, "store",
+      "A file that never settles while read: store (flagged) or skip",
+      CFG_STORE_FILE, 0 },
+
     /* Chunk workers one backup stores files over 16 MiB on (cdc.h), a
      * quarter of which also cut whole files at once (store_pool.h). 0 sizes
      * them from the CPUs and memory available; 1 stores every chunk on the

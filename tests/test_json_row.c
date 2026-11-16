@@ -21,6 +21,7 @@
 #include <cutils/json.h>
 
 #include "json_row.h"
+#include "routes.h"
 
 /* One element under "a", serialised, so a test compares JSON text. */
 static char *elem_json(const jcol_t *cols, size_t n, char **row)
@@ -429,6 +430,81 @@ static void test_query_numbers(void **state)
     assert_string_equal(e.msg, "parent is out of range; it must be from 0 to 9007199254740992");
 }
 
+/* One body through jreq_parse_body: its verdict, and the message on a BAD. */
+static void expect_body(const char *body, size_t len, int want, const char *msg)
+{
+    cutils_json_req_t *r = (cutils_json_req_t *)(uintptr_t)1;
+    jreq_err_t e;
+    e.msg[0] = '\0';
+    int rc = jreq_parse_body(body, len, &r, &e);
+    assert_int_equal(rc, want);
+    if (want == JREQ_OK) {
+        assert_non_null(r);
+        json_req_free(r);
+    } else {
+        assert_null(r);
+        assert_string_equal(e.msg, msg);
+    }
+}
+
+#define BODY(s) s, sizeof(s) - 1
+
+/* B115: a string holding a NUL is refused before cJSON cuts it short. */
+static void test_body_nul(void **state)
+{
+    (void)state;
+    const char *rule = "label must be at most 256 bytes of printable text";
+    expect_body(BODY("{\"label\":\"nul\\u0000here\"}"), JREQ_BAD, rule);
+    expect_body(BODY("{\"label\":\"x\\U0000\"}"), JREQ_BAD, "invalid JSON"); /* not an escape */
+    expect_body(BODY("{\"params\":{\"label\":\"a\\u0000\"}}"), JREQ_BAD, rule);
+    expect_body(BODY("{\"paths\":[\"/a\",\"/b\\u0000c\"]}"), JREQ_BAD,
+                "paths must not contain a NUL character");
+    expect_body(BODY("{\"a\":{\"b\":1},\"note\":\"x\\u0000\"}"), JREQ_BAD,
+                "note must not contain a NUL character");
+    expect_body(BODY("{\"trigger\":{\"type\":\"calendar\",\"at\":\"\\u0000\"}}"),
+                JREQ_BAD, "at must not contain a NUL character");
+    expect_body(BODY("{\"a\\u0000b\":1}"), JREQ_BAD,
+                "a member name must not contain a NUL character");
+    expect_body(BODY("[\"\\u0000\"]"), JREQ_BAD,
+                "a string must not contain a NUL character");
+    /* A raw NUL inside a string is the same thing, unescaped. */
+    expect_body(BODY("{\"label\":\"a\0b\"}"), JREQ_BAD, rule);
+    /* An escaped backslash followed by u0000 is text, not a NUL. */
+    expect_body(BODY("{\"label\":\"a\\\\u0000\"}"), JREQ_OK, NULL);
+    /* A NUL among other escapes is found; other escapes pass. */
+    expect_body(BODY("{\"label\":\"\\u0001\\u0100\\\"\\u00000\"}"), JREQ_BAD, rule);
+    expect_body(BODY("{\"label\":\"\\u0010\\\"q\"}"), JREQ_OK, NULL);
+    /* Malformed JSON is still the parser's to refuse. */
+    expect_body(BODY("{\"label\":"), JREQ_BAD, "invalid JSON");
+    expect_body(BODY("{\"a\":1}x"), JREQ_BAD, "invalid JSON");
+    expect_body(BODY("{\"a\":1}\0"), JREQ_BAD, "invalid JSON");
+    /* NIT-8: a repeated key is named, in one wording for every route. */
+    expect_body(BODY("{\"a\":1,\"a\":2}"), JREQ_BAD,
+                "invalid JSON: duplicate key 'a' at the top level");
+}
+
+/* NIT-8: a path id is digits up to the next slash, from min to 2^53. */
+static void test_path_ids(void **state)
+{
+    (void)state;
+    int64_t v = -7;
+    const char *end = NULL;
+    assert_int_equal(routes_path_id("42/tree", 1, &v, &end), 1);
+    assert_int_equal(v, 42);
+    assert_string_equal(end, "/tree");
+    assert_int_equal(routes_path_id("9007199254740992", 1, &v, &end), 1);
+    assert_int_equal(v, (int64_t)1 << 53);
+    assert_int_equal(routes_path_id("0", 0, &v, NULL), 1);
+    assert_int_equal(v, 0);
+    assert_int_equal(routes_path_id("", 1, &v, NULL), 0);
+    assert_int_equal(routes_path_id("/x", 1, &v, NULL), 0);
+    static const char *bad[] = { "0", "-1", "+1", "1e999", "1.5", "abc", "1a",
+                                 "9007199254740993", "99999999999999999999",
+                                 "123456789012345678901234567890" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        assert_int_equal(routes_path_id(bad[i], 1, &v, NULL), -1);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -448,6 +524,8 @@ int main(void)
         cmocka_unit_test(test_request_wide_ints),
         cmocka_unit_test(test_request_string_lists),
         cmocka_unit_test(test_query_numbers),
+        cmocka_unit_test(test_body_nul),
+        cmocka_unit_test(test_path_ids),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

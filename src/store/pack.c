@@ -3456,9 +3456,15 @@ static status_t maybe_coalesce_packs(store_t *store, gc_live_t *live,
     rc = pack_rw_replace(&rw, old_nums, n_cand, &base, &packs_written);
     pack_rw_free(&rw);
     free(old_nums);
-    if (rc == OK)
+    if (rc == OK) {
         log_info("pack-coalesce: merged %zu pack(s) into %zu pack(s) (%u objects)",
                  n_cand, packs_written, total_live);
+        if (stats) {
+            stats->packs_coalesced += (uint32_t)n_cand;
+            if (n_cand > packs_written)
+                stats->packs_removed_by_coalesce += (uint32_t)(n_cand - packs_written);
+        }
+    }
     free(cand);
     return rc;
 }

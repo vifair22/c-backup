@@ -24,11 +24,13 @@
 #include <cutils/config.h>
 #include <cutils/db.h>
 #include <cutils/log.h>
+#include <cutils/push.h>
 #include <cutils/version.h>
 
 #include "app_config.h"
 #include "auth.h"
 #include "file_cache.h"
+#include "settle.h"
 #include "index_reconcile.h"
 #include "job_manager.h"
 #include "lock.h"
@@ -259,6 +261,13 @@ int main(int argc, char *argv[])
         appguard_shutdown(guard);
         return 1;
     }
+    /* The same test push_init makes before it starts its worker: without
+     * both, push_send drops every message. */
+    {
+        const char *tok = config_get_str(cfg, PUSH_CONFIG_TOKEN);
+        const char *usr = config_get_str(cfg, PUSH_CONFIG_USER);
+        job_manager_set_alerts(jm, tok && tok[0] && usr && usr[0]);
+    }
 
     /*
      * The scheduler submits work through the job manager rather than running
@@ -313,6 +322,14 @@ int main(int argc, char *argv[])
             log_info("backup.store_workers: %d", sw);
         if (mode != FILE_CACHE_MATCH_AUTO)
             log_info("backup.file_cache_match: %s", m);
+
+        /* Refused at config init unless store or skip; every store path
+         * reads it through settle_store_fd. */
+        const char *u = config_get_str(cfg, "backup.unsettled");
+        int up = settle_unsettled_parse(u);
+        settle_set_unsettled_policy(up < 0 ? SETTLE_UNSETTLED_STORE_FLAGGED
+                                           : (settle_unsettled_policy_t)up);
+        log_info("backup.unsettled: %s", up == SETTLE_UNSETTLED_SKIP ? "skip" : "store");
     }
     routes_repos_set_key_dir(config_get_str(cfg, "security.key_dir"));
     routes_snapshots_init(db, jm);
