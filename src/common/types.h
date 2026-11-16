@@ -30,6 +30,20 @@
 #define OBJECT_TYPE_CHUNKLIST 6
 
 /*
+ * Every object header reader refuses a type outside 1-5 (OWN-39). A reader
+ * that passed the byte through let restore treat any non-sparse object as
+ * raw file bytes, so a type this build does not know would have been
+ * written out as a file's content. A new type is a format change, and an
+ * older build has to say so rather than guess.
+ */
+static inline int object_type_known(unsigned type)
+{
+    return type >= OBJECT_TYPE_FILE && type <= OBJECT_TYPE_TREE;
+}
+#define OBJECT_TYPE_UNKNOWN_FMT \
+    "object type %u is not known to this build; written by a newer c-backup?"
+
+/*
  * Metadata blob wire formats. Both blobs are stored as content-addressed
  * objects whose hashes land in manifest trees, so their bytes are part of the
  * determinism contract: explicit little-endian lengths, deterministic entry

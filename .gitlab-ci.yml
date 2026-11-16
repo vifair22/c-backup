@@ -20,6 +20,13 @@ variables:
   # dies on an illegal instruction, so CI builds to the portable floor.
   MARCH: x86-64-v2
   MTUNE: generic
+  # Every suite's scratch, in the job's own directory so it goes when the
+  # job does. The test, coverage and fuzz targets run each suite under
+  # tests/scratch-guard.sh, which fails the suite that holds more than the
+  # budget at once: jobs on one runner share its disk, and a single test
+  # writing a sparse fixture out densely once filled it for all of them.
+  C_BACKUP_TEST_DIR: $CI_PROJECT_DIR/build/test-scratch
+  C_BACKUP_SCRATCH_BUDGET: 10G
 
 .debian_deps: &debian_deps
   - apt-get update -qq
@@ -40,6 +47,9 @@ variables:
 
 test:
   stage: test
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
@@ -50,6 +60,7 @@ test:
     # Find somewhere the sparse fixtures can have real holes. Sourced, not
     # run: it exports the directory the suites read. Never fails the job -
     # if nothing here supports holes the suites skip, exactly as before.
+    - mkdir -p "$C_BACKUP_TEST_DIR"
     - . tests/ci-sparse-fs.sh
     # Unit suites, then the two shell suites. The shell ones drive a real
     # daemon over HTTP and the CLI over its socket, which is the only way to
@@ -88,6 +99,9 @@ analyze:
 # run the parsers against bytes nobody intended.
 fuzz:
   stage: analyze
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
@@ -102,6 +116,7 @@ fuzz:
     # Without this fuzz_sparse_write returns at its first line, and spends
     # its whole budget doing so: 23 million no-op executions in the run that
     # measured it, against 63 a second when it has somewhere to work.
+    - mkdir -p "$C_BACKUP_TEST_DIR"
     - . tests/ci-sparse-fs.sh
     # The gate. Any crash, timeout or sanitizer report on a known input fails
     # the pipeline.
@@ -174,6 +189,9 @@ ui:
 # list by hand to find out whether the app works.
 ui-e2e:
   stage: analyze
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: node:24-trixie-slim
   tags: [docker]
   needs:
@@ -214,6 +232,9 @@ ui-e2e:
 
 coverage:
   stage: coverage
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
@@ -223,6 +244,7 @@ coverage:
     # Same as the test job: this one builds and runs its own binaries, so
     # without it the sparse suites skip here and the figure the gate reads
     # is missing everything they cover.
+    - mkdir -p "$C_BACKUP_TEST_DIR"
     - . tests/ci-sparse-fs.sh
     - make coverage
   coverage: '/^lines:\s*(\d+\.\d+)%/'

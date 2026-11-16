@@ -21,10 +21,11 @@
 
 #include <cutils/db.h>
 #include <cutils/error.h>
+#include "test_tmp.h"
 
 extern const db_migration_t app_migrations[];
 
-#define TEST_DB "/tmp/c_backup_test_schema.db"
+#define TEST_DB TEST_TMP "/c_backup_test_schema.db"
 
 static void unlink_db(void)
 {

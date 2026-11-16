@@ -28,9 +28,10 @@
 #include <cmocka.h>
 
 #include "server.h"
+#include "test_tmp.h"
 
 #define TEST_PORT  18731
-#define TEST_SOCK  "/tmp/c_backup_test_server.sock"
+#define TEST_SOCK  TEST_TMP "/c_backup_test_server.sock"
 
 /* 1 if something accepts a TCP connection on addr:port (host byte order). */
 static int tcp_listening_on(uint32_t addr, int port)

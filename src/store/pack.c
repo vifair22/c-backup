@@ -92,7 +92,8 @@ typedef struct {
  * to spare. The packs this is actually for are the trailing partial one each
  * backup leaves behind, which is nowhere near the cap.
  */
-#define PACK_COALESCE_SMALL_BYTES    (PACK_MAX_MULTI_BYTES / 4)
+#define PACK_COALESCE_SMALL_DIV      4u
+#define PACK_COALESCE_SMALL_BYTES    (pack_seal_bytes() / PACK_COALESCE_SMALL_DIV)
 /* Do not rewrite unless the merge removes at least this many pack files. */
 #define PACK_COALESCE_MIN_REDUCTION  2u
 #define PACK_COALESCE_MIN_SMALL      8u
@@ -112,7 +113,7 @@ typedef struct {
  * merges full packs into full packs forever. Cheap to get wrong again by
  * tuning one constant, so state it where the compiler checks it.
  */
-_Static_assert(PACK_COALESCE_SMALL_BYTES < PACK_MAX_MULTI_BYTES,
+_Static_assert(PACK_MAX_MULTI_BYTES / PACK_COALESCE_SMALL_DIV < PACK_MAX_MULTI_BYTES,
                "coalesce smallness must be below the pack seal size");
 
 /* Sweeper intelligence constants */
@@ -362,8 +363,19 @@ static uint32_t next_pack_num(store_t *store) {
  * and whose inode is hot. The alternative is threading a file size through
  * every caller, and a caller that forgets is silently unchecked again.
  */
-static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
+#define ENTRY_HDR_UNKNOWN_TYPE (-2)
+
+static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out, int check_type) {
     if (fread(out, sizeof(*out), 1, f) != 1) return -1;
+
+    /* The one refusal with its own message: "bad entry header" would send
+     * an operator looking for damage when the pack is simply newer than
+     * this build (OWN-39). Callers keep this message rather than writing
+     * their own over it; see entry_hdr_error. */
+    if (check_type && !object_type_known(out->type)) {
+        set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, out->type);
+        return ENTRY_HDR_UNKNOWN_TYPE;
+    }
 
     if (out->compression != COMPRESS_NONE && out->compression != COMPRESS_LZ4 &&
         out->compression != COMPRESS_LZ4_FRAME)
@@ -381,6 +393,14 @@ static int read_entry_hdr(FILE *f, pack_dat_entry_hdr_t *out) {
 
     return 0;
 }
+
+/*
+ * The status for a failed read_entry_hdr: its own message when it refused
+ * an unknown type, otherwise the caller's. A macro so the caller's format
+ * and arguments reach set_error unchanged.
+ */
+#define entry_hdr_error(rc, ...) \
+    ((rc) == ENTRY_HDR_UNKNOWN_TYPE ? ERR_CORRUPT : set_error(ERR_CORRUPT, __VA_ARGS__))
 
 /* write_full_fd: uses io_write_full from util.h */
 #define write_full_fd io_write_full
@@ -538,9 +558,10 @@ status_t pack_object_physical_size(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
+    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    if (ehrc != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
+        return entry_hdr_error(ehrc, "pack_object_physical_size: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
     *out_bytes = (uint64_t)sizeof(pack_dat_entry_hdr_t) + ehdr.compressed_size;
@@ -562,8 +583,9 @@ status_t pack_object_get_info(store_t *store,
         fclose(f); return set_error_errno(ERR_IO, "pack_object_get_info: fseeko pack-%08u.dat", found.pack_num);
     }
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
+    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    if (ehrc != 0) {
+        fclose(f); return entry_hdr_error(ehrc, "pack_object_get_info: bad entry header in pack-%08u.dat", found.pack_num);
     }
     dat_return_or_close(store, found.pack_num, f);
 
@@ -574,18 +596,314 @@ status_t pack_object_get_info(store_t *store,
 }
 
 /*
+ * Where one entry's parity sits in its pack's trailer, without the parity.
+ *
+ * The RS parity for an entry is 1 KiB per 15 KiB group, 6.7% of what it
+ * protects: 3.3 GiB for a 50 GiB entry. It used to be read whole into one
+ * malloc on every read of a packed entry - even by the in-memory reader,
+ * which then found the entry too large for it and threw the buffer away -
+ * which is design constraint 2 broken one level below the payload. Readers
+ * now record where the parity is and fetch it a window of groups at a time,
+ * so what a read holds is fixed by the window, not by the entry.
+ */
+typedef struct {
+    parity_record_t hdr_par;
+    uint32_t        payload_crc;
+    off_t           rs_off;         /* absolute offset of the RS parity */
+    uint64_t        rs_sz;          /* its length, as the trailer bounds it */
+    off_t           trailer_start;  /* no payload may run past this */
+} entry_parity_t;
+
+#define EP_GROUP_DATA ((size_t)RS_K * RS_INTERLEAVE)   /* 15,296 */
+#define EP_GROUP_PAR  ((size_t)RS_2T * RS_INTERLEAVE)  /* 1,024 */
+
+/*
+ * Groups per parity window. The default makes the data window the 16 MiB the
+ * streaming readers already used as a read buffer (1,096 groups: 16.0 MiB of
+ * data, 1.07 MiB of parity), so a clean read does the I/O it always did. A
+ * test lowers it so an entry of a few MiB spans many windows and the bound
+ * can be measured; nothing else changes it.
+ */
+#define PARITY_WINDOW_GROUPS_DEFAULT \
+    ((size_t)(PACK_STREAM_THRESHOLD / EP_GROUP_DATA))
+static _Atomic size_t parity_window_groups_cfg = PARITY_WINDOW_GROUPS_DEFAULT;
+
+/* The seal every writer rolls over at; see pack_test_set_seal. */
+static _Atomic uint64_t pack_seal_cfg = PACK_MAX_MULTI_BYTES;
+
+void pack_test_set_seal(uint64_t bytes)
+{
+    atomic_store_explicit(&pack_seal_cfg, bytes ? bytes : PACK_MAX_MULTI_BYTES,
+                          memory_order_relaxed);
+}
+
+uint64_t pack_seal_bytes(void)
+{
+    return atomic_load_explicit(&pack_seal_cfg, memory_order_relaxed);
+}
+
+void pack_test_set_parity_window(size_t groups)
+{
+    atomic_store_explicit(&parity_window_groups_cfg,
+                          groups ? groups : PARITY_WINDOW_GROUPS_DEFAULT,
+                          memory_order_relaxed);
+}
+
+static size_t parity_window_groups(void)
+{
+    return atomic_load_explicit(&parity_window_groups_cfg, memory_order_relaxed);
+}
+
+/*
+ * OWN-30: the footer's trailer_size and each block's entry_parity_size are
+ * uint32. Parity is 1,024 bytes per 15,296, so they wrap once the parity
+ * reaches 4 GiB, at about 59.75 GiB of stored data, and a trailer located
+ * through a wrapped size is somebody else's bytes. Correcting from those
+ * would write a wrong correction with full confidence. A pack file below
+ * this size cannot hold enough parity to wrap, so the file size is the test.
+ *
+ * Kept as a cheap first test on every parity lookup, by file size alone.
+ * Repair also asks pack_parity_fields_fit (below), which is exact for the
+ * pack's entry count; both go away when the format bump widens the fields.
+ */
+#define PARITY_FIT_LIMIT_DEFAULT \
+    ((uint64_t)((UINT64_C(1) << 32) / EP_GROUP_PAR) * (uint64_t)EP_GROUP_DATA)
+static _Atomic uint64_t parity_fit_limit = PARITY_FIT_LIMIT_DEFAULT;
+
+void pack_test_set_parity_fit_limit(uint64_t bytes)
+{
+    atomic_store_explicit(&parity_fit_limit, bytes ? bytes : PARITY_FIT_LIMIT_DEFAULT,
+                          memory_order_relaxed);
+}
+
+static int pack_file_parity_fits(uint64_t pack_bytes)
+{
+    return pack_bytes < atomic_load_explicit(&parity_fit_limit, memory_order_relaxed);
+}
+
+/* Locate a pack entry's parity in the .dat parity trailer: reads the header
+ * parity record and the payload CRC, and only finds the RS parity.
+ * Returns 0 on success, -1 if parity is unavailable - including for a pack
+ * whose 32-bit trailer sizes may have wrapped (pack_file_parity_fits), so every
+ * reader, repair and copy treats such an entry as having no parity and
+ * nothing is ever corrected or written from it. */
+static int locate_entry_parity(FILE *f, uint32_t entry_index, entry_parity_t *out) {
+    if (entry_index == UINT32_MAX) return -1;
+    memset(out, 0, sizeof(*out));
+
+    /* Read parity footer (last 12 bytes of file) */
+    if (fseeko(f, -(off_t)sizeof(parity_footer_t), SEEK_END) != 0) return -1;
+    parity_footer_t pftr;
+    if (fread(&pftr, sizeof(pftr), 1, f) != 1) return -1;
+    if (pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) return -1;
+
+    off_t file_end = ftello(f);
+    if (file_end < 0) return -1;
+    if (!pack_file_parity_fits((uint64_t)file_end)) {
+        log_warn("pack: %llu-byte pack is past where its 32-bit parity sizes can be "
+                 "trusted; parity not applied (OWN-30)", (unsigned long long)file_end);
+        return -1;
+    }
+    off_t trailer_start = file_end - (off_t)pftr.trailer_size;
+    if (trailer_start < 0) return -1;
+
+    /* Trailer tail layout (after per-entry parity blocks):
+     *   entry_parity_offsets[N](8*N) + entry_count(4) + footer(12)
+     * entry_count is at the fixed position file_end - 16. */
+    uint32_t entry_count = 0;
+    off_t ec_pos = file_end - 16;
+    if (ec_pos < trailer_start) return -1;
+    if (fseeko(f, ec_pos, SEEK_SET) != 0) return -1;
+    if (fread(&entry_count, sizeof(entry_count), 1, f) != 1) return -1;
+    if (entry_count > 10000000u) return -1;
+
+    if (entry_index >= entry_count) return -1;
+
+    /* Read entry_parity_offsets[entry_index]; the offsets table ends at ec_pos */
+    off_t offsets_start = ec_pos - (off_t)entry_count * 8;
+    if (offsets_start < trailer_start) return -1;
+    if (fseeko(f, offsets_start + (off_t)entry_index * 8, SEEK_SET) != 0) return -1;
+    uint64_t entry_par_offset = 0;
+    if (fread(&entry_par_offset, sizeof(entry_par_offset), 1, f) != 1) return -1;
+
+    /*
+     * Every parity block lives between the start of the trailer and the
+     * start of the offsets table, so that span bounds both the offset and
+     * the block size below.
+     *
+     * Bounding it is not belt and braces. block_size used to be the plain
+     * difference of two offsets read out of the file, and a next_offset
+     * below entry_par_offset wrapped it to just under 4 GiB, which the
+     * reader then handed to malloc. A fuzzer reached it from a corrupt
+     * trailer in four minutes; on a real repository it is a bad sector in
+     * an offsets table turning a scrub into an out-of-memory kill. Nothing
+     * mallocs the block any more, but every window read is still placed by
+     * these numbers.
+     */
+    uint64_t blocks_len = (uint64_t)(offsets_start - trailer_start);
+    if (entry_par_offset >= blocks_len) return -1;
+
+    /* Seek to this entry's parity block */
+    off_t par_pos = trailer_start + (off_t)entry_par_offset;
+    if (fseeko(f, par_pos, SEEK_SET) != 0) return -1;
+
+    /* Read XOR header parity */
+    if (fread(&out->hdr_par, sizeof(out->hdr_par), 1, f) != 1) return -1;
+
+    /* Compute block size from next entry's offset or entry_count position.
+     * Block layout: hdr_parity(260) + rs_parity(var) + crc(4) + len(4) + size(4) */
+    uint64_t block_end;
+    if (entry_index + 1 < entry_count) {
+        uint64_t next_offset = 0;
+        if (fseeko(f, offsets_start + (off_t)(entry_index + 1) * 8, SEEK_SET) != 0) return -1;
+        if (fread(&next_offset, sizeof(next_offset), 1, f) != 1) return -1;
+        block_end = next_offset;
+    } else {
+        /* Last entry: block ends where offsets table begins */
+        block_end = blocks_len;
+    }
+    if (block_end <= entry_par_offset || block_end > blocks_len) return -1;
+
+    uint64_t block_size = block_end - entry_par_offset;
+    if (block_size < sizeof(parity_record_t) + 12) return -1;
+
+    out->rs_off        = par_pos + (off_t)sizeof(parity_record_t);
+    out->rs_sz         = block_size - sizeof(parity_record_t) - 12;
+    out->trailer_start = trailer_start;
+
+    /* Read payload_crc; the deprecated rs_data_len after it is ignored.
+     * Layout at block_size - 12: payload_crc(4) + rs_data_len_dep(4, ignored)
+     * + entry_parity_size(4, computed from offsets). */
+    if (fseeko(f, par_pos + (off_t)(block_size - 12), SEEK_SET) != 0) return -1;
+    if (fread(&out->payload_crc, sizeof(out->payload_crc), 1, f) != 1) return -1;
+
+    return 0;
+}
+
+static int pread_full(int fd, void *buf, size_t n, off_t off)
+{
+    uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t r = pread(fd, p, n, off);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) { errno = EIO; return -1; }
+        p += r; n -= (size_t)r; off += r;
+    }
+    return 0;
+}
+
+static int pwrite_full(int fd, const void *buf, size_t n, off_t off)
+{
+    const uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t r = pwrite(fd, p, n, off);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) { errno = EIO; return -1; }
+        p += r; n -= (size_t)r; off += r;
+    }
+    return 0;
+}
+
+/*
+ * Correct `len` stored payload bytes held in buf, which begin at payload
+ * offset pay_off. pay_off must be a multiple of the group size: groups are
+ * fixed by the format, and a window that straddled one could not decode it.
+ * Parity is fetched from fd into par, par_cap bytes (whole groups) at a time,
+ * so a buffer of any length is corrected in the same memory.
+ *
+ * Returns the bytes corrected. *bad counts groups left wrong: uncorrectable,
+ * or with no parity to decode them from because the trailer holds less than
+ * the header says the payload needs. A failed parity read returns -1.
+ */
+static int64_t entry_repair_buf(int fd, const entry_parity_t *ep, uint64_t pay_off,
+                                uint8_t *buf, size_t len,
+                                uint8_t *par, size_t par_cap, uint64_t *bad)
+{
+    size_t   per = par_cap / EP_GROUP_PAR;
+    uint64_t g = pay_off / EP_GROUP_DATA;
+    size_t   done = 0;
+    int64_t  corrected = 0;
+
+    if (per == 0) return -1;
+    rs_init();
+    while (done < len) {
+        size_t left   = len - done;
+        size_t groups = (left + EP_GROUP_DATA - 1) / EP_GROUP_DATA;
+        if (groups > per) groups = per;
+        size_t chunk  = groups * EP_GROUP_DATA < left ? groups * EP_GROUP_DATA : left;
+
+        /* How many of these groups the trailer actually holds parity for. */
+        uint64_t par_start = g * EP_GROUP_PAR;
+        size_t have = 0;
+        if (ep->rs_sz > par_start) {
+            uint64_t avail = (ep->rs_sz - par_start) / EP_GROUP_PAR;
+            have = avail < groups ? (size_t)avail : groups;
+        }
+        if (have > 0 &&
+            pread_full(fd, par, have * EP_GROUP_PAR, ep->rs_off + (off_t)par_start) != 0)
+            return -1;
+
+        for (size_t j = 0; j < groups; j++) {
+            size_t goff = j * EP_GROUP_DATA;
+            size_t glen = chunk - goff < EP_GROUP_DATA ? chunk - goff : EP_GROUP_DATA;
+            if (j >= have) { (*bad)++; continue; }
+            int rc = rs_parity_decode(buf + done + goff, glen,
+                                      par + j * EP_GROUP_PAR, EP_GROUP_PAR);
+            if (rc > 0)      corrected += rc;
+            else if (rc < 0) (*bad)++;
+        }
+        done += chunk;
+        g    += groups;
+    }
+    return corrected;
+}
+
+/*
+ * Correct a whole payload held in memory - the in-memory readers, which
+ * PACK_STREAM_THRESHOLD bounds - one parity window at a time, and count the
+ * outcome in the parity stats. Returns 0 unless something is left wrong.
+ */
+static int entry_repair_mem(FILE *f, const entry_parity_t *ep,
+                            uint8_t *buf, size_t len, const char *what)
+{
+    size_t par_cap = parity_window_groups() * EP_GROUP_PAR;
+    uint8_t *par = malloc(par_cap);
+    if (!par) {
+        log_warn("pack: no memory for a parity window (%s)", what);
+        parity_stats_add_uncorrectable(1);
+        return -1;
+    }
+    uint64_t bad = 0;
+    int64_t fixed = entry_repair_buf(fileno(f), ep, 0, buf, len, par, par_cap, &bad);
+    free(par);
+    if (fixed < 0 || bad > 0) {
+        log_warn("pack: payload RS parity uncorrectable (%s)", what);
+        parity_stats_add_uncorrectable(1);
+        return -1;
+    }
+    if (fixed > 0) {
+        log_warn("pack: repaired payload via RS parity (%s)", what);
+        parity_stats_add_repaired(1);
+    }
+    return 0;
+}
+
+/*
  * The entry exactly as it sits in the .dat, with nothing decoded.
  *
- * Deliberately shorter than pack_object_load: no parity check, no CRC, no
- * decrypt, no decompress, no hash comparison. A caller moving these bytes
- * somewhere else is not vouching for them, and cannot - the hash covers
- * plaintext, which is what it is choosing not to produce. Verification
- * happens wherever the box is eventually opened.
+ * Deliberately shorter than pack_object_load: no decrypt, no decompress, no
+ * hash comparison. A caller moving these bytes somewhere else is not
+ * vouching for them, and cannot - the hash covers plaintext, which is what
+ * it is choosing not to produce. Verification happens wherever the box is
+ * eventually opened.
  *
- * Skipping the parity check is not a shortcut around damage. Damage that a
- * scrub would repair here is copied faithfully, and the target's own parity
- * covers what it stored, so a corrupt object arrives corrupt and is caught
- * by the first read that decrypts it - at either end.
+ * Parity is the exception, because it needs no key and the alternative
+ * launders damage. It used to be skipped on the grounds that damage would be
+ * copied faithfully and caught at the far end; but the target computes fresh
+ * parity over whatever it stores, so damage this end could still correct
+ * arrived protected as if it were right, and the far end could then only
+ * detect it. The payload is already in memory here, so the CRC costs one
+ * pass over it and parity is fetched a window at a time only on a mismatch.
  */
 status_t pack_object_read_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
@@ -612,9 +930,34 @@ status_t pack_object_read_stored(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
+    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    if (ehrc != 0) {
         fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_read_stored: bad entry header in %s", dat_path);
+        return entry_hdr_error(ehrc, "pack_object_read_stored: bad entry header in %s", dat_path);
+    }
+
+    entry_parity_t ep;
+    int have_parity = 0;
+    if (found.pack_version == PACK_VERSION &&
+        locate_entry_parity(f, found.entry_index, &ep) == 0) {
+        have_parity = 1;
+        int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
+        if (hrc == 1) {
+            log_warn("pack: repaired entry header via parity (stored read)");
+            parity_stats_add_repaired(1);
+        } else if (hrc < 0) {
+            log_warn("pack: entry header parity uncorrectable (stored read)");
+            parity_stats_add_uncorrectable(1);
+        }
+        if (found.dat_offset + sizeof(ehdr) + ehdr.compressed_size >
+            (uint64_t)ep.trailer_start) {
+            fclose(f);
+            return set_error(ERR_CORRUPT, "pack_object_read_stored: entry runs into the parity trailer in %s", dat_path);
+        }
+    }
+    if (fseeko(f, (off_t)(found.dat_offset + sizeof(ehdr)), SEEK_SET) != 0) {
+        fclose(f);
+        return set_error_errno(ERR_IO, "pack_object_read_stored: fseeko(%s)", dat_path);
     }
 
     /* read_entry_hdr has already refused a length the file cannot hold, so
@@ -631,6 +974,9 @@ status_t pack_object_read_stored(store_t *store,
         fclose(f);
         return set_error(ERR_CORRUPT, "pack_object_read_stored: short read in %s", dat_path);
     }
+    if (have_parity && ep.rs_sz > 0 && ehdr.compressed_size > 0 &&
+        crc32c(buf, (size_t)ehdr.compressed_size) != ep.payload_crc)
+        (void)entry_repair_mem(f, &ep, buf, (size_t)ehdr.compressed_size, "stored read");
     dat_return_or_close(store, pnum, f);
 
     if (out_type)              *out_type = ehdr.type;
@@ -643,19 +989,57 @@ status_t pack_object_read_stored(store_t *store,
 }
 
 /*
- * The same entry, opened for the caller to read in pieces.
- *
- * A private stream rather than one checked out of the dat cache: the caller
- * holds it for as long as a large payload takes to move, and a cached
- * handle held that long is one every reader of that pack waits on.
+ * Groups a stored-entry reader holds at once: 64 groups is 979 KiB of data
+ * and 64 KiB of parity. Smaller than the readers' window because
+ * replication's whole transfer is held to the 4 MiB the parity stream
+ * replays a trailer through, and this buffer sits inside that transfer.
  */
+#define STORED_READ_GROUPS ((size_t)64)
+
+/*
+ * A packed entry read as stored, in pieces, with its parity applied.
+ *
+ * Replication hands each piece to the target as soon as it is read, and the
+ * target computes fresh parity over whatever it is given, so a damaged byte
+ * shipped as it stood would arrive protected as if it were right: the
+ * source could have corrected it and the replica never can. A piece already
+ * handed over cannot be taken back, so a clean single pass is not something
+ * the reader can promise. It CRC-scans the stored bytes at open instead, one
+ * window at a time, and only if the scan disagrees with the trailer does it
+ * serve the payload from a window corrected from parity. A clean entry
+ * costs one extra sequential read and the same memory either way.
+ *
+ * Damage beyond parity is served as it is, with a warning and the
+ * uncorrectable count, the same choice gc's copy makes: the object was lost
+ * before the copy, its hash still exposes it at either end, and refusing it
+ * would stop every later replication of the repository at one bad object.
+ */
+struct pack_stored_reader {
+    FILE          *f;              /* private stream, not a cached handle */
+    off_t          pay_start;
+    uint64_t       len;
+    uint64_t       pos;            /* next payload byte to hand over */
+    int            repair;
+    entry_parity_t ep;
+    uint8_t       *win;            /* corrected window (repair mode only) */
+    uint8_t       *par;
+    size_t         win_cap;
+    size_t         par_cap;
+    uint64_t       win_off;
+    size_t         win_len;        /* 0: no window loaded */
+    int64_t        fixed;
+    uint64_t       bad;
+    uint8_t        hash[OBJECT_HASH_SIZE];
+};
+
 status_t pack_object_open_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  uint8_t *out_type, uint8_t *out_compression,
                                  uint8_t *out_encryption,
                                  uint64_t *out_uncompressed_size,
-                                 uint64_t *out_len, FILE **out_f) {
+                                 uint64_t *out_len, pack_stored_reader_t **out) {
     pack_cache_entry_t found;
+    memset(&found, 0, sizeof(found));
     status_t st = pack_find_entry(store, hash, &found);
     if (st != OK) return st;
 
@@ -664,137 +1048,174 @@ status_t pack_object_open_stored(store_t *store,
                               store_root(store), found.pack_num) != 0)
         return set_error(ERR_IO, "pack_object_open_stored: path too long");
 
-    FILE *f = fopen(dat_path, "rb");
-    if (!f) return set_error_errno(ERR_IO, "pack_object_open_stored: fopen(%s)", dat_path);
+    pack_stored_reader_t *r = calloc(1, sizeof(*r));
+    if (!r) return set_error(ERR_NOMEM, "pack_object_open_stored: alloc");
+    memcpy(r->hash, hash, OBJECT_HASH_SIZE);
+
+    r->f = fopen(dat_path, "rb");
+    if (!r->f) {
+        free(r);
+        return set_error_errno(ERR_IO, "pack_object_open_stored: fopen(%s)", dat_path);
+    }
 
     pack_dat_entry_hdr_t ehdr;
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        fclose(f);
-        return set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+    if (fseeko(r->f, (off_t)found.dat_offset, SEEK_SET) != 0) {
+        st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+        goto fail;
     }
     /* read_entry_hdr refuses a length the file cannot hold, so a reader of
      * *out_len bytes cannot be sent past the end of the pack. */
-    if (read_entry_hdr(f, &ehdr) != 0 || memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
-        fclose(f);
-        return set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s",
-                         dat_path);
+    int ehrc = read_entry_hdr(r->f, &ehdr, 1);
+    if (ehrc != 0) {
+        st = entry_hdr_error(ehrc, "pack_object_open_stored: bad entry header in %s", dat_path);
+        goto fail;
+    }
+
+    int have_parity = found.pack_version == PACK_VERSION &&
+                      locate_entry_parity(r->f, found.entry_index, &r->ep) == 0;
+    if (have_parity) {
+        int hrc = parity_record_check(&ehdr, sizeof(ehdr), &r->ep.hdr_par);
+        if (hrc == 1) {
+            log_warn("pack: repaired entry header via parity (stored stream)");
+            parity_stats_add_repaired(1);
+        } else if (hrc < 0) {
+            log_warn("pack: entry header parity uncorrectable (stored stream)");
+            parity_stats_add_uncorrectable(1);
+        }
+        if (found.dat_offset + sizeof(ehdr) + ehdr.compressed_size >
+            (uint64_t)r->ep.trailer_start) {
+            st = set_error(ERR_CORRUPT, "pack_object_open_stored: entry runs into the "
+                           "parity trailer in %s", dat_path);
+            goto fail;
+        }
+    }
+    if (memcmp(ehdr.hash, hash, OBJECT_HASH_SIZE) != 0) {
+        st = set_error(ERR_CORRUPT, "pack_object_open_stored: bad entry header in %s", dat_path);
+        goto fail;
+    }
+
+    r->pay_start = (off_t)(found.dat_offset + sizeof(ehdr));
+    r->len       = ehdr.compressed_size;
+
+    if (have_parity && r->ep.rs_sz > 0 && r->len > 0) {
+        size_t groups = parity_window_groups();
+        if (groups > STORED_READ_GROUPS) groups = STORED_READ_GROUPS;
+        r->win_cap = groups * EP_GROUP_DATA;
+        r->par_cap = groups * EP_GROUP_PAR;
+        r->win = malloc(r->win_cap);
+        if (!r->win) { st = set_error(ERR_NOMEM, "pack_object_open_stored: window"); goto fail; }
+
+        if (fseeko(r->f, r->pay_start, SEEK_SET) != 0) {
+            st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+            goto fail;
+        }
+        uint32_t crc = 0;
+        for (uint64_t o = 0; o < r->len; ) {
+            size_t want = r->len - o < r->win_cap ? (size_t)(r->len - o) : r->win_cap;
+            if (fread_full(r->win, want, r->f) != 0) {
+                st = set_error(ERR_CORRUPT, "pack_object_open_stored: short read in %s", dat_path);
+                goto fail;
+            }
+            crc = crc32c_update(crc, r->win, want);
+            o += want;
+        }
+        if (crc != r->ep.payload_crc) {
+            r->repair = 1;
+            r->par = malloc(r->par_cap);
+            if (!r->par) { st = set_error(ERR_NOMEM, "pack_object_open_stored: parity window"); goto fail; }
+        } else {
+            free(r->win);
+            r->win = NULL;
+        }
+    }
+    if (!r->repair && fseeko(r->f, r->pay_start, SEEK_SET) != 0) {
+        st = set_error_errno(ERR_IO, "pack_object_open_stored: fseeko(%s)", dat_path);
+        goto fail;
     }
 
     *out_type              = ehdr.type;
     *out_compression       = ehdr.compression;
     *out_encryption        = ehdr.encryption;
     *out_uncompressed_size = ehdr.uncompressed_size;
-    *out_len               = ehdr.compressed_size;
-    *out_f                 = f;
+    *out_len               = r->len;
+    *out                   = r;
+    return OK;
+
+fail:
+    fclose(r->f);
+    free(r->win);
+    free(r->par);
+    free(r);
+    return st;
+}
+
+status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n)
+{
+    if ((uint64_t)n > r->len - r->pos)
+        return set_error(ERR_INVALID, "pack_stored_read: %zu bytes asked for, %llu left",
+                         n, (unsigned long long)(r->len - r->pos));
+    if (!r->repair) {
+        if (n && fread_full(buf, n, r->f) != 0)
+            return set_error(ERR_CORRUPT, "pack_stored_read: short read");
+        r->pos += n;
+        return OK;
+    }
+
+    uint8_t *out = buf;
+    while (n > 0) {
+        if (r->win_len == 0 || r->pos < r->win_off || r->pos >= r->win_off + r->win_len) {
+            /* Windows start on group boundaries: win_cap is whole groups. */
+            r->win_off = r->pos - r->pos % r->win_cap;
+            uint64_t left = r->len - r->win_off;
+            r->win_len = left < r->win_cap ? (size_t)left : r->win_cap;
+            if (fseeko(r->f, r->pay_start + (off_t)r->win_off, SEEK_SET) != 0 ||
+                fread_full(r->win, r->win_len, r->f) != 0) {
+                r->win_len = 0;
+                return set_error(ERR_CORRUPT, "pack_stored_read: short read");
+            }
+            int64_t fx = entry_repair_buf(fileno(r->f), &r->ep, r->win_off, r->win,
+                                          r->win_len, r->par, r->par_cap, &r->bad);
+            if (fx < 0) {
+                r->win_len = 0;
+                return set_error_errno(ERR_IO, "pack_stored_read: cannot read parity");
+            }
+            r->fixed += fx;
+        }
+        size_t at   = (size_t)(r->pos - r->win_off);
+        size_t take = r->win_len - at < n ? r->win_len - at : n;
+        memcpy(out, r->win + at, take);
+        out    += take;
+        n      -= take;
+        r->pos += take;
+    }
     return OK;
 }
 
+int pack_stored_damaged(const pack_stored_reader_t *r)
+{
+    return r && r->bad > 0;
+}
 
-/* Load parity data for a pack entry from the .dat parity trailer.
- * On success, *out_hdr_par, *out_payload_crc, *out_rs_par (caller frees) are
- * populated.  Returns 0 on success, -1 if parity is unavailable. */
-static int load_entry_parity(FILE *f, uint32_t entry_index,
-                             parity_record_t *out_hdr_par,
-                             uint32_t *out_payload_crc,
-                             uint8_t **out_rs_par, size_t *out_rs_par_sz) {
-    if (entry_index == UINT32_MAX) return -1;
-
-    /* Read parity footer (last 12 bytes of file) */
-    if (fseeko(f, -(off_t)sizeof(parity_footer_t), SEEK_END) != 0) return -1;
-    parity_footer_t pftr;
-    if (fread(&pftr, sizeof(pftr), 1, f) != 1) return -1;
-    if (pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) return -1;
-
-    off_t file_end = ftello(f);
-    if (file_end < 0) return -1;
-    off_t trailer_start = file_end - (off_t)pftr.trailer_size;
-    if (trailer_start < 0) return -1;
-
-    /* Trailer tail layout (after per-entry parity blocks):
-     *   entry_parity_offsets[N](8*N) + entry_count(4) + footer(12)
-     * entry_count is at the fixed position file_end - 16. */
-    uint32_t entry_count = 0;
-    off_t ec_pos = file_end - 16;
-    if (ec_pos < trailer_start) return -1;
-    if (fseeko(f, ec_pos, SEEK_SET) != 0) return -1;
-    if (fread(&entry_count, sizeof(entry_count), 1, f) != 1) return -1;
-    if (entry_count > 10000000u) return -1;
-
-    if (entry_index >= entry_count) return -1;
-
-    /* Read entry_parity_offsets[entry_index] — offsets table ends at ec_pos */
-    off_t offsets_start = ec_pos - (off_t)entry_count * 8;
-    if (offsets_start < trailer_start) return -1;
-    if (fseeko(f, offsets_start + (off_t)entry_index * 8, SEEK_SET) != 0) return -1;
-    uint64_t entry_par_offset = 0;
-    if (fread(&entry_par_offset, sizeof(entry_par_offset), 1, f) != 1) return -1;
-
-    /*
-     * Every parity block lives between the start of the trailer and the
-     * start of the offsets table, so that span bounds both the offset and
-     * the block size below.
-     *
-     * Bounding it is not belt and braces. block_size used to be the plain
-     * difference of two offsets read out of the file, and a next_offset
-     * below entry_par_offset wrapped it to just under 4 GiB, which the
-     * reader then handed to malloc. A fuzzer reached it from a corrupt
-     * trailer in four minutes; on a real repository it is a bad sector in
-     * an offsets table turning a scrub into an out-of-memory kill.
-     */
-    uint64_t blocks_len = (uint64_t)(offsets_start - trailer_start);
-    if (entry_par_offset >= blocks_len) return -1;
-
-    /* Seek to this entry's parity block */
-    off_t par_pos = trailer_start + (off_t)entry_par_offset;
-    if (fseeko(f, par_pos, SEEK_SET) != 0) return -1;
-
-    /* Read XOR header parity */
-    if (fread(out_hdr_par, sizeof(*out_hdr_par), 1, f) != 1) return -1;
-
-    /* Compute block size from next entry's offset or entry_count position.
-     * Block layout: hdr_parity(260) + rs_parity(var) + crc(4) + len(4) + size(4) */
-    uint64_t block_end;
-    if (entry_index + 1 < entry_count) {
-        uint64_t next_offset = 0;
-        if (fseeko(f, offsets_start + (off_t)(entry_index + 1) * 8, SEEK_SET) != 0) return -1;
-        if (fread(&next_offset, sizeof(next_offset), 1, f) != 1) return -1;
-        block_end = next_offset;
-    } else {
-        /* Last entry: block ends where offsets table begins */
-        block_end = blocks_len;
-    }
-    if (block_end <= entry_par_offset || block_end > blocks_len) return -1;
-
-    uint64_t block_size = block_end - entry_par_offset;
-    if (block_size < sizeof(parity_record_t) + 12) return -1;
-    size_t rs_par_sz = (size_t)block_size - sizeof(parity_record_t) - 12;
-
-    /* Read RS parity */
-    *out_rs_par = NULL;
-    *out_rs_par_sz = rs_par_sz;
-    if (rs_par_sz > 0) {
-        if (fseeko(f, par_pos + (off_t)sizeof(parity_record_t), SEEK_SET) != 0) return -1;
-        *out_rs_par = malloc(rs_par_sz);
-        if (!*out_rs_par) return -1;
-        if (fread_full(*out_rs_par, rs_par_sz, f) != 0) {
-            free(*out_rs_par); *out_rs_par = NULL; return -1;
+void pack_stored_close(pack_stored_reader_t *r)
+{
+    if (!r) return;
+    if (r->repair) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(r->hash, hex);
+        if (r->bad > 0) {
+            log_warn("pack: %s is damaged beyond its parity (%llu group(s)); "
+                     "read as stored", hex, (unsigned long long)r->bad);
+            parity_stats_add_uncorrectable(1);
+        } else if (r->fixed > 0) {
+            log_warn("pack: %s corrected from parity while reading it as stored "
+                     "(%lld byte(s))", hex, (long long)r->fixed);
+            parity_stats_add_repaired(1);
         }
     }
-
-    /* Read payload_crc, then skip the deprecated rs_data_len field (4 bytes).
-     * Layout at block_size - 12: payload_crc(4) + rs_data_len_dep(4, ignored)
-     * + entry_parity_size(4, computed from offsets). */
-    if (fseeko(f, par_pos + (off_t)(block_size - 12), SEEK_SET) != 0) {
-        free(*out_rs_par); *out_rs_par = NULL; return -1;
-    }
-    uint32_t rs_data_len_skip;  /* deprecated — value ignored, see parity.h */
-    if (fread(out_payload_crc, sizeof(*out_payload_crc), 1, f) != 1 ||
-        fread(&rs_data_len_skip, sizeof(rs_data_len_skip), 1, f) != 1) {
-        free(*out_rs_par); *out_rs_par = NULL; return -1;
-    }
-    (void)rs_data_len_skip;
-
-    return 0;
+    fclose(r->f);
+    free(r->win);
+    free(r->par);
+    free(r);
 }
 
 /*
@@ -876,19 +1297,18 @@ status_t pack_object_load(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header in %s", dat_path); }
+    /* The type is checked after header parity has had its chance: a
+     * damaged type byte is repairable, an unknown one is not. */
+    int ehrc = read_entry_hdr(f, &ehdr, 0);
+    if (ehrc != 0) { fclose(f); return entry_hdr_error(ehrc, "pack_object_load: bad entry header in %s", dat_path); }
 
     /* --- Parity: attempt entry header repair --- */
     if (found.pack_version == PACK_VERSION && found.entry_index != UINT32_MAX) {
-        parity_record_t hdr_par;
-        uint32_t pay_crc = 0;
-        uint8_t *rs_par = NULL;
-        size_t rs_par_sz = 0;
+        entry_parity_t ep;
 
-        if (load_entry_parity(f, found.entry_index, &hdr_par,
-                              &pay_crc, &rs_par, &rs_par_sz) == 0) {
+        if (locate_entry_parity(f, found.entry_index, &ep) == 0) {
             /* Verify/repair entry header */
-            int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
+            int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
             if (hrc == 1) {
                 log_warn("pack: repaired entry header via parity");
                 parity_stats_add_repaired(1);
@@ -897,10 +1317,15 @@ status_t pack_object_load(store_t *store,
                 parity_stats_add_uncorrectable(1);
             }
 
+            if (!object_type_known(ehdr.type)) {
+                fclose(f);
+                return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, ehdr.type);
+            }
+
             /* Re-seek to payload position after header repair */
             if (fseeko(f, (off_t)(found.dat_offset + sizeof(pack_dat_entry_hdr_t)),
                        SEEK_SET) != 0) {
-                free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load: fseeko after parity repair in %s", dat_path);
+                fclose(f); return set_error_errno(ERR_IO, "pack_object_load: fseeko after parity repair in %s", dat_path);
             }
 
             /* Read payload */
@@ -910,28 +1335,19 @@ status_t pack_object_load(store_t *store,
                   (ehdr.compressed_size > (uint64_t)INT_MAX ||
                    ehdr.uncompressed_size > (uint64_t)INT_MAX))) {
 
-                char *cpayload = malloc((size_t)ehdr.compressed_size);
-                if (!cpayload) { free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load: payload alloc failed (%llu bytes)", (unsigned long long)ehdr.compressed_size); }
+                char *cpayload = malloc(ehdr.compressed_size ? (size_t)ehdr.compressed_size : 1);
+                if (!cpayload) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load: payload alloc failed (%llu bytes)", (unsigned long long)ehdr.compressed_size); }
                 if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
-                    free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
+                    free(cpayload); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: short read of payload in %s", dat_path);
                 }
-                dat_return_or_close(store, pnum, f); f = NULL;
 
-                /* CRC fast-check on compressed payload */
+                /* CRC fast-check on the stored payload; parity is fetched
+                 * only when it fails, and a window at a time. */
                 uint32_t got_crc = crc32c(cpayload, (size_t)ehdr.compressed_size);
-                if (got_crc != pay_crc && rs_par != NULL && rs_par_sz > 0) {
-                    rs_init();
-                    int rrc = rs_parity_decode(cpayload, (size_t)ehdr.compressed_size,
-                                               rs_par, rs_par_sz);
-                    if (rrc > 0) {
-                        log_warn("pack: repaired payload via RS parity");
-                        parity_stats_add_repaired(1);
-                    } else if (rrc < 0) {
-                        log_warn("pack: payload RS parity uncorrectable");
-                        parity_stats_add_uncorrectable(1);
-                    }
-                }
-                free(rs_par); rs_par = NULL;
+                if (got_crc != ep.payload_crc && ep.rs_sz > 0)
+                    (void)entry_repair_mem(f, &ep, (uint8_t *)cpayload,
+                                           (size_t)ehdr.compressed_size, "load");
+                dat_return_or_close(store, pnum, f); f = NULL;
 
                 status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
                 if (dst != OK) { free(cpayload); return dst; }
@@ -973,16 +1389,21 @@ status_t pack_object_load(store_t *store,
                 if (out_type) *out_type = ehdr.type;
                 return OK;
             }
-            free(rs_par);
         }
         /* If parity load failed or object is too large, fall through to
          * non-parity path (re-seek needed). */
         if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
             fclose(f); return set_error_errno(ERR_IO, "pack_object_load: re-seek failed in %s", dat_path);
         }
-        if (read_entry_hdr(f, &ehdr) != 0) {
-            fclose(f); return set_error(ERR_CORRUPT, "pack_object_load: bad entry header on re-read in %s", dat_path);
+        ehrc = read_entry_hdr(f, &ehdr, 1);
+        if (ehrc != 0) {
+            fclose(f); return entry_hdr_error(ehrc, "pack_object_load: bad entry header on re-read in %s", dat_path);
         }
+    }
+
+    if (!object_type_known(ehdr.type)) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, ehdr.type);
     }
 
     /* Large uncompressed objects must be loaded via pack_object_load_stream. */
@@ -1073,8 +1494,9 @@ status_t pack_object_load_prefix(store_t *store,
     }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) {
-        fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_prefix: bad entry header");
+    int ehrc = read_entry_hdr(f, &ehdr, 1);
+    if (ehrc != 0) {
+        fclose(f); return entry_hdr_error(ehrc, "pack_object_load_prefix: bad entry header");
     }
 
     if (out_full_size) *out_full_size = ehdr.uncompressed_size;
@@ -1333,6 +1755,246 @@ static void sink_free(plain_sink_t *sk)
     sk->cs = NULL;
 }
 
+/* What a streaming read of one entry works from. */
+typedef struct {
+    store_t                    *store;
+    FILE                       *f;
+    const char                 *dat_path;
+    const uint8_t              *hash;
+    const pack_dat_entry_hdr_t *ehdr;
+    off_t                       payload_start;
+    const entry_parity_t       *ep;     /* NULL when the entry has no parity */
+} entry_stream_t;
+
+typedef enum {
+    PASS_SCAN,      /* read and CRC the stored bytes, emit nothing */
+    PASS_PLAIN,     /* decode, hash and emit, trusting the stored bytes */
+    PASS_REPAIR     /* the same, correcting each window from parity first */
+} entry_pass_t;
+
+/*
+ * One pass over an entry's stored payload, one window at a time: correct the
+ * window from parity (PASS_REPAIR), decrypt, decompress (frame codec) or pass
+ * through, hash and emit. Every buffer is a window, so the memory a pass
+ * holds is the same for a 1 MiB entry and a 1 TB one.
+ *
+ * Windows start on group boundaries because the read loop only ever asks for
+ * whole windows until the last one, and a window is a whole number of
+ * groups. That is what lets the frame codec be repaired at all: LZ4F used to
+ * be detection-only here, on the grounds that repair meant buffering the
+ * compressed payload whole, but repair is per group and the decompressor
+ * takes its input in whatever pieces it is given.
+ *
+ * *out_crc is the CRC32C of the stored bytes as read, before any correction.
+ */
+static status_t entry_stream_pass(const entry_stream_t *es, entry_pass_t mode,
+                                  int out_fd, uint32_t *out_crc,
+                                  int64_t *out_fixed, uint64_t *out_bad)
+{
+    const pack_dat_entry_hdr_t *ehdr = es->ehdr;
+    const size_t groups  = parity_window_groups();
+    const size_t win     = groups * EP_GROUP_DATA;
+    const size_t par_cap = groups * EP_GROUP_PAR;
+    const int    frame   = ehdr->compression == COMPRESS_LZ4_FRAME;
+    const int    emit    = mode != PASS_SCAN;
+
+    *out_crc = 0;
+    *out_fixed = 0;
+    *out_bad = 0;
+
+    if (fseeko(es->f, es->payload_start, SEEK_SET) != 0)
+        return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", es->dat_path);
+
+    uint8_t    *src   = malloc(win);
+    uint8_t    *par   = mode == PASS_REPAIR ? malloc(par_cap) : NULL;
+    uint8_t    *dst   = emit && frame ? malloc(win) : NULL;
+    LZ4F_dctx  *dctx  = NULL;
+    EVP_MD_CTX *mdctx = NULL;
+    plain_sink_t sink;
+    int         sink_live = 0;
+    status_t    st = OK;
+
+    if (!src || (mode == PASS_REPAIR && !par) || (emit && frame && !dst)) {
+        st = set_error(ERR_NOMEM, "pack_object_load_stream: window alloc failed");
+        goto out;
+    }
+    if (emit) {
+        if (frame && LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION))) {
+            dctx = NULL;
+            st = set_error(ERR_NOMEM, "pack_object_load_stream: LZ4F decompression context alloc failed");
+            goto out;
+        }
+        mdctx = EVP_MD_CTX_new();
+        if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
+            st = set_error(ERR_NOMEM, "pack_object_load_stream: SHA-256 context alloc failed");
+            goto out;
+        }
+        st = sink_init(&sink, es->store, ehdr);
+        sink_live = 1;
+        if (st != OK) goto out;
+    }
+
+    uint64_t remaining = ehdr->compressed_size;
+    uint64_t pay_off = 0;
+    uint32_t crc = 0;
+    while (remaining > 0 && st == OK) {
+        /* A restore of one large object is cancellable inside it. */
+        if (store_cancelled(es->store)) {
+            st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+        }
+        size_t want = remaining > win ? win : (size_t)remaining;
+        if (fread_full(src, want, es->f) != 0) {
+            st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", es->dat_path);
+            break;
+        }
+        /* CRC and parity cover the stored bytes, so both run before decryption. */
+        crc = crc32c_update(crc, src, want);
+        if (mode == PASS_REPAIR) {
+            int64_t fx = entry_repair_buf(fileno(es->f), es->ep, pay_off, src, want,
+                                          par, par_cap, out_bad);
+            if (fx < 0) {
+                st = set_error_errno(ERR_IO, "pack_object_load_stream: cannot read parity in %s", es->dat_path);
+                break;
+            }
+            *out_fixed += fx;
+        }
+        remaining -= want;
+        pay_off   += want;
+        if (!emit) continue;
+
+        uint8_t *pp = NULL;
+        size_t   pn = 0;
+        st = sink_push(&sink, src, want, &pp, &pn);
+        if (st != OK) break;
+
+        while (pn > 0 && st == OK) {
+            uint8_t *outp = pp;
+            size_t   outn = pn;
+            if (frame) {
+                size_t dst_sz = win;
+                size_t src_sz = pn;
+                size_t ret = LZ4F_decompress(dctx, dst, &dst_sz, pp, &src_sz, NULL);
+                if (LZ4F_isError(ret)) {
+                    st = set_error(ERR_CORRUPT, "pack_object_load_stream: LZ4 frame decode failed in %s: %s",
+                                   es->dat_path, LZ4F_getErrorName(ret));
+                    break;
+                }
+                outp = dst;
+                outn = dst_sz;
+                pp += src_sz;
+                pn -= src_sz;
+            } else {
+                pn = 0;
+            }
+            if (outn == 0) continue;
+            if (EVP_DigestUpdate(mdctx, outp, outn) != 1) {
+                st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break;
+            }
+            if (write_full_fd(out_fd, outp, outn) != 0) {
+                st = set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed"); break;
+            }
+            store_io_progress(es->store, (uint64_t)outn);
+        }
+    }
+    *out_crc = crc;
+
+    if (st == OK && emit) st = sink_finish(&sink);
+    if (st == OK && emit) {
+        uint8_t got[OBJECT_HASH_SIZE];
+        unsigned int dl = 0;
+        if (EVP_DigestFinal_ex(mdctx, got, &dl) != 1 ||
+            dl != OBJECT_HASH_SIZE ||
+            memcmp(got, es->hash, OBJECT_HASH_SIZE) != 0)
+            st = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch in %s", es->dat_path);
+    }
+
+out:
+    if (sink_live) sink_free(&sink);
+    if (dctx) LZ4F_freeDecompressionContext(dctx);
+    EVP_MD_CTX_free(mdctx);
+    free(src);
+    free(par);
+    free(dst);
+    return st;
+}
+
+/*
+ * Can what has been written to out_fd be taken back? A regular file can, by
+ * truncating to where this object started; a character device (/dev/null,
+ * which verify streams into) keeps nothing to take back. A pipe or socket
+ * cannot. Mirrors the loose reader's rule, but rewinds to where the object
+ * began rather than to the start of the file.
+ */
+static int out_rewind_point(int out_fd, off_t *pos)
+{
+    struct stat sb;
+    if (fstat(out_fd, &sb) != 0) return 0;
+    if (S_ISCHR(sb.st_mode)) { *pos = -1; return 1; }
+    if (!S_ISREG(sb.st_mode)) return 0;
+    off_t p = lseek(out_fd, 0, SEEK_CUR);
+    if (p < 0) return 0;
+    *pos = p;
+    return 1;
+}
+
+static int out_rewind(int out_fd, off_t pos)
+{
+    if (pos < 0) return 0;
+    if (lseek(out_fd, pos, SEEK_SET) == (off_t)-1) return -1;
+    return ftruncate(out_fd, pos);
+}
+
+/*
+ * Stream an entry with parity applied, paying for parity only when the entry
+ * is damaged.
+ *
+ * Into a destination that can be rewound - restore's regular files, verify's
+ * /dev/null - the first pass trusts the stored bytes, and only a failure that
+ * says they are wrong (a decode error or a hash mismatch) rewinds and runs a
+ * repairing pass. A clean entry is read once. A pipe cannot be rewound, so
+ * there the stored bytes are CRC-scanned first and the emitting pass repairs
+ * if the scan disagrees with the trailer: correctness over a second read.
+ */
+static status_t entry_stream(const entry_stream_t *es, int out_fd)
+{
+    uint32_t crc = 0;
+    int64_t  fixed = 0;
+    uint64_t bad = 0;
+
+    if (!es->ep || es->ep->rs_sz == 0)
+        return entry_stream_pass(es, PASS_PLAIN, out_fd, &crc, &fixed, &bad);
+
+    off_t out_start = -1;
+    status_t st;
+    if (out_rewind_point(out_fd, &out_start)) {
+        st = entry_stream_pass(es, PASS_PLAIN, out_fd, &crc, &fixed, &bad);
+        if (st != ERR_CORRUPT) return st;
+        err_clear();
+        if (out_rewind(out_fd, out_start) != 0)
+            return set_error_errno(ERR_IO, "pack_object_load_stream: cannot rewind the "
+                                   "destination to rewrite a damaged entry");
+    } else {
+        st = entry_stream_pass(es, PASS_SCAN, out_fd, &crc, &fixed, &bad);
+        if (st != OK) return st;
+        if (crc == es->ep->payload_crc)
+            return entry_stream_pass(es, PASS_PLAIN, out_fd, &crc, &fixed, &bad);
+    }
+
+    st = entry_stream_pass(es, PASS_REPAIR, out_fd, &crc, &fixed, &bad);
+    if (st == OK) {
+        if (fixed > 0) {
+            log_warn("pack: repaired payload via RS parity (stream, %lld byte(s))",
+                     (long long)fixed);
+            parity_stats_add_repaired(1);
+        }
+    } else if (st == ERR_CORRUPT) {
+        log_warn("pack: payload RS parity uncorrectable (stream, %llu group(s) left wrong)",
+                 (unsigned long long)bad);
+        parity_stats_add_uncorrectable(1);
+    }
+    return st;
+}
+
 status_t pack_object_load_stream(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  int out_fd,
@@ -1355,20 +2017,18 @@ status_t pack_object_load_stream(store_t *store,
     if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) { fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko(%s)", dat_path); }
 
     pack_dat_entry_hdr_t ehdr;
-    if (read_entry_hdr(f, &ehdr) != 0) { fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: bad entry header in %s", dat_path); }
+    /* Type checked after header parity, as in pack_object_load. */
+    int ehrc = read_entry_hdr(f, &ehdr, 0);
+    if (ehrc != 0) { fclose(f); return entry_hdr_error(ehrc, "pack_object_load_stream: bad entry header in %s", dat_path); }
 
-    /* Parity: load entry parity for v3 packs (persists across codec paths) */
-    uint32_t pay_crc = 0;
-    uint8_t *rs_par = NULL;
-    size_t rs_par_sz = 0;
+    /* Parity: locate the entry's parity for v3 packs (persists across codec paths) */
+    entry_parity_t ep;
     int have_parity = 0;
 
     if (found.pack_version == PACK_VERSION && found.entry_index != UINT32_MAX) {
-        parity_record_t hdr_par;
-        if (load_entry_parity(f, found.entry_index, &hdr_par,
-                              &pay_crc, &rs_par, &rs_par_sz) == 0) {
+        if (locate_entry_parity(f, found.entry_index, &ep) == 0) {
             have_parity = 1;
-            int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
+            int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
             if (hrc == 1) {
                 log_warn("pack: repaired entry header via parity (stream)");
                 parity_stats_add_repaired(1);
@@ -1376,54 +2036,54 @@ status_t pack_object_load_stream(store_t *store,
                 log_warn("pack: entry header parity uncorrectable (stream)");
                 parity_stats_add_uncorrectable(1);
             }
+            /* A header parity corrected must still describe bytes that are
+             * in front of the trailer. */
+            if (found.dat_offset + sizeof(ehdr) + ehdr.compressed_size >
+                (uint64_t)ep.trailer_start) {
+                fclose(f);
+                return set_error(ERR_CORRUPT, "pack_object_load_stream: entry runs into the parity trailer in %s", dat_path);
+            }
         }
         /* Re-seek to payload position */
         if (fseeko(f, (off_t)(found.dat_offset + sizeof(pack_dat_entry_hdr_t)),
                    SEEK_SET) != 0) {
-            free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko after parity in %s", dat_path);
+            fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko after parity in %s", dat_path);
         }
     }
 
+    if (!object_type_known(ehdr.type)) {
+        fclose(f);
+        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, ehdr.type);
+    }
     if (out_type) *out_type = ehdr.type;
     if (out_size) *out_size = ehdr.uncompressed_size;
 
-    /* LZ4 objects are always small enough to load in RAM —
-     * add CRC check + RS repair on the compressed buffer. */
+    /* LZ4 block objects are always small enough to load in RAM (the codec
+     * takes an int), so they are CRC-checked and repaired as one buffer. */
     if (ehdr.compression == COMPRESS_LZ4) {
         if (ehdr.compressed_size > (uint64_t)INT_MAX ||
             ehdr.uncompressed_size > (uint64_t)INT_MAX) {
-            free(rs_par); fclose(f); return set_error(ERR_TOO_LARGE, "pack_object_load_stream: LZ4 object exceeds INT_MAX in %s", dat_path);
+            fclose(f); return set_error(ERR_TOO_LARGE, "pack_object_load_stream: LZ4 object exceeds INT_MAX in %s", dat_path);
         }
-        char *cpayload = malloc((size_t)ehdr.compressed_size);
-        if (!cpayload) { free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: payload alloc failed (%llu bytes)", (unsigned long long)ehdr.compressed_size); }
+        char *cpayload = malloc(ehdr.compressed_size ? (size_t)ehdr.compressed_size : 1);
+        if (!cpayload) { fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: payload alloc failed (%llu bytes)", (unsigned long long)ehdr.compressed_size); }
         if (fread_full(cpayload, (size_t)ehdr.compressed_size, f) != 0) {
-            free(cpayload); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 payload in %s", dat_path);
+            free(cpayload); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 payload in %s", dat_path);
         }
-        dat_return_or_close(store, pnum, f);
 
-        /* CRC fast-check + RS repair on compressed payload */
-        if (have_parity) {
-            uint32_t got_crc = crc32c(cpayload, (size_t)ehdr.compressed_size);
-            if (got_crc != pay_crc && rs_par != NULL && rs_par_sz > 0) {
-                rs_init();
-                int rrc = rs_parity_decode(cpayload, (size_t)ehdr.compressed_size, rs_par, rs_par_sz);
-                if (rrc > 0) {
-                    log_warn("pack: repaired payload via RS parity (stream/lz4)");
-                    parity_stats_add_repaired(1);
-                } else if (rrc < 0) {
-                    log_warn("pack: payload RS parity uncorrectable (stream/lz4)");
-                    parity_stats_add_uncorrectable(1);
-                }
-            }
-        }
-        free(rs_par);
+        /* CRC fast-check, then repair a window at a time */
+        if (have_parity && ep.rs_sz > 0 &&
+            crc32c(cpayload, (size_t)ehdr.compressed_size) != ep.payload_crc)
+            (void)entry_repair_mem(f, &ep, (uint8_t *)cpayload,
+                                   (size_t)ehdr.compressed_size, "stream/lz4");
+        dat_return_or_close(store, pnum, f);
 
         {
             status_t dst = entry_decrypt_inplace(store, &ehdr, cpayload);
             if (dst != OK) { free(cpayload); return dst; }
         }
 
-        char *out = malloc((size_t)ehdr.uncompressed_size);
+        char *out = malloc(ehdr.uncompressed_size ? (size_t)ehdr.uncompressed_size : 1);
         if (!out) { free(cpayload); return set_error(ERR_NOMEM, "pack_object_load_stream: decompress alloc failed (%llu bytes)", (unsigned long long)ehdr.uncompressed_size); }
         int r = LZ4_decompress_safe(cpayload, out,
                                     (int)ehdr.compressed_size,
@@ -1438,257 +2098,21 @@ status_t pack_object_load_stream(store_t *store,
         return wr == 0 ? OK : set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed");
     }
 
-    if (ehdr.compression == COMPRESS_LZ4_FRAME) {
-        /* Stream-decompress LZ4 frame payload, verify hash over decompressed bytes.
-         * Compute CRC over compressed chunks for parity detection. */
-        uint8_t *src = malloc(PACK_STREAM_THRESHOLD);
-        uint8_t *dst = malloc(PACK_STREAM_THRESHOLD);
-        LZ4F_dctx *dctx = NULL;
-        if (!src || !dst || LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION))) {
-            free(src); free(dst);
-            if (dctx) LZ4F_freeDecompressionContext(dctx);
-            free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: LZ4F decompression context alloc failed");
-        }
-
-        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-        if (!mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
-            EVP_MD_CTX_free(mdctx);
-            LZ4F_freeDecompressionContext(dctx);
-            free(src); free(dst); free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: SHA-256 context alloc failed");
-        }
-
-        uint32_t running_crc = 0;
-        uint64_t remaining = ehdr.compressed_size;
-        plain_sink_t sink;
-        status_t fst = sink_init(&sink, store, &ehdr);
-        if (fst != OK) {
-            EVP_MD_CTX_free(mdctx);
-            LZ4F_freeDecompressionContext(dctx);
-            free(src); free(dst); free(rs_par); fclose(f);
-            return fst;
-        }
-        while (remaining > 0 && fst == OK) {
-            /* A restore of one large object is cancellable inside it. */
-            if (store_cancelled(store)) {
-                fst = set_error(ERR_BUSY, "cancelled while reading an object"); break;
-            }
-            size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
-                          (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
-            if (fread(src, 1, want, f) != want) { fst = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of LZ4 frame in %s", dat_path); break; }
-            /* CRC covers the stored bytes, so it runs before decryption. */
-            if (have_parity)
-                running_crc = crc32c_update(running_crc, src, want);
-            uint8_t *srcp = NULL;
-            size_t   src_left = 0;
-            fst = sink_push(&sink, src, want, &srcp, &src_left);
-            if (fst != OK) break;
-            remaining -= want;
-            while (src_left > 0 && fst == OK) {
-                size_t dst_sz = PACK_STREAM_THRESHOLD;
-                size_t src_sz = src_left;
-                size_t ret = LZ4F_decompress(dctx, dst, &dst_sz, srcp, &src_sz, NULL);
-                if (LZ4F_isError(ret)) { fst = set_error(ERR_CORRUPT, "pack_object_load_stream: LZ4 frame decode failed in %s: %s", dat_path, LZ4F_getErrorName(ret)); break; }
-                if (dst_sz > 0) {
-                    if (EVP_DigestUpdate(mdctx, dst, dst_sz) != 1 ||
-                        write_full_fd(out_fd, dst, dst_sz) != 0)
-                        fst = set_error_errno(ERR_IO, "pack_object_load_stream: write of decoded object failed");
-                    else
-                        store_io_progress(store, (uint64_t)dst_sz);
-                }
-                srcp     += src_sz;
-                src_left -= src_sz;
-            }
-        }
-        if (fst == OK) fst = sink_finish(&sink);
-        sink_free(&sink);
-        dat_return_or_close(store, pnum, f);
-        free(src); free(dst);
-        LZ4F_freeDecompressionContext(dctx);
-
-        /* Detection only for LZ4_FRAME: RS repair would require buffering the
-         * entire compressed payload, which defeats the point of streaming a
-         * payload too large to hold. Counted as uncorrectable, not repaired,
-         * because nothing was fixed - calling it a repair would inflate the
-         * repaired figure and hide damage that needs operator attention. */
-        if (have_parity && fst == OK && running_crc != pay_crc) {
-            log_warn("pack: LZ4_FRAME payload CRC mismatch (stream, not repairable)");
-            parity_stats_add_uncorrectable(1);
-        }
-        free(rs_par);
-
-        if (fst == OK) {
-            uint8_t got[OBJECT_HASH_SIZE];
-            unsigned int dl = OBJECT_HASH_SIZE;
-            if (EVP_DigestFinal_ex(mdctx, got, &dl) != 1 ||
-                dl != OBJECT_HASH_SIZE ||
-                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-                fst = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch (LZ4 frame) in %s", dat_path);
-        }
-        EVP_MD_CTX_free(mdctx);
-        return fst;
+    if (ehdr.compression != COMPRESS_NONE && ehdr.compression != COMPRESS_LZ4_FRAME) {
+        fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: unexpected compression codec %u in %s", ehdr.compression, dat_path);
     }
 
-    if (ehdr.compression != COMPRESS_NONE) { free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: unexpected compression codec %u in %s", ehdr.compression, dat_path); }
-
-    /* Stream COMPRESS_NONE payload with RS parity repair.
-     *
-     * Strategy: CRC pre-scan the payload (one sequential read, no allocation
-     * beyond the existing read buffer).  If CRC passes, seek back and stream
-     * to out_fd — no RS overhead on clean data.  If CRC fails, seek back and
-     * process in RS_GROUP_DATA (15 KiB) chunks with per-group RS decode,
-     * writing corrected data to out_fd. */
-    off_t payload_start = ftello(f);
-    if (payload_start < 0) { free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: ftello(%s)", dat_path); }
-
-    int need_rs_repair = 0;
-    if (have_parity) {
-        /* CRC pre-scan */
-        uint8_t *scanbuf = malloc(PACK_STREAM_THRESHOLD);
-        if (!scanbuf) { free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: CRC scan buffer alloc failed"); }
-        uint32_t running_crc = 0;
-        uint64_t scan_rem = ehdr.compressed_size;
-        while (scan_rem > 0) {
-            size_t want = (scan_rem > PACK_STREAM_THRESHOLD) ?
-                          (size_t)PACK_STREAM_THRESHOLD : (size_t)scan_rem;
-            if (fread(scanbuf, 1, want, f) != want) {
-                free(scanbuf); free(rs_par); fclose(f); return set_error(ERR_CORRUPT, "pack_object_load_stream: short read during CRC scan in %s", dat_path);
-            }
-            running_crc = crc32c_update(running_crc, scanbuf, want);
-            scan_rem -= want;
-        }
-        free(scanbuf);
-        if (running_crc != pay_crc)
-            need_rs_repair = 1;
-        /* Seek back to payload start */
-        if (fseeko(f, payload_start, SEEK_SET) != 0) {
-            free(rs_par); fclose(f); return set_error_errno(ERR_IO, "pack_object_load_stream: fseeko for CRC re-scan in %s", dat_path);
-        }
-    }
-
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) { free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: EVP_MD_CTX_new failed"); }
-    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
-        EVP_MD_CTX_free(mdctx); free(rs_par); fclose(f); return set_error(ERR_IO, "pack_object_load_stream: EVP_DigestInit_ex failed");
-    }
-
-    if (need_rs_repair && rs_par != NULL && rs_par_sz > 0) {
-        /* Group-by-group RS decode while streaming.  Each RS interleave
-         * group is RS_K * RS_INTERLEAVE = 15296 bytes of data with
-         * RS_2T * RS_INTERLEAVE = 1024 bytes of parity. */
-        rs_init();
-        size_t grp_data = (size_t)RS_K * RS_INTERLEAVE;
-        size_t grp_par  = (size_t)RS_2T * RS_INTERLEAVE;
-        uint8_t *gbuf = malloc(grp_data);
-        if (!gbuf) { EVP_MD_CTX_free(mdctx); free(rs_par); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: RS group buffer alloc failed"); }
-
-        uint64_t remaining = ehdr.compressed_size;
-        const uint8_t *par_ptr = rs_par;
-        /* Walks alongside par_ptr. The trailer decides how much parity
-         * there is; the entry header decides how many groups get read. */
-        size_t par_left = rs_par_sz;
-        plain_sink_t sink;
-        status_t stream_st = sink_init(&sink, store, &ehdr);
-        if (stream_st != OK) {
-            free(gbuf); EVP_MD_CTX_free(mdctx); free(rs_par); fclose(f);
-            return stream_st;
-        }
-        int total_corrected = 0;
-
-        while (remaining > 0 && stream_st == OK) {
-            if (store_cancelled(store)) {
-                stream_st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
-            }
-            size_t want = (remaining < grp_data) ? (size_t)remaining : grp_data;
-            if (fread(gbuf, 1, want, f) != want) { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
-
-            /* Repair the stored bytes, then decrypt what was repaired. The
-             * parity groups know nothing about where the nonce and tag fall. */
-            int rrc = rs_parity_decode(gbuf, want, par_ptr, par_left);
-            if (rrc > 0) {
-                total_corrected += rrc;
-            } else if (rrc < 0) {
-                log_warn("pack: payload RS group uncorrectable (stream)");
-                parity_stats_add_uncorrectable(1);
-                /* Continue — write what we have, SHA-256 will catch it */
-            }
-
-            uint8_t *pp = NULL; size_t pn = 0;
-            stream_st = sink_push(&sink, gbuf, want, &pp, &pn);
-            if (stream_st != OK) break;
-            if (pn) {
-                if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
-                if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
-                store_io_progress(store, (uint64_t)pn);
-            }
-            par_ptr += grp_par;
-            par_left = par_left > grp_par ? par_left - grp_par : 0;
-            remaining -= want;
-        }
-        if (stream_st == OK) stream_st = sink_finish(&sink);
-        sink_free(&sink);
-        free(gbuf);
-
-        if (total_corrected > 0) {
-            log_warn("pack: repaired payload via RS parity (stream)");
-            parity_stats_add_repaired(1);
-        }
-
-        free(rs_par); rs_par = NULL;
-        dat_return_or_close(store, pnum, f);
-
-        if (stream_st == OK) {
-            uint8_t got[OBJECT_HASH_SIZE];
-            unsigned dlen = 0;
-            if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
-                dlen != OBJECT_HASH_SIZE ||
-                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-                stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch after parity repair in %s", dat_path);
-        }
-        EVP_MD_CTX_free(mdctx);
-        return stream_st;
-    }
-
-    /* Clean path: stream normally with SHA-256 verification. */
-    free(rs_par); rs_par = NULL;
-
-    uint8_t *buf = malloc(PACK_STREAM_THRESHOLD);
-    if (!buf) { EVP_MD_CTX_free(mdctx); fclose(f); return set_error(ERR_NOMEM, "pack_object_load_stream: stream buffer alloc failed"); }
-
-    uint64_t remaining = ehdr.compressed_size;
-    plain_sink_t sink;
-    status_t stream_st = sink_init(&sink, store, &ehdr);
-    while (remaining > 0 && stream_st == OK) {
-        if (store_cancelled(store)) {
-            stream_st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
-        }
-        size_t want = (remaining > PACK_STREAM_THRESHOLD) ?
-                      (size_t)PACK_STREAM_THRESHOLD : (size_t)remaining;
-        if (fread(buf, 1, want, f) != want)           { stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: short read of payload in %s", dat_path); break; }
-        uint8_t *pp = NULL; size_t pn = 0;
-        stream_st = sink_push(&sink, buf, want, &pp, &pn);
-        if (stream_st != OK) break;
-        if (pn) {
-            if (EVP_DigestUpdate(mdctx, pp, pn) != 1) { stream_st = set_error(ERR_IO, "pack_object_load_stream: SHA-256 update failed"); break; }
-            if (write_full_fd(out_fd, pp, pn) != 0)   { stream_st = set_error_errno(ERR_IO, "pack_object_load_stream: write of object failed"); break; }
-            store_io_progress(store, (uint64_t)pn);
-        }
-        remaining -= want;
-    }
-    if (stream_st == OK) stream_st = sink_finish(&sink);
-    sink_free(&sink);
-    free(buf);
+    /* Stored and frame-codec payloads stream, with parity applied group by
+     * group in bounded memory whatever the entry's size. */
+    off_t payload_start = (off_t)(found.dat_offset + sizeof(pack_dat_entry_hdr_t));
+    entry_stream_t es = {
+        .store = store, .f = f, .dat_path = dat_path, .hash = hash,
+        .ehdr = &ehdr, .payload_start = payload_start,
+        .ep = have_parity ? &ep : NULL,
+    };
+    st = entry_stream(&es, out_fd);
     dat_return_or_close(store, pnum, f);
-
-    if (stream_st == OK) {
-        uint8_t got[OBJECT_HASH_SIZE];
-        unsigned dlen = 0;
-        if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
-            dlen != OBJECT_HASH_SIZE ||
-            memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-            stream_st = set_error(ERR_CORRUPT, "pack_object_load_stream: SHA-256 mismatch in %s", dat_path);
-    }
-    EVP_MD_CTX_free(mdctx);
-    return stream_st;
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1806,6 +2230,22 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
 
     (void)pack_num;  /* used by caller for naming, not needed here */
     return OK;
+}
+
+/*
+ * OWN-30: the pack trailer's size goes into a uint32 footer field and each
+ * entry's block size into another. Past the limit they wrap and repair
+ * refuses the whole pack, so say so when the pack is written. The write
+ * itself goes ahead - design constraint 1 is arbitrary size.
+ */
+static void warn_if_pack_parity_unusable(uint64_t blocks_end, uint32_t packed)
+{
+    uint64_t total = blocks_end + sizeof(packed) + (uint64_t)packed * sizeof(uint64_t)
+                   + sizeof(parity_footer_t);
+    if (total <= parity_trailer_limit()) return;
+    log_warn("pack: parity trailer of %llu bytes (%u entries) is too large for "
+             "32-bit parity fields; parity in this pack cannot be used for repair "
+             "until the format is fixed", (unsigned long long)total, packed);
 }
 
 /* Write parity trailer for a .dat file.  The dat file must be open and
@@ -1968,6 +2408,7 @@ static status_t write_dat_parity(store_t *store, FILE *dat_f,
     }
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -2039,6 +2480,7 @@ static status_t write_dat_parity_precomputed(FILE *dat_f,
         return set_error_errno(ERR_IO, "write_dat_parity_pre: fwrite entry_count failed");
 
     /* 4. Parity footer */
+    warn_if_pack_parity_unusable((uint64_t)cur_trailer_pos, packed);
     uint32_t trailer_size = (uint32_t)((size_t)cur_trailer_pos +
                              sizeof(packed) + (size_t)packed * sizeof(uint64_t) +
                              sizeof(parity_footer_t));
@@ -2361,7 +2803,7 @@ uint32_t pack_stored_count(const pack_stored_writer_t *w)
 int pack_stored_full(const pack_stored_writer_t *w, uint64_t len)
 {
     if (!w || w->count == 0) return 0;
-    return w->body + sizeof(pack_dat_entry_hdr_t) + len > PACK_MAX_MULTI_BYTES;
+    return w->body + sizeof(pack_dat_entry_hdr_t) + len > pack_seal_bytes();
 }
 
 status_t pack_stored_open(store_t *store, pack_stored_writer_t **out)
@@ -2449,8 +2891,12 @@ status_t pack_stored_add_stream(pack_stored_writer_t *w,
      * is still cheap.
      *
      * The checks are the reader's own, not stricter ones: whatever
-     * read_entry_hdr accepts, this accepts.
+     * read_entry_hdr accepts, this accepts. That includes the type since
+     * OWN-39: a reader refuses one outside 1-5, so writing it would store
+     * exactly the unreadable entry this check exists to keep out.
      */
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_stored_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (compression != COMPRESS_NONE && compression != COMPRESS_LZ4 &&
         compression != COMPRESS_LZ4_FRAME)
         return set_error(ERR_INVALID, "pack_stored_add: unknown compression codec %u",
@@ -3532,7 +3978,7 @@ int pack_backup_full(const pack_backup_writer_t *w, uint64_t bytes)
 {
     if (!w || !w->pw.dat_f || w->pw.packed == 0) return 0;
     return w->pw.body_offset + sizeof(pack_dat_entry_hdr_t) + bytes
-           > PACK_MAX_MULTI_BYTES;
+           > pack_seal_bytes();
 }
 
 status_t pack_backup_rollover(pack_backup_writer_t *w)
@@ -3555,6 +4001,8 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
                          uint64_t *out_payload_size)
 {
     if (!w || (!data && len)) return set_error(ERR_INVALID, "pack_backup_add: null argument");
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "pack_backup_add: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (len > PACK_STREAM_THRESHOLD)
         return set_error(ERR_TOO_LARGE,
                          "pack_backup_add: %zu bytes exceeds the streaming threshold", len);
@@ -3720,7 +4168,7 @@ static void *pack_unified_worker(void *arg) {
         /* Pack split check: use stored size (upper bound) */
         uint64_t entry_bytes_ub = sizeof(pack_dat_entry_hdr_t) + m->compressed_size;
         if (pw.dat_f && pw.packed > 0 &&
-            pw.body_offset + entry_bytes_ub > PACK_MAX_MULTI_BYTES) {
+            pw.body_offset + entry_bytes_ub > pack_seal_bytes()) {
             status_t st = pw_finalize(&pw);
             if (st != OK) { close(fd); pw.error = st; break; }
         }
@@ -4031,7 +4479,7 @@ status_t repo_pack_report(store_t *store, pack_report_t *out,
      * workers than needed.  Use 1 worker per ~PACK_MAX_MULTI_BYTES of data
      * to avoid creating lots of tiny packs. */
     {
-        uint32_t packs_needed = (uint32_t)(total_bytes_for_pack / PACK_MAX_MULTI_BYTES) + 1;
+        uint32_t packs_needed = (uint32_t)(total_bytes_for_pack / pack_seal_bytes()) + 1;
         if (n_workers > packs_needed) n_workers = packs_needed;
     }
     if (n_workers < 1) n_workers = 1;
@@ -4415,6 +4863,10 @@ typedef struct {
     pack_dat_hdr_t         hdr;
     uint64_t               body;
     uint32_t               cur_first, cur_n;
+
+    /* Where entries copied with damage beyond parity are noted (OWN-31);
+     * NULL when nobody asked. */
+    pack_gc_stats_t       *stats;
 } pack_rw_t;
 
 /* cap is the most entries the rewrite can copy: the caller knows it from
@@ -4457,21 +4909,125 @@ static status_t pack_rw_seal(pack_rw_t *rw)
     return OK;
 }
 
+/* Note an entry copied with damage beyond parity (OWN-31). */
+static void note_damaged(pack_gc_stats_t *stats, const uint8_t hash[OBJECT_HASH_SIZE])
+{
+    if (!stats) return;
+    if (stats->damaged_listed < PACK_DAMAGED_LIST_MAX)
+        memcpy(stats->damaged[stats->damaged_listed++], hash, OBJECT_HASH_SIZE);
+    stats->entries_damaged++;
+}
+
+/*
+ * Rewrite the payload just copied to out at out_pay, this time corrected
+ * from the source entry's parity a window at a time.
+ *
+ * Copying is the one moment damage can be laundered: the output's parity
+ * and CRC are computed afresh over whatever bytes it holds, so a damaged
+ * byte copied as it stands is protected from then on as if it were right,
+ * and the old pack - the only thing that could still have corrected it - is
+ * about to be deleted. Damage beyond parity is copied as it is, noted in the
+ * gc stats so the job fails (OWN-31), and logged;
+ * it was lost before the copy, and the hash still exposes it.
+ */
+static status_t pack_rw_copy_repaired(FILE *out, off_t out_pay, FILE *src, off_t src_pay,
+                                      const entry_parity_t *ep,
+                                      const pack_dat_entry_hdr_t *ehdr,
+                                      pack_gc_stats_t *stats)
+{
+    const size_t groups  = parity_window_groups();
+    const size_t win     = groups * EP_GROUP_DATA;
+    const size_t par_cap = groups * EP_GROUP_PAR;
+    uint8_t *buf = malloc(win);
+    uint8_t *par = malloc(par_cap);
+    status_t st = OK;
+    uint64_t bad = 0;
+    int64_t  fixed = 0;
+
+    if (!buf || !par) { st = set_error(ERR_NOMEM, "pack rewrite: parity window"); goto out; }
+    if (fseeko(src, src_pay, SEEK_SET) != 0 || fseeko(out, out_pay, SEEK_SET) != 0) {
+        st = set_error_errno(ERR_IO, "pack rewrite: seek to repair an entry"); goto out;
+    }
+    for (uint64_t o = 0; o < ehdr->compressed_size; ) {
+        uint64_t left = ehdr->compressed_size - o;
+        size_t want = left < win ? (size_t)left : win;
+        if (fread_full(buf, want, src) != 0) {
+            st = set_error(ERR_CORRUPT, "pack rewrite: short entry"); goto out;
+        }
+        int64_t fx = entry_repair_buf(fileno(src), ep, o, buf, want, par, par_cap, &bad);
+        if (fx < 0) { st = set_error_errno(ERR_IO, "pack rewrite: cannot read parity"); goto out; }
+        fixed += fx;
+        if (fwrite_full(buf, want, out) != 0) {
+            st = set_error_errno(ERR_IO, "pack rewrite: write entry payload"); goto out;
+        }
+        o += want;
+    }
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(ehdr->hash, hex);
+    if (bad > 0) {
+        log_warn("pack rewrite: %s is damaged beyond its parity (%llu group(s)); "
+                 "copied as it is", hex, (unsigned long long)bad);
+        parity_stats_add_uncorrectable(1);
+        note_damaged(stats, ehdr->hash);
+    } else if (fixed > 0) {
+        log_warn("pack rewrite: %s corrected from parity while copying (%lld byte(s))",
+                 hex, (long long)fixed);
+        parity_stats_add_repaired(1);
+    }
+
+out:
+    free(buf);
+    free(par);
+    return st;
+}
+
 /*
  * Copy one entry, whose header has been read from src and whose payload
  * follows at src's position, into the open output - sealing it first if the
  * entry would take it past the seal. An empty output never seals, so an
  * entry larger than the seal is written alone rather than refused. The
  * payload is streamed through chunk, never held whole.
+ *
+ * src_index is the entry's position in src, which its parity is indexed by.
+ * The header is checked against its parity record and the payload's CRC
+ * against the trailer as the bytes go by; a mismatch rewrites the payload
+ * corrected (pack_rw_copy_repaired), so a clean entry is still read once.
  */
-static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_t *ehdr,
-                             char *chunk, size_t chunk_sz)
+static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_t *ehdr_in,
+                             uint32_t src_index, char *chunk, size_t chunk_sz)
 {
     if (rw->kept >= rw->ents_cap)
         return set_error(ERR_CORRUPT, "pack rewrite: more entries than the headers said");
+
+    pack_dat_entry_hdr_t hdr_copy = *ehdr_in;
+    const pack_dat_entry_hdr_t *ehdr = &hdr_copy;
+    off_t src_pay = ftello(src);
+    if (src_pay < 0) return set_error_errno(ERR_IO, "pack rewrite: ftello");
+    entry_parity_t ep;
+    int have_parity = locate_entry_parity(src, src_index, &ep) == 0;
+    if (have_parity) {
+        int hrc = parity_record_check(&hdr_copy, sizeof(hdr_copy), &ep.hdr_par);
+        if (hrc == 1) {
+            log_warn("pack rewrite: repaired an entry header via parity while copying");
+            parity_stats_add_repaired(1);
+        } else if (hrc < 0) {
+            log_warn("pack rewrite: entry header parity uncorrectable");
+            parity_stats_add_uncorrectable(1);
+        }
+        /* No size cap (OWN-25): the entry only has to fit before the
+         * trailer. Compared by subtraction so a damaged, huge size cannot
+         * overflow the sum and slip past. */
+        if ((off_t)ep.trailer_start < src_pay ||
+            hdr_copy.compressed_size > (uint64_t)((off_t)ep.trailer_start - src_pay))
+            return set_error(ERR_CORRUPT, "pack rewrite: entry runs into the parity trailer");
+    }
+    if (fseeko(src, src_pay, SEEK_SET) != 0)
+        return set_error_errno(ERR_IO, "pack rewrite: seek back to the payload");
+
     uint64_t entry_total = sizeof(*ehdr) + ehdr->compressed_size;
 
-    if (rw->cur && rw->cur_n > 0 && rw->body + entry_total > PACK_MAX_MULTI_BYTES) {
+    if (rw->cur && rw->cur_n > 0 && rw->body + entry_total > pack_seal_bytes()) {
         status_t st = pack_rw_seal(rw);
         if (st != OK) return st;
     }
@@ -4485,14 +5041,23 @@ static status_t pack_rw_copy(pack_rw_t *rw, FILE *src, const pack_dat_entry_hdr_
 
     if (fwrite(ehdr, sizeof(*ehdr), 1, rw->cur) != 1)
         return set_error_errno(ERR_IO, "pack rewrite: write entry header");
+    off_t out_pay = ftello(rw->cur);
+    if (out_pay < 0) return set_error_errno(ERR_IO, "pack rewrite: ftello");
     uint64_t remaining = ehdr->compressed_size;
+    uint32_t crc = 0;
     while (remaining > 0) {
         size_t want = remaining < chunk_sz ? (size_t)remaining : chunk_sz;
         if (fread_full(chunk, want, src) != 0)
             return set_error(ERR_CORRUPT, "pack rewrite: short entry");
+        if (have_parity) crc = crc32c_update(crc, chunk, want);
         if (fwrite_full(chunk, want, rw->cur) != 0)
             return set_error_errno(ERR_IO, "pack rewrite: write entry payload");
         remaining -= want;
+    }
+    if (have_parity && ep.rs_sz > 0 && ehdr->compressed_size > 0 && crc != ep.payload_crc) {
+        status_t st = pack_rw_copy_repaired(rw->cur, out_pay, src, src_pay, &ep, ehdr,
+                                            rw->stats);
+        if (st != OK) return st;
     }
 
     pack_idx_disk_entry_t *e = &rw->ents[rw->kept];
@@ -4626,7 +5191,8 @@ static status_t pack_rw_replace(pack_rw_t *rw, const uint32_t *old_nums, size_t 
 }
 
 static status_t maybe_coalesce_packs(store_t *store,
-                                     const uint8_t *refs, size_t refs_cnt) {
+                                     const uint8_t *refs, size_t refs_cnt,
+                                     pack_gc_stats_t *stats) {
     pack_resume_deleting(store);
     pack_meta_t *meta = NULL;
     size_t pack_cnt = 0;
@@ -4679,8 +5245,8 @@ static status_t maybe_coalesce_packs(store_t *store,
      * on every GC.
      */
     {
-        uint64_t out_packs = (cand_bytes + PACK_MAX_MULTI_BYTES - 1)
-                             / PACK_MAX_MULTI_BYTES;
+        uint64_t out_packs = (cand_bytes + pack_seal_bytes() - 1)
+                             / pack_seal_bytes();
         if (out_packs >= n_cand ||
             (uint64_t)n_cand - out_packs < PACK_COALESCE_MIN_REDUCTION) {
             log_info("pack-coalesce: %zu candidate(s) would produce %llu pack(s),"
@@ -4698,6 +5264,7 @@ static status_t maybe_coalesce_packs(store_t *store,
      * durable installs, rows moved, then the marker and the removals. */
     pack_rw_t rw;
     status_t rc = pack_rw_init(&rw, store, (uint32_t)total_entries);
+    rw.stats = stats;
     if (rc != OK) { free(cand); return rc; }
 
     const size_t CHUNK = 128 * 1024;
@@ -4751,12 +5318,13 @@ static status_t maybe_coalesce_packs(store_t *store,
                 break;
             }
             pack_dat_entry_hdr_t ehdr;
-            if (read_entry_hdr(datf, &ehdr) != 0) {
-                rc = set_error(ERR_CORRUPT, "pack-coalesce: bad entry header in pack %u",
-                               cand[ci].num);
+            int ehrc = read_entry_hdr(datf, &ehdr, 1);
+            if (ehrc != 0) {
+                rc = entry_hdr_error(ehrc, "pack-coalesce: bad entry header in pack %u",
+                                     cand[ci].num);
                 break;
             }
-            rc = pack_rw_copy(&rw, datf, &ehdr, chunk, CHUNK);
+            rc = pack_rw_copy(&rw, datf, &ehdr, i, chunk, CHUNK);
         }
 
         free(disk_idx);
@@ -4793,6 +5361,76 @@ static status_t maybe_coalesce_packs(store_t *store,
     return rc;
 }
 
+/*
+ * OWN-30 stopgap. load_entry_parity finds the trailer through the footer's
+ * uint32 trailer_size, and in a pack whose trailer outgrew it that points
+ * into the wrong bytes - for every entry, not just a large one, since an
+ * old unsealed pack can hold any amount. The bound is taken from the file
+ * size and the larger of the two entry counts, never an entry header,
+ * because a header is what repair may be about to rewrite.
+ *
+ * An unreadable count says nothing about size, so it passes here and
+ * load_entry_parity, which reads the same bytes, refuses on its own terms.
+ */
+int pack_parity_fields_fit(FILE *f)
+{
+    struct stat sb;
+    if (fstat(fileno(f), &sb) != 0) return 1;
+    uint64_t fsize = (uint64_t)sb.st_size;
+    if (fsize <= parity_trailer_limit()) return 1;
+
+    pack_dat_hdr_t dh;
+    uint32_t tail_count = 0;
+    if (pread(fileno(f), &dh, sizeof(dh), 0) != (ssize_t)sizeof(dh) ||
+        pread(fileno(f), &tail_count, sizeof(tail_count), (off_t)(fsize - 16))
+            != (ssize_t)sizeof(tail_count))
+        return 1;
+    uint64_t n = dh.count > tail_count ? dh.count : tail_count;
+
+    return parity_trailer_fits_file(fsize, n,
+        sizeof(pack_dat_hdr_t), sizeof(pack_dat_entry_hdr_t),
+        /* header CRC, entry_count, footer */
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(parity_footer_t),
+        /* header parity, CRC, rs_data_len, block size, offset table slot */
+        sizeof(parity_record_t) + 3 * sizeof(uint32_t) + sizeof(uint64_t));
+}
+
+/*
+ * Repair a packed entry in place, from its own parity, in bounded memory.
+ *
+ * This used to stop at PACK_STREAM_THRESHOLD: past 16 MiB it read the whole
+ * parity, then skipped the payload, so every large object the pack pass had
+ * packed lost the repair it had as a loose object - and the pack pass packs
+ * exactly the large compressible ones. Parity is per entry and per group, so
+ * it now works the way object_repair does, a window of groups at a time,
+ * whatever the entry's size or codec. The CRC and parity cover the stored
+ * bytes, so no key is needed and nothing is decompressed.
+ *
+ * Three passes over the payload, the last two only for a damaged entry:
+ *
+ *   1. CRC the stored bytes. Equal to the trailer's: nothing to do, and a
+ *      clean entry pays one read.
+ *   2. Correct every window in memory and CRC the result, writing nothing.
+ *      Only a result that matches the trailer's CRC proves the corrections
+ *      right; RS can miscorrect a group damaged past its capacity into some
+ *      other valid codeword, and writing that back would replace damage that
+ *      verify reports with damage that it cannot see.
+ *   3. Correct again and pwrite each window that changed.
+ *
+ * In place rather than through pack_rw_replace, because in place is the
+ * safer of the two here. Each pwrite puts back the bytes the entry was
+ * written with, at their own offsets, and touches nothing else: not the
+ * parity, not the CRC, not any other entry, not the index. A crash or a torn
+ * write in the middle leaves every byte either as it was (damaged, and
+ * already covered by parity) or as it should be, so the errors left are a
+ * subset of those found, still within capacity, and a rerun finishes the job.
+ * pack_rw_replace would copy the whole pack - up to the seal, or any size for
+ * a pack written before the seal - under new numbers to fix a few bytes, and
+ * would need that much free space on a disk that is already failing.
+ *
+ * Returns the bytes corrected (header and payload), 0 when the entry is
+ * clean, -1 when it cannot be repaired or the repair cannot be written.
+ */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     pack_cache_entry_t found;
     if (pack_find_entry(store, hash, &found) != OK) return -1;
@@ -4805,80 +5443,123 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
                               store_root(store), found.pack_num) != 0)
         return -1;
 
-    /* Open read-only FILE* for load_entry_parity and reading current data */
     FILE *f = fopen(dat_path, "rb");
     if (!f) return -1;
 
-    /* Load parity data */
-    parity_record_t hdr_par;
-    uint32_t pay_crc = 0;
-    uint8_t *rs_par = NULL;
-    size_t rs_par_sz = 0;
-    if (load_entry_parity(f, found.entry_index, &hdr_par,
-                          &pay_crc, &rs_par, &rs_par_sz) != 0) {
+    if (!pack_parity_fields_fit(f)) {
+        log_warn("pack %u: not repaired: pack is " PARITY_TOO_LARGE_REASON,
+                 found.pack_num);
+        fclose(f);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
+    }
+
+    entry_parity_t ep;
+    if (locate_entry_parity(f, found.entry_index, &ep) != 0) {
         fclose(f);
         return -1;
     }
 
-    /* Read entry header */
-    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0) {
-        free(rs_par); fclose(f); return -1;
-    }
     pack_dat_entry_hdr_t ehdr;
-    if (fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
-        free(rs_par); fclose(f); return -1;
+    if (fseeko(f, (off_t)found.dat_offset, SEEK_SET) != 0 ||
+        fread(&ehdr, sizeof(ehdr), 1, f) != 1) {
+        fclose(f);
+        return -1;
     }
 
-    int fixed = 0;
-    int fd = -1;  /* opened lazily for pwrite */
+    int      rfd = fileno(f);
+    int      wfd = -1;      /* opened only once there is something to write */
+    int64_t  fixed = 0;
+    int      failed = 0;
+    uint8_t *buf = NULL;
+    uint8_t *par = NULL;
 
-    /* Check/repair entry header */
-    int hrc = parity_record_check(&ehdr, sizeof(ehdr), &hdr_par);
+    /* Header first: every payload offset below depends on compressed_size. */
+    int hrc = parity_record_check(&ehdr, sizeof(ehdr), &ep.hdr_par);
+    if (hrc < 0) { failed = 1; goto out; }
     if (hrc == 1) {
-        fd = open(dat_path, O_WRONLY);
-        if (fd < 0) { free(rs_par); fclose(f); return -1; }
-        if (pwrite(fd, &ehdr, sizeof(ehdr), (off_t)found.dat_offset) != sizeof(ehdr)) {
-            close(fd); free(rs_par); fclose(f); return -1;
+        wfd = open(dat_path, O_WRONLY);
+        if (wfd < 0 ||
+            pwrite_full(wfd, &ehdr, sizeof(ehdr), (off_t)found.dat_offset) != 0) {
+            failed = 1; goto out;
         }
         fixed++;
     }
 
-    /* Check/repair payload via CRC + RS */
-    if (ehdr.compressed_size > 0 && ehdr.compressed_size <= PACK_STREAM_THRESHOLD) {
-        uint8_t *payload = malloc((size_t)ehdr.compressed_size);
-        if (payload) {
-            off_t pay_off = (off_t)(found.dat_offset + sizeof(ehdr));
-            if (fseeko(f, pay_off, SEEK_SET) == 0 &&
-                fread_full(payload, (size_t)ehdr.compressed_size, f) == 0) {
+    off_t    pay_off = (off_t)(found.dat_offset + sizeof(ehdr));
+    uint64_t csize   = ehdr.compressed_size;
+    if ((uint64_t)pay_off + csize > (uint64_t)ep.trailer_start) { failed = 1; goto out; }
+    if (csize == 0 || ep.rs_sz == 0) goto out;
 
-                uint32_t got_crc = crc32c(payload, (size_t)ehdr.compressed_size);
-                if (got_crc != pay_crc && rs_par != NULL && rs_par_sz > 0) {
-                    rs_init();
-                    int rrc = rs_parity_decode(payload, (size_t)ehdr.compressed_size, rs_par, rs_par_sz);
-                    if (rrc > 0) {
-                        if (fd < 0) {
-                            fd = open(dat_path, O_WRONLY);
-                        }
-                        if (fd >= 0) {
-                            if (pwrite(fd, payload, (size_t)ehdr.compressed_size, pay_off)
-                                == (ssize_t)ehdr.compressed_size) {
-                                fixed += rrc;
-                            }
-                        }
-                    }
-                }
-            }
-            free(payload);
+    const size_t groups  = parity_window_groups();
+    const size_t win     = groups * EP_GROUP_DATA;
+    const size_t par_cap = groups * EP_GROUP_PAR;
+    buf = malloc(win);
+    par = malloc(par_cap);
+    if (!buf || !par) { failed = 1; goto out; }
+
+    /* Pass 1: is anything wrong at all? */
+    uint32_t crc = 0;
+    for (uint64_t o = 0; o < csize; ) {
+        size_t want = csize - o < win ? (size_t)(csize - o) : win;
+        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
+        crc = crc32c_update(crc, buf, want);
+        o += want;
+    }
+    if (crc == ep.payload_crc) goto out;
+
+    /* Pass 2: correct in memory and prove the result before writing any of it. */
+    uint64_t bad = 0;
+    uint32_t fixed_crc = 0;
+    int64_t  payload_fixed = 0;
+    for (uint64_t o = 0; o < csize; ) {
+        size_t want = csize - o < win ? (size_t)(csize - o) : win;
+        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
+        int64_t fx = entry_repair_buf(rfd, &ep, o, buf, want, par, par_cap, &bad);
+        if (fx < 0) { failed = 1; goto out; }
+        payload_fixed += fx;
+        fixed_crc = crc32c_update(fixed_crc, buf, want);
+        o += want;
+    }
+    if (bad > 0 || fixed_crc != ep.payload_crc || payload_fixed == 0) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        log_warn("pack: %s in pack-%08u.dat is damaged beyond its parity "
+                 "(%llu group(s) uncorrectable); nothing written",
+                 hex, found.pack_num, (unsigned long long)bad);
+        failed = 1;
+        goto out;
+    }
+
+    /* Pass 3: write back each window that changed. */
+    if (wfd < 0) {
+        wfd = open(dat_path, O_WRONLY);
+        if (wfd < 0) { failed = 1; goto out; }
+    }
+    for (uint64_t o = 0; o < csize; ) {
+        size_t want = csize - o < win ? (size_t)(csize - o) : win;
+        uint64_t bad3 = 0;
+        if (pread_full(rfd, buf, want, pay_off + (off_t)o) != 0) { failed = 1; goto out; }
+        int64_t fx = entry_repair_buf(rfd, &ep, o, buf, want, par, par_cap, &bad3);
+        if (fx < 0 || bad3 > 0) { failed = 1; goto out; }
+        if (fx > 0 && pwrite_full(wfd, buf, want, pay_off + (off_t)o) != 0) {
+            failed = 1; goto out;
         }
+        o += want;
     }
+    fixed += payload_fixed;
 
-    free(rs_par);
+out:
+    free(buf);
+    free(par);
     fclose(f);
-    if (fd >= 0) {
-        if (fixed > 0) fsync(fd);
-        close(fd);
+    if (wfd >= 0) {
+        if (fixed > 0 && fsync(wfd) != 0) failed = 1;
+        close(wfd);
     }
-    return fixed;
+    /* Open .dat handles may hold the damaged bytes in their stdio buffers. */
+    if (fixed > 0) pack_cache_invalidate(store);
+    if (failed) return -1;
+    return fixed > INT_MAX ? INT_MAX : (int)fixed;
 }
 
 /*
@@ -4907,7 +5588,7 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
                                 const uint8_t *refs, size_t refs_cnt,
                                 char *chunk, size_t chunk_sz,
                                 uint32_t *out_kept, uint32_t *out_dropped,
-                                uint32_t *out_written)
+                                uint32_t *out_written, pack_gc_stats_t *stats)
 {
     *out_kept = 0;
     *out_dropped = 0;
@@ -4919,6 +5600,7 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
     pack_rw_t rw;
     status_t st = pack_rw_init(&rw, store, count);
     if (st != OK) { fclose(old); return st; }
+    rw.stats = stats;
 
     uint32_t dropped = 0;
     for (uint32_t i = 0; st == OK && i < count; i++) {
@@ -4931,15 +5613,14 @@ static status_t gc_rewrite_pack(store_t *store, uint32_t pnum, const char *dat_p
             break;
         }
         pack_dat_entry_hdr_t ehdr;
-        /* read_entry_hdr bounds the size by what the file holds, which is
-         * the only bound that means anything: the copy below streams. */
-        if (read_entry_hdr(old, &ehdr) != 0) {
-            st = set_error(ERR_CORRUPT, "pack_gc: bad entry header at %llu in pack %u",
-                           (unsigned long long)disk_idx[i].dat_offset, pnum);
+        int ehrc = read_entry_hdr(old, &ehdr, 1);
+        if (ehrc != 0) {
+            st = entry_hdr_error(ehrc, "pack_gc: bad entry header at %llu in pack %u",
+                                 (unsigned long long)disk_idx[i].dat_offset, pnum);
             break;
         }
         size_t sealed = rw.nouts;
-        st = pack_rw_copy(&rw, old, &ehdr, chunk, chunk_sz);
+        st = pack_rw_copy(&rw, old, &ehdr, i, chunk, chunk_sz);
         /* A rewrite of a large pack can run for hours. Just after an output
          * seals is a clean place to stop: nothing is installed yet. */
         if (st == OK && rw.nouts != sealed && store_cancelled(store))
@@ -5069,7 +5750,7 @@ status_t pack_gc_stats(store_t *store,
         uint32_t kept = 0, dropped = 0, written = 0;
         status_t st = gc_rewrite_pack(store, pnum, dat_path, disk_idx, count,
                                       refs, refs_cnt, gc_chunk, GC_CHUNK,
-                                      &kept, &dropped, &written);
+                                      &kept, &dropped, &written, stats);
         free(disk_idx);
         if (st == ERR_BUSY) {
             /* Cancelled mid-rewrite, with nothing installed: the pack is
@@ -5100,7 +5781,7 @@ status_t pack_gc_stats(store_t *store,
         return set_error(ERR_BUSY, "pack compaction cancelled");
     }
 
-    status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt);
+    status_t coalesce_st = maybe_coalesce_packs(store, refs, refs_cnt, stats);
     if (coalesce_st != OK)
         log_warn("pack-coalesce: skipped due to error");
 

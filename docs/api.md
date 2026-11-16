@@ -446,7 +446,7 @@ lazily on first append, which used to leave an empty result serialising as
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used |
+| POST | `/repos/<id>/backup` | `{paths:[...], label, exclude:[...], one_filesystem}`; with no `paths`, the repository's configured sources are used. `label` is at most 256 bytes of well-formed UTF-8 with no control characters (C0, DEL or C1); anything else is `400 {"error":"label must be at most 256 bytes of printable text"}` |
 | GET/PUT | `/repos/<id>/sources` | What this repository backs up: `{sources:[...], exclude:[...]}` |
 | POST | `/repos/<id>/snapshots/<sid>/restore` | `{dest, overwrite, subpath}` |
 | POST | `/repos/<id>/gc` | Mark and sweep; `?dry_run=1` to report only |
@@ -480,6 +480,16 @@ what was asked:
 A snapshot whose nodes are not resident cannot be checked up front, so for
 that one a subpath that matches nothing fails the job with the same message
 instead of reporting a restore that wrote nothing.
+
+A restore job's `result` is `files`, `dirs`, `symlinks`, `hardlinks`,
+`specials`, `bytes`, `skipped`, `kept` and `failed`. Without `overwrite`, a
+regular file already at its path with the snapshot's size and an mtime
+within two seconds of the snapshot's counts as `skipped` (an earlier run
+restored it); anything else there is left alone and counted as `kept`.
+Neither fails the job; any `failed` entry does. Each file is written under a
+temporary `.c-backup-partial.*` name and renamed into place only once its
+object has read back verified, so a file at its final path is always
+complete (Manual section 8).
 
 `exclude` takes patterns, and how one is matched follows from what it
 contains rather than from a flag:
@@ -551,7 +561,16 @@ that reached `max_hits_per_file` does not set it; it is counted in
 `files_capped` (files that may hold more than was recorded), which both the
 run record in `GET /repos/<id>/grep` and the job's `result` carry. The
 `result` also has `run_id`, `snapshot`, `files_scanned`, `files_matched`,
-`hits` and `truncated`. `ignore_case` is a boolean; `0` and `1` are still
+`files_skipped`, `hits` and `truncated`.
+
+A file's matches are recorded only once its object has read back whole and
+authentic: hash, and in an encrypted repository the authentication tag,
+both checked at the end of the read, so an object over 16 MiB is read to
+its end even after its cap or a binary match. A file that does not read
+back (damaged beyond parity, failing its tag, or an object that is not file
+content) records nothing and is counted in `files_skipped`; the run record
+carries `files_skipped` and `skip_reason`, the first such file as `<path>:
+<reason>` (`null` when there was none). `ignore_case` is a boolean; `0` and `1` are still
 accepted. The CLI takes `--limit`, `--max-hits-per-file` and
 `--max-hits`.
 
@@ -620,9 +639,15 @@ A run (`GET /repos/<id>/verify`) carries these counts:
 Findings (`GET /repos/<id>/verify/<run-id>`) name files, not hashes, so the
 report says what was lost and what is still clean. Every object that is not
 `ok` gets one, with `status` one of `missing`, `unrecoverable`, `unreadable
-header`, `uncorrectable parity`, `damaged (run with repair to attempt
-recovery)` (a large streamed object with repair off, whose recoverability
-cannot be known without writing), `recoverable` or `repaired`:
+header`, `uncorrectable parity`, `recoverable` or `repaired`. Parity is
+applied in memory at every object size, so `unrecoverable` means the same
+with repair off as with it on. (Before 1.0 a large streamed object with
+repair off was reported `damaged (run with repair to attempt recovery)`;
+that status is gone.) Two more carry the reason repair declined to write:
+`unrecoverable: too large for 32-bit parity fields; repair disabled pending
+format fix` and `recoverable, not written back: ` followed by the same
+reason, for an object or pack past the parity format's size limit (Manual
+section 11). Each finding also carries:
 
 | Field | Meaning |
 |---|---|
@@ -722,8 +747,17 @@ instead of being overwritten. The job fails, saying which, when `dest` is
 not a repository, is a replica of the source, or is encrypted and its key is
 not on this host. The job's result reports `snapshots_sent`,
 `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent`,
-`subtrees_skipped` and `reencrypted`. Re-encrypting is a manual operation: the
-schedule route does not store `reencrypt`.
+`subtrees_skipped` and `reencrypted`. An object damaged beyond parity is
+sent and the run finishes, then the job fails with `replicated with N
+object(s) damaged beyond parity; the replica holds them as damaged`, and the
+result adds `objects_damaged`, `damaged` (the first 100, each
+`{"hash","snapshot"}`) and `damaged_listed`. Re-encrypting is a manual
+operation: the schedule route does not store `reencrypt`. Objects are
+re-encrypted as they stream, and the source tag is checked at the end of
+each, so an object's bytes reach the destination's `tmp/` staging pack
+before they are authenticated - as plaintext, into an unencrypted
+destination. An object whose tag fails is cut back out of the staging pack
+and fails the run; nothing unverified is installed or named by a snapshot.
 
 There is no delete. Retention at the target belongs to the target, which is
 what stops a compromised source from taking the offsite copy with it.
@@ -811,8 +845,8 @@ What some jobs report in `result`, beyond the backup and restore counts:
 
 | Job | `result` |
 |---|---|
-| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed` |
-| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted` |
+| gc | `dry_run`, `reachable`, `objects_swept` and `bytes_freed` (what was or would be swept), `pack_entries_kept`, `pack_entries_dropped`, `packs_rewritten`, `packs_deleted`, `tmp_files_removed`, `tmp_bytes_removed`, `pack_entries_damaged`, `damaged` (first 100 hashes), `damaged_listed`; the job fails when `pack_entries_damaged` is non-zero |
+| replicate | `snapshots_sent`, `snapshots_skipped`, `objects_asked`, `objects_sent`, `bytes_sent` (as stored), `subtrees_skipped`, `reencrypted`, `objects_damaged`, `damaged` (first 100, with snapshot), `damaged_listed`; the job fails when `objects_damaged` is non-zero |
 | pack | `loose` (loose objects found), `packed`, `skip_marked` (already marked incompressible, left loose), `incompressible` (marked by this run's probe, left loose), `reason` |
 
 A backup's `result` has its counts (`snapshot_id`, `files`, `dirs`,
@@ -1136,7 +1170,7 @@ different action is a 400 rather than a value stored and never read:
 
 | Action | Parameters |
 |---|---|
-| `backup` | `paths` (optional; the repository's sources otherwise) |
+| `backup` | `paths` (optional; the repository's sources otherwise), `label` (optional; the same rule as a backup request, checked at creation) |
 | `replicate` | `dest` (required, absolute) |
 | `grep` | `pattern` (required, a valid extended regular expression), `path_prefix`, `ignore_case` (a boolean, stored as one; `0`/`1` accepted), `max_files` |
 | others | none |

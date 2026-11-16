@@ -310,6 +310,13 @@ export function GrepView({ connName, repoPath, initialPrefix, onBack }: Props): 
                     - {selected.files_capped} file(s) stopped at the per-file hit limit
                   </span>
                 )}
+                {/* A skipped file was not searched: it did not read back
+                  * authentic and whole, so no match from it is listed. */}
+                {(selected.files_skipped ?? 0) > 0 && (
+                  <span className="text-status-warning ml-2" title={selected.skip_reason ?? undefined}>
+                    - {selected.files_skipped} file(s) could not be read and were not searched
+                  </span>
+                )}
                 {/* A cancelled run has real hits, just not all of them.
                   * Presenting them as a finished search would be a lie by
                   * omission. */}

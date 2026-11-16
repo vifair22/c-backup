@@ -35,8 +35,9 @@
 #include "parity.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_parity"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_parity"
 
 /* Above the block-codec threshold, so the frame codec is used. */
 #define FRAME_SIZE (17u * 1024u * 1024u)
@@ -135,7 +136,7 @@ static void assert_buffered_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
 static void assert_stream_read_matches(const uint8_t hash[OBJECT_HASH_SIZE],
                                        const uint8_t *expect, size_t len)
 {
-    char out[] = "/tmp/c_backup_pack_parity_stream.XXXXXX";
+    char out[] = TEST_TMP "/c_backup_pack_parity_stream.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 
@@ -317,13 +318,13 @@ static void test_frame_codec_entry_reads_clean(void **state)
 }
 
 /*
- * The frame codec is detection-only by design: repairing it would mean
- * buffering the whole compressed payload, which is exactly what streaming
- * exists to avoid for a payload that may not fit in RAM. So corruption must
- * surface as an error rather than as repaired-looking output, and it must be
- * counted as uncorrectable rather than as a repair.
+ * The frame codec used to be detection-only, on the grounds that repairing
+ * it meant buffering the whole compressed payload. It does not: parity is
+ * per group and the decompressor takes its input in any pieces, so the
+ * stream is corrected a window at a time (OWN-24/OWN-23), and a flipped byte
+ * now reads back as the original, counted as a repair.
  */
-static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
+static void test_frame_codec_corruption_is_repaired(void **state)
 {
     (void)state;
     uint8_t *data = malloc(FRAME_SIZE);
@@ -336,7 +337,45 @@ static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
 
     flip_pack_byte((off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 128));
 
-    char out[] = "/tmp/c_backup_pack_parity_frame.XXXXXX";
+    parity_stats_reset();
+    assert_stream_read_matches(hash, data, FRAME_SIZE);
+    assert_true(parity_stats_get().repaired > 0);
+    assert_int_equal((int)parity_stats_get().uncorrectable, 0);
+    free(data);
+}
+
+/*
+ * Damage past what parity can carry must still surface as an error rather
+ * than as plausible output, and must be counted as uncorrectable rather than
+ * as a repair: nothing was fixed.
+ */
+static void test_frame_codec_damage_beyond_parity_is_not_repaired(void **state)
+{
+    (void)state;
+    uint8_t *data = malloc(FRAME_SIZE);
+    assert_non_null(data);
+    fill_compressible(data, FRAME_SIZE);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, FRAME_SIZE, hash), OK);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    /* 2 KiB of junk in one group: four times the 512-byte burst it covers. */
+    {
+        char path[512];
+        assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+        int dfd = open(path, O_RDWR);
+        assert_true(dfd >= 0);
+        uint8_t junk[2048];
+        memset(junk, 0xA7, sizeof(junk));
+        assert_int_equal(pwrite(dfd, junk, sizeof(junk),
+                                (off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 4096)),
+                         (ssize_t)sizeof(junk));
+        close(dfd);
+        pack_cache_invalidate(store);
+    }
+
+    char out[] = TEST_TMP "/c_backup_pack_parity_frame.XXXXXX";
     int fd = mkstemp(out);
     assert_true(fd >= 0);
 
@@ -349,6 +388,10 @@ static void test_frame_codec_corruption_is_detected_not_repaired(void **state)
 
     /* Nothing was fixed, so nothing may be counted as fixed. */
     assert_int_equal((int)parity_stats_get().repaired, 0);
+    assert_true(parity_stats_get().uncorrectable > 0);
+
+    /* And a repair refuses to write what it cannot prove. */
+    assert_int_equal(pack_object_repair(store, hash), -1);
     free(data);
 }
 
@@ -495,6 +538,18 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
                                          ENCRYPT_CHACHA20, 1, body, 4), OK);
     err_clear();
 
+    /* An object type every reader refuses (OWN-39); 0, 6 and 9 all came
+     * through before, and fuzz_pack_stored found the first. */
+    const uint8_t bad_types[] = { 0, 6, 9 };
+    for (size_t i = 0; i < sizeof(bad_types); i++) {
+        err_clear();
+        assert_int_not_equal(pack_stored_add(w, hash, bad_types[i], COMPRESS_NONE,
+                                             ENCRYPT_NONE, sizeof(body) - 1,
+                                             body, sizeof(body) - 1), OK);
+        assert_non_null(strstr(err_msg(), "is not known to this build"));
+    }
+    err_clear();
+
     /* Nothing was accepted, so there is nothing to install. */
     assert_int_equal(pack_stored_count(w), 0);
 
@@ -522,10 +577,235 @@ static void test_stored_writer_refuses_what_no_reader_opens(void **state)
     free(payload);
 }
 
+/* ------------------------------------------------------------------ */
+/* OWN-30: repair refuses a pack whose 32-bit parity fields may wrap    */
+/* ------------------------------------------------------------------ */
+
+static uint8_t *slurp_pack(size_t *out_len)
+{
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    assert_int_equal(fseeko(f, 0, SEEK_END), 0);
+    off_t len = ftello(f);
+    assert_true(len > 0);
+    rewind(f);
+    uint8_t *buf = malloc((size_t)len);
+    assert_non_null(buf);
+    assert_int_equal(fread(buf, 1, (size_t)len, f), (size_t)len);
+    fclose(f);
+    *out_len = (size_t)len;
+    return buf;
+}
+
+#define TOO_LARGE_BYTES (2u * 1024u * 1024u)
+
+/*
+ * A pack past the threshold must come out of repair byte-for-byte as it
+ * went in: its footer's trailer_size has wrapped, so whatever it would have
+ * written was read from the wrong place. The test hook moves the threshold
+ * under a 2 MiB entry; the same pack with the same damage is then repaired
+ * normally once the real limit is back, which is what shows the refusal is
+ * the guard and not some other failure.
+ */
+static void test_too_large_pack_is_not_repaired(void **state)
+{
+    (void)state;
+    uint8_t *data = malloc(TOO_LARGE_BYTES);
+    assert_non_null(data);
+    fill_random(data, TOO_LARGE_BYTES, 0x0D15EA5Eu);
+
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, TOO_LARGE_BYTES, hash);
+    flip_pack_byte((off_t)(entry_offset(hash) + sizeof(pack_dat_entry_hdr_t) + 1000));
+    /* And the header, the other thing repair writes. */
+    flip_pack_byte((off_t)(entry_offset(hash) + 40));
+
+    size_t before_len = 0;
+    uint8_t *before = slurp_pack(&before_len);
+
+    parity_fields_set_test_limit(1024u * 1024u);
+    assert_int_equal(pack_object_repair(store, hash), PARITY_REPAIR_REFUSED_TOO_LARGE);
+    parity_fields_set_test_limit(0);
+
+    size_t after_len = 0;
+    uint8_t *after = slurp_pack(&after_len);
+    assert_int_equal(after_len, before_len);
+    assert_memory_equal(after, before, before_len);
+    free(after);
+
+    /* Below the threshold the same damage is repaired as before. */
+    assert_true(pack_object_repair(store, hash) > 0);
+    pack_cache_invalidate(store);
+    parity_stats_reset();
+    assert_buffered_read_matches(hash, data, TOO_LARGE_BYTES);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+
+    free(before);
+    free(data);
+}
+
+/* The bound the guard uses, against real trailers. */
+static uint64_t pack_bound_of(FILE *f, uint32_t *out_trailer_size)
+{
+    assert_int_equal(fseeko(f, 0, SEEK_END), 0);
+    uint64_t fsize = (uint64_t)ftello(f);
+    parity_footer_t pftr;
+    assert_int_equal(fseeko(f, -(off_t)sizeof(pftr), SEEK_END), 0);
+    assert_int_equal(fread(&pftr, sizeof(pftr), 1, f), 1);
+    pack_dat_hdr_t dh;
+    rewind(f);
+    assert_int_equal(fread(&dh, sizeof(dh), 1, f), 1);
+    *out_trailer_size = pftr.trailer_size;
+    return parity_trailer_bound(fsize, dh.count,
+        sizeof(pack_dat_hdr_t), sizeof(pack_dat_entry_hdr_t),
+        4 + 4 + sizeof(parity_footer_t),
+        sizeof(parity_record_t) + 12 + 8);
+}
+
+/* One entry: the bound is the trailer, so the guard's threshold is exact. */
+static void test_pack_guard_is_exact_for_one_entry(void **state)
+{
+    (void)state;
+    const size_t len = 300000;   /* not a whole number of groups */
+    uint8_t *data = malloc(len);
+    assert_non_null(data);
+    fill_random(data, len, 0x5EED5EEDu);
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, len, hash);
+    free(data);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    uint32_t ts = 0;
+    uint64_t b = pack_bound_of(f, &ts);
+    assert_int_equal(b, ts);
+
+    pack_dat_entry_hdr_t eh;
+    assert_int_equal(fseeko(f, (off_t)entry_offset(hash), SEEK_SET), 0);
+    assert_int_equal(fread(&eh, sizeof(eh), 1, f), 1);
+
+    parity_fields_set_test_limit(eh.compressed_size);
+    assert_int_equal(pack_parity_fields_fit(f), 1);
+    parity_fields_set_test_limit(eh.compressed_size - PARITY_GROUP_DATA);
+    assert_int_equal(pack_parity_fields_fit(f), 0);
+    parity_fields_set_test_limit(0);
+    assert_int_equal(pack_parity_fields_fit(f), 1);
+    fclose(f);
+}
+
+/* Several entries: the bound may overstate, never understate. */
+static void test_pack_guard_bound_covers_many_entries(void **state)
+{
+    (void)state;
+    const size_t sizes[] = { 1, 100, 15296, 15297, 40000, 70001, 123457 };
+    uint8_t *data = malloc(123457);
+    assert_non_null(data);
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        uint8_t hash[OBJECT_HASH_SIZE];
+        fill_random(data, sizes[i], 0x1000u + (uint32_t)i);
+        assert_int_equal(object_store(store, OBJECT_TYPE_FILE, data, sizes[i], hash), OK);
+    }
+    free(data);
+    assert_int_equal(repo_pack(store, NULL, NULL, NULL), OK);
+
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    FILE *f = fopen(path, "rb");
+    assert_non_null(f);
+    uint32_t ts = 0;
+    uint64_t b = pack_bound_of(f, &ts);
+    assert_true(b >= ts);
+    assert_true(b <= (uint64_t)ts + 6 * PARITY_GROUP_PAR);
+    fclose(f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Entry types (OWN-39)                                                */
+/* ------------------------------------------------------------------ */
+
+static void set_pack_byte(off_t off, uint8_t v)
+{
+    char path[512];
+    assert_int_equal(find_pack_dat(path, sizeof(path)), 0);
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    if (off < 0) off += lseek(fd, 0, SEEK_END);
+    assert_int_equal(pwrite(fd, &v, 1, off), 1);
+    close(fd);
+    pack_cache_invalidate(store);
+}
+
+#define UNKNOWN_TYPE_MSG \
+    "object type 9 is not known to this build; written by a newer c-backup?"
+
+/*
+ * A pack entry of a type this build does not know is refused by name, by
+ * every reader, rather than handed to restore as file bytes. The footer is
+ * broken too so the entry has no parity: with parity, header repair would
+ * (rightly) put the original type back, which is the next test.
+ */
+static void test_unknown_entry_type_is_refused(void **state)
+{
+    (void)state;
+    uint8_t data[4096];
+    fill_compressible(data, sizeof(data));
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, sizeof(data), hash);
+
+    set_pack_byte((off_t)(entry_offset(hash) + offsetof(pack_dat_entry_hdr_t, type)), 9);
+    set_pack_byte(-(off_t)sizeof(parity_footer_t), 0);   /* footer magic */
+
+    void *out = NULL;
+    size_t len = 0;
+    err_clear();
+    assert_int_equal(object_load(store, hash, &out, &len, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+
+    char tmp[] = TEST_TMP "/c_backup_pack_type.XXXXXX";
+    int fd = mkstemp(tmp);
+    assert_true(fd >= 0);
+    err_clear();
+    assert_int_equal(object_load_stream(store, hash, fd, NULL, NULL), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+    close(fd);
+    unlink(tmp);
+
+    uint64_t sz = 0;
+    uint8_t  type = 0;
+    err_clear();
+    assert_int_equal(object_get_info(store, hash, &sz, &type), ERR_CORRUPT);
+    assert_non_null(strstr(err_msg(), UNKNOWN_TYPE_MSG));
+}
+
+/* One flipped bit that lands the type outside 1-5 is damage, and the entry
+ * header parity still repairs it on both reads. */
+static void test_damaged_entry_type_byte_is_repaired(void **state)
+{
+    (void)state;
+    uint8_t data[4096];
+    fill_compressible(data, sizeof(data));
+    uint8_t hash[OBJECT_HASH_SIZE];
+    pack_one(data, sizeof(data), hash);
+
+    set_pack_byte((off_t)(entry_offset(hash) + offsetof(pack_dat_entry_hdr_t, type)),
+                  OBJECT_TYPE_FILE | 0x08);
+
+    parity_stats_reset();
+    assert_buffered_read_matches(hash, data, sizeof(data));
+    assert_stream_read_matches(hash, data, sizeof(data));
+    assert_true(parity_stats_get().repaired > 0);
+}
+
 int main(void)
 {
     rs_init();
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test_setup_teardown(test_unknown_entry_type_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_damaged_entry_type_byte_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_uncompressed_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_lz4_block_entry_reads_clean, setup, teardown),
         cmocka_unit_test_setup_teardown(test_payload_corruption_repaired_for_uncompressed, setup, teardown),
@@ -534,10 +814,14 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_entry_header_corruption_is_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_repair_persists_and_is_idempotent, setup, teardown),
         cmocka_unit_test_setup_teardown(test_frame_codec_entry_reads_clean, setup, teardown),
-        cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_detected_not_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_frame_codec_corruption_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_frame_codec_damage_beyond_parity_is_not_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_absurd_entry_count_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_entry_header_beyond_file_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_stored_writer_refuses_what_no_reader_opens, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_too_large_pack_is_not_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_guard_is_exact_for_one_entry, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_pack_guard_bound_covers_many_entries, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

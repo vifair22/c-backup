@@ -35,8 +35,9 @@
 #include "repo.h"
 #include "store.h"
 #include "store_index.h"
+#include "test_tmp.h"
 
-#define TEST_DIR  "/tmp/c_backup_test_incr"
+#define TEST_DIR  TEST_TMP "/c_backup_test_incr"
 #define TEST_DB   TEST_DIR "/state.db"
 #define TEST_REPO TEST_DIR "/repo"
 #define TEST_SRC  TEST_DIR "/src"
@@ -76,7 +77,17 @@ static void write_file(const char *path, const char *content)
  * O(changed dirs + depth), and it is a fixed cost per snapshot rather than
  * one that grows with the size of the tree.
  */
-#define ANCESTOR_TREES 3   /* /tmp, /tmp/c_backup_test_incr, and src itself */
+/* Each component of the scratch directory (TEST_TMP: /tmp is one, a cache
+ * directory several), then c_backup_test_incr, then src itself. */
+static int ancestor_trees(void)
+{
+    const char *base = TEST_TMP;
+    int n = 0;
+    for (const char *p = base; *p; p++)
+        if (*p != '/' && (p == base || p[-1] == '/')) n++;
+    return n + 2;
+}
+#define ANCESTOR_TREES ancestor_trees()
 #define ROOT_TREES     1   /* the synthetic root joining all source paths */
 static int setup(void **state)
 {
@@ -231,8 +242,15 @@ static void test_new_tree_fraction_stays_low(void **state)
      * instead of 10,000. What matters is that untouched siblings are reused
      * at all: a determinism regression takes this to 1.0.
      */
-    double fraction = (double)second.trees_new / (double)total;
-    assert_true(fraction < 0.6);
+    /* Measured inside the source tree: the ancestors of the scratch
+     * directory are rewritten on every run whatever changed (scan_tree
+     * records absolute paths), and how many there are depends on where the
+     * scratch directory lives - two levels under /tmp, seven in a CI build
+     * directory. Counting them made the fraction a property of the machine. */
+    uint64_t fixed = (uint64_t)(ANCESTOR_TREES + ROOT_TREES);
+    assert_true(second.trees_new >= fixed && total > fixed);
+    double fraction = (double)(second.trees_new - fixed) / (double)(total - fixed);
+    assert_true(fraction < 0.5);
     assert_true(second.trees_reused >= 7);
 }
 

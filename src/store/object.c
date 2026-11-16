@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,27 @@ static void hash_to_path(const uint8_t hash[OBJECT_HASH_SIZE],
     fname[OBJECT_HASH_SIZE * 2 - 2] = '\0';
 }
 
+/* A loose trailer's bytes besides the RS parity: header parity record,
+ * payload CRC, the deprecated rs_data_len and the footer. */
+#define LOOSE_TRAILER_FIXED \
+    (sizeof(parity_record_t) + 2 * sizeof(uint32_t) + sizeof(parity_footer_t))
+_Static_assert(LOOSE_TRAILER_FIXED <= PARITY_TRAILER_FIXED_MAX,
+               "the loose trailer must sit under the shared threshold");
+
+/*
+ * The write is never refused - design constraint 1 is arbitrary size - but
+ * an object whose trailer_size wraps has parity no repair will use, and the
+ * operator should hear that when it is written rather than when it is
+ * damaged. `what` names the writer, since the hash is not always known yet.
+ */
+static void warn_if_parity_unusable(uint64_t stored_size, const char *what)
+{
+    if (parity_fields_fit(stored_size)) return;
+    log_warn("%s: stored size %llu is too large for 32-bit parity fields; "
+             "its parity cannot be used for repair until the format is fixed",
+             what, (unsigned long long)stored_size);
+}
+
 void object_hash_to_hex(const uint8_t hash[OBJECT_HASH_SIZE], char *buf) {
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < OBJECT_HASH_SIZE; i++) {
@@ -84,8 +106,44 @@ static void sha256(const void *data, size_t len, uint8_t out[OBJECT_HASH_SIZE]) 
  * refuse: the payload cannot be bigger than the file holding it.
  *
  * The codecs are checked here too, so exactly one place decides what a
- * plausible header looks like.
+ * plausible header looks like. So is the type: a type this build does not
+ * know is refused by name rather than handed to a caller that would treat
+ * it as file bytes (OWN-39).
  */
+/*
+ * A type byte this build does not know may be damage rather than a newer
+ * format, and the header parity record can tell: if it reconstructs a
+ * header whose type is known, that is the header. Checked here, before the
+ * refusal, because every reader refuses at this point and the parity pass
+ * the two loaders run afterwards would otherwise never see the header.
+ * pread, so the descriptor stays just past the header for the caller.
+ */
+static int header_parity_fixes_type(int fd, object_header_t *hdr)
+{
+    off_t trailer_off = (off_t)sizeof(*hdr) + (off_t)hdr->compressed_size;
+    parity_record_t hpar;
+    parity_footer_t pftr;
+    size_t rs_sz = rs_parity_size((size_t)hdr->compressed_size);
+    off_t ftr_off = trailer_off + (off_t)sizeof(hpar) + (off_t)rs_sz
+                  + (off_t)(sizeof(uint32_t) * 2);
+    if (pread(fd, &hpar, sizeof(hpar), trailer_off) != (ssize_t)sizeof(hpar) ||
+        pread(fd, &pftr, sizeof(pftr), ftr_off) != (ssize_t)sizeof(pftr) ||
+        pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION)
+        return 0;
+    object_header_t copy = *hdr;
+    /* The trailer was found through compressed_size, so a reconstruction
+     * that changes it located its own parity through a wrong field. */
+    if (parity_record_check(&copy, sizeof(copy), &hpar) != 1 ||
+        !object_type_known(copy.type) ||
+        copy.compressed_size != hdr->compressed_size)
+        return 0;
+    log_warn("object: repaired a damaged type byte (%u -> %u) via header parity",
+             hdr->type, copy.type);
+    parity_stats_add_repaired(1);
+    *hdr = copy;
+    return 1;
+}
+
 static status_t read_object_header(int fd, object_header_t *hdr)
 {
     if (io_read_full(fd, hdr, sizeof(*hdr)) != 0)
@@ -116,6 +174,8 @@ static status_t read_object_header(int fd, object_header_t *hdr)
                          "object: header claims %llu payload bytes, file holds %llu",
                          (unsigned long long)hdr->compressed_size,
                          (unsigned long long)avail);
+    if (!object_type_known(hdr->type) && !header_parity_fixes_type(fd, hdr))
+        return set_error(ERR_CORRUPT, OBJECT_TYPE_UNKNOWN_FMT, hdr->type);
     return OK;
 }
 
@@ -188,6 +248,10 @@ static status_t write_object(store_t *store, uint8_t type,
                              const void *data, size_t len,
                              uint8_t out_hash[OBJECT_HASH_SIZE],
                              int *out_is_new, uint64_t *out_phys_bytes) {
+    /* Every reader refuses a type outside 1-5 (OWN-39), so writing one
+     * would store an object nothing can open. */
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "write_object: " OBJECT_TYPE_UNKNOWN_FMT, type);
     if (store_needs_key(store))
         return set_error(ERR_INVALID,
                          "repository is encrypted and no key is loaded: "
@@ -278,6 +342,7 @@ static status_t write_object(store_t *store, uint8_t type,
     }
 
     size_t rs_sz = rs_parity_size(payload_size);
+    warn_if_parity_unusable(payload_size, "write_object");
     uint8_t *rs_buf = NULL;
     if (rs_sz > 0) {
         rs_buf = malloc(rs_sz);
@@ -1065,6 +1130,7 @@ done:
         }
 
         size_t rs_sz = rs_parity_stream_total(&ps);
+        warn_if_parity_unusable(hdr.compressed_size, "stream");
 
         if (rs_sz > 0) {
             if (rs_parity_stream_replay_fd(&ps, tfd) != 0) {
@@ -1496,6 +1562,7 @@ sp_done:
         return set_error_errno(ERR_IO, "sparse_stream: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "sparse_stream");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "sparse_stream: write rs parity");
@@ -1823,8 +1890,10 @@ status_t object_load(store_t *store,
     object_header_t hdr;
     if (read_object_header(fd, &hdr) != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
         close(fd);
-        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, why);
     }
 
     /* Large uncompressed objects must be loaded via object_load_stream. */
@@ -1978,25 +2047,28 @@ status_t object_load(store_t *store,
  * Can the destination be rewound so a corrective pass may replace what the
  * first pass already wrote?
  *
- * A regular file can be truncated back. A character device - /dev/null, which
- * is what verify streams into - swallows everything, so there is nothing to
- * undo. A pipe cannot unsend, which is the sparse-restore path: those objects
- * fall back to an explicit repair.
+ * A regular file can be truncated back to where this object started. A
+ * character device - /dev/null, which is what verify streams into - keeps
+ * nothing, so there is nothing to undo. A pipe cannot unsend: a damaged
+ * object read into one fails, and an explicit repair fixes it on disk.
  */
-static int out_fd_rewindable(int out_fd)
+static int out_rewind_point(int out_fd, off_t *pos)
 {
     struct stat sb;
     if (fstat(out_fd, &sb) != 0) return 0;
-    return S_ISREG(sb.st_mode) || S_ISCHR(sb.st_mode);
+    if (S_ISCHR(sb.st_mode)) { *pos = -1; return 1; }
+    if (!S_ISREG(sb.st_mode)) return 0;
+    off_t p = lseek(out_fd, 0, SEEK_CUR);
+    if (p < 0) return 0;
+    *pos = p;
+    return 1;
 }
 
-static int out_fd_rewind(int out_fd)
+static int out_rewind(int out_fd, off_t pos)
 {
-    struct stat sb;
-    if (fstat(out_fd, &sb) != 0) return -1;
-    if (!S_ISREG(sb.st_mode)) return 0;   /* nothing written that persists */
-    if (lseek(out_fd, 0, SEEK_SET) == (off_t)-1) return -1;
-    return ftruncate(out_fd, 0);
+    if (pos < 0) return 0;   /* a device: nothing persisted */
+    if (lseek(out_fd, pos, SEEK_SET) == (off_t)-1) return -1;
+    return ftruncate(out_fd, pos);
 }
 
 /*
@@ -2005,8 +2077,8 @@ static int out_fd_rewind(int out_fd)
  * The block is proportional to the payload - about 1 KiB per 15 KiB of data,
  * so 144 MiB for a 2 GiB object and several gigabytes for the large ones this
  * path exists to serve. Loading it whole to repair a stream would reintroduce
- * the unbounded allocation one level down, which is exactly the bug being
- * fixed here. Groups are read one at a time from this offset instead.
+ * the unbounded allocation one level down. Groups are read a window at a
+ * time from this offset instead.
  *
  * Returns 0 with the offset and size of the parity block when the footer
  * agrees with the layout, -1 when there is nothing usable.
@@ -2035,90 +2107,280 @@ static int locate_loose_rs_parity(int fd, const object_header_t *hdr,
 }
 
 /*
- * Second pass: re-read the payload group by group, correct each group from
- * its parity, and re-emit. Bounded by one group buffer (about 15 KiB)
- * regardless of how large the object is, which is design constraint 2 - the
- * old whole-payload repair path could not honour it.
+ * OWN-30: a loose trailer's trailer_size is a uint32, and parity is 1,024
+ * bytes per 15,296 stored, so the field wraps at about 59.75 GiB of stored
+ * data. The streamed read locates parity from the header rather than from
+ * that field, but repair is held to the same line as every other repair
+ * path: past it nothing is corrected, so one rule covers every reader.
+ *
+ * TODO(OWN-30): switch to the shared parity_fields_fit helper from
+ * fix/own30-repair-guard when it lands; this is the equivalent check.
  */
-static status_t stream_payload_repaired(int fd, const object_header_t *hdr,
-                                        const uint8_t hash[OBJECT_HASH_SIZE],
-                                        int out_fd)
+#define LOOSE_PARITY_FIT_DEFAULT \
+    ((uint64_t)((UINT64_C(1) << 32) / RS_STREAM_GROUP_PAR) * (uint64_t)RS_STREAM_GROUP_DATA)
+static _Atomic uint64_t loose_parity_fit_limit = LOOSE_PARITY_FIT_DEFAULT;
+
+void object_test_set_parity_fit_limit(uint64_t bytes)
+{
+    atomic_store_explicit(&loose_parity_fit_limit,
+                          bytes ? bytes : LOOSE_PARITY_FIT_DEFAULT,
+                          memory_order_relaxed);
+}
+
+static int loose_parity_fits(uint64_t stored_size)
+{
+    return stored_size < atomic_load_explicit(&loose_parity_fit_limit,
+                                              memory_order_relaxed);
+}
+
+/* RS groups a streamed read holds at once: 1,096 groups is 16,764,416 bytes
+ * of payload, just under STREAM_LOAD_MAX, and 1.1 MiB of parity when
+ * repairing. Windows are whole groups so that each one can be corrected
+ * on its own. */
+#define LOOSE_WIN_GROUPS 1096u
+
+static int pread_full(int fd, void *buf, size_t n, off_t off)
+{
+    uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t r = pread(fd, p, n, off);
+        if (r == 0) return -1;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        p += r; n -= (size_t)r; off += r;
+    }
+    return 0;
+}
+
+/*
+ * The stored payload of an encrypted object is nonce, ciphertext, tag. This
+ * splits a window of stored bytes into those three, decrypting the
+ * ciphertext in place, so that a window can be corrected from parity first:
+ * parity covers the stored bytes, nonce and tag included.
+ */
+typedef struct {
+    int                    encrypted;
+    const repo_key_t      *key;
+    object_crypt_stream_t *cs;
+    uint8_t                nonce[OBJECT_CRYPT_NONCE_BYTES];
+    size_t                 nonce_have;
+    uint8_t                tag[OBJECT_CRYPT_TAG_BYTES];
+    size_t                 tag_have;
+    uint64_t               pos, total;
+} loose_sink_t;
+
+static status_t loose_sink_push(loose_sink_t *sk, uint8_t *buf, size_t n,
+                                uint8_t **out, size_t *out_n)
+{
+    if (!sk->encrypted) {
+        sk->pos += n;
+        *out = buf; *out_n = n;
+        return OK;
+    }
+
+    const uint64_t nb = OBJECT_CRYPT_NONCE_BYTES;
+    const uint64_t tb = OBJECT_CRYPT_TAG_BYTES;
+    uint64_t start = sk->pos, end = start + n;
+    uint64_t ct_end = sk->total - tb;
+
+    uint64_t ns = start < nb ? start : nb;
+    uint64_t ne = end   < nb ? end   : nb;
+    if (ne > ns) {
+        memcpy(sk->nonce + sk->nonce_have, buf + (ns - start), (size_t)(ne - ns));
+        sk->nonce_have += (size_t)(ne - ns);
+        if (sk->nonce_have == nb) {
+            status_t st = object_crypt_stream_begin(&sk->cs, sk->key, sk->nonce, 0);
+            if (st != OK) return st;
+        }
+    }
+
+    uint8_t *pp = buf;
+    size_t   pn = 0;
+    uint64_t cs0 = start > nb     ? start : nb;
+    uint64_t ce0 = end   < ct_end ? end   : ct_end;
+    if (ce0 > cs0) {
+        if (!sk->cs) return set_error(ERR_CORRUPT, "load_stream: ciphertext before nonce");
+        pp = buf + (cs0 - start);
+        pn = (size_t)(ce0 - cs0);
+        status_t st = object_crypt_stream_update(sk->cs, pp, pn, pp);
+        if (st != OK) return st;
+    }
+
+    uint64_t ts = start > ct_end ? start : ct_end;
+    if (end > ts) {
+        size_t take = (size_t)(end - ts);
+        if (sk->tag_have + take > sizeof(sk->tag))
+            return set_error(ERR_CORRUPT, "load_stream: oversized tag");
+        memcpy(sk->tag + sk->tag_have, buf + (ts - start), take);
+        sk->tag_have += take;
+    }
+
+    sk->pos = end;
+    *out = pp; *out_n = pn;
+    return OK;
+}
+
+static status_t loose_sink_finish(loose_sink_t *sk)
+{
+    if (!sk->encrypted) return OK;
+    if (!sk->cs || sk->tag_have != OBJECT_CRYPT_TAG_BYTES)
+        return set_error(ERR_CORRUPT, "load_stream: truncated ciphertext");
+    return object_crypt_stream_finish(sk->cs, NULL, sk->tag);
+}
+
+/*
+ * One pass over a loose object's stored payload, a window at a time:
+ * correct the window from parity (repair), decrypt, hash and emit. Ends by
+ * checking the tag and then the hash, so ERR_CORRUPT from here means the
+ * bytes emitted are not the object, whichever check said so.
+ *
+ * *out_fixed counts bytes parity corrected; a group parity could not
+ * correct ends the pass with ERR_CORRUPT.
+ */
+static status_t loose_stream_pass(store_t *store, int fd, const object_header_t *hdr,
+                                  const uint8_t hash[OBJECT_HASH_SIZE], int out_fd,
+                                  int repair, off_t par_off, int *out_fixed)
+{
+    const size_t win = (size_t)LOOSE_WIN_GROUPS * RS_STREAM_GROUP_DATA;
+    *out_fixed = 0;
+
+    uint8_t    *buf = malloc(win);
+    uint8_t    *par = repair ? malloc((size_t)LOOSE_WIN_GROUPS * RS_STREAM_GROUP_PAR) : NULL;
+    EVP_MD_CTX *md  = EVP_MD_CTX_new();
+    loose_sink_t sk;
+    memset(&sk, 0, sizeof(sk));
+    sk.encrypted = hdr->encryption != ENCRYPT_NONE;
+    sk.key       = store_key(store);
+    sk.total     = hdr->compressed_size;
+
+    status_t st = OK;
+    if (!buf || (repair && !par) || !md || EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1) {
+        st = set_error(ERR_NOMEM, "load_stream: window alloc failed");
+        goto out;
+    }
+
+    uint64_t done = 0;
+    off_t    pay_off = (off_t)sizeof(*hdr);
+    if (repair) rs_init();
+    while (done < hdr->compressed_size && st == OK) {
+        /* A restore of one large file is cancellable inside it. */
+        if (store_cancelled(store)) {
+            st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
+        }
+        uint64_t left = hdr->compressed_size - done;
+        size_t want = left > win ? win : (size_t)left;
+        if (pread_full(fd, buf, want, pay_off + (off_t)done) != 0) {
+            st = set_error(ERR_CORRUPT, "load_stream: truncated payload"); break;
+        }
+        if (repair) {
+            size_t plen = rs_parity_size(want);
+            off_t  poff = par_off + (off_t)((done / RS_STREAM_GROUP_DATA) * RS_STREAM_GROUP_PAR);
+            if (pread_full(fd, par, plen, poff) != 0) {
+                st = set_error(ERR_CORRUPT, "load_stream: truncated parity"); break;
+            }
+            int rc = rs_parity_decode(buf, want, par, plen);
+            if (rc < 0) {
+                st = set_error(ERR_CORRUPT, "load_stream: damage beyond what parity can correct");
+                break;
+            }
+            *out_fixed += rc;
+        }
+        done += want;
+
+        uint8_t *pp = NULL;
+        size_t   pn = 0;
+        st = loose_sink_push(&sk, buf, want, &pp, &pn);
+        if (st != OK) break;
+        if (pn == 0) continue;
+        if (EVP_DigestUpdate(md, pp, pn) != 1) {
+            st = set_error(ERR_IO, "load_stream: SHA256 update failed"); break;
+        }
+        if (io_write_full(out_fd, pp, pn) != 0) {
+            st = set_error_errno(ERR_IO, "load_stream: write to out_fd"); break;
+        }
+        store_io_progress(store, (uint64_t)pn);
+    }
+
+    if (st == OK) st = loose_sink_finish(&sk);
+    if (st == OK) {
+        uint8_t got[OBJECT_HASH_SIZE];
+        unsigned dlen = 0;
+        if (EVP_DigestFinal_ex(md, got, &dlen) != 1 || dlen != OBJECT_HASH_SIZE ||
+            memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
+            st = set_error(ERR_CORRUPT, "load_stream: hash mismatch");
+    }
+
+out:
+    object_crypt_stream_free(sk.cs);
+    EVP_MD_CTX_free(md);
+    free(buf);
+    free(par);
+    return st;
+}
+
+/*
+ * Stream with parity applied, paying for parity only when the object is
+ * damaged. The first pass trusts the stored bytes; a failure that says they
+ * are wrong - the tag, the hash, a truncation - rewinds the destination and
+ * runs a correcting pass, which decrypts and authenticates again.
+ *
+ * A failed tag is treated exactly like a hash mismatch. It used to end the
+ * read before repair was considered, so an encrypted loose object with one
+ * flipped byte was unreadable although its parity could rebuild it (OWN-37):
+ * the ciphertext is what parity covers, so the correction applies to it
+ * unchanged.
+ */
+static status_t loose_stream(store_t *store, int fd, const object_header_t *hdr,
+                             const uint8_t hash[OBJECT_HASH_SIZE], int out_fd)
 {
     char hex[OBJECT_HASH_SIZE * 2 + 1];
     object_hash_to_hex(hash, hex);
 
-    if (!out_fd_rewindable(out_fd)) {
-        log_warn("object %s: damaged, and the destination cannot be rewound "
-                 "to rewrite it; run a repairing verify", hex);
-        return ERR_CORRUPT;
-    }
+    off_t start = -1;
+    int   rewindable = out_rewind_point(out_fd, &start);
+    int   fixed = 0;
+
+    status_t st = loose_stream_pass(store, fd, hdr, hash, out_fd, 0, 0, &fixed);
+    if (st != ERR_CORRUPT) return st;
+
+    char first[ERR_MSG_MAX];
+    snprintf(first, sizeof(first), "%s", err_msg());
 
     off_t  par_off = 0;
     size_t rs_sz   = 0;
     if (locate_loose_rs_parity(fd, hdr, &par_off, &rs_sz) != 0) {
         log_warn("object %s: damaged and has no usable parity", hex);
-        return ERR_CORRUPT;
+        parity_stats_add_uncorrectable(1);
+        return set_error(ERR_CORRUPT, "object %s: %s (no usable parity)", hex, first);
     }
-
-    if (out_fd_rewind(out_fd) != 0) return ERR_IO;
-
-    uint8_t *gbuf = malloc(RS_STREAM_GROUP_DATA);
-    uint8_t *gpar = malloc(RS_STREAM_GROUP_PAR);
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!gbuf || !gpar || !mdctx || EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
-        free(gbuf); free(gpar); EVP_MD_CTX_free(mdctx);
-        return ERR_NOMEM;
+    if (!loose_parity_fits(hdr->compressed_size)) {
+        log_warn("object %s: %llu stored bytes is past where its 32-bit parity "
+                 "sizes can be trusted; parity not applied (OWN-30)", hex,
+                 (unsigned long long)hdr->compressed_size);
+        parity_stats_add_uncorrectable(1);
+        return set_error(ERR_CORRUPT, "object %s: %s (parity not applied)", hex, first);
     }
-
-    rs_init();
-    status_t st = OK;
-    uint64_t remaining = hdr->compressed_size;
-    off_t    off = (off_t)sizeof(*hdr);
-    size_t   par_left = rs_sz;
-    int      corrected = 0;
-
-    while (remaining > 0 && st == OK) {
-        size_t want = (remaining < RS_STREAM_GROUP_DATA)
-                      ? (size_t)remaining : RS_STREAM_GROUP_DATA;
-        if (pread(fd, gbuf, want, off) != (ssize_t)want) { st = ERR_CORRUPT; break; }
-
-        if (par_left >= RS_STREAM_GROUP_PAR) {
-            if (pread(fd, gpar, RS_STREAM_GROUP_PAR, par_off)
-                != (ssize_t)RS_STREAM_GROUP_PAR) { st = ERR_CORRUPT; break; }
-            int rc = rs_parity_decode(gbuf, want, gpar, RS_STREAM_GROUP_PAR);
-            if (rc > 0) corrected += rc;
-            else if (rc < 0) { st = ERR_CORRUPT; break; }
-            par_off  += (off_t)RS_STREAM_GROUP_PAR;
-            par_left -= RS_STREAM_GROUP_PAR;
-        }
-
-        if (EVP_DigestUpdate(mdctx, gbuf, want) != 1) { st = ERR_IO; break; }
-        if (io_write_full(out_fd, gbuf, want) != 0)   { st = ERR_IO; break; }
-        off += (off_t)want;
-        remaining -= want;
+    if (!rewindable) {
+        log_warn("object %s: damaged, and the destination cannot be rewound "
+                 "to rewrite it; run a repairing verify", hex);
+        return set_error(ERR_CORRUPT, "object %s: %s (stream)", hex, first);
     }
+    if (out_rewind(out_fd, start) != 0)
+        return set_error_errno(ERR_IO, "object %s: cannot rewind the destination "
+                               "to rewrite a damaged object", hex);
 
-    if (st == OK) {
-        uint8_t got[OBJECT_HASH_SIZE];
-        unsigned dlen = 0;
-        if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
-            dlen != OBJECT_HASH_SIZE ||
-            memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-            st = ERR_CORRUPT;
-    }
-
-    free(gbuf);
-    free(gpar);
-    EVP_MD_CTX_free(mdctx);
-
+    err_clear();
+    st = loose_stream_pass(store, fd, hdr, hash, out_fd, 1, par_off, &fixed);
     if (st == OK) {
         log_warn("object %s: %d byte(s) corrected from parity while streaming",
-                 hex, corrected);
+                 hex, fixed);
         parity_stats_add_repaired(1);
-    } else {
-        parity_stats_add_uncorrectable(1);
+        return OK;
     }
-    return st;
+    if (st != ERR_CORRUPT) return st;
+    parity_stats_add_uncorrectable(1);
+    char second[ERR_MSG_MAX];
+    snprintf(second, sizeof(second), "%s", err_msg());
+    return set_error(ERR_CORRUPT, "object %s: %s; after parity: %s", hex, first, second);
 }
 
 status_t object_load_stream(store_t *store,
@@ -2143,11 +2405,15 @@ status_t object_load_stream(store_t *store,
         return OK;
     }
 
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    object_hash_to_hex(hash, hex);
+
     object_header_t hdr;
     if (read_object_header(fd, &hdr) != OK) {
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
         close(fd);
-        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, why);
     }
 
     /* For version 2 objects, attempt header repair via parity.
@@ -2156,7 +2422,6 @@ status_t object_load_stream(store_t *store,
         off_t trailer_off = (off_t)sizeof(hdr) + (off_t)hdr.compressed_size;
         parity_record_t hpar;
         parity_footer_t pftr;
-        /* Read header parity record + footer in two preads (no seek) */
         if (pread(fd, &hpar, sizeof(hpar), trailer_off) == (ssize_t)sizeof(hpar)) {
             size_t rs_sz = rs_parity_size((size_t)hdr.compressed_size);
             off_t ftr_off = trailer_off + (off_t)sizeof(hpar) + (off_t)rs_sz
@@ -2173,121 +2438,41 @@ status_t object_load_stream(store_t *store,
                 }
             }
         }
-        /* File position is still at sizeof(hdr) — no seek needed. */
+    }
+
+    if (hdr.compression != COMPRESS_NONE) {
+        /* Loose objects are always COMPRESS_NONE — compression happens at
+         * pack time.  Any other value indicates corruption. */
+        close(fd);
+        return set_error(ERR_CORRUPT, "object %s: unexpected compression %u in loose object",
+                         hex, hdr.compression);
+    }
+    if (hdr.encryption != ENCRYPT_NONE) {
+        if (!store_key(store)) {
+            close(fd);
+            return set_error(ERR_INVALID, "object %s is encrypted and no key is loaded", hex);
+        }
+        if (hdr.compressed_size < OBJECT_CRYPT_OVERHEAD) {
+            close(fd);
+            return set_error(ERR_CORRUPT, "object %s: truncated ciphertext", hex);
+        }
     }
 
     if (out_type) *out_type = hdr.type;
     if (out_size) *out_size = hdr.uncompressed_size;
 
-    if (hdr.compression == COMPRESS_NONE) {
-        /* Stream payload to out_fd in chunks, hashing as we go. */
-        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-        if (!mdctx) { close(fd); return set_error(ERR_NOMEM, "EVP_MD_CTX_new"); }
-        if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1) {
-            EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_IO, "load_stream: SHA256 init failed");
-        }
-
-        uint8_t *buf = malloc(STREAM_LOAD_MAX);
-        if (!buf) { EVP_MD_CTX_free(mdctx); close(fd); return set_error(ERR_NOMEM, "malloc(%zu)", STREAM_LOAD_MAX); }
-
-        status_t st = OK;
-
-        /*
-         * Encrypted payloads are stored as nonce, ciphertext, tag. The nonce
-         * comes off the front so the cipher can start, and the tag is only
-         * reached at the end - so a streamed read cannot know the payload is
-         * authentic until it has emitted all of it. That was already true of
-         * the hash check these paths have always ended with.
-         */
-        object_crypt_stream_t *cs = NULL;
-        uint64_t remaining = hdr.compressed_size;
-        if (hdr.encryption != ENCRYPT_NONE) {
-            const repo_key_t *key = store_key(store);
-            if (!key) {
-                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
-                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-                return set_error(ERR_INVALID,
-                                 "object %s is encrypted and no key is loaded", hex);
-            }
-            if (hdr.compressed_size < OBJECT_CRYPT_OVERHEAD) {
-                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
-                return set_error(ERR_CORRUPT, "load_stream: truncated ciphertext");
-            }
-            uint8_t nonce[OBJECT_CRYPT_NONCE_BYTES];
-            if (io_read_full(fd, nonce, sizeof(nonce)) != 0) {
-                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
-                return set_error(ERR_CORRUPT, "load_stream: truncated nonce");
-            }
-            st = object_crypt_stream_begin(&cs, key, nonce, 0);
-            if (st != OK) {
-                free(buf); EVP_MD_CTX_free(mdctx); close(fd);
-                return st;
-            }
-            remaining = hdr.compressed_size - OBJECT_CRYPT_OVERHEAD;
-        }
-
-        while (remaining > 0 && st == OK) {
-            /* A restore of one large file is cancellable inside it. */
-            if (store_cancelled(store)) {
-                st = set_error(ERR_BUSY, "cancelled while reading an object"); break;
-            }
-            size_t want = (remaining > STREAM_LOAD_MAX) ? STREAM_LOAD_MAX : (size_t)remaining;
-            if (io_read_full(fd, buf, want) != 0)           { st = set_error(ERR_CORRUPT, "load_stream: truncated payload"); break; }
-            /* Decrypt in place, then hash and emit the plaintext. */
-            if (cs && object_crypt_stream_update(cs, buf, want, buf) != OK) {
-                st = set_error(ERR_CORRUPT, "load_stream: decryption failed"); break;
-            }
-            if (EVP_DigestUpdate(mdctx, buf, want) != 1) { st = set_error(ERR_IO, "load_stream: SHA256 update failed"); break; }
-            if (io_write_full(out_fd, buf, want) != 0)      { st = set_error_errno(ERR_IO, "load_stream: write to out_fd"); break; }
-            store_io_progress(store, (uint64_t)want);
-            remaining -= want;
-        }
-        free(buf);
-
-        if (cs) {
-            uint8_t tag[OBJECT_CRYPT_TAG_BYTES];
-            if (st == OK && io_read_full(fd, tag, sizeof(tag)) != 0)
-                st = set_error(ERR_CORRUPT, "load_stream: truncated tag");
-            if (st == OK) st = object_crypt_stream_finish(cs, NULL, tag);
-            object_crypt_stream_free(cs);
-        }
-
-        int hash_bad = 0;
-        if (st == OK) {
-            uint8_t got[OBJECT_HASH_SIZE];
-            unsigned dlen = 0;
-            if (EVP_DigestFinal_ex(mdctx, got, &dlen) != 1 ||
-                dlen != OBJECT_HASH_SIZE ||
-                memcmp(got, hash, OBJECT_HASH_SIZE) != 0)
-                hash_bad = 1;
-        }
-        EVP_MD_CTX_free(mdctx);
-
-        /*
-         * The bytes on disk do not match the name they are filed under.
-         * Parity may still be able to rebuild them, one group at a time, in
-         * bounded memory - which is the whole reason the trailer exists. The
-         * first pass has already written what it read, so this only runs
-         * where that can be taken back.
-         */
-        if (st == OK && hash_bad) {
-            st = stream_payload_repaired(fd, &hdr, hash, out_fd);
-            if (st != OK) {
-                char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-                close(fd);
-                return set_error(ERR_CORRUPT, "object %s: hash mismatch (stream)", hex);
-            }
-        }
-        close(fd);
-        return st;
-
-    } else {
-        /* Loose objects are always COMPRESS_NONE — compression happens at
-         * pack time.  Any other value indicates corruption. */
-        char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        close(fd);
-        return set_error(ERR_CORRUPT, "object %s: unexpected compression %u in loose object", hex, hdr.compression);
-    }
+    /*
+     * Encrypted payloads are stored as nonce, ciphertext, tag, and the tag
+     * is only reached at the end - so a streamed read cannot know the
+     * payload is authentic until it has emitted all of it. The same was
+     * always true of the hash. A caller that must not act on unverified
+     * bytes streams into something it can discard: restore writes a
+     * temporary file and renames it into place only on OK, and grep holds
+     * a file's matches until the read returns.
+     */
+    status_t st = loose_stream(store, fd, &hdr, hash, out_fd);
+    close(fd);
+    return st;
 }
 
 status_t object_load_prefix(store_t *store,
@@ -2310,7 +2495,9 @@ status_t object_load_prefix(store_t *store,
 
     object_header_t hdr;
     if (read_object_header(fd, &hdr) != OK) {
-        close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: bad header");
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        close(fd); return set_error(ERR_CORRUPT, "object_load_prefix: %s", why);
     }
 
     if (out_full_size) *out_full_size = hdr.uncompressed_size;
@@ -2446,10 +2633,86 @@ status_t object_read_stored(store_t *store,
     return OK;
 }
 
+/*
+ * A stored-form reader, loose or packed, that never passes on damage parity
+ * can correct.
+ *
+ * Replication streams what this hands over straight into the target, which
+ * computes fresh parity over it; a damaged byte shipped as it stood would
+ * be protected there as if it were right. Bytes already handed over cannot
+ * be recalled, so open CRC-scans the payload first and, only on a mismatch
+ * with the trailer, serves every read from a group corrected from parity.
+ * The packed half lives in pack.c (pack_object_open_stored); the loose half
+ * is here, one 15 KiB group at a time so a loose transfer stays inside its
+ * chunk.
+ */
 struct object_stored_reader {
-    FILE    *f;          /* positioned at the next payload byte */
+    FILE    *f;          /* loose, plain: positioned at the next payload byte */
+    pack_stored_reader_t *p;   /* packed */
     uint64_t remaining;
+
+    /* Loose, repair mode: groups read by pread and corrected. */
+    int      fd;
+    int      repair;
+    uint64_t len;
+    off_t    par_off;
+    size_t   rs_sz;
+    uint8_t *gbuf;
+    uint8_t *gpar;
+    uint64_t g_off;
+    size_t   g_len;      /* 0: no group loaded */
+    int64_t  fixed;
+    uint64_t bad;
+    uint8_t  hash[OBJECT_HASH_SIZE];
 };
+
+/* CRC the loose payload; on a mismatch with the trailer switch r to repair
+ * mode. Returns OK whether or not there was damage. */
+static status_t loose_stored_scan(object_stored_reader_t *r, const object_header_t *hdr)
+{
+    off_t  par_off = 0;
+    size_t rs_sz   = 0;
+    if (r->len == 0 || locate_loose_rs_parity(r->fd, hdr, &par_off, &rs_sz) != 0)
+        return OK;   /* no parity to apply: read as it is */
+
+    uint32_t stored_crc = 0;
+    if (pread(r->fd, &stored_crc, sizeof(stored_crc), par_off + (off_t)rs_sz)
+        != (ssize_t)sizeof(stored_crc))
+        return OK;
+
+    r->gbuf = malloc(RS_STREAM_GROUP_DATA);
+    if (!r->gbuf) return set_error(ERR_NOMEM, "object_stored_open: group buffer");
+    uint32_t crc = 0;
+    for (uint64_t o = 0; o < r->len; ) {
+        size_t want = r->len - o < RS_STREAM_GROUP_DATA ? (size_t)(r->len - o)
+                                                         : RS_STREAM_GROUP_DATA;
+        if (pread(r->fd, r->gbuf, want, (off_t)sizeof(*hdr) + (off_t)o) != (ssize_t)want)
+            return set_error(ERR_CORRUPT, "object_stored_open: short read");
+        crc = crc32c_update(crc, r->gbuf, want);
+        o += want;
+    }
+    if (crc == stored_crc) {
+        free(r->gbuf);
+        r->gbuf = NULL;
+        return OK;
+    }
+    r->gpar = malloc(RS_STREAM_GROUP_PAR);
+    if (!r->gpar) return set_error(ERR_NOMEM, "object_stored_open: parity buffer");
+    r->repair  = 1;
+    r->par_off = par_off;
+    r->rs_sz   = rs_sz;
+    return OK;
+}
+
+static void object_stored_free(object_stored_reader_t *r)
+{
+    if (r->f) fclose(r->f);
+    else if (r->fd >= 0) close(r->fd);
+    if (r->p) pack_stored_close(r->p);
+    free(r->gbuf);
+    free(r->gpar);
+    free(r);
+}
 
 status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                             object_stored_info_t *out_info, uint64_t *out_len,
@@ -2460,6 +2723,8 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
 
     object_stored_reader_t *r = calloc(1, sizeof(*r));
     if (!r) return set_error(ERR_NOMEM, "object_stored_open: alloc");
+    r->fd = -1;
+    memcpy(r->hash, hash, OBJECT_HASH_SIZE);
 
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
@@ -2472,26 +2737,33 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
                                               &out_info->compression,
                                               &out_info->encryption,
                                               &out_info->uncompressed_size,
-                                              &r->remaining, &r->f);
+                                              &r->remaining, &r->p);
         if (st != OK) { free(r); return st; }
         *out_len = r->remaining;
         *out = r;
         return OK;
     }
+    r->fd = fd;
 
     /* read_object_header refuses a payload longer than the file, so the
      * reads below cannot be sent past the object. */
     object_header_t hdr;
     status_t hst = read_object_header(fd, &hdr);
-    if (hst != OK) { close(fd); free(r); return hst; }
+    if (hst != OK) { object_stored_free(r); return hst; }
+    r->remaining = r->len = hdr.compressed_size;
 
-    r->f = fdopen(fd, "rb");
-    if (!r->f) {
-        close(fd);
-        free(r);
-        return set_error_errno(ERR_IO, "object_stored_open: fdopen(%s)", path);
+    hst = loose_stored_scan(r, &hdr);
+    if (hst != OK) { object_stored_free(r); return hst; }
+
+    if (!r->repair) {
+        /* The scan used pread, so the descriptor is still just past the header. */
+        r->f = fdopen(fd, "rb");
+        if (!r->f) {
+            status_t st = set_error_errno(ERR_IO, "object_stored_open: fdopen(%s)", path);
+            object_stored_free(r);
+            return st;
+        }
     }
-    r->remaining = hdr.compressed_size;
 
     out_info->type              = hdr.type;
     out_info->compression       = hdr.compression;
@@ -2502,23 +2774,84 @@ status_t object_stored_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
     return OK;
 }
 
+/* Serve n loose payload bytes from groups corrected from parity. */
+static status_t loose_stored_read_repaired(object_stored_reader_t *r, uint8_t *out, size_t n)
+{
+    uint64_t pos = r->len - r->remaining;
+    while (n > 0) {
+        if (r->g_len == 0 || pos < r->g_off || pos >= r->g_off + r->g_len) {
+            r->g_off = pos - pos % RS_STREAM_GROUP_DATA;
+            uint64_t left = r->len - r->g_off;
+            r->g_len = left < RS_STREAM_GROUP_DATA ? (size_t)left : RS_STREAM_GROUP_DATA;
+            if (pread(r->fd, r->gbuf, r->g_len, (off_t)sizeof(object_header_t) + (off_t)r->g_off)
+                != (ssize_t)r->g_len) {
+                r->g_len = 0;
+                return set_error(ERR_CORRUPT, "object_stored_read: short read");
+            }
+            size_t pstart = (size_t)(r->g_off / RS_STREAM_GROUP_DATA) * RS_STREAM_GROUP_PAR;
+            if (pstart + RS_STREAM_GROUP_PAR <= r->rs_sz &&
+                pread(r->fd, r->gpar, RS_STREAM_GROUP_PAR, r->par_off + (off_t)pstart)
+                    == (ssize_t)RS_STREAM_GROUP_PAR) {
+                int rc = rs_parity_decode(r->gbuf, r->g_len, r->gpar, RS_STREAM_GROUP_PAR);
+                if (rc > 0)      r->fixed += rc;
+                else if (rc < 0) r->bad++;
+            } else {
+                r->bad++;
+            }
+        }
+        size_t at   = (size_t)(pos - r->g_off);
+        size_t take = r->g_len - at < n ? r->g_len - at : n;
+        memcpy(out, r->gbuf + at, take);
+        out += take;
+        n   -= take;
+        pos += take;
+        r->remaining -= take;
+    }
+    return OK;
+}
+
 status_t object_stored_read(object_stored_reader_t *r, void *buf, size_t n)
 {
     if (!r || (!buf && n)) return set_error(ERR_INVALID, "object_stored_read: null argument");
     if ((uint64_t)n > r->remaining)
         return set_error(ERR_INVALID, "object_stored_read: %zu bytes asked for, %llu left",
                          n, (unsigned long long)r->remaining);
+    if (r->p) {
+        status_t st = pack_stored_read(r->p, buf, n);
+        if (st == OK) r->remaining -= n;
+        return st;
+    }
+    if (r->repair) return loose_stored_read_repaired(r, buf, n);
     if (n && fread(buf, 1, n, r->f) != n)
         return set_error(ERR_CORRUPT, "object_stored_read: short read");
     r->remaining -= n;
     return OK;
 }
 
+int object_stored_damaged(const object_stored_reader_t *r)
+{
+    if (!r) return 0;
+    if (r->p) return pack_stored_damaged(r->p);
+    return r->bad > 0;
+}
+
 void object_stored_close(object_stored_reader_t *r)
 {
     if (!r) return;
-    if (r->f) fclose(r->f);
-    free(r);
+    if (r->repair) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(r->hash, hex);
+        if (r->bad > 0) {
+            log_warn("object %s: damaged beyond its parity (%llu group(s)); read as stored",
+                     hex, (unsigned long long)r->bad);
+            parity_stats_add_uncorrectable(1);
+        } else if (r->fixed > 0) {
+            log_warn("object %s: corrected from parity while reading it as stored "
+                     "(%lld byte(s))", hex, (long long)r->fixed);
+            parity_stats_add_repaired(1);
+        }
+    }
+    object_stored_free(r);
 }
 
 status_t object_get_info(store_t *store,
@@ -2538,7 +2871,9 @@ status_t object_get_info(store_t *store,
     close(fd);
     if (hst != OK) {
         char hex[OBJECT_HASH_SIZE * 2 + 1]; object_hash_to_hex(hash, hex);
-        return set_error(ERR_CORRUPT, "object %s: %s", hex, err_msg());
+        char why[ERR_MSG_MAX];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        return set_error(ERR_CORRUPT, "object %s: %s", hex, why);
     }
 
     if (out_size) *out_size = hdr.uncompressed_size;
@@ -2561,6 +2896,8 @@ status_t object_get_info(store_t *store,
  */
 status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size,
                           const uint8_t expected_hash[OBJECT_HASH_SIZE]) {
+    if (!object_type_known(type))
+        return set_error(ERR_INVALID, "store_fd: " OBJECT_TYPE_UNKNOWN_FMT, type);
     /* Check existence first to avoid redundant work. */
     if (object_exists(store, expected_hash)) return OK;
 
@@ -2704,6 +3041,7 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
         return set_error_errno(ERR_IO, "store_fd: write hpar");
     }
     size_t rs_sz = rs_parity_stream_total(&ps);
+    warn_if_parity_unusable(hdr.compressed_size, "store_fd");
     if (rs_sz > 0 && rs_parity_stream_replay_fd(&ps, tfd) != 0) {
         rs_parity_stream_destroy(&ps); close(tfd); unlink(tmppath);
         return set_error_errno(ERR_IO, "store_fd: write rs parity");
@@ -2758,6 +3096,25 @@ status_t object_store_fd(store_t *store, uint8_t type, int src_fd, uint64_t size
     return OK;
 }
 
+/*
+ * Whether a header that parity has just reconstructed describes this file.
+ * Parity only promises the bytes match the CRC it recorded; this is the
+ * check that the result is also an object header for these bytes, before
+ * it is written over the old one.
+ */
+static int repaired_header_fits(const object_header_t *h,
+                                const uint8_t hash[OBJECT_HASH_SIZE],
+                                uint64_t stored_size)
+{
+    return h->magic == OBJECT_MAGIC &&
+           h->version == OBJECT_HDR_VERSION &&
+           (h->compression == COMPRESS_NONE || h->compression == COMPRESS_LZ4 ||
+            h->compression == COMPRESS_LZ4_FRAME) &&
+           (h->encryption == ENCRYPT_NONE || h->encryption == ENCRYPT_CHACHA20) &&
+           h->compressed_size == stored_size &&
+           memcmp(h->hash, hash, OBJECT_HASH_SIZE) == 0;
+}
+
 int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     char subdir[3], fname[OBJECT_HASH_SIZE * 2 - 1];
     hash_to_path(hash, subdir, fname);
@@ -2767,37 +3124,79 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
     int fd = open(path, O_RDWR);
     if (fd == -1) return -1;  /* not a loose object or not writable */
 
+    /*
+     * The header is read raw, not through read_object_header. Its fields
+     * are what this function may be about to rewrite, so none of them is
+     * allowed to decide whether or where repair looks: a damaged magic,
+     * version or compressed_size used to end the repair before it began,
+     * and a compressed_size that grew past the trailer's start was refused
+     * by the sanity check meant to protect it (OWN-32).
+     */
     object_header_t hdr;
-    if (read_object_header(fd, &hdr) != OK) { err_clear(); close(fd); return -1; }
-    /* Version 1 has no parity to repair from. */
-    if (hdr.version < 2) { close(fd); return 0; }
+    if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) { close(fd); return -1; }
 
-    /* Read parity footer */
+    /* Read parity footer. A file without one (a version 1 object) has no
+     * parity to repair from. */
     parity_footer_t pftr;
     off_t file_end = lseek(fd, 0, SEEK_END);
-    if (file_end < (off_t)sizeof(pftr)) { close(fd); return 0; }
+    if (file_end < (off_t)(sizeof(hdr) + LOOSE_TRAILER_FIXED)) { close(fd); return 0; }
     if (pread(fd, &pftr, sizeof(pftr), file_end - (off_t)sizeof(pftr))
         != (ssize_t)sizeof(pftr) ||
         pftr.magic != PARITY_FOOTER_MAGIC || pftr.version != PARITY_VERSION) {
         close(fd); return 0;
     }
 
+    /*
+     * OWN-30 stopgap: past the threshold trailer_size has wrapped, so the
+     * trailer_start computed below points into the wrong bytes and every
+     * "correction" read from there would be written into user data. Judged
+     * from the file size alone, which is exact for one object and does not
+     * depend on a header this function may rewrite.
+     */
+    if (!parity_trailer_fits_file((uint64_t)file_end, 1, sizeof(hdr), 0,
+                                  LOOSE_TRAILER_FIXED, 0)) {
+        char hex[OBJECT_HASH_SIZE * 2 + 1];
+        object_hash_to_hex(hash, hex);
+        log_warn("object %s: not repaired: %lld-byte file (header claims "
+                 "%llu stored) is " PARITY_TOO_LARGE_REASON, hex,
+                 (long long)file_end, (unsigned long long)hdr.compressed_size);
+        close(fd);
+        return PARITY_REPAIR_REFUSED_TOO_LARGE;
+    }
+
+    /*
+     * The layout comes from the file size and the footer: the trailer is
+     * the last trailer_size bytes, the payload is everything between the
+     * header and it, and the trailer must then be exactly what a payload of
+     * that size is given. A footer that disagrees is itself damaged, and
+     * nothing located through it is safe to write from.
+     */
     off_t trailer_start = file_end - (off_t)pftr.trailer_size;
-    if (trailer_start < (off_t)(sizeof(hdr) + hdr.compressed_size)) {
+    if (trailer_start < (off_t)sizeof(hdr)) { close(fd); return 0; }
+    uint64_t stored_size = (uint64_t)trailer_start - sizeof(hdr);
+    if ((uint64_t)pftr.trailer_size
+        != LOOSE_TRAILER_FIXED + (uint64_t)rs_parity_size((size_t)stored_size)) {
         close(fd); return 0;
     }
 
     int total_fixed = 0;
 
-    /* Header: XOR parity repair and write back */
+    /* Header: XOR parity repair, written back only when the result is a
+     * header for this file. */
     parity_record_t hdr_par;
     if (pread(fd, &hdr_par, sizeof(hdr_par), trailer_start) == (ssize_t)sizeof(hdr_par)) {
         object_header_t hdr_copy = hdr;
         int hrc = parity_record_check(&hdr_copy, sizeof(hdr_copy), &hdr_par);
         if (hrc == 1) {
-            /* Write corrected header back */
-            if (pwrite(fd, &hdr_copy, sizeof(hdr_copy), 0) == (ssize_t)sizeof(hdr_copy))
-                total_fixed++;
+            if (repaired_header_fits(&hdr_copy, hash, stored_size)) {
+                if (pwrite(fd, &hdr_copy, sizeof(hdr_copy), 0) == (ssize_t)sizeof(hdr_copy))
+                    total_fixed++;
+            } else {
+                char hex[OBJECT_HASH_SIZE * 2 + 1];
+                object_hash_to_hex(hash, hex);
+                log_warn("object %s: header parity produced a header that does "
+                         "not describe the file; header left as it is", hex);
+            }
         }
     }
 
@@ -2812,8 +3211,11 @@ int object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]) {
      * exactly where it was most needed. Groups are independent, so
      * correcting one at a time costs a 15 KiB buffer whatever the size.
      */
-    if (hdr.compressed_size > 0) {
-        size_t   csize = (size_t)hdr.compressed_size;
+    /* Sized from the file, never from the header: the header may be the
+     * damaged part, and the old code repaired it on disk and then walked
+     * the payload with the damaged copy's length anyway (OWN-32). */
+    if (stored_size > 0) {
+        size_t   csize = (size_t)stored_size;
         size_t   rs_sz = rs_parity_size(csize);
         uint32_t stored_crc = 0;
         off_t crc_off = file_end - (off_t)sizeof(pftr)

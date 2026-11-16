@@ -200,9 +200,9 @@ packing and restoring a file all stop within one read of at most 8 MiB, so a
 multi-gigabyte file in progress does not hold up the shutdown. This takes
 about a second, well inside `docker stop`'s 10 second grace. A second SIGTERM
 or SIGINT forces an immediate exit. Run the cancelled job again after the
-restart; a backup skips what it already stored, a restore skips what it
-already wrote. `c-backup jobs cancel <id>` is the same cancellation for one
-job, and prints the job record with `"cancel_requested":true`. A job still
+restart; a backup skips what it already stored, a restore skips the files it
+finished and redoes the one it was inside. `c-backup jobs cancel <id>` is the
+same cancellation for one job, and prints the job record with `"cancel_requested":true`. A job still
 waiting in the queue never starts: it is `cancelled` in that record already,
 and in the journal as "cancelled before it started".
 
@@ -671,7 +671,7 @@ Options:
 |---|---|
 | `--exclude PAT` | Repeatable. See 6.2 |
 | `--one-filesystem` | Do not cross into other mounts below a source |
-| `--label TEXT` | A label on the snapshot |
+| `--label TEXT` | A label on the snapshot: at most 256 bytes of UTF-8 text with no control characters (tabs and newlines included). Anything else is refused before the backup starts |
 
 ### 6.2 Exclusion patterns
 
@@ -820,9 +820,21 @@ sudo c-backup diff 1 11 12                 # what changed between two snapshots
   matching files. A file stops being read after `--max-hits-per-file`
   matches (default 100) and the whole search after `--max-hits` (default
   10,000). `truncated` says the search itself stopped early (`--limit` or
-  `--max-hits`); `files_capped` counts files read only as far as their cap,
-  which may hold more matches than were recorded. Both are on the job's
-  result and on the run in `grep runs`. The hits are kept: `c-backup grep runs <id>` lists past
+  `--max-hits`); `files_capped` counts files whose matching stopped at their
+  cap, which may hold more matches than were recorded. Both are on the job's
+  result and on the run in `grep runs`.
+- **A match is recorded only from a file that read back whole and
+  authentic.** A file's matches are held until its object has been read to
+  the end and its SHA-256 (and, in an encrypted repository, its
+  authentication tag) has checked out; only then are they kept. A capped or
+  binary file over 16 MiB is therefore still read to its end, just not
+  matched further. A file that does not read back - damaged beyond its
+  parity, failing its tag, or not file content - contributes no matches and
+  is counted in `files_skipped`, with the first such file and the reason in
+  the run's `skip_reason` and every one in the daemon log. A damaged file
+  over 16 MiB is skipped even when its parity could correct it, because the
+  search streams it and cannot rewind to apply the correction; a repairing
+  `verify` fixes it on disk. The hits are kept: `c-backup grep runs <id>` lists past
   searches, newest first, and `c-backup grep show <id> <run>` prints one
   search's hits again, which is how a `--no-wait` search is read once it
   has finished.
@@ -867,9 +879,32 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   backup of `/home/me` into `/mnt/restore` produces `/mnt/restore/home/me/...`.
 - `--subpath` restores one file or directory. It matches on component
   boundaries and accepts the path with or without its leading slash.
-- **Existing files are skipped, not overwritten**, and counted as skipped.
-  This makes an interrupted restore re-runnable: run it again and it
-  continues. `--overwrite` replaces existing files instead.
+- **A file appears at its path only once it is complete and verified.**
+  Each regular file is written to a temporary file named
+  `.c-backup-partial.` plus six random characters, in the directory it
+  belongs in, with mode 0600. Only once the whole object has read back and
+  its SHA-256 (and, in an encrypted repository, its authentication tag) has
+  checked out are its mode, ownership, times, extended attributes and ACLs
+  applied, the data synced to disk, and the file renamed over its real
+  name. A file whose object is damaged beyond its parity, or fails its tag,
+  never appears; its temporary file is removed.
+- **An interrupted restore leaves only temporary files.** A daemon killed
+  mid-file (`kill -9`, a crash, power loss) leaves a `.c-backup-partial.*`
+  file, never a file of the right name with the wrong content. The next
+  restore into that directory removes them before it writes there. Do not
+  run two restores into the same directory at the same time: each would
+  remove the other's temporary files.
+- **Existing files are not overwritten.** This makes an interrupted restore
+  re-runnable: run it again and it continues. An existing regular file whose
+  size matches the snapshot's and whose modification time is within two
+  seconds of it (the slack is for filesystems with coarse timestamps) is
+  taken as already restored and counted as **skipped**. Anything else at
+  the path - a different size or time, a directory, a symlink - is the
+  operator's and is left alone, logged, and counted as **kept**; the
+  snapshot's version of that file is not in the destination. Neither fails
+  the restore. `--overwrite` replaces existing files instead, by renaming
+  the verified file over them; a symlink at the path is replaced, not
+  followed.
 - Hardlinks are restored as hardlinks, including across a resumed restore.
 - Sparse files come back sparse.
 - Modes, times (directories included), extended attributes and ACLs are
@@ -878,9 +913,21 @@ sudo c-backup restore 1 12 /mnt/restore --subpath /home/me/documents
   created is skipped and counted, not failed.
 - Sockets are skipped: they have no content.
 
-The job reports files, directories, links, specials, skipped and failed. Any
-failed entry makes the job fail with "restore incomplete", so a restore that
-reports success restored everything restorable.
+The job reports files, directories, links, specials, skipped, kept and
+failed. Any failed entry makes the job fail with "restore incomplete", so a
+restore that reports success restored everything restorable. An object of a
+type this build does not know fails its file with "object type N is not
+known to this build; written by a newer c-backup?", and a file entry whose
+object is not file content (a directory tree, say) fails rather than being
+written out as bytes.
+
+Verified files are made durable in batches - up to 512 files or 256 MiB,
+one `syncfs` on the destination filesystem - and only then renamed, so a
+power failure cannot leave a right-named file whose data never reached
+the disk. Syncing each file on its own ran at 175 files/s on btrfs; the
+batch measured 6,200 files/s for 10,000 small files where the old restore,
+which synced nothing, measured 13,600 (PERF.md). `syncfs` also flushes
+whatever else is dirty on that filesystem, once per batch.
 
 ---
 
@@ -1120,7 +1167,10 @@ sudo c-backup verify list 1                # past runs
 A deep verify repairs what it finds by default: every object carries
 Reed-Solomon parity, and having already read the damaged bytes, writing the
 correction costs almost nothing more. With `--no-repair` it still tells
-recoverable damage from loss for small objects, applying parity in memory.
+recoverable damage from loss, applying parity in memory. Both work at any
+object size, loose or packed and whatever the codec: parity is read and
+applied one group window at a time (about 16 MiB of data and 1 MiB of
+parity), never loaded whole.
 
 `--dry-run` is exactly `--no-repair`, and wins over anything else on the
 command line. It changes one thing: repair is off, so nothing in the
@@ -1134,8 +1184,8 @@ nothing to repair. The differences show only when there is damage:
 |---|---|---|
 | Level | deep | deep (or what `--level` says) |
 | Reads | every payload | every payload |
-| Damage within parity, object up to 16 MiB | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
-| Damage within parity, larger object | corrected on disk, counted `repaired` | reported damaged, with a note to run a repairing verify: streaming it through parity would mean writing |
+| Damage within parity, any size | corrected on disk, counted `repaired` | corrected in memory only, counted `recoverable`; the disk stays wrong |
+| Damage beyond parity | nothing written, counted `unrecoverable` | counted `unrecoverable` |
 | Lock | write | read |
 | Job `result` | `"repair":true,"dry_run":false` | `"repair":false`, and `"dry_run":true` for `--dry-run` |
 
@@ -1161,6 +1211,19 @@ status sees it. The run and its findings are still recorded and still
 printed on stdout (the failed job goes to stderr); `verify show <id> <run>`
 reads them back later. A missing pack is reported as missing, never as
 damage to repair: its parity went with it.
+
+**Repair is disabled past about 59.75 GiB.** The parity trailer records its
+own size in 32-bit fields, and RS parity costs 1024 bytes per 15296 stored,
+so an object stored in more than 64,156,058,688 bytes, or any object in a
+pack whose trailer outgrew those fields (an old unsealed pack can be any
+size), has a trailer size that has wrapped. Reads are unaffected, because
+they find parity from the object's header, but repair finds it from that
+size and would write a wrong correction into the data. Until the format
+carries wider fields, repair refuses these and writes nothing; the finding
+says `unrecoverable: too large for 32-bit parity fields; repair disabled
+pending format fix` when the object could not be read, or `recoverable, not
+written back: ...` with the same reason when the read corrected it in
+memory. The daemon logs a warning when it writes such an object or pack.
 
 Findings name files, not hashes: each object that is not intact is reported
 with its status, how many distinct paths reference it (`affected_files`),
@@ -1223,6 +1286,14 @@ would do:
 would be. `packs_rewritten` and `packs_deleted` are compaction, which a dry run
 does not do; `tmp_files_removed` counts staging files an interrupted run left
 behind (section 2.2). The journal entry carries the same in a line.
+
+Compaction copies entries into packs whose parity is computed afresh, so it
+corrects each entry from its old parity on the way. An entry damaged beyond
+parity is copied as it is and compaction finishes, then the job **fails**
+with `gc: N pack entr(ies) damaged beyond parity were copied as damaged`,
+the alert goes out and `c-backup gc` exits 1. The result adds
+`pack_entries_damaged`, `damaged` (the first 100 hashes) and
+`damaged_listed`.
 
 **Compaction rewrites a pack without its dead entries, split at 256 MiB.**
 A pack holding any entry no snapshot names is copied, live entries only,
@@ -1438,6 +1509,17 @@ The job's `result` says what moved: `snapshots_sent`, `snapshots_skipped`
 `subtrees_skipped` and `reencrypted`. A run with nothing to send reports
 zeros and journals `target already up to date`, so a no-op and a full copy
 are told apart at a glance.
+
+Damage is corrected from parity before it is sent: the target computes
+fresh parity over what it receives, so damage sent as it stood could never
+be corrected there. An object damaged beyond parity is still sent, and the
+run carries on and records its snapshots, so one lost object does not stop
+replication for good. The job then **fails** with `replicated with N
+object(s) damaged beyond parity; the replica holds them as damaged`, the
+failure alert goes out, and `c-backup replicate` exits 1. The result adds
+`objects_damaged` and `damaged`, the first 100 as `{"hash","snapshot"}`,
+with `damaged_listed` saying how many are listed. Each is lost at the source
+too; `verify` names the files.
 
 The target is a path. Replicating to another machine means mounting it (NFS,
 SMB, sshfs) or running a daemon there and replicating locally on that side.
@@ -1843,7 +1925,8 @@ Known limits:
 - **One admin password.** No users or roles.
 - **No configuration API.** Edit `config.yaml` and restart.
 - **No resumable jobs.** A job interrupted by a restart is marked failed and
-  run again. Backups skip what is unchanged; restores skip what exists.
+  run again. Backups skip what is unchanged; restores skip what they
+  already finished (section 8).
 
 Not in 1.0, by decision:
 

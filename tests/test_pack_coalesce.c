@@ -42,8 +42,9 @@
 #include "parity.h"
 #include "store.h"
 #include "util.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_pack_coalesce"
+#define TEST_REPO TEST_TMP "/c_backup_test_pack_coalesce"
 #define NOBJ 12
 
 static store_t *store;

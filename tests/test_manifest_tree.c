@@ -25,8 +25,9 @@
 #include "manifest.h"
 #include "object.h"
 #include "store.h"
+#include "test_tmp.h"
 
-#define TEST_ROOT "/tmp/c_backup_test_manifest"
+#define TEST_ROOT TEST_TMP "/c_backup_test_manifest"
 
 static store_t *store;
 

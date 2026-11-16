@@ -36,12 +36,22 @@ typedef struct {
     uint64_t bytes;
     /*
      * Not restored, and that is not the repository's fault: already present
-     * at the destination with overwrite off, which is what a resumed restore
-     * does to everything an earlier attempt wrote; or a device node the
-     * kernel refused to create for an unprivileged process. No content was
-     * lost - a device node has none.
+     * at the destination as the snapshot's version (same size, mtime within
+     * two seconds) with overwrite off, which is what a resumed restore does
+     * to everything an earlier attempt wrote; or a device node the kernel
+     * refused to create for an unprivileged process. No content was lost -
+     * a device node has none.
      */
     uint64_t skipped;
+    /*
+     * Regular files not restored because something else is at the path -
+     * another size or mtime, a directory, a symlink - and overwrite is off.
+     * What is there is the operator's and stays; the snapshot's version is
+     * not in the destination, which is why this is not counted as skipped.
+     * Not a failure: restoring into a live tree without overwrite, to bring
+     * back what was deleted, keeps every changed file by design.
+     */
+    uint64_t kept;
     /*
      * The repository could not produce it: an object that would not read, a
      * path that could not be reconstructed, a symlink whose target was never

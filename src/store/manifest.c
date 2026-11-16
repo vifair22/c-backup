@@ -20,12 +20,14 @@
  *            target_hash[32] | xattr_hash[32] | acl_hash[32] |
  *            name | link_target
  *
- * Version 2 added the device pair. Readers accept both; writers always emit
- * the current version, so the first backup after the upgrade re-serialises
- * every directory and stores a new object for each one. That is a one-time
- * ~100% new-tree run, which is otherwise the signature of determinism
- * breaking - see the note on manifest_serialise. It settles back to the
- * usual few percent on the next snapshot.
+ * Version 2 added the device pair. manifest_parse accepts version 2 only
+ * and refuses anything else as corrupt: version 1 trees predate the daemon
+ * rewrite, which has no migration path for pre-rewrite repositories, so no
+ * repository this build can open holds one. Writers always emit the current
+ * version. A future version bump that keeps reading the old one makes the
+ * first backup after the upgrade re-serialise every directory, a one-time
+ * ~100% new-tree run that is otherwise the signature of determinism
+ * breaking - see the note on manifest_serialise.
  */
 #define MANIFEST_TREE_MAGIC   0x52544243u   /* "CBTR" little-endian */
 #define MANIFEST_TREE_VERSION 2u

@@ -6,6 +6,7 @@
 #include "scheduler.h"
 #include "trigger.h"
 #include "json_row.h"
+#include "snap_record.h"
 
 /* c-utils fences its cJSON behind cutils/json.h; this file needs it raw. */
 #define CUTILS_CJSON_ALLOW
@@ -263,6 +264,7 @@ static const struct {
     const char *action;
 } k_param_owner[] = {
     { "paths",       "backup"    },
+    { "label",       "backup"    },
     { "dest",        "replicate" },
     { "pattern",     "grep"      },
     { "path_prefix", "grep"      },
@@ -445,6 +447,18 @@ api_response_t schedules_post(const api_request_t *req, int64_t repo_id)
             }
         }
         jreq_strv_free(paths, npaths);
+
+        /* The label every snapshot this schedule takes will carry. Checked
+         * by the rule a backup request is, and here rather than at fire
+         * time, so a bad one is a 400 now and not a failure every night. */
+        CUTILS_AUTOFREE char *label = NULL;
+        if (jreq_str(body, "label", &label, &je) == JREQ_BAD)
+            return api_error(400, je.msg);
+        if (snapshot_label_check(label) != 0)
+            return api_error(400, SNAPSHOT_LABEL_RULE);
+        if (label && *label && json_resp_add_str(pr, "label", label) != 0)
+            return api_error(500, "cannot encode schedule parameters");
+
         /* No paths given is fine when the repository has some configured;
          * whether it does is a fact about the repository, checked below. */
         need_sources = npaths == 0;

@@ -39,9 +39,10 @@
 #include "parity.h"
 #include "store.h"
 #include "types.h"
+#include "test_tmp.h"
 
-#define TEST_REPO "/tmp/c_backup_test_streaming"
-#define TEST_SRC  "/tmp/c_backup_test_streaming_src"
+#define TEST_REPO TEST_TMP "/c_backup_test_streaming"
+#define TEST_SRC  TEST_TMP "/c_backup_test_streaming_src"
 
 /* Above PACK_STREAM_THRESHOLD, so the large-object path is taken. */
 #define LARGE_SIZE (17u * 1024u * 1024u)
@@ -124,7 +125,7 @@ static void store_path(const char *path, uint8_t hash[OBJECT_HASH_SIZE])
 static void assert_streams_match(const uint8_t hash[OBJECT_HASH_SIZE],
                                  const char *original, size_t expect_size)
 {
-    char outpath[] = "/tmp/c_backup_stream_out_XXXXXX";
+    char outpath[] = TEST_TMP "/c_backup_stream_out_XXXXXX";
     int out_fd = mkstemp(outpath);
     assert_true(out_fd >= 0);
 

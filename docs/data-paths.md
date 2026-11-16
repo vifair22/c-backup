@@ -485,16 +485,74 @@ Every load verifies before it trusts:
   payload, RS-repairs on mismatch), decompresses (`COMPRESS_NONE` or LZ4
   block for pack entries; loose is always `COMPRESS_NONE`), and re-hashes
   the result against the requested hash. LZ4-frame entries must stream.
-- `object_load_stream`: streams to a caller fd in 16 MiB chunks, hashing
-  as it goes; this is the restore path's workhorse and the only correct
-  path for arbitrary-size objects.
+- `object_load_stream`: streams to a caller fd in windows of whole RS
+  groups (just under 16 MiB), decrypting and hashing as it goes; this is
+  the restore path's workhorse and the only correct path for
+  arbitrary-size objects. The tag and the hash are checked only at the
+  end, so the caller has emitted bytes before it knows they are right: a
+  caller that must not act on unverified bytes writes somewhere it can
+  discard (restore's temporary file, grep's held matches). A failure that
+  says the stored bytes are wrong - a tag that does not verify, a hash
+  mismatch, a truncation - rewinds a rewindable destination (a regular
+  file, to where the object began; `/dev/null`) and runs a second pass
+  that corrects each window from parity first, then decrypts and
+  authenticates again. A failed tag used to end the read before parity
+  was considered, so an encrypted loose object with one flipped byte was
+  unreadable (OWN-37). A pipe cannot be rewound, so a damaged loose object
+  streamed into one fails and a repairing verify fixes it on disk.
+- Every header reader refuses an object type outside 1-5 with "object type
+  N is not known to this build; written by a newer c-backup?" (OWN-39),
+  after header parity has had its chance: a damaged type byte is
+  repairable, an unknown one is not.
 - `object_load_prefix`: bounded prefix for previews and probes, LZ4
   partial decode for packed entries, no hash verification (a prefix
   cannot be hash-checked).
+- `object_stored_open` / `object_stored_read`: the object as stored, in
+  pieces, which is what replication moves. No decrypt or decompress, but
+  open CRC-scans the payload (loose or packed) and on a mismatch every read
+  is served from a window corrected from parity, so damage parity covers is
+  never shipped to a replica that would compute fresh parity over it. A
+  clean object costs one extra sequential read; memory is one window (a
+  15 KiB group for loose, at most 64 groups for packed). Damage beyond
+  parity is sent as it is so one lost object does not block replication,
+  and `object_stored_damaged` says so; `replicate_run` counts and lists
+  those objects and fails the job at the end (OWN-31). `object_read_stored` is the
+  whole-buffer form, for tests and inspection, with the same correction.
+
+A pack at or above about 59.75 GiB is not corrected from at all (OWN-30):
+the trailer's `trailer_size` and per-entry `entry_parity_size` are 32-bit
+and wrap once its parity reaches 4 GiB, and parity located through a
+wrapped size would produce a confident wrong correction. Every reader,
+repair and copy treats such a pack's entries as having no parity; repair
+reports failure and writes nothing.
+
+Parity on a packed entry is never loaded whole. A reader records where the
+entry's RS parity sits in the trailer and fetches it one window of groups
+at a time (1,096 groups: 16.0 MiB of data, 1.07 MiB of parity), so what a
+read or repair holds is fixed by the window, not by the entry; a whole-
+entry load was 6.7% of the stored size, 3.3 GiB for a 50 GiB entry. The
+window applies to every codec, the LZ4 frame included, which used to be
+detection-only.
 
 In-place repair (`object_repair`, `pack_object_repair`) rewrites corrected
 bytes via `pwrite` and is invoked by the integrity endpoints, not by normal
-reads; normal reads repair the in-memory copy only.
+reads; normal reads repair the in-memory copy only. Both work group by
+group at any object size. `pack_object_repair` first corrects the whole
+entry in memory and checks the result against the trailer's CRC, and only
+then writes, window by window: RS can miscorrect a group damaged past its
+capacity, and writing that back would trade damage verify can see for
+damage it cannot. Writing in place is crash-safe because each write puts
+back the bytes the entry was written with and touches nothing else, so an
+interrupted repair leaves a subset of the original damage and a rerun
+finishes it. Rewriting the pack through `pack_rw_replace` would copy up to
+the whole pack to fix a few bytes, on a disk that is already failing.
+
+gc's rewrite and coalescing copy entries into new packs whose parity is
+computed afresh over what they hold. They check each entry's CRC as the
+bytes go by and rewrite it corrected on a mismatch, so a copy never turns
+damage parity could still fix into damage it protects. An entry damaged
+beyond parity is copied as it is and listed in `pack_gc_stats_t`, and
+`gc_run` fails once compaction has finished (OWN-31).
 
 ---
 
@@ -528,12 +586,18 @@ flowchart TD
     HL -->|no| CH{content hash present?}
     CP --> CH
     CH -->|null or zero| SKIP2[skip; warn if unexpected type]
-    CH -->|yes| ST[object_load_stream to dest fd]
+    CH -->|yes| EX{path exists, overwrite off?}
+    EX -->|size + mtime match| SKIP3[skipped: already restored]
+    EX -->|anything else| KEPT[kept: left alone]
+    EX -->|no| SW[first file in this directory this run:<br>remove .c-backup-partial.* leftovers]
+    SW --> ST[object_load_stream into<br>.c-backup-partial.XXXXXX]
+    ST -->|not OK, or type not FILE/SPARSE| DEL[unlink temp; failed]
     ST --> SP{OBJECT_TYPE_SPARSE?}
-    SP -->|yes| SCAT[reopen + scatter regions via<br>restore_sparse_streaming]
-    SP -->|no| META[apply mode/owner/mtime]
+    SP -->|yes| SCAT[scatter regions from the verified<br>payload into a second temp file]
+    SP -->|no| META[mode/owner/mtime, xattrs, ACLs<br>on the temp file]
     SCAT --> META
-    META --> REM[first of a hardlink group:<br>remember path for later members]
+    META --> REN[queue; per batch of 512 files or 256 MiB:<br>one syncfs, then rename each over its final path]
+    REN --> REM[first of a hardlink group:<br>remember path for later members]
 ```
 
 Type-specific behaviour, spelled out:
@@ -556,22 +620,45 @@ Type-specific behaviour, spelled out:
   to it, preserving the shared inode. If the link fails (cross-device
   destination, filesystem without hardlinks) the member falls through to
   a full content copy, correct but larger.
-- **Regular files**: content streams straight from the store to the
-  destination fd, then metadata, then xattrs, then ACLs - the ACL last
-  because its base entries carry the definitive permissions and must win
-  over chmod. Later hardlink members share the first member's inode, so
-  the attributes applied there are already theirs. All of it is best
-  effort with warnings: an unprivileged restore cannot set `security.*`
-  or `trusted.*` attributes, and that must not fail a file whose content
-  just restored correctly. If the object turns out to be `OBJECT_TYPE_SPARSE`, the
-  linear bytes just written are a region-table serialisation, not file
-  content, so the file is reopened and `restore_sparse_streaming` scatters
-  each region to its recorded offset through a pipe from
-  `object_load_stream` - holes are never materialised and RAM stays
-  bounded no matter the logical size.
-- **Overwrite**: with `overwrite` off, an existing destination file is
-  skipped; with it on, symlink/hardlink sites `unlink` first and regular
-  files are `O_TRUNC`ed.
+- **Regular files** (OWN-36): content streams from the store into a
+  temporary file, `.c-backup-partial.XXXXXX` from `mkostemp` (O_EXCL, mode
+  0600), in the destination's own directory so the final rename is atomic.
+  The streaming read emits as it goes and learns whether the bytes are
+  right only at the end, from the AEAD tag and the SHA-256, so nothing it
+  writes may sit at the final path before it returns OK. Then metadata,
+  xattrs and ACLs go onto the temporary file - the ACL last because its
+  base entries carry the definitive permissions and must win over chmod -
+  then the file joins a batch: once 512 files or 256 MiB are queued (or a
+  hardlink needs a queued member, or the run ends), one `syncfs` makes the
+  batch durable and each file is renamed over its final path. The final
+  name never reaches disk before the data, and one sync per batch instead
+  of per file is the difference between 175 and 6,200 small files a second
+  on btrfs. Later hardlink
+  members share the first member's inode, so the attributes applied there
+  are already theirs. Metadata is best effort with warnings: an
+  unprivileged restore cannot set `security.*` or `trusted.*` attributes,
+  and that must not fail a file whose content restored correctly. The
+  object must be `OBJECT_TYPE_FILE` or `OBJECT_TYPE_SPARSE` (OWN-39); any
+  other type fails the file. If it is `OBJECT_TYPE_SPARSE`, what was just
+  written is the verified region-table serialisation, not file content, so
+  `restore_sparse_from_fd` scatters each region to its recorded offset in
+  a second temporary file and the first is dropped - holes are never
+  materialised, RAM stays bounded, the payload is read from the repository
+  once, and a damaged loose payload is corrected from parity on the way,
+  which the old second read through a pipe could not do.
+- **Interruption**: a daemon killed mid-file leaves only a temporary file.
+  Before the first file restored into a directory in a run, that
+  directory's `.c-backup-partial.` + six-character regular files are
+  removed, so a resumed restore cleans up exactly where it goes back to
+  work, at one `readdir` per directory written into.
+- **Overwrite**: with `overwrite` off, an existing regular file whose size
+  matches and whose mtime is within two seconds of the node's is skipped as
+  already restored (the final name only ever appears after verification
+  and metadata, so such a file is complete); anything else at the path is
+  kept and counted in `kept`. The hardlink pre-pass anchors a group only on
+  a member that passes the same rule. With `overwrite` on, symlink/hardlink
+  sites `unlink` first and regular files are replaced by the rename, which
+  replaces a symlink at the path rather than writing through it.
 - **FIFOs and device nodes**: recreated by `mkfifo`/`mknod`, then metadata,
   xattrs and ACLs like any other node. Neither has a content object; for a
   device the major/minor pair is the whole file, which is why the manifest
@@ -582,9 +669,9 @@ Type-specific behaviour, spelled out:
   Sockets are scanned but have no meaningful restore and are skipped.
 
 Per-file failures (unreadable object, unwritable destination) are counted
-as skips and logged; the restore completes and reports
-files/dirs/symlinks/hardlinks/skipped so partial success is visible rather
-than binary.
+in `failed` and logged; the restore completes and reports
+files/dirs/symlinks/hardlinks/specials/skipped/kept/failed so partial
+success is visible rather than binary, and any failure fails the job.
 
 ---
 
@@ -631,7 +718,8 @@ never outlive their pack.
   back, and compares against its SHA-256. Objects up to 16 MiB are read
   through `object_load`, which applies the payload Reed-Solomon parity in
   memory; larger ones stream and self-correct on a second pass when the hash
-  disagrees. Damage that parity covers is written back
+  disagrees, packed LZ4-frame entries included. Damage that parity covers is
+  written back, at any size and codec,
   to disk via `object_repair`/`pack_object_repair` - the only callers those
   functions have ever had. Damage beyond parity is reported with its blast
   radius resolved through `nodes.content_hash`: which files, which snapshots.
@@ -655,9 +743,13 @@ hashes and emits, and only a hash mismatch triggers a second pass that
 re-reads group by group, corrects each group from its parity and re-emits, so
 a clean object pays nothing for the machinery. That second pass needs a
 destination it can rewind - a regular file or `/dev/null` - which covers
-restore and verify; a non-rewindable sink (the pipe inside sparse restore)
-falls back to an explicit repairing verify. Repair on disk is bounded the
-same way, one 15 KiB group at a time regardless of object size.
+restore and verify. Into a non-rewindable sink (the pipes inside grep and
+sparse restore) a loose object falls back to an explicit repairing verify;
+a packed entry is CRC-scanned first and the emitting pass corrects it when
+the scan disagrees with the trailer, which costs such a read a second pass
+over the stored bytes. Repair on disk is bounded the same way, one window of
+groups at a time regardless of object size, for loose objects and every
+packed codec alike.
 
 ## Part 6: sizes, thresholds and where they live
 
@@ -672,6 +764,7 @@ same way, one 15 KiB group at a time regardless of object size.
 | `STREAM_CHUNK` | 128 MiB | sparse-object stream buffer |
 | `STREAM_LOAD_MAX` | 16 MiB | in-memory load cap / stream chunk on load |
 | RS parity stream bound | 256 MiB | parity RAM ceiling before spilling to `<repo>/tmp/` |
+| `PARITY_WINDOW_GROUPS_DEFAULT` | 1,096 groups | packed-entry parity read window: 16.0 MiB of data, 1.07 MiB of parity, per read or repair |
 | `PACK_WORKER_THREADS_MAX` | 32 | pack worker ceiling (also capped at one per 256 MiB of input) |
 | `CACHE_BATCH` | 2,000 | file-cache entries per transaction |
 | `PACK_COALESCE_SMALL_BYTES` | 64 MiB | a pack below this is a coalesce candidate |

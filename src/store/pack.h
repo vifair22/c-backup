@@ -6,6 +6,7 @@
 #include "progress.h"
 #include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define PACK_DAT_MAGIC   0x42504b44u   /* "BPKD" */
 #define PACK_IDX_MAGIC   0x42504b49u   /* "BPKI" */
@@ -140,16 +141,30 @@ status_t pack_object_read_stored(store_t *store,
 
 /*
  * Open a packed object's entry for reading as stored, without loading it.
- * On OK, *out_f is positioned at the first payload byte and holds *out_len
- * of them; the caller reads and fcloses it. object_stored_open is the
- * caller and the only one that should be.
+ * On OK, *out reads *out_len payload bytes, in order, through
+ * pack_stored_read; pack_stored_close releases it. object_stored_open is
+ * the caller and the only one that should be.
+ *
+ * The bytes handed over are corrected from the entry's parity: open
+ * CRC-scans the payload, and on a mismatch every read is served from a
+ * window corrected group by group, so damage parity can carry is never
+ * passed on. Memory is one window (at most 64 groups, about 1 MiB) whatever
+ * the entry's size.
  */
+typedef struct pack_stored_reader pack_stored_reader_t;
+
 status_t pack_object_open_stored(store_t *store,
                                  const uint8_t hash[OBJECT_HASH_SIZE],
                                  uint8_t *out_type, uint8_t *out_compression,
                                  uint8_t *out_encryption,
                                  uint64_t *out_uncompressed_size,
-                                 uint64_t *out_len, FILE **out_f);
+                                 uint64_t *out_len, pack_stored_reader_t **out);
+status_t pack_stored_read(pack_stored_reader_t *r, void *buf, size_t n);
+void     pack_stored_close(pack_stored_reader_t *r);
+
+/* After every byte has been read: did any of them carry damage beyond
+ * parity, handed over as it stood? The caller must report it (OWN-31). */
+int      pack_stored_damaged(const pack_stored_reader_t *r);
 
 /*
  * Write a pack out of objects that are already in stored form.
@@ -328,10 +343,51 @@ status_t pack_resolve_location(store_t *store,
                                uint64_t *out_dat_offset);
 
 /*
- * Attempt to repair a packed object's entry in-place via pwrite().
- * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error.
+ * Attempt to repair a packed object's entry in-place via pwrite(), at any
+ * entry size and codec, in memory bounded by the parity window. Writes only
+ * once the corrected payload matches the trailer's CRC.
+ * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error or
+ * damage beyond parity.
  */
 int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
+
+/*
+ * Test hook: how many RS groups (15,296 data bytes, 1,024 parity bytes each)
+ * a packed-entry reader or repair holds at once. 0 restores the default of
+ * 1,096 groups (16 MiB of data). Lowering it lets a test push an entry of a
+ * few MiB through many windows and measure that memory stays bounded.
+ */
+void pack_test_set_parity_window(size_t groups);
+
+/*
+ * Test hook: the pack size at and above which parity is not trusted because
+ * the trailer's 32-bit sizes may have wrapped (OWN-30; about 59.75 GiB). 0
+ * restores the default. Lowering it lets a test show that repair refuses
+ * such a pack and writes nothing.
+ */
+void pack_test_set_parity_fit_limit(uint64_t bytes);
+
+/*
+ * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
+ */
+uint64_t pack_seal_bytes(void);
+
+/*
+ * Test hook: the size every writer seals a pack at, in place of
+ * PACK_MAX_MULTI_BYTES; coalescing's idea of a small pack follows it. 0
+ * restores the default. A test of rollover, splitting or coalescing then
+ * proves the same structure with packs of a few MiB instead of writing
+ * several 256 MiB ones, which is what made the suites fill a CI runner's
+ * disk.
+ */
+void pack_test_set_seal(uint64_t bytes);
+
+/*
+ * 1 when the pack open on f cannot have a parity trailer whose uint32 size
+ * fields wrapped, 0 when repair must leave it alone (OWN-30). Exposed for
+ * the tests that pin it against real trailers.
+ */
+int pack_parity_fields_fit(FILE *f);
 
 /*
  * Rewrite any pack files that contain unreferenced objects, keeping only
@@ -363,9 +419,22 @@ void pack_resume_removals(store_t *store);
 
 /* Packs pack_gc_stats touched: rewritten without their dead entries, and
  * deleted outright because every entry was dead. Coalescing is not counted. */
+#define PACK_DAMAGED_LIST_MAX 100u
+
 typedef struct {
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
+    /*
+     * Entries copied by a rewrite or a coalesce that carried damage beyond
+     * their parity (OWN-31). They are copied as they are, so one lost
+     * object does not stop compaction for ever, but the new pack's parity
+     * is computed over the damage and nothing can correct it later: the
+     * caller must fail the job, not report it OK. The first
+     * PACK_DAMAGED_LIST_MAX hashes are listed.
+     */
+    uint64_t entries_damaged;
+    uint32_t damaged_listed;
+    uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
 } pack_gc_stats_t;
 
 /* pack_gc, also reporting which packs it rewrote or deleted. stats may be
