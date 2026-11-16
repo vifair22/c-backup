@@ -1293,13 +1293,20 @@ static status_t move_aside(struct sp_ctx *c, const char *path, char *moved, size
  * Every field is read by name and the create body is built here; nothing
  * the daemon sent is forwarded as it is.
  */
+static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
+                               const helper_policy_t *pol, cJSON **result);
+
 static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definition,
                          const helper_policy_t *pol, cJSON **result)
 {
     *result = NULL;
-    if (strncmp(unit_id, "compose:", 8) == 0)
-        return set_error(ERR_INVALID, "docker: define of a compose project is not built; restore its files "
-                         "and data, then run docker compose up");
+    if (strncmp(unit_id, "compose:", 8) == 0) {
+        cJSON *cd = cJSON_Parse(definition);
+        status_t cst = cd ? define_compose(c, unit_id, cd, pol, result)
+                          : set_error(ERR_INVALID, "docker: the definition is not JSON");
+        cJSON_Delete(cd);
+        return cst;
+    }
     cJSON *d = cJSON_Parse(definition);
     const cJSON *in = cJSON_GetObjectItemCaseSensitive(d, "inspect");
     const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(in, "Config");
@@ -1424,6 +1431,223 @@ static status_t d_define(sp_ctx_t *c, const char *unit_id, const char *definitio
     cJSON_Delete(made);
     cJSON_Delete(res);
     cJSON_Delete(d);
+    return st;
+}
+
+/* A compose project name, as compose itself allows. */
+static int project_ok(const char *p)
+{
+    size_t l = strlen(p);
+    if (l == 0 || l > 64 || !((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= '0' && p[0] <= '9'))) return 0;
+    return strspn(p, "abcdefghijklmnopqrstuvwxyz0123456789_-") == l;
+}
+
+static int file_name_ok(const char *n)
+{
+    size_t l = strlen(n);
+    return l && l <= 128 && n[0] != '.' && strspn(n, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") == l;
+}
+
+/* A YAML double-quoted scalar: JSON's escaping is valid YAML. */
+static int yaml_str(char *buf, size_t sz, const char *s)
+{
+    cJSON *j = cJSON_CreateString(s);
+    char *t = j ? cJSON_PrintUnformatted(j) : NULL;
+    cJSON_Delete(j);
+    int ok = t && strlen(t) < sz;
+    if (ok) snprintf(buf, sz, "%s", t);
+    cJSON_free(t);
+    return ok ? 0 : -1;
+}
+
+static status_t write_host_file(struct sp_ctx *c, const char *path, const char *text, cJSON *moved)
+{
+    char aside[PATH_MAX + 40];
+    status_t st = move_aside(c, path, aside, sizeof(aside));
+    if (st != OK) return st;
+    if (aside[0] && moved) cJSON_AddItemToArray(moved, cJSON_CreateString(aside));
+    char hp[PATH_MAX + HOST_TOOL_PATH_MAX];
+    if (host_path(&c->tools, path, hp, sizeof(hp)) != 0) return set_error(ERR_INVALID, "docker: path too long");
+    FILE *f = fopen(hp, "wxe");
+    if (!f) return set_error_errno(ERR_IO, "docker: writing %s", path);
+    int bad = fputs(text, f) == EOF;
+    if (fclose(f) != 0) bad = 1;
+    return bad ? set_error_errno(ERR_IO, "docker: writing %s", path) : OK;
+}
+
+/*
+ * Compose define (11.2): the recorded compose files and .env written back to
+ * the project directory, an override pinning each service's image by digest
+ * (and, under a new name, its binds and container name), then `docker
+ * compose up -d --no-build` with the host's docker CLI in the host's mount
+ * namespace, where the compose plugin lives.
+ *   {"compose": {"files": {"<name>": "<text>"}, "env": "<text>",
+ *                "working_dir": "/abs", "services": [{"service": "",
+ *                "image": {"RepoDigests": [], "RepoTags": []},
+ *                "volumes": ["src:dst[:mode]"]}]},
+ *    "name": "", "target_root": "", "replace": false, "start": false,
+ *    "pin_digest": false}
+ */
+static status_t define_compose(struct sp_ctx *c, const char *unit_id, cJSON *d,
+                               const helper_policy_t *pol, cJSON **result)
+{
+    const cJSON *cp = cJSON_GetObjectItemCaseSensitive(d, "compose");
+    const cJSON *files = cJSON_GetObjectItemCaseSensitive(cp, "files");
+    const char *wd0 = jstr(cp, "working_dir");
+    const char *want = jstr(d, "name");
+    const char *troot = jstr(d, "target_root");
+    int replace = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "replace"));
+    int start = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "start"));
+    int pin = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(d, "pin_digest"));
+    const char *orig = unit_id + 8;
+    char project[72];
+    snprintf(project, sizeof(project), "%s", want[0] ? want : orig);
+    int new_name = strcmp(project, orig) != 0;
+    if (!project_ok(project)) return set_error(ERR_INVALID, "docker: bad compose project name %.80s", project);
+    if (!cJSON_IsObject(files) || !files->child) return set_error(ERR_INVALID, "docker: the definition has no compose files");
+    if (wd0[0] != '/' || !helper_path_clean(wd0)) return set_error(ERR_INVALID, "docker: bad compose working_dir");
+    if (new_name && (troot[0] != '/' || !helper_path_clean(troot)))
+        return set_error(ERR_INVALID, "docker: a compose project under a new name needs a target_root");
+    char wd[PATH_MAX];
+    snprintf(wd, sizeof(wd), "%s%s", new_name ? troot : "", wd0);
+    int inc = 0;
+    for (size_t i = 0; i < pol->n_include && !inc; i++) inc = under_root(wd, pol->include_roots[i]);
+    if (!inc && !pol->allow_privileged_define)
+        return set_error(ERR_INVALID, "docker: the project directory %.200s is outside the include roots", wd);
+    const cJSON *svc;
+    cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services")) {
+        const cJSON *v;
+        cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(svc, "volumes")) {
+            const char *b = cJSON_GetStringValue(v);
+            char src[PATH_MAX];
+            snprintf(src, sizeof(src), "%.*s", b ? (int)strcspn(b, ":") : 0, b ? b : "");
+            int ok = 0;
+            for (size_t i = 0; i < pol->n_include && !ok; i++) ok = under_root(src, pol->include_roots[i]);
+            if (!ok && !pol->allow_privileged_define)
+                return set_error(ERR_INVALID, "docker: a bind of %.200s outside the include roots", src);
+        }
+    }
+
+    /* The project's own containers: refused unless replacing, stopped, and
+     * renamed aside rather than left for compose to remove. */
+    cJSON *res = cJSON_CreateObject();
+    cJSON *warn = res ? cJSON_AddArrayToObject(res, "warnings") : NULL;
+    cJSON *moved = res ? cJSON_AddArrayToObject(res, "moved_aside") : NULL;
+    if (!warn || !moved) { cJSON_Delete(res); return set_error(ERR_NOMEM, "docker: define"); }
+    member_t m[MEMBERS_MAX];
+    size_t nm = 0;
+    char pkey[96];
+    snprintf(pkey, sizeof(pkey), "compose:%s", project);
+    status_t st = members_of(c, pkey, m, &nm);
+    if (st == ERR_NOT_FOUND) { err_clear(); st = OK; nm = 0; }
+    if (st == OK && nm && !replace) st = set_error(ERR_BUSY, "docker: compose project %s exists; pass replace, or a new name", project);
+    for (size_t i = 0; st == OK && i < nm; i++)
+        if (m[i].running) st = set_error(ERR_BUSY, "docker: %s of project %s is running; stop it before replacing", m[i].name, project);
+    for (size_t i = 0; st == OK && i < nm; i++) {
+        char q[512], aside[200];
+        snprintf(aside, sizeof(aside), "%.128s.cbackup-old-%lld", m[i].name, (long long)time(NULL));
+        snprintf(q, sizeof(q), "/containers/%.79s/rename?name=%.200s", m[i].id, aside);
+        st = docker_call(&c->api, "POST", q, NULL, 0, NULL, NULL);
+        if (st == OK) cJSON_AddItemToArray(moved, cJSON_CreateString(aside));
+    }
+
+    /* The files, each old one moved aside. */
+    char hd[PATH_MAX + HOST_TOOL_PATH_MAX];
+    if (st == OK && host_path(&c->tools, wd, hd, sizeof(hd)) == 0) {
+        char tmp[PATH_MAX + HOST_TOOL_PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", hd);
+        for (char *p = tmp + 1; *p; p++) if (*p == '/') { *p = '\0'; (void)mkdir(tmp, 0755); *p = '/'; }
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) st = set_error_errno(ERR_IO, "docker: creating %s", wd);
+    }
+    const char *argv[64];
+    size_t na = 0;
+    char fpaths[16][PATH_MAX + 160];
+    size_t nf = 0;
+    argv[na++] = c->tools.docker;
+    argv[na++] = "compose";
+    argv[na++] = "-p";
+    argv[na++] = project;
+    argv[na++] = "--project-directory";
+    argv[na++] = wd;
+    const cJSON *f;
+    cJSON_ArrayForEach(f, files) {
+        if (st != OK) break;
+        if (!file_name_ok(f->string) || !cJSON_IsString(f) || nf >= 15) { st = set_error(ERR_INVALID, "docker: bad compose file entry"); break; }
+        snprintf(fpaths[nf], sizeof(fpaths[nf]), "%s/%s", wd, f->string);
+        st = write_host_file(c, fpaths[nf], f->valuestring, moved);
+        argv[na++] = "-f";
+        argv[na++] = fpaths[nf++];
+    }
+    const char *env = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(cp, "env"));
+    if (st == OK && env) {
+        char ep[PATH_MAX + 16];
+        snprintf(ep, sizeof(ep), "%s/.env", wd);
+        st = write_host_file(c, ep, env, moved);
+    }
+
+    /* The override: images pinned by digest; under a new name, the binds
+     * on their new paths (compose merges volumes by container path) and
+     * container names that cannot collide with the original's. */
+    size_t cap = 65536, o = 0;
+    char *ov = st == OK ? malloc(cap) : NULL;
+    if (st == OK && !ov) st = set_error(ERR_NOMEM, "docker: override");
+    if (ov) o += (size_t)snprintf(ov + o, cap - o, "# Written by c-backup-helper for a restore.\nservices:\n");
+    cJSON *imgs = cJSON_AddObjectToObject(res, "images");
+    cJSON_ArrayForEach(svc, cJSON_GetObjectItemCaseSensitive(cp, "services")) {
+        if (st != OK) break;
+        const char *name = jstr(svc, "service");
+        if (!file_name_ok(name)) { st = set_error(ERR_INVALID, "docker: bad service name"); break; }
+        char ref[600] = "", q1[700], q2[700];
+        st = pull_image(c, cJSON_GetObjectItemCaseSensitive(svc, "image"), pin, ref, sizeof(ref), warn);
+        if (st != OK) break;
+        if (imgs) cJSON_AddStringToObject(imgs, name, ref);
+        if (yaml_str(q1, sizeof(q1), ref) != 0) { st = set_error(ERR_INVALID, "docker: image name too long"); break; }
+        o += (size_t)snprintf(ov + o, cap - o, "  %s:\n    image: %s\n", name, q1);
+        if (new_name) {
+            char cn[200];
+            snprintf(cn, sizeof(cn), "%s-%s", project, name);
+            if (yaml_str(q2, sizeof(q2), cn) == 0) o += (size_t)snprintf(ov + o, cap - o, "    container_name: %s\n", q2);
+            const cJSON *v = cJSON_GetObjectItemCaseSensitive(svc, "volumes");
+            if (cJSON_GetArraySize(v) > 0) o += (size_t)snprintf(ov + o, cap - o, "    volumes:\n");
+            const cJSON *x;
+            cJSON_ArrayForEach(x, v) {
+                if (!cJSON_IsString(x) || yaml_str(q2, sizeof(q2), x->valuestring) != 0) continue;
+                o += (size_t)snprintf(ov + o, cap - o, "      - %s\n", q2);
+            }
+        }
+        if (o >= cap - 2048) { st = set_error(ERR_TOO_LARGE, "docker: the override is too large"); break; }
+    }
+    char ovp[PATH_MAX + 40];
+    snprintf(ovp, sizeof(ovp), "%s/cbackup-override.yaml", wd);
+    if (st == OK) st = write_host_file(c, ovp, ov, moved);
+    free(ov);
+    if (st == OK) {
+        argv[na++] = "-f";
+        argv[na++] = ovp;
+        argv[na++] = "up";
+        argv[na++] = "-d";
+        argv[na++] = "--no-build";
+        if (!start) argv[na++] = "--no-start";
+        argv[na] = NULL;
+        char *out = NULL;
+        st = host_run(&c->tools, 0, argv, 1800, &out, 65536);
+        free(out);
+        if (st != OK) {
+            char why[512];
+            snprintf(why, sizeof(why), "%.500s", err_msg());
+            err_clear();
+            st = set_error(ERR_IO, "docker: compose up failed (is the compose plugin installed on the host, "
+                           "as [host] docker names it?): %s", why);
+        }
+    }
+    if (st == OK) {
+        cJSON_AddStringToObject(res, "project", project);
+        cJSON_AddStringToObject(res, "working_dir", wd);
+        cJSON_AddBoolToObject(res, "started", start);
+        *result = res;
+        return OK;
+    }
+    cJSON_Delete(res);
     return st;
 }
 

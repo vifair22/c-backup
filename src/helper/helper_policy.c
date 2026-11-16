@@ -195,6 +195,7 @@ status_t helper_policy_parse(const char *text, helper_policy_t *out)
                 { "zfs", out->host_zfs, sizeof(out->host_zfs) },
                 { "btrfs", out->host_btrfs, sizeof(out->host_btrfs) },
                 { "realpath", out->host_realpath, sizeof(out->host_realpath) },
+                { "docker", out->host_docker, sizeof(out->host_docker) },
                 { "lxc_dir", out->host_lxc_dir, sizeof(out->host_lxc_dir) },
                 { "user_root", out->user_root, sizeof(out->user_root) },
                 { "mnt_root", out->mnt_root, sizeof(out->mnt_root) },

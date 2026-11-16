@@ -344,7 +344,35 @@ registry no longer has the digest (`pin_digest` refuses that), the
 template written back; for LXC the config with its name, rootfs path and
 MAC addresses rewritten. A name in use is refused unless `replace`, which
 needs the container stopped and moves the old one aside (renamed, or its
-config renamed). Privileged settings need `allow_privileged_define`.
+config renamed). Privileged settings, and binds of host paths outside
+the include roots, need `allow_privileged_define`.
+
+The daemon's side is `mode: unit` (`c-backup unit restore <repo> <snap>
+--define ...`):
+
+- **In place** needs `--replace`: the unit is stopped, each mount staged,
+  restored and swapped in, the old data left at `<mount>.cbackup-old-<job>`,
+  then the definition applied with replace.
+- **Under a new name** needs `--target-root DIR`: each mount is restored to
+  `DIR/<its original path>` and the definition's bind sources (Docker,
+  compose volumes), rootfs and mount entries (LXC) are rewritten there; the
+  original's paths are never written. `DIR` must lie inside an include root,
+  since the helper refuses binds outside them.
+- The definition travels to the helper as a sealed memfd (no size limit);
+  the helper's warnings land in the job result and the journal.
+
+**Compose projects** are re-created with the host's own docker CLI and
+its compose plugin, run in the host's mount namespace (`[host] docker`,
+default `/usr/bin/docker`). That plugin is a host requirement: on Unraid
+it comes with the Compose Manager plugin; the helper image does not carry
+one. The recorded compose files and `.env` are written back to the
+project directory (under the target root for a new name), any file they
+replace moved aside; `cbackup-override.yaml` pins each service's image by
+digest (tag fallback with a warning), and under a new name rewrites the
+services' binds and sets container names `<project>-<service>`; then
+`docker compose -p <project> up -d --no-build` (`--no-start` unless
+`--start`). Replacing a project needs its containers stopped; they are
+renamed aside rather than removed by compose.
 
 ## Testing
 
@@ -432,10 +460,7 @@ journal rows after every fault (`GET /providers` `holds_open` 0, helper
   policy (`pause`, `pause_always`) instead.
 - Not built yet (container-backup.md): the fallback's second, paused pass
   (`pause-read`; a non-snapshot mount is read live and flagged
-  `inconsistent`); pause scope `group` and `job`; define for compose
-  projects (`docker compose up` through the helper); the daemon's
-  `mode: unit` restore that stages each mount, swaps it in and then calls
-  `unit.define` (the helper side is built and tested).
+  `inconsistent`); pause scope `group` and `job`.
 - `restore.stage` and `restore.swap` act on host paths directly, so for a
   container provider they need the helper to see the pools at their host
   paths (bind them in as well as using `host_root`).

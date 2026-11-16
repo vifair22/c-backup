@@ -28,6 +28,7 @@ void host_tools_defaults(host_tools_t *t)
     snprintf(t->btrfs, sizeof(t->btrfs), "/sbin/btrfs");
     snprintf(t->lxc_dir, sizeof(t->lxc_dir), "/usr/bin");
     snprintf(t->realpath, sizeof(t->realpath), "/usr/bin/realpath");
+    snprintf(t->docker, sizeof(t->docker), "/usr/bin/docker");
     snprintf(t->host_root, sizeof(t->host_root), "/proc/1/root");
 }
 

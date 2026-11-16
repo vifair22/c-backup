@@ -42,6 +42,7 @@ void snap_host_setup(const helper_policy_t *pol, host_tools_t *t, snap_ctx_t *c)
     if (pol->host_zfs[0]) snprintf(t->zfs, sizeof(t->zfs), "%s", pol->host_zfs);
     if (pol->host_btrfs[0]) snprintf(t->btrfs, sizeof(t->btrfs), "%s", pol->host_btrfs);
     if (pol->host_realpath[0]) snprintf(t->realpath, sizeof(t->realpath), "%s", pol->host_realpath);
+    if (pol->host_docker[0]) snprintf(t->docker, sizeof(t->docker), "%s", pol->host_docker);
     if (pol->host_lxc_dir[0]) snprintf(t->lxc_dir, sizeof(t->lxc_dir), "%s", pol->host_lxc_dir);
     snprintf(t->host_root, sizeof(t->host_root), "%s", pol->host_root);
     memset(c, 0, sizeof(*c));

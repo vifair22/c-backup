@@ -408,6 +408,44 @@ static void test_unit_restore(void **state)
     unit_define_result_free(&dr);
 }
 
+/* A compose project's definition as the daemon assembles it from a
+ * snapshot: files, .env, services with their image records, and under a new
+ * name the binds remapped under the target root. */
+static void test_compose_definition(void **state)
+{
+    (void)state;
+    static const char inspect[] =
+        "{\"Name\":\"/web-db\",\"Config\":{\"Labels\":{\"com.docker.compose.service\":\"db\","
+        "\"com.docker.compose.project.working_dir\":\"" HF_POOL "/proj\"}},"
+        "\"HostConfig\":{\"Binds\":[\"" HF_MOUNT "/pg:/var/lib/pg:rw\",\"/etc/localtime:/etc/localtime:ro\"]}}";
+    static const char image[] = "{\"RepoDigests\":[\"postgres@sha256:feed\"],\"RepoTags\":[\"postgres:16\"]}";
+    assert_int_equal(fake_blob_add(fk, "u1", "c1", ".cbackup-unit/config/compose/compose.yaml", "services: {}\n", 13), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c2", ".cbackup-unit/config/compose/.env", "A=1\n", 4), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c3", ".cbackup-unit/config/containers/web-db/inspect.json",
+                                   inspect, strlen(inspect)), OK);
+    assert_int_equal(fake_blob_add(fk, "u1", "c4", ".cbackup-unit/config/containers/web-db/image.json",
+                                   image, strlen(image)), OK);
+    unit_backup_result_t res;
+    assert_int_equal(backup_one("cbk-uat-one", &res), OK);
+    int64_t snap = res.units[0].snapshot_id;
+    unit_backup_result_free(&res);
+    unit_define_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.name = "webcopy";
+    o.target_root = "/restore";
+    char *txt = NULL;
+    assert_int_equal(unit_define_build(store, db, repo_id, snap, "docker", "compose:web", &o, &txt), OK);
+    assert_non_null(strstr(txt, "\"compose.yaml\":\"services: {}"));
+    assert_non_null(strstr(txt, "\"env\":\"A=1"));
+    assert_non_null(strstr(txt, "\"working_dir\":\"" HF_POOL "/proj\""));
+    assert_non_null(strstr(txt, "\"service\":\"db\""));
+    assert_non_null(strstr(txt, "postgres@sha256:feed"));
+    assert_non_null(strstr(txt, "/restore" HF_MOUNT "/pg:/var/lib/pg:rw"));
+    assert_null(strstr(txt, "/restore/etc/localtime"));     /* in no tree: not remapped */
+    assert_non_null(strstr(txt, "\"target_root\":\"/restore\""));
+    free(txt);
+}
+
 /* Wait up to 5 s for the link to be connected with fake enabled. */
 static int wait_connected(void)
 {
@@ -504,6 +542,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_large_blob, setup, teardown),
         cmocka_unit_test_setup_teardown(test_dumps_through_helper, setup_dumps, teardown),
         cmocka_unit_test_setup_teardown(test_unit_restore, setup_define, teardown),
+        cmocka_unit_test_setup_teardown(test_compose_definition, setup, teardown),
         cmocka_unit_test_setup_teardown(test_attach_and_list, setup, teardown),
         cmocka_unit_test_setup_teardown(test_backup_through_helper, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failure_through_helper, setup, teardown),

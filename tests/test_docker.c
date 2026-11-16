@@ -119,11 +119,11 @@ static int start(const char *extra_policy)
     snprintf(text, sizeof(text),
              "[helper]\ndaemon_uid = 1000\ndaemon_id = 0badf00d\nstate_dir = " STATE "\n"
              "[snapshot]\nzfs_domains = cache/appdata, media\n"
-             "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\nuser_root = " MNT "/user\n"
+             "[host]\nnsenter = 0\nhost_root =\nzfs = %s/tests/fake_host/zfs\ndocker = %s/tests/fake_host/docker\nuser_root = " MNT "/user\n"
              "mnt_root = " MNT "\nboot_config = " D "/boot\n"
              "[docker]\nenabled = 1\nsocket = " SOCK "\ninclude_roots = " APPS ", " MNT "/media, " MNT "/disk1\n"
              "templates_dir = " D "/tmpl\n%s",
-             cwd, extra_policy ? extra_policy : "");
+             cwd, cwd, extra_policy ? extra_policy : "");
     memset(&pol, 0, sizeof(pol));
     if (helper_policy_parse(text, &pol) != OK) { fprintf(stderr, "%s\n", err_msg()); return -1; }
     holds_open = 0;
@@ -438,6 +438,63 @@ static void test_define(void **state)
     err_clear();
 }
 
+static const char *k_compose =
+    "{\"compose\":{\"files\":{\"compose.yaml\":\"services:\\n  db: {image: postgres}\\n\"},"
+    "\"env\":\"PASSWORD=x\\n\",\"working_dir\":\"" APPS "/web/proj\","
+    "\"services\":[{\"service\":\"db\",\"image\":{\"RepoDigests\":[\"postgres@sha256:feed\"],"
+    "\"RepoTags\":[\"postgres:16\"]},\"volumes\":[\"%s:/var/lib/pg\"]}]}%s}";
+
+/* Compose define: refused over a running project, replaced with its
+ * containers renamed aside, and under a new name with its binds and
+ * container names moved off the original's. */
+static void test_define_compose(void **state)
+{
+    (void)state;
+    char def[4096];
+    cJSON *res = NULL;
+    snprintf(def, sizeof(def), k_compose, APPS "/web/db", "");
+    assert_int_not_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "exists"));
+    err_clear();
+    snprintf(def, sizeof(def), k_compose, APPS "/web/db", ",\"replace\":true");
+    assert_int_not_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "running"));
+    err_clear();
+    snprintf(fdk.c[0].state, sizeof(fdk.c[0].state), "exited");
+    snprintf(fdk.c[1].state, sizeof(fdk.c[1].state), "exited");
+    assert_int_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    assert_int_equal(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(res, "moved_aside")), 2);
+    cJSON_Delete(res);
+    res = NULL;
+    assert_true(has(APPS "/web/proj/compose.yaml", "postgres"));
+    assert_true(has(APPS "/web/proj/.env", "PASSWORD=x"));
+    assert_true(has(STATE "/override.yaml", "postgres@sha256:feed"));
+    assert_true(has(STATE "/compose.log", "compose -p web --project-directory " APPS "/web/proj"));
+    assert_true(has(STATE "/compose.log", "--no-start"));
+
+    /* A new name without a target root is refused; with one, everything
+     * lands under it. */
+    snprintf(def, sizeof(def), k_compose, APPS "/r" APPS "/web/db", ",\"name\":\"webcopy\"");
+    assert_int_not_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "target_root"));
+    err_clear();
+    snprintf(def, sizeof(def), k_compose, APPS "/r" APPS "/web/db",
+             ",\"name\":\"webcopy\",\"target_root\":\"" APPS "/r\",\"start\":true");
+    assert_int_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    cJSON_Delete(res);
+    assert_true(has(APPS "/r" APPS "/web/proj/compose.yaml", "postgres"));
+    assert_true(has(STATE "/override.yaml", "container_name: \"webcopy-db\""));
+    assert_true(has(STATE "/override.yaml", APPS "/r" APPS "/web/db:/var/lib/pg"));
+    /* Without the compose plugin: a clear error. */
+    setenv("FAKE_COMPOSE_FAIL", "1", 1);
+    snprintf(def, sizeof(def), k_compose, APPS "/r2" APPS "/web/db",
+             ",\"name\":\"webthree\",\"target_root\":\"" APPS "/r2\"");
+    assert_int_not_equal(be.define(be.ctx, "compose:web", def, &pol, &res), OK);
+    assert_non_null(strstr(err_msg(), "compose plugin"));
+    err_clear();
+    unsetenv("FAKE_COMPOSE_FAIL");
+}
+
 /* A mount on no snapshot domain is read live, and the level says so. */
 static void test_fallback_flagged(void **state)
 {
@@ -541,6 +598,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_parallel_pause, setup, teardown),
         cmocka_unit_test_setup_teardown(test_hook_logs_and_dumps, setup, teardown),
         cmocka_unit_test_setup_teardown(test_define, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_define_compose, setup, teardown),
         cmocka_unit_test_setup_teardown(test_fallback_flagged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failing_hook, setup_failing_hook, teardown),
         cmocka_unit_test_setup_teardown(test_sweep_unpauses, setup, teardown),

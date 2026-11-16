@@ -47,6 +47,11 @@ status_t unit_define_run(store_t *store, cutils_db_t *db, int64_t repo_id, int64
                          int64_t job_id, const unit_define_opts_t *o, unit_define_result_t *out);
 void     unit_define_result_free(unit_define_result_t *r);
 
+/* The definition unit_define_run would send for prov:unit, as JSON text
+ * (malloc'd); for tests and for showing a restore before running it. */
+status_t unit_define_build(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                           const char *prov, const char *unit, const unit_define_opts_t *o, char **text);
+
 /* A file of the snapshot (a path relative to its root) into memory, at
  * most max bytes. ERR_NOT_FOUND when it is not there. */
 status_t unit_read_file(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,

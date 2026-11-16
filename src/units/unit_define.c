@@ -174,6 +174,79 @@ static cJSON *args_unit(const char *prov, const char *unit)
     return a;
 }
 
+/* A compose project's definition: its files and .env, and per member its
+ * service, image record and (under a new name) its binds remapped. */
+static status_t compose_definition(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                                   int new_name, const tree_t *t, size_t n, cJSON *d)
+{
+    char repo[32], snap[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    snprintf(snap, sizeof(snap), "%lld", (long long)snap_id);
+    db_result_t *r = NULL;
+    if (db_execute(db, "SELECT path FROM snapshot_unit_items WHERE repo_id = ? AND snap_id = ? AND kind = 'blob'"
+                       " ORDER BY path", (const char *[]){ repo, snap, NULL }, &r) != 0 || !r) {
+        db_result_free(r);
+        return set_error(ERR_IO, "unit restore: cannot list the snapshot's configuration");
+    }
+    cJSON *cp = cJSON_AddObjectToObject(d, "compose");
+    cJSON *files = cp ? cJSON_AddObjectToObject(cp, "files") : NULL;
+    cJSON *svcs = cp ? cJSON_AddArrayToObject(cp, "services") : NULL;
+    status_t st = svcs ? OK : set_error(ERR_NOMEM, "unit restore: definition");
+    static const char cdir[] = ".cbackup-unit/config/compose/";
+    static const char mdir[] = ".cbackup-unit/config/containers/";
+    for (int i = 0; st == OK && i < r->nrows; i++) {
+        const char *path = r->rows[i][0];
+        char *data = NULL;
+        size_t len = 0;
+        if (strncmp(path, cdir, sizeof(cdir) - 1) == 0) {
+            const char *base = path + sizeof(cdir) - 1;
+            if ((st = unit_read_file(store, db, repo_id, snap_id, path, DEF_FILE_MAX, &data, &len)) != OK) break;
+            if (strcmp(base, ".env") == 0) cJSON_AddStringToObject(cp, "env", data);
+            else cJSON_AddStringToObject(files, base, data);
+            free(data);
+            continue;
+        }
+        size_t pl = strlen(path);
+        if (strncmp(path, mdir, sizeof(mdir) - 1) != 0 || pl < 13 || strcmp(path + pl - 13, "/inspect.json") != 0) continue;
+        if ((st = unit_read_file(store, db, repo_id, snap_id, path, DEF_FILE_MAX, &data, &len)) != OK) break;
+        cJSON *in = cJSON_ParseWithLength(data, len);
+        free(data);
+        const cJSON *labels = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "Config"), "Labels");
+        const char *svc = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(labels, "com.docker.compose.service"));
+        const char *wd = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(labels, "com.docker.compose.project.working_dir"));
+        if (!svc) { cJSON_Delete(in); continue; }
+        if (wd && !cJSON_GetObjectItemCaseSensitive(cp, "working_dir")) cJSON_AddStringToObject(cp, "working_dir", wd);
+        cJSON *o = cJSON_CreateObject();
+        if (!o) { cJSON_Delete(in); st = set_error(ERR_NOMEM, "unit restore"); break; }
+        cJSON_AddItemToArray(svcs, o);
+        cJSON_AddStringToObject(o, "service", svc);
+        char ip[PATH_MAX];
+        snprintf(ip, sizeof(ip), "%.*simage.json", (int)(pl - 12), path);
+        if (unit_read_file(store, db, repo_id, snap_id, ip, DEF_FILE_MAX, &data, &len) == OK) {
+            cJSON *im = cJSON_ParseWithLength(data, len);
+            if (im) cJSON_AddItemToObject(o, "image", im);
+            free(data);
+        } else {
+            err_clear();
+        }
+        cJSON *vols = cJSON_AddArrayToObject(o, "volumes");
+        const cJSON *b;
+        cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(in, "HostConfig"), "Binds")) {
+            const char *v = cJSON_GetStringValue(b);
+            if (!new_name || !v || v[0] != '/' || !vols) continue;
+            size_t sl = strcspn(v, ":");
+            char src[PATH_MAX], to[PATH_MAX * 2], full[PATH_MAX * 3];
+            snprintf(src, sizeof(src), "%.*s", (int)sl, v);
+            if (!remap(t, n, src, to, sizeof(to))) continue;
+            snprintf(full, sizeof(full), "%s%s", to, v + sl);
+            cJSON_AddItemToArray(vols, cJSON_CreateString(full));
+        }
+        cJSON_Delete(in);
+    }
+    db_result_free(r);
+    return st;
+}
+
 /* The provider's definition, from the snapshot's .cbackup-unit/config. */
 static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
                                  const char *prov, const char *unit, const unit_define_opts_t *o,
@@ -187,8 +260,9 @@ static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_i
     char rel[PATH_MAX];
     if (strcmp(prov, "docker") == 0) {
         if (strncmp(unit, "compose:", 8) == 0) {
-            cJSON_Delete(d);
-            return set_error(ERR_INVALID, "unit restore: define of a compose project is not built");
+            st = compose_definition(store, db, repo_id, snap_id, new_name, t, n, d);
+            if (st == OK && new_name) cJSON_AddStringToObject(d, "target_root", o->target_root);
+            goto common;
         }
         snprintf(rel, sizeof(rel), ".cbackup-unit/config/containers/%s/inspect.json", unit);
         st = unit_read_file(store, db, repo_id, snap_id, rel, DEF_FILE_MAX, &data, &len);
@@ -232,6 +306,7 @@ static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_i
         cJSON *mm = cJSON_AddObjectToObject(d, "mount_map");
         for (size_t i = 0; mm && new_name && i < n; i++) cJSON_AddStringToObject(mm, t[i].path, t[i].dest);
     }
+common:
     if (st == OK) {
         cJSON_AddStringToObject(d, "name", new_name ? o->name : "");
         cJSON_AddBoolToObject(d, "replace", !new_name && o->replace);
@@ -242,6 +317,25 @@ static status_t build_definition(store_t *store, cutils_db_t *db, int64_t repo_i
         return OK;
     }
     cJSON_Delete(d);
+    return st;
+}
+
+status_t unit_define_build(store_t *store, cutils_db_t *db, int64_t repo_id, int64_t snap_id,
+                           const char *prov, const char *unit, const unit_define_opts_t *o, char **text)
+{
+    *text = NULL;
+    int new_name = o->name && *o->name && strcmp(o->name, unit) != 0;
+    tree_t *t = calloc(TREES_MAX, sizeof(*t));
+    if (!t) return set_error(ERR_NOMEM, "unit restore");
+    size_t n = 0;
+    status_t st = trees_of(db, repo_id, snap_id, t, &n);
+    for (size_t i = 0; st == OK && new_name && i < n; i++)
+        snprintf(t[i].dest, sizeof(t[i].dest), "%s%s", o->target_root ? o->target_root : "", t[i].path);
+    cJSON *def = NULL;
+    if (st == OK) st = build_definition(store, db, repo_id, snap_id, prov, unit, o, new_name, t, n, &def);
+    if (st == OK && !(*text = cJSON_PrintUnformatted(def))) st = set_error(ERR_NOMEM, "unit restore");
+    cJSON_Delete(def);
+    free(t);
     return st;
 }
 
