@@ -518,14 +518,28 @@ with those mounts flagged `inconsistent`.
   `zfs snapshot -o com.cbackup:owner=<daemon id> cache/appdata@cbk-<d8>-<job>-<n> cache/Photos@... cache/system@...`.
   Non-recursive: child datasets are added explicitly only when a unit's
   path lies in them.
-- **Read**: `<mountpoint>/.zfs/snapshot/<name>/<rest>`. The `.zfs`
-  directory is hidden from listings by default but reachable by path, and
-  ZFS mounts the snapshot on first access. From inside a container, that
-  automount must propagate into the container's view: the pool is bound
-  with `rslave` (`-v /mnt/cache:/mnt/cache:ro,rslave`), or the helper
-  mounts the snapshot explicitly (`mount -t zfs -o ro <ds>@<snap>
-  /mnt/cache/.cbackup-mnt/<name>`). Which works on Unraid 7.4 / ZFS 2.4.4
-  is UAT item U3.
+- **Read**: `<dataset mountpoint>/.zfs/snapshot/<name>/<rest>`. FS1's
+  datasets have `snapdir=hidden` (survey section 7, U3): `.zfs` exists only
+  at a dataset's root, is not listed, and is reachable by name. The daemon
+  binds the pool root (`-v /mnt/cache:/mnt/cache:ro,rslave`), so it reaches
+  `/mnt/cache/appdata/.zfs/snapshot/<name>`; ZFS mounts the snapshot on
+  first access, and `rslave` lets that automount appear in the daemon's
+  view. If the automount does not propagate, the helper mounts the snapshot
+  explicitly (`mount -t zfs -o ro <ds>@<snap> <dir>`). c-backup never
+  changes `snapdir`.
+- **Who else can see it** (U3): a container that binds a subdirectory of a
+  dataset (every appdata container on FS1) cannot reach `.zfs` at all. A
+  container that binds a **dataset root** can: Plex-Mover binds `/mnt/cache`
+  read-write and reaches `/mnt/cache/appdata/.zfs/snapshot`. While a
+  capture snapshot exists, such a container can read every unit's data in
+  that dataset **as of the capture instant**. It can already read the same
+  data live, so what the snapshot adds is narrow: files deleted, or made
+  unreadable, after the instant stay readable until the snapshot is gone.
+  Whether shfs also resolves `/mnt/user/appdata/.zfs` (shfs passes dot
+  names through below the share level, U4) is to be checked in UAT; if it
+  does, containers binding `/mnt/user` see the same window. The answer is
+  to keep that window as short as possible (8.3), and it is recorded in
+  `source-providers.md` 11.8.
 - **Destroy**: `zfs destroy <ds>@<name>` only after checking the
   `com.cbackup:owner` property equals this daemon's id. A snapshot with a
   hold or a clone (neither of which c-backup creates) is left alone and
@@ -533,9 +547,10 @@ with those mounts flagged `inconsistent`.
 - **Sweep**: `zfs list -H -t snapshot -o name,com.cbackup:owner`, filter by
   the name grammar and the owner property, skip those owned by a running
   job, destroy the rest.
-- **Exclusion**: `.zfs` is never descended into by the scanner (it is a
-  separate mount, and the scanner also excludes it by name at any dataset
-  root), so a file backup of `/mnt/cache` never reads snapshots.
+- **Exclusion**: the scanner never descends into `.zfs` at any depth, under
+  the pool path and under its `/mnt/user` alias (it is excluded by name, and
+  it is a separate mount besides), so a file backup of `/mnt/cache` or
+  `/mnt/user/appdata` never reads snapshots.
 
 ### 8.2 btrfs without subvolumes (FS2)
 
@@ -555,15 +570,26 @@ domain is the top-level subvolume (id 5): the whole pool.
   a subvolume root) and snapshots each one a unit's path lies in, in the
   same pause (separate btrfs snapshots are not atomic together, which is
   what the pause is for).
-- **Where it goes**: the snapshot must be inside the same filesystem. It
-  must **not** be a new top-level directory: Unraid treats top-level
-  directories on a pool as shares, so `/mnt/cache/.cbackup-snapshots` could
-  surface as a user share, be walked through `/mnt/user`, or worse be
-  handed to the mover. The location is
-  `/mnt/cache/system/.cbackup-snapshots/` (`containers.btrfs_snapshot_dir`),
-  inside an existing pool-only share. Whether Unraid exports or moves dot
-  directories at a pool's top level, and confirming `system` is pool-only
-  on FS2, is UAT item U4.
+- **Where it goes** (survey section 7, U4): inside the same filesystem,
+  and chosen so that nothing else picks it up.
+  - **Inside an existing share**, not at the top of the pool: a dot
+    directory at a pool's top level is skipped by the mover, but whether
+    Unraid's GUI would treat it as a share is unverified, so it is avoided.
+  - **Inside a pool-only share**: the mover never moves pool-only shares
+    (`shareUseCache="only"`), dot names included. On FS2, `system`,
+    `appdata` and `cbackup` are pool-only.
+  - **Never inside an exported share**: NFS exports whole share paths, dot
+    directories included (FS1 exports Media, Media - Program, isos and
+    Documents), and SMB hides dot files only by attribute on FS1 and not at
+    all on FS2. The helper reads the share's `/boot/config/shares/<share>.cfg`
+    and refuses a snapshot directory in a share with `shareExport` or
+    `shareExportNFS` set. FS2 exports nothing.
+  - The location is `/mnt/cache/system/.cbackup-snapshots/`
+    (`containers.btrfs_snapshot_dir`).
+  - shfs passes dot names through below the share level, so the same
+    directory also appears as `/mnt/user/system/.cbackup-snapshots/`; it is
+    visible to containers that bind `/mnt/user`, for the snapshot's
+    lifetime (8.3).
 - **Read**: `<snapshot dir>/<name>/<path relative to the pool root>`.
 - **Destroy**: `BTRFS_IOC_SNAP_DESTROY_V2`, after checking the subvolume is
   read-only, its name matches the grammar with this daemon's id, and its
@@ -574,19 +600,45 @@ domain is the top-level subvolume (id 5): the whole pool.
   three checks, destroy what no running job owns. The intent row names
   each snapshot before it is created, so a crash between create and the
   read is covered even if the directory listing is the only evidence left.
-- **Exclusion**: the scanner never descends into a directory named
-  `.cbackup-snapshots` and never crosses into a btrfs subvolume whose name
-  matches the grammar; snapshots are separate subvolumes with their own
-  `st_dev`, so `--one-filesystem` stops at them as well. Other tools that
-  walk `/mnt/cache/system` (indexers, `du`, another backup tool) would see
-  a read-only copy of the pool for the minutes a job holds it; that window
-  is the cost of no subvolumes.
+- **Exclusion**: the scanner never descends into the configured snapshot
+  directory under **both** its pool path (`/mnt/cache/system/.cbackup-snapshots`)
+  and its shfs alias (`/mnt/user/system/.cbackup-snapshots`), nor into any
+  directory named `.cbackup-snapshots`, nor into a btrfs subvolume whose
+  name matches the grammar. Under `/mnt/user` the alias is a FUSE path with
+  the share's device number, so `--one-filesystem` would not stop there;
+  the name rule is what does. Other tools that walk `/mnt/cache/system` or
+  `/mnt/user/system` (indexers, `du`, another backup tool) would see a
+  read-only copy of the pool while a job holds one; that window is the cost
+  of no subvolumes, and 8.3 keeps it short.
 - **Decided (C6): snapshot the whole pool.** The alternative, converting
   `appdata` into a subvolume (stop containers, `btrfs subvolume create`,
   `cp -a --reflink=always`, swap names) so snapshots cover appdata only, was
   not adopted: it is an operator step with downtime. FS2 carries no
   production containers, so the top-level design is what UAT exercises
   there.
+
+### 8.3 Snapshot lifetime is kept minimal
+
+A capture snapshot is visible to more than c-backup while it exists:
+containers that bind a dataset root reach `.zfs` (8.1), containers that
+bind `/mnt/user` see the btrfs snapshot directory (8.2), and any tool
+walking those paths sees a frozen copy of the pool or dataset. So no
+snapshot lives longer than its read:
+
+- **Per-unit captures** (`pause_scope: unit`, the default) mean a snapshot
+  exists only while that unit's mounts are read, minutes on an
+  incremental, and is destroyed by `capture.end` the moment the last read
+  finishes, before the snapshot record is even written. A `job`-scope
+  capture lives for the whole job, which is one more reason it is not the
+  default.
+- **Leases.** Every capture has a deadline (`capture_max_s`, default 24 h,
+  for a first full backup of a large unit); at the deadline the helper
+  destroys the snapshot itself, whatever the daemon is doing, and the
+  unit's read fails rather than outliving its lease.
+- **Sweep** at helper and daemon start destroys any capture snapshot no
+  running job owns.
+- `cbackup_unit_hold_seconds_max` has a sibling,
+  `cbackup_capture_snapshot_seconds_max`, so the lifetime is monitored.
 
 ## 9. Privileges and deployment
 
@@ -997,6 +1049,14 @@ Decided by the user (2026-11-16):
 | Secrets in definitions | Never stripped: `docker inspect`, templates and compose files are stored verbatim; an unencrypted repository holds them in the clear (4.1) |
 | FS1 repository | An FS1 array disk by disk path, replicated daily to FS2 (9.3) |
 
-UAT items to settle before conclusions: U3 (`.zfs` snapshot visibility
-inside a container with `rslave`), U4 (whether Unraid exports or moves dot
-directories on a pool, and that `system` is pool-only on FS2).
+Answered by the read-only follow-up checks (survey section 7):
+
+| Item | Finding | Design consequence |
+|---|---|---|
+| U3 | `snapdir=hidden`; `.zfs` is reachable only through a mount of a dataset root. Subdirectory binds (every appdata container) cannot see it; Plex-Mover, binding `/mnt/cache`, can | The daemon binds the pool root to read snapshots; the exposure to dataset-root binds is documented (8.1, `source-providers.md` 11.8) and bounded by minimal snapshot lifetime (8.3) |
+| U4 | The mover skips top-level dot directories and never moves pool-only shares; shfs passes dot names through below the share level; FS1 NFS exports whole shares, FS1 SMB hides dot files by attribute, FS2 exports nothing | Snapshot directory inside an existing pool-only, unexported share (`system`); the helper refuses an exported share; the scanner excludes it under both the pool path and the `/mnt/user` alias (8.2) |
+
+Still to check in UAT: whether shfs resolves `/mnt/user/<share>/.zfs` for a
+share that is its own dataset, and that the `rslave` automount of
+`.zfs/snapshot` reaches the daemon's container (else the helper mounts the
+snapshot explicitly).

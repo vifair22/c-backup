@@ -304,13 +304,38 @@ though its target name is the same.
 
 ### 3.3 NVRAM and TPM
 
-The NVRAM file and swtpm state are read from host paths, so they need the
-host directories mounted read-only into the daemon's container at the same
-paths. On Unraid, NVRAM is under `/etc/libvirt/qemu/nvram/`, which is the
-loop-mounted `libvirt.img` (survey: `/mnt/cache/system/libvirt/libvirt.img`
-mounted at `/etc/libvirt`). The TPM state location on Unraid 7.4 is to be
-confirmed (open question Q6). A missing NVRAM file for a domain that names
-one fails the unit: a UEFI VM restored without its variables may not boot.
+A complete VM on Unraid is its domain XML, its disks, its UEFI NVRAM and,
+for a VM with an emulated TPM, its swtpm state (survey section 7, Q6):
+
+| State | Where (FS1, confirmed) | Persistent |
+|---|---|---|
+| NVRAM | `/etc/libvirt/qemu/nvram/<uuid>_VARS-pure-efi[-tpm].fd`, for all five domains | yes: inside `libvirt.img` (`/mnt/cache/system/libvirt/libvirt.img`, loop-mounted at `/etc/libvirt`) |
+| swtpm state | `/var/lib/libvirt/swtpm/<uuid>/`, where `/var/lib/libvirt/swtpm` is a symlink to `/etc/libvirt/qemu/swtpm/tpm-states` | yes: inside `libvirt.img` |
+| domains with a TPM (`<tpm model='tpm-tis'><backend type='emulator' version='2.0' persistent_state='yes'/>`) | Noah MC, runner-firmware, runner-general | |
+
+**Both are required.** For every domain whose XML names an `<nvram>`, the
+NVRAM file is captured (BLOB item `nvram`); for every domain with an
+emulator TPM, its whole state directory for **its own UUID** is captured
+(TREE item `tpm`, ownership and modes kept: swtpm runs as `tss`). A guest
+that sealed keys to its TPM (BitLocker, LUKS with a TPM-bound key, measured
+boot) will not boot, or will demand its recovery key, without the exact TPM
+state, so a missing or unreadable NVRAM file or TPM state directory **fails
+the unit**; it never produces a snapshot that looks complete and is not.
+
+Both are read through the libvirt paths the domain XML implies (the UUID
+from the XML, never a directory listing), with OWN-45's settle bracket:
+swtpm rewrites its state file when the guest changes TPM NV data, which is
+rare, and a read that keeps moving is flagged rather than silently torn.
+They are small (KB to a few MB) and are read right after `virDomainBackupBegin`
+returns, so they belong to the same point in time as the disks within
+milliseconds. The daemon's container mounts `/etc/libvirt/qemu/nvram` and
+`/etc/libvirt/qemu/swtpm/tpm-states` read-only at the same paths (9.2).
+
+**Other UUIDs are never touched.** `tpm-states/` on FS1 also holds two
+directories of domains that no longer exist (`3ad5d032-...`,
+`4838ee2f-...`). c-backup reads only the directory named by the UUID of a
+domain it is backing up, writes only the directory of the domain it is
+restoring (7.2), and never lists, cleans or deletes anything else there.
 
 ### 3.4 Passthrough disks
 
@@ -815,17 +840,48 @@ one binds. GFS never prunes a group's head (`source-providers.md` 8.1), and
 the head is the token's snapshot in steady state, so scheduled retention
 never costs a full read.
 
-**Checkpoint metadata on Unraid.** libvirt keeps checkpoint metadata on the
-host (`/var/lib/libvirt/qemu/checkpoint/<domain>/` by default), while the
-bitmaps live in the qcow2 files. Unraid's root filesystem is RAM (survey
-section 6): if that directory is not on persistent storage, a host reboot
-leaves the bitmaps and forgets the checkpoints. The token row keeps the
-checkpoint XML for this: when `virDomainCheckpointLookupByName` fails but
-the row is otherwise valid, the provider re-creates the metadata with
-`virDomainCheckpointCreateXML(dom, xml, VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE
-| VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE)`; `REDEFINE_VALIDATE`
-makes libvirt check the bitmaps are present and consistent. If it refuses,
-full read. Where Unraid 7.4 keeps that directory is open question Q2.
+**Checkpoint metadata on Unraid does not survive a reboot (confirmed,
+survey section 7, Q2).** libvirt's QEMU driver keeps checkpoint metadata in
+`/var/lib/libvirt/qemu/checkpoint/<domain>/`, which on Unraid 7.4 is a
+plain directory on the RAM rootfs. Unraid's `rc.libvirt` makes *snapshot*
+metadata persistent by symlinking `/var/lib/libvirt/qemu/snapshot` into
+`libvirt.img`, and does nothing equivalent for checkpoints. The qcow2
+persistent bitmaps survive (they are in the images), but after every host
+reboot `checkpoint-list` is empty and no incremental can name its base.
+
+So redefining checkpoints is a **hard requirement**, not a fallback:
+
+- **Who keeps the XML.** Every checkpoint c-backup creates has its full XML
+  (`virDomainCheckpointGetXMLDesc` with `VIR_DOMAIN_CHECKPOINT_XML_SECURE`)
+  stored at creation, on persistent storage: by the helper in its own state
+  directory on a pool (option B; never on the RAM rootfs), and in the
+  daemon's `unit_tokens.token_blob`.
+- **Startup step.** When the helper starts, and again when the daemon
+  starts, every checkpoint the records say should exist on an enrolled,
+  defined domain is looked up; each missing one is re-created with
+  `virDomainCheckpointCreateXML(dom, xml,
+  VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE |
+  VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE)`, oldest first, so parent
+  links resolve. `REDEFINE_VALIDATE` makes libvirt check the bitmap is
+  present, recording and consistent in each image. The step runs before the
+  scheduler starts, and its result per domain is logged and shown in
+  `GET /providers`.
+- **Before every session** the same check runs for that domain, so a
+  libvirtd restart without a host reboot is covered too.
+- **Refusal** (bitmap missing or inconsistent, image replaced, domain
+  redefined): the token is dropped and that session reads in full with
+  reason `token-invalid`, creating a fresh checkpoint.
+- The UAT plan's host reboot (10.4) becomes a required test: reboot, check
+  the startup step redefines, check the next session is incremental and
+  passes a forced audit.
+
+**The alternative**, a host change mirroring `rc.libvirt`'s snapshot
+handling (`/var/lib/libvirt/qemu/checkpoint` symlinked into
+`/etc/libvirt/qemu/checkpoint`, made at each boot from the `go` file or a
+plugin), would make libvirt itself remember checkpoints. It changes the host
+and needs the user's approval; the design does not depend on it, and the
+redefine step stays even if it is adopted (it is harmless when every
+checkpoint is already present).
 
 ## 6. Representation
 
@@ -885,17 +941,33 @@ failed restore never leaves a plausible-looking image.
    | a domain with the same name exists | name `<name>-restored-<snapid>`, or `name` from the request |
    | MAC addresses | regenerated (removed, libvirt generates) unless `keep_macs`, because two VMs with one MAC on one bridge break both |
    | disk sources | rewritten to the restored files under `dest_dir` |
-   | NVRAM path | restored next to the disks and rewritten |
+   | NVRAM path | rewritten to `/etc/libvirt/qemu/nvram/<new uuid>_VARS-...fd`, the place Unraid's libvirt keeps it |
+   | TPM state | installed for the restored domain's UUID (below) |
    | `<hostdev>` (PCI/USB passthrough), `type='block'` disks, `<filesystem>` host directories | listed as privileged; define refused without `accept_privileged` (`source-providers.md` section 11) |
    | excluded disks (passthrough) | removed from the definition, listed |
 
-2. **Data**: every disk restored (7.1), NVRAM and TPM state written.
+2. **Data**: every disk restored (7.1). NVRAM and TPM state are staged by
+   the daemon (they live in `libvirt.img`, which the daemon only mounts
+   read-only).
 3. **Define**: `virDomainDefineXML(conn, xml)`. The domain is defined, not
-   started; `start: true` in the request starts it.
-4. **Replace in place** (`replace: true`): only for a domain that exists
+   started.
+4. **Install NVRAM and TPM state**, after define (only then is the UUID
+   final) and before any start: the helper's `vm.install_state` writes the
+   staged NVRAM file to the path the defined XML names, and the TPM state
+   directory to `/etc/libvirt/qemu/swtpm/tpm-states/<that uuid>/`, with the
+   recorded owners (`tss`) and modes. It refuses a UUID that is not the
+   domain just defined or replaced, and an existing state directory for a
+   new UUID; it never lists, cleans or writes any other UUID's directory
+   (the orphans stay as they are). A TPM VM restored without its state is
+   refused unless the request says `"allow_missing_tpm": true`, with a
+   warning that sealed keys will not unseal.
+5. **Start** only if `start: true`.
+6. **Replace in place** (`replace: true`): only for a domain that exists
    and is shut off; preflight shows what will be overwritten; disks are
    restored to temporary names beside the originals and renamed over them
-   only after every disk restored, then the XML is redefined. Its
+   only after every disk restored, then the XML is redefined and that
+   domain's NVRAM and TPM state are installed, the previous ones moved
+   aside, not deleted. Its
    c-backup checkpoints are deleted with `VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY`
    (the bitmaps belonged to the overwritten images) and its token rows
    dropped, so the next session is full. Never on a running domain.
@@ -1086,6 +1158,7 @@ docker run -d --name c-backupd-fs1 --restart unless-stopped \
   -v /mnt/cache/domains:/mnt/cache/domains:ro \
   -v /mnt/user/domains:/mnt/user/domains:ro \
   -v /etc/libvirt/qemu/nvram:/etc/libvirt/qemu/nvram:ro \
+  -v /etc/libvirt/qemu/swtpm/tpm-states:/etc/libvirt/qemu/swtpm/tpm-states:ro \
   -v /mnt/disk3/cbackup:/mnt/disk3/cbackup \
   -e C_BACKUP_VM_ENABLED=1 -e TZ=America/Chicago \
   <image>
@@ -1140,7 +1213,10 @@ to verify per distribution.
   XML and NVRAM. c-backup reads domain XML through the API and NVRAM
   through the mount; it never opens `libvirt.img` itself. Backing up the
   `libvirt.img` file is a file backup's job.
-- Checkpoint metadata location and RAM rootfs: 5.8, Q2.
+- Checkpoint metadata is on the RAM rootfs and lost at every reboot; the
+  startup redefine step restores it (5.8).
+- NVRAM and swtpm state live in `libvirt.img` and are captured and restored
+  per domain UUID (3.3, 7.2).
 - Unraid's VM manager rewrites domain XML when a VM is edited in its UI. A
   restored, re-defined domain is a normal libvirt domain and appears in the
   UI; Unraid-specific metadata in the XML (`<metadata><vmtemplate .../>`)
@@ -1237,6 +1313,7 @@ destroyed after, never the five production domains:
 | `cbk-uat-img` | qcow2 named `.img`: format detection |
 | `cbk-uat-w` | Windows with qemu-ga (optional): VSS level |
 | `cbk-uat-pt` | a passthrough of a spare scratch block device or loop device: exclusion and opt-in |
+| `cbk-uat-tpm` | UEFI with an emulated TPM and a guest secret sealed to it (LUKS with a TPM-bound key): NVRAM and TPM state captured, restored under a new UUID, and the restored guest unseals and boots without its recovery key |
 
 Scenarios: a week of nightly schedules with a guest workload (fio with a
 known write pattern), audits forced daily (`vm.audit_days: 1`), host-side
@@ -1339,10 +1416,11 @@ Decided by the user (2026-11-16):
 | Audit cadence | A full audit read every 30 days per unit, configurable (`vm.audit_days`) |
 | FS1 repository | On an FS1 array disk by disk path (`/mnt/diskN/...`, not `/mnt/user`), replicated daily to FS2 (9.1) |
 
-Still to verify (facts, not decisions), read-only or in UAT:
+Answered by the read-only follow-up checks (survey section 7):
 
-1. **Q2.** Where Unraid 7.4 keeps `/var/lib/libvirt/qemu/checkpoint`: if in
-   RAM, every host reboot costs a checkpoint redefine (handled), and an
-   untested path becomes routine.
-2. **Q6.** Unraid's swtpm state location, for Windows 11 VMs with a TPM.
-3. **R1** above: QEMU's behaviour when scratch fills.
+| Item | Finding | Design consequence |
+|---|---|---|
+| Q2 | Checkpoint metadata is on the RAM rootfs and is lost at every reboot; the qcow2 bitmaps survive | Redefine from stored XML is a hard requirement with a startup step (5.8). A host symlink would avoid it but needs the user's approval |
+| Q6 | NVRAM and swtpm state are inside `libvirt.img`; Noah MC and both runners have TPMs; two orphan TPM state directories exist | NVRAM and TPM state are both captured and restored, failing the unit if missing; only the UUIDs being backed up or restored are ever touched (3.3, 7.2) |
+
+Still to verify in UAT: **R1** above, QEMU's behaviour when scratch fills.

@@ -784,7 +784,10 @@ Estimated size: 1,500 to 2,500 lines of C, most of it the providers'
 control code compiled twice (in-process for tests and development, behind
 the helper for deployment), so the providers are written once against the
 split. It is built with the same flags, analysers and fuzzing as the
-daemon; its request parser is a fuzz target.
+daemon; its request parser is a fuzz target. Its own records (artefacts it
+created, tokens, leases, and the XML of every checkpoint it created) live in
+a state directory on a pool (for example `/mnt/cache/system/c-backup-helper/`),
+never on Unraid's RAM rootfs, because they must survive a host reboot.
 
 ### 11.2 Wire protocol
 
@@ -833,7 +836,8 @@ snapshot name, raw XML for libvirt, or a raw create body for Docker.
 | `hook.wait` | `run` token | exit status, timed-out flag, log (capped) |
 | `vm.backup_begin` | `unit`; `disks` list of {`target` string, `mode` enum full/incremental}; `base` checkpoint name or null; `freeze` enum | builds the backup and checkpoint XML itself from these fields and its own configured socket and scratch paths; accepts `base` only if it is a checkpoint the helper created for this daemon id; freeze, begin, thaw with its own watchdog; returns socket, export and bitmap names, level, `freeze_ms` |
 | `vm.backup_end` | `session` token; `outcome` enum | aborts the job, settles checkpoints (keep or delete the new one, delete the retired base) |
-| `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint |
+| `vm.checkpoint_redefine` | `unit`; `checkpoint` name | redefines from the XML the helper itself stored when it created the checkpoint. The helper also runs this for every recorded checkpoint at its own start, because Unraid keeps checkpoint metadata on the RAM rootfs (`vm-backup.md` 5.8) |
+| `vm.install_state` | `unit` (the domain just defined or replaced); `staging` token | installs the staged NVRAM file at the path the domain's XML names and the TPM state directory at `tpm-states/<that domain's uuid>/`, with recorded owners and modes; refuses any other UUID and an existing state directory for a new UUID; never lists or touches other UUIDs' state (`vm-backup.md` 7.2) |
 | `restore.stage` | `unit`; `mount` (a source path as recorded); `job` int | creates `<dataset root>/.cbackup-restore/<job>/` for that mount, owned by the daemon uid; returns a staging token and the path |
 | `restore.swap` | `staging` token | with the unit stopped, renames the staged restore into place and moves the old data aside (11.6); never deletes |
 | `unit.stop`, `unit.start` | `unit` | for restore; policy `allow_restore` |
@@ -1005,8 +1009,36 @@ repository is not authenticated (content addressing detects damage, not a
 forger who rewrites names), so on such a repository define is refused
 unless the config sets `units.define_from_unencrypted: 1`.
 
+### 11.8 Who else can see a capture snapshot
+
+A capture snapshot is a frozen, read-only copy of a whole dataset (ZFS) or
+a whole pool (FS2's btrfs), and it is visible beyond c-backup while it
+exists (survey section 7, U3 and U4):
+
+| Path to it | Who | Exposure |
+|---|---|---|
+| `<dataset root>/.zfs/snapshot/<name>` (`snapdir=hidden`: unlisted, reachable by name) | any container or process with a mount of that **dataset's root**. On FS1 today: Plex-Mover, which binds `/mnt/cache` read-write | every unit's data in that dataset as of the capture instant |
+| `/mnt/user/<share>/.zfs/...`, if shfs resolves it (unverified) | containers binding `/mnt/user` (Plex-Mover again) | the same |
+| `<pool>/system/.cbackup-snapshots/<name>` and its shfs alias `/mnt/user/system/.cbackup-snapshots/<name>` (btrfs) | anything that can read the pool root or `/mnt/user/system` | the whole pool as of the capture instant |
+| NFS or SMB | nobody, by construction: the snapshot directory is refused inside an exported share, and `.zfs` is not under FS1's exported shares | none |
+
+What this adds over what those processes can already read is narrow,
+because a mount that reaches the snapshot also reaches the live data: data
+deleted, or made unreadable, after the capture instant stays readable until
+the snapshot is destroyed. So the defences are about time and about not
+widening anything:
+
+- snapshots live only while their unit is read, are destroyed immediately
+  after, and are bounded by a lease the helper enforces itself
+  (`container-backup.md` 8.3);
+- c-backup never changes `snapdir`, never creates a snapshot directory in an
+  exported share, and never puts one at a pool's top level;
+- the operator should know which containers bind a dataset root or
+  `/mnt/user` (on FS1, Plex-Mover): `GET /providers` lists them as able to
+  read capture snapshots, and the Manual's security chapter says so.
+
 **Decided (user, 2026-11-16): option B**, the privileged helper sidecar as
-specified in 11.1 to 11.7, built in phase C2 of the container work.
+specified in 11.1 to 11.8, built in phase C2 of the container work.
 Option A remains only as the in-process transport for tests and
 development.
 
