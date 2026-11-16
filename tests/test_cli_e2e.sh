@@ -122,9 +122,9 @@ echo "content one" > "$WORK/src/one.txt"
 head -c 65536 /dev/urandom > "$WORK/src/random.bin"
 echo "content two" > "$WORK/src/two.txt"
 
-# info, not warn: the OWN-31 checks read the line the job manager logs as it
-# sends a failure notification, the only trace that path leaves with
-# Pushover unconfigured.
+# info, not warn: the OWN-31 checks read the line the job manager logs for
+# a failure notification, the only trace that path leaves with Pushover
+# unconfigured (where the line says it was not sent, NIT-11).
 cat > "$WORK/config.yaml" <<EOF
 db:
   path: $WORK/state.db
@@ -1409,10 +1409,21 @@ damage_beyond_parity() {  # damage_beyond_parity <sample> <pack>
         dd of="$2" bs=1 seek=$((at / 2 + 8192)) conv=notrunc status=none
 }
 
-# The failure path is the job manager's: it marks the job failed and sends
-# the alert, and the line it logs as it sends is the evidence.
+# The failure path is the job manager's: it marks the job failed and then
+# composes the alert, and the line it logs for it is the evidence. That line
+# follows the state the client returned on, so it is waited for. With no
+# Pushover credentials here it must say the alert was not sent (NIT-11).
 alerted() {  # alerted <job-id>
-    grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+    local _
+    for _ in $(seq 1 50); do
+        if grep -q "failure notification for job $1 not sent, Pushover is not configured: " \
+                "$WORK/daemon.log"; then
+            ! grep -q "sending failure notification for job $1:" "$WORK/daemon.log"
+            return
+        fi
+        sleep 0.1
+    done
+    return 1
 }
 job_of() {  # job_of <failed job document>: its id, the first "id" in it
     printf '%s' "$1" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2
@@ -1438,8 +1449,8 @@ if damage_beyond_parity "$WORK/dmgsrc/lost.bin" "$DMG_DAT"; then
     contains "and counts it"                   '"objects_damaged":1' "$OUT$ERR"
     contains "everything else was still sent"  '"snapshots_sent":1' "$OUT$ERR"
     DJ=$(job_of "$ERR")
-    if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was sent"
-    else bad "the failure alert was sent" "a notification for job '$DJ'" "none"; fi
+    if [ -n "$DJ" ] && alerted "$DJ"; then ok "the failure alert was composed, and not claimed as sent"
+    else bad "the failure alert was composed, and not claimed as sent" "a notification for job '$DJ'" "none"; fi
 else
     bad "damage fixture" "the file's bytes in the pack" "not found"
 fi
@@ -1465,8 +1476,8 @@ if [ -n "$GCD_DAT" ] && damage_beyond_parity "$WORK/gcdsrc/keep.bin" "$GCD_DAT";
     contains "the gc result lists the entry"  "$KEEP_HASH" "$OUT$ERR"
     contains "and counts it"                  '"pack_entries_damaged":1' "$OUT$ERR"
     GJ=$(job_of "$ERR")
-    if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was sent"
-    else bad "the gc failure alert was sent" "a notification for job '$GJ'" "none"; fi
+    if [ -n "$GJ" ] && alerted "$GJ"; then ok "the gc failure alert was composed, and not claimed as sent"
+    else bad "the gc failure alert was composed, and not claimed as sent" "a notification for job '$GJ'" "none"; fi
 else
     bad "gc damage fixture" "the file's bytes in the pack" "not found"
 fi

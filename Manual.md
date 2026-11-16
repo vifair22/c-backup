@@ -1729,6 +1729,11 @@ push permanently failed (HTTP 400, {"user":"invalid",...}): c-backup: backup of 
 and `cbackup_alerts_failed_total` counts it (section 16.2). Watch that
 counter: an alert path that has stopped working is otherwise silent.
 
+The daemon log has one line per failed job either way: `sending failure
+notification for job N: <title>: <body>` with credentials set, and
+`failure notification for job N not sent, Pushover is not configured:
+<title>: <body>` without them.
+
 ---
 
 ## 17. Disaster recovery
@@ -2002,7 +2007,7 @@ usage, rather than ignore it: `grep runs 1 2` is an error, not repository
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt]` | Copy into another directory; `--reencrypt` into another repository under its own encryption |
 | `stats <id> [--scope loose]`, `summary <id>`, `fanout <id>` | Repository statistics |
-| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects |
+| `objects <id> [--location loose\|packed]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id]` | Packs |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |

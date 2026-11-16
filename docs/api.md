@@ -977,6 +977,18 @@ includes the parity trailer. A packed object that reports `phys_size`
 | GET | `/repos/<id>/fanout` | Hash-prefix histogram |
 | GET | `/repos/<id>/diff?from=<sid>&to=<sid>` | Compare two snapshots |
 
+An object's `refcount` is the number of references to it as the last `gc`
+or `reindex` counted them, not a live count: a backup records the objects it
+writes with `refcount` 0 and does not count them, and deleting a snapshot
+does not take its references away. So right after a first backup every
+object reads 0, which does not mean unreferenced, and after a prune a count
+can be too high until the next `gc`. GC does not trust the column either -
+it zeroes it and re-marks from the snapshots' trees on every run, which is
+what makes the count exact afterwards - and `/objects/<hash>/refs` is the
+live answer for one object. Keeping it exact through every backup and
+prune would mean adjusting it on every path that adds or drops a
+reference, which is the drift mark-and-sweep exists to avoid (`gc.h`).
+
 An object's `location` is `loose`, `staged` or `packed`, and `pack_id` is
 the pack's number or `null`. The index stores the pack number in place of
 the location, and serving it as stored made `location` a word for some

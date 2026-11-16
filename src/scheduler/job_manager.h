@@ -36,6 +36,11 @@ typedef status_t (*job_fn)(void *arg, atomic_int *cancel,
 
 status_t job_manager_start(cutils_db_t *db, int max_parallel, job_manager_t **out);
 
+/* Whether failure alerts are delivered (Pushover has credentials). Off by
+ * default; it decides only whether a failed job's log line says the alert
+ * is being sent or that it is not. */
+void     job_manager_set_alerts(job_manager_t *jm, int enabled);
+
 /* Shut down: every queued job is recorded cancelled without starting, every
  * running job is asked to stop, and this returns once the workers have
  * joined. A submit racing the shutdown is refused. */
