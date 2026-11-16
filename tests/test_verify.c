@@ -872,6 +872,32 @@ static void test_too_large_loose_payload_damage_is_not_written(void **state)
     free(before);
 }
 
+/* compressed_size as the header on disk states it. */
+static uint64_t header_csize_of(const char *path)
+{
+    uint64_t csz = 0;
+    int fd = open(path, O_RDONLY);
+    assert_true(fd >= 0);
+    assert_int_equal(pread(fd, &csz, sizeof(csz),
+                           (off_t)offsetof(object_header_t, compressed_size)),
+                     (ssize_t)sizeof(csz));
+    close(fd);
+    return csz;
+}
+
+/* Flip one bit of the header's compressed_size in place. */
+static void flip_header_csize_bit(const char *path, int bit)
+{
+    off_t at = (off_t)offsetof(object_header_t, compressed_size) + bit / 8;
+    int fd = open(path, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t b = 0;
+    assert_int_equal(pread(fd, &b, 1, at), 1);
+    b ^= (uint8_t)(1u << (bit % 8));
+    assert_int_equal(pwrite(fd, &b, 1, at), 1);
+    close(fd);
+}
+
 /*
  * Damage to the header's compressed_size: the read now looks for its parity
  * in the wrong place and fails, so only repair could rescue it - and repair
@@ -889,30 +915,15 @@ static void test_too_large_loose_header_damage_is_unrecoverable(void **state)
     content_hash_of("big.bin", hex);
     char path[PATH_MAX];
     loose_path_of(hex, path, sizeof(path));
-    /* Clear a set bit of compressed_size, shrinking it, which the header's
-     * own length check and object_repair's trailer sanity check both still
-     * accept. Growing it would trip the latter and repair would decline for
-     * a reason unrelated to the guard under test. */
-    off_t csz_off = (off_t)offsetof(object_header_t, compressed_size);
-    uint64_t csz = 0;
-    {
-        int fd = open(path, O_RDONLY);
-        assert_true(fd >= 0);
-        assert_int_equal(pread(fd, &csz, sizeof(csz), csz_off), (ssize_t)sizeof(csz));
-        close(fd);
-    }
+    /* Clear the highest set bit, so the damaged header claims well under
+     * the test limit and only the file-size half of the guard can refuse. */
+    size_t orig_len = 0;
+    uint8_t *orig = slurp(path, &orig_len);
+    uint64_t csz = header_csize_of(path);
     assert_true(csz > 1);
     int bit = 63;
     while (bit > 0 && !(csz & ((uint64_t)1 << bit))) bit--;
-    {
-        int fd = open(path, O_RDWR);
-        assert_true(fd >= 0);
-        uint8_t b = 0;
-        assert_int_equal(pread(fd, &b, 1, csz_off + bit / 8), 1);
-        b ^= (uint8_t)(1u << (bit % 8));
-        assert_int_equal(pwrite(fd, &b, 1, csz_off + bit / 8), 1);
-        close(fd);
-    }
+    flip_header_csize_bit(path, bit);
 
     size_t len = 0;
     uint8_t *before = slurp(path, &len);
@@ -937,6 +948,8 @@ static void test_too_large_loose_header_damage_is_unrecoverable(void **state)
                                 NULL, NULL, NULL, &again), OK);
     assert_int_equal(again.unrecoverable, 0);
     assert_int_equal(again.repaired, 1);
+    assert_file_is(path, orig, orig_len);
+    free(orig);
     free(before);
 }
 
@@ -982,6 +995,96 @@ static void test_too_large_packed_damage_is_not_written(void **state)
     free(before);
 }
 
+/* ------------------------------------------------------------------ */
+/* OWN-32: header repair no longer trusts the header it is repairing   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A compressed_size that grew used to be unrepairable twice over: past the
+ * file's end read_object_header refused the file before repair started, and
+ * inside the trailer the trailer_start sanity check rejected it. Both sizes
+ * are tried here, the small growth into the trailer and a large one past the
+ * end of the file, and each must come back as the exact bytes it was.
+ */
+static void test_grown_header_size_is_repaired(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 53u);
+    run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", hex);
+    char path[PATH_MAX];
+    loose_path_of(hex, path, sizeof(path));
+
+    size_t orig_len = 0;
+    uint8_t *orig = slurp(path, &orig_len);
+    uint64_t csz = header_csize_of(path);
+
+    int low = 0;
+    while (csz & ((uint64_t)1 << low)) low++;
+    const int bits[] = { low, 40 };
+    for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
+        assert_false(csz & ((uint64_t)1 << bits[i]));
+        flip_header_csize_bit(path, bits[i]);
+        assert_true(header_csize_of(path) > csz);
+
+        verify_result_t res;
+        assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                    NULL, NULL, NULL, &res), OK);
+        assert_int_equal(res.repaired, 1);
+        assert_int_equal(res.unrecoverable, 0);
+        char status[64];
+        finding_status_of(hex, status, sizeof(status));
+        assert_string_equal(status, "repaired");
+        assert_file_is(path, orig, orig_len);
+    }
+    free(orig);
+}
+
+/*
+ * Header and payload damaged together. The old repair fixed the header on
+ * disk and then walked the payload with the damaged copy's length, so the
+ * second half could not succeed in the same call. One run must now repair
+ * both, leaving the file exactly as it was written.
+ */
+static void test_header_and_payload_damage_repaired_in_one_run(void **state)
+{
+    (void)state;
+    write_incompressible(TEST_SRC "/big.bin", BIG_OBJECT_BYTES, 59u);
+    run_backup();
+
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    content_hash_of("big.bin", hex);
+    char path[PATH_MAX];
+    loose_path_of(hex, path, sizeof(path));
+
+    size_t orig_len = 0;
+    uint8_t *orig = slurp(path, &orig_len);
+    uint64_t csz = header_csize_of(path);
+    int low = 0;
+    while (csz & ((uint64_t)1 << low)) low++;
+    flip_header_csize_bit(path, low);
+    flip_byte(path, (off_t)sizeof(object_header_t) + 7 * 1024 * 1024 + 3);
+    flip_byte(path, (off_t)sizeof(object_header_t) + 15);
+
+    verify_result_t res;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &res), OK);
+    assert_int_equal(res.repaired, 1);
+    assert_int_equal(res.unrecoverable, 0);
+    assert_file_is(path, orig, orig_len);
+
+    /* Nothing left for a second pass, or for parity to cover on read. */
+    parity_stats_reset();
+    verify_result_t again;
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1,
+                                NULL, NULL, NULL, &again), OK);
+    assert_int_equal(again.ok, again.checked);
+    assert_int_equal((int)parity_stats_get().repaired, 0);
+    free(orig);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1004,6 +1107,8 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_too_large_loose_payload_damage_is_not_written, setup, teardown),
         cmocka_unit_test_setup_teardown(test_too_large_loose_header_damage_is_unrecoverable, setup, teardown),
         cmocka_unit_test_setup_teardown(test_too_large_packed_damage_is_not_written, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_grown_header_size_is_repaired, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_header_and_payload_damage_repaired_in_one_run, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
