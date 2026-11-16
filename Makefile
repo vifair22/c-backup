@@ -295,6 +295,14 @@ test-api: all $(FREE_PORT)
 # The CLI holds no repository logic, so what is worth testing is that each
 # command reaches the right endpoint and that a missing daemon produces a
 # clear message rather than a crash or a hang.
+# B134 at UAT's sizes: one 300 MB, 600 MB and 2 GiB file each into a fresh
+# repository at the production pack seal. About 2.5 GiB of scratch, so it is
+# a nightly target, not part of make test (which runs the same rollover
+# logic at an 8 MiB seal in test_pack_rollover).
+.PHONY: test-rollover-full
+test-rollover-full: $(BINS)/test_pack_rollover
+	@ROLLOVER_FULL=1 $(SCRATCH_GUARD) test_pack_rollover_full $(BINS)/test_pack_rollover
+
 .PHONY: test-cli
 test-cli: all $(FREE_PORT)
 	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
