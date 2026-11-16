@@ -197,6 +197,8 @@ typedef enum {
     STORE_WR_PACK_PARITY,    /* the parity trailers of those packs */
     STORE_WR_PARITY_SPILL,   /* RS parity over its memory cap, staged in tmp/
                                 before being copied into its trailer */
+    STORE_WR_PACK_ABANDONED, /* entries the pack pass began, found not to
+                                compress and truncated off the pack again */
     STORE_WR__COUNT
 } store_write_cat_t;
 
