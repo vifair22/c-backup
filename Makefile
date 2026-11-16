@@ -78,6 +78,7 @@ WARN_FLAGS := -Wshadow -Wunused -Wunused-function -Wunused-variable \
               -Wstrict-prototypes -Wmissing-declarations -Wcast-align \
               -Wcast-qual -Wnull-dereference -Wconversion -Wsign-conversion
 SRC_INCLUDES := -I src -I src/cli -I src/ops -I src/store -I src/api -I src/api/routes -I src/meta -I src/scheduler -I src/common \
+                -I src/providers -I src/units \
                 -I src/config -I src/daemon -I $(CUTILS_DIR)/include \
                 -I $(CUTILS_DIR)/lib/cJSON
 COMMON_CFLAGS := -std=c11 -pthread -Wall -Wextra -Wpedantic $(WARN_FLAGS) \

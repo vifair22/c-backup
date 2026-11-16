@@ -1,0 +1,1278 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include "fake_provider.h"
+#include "artefact.h"
+
+#define CUTILS_CJSON_ALLOW
+#include "cJSON.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/* Model                                                               */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char     id[SP_ITEM_ID_MAX];
+    char    *path;
+    uint8_t *data;
+    size_t   len;
+} fblob_t;
+
+typedef struct {
+    char         id[SP_ITEM_ID_MAX];
+    uint64_t     size;
+    fake_run_t  *runs;
+    size_t       n_runs;
+    fake_alloc_t alloc;
+    int64_t      mtime;
+} fdisk_t;
+
+typedef struct {
+    char  id[SP_ITEM_ID_MAX];
+    char *read_root;
+    char *path;
+} ftree_t;
+
+typedef struct {
+    char     id[SP_UNIT_ID_MAX];
+    char    *name;
+    int      state;
+    uint32_t caps;
+    fblob_t *blobs; size_t nb;
+    fdisk_t *disks; size_t nd;
+    ftree_t *trees; size_t nt;
+} funit_t;
+
+typedef struct {
+    char unit_id[SP_UNIT_ID_MAX];
+    char kind[16];
+    char detail[128];
+    int  held;
+} fhold_t;
+
+typedef struct {
+    char name[ARTEFACT_NAME_MAX];
+    char owner[16];
+    int  has_owner;
+    int  present;
+} fart_t;
+
+struct sp_ctx {
+    pthread_mutex_t mu;
+    funit_t *units; size_t nu;
+    fhold_t *holds; size_t nh;
+    fart_t  *arts;  size_t na;
+    struct {
+        char        unit[SP_UNIT_ID_MAX];
+        int         any;
+        fake_fail_t what;
+        uint64_t    arg;
+    } fail;
+    fake_stats_t st;
+    char        *spec;
+    struct timespec spec_mtime;
+    char         daemon8[9];
+};
+
+typedef struct {
+    size_t  hold;       /* index into ctx->holds */
+    int64_t intent;     /* 0: none recorded */
+} fheld_t;
+
+struct sp_session {
+    sp_ctx_t         *ctx;
+    funit_t          *unit;          /* the unit as begin saw it */
+    sp_session_info_t info;
+    fheld_t           held[8];
+    size_t            nheld;
+    sp_holds_t        holds;
+    int64_t           job;
+    fake_fail_t       fail;
+    uint64_t          fail_arg;
+};
+
+/* ------------------------------------------------------------------ */
+/* Content                                                             */
+/* ------------------------------------------------------------------ */
+
+static uint64_t mix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+uint8_t fake_byte(uint64_t seed, uint64_t off)
+{
+    uint64_t w = mix64(seed * 0x2545F4914F6CDD1DULL ^ (off >> 3));
+    return (uint8_t)(w >> ((off & 7u) * 8u));
+}
+
+static void gen_fill(uint8_t *buf, uint64_t seed, uint64_t off, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        uint64_t o = off + i;
+        uint64_t w = mix64(seed * 0x2545F4914F6CDD1DULL ^ (o >> 3));
+        for (unsigned b = (unsigned)(o & 7u); b < 8u && i < n; b++, i++)
+            buf[i] = (uint8_t)(w >> (b * 8u));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Unit memory                                                         */
+/* ------------------------------------------------------------------ */
+
+static void funit_clear(funit_t *u)
+{
+    if (!u) return;
+    for (size_t i = 0; i < u->nb; i++) { free(u->blobs[i].path); free(u->blobs[i].data); }
+    for (size_t i = 0; i < u->nd; i++) free(u->disks[i].runs);
+    for (size_t i = 0; i < u->nt; i++) { free(u->trees[i].read_root); free(u->trees[i].path); }
+    free(u->blobs); free(u->disks); free(u->trees); free(u->name);
+    memset(u, 0, sizeof(*u));
+}
+
+static void *dupmem(const void *p, size_t n)
+{
+    void *d = malloc(n ? n : 1);
+    if (d && n) memcpy(d, p, n);
+    return d;
+}
+
+static status_t funit_copy(const funit_t *in, funit_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out->id, in->id, sizeof(out->id));
+    out->state = in->state;
+    out->caps = in->caps;
+    out->name = strdup(in->name ? in->name : "");
+    out->blobs = calloc(in->nb ? in->nb : 1, sizeof(fblob_t));
+    out->disks = calloc(in->nd ? in->nd : 1, sizeof(fdisk_t));
+    out->trees = calloc(in->nt ? in->nt : 1, sizeof(ftree_t));
+    if (!out->name || !out->blobs || !out->disks || !out->trees) goto oom;
+    for (size_t i = 0; i < in->nb; i++, out->nb++) {
+        out->blobs[i] = in->blobs[i];
+        out->blobs[i].path = strdup(in->blobs[i].path);
+        out->blobs[i].data = dupmem(in->blobs[i].data, in->blobs[i].len);
+        if (!out->blobs[i].path || !out->blobs[i].data) { out->nb++; goto oom; }
+    }
+    for (size_t i = 0; i < in->nd; i++, out->nd++) {
+        out->disks[i] = in->disks[i];
+        out->disks[i].runs = dupmem(in->disks[i].runs, in->disks[i].n_runs * sizeof(fake_run_t));
+        if (!out->disks[i].runs) { out->nd++; goto oom; }
+    }
+    for (size_t i = 0; i < in->nt; i++, out->nt++) {
+        out->trees[i] = in->trees[i];
+        out->trees[i].read_root = strdup(in->trees[i].read_root);
+        out->trees[i].path = strdup(in->trees[i].path);
+        if (!out->trees[i].read_root || !out->trees[i].path) { out->nt++; goto oom; }
+    }
+    return OK;
+oom:
+    funit_clear(out);
+    return set_error(ERR_NOMEM, "fake: unit copy");
+}
+
+static funit_t *find_unit(sp_ctx_t *c, const char *id)
+{
+    for (size_t i = 0; i < c->nu; i++)
+        if (strcmp(c->units[i].id, id) == 0) return &c->units[i];
+    return NULL;
+}
+
+/* The failure set for this unit, if any; caller holds the lock. */
+static fake_fail_t fail_for(sp_ctx_t *c, const char *unit_id, uint64_t *arg)
+{
+    if (c->fail.what == FAKE_FAIL_NONE) return FAKE_FAIL_NONE;
+    if (!c->fail.any && strcmp(c->fail.unit, unit_id) != 0) return FAKE_FAIL_NONE;
+    if (arg) *arg = c->fail.arg;
+    return c->fail.what;
+}
+
+void fake_fail_set(sp_ctx_t *ctx, const char *unit_id, fake_fail_t what, uint64_t arg)
+{
+    pthread_mutex_lock(&ctx->mu);
+    ctx->fail.any = unit_id == NULL;
+    snprintf(ctx->fail.unit, sizeof(ctx->fail.unit), "%s", unit_id ? unit_id : "");
+    ctx->fail.what = what;
+    ctx->fail.arg = arg;
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+void fake_fail_clear(sp_ctx_t *ctx) { fake_fail_set(ctx, NULL, FAKE_FAIL_NONE, 0); }
+
+static int id_ok(const char *id, size_t max)
+{
+    return id && *id && strlen(id) < max;
+}
+
+status_t fake_unit_add(sp_ctx_t *ctx, const char *unit_id, const char *name,
+                       int state, uint32_t caps)
+{
+    if (!id_ok(unit_id, SP_UNIT_ID_MAX) || !name)
+        return set_error(ERR_INVALID, "fake: bad unit id or name");
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    if (u) {
+        funit_clear(u);
+    } else {
+        funit_t *g = realloc(ctx->units, (ctx->nu + 1) * sizeof(*g));
+        if (!g) { pthread_mutex_unlock(&ctx->mu); return set_error(ERR_NOMEM, "fake: unit"); }
+        ctx->units = g;
+        u = &g[ctx->nu++];
+        memset(u, 0, sizeof(*u));
+    }
+    snprintf(u->id, sizeof(u->id), "%s", unit_id);
+    u->name = strdup(name);
+    u->state = state;
+    u->caps = caps;
+    status_t st = u->name ? OK : set_error(ERR_NOMEM, "fake: unit name");
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+status_t fake_unit_remove(sp_ctx_t *ctx, const char *unit_id)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    if (u) {
+        funit_clear(u);
+        size_t i = (size_t)(u - ctx->units);
+        memmove(u, u + 1, (ctx->nu - i - 1) * sizeof(*u));
+        ctx->nu--;
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+}
+
+status_t fake_unit_rename(sp_ctx_t *ctx, const char *unit_id, const char *name)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    char *n = u ? strdup(name) : NULL;
+    if (n) { free(u->name); u->name = n; }
+    pthread_mutex_unlock(&ctx->mu);
+    if (!u) return set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    return n ? OK : set_error(ERR_NOMEM, "fake: rename");
+}
+
+status_t fake_unit_set_state(sp_ctx_t *ctx, const char *unit_id, int state)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    if (u) u->state = state;
+    pthread_mutex_unlock(&ctx->mu);
+    return u ? OK : set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+}
+
+status_t fake_blob_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                       const char *tree_path, const void *data, size_t len)
+{
+    if (!id_ok(item_id, SP_ITEM_ID_MAX) || !tree_path || len > SP_BLOB_MAX)
+        return set_error(ERR_INVALID, "fake: bad blob");
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = OK;
+    fblob_t *g = u ? realloc(u->blobs, (u->nb + 1) * sizeof(*g)) : NULL;
+    if (!u) st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    else if (!g) st = set_error(ERR_NOMEM, "fake: blob");
+    else {
+        u->blobs = g;
+        fblob_t *b = &g[u->nb];
+        memset(b, 0, sizeof(*b));
+        snprintf(b->id, sizeof(b->id), "%s", item_id);
+        b->path = strdup(tree_path);
+        b->data = dupmem(data, len);
+        b->len = len;
+        if (!b->path || !b->data) {
+            free(b->path); free(b->data);
+            st = set_error(ERR_NOMEM, "fake: blob");
+        } else {
+            u->nb++;
+        }
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+status_t fake_disk_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                       uint64_t size, const fake_run_t *runs, size_t n_runs,
+                       fake_alloc_t alloc)
+{
+    if (!id_ok(item_id, SP_ITEM_ID_MAX)) return set_error(ERR_INVALID, "fake: bad disk id");
+    uint64_t end = 0;
+    for (size_t i = 0; i < n_runs; i++) {
+        if (runs[i].len == 0 || runs[i].off < end || runs[i].off + runs[i].len > size ||
+            runs[i].kind < FAKE_RUN_DATA || runs[i].kind > FAKE_RUN_FILL)
+            return set_error(ERR_INVALID, "fake: disk %s run %zu out of order or range",
+                             item_id, i);
+        end = runs[i].off + runs[i].len;
+    }
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = OK;
+    fdisk_t *g = u ? realloc(u->disks, (u->nd + 1) * sizeof(*g)) : NULL;
+    if (!u) st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    else if (!g) st = set_error(ERR_NOMEM, "fake: disk");
+    else {
+        u->disks = g;
+        fdisk_t *d = &g[u->nd];
+        memset(d, 0, sizeof(*d));
+        snprintf(d->id, sizeof(d->id), "%s", item_id);
+        d->size = size;
+        d->alloc = alloc;
+        d->runs = dupmem(runs, n_runs * sizeof(*runs));
+        d->n_runs = n_runs;
+        if (!d->runs) st = set_error(ERR_NOMEM, "fake: disk");
+        else u->nd++;
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+status_t fake_disk_set_mtime(sp_ctx_t *ctx, const char *unit_id,
+                             const char *item_id, int64_t mtime)
+{
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    int done = 0;
+    for (size_t i = 0; u && i < u->nd; i++)
+        if (strcmp(u->disks[i].id, item_id) == 0) { u->disks[i].mtime = mtime; done = 1; }
+    pthread_mutex_unlock(&ctx->mu);
+    return done ? OK : set_error(ERR_NOT_FOUND, "fake: no disk %s/%s", unit_id, item_id);
+}
+
+status_t fake_tree_add(sp_ctx_t *ctx, const char *unit_id, const char *item_id,
+                       const char *read_root, const char *tree_path)
+{
+    if (!id_ok(item_id, SP_ITEM_ID_MAX) || !read_root || !tree_path)
+        return set_error(ERR_INVALID, "fake: bad tree");
+    pthread_mutex_lock(&ctx->mu);
+    funit_t *u = find_unit(ctx, unit_id);
+    status_t st = OK;
+    ftree_t *g = u ? realloc(u->trees, (u->nt + 1) * sizeof(*g)) : NULL;
+    if (!u) st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    else if (!g) st = set_error(ERR_NOMEM, "fake: tree");
+    else {
+        u->trees = g;
+        ftree_t *t = &g[u->nt];
+        memset(t, 0, sizeof(*t));
+        snprintf(t->id, sizeof(t->id), "%s", item_id);
+        t->read_root = strdup(read_root);
+        t->path = strdup(tree_path);
+        if (!t->read_root || !t->path) {
+            free(t->read_root); free(t->path);
+            st = set_error(ERR_NOMEM, "fake: tree");
+        } else {
+            u->nt++;
+        }
+    }
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* Holds and artefacts                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Caller holds the lock. Returns the hold's index, or SIZE_MAX. */
+static size_t hold_take(sp_ctx_t *c, const char *unit, const char *kind,
+                        const char *detail)
+{
+    fhold_t *g = realloc(c->holds, (c->nh + 1) * sizeof(*g));
+    if (!g) return SIZE_MAX;
+    c->holds = g;
+    fhold_t *h = &g[c->nh];
+    memset(h, 0, sizeof(*h));
+    snprintf(h->unit_id, sizeof(h->unit_id), "%s", unit);
+    snprintf(h->kind, sizeof(h->kind), "%s", kind);
+    snprintf(h->detail, sizeof(h->detail), "%s", detail);
+    h->held = 1;
+    c->st.holds_now++;
+    return c->nh++;
+}
+
+static fart_t *art_find(sp_ctx_t *c, const char *name)
+{
+    for (size_t i = 0; i < c->na; i++)
+        if (c->arts[i].present && strcmp(c->arts[i].name, name) == 0) return &c->arts[i];
+    return NULL;
+}
+
+static status_t art_add(sp_ctx_t *c, const char *name, const char *owner)
+{
+    fart_t *g = realloc(c->arts, (c->na + 1) * sizeof(*g));
+    if (!g) return set_error(ERR_NOMEM, "fake: artefact");
+    c->arts = g;
+    fart_t *a = &g[c->na++];
+    memset(a, 0, sizeof(*a));
+    snprintf(a->name, sizeof(a->name), "%s", name);
+    if (owner) { a->has_owner = 1; snprintf(a->owner, sizeof(a->owner), "%s", owner); }
+    a->present = 1;
+    c->st.artefacts++;
+    return OK;
+}
+
+static void art_remove(sp_ctx_t *c, fart_t *a)
+{
+    if (!a || !a->present) return;
+    a->present = 0;
+    c->st.artefacts--;
+}
+
+/* Release one hold, idempotently. Caller holds the lock. */
+static status_t hold_release(sp_ctx_t *c, size_t idx, fake_fail_t fail)
+{
+    fhold_t *h = &c->holds[idx];
+    if (!h->held) return OK;
+    if (fail == FAKE_FAIL_RELEASE)
+        return set_error(ERR_IO, "fake: cannot release %s on %s (injected)",
+                         h->kind, h->unit_id);
+    h->held = 0;
+    c->st.holds_now--;
+    c->st.releases++;
+    if (strcmp(h->kind, SP_HOLD_FS_SNAPSHOT) == 0) art_remove(c, art_find(c, h->detail));
+    return OK;
+}
+
+status_t fake_artefact_plant(sp_ctx_t *ctx, const char *name, const char *owner)
+{
+    pthread_mutex_lock(&ctx->mu);
+    status_t st = art_add(ctx, name, owner);
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+int fake_artefact_exists(sp_ctx_t *ctx, const char *name)
+{
+    pthread_mutex_lock(&ctx->mu);
+    int r = art_find(ctx, name) != NULL;
+    pthread_mutex_unlock(&ctx->mu);
+    return r;
+}
+
+status_t fake_hold_plant(sp_ctx_t *ctx, const char *unit_id, const char *kind,
+                         const char *detail)
+{
+    pthread_mutex_lock(&ctx->mu);
+    size_t i = hold_take(ctx, unit_id, kind, detail);
+    status_t st = i == SIZE_MAX ? set_error(ERR_NOMEM, "fake: hold") : OK;
+    if (st == OK && strcmp(kind, SP_HOLD_FS_SNAPSHOT) == 0 && !art_find(ctx, detail))
+        st = art_add(ctx, detail, ctx->daemon8);
+    pthread_mutex_unlock(&ctx->mu);
+    return st;
+}
+
+int fake_hold_held(sp_ctx_t *ctx, const char *unit_id, const char *kind,
+                   const char *detail)
+{
+    pthread_mutex_lock(&ctx->mu);
+    int r = 0;
+    for (size_t i = 0; i < ctx->nh && !r; i++)
+        r = ctx->holds[i].held && strcmp(ctx->holds[i].unit_id, unit_id) == 0 &&
+            strcmp(ctx->holds[i].kind, kind) == 0 &&
+            (!detail || strcmp(ctx->holds[i].detail, detail) == 0);
+    pthread_mutex_unlock(&ctx->mu);
+    return r;
+}
+
+void fake_stats(sp_ctx_t *ctx, fake_stats_t *out)
+{
+    pthread_mutex_lock(&ctx->mu);
+    *out = ctx->st;
+    pthread_mutex_unlock(&ctx->mu);
+}
+
+/* ------------------------------------------------------------------ */
+/* JSON spec                                                           */
+/* ------------------------------------------------------------------ */
+
+static const char *jstr(const cJSON *o, const char *k)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+static int jnum(const cJSON *o, const char *k, uint64_t *out)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > 9007199254740992.0)
+        return -1;
+    *out = (uint64_t)v->valuedouble;
+    return 0;
+}
+
+static int state_parse(const char *s)
+{
+    if (!s) return SP_STATE_RUNNING;
+    if (strcmp(s, "running") == 0)   return SP_STATE_RUNNING;
+    if (strcmp(s, "paused") == 0)    return SP_STATE_PAUSED;
+    if (strcmp(s, "stopped") == 0)   return SP_STATE_STOPPED;
+    if (strcmp(s, "suspended") == 0) return SP_STATE_SUSPENDED;
+    return -1;
+}
+
+static status_t load_unit(sp_ctx_t *ctx, const cJSON *ju)
+{
+    const char *id = jstr(ju, "id"), *name = jstr(ju, "name");
+    int state = state_parse(jstr(ju, "state"));
+    if (!id || state < 0) return set_error(ERR_INVALID, "fake spec: unit needs id and a valid state");
+    uint32_t caps = 0;
+    const cJSON *c;
+    cJSON_ArrayForEach(c, cJSON_GetObjectItemCaseSensitive(ju, "caps")) {
+        if (!cJSON_IsString(c)) continue;
+        if (strcmp(c->valuestring, "quiesce") == 0)  caps |= SP_CAP_QUIESCE;
+        if (strcmp(c->valuestring, "pause") == 0)    caps |= SP_CAP_PAUSE;
+        if (strcmp(c->valuestring, "snapshot") == 0) caps |= SP_CAP_SNAPSHOT;
+    }
+    status_t st = fake_unit_add(ctx, id, name ? name : id, state, caps);
+    const cJSON *b;
+    cJSON_ArrayForEach(b, cJSON_GetObjectItemCaseSensitive(ju, "blobs")) {
+        if (st != OK) break;
+        const char *bid = jstr(b, "id"), *path = jstr(b, "path"), *text = jstr(b, "text");
+        if (!bid || !path || !text) return set_error(ERR_INVALID, "fake spec: blob needs id, path, text");
+        st = fake_blob_add(ctx, id, bid, path, text, strlen(text));
+    }
+    const cJSON *d;
+    cJSON_ArrayForEach(d, cJSON_GetObjectItemCaseSensitive(ju, "disks")) {
+        if (st != OK) break;
+        const char *did = jstr(d, "id"), *al = jstr(d, "alloc");
+        uint64_t size = 0;
+        if (!did || jnum(d, "size", &size) != 0)
+            return set_error(ERR_INVALID, "fake spec: disk needs id and size");
+        fake_alloc_t alloc = FAKE_ALLOC_EXACT;
+        if (al && strcmp(al, "all_data") == 0) alloc = FAKE_ALLOC_ALL_DATA;
+        else if (al && strcmp(al, "zero_as_zero") == 0) alloc = FAKE_ALLOC_ZERO_AS_ZERO;
+        const cJSON *jr = cJSON_GetObjectItemCaseSensitive(d, "runs");
+        int n = cJSON_GetArraySize(jr);
+        fake_run_t *runs = calloc((size_t)(n > 0 ? n : 1), sizeof(*runs));
+        if (!runs) return set_error(ERR_NOMEM, "fake spec: runs");
+        int k = 0;
+        const cJSON *r;
+        cJSON_ArrayForEach(r, jr) {
+            const char *kind = jstr(r, "kind");
+            uint64_t seed = 0;
+            (void)jnum(r, "seed", &seed);
+            if (jnum(r, "off", &runs[k].off) != 0 || jnum(r, "len", &runs[k].len) != 0 || !kind) {
+                free(runs);
+                return set_error(ERR_INVALID, "fake spec: run needs off, len, kind");
+            }
+            runs[k].seed = seed;
+            runs[k].kind = strcmp(kind, "data") == 0      ? FAKE_RUN_DATA
+                         : strcmp(kind, "zero_data") == 0 ? FAKE_RUN_ZERO_DATA
+                         : strcmp(kind, "zero") == 0      ? FAKE_RUN_ZERO
+                         : strcmp(kind, "fill") == 0      ? FAKE_RUN_FILL
+                         : (fake_run_kind_t)0;
+            k++;
+        }
+        st = fake_disk_add(ctx, id, did, size, runs, (size_t)k, alloc);
+        free(runs);
+    }
+    const cJSON *t;
+    cJSON_ArrayForEach(t, cJSON_GetObjectItemCaseSensitive(ju, "trees")) {
+        if (st != OK) break;
+        const char *tid = jstr(t, "id"), *rr = jstr(t, "read_root"), *path = jstr(t, "path");
+        if (!tid || !rr || !path) return set_error(ERR_INVALID, "fake spec: tree needs id, read_root, path");
+        st = fake_tree_add(ctx, id, tid, rr, path);
+    }
+    return st;
+}
+
+status_t fake_provider_load(sp_ctx_t *ctx, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return set_error(ERR_IO, "fake spec %s: %s", path, strerror(errno));
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    for (;;) {
+        if (len + 4096 > cap) {
+            size_t nc = cap ? cap * 2 : 8192;
+            if (nc > (size_t)4 << 20) { free(buf); fclose(f); return set_error(ERR_TOO_LARGE, "fake spec too large"); }
+            char *g = realloc(buf, nc);
+            if (!g) { free(buf); fclose(f); return set_error(ERR_NOMEM, "fake spec"); }
+            buf = g; cap = nc;
+        }
+        size_t r = fread(buf + len, 1, cap - len - 1, f);
+        len += r;
+        if (r == 0) break;
+    }
+    fclose(f);
+    buf[len] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return set_error(ERR_INVALID, "fake spec %s: not JSON", path);
+
+    pthread_mutex_lock(&ctx->mu);
+    for (size_t i = 0; i < ctx->nu; i++) funit_clear(&ctx->units[i]);
+    ctx->nu = 0;
+    pthread_mutex_unlock(&ctx->mu);
+
+    status_t st = OK;
+    const cJSON *ju;
+    cJSON_ArrayForEach(ju, cJSON_GetObjectItemCaseSensitive(root, "units")) {
+        st = load_unit(ctx, ju);
+        if (st != OK) break;
+    }
+    cJSON_Delete(root);
+    return st;
+}
+
+/* With a spec file, units follow it: reloaded when it has changed. */
+static pthread_mutex_t g_reload_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called without ctx->mu held: loading takes it unit by unit. */
+static status_t maybe_reload(sp_ctx_t *c)
+{
+    if (!c->spec) return OK;
+    pthread_mutex_lock(&g_reload_mu);
+    struct stat sb;
+    status_t st = OK;
+    if (stat(c->spec, &sb) != 0)
+        st = set_error(ERR_IO, "fake spec %s: %s", c->spec, strerror(errno));
+    else if (sb.st_mtim.tv_sec != c->spec_mtime.tv_sec ||
+             sb.st_mtim.tv_nsec != c->spec_mtime.tv_nsec) {
+        st = fake_provider_load(c, c->spec);
+        if (st == OK) c->spec_mtime = sb.st_mtim;
+    }
+    pthread_mutex_unlock(&g_reload_mu);
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* The vtable                                                          */
+/* ------------------------------------------------------------------ */
+
+static status_t f_init(const sp_config_t *cfg, sp_ctx_t **out)
+{
+    sp_ctx_t *c = calloc(1, sizeof(*c));
+    if (!c) return set_error(ERR_NOMEM, "fake: context");
+    pthread_mutex_init(&c->mu, NULL);
+    snprintf(c->daemon8, sizeof(c->daemon8), "%s",
+             cfg && cfg->daemon8 ? cfg->daemon8 : "00000000");
+    if (cfg && cfg->spec && *cfg->spec) {
+        c->spec = strdup(cfg->spec);
+        status_t st = c->spec ? maybe_reload(c) : set_error(ERR_NOMEM, "fake: spec");
+        if (st != OK) {
+            free(c->spec);
+            pthread_mutex_destroy(&c->mu);
+            free(c);
+            return st;
+        }
+    }
+    *out = c;
+    return OK;
+}
+
+static void f_fini(sp_ctx_t *c)
+{
+    if (!c) return;
+    for (size_t i = 0; i < c->nu; i++) funit_clear(&c->units[i]);
+    free(c->units);
+    free(c->holds);
+    free(c->arts);
+    free(c->spec);
+    pthread_mutex_destroy(&c->mu);
+    free(c);
+}
+
+static status_t f_probe(sp_ctx_t *c, sp_probe_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->available = 1;
+    snprintf(out->version, sizeof(out->version), "fake-1");
+    pthread_mutex_lock(&c->mu);
+    snprintf(out->detail, sizeof(out->detail), "test provider, %zu unit(s)%s%s",
+             c->nu, c->spec ? ", from " : "", c->spec ? c->spec : "");
+    pthread_mutex_unlock(&c->mu);
+    return OK;
+}
+
+typedef struct { char id[SP_UNIT_ID_MAX]; char *name; int state; } fl_t;
+
+static int fl_cmp(const void *a, const void *b)
+{
+    const fl_t *x = a, *y = b;
+    int r = strcmp(x->name, y->name);
+    return r ? r : strcmp(x->id, y->id);
+}
+
+static status_t f_list(sp_ctx_t *c, sp_unit_cb cb, void *cbctx)
+{
+    status_t st = maybe_reload(c);
+    pthread_mutex_lock(&c->mu);
+    fl_t *l = st == OK ? calloc(c->nu ? c->nu : 1, sizeof(*l)) : NULL;
+    size_t n = 0;
+    if (st == OK && !l) st = set_error(ERR_NOMEM, "fake: list");
+    for (size_t i = 0; st == OK && i < c->nu; i++, n++) {
+        memcpy(l[i].id, c->units[i].id, sizeof(l[i].id));
+        l[i].state = c->units[i].state;
+        if (!(l[i].name = strdup(c->units[i].name))) st = set_error(ERR_NOMEM, "fake: list");
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (st == OK) qsort(l, n, sizeof(*l), fl_cmp);
+    for (size_t i = 0; st == OK && i < n; i++) st = cb(cbctx, l[i].id, l[i].name, l[i].state);
+    for (size_t i = 0; l && i < n; i++) free(l[i].name);
+    free(l);
+    return st;
+}
+
+static char *disk_path(const char *id)
+{
+    size_t n = strlen(".cbackup-unit/disks/") + strlen(id) + 1;
+    char *p = malloc(n);
+    if (p) snprintf(p, n, ".cbackup-unit/disks/%s", id);
+    return p;
+}
+
+static status_t f_describe(sp_ctx_t *c, const char *unit_id, sp_unit_desc_t **out)
+{
+    status_t st = maybe_reload(c);
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = st == OK ? find_unit(c, unit_id) : NULL;
+    if (st == OK && !u) st = set_error(ERR_NOT_FOUND, "fake: no unit %s", unit_id);
+    if (st == OK && fail_for(c, unit_id, NULL) == FAKE_FAIL_DESCRIBE)
+        st = set_error(ERR_IO, "fake: describe %s failed (injected)", unit_id);
+    sp_unit_desc_t *d = NULL;
+    if (st == OK) {
+        d = calloc(1, sizeof(*d));
+        size_t n = u->nb + u->nd + u->nt;
+        if (d) d->items = calloc(n ? n : 1, sizeof(*d->items));
+        if (!d || !d->items || !(d->name = strdup(u->name))) st = set_error(ERR_NOMEM, "fake: describe");
+    }
+    if (st == OK) {
+        snprintf(d->provider, sizeof(d->provider), "fake");
+        memcpy(d->unit_id, u->id, sizeof(d->unit_id));
+        d->state = u->state;
+        d->caps = u->caps;
+        for (size_t i = 0; st == OK && i < u->nb; i++) {
+            sp_item_desc_t *it = &d->items[d->n_items++];
+            memcpy(it->id, u->blobs[i].id, sizeof(it->id));
+            it->kind = SP_ITEM_BLOB;
+            it->size = u->blobs[i].len;
+            if (!(it->tree_path = strdup(u->blobs[i].path))) st = set_error(ERR_NOMEM, "fake");
+        }
+        for (size_t i = 0; st == OK && i < u->nd; i++) {
+            sp_item_desc_t *it = &d->items[d->n_items++];
+            memcpy(it->id, u->disks[i].id, sizeof(it->id));
+            it->kind = SP_ITEM_BLOCK;
+            it->size = u->disks[i].size;
+            snprintf(it->format, sizeof(it->format), "raw");
+            it->mtime_sec = u->disks[i].mtime;
+            if (!(it->tree_path = disk_path(u->disks[i].id))) st = set_error(ERR_NOMEM, "fake");
+        }
+        for (size_t i = 0; st == OK && i < u->nt; i++) {
+            sp_item_desc_t *it = &d->items[d->n_items++];
+            memcpy(it->id, u->trees[i].id, sizeof(it->id));
+            it->kind = SP_ITEM_TREE;
+            it->caps = u->caps & SP_CAP_SNAPSHOT;
+            if (!(it->tree_path = strdup(u->trees[i].path)) ||
+                !(it->source = strdup(u->trees[i].read_root)))
+                st = set_error(ERR_NOMEM, "fake");
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (st != OK) { sp_unit_desc_free(d); return st; }
+    *out = d;
+    return OK;
+}
+
+static void f_desc_free(sp_unit_desc_t *d) { sp_unit_desc_free(d); }
+
+/* Journal, then take. Caller holds the lock across the take only; the
+ * journal call is made without it, since it writes to the database. */
+static status_t take_journalled(sp_session_t *s, const char *kind, const char *detail)
+{
+    sp_ctx_t *c = s->ctx;
+    if (s->nheld >= sizeof(s->held) / sizeof(s->held[0]))
+        return set_error(ERR_INVALID, "fake: too many holds");
+    int64_t intent = 0;
+    if (s->holds.record) {
+        status_t st = s->holds.record(s->holds.ctx, kind, detail, &intent);
+        if (st != OK) return st;
+    }
+    pthread_mutex_lock(&c->mu);
+    size_t h = hold_take(c, s->unit->id, kind, detail);
+    pthread_mutex_unlock(&c->mu);
+    if (h == SIZE_MAX) {
+        if (s->holds.clear) (void)s->holds.clear(s->holds.ctx, intent);
+        return set_error(ERR_NOMEM, "fake: hold");
+    }
+    s->held[s->nheld].hold = h;
+    s->held[s->nheld].intent = intent;
+    s->nheld++;
+    return OK;
+}
+
+/* Release held[i]; on success clear its journal row. A failed release
+ * keeps the row, which is the sweep's to act on. */
+static status_t release_one(sp_session_t *s, size_t i)
+{
+    sp_ctx_t *c = s->ctx;
+    pthread_mutex_lock(&c->mu);
+    /* Release failures are looked up now, not at begin: a test injects
+     * one into a session already running. */
+    fake_fail_t now = fail_for(c, s->unit->id, NULL);
+    status_t st = hold_release(c, s->held[i].hold,
+                               now == FAKE_FAIL_RELEASE ? now : s->fail);
+    pthread_mutex_unlock(&c->mu);
+    if (st == OK && s->held[i].intent && s->holds.clear) {
+        st = s->holds.clear(s->holds.ctx, s->held[i].intent);
+        s->held[i].intent = 0;
+    }
+    return st;
+}
+
+/* Everything still held, newest first. The first failure is returned; the
+ * rest are still attempted. */
+static status_t release_all(sp_session_t *s)
+{
+    status_t first = OK;
+    char msg[512] = "";
+    for (size_t i = s->nheld; i-- > 0;) {
+        status_t st = release_one(s, i);
+        if (st != OK && first == OK) {
+            first = st;
+            snprintf(msg, sizeof(msg), "%s", err_msg());
+        }
+    }
+    s->nheld = 0;
+    if (first != OK) set_error(first, "%s", msg);
+    return first;
+}
+
+static void session_free(sp_session_t *s)
+{
+    if (!s) return;
+    sp_session_info_free(&s->info);
+    if (s->unit) { funit_clear(s->unit); free(s->unit); }
+    free(s);
+}
+
+static int held_kind(sp_session_t *s, size_t i, const char *kind)
+{
+    pthread_mutex_lock(&s->ctx->mu);
+    int r = strcmp(s->ctx->holds[s->held[i].hold].kind, kind) == 0;
+    pthread_mutex_unlock(&s->ctx->mu);
+    return r;
+}
+
+static status_t f_begin(sp_ctx_t *c, const sp_unit_desc_t *unit,
+                        const sp_begin_req_t *req, sp_session_t **out,
+                        const sp_session_info_t **info)
+{
+    sp_session_t *s = calloc(1, sizeof(*s));
+    if (!s) return set_error(ERR_NOMEM, "fake: session");
+    s->ctx = c;
+    s->job = req ? req->job_id : 0;
+    if (req && req->holds) s->holds = *req->holds;
+
+    pthread_mutex_lock(&c->mu);
+    funit_t *u = find_unit(c, unit->unit_id);
+    status_t st = u ? OK : set_error(ERR_NOT_FOUND, "fake: unit %s is gone", unit->unit_id);
+    if (st == OK) {
+        s->unit = calloc(1, sizeof(*s->unit));
+        st = s->unit ? funit_copy(u, s->unit) : set_error(ERR_NOMEM, "fake: session");
+        if (st != OK) { free(s->unit); s->unit = NULL; }
+    }
+    if (st == OK) s->fail = fail_for(c, unit->unit_id, &s->fail_arg);
+    if (st == OK && s->fail == FAKE_FAIL_BEGIN)
+        st = set_error(ERR_IO, "fake: begin %s failed (injected)", unit->unit_id);
+    if (st != OK) c->st.begin_failures++;
+    pthread_mutex_unlock(&c->mu);
+    if (st != OK) { session_free(s); return st; }
+
+    funit_t *su = s->unit;
+    int running = su->state == SP_STATE_RUNNING || su->state == SP_STATE_PAUSED;
+    int froze = 0, watchdog = 0, paused = 0, snapped = 0, exported = 0;
+    char detail[128];
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    if (running && (su->caps & SP_CAP_QUIESCE)) {
+        snprintf(detail, sizeof(detail), "agent:%s", su->id);
+        st = take_journalled(s, SP_HOLD_FREEZE, detail);
+        if (st == OK) froze = 1;
+        if (st == OK && s->fail == FAKE_CRASH_IN_HOLD) {
+            /* As if the process died here: the hold stays taken and its
+             * journal row stays written. Only a sweep releases them. */
+            st = set_error(ERR_IO, "fake: simulated crash while holding a freeze");
+            pthread_mutex_lock(&c->mu);
+            c->st.begin_failures++;
+            pthread_mutex_unlock(&c->mu);
+            s->nheld = 0;
+            session_free(s);
+            return st;
+        }
+        if (st == OK && s->fail == FAKE_HANG_IN_HOLD) {
+            /* The guest agent does not answer: wait, as a stuck libvirt
+             * call would, until the deadline or until something releases
+             * the freeze from outside. */
+            size_t h = s->held[s->nheld - 1].hold;
+            for (uint64_t waited = 0; waited < s->fail_arg; waited += 5) {
+                if (req && req->cancel && atomic_load(req->cancel)) break;
+                pthread_mutex_lock(&c->mu);
+                int still = c->holds[h].held;
+                pthread_mutex_unlock(&c->mu);
+                if (!still) { watchdog = 1; break; }
+                struct timespec ts = { 0, 5 * 1000000L };
+                nanosleep(&ts, NULL);
+            }
+            if (watchdog) {
+                pthread_mutex_lock(&c->mu);
+                c->st.watchdog_released++;
+                pthread_mutex_unlock(&c->mu);
+                /* Its journal row went with the release. */
+                s->held[s->nheld - 1].intent = 0;
+            }
+        }
+        if (st == OK && s->fail == FAKE_FAIL_BEGIN_AFTER_HOLD)
+            st = set_error(ERR_IO, "fake: begin %s failed after the freeze (injected)", su->id);
+    }
+    if (st == OK && running && (su->caps & SP_CAP_PAUSE)) {
+        snprintf(detail, sizeof(detail), "pause:%s", su->id);
+        st = take_journalled(s, SP_HOLD_PAUSE, detail);
+        if (st == OK) paused = 1;
+    }
+    int want_snap = 0;
+    for (size_t i = 0; i < su->nt; i++) want_snap = 1;
+    if (st == OK && want_snap && (su->caps & SP_CAP_SNAPSHOT)) {
+        char name[ARTEFACT_NAME_MAX];
+        if (artefact_name(name, sizeof(name), c->daemon8, s->job, 0) != 0)
+            st = set_error(ERR_INVALID, "fake: artefact name");
+        if (st == OK) st = take_journalled(s, SP_HOLD_FS_SNAPSHOT, name);
+        if (st == OK) {
+            pthread_mutex_lock(&c->mu);
+            st = art_add(c, name, c->daemon8);
+            pthread_mutex_unlock(&c->mu);
+            if (st == OK) snapped = 1;
+        }
+    }
+    if (st == OK && running && su->nd > 0) {
+        snprintf(detail, sizeof(detail), "export:%s:%lld", su->id, (long long)s->job);
+        st = take_journalled(s, SP_HOLD_EXPORT, detail);
+        if (st == OK) exported = 1;
+    }
+
+    /* The point in time is established: freeze and pause go now, before
+     * any data is read. Snapshots and exports stay until end. */
+    for (size_t i = s->nheld; st == OK && i-- > 0;) {
+        if (!held_kind(s, i, SP_HOLD_FREEZE) && !held_kind(s, i, SP_HOLD_PAUSE)) continue;
+        st = release_one(s, i);
+        if (st == OK) {
+            memmove(&s->held[i], &s->held[i + 1], (s->nheld - i - 1) * sizeof(s->held[0]));
+            s->nheld--;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t ms = (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    if (st == OK) {
+        sp_session_info_t *in = &s->info;
+        if (!running)              in->achieved = SP_CONSIST_OFFLINE;
+        else if (froze && !watchdog) in->achieved = SP_CONSIST_QUIESCED;
+        else if (paused || snapped || exported) in->achieved = SP_CONSIST_CRASH;
+        else                       in->achieved = SP_CONSIST_INCONSISTENT;
+        if (froze)    { in->consist_flags |= SP_CF_FROZEN; in->freeze_ms = ms; }
+        if (paused)   { in->consist_flags |= SP_CF_PAUSED; in->pause_ms = ms; }
+        if (snapped)  in->consist_flags |= SP_CF_FS_SNAPSHOT;
+        if (watchdog) {
+            in->consist_flags |= SP_CF_WATCHDOG_RELEASED;
+            st = sp_session_info_warn(in, "freeze on %s released by the watchdog after "
+                                      "%llu ms; consistency is %s, not quiesced",
+                                      su->name, (unsigned long long)ms,
+                                      sp_consistency_name(in->achieved));
+        }
+        if (st == OK && req && in->achieved < req->require)
+            st = set_error(ERR_INVALID, "unit %s: achieved %s, below the required %s",
+                           su->name, sp_consistency_name(in->achieved),
+                           sp_consistency_name(req->require));
+    }
+    if (st == OK) {
+        size_t n = su->nb + su->nd + su->nt;
+        s->info.plans = calloc(n ? n : 1, sizeof(*s->info.plans));
+        if (!s->info.plans) st = set_error(ERR_NOMEM, "fake: plans");
+        for (size_t i = 0; st == OK && i < su->nb; i++)
+            s->info.plans[s->info.n_plans++] =
+                (sp_item_plan_t){ su->blobs[i].id, SP_READ_FULL, "no-incremental-support" };
+        for (size_t i = 0; st == OK && i < su->nd; i++)
+            s->info.plans[s->info.n_plans++] =
+                (sp_item_plan_t){ su->disks[i].id, SP_READ_FULL,
+                                  req && req->n_bases ? "no-base" : "first" };
+        for (size_t i = 0; st == OK && i < su->nt; i++)
+            s->info.plans[s->info.n_plans++] =
+                (sp_item_plan_t){ su->trees[i].id, SP_READ_FULL, "no-incremental-support" };
+    }
+
+    if (st != OK) {
+        /* Nothing left behind: whatever was taken goes, and a release that
+         * fails leaves its journal row for the sweep. */
+        char why[512];
+        snprintf(why, sizeof(why), "%s", err_msg());
+        (void)release_all(s);
+        pthread_mutex_lock(&c->mu);
+        c->st.begin_failures++;
+        pthread_mutex_unlock(&c->mu);
+        session_free(s);
+        return set_error(st, "%s", why);
+    }
+    pthread_mutex_lock(&c->mu);
+    c->st.begins++;
+    pthread_mutex_unlock(&c->mu);
+    *out = s;
+    *info = &s->info;
+    return OK;
+}
+
+static const fblob_t *blob_of(sp_session_t *s, const char *id)
+{
+    for (size_t i = 0; i < s->unit->nb; i++)
+        if (strcmp(s->unit->blobs[i].id, id) == 0) return &s->unit->blobs[i];
+    return NULL;
+}
+
+static status_t f_blob_read(sp_session_t *s, const sp_item_desc_t *item,
+                            void **data, size_t *len)
+{
+    if (s->fail == FAKE_FAIL_BLOB) return set_error(ERR_IO, "fake: blob %s failed (injected)", item->id);
+    const fblob_t *b = blob_of(s, item->id);
+    if (!b) return set_error(ERR_NOT_FOUND, "fake: no blob %s", item->id);
+    void *d = dupmem(b->data, b->len);
+    if (!d) return set_error(ERR_NOMEM, "fake: blob");
+    *data = d;
+    *len = b->len;
+    return OK;
+}
+
+typedef struct {
+    const fdisk_t *d;
+    fake_fail_t    fail;
+    uint64_t       arg;
+} fstream_t;
+
+/* What the run covering off reports, and where that report ends. */
+static sp_ext_type_t run_report(const fdisk_t *d, const fake_run_t *r)
+{
+    if (d->alloc == FAKE_ALLOC_ALL_DATA) return SP_EXT_DATA;
+    switch (r->kind) {
+    case FAKE_RUN_ZERO:      return SP_EXT_ZERO;
+    case FAKE_RUN_ZERO_DATA: return d->alloc == FAKE_ALLOC_ZERO_AS_ZERO ? SP_EXT_ZERO : SP_EXT_DATA;
+    default:                 return SP_EXT_DATA;
+    }
+}
+
+static status_t fs_extent(void *ctx, uint64_t from, sp_ext_type_t *type,
+                          uint64_t *len, int *done)
+{
+    fstream_t *f = ctx;
+    const fdisk_t *d = f->d;
+    if (f->fail == FAKE_FAIL_EXTENT) return set_error(ERR_IO, "fake: extent walk failed (injected)");
+    if (from >= d->size) { *done = 1; *len = 0; return OK; }
+    *done = 0;
+    if (d->alloc == FAKE_ALLOC_ALL_DATA) { *type = SP_EXT_DATA; *len = d->size - from; return OK; }
+    /* Classify from, then extend over neighbours that report the same. */
+    uint64_t pos = from;
+    sp_ext_type_t t = SP_EXT_ZERO;
+    int first = 1;
+    size_t i = 0;
+    while (i < d->n_runs && d->runs[i].off + d->runs[i].len <= pos) i++;
+    for (;;) {
+        sp_ext_type_t here;
+        uint64_t end;
+        if (i < d->n_runs && d->runs[i].off <= pos) {
+            here = run_report(d, &d->runs[i]);
+            end = d->runs[i].off + d->runs[i].len;
+        } else {
+            here = SP_EXT_ZERO;
+            end = i < d->n_runs ? d->runs[i].off : d->size;
+        }
+        if (first) { t = here; first = 0; }
+        else if (here != t) break;
+        pos = end;
+        if (i < d->n_runs && d->runs[i].off + d->runs[i].len <= pos) i++;
+        if (pos >= d->size) break;
+    }
+    *type = t;
+    *len = pos - from;
+    return OK;
+}
+
+static status_t fs_changed(void *ctx, uint64_t from, uint64_t *s, uint64_t *e, int *done)
+{
+    /* No base is ever given in this build, so no plan says incremental;
+     * the whole disk is the honest answer if anything asks. */
+    fstream_t *f = ctx;
+    if (from >= f->d->size) { *done = 1; return OK; }
+    *s = from;
+    *e = f->d->size;
+    *done = 0;
+    return OK;
+}
+
+static status_t fs_read(void *ctx, void *buf, size_t n, uint64_t off)
+{
+    fstream_t *f = ctx;
+    const fdisk_t *d = f->d;
+    if (off > d->size || n > d->size - off)
+        return set_error(ERR_INVALID, "fake: read past the end of the disk");
+    if (f->fail == FAKE_FAIL_READ && f->arg >= off && f->arg < off + n)
+        return set_error(ERR_IO, "fake: read failed at byte %llu (injected)",
+                         (unsigned long long)f->arg);
+    uint8_t *b = buf;
+    memset(b, 0, n);
+    for (size_t i = 0; i < d->n_runs; i++) {
+        const fake_run_t *r = &d->runs[i];
+        uint64_t s = r->off > off ? r->off : off;
+        uint64_t e = r->off + r->len < off + n ? r->off + r->len : off + n;
+        if (s >= e) continue;
+        if (r->kind == FAKE_RUN_DATA) gen_fill(b + (s - off), r->seed, s, (size_t)(e - s));
+        else if (r->kind == FAKE_RUN_FILL) memset(b + (s - off), (int)(r->seed & 0xffu), (size_t)(e - s));
+    }
+    return OK;
+}
+
+static void fs_close(void *ctx) { free(ctx); }
+
+static status_t f_block_open(sp_session_t *s, const sp_item_desc_t *item,
+                             sp_block_stream_t *out)
+{
+    if (s->fail == FAKE_FAIL_BLOCK_OPEN)
+        return set_error(ERR_IO, "fake: block_open %s failed (injected)", item->id);
+    const fdisk_t *d = NULL;
+    for (size_t i = 0; i < s->unit->nd; i++)
+        if (strcmp(s->unit->disks[i].id, item->id) == 0) d = &s->unit->disks[i];
+    if (!d) return set_error(ERR_NOT_FOUND, "fake: no disk %s", item->id);
+    fstream_t *f = calloc(1, sizeof(*f));
+    if (!f) return set_error(ERR_NOMEM, "fake: stream");
+    f->d = d;
+    f->fail = s->fail;
+    f->arg = s->fail_arg;
+    out->extent = fs_extent;
+    out->changed = fs_changed;
+    out->read = fs_read;
+    out->close = fs_close;
+    out->ctx = f;
+    return OK;
+}
+
+static status_t f_tree_root(sp_session_t *s, const sp_item_desc_t *item,
+                            char *read_root, size_t sz)
+{
+    if (s->fail == FAKE_FAIL_TREE_ROOT)
+        return set_error(ERR_IO, "fake: tree_root %s failed (injected)", item->id);
+    for (size_t i = 0; i < s->unit->nt; i++) {
+        if (strcmp(s->unit->trees[i].id, item->id) != 0) continue;
+        if (snprintf(read_root, sz, "%s", s->unit->trees[i].read_root) >= (int)sz)
+            return set_error(ERR_INVALID, "fake: read root too long");
+        return OK;
+    }
+    return set_error(ERR_NOT_FOUND, "fake: no tree %s", item->id);
+}
+
+static status_t f_end(sp_session_t *s, sp_end_outcome_t outcome, int64_t snapshot_id)
+{
+    (void)snapshot_id;
+    sp_ctx_t *c = s->ctx;
+    status_t st = OK;
+    if (s->fail == FAKE_FAIL_END) {
+        st = set_error(ERR_IO, "fake: end could not release %zu hold(s) (injected)", s->nheld);
+        s->nheld = 0;   /* left held, journal rows kept, for the sweep */
+    } else {
+        st = release_all(s);
+    }
+    pthread_mutex_lock(&c->mu);
+    if (outcome == SP_END_COMMITTED) c->st.ends_committed++;
+    else c->st.ends_aborted++;
+    pthread_mutex_unlock(&c->mu);
+    session_free(s);
+    return st;
+}
+
+static int job_live(const sp_sweep_req_t *req, int64_t job)
+{
+    for (size_t i = 0; i < req->n_live_jobs; i++)
+        if (req->live_jobs[i] == job) return 1;
+    return 0;
+}
+
+static status_t f_sweep(sp_ctx_t *c, const sp_sweep_req_t *req, sp_sweep_report_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&c->mu);
+    uint64_t arg = 0;
+    for (size_t k = 0; k < req->n_intents; k++) {
+        const sp_intent_t *in = &req->intents[k];
+        fake_fail_t fail = fail_for(c, in->unit_id, &arg);
+        int ok = 1;
+        for (size_t i = 0; i < c->nh; i++) {
+            fhold_t *h = &c->holds[i];
+            if (!h->held || strcmp(h->unit_id, in->unit_id) != 0 ||
+                strcmp(h->kind, in->kind) != 0 || strcmp(h->detail, in->detail) != 0)
+                continue;
+            if (hold_release(c, i, fail) != OK) { ok = 0; err_clear(); }
+            else out->released++;
+        }
+        /* Nothing held under that name: releasing it is a no-op that
+         * succeeds, as thawing a guest that is not frozen does. */
+        if (!ok) out->failed++;
+        if (req->released) req->released[k] = ok;
+    }
+    if (req->scan_artefacts) {
+        for (size_t i = 0; i < c->na; i++) {
+            fart_t *a = &c->arts[i];
+            if (!a->present) continue;
+            char d8[9];
+            int64_t job = 0;
+            if (artefact_parse(a->name, d8, &job, NULL) != 0 ||
+                !req->daemon8 || strcmp(d8, req->daemon8) != 0) {
+                out->left_foreign++;
+                continue;
+            }
+            if (job_live(req, job)) continue;
+            if (!a->has_owner || strcmp(a->owner, req->daemon8) != 0) {
+                out->left_foreign++;
+                continue;
+            }
+            /* Ours, leftover, and proven: delete, and with it any hold the
+             * table still shows on it. */
+            for (size_t h = 0; h < c->nh; h++)
+                if (c->holds[h].held && strcmp(c->holds[h].kind, SP_HOLD_FS_SNAPSHOT) == 0 &&
+                    strcmp(c->holds[h].detail, a->name) == 0) {
+                    c->holds[h].held = 0;
+                    c->st.holds_now--;
+                    c->st.releases++;
+                }
+            art_remove(c, a);
+            out->removed++;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return OK;
+}
+
+const sp_provider_ops_t fake_provider_ops = {
+    .name              = "fake",
+    .abi               = SP_ABI_VERSION,
+    .init              = f_init,
+    .fini              = f_fini,
+    .probe             = f_probe,
+    .list_units        = f_list,
+    .describe          = f_describe,
+    .desc_free         = f_desc_free,
+    .begin             = f_begin,
+    .blob_read         = f_blob_read,
+    .block_open        = f_block_open,
+    .tree_root         = f_tree_root,
+    .end               = f_end,
+    .sweep             = f_sweep,
+    .restore_preflight = NULL,
+    .define            = NULL,
+};
