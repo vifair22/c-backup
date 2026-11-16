@@ -47,6 +47,9 @@ variables:
 
 test:
   stage: test
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
@@ -96,6 +99,9 @@ analyze:
 # run the parsers against bytes nobody intended.
 fuzz:
   stage: analyze
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
@@ -183,6 +189,9 @@ ui:
 # list by hand to find out whether the app works.
 ui-e2e:
   stage: analyze
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: node:24-trixie-slim
   tags: [docker]
   needs:
@@ -223,6 +232,9 @@ ui-e2e:
 
 coverage:
   stage: coverage
+  # One at a time across every pipeline until the test scratch is
+  # bounded (INFRA-1): four of these at once filled the runner disk.
+  resource_group: cbackup-heavy-scratch
   image: debian:trixie
   tags: [docker]
   before_script:
