@@ -1840,12 +1840,31 @@ static void test_resume_keeps_a_file_that_is_not_the_snapshots(void **state)
     snprintf(top, sizeof(top), "%s/top.txt", restored_root());
     write_file(top, "edited after the restore, and longer than before\n");
 
+    /* NIT-9: the log line says what is there, a directory included. */
+    char mid[700];
+    snprintf(mid, sizeof(mid), "%s/nested/mid.txt", restored_root());
+    assert_int_equal(unlink(mid), 0);
+    assert_int_equal(mkdir(mid, 0700), 0);
+    captured_log[0] = '\0';
+    int h = log_stream_register(capture_log, NULL);
+    assert_true(h >= 0);
     restore_result_t rr;
     assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
                                  TEST_DST, NULL, &rr), OK);
-    assert_int_equal(rr.kept, 1);
+    log_stream_unregister(h);
+    assert_int_equal(rr.kept, 2);
     assert_int_equal(rr.files, 0);
-    assert_int_equal(rr.skipped, 2);   /* mid.txt and leaf.txt */
+    assert_int_equal(rr.skipped, 1);   /* leaf.txt */
+    assert_non_null(strstr(captured_log, "(a file of a different size is there)"));
+    assert_non_null(strstr(captured_log, "(a directory is there, not the file)"));
+    assert_null(strstr(captured_log, "size or mtime differ"));
+    assert_int_equal(rmdir(mid), 0);
+
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.kept, 1);
+    assert_int_equal(rr.files, 1);     /* mid.txt, back once the directory went */
+    assert_int_equal(rr.skipped, 1);   /* leaf.txt */
     FILE *f = fopen(top, "r");
     assert_non_null(f);
     char line[128] = "";
