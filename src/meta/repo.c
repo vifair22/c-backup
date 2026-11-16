@@ -7,6 +7,7 @@
 #include "store.h"
 
 #include <cutils/json.h>
+#include <stdbool.h>
 #include <cutils/log.h>
 
 #include <dirent.h>
@@ -65,7 +66,13 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
         err_clear();
         return OK;
     }
-    if (m.enc_mode == REPO_ENC_NONE) return OK;
+    cdc_params_t cp;
+    if (m.enc_mode == REPO_ENC_NONE) {
+        st = repo_marker_cdc(&m, NULL, &cp);
+        if (st == OK) st = store_set_cdc(*out, &cp);
+        if (st != OK) { store_close(*out); *out = NULL; }
+        return st;
+    }
 
     store_set_encrypted(*out, 1);
 
@@ -86,8 +93,12 @@ status_t repo_store_open(const char *path, const store_config_t *cfg,
                          "(marker says %s)", m.uuid, repo_key_dir(), m.key_id);
     }
     store_set_key(*out, &k);
+    st = repo_marker_cdc(&m, &k, &cp);
+    if (st == OK) st = store_set_cdc(*out, &cp);
+    OPENSSL_cleanse(&cp, sizeof(cp));
     repo_key_wipe(&k);
-    return OK;
+    if (st != OK) { store_close(*out); *out = NULL; }
+    return st;
 }
 
 status_t repo_store_open_keyed(const char *path, const store_config_t *cfg,
@@ -198,6 +209,43 @@ status_t repo_marker_read(const char *path, repo_marker_t *out)
         free(mode);
         free(cipher);
         free(kid);
+
+        /*
+         * Chunking constants (format 3). Required: there are no markers
+         * from before chunking to stay compatible with, and a repository
+         * whose constants are guessed would cut every file differently
+         * from how its existing chunks were cut. The bounds are the ones
+         * cdc_params_init enforces.
+         */
+        char *algo = NULL;
+        uint32_t cmin = 0, cavg = 0, cmax = 0;
+        bool keyed = false;
+        if (rc == OK) {
+            cdc_params_t probe;
+            if (json_req_get_str(req, "chunker.algo", &algo) != 0 || !algo ||
+                strcmp(algo, CDC_ALGO_NAME) != 0 ||
+                json_req_get_u32(req, "chunker.min", &cmin, CDC_MIN_FLOOR,
+                                 CDC_MAX_CEILING) != 0 ||
+                json_req_get_u32(req, "chunker.avg", &cavg, CDC_MIN_FLOOR,
+                                 CDC_MAX_CEILING) != 0 ||
+                json_req_get_u32(req, "chunker.max", &cmax, CDC_MIN_FLOOR,
+                                 CDC_MAX_CEILING) != 0 ||
+                json_req_get_bool(req, "chunker.keyed", &keyed) != 0) {
+                rc = set_error(ERR_CORRUPT, "%s has no usable chunker settings", mp);
+            } else if ((keyed ? 1 : 0) != (out->enc_mode != REPO_ENC_NONE ? 1 : 0)) {
+                rc = set_error(ERR_CORRUPT, "%s: chunker keying disagrees with "
+                               "its encryption", mp);
+            } else if (cdc_params_init(&probe, cmin, cavg, cmax, NULL) != OK) {
+                char why[ERR_MSG_MAX];
+                snprintf(why, sizeof(why), "%s", err_msg());
+                rc = set_error(ERR_CORRUPT, "%s: %s", mp, why);
+            } else {
+                out->cdc_min = cmin;
+                out->cdc_avg = cavg;
+                out->cdc_max = cmax;
+            }
+        }
+        free(algo);
     }
 
     free(fmt);
@@ -235,7 +283,12 @@ status_t repo_marker_write_ex(const char *path, const repo_marker_t *in,
 /* Serialise a fully-decided marker to disk. */
 static status_t marker_emit(const char *mp, const repo_marker_t *mp_in)
 {
-    const repo_marker_t m = *mp_in;
+    repo_marker_t m = *mp_in;
+    if (!m.cdc_min && !m.cdc_avg && !m.cdc_max) {
+        m.cdc_min = CDC_MIN_DEFAULT;
+        m.cdc_avg = CDC_AVG_DEFAULT;
+        m.cdc_max = CDC_MAX_DEFAULT;
+    }
 
     /* O_EXCL: a marker is written exactly once, at creation. Overwriting one
      * would silently sever a repo from its rows in the daemon DB. */
@@ -246,19 +299,26 @@ static status_t marker_emit(const char *mp, const repo_marker_t *mp_in)
         return set_error_errno(ERR_IO, "cannot create %s", mp);
     }
 
+    char chunker[192];
+    snprintf(chunker, sizeof(chunker),
+             "\"chunker\":{\"algo\":\"%s\",\"min\":%u,\"avg\":%u,\"max\":%u,"
+             "\"keyed\":%s}",
+             CDC_ALGO_NAME, m.cdc_min, m.cdc_avg, m.cdc_max,
+             m.enc_mode != REPO_ENC_NONE ? "true" : "false");
+
     char body[2048];
     int n;
     if (m.enc_mode == REPO_ENC_NONE) {
         n = snprintf(body, sizeof(body),
-                     "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\"}\n",
-                     CBACKUP_FORMAT, m.version, m.uuid);
+                     "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\",%s}\n",
+                     CBACKUP_FORMAT, m.version, m.uuid, chunker);
     } else if (m.enc_mode == REPO_ENC_SYSTEM) {
         n = snprintf(body, sizeof(body),
                      "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\","
                      "\"encryption\":{\"mode\":\"%s\",\"cipher\":\"%s\","
-                     "\"key_id\":\"%s\"}}\n",
+                     "\"key_id\":\"%s\"},%s}\n",
                      CBACKUP_FORMAT, m.version, m.uuid,
-                     repo_enc_mode_name(m.enc_mode), m.cipher, m.key_id);
+                     repo_enc_mode_name(m.enc_mode), m.cipher, m.key_id, chunker);
     } else {
         n = snprintf(body, sizeof(body),
                      "{\"format\":\"%s\",\"version\":%d,\"uuid\":\"%s\","
@@ -266,11 +326,11 @@ static status_t marker_emit(const char *mp, const repo_marker_t *mp_in)
                      "\"key_id\":\"%s\","
                      "\"kdf\":{\"name\":\"argon2id\",\"salt\":\"%s\","
                      "\"iterations\":%u,\"memory_kib\":%u,\"lanes\":%u},"
-                     "\"wrapped\":\"%s\"}}\n",
+                     "\"wrapped\":\"%s\"},%s}\n",
                      CBACKUP_FORMAT, m.version, m.uuid,
                      repo_enc_mode_name(m.enc_mode), m.cipher, m.key_id,
                      m.kdf.salt_hex, m.kdf.iterations, m.kdf.memory_kib,
-                     m.kdf.lanes, m.wrapped);
+                     m.kdf.lanes, m.wrapped, chunker);
     }
     if (n >= (int)sizeof(body)) {
         close(fd); unlink(mp);
@@ -960,4 +1020,18 @@ status_t repo_deregister(cutils_db_t *db, int64_t repo_id)
     if (db_txn_commit(db) != OK)
         return set_error(ERR_IO, "cannot delete repo %lld: commit", (long long)repo_id);
     return OK;
+}
+
+status_t repo_marker_cdc(const repo_marker_t *m, const repo_key_t *key,
+                         cdc_params_t *out)
+{
+    if (!m || !out) return set_error(ERR_INVALID, "repo_marker_cdc: null argument");
+    if (m->enc_mode != REPO_ENC_NONE && !key)
+        return set_error(ERR_INVALID, "repository %s is encrypted: its chunk "
+                         "boundaries need its key", m->uuid);
+    uint32_t mn = m->cdc_min ? m->cdc_min : CDC_MIN_DEFAULT;
+    uint32_t av = m->cdc_avg ? m->cdc_avg : CDC_AVG_DEFAULT;
+    uint32_t mx = m->cdc_max ? m->cdc_max : CDC_MAX_DEFAULT;
+    return cdc_params_init(out, mn, av, mx,
+                           m->enc_mode != REPO_ENC_NONE ? key->key : NULL);
 }

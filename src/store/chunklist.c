@@ -580,7 +580,7 @@ status_t content_restore_fd(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]
         return st;
     }
     if (type != OBJECT_TYPE_CHUNKLIST)
-        return set_error(ERR_CORRUPT, "content: object type %u is not file "
+        return set_error(ERR_CORRUPT, "object is of type %u, not file "
                          "content", type);
 
     obj_loader_t ld = obj_loader_store(store);
@@ -646,7 +646,7 @@ status_t content_stream(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
         return st;
     }
     if (type != OBJECT_TYPE_CHUNKLIST)
-        return set_error(ERR_CORRUPT, "content: object type %u is not file "
+        return set_error(ERR_CORRUPT, "object is of type %u, not file "
                          "content", type);
 
     obj_loader_t ld = obj_loader_store(store);
@@ -690,7 +690,7 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
         return object_load_prefix(store, hash, max_bytes, out_data, out_len,
                                   out_full, NULL);
     if (type != OBJECT_TYPE_CHUNKLIST)
-        return set_error(ERR_CORRUPT, "content: object type %u is not file "
+        return set_error(ERR_CORRUPT, "object is of type %u, not file "
                          "content", type);
 
     obj_loader_t ld = obj_loader_store(store);
@@ -759,4 +759,148 @@ status_t content_collect(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
     }
     chunklist_iter_close(it);
     return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* Content as a chunker source                                         */
+/* ------------------------------------------------------------------ */
+
+struct content_src {
+    store_t  *store;
+    int       is_list;
+    uint64_t  total;
+
+    /* FILE: the whole object, one span. */
+    uint8_t  *whole;
+    int       span_given;
+
+    /* Lists: one walk looks ahead for spans, a second loads the data, so
+     * neither has to hold more than one leaf's worth of anything. */
+    chunklist_iter_t *spans_it;
+    int               have_next, spans_done;
+    chunklist_item_t  next;
+    chunklist_iter_t *data_it;
+    uint8_t          *leaf;
+    uint64_t          leaf_off, leaf_len;
+};
+
+static status_t cs_next_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    content_src_t *cs = ctx;
+    *got = 0;
+    if (!cs->is_list) {
+        if (cs->span_given || cs->total == 0) return OK;
+        cs->span_given = 1;
+        *s = 0; *e = cs->total; *got = 1;
+        return OK;
+    }
+    int done = 0;
+    if (!cs->have_next) {
+        if (cs->spans_done) return OK;
+        status_t st = chunklist_iter_next(cs->spans_it, &cs->next, &done);
+        if (st != OK) return st;
+        if (done) { cs->spans_done = 1; return OK; }
+    }
+    uint64_t start = cs->next.offset, end = cs->next.offset + cs->next.length;
+    cs->have_next = 0;
+    for (;;) {
+        status_t st = chunklist_iter_next(cs->spans_it, &cs->next, &done);
+        if (st != OK) return st;
+        if (done) { cs->spans_done = 1; break; }
+        if (cs->next.offset != end) { cs->have_next = 1; break; }
+        end += cs->next.length;
+    }
+    *s = start; *e = end; *got = 1;
+    return OK;
+}
+
+static status_t cs_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    content_src_t *cs = ctx;
+    if (!cs->is_list) {
+        if (off > cs->total || n > cs->total - off)
+            return set_error(ERR_INVALID, "content source: read past the end");
+        memcpy(buf, cs->whole + off, n);
+        return OK;
+    }
+    while (n > 0) {
+        if (!cs->leaf || off >= cs->leaf_off + cs->leaf_len) {
+            free(cs->leaf);
+            cs->leaf = NULL;
+            chunklist_item_t x;
+            int done = 0;
+            status_t st = chunklist_iter_next(cs->data_it, &x, &done);
+            if (st != OK) return st;
+            if (done)
+                return set_error(ERR_INVALID, "content source: read past the last chunk");
+            void *data = NULL;
+            st = load_leaf(cs->store, &x, OBJECT_TYPE_FILE, &data);
+            if (st != OK) return st;
+            cs->leaf = data;
+            cs->leaf_off = x.offset;
+            cs->leaf_len = x.length;
+            continue;
+        }
+        if (off < cs->leaf_off)
+            return set_error(ERR_INVALID, "content source: read in a hole");
+        size_t k = (size_t)(cs->leaf_off + cs->leaf_len - off);
+        if (k > n) k = n;
+        memcpy(buf, cs->leaf + (off - cs->leaf_off), k);
+        buf += k; n -= k; off += k;
+    }
+    return OK;
+}
+
+status_t content_source_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                             content_src_t **out, uint64_t *out_size)
+{
+    if (!store || !hash || !out) return set_error(ERR_INVALID, "content_source_open: null");
+    content_src_t *cs = calloc(1, sizeof(*cs));
+    if (!cs) return set_error(ERR_NOMEM, "content_source_open");
+    cs->store = store;
+
+    uint64_t size = 0;
+    uint8_t type = 0;
+    status_t st = object_get_info(store, hash, &size, &type);
+    if (st == OK && type == OBJECT_TYPE_FILE) {
+        void *data = NULL;
+        size_t len = 0;
+        st = object_load(store, hash, &data, &len, &type);
+        if (st == OK && type != OBJECT_TYPE_FILE) {
+            free(data);
+            st = set_error(ERR_CORRUPT, "object is of type %u, not file content", type);
+        }
+        if (st == OK) { cs->whole = data; cs->total = len; }
+    } else if (st == OK && type == OBJECT_TYPE_CHUNKLIST) {
+        obj_loader_t ld = obj_loader_store(store);
+        chunklist_hdr_t h;
+        memset(&h, 0, sizeof(h));
+        cs->is_list = 1;
+        st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, &h, &cs->spans_it);
+        if (st == OK)
+            st = chunklist_iter_open(&ld, hash, OBJECT_TYPE_FILE, 0, NULL, &cs->data_it);
+        cs->total = h.total_len;
+    } else if (st == OK) {
+        st = set_error(ERR_CORRUPT, "object is of type %u, not file content", type);
+    }
+    if (st != OK) { content_source_close(cs); return st; }
+    if (out_size) *out_size = cs->total;
+    *out = cs;
+    return OK;
+}
+
+cdc_source_t content_source_iface(content_src_t *cs)
+{
+    cdc_source_t s = { .next_span = cs_next_span, .read = cs_read, .ctx = cs };
+    return s;
+}
+
+void content_source_close(content_src_t *cs)
+{
+    if (!cs) return;
+    free(cs->whole);
+    free(cs->leaf);
+    chunklist_iter_close(cs->spans_it);
+    chunklist_iter_close(cs->data_it);
+    free(cs);
 }

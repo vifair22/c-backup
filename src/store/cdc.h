@@ -69,7 +69,7 @@
 
 #define CDC_ALGO_NAME "fastcdc-gear64-v1"
 
-typedef struct {
+typedef struct cdc_params {
     uint32_t min_size, avg_size, max_size;
     uint64_t mask_s, mask_l;
     int      keyed;
@@ -181,3 +181,14 @@ typedef struct {
 status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
                       const obj_sink_t *sink, const cdc_opts_t *opts,
                       cdc_result_t *out);
+
+/*
+ * cdc_store_fd over any cdc_source_t (chunklist.h). Replication that
+ * re-chunks for a target with different boundaries uses it over existing
+ * content (content_source_open), whose spans are the gaps of the source
+ * list: the same spans the original file had, so the target gets exactly
+ * what a backup of the file into it would have stored.
+ */
+status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
+                          uint64_t size, const obj_sink_t *sink,
+                          const cdc_opts_t *opts, cdc_result_t *out);

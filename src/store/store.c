@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
+#include "cdc.h"
 #include "repo_key.h"
 
 #include <openssl/crypto.h>
@@ -88,6 +89,10 @@ struct store {
      * with the calloc in store_open. Updated with __atomic builtins from
      * the backup thread, the large-file workers and the pack workers. */
     uint64_t            written[STORE_WR__COUNT];
+
+    /* Chunking parameters (format 3): the repository's constants and its
+     * keyed gear table. NULL until store_set_cdc; see store_cdc. Owned. */
+    cdc_params_t       *cdc;
 };
 
 static status_t mkdir_at(int base, const char *name) {
@@ -403,6 +408,7 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
     r->removed_cb      = NULL;
     r->removed_user    = NULL;
     r->cancel          = NULL;
+    r->cdc             = NULL;
     pthread_mutex_init(&r->loose_set_mu, NULL);
 
     /* tmp/ is where every staging and spill file goes, and nothing outside
@@ -422,9 +428,15 @@ status_t store_open(const char *path, const store_config_t *cfg, store_t **out) 
 void store_close(store_t *st) {
     if (!st) return;
 
-    /* The key does not outlive the handle that used it. */
+    /* The key does not outlive the handle that used it, nor does the gear
+     * table derived from it. */
     OPENSSL_cleanse(&st->key, sizeof(st->key));
     st->has_key = 0;
+    if (st->cdc) {
+        OPENSSL_cleanse(st->cdc, sizeof(*st->cdc));
+        free(st->cdc);
+        st->cdc = NULL;
+    }
 
     store_dat_cache_flush(st);
     free(st->dat_cache);
@@ -785,4 +797,37 @@ void store_set_pack_removed_cb(store_t *st, store_pack_removed_fn cb, void *user
 void store_emit_pack_removed(store_t *st, uint64_t pack_id) {
     if (!st || !st->removed_cb) return;
     st->removed_cb(st->removed_user, pack_id);
+}
+
+status_t store_set_cdc(store_t *st, const cdc_params_t *p)
+{
+    if (!st || !p) return set_error(ERR_INVALID, "store_set_cdc: null argument");
+    if (!st->cdc && !(st->cdc = malloc(sizeof(*st->cdc))))
+        return set_error(ERR_NOMEM, "store_set_cdc");
+    *st->cdc = *p;
+    return OK;
+}
+
+/*
+ * A bare store (tests, benchmarks, a replica read without its marker) has no
+ * parameters set and chunks with the unkeyed format defaults. An encrypted
+ * one never does: its boundaries come from its key, and guessing them would
+ * cut every file differently from how its chunks were cut. Its write paths
+ * refuse without a key anyway; this makes the reason explicit.
+ */
+static cdc_params_t   g_cdc_defaults;
+static pthread_once_t g_cdc_once = PTHREAD_ONCE_INIT;
+
+static void store_cdc_init_defaults(void)
+{
+    cdc_params_default(&g_cdc_defaults);
+}
+
+const cdc_params_t *store_cdc(const store_t *st)
+{
+    if (!st) return NULL;
+    if (st->cdc) return st->cdc;
+    if (st->encrypted) return NULL;
+    pthread_once(&g_cdc_once, store_cdc_init_defaults);
+    return &g_cdc_defaults;
 }

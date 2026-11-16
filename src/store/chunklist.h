@@ -108,6 +108,20 @@ typedef struct {
  */
 obj_sink_t obj_sink_store(store_t *store);
 
+/*
+ * Where content to be chunked comes from, for anything that is not a file:
+ * its data spans in order (holes are what lies between them, and every span
+ * is chunked on its own, its end always a cut) and reads within them.
+ * next_span gives [*s, *e) with *got set, or *got 0 at the end. read fills
+ * exactly n bytes at off; calls arrive in increasing order within a span.
+ * cdc_store_fd (cdc.h) is this over SEEK_DATA spans and pread.
+ */
+typedef struct {
+    status_t (*next_span)(void *ctx, uint64_t *s, uint64_t *e, int *got);
+    status_t (*read)(void *ctx, uint8_t *buf, size_t n, uint64_t off);
+    void      *ctx;
+} cdc_source_t;
+
 /* ------------------------------------------------------------------ */
 /* Format                                                              */
 /* ------------------------------------------------------------------ */
@@ -285,5 +299,19 @@ status_t content_read_prefix(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE
  */
 typedef int (*content_visit_fn)(void *ctx, const uint8_t hash[OBJECT_HASH_SIZE],
                                 uint8_t type);
+
+/*
+ * File content as a chunker source (cdc.h's cdc_source_t), for re-chunking
+ * it into a repository that cuts differently. Spans are the maximal runs of
+ * contiguous leaves, so the gaps - the holes - are exactly the source's;
+ * reads load one leaf at a time, each hash-checked, in order. A FILE object
+ * is one span. *out_size gets the logical length; close frees everything.
+ */
+typedef struct content_src content_src_t;
+status_t content_source_open(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
+                             content_src_t **out, uint64_t *out_size);
+/* The chunker interface over it; valid until close. */
+cdc_source_t content_source_iface(content_src_t *cs);
+void         content_source_close(content_src_t *cs);
 status_t content_collect(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE],
                          uint8_t leaf_type, content_visit_fn visit, void *ctx);

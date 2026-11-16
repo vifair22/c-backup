@@ -29,8 +29,14 @@
  * docs/repo-format.md. */
 #define OBJECT_TYPE_CHUNKLIST 6
 
+/* The largest payload any object may have in format 3. Owned here per the
+ * v3 interface contract; v3-core defines the same value. */
+#ifndef OBJECT_MAX_BYTES
+#define OBJECT_MAX_BYTES ((uint64_t)16 * 1024 * 1024)
+#endif
+
 /*
- * Every object header reader refuses a type outside 1-5 (OWN-39). A reader
+ * Every object header reader refuses a type outside 1-6 (OWN-39). A reader
  * that passed the byte through let restore treat any non-sparse object as
  * raw file bytes, so a type this build does not know would have been
  * written out as a file's content. A new type is a format change, and an
@@ -38,7 +44,7 @@
  */
 static inline int object_type_known(unsigned type)
 {
-    return type >= OBJECT_TYPE_FILE && type <= OBJECT_TYPE_TREE;
+    return type >= OBJECT_TYPE_FILE && type <= OBJECT_TYPE_CHUNKLIST;
 }
 #define OBJECT_TYPE_UNKNOWN_FMT \
     "object type %u is not known to this build; written by a newer c-backup?"

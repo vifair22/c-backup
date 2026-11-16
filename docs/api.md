@@ -311,8 +311,11 @@ bits included: `33188` is `0100644`, a regular file with `rw-r--r--`, and
 
 The same codes are `type` in search results. Object `type` (in `stats`,
 `objects` and an object's locate, layout and content) is a different set:
-1 file content, 2 extended attributes, 3 ACL, 4 sparse file, 5 manifest
-tree.
+1 file content (a whole small file, or one chunk of a large one), 2 extended
+attributes, 3 ACL, 5 manifest tree (a directory, or one fragment of a large
+one), 6 chunk list (a large or sparse file's chunks, or a large directory's
+fragments; see docs/repo-format.md). 4, the format 2 sparse file, is
+retired.
 
 Search goes through an FTS5 trigram index. A B-tree cannot serve
 `LIKE '%needle%'`, and scanning the node table loses to the pre-rewrite
@@ -962,7 +965,10 @@ rather than a lookup structure.
 
 `/content` is capped deliberately. It feeds a preview pane, and a viewer that
 tries to render a multi-gigabyte object helps nobody; restore is how you get a
-whole file.
+whole file. For a chunk list (type 6) it returns the start of the file the
+list describes rather than the list's own bytes, holes as zeroes:
+`{"type":6,"chunklist":true,"size":<logical size>,"returned":<bytes>,
+"truncated":<bool>,"base64":"..."}`.
 
 `/diff` walks manifest trees rather than comparing node lists. Two directories
 with the same hash have identical contents by construction, so an unchanged

@@ -3,6 +3,7 @@
 
 #include "grep.h"
 
+#include "chunklist.h"
 #include "object.h"
 
 #include <cutils/log.h>
@@ -370,6 +371,25 @@ static void *stream_worker(void *a)
     return NULL;
 }
 
+/* content_stream's consumer: scan, and stop the walk (with ERR_BUSY, which
+ * the caller translates) on a cancel or once the file needs no more. */
+typedef struct {
+    grep_ctx_t *g;
+    char       *carry;
+    size_t     *carry_len;
+    int         stopped;    /* 1 = file done, 2 = cancelled */
+} scan_emit_t;
+
+static status_t scan_emit(void *ctx, const void *data, size_t len)
+{
+    scan_emit_t *se = ctx;
+    if (cancel_requested(se->g->cancel)) { se->stopped = 2; return ERR_BUSY; }
+    scan_buffer(se->g, data, len, se->carry, se->carry_len);
+    se->g->res->bytes_scanned += len;
+    if (se->g->file_done) { se->stopped = 1; return ERR_BUSY; }
+    return OK;
+}
+
 /*
  * Search one object. Returns 1 if the file matched at least once.
  *
@@ -402,12 +422,28 @@ static int scan_object(grep_ctx_t *g, store_t *store,
     char     why[ERR_MSG_MAX] = "";
     int      cancelled = 0;
 
-    if (size <= GREP_INMEM_MAX) {
+    /* Content over one object's bound is a chunk list in format 3; asking
+     * first keeps a list's own bytes out of the streaming path below. */
+    int is_list = 0;
+    if (size > GREP_INMEM_MAX) {
+        uint64_t osz = 0;
+        err_clear();
+        if (object_get_info(store, hash, &osz, &type) == OK &&
+            type == OBJECT_TYPE_CHUNKLIST)
+            is_list = 1;
+        err_clear();
+    }
+
+    if (!is_list && size <= GREP_INMEM_MAX) {
         void  *data = NULL;
         size_t len  = 0;
         err_clear();
         lst = object_load(store, hash, &data, &len, &type);
-        if (lst == OK) {
+        if (lst == OK && type == OBJECT_TYPE_CHUNKLIST) {
+            /* A small sparse or multi-chunk file: what came back is the
+             * list, not the content. Nothing was scanned yet. */
+            is_list = 1;
+        } else if (lst == OK) {
             scan_buffer(g, data, len, carry, &carry_len);
             g->res->bytes_scanned += len;
         } else {
@@ -415,7 +451,24 @@ static int scan_object(grep_ctx_t *g, store_t *store,
             err_clear();
         }
         free(data);
-    } else {
+    }
+
+    if (is_list) {
+        /*
+         * Chunk by chunk, each one hash-checked before it is handed over,
+         * so every byte matched here is verified and the walk can stop as
+         * soon as nothing more is worth scanning. A chunk that fails later
+         * still discards the file's held matches below.
+         */
+        scan_emit_t se = { g, carry, &carry_len, 0 };
+        err_clear();
+        lst = content_stream(store, hash, scan_emit, &se, NULL);
+        if (lst == ERR_BUSY && se.stopped == 2) { cancelled = 1; lst = OK; }
+        else if (lst == ERR_BUSY && se.stopped == 1) lst = OK;
+        if (lst != OK) { snprintf(why, sizeof(why), "%s", err_msg()); err_clear(); }
+        /* Every chunk was verified as file content. */
+        type = OBJECT_TYPE_FILE;
+    } else if (size > GREP_INMEM_MAX) {
         /*
          * Larger than memory is allowed, so the payload arrives through a
          * pipe rather than a buffer. The same shape sparse restore uses.

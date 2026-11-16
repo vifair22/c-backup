@@ -11,6 +11,7 @@
  */
 
 #include "error.h"
+#include "cdc.h"
 #include "repo_key.h"
 #include "store.h"
 #include <cutils/db.h>
@@ -38,7 +39,21 @@ typedef struct {
      * the key, kept in the repository so an offsite copy is self-sufficient. */
     repo_kdf_params_t kdf;
     char              wrapped[REPO_KEY_WRAPPED_HEX];
+
+    /* Content-defined chunking constants (format 3, src/store/cdc.h), fixed
+     * at creation like the encryption. Written as the marker's "chunker"
+     * object, whose "keyed" is true exactly when the repository is
+     * encrypted. A writer handed zeroes records the format defaults. */
+    uint32_t          cdc_min, cdc_avg, cdc_max;
 } repo_marker_t;
+
+/*
+ * The chunking parameters a repository's marker and key imply: its constants,
+ * and the gear table keyed from key when the repository is encrypted (key
+ * may be NULL only for an unencrypted one).
+ */
+status_t repo_marker_cdc(const repo_marker_t *m, const repo_key_t *key,
+                         cdc_params_t *out);
 
 /*
  * What the caller wants when creating a repository. Existing callers that do

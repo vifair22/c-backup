@@ -101,6 +101,17 @@ int  store_needs_key(const store_t *st);
 /* NULL when the repository is not encrypted. */
 const struct repo_key *store_key(const store_t *st);
 
+/*
+ * Chunking parameters (format 3, cdc.h): the repository's constants and its
+ * gear table, keyed from its key when it is encrypted. repo_store_open sets
+ * them from the marker; the store copies them. store_cdc returns them, or
+ * the unkeyed format defaults for a bare unencrypted store, or NULL for an
+ * encrypted store whose key was not loaded (nothing may be written there).
+ */
+struct cdc_params;
+status_t store_set_cdc(store_t *st, const struct cdc_params *p);
+const struct cdc_params *store_cdc(const store_t *st);
+
 /* ---------- cancellation ---------- */
 
 /*

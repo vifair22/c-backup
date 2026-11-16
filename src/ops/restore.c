@@ -5,6 +5,7 @@
 #include "metablob.h"
 
 #include "object.h"
+#include "chunklist.h"
 #include "sparse_restore.h"
 #include "util.h"
 
@@ -641,11 +642,19 @@ static status_t restore_file(store_t *store, const char *chash, const char *full
 
     uint64_t sz = 0;
     uint8_t  otype = 0;
-    status_t st = object_load_stream(store, hash, fd, &sz, &otype);
-    /* The type is checked against what a file can be: an object of any
-     * other type is not file content, whatever its bytes say (OWN-39). */
-    if (st == OK && otype != OBJECT_TYPE_FILE && otype != OBJECT_TYPE_SPARSE)
-        st = set_error(ERR_CORRUPT, "object is of type %u, not file content", otype);
+    status_t st = object_get_info(store, hash, &sz, &otype);
+    if (st == OK && otype == OBJECT_TYPE_SPARSE) {
+        st = object_load_stream(store, hash, fd, &sz, &otype);
+    } else if (st == OK) {
+        /*
+         * One FILE object or a chunk list (format 3). Leaves go in at their
+         * offsets, each hash-checked before a byte of it is written, and the
+         * file is extended to its length, so holes stay holes. Any other
+         * type is refused there: it is not file content, whatever its bytes
+         * say (OWN-39).
+         */
+        st = content_restore_fd(store, hash, fd, &sz);
+    }
 
     if (st == OK && otype == OBJECT_TYPE_SPARSE) {
         /*

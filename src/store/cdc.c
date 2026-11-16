@@ -600,7 +600,8 @@ static status_t read_full_at(int fd, uint8_t *buf, size_t n, uint64_t off)
  * and copying each chunk out cost every byte two extra copies, which
  * capped one file at about 1.8 GB/s however many workers hashed.
  */
-static status_t chunk_span(drv_t *d, int fd, uint64_t s, uint64_t e,
+static status_t chunk_span(drv_t *d, const cdc_source_t *src,
+                           uint64_t s, uint64_t e,
                            uint8_t **cur, uint8_t **spare)
 {
     const size_t max = d->p->max_size;
@@ -621,7 +622,7 @@ static status_t chunk_span(drv_t *d, int fd, uint64_t s, uint64_t e,
             size_t n = max - blen;
             if (n > CDC_READ_STEP) n = CDC_READ_STEP;
             if ((uint64_t)n > e - pos) n = (size_t)(e - pos);
-            status_t st = read_full_at(fd, *cur + blen, n, pos);
+            status_t st = src->read(src->ctx, *cur + blen, n, pos);
             if (st != OK) return st;
             blen += n;
             pos += n;
@@ -650,12 +651,41 @@ static status_t chunk_span(drv_t *d, int fd, uint64_t s, uint64_t e,
     return OK;
 }
 
+/* The file source: SEEK_DATA spans and pread. */
+typedef struct {
+    spans_t sp;
+    int     fd;
+} fd_src_t;
+
+static status_t fd_next_span(void *ctx, uint64_t *s, uint64_t *e, int *got)
+{
+    return next_span(&((fd_src_t *)ctx)->sp, s, e, got);
+}
+
+static status_t fd_read(void *ctx, uint8_t *buf, size_t n, uint64_t off)
+{
+    return read_full_at(((fd_src_t *)ctx)->fd, buf, n, off);
+}
+
 status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
                       const obj_sink_t *sink, const cdc_opts_t *opts,
                       cdc_result_t *out)
 {
-    if (!p || !sink || !sink->put || !out)
-        return set_error(ERR_INVALID, "cdc_store_fd: bad arguments");
+    fd_src_t f;
+    memset(&f, 0, sizeof(f));
+    f.fd = fd;
+    f.sp.fd = fd;
+    f.sp.size = size;
+    cdc_source_t src = { .next_span = fd_next_span, .read = fd_read, .ctx = &f };
+    return cdc_store_source(p, &src, size, sink, opts, out);
+}
+
+status_t cdc_store_source(const cdc_params_t *p, const cdc_source_t *src,
+                          uint64_t size, const obj_sink_t *sink,
+                          const cdc_opts_t *opts, cdc_result_t *out)
+{
+    if (!p || !src || !src->next_span || !src->read || !sink || !sink->put || !out)
+        return set_error(ERR_INVALID, "cdc_store_source: bad arguments");
     memset(out, 0, sizeof(*out));
 
     if (size == 0) {
@@ -684,7 +714,6 @@ status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
 
     uint8_t *cur = NULL, *spare = NULL;
 
-    spans_t sp = { .fd = fd, .size = size };
     uint64_t covered = 0;
     unsigned nspans = 0;
     int whole = 1;          /* one span covering [0, size) */
@@ -692,11 +721,17 @@ status_t cdc_store_fd(const cdc_params_t *p, int fd, uint64_t size,
     for (;;) {
         uint64_t s = 0, e = 0;
         int got = 0;
-        st = next_span(&sp, &s, &e, &got);
+        st = src->next_span(src->ctx, &s, &e, &got);
         if (st != OK || !got) break;
+        if (e <= s || e > size) {
+            st = set_error(ERR_INVALID, "cdc: span [%llu, %llu) outside %llu bytes",
+                           (unsigned long long)s, (unsigned long long)e,
+                           (unsigned long long)size);
+            break;
+        }
         if (nspans++ > 0 || s != 0) whole = 0;
         covered += e - s;
-        st = chunk_span(&d, fd, s, e, &cur, &spare);
+        st = chunk_span(&d, src, s, e, &cur, &spare);
         if (st != OK) break;
     }
     if (covered != size) whole = 0;

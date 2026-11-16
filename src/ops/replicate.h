@@ -179,6 +179,35 @@ typedef struct {
      * snapshot is already durable, so anything still staged here is an
      * optimisation for the next run at most. */
     void (*close)(void *ctx);
+
+    /*
+     * RE-CHUNKING (format 3). Optional: a sink that leaves these NULL only
+     * ever receives objects as stored.
+     *
+     * Chunk boundaries are a function of the repository's chunker constants
+     * and of its key (the gear table is keyed, cdc.h). A target whose
+     * parameters differ from the source's - another key, encrypted from
+     * plain or plain from encrypted, other constants - would hold the
+     * source's chunks cut where its own backups never cut, so its future
+     * backups would deduplicate against none of them, and its lists and
+     * trees would name objects its own chunker cannot produce. So for such
+     * a target file content is reassembled from the source and chunked
+     * again with the target's parameters, and every tree above it is
+     * rebuilt; the snapshot's root at the target is therefore a different
+     * hash from the source's.
+     *
+     * target_cdc: the target's parameters, compared with the source's to
+     * decide which mode a run is in. put_plain: store one plaintext object
+     * the target names and seals itself (compress, encrypt, parity), the
+     * "put (type, bytes) -> name" contract. has_snapshot_at: a re-chunked
+     * snapshot's target root cannot be known without rebuilding it, so a
+     * run asks by id and timestamp instead.
+     */
+    const struct cdc_params *(*target_cdc)(void *ctx);
+    status_t (*put_plain)(void *ctx, uint8_t type, const void *data, size_t len,
+                          uint8_t out_hash[OBJECT_HASH_SIZE], int *out_is_new);
+    status_t (*has_snapshot_at)(void *ctx, int64_t snapshot_id, int64_t ts,
+                                int *out_present);
 } replica_sink_vtbl_t;
 
 typedef struct {
@@ -209,6 +238,16 @@ typedef struct {
     uint64_t objects_sent;
     uint64_t bytes_sent;          /* stored bytes, so what crossed the link */
     uint64_t subtrees_skipped;    /* trees present, and everything beneath */
+
+    /* Re-chunking runs (see the vtable): files reassembled and cut again,
+     * trees rebuilt, and objects that turned out to be new at the target. */
+    int      rechunked;
+    uint64_t files_rechunked;
+    uint64_t trees_rebuilt;
+    uint64_t objects_written;
+    /* The root the target holds for the last tree transferred: the
+     * source's in a copying run, the rebuilt one in a re-chunking run. */
+    uint8_t  target_root[OBJECT_HASH_SIZE];
 
     /*
      * Objects sent damaged beyond parity (OWN-31). The run ships them and

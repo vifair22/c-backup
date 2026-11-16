@@ -33,8 +33,9 @@
 #include "chunklist.h"
 #include "object.h"
 #include "store.h"
+#include "test_tmp.h"
 
-#define TEST_ROOT "/tmp/c_backup_test_cdc"
+#define TEST_ROOT TEST_TMP "/c_backup_test_cdc"
 #define REPO      TEST_ROOT "/repo"
 #define SRC       TEST_ROOT "/src"
 #define DST       TEST_ROOT "/dst"
@@ -55,7 +56,7 @@ static int setup(void **state)
 {
     (void)state;
     rmrf(TEST_ROOT);
-    mkdir(TEST_ROOT, 0755);
+    { int rc = system("mkdir -p '" TEST_ROOT "'"); (void)rc; }
     if (store_init_dirs(REPO) != OK) return -1;
     if (store_open(REPO, NULL, &store) != OK) return -1;
     cdc_params_default(&P);
@@ -618,7 +619,7 @@ static void test_iter_rejects_noncanonical_child(void **state)
                            .count = 1, .total_len = 15 };
     uint8_t buf[CHUNKLIST_HDR_BYTES + CHUNKLIST_ENTRY_BYTES];
     size_t n = chunklist_serialise(&ch, child, buf);
-    uint8_t ch_hash[OBJECT_HASH_SIZE];
+    uint8_t ch_hash[OBJECT_HASH_SIZE] = { 0 };
     assert_int_equal(object_store(store, OBJECT_TYPE_CHUNKLIST, buf, n, ch_hash), OK);
 
     chunklist_entry_t top[1];
