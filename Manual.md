@@ -97,7 +97,8 @@ A repository is a directory that describes itself: objects, packs, manifest
 trees and snapshot records. The daemon's database (`state.db`) is an index
 over it, built for fast browsing and search. Lose the database and
 `c-backup reindex` rebuilds it from the repository. What a database loss
-costs is daemon-only state - schedules, sessions, job history, the journal -
+costs is daemon-only state, listed exactly in section 17.5 - schedules,
+sources, retention policy, notes, the journal, job history, sessions -
 never backups. Section 17 covers recovery.
 
 ### 1.3 Design constraints
@@ -219,7 +220,9 @@ and in the journal as "cancelled before it started".
 A daemon that dies without stopping (a crash, `kill -9`, `docker kill`, power
 loss) marks whatever was running as `failed: interrupted by daemon restart` on
 its next start, and journals each such job then, since the killed process
-could not. Either way the repository is consistent: a backup's partial pack
+could not. A power cut can also cost the database about its last second of
+edits; the next start puts back any snapshot that went with them on its own
+(section 17.5). Either way the repository is consistent: a backup's partial pack
 and the index rows staged into it are discarded, and the next backup stores
 those files again. Staging files a killed writer left in the repository's
 `tmp/` are removed by the next backup or gc, which hold the repository's write
@@ -347,6 +350,9 @@ are different: they live in the database and change through the policy API
 | Key | Default | Meaning |
 |---|---|---|
 | `db.path` | none, required | The daemon database. The shipped config sets `/var/lib/c-backupd/state.db`; a file without it stops the daemon |
+| `db.synchronous` | `normal` | When a database commit reaches the disk. `normal`: the database's log is synced once a second, so a power cut can lose about the last second of edits to it (section 17.5); `full`: every commit is synced before it returns, as SQLite does by default, at a large cost on many small files (section 18.2). `normal` or `full` |
+| `db.cache_mb` | `64` | MiB of page cache for the database. 2 to 65536 |
+| `db.wal_autocheckpoint` | `16384` | Database pages (4 KiB) written to its log between checkpoints, each of which costs two syncs. 1000 to 1048576 |
 | `http.socket` | `/run/c-backupd/c-backupd.sock` | Unix socket for the CLI and local clients. Must fit in 107 bytes |
 | `http.port` | `8765` | TCP port for remote clients, 0 to 65535. `0` disables TCP |
 | `http.bind` | `127.0.0.1` | TCP bind address, an IPv4 address (not a hostname). `0.0.0.0` for every interface |
@@ -929,13 +935,17 @@ known to this build; written by a newer c-backup?", and a file entry whose
 object is not file content (a directory tree, say) fails rather than being
 written out as bytes.
 
-Verified files are made durable in batches - up to 512 files or 256 MiB,
+Verified files are made durable in batches - up to 4,096 files or 1 GiB,
 one `syncfs` on the destination filesystem - and only then renamed, so a
 power failure cannot leave a right-named file whose data never reached
-the disk. Syncing each file on its own ran at 175 files/s on btrfs; the
-batch measured 6,200 files/s for 10,000 small files where the old restore,
-which synced nothing, measured 13,600 (PERF.md). `syncfs` also flushes
-whatever else is dirty on that filesystem, once per batch.
+the disk. Syncing each file on its own ran at 175 files/s on btrfs. A
+`syncfs` costs much the same however much it flushes, so the batch is
+large: 100,000 small files restore in 10.4 s on btrfs over NVMe, where
+batches of 512 files took 12.4 s and spent 9 s of it in 196 calls to
+`syncfs` (PERF.md). `syncfs` also flushes whatever else is dirty
+on that filesystem, once per batch, and a crash redoes at most one batch:
+its files are still under temporary names, which the next restore sweeps
+and writes again.
 
 ---
 
@@ -1785,6 +1795,65 @@ exists). Move it aside, start the daemon, register each repository again
 tags and the snapshot-id mark come back from the repositories; schedules,
 notes, job history and sessions do not.
 
+### 17.5 A power cut
+
+The repository is written so that a power cut cannot damage it: every file
+in it is written to a temporary name, synced and renamed, and a backup's
+snapshot record is the last thing it writes there. Nothing in this section
+affects repository data.
+
+`state.db` is a SQLite database in WAL mode with `db.synchronous: normal`
+(section 3). A commit is written to the database's log at once and synced
+with the next once-a-second flush; a checkpoint, or a clean stop, syncs it
+too. A power cut can therefore lose about the last second of edits to the
+database, and never corrupts it. `db.synchronous: full` syncs every commit
+instead, so nothing acknowledged is lost, at the cost section 18.2
+measures.
+
+What that second can cost depends on what lives where:
+
+| In the repository (survives; a reindex rebuilds the index from it) | Only in `state.db` (the last second of edits can be lost) |
+|---|---|
+| Objects, packs, manifest trees | Registered repositories: path, label, key escrow flag |
+| Snapshot records | Schedules |
+| The snapshot-id mark (`snapshot-ids`) | Sources and excludes (`sources`) |
+| The tag list (`tags`) | Retention policy (`policy`) |
+| | Snapshot notes |
+| | The journal, and job history |
+| | The admin password, API tokens and sessions |
+| | Verify and search run records |
+| | The file cache (the next backup reads those files again) |
+| | Resumable retention state, and pending repository removals |
+| | The daemon's own log lines (30 days) and queued push notifications |
+
+The index itself - snapshots, browse and search rows, the object and pack
+tables - is in `state.db` too, and a backup's index rows are its last
+commits, so they are what a power cut takes. **The daemon puts them back on
+its own.** At every start it compares, for each registered repository, the
+highest snapshot id in the index with the repository's snapshot-id mark,
+and looks for snapshot records above the index's highest one; this costs a
+query and a small file read per repository when nothing is missing. For a
+repository with missing snapshots it logs a warning naming the repository
+and the count:
+
+```
+reconcile: repo 1 (/srv/backup/main) has 1 snapshot(s) missing from the index, most likely lost with the last moments before a power cut or crash; reindexing it as job 41
+```
+
+and queues a reindex job, which runs like any other: under the repository's
+lock, in `c-backup jobs` with origin `startup`, and in the journal with
+source `startup`. Until it finishes the missing snapshots are not listed;
+backups queued for that repository wait for it. An encrypted repository
+whose key is not on the host cannot be reindexed; its warning says to load
+the key and run `c-backup reindex <id>`. A repository that cannot be read
+at start (an unmounted disk) is skipped with a warning and checked again at
+the next start.
+
+A tag set in the last second before a power cut is already in the
+repository's tag list, and comes back with the next reindex; if no reindex
+runs, set it again. Any other edit from that second (a schedule, a note, a
+policy value) is simply not there after the restart: make it again.
+
 ---
 
 ## 18. Capacity planning and performance
@@ -1828,6 +1897,15 @@ small and random. **Put `state.db` on the fastest storage available, never on
 a parity-protected array.** Measured on the same 60,875 files, with only the
 index moving: 3.35 ms/file on an Unraid array disk against 1.05 ms/file on
 the SSD cache, a 3.2x difference for byte-identical repositories.
+
+The daemon's own settings for it matter as much. On 100,000 small files
+on NVMe, SQLite's defaults (a sync on every commit, a 2 MB page cache, a
+checkpoint every 4 MB) made a first backup take 12.5 s and write 1.49 GB for
+390 MB of files. With the shipped `db.synchronous: normal`, `db.cache_mb: 64`
+and `db.wal_autocheckpoint: 16384` it takes 8.5 s and writes 1.07 GB, and
+an unchanged backup takes 3.4 s instead of 5.3 s (PERF.md; about 0.4 s of
+the first backup's saving is a compression change in the same release). Section 17.5
+says what `normal` trades for that.
 
 That 3.2x was the index, not the repository. A repository is written in
 large sequential pieces and is far less sensitive, and where it is fastest

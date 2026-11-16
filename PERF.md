@@ -6,6 +6,75 @@ Tracking benchmark results across commits to catch regressions and measure optim
 
 ---
 
+## 2026-11-16 - Many small files: state.db settings, restore batches, one LZ4 pass
+
+Three of the proposals in the profile below, built (`perf/many-small-fixes`):
+
+- **state.db settings** (src/common/state_db.c): `synchronous=NORMAL`,
+  `cache_size` 64 MiB and `wal_autocheckpoint` 16,384 pages on the daemon's
+  handle, read back after setting, and config keys `db.synchronous`,
+  `db.cache_mb` and `db.wal_autocheckpoint`. A thread syncs the WAL once a
+  second when it has changed, so NORMAL loses at most about a second of
+  edits on a power cut rather than the kernel's 30-second writeback; at
+  every start the daemon reindexes, as a job, any repository whose index
+  lost snapshots the repository holds (src/meta/index_reconcile.c, Manual
+  17.5). bench_phases now opens state.db the way the daemon does, flusher
+  included; earlier entries ran on SQLite's defaults.
+- **Restore** syncs every 4,096 files or 1 GiB (was 512 / 256 MiB), and
+  `make_parents` skips a file whose parent it made last (per restore).
+- **One LZ4 pass** for an object no larger than the 64 KiB probe: the
+  probe's output is the result.
+
+The statement cache (proposal 1) is not in this: it is going into c-utils
+1.7.0 separately, and these numbers are against c-utils 1.6.0.
+
+`bench_phases -n 100000 -l 0 -t 0`, before = `feat/v3-cdc` 4269bc1 plus the
+profiling tools, after = this branch, both linked against c-utils 1.6.0.
+Three interleaved rounds, medians, range in brackets; NVMe is `~/.cache`
+(btrfs on LVM on LUKS, shared), tmpfs `/dev/shm`, page cache warm, bench.slice
+at nice 19.
+
+| | NVMe first | NVMe incr | NVMe restore | tmpfs first | tmpfs incr | tmpfs restore |
+|---|---:|---:|---:|---:|---:|---:|
+| Before | 12.46 [12.23-12.51] | 5.33 [5.32-5.63] | 12.41 [12.14-13.60] | 8.12 [8.10-8.29] | 2.96 [2.93-2.98] | 5.80 [5.71-6.05] |
+| After | 8.51 [8.41-9.81] | 3.37 [3.33-3.47] | 10.39 [10.16-11.09] | 7.27 [7.24-7.54] | 2.80 [2.74-2.87] | 5.53 [5.51-5.53] |
+| Change | -32% | -37% | -16% | -10% | -5% | -5% |
+
+/proc/self/io write_bytes on NVMe: first backup 1,485 to 1,071 MiB (3.80x
+to 2.74x content), incremental 875 to 520 MiB (2.24x to 1.33x).
+
+### From the shim (`prof_shim.so`, one NVMe run each)
+
+| | Before | After |
+|---|---:|---:|
+| First backup: fdatasync | 356 (2.74 s) | 31 (0.61 s) |
+| First backup: COMMIT and BEGIN (`sqlite3_exec`) | 2.90 s | 1.03 s |
+| First backup: state.db pread / pwrite | 729k / 784k | 139k / 303k |
+| Incremental: fdatasync | 206 (1.88 s) | 22 (0.44 s) |
+| Incremental: state.db pread / pwrite | 513k / 444k | 40k / 234k |
+| Restore: syncfs | 196 (9.16 s) | 25 (3.55 s) |
+| Restore: mkdir | 1,414,071 (0.49 s) | 15,084 (0.01 s) |
+| First backup: LZ4 samples (self) | 706 ms | 325 ms |
+
+A syncfs costs more when it flushes more (142 ms a call against 47 ms), but
+far less in total. The fdatasyncs that remain are checkpoints, the flusher's
+once-a-second sync, and the pack and snapshot record syncs. The flusher's
+cost is in the numbers: it runs in the benchmark as in the daemon.
+
+The profiled runs' totals (13.7 / 6.0 / 17.9 s before, 10.5 / 3.8 / 11.4 s
+after) are above the matrix because the shim times every call and samples
+the stack; their proportions are what the table uses.
+
+### Where a first backup goes now (NVMe, median run, phase timers)
+
+read+hash+write 2.56 s, pack-seal 1.20, index-nodes 1.18, index-put 1.09,
+txn-commit 0.84, cache-put 0.72, cache-lookup 0.48, scan 0.26. The
+incremental: index-nodes 1.23 s, cache-lookup 0.96, txn-commit 0.76, scan
+0.24. Most of what is left is statement preparation (806,267 prepares in a
+first backup, 3.6 s under the shim), which is the c-utils statement cache's
+to remove; the profile entry's prototype of both together measured 4.9 s
+first and 2.3 s incremental on NVMe.
+
 ## 2026-11-16 - Where a many-small-files backup goes (format 3, profile)
 
 The many-small preset barely moved between 1.0.0 and format 3 (NVMe 21.7 s

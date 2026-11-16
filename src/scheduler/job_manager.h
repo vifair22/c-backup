@@ -67,6 +67,16 @@ status_t job_submit_scheduled(job_manager_t *jm, int64_t repo_id, const char *ac
                               int64_t *out_job_id);
 
 /*
+ * job_submit for a job the daemon queued itself while starting: the reindex
+ * of a repository whose newest snapshots the index lost (index_reconcile.h).
+ * The job row says origin "startup" and the journal entry's source is
+ * "startup", so nobody mistakes it for something an operator ran.
+ */
+status_t job_submit_startup(job_manager_t *jm, int64_t repo_id, const char *action,
+                            const char *params_json, job_fn fn, void *arg,
+                            void (*arg_free)(void *), int64_t *out_job_id);
+
+/*
  * What a job reports beyond its phase and item count, through the progress
  * context the job function was given. Both are optional: a job that never
  * calls them has no bytes and no result. NULL is ignored.

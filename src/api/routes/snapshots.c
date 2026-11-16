@@ -2143,6 +2143,21 @@ status_t routes_submit_scheduled(job_manager_t *jm, int64_t repo_id,
                                 out_job_id);
 }
 
+status_t routes_submit_startup_reindex(job_manager_t *jm, int64_t repo_id,
+                                       int64_t *out_job_id)
+{
+    char *repo_path = repo_path_for(g_ctx.db, repo_id);
+    if (!repo_path) return set_error(ERR_NOT_FOUND, "no such repo");
+    snap_job_t *j = calloc(1, sizeof(*j));
+    if (!j) { free(repo_path); return set_error(ERR_NOMEM, "startup reindex: alloc"); }
+    j->db = g_ctx.db;
+    j->repo_id = repo_id;
+    j->repo_path = repo_path;
+    j->kind = SNAP_JOB_REINDEX;
+    return job_submit_startup(jm ? jm : g_ctx.jm, repo_id, "reindex", NULL,
+                              snap_job_run, j, snap_job_free, out_job_id);
+}
+
 void routes_snapshots_init(cutils_db_t *db, job_manager_t *jm)
 {
     g_ctx.db = db;

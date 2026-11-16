@@ -1521,6 +1521,62 @@ contains "a quoted label backs up" '"state":"completed"' \
     "$(cb backup 1 "$WORK/src" --label 'say "hi" C:\dir')"
 contains "and is listed as given" '"label":"say \"hi\" C:\\dir"' "$(cb snapshots 1)"
 
+echo "start-up reconcile"
+# state.db runs synchronous=NORMAL, so a power cut can lose its newest
+# commits; a backup's are its last, after the snapshot-id mark and the record
+# are durable in the repository. That lost tail is made here by hand - the
+# newest snapshot's rows deleted from a stopped daemon's database - and the
+# next start has to put it back with no operator action: a reindex job of
+# origin "startup", a WARN naming the repository and the count.
+contains "the default state.db settings are applied" \
+    "state database: synchronous=normal, cache 64 MiB, checkpoint every 16384 pages" \
+    "$(cat "$WORK/daemon.log")"
+contains "a start with nothing lost says the index is complete" "index complete" \
+    "$(cat "$WORK/daemon.log")"
+contains "a backup to lose" '"state":"completed"' "$(cb backup 1 "$WORK/src" --label tail)"
+LOST=$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)
+kill -TERM "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$WORK/state.db" "DELETE FROM nodes WHERE repo_id = 1 AND snap_id = $LOST;
+        DELETE FROM snapshots WHERE repo_id = 1 AND id = $LOST;
+        UPDATE snapshot_id_seq SET last_id = $LOST - 1 WHERE repo_id = 1;"
+    check "the lost snapshot is gone from the index" "0" \
+        "$(sqlite3 "$WORK/state.db" "SELECT COUNT(*) FROM snapshots WHERE repo_id = 1 AND id = $LOST")"
+    # The restart also changes every state.db setting, to show each one is
+    # read from the file and applied (the line is logged after reading back).
+    sed -i 's|^  path: \(.*state.db\)$|  path: \1\n  synchronous: full\n  cache_mb: 8\n  wal_autocheckpoint: 2000|' \
+        "$WORK/config.yaml"
+    : > "$WORK/daemon.log"
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    contains "the configured state.db settings are applied" \
+        "state database: synchronous=full, cache 8 MiB, checkpoint every 2000 pages" \
+        "$(cat "$WORK/daemon.log")"
+    contains "the start names the repository and the count" \
+        "reconcile: repo 1 ($WORK/repo) has 1 snapshot(s) missing from the index" \
+        "$(cat "$WORK/daemon.log")"
+    STATE=""
+    for _ in $(seq 1 300); do
+        STATE=$(sqlite3 "$WORK/state.db" "SELECT state FROM jobs WHERE repo_id = 1
+            AND action = 'reindex' AND origin = 'startup' ORDER BY id DESC LIMIT 1")
+        [ "$STATE" = completed ] && break
+        sleep 0.1
+    done
+    check "the reindex is a startup job and completes" "completed" "$STATE"
+    contains "and its journal entry says startup" '"source":"startup"' "$(cb journal 1)"
+    contains "the lost snapshot is listed again" "\"id\":$LOST," "$(cb snapshots 1)"
+    contains "with its label" '"label":"tail"' "$(cb snapshots 1)"
+    contains "and the next backup numbers past it" '"state":"completed"' "$(cb backup 1 "$WORK/src")"
+    check "to the id after it" "$((LOST + 1))" \
+        "$(cb snapshots 1 | grep -o '"id":[0-9]*' | cut -d: -f2 | sort -n | tail -1)"
+else
+    C_BACKUP_CONFIG_PATH="$WORK/config.yaml" "$DAEMON" >> "$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    ok "start-up reconcile (skipped: no sqlite3)"
+fi
+
 echo "error handling"
 OUT=$(cb repo show 999 2>&1); RC=$?
 check    "unknown repo exits non-zero" 1 "$RC"
