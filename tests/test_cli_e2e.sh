@@ -17,16 +17,16 @@ TEST_ROOT="${C_BACKUP_TEST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/c-backup-test}"
 mkdir -p "$TEST_ROOT"
 WORK="$(mktemp -d "$TEST_ROOT/c_backup_cli_e2e.XXXXXX")"
 # Ports per run, so concurrent suites (CI jobs on one runner, parallel
-# worktrees) never reach each other's daemons.
-PORTBASE=$((20000 + ($$ % 15000) * 3))
-# Skip past ports something already holds: the base is derived from the pid,
-# and anything bound there (a listener, or an outgoing connection that drew
-# it from the ephemeral range) made the daemon exit with "cannot start API
-# server" about once in a few dozen runs.
-port_busy() { ss -Htan "( sport = :$1 )" 2>/dev/null | grep -q .; }
-while port_busy "$PORTBASE" || port_busy $((PORTBASE + 1)) || port_busy $((PORTBASE + 2)); do
-    PORTBASE=$((PORTBASE + 3)); [ "$PORTBASE" -gt 64990 ] && PORTBASE=20000
-done
+# worktrees) never reach each other's daemons: one for the main daemon, one
+# for the second daemon that adopts a replica, one for the bind test. They
+# came from the pid, skipping any `ss` showed busy, which still raced the
+# bind; the kernel chooses them now (FLAKE-13).
+. "$(dirname "$0")/free_port.sh"
+mapfile -t PORTS < <(free_ports 3 "$WORK")
+[ "${#PORTS[@]}" -eq 3 ] || { echo "cannot choose TCP ports"; exit 1; }
+MAIN_PORT=${PORTS[0]}
+PORT2=${PORTS[1]}
+BINDPORT=${PORTS[2]}
 SOCK="$WORK/c.sock"
 PASS=0
 FAIL=0
@@ -130,7 +130,7 @@ db:
   path: $WORK/state.db
 http:
   socket: $SOCK
-  port: $PORTBASE
+  port: $MAIN_PORT
   bind: 127.0.0.1
 log:
   level: info
@@ -166,7 +166,9 @@ contains "snapshots"     '"id":1,'             "$(cb snapshots 1)"
 contains "ls"            '"name"'              "$(cb ls 1 1)"
 contains "search"        'one.txt'             "$(cb search 1 txt)"
 # B074: these were silently replaced by the defaults.
-OUT=$(cb snapshots 1 --limit -1 2>&1); RC=$?
+# Written --limit=-1: spaced, a value starting with a dash is refused by the
+# CLI as a missing one (B127), and this checks what the daemon says.
+OUT=$(cb snapshots 1 --limit=-1 2>&1); RC=$?
 check    "snapshots --limit -1 fails" 1 "$RC"
 contains "and says why" "limit is out of range; it must be from 1 to" "$OUT"
 OUT=$(cb objects 1 --location nowhere 2>&1); RC=$?
@@ -324,7 +326,7 @@ contains "naming the source" "no-such-dir" "$OUT"
 # row nothing will finish holds the stream open for as long as the test
 # needs, so the assertion is on what arrived, not on a race with real work.
 if command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "INSERT INTO jobs (id, repo_id, action, state, started,
         progress_phase) VALUES (9999, 1, 'backup', 'running', strftime('%s','now'),
         'store')"
     "$CLI" --socket "$SOCK" jobs watch 9999 > "$WORK/watch.out" 2> "$WORK/watch.err" &
@@ -332,7 +334,7 @@ if command -v sqlite3 > /dev/null 2>&1; then
     sleep 1
     contains "jobs watch prints a running job at once" '"state":"running"' \
         "$(cat "$WORK/watch.out")"
-    sqlite3 "$WORK/state.db" "UPDATE jobs SET state = 'completed',
+    sqlite3 -cmd ".timeout 10000" "$WORK/state.db" "UPDATE jobs SET state = 'completed',
         ended = strftime('%s','now') WHERE id = 9999"
     for _ in $(seq 1 50); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.1; done
     if kill -0 "$WPID" 2>/dev/null; then
@@ -382,8 +384,9 @@ for _ in $(seq 1 100); do
     cb jobs "$BJ" | grep -Eq '"state":"(cancelled|completed)"' && break
     sleep 0.1
 done
+# tmp/.lock is the writers' claim on tmp/ (B133), not staging: it stays.
 check "a cancelled backup leaves no staging files" "" \
-    "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
+    "$(find "$WORK/repo/tmp" -type f ! -name .lock 2>/dev/null)"
 rm -f "$WORK"/big/big*.bin
 
 # A second snapshot so diff has two sides, and so snapshot delete has
@@ -672,6 +675,7 @@ check    "and creates nothing" 1 "$([ -e "$WORK/syspass" ]; echo $?)"
 
 # Removing a repository deregisters it and leaves its data where it was.
 RM_ID=$(cb repo add "$WORK/gone" gone | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+cb backup "$RM_ID" "$WORK/src" >/dev/null
 OUT=$(cb repo remove "$RM_ID"); RC=$?
 check    "repo remove" 0 "$RC"
 check    "repo remove prints what it removed" "{\"removed\":true,\"id\":$RM_ID}" "$OUT"
@@ -686,6 +690,29 @@ else
     bad "a removed repository's id is not reused" "greater than $RM_ID" "${NEXT_ID:-none}"
 fi
 cb repo remove "$NEXT_ID" >/dev/null 2>&1
+
+# NIT-16: registering a repository that already holds snapshots listed none,
+# and verify passed with "checked 0", until a manual reindex. Registration
+# now queues the reindex itself, as origin "register".
+OUT=$(cb repo add "$WORK/gone" back)
+contains "re-adding a repository with snapshots counts them" '"snapshots_unindexed":1' "$OUT"
+contains "and queues a reindex" '"reindex_job":' "$OUT"
+BACK_ID=$(printf '%s' "$OUT" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+RJ=$(printf '%s' "$OUT" | sed -n 's/.*"reindex_job":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    cb jobs "$RJ" | grep -q '"state":"completed"' && break
+    sleep 0.1
+done
+contains "the reindex completes" '"state":"completed"' "$(cb jobs "$RJ")"
+contains "and records who asked" '"origin":"register"' "$(cb jobs "$RJ")"
+contains "the snapshot is listed without a manual reindex" '"id":1,' "$(cb snapshots "$BACK_ID")"
+contains "the journal names the registration" '"source":"register"' "$(cb journal "$BACK_ID")"
+OUT=$(cb repo add "$WORK/gone" back)
+case "$OUT" in
+    *reindex_job*) bad "re-adding an indexed repository queues nothing" "no reindex_job" "$OUT" ;;
+    *) ok "re-adding an indexed repository queues nothing" ;;
+esac
+cb repo remove "$BACK_ID" >/dev/null 2>&1
 
 # Data written into an encrypted repository has to actually be encrypted.
 # Everything above this tests key management, which was all working while the
@@ -765,9 +792,15 @@ OUT=$(cb repo add "$WORK/passrepo" pass2 --passphrase 'correct horse' 2>&1); RC=
 check    "the right passphrase unlocks a registered repo" 0 "$RC"
 contains "and says it did" '"key_unlocked":true' "$OUT"
 check    "and caches the key" 0 "$([ -f "$WORK/keys/$PASS_UUID.key" ]; echo $?)"
-REINDEX_OUT=$(cb reindex "$PASS_ID")
-contains "the unlocked repo reindexes" '"completed"' "$REINDEX_OUT"
-contains "and the job says the tag came back" '"tags_restored":1' "$REINDEX_OUT"
+# NIT-16: with the key loaded, the registration reindexes it unasked.
+PRJ=$(printf '%s' "$OUT" | sed -n 's/.*"reindex_job":\([0-9]*\).*/\1/p')
+for _ in $(seq 1 100); do
+    cb jobs "$PRJ" | grep -q '"state":"completed"' && break
+    sleep 0.1
+done
+contains "the unlocked repo reindexes" '"completed"' "$(cb jobs "$PRJ")"
+contains "and the job says the tag came back" '"tags_restored":1' "$(cb jobs "$PRJ")"
+contains "a manual reindex still runs" '"completed"' "$(cb reindex "$PASS_ID")"
 contains "the tag survives losing its database rows" 'guard' "$(cb tag list "$PASS_ID")"
 contains "and lists its snapshot" '"id":1,' "$(cb snapshots "$PASS_ID")"
 # B047: a reindexed snapshot listed "size":"", which is null now that a
@@ -817,14 +850,27 @@ if [ -n "$LOSS_DAT" ]; then
     contains "its findings still print" '"status":"unrecoverable"' "$OUT"
     check    "and as one document"      "1" "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
 
-    # The index level never opens a pack, and reported a deleted one as ok.
-    rm -f "$LOSS_DAT"
-    OUT=$(cb verify "$LOSS_ID" --level index 2>/dev/null); RC=$?
-    check    "index verify of a deleted pack exits non-zero" 1 "$RC"
-    contains "a deleted pack's objects are missing" '"status":"missing"' "$OUT"
+    # Nothing in that pack survived, trailer included, so the repairing run
+    # salvaged it: every object checked against its own name, every one
+    # failing, each carried into a new pack and reported as lost. What is
+    # left is the true loss, not a pack nothing can walk.
+    contains "the pack was salvaged" '"status":"salvaged"' "$OUT"
+    if [ -e "$LOSS_DAT" ]; then bad "the salvaged pack is gone" "absent" "present"
+    else ok "the salvaged pack is gone"; fi
     case "$OUT" in
-        *'"missing":0,'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
-        *)                 ok  "index verify counts them missing" ;;
+        *'"status":"unwalkable pack"'*) bad "no unwalkable pack is left" "none" "$OUT" ;;
+        *)                              ok  "no unwalkable pack is left" ;;
+    esac
+    OUT=$(cb verify "$LOSS_ID" --level deep --dry-run 2>/dev/null); RC=$?
+    check    "a later check still exits non-zero" 1 "$RC"
+    contains "and names the loss" '"status":"unrecoverable"' "$OUT"
+    case "$OUT" in
+        *'"unrecoverable":0,'*) bad "it counts the objects lost" "unrecoverable > 0" "$OUT" ;;
+        *)                      ok  "it counts the objects lost" ;;
+    esac
+    case "$OUT" in
+        *'"status":"unwalkable pack"'*) bad "with no unwalkable pack" "none" "$OUT" ;;
+        *)                              ok  "with no unwalkable pack" ;;
     esac
     contains "verify show reads the failed run back" '"findings"' \
         "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"
@@ -1070,7 +1116,7 @@ db:
   path: $WORK/state2.db
 http:
   socket: $SOCK2
-  port: $((PORTBASE + 1))
+  port: $PORT2
   bind: 127.0.0.1
 log:
   level: warn
@@ -1157,6 +1203,19 @@ fi
 OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-missing" --reencrypt 2>&1); RC=$?
 check    "re-encrypting into no repository is refused" 1 "$RC"
 contains "and says to create it first" "repo add" "$OUT"
+# Into an unencrypted repository the copy is plaintext, which takes
+# --to-plaintext; without it nothing is written.
+cb repo add "$WORK/reenc-plain" rp >/dev/null
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --reencrypt 2>&1); RC=$?
+check    "re-encrypting into plaintext without --to-plaintext is refused" 1 "$RC"
+contains "and names the flag" "--to-plaintext" "$OUT"
+check    "and wrote no pack" 0 "$(find "$WORK/reenc-plain/packs" -type f | wc -l | tr -d ' ')"
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --to-plaintext 2>&1); RC=$?
+check    "--to-plaintext without --reencrypt is refused locally" 1 "$RC"
+contains "and says why" "--to-plaintext needs --reencrypt" "$OUT"
+OUT=$(cb replicate "$ENC_ID" "$WORK/reenc-plain" --reencrypt --to-plaintext 2>&1); RC=$?
+check    "with --to-plaintext it runs" 0 "$RC"
+contains "and the journal says so" "into plaintext at $WORK/reenc-plain" "$(cb journal "$ENC_ID")"
 
 echo "configured sources"
 
@@ -1305,7 +1364,7 @@ OUT=$(cb auth logout 2>&1); RC=$?
 check    "auth logout without --all fails" 1 "$RC"
 contains "and points at --all" "auth logout --all" "$OUT"
 tcp_login() {  # tcp_login <password>: the response body of a TCP login
-    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$PORTBASE/api/auth/login"
+    curl -s -X POST -d "{\"password\":\"$1\"}" "http://127.0.0.1:$MAIN_PORT/api/auth/login"
 }
 OUT=$(printf 'correcthorsebattery\nbrandnewpassword\n' | cb auth password 2>&1); RC=$?
 check "password change reads both from stdin" 0 "$RC"
@@ -1313,10 +1372,10 @@ contains "old password no longer logs in" "invalid password" "$(tcp_login correc
 # B053: from the host, logout --all ends every session a client holds.
 LTOK=$(tcp_login brandnewpassword | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 check "a fresh token works over tcp" 200 "$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$MAIN_PORT/repos")"
 contains "logout --all revokes" '"revoked":1' "$(cb auth logout --all 2>&1)"
 check "and the token is dead" 401 "$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$PORTBASE/repos")"
+    -H "Authorization: Bearer $LTOK" "http://127.0.0.1:$MAIN_PORT/repos")"
 OUT=$(cb auth setup < /dev/null 2>&1); RC=$?
 check "no password on stdin fails" 1 "$RC"
 contains "and says so" "no password read" "$OUT"
@@ -1328,7 +1387,6 @@ echo "listen address"
 # proxy", and it was never read: MHD was started without a socket address,
 # which binds every interface. Setting it to 127.0.0.1 produced a port
 # answering on the LAN and a config file saying it did not.
-BINDPORT=$((PORTBASE + 2))
 cat > "$WORK/bindcfg.yaml" <<EOF
 db:
   path: $WORK/bind.db
@@ -1359,6 +1417,18 @@ sed -i 's/  bind: 127.0.0.1/  bind: not-an-address/' "$WORK/bindcfg.yaml"
 C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind2.log" 2>&1
 check    "an unparseable bind address stops the daemon" 1 "$?"
 contains "and says which value was rejected" "not-an-address" "$(cat "$WORK/bind2.log")"
+# B132: a port another daemon already holds fails at api_server_start, with
+# the job manager, scheduler and routes all set up. Each startup failure
+# unwinds what came before it; under ASan a leak report lands in the log, so
+# its absence is the check (vacuous in a plain build).
+sed -i "s/  bind: not-an-address/  bind: 127.0.0.1/; s/  port: $BINDPORT/  port: $MAIN_PORT/" \
+    "$WORK/bindcfg.yaml"
+C_BACKUP_CONFIG_PATH="$WORK/bindcfg.yaml" "$DAEMON" > "$WORK/bind3.log" 2>&1
+check    "a port already taken stops the daemon" 1 "$?"
+contains "and says it cannot start" "cannot start API server" "$(cat "$WORK/bind3.log")"
+check    "and unwinds without a leak too" 0 \
+    "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/bind3.log")"
+contains "and leaves the running daemon alone" '"repos"' "$(cb repo list)"
 
 # sun_path is 108 bytes and the daemon used to strncpy into it, so a longer
 # socket path was silently truncated: bind and listen succeeded against a
@@ -1382,6 +1452,11 @@ EOF
 C_BACKUP_CONFIG_PATH="$WORK/longcfg.yaml" "$DAEMON" > "$WORK/long.log" 2>&1
 check    "an over-long socket path stops the daemon" 1 "$?"
 contains "and says so rather than truncating" "socket path too long" "$(cat "$WORK/long.log")"
+# B132: this is api_server_create failing, which returned with the scheduler
+# open and the job manager's workers running; an ASan daemon reported the
+# scheduler as leaked. Now it unwinds both.
+check    "and unwinds its startup without a leak" 0 \
+    "$(grep -c 'LeakSanitizer\|AddressSanitizer' "$WORK/long.log")"
 if [ -n "$(find "$LONGDIR" -maxdepth 1 -name '*.sock' 2>/dev/null)" ]; then
     bad "leaves no socket behind" "no socket" "a socket was created"
 else
@@ -1593,12 +1668,215 @@ contains "missing arguments show usage" "usage:" "$OUT"
 # repository 1's runs and exited 0.
 OUT=$(cb grep runs 1 2 2>&1); RC=$?
 check    "a stray positional exits non-zero" 1 "$RC"
-contains "and names it" "unexpected argument '2'; usage: c-backup grep runs" "$OUT"
+contains "and names it" "unexpected argument '2'" "$OUT"
+contains "with the usage" "usage: c-backup grep runs <repo-id>" "$OUT"
 OUT=$(cb summary 1 --bogus 2>&1); RC=$?
 check    "an unknown option exits non-zero" 1 "$RC"
-contains "and names it too" "unexpected argument '--bogus'" "$OUT"
+contains "and names it too" "unknown option '--bogus'" "$OUT"
 OUT=$(cb grep runs 1 --limit 1 2>&1); RC=$?
 check    "options are still taken" 0 "$RC"
+
+echo "argument parsing (B127)"
+# `repo add PATH Main --encrypt` with the value forgotten registered an
+# UNENCRYPTED repository and exited 0, and encryption is fixed at creation.
+# Every refusal below must leave the registry as it was and create nothing.
+REPOS_BEFORE=$(cb repo list)
+b127_refused() {  # b127_refused <what> <expected message> <args...>
+    local what="$1" msg="$2"; shift 2
+    local out rc
+    out=$(cb "$@" 2>&1 >/dev/null); rc=$?
+    check    "$what exits 1" 1 "$rc"
+    contains "$what: names it" "$msg" "$out"
+    contains "$what: shows the usage, on stderr" "usage: c-backup repo add <path> [label]" "$out"
+}
+b127_refused "--encrypt with no value"      "option '--encrypt' needs a value" \
+    repo add "$WORK/b127" Main --encrypt
+b127_refused "--passphrase with no value"   "option '--passphrase' needs a value" \
+    repo add "$WORK/b127" Main --passphrase
+b127_refused "--encrypt with no label either" "option '--encrypt' needs a value" \
+    repo add "$WORK/b127" --encrypt
+b127_refused "--encrypt followed by an option" \
+    "option '--encrypt' needs a value, and '--passphrase' looks like an option" \
+    repo add "$WORK/b127" Main --encrypt --passphrase 'correct horse'
+b127_refused "an empty --encrypt"           "needs a value, not an empty one" \
+    repo add "$WORK/b127" Main --encrypt=
+b127_refused "an empty --passphrase"        "needs a value, not an empty one" \
+    repo add "$WORK/b127" Main --passphrase ''
+b127_refused "an unknown flag"              "unknown option '--bogus'" \
+    repo add "$WORK/b127" --bogus
+b127_refused "an extra positional"          "unexpected argument 'extra'" \
+    repo add "$WORK/b127" mylabel extra
+b127_refused "--encrypt given twice"        "option '--encrypt' given more than once" \
+    repo add "$WORK/b127" Main --encrypt system --encrypt none
+check "none of them registered a repository" "$REPOS_BEFORE" "$(cb repo list)"
+if [ -e "$WORK/b127" ]; then bad "and none created the directory" "absent" "present"
+else ok "and none created the directory"; fi
+# The usage line shows the label the Manual's examples pass.
+contains "repo add usage shows the label" "repo add <path> [label]" "$(cb help repo add)"
+# `--` ends the options, so a label may start with a dash.
+contains "-- lets a label start with a dash" '"id"' \
+    "$(cb repo add "$WORK/b127dash" --encrypt system -- -dashed 2>&1)"
+contains "and it is the label" '"label":"-dashed"' "$(cb repo list)"
+contains "and the options before it were taken" '"encryption":"system"' \
+    "$(cb repo list | tr '}' '\n' | grep b127dash)"
+# A value starting with a dash is passed in the = form.
+OUT=$(cb backup 1 "$WORK/src" --label=-dash-label 2>&1); RC=$?
+check    "--label=-x passes a dashed value" 0 "$RC"
+contains "and it is the label" '"label":"-dash-label"' "$(cb snapshots 1)"
+OUT=$("$CLI" --socket 2>&1); RC=$?
+check    "--socket with no value exits 1" 1 "$RC"
+contains "and names it" "option '--socket' needs a value" "$OUT"
+# Variadic positionals still take any number.
+contains "sources set takes several paths" '"sources"' \
+    "$(cb sources set 1 "$WORK/src" "$WORK/src/one.txt" --exclude a --exclude b)"
+contains "all of them" "one.txt" "$(cb sources list 1)"
+cb sources set 1 "$WORK/src" >/dev/null
+
+# Every command, in the longest form its spec takes, with an unknown flag
+# and then with one positional too many. A row is "<command words>|<args>";
+# a leading '*' marks a command whose last positional repeats, so it has no
+# "too many". Each must exit 1 naming the argument, with that command's
+# usage, and send nothing: against a socket where nothing listens a request
+# would say "daemon not running", and against the live daemon the state
+# must not move.
+SWEEP=(
+    "repo list|"
+    "repo add|$WORK/sweep lbl"
+    "repo show|1"
+    "repo remove|1"
+    "repo key export|1"
+    "repo key import|1 00"
+    "repo key ack|1"
+    "sources list|1"
+    "*sources set|1 $WORK/src"
+    "*backup|1 $WORK/src"
+    "restore|1 1 $WORK/sweepdst"
+    "snapshots|1"
+    "snapshot delete|1 1"
+    "snapshot note|1 1 text"
+    "snapshot tree|1 1 0"
+    "ls|1 1 0"
+    "search|1 q"
+    "grep|1 pat"
+    "grep runs|1"
+    "grep show|1 1"
+    "diff|1 1 2"
+    "verify|1"
+    "verify list|1"
+    "verify show|1 1"
+    "gc|1"
+    "gfs|1"
+    "replicate|1 $WORK/sweeprepl"
+    "reindex|1"
+    "stats|1"
+    "summary|1"
+    "objects|1"
+    "object|1 abc refs"
+    "packs|1 1"
+    "fanout|1"
+    "policy list|1"
+    "policy set|1 retention.keep_snaps 1"
+    "tag list|1"
+    "tag set|1 sweep 1"
+    "tag remove|1 sweep"
+    "journal|1"
+    "schedule list|1"
+    "schedule add|1 backup 60"
+    "schedule remove|1 1"
+    "schedule enable|1 1"
+    "schedule disable|1 1"
+    "jobs|1"
+    "jobs cancel|1"
+    "jobs watch|1"
+    "auth status|"
+    "auth setup|pw"
+    "auth password|a b"
+    "auth logout|--all"
+    "metrics|"
+    "health|live"
+    "version|"
+    "help|repo add"
+)
+# Everything a stray request could change. The newest job on repository 1
+# covers every job-starting command (a replicate schedule from an earlier
+# section fires every second on repository 2); the rest cover direct writes.
+b127_state() {
+    cb repo list; cb snapshots 1; cb sources list 1; cb schedule list 1
+    cb tag list 1; cb policy list 1; cb snapshot note 1 1; cb auth status
+    cb jobs --limit 200 | grep -o '"id":[0-9]*,"repo_id":1,' | head -1
+    cb grep runs 1 --limit 1 | grep -o '"id":[0-9]*' | head -1
+    cb verify list 1 --limit 1 | grep -o '"id":[0-9]*' | head -1
+}
+STATE_BEFORE=$(b127_state 2>&1)
+SWEEP_BAD=0
+sweep_one() {  # sweep_one <socket> <command words> <expected message> <words...>
+    local sock="$1" cmd="$2" msg="$3"; shift 3
+    local out rc
+    out=$("$CLI" --socket "$sock" "$@" 2>&1); rc=$?
+    case "$rc:$out" in
+        1:*"$msg"*"usage: c-backup $cmd"*)
+            case "$out" in
+                *"daemon not running"*|*HTTP*) SWEEP_BAD=$((SWEEP_BAD+1))
+                    printf '       sent a request: %s\n' "$*" ;;
+            esac ;;
+        *) SWEEP_BAD=$((SWEEP_BAD+1))
+           printf '       not refused (rc %s): %s\n       %s\n' "$rc" "$*" "$out" ;;
+    esac
+}
+for row in "${SWEEP[@]}"; do
+    variadic=0
+    case "$row" in \**) variadic=1; row="${row#\*}" ;; esac
+    CMD="${row%%|*}"
+    read -ra W <<< "$CMD ${row#*|}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "unknown option '--b127-bogus'" "${W[@]}" --b127-bogus
+        sweep_one "$sock" "$CMD" "unknown option '--b127-bogus'" "${W[@]}" --b127-bogus=1
+        [ "$variadic" = 1 ] ||
+            sweep_one "$sock" "$CMD" "unexpected argument 'b127extra'" "${W[@]}" b127extra
+    done
+done
+check "every command refuses an unknown flag and an extra positional, sending nothing" \
+    0 "$SWEEP_BAD"
+check "and the daemon's state did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
+
+# A value option with its value missing, at the end of the line or before
+# another option, for every command that takes one. Each used to be taken as
+# a positional, or to take the next option as its value.
+SWEEP_BAD=0
+VALUE_SWEEP=(
+    "backup|1 $WORK/src|--label"
+    "backup|1 $WORK/src|--exclude"
+    "sources set|1 $WORK/src|--exclude"
+    "restore|1 1 $WORK/sweepdst|--subpath"
+    "snapshots|1|--limit"
+    "snapshots|1|--offset"
+    "search|1 q|--snapshot"
+    "grep|1 pat|--snapshot"
+    "grep|1 pat|--path-prefix"
+    "grep|1 pat|--max-hits"
+    "grep|1 pat|--max-hits-per-file"
+    "verify|1|--level"
+    "stats|1|--scope"
+    "objects|1|--location"
+    "journal|1|--result"
+    "schedule add|1 backup 60|--on-overlap"
+    "schedule add|1 backup 60|--source"
+    "schedule add|1 replicate|--every"
+    "repo add|$WORK/sweep|--encrypt"
+    "repo add|$WORK/sweep|--passphrase"
+)
+for row in "${VALUE_SWEEP[@]}"; do
+    CMD="${row%%|*}"
+    rest="${row#*|}"
+    opt="${rest#*|}"
+    read -ra W <<< "$CMD ${rest%|*}"
+    for sock in "$WORK/absent.sock" "$SOCK"; do
+        sweep_one "$sock" "$CMD" "option '$opt' needs a value" "${W[@]}" "$opt"
+        sweep_one "$sock" "$CMD" "option '$opt' needs a value" "${W[@]}" "$opt" --no-wait
+    done
+done
+check "every value option refuses a missing value, sending nothing" 0 "$SWEEP_BAD"
+check "and the state still did not move" "$STATE_BEFORE" "$(b127_state 2>&1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

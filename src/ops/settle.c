@@ -2,7 +2,6 @@
 
 #include "settle.h"
 
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,17 +34,6 @@ int settle_stat_same(const struct stat *a, const struct stat *b)
            a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
            a->st_ctim.tv_sec  == b->st_ctim.tv_sec &&
            a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
-}
-
-const char *settle_open_reason(int err, char *buf, size_t n)
-{
-    if (err == ELOOP)
-        snprintf(buf, n, "no longer a regular file (now a symlink)");
-    else if (err == ENOENT)
-        snprintf(buf, n, "cannot open: it no longer exists");
-    else
-        snprintf(buf, n, "cannot open: %s", strerror(err));
-    return buf;
 }
 
 /*
@@ -116,21 +104,11 @@ status_t settle_store_fd(const cdc_params_t *cp, int fd, const struct stat *scan
             sr->outcome = SETTLE_SKIP;
             return OK;
         }
-        /*
-         * The file the scan saw, not one that took its name since (B128):
-         * the descriptor must be the inode the scan's lstat found. A
-         * symlink is refused by O_NOFOLLOW before this; a rename of another
-         * file over the path is caught here. Only the first look: a later
-         * one is the same descriptor, and settle_stat_same compares the
-         * inode anyway.
-         */
-        if (read_no == 1 && scan_st &&
-            (before.st_dev != scan_st->st_dev || before.st_ino != scan_st->st_ino)) {
-            snprintf(sr->reason, sizeof(sr->reason),
-                     "replaced by another file since the scan");
-            sr->outcome = SETTLE_SKIP;
-            return OK;
-        }
+        /* A different inode from the scan's is a file renamed over the
+         * path, as editors save: a change like any other (B128 as 1.0.0
+         * settled it), stored as read. settle_stat_same compares the inode.
+         * Symlinks, other types and parent swaps never get this far: the
+         * open beneath the source root refused them (open_scanned.h). */
         if (read_no == 1 && scan_st && !settle_stat_same(&before, scan_st))
             sr->changed = 1;
 

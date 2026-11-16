@@ -177,7 +177,7 @@ else
 endif
 
 # ---- Phony targets ----------------------------------------------------
-.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint
+.PHONY: all static asan debug clean test bench bench-micro bench-phases bench-browse analyze lint check-conflict-markers
 
 all:
 	$(MAKE) BUILD_TYPE=release _build
@@ -266,7 +266,8 @@ FAULT_BINS  := $(patsubst $(TESTS)/%.c, $(BINS)/%, $(FAULT_SRCS))
 
 FAULT_WRAP := -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
               -Wl,--wrap=fread,--wrap=fwrite,--wrap=fseeko,--wrap=fsync,--wrap=fdatasync \
-              -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename,--wrap=read,--wrap=pread
+              -Wl,--wrap=sync_file_range,--wrap=mkstemp,--wrap=rename,--wrap=read,--wrap=pread \
+              -Wl,--wrap=pwrite,--wrap=syscall
 
 # Ensure release objects exist before linking tests
 $(TEST_DIR_STAMP): FORCE
@@ -286,15 +287,25 @@ $(BINS)/test_%_fault: $(TESTS)/test_%_fault.c $(TESTS)/fault_inject.c $(TESTS)/f
 # code behind the routes; nothing else covers the routes themselves, the auth
 # middleware, or the job manager running work on a worker thread, because
 # those only exist once a process is listening.
+#
+# The shell suites take their TCP ports from free-port, which asks the
+# kernel for ones nothing holds (FLAKE-13), so concurrent worktrees and CI
+# jobs on one host never meet on a port. Not part of the product, so built
+# here rather than under src/, with the same strict flags.
+FREE_PORT := $(BINS)/free-port
+export C_BACKUP_FREE_PORT := $(abspath $(FREE_PORT))
+$(FREE_PORT): $(TESTS)/tools/free_port.c | $(BINS)
+	$(CC) $(COMMON_CFLAGS) -O2 $< -o $@
+
 .PHONY: test-api
-test-api: all
+test-api: all $(FREE_PORT)
 	@$(SCRATCH_GUARD) test_api_e2e.sh ./$(TESTS)/test_api_e2e.sh $(BINS)/c-backupd
 
 # The CLI holds no repository logic, so what is worth testing is that each
 # command reaches the right endpoint and that a missing daemon produces a
 # clear message rather than a crash or a hang.
 .PHONY: test-cli
-test-cli: all
+test-cli: all $(FREE_PORT)
 	@$(SCRATCH_GUARD) test_cli_e2e.sh ./$(TESTS)/test_cli_e2e.sh $(BINS)/c-backupd $(BINS)/c-backup
 
 # Units through the API and the CLI, with the fake provider enabled by its
@@ -558,7 +569,17 @@ fuzz-regress: fuzz
 ANALYZE_CFLAGS := -std=c11 -pthread -Wall -Wextra -O2 -march=$(MARCH) $(SRC_INCLUDES) $(CUTILS_VERSION_DEF)
 STACK_LIMIT    := 65536
 
-analyze: | $(BUILD)
+# A merge that commits both sides of a conflict builds and passes tests when
+# the markers land in prose (docs/repo-format.md did, in the OWN-46 merge), so
+# look for them in every tracked file. Only the seven-character opening and
+# closing markers count: a line of '=' is a legitimate Markdown heading rule.
+check-conflict-markers:
+	@echo "=== conflict markers ==="
+	@if git grep -nE '^(<{7}|>{7})( |$$)' -- . ; then \
+	    echo "conflict markers: FAIL"; exit 1; fi
+	@echo "conflict markers: OK"
+
+analyze: check-conflict-markers | $(BUILD)
 	@echo "=== stack-usage ==="
 	@mkdir -p $(BUILD)/analyze
 	@for f in $(SRCS); do \
@@ -774,7 +795,7 @@ GCOVR_FLAGS := $(shell gcovr --help 2>/dev/null | grep -q -- --gcov-suspicious-h
 # Counters from an earlier run are cleared first. gcov adds to whatever .gcda
 # it finds, so a second local run reported the sum of both, and a few runs in
 # the hit counts on parity.c's SIMD loop grew past what gcovr will believe.
-coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI)
+coverage: $(COV_TESTS) $(COV_FAULT_TESTS) $(COV_DAEMON) $(COV_CLI) $(FREE_PORT)
 	@find $(COV_DIR) -name '*.gcda' -delete
 	@over=0; \
 	run() { n=$$1; shift; \

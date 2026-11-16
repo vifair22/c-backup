@@ -303,7 +303,7 @@ static void test_failed_install_fails_the_run(void **state)
 
     /* Nothing of the failed install is left staged. */
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp')\"", TEST_REPL);
+    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp' | grep -vx .lock)\"", TEST_REPL);
     assert_int_equal(system(cmd), 0);
 
     st = replicate_once(&rr);
@@ -477,7 +477,7 @@ static void test_killed_run_leaves_whole_snapshots(void **state)
 static int replica_tmp_is_empty(void)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp')\"", TEST_REPL);
+    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp' | grep -vx .lock)\"", TEST_REPL);
     return system(cmd) == 0;
 }
 

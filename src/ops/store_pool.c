@@ -14,14 +14,10 @@
 
 #define MIB ((uint64_t)1024 * 1024)
 
-/* What each object writer holds besides parity: STREAM_PIPE_DEPTH chunks of
- * STREAM_PIPE_CHUNK in object.c. */
-#define POOL_BUFFERS_PER_WORKER (8 * MIB)
-/* Below this a worker would spill nearly all of its parity, so the memory
- * budget stops adding workers rather than starving each of them. */
+/* What the memory budget allows a chunk worker: a few chunk buffers of up
+ * to 8 MiB each. Pack writers' buffers are budgeted separately, from the
+ * daemon's buffer budget (pack_writer_budget_bytes). */
 #define POOL_MIN_PER_WORKER     (40 * MIB)
-#define POOL_PARITY_MIN         (16 * MIB)
-#define POOL_PARITY_MAX         (256 * MIB)
 #define POOL_BUDGET_MIN         (256 * MIB)
 #define POOL_BUDGET_MAX         (2048 * MIB)
 /* The ceiling on an explicit request, matching the config key's range. */
@@ -157,8 +153,7 @@ uint64_t store_pool_mem_budget(void)
         store_pool_cgroup_limit("/proc/self/cgroup", "/sys/fs/cgroup"));
 }
 
-void store_pool_plan(unsigned requested, uint64_t n_large,
-                     unsigned *out_workers, size_t *out_parity_cap)
+void store_pool_plan(unsigned requested, uint64_t n_large, unsigned *out_workers)
 {
     uint64_t budget = store_pool_mem_budget();
     unsigned w;
@@ -172,14 +167,7 @@ void store_pool_plan(unsigned requested, uint64_t n_large,
     }
     if ((uint64_t)w > n_large) w = (unsigned)n_large;
     if (w < 1) w = 1;
-
-    uint64_t share = budget / w;
-    uint64_t cap = share > POOL_BUFFERS_PER_WORKER ? share - POOL_BUFFERS_PER_WORKER : 0;
-    if (cap < POOL_PARITY_MIN) cap = POOL_PARITY_MIN;
-    if (cap > POOL_PARITY_MAX) cap = POOL_PARITY_MAX;
-
     *out_workers = w;
-    *out_parity_cap = (size_t)cap;
 }
 
 /*

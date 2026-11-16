@@ -7,6 +7,10 @@
 
 uint32_t crc32c(const void *data, size_t len);
 uint32_t crc32c_update(uint32_t crc, const void *data, size_t len);
+/* The CRC-32C of A||B from crc32c(A), crc32c(B) and the length of B, so a
+ * CRC computed on one thread can be extended by another without a second
+ * pass over the bytes. */
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b);
 
 /* ---- XOR interleaved parity (headers, stride=256) ----
  *
@@ -91,39 +95,6 @@ void parity_stats_reset(void);
 /* Increment counters (called internally by parity_record_check / rs_parity_decode). */
 void parity_stats_add_repaired(uint64_t n);
 void parity_stats_add_uncorrectable(uint64_t n);
-
-/* ---- On-disk parity footer ---- */
-
-#define PARITY_FOOTER_MAGIC  0x50415249u  /* "PARI" */
-#define PARITY_VERSION       1u
-
-/* ---- Deprecated trailer field: rs_data_len ----
- *
- * Every parity trailer historically contained a 4-byte `rs_data_len` field
- * between the payload CRC and the footer.  It was intended to let a
- * standalone verifier RS-decode a payload without trusting the entry/object
- * header for its length, as part of a header-corruption recovery story.
- *
- * That recovery path was never built: rs_data_len alone is insufficient
- * (you also need the compression codec, uncompressed size, type, and
- * expected hash — none of which are in the trailer), and every existing
- * reader trusts the header for the length anyway.  Meanwhile the field
- * capped per-entry payloads at 4 GiB because it was only 32 bits wide.
- *
- * The field is now officially dead weight: writers must store 0, readers
- * must ignore any value they find there.  The 4 bytes are retained on disk
- * so the trailer layout is unchanged and old repositories remain readable
- * without a format bump.  If header-corruption recovery is ever revisited,
- * the right design is to duplicate the entire header in the trailer, not
- * to resurrect this single field.
- */
-#define PARITY_RS_DATA_LEN_DEPRECATED 0u
-
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t trailer_size;  /* total trailer INCLUDING this footer */
-} __attribute__((packed)) parity_footer_t;  /* 12 bytes */
 
 /* One interleave group: 15,296 data bytes protected by 1,024 parity bytes.
  * rs_parity_size(n) is ceil(n / PARITY_GROUP_DATA) * PARITY_GROUP_PAR. The

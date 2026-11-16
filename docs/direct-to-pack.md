@@ -37,7 +37,7 @@ share it: the `repo_pack` workers, replication, and `pack_gc`.
 | Piece | What it does |
 |-------|--------------|
 | `open_new_pack` | `mkstemp` in `<repo>/tmp`, 8 MiB stdio buffer, writes the 12-byte header |
-| `finalize_pack` | Patches the entry count, appends the pack parity trailer, fsyncs, refuses to overwrite an existing pack number, renames into place, emits the commit callback |
+| `finalize_pack` | Patches the entry count, appends the striped parity trailer, fsyncs, refuses to overwrite an existing pack number, renames into place, emits the commit callback |
 | `pack_stored_writer_t` | An incremental single-pack writer: `open` / `add` / `has` / `count` / `finish` / `abort` |
 
 `pack_stored_writer_t` is the closest existing analogue to what this needs. It

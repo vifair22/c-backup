@@ -31,8 +31,13 @@
  * cover the type byte, entries are bounded and encrypted entries carry
  * type || name as associated data, so a version 5 pack copied in by hand
  * would fail every name check. Refusing it at its header says why.
+ *
+ * 7 replaces per-entry parity with striped parity over the whole body
+ * (docs/pack-parity.md): one stream of RS groups, a CRC per entry and a
+ * doubled tail. Per-entry parity rounded every entry up to a whole group,
+ * which cost 17x the RS rate on a tree of small files.
  */
-#define PACK_VERSION     6u
+#define PACK_VERSION     7u
 
 /*
  * Where pack n lives: packs/<shard>/pack-<n>.dat, the shard being n >> 8 so
@@ -59,14 +64,10 @@
 /*
  * Entries per pack, at most. Every writer rolls over on it as well as on
  * bytes (the *_full predicates), and every reader refuses a pack claiming
- * more, so no writer can produce a pack its own reader refuses.
- *
- * Chosen for the trailer, not the body: each entry costs 280 fixed trailer
- * bytes plus up to one parity group of rounding (1,024 bytes) whatever its
- * size, so a pack of a million one-byte entries has a 1.3 GB trailer. The
- * assertion below holds it under the trailer's 32-bit size field. A million
- * entries at the seal is a 268-byte mean entry; real packs roll over on
- * bytes long before.
+ * more, so no writer can produce a pack its own reader refuses. Each entry
+ * costs eight trailer bytes (its CRCs) plus their share of table parity;
+ * a million entries at the seal is a 268-byte mean entry, and real packs
+ * roll over on bytes long before.
  */
 #define PACK_MAX_ENTRIES 1000000u
 
@@ -81,35 +82,42 @@
  */
 #define PACK_MAX_BYTES (PACK_MAX_MULTI_BYTES + PACK_ENTRY_MAX_BYTES)
 
+/* The tail that locates the trailer, written twice at the end of the file. */
+#define PACK_TAIL_BYTES 32u
+
+/* One entry's slot in the crc table: the CRC-32C of the whole entry, then
+ * of its header alone, so a walk can check each header without reading
+ * the payload behind it. */
+#define PACK_CRC_SLOT_BYTES 8u
+
+#define PACK_PARITY_GROUPS(n) \
+    (((uint64_t)(n) + PARITY_GROUP_DATA - 1u) / PARITY_GROUP_DATA)
+
 /*
- * The largest parity trailer such a body can carry, every term at its worst:
+ * The largest parity trailer such a body can carry:
  *
- *   4                         file header CRC
- *   + n * (260 + 4 + 4 + 4)   per entry: header parity, CRC, two size words
- *   + n * 8                   the offsets table
- *   + 4 + 12                  entry count and footer
- *   + RS parity               ceil(C_i / 15,296) * 1,024 per entry, at most
- *                             (body / 15,296 + n) * 1,024 in total
+ *   stripe parity   ceil(body / 15,296) * 1,024
+ *   crc table       8 * n
+ *   table parity    ceil(8n / 15,296) * 1,024
+ *   tail            2 * 32
  */
-#define PACK_TRAILER_MAX_BYTES                                                    \
-    ((uint64_t)4 + (uint64_t)PACK_MAX_ENTRIES * (260u + 12u + 8u) + 16u +         \
-     (PACK_MAX_BYTES / PARITY_GROUP_DATA + 1u + (uint64_t)PACK_MAX_ENTRIES) *    \
-         PARITY_GROUP_PAR)
+#define PACK_TRAILER_MAX_BYTES                                                \
+    (PACK_PARITY_GROUPS(PACK_MAX_BYTES) * PARITY_GROUP_PAR +                  \
+     (uint64_t)PACK_CRC_SLOT_BYTES * PACK_MAX_ENTRIES +                       \
+     PACK_PARITY_GROUPS((uint64_t)PACK_CRC_SLOT_BYTES * PACK_MAX_ENTRIES) *   \
+         PARITY_GROUP_PAR +                                                   \
+     2u * PACK_TAIL_BYTES)
 
 /* The largest pack file there can be. A reader refuses anything larger. */
 #define PACK_MAX_FILE_BYTES (PACK_MAX_BYTES + PACK_TRAILER_MAX_BYTES)
 
 /*
- * Format 3 keeps the trailer's sizes 32-bit (the footer's trailer_size and
- * each block's size word) and makes wrapping impossible instead: no pack a
- * writer can produce has a trailer, or a parity block, past UINT32_MAX. If
- * a constant above moves, this decides whether the format still holds.
+ * The tail's trailer_size is 32-bit, and wrapping is made impossible rather
+ * than handled: no pack a writer can produce has a trailer past UINT32_MAX.
+ * If a constant above moves, this decides whether the format still holds.
  */
 _Static_assert(PACK_TRAILER_MAX_BYTES <= (uint64_t)UINT32_MAX,
                "a maximal pack's parity trailer must fit its 32-bit size field");
-_Static_assert(OBJECT_MAX_STORED_BYTES / PARITY_GROUP_DATA * PARITY_GROUP_PAR +
-               PARITY_GROUP_PAR + 272u <= (uint64_t)UINT32_MAX,
-               "a maximal entry's parity block must fit its 32-bit size word");
 
 /* --- used by object.c -------------------------------------------- */
 
@@ -232,9 +240,10 @@ status_t pack_backup_add(pack_backup_writer_t *w, uint8_t type,
  * Staging split in two, for callers that do the CPU work on threads of their
  * own (content-defined chunking, cdc.h). pack_backup_prepare is thread-safe
  * and needs no writer: it names the object and compresses it when the probe
- * says so. pack_backup_add_prepared does the rest - dedup against the
- * repository and the open pack, encrypt, parity, write - and is called with
- * whatever lock serialises the writer. data must stay valid until then.
+ * says so, and with a store encrypts it and computes its CRC.
+ * pack_backup_add_prepared does the rest - dedup against the repository and
+ * the open pack, the write, and handing its bytes to the pack's stripe
+ * encoder - and is called with whatever lock serialises the writer. data must stay valid until then.
  * pack_backup_add is exactly the two in sequence.
  */
 typedef struct {
@@ -246,13 +255,14 @@ typedef struct {
     const uint8_t *payload;      /* data, or owned when compressed */
     uint64_t       payload_len;
     uint8_t       *owned;
-    /* Encrypted under the store's key, with CRC and parity, when prepared
-     * with a store: the append is then a write and nothing more. */
+    /* Encrypted under the store's key, with the stored bytes' CRC, when
+     * prepared with a store: the append is then a write and nothing more.
+     * Parity is the pack's, striped as the body is appended. */
     void          *sealed;
 } pack_prepared_t;
 
-/* Name, probe, compress; then encrypt and compute CRC and parity for
- * store's repository, all on the calling thread. */
+/* Name, probe, compress; then encrypt and compute the CRC for store's
+ * repository, all on the calling thread. */
 status_t pack_backup_prepare(store_t *store, uint8_t type, const void *data,
                              size_t len, pack_prepared_t *out);
 /* The same without sealing: pack_backup_add_prepared seals under its lock. */
@@ -345,9 +355,10 @@ status_t pack_resolve_location(store_t *store,
                                uint64_t *out_dat_offset);
 
 /*
- * Attempt to repair a packed object's entry in-place via pwrite(), at any
- * entry size and codec, in memory bounded by the parity window. Writes only
- * once the corrected payload matches the trailer's CRC.
+ * Attempt to repair a packed object's entry in place via pwrite(), from the
+ * pack's striped parity, one group at a time. Writes only the entry's own
+ * bytes (and its CRC slot, when that was the damage), and only once they
+ * match the entry's CRC.
  * Returns: >0 = bytes corrected, 0 = no corruption found, -1 = error or
  * damage beyond parity.
  */
@@ -355,11 +366,34 @@ int pack_object_repair(store_t *store, const uint8_t hash[OBJECT_HASH_SIZE]);
 
 /*
  * Test hook: how many RS groups (15,296 data bytes, 1,024 parity bytes each)
- * a packed-entry reader or repair holds at once. 0 restores the default of
- * 1,096 groups (16 MiB of data). Lowering it lets a test push an entry of a
- * few MiB through many windows and measure that memory stays bounded.
+ * sealing a pack reads back and encodes at once. 0 restores the default of
+ * 64 groups. Lowering it lets a test push a small pack through many windows.
  */
 void pack_test_set_parity_window(size_t groups);
+
+/*
+ * Test hook: how many seals so far had to read their pack's body back to
+ * compute its parity. The plaintext writer encodes as it appends and never
+ * should; gc's rewrite, coalescing and the stored writer do.
+ */
+uint64_t pack_test_seal_readbacks(void);
+
+/*
+ * What one plaintext pack writer (a backup's, the store's own) takes from
+ * the daemon's buffer budget while it has a pack open: its stripe encoder
+ * (parity for a pack at its bound plus nine groups of body) and its 8 MiB
+ * stdio buffer, about 26.3 MiB. A writer that cannot take it seals by
+ * reading its body back. A backup sizes its file workers by it.
+ */
+uint64_t pack_writer_budget_bytes(void);
+
+/* Test hook: writers opened without an encoder because the budget could
+ * not cover one. */
+uint64_t pack_test_writers_unbudgeted(void);
+
+/* Test hook: threads in the process-wide stripe encoder pool, at most
+ * min(4, CPUs) whatever the number of writers. */
+uint64_t pack_test_encoder_threads(void);
 
 /*
  * The seal in force: PACK_MAX_MULTI_BYTES unless a test moved it.
@@ -409,6 +443,15 @@ void pack_resume_removals(store_t *store);
  * coalescing pass that follows. */
 #define PACK_DAMAGED_LIST_MAX 100u
 
+/* Packs gc found it could not walk, listed with why (at most this many). */
+#define PACK_UNWALKABLE_LIST_MAX   16u
+#define PACK_UNWALKABLE_REASON_MAX 96u
+
+typedef struct {
+    uint32_t pack;
+    char     reason[PACK_UNWALKABLE_REASON_MAX];
+} pack_unwalkable_t;
+
 typedef struct {
     uint32_t packs_rewritten;
     uint32_t packs_deleted;
@@ -429,7 +472,79 @@ typedef struct {
     uint64_t entries_damaged;
     uint32_t damaged_listed;
     uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
+    /*
+     * Packs whose entry headers could not be walked even with parity: gc
+     * left them exactly as they were, since rewriting one would guess at
+     * offsets and at which entries are live. Like damage, a failure the
+     * caller must report, not a log line; verify reports the same packs
+     * until a repair restores their headers.
+     */
+    uint32_t packs_unwalkable;
+    uint32_t unwalkable_listed;
+    pack_unwalkable_t unwalkable[PACK_UNWALKABLE_LIST_MAX];
 } pack_gc_stats_t;
+
+/*
+ * Can this pack be walked whole: its header read and every entry header
+ * stepped over to the end of the body, with parity's help where needed?
+ * OK, or ERR_CORRUPT with the reason in reason (and the error message).
+ * This is what gc needs of a pack before it will rewrite it.
+ */
+status_t pack_walk_check(store_t *store, uint32_t pack_num, char *reason, size_t cap);
+
+/* What the index knows of one entry: enough to rebuild its header. type 0
+ * means unknown (every known type is tried). */
+typedef struct {
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t offset;
+    uint64_t comp_size;
+    uint64_t orig_size;
+    uint32_t entry_index;
+    uint8_t  type;
+} pack_hdr_hint_t;
+
+/*
+ * Rewrite entry headers damaged beyond parity from the index's rows, each
+ * only once its header CRC and its whole-entry CRC prove it right. This is
+ * what makes a pack gc could not walk walkable again: verify with repair
+ * calls it. Returns headers written, or -1 when the pack has no usable
+ * trailer or a write fails.
+ */
+int pack_restore_headers(store_t *store, uint32_t pack_num,
+                         const pack_hdr_hint_t *hints, size_t n);
+
+/* What a salvage kept and left behind. */
+#define PACK_SALVAGE_LIST_MAX 16u
+typedef struct {
+    uint64_t entries_kept;      /* every indexed entry, damaged ones included */
+    uint64_t entries_damaged;   /* of those, damaged beyond parity, carried as they were */
+    uint32_t damaged_listed;
+    uint8_t  damaged[PACK_DAMAGED_LIST_MAX][OBJECT_HASH_SIZE];
+    /* Bytes no index row covers - unreferenced entries gc had swept - and
+     * the first PACK_SALVAGE_LIST_MAX of their ranges in the old pack. */
+    uint64_t dropped_bytes;
+    uint64_t dropped_ranges;
+    uint32_t dropped_listed;
+    struct { uint64_t offset, length; } dropped[PACK_SALVAGE_LIST_MAX];
+    uint32_t first_pack;        /* the new packs: first_pack onward */
+    uint32_t packs_written;
+} pack_salvage_result_t;
+
+/*
+ * The way out for a pack that cannot be walked and whose damaged headers
+ * cannot all be rebuilt, because some belong to entries with no index row.
+ * Copies every entry the index names, located by its indexed offset rather
+ * than by walking, into new packs through gc's rewrite path (install, rows,
+ * .deleting marker, removal, unlink), and drops the rest: bytes no row
+ * covers, which are unreferenced. An indexed entry damaged beyond parity
+ * is carried as it is and listed, so its loss is still reported while the
+ * pack stops being unwalkable. With no usable trailer each entry is checked
+ * by decoding it (AEAD, or its name) instead of by CRC, which an encrypted
+ * repository can do only with its key loaded. hints are the pack's index
+ * rows.
+ */
+status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *hints,
+                      size_t n, pack_salvage_result_t *out);
 
 /* pack_gc, also reporting which packs it rewrote or deleted. stats may be
  * NULL, which is what pack_gc passes. */
@@ -499,19 +614,23 @@ typedef struct {
 } __attribute__((packed)) pack_idx_hdr_t;
 
 /*
- * On-disk index entry, sorted by hash. Carries type and sizes so repository
- * statistics can be computed from the index alone, without seeking the .dat.
+ * One entry of a pack being written or rewritten: where it is and what its
+ * header says, and - from the plaintext writer, which computes them as it
+ * appends - the entry's two CRCs for the trailer's table. No longer on
+ * disk (there is no .idx sidecar); the name is historical.
  */
 typedef struct {
-    uint8_t  hash[OBJECT_HASH_SIZE];   /* 32 */
-    uint64_t dat_offset;               /*  8 */
-    uint32_t entry_index;              /*  4 */
-    uint8_t  type;                     /*  1 */
-    uint8_t  compression;              /*  1 */
-    uint8_t  encryption;               /*  1 */
-    uint64_t uncompressed_size;        /*  8 */
-    uint64_t compressed_size;          /*  8 */
-} __attribute__((packed)) pack_idx_disk_entry_t;  /* 63 bytes */
+    uint8_t  hash[OBJECT_HASH_SIZE];
+    uint64_t dat_offset;
+    uint32_t entry_index;
+    uint8_t  type;
+    uint8_t  compression;
+    uint8_t  encryption;
+    uint64_t uncompressed_size;
+    uint64_t compressed_size;
+    uint32_t entry_crc;                /* header and payload */
+    uint32_t hdr_crc;                  /* header alone */
+} pack_idx_disk_entry_t;
 
 /* ------------------------------------------------------------------ */
 /* Pack enumeration (read-only iteration)                              */

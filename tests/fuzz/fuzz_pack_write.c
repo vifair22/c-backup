@@ -4,10 +4,10 @@
  * The store's own pack writer is the most intricate writer here.
  * object_store stages each object into it - probing for compressibility,
  * compressing, encrypting with a fresh nonce under associated data that
- * binds the type and name - and object_store_flush seals it: a parity
- * record and a Reed-Solomon trailer per entry, the entries sorted by hash,
- * and only then the offsets table that every later parity lookup is
- * indexed through. Almost none of that fails loudly when it is wrong.
+ * binds the type and name - and object_store_flush seals it: Reed-Solomon
+ * parity striped over the whole body, and a table of entry CRCs indexed by
+ * on-disk position, while the commit entries are sorted by hash. Almost
+ * none of that fails loudly when it is wrong.
  *
  * Two properties, both aimed at failures that do not announce themselves:
  *
@@ -20,8 +20,8 @@
  * Repair after packing. finalize_pack sorts the entry array by hash before
  * writing it, so an entry's position in that array is not its position on
  * disk, and pack_commit_entry_t.entry_index means the latter. Recording the
- * wrong one - which has happened - makes every parity lookup read another
- * entry's offsets. Nothing fails: reads still work, hashes still match, and
+ * wrong one - which has happened - makes every CRC check read another
+ * entry's slot. Nothing fails: reads still work, hashes still match, and
  * the repository has simply stopped being repairable. So this damages a
  * byte of a packed payload and requires the read to come back correct
  * anyway. If the indexing regresses, that read returns corruption instead,
@@ -169,9 +169,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     /*
      * Damage one payload byte and require the read to survive it. The
-     * parity that has to be found for that to work is located through the
-     * entry's on-disk index, which is the number finalize_pack has to
-     * record correctly after sorting.
+     * CRC that finds the damage is located through the entry's on-disk
+     * index, which is the number finalize_pack has to record correctly
+     * after sorting.
      */
     {
         unsigned victim = (unsigned)(flags >> 4) % stored;
