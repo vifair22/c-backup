@@ -245,6 +245,16 @@ uint64_t store_write_stats_diff(const store_write_stats_t *after,
  */
 unsigned store_sweep_tmp_before(store_t *st, time_t before, uint64_t *bytes);
 
+/*
+ * Take this handle's claim on tmp/ (an flock on tmp/.lock, held until
+ * store_close); 1 if held. Pack staging takes it, and
+ * store_sweep_tmp_before needs it to remove staging younger than an hour:
+ * without it, another handle may be writing, so only the hour rule applies.
+ * Callers that sweep with the claim: backup, gc, reindex, a replica sink's
+ * open, and registering an existing repository (B133).
+ */
+int store_claim_tmp(store_t *st);
+
 status_t store_locate(store_t *st, const uint8_t hash[OBJECT_HASH_SIZE],
                       store_location_t *out);
 

@@ -1064,6 +1064,9 @@ static status_t open_new_pack(store_t *store, uint32_t pack_num,
     if (path_fmt(dat_tmp, PATH_MAX, "%s/tmp/pack-dat.XXXXXX", store_root(store)) != 0)
         return set_error(ERR_IO, "open_new_pack: tmp path too long");
 
+    /* Staging is about to exist here: claim tmp/, so a sweep by another
+     * handle meanwhile leaves it alone (store_claim_tmp). */
+    (void)store_claim_tmp(store);
     int dat_fd = mkstemp(dat_tmp);
     if (dat_fd == -1) return set_error_errno(ERR_IO, "open_new_pack: mkstemp(%s)", dat_tmp);
 

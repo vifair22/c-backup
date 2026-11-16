@@ -380,8 +380,9 @@ for _ in $(seq 1 100); do
     cb jobs "$BJ" | grep -Eq '"state":"(cancelled|completed)"' && break
     sleep 0.1
 done
+# tmp/.lock is the writers' claim on tmp/ (B133), not staging: it stays.
 check "a cancelled backup leaves no staging files" "" \
-    "$(find "$WORK/repo/tmp" -type f 2>/dev/null)"
+    "$(find "$WORK/repo/tmp" -type f ! -name .lock 2>/dev/null)"
 rm -f "$WORK"/big/big*.bin
 
 # A second snapshot so diff has two sides, and so snapshot delete has

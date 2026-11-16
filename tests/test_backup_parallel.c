@@ -392,7 +392,11 @@ static int dir_entries(const char *path)
     int n = 0;
     struct dirent *de;
     while ((de = readdir(d)) != NULL)
-        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) n++;
+        /* tmp/.lock is the writers' claim on tmp/ (store_claim_tmp), not
+         * staging: it stays. */
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0 &&
+            strcmp(de->d_name, ".lock") != 0)
+            n++;
     closedir(d);
     return n;
 }
