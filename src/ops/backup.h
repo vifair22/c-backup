@@ -64,6 +64,27 @@ typedef struct {
      * Zero is auto, which is right everywhere it can tell. */
     int          file_cache_match;
 
+    /*
+     * The fallback's two passes (container-backup.md section 7).
+     *
+     * content_only: store every file's content and its file cache row, seal
+     * the pack, and stop: no trees, no snapshot record. Pass 1 of
+     * pause-read, read live, so that the paused pass only re-reads what
+     * changed since.
+     *
+     * held_roots / held_done: the first held_roots paths are read under a
+     * hold (a pause the caller took). Their files are stored first, then
+     * held_done(held_ctx) is called once, and only then the other roots'
+     * files and the synthetic entries, so the hold covers the scan and the
+     * changed files of the held roots and not the bulk of the rest. (The
+     * scan of every root happens before any store, so the other roots'
+     * directory walk falls inside the hold too.)
+     */
+    int          content_only;
+    int          held_roots;
+    void       (*held_done)(void *ctx);
+    void        *held_ctx;
+
     /* Cooperative cancellation. The job manager sets this; the pipeline
      * checks it between entries, and backup_run lends it to the store for
      * the run so the object writers check it between chunks of one file.

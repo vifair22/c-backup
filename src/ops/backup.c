@@ -142,6 +142,9 @@ typedef struct {
     small_pool_t  *spool;
     small_batch_t *sbatch;
     uint64_t       spool_taken;
+    /* Entries below held_end belong to the held roots (backup_opts_t). */
+    uint32_t       held_end;
+    int            held_pending;
 } pipeline_t;
 
 /*
@@ -1363,8 +1366,16 @@ static status_t store_content(pipeline_t *p)
     p->sink = sink;
 
     p->timers->txn_site = PHASE_COMMIT_STORE;
-    status_t st = store_synth_all(p);
-    if (st == OK) st = store_content_loop(p);
+    /* Under a hold the held roots' files go first and the synthetic
+     * entries (a dump among them) after it is released. */
+    status_t st;
+    if (p->held_pending) {
+        st = store_content_loop(p);
+        if (st == OK) st = store_synth_all(p);
+    } else {
+        st = store_synth_all(p);
+        if (st == OK) st = store_content_loop(p);
+    }
 
     char why[ERR_MSG_MAX];
     snprintf(why, sizeof(why), "%s", err_msg());
@@ -1424,6 +1435,32 @@ static status_t store_content(pipeline_t *p)
     return st;
 }
 
+/* Everything still out on the small-file and large-file workers. */
+static status_t drain_all(pipeline_t *p, batch_t *b)
+{
+    if (p->spool) {
+        status_t sst = small_submit(p, b);
+        while (sst == OK && small_pool_outstanding(p->spool) > 0)
+            sst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled") : small_drain(p, b, POOL_WAIT_MS);
+        if (sst != OK) return sst;
+    }
+    while (p->pool && store_pool_outstanding(p->pool) > 0) {
+        status_t wst = cancelled(p) ? set_error(ERR_BUSY, "backup cancelled") : pool_drain(p, b, POOL_WAIT_MS);
+        if (wst != OK) return wst;
+    }
+    return OK;
+}
+
+/* The held roots are all stored: let the hold go. */
+static status_t release_hold(pipeline_t *p, batch_t *b)
+{
+    status_t st = drain_all(p, b);
+    if (st != OK) return st;
+    p->held_pending = 0;
+    if (p->opts->held_done) p->opts->held_done(p->opts->held_ctx);
+    return OK;
+}
+
 static status_t store_content_loop(pipeline_t *p)
 {
     /*
@@ -1465,6 +1502,11 @@ static status_t store_content_loop(pipeline_t *p)
             return set_error(ERR_BUSY, "backup cancelled");
         }
 
+
+        if (p->held_pending && i >= p->held_end) {
+            status_t hst = release_hold(p, b);
+            if (hst != OK) { batch_close(p, b); return hst; }
+        }
 
         /* Results come back between entries. */
         status_t dst = pool_drain(p, b, 0);
@@ -1718,6 +1760,10 @@ static status_t store_content_loop(pipeline_t *p)
         }
         unsigned left = store_pool_outstanding(p->pool);
         report(p, "store", p->count > left ? p->count - left : 0, p->count);
+    }
+    if (p->held_pending) {
+        status_t hst = release_hold(p, b);
+        if (hst != OK) { batch_close(p, b); return hst; }
     }
 
     batch_close(p, b);
@@ -2336,7 +2382,9 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
 
     uint64_t _tscan = phase_now();
     uint64_t from_sources = 0;
+    uint32_t held_end = 0;
     for (int i = 0; i < opts->n_paths; i++) {
+        if (i == opts->held_roots && scan) held_end = scan->count;
         scan_result_t *part = NULL;
         const char *rd = (opts->read_paths && opts->read_paths[i]) ? opts->read_paths[i] : NULL;
         st = (rd && strcmp(rd, opts->paths[i]) != 0)
@@ -2433,6 +2481,10 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     p.opts        = opts;
     p.cache_stamp = (int64_t)time(NULL);
     p.timers      = &timers;
+    if (opts->held_roots > 0) {
+        p.held_end = opts->held_roots >= opts->n_paths ? scan->count : held_end;
+        p.held_pending = 1;
+    }
 
     /* Layers below here attribute through the thread-local; see phase_timer.h.
      * Set before setup so its transaction is counted with the rest. */
@@ -2453,7 +2505,7 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
     st = store_content(&p);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t _ttr = phase_now(), _ttrn = phase_nested(&timers);
-    if (st == OK) st = build_trees(&p, root_hash);
+    if (st == OK && !opts->content_only) st = build_trees(&p, root_hash);
     phase_add_excl(&timers, PHASE_TREES, _ttr, _ttrn);
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
@@ -2501,6 +2553,21 @@ static status_t backup_run_inner(store_t *store, cutils_db_t *db, int64_t repo_i
         free(links);
         scan_result_free(scan);
         return st;
+    }
+
+    if (opts->content_only) {
+        /* Pass 1: the content and its cache rows are in, the pack sealed;
+         * nothing names them yet, and the next pass will. */
+        log_info("backup: content pass stored %llu file(s), %llu unchanged, %llu new object(s)",
+                 (unsigned long long)res.files, (unsigned long long)res.files_unchanged,
+                 (unsigned long long)res.objects_new);
+        hashset_free(&p.meta_seen);
+        free(links);
+        scan_result_free(scan);
+        res.snapshot_id = 0;
+        if (out) *out = res;
+        else backup_result_free(&res);
+        return OK;
     }
 
     /* Snapshot ids are per repo and never reused (snapshot_id_seq). */

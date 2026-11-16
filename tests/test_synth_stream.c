@@ -192,11 +192,89 @@ static void test_cdc_stream_sizes(void **state)
     }
 }
 
+static void put_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    assert_non_null(f);
+    fputs(text, f);
+    fclose(f);
+}
+
+static long long count_of(const char *sql, const char *arg)
+{
+    char r[32];
+    snprintf(r, sizeof(r), "%lld", (long long)repo_id);
+    db_result_t *res = NULL;
+    long long n = -1;
+    if (db_execute(db, sql, (const char *[]){ r, arg, NULL }, &res) == 0 && res && res->nrows == 1)
+        n = strtoll(res->rows[0][0], NULL, 10);
+    db_result_free(res);
+    return n;
+}
+
+typedef struct { int calls; long long held_rows, other_rows; } hold_seen_t;
+
+static void on_held(void *ctx)
+{
+    hold_seen_t *h = ctx;
+    h->calls++;
+    h->held_rows = count_of("SELECT COUNT(*) FROM file_cache WHERE repo_id = ? AND path LIKE ?", D "/held/%");
+    h->other_rows = count_of("SELECT COUNT(*) FROM file_cache WHERE repo_id = ? AND path LIKE ?", D "/other/%");
+}
+
+/* Pass 1 stores content and cache rows and no snapshot; the held roots'
+ * files are all stored before the hold is let go, the others' after. */
+static void test_content_only_and_hold(void **state)
+{
+    (void)state;
+    assert_int_equal(mkdir(D "/held", 0700), 0);
+    assert_int_equal(mkdir(D "/other", 0700), 0);
+    char p[256];
+    for (int i = 0; i < 20; i++) {
+        snprintf(p, sizeof(p), D "/held/f%d", i);
+        put_file(p, "held content");
+        snprintf(p, sizeof(p), D "/other/g%d", i);
+        put_file(p, "other content");
+    }
+    const char *held[] = { D "/held" };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = held;
+    o.n_paths = 1;
+    o.content_only = 1;
+    backup_result_t r;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    assert_int_equal(r.snapshot_id, 0);
+    backup_result_free(&r);
+    assert_int_equal(count_of("SELECT COUNT(*) FROM snapshots WHERE repo_id = ? AND ? IS NOT NULL", "x"), 0);
+
+    /* The real run: the held root's files come from pass 1's cache, and the
+     * hold is released before the other root is stored. */
+    const char *both[] = { D "/held", D "/other" };
+    hold_seen_t h = { 0, 0, 0 };
+    memset(&o, 0, sizeof(o));
+    o.paths = both;
+    o.n_paths = 2;
+    o.held_roots = 1;
+    o.held_done = on_held;
+    o.held_ctx = &h;
+    memset(&r, 0, sizeof(r));
+    assert_int_equal(backup_run(store, db, repo_id, &o, &r), OK);
+    assert_true(r.snapshot_id > 0);
+    assert_int_equal(r.files_unchanged, 20);         /* pass 1 vouched for them */
+    backup_result_free(&r);
+    assert_int_equal(h.calls, 1);
+    assert_int_equal(h.held_rows, 20);
+    assert_int_equal(h.other_rows, 0);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_stream_and_drop, setup, teardown),
         cmocka_unit_test(test_cdc_stream_sizes),
+        cmocka_unit_test_setup_teardown(test_content_only_and_hold, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
