@@ -647,8 +647,9 @@ COV_DIR     := $(BUILD)/coverage
 # gcov derives from them by subtraction come out negative: "branch 1 taken
 # -1" in store_pool.c, which gcovr rejects, intermittently failing the CI
 # coverage job (FLAKE-9). With the default, eight threads in one loop kept
-# 14% of their increments. gcc only picks atomic updates by itself under
-# -pthread, which this build links with -lpthread instead.
+# 14% of their increments. gcc picks atomic updates by itself under
+# -pthread, which the build now uses too, but the flag stays explicit so
+# coverage never depends on how the link line is spelled.
 COV_PROFILE := -fprofile-update=atomic
 COV_CFLAGS  := -std=c11 -pthread -Wall -Wextra -O0 -g --coverage $(COV_PROFILE) -march=$(MARCH) \
                -Wno-unused-result -Wno-format-truncation $(SRC_INCLUDES) \
