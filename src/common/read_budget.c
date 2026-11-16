@@ -82,6 +82,18 @@ void read_budget_release_foreign(uint64_t taken)
     give_back(taken);
 }
 
+uint64_t read_budget_try_take(uint64_t n, uint64_t reserve)
+{
+    pthread_mutex_lock(&g_mu);
+    int fits = !g_total || (g_used + n <= g_total && g_total - g_used - n >= reserve);
+    if (fits) {
+        g_used += n;
+        note_use_locked();
+    }
+    pthread_mutex_unlock(&g_mu);
+    return fits ? n : 0;
+}
+
 uint64_t read_budget_in_use(void)
 {
     pthread_mutex_lock(&g_mu);

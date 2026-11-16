@@ -51,6 +51,8 @@
 #define REPL       TEST_DIR "/replica"
 
 #define MiB ((uint64_t)1024 * 1024)
+/* The smallest budget the daemon accepts; every semaphore test runs at it. */
+#define BUDGET READ_BUDGET_MIN
 
 extern const db_migration_t app_migrations[];
 
@@ -76,9 +78,9 @@ static void test_floor_is_refused(void **state)
 static void test_oversized_request_is_clamped(void **state)
 {
     (void)state;
-    assert_int_equal(read_budget_init(16 * MiB), OK);
-    uint64_t t = read_budget_acquire(40 * MiB);
-    assert_true(t == 16 * MiB);
+    assert_int_equal(read_budget_init(BUDGET), OK);
+    uint64_t t = read_budget_acquire(BUDGET + 24 * MiB);
+    assert_true(t == BUDGET);
     read_budget_release(t);
     assert_true(read_budget_in_use() == 0);
     read_budget_init(0);
@@ -89,9 +91,9 @@ static void test_oversized_request_is_clamped(void **state)
 static void test_nested_acquire_never_waits(void **state)
 {
     (void)state;
-    assert_int_equal(read_budget_init(16 * MiB), OK);
+    assert_int_equal(read_budget_init(BUDGET), OK);
     read_budget_reset_stats();
-    uint64_t a = read_budget_acquire(16 * MiB);
+    uint64_t a = read_budget_acquire(BUDGET);
     uint64_t b = read_budget_acquire(8 * MiB);
     assert_true(read_budget_nested() == 1);
     read_budget_release(b);
@@ -107,7 +109,7 @@ static void *churn(void *arg)
     churn_t *c = arg;
     for (int i = 0; i < c->rounds; i++) {
         c->seed = c->seed * 1103515245u + 12345u;
-        uint64_t n = 1 + (c->seed >> 8) % (8 * MiB);
+        uint64_t n = 1 + (c->seed >> 8) % (BUDGET / 2);
         uint64_t t = read_budget_acquire(n);
         struct timespec ts = { 0, 20000 };
         nanosleep(&ts, NULL);
@@ -119,7 +121,7 @@ static void *churn(void *arg)
 static void test_cap_holds_under_contention(void **state)
 {
     (void)state;
-    assert_int_equal(read_budget_init(16 * MiB), OK);
+    assert_int_equal(read_budget_init(BUDGET), OK);
     read_budget_reset_stats();
     enum { N = 16 };
     pthread_t th[N];
@@ -131,9 +133,9 @@ static void test_cap_holds_under_contention(void **state)
     }
     for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
     printf("peak %llu of %llu\n", (unsigned long long)read_budget_peak(),
-           (unsigned long long)(16 * MiB));
-    assert_true(read_budget_peak() <= 16 * MiB);
-    assert_true(read_budget_peak() > 8 * MiB);
+           (unsigned long long)BUDGET);
+    assert_true(read_budget_peak() <= BUDGET);
+    assert_true(read_budget_peak() > BUDGET / 2);
     assert_true(read_budget_nested() == 0);
     assert_true(read_budget_in_use() == 0);
     read_budget_init(0);
@@ -149,14 +151,14 @@ static void *finish_foreign(void *arg)
 static void test_handoff(void **state)
 {
     (void)state;
-    assert_int_equal(read_budget_init(16 * MiB), OK);
+    assert_int_equal(read_budget_init(BUDGET), OK);
     read_budget_reset_stats();
-    uint64_t t = read_budget_acquire(10 * MiB);
+    uint64_t t = read_budget_acquire(BUDGET * 5 / 8);
     read_budget_handoff(t);
     /* This thread holds nothing now, so it waits like anyone else. */
     pthread_t th;
     assert_int_equal(pthread_create(&th, NULL, finish_foreign, &t), 0);
-    uint64_t u = read_budget_acquire(10 * MiB);
+    uint64_t u = read_budget_acquire(BUDGET * 5 / 8);
     pthread_join(th, NULL);
     read_budget_release(u);
     assert_true(read_budget_nested() == 0);
@@ -348,8 +350,9 @@ static void *job_backup(void *arg)
 }
 
 /*
- * Budget exactly one largest object, and restore twice, verify, grep,
- * replicate and a pooled backup all running at once over chunked files.
+ * The smallest budget - one largest object and one pack writer - and
+ * restore twice, verify, grep, replicate and a pooled backup all running at
+ * once over chunked files.
  * Every one finishes - the alarm fails the suite if anything deadlocks -
  * the peak never passes the budget, and nobody acquired while holding.
  */

@@ -413,6 +413,12 @@ static void test_contentless_file_is_named_by_restore_and_verify(void **state)
     st = verify_run(store, db, repo_id, VERIFY_LEVEL_INDEX, 0, NULL, NULL, NULL, &vr);
     assert_int_equal(st, ERR_CORRUPT);
     assert_int_equal(vr.missing, 1);
+    /* NIT-17: the summary adds up and ok excludes the failure. It read
+     * "checked 52, ok 52" with 2 missing. */
+    assert_true(vr.ok < vr.checked);
+    assert_int_equal(vr.checked, vr.ok + vr.repaired + vr.recoverable +
+                                 vr.unrecoverable + vr.missing);
+    assert_non_null(strstr(err_msg(), "ok, 0 unrecoverable and 1 missing"));
     assert_int_equal(vr.affected_files, 1);
     assert_int_equal(vr.affected_snapshots, 1);
     char run[32];
@@ -1305,6 +1311,124 @@ static void test_gc_compacts_packs(void **state)
     assert_int_equal(rr.skipped, 0);
 }
 
+/* ---------- symlinks planted in the destination (B128) ---------- */
+
+/*
+ * The restore wrote by path, so anything already in the destination was
+ * followed. The daemon runs as root: a symlink planted where a directory
+ * belongs had its target chown'd and chmod'd and every file beneath it
+ * created inside the target, renamed over what was there with --overwrite.
+ * Now nothing below the destination is reached through a symlink.
+ */
+static void plant_dest(void)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", restored_root());
+    assert_int_equal(system(cmd), 0);
+}
+
+static void assert_file_is(const char *path, const char *want, mode_t mode)
+{
+    char buf[256] = "";
+    FILE *f = fopen(path, "r");
+    assert_non_null(f);
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    assert_string_equal(buf, want);
+    struct stat sb;
+    assert_int_equal(stat(path, &sb), 0);
+    assert_int_equal(sb.st_mode & 07777, mode);
+}
+
+static void test_planted_symlink_at_a_file_path_is_not_followed(void **state)
+{
+    (void)state;
+    backup_result_t br;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    write_file(TEST_DIR "/victim.txt", "victim\n");
+    assert_int_equal(chmod(TEST_DIR "/victim.txt", 0600), 0);
+    plant_dest();
+    char at[PATH_MAX];
+    snprintf(at, sizeof(at), "%s/top.txt", restored_root());
+    assert_int_equal(symlink(TEST_DIR "/victim.txt", at), 0);
+
+    /* Without overwrite the link is the operator's: kept, not followed. */
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+    assert_int_equal(rr.kept, 1);
+    assert_file_is(TEST_DIR "/victim.txt", "victim\n", 0600);
+    struct stat sb;
+    assert_int_equal(lstat(at, &sb), 0);
+    assert_true(S_ISLNK(sb.st_mode));
+
+    /* With overwrite the link itself is replaced; its target is untouched. */
+    restore_opts_t ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.overwrite = 1;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, &ro, &rr), OK);
+    assert_int_equal(lstat(at, &sb), 0);
+    assert_true(S_ISREG(sb.st_mode));
+    struct stat src;
+    assert_int_equal(stat(TEST_SRC "/top.txt", &src), 0);
+    assert_file_is(at, "top level content\n", src.st_mode & 07777);
+    assert_file_is(TEST_DIR "/victim.txt", "victim\n", 0600);
+}
+
+static int dir_count(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+    closedir(d);
+    return n;
+}
+
+static void test_planted_symlink_at_a_directory_path_is_not_followed(void **state)
+{
+    (void)state;
+    backup_result_t br;
+    backup_opts_t o = basic_opts();
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    assert_int_equal(mkdir(TEST_DIR "/outside", 0700), 0);
+    plant_dest();
+    char at[PATH_MAX];
+    snprintf(at, sizeof(at), "%s/nested", restored_root());
+    assert_int_equal(symlink(TEST_DIR "/outside", at), 0);
+
+    for (int overwrite = 0; overwrite <= 1; overwrite++) {
+        restore_opts_t ro;
+        memset(&ro, 0, sizeof(ro));
+        ro.overwrite = overwrite;
+        restore_result_t rr;
+        memset(&rr, 0, sizeof(rr));
+        /* nested, nested/deeper, mid.txt and leaf.txt cannot be restored:
+         * a failure the job reports, not a write into the link's target. */
+        assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                     TEST_DST, &ro, &rr), ERR_CORRUPT);
+        assert_int_equal(rr.failed, 4);
+        assert_int_equal(dir_count(TEST_DIR "/outside"), 0);
+        struct stat sb;
+        assert_int_equal(stat(TEST_DIR "/outside", &sb), 0);
+        assert_int_equal(sb.st_mode & 07777, 0700);
+        assert_int_equal(lstat(at, &sb), 0);
+        assert_true(S_ISLNK(sb.st_mode));
+        /* The rest of the tree still restores. */
+        char top[PATH_MAX];
+        snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+        assert_int_equal(lstat(top, &sb), 0);
+        assert_true(S_ISREG(sb.st_mode));
+    }
+}
+
 /* ---------- xattrs and ACLs ---------- */
 
 /*
@@ -1355,6 +1479,79 @@ static void assert_acl_equals(const char *path, acl_type_t type,
     assert_non_null(txt);
     assert_string_equal(txt, want_text);
     acl_free(txt);
+}
+
+/*
+ * B129: an entry backed up with no ACL, restored inside a directory whose
+ * default ACL the restore has already set, inherited that default - a
+ * file as its access ACL, a directory as its access and default ACL - and
+ * kept it. The children here are made before the parent gets its default,
+ * so at the source they have none.
+ */
+static int has_xattr(const char *path, const char *name)
+{
+    return getxattr(path, name, NULL, 0) >= 0;
+}
+
+static void test_inherited_acls_are_not_restored(void **state)
+{
+    (void)state;
+    const char *dir = TEST_SRC "/acldir";
+    assert_int_equal(mkdir(dir, 0750), 0);
+    assert_int_equal(mkdir(TEST_SRC "/acldir/inner", 0751), 0);
+    write_file(TEST_SRC "/acldir/plain.txt", "no acl of its own\n");
+    assert_int_equal(chmod(TEST_SRC "/acldir/plain.txt", 0640), 0);
+    write_file(TEST_SRC "/acldir/own.txt", "its own acl\n");
+
+    acl_t dflt = acl_from_text("u::rwx,g::r-x,o::---,u:1234:rwx,g:4321:r-x,m::rwx");
+    acl_t own  = acl_from_text("u::rw-,g::r--,o::---,u:1234:r--,m::r--");
+    assert_non_null(dflt);
+    assert_non_null(own);
+    int rc = acl_set_file(dir, ACL_TYPE_DEFAULT, dflt);
+    if (rc == 0) rc = acl_set_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS, own);
+    acl_free(dflt);
+    acl_free(own);
+    if (rc != 0) skip();   /* no ACL support here */
+
+    acl_t a = acl_get_file(TEST_SRC "/acldir/own.txt", ACL_TYPE_ACCESS);
+    assert_non_null(a);
+    char *want_own = acl_to_text(a, NULL);
+    acl_free(a);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+    restore_result_t rr;
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id,
+                                 TEST_DST, NULL, &rr), OK);
+
+    static const char *const kids[] = { "inner", "plain.txt" };
+    for (size_t k = 0; k < 2; k++) {
+        char src[PATH_MAX], dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s/acldir/%s", TEST_SRC, kids[k]);
+        snprintf(dst, sizeof(dst), "%s/acldir/%s", restored_root(), kids[k]);
+        if (has_xattr(dst, "system.posix_acl_access"))
+            fail_msg("%s inherited an access ACL", kids[k]);
+        if (has_xattr(dst, "system.posix_acl_default"))
+            fail_msg("%s inherited a default ACL", kids[k]);
+        struct stat ss, ds;
+        assert_int_equal(stat(src, &ss), 0);
+        assert_int_equal(stat(dst, &ds), 0);
+        assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    }
+
+    /* The parent keeps its default, and a child with its own ACL keeps
+     * exactly that. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/acldir", restored_root());
+    assert_true(has_xattr(path, "system.posix_acl_default"));
+    snprintf(path, sizeof(path), "%s/acldir/own.txt", restored_root());
+    assert_acl_equals(path, ACL_TYPE_ACCESS, want_own);
+    struct stat ss, ds;
+    assert_int_equal(stat(TEST_SRC "/acldir/own.txt", &ss), 0);
+    assert_int_equal(stat(path, &ds), 0);
+    assert_int_equal(ds.st_mode & 07777, ss.st_mode & 07777);
+    acl_free(want_own);
 }
 
 static void test_xattrs_and_acls_round_trip(void **state)
@@ -2052,24 +2249,259 @@ static void test_resume_keeps_a_file_that_is_not_the_snapshots(void **state)
     assert_int_equal(trees_differ(TEST_SRC, restored_root()), 0);
 }
 
-/* A failed object leaves neither a file of its name nor a temporary file. */
+/* Temporary restore files anywhere under dir, at any depth. */
+static int count_partials_deep(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (strncmp(de->d_name, ".c-backup-partial.", 18) == 0) { n++; continue; }
+        char p[PATH_MAX];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, de->d_name) >= (int)sizeof(p)) continue;
+        struct stat sb;
+        if (lstat(p, &sb) == 0 && S_ISDIR(sb.st_mode)) n += count_partials_deep(p);
+    }
+    closedir(d);
+    return n;
+}
+
+/* The pack bytes [off, off + 51-byte entry header + stored payload) of a
+ * file's object, which is everything a read of it touches besides parity. */
+static void entry_span(const char *name, uint64_t *off, uint64_t *end, uint8_t hash[OBJECT_HASH_SIZE])
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT n.content_hash, p.comp_size FROM nodes n"
+                                " JOIN pack_objects p ON p.hash = n.content_hash"
+                                " WHERE n.repo_id = ? AND n.name = ? AND n.type = 1",
+                                (const char *[]){ repo, name, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    const char *hex = r->rows[0][0];
+    assert_int_equal(strlen(hex), OBJECT_HASH_SIZE * 2);
+    for (size_t i = 0; i < OBJECT_HASH_SIZE; i++) {
+        unsigned int byte = 0;
+        assert_int_equal(sscanf(hex + 2 * i, "%2x", &byte), 1);
+        hash[i] = (uint8_t)byte;
+    }
+    uint64_t size = strtoull(r->rows[0][1], NULL, 10);
+    db_result_free(r);
+    uint32_t pnum = 0;
+    assert_int_equal(pack_resolve_location(store, hash, &pnum, off), OK);
+    *end = *off + sizeof(pack_dat_entry_hdr_t) + size;
+}
+
+/*
+ * A failed object leaves neither a file of its name nor a temporary file
+ * (OWN-36), and a file whose bytes were not touched still comes back whole.
+ *
+ * wreck_packs overwrites every pack between its first and last 128 bytes,
+ * which takes every parity stripe with it, so nothing in a damaged entry
+ * can be rebuilt. What it spares depends on where the backup laid each
+ * object out: the first entry ends inside the first 128 bytes, so it is
+ * untouched and reads back by its CRC and name, no repair involved. Which
+ * file that is depends on the filesystem, because the scan visits a
+ * directory's entries in inode order: on btrfs or tmpfs nested/ is older
+ * than top.txt and leaf.txt comes first; on the CI runner top.txt came
+ * first, restored intact, and the old assertion that it was absent failed
+ * (v3 pipeline 5100). So top.txt is now damaged deliberately as well,
+ * wherever it lies, and every file is judged by whether its own bytes were
+ * hit: hit means no file and no partial, untouched means byte-exact.
+ */
 static void test_damaged_object_leaves_no_file_and_no_partial(void **state)
 {
     (void)state;
     backup_opts_t o = basic_opts();
     backup_result_t br;
     assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    static const struct { const char *name, *rel, *content; } files[] = {
+        { "top.txt",  "/top.txt",               "top level content\n" },
+        { "mid.txt",  "/nested/mid.txt",        "middle content\n" },
+        { "leaf.txt", "/nested/deeper/leaf.txt", "leaf content\n" },
+    };
+    enum { NFILES = sizeof(files) / sizeof(files[0]) };
+    uint64_t off[NFILES], end[NFILES];
+    uint8_t hash[NFILES][OBJECT_HASH_SIZE];
+    for (int i = 0; i < NFILES; i++) entry_span(files[i].name, &off[i], &end[i], hash[i]);
+
+    /* The one pack the backup wrote, and its size before the damage. */
+    char pack[512] = "";
+    FILE *fp = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(fp);
+    int npacks = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        snprintf(pack, sizeof(pack), "%s", line);
+        npacks++;
+    }
+    pclose(fp);
+    assert_int_equal(npacks, 1);
+    struct stat psb;
+    assert_int_equal(stat(pack, &psb), 0);
+    uint64_t wreck_lo = 128, wreck_hi = (uint64_t)psb.st_size - 128;
+
     wreck_packs();
+    /* And top.txt's own entry, wherever it is: one file always fails. */
+    {
+        int fd = open(pack, O_RDWR);
+        assert_true(fd >= 0);
+        size_t n = (size_t)(end[0] - off[0]);
+        uint8_t *buf = malloc(n);
+        assert_non_null(buf);
+        assert_int_equal(pread(fd, buf, n, (off_t)off[0]), (ssize_t)n);
+        for (size_t k = 0; k < n; k++) buf[k] ^= 0xA5;
+        assert_int_equal(pwrite(fd, buf, n, (off_t)off[0]), (ssize_t)n);
+        free(buf);
+        close(fd);
+        pack_cache_invalidate(store);
+        store_dat_cache_flush(store);
+    }
+
+    int damaged[NFILES], ndamaged = 0;
+    for (int i = 0; i < NFILES; i++) {
+        damaged[i] = i == 0 || (off[i] < wreck_hi && end[i] > wreck_lo);
+        ndamaged += damaged[i];
+    }
 
     restore_result_t rr;
-    assert_int_not_equal(restore_run(store, db, repo_id, br.snapshot_id,
-                                     TEST_DST, NULL, &rr), OK);
-    assert_true(rr.failed >= 1);
-    char top[700];
-    snprintf(top, sizeof(top), "%s/top.txt", restored_root());
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr),
+                     ERR_CORRUPT);
+    assert_int_equal(rr.failed, (uint64_t)ndamaged);
+    assert_int_equal(rr.files, (uint64_t)(NFILES - ndamaged));
+
+    for (int i = 0; i < NFILES; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s%s", restored_root(), files[i].rel);
+        struct stat sb;
+        if (damaged[i]) {
+            /* Neither a file of its name, nor anything of it left about. */
+            if (lstat(path, &sb) == 0)
+                fail_msg("%s failed to restore and still left a file of its name", files[i].rel);
+            continue;
+        }
+        /* Untouched bytes: whole, exactly as backed up. */
+        FILE *f = fopen(path, "rb");
+        if (!f) fail_msg("%s was not damaged and did not restore", files[i].rel);
+        char got[128] = { 0 };
+        size_t n = fread(got, 1, sizeof(got) - 1, f);
+        fclose(f);
+        assert_int_equal(n, strlen(files[i].content));
+        assert_string_equal(got, files[i].content);
+    }
+    assert_int_equal(count_partials_deep(TEST_DST), 0);
+}
+
+/* Read path whole and compare it with want. */
+static void assert_restored_exact(const char *path, const uint8_t *want, size_t want_len)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) fail_msg("%s did not restore", path);
+    uint8_t *got = malloc(want_len + 1);
+    assert_non_null(got);
+    ssize_t n = read(fd, got, want_len + 1);
+    close(fd);
+    assert_int_equal(n, (ssize_t)want_len);
+    assert_memory_equal(got, want, want_len);
+    free(got);
+}
+
+/*
+ * One object damaged beyond its parity, everything else in the pack intact:
+ * that one file fails and leaves nothing behind (OWN-36), and every other
+ * file restores byte-exact, on any layout.
+ *
+ * The fixture's files are entries of about 70 bytes side by side in one
+ * parity group, and a group corrects a 512-byte burst, so no damage
+ * confined to one of them goes beyond repair. So this adds a 40,000-byte
+ * incompressible file - one object, being under the CDC minimum - and puts
+ * 2048 bytes of junk inside its payload and inside one group, four times
+ * the burst the group carries, as test_pack_stripe does. Its neighbours'
+ * CRCs pass before parity is consulted, so they read untouched.
+ */
+static void test_one_unrepairable_object_fails_alone(void **state)
+{
+    (void)state;
+    enum { BIG = 40000 };
+    uint8_t *big = malloc(BIG);
+    assert_non_null(big);
+    uint32_t x = 0x9E3779B9u;
+    for (size_t i = 0; i < BIG; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        big[i] = (uint8_t)x;
+    }
+    int bfd = open(TEST_SRC "/big.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(bfd >= 0);
+    assert_int_equal(write(bfd, big, BIG), BIG);
+    close(bfd);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    uint64_t off = 0, end = 0;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    entry_span("big.bin", &off, &end, hash);
+    /* Stored whole: LZ4 gives up on random bytes. */
+    assert_int_equal(end - off, sizeof(pack_dat_entry_hdr_t) + BIG);
+
+    /* 2048 bytes inside the payload, clear of its edges, in one group. */
+    uint64_t pstart = off + sizeof(pack_dat_entry_hdr_t) + 20, pend = end - 20;
+    uint64_t start = pstart;
+    if (start / PARITY_GROUP_DATA != (start + 2048 - 1) / PARITY_GROUP_DATA)
+        start = (start / PARITY_GROUP_DATA + 1) * PARITY_GROUP_DATA + 20;
+    assert_true(start + 2048 <= pend);
+
+    char pack[512] = "";
+    FILE *fp = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(fp);
+    int npacks = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        snprintf(pack, sizeof(pack), "%s", line);
+        npacks++;
+    }
+    pclose(fp);
+    assert_int_equal(npacks, 1);
+    int fd = open(pack, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t junk[2048];
+    assert_int_equal(pread(fd, junk, sizeof(junk), (off_t)start), (ssize_t)sizeof(junk));
+    for (size_t k = 0; k < sizeof(junk); k++) junk[k] ^= 0xA5;
+    assert_int_equal(pwrite(fd, junk, sizeof(junk), (off_t)start), (ssize_t)sizeof(junk));
+    close(fd);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr),
+                     ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    assert_int_equal(rr.files, 3);
+
+    char path[PATH_MAX];
     struct stat sb;
-    assert_int_not_equal(lstat(top, &sb), 0);
-    assert_int_equal(count_partials(restored_root()), 0);
+    snprintf(path, sizeof(path), "%s/big.bin", restored_root());
+    if (lstat(path, &sb) == 0)
+        fail_msg("big.bin failed to restore and still left a file of its name");
+    static const struct { const char *rel, *content; } files[] = {
+        { "/top.txt",                "top level content\n" },
+        { "/nested/mid.txt",         "middle content\n" },
+        { "/nested/deeper/leaf.txt", "leaf content\n" },
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s%s", restored_root(), files[i].rel);
+        assert_restored_exact(path, (const uint8_t *)files[i].content, strlen(files[i].content));
+    }
+    assert_int_equal(count_partials_deep(TEST_DST), 0);
+    free(big);
 }
 
 /*
@@ -2128,12 +2560,15 @@ static void test_unknown_object_type_is_refused_by_restore(void **state)
     uint8_t t = 9;
     assert_int_equal(pwrite(fd, &t, 1, (off_t)(el.entry_offset +
                                 offsetof(pack_dat_entry_hdr_t, type))), 1);
-    /* Break the footer too, so the pack has no parity: with it, header
-     * repair would (rightly) put the original type back. */
+    /* Take the parity away too - both tails broken, and a byte appended so
+     * the trailer cannot be derived from the body: with parity, repair
+     * would (rightly) put the original type back. */
     uint8_t z = 0;
     off_t end = lseek(fd, 0, SEEK_END);
-    assert_true(end > (off_t)sizeof(parity_footer_t));
-    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)sizeof(parity_footer_t)), 1);
+    assert_true(end > (off_t)(2 * PACK_TAIL_BYTES));
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)PACK_TAIL_BYTES), 1);
+    assert_int_equal(pwrite(fd, &z, 1, end - (off_t)(2 * PACK_TAIL_BYTES)), 1);
+    assert_int_equal(ftruncate(fd, end + 1), 0);
     close(fd);
     pack_cache_invalidate(store);
     store_dat_cache_flush(store);
@@ -2182,7 +2617,10 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_device_the_kernel_refuses_is_skipped_not_created, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unprivileged_device_failure_does_not_fail_the_restore, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_compacts_packs, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_file_path_is_not_followed, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_planted_symlink_at_a_directory_path_is_not_followed, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_round_trip, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_inherited_acls_are_not_restored, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattr_backup_is_deterministic, setup, teardown),
         cmocka_unit_test_setup_teardown(test_xattrs_and_acls_survive_a_reindex, setup, teardown),
         cmocka_unit_test_setup_teardown(test_reindex_rebuilds_the_index, setup, teardown),
@@ -2196,6 +2634,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_killed_mid_file_leaves_no_partial_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resume_keeps_a_file_that_is_not_the_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_object_leaves_no_file_and_no_partial, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_one_unrepairable_object_fails_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_entry_naming_a_tree_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_object_type_is_refused_by_restore, setup, teardown),
     };

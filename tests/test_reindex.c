@@ -207,7 +207,8 @@ static void test_unreadable_snapshot_fails_the_run_and_keeps_its_rows(void **sta
 /*
  * The pack index rebuild began by deleting every pack row, so one pack that
  * could not be read lost its rows for good. They are kept now, and the pack
- * fails the run.
+ * fails the run. Its parity is taken away too: with it, the header is put
+ * back and the pack is readable after all.
  */
 static void test_unreadable_pack_keeps_its_rows(void **state)
 {
@@ -227,7 +228,9 @@ static void test_unreadable_pack_keeps_its_rows(void **state)
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "f=$(find '%s/packs' -name 'pack-%010u.dat' | head -1);"
-             " printf 'garbagegarbagegarbage' | dd of=\"$f\" conv=notrunc status=none",
+             " printf 'garbagegarbagegarbage' | dd of=\"$f\" conv=notrunc status=none;"
+             /* and a byte appended, so no parity can put the header back */
+             " truncate -s +1 \"$f\"",
              TEST_REPO, pack_num);
     assert_int_equal(system(cmd), 0);
 
@@ -657,7 +660,7 @@ static void test_replica_of_another_format_is_refused(void **state)
     assert_int_equal(replica_sink_local_open(TEST_REPLICA, &m, &sink), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "is repository format 2; this build reads only format 3"));
     err_clear();
-    assert_int_equal(replica_sink_local_open_reencrypt(TEST_REPLICA, &m, &sink), ERR_INVALID);
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_REPLICA, &m, 0, &sink), ERR_INVALID);
     assert_non_null(strstr(err_msg(), "is repository format 2"));
     err_clear();
     replica_reader_t *rd = NULL;

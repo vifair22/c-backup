@@ -198,7 +198,7 @@ static int record_exists(const char *root, int64_t id)
 static int tmp_is_empty(const char *root)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp')\"", root);
+    snprintf(cmd, sizeof(cmd), "test -z \"$(ls -A '%s/tmp' | grep -vx .lock)\"", root);
     return system(cmd) == 0;
 }
 
@@ -282,7 +282,7 @@ static int64_t make_dest(repo_enc_mode_t mode)
 static status_t replicate_reencrypt(replicate_result_t *rr)
 {
     replica_sink_t sink;
-    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, &sink), OK);
+    assert_int_equal(replica_sink_local_open_reencrypt(TEST_DST, &marker, 1, &sink), OK);
     status_t st = replicate_run(store, db, repo_id, &sink, NULL, NULL, NULL, rr);
     sink.v->close(sink.ctx);
     return st;

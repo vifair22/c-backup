@@ -333,11 +333,15 @@ static void test_small_files_racing_the_small_file_workers(void **state)
 
 /*
  * B128: a file replaced by a symlink between the scan and the store was
- * followed, and `ln -s /etc/shadow` put the shadow file in the snapshot. A
- * file another one was renamed over is not the scanned file either. Both
- * are left out, on every path, and nothing the link named is stored.
+ * followed, and `ln -s /etc/shadow` put the shadow file in the snapshot.
+ * Every store path opens beneath the source root (open_scanned.h), so a
+ * symlink in the file's place, or in place of a directory on its path, is
+ * refused and the file left out. A file something else was renamed over is
+ * a regular file still, an editor's save: stored as read and listed as
+ * changed (OWN-45), never skipped for the new inode.
  */
-#define SECRET TEST_DIR "/secret.txt"
+#define SECRET_DIR TEST_DIR "/elsewhere"
+#define SECRET     SECRET_DIR "/x.bin"
 #define SECRET_TEXT "the content a symlink must never smuggle in\n"
 
 static void swap_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
@@ -348,9 +352,15 @@ static void swap_at_store(const char *phase, uint64_t done, uint64_t total, void
     r->done = 1;
     const char *d = r->small ? TEST_SRC "/many" : TEST_SRC;
     char p[PATH_MAX], tmp[PATH_MAX];
+    /* The file itself becomes a symlink. */
     snprintf(p, sizeof(p), "%s/becomes-link.bin", d);
     assert_int_equal(unlink(p), 0);
     assert_int_equal(symlink(SECRET, p), 0);
+    /* A directory on the path becomes a symlink to one holding a file of
+     * the same name. */
+    assert_int_equal(rename(TEST_SRC "/deep", TEST_DIR "/deep.old"), 0);
+    assert_int_equal(symlink(SECRET_DIR, TEST_SRC "/deep"), 0);
+    /* Another file renamed over this one. */
     snprintf(p, sizeof(p), "%s/renamed-over.bin", d);
     snprintf(tmp, sizeof(tmp), "%s/.renamed-over.tmp", TEST_DIR);
     write_rand(tmp, r->small ? 3000 : 20 * MiB, 999, "wb");
@@ -359,6 +369,7 @@ static void swap_at_store(const char *phase, uint64_t done, uint64_t total, void
 
 static void run_symlink_swap(unsigned workers, int small)
 {
+    assert_int_equal(mkdir(SECRET_DIR, 0700), 0);
     write_text(SECRET, SECRET_TEXT);
     const char *d = small ? TEST_SRC "/many" : TEST_SRC;
     char p[PATH_MAX];
@@ -376,6 +387,8 @@ static void run_symlink_swap(unsigned workers, int small)
         snprintf(p, sizeof(p), "%s/%s", d, names[i]);
         write_rand(p, small ? 4096 : 24 * MiB + 1, (uint64_t)i + 31, "wb");
     }
+    assert_int_equal(mkdir(TEST_SRC "/deep", 0700), 0);
+    write_rand(TEST_SRC "/deep/x.bin", small ? 2048 : 18 * MiB, 77, "wb");
 
     race_t rc = { 0, small };
     static const char *paths[] = { TEST_SRC };
@@ -390,31 +403,39 @@ static void run_symlink_swap(unsigned workers, int small)
     assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
     assert_true(rc.done);
 
+    /* Two left out, each with what is in the way. */
     assert_int_equal(res.files_skipped, 2);
     snprintf(p, sizeof(p), "%s/becomes-link.bin", d);
     assert_true(skipped_has(&res, p, "no longer a regular file (now a symlink)"));
-    snprintf(p, sizeof(p), "%s/renamed-over.bin", d);
-    assert_true(skipped_has(&res, p, "replaced by another file since the scan"));
+    assert_true(skipped_has(&res, TEST_SRC "/deep/x.bin",
+                            "a directory on its path is now a symlink"));
     assert_int_equal(count_nodes_named("becomes-link.bin"), 0);
-    assert_int_equal(count_nodes_named("renamed-over.bin"), 0);
+    assert_int_equal(count_nodes_named("x.bin"), 0);
     assert_no_contentless_rows();
 
-    /* Nothing the link named reached the repository: a grep of the whole
-     * restore for its text finds nothing, and the restore holds neither
-     * entry. */
+    /* The renamed-over file is stored, as the file now at the path. */
+    snprintf(p, sizeof(p), "%s/renamed-over.bin", d);
+    assert_true(changed_has(&res, p));
+    assert_int_equal(count_nodes_named("renamed-over.bin"), 1);
+
+    /* Nothing either symlink named reached the repository, and the restore
+     * holds the renamed-over file as it is in the source now. */
     rmrf(TEST_OUT);
     restore_result_t rr;
     memset(&rr, 0, sizeof(rr));
     assert_int_equal(restore_run(store, db, repo_id, res.snapshot_id, TEST_OUT, NULL, &rr), OK);
     assert_int_equal(rr.failed, 0);
-    char cmd[PATH_MAX * 2];
+    char cmd[PATH_MAX * 3];
     snprintf(cmd, sizeof(cmd), "grep -rqF 'must never smuggle' '%s'", TEST_OUT);
     assert_int_not_equal(system(cmd), 0);
     struct stat sb;
     snprintf(p, sizeof(p), "%s%s/becomes-link.bin", TEST_OUT, d);
     assert_int_not_equal(lstat(p, &sb), 0);
-    snprintf(p, sizeof(p), "%s%s/renamed-over.bin", TEST_OUT, d);
+    snprintf(p, sizeof(p), "%s" TEST_SRC "/deep/x.bin", TEST_OUT);
     assert_int_not_equal(lstat(p, &sb), 0);
+    snprintf(cmd, sizeof(cmd), "cmp -s '%s/renamed-over.bin' '%s%s/renamed-over.bin'",
+             d, TEST_OUT, d);
+    assert_int_equal(system(cmd), 0);
     verify_clean();
     backup_result_free(&res);
 }
