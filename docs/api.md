@@ -954,7 +954,9 @@ small-file workers. The job still completes (Manual section 6.3), and says so:
 
 `reason` reads `cannot open: it no longer exists`, `cannot open:
 Permission denied` (or another errno text), `no longer a regular file (now
-a directory)`, `no longer a regular file`, `changed while it was being
+a directory)`, `no longer a regular file (now a symlink)` (never
+followed: B128), `no longer a regular file`, `replaced by another file since
+the scan` (another inode now holds the path), `changed while it was being
 read, and again on a second read` (a file still changing when read a second
 time; Manual section 6.3), or `cannot read: ` followed by the store's
 error. Each is also a `WARN` line in the daemon log, `backup:

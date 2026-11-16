@@ -137,13 +137,11 @@ static void discard_objs(void *ctx)
 static void store_one(small_pool_t *pool, small_file_t *f)
 {
     f->ran = 1;
-    /* O_NONBLOCK so a FIFO put where the file was cannot hang the worker;
-     * settle_store_fd refuses anything that is not a regular file. */
-    int fd = open(f->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    /* Never through a symlink (B128); see SETTLE_OPEN_FLAGS. */
+    int fd = open(f->path, SETTLE_OPEN_FLAGS);
     if (fd == -1) {
         f->skipped = 1;
-        snprintf(f->err, sizeof(f->err), "cannot open: %s",
-                 errno == ENOENT ? "it no longer exists" : strerror(errno));
+        settle_open_reason(errno, f->err, sizeof(f->err));
         return;
     }
     keep_ctx_t k = { pool->store, f };

@@ -785,7 +785,12 @@ or its index, so the snapshot never lists a file it cannot restore. That
 covers a file that vanished between the scan and the read, one the daemon
 may not open, one replaced by a directory or anything else that is not a
 regular file, one whose read fails partway (an I/O error), and one still
-changing on a second read (below). A backup
+changing on a second read (below). A file replaced by a symlink is left
+out too, and the link is never followed: every store path opens with
+`O_NOFOLLOW` and checks the open file is the inode the scan saw, so a
+symlink to `/etc/shadow` swapped in mid-backup cannot put the shadow file
+in a snapshot (B128); a file something else was renamed over is left out
+the same way. A backup
 with skipped files still ends `completed`, but not silently:
 
 - each file is a `WARN` line naming it and the reason, `backup: skipping

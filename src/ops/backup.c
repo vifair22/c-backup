@@ -1398,16 +1398,14 @@ static status_t store_content_loop(pipeline_t *p)
 
         /* Open is part of reading: over NFS it is a round trip per file. */
         uint64_t _tr = phase_now(), _trn = phase_nested(p->timers);
-        /* O_NONBLOCK so a FIFO put where the file was cannot hang the
-         * backup in open; it changes nothing for a regular file. */
-        int fd = open(e->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        /* Never through a symlink (B128): one swapped in for the file
+         * since the scan was followed, and stored whatever it named. */
+        int fd = open(e->path, SETTLE_OPEN_FLAGS);
         if (fd == -1) {
             /* A file that vanished between scan and store is normal on a live
              * filesystem; it is a warning, not a failed backup. */
             char why[160];
-            snprintf(why, sizeof(why), "cannot open: %s",
-                     errno == ENOENT ? "it no longer exists" : strerror(errno));
-            skip_file(p, i, why);
+            skip_file(p, i, settle_open_reason(errno, why, sizeof(why)));
             continue;
         }
         /* Replaced by something else since the scan (OWN-41). settle_store_fd
@@ -1419,6 +1417,13 @@ static status_t store_content_loop(pipeline_t *p)
             close(fd);
             skip_file(p, i, was_dir ? "no longer a regular file (now a directory)"
                                     : "no longer a regular file");
+            continue;
+        }
+        /* And the inode the scan saw (B128), before a file worker gets it;
+         * settle_store_fd checks it again on every path. */
+        if (fst.st_dev != e->st.st_dev || fst.st_ino != e->st.st_ino) {
+            close(fd);
+            skip_file(p, i, "replaced by another file since the scan");
             continue;
         }
 

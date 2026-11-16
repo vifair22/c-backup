@@ -331,6 +331,112 @@ static void test_small_files_racing_the_small_file_workers(void **state)
     run_scan_store_race(4, 1);
 }
 
+/*
+ * B128: a file replaced by a symlink between the scan and the store was
+ * followed, and `ln -s /etc/shadow` put the shadow file in the snapshot. A
+ * file another one was renamed over is not the scanned file either. Both
+ * are left out, on every path, and nothing the link named is stored.
+ */
+#define SECRET TEST_DIR "/secret.txt"
+#define SECRET_TEXT "the content a symlink must never smuggle in\n"
+
+static void swap_at_store(const char *phase, uint64_t done, uint64_t total, void *ctx)
+{
+    (void)total;
+    race_t *r = ctx;
+    if (r->done || strcmp(phase, "store") != 0 || done != 0) return;
+    r->done = 1;
+    const char *d = r->small ? TEST_SRC "/many" : TEST_SRC;
+    char p[PATH_MAX], tmp[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/becomes-link.bin", d);
+    assert_int_equal(unlink(p), 0);
+    assert_int_equal(symlink(SECRET, p), 0);
+    snprintf(p, sizeof(p), "%s/renamed-over.bin", d);
+    snprintf(tmp, sizeof(tmp), "%s/.renamed-over.tmp", TEST_DIR);
+    write_rand(tmp, r->small ? 3000 : 20 * MiB, 999, "wb");
+    assert_int_equal(rename(tmp, p), 0);
+}
+
+static void run_symlink_swap(unsigned workers, int small)
+{
+    write_text(SECRET, SECRET_TEXT);
+    const char *d = small ? TEST_SRC "/many" : TEST_SRC;
+    char p[PATH_MAX];
+    if (small) {
+        assert_int_equal(mkdir(d, 0700), 0);
+        for (int i = 0; i < 600; i++) {
+            snprintf(p, sizeof(p), "%s/f%03d.txt", d, i);
+            char body[64];
+            snprintf(body, sizeof(body), "small file %d\n", i);
+            write_text(p, body);
+        }
+    }
+    static const char *names[] = { "becomes-link.bin", "renamed-over.bin", "steady.bin" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), "%s/%s", d, names[i]);
+        write_rand(p, small ? 4096 : 24 * MiB + 1, (uint64_t)i + 31, "wb");
+    }
+
+    race_t rc = { 0, small };
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = workers;
+    o.progress_cb = swap_at_store;
+    o.progress_ctx = &rc;
+    backup_result_t res;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &res), OK);
+    assert_true(rc.done);
+
+    assert_int_equal(res.files_skipped, 2);
+    snprintf(p, sizeof(p), "%s/becomes-link.bin", d);
+    assert_true(skipped_has(&res, p, "no longer a regular file (now a symlink)"));
+    snprintf(p, sizeof(p), "%s/renamed-over.bin", d);
+    assert_true(skipped_has(&res, p, "replaced by another file since the scan"));
+    assert_int_equal(count_nodes_named("becomes-link.bin"), 0);
+    assert_int_equal(count_nodes_named("renamed-over.bin"), 0);
+    assert_no_contentless_rows();
+
+    /* Nothing the link named reached the repository: a grep of the whole
+     * restore for its text finds nothing, and the restore holds neither
+     * entry. */
+    rmrf(TEST_OUT);
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, res.snapshot_id, TEST_OUT, NULL, &rr), OK);
+    assert_int_equal(rr.failed, 0);
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof(cmd), "grep -rqF 'must never smuggle' '%s'", TEST_OUT);
+    assert_int_not_equal(system(cmd), 0);
+    struct stat sb;
+    snprintf(p, sizeof(p), "%s%s/becomes-link.bin", TEST_OUT, d);
+    assert_int_not_equal(lstat(p, &sb), 0);
+    snprintf(p, sizeof(p), "%s%s/renamed-over.bin", TEST_OUT, d);
+    assert_int_not_equal(lstat(p, &sb), 0);
+    verify_clean();
+    backup_result_free(&res);
+}
+
+static void test_symlink_swap_on_the_backup_thread(void **state)
+{
+    (void)state;
+    run_symlink_swap(1, 0);
+}
+
+static void test_symlink_swap_on_the_file_workers(void **state)
+{
+    (void)state;
+    run_symlink_swap(8, 0);
+}
+
+static void test_symlink_swap_on_the_small_file_workers(void **state)
+{
+    (void)state;
+    run_symlink_swap(4, 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* During the read                                                     */
 /* ------------------------------------------------------------------ */
@@ -479,6 +585,9 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_large_files_racing_the_chunk_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_files_racing_the_file_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_small_files_racing_the_small_file_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_symlink_swap_on_the_backup_thread, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_symlink_swap_on_the_file_workers, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_symlink_swap_on_the_small_file_workers, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_file_that_grows_mid_read_is_read_again, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_file_that_shrinks_mid_read_is_read_again, setup, teardown),
         cmocka_unit_test_setup_teardown(test_large_file_that_never_settles_is_left_out, setup, teardown),
