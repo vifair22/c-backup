@@ -2397,6 +2397,113 @@ static void test_damaged_object_leaves_no_file_and_no_partial(void **state)
     assert_int_equal(count_partials_deep(TEST_DST), 0);
 }
 
+/* Read path whole and compare it with want. */
+static void assert_restored_exact(const char *path, const uint8_t *want, size_t want_len)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) fail_msg("%s did not restore", path);
+    uint8_t *got = malloc(want_len + 1);
+    assert_non_null(got);
+    ssize_t n = read(fd, got, want_len + 1);
+    close(fd);
+    assert_int_equal(n, (ssize_t)want_len);
+    assert_memory_equal(got, want, want_len);
+    free(got);
+}
+
+/*
+ * One object damaged beyond its parity, everything else in the pack intact:
+ * that one file fails and leaves nothing behind (OWN-36), and every other
+ * file restores byte-exact, on any layout.
+ *
+ * The fixture's files are entries of about 70 bytes side by side in one
+ * parity group, and a group corrects a 512-byte burst, so no damage
+ * confined to one of them goes beyond repair. So this adds a 40,000-byte
+ * incompressible file - one object, being under the CDC minimum - and puts
+ * 2048 bytes of junk inside its payload and inside one group, four times
+ * the burst the group carries, as test_pack_stripe does. Its neighbours'
+ * CRCs pass before parity is consulted, so they read untouched.
+ */
+static void test_one_unrepairable_object_fails_alone(void **state)
+{
+    (void)state;
+    enum { BIG = 40000 };
+    uint8_t *big = malloc(BIG);
+    assert_non_null(big);
+    uint32_t x = 0x9E3779B9u;
+    for (size_t i = 0; i < BIG; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        big[i] = (uint8_t)x;
+    }
+    int bfd = open(TEST_SRC "/big.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(bfd >= 0);
+    assert_int_equal(write(bfd, big, BIG), BIG);
+    close(bfd);
+
+    backup_opts_t o = basic_opts();
+    backup_result_t br;
+    assert_int_equal(backup_run(store, db, repo_id, &o, &br), OK);
+
+    uint64_t off = 0, end = 0;
+    uint8_t hash[OBJECT_HASH_SIZE];
+    entry_span("big.bin", &off, &end, hash);
+    /* Stored whole: LZ4 gives up on random bytes. */
+    assert_int_equal(end - off, sizeof(pack_dat_entry_hdr_t) + BIG);
+
+    /* 2048 bytes inside the payload, clear of its edges, in one group. */
+    uint64_t pstart = off + sizeof(pack_dat_entry_hdr_t) + 20, pend = end - 20;
+    uint64_t start = pstart;
+    if (start / PARITY_GROUP_DATA != (start + 2048 - 1) / PARITY_GROUP_DATA)
+        start = (start / PARITY_GROUP_DATA + 1) * PARITY_GROUP_DATA + 20;
+    assert_true(start + 2048 <= pend);
+
+    char pack[512] = "";
+    FILE *fp = popen("find " TEST_REPO "/packs -name '*.dat'", "r");
+    assert_non_null(fp);
+    int npacks = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        snprintf(pack, sizeof(pack), "%s", line);
+        npacks++;
+    }
+    pclose(fp);
+    assert_int_equal(npacks, 1);
+    int fd = open(pack, O_RDWR);
+    assert_true(fd >= 0);
+    uint8_t junk[2048];
+    assert_int_equal(pread(fd, junk, sizeof(junk), (off_t)start), (ssize_t)sizeof(junk));
+    for (size_t k = 0; k < sizeof(junk); k++) junk[k] ^= 0xA5;
+    assert_int_equal(pwrite(fd, junk, sizeof(junk), (off_t)start), (ssize_t)sizeof(junk));
+    close(fd);
+    pack_cache_invalidate(store);
+    store_dat_cache_flush(store);
+
+    restore_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    assert_int_equal(restore_run(store, db, repo_id, br.snapshot_id, TEST_DST, NULL, &rr),
+                     ERR_CORRUPT);
+    assert_int_equal(rr.failed, 1);
+    assert_int_equal(rr.files, 3);
+
+    char path[PATH_MAX];
+    struct stat sb;
+    snprintf(path, sizeof(path), "%s/big.bin", restored_root());
+    if (lstat(path, &sb) == 0)
+        fail_msg("big.bin failed to restore and still left a file of its name");
+    static const struct { const char *rel, *content; } files[] = {
+        { "/top.txt",                "top level content\n" },
+        { "/nested/mid.txt",         "middle content\n" },
+        { "/nested/deeper/leaf.txt", "leaf content\n" },
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s%s", restored_root(), files[i].rel);
+        assert_restored_exact(path, (const uint8_t *)files[i].content, strlen(files[i].content));
+    }
+    assert_int_equal(count_partials_deep(TEST_DST), 0);
+    free(big);
+}
+
 /*
  * OWN-39: a file node whose content hash names a tree is refused. The
  * object reads back fine - it is a valid tree - and restore used to write
@@ -2527,6 +2634,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_restore_killed_mid_file_leaves_no_partial_file, setup, teardown),
         cmocka_unit_test_setup_teardown(test_resume_keeps_a_file_that_is_not_the_snapshots, setup, teardown),
         cmocka_unit_test_setup_teardown(test_damaged_object_leaves_no_file_and_no_partial, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_one_unrepairable_object_fails_alone, setup, teardown),
         cmocka_unit_test_setup_teardown(test_file_entry_naming_a_tree_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unknown_object_type_is_refused_by_restore, setup, teardown),
     };
