@@ -29,6 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 
 #include <cmocka.h>
@@ -502,6 +503,42 @@ static void test_target_of_another_repository_is_refused(void **state)
     err_clear();
 }
 
+/*
+ * B121: the refusal carries the advice and the whole path. Its 256-byte
+ * buffer cut a 135-character path mid-way, parenthesis unclosed. The path
+ * here is longer than the old buffer on its own.
+ */
+static void test_refusal_names_a_long_path_whole(void **state)
+{
+    (void)state;
+    char deep[PATH_MAX];
+    int n = snprintf(deep, sizeof(deep), "%s/%s/%s/t", DST_REPO,
+                     "a-rather-long-directory-name-for-a-replica-target-"
+                     "that-goes-on-for-quite-some-time-0123456789",
+                     "and-a-second-long-component-so-the-path-alone-passes-"
+                     "the-old-two-hundred-and-fifty-six-byte-buffer-by-itself-"
+                     "with-room-to-spare");
+    assert_true(n > 256 && (size_t)n < sizeof(deep));
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", deep);
+    assert_int_equal(system(cmd), 0);
+
+    assert_int_equal(store_init_dirs(deep), OK);
+    repo_marker_t other;
+    assert_int_equal(repo_marker_write(deep, &other), OK);
+
+    replica_sink_t sink;
+    assert_int_not_equal(replica_sink_local_open(deep, &src_marker, &sink), OK);
+    const char *msg = err_msg();
+    assert_non_null(strstr(msg, "replicate with --reencrypt"));
+    char tail[PATH_MAX + 32];
+    snprintf(tail, sizeof(tail), "(replica at %s)", deep);
+    size_t ml = strlen(msg), tl = strlen(tail);
+    assert_true(ml >= tl);
+    assert_string_equal(msg + ml - tl, tail);
+    err_clear();
+}
+
 static void test_replica_carries_the_source_identity(void **state)
 {
     (void)state;
@@ -645,6 +682,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_interrupted_transfer_leaves_no_lying_tree, setup, teardown),
         cmocka_unit_test_setup_teardown(test_existing_objects_are_never_rewritten, setup, teardown),
         cmocka_unit_test_setup_teardown(test_target_of_another_repository_is_refused, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_refusal_names_a_long_path_whole, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replica_carries_the_source_identity, setup, teardown),
         cmocka_unit_test_setup_teardown(test_packed_source_replicates_readably, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replica_record_escapes_the_label, setup, teardown),

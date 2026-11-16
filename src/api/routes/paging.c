@@ -9,13 +9,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 2^53: the largest whole number a double holds exactly, and so the
+ * largest one the API can be sure it read as sent. */
+#define PAGING_EXACT_MAX 9007199254740992.0
+
 /*
  * One count from the query string, in the words every numeric parameter
  * uses (B112): something that is not a whole number says so, and a whole
  * number below lo is out of range. Above hi is not an error - a limit is
  * clamped to the route's maximum and an offset past every row is an empty
- * page, however many digits or however large an exponent it has (NIT-6) -
- * so it reads as hi. Returns 0 with *out set, or -1 with *bad set.
+ * page (NIT-6) - so it reads as hi, up to 2^53. Past that the number cannot
+ * be represented, 1e999 being the extreme, and it is out of range as
+ * docs/api.md says such a number is everywhere else (NIT-8): a 20-digit
+ * limit was quietly read as 1000. Returns 0 with *out set, or -1 with *bad
+ * set.
  */
 static int parse_count(const char *name, const char *s, long lo, long hi,
                        const char *range, long *out, api_response_t *bad)
@@ -31,7 +38,7 @@ static int parse_count(const char *name, const char *s, long lo, long hi,
         *bad = api_error(400, msg);
         return -1;
     }
-    if (d < (double)lo) {
+    if (d < (double)lo || !(d <= PAGING_EXACT_MAX)) {
         snprintf(msg, sizeof(msg), "%s is out of range; it must be %s", name, range);
         *bad = api_error(400, msg);
         return -1;
@@ -59,9 +66,10 @@ int routes_paging(const api_request_t *req, int def_limit, int max_limit,
     const char *v = api_query_param(req, "limit");
     long n = def_limit;
     if (v) {
-        char range[96];
+        char range[128];
         snprintf(range, sizeof(range),
-                 "from 1 to %d (a larger one is reduced to %d)", max_limit, max_limit);
+                 "from 1 to %d (a larger one, up to 9007199254740992, is reduced to %d)",
+                 max_limit, max_limit);
         if (parse_count("limit", v, 1, max_limit, range, &n, bad) != 0) return -1;
     }
     *limit = (int)n;
@@ -69,11 +77,31 @@ int routes_paging(const api_request_t *req, int def_limit, int max_limit,
     if (offset) {
         v = api_query_param(req, "offset");
         long o = 0;
-        char range[96];
+        char range[128];
         snprintf(range, sizeof(range),
-                 "from 0 to %d (a larger one is past every row)", INT_MAX);
+                 "from 0 to %d (a larger one, up to 9007199254740992, is past every row)",
+                 INT_MAX);
         if (v && parse_count("offset", v, 0, INT_MAX, range, &o, bad) != 0) return -1;
         *offset = (int)o;
     }
     return 0;
+}
+
+int routes_path_id(const char *p, int64_t min, int64_t *out, const char **end)
+{
+    const char *e = p;
+    while (*e && *e != '/') e++;
+    if (e == p) return 0;
+
+    /* Sixteen digits hold 2^53; a longer run is too large whatever it
+     * says, and is refused before it can overflow. */
+    int64_t v = 0;
+    for (const char *q = p; q < e; q++) {
+        if (*q < '0' || *q > '9' || q - p >= 17) return -1;
+        v = v * 10 + (*q - '0');
+    }
+    if (v < min || v > ((int64_t)1 << 53)) return -1;
+    *out = v;
+    if (end) *end = e;
+    return 1;
 }
