@@ -160,12 +160,13 @@ static void root_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
  * made from the files. */
 static void src_tree_of(int64_t snap, char out[OBJECT_HASH_SIZE * 2 + 1])
 {
-    char id[32];
+    char id[32], repo[32];
     snprintf(id, sizeof(id), "%lld", (long long)snap);
+    snprintf(repo, sizeof(repo), "%lld", (long long)repo_id);
     db_result_t *r = NULL;
     assert_int_equal(db_execute(db, "SELECT subtree_hash FROM nodes WHERE snap_id = ?"
-                                " AND name = 'src' AND type = 2",
-                                (const char *[]){ id, NULL }, &r), 0);
+                                " AND repo_id = ? AND name = 'src' AND type = 2",
+                                (const char *[]){ id, repo, NULL }, &r), 0);
     assert_int_equal(r->nrows, 1);
     snprintf(out, OBJECT_HASH_SIZE * 2 + 1, "%s", r->rows[0][0]);
     db_result_free(r);
@@ -243,6 +244,137 @@ static void test_workers_do_not_change_the_snapshot(void **state)
     assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
                             " AND location IN ('loose', 'staged')"), 0);
     restore_and_diff(b.snapshot_id);
+}
+
+/*
+ * Small files on workers (small_files.h): a fresh backup of a tree of many
+ * small files gives the same snapshot, the same objects with the same rows,
+ * the same counters and a cache row per file whether one thread stores them
+ * or eight do. The tree has duplicates within and across batches, empty
+ * files, a file with a hole, one that is several chunks, and one that
+ * cannot be opened.
+ */
+static void make_small_tree(void)
+{
+    char path[256];
+    assert_int_equal(mkdir(TEST_SRC "/d0", 0700), 0);
+    assert_int_equal(mkdir(TEST_SRC "/d1", 0700), 0);
+    for (int i = 0; i < 1500; i++) {
+        snprintf(path, sizeof(path), TEST_SRC "/d%d/f%04d.dat", i % 2, i);
+        size_t n = (size_t)(i * 37) % 9000;
+        /* Every tenth repeats an earlier file's content. */
+        uint8_t *d = rand_buf(n, (uint64_t)(i % 10 == 0 ? i / 10 + 1 : 1000 + i));
+        write_buf(path, d, n);
+        free(d);
+    }
+    uint8_t *d = rand_buf(900 * 1024, 77);
+    write_buf(TEST_SRC "/several-chunks.bin", d, 900 * 1024);
+    int fd = open(TEST_SRC "/holey.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert_true(fd >= 0);
+    assert_int_equal(pwrite(fd, d, 100 * 1024, 0), 100 * 1024);
+    assert_int_equal(pwrite(fd, d, 100 * 1024, 800 * 1024), 100 * 1024);
+    close(fd);
+    free(d);
+    write_text(TEST_SRC "/locked.txt", "nobody may read this\n");
+    assert_int_equal(chmod(TEST_SRC "/locked.txt", 0), 0);
+}
+
+/* Every object but the trees: the trees above the source directory hold
+ * the scratch directories' own times, which the second repository's
+ * creation moves; the source's tree is compared on its own. */
+static char *object_rows_of(int64_t rid)
+{
+    char repo[32];
+    snprintf(repo, sizeof(repo), "%lld", (long long)rid);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT hash, type, orig_size, phys_size FROM objects"
+                                " WHERE repo_id = ? AND type != 5 ORDER BY hash",
+                                (const char *[]){ repo, NULL }, &r), 0);
+    size_t cap = (size_t)r->nrows * 120 + 1, off = 0;
+    char *out = malloc(cap);
+    assert_non_null(out);
+    out[0] = '\0';
+    for (int i = 0; i < r->nrows; i++)
+        off += (size_t)snprintf(out + off, cap - off, "%s %s %s %s\n", r->rows[i][0],
+                                r->rows[i][1], r->rows[i][2], r->rows[i][3]);
+    db_result_free(r);
+    return out;
+}
+
+static void test_small_files_on_workers_match_serial(void **state)
+{
+    (void)state;
+    make_small_tree();
+
+    /* Eight workers into the setup's repository. */
+    backup_result_t a = backup(8);
+    assert_int_equal(a.store_workers, 8);
+
+    /* One thread into a second, fresh one. */
+    int64_t rid2 = 0;
+    store_t *st2 = NULL;
+    store_index_t *idx2 = NULL;
+    assert_int_equal(repo_register(db, TEST_DIR "/serial", "serial", &rid2), OK);
+    assert_int_equal(repo_store_open(TEST_DIR "/serial", NULL, &st2), OK);
+    assert_int_equal(store_index_bind(st2, db, rid2, &idx2), OK);
+    static const char *paths[] = { TEST_SRC };
+    backup_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.paths = paths;
+    o.n_paths = 1;
+    o.store_workers = 1;
+    backup_result_t b;
+    memset(&b, 0, sizeof(b));
+    assert_int_equal(backup_run(st2, db, rid2, &o, &b), OK);
+    assert_int_equal(b.store_workers, 1);
+
+    assert_int_equal(a.files, b.files);
+    assert_int_equal(a.bytes_logical, b.bytes_logical);
+    assert_int_equal(a.objects_new, b.objects_new);
+    assert_int_equal(a.bytes_stored, b.bytes_stored);
+
+    char ta[OBJECT_HASH_SIZE * 2 + 1], tb[OBJECT_HASH_SIZE * 2 + 1];
+    src_tree_of(a.snapshot_id, ta);
+    char id[32], r2[32];
+    snprintf(id, sizeof(id), "%lld", (long long)b.snapshot_id);
+    snprintf(r2, sizeof(r2), "%lld", (long long)rid2);
+    db_result_t *r = NULL;
+    assert_int_equal(db_execute(db, "SELECT subtree_hash FROM nodes WHERE snap_id = ?"
+                                " AND repo_id = ? AND name = 'src' AND type = 2",
+                                (const char *[]){ id, r2, NULL }, &r), 0);
+    assert_int_equal(r->nrows, 1);
+    snprintf(tb, sizeof(tb), "%s", r->rows[0][0]);
+    db_result_free(r);
+    assert_string_equal(ta, tb);
+
+    char *oa = object_rows_of(repo_id), *ob = object_rows_of(rid2);
+    assert_string_equal(oa, ob);
+    free(oa);
+    free(ob);
+
+    /* A cache row for every file stored, none for the one that could not
+     * be opened, and nothing left staged. */
+    assert_int_equal(scalar("SELECT COUNT(*) FROM file_cache WHERE repo_id = ?"),
+                     (int)a.files);
+    assert_int_equal(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ?"
+                            " AND location = 'staged'"), 0);
+    /* The holey file is a list with its hole as a gap. */
+    assert_true(scalar("SELECT COUNT(*) FROM objects WHERE repo_id = ? AND type = 6") >= 1);
+
+    /* Unchanged: the next run reads nothing. */
+    backup_result_t c = backup(8);
+    assert_int_equal(c.files_unchanged, c.files);
+    assert_int_equal(c.objects_new, 0);
+
+    store_index_free(idx2);
+    store_close(st2);
+    assert_int_equal(chmod(TEST_SRC "/locked.txt", 0600), 0);
+    assert_int_equal(unlink(TEST_SRC "/locked.txt"), 0);
+    /* Every other file is vouched for by the cache rows the workers' run
+     * wrote, so this snapshot names exactly the objects they prepared. */
+    backup_result_t d = backup(8);
+    assert_int_equal(d.objects_new, 0);
+    restore_and_diff(d.snapshot_id);
 }
 
 /*
@@ -687,6 +819,7 @@ int main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_workers_do_not_change_the_snapshot, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_small_files_on_workers_match_serial, setup, teardown),
         cmocka_unit_test_setup_teardown(test_append_and_edit_write_little, setup, teardown),
         cmocka_unit_test_setup_teardown(test_gc_keeps_chunks_of_live_lists, setup, teardown),
         cmocka_unit_test_setup_teardown(test_failed_backup_leaves_garbage_gc_reclaims, setup, teardown),
