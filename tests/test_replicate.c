@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 
 #include <cmocka.h>
+#include <cutils/json.h>
 
 #include "fake_index.h"
 #include "manifest.h"
@@ -40,6 +41,7 @@
 #include "parity.h"
 #include "replicate.h"
 #include "repo.h"
+#include "snap_record.h"
 #include "store.h"
 #include "types.h"
 
@@ -569,6 +571,69 @@ static void test_packed_source_replicates_readably(void **state)
     replica_reader_close(rd);
 }
 
+/*
+ * OWN-33: the replica's record is the encoder's output byte for byte, for a
+ * label that needs escaping and for one stored before the label rules (a
+ * control character, a byte that is not UTF-8, longer than the limit),
+ * which is escaped rather than refused so the snapshot still replicates.
+ * Either way the file is the record and nothing after it.
+ */
+static void test_replica_record_escapes_the_label(void **state)
+{
+    (void)state;
+    uint8_t root[OBJECT_HASH_SIZE];
+    build_tree(root);
+    char hex[OBJECT_HASH_SIZE * 2 + 1];
+    for (int i = 0; i < OBJECT_HASH_SIZE; i++)
+        snprintf(hex + 2 * i, 3, "%02x", root[i]);
+
+    char legacy[700];
+    memset(legacy, 'z', sizeof(legacy) - 1);
+    legacy[sizeof(legacy) - 1] = '\0';
+    legacy[0] = '\n';
+    legacy[1] = (char)0xff;
+    legacy[2] = '"';
+
+    const char *labels[] = { "say \"hi\" C:\\dir caf\xc3\xa9 \xe2\x98\x83", legacy };
+    for (int k = 0; k < 2; k++) {
+        replica_sink_t sink;
+        assert_int_equal(replica_sink_local_open(DST_REPO, &src_marker, &sink), OK);
+        replicate_result_t res;
+        assert_int_equal(walk_one(&sink, root, &res), OK);
+        replica_snapshot_t snap;
+        memset(&snap, 0, sizeof(snap));
+        snap.snapshot_id = k + 1;
+        snap.ts = 1700000000;
+        snap.label = labels[k];
+        memcpy(snap.root_tree_hash, root, OBJECT_HASH_SIZE);
+        assert_int_equal(sink.v->commit_snapshot(sink.ctx, &snap), OK);
+        sink.v->close(sink.ctx);
+
+        size_t want_len = 0;
+        char *want = snapshot_record_encode(k + 1, 1700000000, hex, labels[k], &want_len);
+        assert_non_null(want);
+
+        char path[256];
+        snprintf(path, sizeof(path), "%s/snapshots/%d", DST_REPO, k + 1);
+        struct stat sb;
+        assert_int_equal(stat(path, &sb), 0);
+        assert_int_equal((size_t)sb.st_size, want_len);
+        char *got = malloc(want_len + 1);
+        assert_non_null(got);
+        FILE *f = fopen(path, "rb");
+        assert_non_null(f);
+        assert_int_equal(fread(got, 1, want_len, f), want_len);
+        fclose(f);
+        assert_memory_equal(got, want, want_len);
+
+        cutils_json_req_t *req = NULL;
+        assert_int_equal(json_req_parse(got, want_len, &req), 0);
+        json_req_free(req);
+        free(got);
+        free(want);
+    }
+}
+
 int main(void)
 {
     rs_init();
@@ -581,6 +646,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_target_of_another_repository_is_refused, setup, teardown),
         cmocka_unit_test_setup_teardown(test_replica_carries_the_source_identity, setup, teardown),
         cmocka_unit_test_setup_teardown(test_packed_source_replicates_readably, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_replica_record_escapes_the_label, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

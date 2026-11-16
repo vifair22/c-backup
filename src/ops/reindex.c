@@ -9,11 +9,14 @@
 #include "pack.h"
 #include "db_txn.h"
 #include "repo_tags.h"
+#include "snap_record.h"
 
 #include <cutils/json.h>
 #include <cutils/log.h>
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,22 +242,59 @@ static status_t read_snapshot_record(store_t *store, int64_t snap_id,
                  store_root(store), (long long)snap_id) >= (int)sizeof(path))
         return set_error(ERR_IO, "reindex: path too long");
 
-    FILE *f = fopen(path, "rb");
-    if (!f) return set_error_errno(ERR_NOT_FOUND, "reindex: cannot open %s", path);
-    char buf[1024];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
+    /*
+     * Sized by the file, not a fixed buffer. A 1,024-byte read truncated any
+     * record longer than that, and a truncated record is not JSON, so the
+     * snapshot dropped out of the rebuilt index. The bound is what the
+     * writer will produce at most; anything larger is not a record.
+     */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return set_error_errno(ERR_NOT_FOUND, "reindex: cannot open %s", path);
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return set_error_errno(ERR_IO, "reindex: cannot stat %s", path);
+    }
+    if (!S_ISREG(sb.st_mode) || sb.st_size < 0 || sb.st_size > SNAPSHOT_RECORD_MAX) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "reindex: %s is not a snapshot record "
+                         "(%lld bytes; at most %d expected)", path,
+                         (long long)sb.st_size, SNAPSHOT_RECORD_MAX);
+    }
+    size_t want = (size_t)sb.st_size;
+    char *buf = malloc(want + 1);
+    if (!buf) { close(fd); return set_error(ERR_NOMEM, "reindex: out of memory"); }
+    size_t n = 0;
+    while (n < want) {
+        ssize_t r = read(fd, buf + n, want - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) {
+            int err = errno;
+            free(buf); close(fd);
+            errno = err;
+            return set_error_errno(ERR_IO, "reindex: cannot read %s", path);
+        }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
     buf[n] = '\0';
 
     cutils_json_req_t *req = NULL;
-    if (json_req_parse(buf, n, &req) != 0 || !req)
+    int parsed = json_req_parse(buf, n, &req);
+    free(buf);
+    if (parsed != 0 || !req)
         return set_error(ERR_CORRUPT, "reindex: %s is not valid JSON", path);
 
     char *root_hex = NULL, *label = NULL;
-    uint64_t ts = 0;
+    /* Signed: the writer records time_t as is, and an unsigned read turned
+     * any time before 1970 into 0. */
+    int64_t ts = 0;
     int bad = json_req_get_str(req, "root", &root_hex) != 0 || !root_hex ||
               strlen(root_hex) != OBJECT_HASH_SIZE * 2;
-    if (json_req_get_u64(req, "ts", &ts, 0, UINT64_MAX) != 0) ts = 0;
+    if (json_req_get_i64(req, "ts", &ts, INT64_MIN, INT64_MAX) != 0) ts = 0;
     if (json_req_get_str_opt(req, "label", &label) != 0) label = NULL;
 
     if (bad) {
@@ -264,7 +304,7 @@ static status_t read_snapshot_record(store_t *store, int64_t snap_id,
     }
 
     hex_to_hash(root_hex, root);
-    if (out_ts) *out_ts = (int64_t)ts;
+    if (out_ts) *out_ts = ts;
     if (out_label) *out_label = label; else free(label);
     free(root_hex);
     json_req_free(req);

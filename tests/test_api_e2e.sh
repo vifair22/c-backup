@@ -558,6 +558,16 @@ contains "and the stored value is untouched" '"key":"retention.keep_daily","valu
 # anyway, from the configured sources or with the wrong options.
 check "a backup label must be a string" '{"error":"label must be a string"} 400' \
     "$(sock_send POST /repos/1/backup '{"label":["x"]}')"
+# OWN-33: a long label overran the record writer's buffer and put daemon
+# stack into the repository; a control character is not text.
+LONG_LABEL=$(head -c 1000 /dev/zero | tr '\0' x)
+LABEL_RULE='{"error":"label must be at most 256 bytes of printable text"} 400'
+check "a 1,000-byte backup label is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"$LONG_LABEL\"}")"
+check "a label with a newline is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\nb\"}")"
+check "a label with a C1 control is refused" "$LABEL_RULE" \
+    "$(sock_send POST /repos/1/backup "{\"paths\":[\"$WORK/src\"],\"label\":\"a\\u009bb\"}")"
 check "backup paths must be a list" '{"error":"paths must be a list of strings"} 400' \
     "$(sock_send POST /repos/1/backup '{"paths":"/x"}')"
 check "a non-string backup path" \
@@ -607,6 +617,11 @@ check "a bad catchup is reported before missing sources" \
 check "non-string schedule paths are reported before missing sources" \
     '{"error":"paths must be a list of strings; entry 1 is not one"} 400' \
     "$(sched '{"action":"backup","paths":[1],"trigger":{"type":"interval","seconds":60}}')"
+check "a schedule's 1,000-byte backup label is refused" "$LABEL_RULE" \
+    "$(sched "{\"action\":\"backup\",\"label\":\"$LONG_LABEL\",\"trigger\":{\"type\":\"interval\",\"seconds\":60}}")"
+check "a label belongs to a backup schedule only" \
+    '{"error":"label applies only to a backup schedule, not gc"} 400' \
+    "$(sched '{"action":"gc","label":"x","trigger":{"type":"interval","seconds":60}}')"
 check "a sound body then hears about the sources" \
     '{"error":"this repository has no backup sources configured, and none were given"} 400' \
     "$(sched '{"action":"backup","trigger":{"type":"interval","seconds":60}}')"
@@ -1494,6 +1509,38 @@ if [ "$AFTER_JOB" -gt "$GONE_JOB" ]; then
 else
     check "a purged job's id is not reused" "above $GONE_JOB" "$AFTER_JOB"
 fi
+# OWN-33: a label with quotes, a backslash and non-ASCII text was written
+# into the snapshot record unescaped, so the record was not JSON and a
+# reindex lost the snapshot. It survives the listing and, with the index
+# rows gone, a reindex from the repository alone. Sent as \u escapes; the
+# listing returns UTF-8.
+LBL_JSON='q\"u\\o caf\u00e9 \u2603'
+LBL_OUT='q\"u\\o '$(printf 'caf\303\251 \342\230\203')
+LJ=$(job_id "$(sock_post /repos/1/backup "{\"paths\":[\"$R/src\"],\"label\":\"$LBL_JSON\"}")")
+wait_job "$LJ"
+LSID=$(sock_body "/jobs/$LJ" | sed -n 's/.*"result":{"snapshot_id":\([0-9]*\).*/\1/p')
+contains "an escaped label is listed intact" "\"id\":$LSID,\"ts\":" "$(sock_body /repos/1/snapshots)"
+contains "with its label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/snapshots)"
+contains "the record holds it escaped" "\"label\":\"$LBL_OUT\"}" "$(cat "$R/repo/snapshots/$LSID")"
+if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$R/state.db" "DELETE FROM nodes WHERE repo_id = 1;
+                           DELETE FROM node_fts WHERE repo_id = 1;
+                           DELETE FROM snapshots WHERE repo_id = 1"
+    check "no snapshots listed once the rows are gone" 0 \
+        "$(sock_body /repos/1/snapshots | grep -o '"id":[0-9]*' | wc -l | tr -d ' ')"
+fi
+RX=$(job_id "$(sock_post /repos/1/reindex)")
+wait_job "$RX"
+contains "the reindex succeeds" '"state":"completed"' "$(sock_body "/jobs/$RX")"
+contains "and the label comes back from the record" "\"label\":\"$LBL_OUT\"" \
+    "$(sock_body /repos/1/snapshots)"
+
+# A backup schedule carries its label, checked when it is made.
+SCH=$(sock_send POST /repos/1/schedules \
+    "{\"action\":\"backup\",\"paths\":[\"$R/src\"],\"label\":\"$LBL_JSON\",\"trigger\":{\"type\":\"interval\",\"seconds\":86400}}")
+contains "a labelled backup schedule is created" ' 201' "$SCH"
+contains "and stores the label" "\"label\":\"$LBL_OUT\"" "$(sock_body /repos/1/schedules)"
+
 kill -TERM "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 DAEMON_PID=""
