@@ -418,6 +418,7 @@ What stops it:
 | A tab in the indentation | YAML indents with spaces |
 | A `log.level` that is not a level | `log.level: chatty` |
 | A `backup.file_cache_match` that is not a mode | `fast` |
+| An empty value for a key whose values are named or numbered: `log.level`, `db.synchronous`, `backup.file_cache_match`, `backup.unsettled` and every number, in the file or the environment. Leave the key out for its default. `http.bind` (empty is the loopback default) and the paths and Pushover credentials are exempt | `backup.unsettled: ""`, `http.port:` |
 
 The file format is a small subset of YAML: sections at the left margin, each
 holding `key: value` lines indented the same way with spaces, `#` comments,
@@ -1281,6 +1282,12 @@ it.
 A schedule has one trigger: an interval in seconds, or a calendar with
 `--every`. Giving both, or `--at`, `--on`, `--on-day` or `--on-month`
 without `--every`, is refused by the CLI rather than one half being dropped.
+So is the reverse: `--every` always needs `--at`, `week` needs `--on`,
+`month` needs `--on-day` and `year` needs `--on-day` and `--on-month`, and a
+field the period does not use (`--on` with `--every day`) is refused rather
+than ignored. Every option with a fixed set of values (`--every`, `--level`,
+`--location`, `--encrypt`, `--on-overlap`, `--catchup`, `--scope`) refuses
+anything else before a request is sent.
 
 **Interval** triggers anchor to the last successful run, not to wall-clock
 multiples: a long backup does not make the next one due the moment it ends.
@@ -2413,7 +2420,7 @@ lists every command with all of its arguments.
 | `reindex <id>` | Rebuild the index |
 | `replicate <id> <dest> [--reencrypt] [--to-plaintext]` | Copy into another directory; `--reencrypt` into another repository under its own encryption; `--to-plaintext` to allow that repository to be unencrypted (section 14.1) |
 | `stats <id> [--scope staged]`, `summary <id>`, `fanout <id>` | Repository statistics; `staged` is objects in packs a running backup has not sealed |
-| `objects <id> [--location staged\|packed] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
+| `objects <id> [--location staged\|packed\|all] [--limit N] [--offset N]`, `object <id> <hash> [refs\|layout\|content]` | Objects. `refcount` is as the last `gc` or `reindex` counted it: 0 for everything right after a first backup, and possibly high after a prune until the next `gc`. `object <id> <hash> refs` is the live answer |
 | `packs <id> [pack-id] [--limit N] [--offset N]` | Packs, or one pack's entries |
 | `policy list <id>`, `policy set <id> <key> <value>` | Per-repository settings |
 | `tag list <id>`, `tag set <id> <name> <snapshot> [--move]`, `tag remove <id> <name>` | Tags |

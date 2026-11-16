@@ -6,6 +6,71 @@
 #include <arpa/inet.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+
+/*
+ * Whether the file's own line for `key` gives it an empty value: `key:`,
+ * `key: ""`, `key:   # comment`.
+ *
+ * c-utils treats an empty value as unset and hands back the compiled-in
+ * default, which is right for a free-form string like pushover.token and
+ * wrong for a key whose every legal value is named: `backup.unsettled: ""`
+ * started the daemon as `store` (UAT NIT-18) while the Manual says any value
+ * but store or skip stops it. config_get_str cannot tell that line from one
+ * that says `store`, so this reads the line back. The format is c-utils'
+ * one-line subset (config_yaml.h), so the value is whatever follows the
+ * first colon, minus an unquoted ` #` comment and one pair of double quotes.
+ */
+static int file_value_empty(const cutils_config_t *cfg, const char *key)
+{
+    int want = config_key_line(cfg, key);
+    const char *path = config_get_path(cfg);
+    if (want <= 0 || !path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char buf[512];
+    int line = 1, empty = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        int whole = strchr(buf, '\n') != NULL;
+        if (line == want) {
+            char *v = strchr(buf, ':');
+            if (v) {
+                v++;
+                v += strspn(v, " \t");
+                if (v[0] == '"')
+                    empty = v[1] == '"';
+                else
+                    empty = v[0] == '\0' || v[0] == '\n' || v[0] == '\r' ||
+                            v[0] == '#';
+            }
+            break;
+        }
+        if (whole) line++;
+    }
+    fclose(f);
+    return empty;
+}
+
+/*
+ * Refuse an empty value for a key that has no empty meaning. An empty
+ * environment variable reads back as "", so it is caught by the value; an
+ * empty line in the file reads back as the default and is caught by
+ * file_value_empty. `legal` completes "set ..." in the message.
+ */
+static void check_not_empty(const cutils_config_t *cfg, config_check_t *chk,
+                            const char *key, const char *legal)
+{
+    const char *v = config_get_str(cfg, key);
+    if (!v) return;
+    if (v[0] && !file_value_empty(cfg, key)) return;
+    const config_key_t *def = config_get_key_def(cfg, key);
+    config_check_fail(chk, key,
+                      "an empty value is not allowed; set %s, or leave the key "
+                      "out for the default (%s)", legal,
+                      def && def->default_value ? def->default_value : "none");
+}
 
 /*
  * What the types in app_file_keys cannot say. c-utils calls this during
@@ -72,6 +137,17 @@ void app_config_check(const cutils_config_t *cfg, config_check_t *chk,
     /* An empty bind is the documented loopback default, which the listener
      * applies itself. Anything else has to be what the listener parses: an
      * IPv4 address, not a hostname. */
+    /* Every key whose legal values are named or numeric. Left out on
+     * purpose: http.bind, where empty is the documented loopback default,
+     * and the free-form strings (paths, Pushover credentials). */
+    check_not_empty(cfg, chk, "backup.unsettled", "one of store, skip");
+    check_not_empty(cfg, chk, "backup.file_cache_match", "one of auto, strict, relaxed");
+    check_not_empty(cfg, chk, "db.synchronous", "one of normal, full");
+    check_not_empty(cfg, chk, "log.level", "one of debug, info, warn, error");
+    for (int i = 0; app_file_keys[i].key; i++)
+        if (app_file_keys[i].type == CFG_INT)
+            check_not_empty(cfg, chk, app_file_keys[i].key, "a whole number");
+
     const char *bind = config_get_str(cfg, "http.bind");
     struct in_addr a;
     if (bind && bind[0] && inet_pton(AF_INET, bind, &a) != 1)

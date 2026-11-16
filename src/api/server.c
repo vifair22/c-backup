@@ -852,6 +852,11 @@ void api_server_set_auth(api_server_t *srv, api_auth_fn fn, void *userdata)
  * walking it. Starting the listeners only once the caller says the server is
  * fully configured closes both.
  */
+const char *api_server_error(void)
+{
+    return cutils_get_error();
+}
+
 int api_server_start(api_server_t *srv)
 {
     mhd_cls_t *tcp_cls  = srv->_tcp_cls;
@@ -882,8 +887,8 @@ int api_server_start(api_server_t *srv)
             MHD_OPTION_SOCK_ADDR, (struct sockaddr *)&srv->bind_addr,
             MHD_OPTION_END);
         if (!srv->tcp_daemon)
-            return set_error(CUTILS_ERR, "failed to start HTTP server on %s:%d",
-                             srv->bind_str, srv->tcp_port);
+            return set_error_errno(CUTILS_ERR, "failed to start HTTP server on %s:%d",
+                                   srv->bind_str, srv->tcp_port);
         log_info("HTTP server listening on %s:%d", srv->bind_str, srv->tcp_port);
     }
 
@@ -913,19 +918,28 @@ int api_server_start(api_server_t *srv)
         }
         unlink(path);
 
+        /* Each failure names the path and the reason (NIT-19): "cannot
+         * start API server" alone left an operator to guess between a
+         * missing directory, its permissions and a path too long. errno is
+         * set into the message before close or unlink can change it. */
         int sock = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sock < 0)
-            return set_error(CUTILS_ERR, "failed to create unix socket");
+            return set_error_errno(CUTILS_ERR, "cannot create the unix socket for %s",
+                                   path);
 
         if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            int rc = set_error_errno(CUTILS_ERR, "cannot bind the unix socket at %s "
+                                     "(http.socket)", path);
             close(sock);
-            return set_error(CUTILS_ERR, "failed to bind unix socket at %s", path);
+            return rc;
         }
         srv->unix_bound = 1;
         if (listen(sock, 8) < 0) {
+            int rc = set_error_errno(CUTILS_ERR, "cannot listen on the unix socket at %s",
+                                     path);
             close(sock);
             unlink(path);
-            return set_error(CUTILS_ERR, "failed to listen on unix socket");
+            return rc;
         }
 
         srv->unix_daemon = MHD_start_daemon(

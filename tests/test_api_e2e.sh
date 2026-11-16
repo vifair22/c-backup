@@ -156,6 +156,24 @@ refuses "unsettled policy" "backup.unsettled: 'maybe' is not one of store, skip"
     'backup:' '  unsettled: maybe'
 refuses "store workers out of range" "backup.store_workers: '65' is not between 0 and 64" \
     'backup:' '  store_workers: 65'
+# An empty value is not a choice either (NIT-18): c-utils reads it as unset,
+# so `unsettled: ""` started as store and an empty port as 8765.
+refuses "empty unsettled policy" \
+    "bad.yaml:7: error: backup.unsettled: an empty value is not allowed; set one of store, skip" \
+    'backup:' '  unsettled: ""'
+refuses "bare file cache mode" "bad.yaml:7: error: backup.file_cache_match: an empty value" \
+    'backup:' '  file_cache_match:'
+refuses "empty synchronous" "db.synchronous: an empty value is not allowed" \
+    'db:' '  synchronous: ""   # comment'
+refuses "empty integer" \
+    "bad.yaml:7: error: jobs.max_parallel: an empty value is not allowed; set a whole number" \
+    'jobs:' '  max_parallel: ""'
+out=$(printf 'db:\n  path: %s/bad.db\nhttp:\n  socket: %s/bad.sock\n  port: 0\n' "$WORK" "$WORK" \
+          > "$WORK/bad.yaml"; chmod 600 "$WORK/bad.yaml"
+      C_BACKUP_BACKUP_UNSETTLED= C_BACKUP_CONFIG_PATH="$WORK/bad.yaml" timeout 10 "$BIN" 2>&1)
+contains "empty unsettled from the environment refused" \
+    "C_BACKUP_BACKUP_UNSETTLED (backup.unsettled): an empty value is not allowed" "$out"
+rm -f "$WORK/bad.db" "$WORK/bad.db-wal" "$WORK/bad.db-shm" "$WORK/bad.sock"
 refuses "tab indentation" "bad.yaml:6: error: tab in the indentation" \
     "$(printf '\tbind: 127.0.0.1')"
 # log.level among other problems: it was dropped from the list.

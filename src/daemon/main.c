@@ -430,7 +430,7 @@ int main(int argc, char *argv[])
     api_server_set_auth(srv, auth_check, db);
 
     if (api_server_start(srv) != 0) {
-        log_error("cannot start API server");
+        log_error("cannot start API server: %s", api_server_error());
         goto out_srv;
     }
 
