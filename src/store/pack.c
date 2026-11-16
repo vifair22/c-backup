@@ -3203,6 +3203,49 @@ static int salvage_header(int fd, const pack_trailer_t *t, const pack_hdr_hint_t
 }
 
 /*
+ * Check an entry with no CRCs to check it against: decode it - decrypt, so
+ * AEAD authenticates type and name; decompress; hash type and payload
+ * against the name - under each header the index allows, nothing corrected.
+ * On success the header that decoded is left at the front of buf. Returns
+ * 1 intact, 0 not (buf's header left as it was), -1 out of memory.
+ */
+static int salvage_verify(store_t *store, const pack_hdr_hint_t *hi, int keyed,
+                          uint8_t *buf, size_t len)
+{
+    static const uint8_t comps[2] = { COMPRESS_NONE, COMPRESS_LZ4 };
+    size_t plen = len - sizeof(pack_dat_entry_hdr_t);
+    for (unsigned ty = 0; ty < 256; ty++) {
+        if (!object_type_known(ty) || (hi->type && ty != hi->type)) continue;
+        for (int c = 0; c < 2; c++) {
+            pack_dat_entry_hdr_t cand;
+            memset(&cand, 0, sizeof(cand));
+            memcpy(cand.hash, hi->hash, OBJECT_HASH_SIZE);
+            cand.type              = (uint8_t)ty;
+            cand.compression       = comps[c];
+            cand.encryption        = keyed ? ENCRYPT_CHACHA20 : ENCRYPT_NONE;
+            cand.uncompressed_size = hi->orig_size;
+            cand.compressed_size   = hi->comp_size;
+            if (hdr_fields_valid(&cand, 0) != 0) continue;
+            uint8_t *copy = malloc(plen ? plen : 1);
+            if (!copy) return -1;
+            memcpy(copy, buf + sizeof(cand), plen);
+            void *data = NULL;
+            size_t dsz = 0;
+            pack_dat_entry_hdr_t dec = cand;   /* decrypting rewrites its size */
+            status_t st = entry_decode(store, &dec, hi->hash, copy, &data, &dsz,
+                                       "pack salvage");
+            if (st == OK) {
+                free(data);
+                memcpy(buf, &cand, sizeof(cand));
+                return 1;
+            }
+            err_clear();
+        }
+    }
+    return 0;
+}
+
+/*
  * Salvage a pack that cannot be walked and whose headers cannot all be
  * rebuilt: some of the damaged headers belong to entries the index no
  * longer has a row for (gc swept them), so nothing knows what they said.
@@ -3216,8 +3259,13 @@ static int salvage_header(int fd, const pack_trailer_t *t, const pack_hdr_hint_t
  * covers: unreferenced entries, garbage gc had already swept. Those ranges
  * are reported.
  *
- * A live entry still failing its CRC after correction is damage beyond
- * parity. It is carried into the new pack as it is, with its header right,
+ * With no usable trailer, each entry is checked by decoding it instead
+ * (salvage_verify): the object's own AEAD or name, nothing corrected. The
+ * bytes after the last indexed entry, the old trailer among them, are
+ * reported with the dropped ranges.
+ *
+ * A live entry still failing its CRC after correction, or failing to
+ * decode, is damage beyond parity. It is carried into the new pack as it is, with its header right,
  * and listed in out->damaged: the pack becomes walkable, so the unwalkable
  * finding clears, while the object's own loss stays exactly what verify
  * reports for damage beyond parity anywhere. Keeping the old pack for one
@@ -3236,18 +3284,28 @@ status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *
         return set_error(ERR_IO, "pack %u: path too long", pack_num);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return set_error_errno(ERR_IO, "pack salvage: open pack-%010u.dat", pack_num);
-    /* The CRCs are the only witness of which entries came through intact.
-     * Without them a salvage could only copy bytes on faith, so the pack is
-     * left as it is, still reported, rather than rewritten unverified. */
+    /*
+     * With a trailer, the CRCs say which entries came through and parity
+     * corrects what it can. Without one, every object still verifies
+     * itself - AEAD over type and name when encrypted, SHA-256 of type and
+     * payload against its name when not - so each entry is checked by
+     * decoding it, at salvage time and with nothing corrected. That needs
+     * the key for an encrypted repository; without it nothing can be
+     * proven and the pack is left as it is, still reported.
+     */
     pack_trailer_t tr;
-    if (pack_trailer_read(fd, &tr) != 0) {
-        close(fd);
-        return set_error(ERR_CORRUPT, "pack-%010u.dat has no usable trailer to check its "
-                         "entries against; not salvaged", pack_num);
-    }
-    const pack_trailer_t *t = &tr;
-    uint64_t body_end = tr.body_len;
+    int have_t = pack_trailer_read(fd, &tr) == 0;
+    const pack_trailer_t *t = have_t ? &tr : NULL;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) { close(fd); return set_error_errno(ERR_IO, "pack salvage: stat"); }
+    uint64_t body_end = have_t ? tr.body_len : (uint64_t)sb.st_size;
     int keyed = store_needs_key(store) || store_key(store) != NULL;
+    if (!have_t && store_needs_key(store)) {
+        close(fd);
+        return set_error(ERR_CORRUPT, "pack-%010u.dat has no usable trailer and the "
+                         "repository key is not loaded, so its entries cannot be checked; "
+                         "not salvaged", pack_num);
+    }
 
     pack_hdr_hint_t *h = malloc(n * sizeof(*h));
     if (!h) { close(fd); return set_error(ERR_NOMEM, "pack salvage: hints"); }
@@ -3296,7 +3354,11 @@ status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *
             break;
         }
         int damaged = 0;
-        {
+        if (!t) {
+            int v = salvage_verify(store, &h[i], keyed, buf, len);
+            if (v < 0) { free(buf); st = set_error(ERR_NOMEM, "pack salvage: verify"); break; }
+            damaged = v == 0;
+        } else {
             uint32_t want_e = 0;
             int have_e = entry_table_slot(fd, t, h[i].entry_index, 1, &want_e, NULL) == 0;
             if (!have_e || crc32c(buf, len) != want_e) {

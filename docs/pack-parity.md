@@ -133,7 +133,9 @@ written. When a damaged header has no index row (gc swept its entry), the
 repairing verify salvages the pack: every indexed entry is copied by its
 indexed offset into a new pack through gc's rewrite path, damaged ones as
 they are (their loss stays reported), and the unreferenced bytes are
-dropped and listed.
+dropped and listed. With no usable trailer the entries are checked by
+decoding them instead: every object verifies itself, by AEAD or by its
+name.
 
 `tests/test_pack_stripe.c` damages 2, 4 and 16 bytes of an entry header, of
 the pack header and of the tail (one copy, then both), and checks that

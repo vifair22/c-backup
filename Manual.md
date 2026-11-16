@@ -1329,8 +1329,14 @@ damaged beyond parity is carried into the new pack as it is: the pack stops
 being unwalkable, and verify goes on reporting that object as
 `unrecoverable` with its files, exactly as for damage beyond parity
 anywhere, so what remains on the report is the real loss and nothing else.
-A pack with no usable trailer is not salvaged: without its CRCs nothing can
-say which entries came through intact, so it stays reported as unwalkable.
+A pack with no usable trailer is salvaged too: without its CRCs each live
+entry is checked the way a deep verify checks it - decrypted, so AEAD
+authenticates its type and name, or decompressed and hashed against its
+name - nothing corrected, and kept clean or carried as lost accordingly.
+That costs a read of the pack's live payloads. An encrypted repository needs
+its key loaded for it; without one the pack stays reported as unwalkable.
+A pack overwritten wholesale therefore ends as what it is: every object in
+it `unrecoverable`, with its files, and no pack left that nothing can walk.
 Checking every pack's headers costs index and structure verifies a read of
 each entry header (8 bytes of CRC table each, no payloads).
 

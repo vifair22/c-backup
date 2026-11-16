@@ -816,14 +816,27 @@ if [ -n "$LOSS_DAT" ]; then
     contains "its findings still print" '"status":"unrecoverable"' "$OUT"
     check    "and as one document"      "1" "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
 
-    # The index level never opens a pack, and reported a deleted one as ok.
-    rm -f "$LOSS_DAT"
-    OUT=$(cb verify "$LOSS_ID" --level index 2>/dev/null); RC=$?
-    check    "index verify of a deleted pack exits non-zero" 1 "$RC"
-    contains "a deleted pack's objects are missing" '"status":"missing"' "$OUT"
+    # Nothing in that pack survived, trailer included, so the repairing run
+    # salvaged it: every object checked against its own name, every one
+    # failing, each carried into a new pack and reported as lost. What is
+    # left is the true loss, not a pack nothing can walk.
+    contains "the pack was salvaged" '"status":"salvaged"' "$OUT"
+    if [ -e "$LOSS_DAT" ]; then bad "the salvaged pack is gone" "absent" "present"
+    else ok "the salvaged pack is gone"; fi
     case "$OUT" in
-        *'"missing":0,'*) bad "index verify counts them missing" "missing > 0" "$OUT" ;;
-        *)                 ok  "index verify counts them missing" ;;
+        *'"status":"unwalkable pack"'*) bad "no unwalkable pack is left" "none" "$OUT" ;;
+        *)                              ok  "no unwalkable pack is left" ;;
+    esac
+    OUT=$(cb verify "$LOSS_ID" --level deep --dry-run 2>/dev/null); RC=$?
+    check    "a later check still exits non-zero" 1 "$RC"
+    contains "and names the loss" '"status":"unrecoverable"' "$OUT"
+    case "$OUT" in
+        *'"unrecoverable":0,'*) bad "it counts the objects lost" "unrecoverable > 0" "$OUT" ;;
+        *)                      ok  "it counts the objects lost" ;;
+    esac
+    case "$OUT" in
+        *'"status":"unwalkable pack"'*) bad "with no unwalkable pack" "none" "$OUT" ;;
+        *)                              ok  "with no unwalkable pack" ;;
     esac
     contains "verify show reads the failed run back" '"findings"' \
         "$(cb verify show "$LOSS_ID" "$(printf '%s' "$OUT" | sed -n 's/.*"runs":\[{"id":\([0-9]*\),.*/\1/p')")"

@@ -443,7 +443,10 @@ typedef struct {
  * .deleting marker, removal, unlink), and drops the rest: bytes no row
  * covers, which are unreferenced. An indexed entry damaged beyond parity
  * is carried as it is and listed, so its loss is still reported while the
- * pack stops being unwalkable. hints are the pack's index rows.
+ * pack stops being unwalkable. With no usable trailer each entry is checked
+ * by decoding it (AEAD, or its name) instead of by CRC, which an encrypted
+ * repository can do only with its key loaded. hints are the pack's index
+ * rows.
  */
 status_t pack_salvage(store_t *store, uint32_t pack_num, const pack_hdr_hint_t *hints,
                       size_t n, pack_salvage_result_t *out);

@@ -1328,6 +1328,74 @@ static void test_salvage_carries_a_damaged_live_entry_and_reports_its_loss(void 
     unw_assert_restores(s2, live_hex);
 }
 
+/*
+ * Case (a) with the trailer gone as well: both tails broken, and the walk
+ * that would derive the trailer is the thing that fails. No CRC can vouch
+ * for anything, but every object vouches for itself - its name is the hash
+ * of its type and content - so salvage decodes each live entry under the
+ * header the index implies, nothing corrected. The intact ones are kept
+ * clean, the one whose payload was also damaged is carried as it is and
+ * reported as the one loss, and the bytes no row covers are dropped.
+ */
+static void test_salvage_without_a_trailer_verifies_by_name(void **state)
+{
+    (void)state;
+    int64_t s1 = 0, s2 = 0;
+    unw_two_snapshots(&s1, &s2);
+    int dead = 0, live = 0;
+    char live_hex[OBJECT_HASH_SIZE * 2 + 1];
+    entry_at_t live_at;
+    uint32_t pnum = unw_wipe_group_of("f049", s2, &dead, &live, live_hex, &live_at);
+    assert_true(dead >= 1);
+    assert_true(live_hex[0] != '\0');
+    flip_byte(live_at.path, (off_t)(live_at.payload + 3));
+
+    /* Both tails' magic, so no copy verifies. */
+    {
+        int fd = open(live_at.path, O_RDWR);
+        assert_true(fd >= 0);
+        off_t end = lseek(fd, 0, SEEK_END);
+        uint8_t z[4] = { 0 };
+        assert_int_equal(pwrite(fd, z, 4, end - (off_t)PACK_TAIL_BYTES), 4);
+        assert_int_equal(pwrite(fd, z, 4, end - 2 * (off_t)PACK_TAIL_BYTES), 4);
+        close(fd);
+        pack_cache_invalidate(store);
+        store_dat_cache_flush(store);
+    }
+
+    assert_int_equal(prune_snapshot(store, db, repo_id, s1), OK);
+    gc_result_t gr;
+    memset(&gr, 0, sizeof(gr));
+    assert_int_equal(gc_run(store, db, repo_id, 0, NULL, &gr), ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(gr.packs_unwalkable, 1);
+    assert_non_null(strstr(gr.unwalkable[0].reason, "no usable trailer"));
+
+    verify_result_t vr;
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_DEEP, 1, NULL, NULL, NULL, &vr),
+                     ERR_CORRUPT);
+    err_clear();
+    assert_int_equal(vr.packs_salvaged, 1);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(vr.unrecoverable, 1);
+    assert_int_equal(vr.missing, 0);
+    assert_true(vr.unreferenced_dropped_ranges >= 1);
+    char status[64];
+    finding_status_of(live_hex, status, sizeof(status));
+    assert_string_equal(status, "unrecoverable");
+
+    char pname[32];
+    snprintf(pname, sizeof(pname), "pack-%010u", pnum);
+    memset(&vr, 0, sizeof(vr));
+    assert_int_equal(verify_run(store, db, repo_id, VERIFY_LEVEL_STRUCTURE, 0, NULL, NULL, NULL,
+                                &vr), OK);
+    assert_int_equal(vr.packs_unwalkable, 0);
+    assert_int_equal(verify_finding_count(pname, "unwalkable pack"), 0);
+
+    unw_assert_restores(s2, live_hex);
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -1351,6 +1419,7 @@ int main(void)
         cmocka_unit_test_setup_teardown(test_unwalkable_pack_is_reported_until_repaired, setup, teardown),
         cmocka_unit_test_setup_teardown(test_unwalkable_pack_with_swept_headers_is_salvaged, setup, teardown),
         cmocka_unit_test_setup_teardown(test_salvage_carries_a_damaged_live_entry_and_reports_its_loss, setup, teardown),
+        cmocka_unit_test_setup_teardown(test_salvage_without_a_trailer_verifies_by_name, setup, teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
